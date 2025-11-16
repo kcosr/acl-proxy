@@ -1,0 +1,30 @@
+{
+  "proxy": {
+    "bindAddress": "0.0.0.0",
+    "port": 8881,
+    "httpsBindAddress": "0.0.0.0",
+    "httpsPort": 8889
+  },
+  "policy": {
+    "default": "allow",
+    "rules": []
+  },
+  "logging": {
+    "level": "info",
+    "directory": "/workspace/devtools/acl-proxy/logs",
+    "console": {
+      "enabled": true
+    },
+    "file": {
+      "enabled": true
+    }
+  },
+  "loopProtection": {
+    "enabled": true,
+    "addHeader": true,
+    "headerName": "x-acl-proxy-request-id"
+  },
+  "certificates": {
+    "certsDir": "/workspace/devtools/acl-proxy/certs"
+  }
+}

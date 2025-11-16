@@ -1,0 +1,45 @@
+{
+  "proxy": {
+    "bindAddress": "127.0.0.1",
+    "port": 8881,
+    "httpsBindAddress": "127.0.0.1",
+    "httpsPort": 8889
+  },
+  "policy": {
+    "default": "deny",
+    "rules": [
+      { "action": "allow", "pattern": "https://www.google.com/**" },
+      { "action": "allow", "pattern": "https://example.com/**" },
+      { "action": "allow", "pattern": "https://httpbin.org/**" },
+      { "action": "allow", "pattern": "https://api.github.com/repos/*/readme" },
+      { "action": "allow", "pattern": "https://*.allowed.test/**" },
+      { "action": "deny", "pattern": "https://blocked.com/**" }
+    ]
+  },
+  "logging": {
+    "level": "debug",
+    "directory": "logs",
+    "console": { "enabled": true },
+    "file": { "enabled": false },
+    "policyDecisions": {
+      "logAllows": true,
+      "logDenies": true,
+      "levelAllows": "debug",
+      "levelDenies": "warn"
+    }
+  },
+  "capture": {
+    "allowed_request": false,
+    "allowed_response": false,
+    "denied_request": false,
+    "denied_response": false
+  },
+  "loopProtection": {
+    "enabled": true,
+    "addHeader": true,
+    "headerName": "x-acl-proxy-request-id"
+  },
+  "certificates": {
+    "certsDir": "certs"
+  }
+}

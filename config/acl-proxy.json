@@ -1,0 +1,52 @@
+{
+  "proxy": {
+    "bindAddress": "0.0.0.0",
+    "port": 8881,
+    "httpsBindAddress": "0.0.0.0",
+    "httpsPort": 8889
+  },
+  "policy": {
+    "default": "deny",
+    "rules": [
+      { "action": "allow", "pattern": "https://registry.npmjs.org/**" },
+
+      { "action": "allow", "pattern": "https://api2.cursor.sh/**" },
+
+      { "action": "allow", "pattern": "https://api.anthropic.com/**" },
+      { "action": "allow", "pattern": "https://raw.githubusercontent.com/anthropics/claude-code/refs/heads/main/CHANGELOG.md" },
+      { "action": "allow", "pattern": "https://statsig.anthropic.com/**" },
+      { "action": "allow", "pattern": "https://console.anthropic.com/**" },
+      { "action": "allow", "pattern": "https://http-intake.logs.datadoghq.com/api/**" },
+      { "action": "allow", "pattern": "https://api.segment.io/**" },
+
+      { "action": "allow", "pattern": "https://api.github.com/repos/openai/codex/**" },
+      { "action": "allow", "pattern": "https://chatgpt.com/backend-api/**" }
+    ]
+  },
+  "logging": {
+    "level": "debug",
+    "directory": "logs",
+    "console": { "enabled": true },
+    "file": { "enabled": true },
+    "policyDecisions": {
+      "logAllows": true,
+      "logDenies": true,
+      "levelAllows": "debug",
+      "levelDenies": "warn"
+    }
+  },
+  "capture": {
+    "allowed_request": false,
+    "allowed_response": false,
+    "denied_request": false,
+    "denied_response": false
+  },
+  "loopProtection": {
+    "enabled": true,
+    "addHeader": true,
+    "headerName": "x-acl-proxy-request-id"
+  },
+  "certificates": {
+    "certsDir": "certs"
+  }
+}
