@@ -1,0 +1,48 @@
+[package]
+name = "acl-proxy"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["tsagent <tsagent@example.com>"]
+description = "Rust rewrite of acl-proxy with HTTP/2, streaming, and TOML configuration."
+
+[[bin]]
+name = "acl-proxy-extract-capture-body"
+path = "src/bin/extract-capture-body.rs"
+
+[dependencies]
+clap = { version = "4.5.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+thiserror = "1.0"
+once_cell = "1.19"
+arc-swap = "1.7"
+ipnet = { version = "2.9", features = ["serde"] }
+regex = "1.11"
+url = "2.5"
+urlencoding = "2.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+base64 = "0.22"
+tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal"] }
+hyper = { version = "0.14", features = ["full"] }
+hyper-tls = "0.5"
+tokio-stream = "0.1"
+chrono = { version = "0.4", features = ["serde", "clock"] }
+http = "0.2"
+hyper-rustls = { version = "0.24", features = ["rustls-native-certs", "webpki-roots", "http1", "http2", "tokio-runtime"] }
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
+tokio-rustls = "0.24"
+rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
+rustls-pemfile = "1"
+
+[dev-dependencies]
+assert_cmd = "2.0"
+predicates = "3.1"
+tempfile = "3.10"
+h2 = "0.3"
+bytes = "1"
+
+[profile.release]
+opt-level = 3

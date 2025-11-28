@@ -1,0 +1,194 @@
+# Example acl-proxy configuration
+#
+# This sample demonstrates a reasonably complete configuration for
+# running acl-proxy in front of internal services. It is safe to use
+# as a starting point, but you should review and customize values
+# (hosts, ports, directories, subnets, and policy rules) for your
+# environment before deploying.
+#
+# To use this file:
+#   1. Copy it to config/acl-proxy.toml (the default path), e.g.:
+#        mkdir -p config
+#        cp acl-proxy.sample.toml config/acl-proxy.toml
+#   2. Adjust directories, ports, and policy rules as needed.
+#   3. Validate with:
+#        acl-proxy config validate --config config/acl-proxy.toml
+#
+# For a full schema reference, see docs/CONFIG_REFERENCE.md.
+
+schema_version = "1"
+
+###############################################################################
+# Proxy listeners
+###############################################################################
+
+[proxy]
+# HTTP explicit proxy listener. Clients send absolute-form HTTP/1.1
+# requests to this address (e.g. via curl -x).
+bind_address = "0.0.0.0"
+http_port = 8881
+
+# Transparent HTTPS listener. When enabled (https_port != 0), the proxy
+# terminates TLS directly and applies the same policy engine to HTTPS
+# traffic. For local-only use, you may prefer "127.0.0.1" and/or
+# disable this listener by setting https_port = 0.
+https_bind_address = "0.0.0.0"
+https_port = 8889
+
+###############################################################################
+# Logging
+###############################################################################
+
+[logging]
+# Base directory used as a fallback for capture files when
+# [capture].directory is empty. It does not currently control log
+# files; logs are emitted via tracing.
+directory = "logs"
+
+# Global log level for acl-proxy (trace|debug|info|warn|error).
+level = "info"
+
+[logging.policy_decisions]
+# Control structured logging of allow/deny decisions.
+log_allows = false
+log_denies = true
+level_allows = "info"
+level_denies = "warn"
+
+###############################################################################
+# Capture
+###############################################################################
+
+[capture]
+# Enable capture for allowed and denied traffic. Capture is optional;
+# you may want to start with denied-only in production.
+allowed_request = false
+allowed_response = false
+denied_request = true
+denied_response = true
+
+# Directory where JSON capture files are written. This must be
+# non-empty; the default is "logs-capture".
+directory = "logs-capture"
+
+# Template used to generate capture filenames. Supported placeholders:
+# {requestId}, {kind}, {suffix}. The default is "{requestId}-{suffix}.json".
+filename = "{requestId}-{kind}.json"
+
+###############################################################################
+# Loop protection
+###############################################################################
+
+[loop_protection]
+# When enabled, acl-proxy rejects requests that already contain the
+# loop header and optionally injects the header into outbound requests.
+enabled = true
+add_header = true
+
+# Header name used for loop detection and injection. Must be a valid
+# HTTP header name.
+header_name = "x-acl-proxy-request-id"
+
+###############################################################################
+# Certificates and TLS
+###############################################################################
+
+[certificates]
+# Base directory for CA material and per-host certificates. A generated
+# CA key/cert will be placed here when ca_key_path/ca_cert_path are not
+# set.
+certs_dir = "certs"
+
+# Optional: use an existing CA by providing both key and cert paths.
+# When both are omitted or empty, acl-proxy generates its own CA under
+# {certs_dir}.
+# ca_key_path = "/path/to/ca-key.pem"
+# ca_cert_path = "/path/to/ca-cert.pem"
+
+[tls]
+# Verify upstream HTTPS certificates by default. Set to false only in
+# controlled testing environments.
+verify_upstream = true
+
+# When true, enable HTTP/2 for upstream HTTPS connections where the
+# origin server supports it via ALPN. The default (false) always uses
+# HTTP/1.1 upstream for maximum compatibility.
+enable_http2_upstream = false
+
+###############################################################################
+# URL policy
+###############################################################################
+
+[policy]
+# Fallback decision when no rule matches ("allow" or "deny").
+default = "deny"
+
+# Macros define reusable placeholders that can be referenced from
+# patterns and descriptions.
+[policy.macros]
+repo = [
+  # Example repositories on an internal Git server.
+  "team1/service-a",
+  "team2/service-b",
+]
+
+status_host = [
+  # Example status/health dashboard hosts.
+  "status.internal",
+  "status2.internal",
+]
+
+###############################################################################
+# Rulesets
+###############################################################################
+
+# Rulesets are named collections of template rules that can be included
+# from top-level rules using [[policy.rules]] with `include = "..."`
+# and optional `with` overrides.
+
+[[policy.rulesets.git_repo]]
+action = "allow"
+pattern = "https://git.internal/{repo}.git/**"
+description = "Git HTTP(S) for {repo}"
+
+[[policy.rulesets.git_repo]]
+action = "allow"
+pattern = "https://git.internal/api/v4/projects/{repo}?**"
+description = "Git API for {repo}"
+
+###############################################################################
+# Top-level rules
+###############################################################################
+
+[[policy.rules]]
+# Allow Git traffic (HTTP(S) and API) for repositories listed in
+# [policy.macros].repo from the 10.0.0.0/8 network, including URL
+# encoded variants of the {repo} placeholder.
+include = "git_repo"
+add_url_enc_variants = true
+subnets = ["10.0.0.0/8"]
+
+[[policy.rules]]
+# Allow internal status pages defined in [policy.macros].status_host
+# for all methods from a specific internal CIDR.
+action = "allow"
+pattern = "https://{status_host}/**"
+description = "Allow internal status dashboards"
+methods = ["GET", "HEAD"]
+subnets = ["10.1.0.0/16"]
+
+[[policy.rules]]
+# Example: allow direct HTTP access to example.com for local testing.
+action = "allow"
+pattern = "http://example.com/**"
+description = "Allow HTTP to example.com for development"
+methods = ["GET", "POST"]
+subnets = ["127.0.0.0/8"]
+
+[[policy.rules]]
+# Explicitly deny access to administrative paths on the Git server,
+# even if a previous rule might otherwise allow the host.
+action = "deny"
+pattern = "https://git.internal/admin/**"
+description = "Block Git admin area"
+
