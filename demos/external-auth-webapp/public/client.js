@@ -1,7 +1,7 @@
 (() => {
   const statusEl = document.getElementById("status");
-  const listEl = document.getElementById("list");
-  const historyEl = document.getElementById("history");
+  const activeListEl = document.getElementById("active-list");
+  const inactiveListEl = document.getElementById("inactive-list");
   const pending = new Map(); // requestId -> <li>
 
   function setStatus(text) {
@@ -15,17 +15,26 @@
 
   ws.onopen = () => {
     setStatus("Connected. Waiting for approvals from acl-proxy…");
+    // eslint-disable-next-line no-console
+    console.log("[ws:client] open");
   };
 
   ws.onclose = () => {
     setStatus("WebSocket connection closed.");
+    // eslint-disable-next-line no-console
+    console.log("[ws:client] close");
   };
 
-  ws.onerror = () => {
+  ws.onerror = (event) => {
     setStatus("WebSocket error.");
+    // eslint-disable-next-line no-console
+    console.log("[ws:client] error", event);
   };
 
   ws.onmessage = (event) => {
+    // eslint-disable-next-line no-console
+    console.log("[ws:client] message", event.data);
+
     let msg;
     try {
       msg = JSON.parse(event.data);
@@ -33,28 +42,23 @@
       return;
     }
 
+    // eslint-disable-next-line no-console
+    console.log("[ws:client] message parsed", msg);
+
     if (msg.type === "pending" && msg.approval) {
       addPending(msg.approval);
     } else if (msg.type === "status" && msg.event) {
-      addStatus(msg.event);
+      handleStatus(msg.event);
     } else if (msg.type === "callbackResult") {
-      const li = pending.get(msg.requestId);
-      if (li) {
-        li.dataset.status = "completed";
-        li.append(
-          document.createTextNode(
-            ` – callback status ${msg.status}${
-              msg.error ? ` (${msg.error})` : ""
-            }`,
-          ),
-        );
-      }
+      handleCallbackResult(msg);
     } else if (msg.type === "error" && msg.message) {
       setStatus(`Error from server: ${msg.message}`);
     }
   };
 
   function addPending(approval) {
+    if (!activeListEl) return;
+
     const li = document.createElement("li");
     li.dataset.requestId = approval.requestId;
     li.dataset.status = "pending";
@@ -83,15 +87,41 @@
 
     li.appendChild(text);
     li.appendChild(buttons);
-    listEl.appendChild(li);
+    activeListEl.appendChild(li);
     pending.set(approval.requestId, li);
   }
 
-  function addStatus(event) {
-    if (!historyEl) return;
+  function handleStatus(event) {
+    const li = pending.get(event.requestId);
+
+    const resultLabel = (() => {
+      switch (event.status) {
+        case "timed_out":
+          return "timed out";
+        case "cancelled":
+          return "cancelled";
+        case "error":
+          return "error";
+        case "webhook_failed":
+          return "webhook failed";
+        default:
+          return event.status || "completed";
+      }
+    })();
+
+    if (li) {
+      moveToInactive(li, {
+        summary: resultLabel,
+        reason: event.reason,
+      });
+      pending.delete(event.requestId);
+      return;
+    }
+
+    if (!inactiveListEl) return;
     const li = document.createElement("li");
     const parts = [];
-    parts.push(event.status || "unknown");
+    parts.push(resultLabel);
     if (event.method && event.url) {
       parts.push(`for ${event.method} ${event.url}`);
     }
@@ -102,7 +132,56 @@
       parts.push(`reason: ${event.reason}`);
     }
     li.textContent = parts.join(" · ");
-    historyEl.appendChild(li);
+    inactiveListEl.appendChild(li);
+  }
+
+  function handleCallbackResult(msg) {
+    const li = pending.get(msg.requestId);
+    if (!li) return;
+
+    const decision = li.dataset.decision;
+    const label =
+      decision === "allow"
+        ? "approved"
+        : decision === "deny"
+        ? "denied"
+        : "completed";
+
+    moveToInactive(li, {
+      summary: `${label} (callback ${msg.status})`,
+      reason: msg.error || null,
+    });
+    pending.delete(msg.requestId);
+  }
+
+  function moveToInactive(li, info) {
+    if (!inactiveListEl) return;
+
+    li.dataset.status = "inactive";
+
+    const buttons = li.querySelector("button")?.parentElement;
+    if (buttons) {
+      buttons.remove();
+    }
+
+    const textDiv = li.querySelector("div");
+    const parts = [];
+    if (textDiv && textDiv.textContent) {
+      parts.push(textDiv.textContent);
+    }
+    if (info.summary) {
+      parts.push(`result: ${info.summary}`);
+    }
+    if (info.reason) {
+      parts.push(`reason: ${info.reason}`);
+    }
+    if (textDiv) {
+      textDiv.textContent = parts.join(" · ");
+    } else if (parts.length > 0) {
+      li.textContent = parts.join(" · ");
+    }
+
+    inactiveListEl.appendChild(li);
   }
 
   function sendDecision(requestId, decision, li) {
@@ -110,13 +189,15 @@
       setStatus("Cannot send decision: WebSocket not open.");
       return;
     }
-    ws.send(
-      JSON.stringify({
-        type: "decision",
-        requestId,
-        decision,
-      }),
-    );
+    const payload = {
+      type: "decision",
+      requestId,
+      decision,
+    };
+    // eslint-disable-next-line no-console
+    console.log("[ws:client] send decision", payload);
+    ws.send(JSON.stringify(payload));
     li.dataset.status = "sent";
+    li.dataset.decision = decision;
   }
 })();
