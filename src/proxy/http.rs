@@ -390,7 +390,7 @@ async fn handle_external_auth_callback_request(
     resp
 }
 
-async fn handle_external_auth_gate(
+pub(crate) async fn run_external_auth_gate_lifecycle(
     state: Arc<AppState>,
     request_id: &str,
     url: &str,
@@ -405,6 +405,7 @@ async fn handle_external_auth_gate(
     profile: &ExternalAuthProfile,
     profile_name: &str,
     header_actions: Vec<CompiledHeaderAction>,
+    mode: CaptureMode,
 ) -> Response<Body> {
     let (guard, decision_rx) = state.external_auth.start_pending(
         request_id.to_string(),
@@ -438,10 +439,10 @@ async fn handle_external_auth_gate(
                     url,
                     method,
                     client,
-                    target,
+                    target.clone(),
                     version,
                     req.headers(),
-                    CaptureMode::HttpProxy,
+                    mode,
                 )
                 .await
             }
@@ -452,10 +453,10 @@ async fn handle_external_auth_gate(
                     url,
                     method,
                     client,
-                    target,
+                    target.clone(),
                     version,
                     req.headers(),
-                    CaptureMode::HttpProxy,
+                    mode,
                     "ExternalApprovalError",
                     "External approval webhook failed",
                 )
@@ -468,10 +469,10 @@ async fn handle_external_auth_gate(
                     url,
                     method,
                     client,
-                    target,
+                    target.clone(),
                     version,
                     req.headers(),
-                    CaptureMode::HttpProxy,
+                    mode,
                 )
                 .await
             }
@@ -493,7 +494,7 @@ async fn handle_external_auth_gate(
                 client.clone(),
                 target,
                 req,
-                CaptureMode::HttpProxy,
+                mode,
                 header_actions,
             )
             .await
@@ -509,7 +510,7 @@ async fn handle_external_auth_gate(
                 target,
                 version,
                 req.headers(),
-                CaptureMode::HttpProxy,
+                mode,
             )
             .await
         }
@@ -528,7 +529,7 @@ async fn handle_external_auth_gate(
                 target,
                 version,
                 req.headers(),
-                CaptureMode::HttpProxy,
+                mode,
                 "ExternalApprovalError",
                 "External approval channel closed",
             )
@@ -546,11 +547,47 @@ async fn handle_external_auth_gate(
                 target,
                 version,
                 req.headers(),
-                CaptureMode::HttpProxy,
+                mode,
             )
             .await
         }
     }
+}
+
+async fn handle_external_auth_gate(
+    state: Arc<AppState>,
+    request_id: &str,
+    url: &str,
+    method: &Method,
+    client: &CaptureEndpoint,
+    target: Option<CaptureEndpoint>,
+    version: Version,
+    req: Request<Body>,
+    client_ip_for_policy: &str,
+    rule_index: usize,
+    rule_id: Option<String>,
+    profile: &ExternalAuthProfile,
+    profile_name: &str,
+    header_actions: Vec<CompiledHeaderAction>,
+) -> Response<Body> {
+    run_external_auth_gate_lifecycle(
+        state,
+        request_id,
+        url,
+        method,
+        client,
+        target,
+        version,
+        req,
+        client_ip_for_policy,
+        rule_index,
+        rule_id,
+        profile,
+        profile_name,
+        header_actions,
+        CaptureMode::HttpProxy,
+    )
+    .await
 }
 
 fn build_full_url(

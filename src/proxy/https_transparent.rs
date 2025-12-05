@@ -12,7 +12,6 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::app::{AppState, SharedAppState};
 use crate::capture::{CaptureEndpoint, CaptureMode};
-use crate::external_auth::ExternalDecision;
 use crate::logging::PolicyDecisionLogContext;
 use crate::proxy::http::{
     build_external_auth_denied_response,
@@ -23,6 +22,7 @@ use crate::proxy::http::{
     generate_request_id,
     has_loop_header,
     proxy_allowed_request,
+    run_external_auth_gate_lifecycle,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -396,150 +396,24 @@ async fn handle_https_transparent_external_auth_gate(
     profile_name: &str,
     header_actions: Vec<crate::policy::CompiledHeaderAction>,
 ) -> Response<Body> {
-    let (guard, decision_rx) = state.external_auth.start_pending(
-        request_id.to_string(),
+    run_external_auth_gate_lifecycle(
+        state,
+        request_id,
+        url,
+        method,
+        client,
+        Some(target),
+        version,
+        req,
+        client_ip_for_policy,
         rule_index,
         rule_id,
-        profile_name.to_string(),
-        url.to_string(),
-        Some(method.to_string()),
-        Some(client_ip_for_policy.to_string()),
-    );
-
-    let webhook_result = state
-        .external_auth
-        .send_initial_webhook(request_id)
-        .await;
-
-    if let Err((kind, http_status)) = webhook_result {
-        state.external_auth.finalize_webhook_failed(
-            request_id,
-            kind,
-            http_status,
-        );
-
-        drop(guard);
-
-        return match profile.on_webhook_failure {
-            crate::external_auth::WebhookFailureMode::Deny => {
-                build_external_auth_denied_response(
-                    &state,
-                    request_id,
-                    url,
-                    method,
-                    client,
-                    Some(target),
-                    version,
-                    req.headers(),
-                    CaptureMode::HttpsTransparent,
-                )
-                .await
-            }
-            crate::external_auth::WebhookFailureMode::Error => {
-                build_external_auth_error_response(
-                    &state,
-                    request_id,
-                    url,
-                    method,
-                    client,
-                    Some(target),
-                    version,
-                    req.headers(),
-                    CaptureMode::HttpsTransparent,
-                    "ExternalApprovalError",
-                    "External approval webhook failed",
-                )
-                .await
-            }
-            crate::external_auth::WebhookFailureMode::Timeout => {
-                build_external_auth_timeout_response(
-                    &state,
-                    request_id,
-                    url,
-                    method,
-                    client,
-                    Some(target),
-                    version,
-                    req.headers(),
-                    CaptureMode::HttpsTransparent,
-                )
-                .await
-            }
-        };
-    }
-
-    let decision = tokio::time::timeout(profile.timeout, decision_rx).await;
-
-    match decision {
-        Ok(Ok(ExternalDecision::Allow)) => {
-            drop(guard);
-            proxy_allowed_request(
-                state.clone(),
-                request_id.to_string(),
-                url.to_string(),
-                method.clone(),
-                version,
-                client.clone(),
-                Some(target),
-                req,
-                CaptureMode::HttpsTransparent,
-                header_actions,
-            )
-            .await
-        }
-        Ok(Ok(ExternalDecision::Deny)) => {
-            drop(guard);
-            build_external_auth_denied_response(
-                &state,
-                request_id,
-                url,
-                method,
-                client,
-                Some(target),
-                version,
-                req.headers(),
-                CaptureMode::HttpsTransparent,
-            )
-            .await
-        }
-        Ok(Err(_recv_closed)) => {
-            state.external_auth.finalize_internal_error(
-                request_id,
-                "External approval channel closed",
-            );
-            drop(guard);
-            build_external_auth_error_response(
-                &state,
-                request_id,
-                url,
-                method,
-                client,
-                Some(target),
-                version,
-                req.headers(),
-                CaptureMode::HttpsTransparent,
-                "ExternalApprovalError",
-                "External approval channel closed",
-            )
-            .await
-        }
-        Err(_elapsed) => {
-            state.external_auth.finalize_timed_out(request_id);
-            drop(guard);
-            build_external_auth_timeout_response(
-                &state,
-                request_id,
-                url,
-                method,
-                client,
-                Some(target),
-                version,
-                req.headers(),
-                CaptureMode::HttpsTransparent,
-            )
-            .await
-        }
-    }
+        profile,
+        profile_name,
+        header_actions,
+        CaptureMode::HttpsTransparent,
+    )
+    .await
 }
 
 fn build_https_url_for_transparent(
