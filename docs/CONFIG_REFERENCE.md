@@ -470,6 +470,71 @@ as invalid.
 Rules without `pattern` but with subnets and/or methods are allowed (e.g., “allow POST requests
 from `10.0.0.0/8` to any URL”).
 
+##### Header actions (per rule)
+
+Each direct rule (and each ruleset template entry) may optionally define an ordered list of
+per-rule header actions under `[[policy.rules.header_actions]]`. These actions do not affect rule
+matching; they only mutate headers on the matching requests/responses.
+
+Example:
+
+```toml
+[[policy.rules]]
+action = "allow"
+pattern = "https://github.com/**"
+description = "Allow GitHub; tweak headers"
+
+[[policy.rules.header_actions]]
+direction = "request"          # "request" | "response" | "both"
+action    = "set"              # "set" | "add" | "remove" | "replace_substring"
+name      = "user-agent"
+value     = "acl-proxy/1.0"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action    = "set"
+name      = "x-if-present"
+value     = "set-value"
+when      = "if_present"       # "always" (default) | "if_present" | "if_absent"
+
+[[policy.rules.header_actions]]
+direction = "response"
+action    = "replace_substring"
+name      = "x-upstream-tag"
+search    = "old"
+replace   = "new"
+```
+
+Fields:
+
+- `direction` (`"request" | "response" | "both"`, required):
+  - Where to apply the action:
+    - `request` – outbound request to the upstream.
+    - `response` – response back to the client.
+    - `both` – applies once on the request and once on the response.
+- `action` (`"remove" | "set" | "add" | "replace_substring"`, required):
+  - `remove` – delete the header entirely.
+  - `set` – replace all existing values with the configured value(s).
+  - `add` – append new values without removing existing ones (multi-valued headers).
+  - `replace_substring` – for textual headers, replace all occurrences of `search` with
+    `replace` in each current value.
+- `name` (string, required):
+  - Header name (case-insensitive). Must be a valid HTTP header name.
+- `value` / `values` (string or list, for `set`/`add`):
+  - Exactly one of `value` or `values` must be provided, and at least one value overall.
+  - Values must be valid HTTP header values; invalid values cause config validation to fail.
+- `when` (`"always" | "if_present" | "if_absent"`, optional):
+  - `always` (default) – action is always considered.
+  - `if_present` – action runs only if the header was present on the **original** message for
+    that direction (before any actions for that direction run).
+  - `if_absent` – action runs only if the header was **not** present on the original message.
+- `search` / `replace` (strings, for `replace_substring`):
+  - `search` must be non-empty; both fields are required for `replace_substring`.
+
+For `when` evaluation, the proxy snapshots header presence separately for the request and response
+before applying any header actions for that side, and uses that snapshot for all actions in the
+rule. Actions are then applied in the order they appear in the configuration.
+
 #### Include rules
 
 Include rules expand a ruleset into one or more concrete rules:
@@ -494,6 +559,110 @@ Fields:
 
 Missing macros required by a referenced ruleset (after accounting for `with` overrides) cause
 configuration validation to fail with a clear error message.
+
+### External auth profiles and approval-required rules
+
+The policy engine supports **external auth profiles** that turn certain allow rules into
+**approval-required** rules. When such a rule matches, the proxy:
+
+- Creates a pending entry keyed by the internal `requestId`.
+- POSTs a JSON webhook to an external auth service describing the pending request.
+- Waits asynchronously for a callback decision.
+- Either forwards the request upstream on approval, or returns a synthetic deny/timeout/error
+  response to the client.
+
+Profiles are defined under `[policy.external_auth_profiles]`:
+
+```toml
+[policy.external_auth_profiles]
+
+[policy.external_auth_profiles.github_mfa]
+webhook_url = "https://auth.internal/github/mfa-start"
+timeout_ms = 5000           # approval timeout for the original client request
+webhook_timeout_ms = 1000   # optional timeout for the webhook delivery itself
+on_webhook_failure = "error"# "deny" | "error" | "timeout" (default: "error")
+```
+
+Fields:
+
+- `webhook_url` (string, required):
+  - URL of the external auth service that receives the initial webhook.
+
+- `timeout_ms` (integer, required):
+  - How long to wait for an approval/deny callback before timing out the client with a
+    `504 Gateway Timeout`.
+
+- `webhook_timeout_ms` (integer, optional):
+  - Optional timeout (in milliseconds) for delivering the webhook itself.
+  - If the webhook cannot be delivered within this timeout (or fails quickly), the proxy applies
+    `on_webhook_failure`.
+  - When omitted, the webhook delivery is not additionally time-bounded by acl-proxy; it relies on
+    the underlying HTTP client’s behavior. In most environments you should set this explicitly to
+    avoid long-hanging webhook calls.
+
+- `on_webhook_failure` (`"deny" | "error" | "timeout"`, optional):
+  - Behavior when the webhook fails fast:
+    - `"deny"` – respond `403 Forbidden` with the normal policy-deny JSON shape.
+    - `"error"` – respond `503 Service Unavailable` with an external-approval error JSON.
+    - `"timeout"` – behave as if approval timed out (`504`) and remove the pending entry.
+  - When omitted, `"error"` is used.
+
+Profiles are attached to rules via the `external_auth_profile` field:
+
+```toml
+[[policy.rules]]
+action = "allow"
+pattern = "https://api.github.com/**"
+description = "GitHub API with external MFA"
+external_auth_profile = "github_mfa"
+```
+
+Semantics:
+
+- Rules keep `action = "allow"` or `"deny"` as before.
+- When `action = "allow"` **and** `external_auth_profile` is set:
+  - The rule becomes **approval-required**.
+  - On match, the proxy:
+    - Creates a pending entry keyed by `requestId`.
+    - Sends a webhook to the configured profile’s `webhook_url`.
+    - Waits for a callback decision (up to `timeout_ms`).
+    - On approval: proxies the request upstream as usual (including any header actions).
+    - On deny: returns `403 Forbidden` with the standard policy-deny JSON shape.
+    - On timeout: returns `504 Gateway Timeout` with an `"ExternalApprovalTimeout"` error.
+    - On internal error (e.g., callback channel closed): returns `503 Service Unavailable`.
+- When `action = "deny"` and `external_auth_profile` is set:
+  - Configuration validation fails; approval-required deny rules are not allowed.
+- Rules without `external_auth_profile` behave exactly as today.
+- Ruleset templates (`[[policy.rulesets.<name>]]`) may also specify `external_auth_profile`; the
+  expanded rules inherit the profile.
+
+Callback endpoint:
+
+- The proxy exposes a dedicated callback path on the HTTP listener:
+
+  ```http
+  POST /_acl-proxy/external-auth/callback
+  Content-Type: application/json
+
+  { "requestId": "req-...", "decision": "allow" | "deny" }
+  ```
+
+- Behavior:
+  - If `requestId` refers to an active pending request:
+    - The pending entry is removed.
+    - The decision is delivered to the waiting request task.
+    - The callback responds with `200 OK` and body `{ "status": "ok" }`.
+  - If no pending entry exists (unknown or already completed/timed-out `requestId`):
+    - The callback responds with `404 Not Found` and JSON
+      `{ "error": "RequestNotFound", "message": "No pending request for this requestId" }`.
+
+Security note:
+
+- The callback endpoint does not perform authentication in this initial version.
+- Deployments should ensure that only the trusted external auth service (or a tightly controlled
+  network segment) can reach `/_acl-proxy/external-auth/callback` (for example via firewall rules
+  or network policy).
+- Future versions may add optional shared-secret or signature-based callback authentication.
 
 ---
 
