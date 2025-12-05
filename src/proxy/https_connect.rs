@@ -15,9 +15,7 @@ use crate::logging::PolicyDecisionLogContext;
 use crate::proxy::http::{
     build_loop_detected_response, generate_request_id, has_loop_header,
     proxy_allowed_request, run_external_auth_gate_lifecycle,
-    build_external_auth_denied_response,
     build_external_auth_error_response,
-    build_external_auth_timeout_response,
 };
 
 /// Handle an incoming CONNECT request on the HTTP listener.

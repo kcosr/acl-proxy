@@ -14,9 +14,7 @@ use crate::app::{AppState, SharedAppState};
 use crate::capture::{CaptureEndpoint, CaptureMode};
 use crate::logging::PolicyDecisionLogContext;
 use crate::proxy::http::{
-    build_external_auth_denied_response,
     build_external_auth_error_response,
-    build_external_auth_timeout_response,
     build_loop_detected_response,
     build_policy_denied_response_with_mode,
     generate_request_id,
