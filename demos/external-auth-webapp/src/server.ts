@@ -132,6 +132,8 @@ app.post("/webhook", (req, res) => {
       type: "status",
       event: statusEvent,
     });
+    // eslint-disable-next-line no-console
+    console.log("[ws:broadcast] status", msg);
     wss.clients.forEach((ws) => {
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(msg);
@@ -160,6 +162,8 @@ app.post("/webhook", (req, res) => {
   pending.set(requestId, approval);
 
   const msg = JSON.stringify({ type: "pending", approval });
+  // eslint-disable-next-line no-console
+  console.log("[ws:broadcast] pending", msg);
   wss.clients.forEach((ws) => {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(msg);
@@ -171,12 +175,19 @@ app.post("/webhook", (req, res) => {
 
 // WebSocket handling for browser clients.
 wss.on("connection", (ws) => {
+  // eslint-disable-next-line no-console
+  console.log("[ws] client connected");
   // On connect, send the current pending list.
   for (const approval of pending.values()) {
-    ws.send(JSON.stringify({ type: "pending", approval }));
+    const msg = JSON.stringify({ type: "pending", approval });
+    // eslint-disable-next-line no-console
+    console.log("[ws:broadcast] pending (initial)", msg);
+    ws.send(msg);
   }
 
   ws.on("message", async (data) => {
+    // eslint-disable-next-line no-console
+    console.log("[ws:recv]", String(data));
     let msg: WebsocketMessage;
     try {
       msg = JSON.parse(String(data));
