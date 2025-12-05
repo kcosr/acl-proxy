@@ -358,6 +358,13 @@ pub struct PolicyRuleTemplateConfig {
 
     #[serde(default)]
     pub external_auth_profile: Option<String>,
+
+    /// Optional stable identifier for this rule.
+    ///
+    /// When set, this is included in external auth webhooks as
+    /// `ruleId` alongside the numeric `ruleIndex`.
+    #[serde(default)]
+    pub rule_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -408,6 +415,13 @@ pub struct PolicyRuleDirectConfig {
 
     #[serde(default)]
     pub external_auth_profile: Option<String>,
+
+    /// Optional stable identifier for this rule.
+    ///
+    /// When set, this is included in external auth webhooks as
+    /// `ruleId` alongside the numeric `ruleIndex`.
+    #[serde(default)]
+    pub rule_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

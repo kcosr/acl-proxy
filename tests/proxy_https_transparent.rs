@@ -648,6 +648,8 @@ async fn allowed_https_transparent_is_proxied_and_captured() {
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
         },
     )];
 
@@ -746,6 +748,8 @@ async fn allowed_https_transparent_h2_is_proxied_and_captured() {
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
         },
     )];
 
@@ -845,6 +849,8 @@ async fn concurrent_h2_streams_share_connection_and_are_captured() {
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
         },
     )];
 
@@ -1059,6 +1065,8 @@ async fn concurrent_h2_streams_mixed_allow_and_deny() {
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
         },
     )];
 
@@ -1291,6 +1299,8 @@ async fn large_h2_request_body_is_truncated_in_capture() {
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
         },
     )];
 
@@ -1426,6 +1436,8 @@ async fn large_h2_response_body_is_truncated_in_capture() {
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
         },
     )];
 
@@ -1566,6 +1578,8 @@ async fn h2_client_to_http1_only_upstream_preserves_versions_in_capture() {
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
         },
     )];
 
@@ -1692,6 +1706,8 @@ async fn denied_https_transparent_returns_403() {
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
         },
     )];
 
@@ -1820,6 +1836,8 @@ async fn denied_https_transparent_h2_returns_403() {
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
         },
     )];
 

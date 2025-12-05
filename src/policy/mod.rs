@@ -50,6 +50,7 @@ pub struct MatchedRule {
     pub action: PolicyDefaultAction,
     pub pattern: Option<String>,
     pub description: Option<String>,
+    pub rule_id: Option<String>,
     pub subnets: Vec<Ipv4Net>,
     pub methods: Vec<String>,
     pub header_actions: Vec<CompiledHeaderAction>,
@@ -69,6 +70,7 @@ struct CompiledRule {
     pattern: Option<String>,
     regex: Option<Regex>,
     description: Option<String>,
+    rule_id: Option<String>,
     subnets: Vec<Ipv4Net>,
     methods: Vec<String>,
     header_actions: Vec<CompiledHeaderAction>,
@@ -86,6 +88,7 @@ struct ExpandedRule {
     action: PolicyDefaultAction,
     pattern: Option<String>,
     description: Option<String>,
+    rule_id: Option<String>,
     subnets: Vec<Ipv4Net>,
     methods: Vec<String>,
     header_actions: Vec<HeaderActionConfig>,
@@ -104,6 +107,7 @@ pub struct EffectiveRule {
     pub action: PolicyDefaultAction,
     pub pattern: Option<String>,
     pub description: Option<String>,
+    pub rule_id: Option<String>,
     pub subnets: Vec<Ipv4Net>,
     pub methods: Vec<String>,
     pub header_actions: Vec<EffectiveHeaderAction>,
@@ -168,6 +172,7 @@ impl PolicyEngine {
                 pattern: rule.pattern,
                 regex,
                 description: rule.description,
+                rule_id: rule.rule_id,
                 subnets: rule.subnets,
                 methods: rule.methods,
                 header_actions,
@@ -229,6 +234,7 @@ impl PolicyEngine {
                 action: rule.action,
                 pattern: rule.pattern.clone(),
                 description: rule.description.clone(),
+                rule_id: rule.rule_id.clone(),
                 subnets: rule.subnets.clone(),
                 methods: rule.methods.clone(),
                 header_actions: rule.header_actions.clone(),
@@ -306,6 +312,7 @@ impl EffectivePolicy {
                     action: rule.action,
                     pattern: rule.pattern,
                     description: rule.description,
+                    rule_id: rule.rule_id,
                     subnets: rule.subnets,
                     methods: rule.methods,
                     header_actions,
@@ -407,6 +414,7 @@ fn expand_direct_rule(
             action: rule.action,
             pattern: None,
             description: rule.description.clone(),
+            rule_id: rule.rule_id.clone(),
             subnets: rule.subnets.clone(),
             methods,
             header_actions: rule.header_actions.clone(),
@@ -430,11 +438,16 @@ fn expand_direct_rule(
         collect_placeholders(desc, &mut placeholders);
     }
 
+    if let Some(rule_id) = &rule.rule_id {
+        collect_placeholders(rule_id, &mut placeholders);
+    }
+
     if placeholders.is_empty() {
         out.push(ExpandedRule {
             action: rule.action,
             pattern: Some(pattern_str),
             description: rule.description.clone(),
+            rule_id: rule.rule_id.clone(),
             subnets: rule.subnets.clone(),
             methods,
             header_actions: rule.header_actions.clone(),
@@ -459,14 +472,22 @@ fn expand_direct_rule(
     }
 
     for combo in combos {
-        let pattern_interp = interpolate_template(&pattern_str, &combo);
-        let description_interp =
-            rule.description.as_ref().map(|d| interpolate_template(d, &combo));
+        let pattern_interp =
+            interpolate_template(&pattern_str, &combo);
+        let description_interp = rule
+            .description
+            .as_ref()
+            .map(|d| interpolate_template(d, &combo));
+        let rule_id_interp = rule
+            .rule_id
+            .as_ref()
+            .map(|id| interpolate_template(id, &combo));
 
         out.push(ExpandedRule {
             action: rule.action,
             pattern: Some(pattern_interp),
             description: description_interp,
+            rule_id: rule_id_interp,
             subnets: rule.subnets.clone(),
             methods: methods.clone(),
             header_actions: rule.header_actions.clone(),
@@ -521,6 +542,9 @@ fn expand_include_rule(
         if let Some(desc) = &template.description {
             collect_placeholders(desc, &mut placeholders);
         }
+        if let Some(rule_id) = &template.rule_id {
+            collect_placeholders(rule_id, &mut placeholders);
+        }
     }
 
     if placeholders.is_empty() {
@@ -541,6 +565,7 @@ fn expand_include_rule(
                 action: template.action,
                 pattern: Some(template.pattern.clone()),
                 description: template.description.clone(),
+                rule_id: template.rule_id.clone(),
                 subnets: if !rule.subnets.is_empty() {
                     rule.subnets.clone()
                 } else {
@@ -584,16 +609,22 @@ fn expand_include_rule(
                 })
                 .unwrap_or_default();
 
-            let pattern_interp = interpolate_template(&template.pattern, &combo);
+            let pattern_interp =
+                interpolate_template(&template.pattern, &combo);
             let description_interp = template
                 .description
                 .as_ref()
                 .map(|d| interpolate_template(d, &combo));
+            let rule_id_interp = template
+                .rule_id
+                .as_ref()
+                .map(|id| interpolate_template(id, &combo));
 
             out.push(ExpandedRule {
                 action: template.action,
                 pattern: Some(pattern_interp),
                 description: description_interp,
+                rule_id: rule_id_interp,
                 subnets: if !rule.subnets.is_empty() {
                     rule.subnets.clone()
                 } else {
@@ -1117,6 +1148,7 @@ mod tests {
             default: PolicyDefaultAction::Deny,
             macros: MacroMap::default(),
             rulesets: RulesetMap::default(),
+             external_auth_profiles: ExternalAuthProfileConfigMap::default(),
             rules: vec![PolicyRuleConfig::Direct(
                 PolicyRuleDirectConfig {
                     action: PolicyDefaultAction::Allow,
@@ -1129,6 +1161,8 @@ mod tests {
                     with: None,
                     add_url_enc_variants: None,
                     header_actions: Vec::new(),
+                    rule_id: None,
+                    external_auth_profile: None,
                 },
             )],
         };
@@ -1171,6 +1205,8 @@ mod tests {
                     methods: None,
                     subnets: Vec::new(),
                     header_actions: Vec::new(),
+                    external_auth_profile: None,
+                    rule_id: None,
                 },
                 PolicyRuleTemplateConfig {
                     action: allow_action(),
@@ -1180,6 +1216,8 @@ mod tests {
                     methods: None,
                     subnets: Vec::new(),
                     header_actions: Vec::new(),
+                    external_auth_profile: None,
+                    rule_id: None,
                 },
             ],
         );
@@ -1188,6 +1226,7 @@ mod tests {
             default: PolicyDefaultAction::Deny,
             macros,
             rulesets,
+            external_auth_profiles: ExternalAuthProfileConfigMap::default(),
             rules: vec![PolicyRuleConfig::Include(
                 PolicyRuleIncludeConfig {
                     include: "gitlabRepo".to_string(),
@@ -1244,6 +1283,8 @@ mod tests {
                     methods: None,
                     subnets: Vec::new(),
                     header_actions: Vec::new(),
+                    external_auth_profile: None,
+                    rule_id: None,
                 }],
             );
             m
@@ -1253,6 +1294,7 @@ mod tests {
             default: PolicyDefaultAction::Deny,
             macros: MacroMap::default(),
             rulesets,
+            external_auth_profiles: ExternalAuthProfileConfigMap::default(),
             rules: vec![PolicyRuleConfig::Include(
                 PolicyRuleIncludeConfig {
                     include: "needsRepo".to_string(),

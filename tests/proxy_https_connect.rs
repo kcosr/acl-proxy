@@ -314,6 +314,8 @@ async fn allowed_https_via_connect_is_proxied_and_captured() {
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
         },
     )];
 
@@ -403,6 +405,8 @@ async fn denied_https_via_connect_returns_403() {
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
         },
     )];
 
@@ -456,6 +460,8 @@ async fn loop_detected_on_connect_returns_508() {
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
         },
     )];
 

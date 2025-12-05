@@ -1,6 +1,7 @@
 (() => {
   const statusEl = document.getElementById("status");
   const listEl = document.getElementById("list");
+  const historyEl = document.getElementById("history");
   const pending = new Map(); // requestId -> <li>
 
   function setStatus(text) {
@@ -34,6 +35,8 @@
 
     if (msg.type === "pending" && msg.approval) {
       addPending(msg.approval);
+    } else if (msg.type === "status" && msg.event) {
+      addStatus(msg.event);
     } else if (msg.type === "callbackResult") {
       const li = pending.get(msg.requestId);
       if (li) {
@@ -84,6 +87,24 @@
     pending.set(approval.requestId, li);
   }
 
+  function addStatus(event) {
+    if (!historyEl) return;
+    const li = document.createElement("li");
+    const parts = [];
+    parts.push(event.status || "unknown");
+    if (event.method && event.url) {
+      parts.push(`for ${event.method} ${event.url}`);
+    }
+    if (event.requestId) {
+      parts.push(`id: ${event.requestId}`);
+    }
+    if (event.reason) {
+      parts.push(`reason: ${event.reason}`);
+    }
+    li.textContent = parts.join(" · ");
+    historyEl.appendChild(li);
+  }
+
   function sendDecision(requestId, decision, li) {
     if (ws.readyState !== WebSocket.OPEN) {
       setStatus("Cannot send decision: WebSocket not open.");
@@ -99,4 +120,3 @@
     li.dataset.status = "sent";
   }
 })();
-

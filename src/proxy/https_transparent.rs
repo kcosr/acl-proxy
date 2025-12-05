@@ -23,7 +23,6 @@ use crate::proxy::http::{
     generate_request_id,
     has_loop_header,
     proxy_allowed_request,
-    send_external_auth_webhook,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -320,6 +319,7 @@ async fn handle_inner_https_request(
                             req,
                             &client_ip_for_policy,
                             rule.index,
+                            rule.rule_id.clone(),
                             &profile,
                             profile_name,
                             header_actions,
@@ -391,6 +391,7 @@ async fn handle_https_transparent_external_auth_gate(
     req: Request<Body>,
     client_ip_for_policy: &str,
     rule_index: usize,
+    rule_id: Option<String>,
     profile: &crate::external_auth::ExternalAuthProfile,
     profile_name: &str,
     header_actions: Vec<crate::policy::CompiledHeaderAction>,
@@ -398,26 +399,25 @@ async fn handle_https_transparent_external_auth_gate(
     let (guard, decision_rx) = state.external_auth.start_pending(
         request_id.to_string(),
         rule_index,
-        None,
+        rule_id,
         profile_name.to_string(),
         url.to_string(),
         Some(method.to_string()),
         Some(client_ip_for_policy.to_string()),
     );
 
-    let webhook_ok = send_external_auth_webhook(
-        &state,
-        profile,
-        request_id,
-        rule_index,
-        profile_name,
-        url,
-        Some(method.as_str()),
-        Some(client_ip_for_policy),
-    )
-    .await;
+    let webhook_result = state
+        .external_auth
+        .send_initial_webhook(request_id)
+        .await;
 
-    if !webhook_ok {
+    if let Err((kind, http_status)) = webhook_result {
+        state.external_auth.finalize_webhook_failed(
+            request_id,
+            kind,
+            http_status,
+        );
+
         drop(guard);
 
         return match profile.on_webhook_failure {
@@ -488,6 +488,7 @@ async fn handle_https_transparent_external_auth_gate(
             .await
         }
         Ok(Ok(ExternalDecision::Deny)) => {
+            drop(guard);
             build_external_auth_denied_response(
                 &state,
                 request_id,
@@ -502,6 +503,11 @@ async fn handle_https_transparent_external_auth_gate(
             .await
         }
         Ok(Err(_recv_closed)) => {
+            state.external_auth.finalize_internal_error(
+                request_id,
+                "External approval channel closed",
+            );
+            drop(guard);
             build_external_auth_error_response(
                 &state,
                 request_id,
@@ -518,6 +524,8 @@ async fn handle_https_transparent_external_auth_gate(
             .await
         }
         Err(_elapsed) => {
+            state.external_auth.finalize_timed_out(request_id);
+            drop(guard);
             build_external_auth_timeout_response(
                 &state,
                 request_id,

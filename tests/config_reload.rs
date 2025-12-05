@@ -156,6 +156,8 @@ async fn loop_header_injection_updates_after_reload() {
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
         },
     )];
 
@@ -253,6 +255,8 @@ async fn failed_reload_keeps_previous_state() {
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
         },
     )];
 
