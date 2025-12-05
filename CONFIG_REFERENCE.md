@@ -664,7 +664,7 @@ Lifecycle status telemetry:
   - `elapsedMs`: milliseconds since the pending entry was created.
   - `terminal`: `false` for `"pending"`, `true` for terminal statuses.
   - `eventId`: unique identifier for the notification (useful for dedupe).
-  - `failureKind` (terminal only): `"timeout" | "dns" | "connect" | "non_2xx"`.
+  - `failureKind` (terminal only): `"timeout" | "connect" | "non_2xx"`.
   - `httpStatus` (terminal only): HTTP status code when applicable.
 
 The proxy may emit at most one terminal status event per `requestId` in addition to the initial

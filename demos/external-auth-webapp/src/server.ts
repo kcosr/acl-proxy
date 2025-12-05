@@ -99,11 +99,7 @@ app.post("/webhook", (req, res) => {
   } = body;
 
   const eventType =
-    eventTypeHeader === "status" || status === "webhook_failed" ||
-    status === "timed_out" || status === "error" ||
-    status === "cancelled"
-      ? "status"
-      : "pending";
+    eventTypeHeader === "status" ? "status" : "pending";
 
   if (eventType === "status") {
     if (!requestId || !status) {
