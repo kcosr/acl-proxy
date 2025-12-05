@@ -119,7 +119,7 @@
     }
 
     if (!inactiveListEl) return;
-    const li = document.createElement("li");
+    const item = document.createElement("li");
     const parts = [];
     parts.push(resultLabel);
     if (event.method && event.url) {
@@ -131,8 +131,8 @@
     if (event.reason) {
       parts.push(`reason: ${event.reason}`);
     }
-    li.textContent = parts.join(" · ");
-    inactiveListEl.appendChild(li);
+    item.textContent = parts.join(" · ");
+    inactiveListEl.appendChild(item);
   }
 
   function handleCallbackResult(msg) {
