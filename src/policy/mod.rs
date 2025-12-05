@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
+use http::header::{HeaderName, HeaderValue};
 use ipnet::Ipv4Net;
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
@@ -8,9 +9,11 @@ use thiserror::Error;
 use url::Url;
 
 use crate::config::{
-    MacroMap, MacroOverrideMap, MacroValues, PolicyConfig, PolicyDefaultAction,
-    PolicyRuleConfig, PolicyRuleDirectConfig, PolicyRuleIncludeConfig,
-    RulesetMap, UrlEncVariants,
+    ExternalAuthProfileConfigMap, HeaderActionConfig, HeaderActionKind,
+    HeaderDirection, HeaderWhen, MacroMap, MacroOverrideMap, MacroValues,
+    PolicyConfig, PolicyDefaultAction, PolicyRuleConfig,
+    PolicyRuleDirectConfig, PolicyRuleIncludeConfig, RulesetMap,
+    UrlEncVariants,
 };
 
 #[derive(Debug, Error)]
@@ -43,11 +46,14 @@ pub struct PolicyDecision {
 
 #[derive(Debug, Clone)]
 pub struct MatchedRule {
+    pub index: usize,
     pub action: PolicyDefaultAction,
     pub pattern: Option<String>,
     pub description: Option<String>,
     pub subnets: Vec<Ipv4Net>,
     pub methods: Vec<String>,
+    pub header_actions: Vec<CompiledHeaderAction>,
+    pub external_auth_profile: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,12 +64,15 @@ pub struct PolicyEngine {
 
 #[derive(Debug, Clone)]
 struct CompiledRule {
+    index: usize,
     action: PolicyDefaultAction,
     pattern: Option<String>,
     regex: Option<Regex>,
     description: Option<String>,
     subnets: Vec<Ipv4Net>,
     methods: Vec<String>,
+    header_actions: Vec<CompiledHeaderAction>,
+    external_auth_profile: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +88,8 @@ struct ExpandedRule {
     description: Option<String>,
     subnets: Vec<Ipv4Net>,
     methods: Vec<String>,
+    header_actions: Vec<HeaderActionConfig>,
+    external_auth_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,6 +106,36 @@ pub struct EffectiveRule {
     pub description: Option<String>,
     pub subnets: Vec<Ipv4Net>,
     pub methods: Vec<String>,
+    pub header_actions: Vec<EffectiveHeaderAction>,
+    pub external_auth: Option<EffectiveExternalAuth>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledHeaderAction {
+    pub direction: HeaderDirection,
+    pub action: HeaderActionKind,
+    pub name: HeaderName,
+    pub values: Vec<HeaderValue>,
+    pub when: HeaderWhen,
+    pub search: Option<String>,
+    pub replace: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EffectiveHeaderAction {
+    pub direction: HeaderDirection,
+    pub action: HeaderActionKind,
+    pub name: String,
+    pub values: Vec<String>,
+    pub when: HeaderWhen,
+    pub search: Option<String>,
+    pub replace: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EffectiveExternalAuth {
+    pub profile: String,
+    pub timeout_ms: u64,
 }
 
 impl PolicyEngine {
@@ -103,6 +144,9 @@ impl PolicyEngine {
         let mut compiled_rules = Vec::with_capacity(expanded.rules.len());
 
         for (idx, rule) in expanded.rules.into_iter().enumerate() {
+            let header_actions =
+                compile_header_actions(&rule.header_actions, idx)?;
+
             let regex = if let Some(ref pattern) = rule.pattern {
                 let pattern_re = pattern_to_regex(pattern);
                 Some(
@@ -119,12 +163,15 @@ impl PolicyEngine {
             };
 
             compiled_rules.push(CompiledRule {
+                index: idx,
                 action: rule.action,
                 pattern: rule.pattern,
                 regex,
                 description: rule.description,
                 subnets: rule.subnets,
                 methods: rule.methods,
+                header_actions,
+                external_auth_profile: rule.external_auth_profile,
             });
         }
 
@@ -178,11 +225,14 @@ impl PolicyEngine {
             }
 
             let matched = MatchedRule {
+                index: rule.index,
                 action: rule.action,
                 pattern: rule.pattern.clone(),
                 description: rule.description.clone(),
                 subnets: rule.subnets.clone(),
                 methods: rule.methods.clone(),
+                header_actions: rule.header_actions.clone(),
+                external_auth_profile: rule.external_auth_profile.clone(),
             };
 
             let allowed = matches!(rule.action, PolicyDefaultAction::Allow);
@@ -217,13 +267,50 @@ impl EffectivePolicy {
             .rules
             .into_iter()
             .enumerate()
-            .map(|(index, rule)| EffectiveRule {
-                index,
-                action: rule.action,
-                pattern: rule.pattern,
-                description: rule.description,
-                subnets: rule.subnets,
-                methods: rule.methods,
+            .map(|(index, rule)| {
+                let header_actions = rule
+                    .header_actions
+                    .iter()
+                    .map(|cfg| {
+                        let values = cfg
+                            .values
+                            .clone()
+                            .or_else(|| cfg.value.as_ref().map(|v| vec![v.clone()]))
+                            .unwrap_or_default();
+
+                        EffectiveHeaderAction {
+                            direction: cfg.direction.clone(),
+                            action: cfg.action.clone(),
+                            name: cfg.name.to_ascii_lowercase(),
+                            values,
+                            when: cfg.when.clone(),
+                            search: cfg.search.clone(),
+                            replace: cfg.replace.clone(),
+                        }
+                    }).collect();
+
+                let external_auth = rule
+                    .external_auth_profile
+                    .as_ref()
+                    .and_then(|name| {
+                        cfg.external_auth_profiles
+                            .get(name)
+                            .map(|profile| EffectiveExternalAuth {
+                                profile: name.clone(),
+                                timeout_ms: profile.timeout_ms,
+                            })
+                    });
+
+                EffectiveRule {
+                    index,
+                    action: rule.action,
+                    pattern: rule.pattern,
+                    description: rule.description,
+                    subnets: rule.subnets,
+                    methods: rule.methods,
+                    header_actions,
+                    external_auth,
+                }
             })
             .collect();
 
@@ -237,23 +324,25 @@ impl EffectivePolicy {
 fn expand_policy(cfg: &PolicyConfig) -> Result<ExpandedPolicy, PolicyError> {
     let macros = &cfg.macros;
     let rulesets = &cfg.rulesets;
+    let external_profiles: &ExternalAuthProfileConfigMap =
+        &cfg.external_auth_profiles;
 
     let mut expanded_rules = Vec::new();
 
     for (index, rule) in cfg.rules.iter().enumerate() {
         match rule {
-            PolicyRuleConfig::Direct(d) => {
-                expand_direct_rule(
-                    d,
-                    macros,
-                    index,
-                    &mut expanded_rules,
-                )?
-            }
+            PolicyRuleConfig::Direct(d) => expand_direct_rule(
+                d,
+                macros,
+                external_profiles,
+                index,
+                &mut expanded_rules,
+            )?,
             PolicyRuleConfig::Include(i) => expand_include_rule(
                 i,
                 macros,
                 rulesets,
+                external_profiles,
                 index,
                 &mut expanded_rules,
             )?,
@@ -269,6 +358,7 @@ fn expand_policy(cfg: &PolicyConfig) -> Result<ExpandedPolicy, PolicyError> {
 fn expand_direct_rule(
     rule: &PolicyRuleDirectConfig,
     macros: &MacroMap,
+    external_profiles: &ExternalAuthProfileConfigMap,
     index: usize,
     out: &mut Vec<ExpandedRule>,
 ) -> Result<(), PolicyError> {
@@ -285,6 +375,29 @@ fn expand_direct_rule(
         .map(|m| m.as_slice().to_vec())
         .unwrap_or_default();
 
+    if rule.external_auth_profile.is_some()
+        && matches!(rule.action, PolicyDefaultAction::Deny)
+    {
+        return Err(PolicyError::RuleInvalid {
+            index,
+            reason:
+                "external_auth_profile is not allowed on deny rules"
+                    .to_string(),
+        });
+    }
+
+    if let Some(name) = &rule.external_auth_profile {
+        if !external_profiles.contains_key(name) {
+            return Err(PolicyError::RuleInvalid {
+                index,
+                reason: format!(
+                    "external_auth_profile '{}' not found",
+                    name
+                ),
+            });
+        }
+    }
+
     let has_pattern = pattern.is_some();
     let has_subnets = !rule.subnets.is_empty();
     let has_methods = !methods.is_empty();
@@ -296,6 +409,8 @@ fn expand_direct_rule(
             description: rule.description.clone(),
             subnets: rule.subnets.clone(),
             methods,
+            header_actions: rule.header_actions.clone(),
+            external_auth_profile: rule.external_auth_profile.clone(),
         });
         return Ok(());
     }
@@ -322,6 +437,8 @@ fn expand_direct_rule(
             description: rule.description.clone(),
             subnets: rule.subnets.clone(),
             methods,
+            header_actions: rule.header_actions.clone(),
+            external_auth_profile: rule.external_auth_profile.clone(),
         });
         return Ok(());
     }
@@ -352,6 +469,8 @@ fn expand_direct_rule(
             description: description_interp,
             subnets: rule.subnets.clone(),
             methods: methods.clone(),
+            header_actions: rule.header_actions.clone(),
+            external_auth_profile: rule.external_auth_profile.clone(),
         });
     }
 
@@ -362,7 +481,8 @@ fn expand_include_rule(
     rule: &PolicyRuleIncludeConfig,
     macros: &MacroMap,
     rulesets: &RulesetMap,
-    _index: usize,
+    external_profiles: &ExternalAuthProfileConfigMap,
+    index: usize,
     out: &mut Vec<ExpandedRule>,
 ) -> Result<(), PolicyError> {
     let templates = rulesets
@@ -370,6 +490,30 @@ fn expand_include_rule(
         .ok_or_else(|| PolicyError::RulesetNotFound {
             name: rule.include.clone(),
         })?;
+
+    for template in templates {
+        if template.external_auth_profile.is_some()
+            && matches!(template.action, PolicyDefaultAction::Deny)
+        {
+            return Err(PolicyError::RuleInvalid {
+                index,
+                reason:
+                    "external_auth_profile is not allowed on deny rules"
+                        .to_string(),
+            });
+        }
+        if let Some(name) = &template.external_auth_profile {
+            if !external_profiles.contains_key(name) {
+                return Err(PolicyError::RuleInvalid {
+                    index,
+                    reason: format!(
+                        "external_auth_profile '{}' not found",
+                        name
+                    ),
+                });
+            }
+        }
+    }
 
     let mut placeholders = BTreeSet::new();
     for template in templates {
@@ -403,6 +547,8 @@ fn expand_include_rule(
                     template.subnets.clone()
                 },
                 methods,
+                header_actions: template.header_actions.clone(),
+                external_auth_profile: template.external_auth_profile.clone(),
             });
         }
         return Ok(());
@@ -454,6 +600,8 @@ fn expand_include_rule(
                     template.subnets.clone()
                 },
                 methods,
+                header_actions: template.header_actions.clone(),
+                external_auth_profile: template.external_auth_profile.clone(),
             });
         }
     }
@@ -524,6 +672,124 @@ fn cartesian_product(
     }
 
     acc
+}
+
+fn compile_header_actions(
+    actions: &[HeaderActionConfig],
+    index: usize,
+) -> Result<Vec<CompiledHeaderAction>, PolicyError> {
+    let mut compiled = Vec::with_capacity(actions.len());
+
+    for action_cfg in actions {
+        let name = HeaderName::from_lowercase(action_cfg.name.to_ascii_lowercase().as_bytes())
+            .map_err(|e| PolicyError::RuleInvalid {
+                index,
+                reason: format!(
+                    "invalid header name '{}' in header action: {e}",
+                    action_cfg.name
+                ),
+            })?;
+
+        let when = action_cfg.when.clone();
+        let mut values: Vec<HeaderValue> = Vec::new();
+
+        match action_cfg.action {
+            HeaderActionKind::Set | HeaderActionKind::Add => {
+                let source_values = match (&action_cfg.value, &action_cfg.values) {
+                    (Some(v), None) => vec![v.clone()],
+                    (None, Some(vs)) if !vs.is_empty() => vs.clone(),
+                    (Some(_), Some(_)) => {
+                        return Err(PolicyError::RuleInvalid {
+                            index,
+                            reason: format!(
+                                "header action for '{}' must not set both value and values",
+                                action_cfg.name
+                            ),
+                        })
+                    }
+                    _ => {
+                        return Err(PolicyError::RuleInvalid {
+                            index,
+                            reason: format!(
+                                "header action for '{}' must provide value or values",
+                                action_cfg.name
+                            ),
+                        })
+                    }
+                };
+
+                for v in source_values {
+                    let hv = HeaderValue::from_str(&v).map_err(|e| {
+                        PolicyError::RuleInvalid {
+                            index,
+                            reason: format!(
+                                "invalid header value for '{}': {} ({e})",
+                                action_cfg.name, v
+                            ),
+                        }
+                    })?;
+                    values.push(hv);
+                }
+            }
+            HeaderActionKind::Remove | HeaderActionKind::ReplaceSubstring => {
+                if action_cfg.value.is_some() || action_cfg.values.is_some() {
+                    return Err(PolicyError::RuleInvalid {
+                        index,
+                        reason: format!(
+                            "header action for '{}' with action {:?} must not set value/values",
+                            action_cfg.name, action_cfg.action
+                        ),
+                    });
+                }
+            }
+        }
+
+        let (search, replace) = match action_cfg.action {
+            HeaderActionKind::ReplaceSubstring => {
+                let search = action_cfg.search.clone().ok_or_else(|| {
+                    PolicyError::RuleInvalid {
+                        index,
+                        reason: format!(
+                            "header action for '{}' with action replace_substring requires search",
+                            action_cfg.name
+                        ),
+                    }
+                })?;
+                if search.is_empty() {
+                    return Err(PolicyError::RuleInvalid {
+                        index,
+                        reason: format!(
+                            "header action for '{}' with action replace_substring requires non-empty search",
+                            action_cfg.name
+                        ),
+                    });
+                }
+                let replace = action_cfg.replace.clone().ok_or_else(|| {
+                    PolicyError::RuleInvalid {
+                        index,
+                        reason: format!(
+                            "header action for '{}' with action replace_substring requires replace",
+                            action_cfg.name
+                        ),
+                    }
+                })?;
+                (Some(search), Some(replace))
+            }
+            _ => (None, None),
+        };
+
+        compiled.push(CompiledHeaderAction {
+            direction: action_cfg.direction.clone(),
+            action: action_cfg.action.clone(),
+            name,
+            values,
+            when,
+            search,
+            replace,
+        });
+    }
+
+    Ok(compiled)
 }
 
 fn keys_for_url_variants(
@@ -862,6 +1128,7 @@ mod tests {
                         .unwrap()],
                     with: None,
                     add_url_enc_variants: None,
+                    header_actions: Vec::new(),
                 },
             )],
         };
@@ -903,6 +1170,7 @@ mod tests {
                     description: None,
                     methods: None,
                     subnets: Vec::new(),
+                    header_actions: Vec::new(),
                 },
                 PolicyRuleTemplateConfig {
                     action: allow_action(),
@@ -911,6 +1179,7 @@ mod tests {
                     description: None,
                     methods: None,
                     subnets: Vec::new(),
+                    header_actions: Vec::new(),
                 },
             ],
         );
@@ -974,6 +1243,7 @@ mod tests {
                     description: None,
                     methods: None,
                     subnets: Vec::new(),
+                    header_actions: Vec::new(),
                 }],
             );
             m
@@ -1220,5 +1490,64 @@ add_url_enc_variants = true
             msg.contains("Policy macro not found: repo"),
             "unexpected error message: {msg}"
         );
+    }
+
+    #[test]
+    fn effective_policy_includes_header_actions() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/**"
+
+[[rules.header_actions]]
+direction = "request"
+action = "set"
+name = "x-test"
+value = "one"
+        "#;
+
+        let cfg: PolicyConfig =
+            toml::from_str(toml).expect("parse policy config");
+        let effective =
+            EffectivePolicy::from_config(&cfg).expect("build effective policy");
+
+        assert_eq!(effective.rules.len(), 1);
+        let rule = &effective.rules[0];
+        assert_eq!(rule.header_actions.len(), 1);
+        let ha = &rule.header_actions[0];
+        assert_eq!(ha.name, "x-test");
+        assert_eq!(ha.values, vec!["one".to_string()]);
+    }
+
+    #[test]
+    fn effective_policy_includes_external_auth_metadata() {
+        let toml = r#"
+default = "deny"
+
+[external_auth_profiles.example]
+webhook_url = "https://auth.internal/start"
+timeout_ms = 5000
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/**"
+external_auth_profile = "example"
+        "#;
+
+        let cfg: PolicyConfig =
+            toml::from_str(toml).expect("parse policy config");
+        let effective =
+            EffectivePolicy::from_config(&cfg).expect("build effective policy");
+
+        assert_eq!(effective.rules.len(), 1);
+        let rule = &effective.rules[0];
+        let ext = rule
+            .external_auth
+            .as_ref()
+            .expect("external_auth metadata should be present");
+        assert_eq!(ext.profile, "example");
+        assert_eq!(ext.timeout_ms, 5000);
     }
 }

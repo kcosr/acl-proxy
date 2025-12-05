@@ -155,6 +155,7 @@ async fn loop_header_injection_updates_after_reload() {
             subnets: Vec::new(),
             with: None,
             add_url_enc_variants: None,
+            header_actions: Vec::new(),
         },
     )];
 
@@ -251,6 +252,7 @@ async fn failed_reload_keeps_previous_state() {
             subnets: Vec::new(),
             with: None,
             add_url_enc_variants: None,
+            header_actions: Vec::new(),
         },
     )];
 
@@ -330,4 +332,3 @@ async fn failed_reload_keeps_previous_state() {
 
     shutdown.notify_waiters();
 }
-

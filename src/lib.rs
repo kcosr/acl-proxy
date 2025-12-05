@@ -7,3 +7,4 @@ pub mod app;
 pub mod loop_protection;
 pub mod proxy;
 pub mod certs;
+pub mod external_auth;

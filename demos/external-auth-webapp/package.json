@@ -1,0 +1,23 @@
+{
+  "name": "acl-proxy-external-auth-webapp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal external auth web UI for acl-proxy external_auth_profiles demo.",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "ts-node src/server.ts"
+  },
+  "dependencies": {
+    "express": "^4.19.0",
+    "ws": "^8.17.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.0.0",
+    "@types/ws": "^8.5.10",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.0"
+  }
+}
+

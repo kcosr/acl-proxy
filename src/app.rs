@@ -1,5 +1,6 @@
 use crate::certs::CertManager;
 use crate::config::{Config, TlsConfig};
+use crate::external_auth::ExternalAuthManager;
 use crate::logging::{LoggingError, LoggingSettings};
 use crate::loop_protection::{LoopProtectionError, LoopProtectionSettings};
 use crate::policy::{PolicyEngine, PolicyError};
@@ -39,6 +40,7 @@ pub struct AppState {
     pub loop_protection: LoopProtectionSettings,
     pub http_client: Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>,
     pub cert_manager: CertManager,
+    pub external_auth: ExternalAuthManager,
 }
 
 impl AppState {
@@ -50,6 +52,8 @@ impl AppState {
 
         let http_client = build_http_client(&config.tls);
         let cert_manager = CertManager::from_config(&config.certificates)?;
+        let external_auth =
+            ExternalAuthManager::new(&config.policy.external_auth_profiles);
 
         Ok(AppState {
             config,
@@ -58,6 +62,7 @@ impl AppState {
             loop_protection,
             http_client,
             cert_manager,
+            external_auth,
         })
     }
 
