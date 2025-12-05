@@ -23,7 +23,9 @@ use crate::capture::{
     CaptureDecision, CaptureEndpoint, CaptureKind, CaptureMode,
     CaptureRecordOptions, HeaderMap, DEFAULT_MAX_BODY_BYTES,
 };
-use crate::external_auth::{ExternalDecision, ExternalAuthProfile};
+use crate::external_auth::{
+    ExternalAuthProfile, ExternalDecision,
+};
 use crate::logging::PolicyDecisionLogContext;
 use crate::proxy::https_connect;
 use crate::policy::CompiledHeaderAction;
@@ -229,6 +231,7 @@ async fn handle_http_request(
                     req,
                     &client_ip_for_policy,
                     rule.index,
+                    rule.rule_id.clone(),
                     &profile,
                     profile_name,
                     header_actions,
@@ -398,6 +401,7 @@ async fn handle_external_auth_gate(
     req: Request<Body>,
     client_ip_for_policy: &str,
     rule_index: usize,
+    rule_id: Option<String>,
     profile: &ExternalAuthProfile,
     profile_name: &str,
     header_actions: Vec<CompiledHeaderAction>,
@@ -405,26 +409,25 @@ async fn handle_external_auth_gate(
     let (guard, decision_rx) = state.external_auth.start_pending(
         request_id.to_string(),
         rule_index,
-        None,
+        rule_id,
         profile_name.to_string(),
         url.to_string(),
         Some(method.to_string()),
         Some(client_ip_for_policy.to_string()),
     );
 
-    let webhook_ok = send_external_auth_webhook(
-        &state,
-        profile,
-        request_id,
-        rule_index,
-        profile_name,
-        url,
-        Some(method.as_str()),
-        Some(client_ip_for_policy),
-    )
-    .await;
+    let webhook_result = state
+        .external_auth
+        .send_initial_webhook(request_id)
+        .await;
 
-    if !webhook_ok {
+    if let Err((kind, http_status)) = webhook_result {
+        state.external_auth.finalize_webhook_failed(
+            request_id,
+            kind,
+            http_status,
+        );
+
         drop(guard);
 
         return match profile.on_webhook_failure {
@@ -475,7 +478,8 @@ async fn handle_external_auth_gate(
         };
     }
 
-    let decision = tokio::time::timeout(profile.timeout, decision_rx).await;
+    let decision =
+        tokio::time::timeout(profile.timeout, decision_rx).await;
 
     match decision {
         Ok(Ok(ExternalDecision::Allow)) => {
@@ -495,6 +499,7 @@ async fn handle_external_auth_gate(
             .await
         }
         Ok(Ok(ExternalDecision::Deny)) => {
+            drop(guard);
             build_external_auth_denied_response(
                 &state,
                 request_id,
@@ -509,6 +514,11 @@ async fn handle_external_auth_gate(
             .await
         }
         Ok(Err(_recv_closed)) => {
+            state.external_auth.finalize_internal_error(
+                request_id,
+                "External approval channel closed",
+            );
+            drop(guard);
             build_external_auth_error_response(
                 &state,
                 request_id,
@@ -525,6 +535,8 @@ async fn handle_external_auth_gate(
             .await
         }
         Err(_elapsed) => {
+            state.external_auth.finalize_timed_out(request_id);
+            drop(guard);
             build_external_auth_timeout_response(
                 &state,
                 request_id,
@@ -838,89 +850,6 @@ pub(crate) async fn build_external_auth_error_response(
         message,
     )
     .await
-}
-
-pub(crate) async fn send_external_auth_webhook(
-    state: &AppState,
-    profile: &ExternalAuthProfile,
-    request_id: &str,
-    rule_index: usize,
-    profile_name: &str,
-    url: &str,
-    method: Option<&str>,
-    client_ip: Option<&str>,
-) -> bool {
-    let payload = serde_json::json!({
-        "requestId": request_id,
-        "profile": profile_name,
-        "ruleIndex": rule_index,
-        "url": url,
-        "method": method,
-        "clientIp": client_ip,
-    });
-
-    let body_bytes =
-        match serde_json::to_vec(&payload) {
-            Ok(b) => b,
-            Err(err) => {
-                tracing::error!(
-                    "failed to serialize external auth webhook payload: {err}"
-                );
-                return false;
-            }
-        };
-
-    let req = match Request::builder()
-        .method(Method::POST)
-        .uri(&profile.webhook_url)
-        .header(http::header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body_bytes))
-    {
-        Ok(r) => r,
-        Err(err) => {
-            tracing::error!(
-                "failed to build external auth webhook request: {err}"
-            );
-            return false;
-        }
-    };
-
-    let client_http: Client<_> = state.http_client.clone();
-    let send_fut = client_http.request(req);
-
-    let result = match profile.webhook_timeout {
-        Some(timeout) => match tokio::time::timeout(timeout, send_fut).await {
-            Ok(res) => res,
-            Err(_elapsed) => {
-                tracing::warn!(
-                    "external auth webhook timed out after {:?}",
-                    timeout
-                );
-                return false;
-            }
-        },
-        None => send_fut.await,
-    };
-
-    match result {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                true
-            } else {
-                tracing::warn!(
-                    "external auth webhook returned non-success status: {}",
-                    resp.status()
-                );
-                false
-            }
-        }
-        Err(err) => {
-            tracing::warn!(
-                "external auth webhook request failed: {err}"
-            );
-            false
-        }
-    }
 }
 
 pub(crate) async fn maybe_capture_static_response(

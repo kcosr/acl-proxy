@@ -52,8 +52,10 @@ impl AppState {
 
         let http_client = build_http_client(&config.tls);
         let cert_manager = CertManager::from_config(&config.certificates)?;
-        let external_auth =
-            ExternalAuthManager::new(&config.policy.external_auth_profiles);
+        let external_auth = ExternalAuthManager::new(
+            &config.policy.external_auth_profiles,
+            http_client.clone(),
+        );
 
         Ok(AppState {
             config,

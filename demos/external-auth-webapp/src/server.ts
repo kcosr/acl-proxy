@@ -12,6 +12,24 @@ type PendingApproval = {
   clientIp?: string | null;
 };
 
+type StatusEvent = {
+  requestId: string;
+  profile?: string;
+  ruleIndex?: number;
+  ruleId?: string | null;
+  url?: string;
+  method?: string | null;
+  clientIp?: string | null;
+  status: string;
+  reason?: string | null;
+  timestamp?: string;
+  elapsedMs?: number;
+  terminal?: boolean;
+  eventId?: string;
+  failureKind?: string | null;
+  httpStatus?: number | null;
+};
+
 type WebsocketMessage =
   | {
       type: "decision";
@@ -41,6 +59,9 @@ app.use(express.static("public"));
 
 // Webhook endpoint that acl-proxy calls when an approval-required rule matches.
 app.post("/webhook", (req, res) => {
+  const eventTypeHeader =
+    (req.header("x-acl-proxy-event") ?? "").toLowerCase();
+
   const body = req.body as {
     requestId?: string;
     profile?: string;
@@ -48,9 +69,84 @@ app.post("/webhook", (req, res) => {
     url?: string;
     method?: string;
     clientIp?: string;
+    status?: string;
+    reason?: string;
+    ruleId?: string;
+    timestamp?: string;
+    elapsedMs?: number;
+    terminal?: boolean;
+    eventId?: string;
+    failureKind?: string;
+    httpStatus?: number;
   };
 
-  const { requestId, profile, ruleIndex, url, method, clientIp } = body;
+  const {
+    requestId,
+    profile,
+    ruleIndex,
+    url,
+    method,
+    clientIp,
+    status,
+    reason,
+    ruleId,
+    timestamp,
+    elapsedMs,
+    terminal,
+    eventId,
+    failureKind,
+    httpStatus,
+  } = body;
+
+  const eventType =
+    eventTypeHeader === "status" ? "status" : "pending";
+
+  if (eventType === "status") {
+    if (!requestId || !status) {
+      return res.status(400).json({
+        error: "InvalidStatusWebhook",
+        message:
+          "Missing requestId or status in lifecycle webhook payload",
+      });
+    }
+
+    const statusEvent: StatusEvent = {
+      requestId,
+      profile: profile ?? "",
+      ruleIndex,
+      ruleId: ruleId ?? null,
+      url,
+      method: method ?? null,
+      clientIp: clientIp ?? null,
+      status,
+      reason: reason ?? null,
+      timestamp,
+      elapsedMs,
+      terminal,
+      eventId,
+      failureKind: failureKind ?? null,
+      httpStatus: httpStatus ?? null,
+    };
+
+    // Once a terminal status webhook arrives (timed out, cancelled, error,
+    // webhook_failed, etc.), this request should no longer be considered
+    // pending for new WebSocket clients.
+    pending.delete(requestId);
+
+    const msg = JSON.stringify({
+      type: "status",
+      event: statusEvent,
+    });
+    // eslint-disable-next-line no-console
+    console.log("[ws:broadcast] status", msg);
+    wss.clients.forEach((ws) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(msg);
+      }
+    });
+
+    return res.json({ status: "accepted" });
+  }
 
   if (!requestId || !url || typeof ruleIndex !== "number") {
     return res.status(400).json({
@@ -71,6 +167,8 @@ app.post("/webhook", (req, res) => {
   pending.set(requestId, approval);
 
   const msg = JSON.stringify({ type: "pending", approval });
+  // eslint-disable-next-line no-console
+  console.log("[ws:broadcast] pending", msg);
   wss.clients.forEach((ws) => {
     if (ws.readyState === WebSocket.OPEN) {
       ws.send(msg);
@@ -82,12 +180,19 @@ app.post("/webhook", (req, res) => {
 
 // WebSocket handling for browser clients.
 wss.on("connection", (ws) => {
+  // eslint-disable-next-line no-console
+  console.log("[ws] client connected");
   // On connect, send the current pending list.
   for (const approval of pending.values()) {
-    ws.send(JSON.stringify({ type: "pending", approval }));
+    const msg = JSON.stringify({ type: "pending", approval });
+    // eslint-disable-next-line no-console
+    console.log("[ws:broadcast] pending (initial)", msg);
+    ws.send(msg);
   }
 
   ws.on("message", async (data) => {
+    // eslint-disable-next-line no-console
+    console.log("[ws:recv]", String(data));
     let msg: WebsocketMessage;
     try {
       msg = JSON.parse(String(data));
@@ -174,4 +279,3 @@ server.listen(PORT, () => {
     `Expecting acl-proxy callbacks at ${CALLBACK_URL}`,
   );
 });
-

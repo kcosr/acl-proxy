@@ -52,6 +52,172 @@ async fn start_upstream_echo_server(
     (addr, seen_headers)
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn external_auth_webhook_failure_emits_status_event() {
+    use hyper::service::{make_service_fn, service_fn};
+    use hyper::{Body, Request, Response, Server};
+    use std::time::Duration;
+
+    #[derive(Clone, Debug)]
+    struct ReceivedEvent {
+        event_header: String,
+        body: serde_json::Value,
+    }
+
+    let events: Arc<Mutex<Vec<ReceivedEvent>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let events_clone = events.clone();
+
+    let make_svc = make_service_fn(move |_conn| {
+        let events = events_clone.clone();
+        async move {
+            Ok::<_, hyper::Error>(service_fn(
+                move |req: Request<Body>| {
+                    let events = events.clone();
+                    async move {
+                        let event_header = req
+                            .headers()
+                            .get("x-acl-proxy-event")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+
+                        let bytes = hyper::body::to_bytes(
+                            req.into_body(),
+                        )
+                        .await
+                        .unwrap_or_default();
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&bytes)
+                                .unwrap_or_else(|_| {
+                                    serde_json::json!({})
+                                });
+
+                        let status = if event_header == "pending" {
+                            http::StatusCode::INTERNAL_SERVER_ERROR
+                        } else {
+                            events.lock().unwrap().push(
+                                ReceivedEvent {
+                                    event_header:
+                                        event_header.clone(),
+                                    body: body.clone(),
+                                },
+                            );
+                            http::StatusCode::OK
+                        };
+
+                        Ok::<_, hyper::Error>(
+                            Response::builder()
+                                .status(status)
+                                .body(Body::from("ok"))
+                                .unwrap(),
+                        )
+                    }
+                },
+            ))
+        }
+    });
+
+    let webhook_listener = StdTcpListener::bind("127.0.0.1:0")
+        .expect("bind webhook");
+    webhook_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking webhook");
+    let webhook_addr =
+        webhook_listener.local_addr().expect("webhook addr");
+
+    tokio::spawn(
+        Server::from_tcp(webhook_listener)
+            .expect("server from tcp")
+            .serve(make_svc),
+    );
+
+    let toml = format!(
+        r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+
+[logging]
+directory = "logs"
+level = "info"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles]
+[policy.external_auth_profiles.test_profile]
+webhook_url = "http://{addr}/webhook"
+timeout_ms = 1000
+webhook_timeout_ms = 200
+on_webhook_failure = "error"
+
+[[policy.rules]]
+action = "allow"
+pattern = "http://example.com/**"
+description = "External auth test rule"
+external_auth_profile = "test_profile"
+rule_id = "external-auth-test-rule"
+    "#,
+        addr = webhook_addr
+    );
+
+    let config: Config =
+        toml::from_str(&toml).expect("parse config");
+
+    let proxy_listener =
+        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir) =
+        start_proxy_with_config(config, proxy_listener).await;
+
+    let raw_request = "GET http://example.com/ok HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+
+    let (_response, status) =
+        send_raw_http_request(proxy_addr, raw_request).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let events_guard = events.lock().unwrap();
+    let status_event = events_guard
+        .iter()
+        .find(|e| e.event_header == "status")
+        .unwrap_or_else(|| panic!("expected status webhook event"));
+
+    assert_eq!(
+        status_event.body["status"],
+        serde_json::Value::String("webhook_failed".to_string())
+    );
+    assert_eq!(
+        status_event.body["terminal"],
+        serde_json::Value::Bool(true)
+    );
+    assert_eq!(
+        status_event.body["failureKind"],
+        serde_json::Value::String("non_2xx".to_string())
+    );
+    assert_eq!(
+        status_event.body["ruleId"],
+        serde_json::Value::String(
+            "external-auth-test-rule".to_string()
+        )
+    );
+}
+
 fn minimal_config() -> Config {
     let toml = r#"
 schema_version = "1"
@@ -167,6 +333,8 @@ async fn allowed_request_is_proxied_and_loop_header_added() {
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
         },
     )];
 
@@ -240,6 +408,8 @@ async fn loop_header_not_added_when_disabled() {
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
         },
     )];
 
@@ -434,6 +604,8 @@ async fn upstream_connection_failure_returns_502() {
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
         },
     )];
 

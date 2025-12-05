@@ -617,6 +617,19 @@ description = "GitHub API with external MFA"
 external_auth_profile = "github_mfa"
 ```
 
+For rules and templates you may also define an optional, stable `rule_id`:
+
+```toml
+[[policy.rules]]
+action = "allow"
+pattern = "https://api.github.com/**"
+description = "GitHub API with external MFA"
+external_auth_profile = "github_mfa"
+rule_id = "github-allow-mfa"
+```
+
+When present, `rule_id` is included in external auth webhooks alongside the numeric `ruleIndex`.
+
 Semantics:
 
 - Rules keep `action = "allow"` or `"deny"` as before.
@@ -624,7 +637,7 @@ Semantics:
   - The rule becomes **approval-required**.
   - On match, the proxy:
     - Creates a pending entry keyed by `requestId`.
-    - Sends a webhook to the configured profile’s `webhook_url`.
+    - Sends an initial **pending** webhook to the configured profile’s `webhook_url`.
     - Waits for a callback decision (up to `timeout_ms`).
     - On approval: proxies the request upstream as usual (including any header actions).
     - On deny: returns `403 Forbidden` with the standard policy-deny JSON shape.
@@ -635,6 +648,28 @@ Semantics:
 - Rules without `external_auth_profile` behave exactly as today.
 - Ruleset templates (`[[policy.rulesets.<name>]]`) may also specify `external_auth_profile`; the
   expanded rules inherit the profile.
+
+Lifecycle status telemetry:
+
+- All external auth webhooks are POSTed to the profile’s `webhook_url` with a JSON body and an
+  `X-Acl-Proxy-Event` header:
+  - `X-Acl-Proxy-Event: pending` – initial approval webhook.
+  - `X-Acl-Proxy-Event: status` – best-effort lifecycle notifications.
+- Both webhook kinds include the base fields:
+  - `requestId`, `profile`, `ruleIndex`, optional `ruleId`, `url`, `method`, `clientIp`.
+- Additional lifecycle fields:
+  - `status`: `"pending"`, `"webhook_failed"`, `"timed_out"`, `"error"`, or `"cancelled"`.
+  - `reason`: optional human-readable explanation.
+  - `timestamp`: RFC3339 timestamp when the event was generated.
+  - `elapsedMs`: milliseconds since the pending entry was created.
+  - `terminal`: `false` for `"pending"`, `true` for terminal statuses.
+  - `eventId`: unique identifier for the notification (useful for dedupe).
+  - `failureKind` (terminal only): `"timeout" | "connect" | "non_2xx"`.
+  - `httpStatus` (terminal only): HTTP status code when applicable.
+
+The proxy may emit at most one terminal status event per `requestId` in addition to the initial
+`"pending"` webhook. Status webhooks are **best-effort telemetry only**; delivery failures are
+logged but never affect the allow/deny decision or the client’s HTTP response.
 
 Callback endpoint:
 
