@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use acl_proxy::app::AppState;
 use acl_proxy::config::Config;
 use acl_proxy::proxy::http::run_http_proxy_on_listener;
+use http::header::HeaderValue;
 use http::StatusCode;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server};
@@ -32,7 +33,13 @@ async fn start_upstream_echo_server(
                 async move {
                     *seen_headers.lock().unwrap() =
                         Some(req.headers().clone());
-                    Ok::<_, hyper::Error>(Response::new(Body::from("ok")))
+                    let mut resp =
+                        Response::new(Body::from("ok"));
+                    resp.headers_mut().insert(
+                        "x-upstream-tag",
+                        HeaderValue::from_static("old-tag"),
+                    );
+                    Ok::<_, hyper::Error>(resp)
                 }
             }))
         }
@@ -159,6 +166,7 @@ async fn allowed_request_is_proxied_and_loop_header_added() {
             subnets: Vec::new(),
             with: None,
             add_url_enc_variants: None,
+            header_actions: Vec::new(),
         },
     )];
 
@@ -231,6 +239,7 @@ async fn loop_header_not_added_when_disabled() {
             subnets: Vec::new(),
             with: None,
             add_url_enc_variants: None,
+            header_actions: Vec::new(),
         },
     )];
 
@@ -424,6 +433,7 @@ async fn upstream_connection_failure_returns_502() {
             subnets: Vec::new(),
             with: None,
             add_url_enc_variants: None,
+            header_actions: Vec::new(),
         },
     )];
 
@@ -445,4 +455,199 @@ async fn upstream_connection_failure_returns_502() {
         send_raw_http_request(proxy_addr, &raw_request).await;
 
     assert_eq!(status, StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn header_actions_apply_to_request_for_matching_rule() {
+    let (upstream_addr, seen_headers) =
+        start_upstream_echo_server().await;
+
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    let toml = format!(
+        r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+
+[logging]
+directory = "logs"
+level = "info"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "http://{host}/**"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "x-test"
+value = "one"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "add"
+name = "x-test"
+value = "two"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "x-if-present"
+value = "set-value"
+when = "if_present"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "x-if-absent"
+value = "default"
+when = "if_absent"
+"#,
+        host = host
+    );
+
+    let config: Config = toml::from_str(&toml).expect("parse config");
+
+    let proxy_listener =
+        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir) =
+        start_proxy_with_config(config, proxy_listener).await;
+
+    let raw_request = format!(
+        "GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nx-if-present: original\r\n\r\n"
+    );
+
+    let (_response, status) =
+        send_raw_http_request(proxy_addr, &raw_request).await;
+
+    assert_eq!(status, StatusCode::OK);
+
+    let headers_guard = seen_headers.lock().unwrap();
+    let upstream_headers = headers_guard
+        .as_ref()
+        .expect("upstream should see request");
+
+    // x-test should have two values: one and two.
+    let x_test_values: Vec<String> = upstream_headers
+        .get_all("x-test")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(
+        x_test_values,
+        vec!["one".to_string(), "two".to_string()]
+    );
+
+    // x-if-present existed on the original request and should be set.
+    assert_eq!(
+        upstream_headers
+            .get("x-if-present")
+            .and_then(|v| v.to_str().ok()),
+        Some("set-value")
+    );
+
+    // x-if-absent did not exist originally and should be added.
+    assert_eq!(
+        upstream_headers
+            .get("x-if-absent")
+            .and_then(|v| v.to_str().ok()),
+        Some("default")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn header_actions_apply_to_response_for_matching_rule() {
+    let (upstream_addr, _seen_headers) =
+        start_upstream_echo_server().await;
+
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    let toml = format!(
+        r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+
+[logging]
+directory = "logs"
+level = "info"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "http://{host}/**"
+
+[[policy.rules.header_actions]]
+direction = "response"
+action = "replace_substring"
+name = "x-upstream-tag"
+search = "old"
+replace = "new"
+"#,
+        host = host
+    );
+
+    let config: Config = toml::from_str(&toml).expect("parse config");
+
+    let proxy_listener =
+        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir) =
+        start_proxy_with_config(config, proxy_listener).await;
+
+    let raw_request = format!(
+        "GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    );
+
+    let (response, status) =
+        send_raw_http_request(proxy_addr, &raw_request).await;
+
+    assert_eq!(status, StatusCode::OK);
+
+    let mut saw_header = false;
+    for line in response.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("x-upstream-tag:") {
+            assert!(
+                lower.contains("new-tag"),
+                "expected x-upstream-tag to contain 'new-tag', got: {line}"
+            );
+            saw_header = true;
+            break;
+        }
+    }
+
+    assert!(saw_header, "response should include x-upstream-tag header");
 }

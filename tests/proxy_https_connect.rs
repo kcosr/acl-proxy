@@ -313,6 +313,7 @@ async fn allowed_https_via_connect_is_proxied_and_captured() {
             subnets: Vec::new(),
             with: None,
             add_url_enc_variants: None,
+            header_actions: Vec::new(),
         },
     )];
 
@@ -401,6 +402,7 @@ async fn denied_https_via_connect_returns_403() {
             subnets: Vec::new(),
             with: None,
             add_url_enc_variants: None,
+            header_actions: Vec::new(),
         },
     )];
 
@@ -453,6 +455,7 @@ async fn loop_detected_on_connect_returns_508() {
             subnets: Vec::new(),
             with: None,
             add_url_enc_variants: None,
+            header_actions: Vec::new(),
         },
     )];
 

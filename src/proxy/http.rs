@@ -1,9 +1,12 @@
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::Arc;
 
 use chrono::Utc;
-use http::header::{HeaderMap as HttpHeaderMap, HeaderName, HeaderValue, HOST};
+use http::header::{
+    HeaderMap as HttpHeaderMap, HeaderName, HeaderValue, HOST,
+};
 use http::{Method, StatusCode, Uri, Version};
 use hyper::body::{Bytes, HttpBody};
 use hyper::server::conn::AddrStream;
@@ -12,14 +15,19 @@ use hyper::{Body, Client, Request, Response, Server};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
+use serde::Deserialize;
+
 use crate::app::{AppState, SharedAppState};
 use crate::capture::{
     build_capture_record, should_capture, BodyCaptureBuffer, BodyCaptureResult,
     CaptureDecision, CaptureEndpoint, CaptureKind, CaptureMode,
     CaptureRecordOptions, HeaderMap, DEFAULT_MAX_BODY_BYTES,
 };
+use crate::external_auth::{ExternalDecision, ExternalAuthProfile};
 use crate::logging::PolicyDecisionLogContext;
 use crate::proxy::https_connect;
+use crate::policy::CompiledHeaderAction;
+use crate::config::{HeaderActionKind, HeaderDirection, HeaderWhen};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HttpProxyError {
@@ -129,6 +137,12 @@ async fn handle_http_request(
         return Ok(resp);
     }
 
+    if is_external_auth_callback_path(req.uri().path()) {
+        let resp =
+            handle_external_auth_callback_request(state, req).await;
+        return Ok(resp);
+    }
+
     let request_id = generate_request_id();
     let method = req.method().clone();
     let version = req.version();
@@ -165,8 +179,11 @@ async fn handle_http_request(
     }
 
     let policy = &state.policy;
-    let decision =
-        policy.evaluate(&full_url, Some(&client_ip_for_policy), Some(method.as_str()));
+    let decision = policy.evaluate(
+        &full_url,
+        Some(&client_ip_for_policy),
+        Some(method.as_str()),
+    );
 
     state.logging.log_policy_decision(PolicyDecisionLogContext {
         request_id: &request_id,
@@ -190,6 +207,54 @@ async fn handle_http_request(
         return Ok(resp);
     }
 
+    let matched_rule = decision.matched.as_ref();
+    let header_actions = matched_rule
+        .map(|m| m.header_actions.clone())
+        .unwrap_or_default();
+
+    if let Some(rule) = matched_rule {
+        if let Some(profile_name) = rule.external_auth_profile.as_ref()
+        {
+            if let Some(profile) =
+                state.external_auth.get_profile(profile_name)
+            {
+                let resp = handle_external_auth_gate(
+                    state.clone(),
+                    &request_id,
+                    &full_url,
+                    &method,
+                    &client_endpoint,
+                    target,
+                    version,
+                    req,
+                    &client_ip_for_policy,
+                    rule.index,
+                    &profile,
+                    profile_name,
+                    header_actions,
+                )
+                .await;
+                return Ok(resp);
+            } else {
+                let resp = build_external_auth_error_response(
+                    &state,
+                    &request_id,
+                    &full_url,
+                    &method,
+                    &client_endpoint,
+                    target,
+                    version,
+                    req.headers(),
+                    CaptureMode::HttpProxy,
+                    "ExternalApprovalError",
+                    "External auth profile not found",
+                )
+                .await;
+                return Ok(resp);
+            }
+        }
+    }
+
     let response = proxy_allowed_request(
         state.clone(),
         request_id,
@@ -200,10 +265,280 @@ async fn handle_http_request(
         target,
         req,
         CaptureMode::HttpProxy,
+        header_actions,
     )
     .await;
 
     Ok(response)
+}
+
+fn is_external_auth_callback_path(path: &str) -> bool {
+    path == "/_acl-proxy/external-auth/callback"
+}
+
+#[derive(Debug, Deserialize)]
+struct ExternalAuthCallbackBody {
+    #[serde(rename = "requestId")]
+    request_id: String,
+    decision: ExternalAuthCallbackDecision,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ExternalAuthCallbackDecision {
+    Allow,
+    Deny,
+}
+
+async fn handle_external_auth_callback_request(
+    state: Arc<AppState>,
+    req: Request<Body>,
+) -> Response<Body> {
+    if req.method() != Method::POST {
+        let payload = serde_json::json!({
+            "error": "MethodNotAllowed",
+            "message": "External auth callbacks must use POST",
+        });
+        let body_bytes =
+            serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+
+        let mut resp = Response::new(Body::from(body_bytes));
+        *resp.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+        resp.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        return resp;
+    }
+
+    let body_bytes = match hyper::body::to_bytes(req.into_body()).await {
+        Ok(b) => b,
+        Err(_) => {
+            let payload = serde_json::json!({
+                "error": "InvalidRequest",
+                "message": "Failed to read callback body",
+            });
+            let body_bytes = serde_json::to_vec(&payload)
+                .unwrap_or_else(|_| b"{}".to_vec());
+            let mut resp = Response::new(Body::from(body_bytes));
+            *resp.status_mut() = StatusCode::BAD_REQUEST;
+            resp.headers_mut().insert(
+                http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            return resp;
+        }
+    };
+
+    let payload: ExternalAuthCallbackBody =
+        match serde_json::from_slice(&body_bytes) {
+            Ok(p) => p,
+            Err(_) => {
+                let payload = serde_json::json!({
+                    "error": "InvalidRequest",
+                    "message": "Callback body must be valid JSON with requestId and decision",
+                });
+                let body_bytes = serde_json::to_vec(&payload)
+                    .unwrap_or_else(|_| b"{}".to_vec());
+                let mut resp = Response::new(Body::from(body_bytes));
+                *resp.status_mut() = StatusCode::BAD_REQUEST;
+                resp.headers_mut().insert(
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                return resp;
+            }
+        };
+
+    let decision = match payload.decision {
+        ExternalAuthCallbackDecision::Allow => ExternalDecision::Allow,
+        ExternalAuthCallbackDecision::Deny => ExternalDecision::Deny,
+    };
+
+    let found = state
+        .external_auth
+        .resolve(&payload.request_id, decision);
+
+    if !found {
+        let payload = serde_json::json!({
+            "error": "RequestNotFound",
+            "message": "No pending request for this requestId",
+        });
+        let body_bytes =
+            serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+        let mut resp = Response::new(Body::from(body_bytes));
+        *resp.status_mut() = StatusCode::NOT_FOUND;
+        resp.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        return resp;
+    }
+
+    let payload = serde_json::json!({ "status": "ok" });
+    let body_bytes =
+        serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+    let mut resp = Response::new(Body::from(body_bytes));
+    *resp.status_mut() = StatusCode::OK;
+    resp.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    resp
+}
+
+async fn handle_external_auth_gate(
+    state: Arc<AppState>,
+    request_id: &str,
+    url: &str,
+    method: &Method,
+    client: &CaptureEndpoint,
+    target: Option<CaptureEndpoint>,
+    version: Version,
+    req: Request<Body>,
+    client_ip_for_policy: &str,
+    rule_index: usize,
+    profile: &ExternalAuthProfile,
+    profile_name: &str,
+    header_actions: Vec<CompiledHeaderAction>,
+) -> Response<Body> {
+    let (guard, decision_rx) = state.external_auth.start_pending(
+        request_id.to_string(),
+        rule_index,
+        None,
+        profile_name.to_string(),
+        url.to_string(),
+        Some(method.to_string()),
+        Some(client_ip_for_policy.to_string()),
+    );
+
+    let webhook_ok = send_external_auth_webhook(
+        &state,
+        profile,
+        request_id,
+        rule_index,
+        profile_name,
+        url,
+        Some(method.as_str()),
+        Some(client_ip_for_policy),
+    )
+    .await;
+
+    if !webhook_ok {
+        drop(guard);
+
+        return match profile.on_webhook_failure {
+            crate::external_auth::WebhookFailureMode::Deny => {
+                build_external_auth_denied_response(
+                    &state,
+                    request_id,
+                    url,
+                    method,
+                    client,
+                    target,
+                    version,
+                    req.headers(),
+                    CaptureMode::HttpProxy,
+                )
+                .await
+            }
+            crate::external_auth::WebhookFailureMode::Error => {
+                build_external_auth_error_response(
+                    &state,
+                    request_id,
+                    url,
+                    method,
+                    client,
+                    target,
+                    version,
+                    req.headers(),
+                    CaptureMode::HttpProxy,
+                    "ExternalApprovalError",
+                    "External approval webhook failed",
+                )
+                .await
+            }
+            crate::external_auth::WebhookFailureMode::Timeout => {
+                build_external_auth_timeout_response(
+                    &state,
+                    request_id,
+                    url,
+                    method,
+                    client,
+                    target,
+                    version,
+                    req.headers(),
+                    CaptureMode::HttpProxy,
+                )
+                .await
+            }
+        };
+    }
+
+    let decision = tokio::time::timeout(profile.timeout, decision_rx).await;
+
+    match decision {
+        Ok(Ok(ExternalDecision::Allow)) => {
+            drop(guard);
+            proxy_allowed_request(
+                state.clone(),
+                request_id.to_string(),
+                url.to_string(),
+                method.clone(),
+                version,
+                client.clone(),
+                target,
+                req,
+                CaptureMode::HttpProxy,
+                header_actions,
+            )
+            .await
+        }
+        Ok(Ok(ExternalDecision::Deny)) => {
+            build_external_auth_denied_response(
+                &state,
+                request_id,
+                url,
+                method,
+                client,
+                target,
+                version,
+                req.headers(),
+                CaptureMode::HttpProxy,
+            )
+            .await
+        }
+        Ok(Err(_recv_closed)) => {
+            build_external_auth_error_response(
+                &state,
+                request_id,
+                url,
+                method,
+                client,
+                target,
+                version,
+                req.headers(),
+                CaptureMode::HttpProxy,
+                "ExternalApprovalError",
+                "External approval channel closed",
+            )
+            .await
+        }
+        Err(_elapsed) => {
+            build_external_auth_timeout_response(
+                &state,
+                request_id,
+                url,
+                method,
+                client,
+                target,
+                version,
+                req.headers(),
+                CaptureMode::HttpProxy,
+            )
+            .await
+        }
+    }
 }
 
 fn build_full_url(
@@ -370,6 +705,224 @@ pub(crate) async fn build_policy_denied_response_with_mode(
     response
 }
 
+async fn build_external_auth_response(
+    state: &AppState,
+    request_id: &str,
+    url: &str,
+    method: &Method,
+    client: &CaptureEndpoint,
+    target: Option<CaptureEndpoint>,
+    version: Version,
+    req_headers: &HttpHeaderMap,
+    mode: CaptureMode,
+    status: StatusCode,
+    error: &str,
+    message: &str,
+) -> Response<Body> {
+    let payload = serde_json::json!({
+        "error": error,
+        "message": message,
+    });
+    let body_bytes =
+        serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+
+    let mut response = Response::new(Body::from(body_bytes.clone()));
+    *response.status_mut() = status;
+    let headers = response.headers_mut();
+    headers.insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+
+    maybe_capture_static_response(
+        state,
+        request_id,
+        url,
+        method,
+        client,
+        target,
+        version,
+        status,
+        message,
+        &body_bytes,
+        CaptureDecision::Deny,
+        Some(req_headers),
+        mode,
+    )
+    .await;
+
+    response
+}
+
+pub(crate) async fn build_external_auth_denied_response(
+    state: &AppState,
+    request_id: &str,
+    url: &str,
+    method: &Method,
+    client: &CaptureEndpoint,
+    target: Option<CaptureEndpoint>,
+    version: Version,
+    req_headers: &HttpHeaderMap,
+    mode: CaptureMode,
+) -> Response<Body> {
+    build_external_auth_response(
+        state,
+        request_id,
+        url,
+        method,
+        client,
+        target,
+        version,
+        req_headers,
+        mode,
+        StatusCode::FORBIDDEN,
+        "Forbidden",
+        "Blocked by external approval",
+    )
+    .await
+}
+
+pub(crate) async fn build_external_auth_timeout_response(
+    state: &AppState,
+    request_id: &str,
+    url: &str,
+    method: &Method,
+    client: &CaptureEndpoint,
+    target: Option<CaptureEndpoint>,
+    version: Version,
+    req_headers: &HttpHeaderMap,
+    mode: CaptureMode,
+) -> Response<Body> {
+    build_external_auth_response(
+        state,
+        request_id,
+        url,
+        method,
+        client,
+        target,
+        version,
+        req_headers,
+        mode,
+        StatusCode::GATEWAY_TIMEOUT,
+        "ExternalApprovalTimeout",
+        "External approval timed out",
+    )
+    .await
+}
+
+pub(crate) async fn build_external_auth_error_response(
+    state: &AppState,
+    request_id: &str,
+    url: &str,
+    method: &Method,
+    client: &CaptureEndpoint,
+    target: Option<CaptureEndpoint>,
+    version: Version,
+    req_headers: &HttpHeaderMap,
+    mode: CaptureMode,
+    error: &str,
+    message: &str,
+) -> Response<Body> {
+    build_external_auth_response(
+        state,
+        request_id,
+        url,
+        method,
+        client,
+        target,
+        version,
+        req_headers,
+        mode,
+        StatusCode::SERVICE_UNAVAILABLE,
+        error,
+        message,
+    )
+    .await
+}
+
+pub(crate) async fn send_external_auth_webhook(
+    state: &AppState,
+    profile: &ExternalAuthProfile,
+    request_id: &str,
+    rule_index: usize,
+    profile_name: &str,
+    url: &str,
+    method: Option<&str>,
+    client_ip: Option<&str>,
+) -> bool {
+    let payload = serde_json::json!({
+        "requestId": request_id,
+        "profile": profile_name,
+        "ruleIndex": rule_index,
+        "url": url,
+        "method": method,
+        "clientIp": client_ip,
+    });
+
+    let body_bytes =
+        match serde_json::to_vec(&payload) {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::error!(
+                    "failed to serialize external auth webhook payload: {err}"
+                );
+                return false;
+            }
+        };
+
+    let req = match Request::builder()
+        .method(Method::POST)
+        .uri(&profile.webhook_url)
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body_bytes))
+    {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::error!(
+                "failed to build external auth webhook request: {err}"
+            );
+            return false;
+        }
+    };
+
+    let client_http: Client<_> = state.http_client.clone();
+    let send_fut = client_http.request(req);
+
+    let result = match profile.webhook_timeout {
+        Some(timeout) => match tokio::time::timeout(timeout, send_fut).await {
+            Ok(res) => res,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    "external auth webhook timed out after {:?}",
+                    timeout
+                );
+                return false;
+            }
+        },
+        None => send_fut.await,
+    };
+
+    match result {
+        Ok(resp) => {
+            if resp.status().is_success() {
+                true
+            } else {
+                tracing::warn!(
+                    "external auth webhook returned non-success status: {}",
+                    resp.status()
+                );
+                false
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                "external auth webhook request failed: {err}"
+            );
+            false
+        }
+    }
+}
+
 pub(crate) async fn maybe_capture_static_response(
     state: &AppState,
     request_id: &str,
@@ -463,6 +1016,7 @@ pub(crate) async fn proxy_allowed_request(
     target: Option<CaptureEndpoint>,
     req: Request<Body>,
     mode: CaptureMode,
+    header_actions: Vec<CompiledHeaderAction>,
 ) -> Response<Body> {
     let upstream_uri: Uri = match full_url.parse() {
         Ok(u) => u,
@@ -481,6 +1035,8 @@ pub(crate) async fn proxy_allowed_request(
             return resp;
         }
     };
+
+    let original_request_presence = snapshot_header_presence(req.headers());
 
     let mut builder = Request::builder()
         .method(method.clone())
@@ -529,6 +1085,13 @@ pub(crate) async fn proxy_allowed_request(
                 headers.insert(loop_settings.header_name.clone(), value);
             }
         }
+
+        apply_header_actions(
+            headers,
+            &header_actions,
+            HeaderDirection::Request,
+            &original_request_presence,
+        );
     }
 
     let body = req.into_body();
@@ -549,7 +1112,7 @@ pub(crate) async fn proxy_allowed_request(
     let client_http: Client<_> = state.http_client.clone();
     let upstream_resp = client_http.request(upstream_req).await;
 
-    let upstream_resp = match upstream_resp {
+    let mut upstream_resp = match upstream_resp {
         Ok(resp) => resp,
         Err(e) => {
             tracing::debug!("upstream request failed: {e}");
@@ -560,16 +1123,13 @@ pub(crate) async fn proxy_allowed_request(
         }
     };
 
+    let original_response_presence =
+        snapshot_header_presence(upstream_resp.headers());
+
     let status = upstream_resp.status();
     let resp_version = upstream_resp.version();
 
-    let resp_headers_for_capture = if capture_response {
-        Some(headers_to_capture_map(upstream_resp.headers()))
-    } else {
-        None
-    };
-
-    let (resp, resp_capture_rx) = if capture_response {
+    let (mut resp, resp_capture_rx) = if capture_response {
         let (parts, upstream_body) = upstream_resp.into_parts();
         let (body, handle) = tee_body(upstream_body).await;
 
@@ -580,13 +1140,31 @@ pub(crate) async fn proxy_allowed_request(
             for (name, value) in parts.headers.iter() {
                 headers.append(name.clone(), value.clone());
             }
+            apply_header_actions(
+                headers,
+                &header_actions,
+                HeaderDirection::Response,
+                &original_response_presence,
+            );
         }
         let resp = out
             .body(body)
             .unwrap_or_else(|_| Response::new(Body::empty()));
         (resp, Some(handle))
     } else {
+        apply_header_actions(
+            upstream_resp.headers_mut(),
+            &header_actions,
+            HeaderDirection::Response,
+            &original_response_presence,
+        );
         (upstream_resp, None)
+    };
+
+    let resp_headers_for_capture = if capture_response {
+        Some(headers_to_capture_map(resp.headers()))
+    } else {
+        None
     };
 
     tracing::debug!(
@@ -706,6 +1284,122 @@ pub(crate) fn headers_to_capture_map(
         }
     }
     out
+}
+
+fn snapshot_header_presence(
+    headers: &HttpHeaderMap,
+) -> HashSet<HeaderName> {
+    let mut set = HashSet::new();
+    for name in headers.keys() {
+        set.insert(name.clone());
+    }
+    set
+}
+
+fn apply_header_actions(
+    headers: &mut HttpHeaderMap,
+    actions: &[CompiledHeaderAction],
+    direction: HeaderDirection,
+    original_present: &HashSet<HeaderName>,
+) {
+    for action in actions {
+        let applies_to_direction = match (&action.direction, &direction) {
+            (HeaderDirection::Request, HeaderDirection::Request) => true,
+            (HeaderDirection::Response, HeaderDirection::Response) => true,
+            (HeaderDirection::Both, _) => true,
+            _ => false,
+        };
+        if !applies_to_direction {
+            continue;
+        }
+
+        let present_originally = original_present.contains(&action.name);
+        let should_run = match action.when {
+            HeaderWhen::Always => true,
+            HeaderWhen::IfPresent => present_originally,
+            HeaderWhen::IfAbsent => !present_originally,
+        };
+        if !should_run {
+            continue;
+        }
+
+        match action.action {
+            HeaderActionKind::Remove => {
+                headers.remove(&action.name);
+                log_header_action(action, &direction);
+            }
+            HeaderActionKind::Set => {
+                headers.remove(&action.name);
+                for v in &action.values {
+                    headers.append(action.name.clone(), v.clone());
+                }
+                log_header_action(action, &direction);
+            }
+            HeaderActionKind::Add => {
+                for v in &action.values {
+                    headers.append(action.name.clone(), v.clone());
+                }
+                log_header_action(action, &direction);
+            }
+            HeaderActionKind::ReplaceSubstring => {
+                let mut new_values = Vec::new();
+                let all = headers.get_all(&action.name);
+
+                let search = match &action.search {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let replace = action.replace.as_deref().unwrap_or("");
+
+                for val in all.iter() {
+                    let s = match val.to_str() {
+                        Ok(s) => s,
+                        Err(_) => {
+                            tracing::debug!(
+                                "skipping non-UTF8 header value for {} in replace_substring",
+                                action.name
+                            );
+                            continue;
+                        }
+                    };
+                    let replaced = s.replace(search, replace);
+                    match HeaderValue::from_str(&replaced) {
+                        Ok(hv) => new_values.push(hv),
+                        Err(e) => {
+                            tracing::debug!(
+                                "skipping invalid mutated header value for {} in replace_substring: {}",
+                                action.name,
+                                e
+                            );
+                        }
+                    }
+                }
+
+                if !new_values.is_empty() {
+                    headers.remove(&action.name);
+                    for v in new_values {
+                        headers.append(action.name.clone(), v);
+                    }
+                    log_header_action(action, &direction);
+                }
+            }
+        }
+    }
+}
+
+fn log_header_action(action: &CompiledHeaderAction, direction: &HeaderDirection) {
+    let dir_str = match direction {
+        HeaderDirection::Request => "request",
+        HeaderDirection::Response => "response",
+        HeaderDirection::Both => "both",
+    };
+    tracing::debug!(
+        "applied header action {:?} on {} (direction={}, when={:?})",
+        action.action,
+        action.name,
+        dir_str,
+        action.when,
+    );
 }
 
 pub(crate) async fn tee_body(

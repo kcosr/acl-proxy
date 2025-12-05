@@ -352,6 +352,12 @@ pub struct PolicyRuleTemplateConfig {
 
     #[serde(default)]
     pub subnets: Vec<Ipv4Net>,
+
+    #[serde(default)]
+    pub header_actions: Vec<HeaderActionConfig>,
+
+    #[serde(default)]
+    pub external_auth_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,6 +402,12 @@ pub struct PolicyRuleDirectConfig {
 
     #[serde(default)]
     pub add_url_enc_variants: Option<UrlEncVariants>,
+
+    #[serde(default)]
+    pub header_actions: Vec<HeaderActionConfig>,
+
+    #[serde(default)]
+    pub external_auth_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -417,6 +429,9 @@ pub struct PolicyConfig {
     pub rulesets: RulesetMap,
 
     #[serde(default)]
+    pub external_auth_profiles: ExternalAuthProfileConfigMap,
+
+    #[serde(default)]
     pub rules: Vec<PolicyRuleConfig>,
 }
 
@@ -426,6 +441,7 @@ impl Default for PolicyConfig {
             default: PolicyDefaultAction::Deny,
             macros: MacroMap::default(),
             rulesets: RulesetMap::default(),
+            external_auth_profiles: ExternalAuthProfileConfigMap::default(),
             rules: Vec::new(),
         }
     }
@@ -435,6 +451,84 @@ pub type MacroMap = std::collections::BTreeMap<String, MacroValues>;
 pub type RulesetMap = std::collections::BTreeMap<String, Vec<PolicyRuleTemplateConfig>>;
 pub type MacroOverrideMap =
     std::collections::BTreeMap<String, MacroValues>;
+
+pub type ExternalAuthProfileConfigMap =
+    std::collections::BTreeMap<String, ExternalAuthProfileConfig>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExternalAuthWebhookFailureMode {
+    Deny,
+    Error,
+    Timeout,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalAuthProfileConfig {
+    pub webhook_url: String,
+    pub timeout_ms: u64,
+
+    #[serde(default)]
+    pub webhook_timeout_ms: Option<u64>,
+
+    #[serde(default)]
+    pub on_webhook_failure: Option<ExternalAuthWebhookFailureMode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HeaderDirection {
+    Request,
+    Response,
+    Both,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeaderActionKind {
+    Remove,
+    Set,
+    Add,
+    ReplaceSubstring,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeaderWhen {
+    Always,
+    IfPresent,
+    IfAbsent,
+}
+
+impl Default for HeaderWhen {
+    fn default() -> Self {
+        HeaderWhen::Always
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeaderActionConfig {
+    pub direction: HeaderDirection,
+    pub action: HeaderActionKind,
+    pub name: String,
+
+    #[serde(default)]
+    pub when: HeaderWhen,
+
+    // For set/add; allow value or values (but not both).
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub values: Option<Vec<String>>,
+
+    // For replace_substring.
+    #[serde(default)]
+    pub search: Option<String>,
+    #[serde(default)]
+    pub replace: Option<String>,
+
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -907,5 +1001,81 @@ level = "info"
         config
             .validate_basic()
             .expect("sample config should pass basic validation");
+
+        let effective =
+            crate::policy::EffectivePolicy::from_config(&config.policy)
+                .expect("sample policy should produce effective rules");
+        assert!(
+            !effective.rules.is_empty(),
+            "sample policy should produce at least one effective rule"
+        );
+    }
+
+    #[test]
+    fn external_auth_profile_must_exist() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+external_auth_profile = "missing_profile"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err =
+            config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("external_auth_profile 'missing_profile' not found"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn external_auth_profile_not_allowed_on_deny_rule() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles.example]
+webhook_url = "https://auth.internal/start"
+timeout_ms = 1000
+
+[[policy.rules]]
+action = "deny"
+pattern = "https://example.com/**"
+external_auth_profile = "example"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err =
+            config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("external_auth_profile is not allowed on deny rules"),
+            "unexpected error: {msg}"
+        );
     }
 }

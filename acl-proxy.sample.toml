@@ -139,6 +139,23 @@ status_host = [
 ]
 
 ###############################################################################
+# External auth profiles (approval-required rules)
+###############################################################################
+
+# External auth profiles let you mark certain allow rules as
+# approval-required. When such a rule matches, the proxy sends a
+# webhook to the configured service and waits for an allow/deny
+# callback before forwarding the request upstream.
+
+[policy.external_auth_profiles]
+
+[policy.external_auth_profiles.github_mfa]
+webhook_url = "https://auth.internal/github/mfa-start"
+timeout_ms = 5000
+webhook_timeout_ms = 1000
+on_webhook_failure = "error" # "deny" | "error" | "timeout"
+
+###############################################################################
 # Rulesets
 ###############################################################################
 
@@ -186,9 +203,15 @@ methods = ["GET", "POST"]
 subnets = ["127.0.0.0/8"]
 
 [[policy.rules]]
+# Example: require external approval for GitHub API access.
+action = "allow"
+pattern = "https://api.github.com/**"
+description = "GitHub API with external MFA"
+external_auth_profile = "github_mfa"
+
+[[policy.rules]]
 # Explicitly deny access to administrative paths on the Git server,
 # even if a previous rule might otherwise allow the host.
 action = "deny"
 pattern = "https://git.internal/admin/**"
 description = "Block Git admin area"
-

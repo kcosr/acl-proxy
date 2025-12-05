@@ -36,6 +36,7 @@ rustls = { version = "0.21", features = ["dangerous_configuration"] }
 tokio-rustls = "0.24"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 rustls-pemfile = "1"
+dashmap = "5"
 
 [dev-dependencies]
 assert_cmd = "2.0"
