@@ -128,6 +128,11 @@ app.post("/webhook", (req, res) => {
       httpStatus: httpStatus ?? null,
     };
 
+    // Once a terminal status webhook arrives (timed out, cancelled, error,
+    // webhook_failed, etc.), this request should no longer be considered
+    // pending for new WebSocket clients.
+    pending.delete(requestId);
+
     const msg = JSON.stringify({
       type: "status",
       event: statusEvent,
