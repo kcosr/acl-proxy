@@ -16,9 +16,7 @@ pub struct LoopProtectionSettings {
 }
 
 impl LoopProtectionSettings {
-    pub fn from_config(
-        cfg: &LoopProtectionConfig,
-    ) -> Result<Self, LoopProtectionError> {
+    pub fn from_config(cfg: &LoopProtectionConfig) -> Result<Self, LoopProtectionError> {
         if !cfg.enabled {
             // When loop protection is disabled, we still construct a settings
             // value but mark add_header=false so no headers are injected.
@@ -37,10 +35,8 @@ impl LoopProtectionSettings {
             ));
         }
 
-        let header_name =
-            HeaderName::from_bytes(raw.as_bytes()).map_err(|_| {
-                LoopProtectionError::InvalidHeaderName(raw.to_string())
-            })?;
+        let header_name = HeaderName::from_bytes(raw.as_bytes())
+            .map_err(|_| LoopProtectionError::InvalidHeaderName(raw.to_string()))?;
 
         Ok(LoopProtectionSettings {
             enabled: cfg.enabled,
@@ -58,8 +54,7 @@ mod tests {
     #[test]
     fn default_config_builds_settings() {
         let cfg = LoopProtectionConfig::default();
-        let settings =
-            LoopProtectionSettings::from_config(&cfg).expect("settings");
+        let settings = LoopProtectionSettings::from_config(&cfg).expect("settings");
         assert!(settings.enabled);
         assert!(settings.add_header);
         assert_eq!(
@@ -72,8 +67,7 @@ mod tests {
     fn disabled_loop_protection_disables_header_injection() {
         let mut cfg = LoopProtectionConfig::default();
         cfg.enabled = false;
-        let settings =
-            LoopProtectionSettings::from_config(&cfg).expect("settings");
+        let settings = LoopProtectionSettings::from_config(&cfg).expect("settings");
         assert!(!settings.enabled);
         assert!(!settings.add_header);
     }
@@ -82,10 +76,8 @@ mod tests {
     fn invalid_header_name_returns_error() {
         let mut cfg = LoopProtectionConfig::default();
         cfg.header_name = "invalid header".to_string();
-        let err =
-            LoopProtectionSettings::from_config(&cfg).expect_err("error");
+        let err = LoopProtectionSettings::from_config(&cfg).expect_err("error");
         let msg = format!("{err}");
         assert!(msg.contains("invalid loop protection header name"));
     }
 }
-

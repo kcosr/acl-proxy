@@ -12,8 +12,7 @@ use hyper_rustls::HttpsConnector;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::{
-    ExternalAuthProfileConfig, ExternalAuthProfileConfigMap,
-    ExternalAuthWebhookFailureMode,
+    ExternalAuthProfileConfig, ExternalAuthProfileConfigMap, ExternalAuthWebhookFailureMode,
 };
 
 #[derive(Debug, Clone)]
@@ -31,19 +30,11 @@ pub enum WebhookFailureMode {
 }
 
 impl WebhookFailureMode {
-    fn from_config(
-        mode: Option<ExternalAuthWebhookFailureMode>,
-    ) -> Self {
+    fn from_config(mode: Option<ExternalAuthWebhookFailureMode>) -> Self {
         match mode.unwrap_or(ExternalAuthWebhookFailureMode::Error) {
-            ExternalAuthWebhookFailureMode::Deny => {
-                WebhookFailureMode::Deny
-            }
-            ExternalAuthWebhookFailureMode::Error => {
-                WebhookFailureMode::Error
-            }
-            ExternalAuthWebhookFailureMode::Timeout => {
-                WebhookFailureMode::Timeout
-            }
+            ExternalAuthWebhookFailureMode::Deny => WebhookFailureMode::Deny,
+            ExternalAuthWebhookFailureMode::Error => WebhookFailureMode::Error,
+            ExternalAuthWebhookFailureMode::Timeout => WebhookFailureMode::Timeout,
         }
     }
 }
@@ -101,8 +92,7 @@ struct StatusWebhookEvent {
     http_status: Option<u16>,
 }
 
-type SharedHttpClient =
-    Client<HttpsConnector<HttpConnector>>;
+type SharedHttpClient = Client<HttpsConnector<HttpConnector>>;
 
 #[derive(Clone)]
 pub struct ExternalAuthManager {
@@ -115,23 +105,14 @@ pub struct ExternalAuthManager {
 }
 
 impl ExternalAuthManager {
-    pub fn new(
-        cfg: &ExternalAuthProfileConfigMap,
-        http_client: SharedHttpClient,
-    ) -> Self {
-        let mut profiles: BTreeMap<String, ExternalAuthProfile> =
-            BTreeMap::new();
+    pub fn new(cfg: &ExternalAuthProfileConfigMap, http_client: SharedHttpClient) -> Self {
+        let mut profiles: BTreeMap<String, ExternalAuthProfile> = BTreeMap::new();
 
         for (name, profile_cfg) in cfg {
-            let timeout =
-                Duration::from_millis(profile_cfg.timeout_ms);
-            let webhook_timeout = profile_cfg
-                .webhook_timeout_ms
-                .map(Duration::from_millis);
+            let timeout = Duration::from_millis(profile_cfg.timeout_ms);
+            let webhook_timeout = profile_cfg.webhook_timeout_ms.map(Duration::from_millis);
             let on_webhook_failure =
-                WebhookFailureMode::from_config(
-                    profile_cfg.on_webhook_failure.clone(),
-                );
+                WebhookFailureMode::from_config(profile_cfg.on_webhook_failure.clone());
 
             profiles.insert(
                 name.clone(),
@@ -144,8 +125,7 @@ impl ExternalAuthManager {
             );
         }
 
-        let (status_tx, status_rx) =
-            mpsc::channel::<StatusWebhookEvent>(1024);
+        let (status_tx, status_rx) = mpsc::channel::<StatusWebhookEvent>(1024);
 
         ExternalAuthManager {
             pending: Arc::new(DashMap::new()),
@@ -157,10 +137,7 @@ impl ExternalAuthManager {
         }
     }
 
-    pub fn get_profile(
-        &self,
-        name: &str,
-    ) -> Option<ExternalAuthProfile> {
+    pub fn get_profile(&self, name: &str) -> Option<ExternalAuthProfile> {
         self.profiles.get(name).cloned()
     }
 
@@ -208,14 +185,8 @@ impl ExternalAuthManager {
     /// Deliver an external decision callback.
     ///
     /// This removes the pending entry and wakes the waiting request task.
-    pub fn resolve(
-        &self,
-        request_id: &str,
-        decision: ExternalDecision,
-    ) -> bool {
-        if let Some((_key, pending)) =
-            self.pending.remove(request_id)
-        {
+    pub fn resolve(&self, request_id: &str, decision: ExternalDecision) -> bool {
+        if let Some((_key, pending)) = self.pending.remove(request_id) {
             let _ = pending.decision_tx.send(decision);
             true
         } else {
@@ -231,9 +202,7 @@ impl ExternalAuthManager {
         &self,
         request_id: &str,
     ) -> Result<(), (WebhookFailureKind, Option<StatusCode>)> {
-        let snapshot = if let Some(p) =
-            self.pending.get(request_id)
-        {
+        let snapshot = if let Some(p) = self.pending.get(request_id) {
             (
                 p.profile_name.clone(),
                 p.rule_index,
@@ -244,29 +213,16 @@ impl ExternalAuthManager {
                 p.created_at,
             )
         } else {
-            tracing::warn!(
-                "send_initial_webhook called for unknown request_id {request_id}"
-            );
+            tracing::warn!("send_initial_webhook called for unknown request_id {request_id}");
             return Err((WebhookFailureKind::Transport, None));
         };
 
-        let (
-            profile_name,
-            rule_index,
-            rule_id,
-            url,
-            method,
-            client_ip,
-            created_at,
-        ) = snapshot;
+        let (profile_name, rule_index, rule_id, url, method, client_ip, created_at) = snapshot;
 
-        let profile = if let Some(p) = self.profiles.get(&profile_name)
-        {
+        let profile = if let Some(p) = self.profiles.get(&profile_name) {
             p.clone()
         } else {
-            tracing::warn!(
-                "external auth profile {profile_name} not found when sending webhook"
-            );
+            tracing::warn!("external auth profile {profile_name} not found when sending webhook");
             return Err((WebhookFailureKind::Transport, None));
         };
 
@@ -293,16 +249,13 @@ impl ExternalAuthManager {
             "httpStatus": serde_json::Value::Null,
         });
 
-        let body_bytes =
-            match serde_json::to_vec(&payload) {
-                Ok(b) => b,
-                Err(err) => {
-                    tracing::error!(
-                        "failed to serialize external auth webhook payload: {err}"
-                    );
-                    return Err((WebhookFailureKind::Transport, None));
-                }
-            };
+        let body_bytes = match serde_json::to_vec(&payload) {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::error!("failed to serialize external auth webhook payload: {err}");
+                return Err((WebhookFailureKind::Transport, None));
+            }
+        };
 
         let req = match Request::builder()
             .method(Method::POST)
@@ -311,40 +264,27 @@ impl ExternalAuthManager {
                 http::header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
             )
-            .header(
-                "X-Acl-Proxy-Event",
-                HeaderValue::from_static("pending"),
-            )
+            .header("X-Acl-Proxy-Event", HeaderValue::from_static("pending"))
             .body(Body::from(body_bytes))
         {
             Ok(r) => r,
             Err(err) => {
-                tracing::error!(
-                    "failed to build external auth webhook request: {err}"
-                );
+                tracing::error!("failed to build external auth webhook request: {err}");
                 return Err((WebhookFailureKind::Transport, None));
             }
         };
 
-        let client_http: SharedHttpClient =
-            self.http_client.clone();
+        let client_http: SharedHttpClient = self.http_client.clone();
         let send_fut = client_http.request(req);
 
         let result = match profile.webhook_timeout {
-            Some(timeout) => {
-                match tokio::time::timeout(timeout, send_fut)
-                    .await
-                {
-                    Ok(res) => res,
-                    Err(_elapsed) => {
-                        tracing::warn!(
-                            "external auth webhook timed out after {:?}",
-                            timeout
-                        );
-                        return Err((WebhookFailureKind::Timeout, None));
-                    }
+            Some(timeout) => match tokio::time::timeout(timeout, send_fut).await {
+                Ok(res) => res,
+                Err(_elapsed) => {
+                    tracing::warn!("external auth webhook timed out after {:?}", timeout);
+                    return Err((WebhookFailureKind::Timeout, None));
                 }
-            }
+            },
             None => send_fut.await,
         };
 
@@ -358,16 +298,11 @@ impl ExternalAuthManager {
                         "external auth webhook returned non-success status: {}",
                         status
                     );
-                    Err((
-                        WebhookFailureKind::Non2xx,
-                        Some(status),
-                    ))
+                    Err((WebhookFailureKind::Non2xx, Some(status)))
                 }
             }
             Err(err) => {
-                tracing::warn!(
-                    "external auth webhook request failed: {err}"
-                );
+                tracing::warn!("external auth webhook request failed: {err}");
                 Err((WebhookFailureKind::Transport, None))
             }
         }
@@ -380,23 +315,17 @@ impl ExternalAuthManager {
         failure_kind: WebhookFailureKind,
         http_status: Option<StatusCode>,
     ) {
-        if let Some((_key, pending)) =
-            self.pending.remove(request_id)
-        {
+        if let Some((_key, pending)) = self.pending.remove(request_id) {
             let reason = match failure_kind {
                 WebhookFailureKind::Timeout => {
-                    "External auth webhook delivery timed out"
-                        .to_string()
+                    "External auth webhook delivery timed out".to_string()
                 }
                 WebhookFailureKind::Non2xx => format!(
                     "External auth webhook returned non-success status {}",
-                    http_status
-                        .map(|s| s.as_u16())
-                        .unwrap_or_default()
+                    http_status.map(|s| s.as_u16()).unwrap_or_default()
                 ),
                 WebhookFailureKind::Transport => {
-                    "External auth webhook delivery failed"
-                        .to_string()
+                    "External auth webhook delivery failed".to_string()
                 }
             };
 
@@ -421,17 +350,12 @@ impl ExternalAuthManager {
 
     /// Record a terminal "timed_out" status when approval times out.
     pub fn finalize_timed_out(&self, request_id: &str) {
-        if let Some((_key, pending)) =
-            self.pending.remove(request_id)
-        {
+        if let Some((_key, pending)) = self.pending.remove(request_id) {
             let configured_ms = pending
                 .deadline_at
                 .saturating_duration_since(pending.created_at)
                 .as_millis() as u64;
-            let reason = format!(
-                "Approval timeout after {}ms",
-                configured_ms
-            );
+            let reason = format!("Approval timeout after {}ms", configured_ms);
 
             let event = StatusWebhookEvent {
                 request_id: request_id.to_string(),
@@ -453,14 +377,8 @@ impl ExternalAuthManager {
     }
 
     /// Record a terminal "error" status when the approval channel fails.
-    pub fn finalize_internal_error(
-        &self,
-        request_id: &str,
-        message: &str,
-    ) {
-        if let Some((_key, pending)) =
-            self.pending.remove(request_id)
-        {
+    pub fn finalize_internal_error(&self, request_id: &str, message: &str) {
+        if let Some((_key, pending)) = self.pending.remove(request_id) {
             let event = StatusWebhookEvent {
                 request_id: request_id.to_string(),
                 profile_name: pending.profile_name,
@@ -481,13 +399,8 @@ impl ExternalAuthManager {
     }
 
     /// Called from the RAII guard destructor to mark cancellations.
-    pub fn finalize_cancelled_if_pending(
-        &self,
-        request_id: &str,
-    ) {
-        if let Some((_key, pending)) =
-            self.pending.remove(request_id)
-        {
+    pub fn finalize_cancelled_if_pending(&self, request_id: &str) {
+        if let Some((_key, pending)) = self.pending.remove(request_id) {
             let event = StatusWebhookEvent {
                 request_id: request_id.to_string(),
                 profile_name: pending.profile_name,
@@ -498,10 +411,7 @@ impl ExternalAuthManager {
                 client_ip: pending.client_ip,
                 created_at: pending.created_at,
                 status: StatusWebhookStatus::Cancelled,
-                reason: Some(
-                    "Client disconnected or request task aborted"
-                        .to_string(),
-                ),
+                reason: Some("Client disconnected or request task aborted".to_string()),
                 failure_kind: None,
                 http_status: None,
             };
@@ -516,43 +426,30 @@ impl ExternalAuthManager {
         if let Err(err) = self.status_tx.try_send(event) {
             match err {
                 mpsc::error::TrySendError::Full(_) => {
-                    tracing::debug!(
-                        "external auth status webhook queue full; dropping event"
-                    );
+                    tracing::debug!("external auth status webhook queue full; dropping event");
                 }
                 mpsc::error::TrySendError::Closed(_) => {
-                    tracing::debug!(
-                        "external auth status webhook queue closed; dropping event"
-                    );
+                    tracing::debug!("external auth status webhook queue closed; dropping event");
                 }
             }
         }
     }
 
     fn ensure_status_worker(&self) {
-        if self
-            .workers_started
-            .load(Ordering::Acquire)
-        {
+        if self.workers_started.load(Ordering::Acquire) {
             return;
         }
 
         if self
             .workers_started
-            .compare_exchange(
-                false,
-                true,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
             return;
         }
 
         let rx_opt = {
-            let mut guard =
-                self.status_rx.lock().unwrap();
+            let mut guard = self.status_rx.lock().unwrap();
             guard.take()
         };
 
@@ -574,23 +471,15 @@ pub struct PendingGuard {
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
-        self.manager
-            .finalize_cancelled_if_pending(&self.request_id);
+        self.manager.finalize_cancelled_if_pending(&self.request_id);
     }
 }
 
-impl From<&ExternalAuthProfileConfig>
-    for ExternalAuthProfile
-{
+impl From<&ExternalAuthProfileConfig> for ExternalAuthProfile {
     fn from(cfg: &ExternalAuthProfileConfig) -> Self {
         let timeout = Duration::from_millis(cfg.timeout_ms);
-        let webhook_timeout = cfg
-            .webhook_timeout_ms
-            .map(Duration::from_millis);
-        let on_webhook_failure =
-            WebhookFailureMode::from_config(
-                cfg.on_webhook_failure.clone(),
-            );
+        let webhook_timeout = cfg.webhook_timeout_ms.map(Duration::from_millis);
+        let on_webhook_failure = WebhookFailureMode::from_config(cfg.on_webhook_failure.clone());
 
         ExternalAuthProfile {
             webhook_url: cfg.webhook_url.clone(),
@@ -605,8 +494,7 @@ fn generate_event_id() -> String {
     use once_cell::sync::Lazy;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    static COUNTER: Lazy<AtomicU64> =
-        Lazy::new(|| AtomicU64::new(1));
+    static COUNTER: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     let ts = Utc::now().timestamp_millis();
     format!("evt-{}-{}", ts, seq)
@@ -630,24 +518,16 @@ async fn run_status_worker(
         };
 
         let status_str = match event.status {
-            StatusWebhookStatus::WebhookFailed => {
-                "webhook_failed"
-            }
+            StatusWebhookStatus::WebhookFailed => "webhook_failed",
             StatusWebhookStatus::TimedOut => "timed_out",
             StatusWebhookStatus::Error => "error",
             StatusWebhookStatus::Cancelled => "cancelled",
         };
 
         let failure_kind_str = match event.failure_kind {
-            Some(WebhookFailureKind::Timeout) => {
-                Some("timeout")
-            }
-            Some(WebhookFailureKind::Non2xx) => {
-                Some("non_2xx")
-            }
-            Some(WebhookFailureKind::Transport) => {
-                Some("connect")
-            }
+            Some(WebhookFailureKind::Timeout) => Some("timeout"),
+            Some(WebhookFailureKind::Non2xx) => Some("non_2xx"),
+            Some(WebhookFailureKind::Transport) => Some("connect"),
             None => None,
         };
 
@@ -674,16 +554,13 @@ async fn run_status_worker(
             "httpStatus": event.http_status,
         });
 
-        let body_bytes =
-            match serde_json::to_vec(&payload) {
-                Ok(b) => b,
-                Err(err) => {
-                    tracing::warn!(
-                        "failed to serialize external auth status webhook payload: {err}"
-                    );
-                    continue;
-                }
-            };
+        let body_bytes = match serde_json::to_vec(&payload) {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::warn!("failed to serialize external auth status webhook payload: {err}");
+                continue;
+            }
+        };
 
         let req = match Request::builder()
             .method(Method::POST)
@@ -692,17 +569,12 @@ async fn run_status_worker(
                 http::header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
             )
-            .header(
-                "X-Acl-Proxy-Event",
-                HeaderValue::from_static("status"),
-            )
+            .header("X-Acl-Proxy-Event", HeaderValue::from_static("status"))
             .body(Body::from(body_bytes))
         {
             Ok(r) => r,
             Err(err) => {
-                tracing::warn!(
-                    "failed to build external auth status webhook request: {err}"
-                );
+                tracing::warn!("failed to build external auth status webhook request: {err}");
                 continue;
             }
         };
@@ -710,27 +582,18 @@ async fn run_status_worker(
         let send_fut = client.request(req);
 
         let result = match profile.webhook_timeout {
-            Some(timeout) => {
-                match tokio::time::timeout(timeout, send_fut)
-                    .await
-                {
-                    Ok(res) => res,
-                    Err(_elapsed) => {
-                        tracing::debug!(
-                            "external auth status webhook timed out after {:?}",
-                            timeout
-                        );
-                        continue;
-                    }
+            Some(timeout) => match tokio::time::timeout(timeout, send_fut).await {
+                Ok(res) => res,
+                Err(_elapsed) => {
+                    tracing::debug!("external auth status webhook timed out after {:?}", timeout);
+                    continue;
                 }
-            }
+            },
             None => send_fut.await,
         };
 
         if let Err(err) = result {
-            tracing::debug!(
-                "external auth status webhook request failed: {err}"
-            );
+            tracing::debug!("external auth status webhook request failed: {err}");
         }
     }
 }

@@ -9,11 +9,9 @@ use thiserror::Error;
 use url::Url;
 
 use crate::config::{
-    ExternalAuthProfileConfigMap, HeaderActionConfig, HeaderActionKind,
-    HeaderDirection, HeaderWhen, MacroMap, MacroOverrideMap, MacroValues,
-    PolicyConfig, PolicyDefaultAction, PolicyRuleConfig,
-    PolicyRuleDirectConfig, PolicyRuleIncludeConfig, RulesetMap,
-    UrlEncVariants,
+    ExternalAuthProfileConfigMap, HeaderActionConfig, HeaderActionKind, HeaderDirection,
+    HeaderWhen, MacroMap, MacroOverrideMap, MacroValues, PolicyConfig, PolicyDefaultAction,
+    PolicyRuleConfig, PolicyRuleDirectConfig, PolicyRuleIncludeConfig, RulesetMap, UrlEncVariants,
 };
 
 #[derive(Debug, Error)]
@@ -148,8 +146,7 @@ impl PolicyEngine {
         let mut compiled_rules = Vec::with_capacity(expanded.rules.len());
 
         for (idx, rule) in expanded.rules.into_iter().enumerate() {
-            let header_actions =
-                compile_header_actions(&rule.header_actions, idx)?;
+            let header_actions = compile_header_actions(&rule.header_actions, idx)?;
 
             let regex = if let Some(ref pattern) = rule.pattern {
                 let pattern_re = pattern_to_regex(pattern);
@@ -157,10 +154,7 @@ impl PolicyEngine {
                     RegexBuilder::new(&pattern_re)
                         .case_insensitive(true)
                         .build()
-                        .map_err(|source| PolicyError::PatternCompile {
-                            index: idx,
-                            source,
-                        })?,
+                        .map_err(|source| PolicyError::PatternCompile { index: idx, source })?,
                 )
             } else {
                 None
@@ -212,11 +206,10 @@ impl PolicyEngine {
                 }
             }
 
-            if !rule.subnets.is_empty() {
-                if !client_in_any_subnet(normalized_ip.as_deref(), &rule.subnets)
-                {
-                    continue;
-                }
+            if !rule.subnets.is_empty()
+                && !client_in_any_subnet(normalized_ip.as_deref(), &rule.subnets)
+            {
+                continue;
             }
 
             if !rule.methods.is_empty() {
@@ -255,12 +248,7 @@ impl PolicyEngine {
         }
     }
 
-    pub fn is_allowed(
-        &self,
-        url_str: &str,
-        client_ip: Option<&str>,
-        method: Option<&str>,
-    ) -> bool {
+    pub fn is_allowed(&self, url_str: &str, client_ip: Option<&str>, method: Option<&str>) -> bool {
         self.evaluate(url_str, client_ip, method).allowed
     }
 }
@@ -293,19 +281,17 @@ impl EffectivePolicy {
                             search: cfg.search.clone(),
                             replace: cfg.replace.clone(),
                         }
-                    }).collect();
+                    })
+                    .collect();
 
-                let external_auth = rule
-                    .external_auth_profile
-                    .as_ref()
-                    .and_then(|name| {
-                        cfg.external_auth_profiles
-                            .get(name)
-                            .map(|profile| EffectiveExternalAuth {
-                                profile: name.clone(),
-                                timeout_ms: profile.timeout_ms,
-                            })
-                    });
+                let external_auth = rule.external_auth_profile.as_ref().and_then(|name| {
+                    cfg.external_auth_profiles
+                        .get(name)
+                        .map(|profile| EffectiveExternalAuth {
+                            profile: name.clone(),
+                            timeout_ms: profile.timeout_ms,
+                        })
+                });
 
                 EffectiveRule {
                     index,
@@ -331,20 +317,15 @@ impl EffectivePolicy {
 fn expand_policy(cfg: &PolicyConfig) -> Result<ExpandedPolicy, PolicyError> {
     let macros = &cfg.macros;
     let rulesets = &cfg.rulesets;
-    let external_profiles: &ExternalAuthProfileConfigMap =
-        &cfg.external_auth_profiles;
+    let external_profiles: &ExternalAuthProfileConfigMap = &cfg.external_auth_profiles;
 
     let mut expanded_rules = Vec::new();
 
     for (index, rule) in cfg.rules.iter().enumerate() {
         match rule {
-            PolicyRuleConfig::Direct(d) => expand_direct_rule(
-                d,
-                macros,
-                external_profiles,
-                index,
-                &mut expanded_rules,
-            )?,
+            PolicyRuleConfig::Direct(d) => {
+                expand_direct_rule(d, macros, external_profiles, index, &mut expanded_rules)?
+            }
             PolicyRuleConfig::Include(i) => expand_include_rule(
                 i,
                 macros,
@@ -382,14 +363,10 @@ fn expand_direct_rule(
         .map(|m| m.as_slice().to_vec())
         .unwrap_or_default();
 
-    if rule.external_auth_profile.is_some()
-        && matches!(rule.action, PolicyDefaultAction::Deny)
-    {
+    if rule.external_auth_profile.is_some() && matches!(rule.action, PolicyDefaultAction::Deny) {
         return Err(PolicyError::RuleInvalid {
             index,
-            reason:
-                "external_auth_profile is not allowed on deny rules"
-                    .to_string(),
+            reason: "external_auth_profile is not allowed on deny rules".to_string(),
         });
     }
 
@@ -397,10 +374,7 @@ fn expand_direct_rule(
         if !external_profiles.contains_key(name) {
             return Err(PolicyError::RuleInvalid {
                 index,
-                reason: format!(
-                    "external_auth_profile '{}' not found",
-                    name
-                ),
+                reason: format!("external_auth_profile '{}' not found", name),
             });
         }
     }
@@ -426,8 +400,7 @@ fn expand_direct_rule(
     if !has_pattern {
         return Err(PolicyError::RuleInvalid {
             index,
-            reason: "policy rule must define at least a pattern, subnets, or methods"
-                .to_string(),
+            reason: "policy rule must define at least a pattern, subnets, or methods".to_string(),
         });
     }
 
@@ -456,24 +429,21 @@ fn expand_direct_rule(
         return Ok(());
     }
 
-    let resolved =
-        resolve_placeholders(rule.with.as_ref(), macros, &placeholders, |_| {
-            format!(
-                " (required by direct rule pattern {pattern})",
-                pattern = pattern_str
-            )
-        })?;
+    let resolved = resolve_placeholders(rule.with.as_ref(), macros, &placeholders, |_| {
+        format!(
+            " (required by direct rule pattern {pattern})",
+            pattern = pattern_str
+        )
+    })?;
 
     let mut combos = cartesian_product(&resolved);
-    let keys_to_vary =
-        keys_for_url_variants(rule.add_url_enc_variants.as_ref(), &placeholders);
+    let keys_to_vary = keys_for_url_variants(rule.add_url_enc_variants.as_ref(), &placeholders);
     if !keys_to_vary.is_empty() {
         combos = add_url_encoded_variants(combos, &keys_to_vary);
     }
 
     for combo in combos {
-        let pattern_interp =
-            interpolate_template(&pattern_str, &combo);
+        let pattern_interp = interpolate_template(&pattern_str, &combo);
         let description_interp = rule
             .description
             .as_ref()
@@ -518,19 +488,14 @@ fn expand_include_rule(
         {
             return Err(PolicyError::RuleInvalid {
                 index,
-                reason:
-                    "external_auth_profile is not allowed on deny rules"
-                        .to_string(),
+                reason: "external_auth_profile is not allowed on deny rules".to_string(),
             });
         }
         if let Some(name) = &template.external_auth_profile {
             if !external_profiles.contains_key(name) {
                 return Err(PolicyError::RuleInvalid {
                     index,
-                    reason: format!(
-                        "external_auth_profile '{}' not found",
-                        name
-                    ),
+                    reason: format!("external_auth_profile '{}' not found", name),
                 });
             }
         }
@@ -553,12 +518,7 @@ fn expand_include_rule(
                 .methods
                 .as_ref()
                 .map(|m| m.as_slice().to_vec())
-                .or_else(|| {
-                    template
-                        .methods
-                        .as_ref()
-                        .map(|m| m.as_slice().to_vec())
-                })
+                .or_else(|| template.methods.as_ref().map(|m| m.as_slice().to_vec()))
                 .unwrap_or_default();
 
             out.push(ExpandedRule {
@@ -579,18 +539,12 @@ fn expand_include_rule(
         return Ok(());
     }
 
-    let resolved = resolve_placeholders(
-        rule.with.as_ref(),
-        macros,
-        &placeholders,
-        |_| {
-            format!(" (required by ruleset {ruleset})", ruleset = rule.include)
-        },
-    )?;
+    let resolved = resolve_placeholders(rule.with.as_ref(), macros, &placeholders, |_| {
+        format!(" (required by ruleset {ruleset})", ruleset = rule.include)
+    })?;
 
     let mut combos = cartesian_product(&resolved);
-    let keys_to_vary =
-        keys_for_url_variants(rule.add_url_enc_variants.as_ref(), &placeholders);
+    let keys_to_vary = keys_for_url_variants(rule.add_url_enc_variants.as_ref(), &placeholders);
     if !keys_to_vary.is_empty() {
         combos = add_url_encoded_variants(combos, &keys_to_vary);
     }
@@ -601,16 +555,10 @@ fn expand_include_rule(
                 .methods
                 .as_ref()
                 .map(|m| m.as_slice().to_vec())
-                .or_else(|| {
-                    template
-                        .methods
-                        .as_ref()
-                        .map(|m| m.as_slice().to_vec())
-                })
+                .or_else(|| template.methods.as_ref().map(|m| m.as_slice().to_vec()))
                 .unwrap_or_default();
 
-            let pattern_interp =
-                interpolate_template(&template.pattern, &combo);
+            let pattern_interp = interpolate_template(&template.pattern, &combo);
             let description_interp = template
                 .description
                 .as_ref()
@@ -681,9 +629,7 @@ fn resolve_placeholders(
     Ok(resolved)
 }
 
-fn cartesian_product(
-    vars: &BTreeMap<String, Vec<String>>,
-) -> Vec<BTreeMap<String, String>> {
+fn cartesian_product(vars: &BTreeMap<String, Vec<String>>) -> Vec<BTreeMap<String, String>> {
     if vars.is_empty() {
         return vec![BTreeMap::new()];
     }
@@ -750,14 +696,12 @@ fn compile_header_actions(
                 };
 
                 for v in source_values {
-                    let hv = HeaderValue::from_str(&v).map_err(|e| {
-                        PolicyError::RuleInvalid {
-                            index,
-                            reason: format!(
-                                "invalid header value for '{}': {} ({e})",
-                                action_cfg.name, v
-                            ),
-                        }
+                    let hv = HeaderValue::from_str(&v).map_err(|e| PolicyError::RuleInvalid {
+                        index,
+                        reason: format!(
+                            "invalid header value for '{}': {} ({e})",
+                            action_cfg.name, v
+                        ),
                     })?;
                     values.push(hv);
                 }
@@ -777,15 +721,16 @@ fn compile_header_actions(
 
         let (search, replace) = match action_cfg.action {
             HeaderActionKind::ReplaceSubstring => {
-                let search = action_cfg.search.clone().ok_or_else(|| {
-                    PolicyError::RuleInvalid {
+                let search = action_cfg
+                    .search
+                    .clone()
+                    .ok_or_else(|| PolicyError::RuleInvalid {
                         index,
                         reason: format!(
                             "header action for '{}' with action replace_substring requires search",
                             action_cfg.name
                         ),
-                    }
-                })?;
+                    })?;
                 if search.is_empty() {
                     return Err(PolicyError::RuleInvalid {
                         index,
@@ -795,15 +740,17 @@ fn compile_header_actions(
                         ),
                     });
                 }
-                let replace = action_cfg.replace.clone().ok_or_else(|| {
-                    PolicyError::RuleInvalid {
-                        index,
-                        reason: format!(
+                let replace =
+                    action_cfg
+                        .replace
+                        .clone()
+                        .ok_or_else(|| PolicyError::RuleInvalid {
+                            index,
+                            reason: format!(
                             "header action for '{}' with action replace_substring requires replace",
                             action_cfg.name
                         ),
-                    }
-                })?;
+                        })?;
                 (Some(search), Some(replace))
             }
             _ => (None, None),
@@ -883,11 +830,7 @@ fn collect_placeholders(input: &str, out: &mut BTreeSet<String>) {
             }
             if j < bytes.len() {
                 let name = &input[start..j];
-                if !name.is_empty()
-                    && name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                {
+                if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                     out.insert(name.to_string());
                 }
                 i = j + 1;
@@ -898,10 +841,7 @@ fn collect_placeholders(input: &str, out: &mut BTreeSet<String>) {
     }
 }
 
-fn interpolate_template(
-    input: &str,
-    vars: &BTreeMap<String, String>,
-) -> String {
+fn interpolate_template(input: &str, vars: &BTreeMap<String, String>) -> String {
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
     let bytes = input.as_bytes();
@@ -915,11 +855,7 @@ fn interpolate_template(
             }
             if j < bytes.len() {
                 let name = &input[start..j];
-                if !name.is_empty()
-                    && name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-                {
+                if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                     if let Some(val) = vars.get(name) {
                         out.push_str(val);
                     }
@@ -939,8 +875,7 @@ fn escape_regex(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for ch in input.chars() {
         match ch {
-            '.' | '*' | '+' | '?' | '^' | '$' | '{' | '}' | '(' | ')' | '|'
-            | '[' | ']' | '\\' => {
+            '.' | '*' | '+' | '?' | '^' | '$' | '{' | '}' | '(' | ')' | '|' | '[' | ']' | '\\' => {
                 out.push('\\');
                 out.push(ch);
             }
@@ -985,9 +920,7 @@ pub fn pattern_to_regex(pattern: &str) -> String {
     }
 
     let escaped = escape_regex(&rest);
-    let mut s = escaped
-        .replace("\\*\\*", ".*")
-        .replace("\\*", "[^/]*");
+    let mut s = escaped.replace("\\*\\*", ".*").replace("\\*", "[^/]*");
 
     if is_host_only {
         s.push_str("/?");
@@ -998,8 +931,7 @@ pub fn pattern_to_regex(pattern: &str) -> String {
 }
 
 fn normalize_url(raw: &str) -> Result<String, PolicyError> {
-    let url = Url::parse(raw)
-        .map_err(|e| PolicyError::UrlParse(e.to_string()))?;
+    let url = Url::parse(raw).map_err(|e| PolicyError::UrlParse(e.to_string()))?;
 
     let scheme = url.scheme();
     let protocol = format!("{scheme}:");
@@ -1012,11 +944,7 @@ fn normalize_url(raw: &str) -> Result<String, PolicyError> {
                 h.to_string()
             }
         }
-        None => {
-            return Err(PolicyError::UrlParse(
-                "URL is missing host".to_string(),
-            ))
-        }
+        None => return Err(PolicyError::UrlParse("URL is missing host".to_string())),
     };
 
     let path = if url.path().is_empty() {
@@ -1057,10 +985,7 @@ pub fn normalize_client_ip(raw: Option<&str>) -> Option<String> {
     Some(addr)
 }
 
-fn client_in_any_subnet(
-    raw_ip: Option<&str>,
-    subnets: &[Ipv4Net],
-) -> bool {
+fn client_in_any_subnet(raw_ip: Option<&str>, subnets: &[Ipv4Net]) -> bool {
     let ip = match raw_ip {
         Some(s) => s,
         None => return false,
@@ -1102,8 +1027,7 @@ mod tests {
 
     #[test]
     fn pattern_to_regex_host_only() {
-        let re = Regex::new(&pattern_to_regex("https://example.com"))
-            .expect("compile regex");
+        let re = Regex::new(&pattern_to_regex("https://example.com")).expect("compile regex");
         assert!(re.is_match("https://example.com"));
         assert!(re.is_match("https://example.com/"));
         assert!(!re.is_match("https://example.com/path"));
@@ -1111,17 +1035,13 @@ mod tests {
 
     #[test]
     fn pattern_to_regex_wildcards() {
-        let re = Regex::new(&pattern_to_regex(
-            "https://example.com/api/**",
-        ))
-        .expect("compile regex");
+        let re =
+            Regex::new(&pattern_to_regex("https://example.com/api/**")).expect("compile regex");
         assert!(re.is_match("https://example.com/api/"));
         assert!(re.is_match("https://example.com/api/v1/resource"));
 
-        let re2 = Regex::new(&pattern_to_regex(
-            "https://example.com/api/*/resource",
-        ))
-        .expect("compile regex");
+        let re2 = Regex::new(&pattern_to_regex("https://example.com/api/*/resource"))
+            .expect("compile regex");
         assert!(re2.is_match("https://example.com/api/v1/resource"));
         assert!(!re2.is_match("https://example.com/api/v1/v2/resource"));
     }
@@ -1148,37 +1068,24 @@ mod tests {
             default: PolicyDefaultAction::Deny,
             macros: MacroMap::default(),
             rulesets: RulesetMap::default(),
-             external_auth_profiles: ExternalAuthProfileConfigMap::default(),
-            rules: vec![PolicyRuleConfig::Direct(
-                PolicyRuleDirectConfig {
-                    action: PolicyDefaultAction::Allow,
-                    pattern: None,
-                    description: None,
-                    methods: None,
-                    subnets: vec!["192.168.0.0/16"
-                        .parse::<Ipv4Net>()
-                        .unwrap()],
-                    with: None,
-                    add_url_enc_variants: None,
-                    header_actions: Vec::new(),
-                    rule_id: None,
-                    external_auth_profile: None,
-                },
-            )],
+            external_auth_profiles: ExternalAuthProfileConfigMap::default(),
+            rules: vec![PolicyRuleConfig::Direct(PolicyRuleDirectConfig {
+                action: PolicyDefaultAction::Allow,
+                pattern: None,
+                description: None,
+                methods: None,
+                subnets: vec!["192.168.0.0/16".parse::<Ipv4Net>().unwrap()],
+                with: None,
+                add_url_enc_variants: None,
+                header_actions: Vec::new(),
+                rule_id: None,
+                external_auth_profile: None,
+            })],
         };
 
-        let engine =
-            PolicyEngine::from_config(&cfg).expect("build policy engine");
-        assert!(engine.is_allowed(
-            "https://example.com/",
-            Some("192.168.1.10"),
-            None
-        ));
-        assert!(!engine.is_allowed(
-            "https://example.com/",
-            Some("10.0.0.1"),
-            None
-        ));
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+        assert!(engine.is_allowed("https://example.com/", Some("192.168.1.10"), None));
+        assert!(!engine.is_allowed("https://example.com/", Some("10.0.0.1"), None));
     }
 
     #[test]
@@ -1198,9 +1105,7 @@ mod tests {
             vec![
                 PolicyRuleTemplateConfig {
                     action: allow_action(),
-                    pattern:
-                        "https://gitlab.internal/api/v4/projects/{repo}?**"
-                            .to_string(),
+                    pattern: "https://gitlab.internal/api/v4/projects/{repo}?**".to_string(),
                     description: None,
                     methods: None,
                     subnets: Vec::new(),
@@ -1210,8 +1115,7 @@ mod tests {
                 },
                 PolicyRuleTemplateConfig {
                     action: allow_action(),
-                    pattern:
-                        "https://gitlab.internal/{repo}.git/**".to_string(),
+                    pattern: "https://gitlab.internal/{repo}.git/**".to_string(),
                     description: None,
                     methods: None,
                     subnets: Vec::new(),
@@ -1227,19 +1131,16 @@ mod tests {
             macros,
             rulesets,
             external_auth_profiles: ExternalAuthProfileConfigMap::default(),
-            rules: vec![PolicyRuleConfig::Include(
-                PolicyRuleIncludeConfig {
-                    include: "gitlabRepo".to_string(),
-                    with: None,
-                    add_url_enc_variants: Some(UrlEncVariants::All(true)),
-                    methods: None,
-                    subnets: Vec::new(),
-                },
-            )],
+            rules: vec![PolicyRuleConfig::Include(PolicyRuleIncludeConfig {
+                include: "gitlabRepo".to_string(),
+                with: None,
+                add_url_enc_variants: Some(UrlEncVariants::All(true)),
+                methods: None,
+                subnets: Vec::new(),
+            })],
         };
 
-        let engine =
-            PolicyEngine::from_config(&cfg).expect("build policy engine");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
 
         assert!(engine.is_allowed(
             "https://gitlab.internal/api/v4/projects/user%2Fts-test-1?stats=true",
@@ -1261,11 +1162,7 @@ mod tests {
             None,
             None
         ));
-        assert!(!engine.is_allowed(
-            "https://gitlab.internal/other/repo/any",
-            None,
-            None
-        ));
+        assert!(!engine.is_allowed("https://gitlab.internal/other/repo/any", None, None));
     }
 
     #[test]
@@ -1276,9 +1173,7 @@ mod tests {
                 "needsRepo".to_string(),
                 vec![PolicyRuleTemplateConfig {
                     action: allow_action(),
-                    pattern:
-                        "https://gitlab.internal/api/v4/projects/{repo}?**"
-                            .to_string(),
+                    pattern: "https://gitlab.internal/api/v4/projects/{repo}?**".to_string(),
                     description: None,
                     methods: None,
                     subnets: Vec::new(),
@@ -1295,19 +1190,16 @@ mod tests {
             macros: MacroMap::default(),
             rulesets,
             external_auth_profiles: ExternalAuthProfileConfigMap::default(),
-            rules: vec![PolicyRuleConfig::Include(
-                PolicyRuleIncludeConfig {
-                    include: "needsRepo".to_string(),
-                    with: None,
-                    add_url_enc_variants: Some(UrlEncVariants::All(true)),
-                    methods: None,
-                    subnets: Vec::new(),
-                },
-            )],
+            rules: vec![PolicyRuleConfig::Include(PolicyRuleIncludeConfig {
+                include: "needsRepo".to_string(),
+                with: None,
+                add_url_enc_variants: Some(UrlEncVariants::All(true)),
+                methods: None,
+                subnets: Vec::new(),
+            })],
         };
 
-        let err =
-            PolicyEngine::from_config(&cfg).expect_err("expected error");
+        let err = PolicyEngine::from_config(&cfg).expect_err("expected error");
         let msg = format!("{err}");
         assert!(
             msg.contains("Policy macro not found: repo"),
@@ -1326,26 +1218,12 @@ pattern = "https://example.com/**"
 methods = ["GET", "HEAD"]
         "#;
 
-        let cfg: PolicyConfig =
-            toml::from_str(toml).expect("parse policy config");
-        let engine =
-            PolicyEngine::from_config(&cfg).expect("build policy engine");
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
 
-        assert!(engine.is_allowed(
-            "https://example.com/path",
-            None,
-            Some("GET")
-        ));
-        assert!(engine.is_allowed(
-            "https://example.com/path",
-            None,
-            Some("head")
-        ));
-        assert!(!engine.is_allowed(
-            "https://example.com/path",
-            None,
-            Some("POST")
-        ));
+        assert!(engine.is_allowed("https://example.com/path", None, Some("GET")));
+        assert!(engine.is_allowed("https://example.com/path", None, Some("head")));
+        assert!(!engine.is_allowed("https://example.com/path", None, Some("POST")));
 
         // Method-scoped rules do not match when method is omitted.
         assert!(!engine.is_allowed("https://example.com/path", None, None));
@@ -1363,10 +1241,8 @@ subnets = ["10.0.0.0/8"]
 methods = ["POST"]
         "#;
 
-        let cfg: PolicyConfig =
-            toml::from_str(toml).expect("parse policy config");
-        let engine =
-            PolicyEngine::from_config(&cfg).expect("build policy engine");
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
 
         assert!(engine.is_allowed(
             "https://api.internal.example.com/resource",
@@ -1395,21 +1271,11 @@ action = "allow"
 methods = ["HEAD"]
         "#;
 
-        let cfg: PolicyConfig =
-            toml::from_str(toml).expect("parse policy config");
-        let engine =
-            PolicyEngine::from_config(&cfg).expect("build policy engine");
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
 
-        assert!(engine.is_allowed(
-            "https://example.com/path",
-            None,
-            Some("HEAD")
-        ));
-        assert!(!engine.is_allowed(
-            "https://example.com/path",
-            None,
-            Some("GET")
-        ));
+        assert!(engine.is_allowed("https://example.com/path", None, Some("HEAD")));
+        assert!(!engine.is_allowed("https://example.com/path", None, Some("GET")));
     }
 
     #[test]
@@ -1423,21 +1289,11 @@ pattern = "https://example.com/**"
 methods = "PUT"
         "#;
 
-        let cfg: PolicyConfig =
-            toml::from_str(toml).expect("parse policy config");
-        let engine =
-            PolicyEngine::from_config(&cfg).expect("build policy engine");
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
 
-        assert!(engine.is_allowed(
-            "https://example.com/path",
-            None,
-            Some("PUT")
-        ));
-        assert!(!engine.is_allowed(
-            "https://example.com/path",
-            None,
-            Some("GET")
-        ));
+        assert!(engine.is_allowed("https://example.com/path", None, Some("PUT")));
+        assert!(!engine.is_allowed("https://example.com/path", None, Some("GET")));
     }
 
     #[test]
@@ -1454,24 +1310,14 @@ action = "allow"
 pattern = "https://example.com/**"
         "#;
 
-        let cfg: PolicyConfig =
-            toml::from_str(toml).expect("parse policy config");
-        let engine =
-            PolicyEngine::from_config(&cfg).expect("build policy engine");
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
 
         // Matches the second rule.
-        assert!(engine.is_allowed(
-            "https://example.com/public",
-            None,
-            None
-        ));
+        assert!(engine.is_allowed("https://example.com/public", None, None));
 
         // Matches the first (deny) rule.
-        assert!(!engine.is_allowed(
-            "https://example.com/admin/panel",
-            None,
-            None
-        ));
+        assert!(!engine.is_allowed("https://example.com/admin/panel", None, None));
     }
 
     #[test]
@@ -1480,16 +1326,10 @@ pattern = "https://example.com/**"
 default = "allow"
         "#;
 
-        let cfg: PolicyConfig =
-            toml::from_str(toml).expect("parse policy config");
-        let engine =
-            PolicyEngine::from_config(&cfg).expect("build policy engine");
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
 
-        assert!(engine.is_allowed(
-            "https://anything.com/path",
-            None,
-            None
-        ));
+        assert!(engine.is_allowed("https://anything.com/path", None, None));
     }
 
     #[test]
@@ -1498,16 +1338,10 @@ default = "allow"
 default = "allow"
         "#;
 
-        let cfg: PolicyConfig =
-            toml::from_str(toml).expect("parse policy config");
-        let engine =
-            PolicyEngine::from_config(&cfg).expect("build policy engine");
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
 
-        assert!(engine.is_allowed(
-            "https://example.com/path",
-            None,
-            None
-        ));
+        assert!(engine.is_allowed("https://example.com/path", None, None));
         assert!(!engine.is_allowed("not-a-url", None, None));
         assert!(!engine.is_allowed("", None, None));
     }
@@ -1523,10 +1357,8 @@ pattern = "https://gitlab.internal/api/v4/projects/{repo}?**"
 add_url_enc_variants = true
         "#;
 
-        let cfg: PolicyConfig =
-            toml::from_str(toml).expect("parse policy config");
-        let err =
-            PolicyEngine::from_config(&cfg).expect_err("expected error");
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let err = PolicyEngine::from_config(&cfg).expect_err("expected error");
         let msg = format!("{err}");
         assert!(
             msg.contains("Policy macro not found: repo"),
@@ -1550,10 +1382,8 @@ name = "x-test"
 value = "one"
         "#;
 
-        let cfg: PolicyConfig =
-            toml::from_str(toml).expect("parse policy config");
-        let effective =
-            EffectivePolicy::from_config(&cfg).expect("build effective policy");
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let effective = EffectivePolicy::from_config(&cfg).expect("build effective policy");
 
         assert_eq!(effective.rules.len(), 1);
         let rule = &effective.rules[0];
@@ -1578,10 +1408,8 @@ pattern = "https://example.com/**"
 external_auth_profile = "example"
         "#;
 
-        let cfg: PolicyConfig =
-            toml::from_str(toml).expect("parse policy config");
-        let effective =
-            EffectivePolicy::from_config(&cfg).expect("build effective policy");
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let effective = EffectivePolicy::from_config(&cfg).expect("build effective policy");
 
         assert_eq!(effective.rules.len(), 1);
         let rule = &effective.rules[0];

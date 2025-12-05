@@ -25,8 +25,7 @@ default = "deny"
     )
     .expect("write config");
 
-    let mut cmd =
-        assert_cmd::Command::cargo_bin("acl-proxy").expect("binary built");
+    let mut cmd = assert_cmd::Command::cargo_bin("acl-proxy").expect("binary built");
     cmd.arg("config")
         .arg("validate")
         .arg("--config")
@@ -36,4 +35,3 @@ default = "deny"
         .failure()
         .stderr(contains("invalid log level for logging.level"));
 }
-

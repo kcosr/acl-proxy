@@ -4,9 +4,7 @@ use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::Arc;
 
 use chrono::Utc;
-use http::header::{
-    HeaderMap as HttpHeaderMap, HeaderName, HeaderValue, HOST,
-};
+use http::header::{HeaderMap as HttpHeaderMap, HeaderName, HeaderValue, HOST};
 use http::{Method, StatusCode, Uri, Version};
 use hyper::body::{Bytes, HttpBody};
 use hyper::server::conn::AddrStream;
@@ -19,17 +17,15 @@ use serde::Deserialize;
 
 use crate::app::{AppState, SharedAppState};
 use crate::capture::{
-    build_capture_record, should_capture, BodyCaptureBuffer, BodyCaptureResult,
-    CaptureDecision, CaptureEndpoint, CaptureKind, CaptureMode,
-    CaptureRecordOptions, HeaderMap, DEFAULT_MAX_BODY_BYTES,
+    build_capture_record, should_capture, BodyCaptureBuffer, BodyCaptureResult, CaptureDecision,
+    CaptureEndpoint, CaptureKind, CaptureMode, CaptureRecordOptions, HeaderMap,
+    DEFAULT_MAX_BODY_BYTES,
 };
-use crate::external_auth::{
-    ExternalAuthProfile, ExternalDecision,
-};
-use crate::logging::PolicyDecisionLogContext;
-use crate::proxy::https_connect;
-use crate::policy::CompiledHeaderAction;
 use crate::config::{HeaderActionKind, HeaderDirection, HeaderWhen};
+use crate::external_auth::{ExternalAuthProfile, ExternalDecision};
+use crate::logging::PolicyDecisionLogContext;
+use crate::policy::CompiledHeaderAction;
+use crate::proxy::https_connect;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HttpProxyError {
@@ -60,28 +56,25 @@ pub enum HttpProxyError {
 /// connections observe the latest configuration snapshot, while
 /// in-flight requests continue using the state captured for that
 /// request.
-pub async fn run_http_proxy<F>(
-    state: SharedAppState,
-    shutdown: F,
-) -> Result<(), HttpProxyError>
+pub async fn run_http_proxy<F>(state: SharedAppState, shutdown: F) -> Result<(), HttpProxyError>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let initial = state.load();
-    let bind_ip = initial
-        .config
-        .proxy
-        .bind_address
-        .parse()
-        .map_err(|e| HttpProxyError::BindAddress {
-            address: initial.config.proxy.bind_address.clone(),
-            source: e,
-        })?;
+    let bind_ip =
+        initial
+            .config
+            .proxy
+            .bind_address
+            .parse()
+            .map_err(|e| HttpProxyError::BindAddress {
+                address: initial.config.proxy.bind_address.clone(),
+                source: e,
+            })?;
     let addr = SocketAddr::new(bind_ip, initial.config.proxy.http_port);
 
-    let listener = StdTcpListener::bind(addr).map_err(|e| {
-        HttpProxyError::BindListener { addr, source: e }
-    })?;
+    let listener =
+        StdTcpListener::bind(addr).map_err(|e| HttpProxyError::BindListener { addr, source: e })?;
     listener
         .set_nonblocking(true)
         .map_err(HttpProxyError::FromTcp)?;
@@ -105,11 +98,7 @@ where
             Ok::<_, Infallible>(service_fn(move |req| {
                 let state = state.clone();
                 let state_snapshot = state.load_full();
-                handle_http_request(
-                    state_snapshot,
-                    remote_addr,
-                    req,
-                )
+                handle_http_request(state_snapshot, remote_addr, req)
             }))
         }
     });
@@ -130,18 +119,12 @@ async fn handle_http_request(
     // Special-case HTTPS CONNECT requests, which are handled via a dedicated
     // MITM path in `https_connect`.
     if req.method() == Method::CONNECT {
-        let resp = https_connect::handle_connect_request(
-            state,
-            remote_addr,
-            req,
-        )
-        .await;
+        let resp = https_connect::handle_connect_request(state, remote_addr, req).await;
         return Ok(resp);
     }
 
     if is_external_auth_callback_path(req.uri().path()) {
-        let resp =
-            handle_external_auth_callback_request(state, req).await;
+        let resp = handle_external_auth_callback_request(state, req).await;
         return Ok(resp);
     }
 
@@ -162,9 +145,7 @@ async fn handle_http_request(
     let loop_settings = &state.loop_protection;
 
     // Loop protection: reject requests that already carry the loop header.
-    if loop_settings.enabled
-        && has_loop_header(req.headers(), &loop_settings.header_name)
-    {
+    if loop_settings.enabled && has_loop_header(req.headers(), &loop_settings.header_name) {
         let resp = build_loop_detected_response(
             &state,
             &request_id,
@@ -215,11 +196,8 @@ async fn handle_http_request(
         .unwrap_or_default();
 
     if let Some(rule) = matched_rule {
-        if let Some(profile_name) = rule.external_auth_profile.as_ref()
-        {
-            if let Some(profile) =
-                state.external_auth.get_profile(profile_name)
-            {
+        if let Some(profile_name) = rule.external_auth_profile.as_ref() {
+            if let Some(profile) = state.external_auth.get_profile(profile_name) {
                 let resp = handle_external_auth_gate(
                     state.clone(),
                     &request_id,
@@ -302,8 +280,7 @@ async fn handle_external_auth_callback_request(
             "error": "MethodNotAllowed",
             "message": "External auth callbacks must use POST",
         });
-        let body_bytes =
-            serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+        let body_bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
 
         let mut resp = Response::new(Body::from(body_bytes));
         *resp.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
@@ -321,8 +298,7 @@ async fn handle_external_auth_callback_request(
                 "error": "InvalidRequest",
                 "message": "Failed to read callback body",
             });
-            let body_bytes = serde_json::to_vec(&payload)
-                .unwrap_or_else(|_| b"{}".to_vec());
+            let body_bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
             let mut resp = Response::new(Body::from(body_bytes));
             *resp.status_mut() = StatusCode::BAD_REQUEST;
             resp.headers_mut().insert(
@@ -333,42 +309,37 @@ async fn handle_external_auth_callback_request(
         }
     };
 
-    let payload: ExternalAuthCallbackBody =
-        match serde_json::from_slice(&body_bytes) {
-            Ok(p) => p,
-            Err(_) => {
-                let payload = serde_json::json!({
-                    "error": "InvalidRequest",
-                    "message": "Callback body must be valid JSON with requestId and decision",
-                });
-                let body_bytes = serde_json::to_vec(&payload)
-                    .unwrap_or_else(|_| b"{}".to_vec());
-                let mut resp = Response::new(Body::from(body_bytes));
-                *resp.status_mut() = StatusCode::BAD_REQUEST;
-                resp.headers_mut().insert(
-                    http::header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/json"),
-                );
-                return resp;
-            }
-        };
+    let payload: ExternalAuthCallbackBody = match serde_json::from_slice(&body_bytes) {
+        Ok(p) => p,
+        Err(_) => {
+            let payload = serde_json::json!({
+                "error": "InvalidRequest",
+                "message": "Callback body must be valid JSON with requestId and decision",
+            });
+            let body_bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+            let mut resp = Response::new(Body::from(body_bytes));
+            *resp.status_mut() = StatusCode::BAD_REQUEST;
+            resp.headers_mut().insert(
+                http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            return resp;
+        }
+    };
 
     let decision = match payload.decision {
         ExternalAuthCallbackDecision::Allow => ExternalDecision::Allow,
         ExternalAuthCallbackDecision::Deny => ExternalDecision::Deny,
     };
 
-    let found = state
-        .external_auth
-        .resolve(&payload.request_id, decision);
+    let found = state.external_auth.resolve(&payload.request_id, decision);
 
     if !found {
         let payload = serde_json::json!({
             "error": "RequestNotFound",
             "message": "No pending request for this requestId",
         });
-        let body_bytes =
-            serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+        let body_bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
         let mut resp = Response::new(Body::from(body_bytes));
         *resp.status_mut() = StatusCode::NOT_FOUND;
         resp.headers_mut().insert(
@@ -379,8 +350,7 @@ async fn handle_external_auth_callback_request(
     }
 
     let payload = serde_json::json!({ "status": "ok" });
-    let body_bytes =
-        serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+    let body_bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
     let mut resp = Response::new(Body::from(body_bytes));
     *resp.status_mut() = StatusCode::OK;
     resp.headers_mut().insert(
@@ -417,17 +387,12 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
         Some(client_ip_for_policy.to_string()),
     );
 
-    let webhook_result = state
-        .external_auth
-        .send_initial_webhook(request_id)
-        .await;
+    let webhook_result = state.external_auth.send_initial_webhook(request_id).await;
 
     if let Err((kind, http_status)) = webhook_result {
-        state.external_auth.finalize_webhook_failed(
-            request_id,
-            kind,
-            http_status,
-        );
+        state
+            .external_auth
+            .finalize_webhook_failed(request_id, kind, http_status);
 
         drop(guard);
 
@@ -479,8 +444,7 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
         };
     }
 
-    let decision =
-        tokio::time::timeout(profile.timeout, decision_rx).await;
+    let decision = tokio::time::timeout(profile.timeout, decision_rx).await;
 
     match decision {
         Ok(Ok(ExternalDecision::Allow)) => {
@@ -515,10 +479,9 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
             .await
         }
         Ok(Err(_recv_closed)) => {
-            state.external_auth.finalize_internal_error(
-                request_id,
-                "External approval channel closed",
-            );
+            state
+                .external_auth
+                .finalize_internal_error(request_id, "External approval channel closed");
             drop(guard);
             build_external_auth_error_response(
                 &state,
@@ -596,12 +559,8 @@ fn build_full_url(
     let uri = req.uri();
 
     // Absolute-form URLs (standard HTTP proxy mode).
-    if let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority())
-    {
-        let path_and_query = uri
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
+    if let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) {
+        let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
         let normalized = if path_and_query.starts_with('/') {
             format!("{scheme}://{authority}{path}", path = path_and_query)
@@ -622,9 +581,13 @@ fn build_full_url(
 fn extract_target_from_uri(uri: &Uri) -> Option<CaptureEndpoint> {
     let authority = uri.authority()?;
     let host = authority.host().to_string();
-    let port = authority
-        .port_u16()
-        .unwrap_or_else(|| if uri.scheme_str() == Some("https") { 443 } else { 80 });
+    let port = authority.port_u16().unwrap_or_else(|| {
+        if uri.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        }
+    });
 
     Some(CaptureEndpoint {
         address: Some(host),
@@ -632,10 +595,7 @@ fn extract_target_from_uri(uri: &Uri) -> Option<CaptureEndpoint> {
     })
 }
 
-pub(crate) fn has_loop_header(
-    headers: &HttpHeaderMap,
-    name: &HeaderName,
-) -> bool {
+pub(crate) fn has_loop_header(headers: &HttpHeaderMap, name: &HeaderName) -> bool {
     headers.contains_key(name)
 }
 
@@ -654,8 +614,7 @@ pub(crate) async fn build_loop_detected_response(
         "error": "LoopDetected",
         "message": "Proxy loop detected via loop protection header",
     });
-    let body_bytes =
-        serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+    let body_bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
 
     let mut response = Response::new(Body::from(body_bytes.clone()));
     *response.status_mut() = StatusCode::LOOP_DETECTED;
@@ -723,8 +682,7 @@ pub(crate) async fn build_policy_denied_response_with_mode(
         "error": "Forbidden",
         "message": "Blocked by URL policy",
     });
-    let body_bytes =
-        serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+    let body_bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
 
     let mut response = Response::new(Body::from(body_bytes.clone()));
     *response.status_mut() = StatusCode::FORBIDDEN;
@@ -772,8 +730,7 @@ async fn build_external_auth_response(
         "error": error,
         "message": message,
     });
-    let body_bytes =
-        serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+    let body_bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
 
     let mut response = Response::new(Body::from(body_bytes.clone()));
     *response.status_mut() = status;
@@ -1014,10 +971,8 @@ pub(crate) async fn proxy_allowed_request(
 
     let cfg = &state.config;
     let decision = CaptureDecision::Allow;
-    let capture_request =
-        should_capture(cfg, decision, CaptureKind::Request);
-    let capture_response =
-        should_capture(cfg, decision, CaptureKind::Response);
+    let capture_request = should_capture(cfg, decision, CaptureKind::Request);
+    let capture_response = should_capture(cfg, decision, CaptureKind::Response);
 
     let req_headers_for_capture = if capture_request {
         Some(headers_to_capture_map(req.headers()))
@@ -1036,9 +991,8 @@ pub(crate) async fn proxy_allowed_request(
 
         headers.insert(
             HOST,
-            HeaderValue::from_str(authority.as_str()).unwrap_or_else(
-                |_| HeaderValue::from_static(""),
-            ),
+            HeaderValue::from_str(authority.as_str())
+                .unwrap_or_else(|_| HeaderValue::from_static("")),
         );
 
         // Loop protection header injection on outbound allowed requests.
@@ -1082,25 +1036,22 @@ pub(crate) async fn proxy_allowed_request(
         Ok(resp) => resp,
         Err(e) => {
             tracing::debug!("upstream request failed: {e}");
-            let mut resp =
-                Response::new(Body::from("Bad Gateway"));
+            let mut resp = Response::new(Body::from("Bad Gateway"));
             *resp.status_mut() = StatusCode::BAD_GATEWAY;
             return resp;
         }
     };
 
-    let original_response_presence =
-        snapshot_header_presence(upstream_resp.headers());
+    let original_response_presence = snapshot_header_presence(upstream_resp.headers());
 
     let status = upstream_resp.status();
     let resp_version = upstream_resp.version();
 
-    let (mut resp, resp_capture_rx) = if capture_response {
+    let (resp, resp_capture_rx) = if capture_response {
         let (parts, upstream_body) = upstream_resp.into_parts();
         let (body, handle) = tee_body(upstream_body).await;
 
-        let mut out =
-            Response::builder().status(status).version(resp_version);
+        let mut out = Response::builder().status(status).version(resp_version);
         {
             let headers = out.headers_mut().expect("headers mut");
             for (name, value) in parts.headers.iter() {
@@ -1164,11 +1115,7 @@ pub(crate) async fn proxy_allowed_request(
         };
 
         if let Some(body) = req_body {
-            if should_capture(
-                &cfg,
-                CaptureDecision::Allow,
-                CaptureKind::Request,
-            ) {
+            if should_capture(&cfg, CaptureDecision::Allow, CaptureKind::Request) {
                 let headers = req_headers_for_capture_clone
                     .clone()
                     .unwrap_or_else(HeaderMap::new);
@@ -1193,11 +1140,7 @@ pub(crate) async fn proxy_allowed_request(
         }
 
         if let Some(body) = resp_body {
-            if should_capture(
-                &cfg,
-                CaptureDecision::Allow,
-                CaptureKind::Response,
-            ) {
+            if should_capture(&cfg, CaptureDecision::Allow, CaptureKind::Response) {
                 let headers = resp_headers_for_capture_clone
                     .clone()
                     .unwrap_or_else(HeaderMap::new);
@@ -1225,9 +1168,7 @@ pub(crate) async fn proxy_allowed_request(
     resp
 }
 
-pub(crate) fn headers_to_capture_map(
-    headers: &HttpHeaderMap,
-) -> HeaderMap {
+pub(crate) fn headers_to_capture_map(headers: &HttpHeaderMap) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in headers.iter() {
         let key = name.as_str().to_ascii_lowercase();
@@ -1252,9 +1193,7 @@ pub(crate) fn headers_to_capture_map(
     out
 }
 
-fn snapshot_header_presence(
-    headers: &HttpHeaderMap,
-) -> HashSet<HeaderName> {
+fn snapshot_header_presence(headers: &HttpHeaderMap) -> HashSet<HeaderName> {
     let mut set = HashSet::new();
     for name in headers.keys() {
         set.insert(name.clone());
@@ -1368,9 +1307,7 @@ fn log_header_action(action: &CompiledHeaderAction, direction: &HeaderDirection)
     );
 }
 
-pub(crate) async fn tee_body(
-    mut body: Body,
-) -> (Body, oneshot::Receiver<BodyCaptureResult>) {
+pub(crate) async fn tee_body(mut body: Body) -> (Body, oneshot::Receiver<BodyCaptureResult>) {
     let (tx, rx) = mpsc::channel::<Result<Bytes, hyper::Error>>(16);
     let (capture_tx, capture_rx) = oneshot::channel();
 
@@ -1413,9 +1350,8 @@ pub(crate) fn generate_request_id() -> String {
     use once_cell::sync::Lazy;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    static COUNTER: Lazy<AtomicU64> =
-        Lazy::new(|| AtomicU64::new(1));
+    static COUNTER: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
     let ts = Utc::now().timestamp_millis();
-    format!("req-{}-{}", ts.to_string(), seq)
+    format!("req-{}-{}", ts, seq)
 }

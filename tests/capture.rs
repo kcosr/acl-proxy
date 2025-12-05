@@ -3,9 +3,8 @@ use std::fs;
 use tempfile::TempDir;
 
 use acl_proxy::capture::{
-    build_capture_record, should_capture, BodyCaptureBuffer,
-    CaptureDecision, CaptureEndpoint, CaptureKind, CaptureMode,
-    CaptureRecordOptions, HeaderMap, DEFAULT_MAX_BODY_BYTES,
+    build_capture_record, should_capture, BodyCaptureBuffer, CaptureDecision, CaptureEndpoint,
+    CaptureKind, CaptureMode, CaptureRecordOptions, HeaderMap, DEFAULT_MAX_BODY_BYTES,
 };
 use acl_proxy::config::Config;
 
@@ -49,8 +48,7 @@ fn capture_write_creates_expected_file_and_json() {
     };
 
     let record = build_capture_record(opts);
-    let path =
-        acl_proxy::capture::write_capture_record(&config, &record).unwrap();
+    let path = acl_proxy::capture::write_capture_record(&config, &record).unwrap();
 
     assert!(path.exists(), "capture file should exist");
     let contents = fs::read_to_string(&path).expect("read capture file");

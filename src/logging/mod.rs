@@ -3,9 +3,7 @@ use std::fmt;
 use tracing::Level;
 use tracing_subscriber::fmt::SubscriberBuilder;
 
-use crate::config::{
-    LoggingConfig, LoggingPolicyDecisionsConfig, PolicyDefaultAction,
-};
+use crate::config::{LoggingConfig, LoggingPolicyDecisionsConfig, PolicyDefaultAction};
 use crate::policy::PolicyDecision;
 
 #[derive(Debug, thiserror::Error)]
@@ -33,15 +31,12 @@ pub struct LoggingSettings {
 
 impl LoggingSettings {
     pub fn from_config(cfg: &LoggingConfig) -> Result<Self, LoggingError> {
-        let level = parse_level(&cfg.level).map_err(|value| {
-            LoggingError::InvalidLevel {
-                field: "logging.level",
-                value,
-            }
+        let level = parse_level(&cfg.level).map_err(|value| LoggingError::InvalidLevel {
+            field: "logging.level",
+            value,
         })?;
 
-        let policy_decisions =
-            PolicyDecisionLogging::from_config(&cfg.policy_decisions)?;
+        let policy_decisions = PolicyDecisionLogging::from_config(&cfg.policy_decisions)?;
 
         Ok(LoggingSettings {
             level,
@@ -66,10 +61,7 @@ impl LoggingSettings {
     ///
     /// This helper does not assume where the subscriber sends events; it only
     /// emits structured fields that downstream subscribers can consume.
-    pub fn log_policy_decision<'a>(
-        &self,
-        ctx: PolicyDecisionLogContext<'a>,
-    ) {
+    pub fn log_policy_decision<'a>(&self, ctx: PolicyDecisionLogContext<'a>) {
         let allowed = ctx.decision.allowed;
 
         if allowed && !self.policy_decisions.log_allows {
@@ -84,21 +76,16 @@ impl LoggingSettings {
         } else {
             self.policy_decisions.level_denies
         };
-        let (rule_action, rule_pattern, rule_description) =
-            match ctx.decision.matched.as_ref() {
-                Some(m) => {
-                    let action = match m.action {
-                        PolicyDefaultAction::Allow => "allow",
-                        PolicyDefaultAction::Deny => "deny",
-                    };
-                    (
-                        Some(action),
-                        m.pattern.as_deref(),
-                        m.description.as_deref(),
-                    )
-                }
-                None => (None, None, None),
-            };
+        let (rule_action, rule_pattern, rule_description) = match ctx.decision.matched.as_ref() {
+            Some(m) => {
+                let action = match m.action {
+                    PolicyDefaultAction::Allow => "allow",
+                    PolicyDefaultAction::Deny => "deny",
+                };
+                (Some(action), m.pattern.as_deref(), m.description.as_deref())
+            }
+            None => (None, None, None),
+        };
 
         let method = ctx.method.unwrap_or_default();
         let client_ip = ctx.client_ip.unwrap_or_default();
@@ -107,8 +94,8 @@ impl LoggingSettings {
             ctx.request_id,
             allowed,
             ctx.url,
-            &method,
-            &client_ip,
+            method,
+            client_ip,
             rule_action,
             rule_pattern,
             rule_description,
@@ -126,23 +113,17 @@ pub struct PolicyDecisionLogContext<'a> {
 }
 
 impl PolicyDecisionLogging {
-    pub fn from_config(
-        cfg: &LoggingPolicyDecisionsConfig,
-    ) -> Result<Self, LoggingError> {
+    pub fn from_config(cfg: &LoggingPolicyDecisionsConfig) -> Result<Self, LoggingError> {
         let level_allows =
-            parse_level(&cfg.level_allows).map_err(|value| {
-                LoggingError::InvalidLevel {
-                    field: "logging.policy_decisions.level_allows",
-                    value,
-                }
+            parse_level(&cfg.level_allows).map_err(|value| LoggingError::InvalidLevel {
+                field: "logging.policy_decisions.level_allows",
+                value,
             })?;
 
         let level_denies =
-            parse_level(&cfg.level_denies).map_err(|value| {
-                LoggingError::InvalidLevel {
-                    field: "logging.policy_decisions.level_denies",
-                    value,
-                }
+            parse_level(&cfg.level_denies).map_err(|value| LoggingError::InvalidLevel {
+                field: "logging.policy_decisions.level_denies",
+                value,
             })?;
 
         Ok(PolicyDecisionLogging {
@@ -267,8 +248,7 @@ mod tests {
             },
         };
 
-        let settings =
-            LoggingSettings::from_config(&cfg).expect("parse logging config");
+        let settings = LoggingSettings::from_config(&cfg).expect("parse logging config");
         assert_eq!(settings.level, Level::DEBUG);
         assert_eq!(settings.policy_decisions.level_allows, Level::INFO);
         assert_eq!(settings.policy_decisions.level_denies, Level::WARN);
@@ -282,12 +262,8 @@ mod tests {
             policy_decisions: LoggingPolicyDecisionsConfig::default(),
         };
 
-        let err =
-            LoggingSettings::from_config(&cfg).expect_err("should fail");
+        let err = LoggingSettings::from_config(&cfg).expect_err("should fail");
         let msg = format!("{err}");
-        assert!(
-            msg.contains("invalid log level"),
-            "unexpected error: {msg}"
-        );
+        assert!(msg.contains("invalid log level"), "unexpected error: {msg}");
     }
 }
