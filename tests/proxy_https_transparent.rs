@@ -4,27 +4,25 @@ use std::sync::Arc;
 
 use acl_proxy::app::AppState;
 use acl_proxy::capture::{
-    CaptureDecision, CaptureKind, CaptureMode, CaptureRecord,
-    DEFAULT_MAX_BODY_BYTES,
+    CaptureDecision, CaptureKind, CaptureMode, CaptureRecord, DEFAULT_MAX_BODY_BYTES,
 };
 use acl_proxy::config::Config;
 use acl_proxy::proxy::https_transparent::run_https_transparent_proxy_on_listener;
+use h2::client as h2_client;
+use http::Method;
 use http::{StatusCode, Version};
+use hyper::server::conn::Http;
+use hyper::service::service_fn;
+use hyper::{Body, Request as HyperRequest, Response as HyperResponse};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::client::ServerName;
 use rustls::{
-    Certificate as RustlsCertificate, ClientConfig, PrivateKey,
-    RootCertStore, ServerConfig,
+    Certificate as RustlsCertificate, ClientConfig, PrivateKey, RootCertStore, ServerConfig,
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
-use h2::client as h2_client;
-use http::Method;
-use hyper::server::conn::Http;
-use hyper::service::service_fn;
-use hyper::{Body, Request as HyperRequest, Response as HyperResponse};
 
 // Use a body slightly larger than DEFAULT_MAX_BODY_BYTES to exercise
 // truncation logic without introducing excessively large in-memory
@@ -32,24 +30,19 @@ use hyper::{Body, Request as HyperRequest, Response as HyperResponse};
 const LARGE_BODY_BYTES: usize = DEFAULT_MAX_BODY_BYTES + 1024;
 
 async fn start_upstream_https_echo_server() -> SocketAddr {
-    let listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind upstream");
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind upstream");
     listener
         .set_nonblocking(true)
         .expect("set nonblocking upstream");
     let addr = listener.local_addr().expect("upstream addr");
 
     // Generate a simple self-signed certificate for the upstream server.
-    let mut params =
-        CertificateParams::new(vec![addr.ip().to_string()]).expect("params");
+    let mut params = CertificateParams::new(vec![addr.ip().to_string()]).expect("params");
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, addr.ip().to_string());
     params.distinguished_name = dn;
-    let key =
-        KeyPair::generate().expect("generate upstream key");
-    let cert = params
-        .self_signed(&key)
-        .expect("self-signed upstream cert");
+    let key = KeyPair::generate().expect("generate upstream key");
+    let cert = params.self_signed(&key).expect("self-signed upstream cert");
 
     let cert_der: Vec<u8> = cert.der().to_vec();
     let key_der = key.serialize_der();
@@ -57,19 +50,14 @@ async fn start_upstream_https_echo_server() -> SocketAddr {
     let mut tls_config = ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
-        .with_single_cert(
-            vec![RustlsCertificate(cert_der)],
-            PrivateKey(key_der),
-        )
+        .with_single_cert(vec![RustlsCertificate(cert_der)], PrivateKey(key_der))
         .expect("server config");
-    tls_config.alpn_protocols =
-        vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
     tokio::spawn(async move {
-        let listener =
-            TcpListener::from_std(listener).expect("tokio listener");
+        let listener = TcpListener::from_std(listener).expect("tokio listener");
         loop {
             let (socket, _) = match listener.accept().await {
                 Ok(v) => v,
@@ -98,24 +86,19 @@ async fn start_upstream_https_echo_server() -> SocketAddr {
 }
 
 async fn start_upstream_https_large_response_server() -> SocketAddr {
-    let listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind upstream");
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind upstream");
     listener
         .set_nonblocking(true)
         .expect("set nonblocking upstream");
     let addr = listener.local_addr().expect("upstream addr");
 
     // Generate a simple self-signed certificate for the upstream server.
-    let mut params =
-        CertificateParams::new(vec![addr.ip().to_string()]).expect("params");
+    let mut params = CertificateParams::new(vec![addr.ip().to_string()]).expect("params");
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, addr.ip().to_string());
     params.distinguished_name = dn;
-    let key =
-        KeyPair::generate().expect("generate upstream key");
-    let cert = params
-        .self_signed(&key)
-        .expect("self-signed upstream cert");
+    let key = KeyPair::generate().expect("generate upstream key");
+    let cert = params.self_signed(&key).expect("self-signed upstream cert");
 
     let cert_der: Vec<u8> = cert.der().to_vec();
     let key_der = key.serialize_der();
@@ -123,23 +106,15 @@ async fn start_upstream_https_large_response_server() -> SocketAddr {
     let mut tls_config = ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
-        .with_single_cert(
-            vec![RustlsCertificate(cert_der)],
-            PrivateKey(key_der),
-        )
+        .with_single_cert(vec![RustlsCertificate(cert_der)], PrivateKey(key_der))
         .expect("server config");
-    tls_config.alpn_protocols =
-        vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
     tokio::spawn(async move {
-        let listener =
-            TcpListener::from_std(listener).expect("tokio listener");
-        eprintln!(
-            "large_response_upstream: listening on {}",
-            addr
-        );
+        let listener = TcpListener::from_std(listener).expect("tokio listener");
+        eprintln!("large_response_upstream: listening on {}", addr);
         loop {
             let (socket, _) = match listener.accept().await {
                 Ok(v) => v,
@@ -173,24 +148,19 @@ async fn start_upstream_https_large_response_server() -> SocketAddr {
 }
 
 async fn start_upstream_https_http1_only_echo_server() -> SocketAddr {
-    let listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind upstream");
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind upstream");
     listener
         .set_nonblocking(true)
         .expect("set nonblocking upstream");
     let addr = listener.local_addr().expect("upstream addr");
 
     // Generate a simple self-signed certificate for the upstream server.
-    let mut params =
-        CertificateParams::new(vec![addr.ip().to_string()]).expect("params");
+    let mut params = CertificateParams::new(vec![addr.ip().to_string()]).expect("params");
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, addr.ip().to_string());
     params.distinguished_name = dn;
-    let key =
-        KeyPair::generate().expect("generate upstream key");
-    let cert = params
-        .self_signed(&key)
-        .expect("self-signed upstream cert");
+    let key = KeyPair::generate().expect("generate upstream key");
+    let cert = params.self_signed(&key).expect("self-signed upstream cert");
 
     let cert_der: Vec<u8> = cert.der().to_vec();
     let key_der = key.serialize_der();
@@ -198,18 +168,14 @@ async fn start_upstream_https_http1_only_echo_server() -> SocketAddr {
     let mut tls_config = ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
-        .with_single_cert(
-            vec![RustlsCertificate(cert_der)],
-            PrivateKey(key_der),
-        )
+        .with_single_cert(vec![RustlsCertificate(cert_der)], PrivateKey(key_der))
         .expect("server config");
     tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
     tokio::spawn(async move {
-        let listener =
-            TcpListener::from_std(listener).expect("tokio listener");
+        let listener = TcpListener::from_std(listener).expect("tokio listener");
         loop {
             let (socket, _) = match listener.accept().await {
                 Ok(v) => v,
@@ -280,27 +246,18 @@ async fn start_proxy_with_config(
     let temp_dir = TempDir::new().expect("temp dir for capture");
     let capture_dir = temp_dir.path().join("captures");
     let certs_dir = temp_dir.path().join("certs");
-    config.capture.directory =
-        capture_dir.to_string_lossy().to_string();
-    config.certificates.certs_dir =
-        certs_dir.to_string_lossy().to_string();
+    config.capture.directory = capture_dir.to_string_lossy().to_string();
+    config.certificates.certs_dir = certs_dir.to_string_lossy().to_string();
 
-    let state =
-        AppState::shared_from_config(config).expect("app state");
+    let state = AppState::shared_from_config(config).expect("app state");
 
     let listener_addr = addr;
     tokio::spawn(async move {
-        let _ = run_https_transparent_proxy_on_listener(
-            state,
-            listener,
-            std::future::pending(),
-        )
-        .await
-        .map_err(|e| {
-            eprintln!(
-                "HTTPS transparent proxy server on {listener_addr} exited: {e}"
-            );
-        });
+        let _ = run_https_transparent_proxy_on_listener(state, listener, std::future::pending())
+            .await
+            .map_err(|e| {
+                eprintln!("HTTPS transparent proxy server on {listener_addr} exited: {e}");
+            });
     });
 
     let ca_cert_path = certs_dir.join("ca-cert.pem");
@@ -317,18 +274,16 @@ async fn send_https_request_via_transparent(
 ) -> (u16, String) {
     use rustls_pemfile;
 
-    let stream =
-        tokio::net::TcpStream::connect(proxy_addr).await.expect("connect proxy");
+    let stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
 
-    let ca_pem =
-        std::fs::read(ca_cert_path).expect("read ca cert");
+    let ca_pem = std::fs::read(ca_cert_path).expect("read ca cert");
     let mut reader = std::io::Cursor::new(ca_pem);
     let mut roots = RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut reader).expect("parse ca cert") {
         let cert = RustlsCertificate(cert.to_vec());
-        roots
-            .add(&cert)
-            .expect("add root cert to store");
+        roots.add(&cert).expect("add root cert to store");
     }
 
     let config = ClientConfig::builder()
@@ -337,8 +292,7 @@ async fn send_https_request_via_transparent(
         .with_no_client_auth();
 
     let connector = TlsConnector::from(Arc::new(config));
-    let server_name =
-        ServerName::try_from(sni_host).expect("server name");
+    let server_name = ServerName::try_from(sni_host).expect("server name");
     let mut tls_stream = connector
         .connect(server_name, stream)
         .await
@@ -393,18 +347,16 @@ async fn send_h2_https_request_via_transparent(
 ) -> (Version, u16, String) {
     use rustls_pemfile;
 
-    let stream =
-        tokio::net::TcpStream::connect(proxy_addr).await.expect("connect proxy");
+    let stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
 
-    let ca_pem =
-        std::fs::read(ca_cert_path).expect("read ca cert");
+    let ca_pem = std::fs::read(ca_cert_path).expect("read ca cert");
     let mut reader = std::io::Cursor::new(ca_pem);
     let mut roots = RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut reader).expect("parse ca cert") {
         let cert = RustlsCertificate(cert.to_vec());
-        roots
-            .add(&cert)
-            .expect("add root cert to store");
+        roots.add(&cert).expect("add root cert to store");
     }
 
     let mut tls_config = ClientConfig::builder()
@@ -412,20 +364,19 @@ async fn send_h2_https_request_via_transparent(
         .with_root_certificates(roots)
         .with_no_client_auth();
 
-    tls_config.alpn_protocols =
-        vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let connector = TlsConnector::from(Arc::new(tls_config));
-    let server_name =
-        ServerName::try_from("transparent.test").expect("server name");
+    let server_name = ServerName::try_from("transparent.test").expect("server name");
     let tls_stream = connector
         .connect(server_name, stream)
         .await
         .expect("tls connect");
 
     eprintln!("send_h2_https_request_via_transparent: starting h2 handshake");
-    let (send_request, connection) =
-        h2_client::handshake(tls_stream).await.expect("h2 handshake");
+    let (send_request, connection) = h2_client::handshake(tls_stream)
+        .await
+        .expect("h2 handshake");
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -440,10 +391,7 @@ async fn send_h2_https_request_via_transparent(
     };
 
     eprintln!("send_h2_https_request_via_transparent: waiting for send_request.ready()");
-    let mut send_request = send_request
-        .ready()
-        .await
-        .expect("h2 ready");
+    let mut send_request = send_request.ready().await.expect("h2 ready");
 
     let uri = format!("https://{host_header}{path}");
 
@@ -453,28 +401,19 @@ async fn send_h2_https_request_via_transparent(
         .version(Version::HTTP_2);
 
     {
-        let headers = req_builder
-            .headers_mut()
-            .expect("headers mut");
+        let headers = req_builder.headers_mut().expect("headers mut");
         headers.insert(
             http::header::HOST,
-            http::HeaderValue::from_str(host_header)
-                .expect("host header"),
+            http::HeaderValue::from_str(host_header).expect("host header"),
         );
         for (name, value) in extra_headers {
-            let name = http::HeaderName::from_bytes(
-                name.as_bytes(),
-            )
-            .expect("header name");
-            let value = http::HeaderValue::from_str(value)
-                .expect("header value");
+            let name = http::HeaderName::from_bytes(name.as_bytes()).expect("header name");
+            let value = http::HeaderValue::from_str(value).expect("header value");
             headers.insert(name, value);
         }
     }
 
-    let request = req_builder
-        .body(())
-        .expect("build h2 request");
+    let request = req_builder.body(()).expect("build h2 request");
 
     eprintln!(
         "send_h2_https_request_via_transparent: sending request to {}",
@@ -491,12 +430,7 @@ async fn send_h2_https_request_via_transparent(
 
     let mut body_bytes = Vec::new();
     eprintln!("send_h2_https_request_via_transparent: reading response body");
-    while let Some(chunk) = body_stream
-        .data()
-        .await
-        .transpose()
-        .expect("h2 data")
-    {
+    while let Some(chunk) = body_stream.data().await.transpose().expect("h2 data") {
         body_bytes.extend_from_slice(&chunk);
     }
 
@@ -518,40 +452,37 @@ async fn send_h2_https_request_with_body_via_transparent(
     path: &str,
     body_bytes: Vec<u8>,
 ) -> (Version, u16, String) {
-    use rustls_pemfile;
     use bytes::Bytes;
+    use rustls_pemfile;
 
-    let stream =
-        tokio::net::TcpStream::connect(proxy_addr).await.expect("connect proxy");
+    let stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
 
-    let ca_pem =
-        std::fs::read(ca_cert_path).expect("read ca cert");
+    let ca_pem = std::fs::read(ca_cert_path).expect("read ca cert");
     let mut reader = std::io::Cursor::new(ca_pem);
     let mut roots = RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut reader).expect("parse ca cert") {
         let cert = RustlsCertificate(cert.to_vec());
-        roots
-            .add(&cert)
-            .expect("add root cert to store");
+        roots.add(&cert).expect("add root cert to store");
     }
 
     let mut tls_config = ClientConfig::builder()
         .with_safe_defaults()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    tls_config.alpn_protocols =
-        vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let connector = TlsConnector::from(Arc::new(tls_config));
-    let server_name =
-        ServerName::try_from("transparent.test").expect("server name");
+    let server_name = ServerName::try_from("transparent.test").expect("server name");
     let tls_stream = connector
         .connect(server_name, stream)
         .await
         .expect("tls connect");
 
-    let (send_request, connection) =
-        h2_client::handshake(tls_stream).await.expect("h2 handshake");
+    let (send_request, connection) = h2_client::handshake(tls_stream)
+        .await
+        .expect("h2 handshake");
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -565,10 +496,7 @@ async fn send_h2_https_request_with_body_via_transparent(
         format!("/{}", path)
     };
 
-    let mut send_request = send_request
-        .ready()
-        .await
-        .expect("h2 ready");
+    let mut send_request = send_request.ready().await.expect("h2 ready");
 
     let uri = format!("https://{host_header}{path}");
 
@@ -578,24 +506,18 @@ async fn send_h2_https_request_with_body_via_transparent(
         .version(Version::HTTP_2);
 
     {
-        let headers = req_builder
-            .headers_mut()
-            .expect("headers mut");
+        let headers = req_builder.headers_mut().expect("headers mut");
         headers.insert(
             http::header::HOST,
-            http::HeaderValue::from_str(host_header)
-                .expect("host header"),
+            http::HeaderValue::from_str(host_header).expect("host header"),
         );
         headers.insert(
             http::header::CONTENT_LENGTH,
-            http::HeaderValue::from_str(&body_bytes.len().to_string())
-                .expect("content-length"),
+            http::HeaderValue::from_str(&body_bytes.len().to_string()).expect("content-length"),
         );
     }
 
-    let request = req_builder
-        .body(())
-        .expect("build h2 request");
+    let request = req_builder.body(()).expect("build h2 request");
 
     let (response, mut send_stream) = send_request
         .send_request(request, false)
@@ -653,8 +575,7 @@ async fn allowed_https_transparent_is_proxied_and_captured() {
         },
     )];
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
@@ -663,11 +584,7 @@ async fn allowed_https_transparent_is_proxied_and_captured() {
         start_proxy_with_config(config, proxy_listener).await;
 
     let sni_host = "transparent.test";
-    let host_header = format!(
-        "{}:{}",
-        upstream_addr.ip(),
-        upstream_addr.port()
-    );
+    let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
 
     let (status, body) = send_https_request_via_transparent(
         proxy_addr,
@@ -689,8 +606,9 @@ async fn allowed_https_transparent_is_proxied_and_captured() {
     // Wait briefly for async capture tasks to flush to disk.
     for _ in 0..10 {
         if capture_dir.is_dir() {
-            let entries: Vec<_> =
-                std::fs::read_dir(&capture_dir).expect("read capture dir").collect();
+            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
+                .expect("read capture dir")
+                .collect();
             if !entries.is_empty() {
                 break;
             }
@@ -698,8 +616,7 @@ async fn allowed_https_transparent_is_proxied_and_captured() {
         sleep(Duration::from_millis(50)).await;
     }
 
-    let mut entries =
-        std::fs::read_dir(&capture_dir).expect("read capture dir");
+    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
     let mut files = Vec::new();
     while let Some(entry) = entries.next() {
         let entry = entry.expect("dir entry");
@@ -717,8 +634,7 @@ async fn allowed_https_transparent_is_proxied_and_captured() {
         .expect("open capture")
         .read_to_string(&mut contents)
         .expect("read capture");
-    let record: CaptureRecord =
-        serde_json::from_str(&contents).expect("decode capture");
+    let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
     assert_eq!(record.mode, CaptureMode::HttpsTransparent);
     assert!(
         record.url.starts_with("https://"),
@@ -753,8 +669,7 @@ async fn allowed_https_transparent_h2_is_proxied_and_captured() {
         },
     )];
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
@@ -762,21 +677,11 @@ async fn allowed_https_transparent_h2_is_proxied_and_captured() {
     let (proxy_addr, temp_dir, ca_cert_path) =
         start_proxy_with_config(config, proxy_listener).await;
 
-    let host_header = format!(
-        "{}:{}",
-        upstream_addr.ip(),
-        upstream_addr.port()
-    );
+    let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
 
     let (version, status, body) =
-        send_h2_https_request_via_transparent(
-            proxy_addr,
-            &ca_cert_path,
-            &host_header,
-            "/ok",
-            &[],
-        )
-        .await;
+        send_h2_https_request_via_transparent(proxy_addr, &ca_cert_path, &host_header, "/ok", &[])
+            .await;
 
     assert_eq!(version, Version::HTTP_2);
     assert_eq!(status, StatusCode::OK.as_u16());
@@ -787,8 +692,9 @@ async fn allowed_https_transparent_h2_is_proxied_and_captured() {
     let capture_dir = temp_dir.path().join("captures");
     for _ in 0..10 {
         if capture_dir.is_dir() {
-            let entries: Vec<_> =
-                std::fs::read_dir(&capture_dir).expect("read capture dir").collect();
+            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
+                .expect("read capture dir")
+                .collect();
             if !entries.is_empty() {
                 break;
             }
@@ -796,8 +702,7 @@ async fn allowed_https_transparent_h2_is_proxied_and_captured() {
         sleep(Duration::from_millis(50)).await;
     }
 
-    let mut entries =
-        std::fs::read_dir(&capture_dir).expect("read capture dir");
+    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
     let mut files = Vec::new();
     while let Some(entry) = entries.next() {
         let entry = entry.expect("dir entry");
@@ -815,8 +720,7 @@ async fn allowed_https_transparent_h2_is_proxied_and_captured() {
         .expect("open capture")
         .read_to_string(&mut contents)
         .expect("read capture");
-    let record: CaptureRecord =
-        serde_json::from_str(&contents).expect("decode capture");
+    let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
     assert_eq!(record.mode, CaptureMode::HttpsTransparent);
     assert!(
         record
@@ -854,8 +758,7 @@ async fn concurrent_h2_streams_share_connection_and_are_captured() {
         },
     )];
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
@@ -866,37 +769,34 @@ async fn concurrent_h2_streams_share_connection_and_are_captured() {
     // Build a single HTTP/2 connection and send two streams concurrently.
     use rustls_pemfile;
 
-    let stream =
-        tokio::net::TcpStream::connect(proxy_addr).await.expect("connect proxy");
+    let stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
 
-    let ca_pem =
-        std::fs::read(&ca_cert_path).expect("read ca cert");
+    let ca_pem = std::fs::read(&ca_cert_path).expect("read ca cert");
     let mut reader = std::io::Cursor::new(ca_pem);
     let mut roots = RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut reader).expect("parse ca cert") {
         let cert = RustlsCertificate(cert.to_vec());
-        roots
-            .add(&cert)
-            .expect("add root cert to store");
+        roots.add(&cert).expect("add root cert to store");
     }
 
     let mut tls_config = ClientConfig::builder()
         .with_safe_defaults()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    tls_config.alpn_protocols =
-        vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let connector = TlsConnector::from(Arc::new(tls_config));
-    let server_name =
-        ServerName::try_from("transparent.test").expect("server name");
+    let server_name = ServerName::try_from("transparent.test").expect("server name");
     let tls_stream = connector
         .connect(server_name, stream)
         .await
         .expect("tls connect");
 
-    let (send_request, connection) =
-        h2_client::handshake(tls_stream).await.expect("h2 handshake");
+    let (send_request, connection) = h2_client::handshake(tls_stream)
+        .await
+        .expect("h2 handshake");
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -904,17 +804,10 @@ async fn concurrent_h2_streams_share_connection_and_are_captured() {
         }
     });
 
-    let host_header = format!(
-        "{}:{}",
-        upstream_addr.ip(),
-        upstream_addr.port()
-    );
+    let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
 
     // Prepare two requests on the same H2 connection.
-    let mut send_request = send_request
-        .ready()
-        .await
-        .expect("h2 ready");
+    let mut send_request = send_request.ready().await.expect("h2 ready");
 
     let uri1 = format!("https://{host}{path}", host = host_header, path = "/ok");
     let uri2 = format!("https://{host}{path}", host = host_header, path = "/ok2");
@@ -935,10 +828,8 @@ async fn concurrent_h2_streams_share_connection_and_are_captured() {
         .body(())
         .expect("build h2 request 2");
 
-    let (resp1_fut, _send1) =
-        send_request.send_request(req1, true).expect("send h2 req1");
-    let (resp2_fut, _send2) =
-        send_request.send_request(req2, true).expect("send h2 req2");
+    let (resp1_fut, _send1) = send_request.send_request(req1, true).expect("send h2 req1");
+    let (resp2_fut, _send2) = send_request.send_request(req2, true).expect("send h2 req2");
 
     let resp1 = resp1_fut.await.expect("resp1");
     let resp2 = resp2_fut.await.expect("resp2");
@@ -947,16 +838,12 @@ async fn concurrent_h2_streams_share_connection_and_are_captured() {
     let (head2, mut body2) = resp2.into_parts();
 
     let mut body_bytes1 = Vec::new();
-    while let Some(chunk) =
-        body1.data().await.transpose().expect("h2 data1")
-    {
+    while let Some(chunk) = body1.data().await.transpose().expect("h2 data1") {
         body_bytes1.extend_from_slice(&chunk);
     }
 
     let mut body_bytes2 = Vec::new();
-    while let Some(chunk) =
-        body2.data().await.transpose().expect("h2 data2")
-    {
+    while let Some(chunk) = body2.data().await.transpose().expect("h2 data2") {
         body_bytes2.extend_from_slice(&chunk);
     }
 
@@ -973,8 +860,9 @@ async fn concurrent_h2_streams_share_connection_and_are_captured() {
     let capture_dir = temp_dir.path().join("captures");
     for _ in 0..10 {
         if capture_dir.is_dir() {
-            let entries: Vec<_> =
-                std::fs::read_dir(&capture_dir).expect("read capture dir").collect();
+            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
+                .expect("read capture dir")
+                .collect();
             if entries.len() >= 2 {
                 break;
             }
@@ -982,8 +870,7 @@ async fn concurrent_h2_streams_share_connection_and_are_captured() {
         sleep(Duration::from_millis(50)).await;
     }
 
-    let mut entries =
-        std::fs::read_dir(&capture_dir).expect("read capture dir");
+    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
     let mut files = Vec::new();
     while let Some(entry) = entries.next() {
         let entry = entry.expect("dir entry");
@@ -1003,8 +890,7 @@ async fn concurrent_h2_streams_share_connection_and_are_captured() {
             .expect("open capture")
             .read_to_string(&mut contents)
             .expect("read capture");
-        let record: CaptureRecord =
-            serde_json::from_str(&contents).expect("decode capture");
+        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
         assert_eq!(record.mode, CaptureMode::HttpsTransparent);
         assert_eq!(record.decision, CaptureDecision::Allow);
         records.push(record);
@@ -1016,9 +902,7 @@ async fn concurrent_h2_streams_share_connection_and_are_captured() {
 
     let mut by_id: HashMap<String, (usize, usize)> = HashMap::new();
     for rec in records {
-        let entry = by_id
-            .entry(rec.request_id.clone())
-            .or_insert((0, 0));
+        let entry = by_id.entry(rec.request_id.clone()).or_insert((0, 0));
         match rec.kind {
             CaptureKind::Request => entry.0 += 1,
             CaptureKind::Response => entry.1 += 1,
@@ -1070,8 +954,7 @@ async fn concurrent_h2_streams_mixed_allow_and_deny() {
         },
     )];
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
@@ -1082,37 +965,34 @@ async fn concurrent_h2_streams_mixed_allow_and_deny() {
     // Single HTTP/2 connection with one allowed and one denied stream.
     use rustls_pemfile;
 
-    let stream =
-        tokio::net::TcpStream::connect(proxy_addr).await.expect("connect proxy");
+    let stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
 
-    let ca_pem =
-        std::fs::read(&ca_cert_path).expect("read ca cert");
+    let ca_pem = std::fs::read(&ca_cert_path).expect("read ca cert");
     let mut reader = std::io::Cursor::new(ca_pem);
     let mut roots = RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut reader).expect("parse ca cert") {
         let cert = RustlsCertificate(cert.to_vec());
-        roots
-            .add(&cert)
-            .expect("add root cert to store");
+        roots.add(&cert).expect("add root cert to store");
     }
 
     let mut tls_config = ClientConfig::builder()
         .with_safe_defaults()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    tls_config.alpn_protocols =
-        vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let connector = TlsConnector::from(Arc::new(tls_config));
-    let server_name =
-        ServerName::try_from("transparent.test").expect("server name");
+    let server_name = ServerName::try_from("transparent.test").expect("server name");
     let tls_stream = connector
         .connect(server_name, stream)
         .await
         .expect("tls connect");
 
-    let (send_request, connection) =
-        h2_client::handshake(tls_stream).await.expect("h2 handshake");
+    let (send_request, connection) = h2_client::handshake(tls_stream)
+        .await
+        .expect("h2 handshake");
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -1120,21 +1000,12 @@ async fn concurrent_h2_streams_mixed_allow_and_deny() {
         }
     });
 
-    let host_header = format!(
-        "{}:{}",
-        upstream_addr.ip(),
-        upstream_addr.port()
-    );
+    let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
 
-    let mut send_request = send_request
-        .ready()
-        .await
-        .expect("h2 ready");
+    let mut send_request = send_request.ready().await.expect("h2 ready");
 
-    let uri_ok =
-        format!("https://{host}{path}", host = host_header, path = "/ok");
-    let uri_denied =
-        format!("https://{host}{path}", host = host_header, path = "/denied");
+    let uri_ok = format!("https://{host}{path}", host = host_header, path = "/ok");
+    let uri_denied = format!("https://{host}{path}", host = host_header, path = "/denied");
 
     let req_ok = http::Request::builder()
         .method(Method::GET)
@@ -1152,10 +1023,10 @@ async fn concurrent_h2_streams_mixed_allow_and_deny() {
         .body(())
         .expect("build denied request");
 
-    let (resp_ok_fut, _send_ok) =
-        send_request.send_request(req_ok, true).expect("send ok");
-    let (resp_denied_fut, _send_denied) =
-        send_request.send_request(req_denied, true).expect("send denied");
+    let (resp_ok_fut, _send_ok) = send_request.send_request(req_ok, true).expect("send ok");
+    let (resp_denied_fut, _send_denied) = send_request
+        .send_request(req_denied, true)
+        .expect("send denied");
 
     let resp_ok = resp_ok_fut.await.expect("resp ok");
     let resp_denied = resp_denied_fut.await.expect("resp denied");
@@ -1164,15 +1035,11 @@ async fn concurrent_h2_streams_mixed_allow_and_deny() {
     let (head_denied, mut body_denied) = resp_denied.into_parts();
 
     let mut body_bytes_ok = Vec::new();
-    while let Some(chunk) =
-        body_ok.data().await.transpose().expect("ok data")
-    {
+    while let Some(chunk) = body_ok.data().await.transpose().expect("ok data") {
         body_bytes_ok.extend_from_slice(&chunk);
     }
     let mut body_bytes_denied = Vec::new();
-    while let Some(chunk) =
-        body_denied.data().await.transpose().expect("denied data")
-    {
+    while let Some(chunk) = body_denied.data().await.transpose().expect("denied data") {
         body_bytes_denied.extend_from_slice(&chunk);
     }
 
@@ -1183,17 +1050,11 @@ async fn concurrent_h2_streams_mixed_allow_and_deny() {
         "expected ok body"
     );
 
-    assert_eq!(
-        head_denied.status.as_u16(),
-        StatusCode::FORBIDDEN.as_u16()
-    );
+    assert_eq!(head_denied.status.as_u16(), StatusCode::FORBIDDEN.as_u16());
     let denied_json: serde_json::Value =
         serde_json::from_slice(&body_bytes_denied).expect("deny JSON");
     assert_eq!(denied_json["error"], "Forbidden");
-    assert_eq!(
-        denied_json["message"],
-        "Blocked by URL policy"
-    );
+    assert_eq!(denied_json["message"], "Blocked by URL policy");
 
     // Inspect capture to ensure separate requestIds and per-stream decisions.
     use tokio::time::{sleep, Duration};
@@ -1201,8 +1062,9 @@ async fn concurrent_h2_streams_mixed_allow_and_deny() {
     let capture_dir = temp_dir.path().join("captures");
     for _ in 0..10 {
         if capture_dir.is_dir() {
-            let entries: Vec<_> =
-                std::fs::read_dir(&capture_dir).expect("read capture dir").collect();
+            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
+                .expect("read capture dir")
+                .collect();
             if !entries.is_empty() {
                 break;
             }
@@ -1210,8 +1072,7 @@ async fn concurrent_h2_streams_mixed_allow_and_deny() {
         sleep(Duration::from_millis(50)).await;
     }
 
-    let mut entries =
-        std::fs::read_dir(&capture_dir).expect("read capture dir");
+    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
     let mut files = Vec::new();
     while let Some(entry) = entries.next() {
         let entry = entry.expect("dir entry");
@@ -1226,8 +1087,7 @@ async fn concurrent_h2_streams_mixed_allow_and_deny() {
 
     use std::collections::HashMap;
 
-    let mut by_id: HashMap<String, (CaptureDecision, usize, usize)> =
-        HashMap::new();
+    let mut by_id: HashMap<String, (CaptureDecision, usize, usize)> = HashMap::new();
 
     for path in files {
         let mut contents = String::new();
@@ -1235,8 +1095,7 @@ async fn concurrent_h2_streams_mixed_allow_and_deny() {
             .expect("open capture")
             .read_to_string(&mut contents)
             .expect("read capture");
-        let record: CaptureRecord =
-            serde_json::from_str(&contents).expect("decode capture");
+        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
         assert_eq!(record.mode, CaptureMode::HttpsTransparent);
 
         let entry = by_id
@@ -1304,8 +1163,7 @@ async fn large_h2_request_body_is_truncated_in_capture() {
         },
     )];
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
@@ -1313,22 +1171,17 @@ async fn large_h2_request_body_is_truncated_in_capture() {
     let (proxy_addr, temp_dir, ca_cert_path) =
         start_proxy_with_config(config, proxy_listener).await;
 
-    let host_header = format!(
-        "{}:{}",
-        upstream_addr.ip(),
-        upstream_addr.port()
-    );
+    let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
 
     let body = vec![b'y'; LARGE_BODY_BYTES];
-    let (_version, status, resp_body) =
-        send_h2_https_request_with_body_via_transparent(
-            proxy_addr,
-            &ca_cert_path,
-            &host_header,
-            "/large-request",
-            body.clone(),
-        )
-        .await;
+    let (_version, status, resp_body) = send_h2_https_request_with_body_via_transparent(
+        proxy_addr,
+        &ca_cert_path,
+        &host_header,
+        "/large-request",
+        body.clone(),
+    )
+    .await;
 
     assert_eq!(status, StatusCode::OK.as_u16());
     assert_eq!(resp_body, "ok");
@@ -1338,8 +1191,9 @@ async fn large_h2_request_body_is_truncated_in_capture() {
     let capture_dir = temp_dir.path().join("captures");
     for _ in 0..10 {
         if capture_dir.is_dir() {
-            let entries: Vec<_> =
-                std::fs::read_dir(&capture_dir).expect("read capture dir").collect();
+            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
+                .expect("read capture dir")
+                .collect();
             if !entries.is_empty() {
                 break;
             }
@@ -1347,8 +1201,7 @@ async fn large_h2_request_body_is_truncated_in_capture() {
         sleep(Duration::from_millis(50)).await;
     }
 
-    let mut entries =
-        std::fs::read_dir(&capture_dir).expect("read capture dir");
+    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
     let mut files = Vec::new();
     while let Some(entry) = entries.next() {
         let entry = entry.expect("dir entry");
@@ -1371,21 +1224,14 @@ async fn large_h2_request_body_is_truncated_in_capture() {
             .expect("open capture")
             .read_to_string(&mut contents)
             .expect("read capture");
-        let record: CaptureRecord =
-            serde_json::from_str(&contents).expect("decode capture");
+        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
 
         if record.kind == CaptureKind::Request
             && record.decision == CaptureDecision::Allow
-            && record
-                .url
-                .ends_with("/large-request")
+            && record.url.ends_with("/large-request")
         {
-            let body = record
-                .body
-                .as_ref()
-                .expect("expected captured body");
-            let decoded =
-                record.decode_body_bytes().expect("decode capture body");
+            let body = record.body.as_ref().expect("expected captured body");
+            let decoded = record.decode_body_bytes().expect("decode capture body");
             assert!(
                 body.length >= decoded.len(),
                 "logical body length should be at least the number of captured bytes"
@@ -1417,8 +1263,7 @@ async fn large_h2_request_body_is_truncated_in_capture() {
 #[tokio::test(flavor = "multi_thread")]
 async fn large_h2_response_body_is_truncated_in_capture() {
     eprintln!("large_h2_response: starting upstream server");
-    let upstream_addr =
-        start_upstream_https_large_response_server().await;
+    let upstream_addr = start_upstream_https_large_response_server().await;
 
     let mut config = minimal_https_transparent_config();
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
@@ -1441,8 +1286,7 @@ async fn large_h2_response_body_is_truncated_in_capture() {
         },
     )];
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
@@ -1451,11 +1295,7 @@ async fn large_h2_response_body_is_truncated_in_capture() {
     let (proxy_addr, temp_dir, ca_cert_path) =
         start_proxy_with_config(config, proxy_listener).await;
 
-    let host_header = format!(
-        "{}:{}",
-        upstream_addr.ip(),
-        upstream_addr.port()
-    );
+    let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
 
     eprintln!("large_h2_response: sending h2 request via transparent proxy");
     // Use an HTTP/1.1 client to keep the focus of this test on large
@@ -1495,8 +1335,7 @@ async fn large_h2_response_body_is_truncated_in_capture() {
             continue;
         }
 
-        let mut entries =
-            std::fs::read_dir(&capture_dir).expect("read capture dir");
+        let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
         while let Some(entry) = entries.next() {
             let entry = entry.expect("dir entry");
             if !entry.file_type().expect("file type").is_file() {
@@ -1508,14 +1347,11 @@ async fn large_h2_response_body_is_truncated_in_capture() {
                 .expect("open capture")
                 .read_to_string(&mut contents)
                 .expect("read capture");
-            let record: CaptureRecord =
-                serde_json::from_str(&contents).expect("decode capture");
+            let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
 
             if record.kind == CaptureKind::Response
                 && record.decision == CaptureDecision::Allow
-                && record
-                    .url
-                    .ends_with("/large-response")
+                && record.url.ends_with("/large-response")
             {
                 found_response = Some(record);
                 break;
@@ -1529,19 +1365,14 @@ async fn large_h2_response_body_is_truncated_in_capture() {
         sleep(Duration::from_millis(50)).await;
     }
 
-    let record = found_response
-        .expect("did not find large H2 response capture record");
-    let body = record
-        .body
-        .as_ref()
-        .expect("expected captured body");
+    let record = found_response.expect("did not find large H2 response capture record");
+    let body = record.body.as_ref().expect("expected captured body");
     assert_eq!(
         body.length, LARGE_BODY_BYTES,
         "logical body length should reflect full H2 response size"
     );
 
-    let decoded =
-        record.decode_body_bytes().expect("decode capture body");
+    let decoded = record.decode_body_bytes().expect("decode capture body");
     assert!(
         decoded.len() <= DEFAULT_MAX_BODY_BYTES,
         "captured bytes should be truncated to DEFAULT_MAX_BODY_BYTES"
@@ -1554,8 +1385,7 @@ async fn large_h2_response_body_is_truncated_in_capture() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn h2_client_to_http1_only_upstream_preserves_versions_in_capture() {
-    let upstream_addr =
-        start_upstream_https_http1_only_echo_server().await;
+    let upstream_addr = start_upstream_https_http1_only_echo_server().await;
 
     let mut config = minimal_https_transparent_config();
     // Enable optional HTTP/2 upstream support; the origin only offers
@@ -1583,8 +1413,7 @@ async fn h2_client_to_http1_only_upstream_preserves_versions_in_capture() {
         },
     )];
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
@@ -1592,21 +1421,11 @@ async fn h2_client_to_http1_only_upstream_preserves_versions_in_capture() {
     let (proxy_addr, temp_dir, ca_cert_path) =
         start_proxy_with_config(config, proxy_listener).await;
 
-    let host_header = format!(
-        "{}:{}",
-        upstream_addr.ip(),
-        upstream_addr.port()
-    );
+    let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
 
     let (version, status, body) =
-        send_h2_https_request_via_transparent(
-            proxy_addr,
-            &ca_cert_path,
-            &host_header,
-            "/ok",
-            &[],
-        )
-        .await;
+        send_h2_https_request_via_transparent(proxy_addr, &ca_cert_path, &host_header, "/ok", &[])
+            .await;
 
     assert_eq!(version, Version::HTTP_2);
     assert_eq!(status, StatusCode::OK.as_u16());
@@ -1617,8 +1436,9 @@ async fn h2_client_to_http1_only_upstream_preserves_versions_in_capture() {
     let capture_dir = temp_dir.path().join("captures");
     for _ in 0..10 {
         if capture_dir.is_dir() {
-            let entries: Vec<_> =
-                std::fs::read_dir(&capture_dir).expect("read capture dir").collect();
+            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
+                .expect("read capture dir")
+                .collect();
             if !entries.is_empty() {
                 break;
             }
@@ -1626,8 +1446,7 @@ async fn h2_client_to_http1_only_upstream_preserves_versions_in_capture() {
         sleep(Duration::from_millis(50)).await;
     }
 
-    let mut entries =
-        std::fs::read_dir(&capture_dir).expect("read capture dir");
+    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
     let mut files = Vec::new();
     while let Some(entry) = entries.next() {
         let entry = entry.expect("dir entry");
@@ -1642,8 +1461,7 @@ async fn h2_client_to_http1_only_upstream_preserves_versions_in_capture() {
 
     use std::collections::HashMap;
 
-    let mut by_id: HashMap<String, (Option<String>, Option<String>)> =
-        HashMap::new();
+    let mut by_id: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
 
     for path in files {
         let mut contents = String::new();
@@ -1651,8 +1469,7 @@ async fn h2_client_to_http1_only_upstream_preserves_versions_in_capture() {
             .expect("open capture")
             .read_to_string(&mut contents)
             .expect("read capture");
-        let record: CaptureRecord =
-            serde_json::from_str(&contents).expect("decode capture");
+        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
         assert_eq!(record.mode, CaptureMode::HttpsTransparent);
         assert_eq!(record.decision, CaptureDecision::Allow);
 
@@ -1671,8 +1488,7 @@ async fn h2_client_to_http1_only_upstream_preserves_versions_in_capture() {
         "expected a single logical requestId for downgrade test"
     );
 
-    let (req_version, resp_version) =
-        by_id.into_iter().next().unwrap().1;
+    let (req_version, resp_version) = by_id.into_iter().next().unwrap().1;
     assert_eq!(
         req_version.as_deref(),
         Some("2"),
@@ -1711,8 +1527,7 @@ async fn denied_https_transparent_returns_403() {
         },
     )];
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
@@ -1721,11 +1536,7 @@ async fn denied_https_transparent_returns_403() {
         start_proxy_with_config(config, proxy_listener).await;
 
     let sni_host = "transparent.test";
-    let host_header = format!(
-        "{}:{}",
-        upstream_addr.ip(),
-        upstream_addr.port()
-    );
+    let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
 
     let (status, body) = send_https_request_via_transparent(
         proxy_addr,
@@ -1739,8 +1550,7 @@ async fn denied_https_transparent_returns_403() {
 
     assert_eq!(status, StatusCode::FORBIDDEN.as_u16());
     let json_body = body.trim();
-    let json: serde_json::Value =
-        serde_json::from_str(json_body).expect("parse deny JSON");
+    let json: serde_json::Value = serde_json::from_str(json_body).expect("parse deny JSON");
     assert_eq!(json["error"], "Forbidden");
     assert_eq!(json["message"], "Blocked by URL policy");
 
@@ -1751,8 +1561,9 @@ async fn denied_https_transparent_returns_403() {
     let capture_dir = temp_dir.path().join("captures");
     for _ in 0..10 {
         if capture_dir.is_dir() {
-            let entries: Vec<_> =
-                std::fs::read_dir(&capture_dir).expect("read capture dir").collect();
+            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
+                .expect("read capture dir")
+                .collect();
             if !entries.is_empty() {
                 break;
             }
@@ -1760,8 +1571,7 @@ async fn denied_https_transparent_returns_403() {
         sleep(Duration::from_millis(50)).await;
     }
 
-    let mut entries =
-        std::fs::read_dir(&capture_dir).expect("read capture dir");
+    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
     let mut files = Vec::new();
     while let Some(entry) = entries.next() {
         let entry = entry.expect("dir entry");
@@ -1782,8 +1592,7 @@ async fn denied_https_transparent_returns_403() {
             .expect("open capture")
             .read_to_string(&mut contents)
             .expect("read capture");
-        let record: CaptureRecord =
-            serde_json::from_str(&contents).expect("decode capture");
+        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
 
         assert_eq!(record.mode, CaptureMode::HttpsTransparent);
         assert_eq!(record.decision, CaptureDecision::Deny);
@@ -1812,7 +1621,10 @@ async fn denied_https_transparent_returns_403() {
     }
 
     assert!(saw_request, "expected at least one denied request capture");
-    assert!(saw_response, "expected at least one denied response capture");
+    assert!(
+        saw_response,
+        "expected at least one denied response capture"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1841,8 +1653,7 @@ async fn denied_https_transparent_h2_returns_403() {
         },
     )];
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
@@ -1850,26 +1661,20 @@ async fn denied_https_transparent_h2_returns_403() {
     let (proxy_addr, temp_dir, ca_cert_path) =
         start_proxy_with_config(config, proxy_listener).await;
 
-    let host_header = format!(
-        "{}:{}",
-        upstream_addr.ip(),
-        upstream_addr.port()
-    );
+    let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
 
-    let (_version, status, body) =
-        send_h2_https_request_via_transparent(
-            proxy_addr,
-            &ca_cert_path,
-            &host_header,
-            "/denied",
-            &[],
-        )
-        .await;
+    let (_version, status, body) = send_h2_https_request_via_transparent(
+        proxy_addr,
+        &ca_cert_path,
+        &host_header,
+        "/denied",
+        &[],
+    )
+    .await;
 
     assert_eq!(status, StatusCode::FORBIDDEN.as_u16());
     let json_body = body.trim();
-    let json: serde_json::Value =
-        serde_json::from_str(json_body).expect("parse deny JSON");
+    let json: serde_json::Value = serde_json::from_str(json_body).expect("parse deny JSON");
     assert_eq!(json["error"], "Forbidden");
     assert_eq!(json["message"], "Blocked by URL policy");
 
@@ -1880,8 +1685,9 @@ async fn denied_https_transparent_h2_returns_403() {
     let capture_dir = temp_dir.path().join("captures");
     for _ in 0..10 {
         if capture_dir.is_dir() {
-            let entries: Vec<_> =
-                std::fs::read_dir(&capture_dir).expect("read capture dir").collect();
+            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
+                .expect("read capture dir")
+                .collect();
             if !entries.is_empty() {
                 break;
             }
@@ -1889,8 +1695,7 @@ async fn denied_https_transparent_h2_returns_403() {
         sleep(Duration::from_millis(50)).await;
     }
 
-    let mut entries =
-        std::fs::read_dir(&capture_dir).expect("read capture dir");
+    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
     let mut files = Vec::new();
     while let Some(entry) = entries.next() {
         let entry = entry.expect("dir entry");
@@ -1911,8 +1716,7 @@ async fn denied_https_transparent_h2_returns_403() {
             .expect("open capture")
             .read_to_string(&mut contents)
             .expect("read capture");
-        let record: CaptureRecord =
-            serde_json::from_str(&contents).expect("decode capture");
+        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
 
         assert_eq!(record.mode, CaptureMode::HttpsTransparent);
         assert_eq!(record.decision, CaptureDecision::Deny);
@@ -1940,8 +1744,14 @@ async fn denied_https_transparent_h2_returns_403() {
         }
     }
 
-    assert!(saw_request, "expected at least one denied H2 request capture");
-    assert!(saw_response, "expected at least one denied H2 response capture");
+    assert!(
+        saw_request,
+        "expected at least one denied H2 request capture"
+    );
+    assert!(
+        saw_response,
+        "expected at least one denied H2 response capture"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1953,8 +1763,7 @@ async fn loop_detected_https_transparent_returns_508() {
     // Allow traffic so that loop protection is the deciding factor.
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Allow;
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
@@ -1963,11 +1772,7 @@ async fn loop_detected_https_transparent_returns_508() {
         start_proxy_with_config(config, proxy_listener).await;
 
     let sni_host = "transparent.test";
-    let host_header = format!(
-        "{}:{}",
-        upstream_addr.ip(),
-        upstream_addr.port()
-    );
+    let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
 
     let (status, body) = send_https_request_via_transparent(
         proxy_addr,
@@ -1981,8 +1786,7 @@ async fn loop_detected_https_transparent_returns_508() {
 
     assert_eq!(status, StatusCode::LOOP_DETECTED.as_u16());
     let json_body = body.trim();
-    let json: serde_json::Value =
-        serde_json::from_str(json_body).expect("parse loop JSON");
+    let json: serde_json::Value = serde_json::from_str(json_body).expect("parse loop JSON");
     assert_eq!(json["error"], "LoopDetected");
     assert_eq!(
         json["message"],

@@ -13,11 +13,8 @@ use crate::app::AppState;
 use crate::capture::{CaptureDecision, CaptureEndpoint, CaptureMode};
 use crate::logging::PolicyDecisionLogContext;
 use crate::proxy::http::{
-    build_loop_detected_response, generate_request_id, has_loop_header,
-    proxy_allowed_request, run_external_auth_gate_lifecycle,
-    build_external_auth_denied_response,
-    build_external_auth_error_response,
-    build_external_auth_timeout_response,
+    build_external_auth_error_response, build_loop_detected_response, generate_request_id,
+    has_loop_header, proxy_allowed_request, run_external_auth_gate_lifecycle,
 };
 
 /// Handle an incoming CONNECT request on the HTTP listener.
@@ -46,8 +43,7 @@ pub async fn handle_connect_request(
 
     let host = authority.host().to_string();
     if host.is_empty() {
-        let mut resp =
-            Response::new(Body::from("Bad Request: missing CONNECT host"));
+        let mut resp = Response::new(Body::from("Bad Request: missing CONNECT host"));
         *resp.status_mut() = StatusCode::BAD_REQUEST;
         return resp;
     }
@@ -66,9 +62,7 @@ pub async fn handle_connect_request(
 
     // Loop protection on the CONNECT request itself.
     let loop_settings = &state.loop_protection;
-    if loop_settings.enabled
-        && has_loop_header(req.headers(), &loop_settings.header_name)
-    {
+    if loop_settings.enabled && has_loop_header(req.headers(), &loop_settings.header_name) {
         let resp = build_loop_detected_response(
             &state,
             &request_id,
@@ -85,15 +79,11 @@ pub async fn handle_connect_request(
     }
 
     // Prepare TLS acceptor for the CONNECT target host.
-    let tls_acceptor = match state.cert_manager.tls_acceptor_for_host(&host)
-    {
+    let tls_acceptor = match state.cert_manager.tls_acceptor_for_host(&host) {
         Ok(a) => a,
         Err(err) => {
-            tracing::error!(
-                "failed to build TLS acceptor for {host}: {err}"
-            );
-            let mut resp =
-                Response::new(Body::from("Internal Server Error"));
+            tracing::error!("failed to build TLS acceptor for {host}: {err}");
+            let mut resp = Response::new(Body::from("Internal Server Error"));
             *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
             return resp;
         }
@@ -124,15 +114,11 @@ pub async fn handle_connect_request(
                 )
                 .await
                 {
-                    tracing::debug!(
-                        "CONNECT tunnel error for {host}:{port}: {err}"
-                    );
+                    tracing::debug!("CONNECT tunnel error for {host}:{port}: {err}");
                 }
             }
             Err(err) => {
-                tracing::debug!(
-                    "failed to upgrade CONNECT connection: {err}"
-                );
+                tracing::debug!("failed to upgrade CONNECT connection: {err}");
             }
         }
     });
@@ -199,8 +185,7 @@ async fn run_tls_connect_tunnel(
         "accepted TLS connection inside CONNECT tunnel"
     );
 
-    let client_ip_for_policy =
-        client.address.clone().unwrap_or_default();
+    let client_ip_for_policy = client.address.clone().unwrap_or_default();
 
     let state_for_svc = state.clone();
     let client_for_svc = client.clone();
@@ -211,12 +196,7 @@ async fn run_tls_connect_tunnel(
         let client = client_for_svc.clone();
         let target = target_for_svc.clone();
         let client_ip = client_ip_for_policy.clone();
-        async move {
-            handle_inner_https_request(
-                state, client, target, client_ip, req,
-            )
-            .await
-        }
+        async move { handle_inner_https_request(state, client, target, client_ip, req).await }
     });
 
     Http::new()
@@ -244,9 +224,7 @@ async fn handle_inner_https_request(
 
     // Loop protection inside the tunnel.
     let loop_settings = &state.loop_protection;
-    if loop_settings.enabled
-        && has_loop_header(req.headers(), &loop_settings.header_name)
-    {
+    if loop_settings.enabled && has_loop_header(req.headers(), &loop_settings.header_name) {
         let resp = build_loop_detected_response(
             &state,
             &request_id,
@@ -297,11 +275,8 @@ async fn handle_inner_https_request(
         .unwrap_or_default();
 
     if let Some(rule) = matched_rule {
-        if let Some(profile_name) = rule.external_auth_profile.as_ref()
-        {
-            if let Some(profile) =
-                state.external_auth.get_profile(profile_name)
-            {
+        if let Some(profile_name) = rule.external_auth_profile.as_ref() {
+            if let Some(profile) = state.external_auth.get_profile(profile_name) {
                 let resp = handle_inner_external_auth_gate(
                     state.clone(),
                     &request_id,
@@ -393,24 +368,19 @@ async fn handle_inner_external_auth_gate(
     .await
 }
 
-fn build_https_url_for_inner_request(
-    target: &CaptureEndpoint,
-    uri: &Uri,
-) -> String {
-    let host = target
-        .address
-        .as_deref()
-        .unwrap_or("unknown-host");
+fn build_https_url_for_inner_request(target: &CaptureEndpoint, uri: &Uri) -> String {
+    let host = target.address.as_deref().unwrap_or("unknown-host");
     let host_with_port = match target.port {
         Some(443) | None => host.to_string(),
         Some(port) => format!("{host}:{port}"),
     };
-    let path_and_query = uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or("/");
+    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
-    format!("https://{host}{path}", host = host_with_port, path = path_and_query)
+    format!(
+        "https://{host}{path}",
+        host = host_with_port,
+        path = path_and_query
+    )
 }
 
 async fn build_connect_policy_denied_response(

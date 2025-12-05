@@ -47,15 +47,12 @@ impl AppState {
     pub fn from_config(config: Config) -> Result<Self, AppStateError> {
         let logging = LoggingSettings::from_config(&config.logging)?;
         let policy = PolicyEngine::from_config(&config.policy)?;
-        let loop_protection =
-            LoopProtectionSettings::from_config(&config.loop_protection)?;
+        let loop_protection = LoopProtectionSettings::from_config(&config.loop_protection)?;
 
         let http_client = build_http_client(&config.tls);
         let cert_manager = CertManager::from_config(&config.certificates)?;
-        let external_auth = ExternalAuthManager::new(
-            &config.policy.external_auth_profiles,
-            http_client.clone(),
-        );
+        let external_auth =
+            ExternalAuthManager::new(&config.policy.external_auth_profiles, http_client.clone());
 
         Ok(AppState {
             config,
@@ -69,9 +66,7 @@ impl AppState {
     }
 
     /// Build a new shared, reloadable application state from configuration.
-    pub fn shared_from_config(
-        config: Config,
-    ) -> Result<SharedAppState, AppStateError> {
+    pub fn shared_from_config(config: Config) -> Result<SharedAppState, AppStateError> {
         let state = AppState::from_config(config)?;
         Ok(Arc::new(ArcSwap::from_pointee(state)))
     }
@@ -91,7 +86,9 @@ impl AppState {
     }
 }
 
-fn build_http_client(tls: &TlsConfig) -> Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>> {
+fn build_http_client(
+    tls: &TlsConfig,
+) -> Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>> {
     let mut config = ClientConfig::builder()
         .with_safe_defaults()
         .with_native_roots()

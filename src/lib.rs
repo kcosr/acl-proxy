@@ -1,10 +1,10 @@
+pub mod app;
+pub mod capture;
+pub mod certs;
 pub mod cli;
 pub mod config;
-pub mod policy;
-pub mod logging;
-pub mod capture;
-pub mod app;
-pub mod loop_protection;
-pub mod proxy;
-pub mod certs;
 pub mod external_auth;
+pub mod logging;
+pub mod loop_protection;
+pub mod policy;
+pub mod proxy;

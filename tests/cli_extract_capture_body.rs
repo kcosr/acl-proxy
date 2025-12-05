@@ -1,7 +1,9 @@
 use std::fs::File;
 use std::io::Write;
+use std::process::Command;
 
 use acl_proxy::capture::{CaptureBody, CaptureKind, CaptureRecord};
+use assert_cmd::prelude::*;
 use predicates::str::contains;
 use tempfile::{NamedTempFile, TempDir};
 
@@ -30,8 +32,7 @@ fn cli_outputs_decoded_body_for_valid_capture() {
     use base64::engine::general_purpose;
     use base64::Engine as _;
 
-    let encoded =
-        general_purpose::STANDARD.encode(body_bytes);
+    let encoded = general_purpose::STANDARD.encode(body_bytes);
 
     let body = CaptureBody {
         encoding: "base64".to_string(),
@@ -41,63 +42,43 @@ fn cli_outputs_decoded_body_for_valid_capture() {
     };
 
     let record = sample_record(Some(body));
-    let json =
-        serde_json::to_string(&record).expect("serialize record");
+    let json = serde_json::to_string(&record).expect("serialize record");
 
-    let mut file =
-        NamedTempFile::new().expect("create temp capture file");
+    let mut file = NamedTempFile::new().expect("create temp capture file");
     write!(file, "{json}").expect("write capture json");
 
-    let mut cmd = assert_cmd::Command::cargo_bin(
-        "acl-proxy-extract-capture-body",
-    )
-    .expect("binary built");
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy-extract-capture-body"));
     cmd.arg(file.path());
 
-    cmd.assert()
-        .success()
-        .stdout(contains("hello world"));
+    cmd.assert().success().stdout(contains("hello world"));
 }
 
 #[test]
 fn cli_fails_for_invalid_json() {
-    let mut file =
-        NamedTempFile::new().expect("create temp capture file");
+    let file = NamedTempFile::new().expect("create temp capture file");
     {
         let mut f = File::create(file.path()).expect("open file");
         writeln!(f, "{{not-json").expect("write invalid json");
     }
 
-    let mut cmd = assert_cmd::Command::cargo_bin(
-        "acl-proxy-extract-capture-body",
-    )
-    .expect("binary built");
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy-extract-capture-body"));
     cmd.arg(file.path());
 
-    cmd.assert()
-        .failure()
-        .stderr(contains("invalid JSON"));
+    cmd.assert().failure().stderr(contains("invalid JSON"));
 }
 
 #[test]
 fn cli_fails_when_body_missing() {
     let record = sample_record(None);
-    let json =
-        serde_json::to_string(&record).expect("serialize record");
+    let json = serde_json::to_string(&record).expect("serialize record");
 
-    let mut file =
-        NamedTempFile::new().expect("create temp capture file");
+    let mut file = NamedTempFile::new().expect("create temp capture file");
     write!(file, "{json}").expect("write capture json");
 
-    let mut cmd = assert_cmd::Command::cargo_bin(
-        "acl-proxy-extract-capture-body",
-    )
-    .expect("binary built");
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy-extract-capture-body"));
     cmd.arg(file.path());
 
-    cmd.assert()
-        .failure()
-        .stderr(contains("no body field"));
+    cmd.assert().failure().stderr(contains("no body field"));
 }
 
 #[test]
@@ -110,38 +91,25 @@ fn cli_fails_for_unsupported_encoding() {
     };
 
     let record = sample_record(Some(body));
-    let json =
-        serde_json::to_string(&record).expect("serialize record");
+    let json = serde_json::to_string(&record).expect("serialize record");
 
-    let mut file =
-        NamedTempFile::new().expect("create temp capture file");
+    let mut file = NamedTempFile::new().expect("create temp capture file");
     write!(file, "{json}").expect("write capture json");
 
-    let mut cmd = assert_cmd::Command::cargo_bin(
-        "acl-proxy-extract-capture-body",
-    )
-    .expect("binary built");
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy-extract-capture-body"));
     cmd.arg(file.path());
 
-    cmd.assert()
-        .failure()
-        .stderr(contains("utf8"));
+    cmd.assert().failure().stderr(contains("utf8"));
 }
 
 #[test]
 fn cli_fails_for_empty_file() {
-    let file =
-        NamedTempFile::new().expect("create temp capture file");
+    let file = NamedTempFile::new().expect("create temp capture file");
 
-    let mut cmd = assert_cmd::Command::cargo_bin(
-        "acl-proxy-extract-capture-body",
-    )
-    .expect("binary built");
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy-extract-capture-body"));
     cmd.arg(file.path());
 
-    cmd.assert()
-        .failure()
-        .stderr(contains("invalid JSON"));
+    cmd.assert().failure().stderr(contains("invalid JSON"));
 }
 
 #[test]
@@ -149,10 +117,7 @@ fn cli_fails_for_missing_file() {
     let temp_dir = TempDir::new().expect("create temp dir");
     let missing = temp_dir.path().join("missing-capture.json");
 
-    let mut cmd = assert_cmd::Command::cargo_bin(
-        "acl-proxy-extract-capture-body",
-    )
-    .expect("binary built");
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy-extract-capture-body"));
     cmd.arg(&missing);
 
     cmd.assert()

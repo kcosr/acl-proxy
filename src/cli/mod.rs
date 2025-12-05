@@ -29,7 +29,11 @@ pub enum CliError {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "acl-proxy", version, about = "ACL-aware HTTP/HTTPS proxy (Rust)")]
+#[command(
+    name = "acl-proxy",
+    version,
+    about = "ACL-aware HTTP/HTTPS proxy (Rust)"
+)]
 pub struct Cli {
     /// Path to configuration file (TOML or JSON).
     #[arg(long, global = true)]
@@ -117,8 +121,7 @@ pub fn run() -> Result<ExitCode, CliError> {
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => {
             let config = load_config_for_cli(config_path)?;
-            let shared_state =
-                AppState::shared_from_config(config)?;
+            let shared_state = AppState::shared_from_config(config)?;
 
             if let Err(err) = shared_state.load().logging.init_tracing() {
                 eprintln!("failed to initialize logging: {err}");
@@ -126,20 +129,12 @@ pub fn run() -> Result<ExitCode, CliError> {
                 log_startup(shared_state.load().as_ref());
             }
 
-            let runtime = tokio::runtime::Runtime::new().map_err(|e| {
-                CliError::Runtime(format!(
-                    "failed to start tokio runtime: {e}"
-                ))
-            })?;
+            let runtime = tokio::runtime::Runtime::new()
+                .map_err(|e| CliError::Runtime(format!("failed to start tokio runtime: {e}")))?;
 
-            let result: Result<(), CliError> =
-                runtime.block_on(async move {
-                    run_proxy_with_signals(
-                        shared_state,
-                        config_path_owned.as_deref(),
-                    )
-                    .await
-                });
+            let result: Result<(), CliError> = runtime.block_on(async move {
+                run_proxy_with_signals(shared_state, config_path_owned.as_deref()).await
+            });
 
             match result {
                 Ok(()) => Ok(ExitCode::from(0)),
@@ -172,14 +167,10 @@ pub fn run() -> Result<ExitCode, CliError> {
         Command::Policy { command } => match command {
             PolicyCommand::Dump { format } => {
                 let config = load_config_for_cli(config_path)?;
-                let effective = crate::policy::EffectivePolicy::from_config(
-                    &config.policy,
-                )
-                .map_err(|e| {
-                    CliError::Config(crate::config::ConfigError::Invalid(
-                        e.to_string(),
-                    ))
-                })?;
+                let effective = crate::policy::EffectivePolicy::from_config(&config.policy)
+                    .map_err(|e| {
+                        CliError::Config(crate::config::ConfigError::Invalid(e.to_string()))
+                    })?;
 
                 let use_table = match format {
                     Some(OutputFormat::Table) => true,
@@ -190,17 +181,12 @@ pub fn run() -> Result<ExitCode, CliError> {
                 if use_table {
                     print_policy_table(&effective);
                 } else {
-                    match serde_json::to_writer_pretty(
-                        std::io::stdout(),
-                        &effective,
-                    ) {
+                    match serde_json::to_writer_pretty(std::io::stdout(), &effective) {
                         Ok(()) => {
                             println!();
                         }
                         Err(err) => {
-                            eprintln!(
-                                "failed to serialize policy to JSON: {err}"
-                            );
+                            eprintln!("failed to serialize policy to JSON: {err}");
                             return Ok(ExitCode::from(1));
                         }
                     }
@@ -269,25 +255,21 @@ async fn run_proxy_with_signals(
     // Ctrl+C/SIGTERM for graceful shutdown.
     spawn_signal_handlers(state.clone(), config_path, shutdown.clone());
 
-    let http_fut = crate::proxy::http::run_http_proxy(
-        state.clone(),
-        async move {
-            shutdown_http.notified().await;
-        },
-    );
+    let http_fut = crate::proxy::http::run_http_proxy(state.clone(), async move {
+        shutdown_http.notified().await;
+    });
 
     if https_port == 0 {
-        let res = http_fut.await.map_err(CliError::Proxy)?;
+        http_fut.await.map_err(CliError::Proxy)?;
         tracing::info!("HTTP proxy listener shut down gracefully");
-        Ok(res)
+        Ok(())
     } else {
-        let https_fut =
-            crate::proxy::https_transparent::run_https_transparent_proxy(
-                state.clone(),
-                async move {
-                    shutdown_https.notified().await;
-                },
-            );
+        let https_fut = crate::proxy::https_transparent::run_https_transparent_proxy(
+            state.clone(),
+            async move {
+                shutdown_https.notified().await;
+            },
+        );
 
         tokio::select! {
             res = http_fut => {
@@ -313,9 +295,7 @@ fn spawn_signal_handlers(
     let shutdown_clone = shutdown.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!(
-                "received interrupt (Ctrl+C); initiating graceful shutdown"
-            );
+            tracing::info!("received interrupt (Ctrl+C); initiating graceful shutdown");
             shutdown_clone.notify_waiters();
         }
     });
@@ -326,34 +306,24 @@ fn spawn_signal_handlers(
         use tokio::signal::unix::{signal, SignalKind};
 
         let state_for_reload = state.clone();
-        let config_path_for_reload =
-            config_path.map(|p| p.to_path_buf());
+        let config_path_for_reload = config_path.map(|p| p.to_path_buf());
 
         tokio::spawn(async move {
-            let mut hup_stream =
-                match signal(SignalKind::hangup()) {
-                    Ok(s) => s,
-                    Err(err) => {
-                        tracing::warn!(
-                            "failed to install SIGHUP handler: {err}"
-                        );
-                        return;
-                    }
-                };
+            let mut hup_stream = match signal(SignalKind::hangup()) {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::warn!("failed to install SIGHUP handler: {err}");
+                    return;
+                }
+            };
 
             while hup_stream.recv().await.is_some() {
-                match reload_from_sources(
-                    &state_for_reload,
-                    config_path_for_reload
-                        .as_deref(),
-                ) {
+                match reload_from_sources(&state_for_reload, config_path_for_reload.as_deref()) {
                     Ok(()) => {
                         tracing::info!("configuration reload completed successfully");
                     }
                     Err(err) => {
-                        tracing::error!(
-                            "configuration reload failed: {err}"
-                        );
+                        tracing::error!("configuration reload failed: {err}");
                     }
                 }
             }
@@ -361,51 +331,35 @@ fn spawn_signal_handlers(
 
         let shutdown_clone = shutdown.clone();
         tokio::spawn(async move {
-            let mut term_stream =
-                match signal(SignalKind::terminate()) {
-                    Ok(s) => s,
-                    Err(err) => {
-                        tracing::warn!(
-                            "failed to install SIGTERM handler: {err}"
-                        );
-                        return;
-                    }
-                };
+            let mut term_stream = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(err) => {
+                    tracing::warn!("failed to install SIGTERM handler: {err}");
+                    return;
+                }
+            };
 
             if term_stream.recv().await.is_some() {
-                tracing::info!(
-                    "received SIGTERM; initiating graceful shutdown"
-                );
+                tracing::info!("received SIGTERM; initiating graceful shutdown");
                 shutdown_clone.notify_waiters();
             }
         });
     }
 }
 
-fn reload_from_sources(
-    state: &SharedAppState,
-    config_path: Option<&Path>,
-) -> Result<(), String> {
-    let config =
-        Config::load_from_sources(config_path).map_err(|e| e.to_string())?;
-    AppState::reload_shared_from_config(state, config)
-        .map_err(|e| e.to_string())
+fn reload_from_sources(state: &SharedAppState, config_path: Option<&Path>) -> Result<(), String> {
+    let config = Config::load_from_sources(config_path).map_err(|e| e.to_string())?;
+    AppState::reload_shared_from_config(state, config).map_err(|e| e.to_string())
 }
 
 fn log_startup(state: &AppState) {
     let cfg = &state.config;
 
-    let http_bind = format!(
-        "{}:{}",
-        cfg.proxy.bind_address, cfg.proxy.http_port
-    );
+    let http_bind = format!("{}:{}", cfg.proxy.bind_address, cfg.proxy.http_port);
     let https_bind = if cfg.proxy.https_port == 0 {
         "disabled".to_string()
     } else {
-        format!(
-            "{}:{}",
-            cfg.proxy.https_bind_address, cfg.proxy.https_port
-        )
+        format!("{}:{}", cfg.proxy.https_bind_address, cfg.proxy.https_port)
     };
 
     let certs = &cfg.certificates;

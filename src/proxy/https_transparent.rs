@@ -14,15 +14,9 @@ use crate::app::{AppState, SharedAppState};
 use crate::capture::{CaptureEndpoint, CaptureMode};
 use crate::logging::PolicyDecisionLogContext;
 use crate::proxy::http::{
-    build_external_auth_denied_response,
-    build_external_auth_error_response,
-    build_external_auth_timeout_response,
-    build_loop_detected_response,
-    build_policy_denied_response_with_mode,
-    generate_request_id,
-    has_loop_header,
-    proxy_allowed_request,
-    run_external_auth_gate_lifecycle,
+    build_external_auth_error_response, build_loop_detected_response,
+    build_policy_denied_response_with_mode, generate_request_id, has_loop_header,
+    proxy_allowed_request, run_external_auth_gate_lifecycle,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -79,12 +73,10 @@ where
             address: initial.config.proxy.https_bind_address.clone(),
             source: e,
         })?;
-    let addr =
-        SocketAddr::new(bind_ip, initial.config.proxy.https_port);
+    let addr = SocketAddr::new(bind_ip, initial.config.proxy.https_port);
 
-    let listener = StdTcpListener::bind(addr).map_err(|e| {
-        HttpsTransparentError::BindListener { addr, source: e }
-    })?;
+    let listener = StdTcpListener::bind(addr)
+        .map_err(|e| HttpsTransparentError::BindListener { addr, source: e })?;
     listener
         .set_nonblocking(true)
         .map_err(HttpsTransparentError::FromStd)?;
@@ -101,8 +93,7 @@ pub async fn run_https_transparent_proxy_on_listener<F>(
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let listener =
-        TcpListener::from_std(listener).map_err(HttpsTransparentError::FromStd)?;
+    let listener = TcpListener::from_std(listener).map_err(HttpsTransparentError::FromStd)?;
 
     tokio::pin!(shutdown);
 
@@ -212,15 +203,7 @@ async fn handle_tls_connection(
         let state = state_for_svc.clone();
         let client = client_for_svc.clone();
         let client_ip = client_ip.clone();
-        async move {
-            handle_inner_https_request(
-                state,
-                client,
-                client_ip,
-                req,
-            )
-            .await
-        }
+        async move { handle_inner_https_request(state, client, client_ip, req).await }
     });
 
     Http::new()
@@ -247,9 +230,7 @@ async fn handle_inner_https_request(
 
     // Loop protection on inbound decrypted requests.
     let loop_settings = &state.loop_protection;
-    if loop_settings.enabled
-        && has_loop_header(req.headers(), &loop_settings.header_name)
-    {
+    if loop_settings.enabled && has_loop_header(req.headers(), &loop_settings.header_name) {
         let resp = build_loop_detected_response(
             &state,
             &request_id,
@@ -301,30 +282,26 @@ async fn handle_inner_https_request(
         .unwrap_or_default();
 
     if let Some(rule) = matched_rule {
-        if let Some(profile_name) = rule.external_auth_profile.as_ref()
-        {
-            if let Some(profile) =
-                state.external_auth.get_profile(profile_name)
-            {
+        if let Some(profile_name) = rule.external_auth_profile.as_ref() {
+            if let Some(profile) = state.external_auth.get_profile(profile_name) {
                 if let Some(target_endpoint) = target.clone() {
-                    let resp =
-                        handle_https_transparent_external_auth_gate(
-                            state.clone(),
-                            &request_id,
-                            &full_url,
-                            &method,
-                            &client,
-                            target_endpoint,
-                            version,
-                            req,
-                            &client_ip_for_policy,
-                            rule.index,
-                            rule.rule_id.clone(),
-                            &profile,
-                            profile_name,
-                            header_actions,
-                        )
-                        .await;
+                    let resp = handle_https_transparent_external_auth_gate(
+                        state.clone(),
+                        &request_id,
+                        &full_url,
+                        &method,
+                        &client,
+                        target_endpoint,
+                        version,
+                        req,
+                        &client_ip_for_policy,
+                        rule.index,
+                        rule.rule_id.clone(),
+                        &profile,
+                        profile_name,
+                        header_actions,
+                    )
+                    .await;
                     return Ok(resp);
                 } else {
                     let resp = build_external_auth_error_response(
@@ -425,9 +402,7 @@ fn build_https_url_for_transparent(
         match host_header.to_str() {
             Ok(h) => h.trim(),
             Err(_) => {
-                let mut resp = Response::new(Body::from(
-                    "Bad Request: invalid Host header",
-                ));
+                let mut resp = Response::new(Body::from("Bad Request: invalid Host header"));
                 *resp.status_mut() = StatusCode::BAD_REQUEST;
                 return Err(resp);
             }
@@ -435,16 +410,13 @@ fn build_https_url_for_transparent(
     } else if let Some(auth) = req.uri().authority() {
         auth.as_str()
     } else {
-        let mut resp =
-            Response::new(Body::from("Bad Request: missing Host header"));
+        let mut resp = Response::new(Body::from("Bad Request: missing Host header"));
         *resp.status_mut() = StatusCode::BAD_REQUEST;
         return Err(resp);
     };
 
     if host_raw.is_empty() {
-        let mut resp = Response::new(Body::from(
-            "Bad Request: empty Host header",
-        ));
+        let mut resp = Response::new(Body::from("Bad Request: empty Host header"));
         *resp.status_mut() = StatusCode::BAD_REQUEST;
         return Err(resp);
     }
@@ -461,8 +433,7 @@ fn build_https_url_for_transparent(
         format!("/{}", path_and_query)
     };
 
-    let full_url =
-        format!("https://{host}{path}", host = host_raw, path = path);
+    let full_url = format!("https://{host}{path}", host = host_raw, path = path);
 
     let (target_host, target_port) = split_host_and_port(host_raw);
 
@@ -512,8 +483,7 @@ mod tests {
             .body(Body::empty())
             .expect("request");
 
-        let (url, target) =
-            build_https_url_for_transparent(&req).expect("url");
+        let (url, target) = build_https_url_for_transparent(&req).expect("url");
         assert_eq!(url, "https://example.com/foo/bar?x=1");
 
         let target = target.expect("target");
@@ -530,8 +500,7 @@ mod tests {
             .body(Body::empty())
             .expect("request");
 
-        let (url, target) =
-            build_https_url_for_transparent(&req).expect("url");
+        let (url, target) = build_https_url_for_transparent(&req).expect("url");
         assert_eq!(url, "https://example.com:8443/");
 
         let target = target.expect("target");
@@ -548,8 +517,7 @@ mod tests {
             .body(Body::empty())
             .expect("request");
 
-        let (url, target) =
-            build_https_url_for_transparent(&req).expect("url");
+        let (url, target) = build_https_url_for_transparent(&req).expect("url");
         assert_eq!(url, "https://example.com/foo");
 
         let target = target.expect("target");

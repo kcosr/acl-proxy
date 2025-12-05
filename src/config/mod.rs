@@ -328,15 +328,11 @@ impl Default for Config {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum PolicyDefaultAction {
     Allow,
+    #[default]
     Deny,
-}
-
-impl Default for PolicyDefaultAction {
-    fn default() -> Self {
-        PolicyDefaultAction::Deny
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -463,8 +459,7 @@ impl Default for PolicyConfig {
 
 pub type MacroMap = std::collections::BTreeMap<String, MacroValues>;
 pub type RulesetMap = std::collections::BTreeMap<String, Vec<PolicyRuleTemplateConfig>>;
-pub type MacroOverrideMap =
-    std::collections::BTreeMap<String, MacroValues>;
+pub type MacroOverrideMap = std::collections::BTreeMap<String, MacroValues>;
 
 pub type ExternalAuthProfileConfigMap =
     std::collections::BTreeMap<String, ExternalAuthProfileConfig>;
@@ -508,16 +503,12 @@ pub enum HeaderActionKind {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum HeaderWhen {
+    #[default]
     Always,
     IfPresent,
     IfAbsent,
-}
-
-impl Default for HeaderWhen {
-    fn default() -> Self {
-        HeaderWhen::Always
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -541,7 +532,6 @@ pub struct HeaderActionConfig {
     pub search: Option<String>,
     #[serde(default)]
     pub replace: Option<String>,
-
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -679,9 +669,7 @@ impl Config {
                 PolicyRuleConfig::Direct(d) => {
                     d.pattern.is_some() || !d.subnets.is_empty() || d.methods.is_some()
                 }
-                PolicyRuleConfig::Include(i) => {
-                    !i.include.trim().is_empty()
-                }
+                PolicyRuleConfig::Include(i) => !i.include.trim().is_empty(),
             };
 
             if !has_match_criteria {
@@ -799,10 +787,7 @@ default = "deny"
         assert_eq!(config.schema_version, "1");
         assert_eq!(config.proxy.http_port, 8080);
         assert_eq!(config.logging.level, "debug");
-        assert!(matches!(
-            config.policy.default,
-            PolicyDefaultAction::Deny
-        ));
+        assert!(matches!(config.policy.default, PolicyDefaultAction::Deny));
     }
 
     #[test]
@@ -859,8 +844,7 @@ default = "deny"
 ca_key_path = "ca-key.pem"
 "#
         );
-        let config: Config =
-            toml::from_str(&toml_key_only).expect("parse key-only config");
+        let config: Config = toml::from_str(&toml_key_only).expect("parse key-only config");
         assert!(config.validate_basic().is_err());
 
         // Only ca_cert_path set.
@@ -871,8 +855,7 @@ ca_key_path = "ca-key.pem"
 ca_cert_path = "ca-cert.pem"
 "#
         );
-        let config: Config =
-            toml::from_str(&toml_cert_only).expect("parse cert-only config");
+        let config: Config = toml::from_str(&toml_cert_only).expect("parse cert-only config");
         assert!(config.validate_basic().is_err());
 
         // Both set is ok.
@@ -884,8 +867,7 @@ ca_key_path = "ca-key.pem"
 ca_cert_path = "ca-cert.pem"
 "#
         );
-        let config: Config =
-            toml::from_str(&toml_both).expect("parse both config");
+        let config: Config = toml::from_str(&toml_both).expect("parse both config");
         assert!(config.validate_basic().is_ok());
     }
 
@@ -1007,18 +989,15 @@ level = "info"
 
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let sample_path = manifest_dir.join("acl-proxy.sample.toml");
-        let contents =
-            fs::read_to_string(&sample_path).expect("read sample config");
+        let contents = fs::read_to_string(&sample_path).expect("read sample config");
 
-        let config: Config =
-            toml::from_str(&contents).expect("parse sample config");
+        let config: Config = toml::from_str(&contents).expect("parse sample config");
         config
             .validate_basic()
             .expect("sample config should pass basic validation");
 
-        let effective =
-            crate::policy::EffectivePolicy::from_config(&config.policy)
-                .expect("sample policy should produce effective rules");
+        let effective = crate::policy::EffectivePolicy::from_config(&config.policy)
+            .expect("sample policy should produce effective rules");
         assert!(
             !effective.rules.is_empty(),
             "sample policy should produce at least one effective rule"
@@ -1048,8 +1027,7 @@ external_auth_profile = "missing_profile"
         "#;
 
         let config: Config = toml::from_str(toml).expect("parse config");
-        let err =
-            config.validate_basic().expect_err("validation should fail");
+        let err = config.validate_basic().expect_err("validation should fail");
         let msg = format!("{err}");
         assert!(
             msg.contains("external_auth_profile 'missing_profile' not found"),
@@ -1084,8 +1062,7 @@ external_auth_profile = "example"
         "#;
 
         let config: Config = toml::from_str(toml).expect("parse config");
-        let err =
-            config.validate_basic().expect_err("validation should fail");
+        let err = config.validate_basic().expect_err("validation should fail");
         let msg = format!("{err}");
         assert!(
             msg.contains("external_auth_profile is not allowed on deny rules"),

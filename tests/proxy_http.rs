@@ -13,16 +13,14 @@ use serde_json::Value as JsonValue;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-async fn start_upstream_echo_server(
-) -> (SocketAddr, Arc<Mutex<Option<hyper::HeaderMap>>>) {
+async fn start_upstream_echo_server() -> (SocketAddr, Arc<Mutex<Option<hyper::HeaderMap>>>) {
     let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind upstream");
     listener
         .set_nonblocking(true)
         .expect("set nonblocking upstream");
     let addr = listener.local_addr().expect("upstream addr");
 
-    let seen_headers: Arc<Mutex<Option<hyper::HeaderMap>>> =
-        Arc::new(Mutex::new(None));
+    let seen_headers: Arc<Mutex<Option<hyper::HeaderMap>>> = Arc::new(Mutex::new(None));
     let seen_headers_clone = seen_headers.clone();
 
     let make_svc = make_service_fn(move |_conn| {
@@ -31,22 +29,19 @@ async fn start_upstream_echo_server(
             Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
                 let seen_headers = seen_headers.clone();
                 async move {
-                    *seen_headers.lock().unwrap() =
-                        Some(req.headers().clone());
-                    let mut resp =
-                        Response::new(Body::from("ok"));
-                    resp.headers_mut().insert(
-                        "x-upstream-tag",
-                        HeaderValue::from_static("old-tag"),
-                    );
+                    *seen_headers.lock().unwrap() = Some(req.headers().clone());
+                    let mut resp = Response::new(Body::from("ok"));
+                    resp.headers_mut()
+                        .insert("x-upstream-tag", HeaderValue::from_static("old-tag"));
                     Ok::<_, hyper::Error>(resp)
                 }
             }))
         }
     });
 
-    let server =
-        Server::from_tcp(listener).expect("server from tcp").serve(make_svc);
+    let server = Server::from_tcp(listener)
+        .expect("server from tcp")
+        .serve(make_svc);
     tokio::spawn(server);
 
     (addr, seen_headers)
@@ -64,67 +59,54 @@ async fn external_auth_webhook_failure_emits_status_event() {
         body: serde_json::Value,
     }
 
-    let events: Arc<Mutex<Vec<ReceivedEvent>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let events: Arc<Mutex<Vec<ReceivedEvent>>> = Arc::new(Mutex::new(Vec::new()));
     let events_clone = events.clone();
 
     let make_svc = make_service_fn(move |_conn| {
         let events = events_clone.clone();
         async move {
-            Ok::<_, hyper::Error>(service_fn(
-                move |req: Request<Body>| {
-                    let events = events.clone();
-                    async move {
-                        let event_header = req
-                            .headers()
-                            .get("x-acl-proxy-event")
-                            .and_then(|v| v.to_str().ok())
-                            .unwrap_or("")
-                            .to_ascii_lowercase();
+            Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
+                let events = events.clone();
+                async move {
+                    let event_header = req
+                        .headers()
+                        .get("x-acl-proxy-event")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
 
-                        let bytes = hyper::body::to_bytes(
-                            req.into_body(),
-                        )
+                    let bytes = hyper::body::to_bytes(req.into_body())
                         .await
                         .unwrap_or_default();
-                        let body: serde_json::Value =
-                            serde_json::from_slice(&bytes)
-                                .unwrap_or_else(|_| {
-                                    serde_json::json!({})
-                                });
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({}));
 
-                        let status = if event_header == "pending" {
-                            http::StatusCode::INTERNAL_SERVER_ERROR
-                        } else {
-                            events.lock().unwrap().push(
-                                ReceivedEvent {
-                                    event_header:
-                                        event_header.clone(),
-                                    body: body.clone(),
-                                },
-                            );
-                            http::StatusCode::OK
-                        };
+                    let status = if event_header == "pending" {
+                        http::StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        events.lock().unwrap().push(ReceivedEvent {
+                            event_header: event_header.clone(),
+                            body: body.clone(),
+                        });
+                        http::StatusCode::OK
+                    };
 
-                        Ok::<_, hyper::Error>(
-                            Response::builder()
-                                .status(status)
-                                .body(Body::from("ok"))
-                                .unwrap(),
-                        )
-                    }
-                },
-            ))
+                    Ok::<_, hyper::Error>(
+                        Response::builder()
+                            .status(status)
+                            .body(Body::from("ok"))
+                            .unwrap(),
+                    )
+                }
+            }))
         }
     });
 
-    let webhook_listener = StdTcpListener::bind("127.0.0.1:0")
-        .expect("bind webhook");
+    let webhook_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind webhook");
     webhook_listener
         .set_nonblocking(true)
         .expect("set nonblocking webhook");
-    let webhook_addr =
-        webhook_listener.local_addr().expect("webhook addr");
+    let webhook_addr = webhook_listener.local_addr().expect("webhook addr");
 
     tokio::spawn(
         Server::from_tcp(webhook_listener)
@@ -171,22 +153,19 @@ rule_id = "external-auth-test-rule"
         addr = webhook_addr
     );
 
-    let config: Config =
-        toml::from_str(&toml).expect("parse config");
+    let config: Config = toml::from_str(&toml).expect("parse config");
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
 
-    let (proxy_addr, _temp_dir) =
-        start_proxy_with_config(config, proxy_listener).await;
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
 
-    let raw_request = "GET http://example.com/ok HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    let raw_request =
+        "GET http://example.com/ok HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
 
-    let (_response, status) =
-        send_raw_http_request(proxy_addr, raw_request).await;
+    let (_response, status) = send_raw_http_request(proxy_addr, raw_request).await;
 
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
@@ -202,19 +181,14 @@ rule_id = "external-auth-test-rule"
         status_event.body["status"],
         serde_json::Value::String("webhook_failed".to_string())
     );
-    assert_eq!(
-        status_event.body["terminal"],
-        serde_json::Value::Bool(true)
-    );
+    assert_eq!(status_event.body["terminal"], serde_json::Value::Bool(true));
     assert_eq!(
         status_event.body["failureKind"],
         serde_json::Value::String("non_2xx".to_string())
     );
     assert_eq!(
         status_event.body["ruleId"],
-        serde_json::Value::String(
-            "external-auth-test-rule".to_string()
-        )
+        serde_json::Value::String("external-auth-test-rule".to_string())
     );
 }
 
@@ -252,36 +226,26 @@ async fn start_proxy_with_config(
 
     let temp_dir = TempDir::new().expect("temp dir for capture");
     let capture_dir = temp_dir.path().join("captures");
-    config.capture.directory =
-        capture_dir.to_string_lossy().to_string();
+    config.capture.directory = capture_dir.to_string_lossy().to_string();
 
-    let state =
-        AppState::shared_from_config(config).expect("app state");
+    let state = AppState::shared_from_config(config).expect("app state");
 
     let listener_addr = addr;
     tokio::spawn(async move {
-        let _ = run_http_proxy_on_listener(
-            state,
-            listener,
-            std::future::pending(),
-        )
-        .await
-        .map_err(|e| {
-            eprintln!(
-                "proxy server on {listener_addr} exited: {e}"
-            );
-        });
+        let _ = run_http_proxy_on_listener(state, listener, std::future::pending())
+            .await
+            .map_err(|e| {
+                eprintln!("proxy server on {listener_addr} exited: {e}");
+            });
     });
 
     (addr, temp_dir)
 }
 
-async fn send_raw_http_request(
-    addr: SocketAddr,
-    raw_request: &str,
-) -> (String, StatusCode) {
-    let mut stream =
-        tokio::net::TcpStream::connect(addr).await.expect("connect proxy");
+async fn send_raw_http_request(addr: SocketAddr, raw_request: &str) -> (String, StatusCode) {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect proxy");
 
     stream
         .write_all(raw_request.as_bytes())
@@ -293,12 +257,9 @@ async fn send_raw_http_request(
 
     let response = String::from_utf8_lossy(&buf).to_string();
     let status_line = response.lines().next().unwrap_or_default();
-    let status = if let Some(code_str) =
-        status_line.split_whitespace().nth(1)
-    {
+    let status = if let Some(code_str) = status_line.split_whitespace().nth(1) {
         match code_str.parse::<u16>() {
-            Ok(code) => StatusCode::from_u16(code)
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            Ok(code) => StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     } else {
@@ -310,8 +271,7 @@ async fn send_raw_http_request(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn allowed_request_is_proxied_and_loop_header_added() {
-    let (upstream_addr, seen_headers) =
-        start_upstream_echo_server().await;
+    let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
 
     let mut config = minimal_config();
     config.capture.allowed_request = false;
@@ -338,22 +298,18 @@ async fn allowed_request_is_proxied_and_loop_header_added() {
         },
     )];
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
 
-    let (proxy_addr, _temp_dir) =
-        start_proxy_with_config(config, proxy_listener).await;
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
 
     let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
-    let raw_request = format!(
-        "GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-    );
+    let raw_request =
+        format!("GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
 
-    let (response, status) =
-        send_raw_http_request(proxy_addr, &raw_request).await;
+    let (response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
 
     println!("allowed_request raw response:\n{response}");
 
@@ -365,28 +321,21 @@ async fn allowed_request_is_proxied_and_loop_header_added() {
 
     // Ensure the upstream saw the loop protection header and host header.
     let headers_guard = seen_headers.lock().unwrap();
-    let upstream_headers = headers_guard
-        .as_ref()
-        .expect("upstream should see request");
+    let upstream_headers = headers_guard.as_ref().expect("upstream should see request");
 
     assert!(
-        upstream_headers
-            .get("x-acl-proxy-request-id")
-            .is_some(),
+        upstream_headers.get("x-acl-proxy-request-id").is_some(),
         "upstream should receive loop protection header"
     );
     assert_eq!(
-        upstream_headers
-            .get("host")
-            .and_then(|v| v.to_str().ok()),
+        upstream_headers.get("host").and_then(|v| v.to_str().ok()),
         Some(host.as_str())
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn loop_header_not_added_when_disabled() {
-    let (upstream_addr, seen_headers) =
-        start_upstream_echo_server().await;
+    let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
 
     let mut config = minimal_config();
     config.capture.allowed_request = false;
@@ -417,34 +366,26 @@ async fn loop_header_not_added_when_disabled() {
     config.loop_protection.enabled = true;
     config.loop_protection.add_header = false;
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
 
-    let (proxy_addr, _temp_dir) =
-        start_proxy_with_config(config, proxy_listener).await;
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
 
     let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
-    let raw_request = format!(
-        "GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-    );
+    let raw_request =
+        format!("GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
 
-    let (_response, status) =
-        send_raw_http_request(proxy_addr, &raw_request).await;
+    let (_response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
 
     assert_eq!(status, StatusCode::OK);
 
     let headers_guard = seen_headers.lock().unwrap();
-    let upstream_headers = headers_guard
-        .as_ref()
-        .expect("upstream should see request");
+    let upstream_headers = headers_guard.as_ref().expect("upstream should see request");
 
     assert!(
-        upstream_headers
-            .get("x-acl-proxy-request-id")
-            .is_none(),
+        upstream_headers.get("x-acl-proxy-request-id").is_none(),
         "loop header should not be injected when add_header=false"
     );
 }
@@ -459,40 +400,30 @@ async fn denied_request_returns_403_and_captures() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules.clear();
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
 
-    let (proxy_addr, temp_dir) =
-        start_proxy_with_config(config, proxy_listener).await;
+    let (proxy_addr, temp_dir) = start_proxy_with_config(config, proxy_listener).await;
 
     let host = "example.com:80";
-    let raw_request = format!(
-        "GET http://{host}/denied HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-    );
+    let raw_request =
+        format!("GET http://{host}/denied HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
 
-    let (response, status) =
-        send_raw_http_request(proxy_addr, &raw_request).await;
+    let (response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
 
     println!("denied_request raw response:\n{response}");
 
     assert_eq!(status, StatusCode::FORBIDDEN);
-    let body = response
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or_default()
-        .trim();
-    let json: JsonValue =
-        serde_json::from_str(body).expect("parse deny JSON");
+    let body = response.split("\r\n\r\n").nth(1).unwrap_or_default().trim();
+    let json: JsonValue = serde_json::from_str(body).expect("parse deny JSON");
     assert_eq!(json["error"], "Forbidden");
     assert_eq!(json["message"], "Blocked by URL policy");
 
     // Capture files for denied request/response should exist.
     let capture_dir = temp_dir.path().join("captures");
-    let mut entries =
-        std::fs::read_dir(&capture_dir).expect("read capture dir");
+    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
     let mut files = Vec::new();
     while let Some(entry) = entries.next() {
         let entry = entry.expect("dir entry");
@@ -531,31 +462,23 @@ async fn loop_detected_returns_508() {
     config.loop_protection.enabled = true;
     config.loop_protection.add_header = true;
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
 
-    let (proxy_addr, _temp_dir) =
-        start_proxy_with_config(config, proxy_listener).await;
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
 
     let host = "example.com:80";
     let raw_request = format!(
         "GET http://{host}/loop HTTP/1.1\r\nHost: {host}\r\nx-acl-proxy-request-id: existing\r\nConnection: close\r\n\r\n"
     );
 
-    let (response, status) =
-        send_raw_http_request(proxy_addr, &raw_request).await;
+    let (response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
 
     assert_eq!(status, StatusCode::LOOP_DETECTED);
-    let body = response
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or_default()
-        .trim();
-    let json: JsonValue =
-        serde_json::from_str(body).expect("parse loop JSON");
+    let body = response.split("\r\n\r\n").nth(1).unwrap_or_default().trim();
+    let json: JsonValue = serde_json::from_str(body).expect("parse loop JSON");
     assert_eq!(json["error"], "LoopDetected");
     assert_eq!(
         json["message"],
@@ -568,20 +491,18 @@ async fn non_absolute_form_request_returns_400() {
     let mut config = minimal_config();
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Allow;
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
 
-    let (proxy_addr, _temp_dir) =
-        start_proxy_with_config(config, proxy_listener).await;
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
 
     // Origin-form request (no absolute URL) should be rejected with 400.
-    let raw_request = "GET /relative/path HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    let raw_request =
+        "GET /relative/path HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
 
-    let (_response, status) =
-        send_raw_http_request(proxy_addr, raw_request).await;
+    let (_response, status) = send_raw_http_request(proxy_addr, raw_request).await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
@@ -609,30 +530,26 @@ async fn upstream_connection_failure_returns_502() {
         },
     )];
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
 
-    let (proxy_addr, _temp_dir) =
-        start_proxy_with_config(config, proxy_listener).await;
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
 
     let host = "127.0.0.1:1";
     let raw_request = format!(
         "GET http://{host}/unreachable HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
     );
 
-    let (_response, status) =
-        send_raw_http_request(proxy_addr, &raw_request).await;
+    let (_response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
 
     assert_eq!(status, StatusCode::BAD_GATEWAY);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn header_actions_apply_to_request_for_matching_rule() {
-    let (upstream_addr, seen_headers) =
-        start_upstream_echo_server().await;
+    let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
 
     let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
 
@@ -693,28 +610,23 @@ when = "if_absent"
 
     let config: Config = toml::from_str(&toml).expect("parse config");
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
 
-    let (proxy_addr, _temp_dir) =
-        start_proxy_with_config(config, proxy_listener).await;
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
 
     let raw_request = format!(
         "GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nx-if-present: original\r\n\r\n"
     );
 
-    let (_response, status) =
-        send_raw_http_request(proxy_addr, &raw_request).await;
+    let (_response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
 
     assert_eq!(status, StatusCode::OK);
 
     let headers_guard = seen_headers.lock().unwrap();
-    let upstream_headers = headers_guard
-        .as_ref()
-        .expect("upstream should see request");
+    let upstream_headers = headers_guard.as_ref().expect("upstream should see request");
 
     // x-test should have two values: one and two.
     let x_test_values: Vec<String> = upstream_headers
@@ -723,10 +635,7 @@ when = "if_absent"
         .filter_map(|v| v.to_str().ok())
         .map(|s| s.to_string())
         .collect();
-    assert_eq!(
-        x_test_values,
-        vec!["one".to_string(), "two".to_string()]
-    );
+    assert_eq!(x_test_values, vec!["one".to_string(), "two".to_string()]);
 
     // x-if-present existed on the original request and should be set.
     assert_eq!(
@@ -747,8 +656,7 @@ when = "if_absent"
 
 #[tokio::test(flavor = "multi_thread")]
 async fn header_actions_apply_to_response_for_matching_rule() {
-    let (upstream_addr, _seen_headers) =
-        start_upstream_echo_server().await;
+    let (upstream_addr, _seen_headers) = start_upstream_echo_server().await;
 
     let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
 
@@ -790,21 +698,17 @@ replace = "new"
 
     let config: Config = toml::from_str(&toml).expect("parse config");
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
 
-    let (proxy_addr, _temp_dir) =
-        start_proxy_with_config(config, proxy_listener).await;
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
 
-    let raw_request = format!(
-        "GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
-    );
+    let raw_request =
+        format!("GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
 
-    let (response, status) =
-        send_raw_http_request(proxy_addr, &raw_request).await;
+    let (response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
 
     assert_eq!(status, StatusCode::OK);
 

@@ -54,10 +54,7 @@ pub struct CaptureBody {
     pub length: usize,
     pub data: String,
 
-    #[serde(
-        rename = "contentType",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "contentType", skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
 }
 
@@ -77,10 +74,7 @@ pub struct CaptureRecord {
     #[serde(rename = "statusCode", skip_serializing_if = "Option::is_none")]
     pub status_code: Option<u16>,
 
-    #[serde(
-        rename = "statusMessage",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(rename = "statusMessage", skip_serializing_if = "Option::is_none")]
     pub status_message: Option<String>,
 
     pub client: CaptureEndpoint,
@@ -201,25 +195,13 @@ pub enum CaptureError {
 
 /// Determine whether a given request/response should be captured based on
 /// the `[capture]` configuration flags.
-pub fn should_capture(
-    cfg: &Config,
-    decision: CaptureDecision,
-    kind: CaptureKind,
-) -> bool {
+pub fn should_capture(cfg: &Config, decision: CaptureDecision, kind: CaptureKind) -> bool {
     let capture_cfg: &CaptureConfig = &cfg.capture;
     match (decision, kind) {
-        (CaptureDecision::Allow, CaptureKind::Request) => {
-            capture_cfg.allowed_request
-        }
-        (CaptureDecision::Allow, CaptureKind::Response) => {
-            capture_cfg.allowed_response
-        }
-        (CaptureDecision::Deny, CaptureKind::Request) => {
-            capture_cfg.denied_request
-        }
-        (CaptureDecision::Deny, CaptureKind::Response) => {
-            capture_cfg.denied_response
-        }
+        (CaptureDecision::Allow, CaptureKind::Request) => capture_cfg.allowed_request,
+        (CaptureDecision::Allow, CaptureKind::Response) => capture_cfg.allowed_response,
+        (CaptureDecision::Deny, CaptureKind::Request) => capture_cfg.denied_request,
+        (CaptureDecision::Deny, CaptureKind::Response) => capture_cfg.denied_response,
     }
 }
 
@@ -286,32 +268,26 @@ impl CaptureRecord {
     }
 }
 
-fn build_body(
-    headers: Option<&HeaderMap>,
-    body: &BodyCaptureResult,
-) -> Option<CaptureBody> {
+fn build_body(headers: Option<&HeaderMap>, body: &BodyCaptureResult) -> Option<CaptureBody> {
     if body.total_len == 0 {
         return None;
     }
 
-    let content_type = headers
-        .and_then(|map| {
-            map.iter()
-                .find(|(k, _)| k.to_ascii_lowercase() == "content-type")
-                .and_then(|(_, v)| {
-                    match v {
-                        JsonValue::String(s) => Some(s.clone()),
-                        JsonValue::Array(arr) => arr.iter().find_map(|v| {
-                            if let JsonValue::String(s) = v {
-                                Some(s.clone())
-                            } else {
-                                None
-                            }
-                        }),
-                        _ => None,
+    let content_type = headers.and_then(|map| {
+        map.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
+            .and_then(|(_, v)| match v {
+                JsonValue::String(s) => Some(s.clone()),
+                JsonValue::Array(arr) => arr.iter().find_map(|v| {
+                    if let JsonValue::String(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
                     }
-                })
-        });
+                }),
+                _ => None,
+            })
+    });
 
     let data = general_purpose::STANDARD.encode(&body.captured);
 
@@ -350,8 +326,7 @@ pub fn resolve_capture_path(config: &Config, record: &CaptureRecord) -> PathBuf 
     };
 
     let safe_request_id = sanitize_path_component(&record.request_id);
-    let default_name =
-        format!("{}-{}.json", safe_request_id, kind_suffix);
+    let default_name = format!("{}-{}.json", safe_request_id, kind_suffix);
 
     let raw_template = {
         let tmpl = config.capture.filename.trim();
@@ -376,10 +351,7 @@ pub fn resolve_capture_path(config: &Config, record: &CaptureRecord) -> PathBuf 
     Path::new(&directory).join(filename)
 }
 
-fn effective_capture_directory(
-    capture: &CaptureConfig,
-    logging: &LoggingConfig,
-) -> String {
+fn effective_capture_directory(capture: &CaptureConfig, logging: &LoggingConfig) -> String {
     let capture_dir = capture.directory.trim();
     if !capture_dir.is_empty() {
         return capture_dir.to_string();
@@ -407,11 +379,9 @@ pub fn write_capture_record(
     }
 
     let json = serde_json::to_string_pretty(record)?;
-    fs::write(&path, format!("{json}\n")).map_err(|source| {
-        CaptureError::WriteFile {
-            path: path.clone(),
-            source,
-        }
+    fs::write(&path, format!("{json}\n")).map_err(|source| CaptureError::WriteFile {
+        path: path.clone(),
+        source,
     })?;
 
     Ok(path)
@@ -455,9 +425,7 @@ default = "deny"
         buf.finish()
     }
 
-    fn sample_record_with_body(
-        body: Option<CaptureBody>,
-    ) -> CaptureRecord {
+    fn sample_record_with_body(body: Option<CaptureBody>) -> CaptureRecord {
         CaptureRecord {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             request_id: "req-1".to_string(),
@@ -520,8 +488,7 @@ default = "deny"
     #[test]
     fn decode_body_bytes_succeeds_for_base64_body() {
         let body_bytes = b"hello world";
-        let encoded =
-            general_purpose::STANDARD.encode(body_bytes);
+        let encoded = general_purpose::STANDARD.encode(body_bytes);
 
         let body = CaptureBody {
             encoding: "base64".to_string(),
@@ -531,17 +498,14 @@ default = "deny"
         };
 
         let record = sample_record_with_body(Some(body));
-        let decoded =
-            record.decode_body_bytes().expect("decode body");
+        let decoded = record.decode_body_bytes().expect("decode body");
         assert_eq!(decoded, body_bytes);
     }
 
     #[test]
     fn decode_body_bytes_errors_when_body_missing() {
         let record = sample_record_with_body(None);
-        let err = record
-            .decode_body_bytes()
-            .expect_err("expected error");
+        let err = record.decode_body_bytes().expect_err("expected error");
         match err {
             CaptureBodyDecodeError::MissingBody => {}
             other => panic!("unexpected error: {other}"),
@@ -558,9 +522,7 @@ default = "deny"
         };
 
         let record = sample_record_with_body(Some(body));
-        let err = record
-            .decode_body_bytes()
-            .expect_err("expected error");
+        let err = record.decode_body_bytes().expect_err("expected error");
         match err {
             CaptureBodyDecodeError::UnsupportedEncoding { encoding } => {
                 assert_eq!(encoding, "utf8");
@@ -579,9 +541,7 @@ default = "deny"
         };
 
         let record = sample_record_with_body(Some(body));
-        let err = record
-            .decode_body_bytes()
-            .expect_err("expected error");
+        let err = record.decode_body_bytes().expect_err("expected error");
         match err {
             CaptureBodyDecodeError::InvalidBase64(_) => {}
             other => panic!("unexpected error: {other}"),
@@ -610,10 +570,7 @@ default = "deny"
         };
 
         let path = resolve_capture_path(&cfg, &record);
-        assert_eq!(
-            path,
-            Path::new("logs-capture").join("req-123-req.json")
-        );
+        assert_eq!(path, Path::new("logs-capture").join("req-123-req.json"));
     }
 
     #[test]
@@ -656,8 +613,7 @@ default = "deny"
         let record = build_capture_record(opts);
         let json = serde_json::to_string_pretty(&record).expect("serialize");
 
-        let decoded: CaptureRecord =
-            serde_json::from_str(&json).expect("round trip");
+        let decoded: CaptureRecord = serde_json::from_str(&json).expect("round trip");
         assert_eq!(decoded.request_id, "req-1");
         assert_eq!(decoded.method, "POST");
         assert_eq!(decoded.status_code, Some(200));

@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rcgen::{
-    BasicConstraints, Certificate as RcgenCertificate, CertificateParams,
-    DistinguishedName, DnType, IsCa, KeyPair,
+    BasicConstraints, Certificate as RcgenCertificate, CertificateParams, DistinguishedName,
+    DnType, IsCa, KeyPair,
 };
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::{any_supported_type, CertifiedKey};
@@ -77,8 +77,11 @@ impl CertManager {
             certs_dir
         };
 
-        let (ca_key_path, ca_cert_path) =
-            resolve_ca_paths(&certs_dir, cfg.ca_key_path.as_deref(), cfg.ca_cert_path.as_deref());
+        let (ca_key_path, ca_cert_path) = resolve_ca_paths(
+            &certs_dir,
+            cfg.ca_key_path.as_deref(),
+            cfg.ca_cert_path.as_deref(),
+        );
 
         let explicit_ca_paths = cfg
             .ca_key_path
@@ -98,11 +101,8 @@ impl CertManager {
             source,
         })?;
 
-        let (ca_cert, ca_key) = load_or_generate_ca(
-            &ca_key_path,
-            &ca_cert_path,
-            explicit_ca_paths,
-        )?;
+        let (ca_cert, ca_key) =
+            load_or_generate_ca(&ca_key_path, &ca_cert_path, explicit_ca_paths)?;
 
         let inner = Inner {
             ca_cert_path,
@@ -122,9 +122,7 @@ impl CertManager {
     /// This is primarily used for the transparent HTTPS listener, where the
     /// proxy terminates TLS directly from clients and must choose a
     /// certificate matching the requested hostname.
-    pub fn tls_acceptor_with_sni(
-        &self,
-    ) -> Result<TlsAcceptor, CertError> {
+    pub fn tls_acceptor_with_sni(&self) -> Result<TlsAcceptor, CertError> {
         // Seed the config with a placeholder certificate; the dynamic
         // `cert_resolver` below will be responsible for choosing the real
         // certificate based on SNI.
@@ -141,28 +139,20 @@ impl CertManager {
             .with_no_client_auth()
             .with_single_cert(cert_chain, key)
             .map_err(|e| CertError::BuildServerConfig(format!("{e}")))?;
-        config.alpn_protocols =
-            vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        config.cert_resolver =
-            Arc::new(SniResolver::new(self.inner.clone()));
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        config.cert_resolver = Arc::new(SniResolver::new(self.inner.clone()));
 
         Ok(TlsAcceptor::from(Arc::new(config)))
     }
 
     /// Build a `TlsAcceptor` for the given host, generating and caching a
     /// per-host certificate if needed.
-    pub fn tls_acceptor_for_host(
-        &self,
-        host: &str,
-    ) -> Result<TlsAcceptor, CertError> {
+    pub fn tls_acceptor_for_host(&self, host: &str) -> Result<TlsAcceptor, CertError> {
         let config = self.server_config_for_host(host)?;
         Ok(TlsAcceptor::from(config))
     }
 
-    fn server_config_for_host(
-        &self,
-        host: &str,
-    ) -> Result<Arc<ServerConfig>, CertError> {
+    fn server_config_for_host(&self, host: &str) -> Result<Arc<ServerConfig>, CertError> {
         let host = host.to_ascii_lowercase();
         {
             let cache = self.inner.server_configs.lock().unwrap();
@@ -211,10 +201,7 @@ impl SniResolver {
         }
     }
 
-    fn certified_key_for_host(
-        &self,
-        host: &str,
-    ) -> Option<Arc<CertifiedKey>> {
+    fn certified_key_for_host(&self, host: &str) -> Option<Arc<CertifiedKey>> {
         let host = host.to_ascii_lowercase();
         {
             let cache = self.keys.lock().unwrap();
@@ -232,9 +219,7 @@ impl SniResolver {
         ) {
             Ok(v) => v,
             Err(err) => {
-                tracing::error!(
-                    "failed to generate certificate for SNI host {host}: {err}"
-                );
+                tracing::error!("failed to generate certificate for SNI host {host}: {err}");
                 return None;
             }
         };
@@ -242,17 +227,12 @@ impl SniResolver {
         let signing_key = match any_supported_type(&key) {
             Ok(k) => k,
             Err(err) => {
-                tracing::error!(
-                    "failed to build signing key for SNI host {host}: {err}"
-                );
+                tracing::error!("failed to build signing key for SNI host {host}: {err}");
                 return None;
             }
         };
 
-        let certified = Arc::new(CertifiedKey::new(
-            cert_chain,
-            signing_key,
-        ));
+        let certified = Arc::new(CertifiedKey::new(cert_chain, signing_key));
 
         let mut cache = self.keys.lock().unwrap();
         cache.insert(host, certified.clone());
@@ -261,10 +241,7 @@ impl SniResolver {
 }
 
 impl ResolvesServerCert for SniResolver {
-    fn resolve(
-        &self,
-        client_hello: ClientHello<'_>,
-    ) -> Option<Arc<CertifiedKey>> {
+    fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let host = client_hello.server_name()?;
         self.certified_key_for_host(host)
     }
@@ -277,10 +254,7 @@ fn resolve_ca_paths(
 ) -> (PathBuf, PathBuf) {
     match (ca_key_path, ca_cert_path) {
         (Some(key), Some(cert)) => (PathBuf::from(key), PathBuf::from(cert)),
-        _ => (
-            certs_dir.join("ca-key.pem"),
-            certs_dir.join("ca-cert.pem"),
-        ),
+        _ => (certs_dir.join("ca-key.pem"), certs_dir.join("ca-cert.pem")),
     }
 }
 
@@ -318,19 +292,13 @@ fn load_or_generate_ca(
         if !key_exists {
             return Err(CertError::ReadCaKey {
                 path: ca_key_path.to_path_buf(),
-                source: IoError::new(
-                    IoErrorKind::NotFound,
-                    "CA key path does not exist",
-                ),
+                source: IoError::new(IoErrorKind::NotFound, "CA key path does not exist"),
             });
         }
         if !cert_exists {
             return Err(CertError::ReadCaCert {
                 path: ca_cert_path.to_path_buf(),
-                source: IoError::new(
-                    IoErrorKind::NotFound,
-                    "CA certificate path does not exist",
-                ),
+                source: IoError::new(IoErrorKind::NotFound, "CA certificate path does not exist"),
             });
         }
     }
@@ -346,11 +314,10 @@ fn load_ca_from_files(
         path: ca_key_path.to_path_buf(),
         source,
     })?;
-    let cert_pem =
-        fs::read_to_string(ca_cert_path).map_err(|source| CertError::ReadCaCert {
-            path: ca_cert_path.to_path_buf(),
-            source,
-        })?;
+    let cert_pem = fs::read_to_string(ca_cert_path).map_err(|source| CertError::ReadCaCert {
+        path: ca_cert_path.to_path_buf(),
+        source,
+    })?;
 
     let key_pair =
         KeyPair::from_pem(&key_pem).map_err(|e| CertError::ParseCaKey(format!("{e}")))?;
@@ -374,8 +341,7 @@ fn generate_ca(
     dn.push(DnType::CommonName, "acl-proxy CA");
     params.distinguished_name = dn;
 
-    let key_pair =
-        KeyPair::generate().map_err(|e| CertError::ParseCaKey(format!("{e}")))?;
+    let key_pair = KeyPair::generate().map_err(|e| CertError::ParseCaKey(format!("{e}")))?;
     let ca_cert = params
         .self_signed(&key_pair)
         .map_err(|e| CertError::ParseCaCert(format!("{e}")))?;
@@ -421,8 +387,7 @@ fn generate_host_certificate(
     params.not_before = rcgen::date_time_ymd(2024, 1, 1);
     params.not_after = rcgen::date_time_ymd(2030, 1, 1);
 
-    let leaf_key =
-        KeyPair::generate().map_err(|e| CertError::BuildServerConfig(format!("{e}")))?;
+    let leaf_key = KeyPair::generate().map_err(|e| CertError::BuildServerConfig(format!("{e}")))?;
     let leaf_cert = params
         .signed_by(&leaf_key, ca_cert, ca_key)
         .map_err(|e| CertError::BuildServerConfig(format!("{e}")))?;
@@ -431,11 +396,9 @@ fn generate_host_certificate(
     let key_der = leaf_key.serialize_der();
 
     let leaf = RustlsCertificate(cert_der);
-    let ca_pem = fs::read_to_string(ca_cert_path).map_err(|source| {
-        CertError::ReadCaCert {
-            path: ca_cert_path.to_path_buf(),
-            source,
-        }
+    let ca_pem = fs::read_to_string(ca_cert_path).map_err(|source| CertError::ReadCaCert {
+        path: ca_cert_path.to_path_buf(),
+        source,
     })?;
 
     let mut reader = Cursor::new(ca_pem.as_bytes());
@@ -443,11 +406,7 @@ fn generate_host_certificate(
         .map_err(|e| CertError::ParseCaCert(format!("{e}")))?
         .into_iter()
         .next()
-        .ok_or_else(|| {
-            CertError::ParseCaCert(
-                "no CA certificate found in PEM".to_string(),
-            )
-        })?;
+        .ok_or_else(|| CertError::ParseCaCert("no CA certificate found in PEM".to_string()))?;
     let ca_cert_rls = RustlsCertificate(ca_der);
 
     // Persist PEM files on disk for transparency and debugging.
@@ -515,14 +474,12 @@ mod tests {
         let mut cfg = CertificatesConfig::default();
         cfg.certs_dir = certs_dir.to_string_lossy().to_string();
 
-        let mgr1 =
-            CertManager::from_config(&cfg).expect("first cert manager");
+        let mgr1 = CertManager::from_config(&cfg).expect("first cert manager");
         let ca_cert_path = mgr1.ca_cert_path().to_path_buf();
         assert!(ca_cert_path.exists());
 
         // Second manager should reuse existing CA.
-        let mgr2 =
-            CertManager::from_config(&cfg).expect("second cert manager");
+        let mgr2 = CertManager::from_config(&cfg).expect("second cert manager");
         assert_eq!(
             mgr2.ca_cert_path().to_string_lossy(),
             ca_cert_path.to_string_lossy()
@@ -537,12 +494,10 @@ mod tests {
         let mut cfg = CertificatesConfig::default();
         cfg.certs_dir = certs_dir.to_string_lossy().to_string();
 
-        let mgr =
-            CertManager::from_config(&cfg).expect("cert manager");
+        let mgr = CertManager::from_config(&cfg).expect("cert manager");
 
         let host = "example.com";
-        let _acceptor =
-            mgr.tls_acceptor_for_host(host).expect("tls acceptor");
+        let _acceptor = mgr.tls_acceptor_for_host(host).expect("tls acceptor");
 
         let dynamic_dir = certs_dir.join("dynamic");
         let leaf = dynamic_dir.join(format!("{host}.crt"));
@@ -566,30 +521,23 @@ mod tests {
         // Pre-generate a CA on disk so that `from_config` takes the
         // "existing CA" path instead of generating a new one.
         generate_ca(&ca_key_path, &ca_cert_path).expect("generate ca");
-        let ca_cert_pem =
-            fs::read_to_string(&ca_cert_path).expect("read ca cert");
+        let ca_cert_pem = fs::read_to_string(&ca_cert_path).expect("read ca cert");
 
         let mut cfg = CertificatesConfig::default();
         cfg.certs_dir = certs_dir.to_string_lossy().to_string();
-        cfg.ca_key_path =
-            Some(ca_key_path.to_string_lossy().to_string());
-        cfg.ca_cert_path =
-            Some(ca_cert_path.to_string_lossy().to_string());
+        cfg.ca_key_path = Some(ca_key_path.to_string_lossy().to_string());
+        cfg.ca_cert_path = Some(ca_cert_path.to_string_lossy().to_string());
 
-        let mgr =
-            CertManager::from_config(&cfg).expect("cert manager");
+        let mgr = CertManager::from_config(&cfg).expect("cert manager");
 
         let host = "example.com";
-        let _acceptor =
-            mgr.tls_acceptor_for_host(host).expect("tls acceptor");
+        let _acceptor = mgr.tls_acceptor_for_host(host).expect("tls acceptor");
 
         let dynamic_dir = certs_dir.join("dynamic");
-        let chain =
-            dynamic_dir.join(format!("{host}-chain.crt"));
+        let chain = dynamic_dir.join(format!("{host}-chain.crt"));
         assert!(chain.exists(), "chain cert should exist");
 
-        let chain_pem =
-            fs::read_to_string(chain).expect("read chain pem");
+        let chain_pem = fs::read_to_string(chain).expect("read chain pem");
         assert!(
             chain_pem.ends_with(&ca_cert_pem),
             "host chain should end with the configured CA cert PEM",
@@ -616,7 +564,9 @@ mod tests {
                 .to_string(),
         );
 
-        let err = CertManager::from_config(&cfg).err().expect("expected error");
+        let err = CertManager::from_config(&cfg)
+            .err()
+            .expect("expected error");
         let msg = format!("{err}");
         assert!(
             msg.contains("failed to read CA key")

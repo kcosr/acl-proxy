@@ -7,39 +7,33 @@ use acl_proxy::capture::{CaptureMode, CaptureRecord};
 use acl_proxy::config::Config;
 use acl_proxy::proxy::http::run_http_proxy_on_listener;
 use http::StatusCode;
+use hyper::server::conn::Http;
+use hyper::service::service_fn;
+use hyper::{Body, Request as HyperRequest, Response as HyperResponse};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::client::ServerName;
 use rustls::{
-    Certificate as RustlsCertificate, ClientConfig, PrivateKey,
-    RootCertStore, ServerConfig,
+    Certificate as RustlsCertificate, ClientConfig, PrivateKey, RootCertStore, ServerConfig,
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
-use hyper::server::conn::Http;
-use hyper::service::service_fn;
-use hyper::{Body, Request as HyperRequest, Response as HyperResponse};
 
 async fn start_upstream_https_echo_server() -> SocketAddr {
-    let listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind upstream");
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind upstream");
     listener
         .set_nonblocking(true)
         .expect("set nonblocking upstream");
     let addr = listener.local_addr().expect("upstream addr");
 
     // Generate a simple self-signed certificate for the upstream server.
-    let mut params =
-        CertificateParams::new(vec![addr.ip().to_string()]).expect("params");
+    let mut params = CertificateParams::new(vec![addr.ip().to_string()]).expect("params");
     let mut dn = DistinguishedName::new();
     dn.push(DnType::CommonName, addr.ip().to_string());
     params.distinguished_name = dn;
-    let key =
-        KeyPair::generate().expect("generate upstream key");
-    let cert = params
-        .self_signed(&key)
-        .expect("self-signed upstream cert");
+    let key = KeyPair::generate().expect("generate upstream key");
+    let cert = params.self_signed(&key).expect("self-signed upstream cert");
 
     let cert_der: Vec<u8> = cert.der().to_vec();
     let key_der = key.serialize_der();
@@ -47,19 +41,14 @@ async fn start_upstream_https_echo_server() -> SocketAddr {
     let mut tls_config = ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()
-        .with_single_cert(
-            vec![RustlsCertificate(cert_der)],
-            PrivateKey(key_der),
-        )
+        .with_single_cert(vec![RustlsCertificate(cert_der)], PrivateKey(key_der))
         .expect("server config");
-    tls_config.alpn_protocols =
-        vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
     tokio::spawn(async move {
-        let listener =
-            TcpListener::from_std(listener).expect("tokio listener");
+        let listener = TcpListener::from_std(listener).expect("tokio listener");
         loop {
             let (socket, _) = match listener.accept().await {
                 Ok(v) => v,
@@ -128,27 +117,18 @@ async fn start_proxy_with_config(
     let temp_dir = TempDir::new().expect("temp dir for capture");
     let capture_dir = temp_dir.path().join("captures");
     let certs_dir = temp_dir.path().join("certs");
-    config.capture.directory =
-        capture_dir.to_string_lossy().to_string();
-    config.certificates.certs_dir =
-        certs_dir.to_string_lossy().to_string();
+    config.capture.directory = capture_dir.to_string_lossy().to_string();
+    config.certificates.certs_dir = certs_dir.to_string_lossy().to_string();
 
-    let state =
-        AppState::shared_from_config(config).expect("app state");
+    let state = AppState::shared_from_config(config).expect("app state");
 
     let listener_addr = addr;
     tokio::spawn(async move {
-        let _ = run_http_proxy_on_listener(
-            state,
-            listener,
-            std::future::pending(),
-        )
-        .await
-        .map_err(|e| {
-            eprintln!(
-                "proxy server on {listener_addr} exited: {e}"
-            );
-        });
+        let _ = run_http_proxy_on_listener(state, listener, std::future::pending())
+            .await
+            .map_err(|e| {
+                eprintln!("proxy server on {listener_addr} exited: {e}");
+            });
     });
 
     (addr, temp_dir)
@@ -163,8 +143,9 @@ async fn send_https_via_connect(
     use rustls_pemfile;
 
     // Establish a TCP connection to the proxy and send CONNECT.
-    let mut stream =
-        tokio::net::TcpStream::connect(proxy_addr).await.expect("connect proxy");
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
 
     let connect_req = format!(
         "CONNECT {target_host} HTTP/1.1\r\nHost: {target_host}\r\nConnection: keep-alive\r\n\r\n"
@@ -200,15 +181,12 @@ async fn send_https_via_connect(
     }
 
     // Wrap the stream in TLS using the proxy's CA cert.
-    let ca_pem =
-        std::fs::read(_ca_cert_path).expect("read ca cert");
+    let ca_pem = std::fs::read(_ca_cert_path).expect("read ca cert");
     let mut reader = std::io::Cursor::new(ca_pem);
     let mut roots = RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut reader).expect("parse ca cert") {
         let cert = RustlsCertificate(cert.to_vec());
-        roots
-            .add(&cert)
-            .expect("add root cert to store");
+        roots.add(&cert).expect("add root cert to store");
     }
 
     let config = ClientConfig::builder()
@@ -217,12 +195,8 @@ async fn send_https_via_connect(
         .with_no_client_auth();
 
     let connector = TlsConnector::from(Arc::new(config));
-    let host_only = target_host
-        .split(':')
-        .next()
-        .unwrap_or("localhost");
-    let server_name =
-        ServerName::try_from(host_only).expect("server name");
+    let host_only = target_host.split(':').next().unwrap_or("localhost");
+    let server_name = ServerName::try_from(host_only).expect("server name");
 
     let mut tls_stream = connector
         .connect(server_name, stream)
@@ -230,9 +204,8 @@ async fn send_https_via_connect(
         .expect("tls connect");
 
     // Send inner HTTPS request.
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {target_host}\r\nConnection: close\r\n\r\n"
-    );
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {target_host}\r\nConnection: close\r\n\r\n");
     tls_stream
         .write_all(request.as_bytes())
         .await
@@ -264,8 +237,9 @@ async fn send_raw_connect_request(
     proxy_addr: SocketAddr,
     raw_request: &str,
 ) -> (String, StatusCode) {
-    let mut stream =
-        tokio::net::TcpStream::connect(proxy_addr).await.expect("connect proxy");
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
 
     stream
         .write_all(raw_request.as_bytes())
@@ -277,12 +251,9 @@ async fn send_raw_connect_request(
 
     let response = String::from_utf8_lossy(&buf).to_string();
     let status_line = response.lines().next().unwrap_or_default();
-    let status = if let Some(code_str) =
-        status_line.split_whitespace().nth(1)
-    {
+    let status = if let Some(code_str) = status_line.split_whitespace().nth(1) {
         match code_str.parse::<u16>() {
-            Ok(code) => StatusCode::from_u16(code)
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            Ok(code) => StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     } else {
@@ -319,27 +290,19 @@ async fn allowed_https_via_connect_is_proxied_and_captured() {
         },
     )];
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
 
-    let (proxy_addr, temp_dir) =
-        start_proxy_with_config(config, proxy_listener).await;
+    let (proxy_addr, temp_dir) = start_proxy_with_config(config, proxy_listener).await;
 
     let certs_dir = temp_dir.path().join("certs");
     let ca_cert_path = certs_dir.join("ca-cert.pem");
 
-    let target_host =
-        format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
-    let (status, body) = send_https_via_connect(
-        proxy_addr,
-        &ca_cert_path,
-        &target_host,
-        "/ok",
-    )
-    .await;
+    let target_host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    let (status, body) =
+        send_https_via_connect(proxy_addr, &ca_cert_path, &target_host, "/ok").await;
 
     assert_eq!(status, StatusCode::OK.as_u16());
     assert_eq!(body, "ok");
@@ -348,15 +311,19 @@ async fn allowed_https_via_connect_is_proxied_and_captured() {
     use tokio::time::{sleep, Duration};
 
     let capture_dir = temp_dir.path().join("captures");
-    // Wait briefly for async capture tasks to flush to disk.
+    // Wait for async capture tasks to flush to disk and ensure at least one file.
     for _ in 0..10 {
         if capture_dir.is_dir() {
-            break;
+            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
+                .expect("read capture dir")
+                .collect();
+            if !entries.is_empty() {
+                break;
+            }
         }
         sleep(Duration::from_millis(50)).await;
     }
-    let mut entries =
-        std::fs::read_dir(&capture_dir).expect("read capture dir");
+    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
     let mut files = Vec::new();
     while let Some(entry) = entries.next() {
         let entry = entry.expect("dir entry");
@@ -374,8 +341,7 @@ async fn allowed_https_via_connect_is_proxied_and_captured() {
         .expect("open capture")
         .read_to_string(&mut contents)
         .expect("read capture");
-    let record: CaptureRecord =
-        serde_json::from_str(&contents).expect("decode capture");
+    let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
     assert_eq!(record.mode, CaptureMode::HttpsConnect);
     assert!(
         record.url.starts_with("https://"),
@@ -410,27 +376,19 @@ async fn denied_https_via_connect_returns_403() {
         },
     )];
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
 
-    let (proxy_addr, temp_dir) =
-        start_proxy_with_config(config, proxy_listener).await;
+    let (proxy_addr, temp_dir) = start_proxy_with_config(config, proxy_listener).await;
 
     let certs_dir = temp_dir.path().join("certs");
     let ca_cert_path = certs_dir.join("ca-cert.pem");
 
-    let target_host =
-        format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
-    let (status, body) = send_https_via_connect(
-        proxy_addr,
-        &ca_cert_path,
-        &target_host,
-        "/denied",
-    )
-    .await;
+    let target_host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    let (status, body) =
+        send_https_via_connect(proxy_addr, &ca_cert_path, &target_host, "/denied").await;
 
     assert_eq!(status, StatusCode::FORBIDDEN.as_u16());
     assert!(
@@ -465,26 +423,19 @@ async fn loop_detected_on_connect_returns_508() {
         },
     )];
 
-    let proxy_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
 
-    let (proxy_addr, _temp_dir) =
-        start_proxy_with_config(config, proxy_listener).await;
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
 
-    let host = format!(
-        "{}:{}",
-        upstream_addr.ip(),
-        upstream_addr.port()
-    );
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
     let raw_request = format!(
         "CONNECT {host} HTTP/1.1\r\nHost: {host}\r\nx-acl-proxy-request-id: existing\r\nConnection: close\r\n\r\n"
     );
 
-    let (_response, status) =
-        send_raw_connect_request(proxy_addr, &raw_request).await;
+    let (_response, status) = send_raw_connect_request(proxy_addr, &raw_request).await;
 
     assert_eq!(status, StatusCode::LOOP_DETECTED);
 }
