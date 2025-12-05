@@ -1,5 +1,7 @@
 use std::io::Write;
+use std::process::Command;
 
+use assert_cmd::prelude::*;
 use predicates::str::contains;
 use tempfile::{NamedTempFile, TempDir};
 
@@ -25,7 +27,7 @@ default = "deny"
     )
     .expect("write config");
 
-    let mut cmd = assert_cmd::Command::cargo_bin("acl-proxy").expect("binary built");
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
     cmd.arg("config")
         .arg("validate")
         .arg("--config")
@@ -58,7 +60,7 @@ default = "deny"
     )
     .expect("write config");
 
-    let mut cmd = assert_cmd::Command::cargo_bin("acl-proxy").expect("binary built");
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
     cmd.arg("config")
         .arg("validate")
         .arg("--config")
@@ -93,7 +95,7 @@ default = "deny"
 
     // Use a small helper binary run via `cargo run`-style to inspect overrides.
     // For now, just ensure that `config validate` still succeeds with overrides set.
-    let mut cmd = assert_cmd::Command::cargo_bin("acl-proxy").expect("binary built");
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
     cmd.arg("config")
         .arg("validate")
         .arg("--config")
@@ -123,7 +125,7 @@ http_port = 8080
     )
     .expect("write config");
 
-    let mut cmd = assert_cmd::Command::cargo_bin("acl-proxy").expect("binary built");
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
     cmd.arg("config")
         .arg("validate")
         .arg("--config")
@@ -137,7 +139,7 @@ http_port = 8080
 #[test]
 fn missing_default_config_suggests_init() {
     let temp_dir = TempDir::new().expect("create temp dir");
-    let mut cmd = assert_cmd::Command::cargo_bin("acl-proxy").expect("binary built");
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
     cmd.arg("config")
         .arg("validate")
         // No --config and no ACL_PROXY_CONFIG: should use default path and fail with hint.
@@ -151,7 +153,7 @@ fn config_init_creates_file_at_path() {
     let temp_dir = TempDir::new().expect("create temp dir");
     let target = temp_dir.path().join("acl-proxy.toml");
 
-    let mut cmd = assert_cmd::Command::cargo_bin("acl-proxy").expect("binary built");
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
     cmd.arg("config").arg("init").arg(&target);
 
     cmd.assert()
@@ -180,7 +182,7 @@ fn config_init_refuses_to_overwrite_existing_file() {
         writeln!(file, "existing = true").expect("write existing config");
     }
 
-    let mut cmd = assert_cmd::Command::cargo_bin("acl-proxy").expect("binary built");
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
     cmd.arg("config").arg("init").arg(&target);
 
     cmd.assert().failure().stderr(contains("already exists"));

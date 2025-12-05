@@ -1,5 +1,7 @@
 use std::io::Write;
+use std::process::Command;
 
+use assert_cmd::prelude::*;
 use predicates::str::contains;
 use serde_json::Value;
 use tempfile::NamedTempFile;
@@ -36,7 +38,7 @@ add_url_enc_variants = true
     )
     .expect("write config");
 
-    let mut cmd = assert_cmd::Command::cargo_bin("acl-proxy").expect("binary built");
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
     cmd.arg("config")
         .arg("validate")
         .arg("--config")
@@ -76,7 +78,7 @@ add_url_enc_variants = true
     )
     .expect("write config");
 
-    let mut cmd = assert_cmd::Command::cargo_bin("acl-proxy").expect("binary built");
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
     cmd.arg("config")
         .arg("validate")
         .arg("--config")
@@ -113,7 +115,7 @@ add_url_enc_variants = true
     )
     .expect("write config");
 
-    let mut cmd = assert_cmd::Command::cargo_bin("acl-proxy").expect("binary built");
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
     cmd.arg("config")
         .arg("validate")
         .arg("--config")
@@ -152,7 +154,7 @@ subnets = ["10.0.0.0/8"]
     )
     .expect("write config");
 
-    let mut cmd = assert_cmd::Command::cargo_bin("acl-proxy").expect("binary built");
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
     cmd.arg("policy")
         .arg("dump")
         .arg("--config")
@@ -211,7 +213,7 @@ subnets = ["10.0.0.0/8"]
     )
     .expect("write config");
 
-    let mut cmd = assert_cmd::Command::cargo_bin("acl-proxy").expect("binary built");
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
     cmd.arg("policy")
         .arg("dump")
         .arg("--format")

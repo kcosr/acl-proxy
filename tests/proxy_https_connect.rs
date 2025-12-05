@@ -311,10 +311,15 @@ async fn allowed_https_via_connect_is_proxied_and_captured() {
     use tokio::time::{sleep, Duration};
 
     let capture_dir = temp_dir.path().join("captures");
-    // Wait briefly for async capture tasks to flush to disk.
+    // Wait for async capture tasks to flush to disk and ensure at least one file.
     for _ in 0..10 {
         if capture_dir.is_dir() {
-            break;
+            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
+                .expect("read capture dir")
+                .collect();
+            if !entries.is_empty() {
+                break;
+            }
         }
         sleep(Duration::from_millis(50)).await;
     }
