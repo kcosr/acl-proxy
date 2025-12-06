@@ -624,7 +624,11 @@ Client TLS Handshake                    CertManager
 
 ## External Authentication
 
-### External Auth Flow
+The external authentication system enables approval workflows for policy rules. When a request
+matches a rule with `external_auth_profile`, the proxy sends a webhook to an external service
+and waits for an approval callback before forwarding the request upstream.
+
+### External Auth Flow (Basic)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -651,6 +655,8 @@ Client                 acl-proxy               External Auth      Upstream
    │                      │     "url": "...",       │                 │
    │                      │     "method": "GET",    │                 │
    │                      │     "clientIp": "...",  │                 │
+   │                      │     "callbackUrl": "..",│                 │
+   │                      │     "macros": [...],    │                 │
    │                      │     "terminal": false   │                 │
    │                      │   }                     │                 │
    │                      │◀────────────────────────│                 │
@@ -693,6 +699,152 @@ Alternative outcomes:
    │                      │   }                     │                 │
 ```
 
+### External Auth with Approval Macros
+
+Approval macros enable collecting dynamic values (such as credentials or approval reasons)
+from the external auth service and interpolating them into request headers before forwarding
+upstream. This is useful for scenarios like:
+
+- Collecting user credentials during approval and injecting them as `Authorization` headers
+- Adding audit/approval metadata headers to the upstream request
+- Dynamic per-request configuration based on approval context
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                External Auth with Approval Macros Flow                      │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Client                 acl-proxy              External Auth UI     Upstream
+   │                      │                         │                 │
+   │  Request             │                         │                 │
+   │─────────────────────▶│                         │                 │
+   │                      │                         │                 │
+   │                      │ 1. Policy matches rule  │                 │
+   │                      │    with external_auth   │                 │
+   │                      │    AND header_actions   │                 │
+   │                      │    with {{macro}}       │                 │
+   │                      │    placeholders         │                 │
+   │                      │                         │                 │
+   │                      │ 2. Discover macros from │                 │
+   │                      │    header_actions and   │                 │
+   │                      │    approval_macros cfg  │                 │
+   │                      │                         │                 │
+   │                      │ 3. POST webhook with    │                 │
+   │                      │    macro descriptors    │                 │
+   │                      │────────────────────────▶│                 │
+   │                      │   {                     │                 │
+   │                      │     "requestId": "...", │                 │
+   │                      │     "callbackUrl": "..",│                 │
+   │                      │     "macros": [         │                 │
+   │                      │       {                 │                 │
+   │                      │         "name": "token",│                 │
+   │                      │         "label": "API   │                 │
+   │                      │                  Token",│                 │
+   │                      │         "required": true│                 │
+   │                      │         "secret": true  │                 │
+   │                      │       },                │                 │
+   │                      │       {                 │                 │
+   │                      │         "name": "reason"│                 │
+   │                      │         "label": "...", │                 │
+   │                      │         "required":false│                 │
+   │                      │         "secret": false │                 │
+   │                      │       }                 │                 │
+   │                      │     ],                  │                 │
+   │                      │     ...                 │                 │
+   │                      │   }                     │                 │
+   │                      │                         │                 │
+   │                      │         (UI prompts user for values)      │
+   │                      │                         │                 │
+   │                      │   POST callback with    │                 │
+   │                      │   macro values          │                 │
+   │                      │◀────────────────────────│                 │
+   │                      │   {                     │                 │
+   │                      │     "requestId": "...", │                 │
+   │                      │     "decision": "allow",│                 │
+   │                      │     "macros": {         │                 │
+   │                      │       "token": "ghp_..." │                │
+   │                      │       "reason": "..."   │                 │
+   │                      │     }                   │                 │
+   │                      │   }                     │                 │
+   │                      │                         │                 │
+   │                      │ 4. Interpolate macros   │                 │
+   │                      │    into header_actions: │                 │
+   │                      │    {{token}} → "ghp_..."│                 │
+   │                      │                         │                 │
+   │                      │ 5. Apply header_actions │                 │
+   │                      │    to request           │                 │
+   │                      │────────────────────────────────────────▶ │
+   │                      │    Authorization:       │                 │
+   │                      │      Bearer ghp_...     │                 │
+   │                      │                         │                 │
+   │◀─────────────────────│                         │   Response      │
+   │  Response            │◀────────────────────────────────────────│
+   │                      │                         │                 │
+```
+
+### Configuration Example
+
+```toml
+[external_auth]
+# Optional: expose the callback URL in webhooks so external services
+# know where to send approval decisions
+callback_url = "https://proxy.example.com/_acl-proxy/external-auth/callback"
+
+[policy.approval_macros]
+# Define macros that can be collected during approval and interpolated
+# into header actions. The {{name}} syntax in header values triggers
+# macro discovery.
+github_token = { label = "GitHub token", required = true, secret = true }
+reason       = { label = "Approval reason", required = false, secret = false }
+
+[policy.external_auth_profiles.github_mfa]
+webhook_url = "https://auth.internal/github/mfa-start"
+timeout_ms = 5000
+webhook_timeout_ms = 1000
+on_webhook_failure = "error"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://api.github.com/**"
+external_auth_profile = "github_mfa"
+
+# Header actions with approval macro placeholders
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "authorization"
+value = "Bearer {{github_token}}"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "add"
+name = "x-approval-reason"
+value = "{{reason}}"
+```
+
+### Callback Endpoint
+
+The proxy exposes an internal callback endpoint at `/_acl-proxy/external-auth/callback` that
+external auth services use to deliver approval decisions:
+
+```
+POST /_acl-proxy/external-auth/callback
+Content-Type: application/json
+
+{
+  "requestId": "req-1704110400000-1",
+  "decision": "allow",           // or "deny"
+  "macros": {                    // optional: values for approval macros
+    "github_token": "ghp_...",
+    "reason": "Approved by admin"
+  }
+}
+```
+
+The `callbackUrl` field in webhooks (when `external_auth.callback_url` is configured) tells
+external services exactly where to send this callback, which is useful when the proxy runs
+behind load balancers or in multi-instance deployments.
+
 ### External Auth Manager Internals
 
 ```
@@ -713,7 +865,15 @@ Alternative outcomes:
 │  │                    url: "https://api.example.com/...",              │   │
 │  │                    method: Some("POST"),                            │   │
 │  │                    client_ip: Some("192.168.1.100"),                │   │
+│  │                    macros: Vec<ApprovalMacroDescriptor>,            │   │
 │  │                  }                                                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ macro_values: Arc<DashMap<String, BTreeMap<String, String>>>        │   │
+│  │                                                                     │   │
+│  │  Stores macro values received in approval callbacks, keyed by       │   │
+│  │  requestId. Values are consumed when applying header_actions.       │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
@@ -728,6 +888,13 @@ Alternative outcomes:
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ callback_url: Option<String>                                        │   │
+│  │                                                                     │   │
+│  │  When set, included in webhook payloads as "callbackUrl" so         │   │
+│  │  external services know where to send approval decisions.           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │ status_tx/status_rx: mpsc::channel<StatusWebhookEvent>              │   │
 │  │                                                                     │   │
 │  │  Background worker sends terminal status webhooks:                  │   │
@@ -736,6 +903,31 @@ Alternative outcomes:
 │  │  • error (internal error)                                           │   │
 │  │  • cancelled (client disconnected)                                  │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Approval Macro Descriptor Structure
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     ApprovalMacroDescriptor                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Sent in the "macros" array of pending webhooks:                            │
+│                                                                             │
+│  {                                                                          │
+│    "name": "github_token",     // Placeholder name (used as {{name}})       │
+│    "label": "GitHub token",    // Human-readable label for UI               │
+│    "required": true,           // Whether value must be provided            │
+│    "secret": true              // Hint that value is sensitive (passwords)  │
+│  }                                                                          │
+│                                                                             │
+│  Discovery: The proxy scans header_actions for {{placeholder}} patterns    │
+│  and matches them against [policy.approval_macros] to build descriptors.   │
+│                                                                             │
+│  Interpolation: When approval callback includes macro values, the proxy    │
+│  replaces {{name}} patterns in header action values before forwarding.     │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -829,6 +1021,59 @@ Alternative outcomes:
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Upstream Failure Capture (502 Bad Gateway)
+
+When an allowed request fails during upstream connection (e.g., connection refused, timeout,
+TLS handshake failure), the proxy returns a `502 Bad Gateway` response to the client. These
+failure paths are also captured when `allowed_response` capture is enabled:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Upstream Failure Capture Flow                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+Client                 acl-proxy                              Upstream
+   │                      │                                       │
+   │  Request             │                                       │
+   │─────────────────────▶│                                       │
+   │                      │                                       │
+   │                      │  Policy: Allow                        │
+   │                      │                                       │
+   │                      │  Capture request (if enabled)         │
+   │                      │  ┌─────────────────────────────────┐  │
+   │                      │  │ { decision: "allow", ... }      │  │
+   │                      │  └─────────────────────────────────┘  │
+   │                      │                                       │
+   │                      │  Attempt upstream connection          │
+   │                      │───────────────────────────────────────▶ ✕ Connection
+   │                      │                                          refused/
+   │                      │                                          timeout
+   │                      │                                       │
+   │                      │  Generate 502 response                │
+   │                      │                                       │
+   │                      │  Capture response (if enabled)        │
+   │                      │  ┌─────────────────────────────────┐  │
+   │                      │  │ { decision: "allow",            │  │
+   │                      │  │   statusCode: 502,              │  │
+   │                      │  │   statusMessage: "Bad Gateway"} │  │
+   │                      │  └─────────────────────────────────┘  │
+   │                      │                                       │
+   │◀─────────────────────│                                       │
+   │  502 Bad Gateway     │                                       │
+   │                      │                                       │
+```
+
+Key characteristics of upstream failure captures:
+- `decision` remains `"allow"` (the policy allowed the request)
+- `statusCode` is `502` (Bad Gateway)
+- The response body contains `"Bad Gateway"` plaintext
+- Applies to all proxy modes: `http_proxy`, `https_connect`, `https_transparent`
+
+This enables auditing of infrastructure failures and distinguishing between:
+- Policy denials (`decision: "deny"`, `statusCode: 403`)
+- Successful requests (`decision: "allow"`, `statusCode: 2xx/3xx/4xx/5xx from upstream`)
+- Upstream failures (`decision: "allow"`, `statusCode: 502` generated by proxy)
 
 ### Body Capture Buffer
 
@@ -1077,9 +1322,13 @@ The ACL Proxy is a Rust-based HTTP/HTTPS proxy with:
 1. **Dual Listener Architecture**: HTTP proxy (with CONNECT MITM) and HTTPS transparent termination
 2. **Flexible Policy Engine**: Pattern matching with wildcards, macros, rulesets, subnets, and methods
 3. **Dynamic Certificate Generation**: SNI-based per-host TLS certificates signed by a local CA
-4. **External Authentication**: Webhook-based approval workflows with configurable timeouts
-5. **Request/Response Capture**: Bounded body buffering with configurable capture flags
-6. **Hot Reload**: SIGHUP-triggered configuration reload without dropping in-flight requests
-7. **Loop Protection**: Header-based detection to prevent proxy loops
+4. **External Authentication**: Webhook-based approval workflows with configurable timeouts, approval
+   macros for dynamic header injection, and configurable callback URLs
+5. **Approval Macros**: Collect values during external approval (e.g., credentials) and interpolate
+   them into request headers using `{{placeholder}}` syntax before forwarding upstream
+6. **Request/Response Capture**: Bounded body buffering with configurable capture flags, including
+   upstream failure paths (502 Bad Gateway) for allowed requests
+7. **Hot Reload**: SIGHUP-triggered configuration reload without dropping in-flight requests
+8. **Loop Protection**: Header-based detection to prevent proxy loops
 
 All components are designed for safe concurrent access using `Arc`, `ArcSwap`, `DashMap`, and Tokio's async primitives.

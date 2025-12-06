@@ -17,6 +17,7 @@ type PendingApproval = {
   url: string;
   method?: string | null;
   clientIp?: string | null;
+  callbackUrl?: string | null;
   macros: MacroDescriptor[];
 };
 
@@ -80,6 +81,7 @@ app.post("/webhook", (req, res) => {
     url?: string;
     method?: string;
     clientIp?: string;
+    callbackUrl?: string;
     status?: string;
     reason?: string;
     ruleId?: string;
@@ -99,6 +101,7 @@ app.post("/webhook", (req, res) => {
     url,
     method,
     clientIp,
+    callbackUrl,
     status,
     reason,
     ruleId,
@@ -176,11 +179,20 @@ app.post("/webhook", (req, res) => {
     url,
     method: method ?? null,
     clientIp: clientIp ?? null,
+    callbackUrl: callbackUrl ?? null,
     macros: Array.isArray(macros) ? macros : [],
   };
+  if (approval.callbackUrl) {
+    // eslint-disable-next-line no-console
+    console.log(
+      "[webhook] pending approval includes callbackUrl",
+      approval.callbackUrl,
+    );
+  }
   pending.set(requestId, approval);
 
-  const msg = JSON.stringify({ type: "pending", approval });
+  const { callbackUrl: _cb, ...approvalForClient } = approval;
+  const msg = JSON.stringify({ type: "pending", approval: approvalForClient });
   // eslint-disable-next-line no-console
   console.log("[ws:broadcast] pending", msg);
   wss.clients.forEach((ws) => {
@@ -198,7 +210,8 @@ wss.on("connection", (ws) => {
   console.log("[ws] client connected");
   // On connect, send the current pending list.
   for (const approval of pending.values()) {
-    const msg = JSON.stringify({ type: "pending", approval });
+    const { callbackUrl: _cb, ...approvalForClient } = approval;
+    const msg = JSON.stringify({ type: "pending", approval: approvalForClient });
     // eslint-disable-next-line no-console
     console.log("[ws:broadcast] pending (initial)", msg);
     ws.send(msg);
@@ -288,7 +301,14 @@ wss.on("connection", (ws) => {
           }
         }
 
-        const resp = await fetch(CALLBACK_URL, {
+        const targetCallbackUrl =
+          approval.callbackUrl &&
+          typeof approval.callbackUrl === "string" &&
+          approval.callbackUrl.startsWith("http")
+            ? approval.callbackUrl
+            : CALLBACK_URL;
+
+        const resp = await fetch(targetCallbackUrl, {
           method: "POST",
           headers: {
             "content-type": "application/json",

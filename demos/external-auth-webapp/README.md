@@ -16,9 +16,10 @@ The app:
 - Pushes new approvals to connected browsers over WebSocket.
 - Lets a user click **Approve** or **Deny** in the browser and, for rules
   that define approval macros, fill in any required macro values.
-- Sends the callback decision (including any approved macro values) to
-  `acl-proxy` via
-  `/_acl-proxy/external-auth/callback`.
+- Sends the callback decision (including any approved macro values) to the
+  `callbackUrl` provided in the webhook payload when present, falling back to
+  calling `/_acl-proxy/external-auth/callback` on the configured proxy base URL
+  for older `acl-proxy` versions.
 
 ## Prerequisites
 
@@ -38,7 +39,8 @@ npm start
 
 By default, the app listens on `http://localhost:3000` and serves a tiny UI at
 that address. It expects `acl-proxy`'s HTTP listener to be reachable at
-`http://localhost:8881` so it can call the callback endpoint.
+`http://localhost:8881` so it can call the callback endpoint when a webhook
+does not include a `callbackUrl` field.
 
 You can override the proxy base URL or the app port via environment variables:
 
@@ -81,6 +83,11 @@ direction = "request"
 action = "add"
 name = "x-approval-reason"
 value = "{{reason}}"
+
+[external_auth]
+# Full URL external auth services (including this demo app) should use when
+# calling back into this proxy instance.
+callback_url = "http://localhost:8881/_acl-proxy/external-auth/callback"
 ```
 
 Then:
@@ -94,4 +101,7 @@ Then:
 When the rule matches, the app should display a new pending approval in the
 browser. Clicking **Approve** or **Deny** sends the callback to `acl-proxy`,
 which then either proxies the request upstream or returns a synthetic deny /
-timeout / error response according to its configuration.
+timeout / error response according to its configuration. When the webhook
+payload includes a `callbackUrl`, the demo app prefers that URL; otherwise it
+falls back to `ACL_PROXY_BASE + "/_acl-proxy/external-auth/callback"` so it
+continues to work with older `acl-proxy` versions.

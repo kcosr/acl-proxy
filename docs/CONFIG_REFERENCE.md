@@ -616,6 +616,17 @@ The policy engine supports **external auth profiles** that turn certain allow ru
 - Either forwards the request upstream on approval, or returns a synthetic deny/timeout/error
   response to the client.
 
+Global external auth settings are defined under `[external_auth]`:
+
+```toml
+[external_auth]
+# Full URL external auth services should use when calling back into this
+# proxy instance. This value is included in external auth webhooks as
+# `callbackUrl`, but does not change the inbound callback path, which
+# remains `/_acl-proxy/external-auth/callback`.
+callback_url = "https://proxy.example.com/_acl-proxy/external-auth/callback"
+```
+
 Profiles are defined under `[policy.external_auth_profiles]`:
 
 ```toml
@@ -703,6 +714,8 @@ Lifecycle status telemetry:
 - Both webhook kinds include the base fields:
   - `requestId`, `profile`, `ruleIndex`, optional `ruleId`, `url`, `method`, `clientIp`.
 - Additional lifecycle fields:
+  - `callbackUrl` (optional): when `[external_auth].callback_url` is configured, this is the full
+    URL external services should POST approval decisions to for this proxy instance.
   - `status`: `"pending"`, `"webhook_failed"`, `"timed_out"`, `"error"`, or `"cancelled"`.
   - `reason`: optional human-readable explanation.
   - `timestamp`: RFC3339 timestamp when the event was generated.

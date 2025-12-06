@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 const DEFAULT_CONFIG_PATH: &str = "config/acl-proxy.toml";
 const DEFAULT_SCHEMA_VERSION: &str = "1";
@@ -35,6 +36,18 @@ pub enum ConfigPathKind {
     Default,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ExternalAuthConfig {
+    /// Full callback URL external auth services should use when
+    /// delivering approval decisions back to this proxy instance.
+    ///
+    /// When set, this is included in external auth webhooks as
+    /// `callbackUrl` so that external services do not need to infer
+    /// the callback endpoint from deployment-specific base URLs.
+    #[serde(default)]
+    pub callback_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_schema_version")]
@@ -57,6 +70,9 @@ pub struct Config {
 
     #[serde(default)]
     pub tls: TlsConfig,
+
+    #[serde(default)]
+    pub external_auth: ExternalAuthConfig,
 
     #[serde(default)]
     pub policy: PolicyConfig,
@@ -334,6 +350,7 @@ impl Default for Config {
             loop_protection: LoopProtectionConfig::default(),
             certificates: CertificatesConfig::default(),
             tls: TlsConfig::default(),
+            external_auth: ExternalAuthConfig::default(),
             policy: PolicyConfig::default(),
         }
     }
@@ -747,6 +764,7 @@ impl Config {
 
         validate_logging_config(&self.logging)?;
         validate_capture_config(&self.capture)?;
+        validate_external_auth_config(&self.external_auth)?;
 
         Ok(())
     }
@@ -797,6 +815,31 @@ fn validate_capture_config(capture: &CaptureConfig) -> Result<(), ConfigError> {
         return Err(ConfigError::Invalid(
             "capture.directory must not be empty".to_string(),
         ));
+    }
+
+    Ok(())
+}
+
+fn validate_external_auth_config(external_auth: &ExternalAuthConfig) -> Result<(), ConfigError> {
+    if let Some(raw) = external_auth.callback_url.as_deref() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(ConfigError::Invalid(
+                "external_auth.callback_url must not be empty when set".to_string(),
+            ));
+        }
+
+        let parsed = Url::parse(trimmed).map_err(|e| {
+            ConfigError::Invalid(format!(
+                "external_auth.callback_url is not a valid URL: {e}"
+            ))
+        })?;
+
+        if !parsed.has_host() {
+            return Err(ConfigError::Invalid(
+                "external_auth.callback_url must be an absolute URL with host".to_string(),
+            ));
+        }
     }
 
     Ok(())
@@ -1050,6 +1093,64 @@ level = "info"
         // Empty filename is allowed; resolve_capture_path will fall back
         // to the default template.
         assert!(config.validate_basic().is_ok());
+    }
+
+    #[test]
+    fn external_auth_callback_url_must_be_absolute_url() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[external_auth]
+callback_url = "/relative/path"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config
+            .validate_basic()
+            .expect_err("validation should fail for relative callback_url");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("external_auth.callback_url"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn external_auth_callback_url_valid_absolute_url_passes_validation() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[external_auth]
+callback_url = "https://proxy.example.com/_acl-proxy/external-auth/callback"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        assert!(
+            config.validate_basic().is_ok(),
+            "validation should succeed for absolute callback_url"
+        );
     }
 
     #[test]
