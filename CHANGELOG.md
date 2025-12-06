@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fix upstream HTTP/2: remove hardcoded HTTP/1.1 version hint so `tls.enable_http2_upstream` works correctly [#14]
 - Add architecture and code review documentation [#12]
 - Clean up external auth imports and apply fmt/clippy [#9]
 - Refactor external auth gate handlers into shared helper [#7]
@@ -14,6 +15,7 @@
 
 - Initial public release (pre-alpha).
 
+[#14]: https://github.com/kcosr/acl-proxy/pull/14
 [#12]: https://github.com/kcosr/acl-proxy/pull/12
 [#9]: https://github.com/kcosr/acl-proxy/pull/9
 [#7]: https://github.com/kcosr/acl-proxy/pull/7
