@@ -356,6 +356,9 @@ impl ExternalAuthManager {
         http_status: Option<StatusCode>,
     ) {
         if let Some((_key, pending)) = self.pending.remove(request_id) {
+            // Best-effort cleanup of any stored macro values for this request.
+            self.macro_values.remove(request_id);
+
             let reason = match failure_kind {
                 WebhookFailureKind::Timeout => {
                     "External auth webhook delivery timed out".to_string()
@@ -391,6 +394,9 @@ impl ExternalAuthManager {
     /// Record a terminal "timed_out" status when approval times out.
     pub fn finalize_timed_out(&self, request_id: &str) {
         if let Some((_key, pending)) = self.pending.remove(request_id) {
+            // Best-effort cleanup of any stored macro values for this request.
+            self.macro_values.remove(request_id);
+
             let configured_ms = pending
                 .deadline_at
                 .saturating_duration_since(pending.created_at)
@@ -419,6 +425,9 @@ impl ExternalAuthManager {
     /// Record a terminal "error" status when the approval channel fails.
     pub fn finalize_internal_error(&self, request_id: &str, message: &str) {
         if let Some((_key, pending)) = self.pending.remove(request_id) {
+            // Best-effort cleanup of any stored macro values for this request.
+            self.macro_values.remove(request_id);
+
             let event = StatusWebhookEvent {
                 request_id: request_id.to_string(),
                 profile_name: pending.profile_name,
@@ -441,6 +450,9 @@ impl ExternalAuthManager {
     /// Called from the RAII guard destructor to mark cancellations.
     pub fn finalize_cancelled_if_pending(&self, request_id: &str) {
         if let Some((_key, pending)) = self.pending.remove(request_id) {
+            // Best-effort cleanup of any stored macro values for this request.
+            self.macro_values.remove(request_id);
+
             let event = StatusWebhookEvent {
                 request_id: request_id.to_string(),
                 profile_name: pending.profile_name,

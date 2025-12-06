@@ -431,6 +431,8 @@ Fields:
 
 Referencing `{{name}}` in a header action without an entry in `policy.approval_macros` is allowed;
 in that case, the macro uses defaults: `label = name`, `required = true`, `secret = false`.
+When an optional macro is not provided in the callback, any `{{name}}` placeholders using it are
+replaced with an empty string during interpolation.
 
 ### `policy.rulesets`
 

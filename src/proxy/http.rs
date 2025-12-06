@@ -409,7 +409,10 @@ async fn handle_external_auth_callback_request(
                                 return resp;
                             }
                             // Optional macro explicitly empty -> treat as not provided.
-                        } else if raw.contains('\r') || raw.contains('\n') {
+                        } else if raw
+                            .chars()
+                            .any(|c| (c as u32) < 0x20 && c != '\t' || c == '\u{007f}')
+                        {
                             state.external_auth.finalize_internal_error(
                                 &payload.request_id,
                                 &format!("Invalid macro value for {}", desc.name),
