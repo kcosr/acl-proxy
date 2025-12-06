@@ -70,6 +70,45 @@
       approval.clientIp ? `, client: ${approval.clientIp}` : ""
     })`;
 
+    li.appendChild(text);
+
+    if (Array.isArray(approval.macros) && approval.macros.length > 0) {
+      const macrosContainer = document.createElement("div");
+
+      const heading = document.createElement("div");
+      heading.textContent = "Approval details";
+      macrosContainer.appendChild(heading);
+
+      approval.macros.forEach((macro) => {
+        if (!macro || !macro.name) return;
+
+        const field = document.createElement("div");
+
+        const label = document.createElement("label");
+        const labelText =
+          (typeof macro.label === "string" && macro.label.trim()
+            ? macro.label
+            : macro.name) +
+          (macro.required === false ? " (optional)" : " *");
+        label.textContent = labelText;
+
+        const input = document.createElement("input");
+        input.type = macro.secret ? "password" : "text";
+        input.dataset.macroName = macro.name;
+        input.dataset.macroRequired =
+          macro.required === false ? "false" : "true";
+        if (macro.secret) {
+          input.autocomplete = "off";
+        }
+
+        field.appendChild(label);
+        field.appendChild(input);
+        macrosContainer.appendChild(field);
+      });
+
+      li.appendChild(macrosContainer);
+    }
+
     const buttons = document.createElement("div");
 
     const approve = document.createElement("button");
@@ -85,7 +124,6 @@
     buttons.appendChild(approve);
     buttons.appendChild(deny);
 
-    li.appendChild(text);
     li.appendChild(buttons);
     activeListEl.appendChild(li);
     pending.set(approval.requestId, li);
@@ -189,13 +227,48 @@
       setStatus("Cannot send decision: WebSocket not open.");
       return;
     }
+
+    const macroInputs = li.querySelectorAll("input[data-macro-name]");
+    let macros;
+
+    if (decision === "allow" && macroInputs.length > 0) {
+      const collected = {};
+      for (const input of macroInputs) {
+        const name = input.dataset.macroName;
+        if (!name) continue;
+        const required = input.dataset.macroRequired !== "false";
+        const value = input.value;
+        if (required && !value) {
+          const label =
+            input.previousSibling && input.previousSibling.textContent;
+          setStatus(
+            `Missing required approval field: ${label || name}`,
+          );
+          input.focus();
+          return;
+        }
+        if (!required && !value) {
+          continue;
+        }
+        collected[name] = value;
+      }
+      macros = collected;
+    }
+
     const payload = {
       type: "decision",
       requestId,
       decision,
     };
     // eslint-disable-next-line no-console
-    console.log("[ws:client] send decision", payload);
+    if (decision === "allow" && macroInputs.length > 0) {
+      payload.macros = macros || {};
+    }
+    // eslint-disable-next-line no-console
+    console.log("[ws:client] send decision", {
+      requestId,
+      decision,
+    });
     ws.send(JSON.stringify(payload));
     li.dataset.status = "sent";
     li.dataset.decision = decision;

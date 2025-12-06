@@ -14,8 +14,10 @@ The app:
 - Exposes `POST /webhook` for `acl-proxy` to call.
 - Maintains an in-memory list of pending approvals.
 - Pushes new approvals to connected browsers over WebSocket.
-- Lets a user click **Approve** or **Deny** in the browser.
-- Sends the callback decision to `acl-proxy` via
+- Lets a user click **Approve** or **Deny** in the browser and, for rules
+  that define approval macros, fill in any required macro values.
+- Sends the callback decision (including any approved macro values) to
+  `acl-proxy` via
   `/_acl-proxy/external-auth/callback`.
 
 ## Prerequisites
@@ -50,6 +52,10 @@ In your `acl-proxy` config, define an external auth profile that points at the
 demo app and attach it to an allow rule. For example:
 
 ```toml
+[policy.approval_macros]
+github_token = { label = "GitHub token", required = true, secret = true }
+reason       = { label = "Approval reason", required = false, secret = false }
+
 [policy.external_auth_profiles]
 
 [policy.external_auth_profiles.web_ui_demo]
@@ -61,8 +67,20 @@ on_webhook_failure = "error"
 [[policy.rules]]
 action = "allow"
 pattern = "https://api.github.com/**"
-description = "GitHub API with web UI approval"
+description = "GitHub API with web UI approval and macros"
 external_auth_profile = "web_ui_demo"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "authorization"
+value = "token {{github_token}}"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "add"
+name = "x-approval-reason"
+value = "{{reason}}"
 ```
 
 Then:
@@ -77,4 +95,3 @@ When the rule matches, the app should display a new pending approval in the
 browser. Clicking **Approve** or **Deny** sends the callback to `acl-proxy`,
 which then either proxies the request upstream or returns a synthetic deny /
 timeout / error response according to its configuration.
-
