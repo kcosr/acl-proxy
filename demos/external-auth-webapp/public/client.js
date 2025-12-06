@@ -77,6 +77,8 @@
 
       const heading = document.createElement("div");
       heading.textContent = "Approval details";
+       heading.style.fontWeight = "600";
+       macrosContainer.style.marginTop = "0.5rem";
       macrosContainer.appendChild(heading);
 
       approval.macros.forEach((macro) => {
@@ -97,6 +99,7 @@
         input.dataset.macroName = macro.name;
         input.dataset.macroRequired =
           macro.required === false ? "false" : "true";
+        input.dataset.macroLabel = labelText;
         if (macro.secret) {
           input.autocomplete = "off";
         }
@@ -239,8 +242,7 @@
         const required = input.dataset.macroRequired !== "false";
         const value = input.value;
         if (required && !value) {
-          const label =
-            input.previousSibling && input.previousSibling.textContent;
+          const label = input.dataset.macroLabel || name;
           setStatus(
             `Missing required approval field: ${label || name}`,
           );

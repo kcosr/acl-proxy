@@ -219,9 +219,14 @@ wss.on("connection", (ws) => {
     }
 
     if (msg.type === "decision") {
-      const { requestId, decision } = msg as WebsocketDecisionMessage;
+      const { requestId, decision, macros } =
+        msg as WebsocketDecisionMessage;
       // eslint-disable-next-line no-console
-      console.log("[ws:recv] decision", { requestId, decision });
+      console.log("[ws:recv] decision", {
+        requestId,
+        decision,
+        macroKeys: macros ? Object.keys(macros) : undefined,
+      });
     } else {
       // eslint-disable-next-line no-console
       console.log("[ws:recv]", { type: msg.type });
@@ -278,7 +283,9 @@ wss.on("connection", (ws) => {
             filtered[name] = raw;
           }
 
-          callbackBody.macros = filtered;
+          if (Object.keys(filtered).length > 0) {
+            callbackBody.macros = filtered;
+          }
         }
 
         const resp = await fetch(CALLBACK_URL, {
