@@ -105,6 +105,12 @@ certs_dir = "certs"
 # ca_key_path = "/path/to/ca-key.pem"
 # ca_cert_path = "/path/to/ca-cert.pem"
 
+# Maximum number of distinct per-host certificates cached in memory.
+# Implemented as a least-recently-used (LRU) cache. When the cache is
+# full and a new host is added, the least recently used entry is
+# evicted.
+max_cached_certs = 1024
+
 [tls]
 # Verify upstream HTTPS certificates by default. Set to false only in
 # controlled testing environments.

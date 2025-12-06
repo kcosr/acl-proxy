@@ -37,6 +37,7 @@ tokio-rustls = "0.24"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 rustls-pemfile = "1"
 dashmap = "5"
+lru = "0.12"
 
 [dev-dependencies]
 assert_cmd = "2.0"

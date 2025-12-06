@@ -363,6 +363,7 @@ cause configuration validation to fail.
 certs_dir = "certs"
 ca_key_path = "/optional/path/to/ca-key.pem"
 ca_cert_path = "/optional/path/to/ca-cert.pem"
+max_cached_certs = 1024
 ```
 
 - `certs_dir` – base directory for certificate material. If empty or whitespace, `"certs"` is used.
@@ -375,6 +376,10 @@ ca_cert_path = "/optional/path/to/ca-cert.pem"
     - The CA key and certificate must exist and be parseable; errors are treated as fatal.
     - Generated per-host certificates embed the exact configured CA certificate bytes in the chain.
   - Any other combination (only one of the two set) is rejected during config validation.
+- `max_cached_certs` (integer, default `1024`):
+  - Maximum number of distinct per-host certificates kept in the in-memory LRU caches used by
+    the proxy for TLS handshakes.
+  - When the cache is full and a new host is added, the least recently used entry is evicted.
 
 Per-host certificates:
 - Per-host leaf certificates and keys are generated on demand and cached in memory.

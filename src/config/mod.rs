@@ -262,6 +262,13 @@ pub struct CertificatesConfig {
 
     #[serde(default)]
     pub ca_cert_path: Option<String>,
+
+    /// Maximum number of distinct per-host certificates to keep in
+    /// the in-memory LRU caches used by `CertManager` and
+    /// `SniResolver`. When the cache is full, the least recently used
+    /// entry is evicted.
+    #[serde(default = "default_max_cached_certs")]
+    pub max_cached_certs: usize,
 }
 
 impl Default for CertificatesConfig {
@@ -270,12 +277,17 @@ impl Default for CertificatesConfig {
             certs_dir: default_certs_dir(),
             ca_key_path: None,
             ca_cert_path: None,
+            max_cached_certs: default_max_cached_certs(),
         }
     }
 }
 
 fn default_certs_dir() -> String {
     "certs".to_string()
+}
+
+fn default_max_cached_certs() -> usize {
+    1024
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -701,6 +713,12 @@ impl Config {
             )),
         }?;
 
+        if self.certificates.max_cached_certs == 0 {
+            return Err(ConfigError::Invalid(
+                "certificates.max_cached_certs must be at least 1".to_string(),
+            ));
+        }
+
         // Validate policy semantics (macros, rulesets, includes).
         crate::policy::PolicyEngine::from_config(&self.policy)
             .map_err(|e| ConfigError::Invalid(format!("{e}")))?;
@@ -870,6 +888,35 @@ ca_cert_path = "ca-cert.pem"
         );
         let config: Config = toml::from_str(&toml_both).expect("parse both config");
         assert!(config.validate_basic().is_ok());
+    }
+
+    #[test]
+    fn certificate_max_cached_certs_must_be_at_least_one() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[certificates]
+max_cached_certs = 0
+"#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("certificates.max_cached_certs"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[test]
