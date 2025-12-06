@@ -164,29 +164,7 @@ Each `CompiledRule` stores its own `Regex`. For policies with many rules, evalua
 
 ## Opportunities for Improvement
 
-### 1. HTTP/2 Downstream Support is Partial
-
-**Location:** `src/proxy/https_transparent.rs`
-
-The HTTPS transparent listener advertises `h2` via ALPN:
-```rust
-config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-```
-
-But the request handling uses:
-```rust
-Http::new()
-    .http1_keep_alive(true)
-    .serve_connection(tls, service)
-```
-
-**Impact:** If a client negotiates HTTP/2, the behavior is unclear. Hyper may handle it, but this should be explicitly configured with `.http2_only(false)` or similar to be clear about intent.
-
-**Suggested Fix:** Either remove `h2` from ALPN, or explicitly enable HTTP/2 handling with `Http::new().http1_only(false)`.
-
----
-
-### 2. No Request Timeout
+### 1. No Request Timeout
 
 **Location:** `src/proxy/http.rs`
 
@@ -201,7 +179,7 @@ tokio::time::timeout(Duration::from_secs(30), client_http.request(req)).await
 
 ---
 
-### 3. Capture Body Tee Allocation Overhead
+### 2. Capture Body Tee Allocation Overhead
 
 **Location:** `src/proxy/http.rs`
 
@@ -216,7 +194,7 @@ let (tx, rx) = mpsc::channel::<Result<Bytes, hyper::Error>>(16);
 
 ---
 
-### 4. No Metrics/Observability
+### 3. No Metrics/Observability
 
 **Location:** Throughout codebase
 
@@ -234,7 +212,7 @@ There are no Prometheus metrics, OpenTelemetry traces, or similar observability 
 
 ---
 
-### 5. Policy Hot Reload Compiles Regex Twice
+### 4. Policy Hot Reload Compiles Regex Twice
 
 **Location:** `src/config/mod.rs`, `src/app.rs`
 
@@ -248,7 +226,7 @@ On SIGHUP or config validation:
 
 ---
 
-### 6. No Graceful Drain on Shutdown
+### 5. No Graceful Drain on Shutdown
 
 **Location:** `src/cli/mod.rs`
 
@@ -266,7 +244,7 @@ shutdown_clone.notify_waiters();
 
 ---
 
-### 7. External Auth Callback Endpoint Not Configurable
+### 6. External Auth Callback Endpoint Not Configurable
 
 **Location:** `src/proxy/http.rs`
 
@@ -283,7 +261,7 @@ fn is_external_auth_callback_path(path: &str) -> bool {
 
 ---
 
-### 8. No Rate Limiting
+### 7. No Rate Limiting
 
 **Location:** N/A (not implemented)
 
@@ -295,7 +273,7 @@ There's no built-in rate limiting capability.
 
 ---
 
-### 9. Capture Filename Collision Risk
+### 8. Capture Filename Collision Risk
 
 **Location:** `src/capture/mod.rs`
 
@@ -318,11 +296,11 @@ If the process restarts, the counter resets to 1, and if it happens within the s
 |----------|-------|
 | Potential Bugs | 3 |
 | Design Issues | 5 |
-| Improvement Opportunities | 9 |
+| Improvement Opportunities | 8 |
 
 Priority recommendations:
 1. **High:** Fix blocking I/O in async context (#2 Design Issue)
-2. **High:** Add request timeout (#2 Improvement)
+2. **High:** Add request timeout (#1 Improvement)
 3. **Medium:** Add certificate cache eviction (#1 Design Issue)
 4. **Medium:** Add IPv6 subnet support (#1 Bug)
-5. **Medium:** Add basic metrics (#4 Improvement)
+5. **Medium:** Add basic metrics (#3 Improvement)
