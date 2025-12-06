@@ -9,9 +9,9 @@ use thiserror::Error;
 use url::Url;
 
 use crate::config::{
-    ExternalAuthProfileConfigMap, HeaderActionConfig, HeaderActionKind, HeaderDirection, HeaderWhen,
-    MacroMap, MacroOverrideMap, MacroValues, PolicyConfig, PolicyDefaultAction, PolicyRuleConfig,
-    PolicyRuleDirectConfig, PolicyRuleIncludeConfig, RulesetMap, UrlEncVariants,
+    ExternalAuthProfileConfigMap, HeaderActionConfig, HeaderActionKind, HeaderDirection,
+    HeaderWhen, MacroMap, MacroOverrideMap, MacroValues, PolicyConfig, PolicyDefaultAction,
+    PolicyRuleConfig, PolicyRuleDirectConfig, PolicyRuleIncludeConfig, RulesetMap, UrlEncVariants,
 };
 
 #[derive(Debug, Error)]
