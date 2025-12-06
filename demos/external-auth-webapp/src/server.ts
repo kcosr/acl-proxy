@@ -3,6 +3,13 @@ import http from "http";
 import express from "express";
 import { WebSocketServer, WebSocket } from "ws";
 
+type MacroDescriptor = {
+  name: string;
+  label?: string | null;
+  required?: boolean;
+  secret?: boolean;
+};
+
 type PendingApproval = {
   requestId: string;
   profile: string;
@@ -10,6 +17,7 @@ type PendingApproval = {
   url: string;
   method?: string | null;
   clientIp?: string | null;
+  macros: MacroDescriptor[];
 };
 
 type StatusEvent = {
@@ -30,12 +38,15 @@ type StatusEvent = {
   httpStatus?: number | null;
 };
 
+type WebsocketDecisionMessage = {
+  type: "decision";
+  requestId: string;
+  decision: "allow" | "deny";
+  macros?: Record<string, string>;
+};
+
 type WebsocketMessage =
-  | {
-      type: "decision";
-      requestId: string;
-      decision: "allow" | "deny";
-    }
+  | WebsocketDecisionMessage
   | { type: string; [key: string]: unknown };
 
 const app = express();
@@ -78,6 +89,7 @@ app.post("/webhook", (req, res) => {
     eventId?: string;
     failureKind?: string;
     httpStatus?: number;
+    macros?: MacroDescriptor[];
   };
 
   const {
@@ -96,6 +108,7 @@ app.post("/webhook", (req, res) => {
     eventId,
     failureKind,
     httpStatus,
+    macros,
   } = body;
 
   const eventType =
@@ -163,6 +176,7 @@ app.post("/webhook", (req, res) => {
     url,
     method: method ?? null,
     clientIp: clientIp ?? null,
+    macros: Array.isArray(macros) ? macros : [],
   };
   pending.set(requestId, approval);
 
@@ -191,8 +205,6 @@ wss.on("connection", (ws) => {
   }
 
   ws.on("message", async (data) => {
-    // eslint-disable-next-line no-console
-    console.log("[ws:recv]", String(data));
     let msg: WebsocketMessage;
     try {
       msg = JSON.parse(String(data));
@@ -206,12 +218,27 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    if (msg.type === "decision") {
+      const { requestId, decision, macros } =
+        msg as WebsocketDecisionMessage;
+      // eslint-disable-next-line no-console
+      console.log("[ws:recv] decision", {
+        requestId,
+        decision,
+        macroKeys: macros ? Object.keys(macros) : undefined,
+      });
+    } else {
+      // eslint-disable-next-line no-console
+      console.log("[ws:recv]", { type: msg.type });
+    }
+
     if (
       msg.type === "decision" &&
       typeof msg.requestId === "string" &&
       (msg.decision === "allow" || msg.decision === "deny")
     ) {
-      const { requestId, decision } = msg;
+      const { requestId, decision, macros } =
+        msg as WebsocketDecisionMessage;
       const approval = pending.get(requestId);
 
       if (!approval) {
@@ -227,15 +254,46 @@ wss.on("connection", (ws) => {
       pending.delete(requestId);
 
       try {
+        const callbackBody: {
+          requestId: string;
+          decision: "allow" | "deny";
+          macros?: Record<string, string>;
+        } = {
+          requestId,
+          decision,
+        };
+
+        if (decision === "allow" && approval.macros.length > 0) {
+          const provided =
+            macros && typeof macros === "object" ? macros : {};
+          const filtered: Record<string, string> = {};
+
+          for (const desc of approval.macros) {
+            const name = desc.name;
+            if (!name) {
+              continue;
+            }
+            const raw = (provided as Record<string, unknown>)[name];
+            if (typeof raw !== "string") {
+              continue;
+            }
+            if (!raw && desc.required === false) {
+              continue;
+            }
+            filtered[name] = raw;
+          }
+
+          if (Object.keys(filtered).length > 0) {
+            callbackBody.macros = filtered;
+          }
+        }
+
         const resp = await fetch(CALLBACK_URL, {
           method: "POST",
           headers: {
             "content-type": "application/json",
           },
-          body: JSON.stringify({
-            requestId,
-            decision,
-          }),
+          body: JSON.stringify(callbackBody),
         });
 
         ws.send(
