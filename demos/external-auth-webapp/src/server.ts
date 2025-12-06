@@ -37,7 +37,6 @@ type StatusEvent = {
   eventId?: string;
   failureKind?: string | null;
   httpStatus?: number | null;
-  callbackUrl?: string | null;
 };
 
 type WebsocketDecisionMessage = {
@@ -143,7 +142,6 @@ app.post("/webhook", (req, res) => {
       eventId,
       failureKind: failureKind ?? null,
       httpStatus: httpStatus ?? null,
-      callbackUrl: callbackUrl ?? null,
     };
 
     // Once a terminal status webhook arrives (timed out, cancelled, error,
@@ -193,7 +191,8 @@ app.post("/webhook", (req, res) => {
   }
   pending.set(requestId, approval);
 
-  const msg = JSON.stringify({ type: "pending", approval });
+  const { callbackUrl: _cb, ...approvalForClient } = approval;
+  const msg = JSON.stringify({ type: "pending", approval: approvalForClient });
   // eslint-disable-next-line no-console
   console.log("[ws:broadcast] pending", msg);
   wss.clients.forEach((ws) => {
@@ -211,7 +210,8 @@ wss.on("connection", (ws) => {
   console.log("[ws] client connected");
   // On connect, send the current pending list.
   for (const approval of pending.values()) {
-    const msg = JSON.stringify({ type: "pending", approval });
+    const { callbackUrl: _cb, ...approvalForClient } = approval;
+    const msg = JSON.stringify({ type: "pending", approval: approvalForClient });
     // eslint-disable-next-line no-console
     console.log("[ws:broadcast] pending (initial)", msg);
     ws.send(msg);
