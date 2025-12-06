@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Add architecture and code review documentation [#12]
 - Clean up external auth imports and apply fmt/clippy [#9]
 - Refactor external auth gate handlers into shared helper [#7]
 - Implement external auth lifecycle status webhooks [#4]
@@ -13,6 +14,7 @@
 
 - Initial public release (pre-alpha).
 
+[#12]: https://github.com/kcosr/acl-proxy/pull/12
 [#9]: https://github.com/kcosr/acl-proxy/pull/9
 [#7]: https://github.com/kcosr/acl-proxy/pull/7
 [#4]: https://github.com/kcosr/acl-proxy/pull/4
