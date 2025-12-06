@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - Fix upstream HTTP/2: remove hardcoded HTTP/1.1 version hint so `tls.enable_http2_upstream` works correctly [#14]
+- Capture upstream failure paths (502 Bad Gateway) for allowed requests [#14]
 - Add architecture and code review documentation [#12]
 - Clean up external auth imports and apply fmt/clippy [#9]
 - Refactor external auth gate handlers into shared helper [#7]
