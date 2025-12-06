@@ -205,6 +205,31 @@
       buttons.remove();
     }
 
+    // Convert any macro inputs into static labels so completed
+    // approvals no longer show editable fields.
+    const macroInputs = li.querySelectorAll("input[data-macro-name]");
+    for (const input of macroInputs) {
+      const field = input.parentElement;
+      if (!field) continue;
+      const labelEl = field.querySelector("label");
+      const labelText =
+        (labelEl && labelEl.textContent) ||
+        input.dataset.macroLabel ||
+        input.dataset.macroName ||
+        "";
+      const value = input.value;
+      let valueText;
+      if (input.type === "password") {
+        valueText = value ? "********" : "(no value)";
+      } else {
+        valueText = value || "(no value)";
+      }
+      const readOnly = document.createElement("span");
+      readOnly.textContent = `${labelText}: ${valueText}`;
+      field.textContent = "";
+      field.appendChild(readOnly);
+    }
+
     const textDiv = li.querySelector("div");
     const parts = [];
     if (textDiv && textDiv.textContent) {
