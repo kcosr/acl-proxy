@@ -281,6 +281,7 @@ Loop detection is applied:
 certs_dir = "certs"
 ca_key_path = "/optional/path/to/ca-key.pem"
 ca_cert_path = "/optional/path/to/ca-cert.pem"
+max_cached_certs = 1024
 ```
 
 Fields:
@@ -302,6 +303,11 @@ Fields:
       example at startup or on reload).
   - When only one is provided:
     - Validation fails with an error; both must be set or both omitted.
+- `max_cached_certs` (integer, default `1024`):
+  - Maximum number of distinct per-host certificates cached in memory by the proxy.
+  - Implemented as a least-recently-used (LRU) cache shared by the per-host server config and
+    SNI certificate resolvers.
+  - When the cache is full and a new host is added, the least recently used entry is evicted.
 
 Per-host certificates:
 

@@ -1,9 +1,10 @@
-use std::collections::HashMap;
 use std::fs;
 use std::io::{Cursor, Error as IoError, ErrorKind as IoErrorKind};
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use lru::LruCache;
 use rcgen::{
     BasicConstraints, Certificate as RcgenCertificate, CertificateParams, DistinguishedName,
     DnType, IsCa, KeyPair,
@@ -53,6 +54,9 @@ pub enum CertError {
         #[source]
         source: std::io::Error,
     },
+
+    #[error("invalid max_cached_certs ({value}); must be at least 1")]
+    InvalidCacheSize { value: usize },
 }
 
 struct Inner {
@@ -60,7 +64,8 @@ struct Inner {
     dynamic_dir: PathBuf,
     ca_cert: RcgenCertificate,
     ca_key: KeyPair,
-    server_configs: Mutex<HashMap<String, Arc<ServerConfig>>>,
+    cache_capacity: NonZeroUsize,
+    server_configs: Mutex<LruCache<String, Arc<ServerConfig>>>,
 }
 
 #[derive(Clone)]
@@ -104,12 +109,19 @@ impl CertManager {
         let (ca_cert, ca_key) =
             load_or_generate_ca(&ca_key_path, &ca_cert_path, explicit_ca_paths)?;
 
+        let cache_capacity = NonZeroUsize::new(cfg.max_cached_certs).ok_or(
+            CertError::InvalidCacheSize {
+                value: cfg.max_cached_certs,
+            },
+        )?;
+
         let inner = Inner {
             ca_cert_path,
             dynamic_dir,
             ca_cert,
             ca_key,
-            server_configs: Mutex::new(HashMap::new()),
+            cache_capacity,
+            server_configs: Mutex::new(LruCache::new(cache_capacity)),
         };
 
         Ok(CertManager {
@@ -155,7 +167,7 @@ impl CertManager {
     fn server_config_for_host(&self, host: &str) -> Result<Arc<ServerConfig>, CertError> {
         let host = host.to_ascii_lowercase();
         {
-            let cache = self.inner.server_configs.lock().unwrap();
+            let mut cache = self.inner.server_configs.lock().unwrap();
             if let Some(cfg) = cache.get(&host) {
                 return Ok(cfg.clone());
             }
@@ -178,7 +190,7 @@ impl CertManager {
 
         let cfg = Arc::new(config);
         let mut cache = self.inner.server_configs.lock().unwrap();
-        cache.insert(host.clone(), cfg.clone());
+        cache.put(host.clone(), cfg.clone());
         Ok(cfg)
     }
 
@@ -190,21 +202,21 @@ impl CertManager {
 
 struct SniResolver {
     inner: Arc<Inner>,
-    keys: Mutex<HashMap<String, Arc<CertifiedKey>>>,
+    keys: Mutex<LruCache<String, Arc<CertifiedKey>>>,
 }
 
 impl SniResolver {
     fn new(inner: Arc<Inner>) -> Self {
         SniResolver {
-            inner,
-            keys: Mutex::new(HashMap::new()),
+            inner: inner.clone(),
+            keys: Mutex::new(LruCache::new(inner.cache_capacity)),
         }
     }
 
     fn certified_key_for_host(&self, host: &str) -> Option<Arc<CertifiedKey>> {
         let host = host.to_ascii_lowercase();
         {
-            let cache = self.keys.lock().unwrap();
+            let mut cache = self.keys.lock().unwrap();
             if let Some(key) = cache.get(&host) {
                 return Some(key.clone());
             }
@@ -235,7 +247,7 @@ impl SniResolver {
         let certified = Arc::new(CertifiedKey::new(cert_chain, signing_key));
 
         let mut cache = self.keys.lock().unwrap();
-        cache.insert(host, certified.clone());
+        cache.put(host, certified.clone());
         Some(certified)
     }
 }
@@ -507,6 +519,44 @@ mod tests {
         assert!(leaf.exists(), "leaf cert should exist");
         assert!(key.exists(), "key should exist");
         assert!(chain.exists(), "chain cert should exist");
+    }
+
+    #[test]
+    fn server_config_cache_uses_lru_eviction() {
+        let tmp = TempDir::new().expect("tempdir");
+        let certs_dir = tmp.path().join("certs");
+
+        let mut cfg = CertificatesConfig::default();
+        cfg.certs_dir = certs_dir.to_string_lossy().to_string();
+        cfg.max_cached_certs = 1;
+
+        let mgr = CertManager::from_config(&cfg).expect("cert manager");
+
+        // With capacity 1, caching behavior should:
+        // - Cache host1.
+        // - Evict host1 when host2 is inserted.
+        // - Regenerate host1 when requested again.
+        let host1 = "one.example.com";
+        let host2 = "two.example.com";
+
+        let cfg1 = mgr.server_config_for_host(host1).expect("cfg1");
+        let cfg1_again = mgr.server_config_for_host(host1).expect("cfg1 again");
+        assert!(
+            std::sync::Arc::ptr_eq(&cfg1, &cfg1_again),
+            "host1 should be cached on repeated access"
+        );
+
+        let cfg2 = mgr.server_config_for_host(host2).expect("cfg2");
+        assert!(
+            !std::sync::Arc::ptr_eq(&cfg1, &cfg2),
+            "different hosts should have different configs"
+        );
+
+        let cfg1_new = mgr.server_config_for_host(host1).expect("cfg1 new");
+        assert!(
+            !std::sync::Arc::ptr_eq(&cfg1, &cfg1_new),
+            "host1 should be regenerated after eviction when capacity is 1"
+        );
     }
 
     #[test]
