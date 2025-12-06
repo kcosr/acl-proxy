@@ -207,9 +207,10 @@ struct SniResolver {
 
 impl SniResolver {
     fn new(inner: Arc<Inner>) -> Self {
+        let capacity = inner.cache_capacity;
         SniResolver {
             inner,
-            keys: Mutex::new(LruCache::new(inner.cache_capacity)),
+            keys: Mutex::new(LruCache::new(capacity)),
         }
     }
 
