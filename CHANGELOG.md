@@ -2,14 +2,21 @@
 
 ## [Unreleased]
 
-- Fix upstream HTTP/2: remove hardcoded HTTP/1.1 version hint so `tls.enable_http2_upstream` works correctly [#14]
+## [0.0.2] - 2025-12-06
+
+### Added
 - Capture upstream failure paths (502 Bad Gateway) for allowed requests [#14]
 - Add architecture and code review documentation [#12]
 - Add LRU eviction for per-host certificate caches and `certificates.max_cached_certs` setting [#17]
-- Clean up external auth imports and apply fmt/clippy [#9]
-- Refactor external auth gate handlers into shared helper [#7]
 - Implement external auth lifecycle status webhooks [#4]
 - Add external auth webhook support for approval-required policy rules [#2]
+
+### Changed
+- Clean up external auth imports and apply fmt/clippy [#9]
+- Refactor external auth gate handlers into shared helper [#7]
+
+### Fixed
+- Fix upstream HTTP/2: remove hardcoded HTTP/1.1 version hint so `tls.enable_http2_upstream` works correctly [#14]
 
 ## [0.0.1] - 2025-12-04
 
