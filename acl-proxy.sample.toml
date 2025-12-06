@@ -144,6 +144,12 @@ status_host = [
   "status2.internal",
 ]
 
+# Approval macros describe dynamic values that external approvers
+# can supply for header actions on approval-required rules.
+[policy.approval_macros]
+github_token = { label = "GitHub token", required = true, secret = true }
+reason       = { label = "Approval reason", required = false, secret = false }
+
 ###############################################################################
 # External auth profiles (approval-required rules)
 ###############################################################################
@@ -214,6 +220,18 @@ action = "allow"
 pattern = "https://api.github.com/**"
 description = "GitHub API with external MFA"
 external_auth_profile = "github_mfa"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "authorization"
+value = "token {{github_token}}"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "add"
+name = "x-approval-reason"
+value = "{{reason}}"
 
 [[policy.rules]]
 # Explicitly deny access to administrative paths on the Git server,

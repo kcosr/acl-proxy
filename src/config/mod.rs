@@ -449,6 +449,9 @@ pub struct PolicyConfig {
     pub macros: MacroMap,
 
     #[serde(default)]
+    pub approval_macros: ApprovalMacroConfigMap,
+
+    #[serde(default)]
     pub rulesets: RulesetMap,
 
     #[serde(default)]
@@ -463,6 +466,7 @@ impl Default for PolicyConfig {
         Self {
             default: PolicyDefaultAction::Deny,
             macros: MacroMap::default(),
+            approval_macros: ApprovalMacroConfigMap::default(),
             rulesets: RulesetMap::default(),
             external_auth_profiles: ExternalAuthProfileConfigMap::default(),
             rules: Vec::new(),
@@ -474,8 +478,26 @@ pub type MacroMap = std::collections::BTreeMap<String, MacroValues>;
 pub type RulesetMap = std::collections::BTreeMap<String, Vec<PolicyRuleTemplateConfig>>;
 pub type MacroOverrideMap = std::collections::BTreeMap<String, MacroValues>;
 
+pub type ApprovalMacroConfigMap = std::collections::BTreeMap<String, ApprovalMacroConfig>;
+
 pub type ExternalAuthProfileConfigMap =
     std::collections::BTreeMap<String, ExternalAuthProfileConfig>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalMacroConfig {
+    #[serde(default)]
+    pub label: Option<String>,
+
+    #[serde(default = "default_approval_macro_required")]
+    pub required: bool,
+
+    #[serde(default)]
+    pub secret: bool,
+}
+
+fn default_approval_macro_required() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

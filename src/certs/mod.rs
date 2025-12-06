@@ -109,11 +109,10 @@ impl CertManager {
         let (ca_cert, ca_key) =
             load_or_generate_ca(&ca_key_path, &ca_cert_path, explicit_ca_paths)?;
 
-        let cache_capacity = NonZeroUsize::new(cfg.max_cached_certs).ok_or(
-            CertError::InvalidCacheSize {
+        let cache_capacity =
+            NonZeroUsize::new(cfg.max_cached_certs).ok_or(CertError::InvalidCacheSize {
                 value: cfg.max_cached_certs,
-            },
-        )?;
+            })?;
 
         let inner = Inner {
             ca_cert_path,

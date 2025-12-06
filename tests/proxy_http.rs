@@ -192,6 +192,266 @@ rule_id = "external-auth-test-rule"
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn approval_macros_are_exposed_and_applied() {
+    use hyper::service::{make_service_fn, service_fn};
+    use hyper::{Body, Request, Response, Server};
+
+    let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
+
+    #[derive(Clone, Debug)]
+    struct PendingEvent {
+        body: serde_json::Value,
+    }
+
+    let pending_event: Arc<Mutex<Option<PendingEvent>>> = Arc::new(Mutex::new(None));
+    let pending_event_clone = pending_event.clone();
+
+    let proxy_addr_shared: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let proxy_addr_for_svc = proxy_addr_shared.clone();
+
+    let make_svc = make_service_fn(move |_conn| {
+        let pending_event = pending_event_clone.clone();
+        let proxy_addr_for_svc = proxy_addr_for_svc.clone();
+        async move {
+            Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
+                let pending_event = pending_event.clone();
+                let proxy_addr_for_svc = proxy_addr_for_svc.clone();
+                async move {
+                    let event_header = req
+                        .headers()
+                        .get("x-acl-proxy-event")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+
+                    let bytes = hyper::body::to_bytes(req.into_body())
+                        .await
+                        .unwrap_or_default();
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({}));
+
+                    if event_header == "pending" {
+                        {
+                            let mut guard = pending_event.lock().unwrap();
+                            *guard = Some(PendingEvent { body: body.clone() });
+                        }
+
+                        if let Some(request_id) = body
+                            .get("requestId")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                        {
+                            if let Some(proxy_addr) = *proxy_addr_for_svc.lock().unwrap() {
+                                let callback_body = serde_json::json!({
+                                    "requestId": request_id,
+                                    "decision": "allow",
+                                    "macros": {
+                                        "github_token": "ghp_test_token",
+                                        "reason": "Approving for test"
+                                    }
+                                });
+
+                                let client = hyper::Client::new();
+                                let uri = format!(
+                                    "http://{}/_acl-proxy/external-auth/callback",
+                                    proxy_addr
+                                );
+
+                                tokio::spawn(async move {
+                                    let req = Request::builder()
+                                        .method("POST")
+                                        .uri(uri)
+                                        .header(
+                                            http::header::CONTENT_TYPE,
+                                            HeaderValue::from_static("application/json"),
+                                        )
+                                        .body(Body::from(
+                                            serde_json::to_vec(&callback_body)
+                                                .unwrap_or_else(|_| b"{}".to_vec()),
+                                        ))
+                                        .unwrap();
+                                    let _ = client.request(req).await;
+                                });
+                            }
+                        }
+
+                        Ok::<_, hyper::Error>(
+                            Response::builder()
+                                .status(http::StatusCode::OK)
+                                .body(Body::from("ok"))
+                                .unwrap(),
+                        )
+                    } else {
+                        Ok::<_, hyper::Error>(
+                            Response::builder()
+                                .status(http::StatusCode::OK)
+                                .body(Body::from("ok"))
+                                .unwrap(),
+                        )
+                    }
+                }
+            }))
+        }
+    });
+
+    let webhook_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind webhook");
+    webhook_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking webhook");
+    let webhook_addr = webhook_listener.local_addr().expect("webhook addr");
+
+    tokio::spawn(
+        Server::from_tcp(webhook_listener)
+            .expect("server from tcp")
+            .serve(make_svc),
+    );
+
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    let toml = format!(
+        r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+
+[logging]
+directory = "logs"
+level = "info"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[policy]
+default = "deny"
+
+[policy.approval_macros]
+github_token = {{ label = "GitHub token", required = true, secret = true }}
+reason = {{ label = "Approval reason", required = false, secret = false }}
+
+[policy.external_auth_profiles]
+[policy.external_auth_profiles.test_profile]
+webhook_url = "http://{addr}/webhook"
+timeout_ms = 5000
+webhook_timeout_ms = 1000
+on_webhook_failure = "error"
+
+[[policy.rules]]
+action = "allow"
+pattern = "http://{host}/**"
+description = "External auth with macros"
+external_auth_profile = "test_profile"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "authorization"
+value = "token {{{{github_token}}}}"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "add"
+name = "x-approval-reason"
+value = "{{{{reason}}}}"
+"#,
+        addr = webhook_addr,
+        host = host
+    );
+
+    let config: Config = toml::from_str(&toml).expect("parse config");
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+    {
+        let mut guard = proxy_addr_shared.lock().unwrap();
+        *guard = Some(proxy_addr);
+    }
+
+    let raw_request =
+        format!("GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+    let (_response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Verify that upstream saw interpolated headers.
+    let headers_guard = seen_headers.lock().unwrap();
+    let upstream_headers = headers_guard.as_ref().expect("upstream should see request");
+
+    assert_eq!(
+        upstream_headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok()),
+        Some("token ghp_test_token")
+    );
+    assert_eq!(
+        upstream_headers
+            .get("x-approval-reason")
+            .and_then(|v| v.to_str().ok()),
+        Some("Approving for test")
+    );
+
+    // Verify that the pending webhook exposed macro descriptors.
+    let pending_guard = pending_event.lock().unwrap();
+    let pending = pending_guard
+        .as_ref()
+        .expect("expected pending external auth event");
+    let macros = pending
+        .body
+        .get("macros")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    assert_eq!(macros.len(), 2, "expected two macro descriptors");
+
+    let mut names: Vec<String> = macros
+        .iter()
+        .filter_map(|m| {
+            m.get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["github_token".to_string(), "reason".to_string()]
+    );
+
+    for m in macros {
+        let name = m.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        match name {
+            "github_token" => {
+                assert_eq!(
+                    m.get("label").and_then(|v| v.as_str()),
+                    Some("GitHub token")
+                );
+                assert_eq!(m.get("required").and_then(|v| v.as_bool()), Some(true));
+                assert_eq!(m.get("secret").and_then(|v| v.as_bool()), Some(true));
+            }
+            "reason" => {
+                assert_eq!(
+                    m.get("label").and_then(|v| v.as_str()),
+                    Some("Approval reason")
+                );
+                assert_eq!(m.get("required").and_then(|v| v.as_bool()), Some(false));
+                assert_eq!(m.get("secret").and_then(|v| v.as_bool()), Some(false));
+            }
+            other => panic!("unexpected macro name {other}"),
+        }
+    }
+}
+
 fn minimal_config() -> Config {
     let toml = r#"
 schema_version = "1"

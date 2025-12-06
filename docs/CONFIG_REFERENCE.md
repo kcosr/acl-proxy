@@ -406,6 +406,32 @@ Values may be:
 Macros are referenced using `{placeholder}` syntax inside `pattern` and `description` fields.
 Missing macros cause configuration validation to fail.
 
+### `policy.approval_macros`
+
+`[policy.approval_macros]` describes **approval macros** that may be referenced from header
+actions on approval-required rules using `{{name}}` syntax. Each entry is a table keyed by the
+macro name:
+
+```toml
+[policy.approval_macros]
+github_token = { label = "GitHub token", required = true,  secret = true }
+reason       = { label = "Approval reason", required = false, secret = false }
+```
+
+Fields:
+
+- `label` (`string`, optional):
+  - Human-friendly label shown to external approver UIs.
+  - Defaults to the macro name when omitted.
+- `required` (`bool`, optional, default: `true`):
+  - When `true`, the external approver **must** supply a non-empty value on approval.
+  - When `false`, the macro is optional; missing or empty values are treated as "not provided".
+- `secret` (`bool`, optional, default: `false`):
+  - Hint for approver UIs and logging to treat values as sensitive (mask input and avoid logging).
+
+Referencing `{{name}}` in a header action without an entry in `policy.approval_macros` is allowed;
+in that case, the macro uses defaults: `label = name`, `required = true`, `secret = false`.
+
 ### `policy.rulesets`
 
 Rulesets define reusable rule templates. They live under `policy.rulesets.<set_name>` and are
@@ -541,6 +567,16 @@ Fields:
 For `when` evaluation, the proxy snapshots header presence separately for the request and response
 before applying any header actions for that side, and uses that snapshot for all actions in the
 rule. Actions are then applied in the order they appear in the configuration.
+
+Approval macros:
+
+- Header `value`/`values` may contain approval macros using `{{name}}` syntax (double braces).
+- Approval macros are discovered per-rule when `external_auth_profile` is set and described to
+  external approvers via the initial external auth webhook.
+- On `decision: "allow"`, the external auth callback may supply a `macros` object with values
+  for these names; required macros must be present and non-empty.
+- After approval, the proxy interpolates `{{name}}` occurrences in header values using the provided
+  macro values before applying the header actions to the upstream request/response.
 
 #### Include rules
 
@@ -686,17 +722,33 @@ Callback endpoint:
   POST /_acl-proxy/external-auth/callback
   Content-Type: application/json
 
-  { "requestId": "req-...", "decision": "allow" | "deny" }
+  {
+    "requestId": "req-...",
+    "decision": "allow" | "deny",
+    "macros": {
+      "github_token": "ghp_XXXXXXXXXXXXXXXXXXXXX",
+      "reason": "Approving for 1 hour"
+    }
+  }
   ```
 
 - Behavior:
   - If `requestId` refers to an active pending request:
     - The pending entry is removed.
     - The decision is delivered to the waiting request task.
-    - The callback responds with `200 OK` and body `{ "status": "ok" }`.
+    - For `decision: "allow"` and rules that declare approval macros, the callback must include
+      a `macros` object containing non-empty values for all required macros; optional macros may
+      be omitted or empty.
+    - On successful validation, the callback responds with `200 OK` and body `{ "status": "ok" }`.
   - If no pending entry exists (unknown or already completed/timed-out `requestId`):
     - The callback responds with `404 Not Found` and JSON
       `{ "error": "RequestNotFound", "message": "No pending request for this requestId" }`.
+  - On validation failure for approval macros (missing required macro or invalid characters):
+    - The callback responds with `400 Bad Request` and an error JSON such as
+      `{ "error": "MissingMacro", "message": "Missing required macro: github_token" }` or
+      `{ "error": "InvalidMacroValue", "message": "Macro github_token contains invalid characters" }`.
+    - The pending request is marked as an internal error and the waiting client receives an
+      external-approval error response.
 
 Security note:
 
