@@ -208,7 +208,7 @@ struct SniResolver {
 impl SniResolver {
     fn new(inner: Arc<Inner>) -> Self {
         SniResolver {
-            inner: inner.clone(),
+            inner,
             keys: Mutex::new(LruCache::new(inner.cache_capacity)),
         }
     }

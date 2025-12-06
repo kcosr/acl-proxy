@@ -305,9 +305,10 @@ Fields:
     - Validation fails with an error; both must be set or both omitted.
 - `max_cached_certs` (integer, default `1024`):
   - Maximum number of distinct per-host certificates cached in memory by the proxy.
-  - Implemented as a least-recently-used (LRU) cache shared by the per-host server config and
-    SNI certificate resolvers.
-  - When the cache is full and a new host is added, the least recently used entry is evicted.
+  - Implemented as least-recently-used (LRU) caches used by both the per-host server config and
+    SNI certificate resolvers (each maintains its own LRU up to this size).
+  - When a cache is full and a new host is added, the least recently used entry in that cache is
+    evicted.
 
 Per-host certificates:
 
