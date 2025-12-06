@@ -109,6 +109,7 @@ pub struct ExternalAuthManager {
     pending: Arc<DashMap<String, PendingRequest>>,
     macro_values: Arc<DashMap<String, BTreeMap<String, String>>>,
     profiles: Arc<BTreeMap<String, ExternalAuthProfile>>,
+    callback_url: Option<String>,
     http_client: SharedHttpClient,
     status_tx: mpsc::Sender<StatusWebhookEvent>,
     status_rx: Arc<Mutex<Option<mpsc::Receiver<StatusWebhookEvent>>>>,
@@ -117,6 +118,14 @@ pub struct ExternalAuthManager {
 
 impl ExternalAuthManager {
     pub fn new(cfg: &ExternalAuthProfileConfigMap, http_client: SharedHttpClient) -> Self {
+        Self::new_with_callback(cfg, None, http_client)
+    }
+
+    pub fn new_with_callback(
+        cfg: &ExternalAuthProfileConfigMap,
+        callback_url: Option<String>,
+        http_client: SharedHttpClient,
+    ) -> Self {
         let mut profiles: BTreeMap<String, ExternalAuthProfile> = BTreeMap::new();
 
         for (name, profile_cfg) in cfg {
@@ -142,6 +151,7 @@ impl ExternalAuthManager {
             pending: Arc::new(DashMap::new()),
             macro_values: Arc::new(DashMap::new()),
             profiles: Arc::new(profiles),
+            callback_url,
             http_client,
             status_tx,
             status_rx: Arc::new(Mutex::new(Some(status_rx))),
@@ -270,7 +280,7 @@ impl ExternalAuthManager {
             .saturating_duration_since(created_at)
             .as_millis() as u64;
 
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "requestId": request_id,
             "profile": profile_name,
             "ruleIndex": rule_index,
@@ -288,6 +298,15 @@ impl ExternalAuthManager {
             "httpStatus": serde_json::Value::Null,
             "macros": macros,
         });
+
+        if let Some(cb_url) = &self.callback_url {
+            if let serde_json::Value::Object(ref mut map) = payload {
+                map.insert(
+                    "callbackUrl".to_string(),
+                    serde_json::Value::String(cb_url.clone()),
+                );
+            }
+        }
 
         let body_bytes = match serde_json::to_vec(&payload) {
             Ok(b) => b,
@@ -508,9 +527,10 @@ impl ExternalAuthManager {
         if let Some(rx) = rx_opt {
             let client = self.http_client.clone();
             let profiles = self.profiles.clone();
+            let callback_url = self.callback_url.clone();
 
             tokio::spawn(async move {
-                run_status_worker(client, profiles, rx).await;
+                run_status_worker(client, profiles, callback_url, rx).await;
             });
         }
     }
@@ -555,6 +575,7 @@ fn generate_event_id() -> String {
 async fn run_status_worker(
     client: SharedHttpClient,
     profiles: Arc<BTreeMap<String, ExternalAuthProfile>>,
+    callback_url: Option<String>,
     mut rx: mpsc::Receiver<StatusWebhookEvent>,
 ) {
     while let Some(event) = rx.recv().await {
@@ -588,7 +609,7 @@ async fn run_status_worker(
             .saturating_duration_since(event.created_at)
             .as_millis() as u64;
 
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "requestId": event.request_id,
             "profile": event.profile_name,
             "ruleIndex": event.rule_index,
@@ -605,6 +626,15 @@ async fn run_status_worker(
             "failureKind": failure_kind_str,
             "httpStatus": event.http_status,
         });
+
+        if let Some(cb_url) = &callback_url {
+            if let serde_json::Value::Object(ref mut map) = payload {
+                map.insert(
+                    "callbackUrl".to_string(),
+                    serde_json::Value::String(cb_url.clone()),
+                );
+            }
+        }
 
         let body_bytes = match serde_json::to_vec(&payload) {
             Ok(b) => b,

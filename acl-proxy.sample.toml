@@ -154,6 +154,13 @@ reason       = { label = "Approval reason", required = false, secret = false }
 # External auth profiles (approval-required rules)
 ###############################################################################
 
+# Global external auth settings. The callback_url is included in external auth
+# webhooks as `callbackUrl` so that external services know exactly where to
+# send approval decisions for this proxy instance. The inbound callback path
+# remains `/_acl-proxy/external-auth/callback`.
+[external_auth]
+callback_url = "http://localhost:8881/_acl-proxy/external-auth/callback"
+
 # External auth profiles let you mark certain allow rules as
 # approval-required. When such a rule matches, the proxy sends a
 # webhook to the configured service and waits for an allow/deny

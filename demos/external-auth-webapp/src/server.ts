@@ -17,6 +17,7 @@ type PendingApproval = {
   url: string;
   method?: string | null;
   clientIp?: string | null;
+   callbackUrl?: string | null;
   macros: MacroDescriptor[];
 };
 
@@ -36,6 +37,7 @@ type StatusEvent = {
   eventId?: string;
   failureKind?: string | null;
   httpStatus?: number | null;
+   callbackUrl?: string | null;
 };
 
 type WebsocketDecisionMessage = {
@@ -80,6 +82,7 @@ app.post("/webhook", (req, res) => {
     url?: string;
     method?: string;
     clientIp?: string;
+    callbackUrl?: string;
     status?: string;
     reason?: string;
     ruleId?: string;
@@ -99,6 +102,7 @@ app.post("/webhook", (req, res) => {
     url,
     method,
     clientIp,
+    callbackUrl,
     status,
     reason,
     ruleId,
@@ -139,6 +143,7 @@ app.post("/webhook", (req, res) => {
       eventId,
       failureKind: failureKind ?? null,
       httpStatus: httpStatus ?? null,
+      callbackUrl: callbackUrl ?? null,
     };
 
     // Once a terminal status webhook arrives (timed out, cancelled, error,
@@ -176,8 +181,16 @@ app.post("/webhook", (req, res) => {
     url,
     method: method ?? null,
     clientIp: clientIp ?? null,
+    callbackUrl: callbackUrl ?? null,
     macros: Array.isArray(macros) ? macros : [],
   };
+  if (approval.callbackUrl) {
+    // eslint-disable-next-line no-console
+    console.log(
+      "[webhook] pending approval includes callbackUrl",
+      approval.callbackUrl,
+    );
+  }
   pending.set(requestId, approval);
 
   const msg = JSON.stringify({ type: "pending", approval });
@@ -288,7 +301,14 @@ wss.on("connection", (ws) => {
           }
         }
 
-        const resp = await fetch(CALLBACK_URL, {
+        const targetCallbackUrl =
+          approval.callbackUrl &&
+          typeof approval.callbackUrl === "string" &&
+          approval.callbackUrl.startsWith("http")
+            ? approval.callbackUrl
+            : CALLBACK_URL;
+
+        const resp = await fetch(targetCallbackUrl, {
           method: "POST",
           headers: {
             "content-type": "application/json",

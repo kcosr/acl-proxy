@@ -81,13 +81,14 @@ async fn external_auth_webhook_failure_emits_status_event() {
                     let body: serde_json::Value =
                         serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({}));
 
+                    events.lock().unwrap().push(ReceivedEvent {
+                        event_header: event_header.clone(),
+                        body: body.clone(),
+                    });
+
                     let status = if event_header == "pending" {
                         http::StatusCode::INTERNAL_SERVER_ERROR
                     } else {
-                        events.lock().unwrap().push(ReceivedEvent {
-                            event_header: event_header.clone(),
-                            body: body.clone(),
-                        });
                         http::StatusCode::OK
                     };
 
@@ -114,6 +115,8 @@ async fn external_auth_webhook_failure_emits_status_event() {
             .serve(make_svc),
     );
 
+    let callback_url = "https://proxy.example.com/_acl-proxy/external-auth/callback";
+
     let toml = format!(
         r#"
 schema_version = "1"
@@ -133,6 +136,9 @@ denied_request = false
 denied_response = false
 directory = "logs-capture"
 
+[external_auth]
+callback_url = "{callback}"
+
 [policy]
 default = "deny"
 
@@ -150,7 +156,8 @@ description = "External auth test rule"
 external_auth_profile = "test_profile"
 rule_id = "external-auth-test-rule"
     "#,
-        addr = webhook_addr
+        addr = webhook_addr,
+        callback = callback_url
     );
 
     let config: Config = toml::from_str(&toml).expect("parse config");
@@ -172,6 +179,10 @@ rule_id = "external-auth-test-rule"
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let events_guard = events.lock().unwrap();
+    let pending_event = events_guard
+        .iter()
+        .find(|e| e.event_header == "pending")
+        .unwrap_or_else(|| panic!("expected pending webhook event"));
     let status_event = events_guard
         .iter()
         .find(|e| e.event_header == "status")
@@ -189,6 +200,14 @@ rule_id = "external-auth-test-rule"
     assert_eq!(
         status_event.body["ruleId"],
         serde_json::Value::String("external-auth-test-rule".to_string())
+    );
+    assert_eq!(
+        pending_event.body["callbackUrl"],
+        serde_json::Value::String(callback_url.to_string())
+    );
+    assert_eq!(
+        status_event.body["callbackUrl"],
+        serde_json::Value::String(callback_url.to_string())
     );
 }
 
@@ -426,6 +445,11 @@ value = "{{{{reason}}}}"
     assert_eq!(
         names,
         vec!["github_token".to_string(), "reason".to_string()]
+    );
+
+    assert!(
+        pending.body.get("callbackUrl").is_none(),
+        "callbackUrl should be omitted when no external_auth.callback_url is configured"
     );
 
     for m in macros {
