@@ -9,6 +9,7 @@ use http::{header::HeaderValue, Method, StatusCode};
 use hyper::client::HttpConnector;
 use hyper::{Body, Client, Request};
 use hyper_rustls::HttpsConnector;
+use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::{
@@ -55,6 +56,14 @@ pub struct ExternalAuthProfile {
     pub on_webhook_failure: WebhookFailureMode,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ApprovalMacroDescriptor {
+    pub name: String,
+    pub label: String,
+    pub required: bool,
+    pub secret: bool,
+}
+
 #[derive(Debug)]
 pub struct PendingRequest {
     pub rule_index: usize,
@@ -66,6 +75,7 @@ pub struct PendingRequest {
     pub url: String,
     pub method: Option<String>,
     pub client_ip: Option<String>,
+    pub macros: Vec<ApprovalMacroDescriptor>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -97,6 +107,7 @@ type SharedHttpClient = Client<HttpsConnector<HttpConnector>>;
 #[derive(Clone)]
 pub struct ExternalAuthManager {
     pending: Arc<DashMap<String, PendingRequest>>,
+    macro_values: Arc<DashMap<String, BTreeMap<String, String>>>,
     profiles: Arc<BTreeMap<String, ExternalAuthProfile>>,
     http_client: SharedHttpClient,
     status_tx: mpsc::Sender<StatusWebhookEvent>,
@@ -129,6 +140,7 @@ impl ExternalAuthManager {
 
         ExternalAuthManager {
             pending: Arc::new(DashMap::new()),
+            macro_values: Arc::new(DashMap::new()),
             profiles: Arc::new(profiles),
             http_client,
             status_tx,
@@ -150,6 +162,7 @@ impl ExternalAuthManager {
         url: String,
         method: Option<String>,
         client_ip: Option<String>,
+        macros: Vec<ApprovalMacroDescriptor>,
     ) -> (PendingGuard, oneshot::Receiver<ExternalDecision>) {
         let (tx, rx) = oneshot::channel();
         let created_at = Instant::now();
@@ -170,6 +183,7 @@ impl ExternalAuthManager {
             url,
             method,
             client_ip,
+            macros,
         };
 
         self.pending.insert(request_id.clone(), pending);
@@ -194,6 +208,29 @@ impl ExternalAuthManager {
         }
     }
 
+    /// Return the approval macro descriptors for a pending request, if any.
+    pub fn get_macro_descriptors(&self, request_id: &str) -> Option<Vec<ApprovalMacroDescriptor>> {
+        self.pending.get(request_id).map(|p| p.macros.clone())
+    }
+
+    /// Store validated macro values for a request. These are later
+    /// consumed when applying header actions after approval.
+    pub fn store_macro_values(&self, request_id: &str, macros: BTreeMap<String, String>) {
+        if macros.is_empty() {
+            return;
+        }
+        self.macro_values.insert(request_id.to_string(), macros);
+    }
+
+    /// Take (and remove) macro values for a request, returning an
+    /// empty map when none were stored.
+    pub fn take_macro_values(&self, request_id: &str) -> BTreeMap<String, String> {
+        self.macro_values
+            .remove(request_id)
+            .map(|(_, values)| values)
+            .unwrap_or_default()
+    }
+
     /// Send the initial "pending" webhook for a newly created pending entry.
     ///
     /// On failure, returns the failure kind and optional HTTP status
@@ -211,13 +248,15 @@ impl ExternalAuthManager {
                 p.method.clone(),
                 p.client_ip.clone(),
                 p.created_at,
+                p.macros.clone(),
             )
         } else {
             tracing::warn!("send_initial_webhook called for unknown request_id {request_id}");
             return Err((WebhookFailureKind::Transport, None));
         };
 
-        let (profile_name, rule_index, rule_id, url, method, client_ip, created_at) = snapshot;
+        let (profile_name, rule_index, rule_id, url, method, client_ip, created_at, macros) =
+            snapshot;
 
         let profile = if let Some(p) = self.profiles.get(&profile_name) {
             p.clone()
@@ -247,6 +286,7 @@ impl ExternalAuthManager {
             "eventId": generate_event_id(),
             "failureKind": serde_json::Value::Null,
             "httpStatus": serde_json::Value::Null,
+            "macros": macros,
         });
 
         let body_bytes = match serde_json::to_vec(&payload) {
@@ -316,6 +356,9 @@ impl ExternalAuthManager {
         http_status: Option<StatusCode>,
     ) {
         if let Some((_key, pending)) = self.pending.remove(request_id) {
+            // Best-effort cleanup of any stored macro values for this request.
+            self.macro_values.remove(request_id);
+
             let reason = match failure_kind {
                 WebhookFailureKind::Timeout => {
                     "External auth webhook delivery timed out".to_string()
@@ -351,6 +394,9 @@ impl ExternalAuthManager {
     /// Record a terminal "timed_out" status when approval times out.
     pub fn finalize_timed_out(&self, request_id: &str) {
         if let Some((_key, pending)) = self.pending.remove(request_id) {
+            // Best-effort cleanup of any stored macro values for this request.
+            self.macro_values.remove(request_id);
+
             let configured_ms = pending
                 .deadline_at
                 .saturating_duration_since(pending.created_at)
@@ -379,6 +425,9 @@ impl ExternalAuthManager {
     /// Record a terminal "error" status when the approval channel fails.
     pub fn finalize_internal_error(&self, request_id: &str, message: &str) {
         if let Some((_key, pending)) = self.pending.remove(request_id) {
+            // Best-effort cleanup of any stored macro values for this request.
+            self.macro_values.remove(request_id);
+
             let event = StatusWebhookEvent {
                 request_id: request_id.to_string(),
                 profile_name: pending.profile_name,
@@ -401,6 +450,9 @@ impl ExternalAuthManager {
     /// Called from the RAII guard destructor to mark cancellations.
     pub fn finalize_cancelled_if_pending(&self, request_id: &str) {
         if let Some((_key, pending)) = self.pending.remove(request_id) {
+            // Best-effort cleanup of any stored macro values for this request.
+            self.macro_values.remove(request_id);
+
             let event = StatusWebhookEvent {
                 request_id: request_id.to_string(),
                 profile_name: pending.profile_name,

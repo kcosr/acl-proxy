@@ -1067,6 +1067,7 @@ mod tests {
         let cfg = PolicyConfig {
             default: PolicyDefaultAction::Deny,
             macros: MacroMap::default(),
+            approval_macros: crate::config::ApprovalMacroConfigMap::default(),
             rulesets: RulesetMap::default(),
             external_auth_profiles: ExternalAuthProfileConfigMap::default(),
             rules: vec![PolicyRuleConfig::Direct(PolicyRuleDirectConfig {
@@ -1130,6 +1131,7 @@ mod tests {
             default: PolicyDefaultAction::Deny,
             macros,
             rulesets,
+            approval_macros: crate::config::ApprovalMacroConfigMap::default(),
             external_auth_profiles: ExternalAuthProfileConfigMap::default(),
             rules: vec![PolicyRuleConfig::Include(PolicyRuleIncludeConfig {
                 include: "gitlabRepo".to_string(),
@@ -1189,6 +1191,7 @@ mod tests {
             default: PolicyDefaultAction::Deny,
             macros: MacroMap::default(),
             rulesets,
+            approval_macros: crate::config::ApprovalMacroConfigMap::default(),
             external_auth_profiles: ExternalAuthProfileConfigMap::default(),
             rules: vec![PolicyRuleConfig::Include(PolicyRuleIncludeConfig {
                 include: "needsRepo".to_string(),

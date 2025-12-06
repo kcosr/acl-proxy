@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::convert::Infallible;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use crate::capture::{
     DEFAULT_MAX_BODY_BYTES,
 };
 use crate::config::{HeaderActionKind, HeaderDirection, HeaderWhen};
-use crate::external_auth::{ExternalAuthProfile, ExternalDecision};
+use crate::external_auth::{ApprovalMacroDescriptor, ExternalAuthProfile, ExternalDecision};
 use crate::logging::PolicyDecisionLogContext;
 use crate::policy::CompiledHeaderAction;
 use crate::proxy::https_connect;
@@ -262,6 +262,9 @@ struct ExternalAuthCallbackBody {
     #[serde(rename = "requestId")]
     request_id: String,
     decision: ExternalAuthCallbackDecision,
+
+    #[serde(default)]
+    macros: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -327,6 +330,147 @@ async fn handle_external_auth_callback_request(
         }
     };
 
+    // For allow decisions, validate and (if applicable) store approval macros
+    // before delivering the decision to the pending request.
+    if let ExternalAuthCallbackDecision::Allow = payload.decision {
+        let descriptors_opt = state
+            .external_auth
+            .get_macro_descriptors(&payload.request_id);
+
+        let descriptors = match descriptors_opt {
+            Some(d) => d,
+            None => {
+                let payload = serde_json::json!({
+                    "error": "RequestNotFound",
+                    "message": "No pending request for this requestId",
+                });
+                let body_bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+                let mut resp = Response::new(Body::from(body_bytes));
+                *resp.status_mut() = StatusCode::NOT_FOUND;
+                resp.headers_mut().insert(
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                return resp;
+            }
+        };
+
+        if !descriptors.is_empty() {
+            let provided_macros = payload.macros.clone();
+            if provided_macros.is_none() {
+                state.external_auth.finalize_internal_error(
+                    &payload.request_id,
+                    "Missing macros object in approval callback",
+                );
+                let payload = serde_json::json!({
+                    "error": "MissingMacro",
+                    "message": format!(
+                        "Missing required macro: {}",
+                        descriptors[0].name
+                    ),
+                });
+                let body_bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+                let mut resp = Response::new(Body::from(body_bytes));
+                *resp.status_mut() = StatusCode::BAD_REQUEST;
+                resp.headers_mut().insert(
+                    http::header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                return resp;
+            }
+
+            let provided = provided_macros.unwrap_or_default();
+            let mut filtered: BTreeMap<String, String> = BTreeMap::new();
+
+            for desc in &descriptors {
+                match provided.get(&desc.name) {
+                    Some(raw) => {
+                        if raw.is_empty() {
+                            if desc.required {
+                                state.external_auth.finalize_internal_error(
+                                    &payload.request_id,
+                                    &format!("Missing required macro value: {}", desc.name),
+                                );
+                                let payload = serde_json::json!({
+                                    "error": "MissingMacro",
+                                    "message": format!(
+                                        "Missing required macro: {}",
+                                        desc.name
+                                    ),
+                                });
+                                let body_bytes =
+                                    serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+                                let mut resp = Response::new(Body::from(body_bytes));
+                                *resp.status_mut() = StatusCode::BAD_REQUEST;
+                                resp.headers_mut().insert(
+                                    http::header::CONTENT_TYPE,
+                                    HeaderValue::from_static("application/json"),
+                                );
+                                return resp;
+                            }
+                            // Optional macro explicitly empty -> treat as not provided.
+                        } else if raw
+                            .chars()
+                            .any(|c| (c as u32) < 0x20 && c != '\t' || c == '\u{007f}')
+                        {
+                            state.external_auth.finalize_internal_error(
+                                &payload.request_id,
+                                &format!("Invalid macro value for {}", desc.name),
+                            );
+                            let payload = serde_json::json!({
+                                "error": "InvalidMacroValue",
+                                "message": format!(
+                                    "Macro {} contains invalid characters",
+                                    desc.name
+                                ),
+                            });
+                            let body_bytes =
+                                serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+                            let mut resp = Response::new(Body::from(body_bytes));
+                            *resp.status_mut() = StatusCode::BAD_REQUEST;
+                            resp.headers_mut().insert(
+                                http::header::CONTENT_TYPE,
+                                HeaderValue::from_static("application/json"),
+                            );
+                            return resp;
+                        } else {
+                            filtered.insert(desc.name.clone(), raw.clone());
+                        }
+                    }
+                    None => {
+                        if desc.required {
+                            state.external_auth.finalize_internal_error(
+                                &payload.request_id,
+                                &format!("Missing required macro: {}", desc.name),
+                            );
+                            let payload = serde_json::json!({
+                                "error": "MissingMacro",
+                                "message": format!(
+                                    "Missing required macro: {}",
+                                    desc.name
+                                ),
+                            });
+                            let body_bytes =
+                                serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+                            let mut resp = Response::new(Body::from(body_bytes));
+                            *resp.status_mut() = StatusCode::BAD_REQUEST;
+                            resp.headers_mut().insert(
+                                http::header::CONTENT_TYPE,
+                                HeaderValue::from_static("application/json"),
+                            );
+                            return resp;
+                        }
+                    }
+                }
+            }
+
+            // Ignore extra keys not listed in descriptors.
+            state
+                .external_auth
+                .store_macro_values(&payload.request_id, filtered);
+        }
+    }
+
     let decision = match payload.decision {
         ExternalAuthCallbackDecision::Allow => ExternalDecision::Allow,
         ExternalAuthCallbackDecision::Deny => ExternalDecision::Deny,
@@ -377,6 +521,9 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
     header_actions: Vec<CompiledHeaderAction>,
     mode: CaptureMode,
 ) -> Response<Body> {
+    let macro_descriptors =
+        discover_approval_macros(&state.config.policy.approval_macros, &header_actions);
+
     let (guard, decision_rx) = state.external_auth.start_pending(
         request_id.to_string(),
         rule_index,
@@ -385,6 +532,7 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
         url.to_string(),
         Some(method.to_string()),
         Some(client_ip_for_policy.to_string()),
+        macro_descriptors,
     );
 
     let webhook_result = state.external_auth.send_initial_webhook(request_id).await;
@@ -448,6 +596,30 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
 
     match decision {
         Ok(Ok(ExternalDecision::Allow)) => {
+            let macro_values = state.external_auth.take_macro_values(request_id);
+            let header_actions = match interpolate_header_actions(header_actions, &macro_values) {
+                Ok(actions) => actions,
+                Err(msg) => {
+                    state
+                        .external_auth
+                        .finalize_internal_error(request_id, &msg);
+                    drop(guard);
+                    return build_external_auth_error_response(
+                        &state,
+                        request_id,
+                        url,
+                        method,
+                        client,
+                        target,
+                        version,
+                        req.headers(),
+                        mode,
+                        "ExternalApprovalError",
+                        "External approval macro interpolation failed",
+                    )
+                    .await;
+                }
+            };
             drop(guard);
             proxy_allowed_request(
                 state.clone(),
@@ -1213,6 +1385,162 @@ fn snapshot_header_presence(headers: &HttpHeaderMap) -> HashSet<HeaderName> {
         set.insert(name.clone());
     }
     set
+}
+
+fn collect_approval_macros_from_str(s: &str, out: &mut BTreeSet<String>) {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    while i + 3 < chars.len() {
+        if chars[i] == '{' && chars[i + 1] == '{' {
+            let start = i + 2;
+            let mut j = start;
+            while j + 1 < chars.len() && !(chars[j] == '}' && chars[j + 1] == '}') {
+                j += 1;
+            }
+            if j + 1 >= chars.len() {
+                break;
+            }
+            let inner: String = chars[start..j].iter().collect();
+            if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                out.insert(inner);
+            }
+            i = j + 2;
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn discover_approval_macros(
+    macro_cfg: &crate::config::ApprovalMacroConfigMap,
+    header_actions: &[CompiledHeaderAction],
+) -> Vec<ApprovalMacroDescriptor> {
+    let mut names = BTreeSet::new();
+
+    for action in header_actions {
+        match action.action {
+            HeaderActionKind::Set | HeaderActionKind::Add => {
+                for v in &action.values {
+                    if let Ok(s) = v.to_str() {
+                        collect_approval_macros_from_str(s, &mut names);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut descriptors = Vec::new();
+
+    for name in names {
+        let cfg = macro_cfg.get(&name);
+        let label = cfg
+            .and_then(|c| c.label.clone())
+            .unwrap_or_else(|| name.clone());
+        let required = cfg.map(|c| c.required).unwrap_or(true);
+        let secret = cfg.map(|c| c.secret).unwrap_or(false);
+
+        descriptors.push(ApprovalMacroDescriptor {
+            name,
+            label,
+            required,
+            secret,
+        });
+    }
+
+    descriptors
+}
+
+fn interpolate_approval_macros(template: &str, values: &BTreeMap<String, String>) -> String {
+    let chars: Vec<char> = template.chars().collect();
+    let mut out = String::with_capacity(template.len());
+    let mut i = 0;
+
+    while i + 3 < chars.len() {
+        if chars[i] == '{' && chars[i + 1] == '{' {
+            let start = i + 2;
+            let mut j = start;
+            while j + 1 < chars.len() && !(chars[j] == '}' && chars[j + 1] == '}') {
+                j += 1;
+            }
+            if j + 1 >= chars.len() {
+                out.extend(chars[i..].iter());
+                return out;
+            }
+            let inner: String = chars[start..j].iter().collect();
+            if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                if let Some(val) = values.get(&inner) {
+                    out.push_str(val);
+                }
+            } else {
+                out.extend(chars[i..=j + 1].iter());
+            }
+            i = j + 2;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    while i < chars.len() {
+        out.push(chars[i]);
+        i += 1;
+    }
+
+    out
+}
+
+fn interpolate_header_actions(
+    header_actions: Vec<CompiledHeaderAction>,
+    macro_values: &BTreeMap<String, String>,
+) -> Result<Vec<CompiledHeaderAction>, String> {
+    if macro_values.is_empty() {
+        return Ok(header_actions);
+    }
+
+    let mut out = Vec::with_capacity(header_actions.len());
+
+    for mut action in header_actions.into_iter() {
+        match action.action {
+            HeaderActionKind::Set | HeaderActionKind::Add => {
+                let mut new_values = Vec::with_capacity(action.values.len());
+
+                for hv in &action.values {
+                    let original = match hv.to_str() {
+                        Ok(s) => s,
+                        Err(_) => {
+                            new_values.push(hv.clone());
+                            continue;
+                        }
+                    };
+                    let interpolated = interpolate_approval_macros(original, macro_values);
+                    match HeaderValue::from_str(&interpolated) {
+                        Ok(parsed) => new_values.push(parsed),
+                        Err(e) => {
+                            tracing::debug!(
+                                "invalid header value after macro interpolation for {}: {} ({})",
+                                action.name,
+                                interpolated,
+                                e
+                            );
+                            return Err(format!(
+                                "invalid header value after macro interpolation for {}",
+                                action.name
+                            ));
+                        }
+                    }
+                }
+
+                action.values = new_values;
+                out.push(action);
+            }
+            _ => {
+                out.push(action);
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 fn apply_header_actions(

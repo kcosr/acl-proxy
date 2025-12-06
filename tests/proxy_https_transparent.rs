@@ -738,8 +738,7 @@ async fn upstream_failure_https_transparent_is_captured() {
     // Choose an unused local port and immediately drop the listener so
     // that upstream connections will fail, triggering a Bad Gateway
     // error from the proxy.
-    let upstream_listener =
-        StdTcpListener::bind("127.0.0.1:0").expect("bind placeholder upstream");
+    let upstream_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind placeholder upstream");
     let upstream_addr = upstream_listener.local_addr().expect("upstream addr");
     drop(upstream_listener);
 
@@ -822,9 +821,7 @@ async fn upstream_failure_https_transparent_is_captured() {
         let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
         assert_eq!(record.mode, CaptureMode::HttpsTransparent);
 
-        if record.url.ends_with("/upstream-fail")
-            && record.decision == CaptureDecision::Allow
-        {
+        if record.url.ends_with("/upstream-fail") && record.decision == CaptureDecision::Allow {
             match record.kind {
                 CaptureKind::Request => {
                     found_request = true;
