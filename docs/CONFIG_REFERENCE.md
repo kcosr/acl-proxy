@@ -336,9 +336,9 @@ Fields:
     - This is intended for controlled lab/testing environments only.
 
 - `enable_http2_upstream` (bool, default `false`):
-  - When `false`, the proxy always uses HTTP/1.1 for outbound requests to upstream servers, even
-    when clients speak HTTP/2 to the proxy. This is the recommended default for maximum
-    compatibility with arbitrary origins.
+  - When `false`, the proxy uses HTTP/1.1 for outbound requests to upstream servers, even when
+    clients speak HTTP/2 to the proxy. This is the recommended default for maximum compatibility
+    with arbitrary origins.
   - When `true`, the shared HTTP client enables HTTP/2 and lets ALPN negotiation choose the
     protocol per origin:
     - If the origin advertises `h2`, the proxy may use HTTP/2 for upstream traffic.

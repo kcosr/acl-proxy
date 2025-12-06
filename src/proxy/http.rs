@@ -963,11 +963,7 @@ pub(crate) async fn proxy_allowed_request(
 
     let mut builder = Request::builder()
         .method(method.clone())
-        .uri(upstream_uri.clone())
-        // Always use HTTP/1.1 for upstream
-        // connections to maximize compatibility,
-        // regardless of the client-facing version.
-        .version(Version::HTTP_11);
+        .uri(upstream_uri.clone());
 
     let cfg = &state.config;
     let decision = CaptureDecision::Allow;

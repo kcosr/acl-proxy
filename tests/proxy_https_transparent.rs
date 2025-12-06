@@ -1502,6 +1502,124 @@ async fn h2_client_to_http1_only_upstream_preserves_versions_in_capture() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn h2_client_to_h2_capable_upstream_preserves_h2_in_capture() {
+    let upstream_addr = start_upstream_https_echo_server().await;
+
+    let mut config = minimal_https_transparent_config();
+    // Enable optional HTTP/2 upstream support; the origin offers both
+    // HTTP/2 and HTTP/1.1 via ALPN, so the proxy should be able to
+    // negotiate HTTP/2 upstream while serving HTTP/2 to the client.
+    config.tls.enable_http2_upstream = true;
+
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            pattern: Some(format!(
+                "https://{}:{}/ok",
+                upstream_addr.ip(),
+                upstream_addr.port()
+            )),
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, temp_dir, ca_cert_path) =
+        start_proxy_with_config(config, proxy_listener).await;
+
+    let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    let (version, status, body) =
+        send_h2_https_request_via_transparent(proxy_addr, &ca_cert_path, &host_header, "/ok", &[])
+            .await;
+
+    assert_eq!(version, Version::HTTP_2);
+    assert_eq!(status, StatusCode::OK.as_u16());
+    assert_eq!(body, "ok");
+
+    use tokio::time::{sleep, Duration};
+
+    let capture_dir = temp_dir.path().join("captures");
+    for _ in 0..10 {
+        if capture_dir.is_dir() {
+            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
+                .expect("read capture dir")
+                .collect();
+            if !entries.is_empty() {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
+    let mut files = Vec::new();
+    while let Some(entry) = entries.next() {
+        let entry = entry.expect("dir entry");
+        if entry.file_type().expect("file type").is_file() {
+            files.push(entry.path());
+        }
+    }
+    assert!(
+        !files.is_empty(),
+        "expected capture files for HTTP/2-capable upstream scenario"
+    );
+
+    use std::collections::HashMap;
+
+    let mut by_id: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+
+    for path in files {
+        let mut contents = String::new();
+        std::fs::File::open(&path)
+            .expect("open capture")
+            .read_to_string(&mut contents)
+            .expect("read capture");
+        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
+        assert_eq!(record.mode, CaptureMode::HttpsTransparent);
+        assert_eq!(record.decision, CaptureDecision::Allow);
+
+        let entry = by_id
+            .entry(record.request_id.clone())
+            .or_insert((None, None));
+        match record.kind {
+            CaptureKind::Request => entry.0 = record.http_version.clone(),
+            CaptureKind::Response => entry.1 = record.http_version.clone(),
+        }
+    }
+
+    assert_eq!(
+        by_id.len(),
+        1,
+        "expected a single logical requestId for upgrade test"
+    );
+
+    let (req_version, resp_version) = by_id.into_iter().next().unwrap().1;
+    assert_eq!(
+        req_version.as_deref(),
+        Some("2"),
+        "expected client-facing httpVersion \"2\""
+    );
+    assert_eq!(
+        resp_version.as_deref(),
+        Some("2"),
+        "expected upstream httpVersion \"2\" in response capture"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn denied_https_transparent_returns_403() {
     let upstream_addr = start_upstream_https_echo_server().await;
 

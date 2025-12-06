@@ -111,8 +111,8 @@ certs_dir = "certs"
 verify_upstream = true
 
 # When true, enable HTTP/2 for upstream HTTPS connections where the
-# origin server supports it via ALPN. The default (false) always uses
-# HTTP/1.1 upstream for maximum compatibility.
+# origin server supports it via ALPN. When false (the default), the
+# proxy uses HTTP/1.1-only upstream for maximum compatibility.
 enable_http2_upstream = false
 
 ###############################################################################
