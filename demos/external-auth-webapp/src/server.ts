@@ -17,7 +17,7 @@ type PendingApproval = {
   url: string;
   method?: string | null;
   clientIp?: string | null;
-   callbackUrl?: string | null;
+  callbackUrl?: string | null;
   macros: MacroDescriptor[];
 };
 
@@ -37,7 +37,7 @@ type StatusEvent = {
   eventId?: string;
   failureKind?: string | null;
   httpStatus?: number | null;
-   callbackUrl?: string | null;
+  callbackUrl?: string | null;
 };
 
 type WebsocketDecisionMessage = {
