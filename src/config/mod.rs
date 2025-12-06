@@ -837,8 +837,7 @@ fn validate_external_auth_config(external_auth: &ExternalAuthConfig) -> Result<(
 
         if !parsed.has_host() {
             return Err(ConfigError::Invalid(
-                "external_auth.callback_url must be an absolute URL with host"
-                    .to_string(),
+                "external_auth.callback_url must be an absolute URL with host".to_string(),
             ));
         }
     }
