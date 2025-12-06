@@ -734,6 +734,124 @@ async fn allowed_https_transparent_h2_is_proxied_and_captured() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn upstream_failure_https_transparent_is_captured() {
+    // Choose an unused local port and immediately drop the listener so
+    // that upstream connections will fail, triggering a Bad Gateway
+    // error from the proxy.
+    let upstream_listener =
+        StdTcpListener::bind("127.0.0.1:0").expect("bind placeholder upstream");
+    let upstream_addr = upstream_listener.local_addr().expect("upstream addr");
+    drop(upstream_listener);
+
+    let mut config = minimal_https_transparent_config();
+
+    // Allow all HTTPS traffic to the failing upstream host.
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            pattern: Some(format!(
+                "https://{}:{}/**",
+                upstream_addr.ip(),
+                upstream_addr.port()
+            )),
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, temp_dir, ca_cert_path) =
+        start_proxy_with_config(config, proxy_listener).await;
+
+    let sni_host = "transparent.test";
+    let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    let (status, body) = send_https_request_via_transparent(
+        proxy_addr,
+        &ca_cert_path,
+        &sni_host,
+        &host_header,
+        "/upstream-fail",
+        &[],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY.as_u16());
+    assert_eq!(body, "Bad Gateway");
+
+    use tokio::time::{sleep, Duration};
+
+    let capture_dir = temp_dir.path().join("captures");
+    for _ in 0..10 {
+        if capture_dir.is_dir() {
+            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
+                .expect("read capture dir")
+                .collect();
+            if !entries.is_empty() {
+                break;
+            }
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
+    let mut found_request = false;
+    let mut found_response = false;
+    while let Some(entry) = entries.next() {
+        let entry = entry.expect("dir entry");
+        if !entry.file_type().expect("file type").is_file() {
+            continue;
+        }
+
+        let mut contents = String::new();
+        std::fs::File::open(entry.path())
+            .expect("open capture")
+            .read_to_string(&mut contents)
+            .expect("read capture");
+        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
+        assert_eq!(record.mode, CaptureMode::HttpsTransparent);
+
+        if record.url.ends_with("/upstream-fail")
+            && record.decision == CaptureDecision::Allow
+        {
+            match record.kind {
+                CaptureKind::Request => {
+                    found_request = true;
+                }
+                CaptureKind::Response => {
+                    assert_eq!(
+                        record.status_code,
+                        Some(StatusCode::BAD_GATEWAY.as_u16()),
+                        "expected 502 statusCode for upstream failure capture"
+                    );
+                    found_response = true;
+                }
+            }
+        }
+    }
+
+    assert!(
+        found_request,
+        "expected request capture for upstream failure"
+    );
+    assert!(
+        found_response,
+        "expected response capture for upstream failure"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn concurrent_h2_streams_share_connection_and_are_captured() {
     let upstream_addr = start_upstream_https_echo_server().await;
 
