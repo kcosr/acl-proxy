@@ -3,3 +3,7 @@ dist
 
 # Rust build artifacts
 target
+
+# Local config and certs
+acl-proxy.toml
+certs/
