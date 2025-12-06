@@ -402,8 +402,8 @@ enable_http2_upstream = false
     - This is useful in controlled testing environments but **not recommended** for production.
 
 - `enable_http2_upstream` (bool, default `false`):
-  - When `false`, the proxy always uses HTTP/1.1 for outbound requests to upstream servers, even
-    when clients speak HTTP/2 to the proxy. This mirrors the legacy implementation and is the
+  - When `false`, the proxy uses HTTP/1.1 for outbound requests to upstream servers, even when
+    clients speak HTTP/2 to the proxy. This mirrors the legacy implementation and is the
     recommended default for maximum compatibility.
   - When `true`, the shared HTTP client enables HTTP/2 and lets ALPN negotiation choose the
     protocol per origin:

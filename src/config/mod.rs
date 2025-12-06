@@ -286,8 +286,9 @@ pub struct TlsConfig {
     /// Enable HTTP/2 for upstream TLS connections when supported by
     /// the origin server.
     ///
-    /// When `false` (the default), the proxy always uses HTTP/1.1 for
-    /// outbound connections, even if clients speak HTTP/2 to the proxy.
+    /// When `false` (the default), the proxy uses HTTP/1.1 for
+    /// outbound connections, even if clients speak HTTP/2 to the
+    /// proxy.
     ///
     /// When `true`, the shared HTTP client enables HTTP/2 and lets
     /// ALPN negotiate the protocol with each origin. This is intended

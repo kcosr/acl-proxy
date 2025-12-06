@@ -959,15 +959,12 @@ pub(crate) async fn proxy_allowed_request(
         }
     };
 
+    let req_headers_snapshot = req.headers().clone();
     let original_request_presence = snapshot_header_presence(req.headers());
 
     let mut builder = Request::builder()
         .method(method.clone())
-        .uri(upstream_uri.clone())
-        // Always use HTTP/1.1 for upstream
-        // connections to maximize compatibility,
-        // regardless of the client-facing version.
-        .version(Version::HTTP_11);
+        .uri(upstream_uri.clone());
 
     let cfg = &state.config;
     let decision = CaptureDecision::Allow;
@@ -1036,8 +1033,25 @@ pub(crate) async fn proxy_allowed_request(
         Ok(resp) => resp,
         Err(e) => {
             tracing::debug!("upstream request failed: {e}");
-            let mut resp = Response::new(Body::from("Bad Gateway"));
+            let body_bytes = b"Bad Gateway".to_vec();
+            let mut resp = Response::new(Body::from(body_bytes.clone()));
             *resp.status_mut() = StatusCode::BAD_GATEWAY;
+            maybe_capture_static_response(
+                &state,
+                &request_id,
+                &full_url,
+                &method,
+                &client,
+                target.clone(),
+                version,
+                StatusCode::BAD_GATEWAY,
+                "Bad Gateway",
+                &body_bytes,
+                decision,
+                Some(&req_headers_snapshot),
+                mode,
+            )
+            .await;
             return resp;
         }
     };
