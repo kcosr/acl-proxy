@@ -23,6 +23,7 @@ type StatusEvent = {
   requestId: string;
   status: string;
   terminal?: boolean;
+  reason?: string | null;
 };
 
 type AclProxyWebhookBody = {
@@ -89,6 +90,7 @@ type TermStationCallbackBody = {
 type PendingRequestState = {
   callbackUrl: string;
   macros: MacroDescriptor[];
+  notificationId?: string | null;
 };
 
 const app = express();
@@ -160,7 +162,7 @@ function normalizePendingWebhook(body: AclProxyWebhookBody): PendingWebhookEvent
 }
 
 function normalizeStatusEvent(body: AclProxyWebhookBody): StatusEvent {
-  const { requestId, status, terminal } = body;
+  const { requestId, status, terminal, reason } = body;
   if (!requestId || typeof requestId !== "string" || !status) {
     throw new Error(
       "Missing requestId or status in lifecycle webhook payload",
@@ -170,7 +172,41 @@ function normalizeStatusEvent(body: AclProxyWebhookBody): StatusEvent {
     requestId,
     status,
     terminal,
+    reason: reason ?? null,
   };
+}
+
+type TermStationNotificationObject = {
+  id?: string;
+};
+
+type TermStationNotificationCreateResponse = {
+  ok?: boolean;
+  notification?: TermStationNotificationObject;
+} & TermStationNotificationObject;
+
+function extractNotificationIdFromCreateResponse(
+  body: unknown,
+): string | null {
+  if (!body || typeof body !== "object") {
+    return null;
+  }
+
+  const topLevel = body as TermStationNotificationCreateResponse;
+  if (topLevel.notification && typeof topLevel.notification.id === "string") {
+    return topLevel.notification.id;
+  }
+
+  if (typeof topLevel.id === "string") {
+    return topLevel.id;
+  }
+
+  return null;
+}
+
+function buildTermStationCancelUrl(notificationId: string): string {
+  const base = TERMSTATION_NOTIFICATIONS_URL.replace(/\/+$/, "");
+  return `${base}/${encodeURIComponent(notificationId)}/cancel`;
 }
 
 function selectGithubTokenMacro(macros: MacroDescriptor[]): MacroDescriptor | null {
@@ -184,7 +220,7 @@ function selectGithubTokenMacro(macros: MacroDescriptor[]): MacroDescriptor | nu
 
 async function createTermStationNotification(
   ev: PendingWebhookEvent,
-): Promise<void> {
+): Promise<string | null> {
   const tokenMacro = selectGithubTokenMacro(ev.macros);
 
   // Build interactive metadata for TermStation:
@@ -271,6 +307,76 @@ async function createTermStationNotification(
       `TermStation /api/notifications returned status ${resp.status}`,
     );
   }
+
+  let notificationId: string | null = null;
+  try {
+    const json = (await resp.json()) as unknown;
+    notificationId = extractNotificationIdFromCreateResponse(json);
+    if (!notificationId) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[termstation] create notification response missing id field",
+        JSON.stringify(json),
+      );
+    } else {
+      // eslint-disable-next-line no-console
+      console.log(
+        "[termstation] created notification with id",
+        notificationId,
+      );
+    }
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[termstation] failed to parse create notification response body",
+      err instanceof Error ? err.message : err,
+    );
+  }
+
+  return notificationId;
+}
+
+async function cancelTermStationNotification(
+  notificationId: string,
+  reason?: string | null,
+): Promise<void> {
+  const url = buildTermStationCancelUrl(notificationId);
+
+  const headers: Record<string, string> = {
+    "content-type": "application/json; charset=utf-8",
+    authorization: basicAuthHeader(TERMSTATION_BASIC_USER, TERMSTATION_BASIC_PASS),
+  };
+
+  const body: { reason?: string } = {};
+  if (reason && reason.trim().length > 0) {
+    body.reason = reason;
+  }
+
+  // Log the outgoing cancel payload for debugging.
+  // eslint-disable-next-line no-console
+  console.log(
+    "[termstation] cancel payload",
+    JSON.stringify({ url, body }),
+  );
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    // eslint-disable-next-line no-console
+    console.error(
+      "[termstation] failed to cancel notification",
+      resp.status,
+      text,
+    );
+    throw new Error(
+      `TermStation /api/notifications/{id}/cancel returned status ${resp.status}`,
+    );
+  }
 }
 
 // Webhook endpoint that acl-proxy calls when an approval-required rule matches.
@@ -296,6 +402,22 @@ app.post("/webhook", async (req, res) => {
         statusEvent.status === "cancelled";
 
       if (isTerminal) {
+        const state = pendingRequests.get(statusEvent.requestId);
+
+        if (state && state.notificationId) {
+          // Fire-and-forget; status webhooks are best-effort telemetry.
+          void cancelTermStationNotification(
+            state.notificationId,
+            statusEvent.reason ?? undefined,
+          ).catch((err) => {
+            // eslint-disable-next-line no-console
+            console.error(
+              "[webhook] failed to cancel TermStation notification",
+              err instanceof Error ? err.message : err,
+            );
+          });
+        }
+
         pendingRequests.delete(statusEvent.requestId);
       }
 
@@ -327,7 +449,14 @@ app.post("/webhook", async (req, res) => {
     });
 
     try {
-      await createTermStationNotification(pendingEvent);
+      const notificationId = await createTermStationNotification(pendingEvent);
+
+      if (notificationId) {
+        const state = pendingRequests.get(pendingEvent.requestId);
+        if (state) {
+          state.notificationId = notificationId;
+        }
+      }
     } catch (err) {
       // eslint-disable-next-line no-console
       console.error(

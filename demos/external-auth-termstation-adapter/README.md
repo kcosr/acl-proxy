@@ -67,6 +67,10 @@ The adapter:
 - Exposes `POST /webhook` for `acl-proxy` to call.
 - For each `"pending"` webhook, creates an interactive notification in
   TermStation via `/api/notifications`.
+- For terminal lifecycle status webhooks (`"timed_out"`, `"webhook_failed"`,
+  `"error"`, or `"cancelled"`), best-effort cancels the corresponding
+  TermStation notification using the `/api/notifications/{id}/cancel`
+  endpoint, including the webhook `reason` (if present) in the JSON body.
 - Lets the TermStation user click **Approve** or **Deny** and enter a GitHub
   token.
 - Receives the TermStation interactive callback and forwards the decision
@@ -318,3 +322,64 @@ notification:
 Clicking **Approve** with a non-empty token sends the callback to
 `acl-proxy`, which then proxies the request upstream. Clicking **Deny**
 denies the original request.
+
+## Limitations and future work
+
+### Broadcast notifications
+
+Currently, this adapter creates user-scoped notifications (no `session_id`),
+meaning each pending request results in a single notification to a single
+user. TermStation also supports broadcast notifications via `session_id`,
+which would send the same notification to multiple users.
+
+To support broadcast notifications, the adapter would need changes:
+
+1. **Store multiple notification IDs per request.** Change `notificationId`
+   from a single string to an array:
+
+   ```typescript
+   type PendingRequestState = {
+     callbackUrl: string;
+     macros: MacroDescriptor[];
+     notificationIds: string[];  // instead of notificationId?: string
+   };
+   ```
+
+2. **Parse the broadcast response.** When creating with `session_id`,
+   TermStation returns:
+
+   ```json
+   {
+     "recipients": ["alice", "bob"],
+     "notifications": [
+       { "id": "notif-1", ... },
+       { "id": "notif-2", ... }
+     ]
+   }
+   ```
+
+   Extract all IDs from the `notifications` array.
+
+3. **Cancel all notifications on resolution.** When a request is resolved
+   (either by a status webhook like `timed_out`/`cancelled`, or by a user
+   responding), cancel all outstanding notifications:
+
+   ```typescript
+   for (const id of state.notificationIds) {
+     void cancelTermStationNotification(id, reason).catch(...);
+   }
+   ```
+
+4. **Exclude the responding notification on callback.** When a user responds,
+   cancel only the *other* notifications (the responding one is already
+   resolved):
+
+   ```typescript
+   const otherIds = state.notificationIds.filter(id => id !== body.notification_id);
+   for (const id of otherIds) {
+     void cancelTermStationNotification(id, "Resolved by another user").catch(...);
+   }
+   ```
+
+This ensures that when any user approves or denies (or the request times out),
+all other users' notifications are cleaned up.
