@@ -172,6 +172,7 @@ function normalizeStatusEvent(body: AclProxyWebhookBody): StatusEvent {
     requestId,
     status,
     terminal,
+    reason: reason ?? null,
   };
 }
 
