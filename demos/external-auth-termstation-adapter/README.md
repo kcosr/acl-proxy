@@ -67,6 +67,10 @@ The adapter:
 - Exposes `POST /webhook` for `acl-proxy` to call.
 - For each `"pending"` webhook, creates an interactive notification in
   TermStation via `/api/notifications`.
+- For terminal lifecycle status webhooks (`"timed_out"`, `"webhook_failed"`,
+  `"error"`, or `"cancelled"`), best-effort cancels the corresponding
+  TermStation notification using the `/api/notifications/{id}/cancel`
+  endpoint, including the webhook `reason` (if present) in the JSON body.
 - Lets the TermStation user click **Approve** or **Deny** and enter a GitHub
   token.
 - Receives the TermStation interactive callback and forwards the decision
