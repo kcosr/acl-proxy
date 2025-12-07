@@ -201,7 +201,7 @@ async function createTermStationNotification(
       id: inputId,
       label: "Token",
       type: tokenMacro.secret ? "secret" : "secret",
-      required: tokenMacro.required !== false,
+      required: false,
     });
   }
 
