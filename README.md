@@ -190,6 +190,17 @@ In a real deployment you would typically:
 
 ---
 
+## Using acl-proxy with mcp-gateway
+
+When deploying mcp-gateway behind acl-proxy:
+- Bind acl-proxy on the edge (for example 0.0.0.0:8881/8889) and run mcp-gateway on `127.0.0.1:4100` as the only upstream.
+- Start from the commented `MCP Gateway suite` block in `acl-proxy.sample.toml` (or copy it into `config/mcp-gateway-suite.sample.toml`) and adjust hosts/ports to your environment.
+- Enable `[logging.evidence]` to emit JSONL lines (`logs/acl_proxy_evidence.jsonl` by default) that can be merged with mcp-gateway Evidence for chat-to-html and audits.
+
+## Development notes
+
+If OpenSSL headers are missing on your system, you can build a local OpenSSL and point cargo to it. See `docs/DEV_SETUP.md` for the exact commands and environment variables (`OPENSSL_DIR`, `OPENSSL_STATIC`, `OPENSSL_NO_PKG_CONFIG`, `PKG_CONFIG_PATH`).
+
 ## Configuration model
 
 ### File location and environment overrides
