@@ -1,9 +1,18 @@
-use std::fmt;
+use std::{
+    fmt,
+    fs::{self, OpenOptions},
+    io::Write,
+    path::PathBuf,
+};
 
+use chrono::Utc;
+use serde::Serialize;
 use tracing::Level;
 use tracing_subscriber::fmt::SubscriberBuilder;
 
-use crate::config::{LoggingConfig, LoggingPolicyDecisionsConfig, PolicyDefaultAction};
+use crate::config::{
+    LoggingConfig, LoggingEvidenceConfig, LoggingPolicyDecisionsConfig, PolicyDefaultAction,
+};
 use crate::policy::PolicyDecision;
 
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +36,7 @@ pub struct PolicyDecisionLogging {
 pub struct LoggingSettings {
     pub level: Level,
     pub policy_decisions: PolicyDecisionLogging,
+    pub evidence: Option<EvidenceSink>,
 }
 
 impl LoggingSettings {
@@ -41,6 +51,7 @@ impl LoggingSettings {
         Ok(LoggingSettings {
             level,
             policy_decisions,
+            evidence: EvidenceSink::from_config(&cfg.evidence),
         })
     }
 
@@ -100,6 +111,20 @@ impl LoggingSettings {
             rule_pattern,
             rule_description,
         );
+
+        if let Some(evidence) = &self.evidence {
+            evidence.write(EvidenceLine {
+                ts: Utc::now().to_rfc3339(),
+                allowed,
+                request_id: ctx.request_id,
+                url: ctx.url,
+                method,
+                client_ip,
+                rule_action,
+                rule_pattern,
+                rule_description,
+            });
+        }
     }
 }
 
@@ -230,10 +255,81 @@ impl fmt::Display for PolicyDecisionLogging {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct EvidenceSink {
+    path: PathBuf,
+}
+
+impl EvidenceSink {
+    fn from_config(cfg: &LoggingEvidenceConfig) -> Option<Self> {
+        cfg.enabled.then_some(Self {
+            path: PathBuf::from(&cfg.path),
+        })
+    }
+
+    fn write(&self, line: EvidenceLine<'_>) {
+        let json = match serde_json::to_string(&line) {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!(
+                    "failed to serialize evidence log line for {}: {err}",
+                    self.path.display()
+                );
+                return;
+            }
+        };
+
+        if let Some(parent) = self.path.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                eprintln!(
+                    "failed to create evidence directory {}: {err}",
+                    parent.display()
+                );
+                return;
+            }
+        }
+
+        let mut file = match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            Ok(file) => file,
+            Err(err) => {
+                eprintln!("failed to open evidence log {}: {err}", self.path.display());
+                return;
+            }
+        };
+
+        if let Err(err) = writeln!(file, "{json}") {
+            eprintln!(
+                "failed to write evidence log {}: {err}",
+                self.path.display()
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct EvidenceLine<'a> {
+    ts: String,
+    allowed: bool,
+    request_id: &'a str,
+    url: &'a str,
+    method: &'a str,
+    client_ip: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule_action: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule_pattern: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule_description: Option<&'a str>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::LoggingPolicyDecisionsConfig;
+    use crate::config::{LoggingEvidenceConfig, LoggingPolicyDecisionsConfig};
 
     #[test]
     fn logging_settings_parses_levels() {
@@ -246,6 +342,7 @@ mod tests {
                 level_allows: "info".to_string(),
                 level_denies: "warn".to_string(),
             },
+            evidence: LoggingEvidenceConfig::default(),
         };
 
         let settings = LoggingSettings::from_config(&cfg).expect("parse logging config");
@@ -260,6 +357,7 @@ mod tests {
             directory: "logs".to_string(),
             level: "notalevel".to_string(),
             policy_decisions: LoggingPolicyDecisionsConfig::default(),
+            evidence: LoggingEvidenceConfig::default(),
         };
 
         let err = LoggingSettings::from_config(&cfg).expect_err("should fail");

@@ -246,3 +246,40 @@ value = "{{reason}}"
 action = "deny"
 pattern = "https://git.internal/admin/**"
 description = "Block Git admin area"
+
+###############################################################################
+# MCP Gateway suite example
+###############################################################################
+
+# Copy this block into a dedicated config (for example
+# config/mcp-gateway-suite.sample.toml) when pairing with mcp-gateway.
+# schema_version = "1"
+#
+# [proxy]
+# bind_address = "0.0.0.0"
+# http_port = 8881
+# https_bind_address = "0.0.0.0"
+# https_port = 8889
+#
+# [logging]
+# directory = "logs"
+# level = "info"
+#
+# [logging.evidence]
+# enabled = false
+# path = "logs/acl_proxy_evidence.jsonl"
+#
+# [policy]
+# default = "deny"
+#
+# [[policy.rules]]
+# id = "allow-mcp-gateway"
+# action = "allow"
+# upstream = "mcp-gateway"
+# methods = ["CONNECT", "GET", "POST"]
+#
+# [upstream."mcp-gateway"]
+# host = "127.0.0.1"
+# port = 4100
+# risk_level = "medium"
+# capabilities = ["mcp_gateway"]

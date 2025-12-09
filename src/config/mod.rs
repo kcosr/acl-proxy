@@ -172,6 +172,9 @@ pub struct LoggingConfig {
 
     #[serde(default)]
     pub policy_decisions: LoggingPolicyDecisionsConfig,
+
+    #[serde(default)]
+    pub evidence: LoggingEvidenceConfig,
 }
 
 impl Default for LoggingConfig {
@@ -180,6 +183,7 @@ impl Default for LoggingConfig {
             directory: default_logging_directory(),
             level: default_logging_level(),
             policy_decisions: LoggingPolicyDecisionsConfig::default(),
+            evidence: LoggingEvidenceConfig::default(),
         }
     }
 }
@@ -190,6 +194,28 @@ fn default_logging_directory() -> String {
 
 fn default_logging_level() -> String {
     "info".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoggingEvidenceConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default = "default_evidence_path")]
+    pub path: String,
+}
+
+impl Default for LoggingEvidenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            path: default_evidence_path(),
+        }
+    }
+}
+
+fn default_evidence_path() -> String {
+    "logs/acl_proxy_evidence.jsonl".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
