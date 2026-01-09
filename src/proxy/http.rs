@@ -123,7 +123,11 @@ async fn handle_http_request(
         return Ok(resp);
     }
 
-    if is_external_auth_callback_path(req.uri().path()) {
+    if is_internal_endpoint(
+        req.uri(),
+        &state.config.proxy.internal_base_path,
+        "external-auth/callback",
+    ) {
         let resp = handle_external_auth_callback_request(state, req).await;
         return Ok(resp);
     }
@@ -253,8 +257,28 @@ async fn handle_http_request(
     Ok(response)
 }
 
-fn is_external_auth_callback_path(path: &str) -> bool {
-    path == "/_acl-proxy/external-auth/callback"
+fn is_internal_endpoint(uri: &Uri, base: &str, suffix: &str) -> bool {
+    if uri.scheme().is_some() || uri.authority().is_some() {
+        return false;
+    }
+
+    let path = uri.path();
+    let suffix = suffix.trim_start_matches('/');
+
+    if base == "/" {
+        return path.strip_prefix('/') == Some(suffix);
+    }
+
+    if !path.starts_with(base) {
+        return false;
+    }
+
+    let remainder = &path[base.len()..];
+    if !remainder.starts_with('/') {
+        return false;
+    }
+
+    &remainder[1..] == suffix
 }
 
 #[derive(Debug, Deserialize)]
@@ -1710,7 +1734,8 @@ pub(crate) fn generate_request_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::generate_request_id;
+    use super::{generate_request_id, is_internal_endpoint};
+    use http::Uri;
 
     #[test]
     fn request_id_includes_process_tag_and_is_unique() {
@@ -1727,5 +1752,44 @@ mod tests {
         );
         assert!(parts.next().unwrap_or("").parse::<i64>().is_ok());
         assert!(!parts.next().unwrap_or("").is_empty());
+    }
+
+    #[test]
+    fn internal_endpoint_requires_origin_form_and_base_path() {
+        let uri: Uri = "/_acl-proxy/external-auth/callback"
+            .parse()
+            .expect("parse uri");
+        assert!(is_internal_endpoint(
+            &uri,
+            "/_acl-proxy",
+            "external-auth/callback"
+        ));
+
+        let uri: Uri = "http://example.com/_acl-proxy/external-auth/callback"
+            .parse()
+            .expect("parse uri");
+        assert!(!is_internal_endpoint(
+            &uri,
+            "/_acl-proxy",
+            "external-auth/callback"
+        ));
+
+        let uri: Uri = "/internal/external-auth/callback"
+            .parse()
+            .expect("parse uri");
+        assert!(is_internal_endpoint(
+            &uri,
+            "/internal",
+            "external-auth/callback"
+        ));
+
+        let uri: Uri = "/_acl-proxy/external-auth/callback"
+            .parse()
+            .expect("parse uri");
+        assert!(!is_internal_endpoint(
+            &uri,
+            "/internal",
+            "external-auth/callback"
+        ));
     }
 }

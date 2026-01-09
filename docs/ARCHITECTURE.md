@@ -787,7 +787,9 @@ Client                 acl-proxy              External Auth UI     Upstream
 ```toml
 [external_auth]
 # Optional: expose the callback URL in webhooks so external services
-# know where to send approval decisions
+# know where to send approval decisions. The inbound callback path uses
+# {proxy.internal_base_path}/external-auth/callback (default:
+# /_acl-proxy/external-auth/callback).
 callback_url = "https://proxy.example.com/_acl-proxy/external-auth/callback"
 
 [policy.approval_macros]
@@ -824,11 +826,13 @@ value = "{{reason}}"
 
 ### Callback Endpoint
 
-The proxy exposes an internal callback endpoint at `/_acl-proxy/external-auth/callback` that
+The proxy exposes an internal callback endpoint at
+`{proxy.internal_base_path}/external-auth/callback` (default:
+`/_acl-proxy/external-auth/callback`) that
 external auth services use to deliver approval decisions:
 
 ```
-POST /_acl-proxy/external-auth/callback
+POST /{internal_base_path}/external-auth/callback
 Content-Type: application/json
 
 {

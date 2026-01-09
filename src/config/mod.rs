@@ -95,6 +95,9 @@ pub struct ProxyConfig {
 
     #[serde(default = "default_https_port")]
     pub https_port: u16,
+
+    #[serde(default = "default_internal_base_path")]
+    pub internal_base_path: String,
 }
 
 impl Default for ProxyConfig {
@@ -104,6 +107,7 @@ impl Default for ProxyConfig {
             http_port: default_http_port(),
             https_bind_address: default_https_bind_address(),
             https_port: default_https_port(),
+            internal_base_path: default_internal_base_path(),
         }
     }
 }
@@ -122,6 +126,10 @@ fn default_https_bind_address() -> String {
 
 fn default_https_port() -> u16 {
     8889
+}
+
+fn default_internal_base_path() -> String {
+    "/_acl-proxy".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -793,6 +801,8 @@ impl Config {
             ));
         }
 
+        validate_internal_base_path(&self.proxy.internal_base_path)?;
+
         // Validate policy semantics (macros, rulesets, includes).
         crate::policy::PolicyEngine::from_config(&self.policy)
             .map_err(|e| ConfigError::Invalid(format!("{e}")))?;
@@ -822,6 +832,7 @@ bind_address = "0.0.0.0"
 http_port = 8881
 https_bind_address = "0.0.0.0"
 https_port = 8889
+internal_base_path = "/_acl-proxy"
 
 [logging]
 level = "info"
@@ -879,6 +890,32 @@ fn validate_external_auth_config(external_auth: &ExternalAuthConfig) -> Result<(
     Ok(())
 }
 
+fn validate_internal_base_path(path: &str) -> Result<(), ConfigError> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::Invalid(
+            "proxy.internal_base_path must not be empty".to_string(),
+        ));
+    }
+    if trimmed != path {
+        return Err(ConfigError::Invalid(
+            "proxy.internal_base_path must not include leading or trailing whitespace".to_string(),
+        ));
+    }
+    if !trimmed.starts_with('/') {
+        return Err(ConfigError::Invalid(
+            "proxy.internal_base_path must start with '/'".to_string(),
+        ));
+    }
+    if trimmed.len() > 1 && trimmed.ends_with('/') {
+        return Err(ConfigError::Invalid(
+            "proxy.internal_base_path must not end with '/'".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,6 +943,82 @@ default = "deny"
         assert_eq!(config.proxy.http_port, 8080);
         assert_eq!(config.logging.level, "debug");
         assert!(matches!(config.policy.default, PolicyDefaultAction::Deny));
+    }
+
+    #[test]
+    fn proxy_internal_base_path_parse() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+internal_base_path = "/internal"
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        assert_eq!(config.proxy.internal_base_path, "/internal");
+    }
+
+    #[test]
+    fn proxy_internal_base_path_requires_leading_slash() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+internal_base_path = "internal"
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("proxy.internal_base_path"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn proxy_internal_base_path_rejects_trailing_slash() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+internal_base_path = "/internal/"
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("proxy.internal_base_path"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[test]

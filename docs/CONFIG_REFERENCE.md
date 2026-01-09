@@ -82,6 +82,7 @@ bind_address = "0.0.0.0"      # default
 http_port = 8881              # default
 https_bind_address = "0.0.0.0"# default
 https_port = 8889             # default (0 disables transparent HTTPS)
+internal_base_path = "/_acl-proxy" # default
 ```
 
 Fields:
@@ -101,6 +102,12 @@ Fields:
 - `https_port` (integer, default `8889`):
   - Port for the transparent HTTPS listener.
   - `0` disables the transparent HTTPS listener entirely.
+
+- `internal_base_path` (string, default `"/_acl-proxy"`):
+  - Base path for internal HTTP endpoints (for example, external auth callbacks).
+  - Must start with `/` and must not end with `/` (except for the root path `/`).
+  - Internal endpoints are only matched for origin-form (direct) requests, not proxy-style
+    absolute-form requests.
 
 ---
 
@@ -638,8 +645,9 @@ Global external auth settings are defined under `[external_auth]`:
 [external_auth]
 # Full URL external auth services should use when calling back into this
 # proxy instance. This value is included in external auth webhooks as
-# `callbackUrl`, but does not change the inbound callback path, which
-# remains `/_acl-proxy/external-auth/callback`.
+# `callbackUrl`. The inbound callback path uses
+# `{proxy.internal_base_path}/external-auth/callback` (defaults to
+# `/_acl-proxy/external-auth/callback`).
 callback_url = "https://proxy.example.com/_acl-proxy/external-auth/callback"
 ```
 
@@ -750,7 +758,7 @@ Callback endpoint:
 - The proxy exposes a dedicated callback path on the HTTP listener:
 
   ```http
-  POST /_acl-proxy/external-auth/callback
+  POST /{internal_base_path}/external-auth/callback
   Content-Type: application/json
 
   {
@@ -785,8 +793,8 @@ Security note:
 
 - The callback endpoint does not perform authentication in this initial version.
 - Deployments should ensure that only the trusted external auth service (or a tightly controlled
-  network segment) can reach `/_acl-proxy/external-auth/callback` (for example via firewall rules
-  or network policy).
+  network segment) can reach `{internal_base_path}/external-auth/callback` (for example via
+  firewall rules or network policy).
 - Future versions may add optional shared-secret or signature-based callback authentication.
 
 ---

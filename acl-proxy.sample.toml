@@ -35,6 +35,9 @@ http_port = 8881
 https_bind_address = "0.0.0.0"
 https_port = 8889
 
+# Base path for internal endpoints (external auth callbacks, metrics, etc).
+internal_base_path = "/_acl-proxy"
+
 ###############################################################################
 # Logging
 ###############################################################################
@@ -165,7 +168,8 @@ reason       = { label = "Approval reason", required = false, secret = false }
 # Global external auth settings. The callback_url is included in external auth
 # webhooks as `callbackUrl` so that external services know exactly where to
 # send approval decisions for this proxy instance. The inbound callback path
-# remains `/_acl-proxy/external-auth/callback`.
+# uses {proxy.internal_base_path}/external-auth/callback (defaults to
+# /_acl-proxy/external-auth/callback).
 [external_auth]
 callback_url = "http://localhost:8881/_acl-proxy/external-auth/callback"
 
