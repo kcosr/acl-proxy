@@ -2,7 +2,12 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+- Support IPv6 subnet matching in policy rules.
+
+### Fixed
+- Avoid request ID collisions after process restarts by adding a per-process tag.
+- Ensure the external auth status worker starts reliably under concurrent calls.
 
 ## [0.0.3] - 2026-01-09
 

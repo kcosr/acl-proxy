@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
 use http::header::{HeaderName, HeaderValue};
-use ipnet::Ipv4Net;
+use ipnet::IpNet;
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 use thiserror::Error;
@@ -49,7 +49,7 @@ pub struct MatchedRule {
     pub pattern: Option<String>,
     pub description: Option<String>,
     pub rule_id: Option<String>,
-    pub subnets: Vec<Ipv4Net>,
+    pub subnets: Vec<IpNet>,
     pub methods: Vec<String>,
     pub header_actions: Vec<CompiledHeaderAction>,
     pub external_auth_profile: Option<String>,
@@ -69,7 +69,7 @@ struct CompiledRule {
     regex: Option<Regex>,
     description: Option<String>,
     rule_id: Option<String>,
-    subnets: Vec<Ipv4Net>,
+    subnets: Vec<IpNet>,
     methods: Vec<String>,
     header_actions: Vec<CompiledHeaderAction>,
     external_auth_profile: Option<String>,
@@ -87,7 +87,7 @@ struct ExpandedRule {
     pattern: Option<String>,
     description: Option<String>,
     rule_id: Option<String>,
-    subnets: Vec<Ipv4Net>,
+    subnets: Vec<IpNet>,
     methods: Vec<String>,
     header_actions: Vec<HeaderActionConfig>,
     external_auth_profile: Option<String>,
@@ -106,7 +106,7 @@ pub struct EffectiveRule {
     pub pattern: Option<String>,
     pub description: Option<String>,
     pub rule_id: Option<String>,
-    pub subnets: Vec<Ipv4Net>,
+    pub subnets: Vec<IpNet>,
     pub methods: Vec<String>,
     pub header_actions: Vec<EffectiveHeaderAction>,
     pub external_auth: Option<EffectiveExternalAuth>,
@@ -985,7 +985,7 @@ pub fn normalize_client_ip(raw: Option<&str>) -> Option<String> {
     Some(addr)
 }
 
-fn client_in_any_subnet(raw_ip: Option<&str>, subnets: &[Ipv4Net]) -> bool {
+fn client_in_any_subnet(raw_ip: Option<&str>, subnets: &[IpNet]) -> bool {
     let ip = match raw_ip {
         Some(s) => s,
         None => return false,
@@ -1001,14 +1001,19 @@ fn client_in_any_subnet(raw_ip: Option<&str>, subnets: &[Ipv4Net]) -> bool {
         Err(_) => return false,
     };
 
-    let v4 = match parsed {
-        IpAddr::V4(v4) => v4,
-        IpAddr::V6(_) => return false,
-    };
-
     for net in subnets {
-        if net.contains(&v4) {
-            return true;
+        match (net, &parsed) {
+            (IpNet::V4(v4net), IpAddr::V4(v4)) => {
+                if v4net.contains(v4) {
+                    return true;
+                }
+            }
+            (IpNet::V6(v6net), IpAddr::V6(v6)) => {
+                if v6net.contains(v6) {
+                    return true;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1075,7 +1080,7 @@ mod tests {
                 pattern: None,
                 description: None,
                 methods: None,
-                subnets: vec!["192.168.0.0/16".parse::<Ipv4Net>().unwrap()],
+                subnets: vec!["192.168.0.0/16".parse::<IpNet>().unwrap()],
                 with: None,
                 add_url_enc_variants: None,
                 header_actions: Vec::new(),
@@ -1087,6 +1092,33 @@ mod tests {
         let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
         assert!(engine.is_allowed("https://example.com/", Some("192.168.1.10"), None));
         assert!(!engine.is_allowed("https://example.com/", Some("10.0.0.1"), None));
+    }
+
+    #[test]
+    fn subnet_only_rule_allows_ipv6_clients() {
+        let cfg = PolicyConfig {
+            default: PolicyDefaultAction::Deny,
+            macros: MacroMap::default(),
+            approval_macros: crate::config::ApprovalMacroConfigMap::default(),
+            rulesets: RulesetMap::default(),
+            external_auth_profiles: ExternalAuthProfileConfigMap::default(),
+            rules: vec![PolicyRuleConfig::Direct(PolicyRuleDirectConfig {
+                action: PolicyDefaultAction::Allow,
+                pattern: None,
+                description: None,
+                methods: None,
+                subnets: vec!["2001:db8::/32".parse::<IpNet>().unwrap()],
+                with: None,
+                add_url_enc_variants: None,
+                header_actions: Vec::new(),
+                rule_id: None,
+                external_auth_profile: None,
+            })],
+        };
+
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+        assert!(engine.is_allowed("https://example.com/", Some("2001:db8::1"), None));
+        assert!(!engine.is_allowed("https://example.com/", Some("2001:dead::1"), None));
     }
 
     #[test]

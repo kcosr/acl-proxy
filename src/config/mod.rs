@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use ipnet::Ipv4Net;
+use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 
@@ -412,7 +412,7 @@ pub struct PolicyRuleTemplateConfig {
     pub methods: Option<MethodList>,
 
     #[serde(default)]
-    pub subnets: Vec<Ipv4Net>,
+    pub subnets: Vec<IpNet>,
 
     #[serde(default)]
     pub header_actions: Vec<HeaderActionConfig>,
@@ -446,7 +446,7 @@ pub struct PolicyRuleIncludeConfig {
     pub methods: Option<MethodList>,
 
     #[serde(default)]
-    pub subnets: Vec<Ipv4Net>,
+    pub subnets: Vec<IpNet>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -463,7 +463,7 @@ pub struct PolicyRuleDirectConfig {
     pub methods: Option<MethodList>,
 
     #[serde(default)]
-    pub subnets: Vec<Ipv4Net>,
+    pub subnets: Vec<IpNet>,
 
     #[serde(default)]
     pub with: Option<MacroOverrideMap>,

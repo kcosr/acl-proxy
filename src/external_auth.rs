@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -113,7 +112,6 @@ pub struct ExternalAuthManager {
     http_client: SharedHttpClient,
     status_tx: mpsc::Sender<StatusWebhookEvent>,
     status_rx: Arc<Mutex<Option<mpsc::Receiver<StatusWebhookEvent>>>>,
-    workers_started: Arc<AtomicBool>,
 }
 
 impl ExternalAuthManager {
@@ -155,7 +153,6 @@ impl ExternalAuthManager {
             http_client,
             status_tx,
             status_rx: Arc::new(Mutex::new(Some(status_rx))),
-            workers_started: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -507,18 +504,6 @@ impl ExternalAuthManager {
     }
 
     fn ensure_status_worker(&self) {
-        if self.workers_started.load(Ordering::Acquire) {
-            return;
-        }
-
-        if self
-            .workers_started
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return;
-        }
-
         let rx_opt = {
             let mut guard = self.status_rx.lock().unwrap();
             guard.take()

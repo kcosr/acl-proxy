@@ -487,9 +487,8 @@ Fields:
 - `description` – free-form text; propagated into logs and capture for matched rules.
 - `methods` – optional string or list of strings. Values are normalized to uppercase, and rules only
   match when the incoming method is present and matches one of them.
-- `subnets` – list of IPv4 CIDR strings (e.g., `"192.168.0.0/16"`). If present, the client IP must
-  fall within at least one subnet for the rule to match. Subnet matching is currently IPv4-only;
-  IPv6 client addresses do not match any subnet rules.
+- `subnets` – list of IPv4 or IPv6 CIDR strings (e.g., `"192.168.0.0/16"` or `"2001:db8::/32"`). If
+  present, the client IP must fall within at least one subnet for the rule to match.
 - `with` – optional macro overrides used when the pattern/description includes `{placeholder}`
   variables (see below).
 - `add_url_enc_variants` – optional:
