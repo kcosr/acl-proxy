@@ -57,6 +57,6 @@ When PRs are merged to main, add changelog entries under `## [Unreleased]`. This
 3. Updates CHANGELOG: `## [Unreleased]` -> `## [X.Y.Z] - YYYY-MM-DD`
 4. Commits "Release vX.Y.Z" and creates git tag
 5. Pushes commit and tag to origin
-6. Creates GitHub release with notes extracted from CHANGELOG
+6. Creates GitHub prerelease with notes extracted from CHANGELOG
 7. Adds new `## [Unreleased]` section with `_No unreleased changes._` placeholder
 8. Commits "Prepare for next release" and pushes
