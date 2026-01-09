@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.3] - 2026-01-09
 
 ### Added
 - External auth demo for TermStation integration ([#25](https://github.com/kcosr/acl-proxy/pull/25))
