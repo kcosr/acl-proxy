@@ -82,6 +82,7 @@ bind_address = "0.0.0.0"      # default
 http_port = 8881              # default
 https_bind_address = "0.0.0.0"# default
 https_port = 8889             # default (0 disables transparent HTTPS)
+request_timeout_ms = 30000    # default (0 disables upstream timeout)
 internal_base_path = "/_acl-proxy" # default
 ```
 
@@ -102,6 +103,11 @@ Fields:
 - `https_port` (integer, default `8889`):
   - Port for the transparent HTTPS listener.
   - `0` disables the transparent HTTPS listener entirely.
+
+- `request_timeout_ms` (integer, default `30000`):
+  - Maximum time (in milliseconds) to wait for upstream response headers.
+  - `0` disables the upstream timeout.
+  - When a policy rule sets `request_timeout_ms`, that value overrides this default.
 
 - `internal_base_path` (string, default `"/_acl-proxy"`):
   - Base path for internal HTTP endpoints (for example, external auth callbacks).
@@ -484,6 +490,8 @@ Fields:
 - `description` (`string`, optional) – may also contain `{placeholder}` names.
 - `methods` (string or list of strings, optional) – HTTP methods (normalized to uppercase).
 - `subnets` (`["192.168.0.0/16", ...]`, optional) – list of IPv4/IPv6 CIDR subnets.
+- `request_timeout_ms` (integer, optional) – override the upstream timeout for matching requests
+  (`0` disables the timeout for those requests).
 
 Rulesets themselves are not evaluated until referenced from `policy.rules` via an include rule.
 
@@ -514,6 +522,8 @@ Fields:
 - `description` (`string`, optional).
 - `methods` (string or list, optional) – allowed HTTP methods (normalized to uppercase).
 - `subnets` (`["CIDR", ...]`, optional) – allowed client IP subnets (IPv4 or IPv6 CIDR ranges).
+- `request_timeout_ms` (integer, optional) – override the upstream timeout for this rule
+  (`0` disables the timeout for this rule).
 - `with` (map from macro name to single string or list of strings, optional):
   - Overrides values for placeholders used in this rule.
   - Useful when the same macro is reused with different values in different rules.
@@ -624,6 +634,9 @@ Fields:
 - `methods` / `subnets` (optional) – rule-level overrides:
   - If provided, override template-level `methods` / `subnets` in the referenced ruleset.
   - If omitted, the template’s `methods` / `subnets` are used.
+- `request_timeout_ms` (integer, optional):
+  - Overrides the template’s `request_timeout_ms` for all rules produced by this include
+    (`0` disables the timeout for those rules).
 
 Missing macros required by a referenced ruleset (after accounting for `with` overrides) cause
 configuration validation to fail with a clear error message.

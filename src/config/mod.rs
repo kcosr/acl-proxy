@@ -96,6 +96,9 @@ pub struct ProxyConfig {
     #[serde(default = "default_https_port")]
     pub https_port: u16,
 
+    #[serde(default = "default_request_timeout_ms")]
+    pub request_timeout_ms: u64,
+
     #[serde(default = "default_internal_base_path")]
     pub internal_base_path: String,
 }
@@ -107,6 +110,7 @@ impl Default for ProxyConfig {
             http_port: default_http_port(),
             https_bind_address: default_https_bind_address(),
             https_port: default_https_port(),
+            request_timeout_ms: default_request_timeout_ms(),
             internal_base_path: default_internal_base_path(),
         }
     }
@@ -126,6 +130,10 @@ fn default_https_bind_address() -> String {
 
 fn default_https_port() -> u16 {
     8889
+}
+
+fn default_request_timeout_ms() -> u64 {
+    30_000
 }
 
 fn default_internal_base_path() -> String {
@@ -423,6 +431,9 @@ pub struct PolicyRuleTemplateConfig {
     pub subnets: Vec<IpNet>,
 
     #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
+
+    #[serde(default)]
     pub header_actions: Vec<HeaderActionConfig>,
 
     #[serde(default)]
@@ -455,6 +466,10 @@ pub struct PolicyRuleIncludeConfig {
 
     #[serde(default)]
     pub subnets: Vec<IpNet>,
+
+    /// Optional override for the upstream request timeout (milliseconds).
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -472,6 +487,9 @@ pub struct PolicyRuleDirectConfig {
 
     #[serde(default)]
     pub subnets: Vec<IpNet>,
+
+    #[serde(default)]
+    pub request_timeout_ms: Option<u64>,
 
     #[serde(default)]
     pub with: Option<MacroOverrideMap>,
@@ -832,6 +850,7 @@ bind_address = "0.0.0.0"
 http_port = 8881
 https_bind_address = "0.0.0.0"
 https_port = 8889
+request_timeout_ms = 30000
 internal_base_path = "/_acl-proxy"
 
 [logging]

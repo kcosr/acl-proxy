@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::convert::Infallible;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use http::header::{HeaderMap as HttpHeaderMap, HeaderName, HeaderValue, HOST};
@@ -198,6 +199,7 @@ async fn handle_http_request(
     let header_actions = matched_rule
         .map(|m| m.header_actions.clone())
         .unwrap_or_default();
+    let request_timeout_ms = matched_rule.and_then(|m| m.request_timeout_ms);
 
     if let Some(rule) = matched_rule {
         if let Some(profile_name) = rule.external_auth_profile.as_ref() {
@@ -216,6 +218,7 @@ async fn handle_http_request(
                     rule.rule_id.clone(),
                     &profile,
                     profile_name,
+                    request_timeout_ms,
                     header_actions,
                 )
                 .await;
@@ -250,6 +253,7 @@ async fn handle_http_request(
         target,
         req,
         CaptureMode::HttpProxy,
+        request_timeout_ms,
         header_actions,
     )
     .await;
@@ -542,6 +546,7 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
     rule_id: Option<String>,
     profile: &ExternalAuthProfile,
     profile_name: &str,
+    request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
     mode: CaptureMode,
 ) -> Response<Body> {
@@ -655,6 +660,7 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
                 target,
                 req,
                 mode,
+                request_timeout_ms,
                 header_actions,
             )
             .await
@@ -727,6 +733,7 @@ async fn handle_external_auth_gate(
     rule_id: Option<String>,
     profile: &ExternalAuthProfile,
     profile_name: &str,
+    request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
 ) -> Response<Body> {
     run_external_auth_gate_lifecycle(
@@ -743,6 +750,7 @@ async fn handle_external_auth_gate(
         rule_id,
         profile,
         profile_name,
+        request_timeout_ms,
         header_actions,
         CaptureMode::HttpProxy,
     )
@@ -1125,6 +1133,17 @@ pub(crate) async fn maybe_capture_static_response(
     }
 }
 
+fn resolve_request_timeout_ms(
+    rule_timeout_ms: Option<u64>,
+    default_timeout_ms: u64,
+) -> Option<Duration> {
+    let timeout_ms = rule_timeout_ms.unwrap_or(default_timeout_ms);
+    if timeout_ms == 0 {
+        return None;
+    }
+    Some(Duration::from_millis(timeout_ms))
+}
+
 pub(crate) async fn proxy_allowed_request(
     state: Arc<AppState>,
     request_id: String,
@@ -1135,6 +1154,7 @@ pub(crate) async fn proxy_allowed_request(
     target: Option<CaptureEndpoint>,
     req: Request<Body>,
     mode: CaptureMode,
+    request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
 ) -> Response<Body> {
     let upstream_uri: Uri = match full_url.parse() {
@@ -1223,7 +1243,39 @@ pub(crate) async fn proxy_allowed_request(
     };
 
     let client_http: Client<_> = state.http_client.clone();
-    let upstream_resp = client_http.request(upstream_req).await;
+    let request_timeout =
+        resolve_request_timeout_ms(request_timeout_ms, state.config.proxy.request_timeout_ms);
+    let upstream_resp = match request_timeout {
+        Some(timeout) => {
+            match tokio::time::timeout(timeout, client_http.request(upstream_req)).await {
+                Ok(resp) => resp,
+                Err(_) => {
+                    tracing::debug!("upstream request timed out after {:?}", timeout);
+                    let body_bytes = b"Gateway Timeout".to_vec();
+                    let mut resp = Response::new(Body::from(body_bytes.clone()));
+                    *resp.status_mut() = StatusCode::GATEWAY_TIMEOUT;
+                    maybe_capture_static_response(
+                        &state,
+                        &request_id,
+                        &full_url,
+                        &method,
+                        &client,
+                        target.clone(),
+                        version,
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "Gateway Timeout",
+                        &body_bytes,
+                        decision,
+                        Some(&req_headers_snapshot),
+                        mode,
+                    )
+                    .await;
+                    return resp;
+                }
+            }
+        }
+        None => client_http.request(upstream_req).await,
+    };
 
     let mut upstream_resp = match upstream_resp {
         Ok(resp) => resp,
