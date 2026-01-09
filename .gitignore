@@ -7,3 +7,6 @@ target
 # Local config and certs
 acl-proxy.toml
 certs/
+
+# Local tooling output
+.codemap/

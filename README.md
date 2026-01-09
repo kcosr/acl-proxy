@@ -48,7 +48,6 @@ https_bind_address = "0.0.0.0"
 https_port = 8889
 
 [logging]
-directory = "logs"
 level = "info"
 
 [policy]
@@ -76,8 +75,11 @@ https_bind_address = "127.0.0.1"
 https_port = 8889
 
 [logging]
-directory = "logs"
 level = "info"
+directory = "logs"
+max_bytes = 104857600
+max_files = 5
+console = true
 
 [capture]
 allowed_request = false
@@ -139,7 +141,7 @@ acl-proxy --config config/acl-proxy.toml
 
 On startup, the proxy:
 - Loads and validates the configuration (applying environment overrides where applicable).
-- Initializes logging based on `[logging].level`.
+- Initializes logging based on `[logging]` (level + optional file/console sinks).
 - Logs a structured startup event summarizing bind addresses, capture settings, loop protection,
   and certificate/CA mode.
 - Starts the HTTP proxy listener and, if `https_port != 0`, the transparent HTTPS listener.
@@ -245,8 +247,11 @@ https_port = 8889             # default (0 disables transparent HTTPS)
 
 ```toml
 [logging]
-directory = "logs"   # used as a fallback for capture directory
 level = "info"       # TRACE, DEBUG, INFO, WARN, ERROR (case-insensitive)
+directory = "logs"
+max_bytes = 104857600
+max_files = 5
+console = true
 
 [logging.policy_decisions]
 log_allows = false
@@ -257,8 +262,11 @@ level_denies = "warn"
 
 - `logging.level` – global log level used to configure the `tracing` subscriber at startup.
   Invalid values cause `config validate` (and startup) to fail.
-- `logging.directory` – currently **not** used to configure a file sink; it is used as a fallback
-  for the capture directory when `[capture].directory` is empty.
+- `logging.directory` – when set, enables file logging to `{directory}/acl-proxy.log`.
+- `logging.max_bytes` – rotate the log file when it exceeds this size (bytes).
+- `logging.max_files` – number of rotated files kept, excluding the active log file.
+- `logging.console` – when true, also write logs to stdout (when false and no directory is set,
+  logs are discarded).
 - `logging.policy_decisions`:
   - `log_allows` – whether to log allowed policy decisions.
   - `log_denies` – whether to log denied policy decisions.
@@ -671,6 +679,11 @@ client-facing HTTP version (e.g., `"2"` for HTTP/2).
 
 - Logs are emitted via the `tracing` crate.
 - Base log level is controlled by `[logging].level` (or `LOG_LEVEL` env override) at startup.
+- When `[logging].directory` is set, logs are written to `{directory}/acl-proxy.log` and rotated
+  by size (`max_bytes`, keeping `max_files` backups).
+- When `[logging].console = true`, logs also go to stdout (console-only if no directory is set).
+- File logging uses a non-blocking buffer; when it fills, log entries are dropped to avoid
+  stalling the proxy.
 - Startup logs (target `acl_proxy::startup`) summarize:
   - HTTP and HTTPS bind addresses.
   - Loop protection settings.
@@ -684,7 +697,7 @@ client-facing HTTP version (e.g., `"2"` for HTTP/2).
 
 - Capture is optional and must be explicitly enabled via `[capture]` flags.
 - For each captured request/response:
-  - A JSON file is written under `[capture].directory` (or fallback directories).
+  - A JSON file is written under `[capture].directory`.
   - Bodies are base64 encoded and truncated to 64 KiB of captured bytes while preserving the full
     logical length.
 
@@ -796,8 +809,11 @@ https_bind_address = "127.0.0.1"
 https_port = 0        # disable transparent HTTPS for now
 
 [logging]
-directory = "logs"
 level = "debug"
+directory = "logs"
+max_bytes = 104857600
+max_files = 5
+console = true
 
 [capture]
 allowed_request = false
@@ -843,8 +859,11 @@ https_bind_address = "0.0.0.0"
 https_port = 8889
 
 [logging]
-directory = "logs"
 level = "info"
+directory = "logs"
+max_bytes = 104857600
+max_files = 5
+console = true
 
 [capture]
 allowed_request = true

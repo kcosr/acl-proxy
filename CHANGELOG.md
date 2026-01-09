@@ -3,10 +3,15 @@
 ## [Unreleased]
 
 ### Added
-- External auth demo for TermStation integration [#25]
-- Support approval macros for external auth header actions, including macro descriptors in pending webhooks and interpolation of approved values into per-rule header actions [#19]
-- Update external auth demo webapp to support approval macros end-to-end [#21]
-- Expose configurable external auth callbackUrl in webhooks and update demo webapp to consume it [#22]
+- External auth demo for TermStation integration ([#25](https://github.com/kcosr/acl-proxy/pull/25))
+- Support approval macros for external auth header actions, including macro descriptors in pending webhooks and interpolation of approved values into per-rule header actions ([#19](https://github.com/kcosr/acl-proxy/pull/19))
+- Update external auth demo webapp to support approval macros end-to-end ([#21](https://github.com/kcosr/acl-proxy/pull/21))
+- Expose configurable external auth callbackUrl in webhooks and update demo webapp to consume it ([#22](https://github.com/kcosr/acl-proxy/pull/22))
+- Add size-based rotating file logging with optional stdout tee ([#32](https://github.com/kcosr/acl-proxy/pull/32))
+- Add release tooling scripts for versioning, changelog updates, tagging, and GitHub prereleases ([#32](https://github.com/kcosr/acl-proxy/pull/32))
+
+### Changed
+- Capture directory no longer falls back to logging.directory ([#32](https://github.com/kcosr/acl-proxy/pull/32))
 
 ## [0.0.2] - 2025-12-06
 
@@ -37,7 +42,3 @@
 [#7]: https://github.com/kcosr/acl-proxy/pull/7
 [#4]: https://github.com/kcosr/acl-proxy/pull/4
 [#2]: https://github.com/kcosr/acl-proxy/pull/2
-[#19]: https://github.com/kcosr/acl-proxy/pull/19
-[#21]: https://github.com/kcosr/acl-proxy/pull/21
-[#22]: https://github.com/kcosr/acl-proxy/pull/23
-[#25]: https://github.com/kcosr/acl-proxy/pull/25
