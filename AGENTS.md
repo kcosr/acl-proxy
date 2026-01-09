@@ -34,7 +34,7 @@ Use these sections under `## [Unreleased]`:
 
 ### During Development
 
-When PRs are merged to main, add changelog entries under `## [Unreleased]`. This can be done as part of the PR or immediately after merge.
+When preparing PRs for main, open the PR first to get the PR number, then update `CHANGELOG.md` under `## [Unreleased]` with that PR number and push a follow-up commit.
 
 ### When Ready to Release
 
