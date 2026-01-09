@@ -353,8 +353,8 @@ acl_proxy (lib.rs)
 │ │ │  │ • action: Allow|Deny     │  │ • include: String        │         ││ │
 │ │ │  │ • pattern: Option<String>│  │ • with: MacroOverrideMap │         ││ │
 │ │ │  │ • methods: Option<...>   │  │ • add_url_enc_variants   │         ││ │
-│ │ │  │ • subnets: Vec<Ipv4Net>  │  │ • methods: Option<...>   │         ││ │
-│ │ │  │ • header_actions: Vec    │  │ • subnets: Vec<Ipv4Net>  │         ││ │
+│ │ │  │ • subnets: Vec<IpNet>    │  │ • methods: Option<...>   │         ││ │
+│ │ │  │ • header_actions: Vec    │  │ • subnets: Vec<IpNet>    │         ││ │
 │ │ │  │ • external_auth_profile  │  └──────────────────────────┘         ││ │
 │ │ │  │ • rule_id: Option<String>│                                       ││ │
 │ │ │  └──────────────────────────┘                                       ││ │

@@ -476,7 +476,7 @@ Fields:
 - `pattern` (`string`) – required template string; may contain `{placeholder}` names.
 - `description` (`string`, optional) – may also contain `{placeholder}` names.
 - `methods` (string or list of strings, optional) – HTTP methods (normalized to uppercase).
-- `subnets` (`["192.168.0.0/16", ...]`, optional) – list of IPv4 CIDR subnets.
+- `subnets` (`["192.168.0.0/16", ...]`, optional) – list of IPv4/IPv6 CIDR subnets.
 
 Rulesets themselves are not evaluated until referenced from `policy.rules` via an include rule.
 
@@ -506,8 +506,7 @@ Fields:
 - `pattern` (`string`, optional) – match target pattern; may contain placeholders.
 - `description` (`string`, optional).
 - `methods` (string or list, optional) – allowed HTTP methods (normalized to uppercase).
-- `subnets` (`["CIDR", ...]`, optional) – allowed client IP subnets (IPv4 only; IPv6 client
-  addresses do not match subnet rules).
+- `subnets` (`["CIDR", ...]`, optional) – allowed client IP subnets (IPv4 or IPv6 CIDR ranges).
 - `with` (map from macro name to single string or list of strings, optional):
   - Overrides values for placeholders used in this rule.
   - Useful when the same macro is reused with different values in different rules.
@@ -854,7 +853,7 @@ Placeholders (e.g., `{repo}`) are interpolated before the pattern is converted t
 
 ## Client IP normalization and subnets
 
-Subnets are defined as IPv4 CIDR strings, e.g.:
+Subnets are defined as IPv4 or IPv6 CIDR strings, e.g.:
 
 ```toml
 subnets = ["10.0.0.0/8", "192.168.0.0/16"]
@@ -867,7 +866,7 @@ For each request, the engine:
    - Maps `::ffff:x.y.z.w` to `x.y.z.w`.
    - Maps `::1` to `127.0.0.1`.
 2. Parses the normalized string as an IP address (IPv4 or IPv6).
-3. Applies subnet checks only when the address is IPv4 and at least one subnet is configured.
+3. Applies subnet checks when the address family matches a configured subnet (IPv4 or IPv6).
 
 If no subnet rule matches, the rule does not apply.
 
