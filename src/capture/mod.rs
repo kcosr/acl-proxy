@@ -6,7 +6,7 @@ use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
-use crate::config::{CaptureConfig, Config, LoggingConfig};
+use crate::config::{CaptureConfig, Config};
 
 /// Maximum number of body bytes to buffer per request/response for capture.
 ///
@@ -319,7 +319,7 @@ fn sanitize_path_component(input: &str) -> String {
 /// is sanitized to avoid introducing path separators. The directory is
 /// derived via `effective_capture_directory`.
 pub fn resolve_capture_path(config: &Config, record: &CaptureRecord) -> PathBuf {
-    let directory = effective_capture_directory(&config.capture, &config.logging);
+    let directory = effective_capture_directory(&config.capture);
     let kind_suffix = match record.kind {
         CaptureKind::Request => "req",
         CaptureKind::Response => "res",
@@ -351,18 +351,12 @@ pub fn resolve_capture_path(config: &Config, record: &CaptureRecord) -> PathBuf 
     Path::new(&directory).join(filename)
 }
 
-fn effective_capture_directory(capture: &CaptureConfig, logging: &LoggingConfig) -> String {
+fn effective_capture_directory(capture: &CaptureConfig) -> String {
     let capture_dir = capture.directory.trim();
     if !capture_dir.is_empty() {
         return capture_dir.to_string();
     }
-
-    let logging_dir = logging.directory.trim();
-    if !logging_dir.is_empty() {
-        return logging_dir.to_string();
-    }
-
-    "logs".to_string()
+    "logs-capture".to_string()
 }
 
 pub fn write_capture_record(

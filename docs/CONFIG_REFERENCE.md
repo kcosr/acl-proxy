@@ -108,8 +108,11 @@ Fields:
 
 ```toml
 [logging]
-directory = "logs"
 level = "info"
+directory = "logs"
+max_bytes = 104857600
+max_files = 5
+console = true
 
 [logging.policy_decisions]
 log_allows = false
@@ -120,10 +123,24 @@ level_denies = "warn"
 
 ### Base logging
 
-- `directory` (string, default `"logs"`):
-  - Currently used as a **fallback** for the capture directory when `[capture].directory` is empty.
-  - Does not control an on-disk log file; logs are emitted through `tracing` according to the
-    process environment.
+- `directory` (string, optional):
+  - When set, enables file logging to `{directory}/acl-proxy.log`.
+  - When omitted or empty, file logging is disabled.
+
+- `max_bytes` (integer, default `104857600`):
+  - Size threshold (bytes) for rotating the log file.
+  - Must be greater than 0 when `directory` is set.
+
+- `max_files` (integer, default `5`):
+  - Number of rotated files to keep, excluding the active log file.
+  - Must be greater than 0 when `directory` is set.
+
+- `console` (bool, default `true`):
+  - When true, logs are also written to stdout.
+  - When false and `directory` is unset, logs are discarded.
+
+Note: file logging is non-blocking; when the internal buffer fills, log entries are dropped to
+avoid stalling the proxy.
 
 - `level` (string, default `"info"`):
   - Global log level for the `tracing` subscriber installed at startup.

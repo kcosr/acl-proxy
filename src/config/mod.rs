@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ipnet::Ipv4Net;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 
 const DEFAULT_CONFIG_PATH: &str = "config/acl-proxy.toml";
@@ -164,11 +164,20 @@ fn default_policy_deny_level() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
-    #[serde(default = "default_logging_directory")]
-    pub directory: String,
+    #[serde(default, deserialize_with = "deserialize_optional_path")]
+    pub directory: Option<PathBuf>,
 
     #[serde(default = "default_logging_level")]
     pub level: String,
+
+    #[serde(default = "default_logging_max_bytes")]
+    pub max_bytes: u64,
+
+    #[serde(default = "default_logging_max_files")]
+    pub max_files: usize,
+
+    #[serde(default = "default_logging_console")]
+    pub console: bool,
 
     #[serde(default)]
     pub policy_decisions: LoggingPolicyDecisionsConfig,
@@ -177,19 +186,45 @@ pub struct LoggingConfig {
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
-            directory: default_logging_directory(),
+            directory: None,
             level: default_logging_level(),
+            max_bytes: default_logging_max_bytes(),
+            max_files: default_logging_max_files(),
+            console: default_logging_console(),
             policy_decisions: LoggingPolicyDecisionsConfig::default(),
         }
     }
 }
 
-fn default_logging_directory() -> String {
-    "logs".to_string()
-}
-
 fn default_logging_level() -> String {
     "info".to_string()
+}
+
+fn default_logging_max_bytes() -> u64 {
+    104_857_600
+}
+
+fn default_logging_max_files() -> usize {
+    5
+}
+
+fn default_logging_console() -> bool {
+    true
+}
+
+fn deserialize_optional_path<'de, D>(deserializer: D) -> Result<Option<PathBuf>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(value.and_then(|raw| {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(trimmed))
+        }
+    }))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -789,7 +824,6 @@ https_bind_address = "0.0.0.0"
 https_port = 8889
 
 [logging]
-directory = "logs"
 level = "info"
 
 [policy]
@@ -1037,6 +1071,27 @@ default = "deny"
             msg.contains("invalid log level for logging.level"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn empty_logging_directory_is_none() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = ""
+level = "info"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        assert!(config.logging.directory.is_none());
     }
 
     #[test]

@@ -40,13 +40,21 @@ https_port = 8889
 ###############################################################################
 
 [logging]
-# Base directory used as a fallback for capture files when
-# [capture].directory is empty. It does not currently control log
-# files; logs are emitted via tracing.
+# When set, logs are written to {directory}/acl-proxy.log and rotated
+# by size.
 directory = "logs"
 
 # Global log level for acl-proxy (trace|debug|info|warn|error).
 level = "info"
+
+# Maximum size in bytes before rotating the log file.
+max_bytes = 104857600
+
+# Number of rotated files to keep (excludes the active log file).
+max_files = 5
+
+# When true, logs are also written to stdout.
+console = true
 
 [logging.policy_decisions]
 # Control structured logging of allow/deny decisions.

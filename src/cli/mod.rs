@@ -123,11 +123,16 @@ pub fn run() -> Result<ExitCode, CliError> {
             let config = load_config_for_cli(config_path)?;
             let shared_state = AppState::shared_from_config(config)?;
 
-            if let Err(err) = shared_state.load().logging.init_tracing() {
-                eprintln!("failed to initialize logging: {err}");
-            } else {
-                log_startup(shared_state.load().as_ref());
-            }
+            let _logging_guards = match shared_state.load().logging.init_tracing() {
+                Ok(guards) => {
+                    log_startup(shared_state.load().as_ref());
+                    Some(guards)
+                }
+                Err(err) => {
+                    eprintln!("failed to initialize logging: {err}");
+                    None
+                }
+            };
 
             let runtime = tokio::runtime::Runtime::new()
                 .map_err(|e| CliError::Runtime(format!("failed to start tokio runtime: {e}")))?;
