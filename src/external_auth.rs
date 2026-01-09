@@ -493,11 +493,19 @@ impl ExternalAuthManager {
 
         if let Err(err) = self.status_tx.try_send(event) {
             match err {
-                mpsc::error::TrySendError::Full(_) => {
-                    tracing::debug!("external auth status webhook queue full; dropping event");
+                mpsc::error::TrySendError::Full(event) => {
+                    tracing::warn!(
+                        request_id = %event.request_id,
+                        status = ?event.status,
+                        "external auth status webhook queue full; dropping event"
+                    );
                 }
-                mpsc::error::TrySendError::Closed(_) => {
-                    tracing::debug!("external auth status webhook queue closed; dropping event");
+                mpsc::error::TrySendError::Closed(event) => {
+                    tracing::warn!(
+                        request_id = %event.request_id,
+                        status = ?event.status,
+                        "external auth status webhook queue closed; dropping event"
+                    );
                 }
             }
         }
