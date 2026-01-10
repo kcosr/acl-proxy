@@ -14,7 +14,7 @@
 #   3. Validate with:
 #        acl-proxy config validate --config config/acl-proxy.toml
 #
-# For a full schema reference, see docs/CONFIG_REFERENCE.md.
+# For a full schema reference, see docs/config-reference.md.
 
 schema_version = "1"
 
@@ -38,7 +38,7 @@ https_port = 8889
 # Timeout (ms) for upstream responses (0 disables).
 request_timeout_ms = 30000
 
-# Base path for internal endpoints (external auth callbacks, metrics, etc).
+# Base path for internal endpoints (external auth callbacks).
 internal_base_path = "/_acl-proxy"
 
 ###############################################################################
