@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.4] - 2026-01-10
 
 ### Added
 - Support IPv6 subnet matching in policy rules. ([#33](https://github.com/kcosr/acl-proxy/pull/33))
