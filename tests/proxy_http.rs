@@ -1,6 +1,7 @@
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use acl_proxy::app::AppState;
 use acl_proxy::config::Config;
@@ -45,6 +46,34 @@ async fn start_upstream_echo_server() -> (SocketAddr, Arc<Mutex<Option<hyper::He
     tokio::spawn(server);
 
     (addr, seen_headers)
+}
+
+async fn start_upstream_delayed_server(delay: Duration) -> SocketAddr {
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind upstream");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking upstream");
+    let addr = listener.local_addr().expect("upstream addr");
+
+    let make_svc = make_service_fn(move |_conn| {
+        let delay = delay;
+        async move {
+            Ok::<_, hyper::Error>(service_fn(move |_req: Request<Body>| {
+                let delay = delay;
+                async move {
+                    tokio::time::sleep(delay).await;
+                    Ok::<_, hyper::Error>(Response::new(Body::from("ok")))
+                }
+            }))
+        }
+    });
+
+    let server = Server::from_tcp(listener)
+        .expect("server from tcp")
+        .serve(make_svc);
+    tokio::spawn(server);
+
+    addr
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -574,6 +603,7 @@ async fn allowed_request_is_proxied_and_loop_header_added() {
             description: None,
             methods: None,
             subnets: Vec::new(),
+            request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -638,6 +668,7 @@ async fn loop_header_not_added_when_disabled() {
             description: None,
             methods: None,
             subnets: Vec::new(),
+            request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -806,6 +837,7 @@ async fn upstream_connection_failure_returns_502() {
             description: None,
             methods: None,
             subnets: Vec::new(),
+            request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -829,6 +861,52 @@ async fn upstream_connection_failure_returns_502() {
     let (_response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
 
     assert_eq!(status, StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn upstream_request_timeout_returns_504() {
+    let upstream_addr = start_upstream_delayed_server(Duration::from_millis(500)).await;
+
+    let mut config = minimal_config();
+    config.capture.allowed_request = false;
+    config.capture.allowed_response = false;
+    config.proxy.request_timeout_ms = 1_000;
+
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            pattern: Some(format!(
+                "http://{}:{}/**",
+                upstream_addr.ip(),
+                upstream_addr.port()
+            )),
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            request_timeout_ms: Some(150),
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    let raw_request =
+        format!("GET http://{host}/slow HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+    let (_response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
+
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
 }
 
 #[tokio::test(flavor = "multi_thread")]

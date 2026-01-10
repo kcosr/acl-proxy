@@ -280,6 +280,7 @@ async fn handle_inner_https_request(
     let header_actions = matched_rule
         .map(|m| m.header_actions.clone())
         .unwrap_or_default();
+    let request_timeout_ms = matched_rule.and_then(|m| m.request_timeout_ms);
 
     if let Some(rule) = matched_rule {
         if let Some(profile_name) = rule.external_auth_profile.as_ref() {
@@ -299,6 +300,7 @@ async fn handle_inner_https_request(
                         rule.rule_id.clone(),
                         &profile,
                         profile_name,
+                        request_timeout_ms,
                         header_actions,
                     )
                     .await;
@@ -350,6 +352,7 @@ async fn handle_inner_https_request(
         target,
         req,
         CaptureMode::HttpsTransparent,
+        request_timeout_ms,
         header_actions,
     )
     .await;
@@ -371,6 +374,7 @@ async fn handle_https_transparent_external_auth_gate(
     rule_id: Option<String>,
     profile: &crate::external_auth::ExternalAuthProfile,
     profile_name: &str,
+    request_timeout_ms: Option<u64>,
     header_actions: Vec<crate::policy::CompiledHeaderAction>,
 ) -> Response<Body> {
     run_external_auth_gate_lifecycle(
@@ -387,6 +391,7 @@ async fn handle_https_transparent_external_auth_gate(
         rule_id,
         profile,
         profile_name,
+        request_timeout_ms,
         header_actions,
         CaptureMode::HttpsTransparent,
     )

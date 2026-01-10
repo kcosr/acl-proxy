@@ -18,8 +18,8 @@ The app:
   that define approval macros, fill in any required macro values.
 - Sends the callback decision (including any approved macro values) to the
   `callbackUrl` provided in the webhook payload when present, falling back to
-  calling `/_acl-proxy/external-auth/callback` on the configured proxy base URL
-  for older `acl-proxy` versions.
+  calling `{internal_base_path}/external-auth/callback` on the configured proxy
+  base URL for older `acl-proxy` versions.
 
 ## Prerequisites
 
@@ -40,12 +40,16 @@ npm start
 By default, the app listens on `http://localhost:3000` and serves a tiny UI at
 that address. It expects `acl-proxy`'s HTTP listener to be reachable at
 `http://localhost:8881` so it can call the callback endpoint when a webhook
-does not include a `callbackUrl` field.
+does not include a `callbackUrl` field. The fallback path defaults to
+`/_acl-proxy/external-auth/callback`.
 
-You can override the proxy base URL or the app port via environment variables:
+You can override the proxy base URL, internal base path, or the app port via
+environment variables:
 
 ```sh
-ACL_PROXY_BASE=http://localhost:8881 PORT=3000 npm start
+ACL_PROXY_BASE=http://localhost:8881 \
+ACL_PROXY_INTERNAL_BASE_PATH=/_acl-proxy \
+PORT=3000 npm start
 ```
 
 ## Wiring it up with acl-proxy
@@ -103,5 +107,7 @@ browser. Clicking **Approve** or **Deny** sends the callback to `acl-proxy`,
 which then either proxies the request upstream or returns a synthetic deny /
 timeout / error response according to its configuration. When the webhook
 payload includes a `callbackUrl`, the demo app prefers that URL; otherwise it
-falls back to `ACL_PROXY_BASE + "/_acl-proxy/external-auth/callback"` so it
-continues to work with older `acl-proxy` versions.
+falls back to `ACL_PROXY_BASE + ACL_PROXY_INTERNAL_BASE_PATH +
+"/external-auth/callback"` so it continues to work with older `acl-proxy`
+versions. If you change `proxy.internal_base_path`, update both
+`external_auth.callback_url` and `ACL_PROXY_INTERNAL_BASE_PATH` to match.

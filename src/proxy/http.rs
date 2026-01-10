@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::convert::Infallible;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::Arc;
+use std::time::Duration;
 
 use chrono::Utc;
 use http::header::{HeaderMap as HttpHeaderMap, HeaderName, HeaderValue, HOST};
@@ -123,7 +124,11 @@ async fn handle_http_request(
         return Ok(resp);
     }
 
-    if is_external_auth_callback_path(req.uri().path()) {
+    if is_internal_endpoint(
+        req.uri(),
+        &state.config.proxy.internal_base_path,
+        "external-auth/callback",
+    ) {
         let resp = handle_external_auth_callback_request(state, req).await;
         return Ok(resp);
     }
@@ -194,6 +199,7 @@ async fn handle_http_request(
     let header_actions = matched_rule
         .map(|m| m.header_actions.clone())
         .unwrap_or_default();
+    let request_timeout_ms = matched_rule.and_then(|m| m.request_timeout_ms);
 
     if let Some(rule) = matched_rule {
         if let Some(profile_name) = rule.external_auth_profile.as_ref() {
@@ -212,6 +218,7 @@ async fn handle_http_request(
                     rule.rule_id.clone(),
                     &profile,
                     profile_name,
+                    request_timeout_ms,
                     header_actions,
                 )
                 .await;
@@ -246,6 +253,7 @@ async fn handle_http_request(
         target,
         req,
         CaptureMode::HttpProxy,
+        request_timeout_ms,
         header_actions,
     )
     .await;
@@ -253,8 +261,28 @@ async fn handle_http_request(
     Ok(response)
 }
 
-fn is_external_auth_callback_path(path: &str) -> bool {
-    path == "/_acl-proxy/external-auth/callback"
+fn is_internal_endpoint(uri: &Uri, base: &str, suffix: &str) -> bool {
+    if uri.scheme().is_some() || uri.authority().is_some() {
+        return false;
+    }
+
+    let path = uri.path();
+    let suffix = suffix.trim_start_matches('/');
+
+    if base == "/" {
+        return path.strip_prefix('/') == Some(suffix);
+    }
+
+    if !path.starts_with(base) {
+        return false;
+    }
+
+    let remainder = &path[base.len()..];
+    if !remainder.starts_with('/') {
+        return false;
+    }
+
+    &remainder[1..] == suffix
 }
 
 #[derive(Debug, Deserialize)]
@@ -518,6 +546,7 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
     rule_id: Option<String>,
     profile: &ExternalAuthProfile,
     profile_name: &str,
+    request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
     mode: CaptureMode,
 ) -> Response<Body> {
@@ -631,6 +660,7 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
                 target,
                 req,
                 mode,
+                request_timeout_ms,
                 header_actions,
             )
             .await
@@ -703,6 +733,7 @@ async fn handle_external_auth_gate(
     rule_id: Option<String>,
     profile: &ExternalAuthProfile,
     profile_name: &str,
+    request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
 ) -> Response<Body> {
     run_external_auth_gate_lifecycle(
@@ -719,6 +750,7 @@ async fn handle_external_auth_gate(
         rule_id,
         profile,
         profile_name,
+        request_timeout_ms,
         header_actions,
         CaptureMode::HttpProxy,
     )
@@ -1101,6 +1133,17 @@ pub(crate) async fn maybe_capture_static_response(
     }
 }
 
+fn resolve_request_timeout_ms(
+    rule_timeout_ms: Option<u64>,
+    default_timeout_ms: u64,
+) -> Option<Duration> {
+    let timeout_ms = rule_timeout_ms.unwrap_or(default_timeout_ms);
+    if timeout_ms == 0 {
+        return None;
+    }
+    Some(Duration::from_millis(timeout_ms))
+}
+
 pub(crate) async fn proxy_allowed_request(
     state: Arc<AppState>,
     request_id: String,
@@ -1111,6 +1154,7 @@ pub(crate) async fn proxy_allowed_request(
     target: Option<CaptureEndpoint>,
     req: Request<Body>,
     mode: CaptureMode,
+    request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
 ) -> Response<Body> {
     let upstream_uri: Uri = match full_url.parse() {
@@ -1199,7 +1243,39 @@ pub(crate) async fn proxy_allowed_request(
     };
 
     let client_http: Client<_> = state.http_client.clone();
-    let upstream_resp = client_http.request(upstream_req).await;
+    let request_timeout =
+        resolve_request_timeout_ms(request_timeout_ms, state.config.proxy.request_timeout_ms);
+    let upstream_resp = match request_timeout {
+        Some(timeout) => {
+            match tokio::time::timeout(timeout, client_http.request(upstream_req)).await {
+                Ok(resp) => resp,
+                Err(_) => {
+                    tracing::debug!("upstream request timed out after {:?}", timeout);
+                    let body_bytes = b"Gateway Timeout".to_vec();
+                    let mut resp = Response::new(Body::from(body_bytes.clone()));
+                    *resp.status_mut() = StatusCode::GATEWAY_TIMEOUT;
+                    maybe_capture_static_response(
+                        &state,
+                        &request_id,
+                        &full_url,
+                        &method,
+                        &client,
+                        target.clone(),
+                        version,
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "Gateway Timeout",
+                        &body_bytes,
+                        decision,
+                        Some(&req_headers_snapshot),
+                        mode,
+                    )
+                    .await;
+                    return resp;
+                }
+            }
+        }
+        None => client_http.request(upstream_req).await,
+    };
 
     let mut upstream_resp = match upstream_resp {
         Ok(resp) => resp,
@@ -1710,7 +1786,8 @@ pub(crate) fn generate_request_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::generate_request_id;
+    use super::{generate_request_id, is_internal_endpoint};
+    use http::Uri;
 
     #[test]
     fn request_id_includes_process_tag_and_is_unique() {
@@ -1727,5 +1804,44 @@ mod tests {
         );
         assert!(parts.next().unwrap_or("").parse::<i64>().is_ok());
         assert!(!parts.next().unwrap_or("").is_empty());
+    }
+
+    #[test]
+    fn internal_endpoint_requires_origin_form_and_base_path() {
+        let uri: Uri = "/_acl-proxy/external-auth/callback"
+            .parse()
+            .expect("parse uri");
+        assert!(is_internal_endpoint(
+            &uri,
+            "/_acl-proxy",
+            "external-auth/callback"
+        ));
+
+        let uri: Uri = "http://example.com/_acl-proxy/external-auth/callback"
+            .parse()
+            .expect("parse uri");
+        assert!(!is_internal_endpoint(
+            &uri,
+            "/_acl-proxy",
+            "external-auth/callback"
+        ));
+
+        let uri: Uri = "/internal/external-auth/callback"
+            .parse()
+            .expect("parse uri");
+        assert!(is_internal_endpoint(
+            &uri,
+            "/internal",
+            "external-auth/callback"
+        ));
+
+        let uri: Uri = "/_acl-proxy/external-auth/callback"
+            .parse()
+            .expect("parse uri");
+        assert!(!is_internal_endpoint(
+            &uri,
+            "/internal",
+            "external-auth/callback"
+        ));
     }
 }

@@ -51,6 +51,7 @@ pub struct MatchedRule {
     pub rule_id: Option<String>,
     pub subnets: Vec<IpNet>,
     pub methods: Vec<String>,
+    pub request_timeout_ms: Option<u64>,
     pub header_actions: Vec<CompiledHeaderAction>,
     pub external_auth_profile: Option<String>,
 }
@@ -71,6 +72,7 @@ struct CompiledRule {
     rule_id: Option<String>,
     subnets: Vec<IpNet>,
     methods: Vec<String>,
+    request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
     external_auth_profile: Option<String>,
 }
@@ -89,6 +91,7 @@ struct ExpandedRule {
     rule_id: Option<String>,
     subnets: Vec<IpNet>,
     methods: Vec<String>,
+    request_timeout_ms: Option<u64>,
     header_actions: Vec<HeaderActionConfig>,
     external_auth_profile: Option<String>,
 }
@@ -108,6 +111,7 @@ pub struct EffectiveRule {
     pub rule_id: Option<String>,
     pub subnets: Vec<IpNet>,
     pub methods: Vec<String>,
+    pub request_timeout_ms: Option<u64>,
     pub header_actions: Vec<EffectiveHeaderAction>,
     pub external_auth: Option<EffectiveExternalAuth>,
 }
@@ -169,6 +173,7 @@ impl PolicyEngine {
                 rule_id: rule.rule_id,
                 subnets: rule.subnets,
                 methods: rule.methods,
+                request_timeout_ms: rule.request_timeout_ms,
                 header_actions,
                 external_auth_profile: rule.external_auth_profile,
             });
@@ -230,6 +235,7 @@ impl PolicyEngine {
                 rule_id: rule.rule_id.clone(),
                 subnets: rule.subnets.clone(),
                 methods: rule.methods.clone(),
+                request_timeout_ms: rule.request_timeout_ms,
                 header_actions: rule.header_actions.clone(),
                 external_auth_profile: rule.external_auth_profile.clone(),
             };
@@ -301,6 +307,7 @@ impl EffectivePolicy {
                     rule_id: rule.rule_id,
                     subnets: rule.subnets,
                     methods: rule.methods,
+                    request_timeout_ms: rule.request_timeout_ms,
                     header_actions,
                     external_auth,
                 }
@@ -391,6 +398,7 @@ fn expand_direct_rule(
             rule_id: rule.rule_id.clone(),
             subnets: rule.subnets.clone(),
             methods,
+            request_timeout_ms: rule.request_timeout_ms,
             header_actions: rule.header_actions.clone(),
             external_auth_profile: rule.external_auth_profile.clone(),
         });
@@ -423,6 +431,7 @@ fn expand_direct_rule(
             rule_id: rule.rule_id.clone(),
             subnets: rule.subnets.clone(),
             methods,
+            request_timeout_ms: rule.request_timeout_ms,
             header_actions: rule.header_actions.clone(),
             external_auth_profile: rule.external_auth_profile.clone(),
         });
@@ -460,6 +469,7 @@ fn expand_direct_rule(
             rule_id: rule_id_interp,
             subnets: rule.subnets.clone(),
             methods: methods.clone(),
+            request_timeout_ms: rule.request_timeout_ms,
             header_actions: rule.header_actions.clone(),
             external_auth_profile: rule.external_auth_profile.clone(),
         });
@@ -520,6 +530,7 @@ fn expand_include_rule(
                 .map(|m| m.as_slice().to_vec())
                 .or_else(|| template.methods.as_ref().map(|m| m.as_slice().to_vec()))
                 .unwrap_or_default();
+            let request_timeout_ms = rule.request_timeout_ms.or(template.request_timeout_ms);
 
             out.push(ExpandedRule {
                 action: template.action,
@@ -532,6 +543,7 @@ fn expand_include_rule(
                     template.subnets.clone()
                 },
                 methods,
+                request_timeout_ms,
                 header_actions: template.header_actions.clone(),
                 external_auth_profile: template.external_auth_profile.clone(),
             });
@@ -557,6 +569,7 @@ fn expand_include_rule(
                 .map(|m| m.as_slice().to_vec())
                 .or_else(|| template.methods.as_ref().map(|m| m.as_slice().to_vec()))
                 .unwrap_or_default();
+            let request_timeout_ms = rule.request_timeout_ms.or(template.request_timeout_ms);
 
             let pattern_interp = interpolate_template(&template.pattern, &combo);
             let description_interp = template
@@ -579,6 +592,7 @@ fn expand_include_rule(
                     template.subnets.clone()
                 },
                 methods,
+                request_timeout_ms,
                 header_actions: template.header_actions.clone(),
                 external_auth_profile: template.external_auth_profile.clone(),
             });
@@ -1081,6 +1095,7 @@ mod tests {
                 description: None,
                 methods: None,
                 subnets: vec!["192.168.0.0/16".parse::<IpNet>().unwrap()],
+                request_timeout_ms: None,
                 with: None,
                 add_url_enc_variants: None,
                 header_actions: Vec::new(),
@@ -1108,6 +1123,7 @@ mod tests {
                 description: None,
                 methods: None,
                 subnets: vec!["2001:db8::/32".parse::<IpNet>().unwrap()],
+                request_timeout_ms: None,
                 with: None,
                 add_url_enc_variants: None,
                 header_actions: Vec::new(),
@@ -1142,6 +1158,7 @@ mod tests {
                     description: None,
                     methods: None,
                     subnets: Vec::new(),
+                    request_timeout_ms: None,
                     header_actions: Vec::new(),
                     external_auth_profile: None,
                     rule_id: None,
@@ -1152,6 +1169,7 @@ mod tests {
                     description: None,
                     methods: None,
                     subnets: Vec::new(),
+                    request_timeout_ms: None,
                     header_actions: Vec::new(),
                     external_auth_profile: None,
                     rule_id: None,
@@ -1171,6 +1189,7 @@ mod tests {
                 add_url_enc_variants: Some(UrlEncVariants::All(true)),
                 methods: None,
                 subnets: Vec::new(),
+                request_timeout_ms: None,
             })],
         };
 
@@ -1211,6 +1230,7 @@ mod tests {
                     description: None,
                     methods: None,
                     subnets: Vec::new(),
+                    request_timeout_ms: None,
                     header_actions: Vec::new(),
                     external_auth_profile: None,
                     rule_id: None,
@@ -1231,6 +1251,7 @@ mod tests {
                 add_url_enc_variants: Some(UrlEncVariants::All(true)),
                 methods: None,
                 subnets: Vec::new(),
+                request_timeout_ms: None,
             })],
         };
 

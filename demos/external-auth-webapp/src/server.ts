@@ -62,8 +62,25 @@ const pending = new Map<string, PendingApproval>();
 // Base URL for the acl-proxy HTTP listener, used to call the callback endpoint.
 // For example: http://localhost:8881
 const PROXY_BASE =
-  process.env.ACL_PROXY_BASE ?? "http://localhost:8881";
-const CALLBACK_URL = `${PROXY_BASE}/_acl-proxy/external-auth/callback`;
+  (process.env.ACL_PROXY_BASE ?? "http://localhost:8881").replace(
+    /\/+$/,
+    "",
+  );
+const INTERNAL_BASE_PATH =
+  process.env.ACL_PROXY_INTERNAL_BASE_PATH ?? "/_acl-proxy";
+const normalizedInternalBasePath = normalizeBasePath(INTERNAL_BASE_PATH);
+const CALLBACK_URL = `${PROXY_BASE}${normalizedInternalBasePath}/external-auth/callback`;
+
+function normalizeBasePath(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed === "/") {
+    return "";
+  }
+  const withLeadingSlash = trimmed.startsWith("/")
+    ? trimmed
+    : `/${trimmed}`;
+  return withLeadingSlash.replace(/\/+$/, "");
+}
 
 // Serve static UI.
 // This assumes the process is started with CWD = demos/external-auth-webapp.

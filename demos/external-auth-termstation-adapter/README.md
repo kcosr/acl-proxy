@@ -45,7 +45,7 @@ notifications API.
                 │                  callback/:requestId
                 │                  { action, inputs: { github_token } }
                 │
-                │  (6) POST /_acl-proxy/external-auth/callback
+                │  (6) POST /{internal_base_path}/external-auth/callback
                 │      { requestId, decision, macros: { github_token } }
                 │
                 ▼
@@ -120,7 +120,8 @@ Payload (subset of fields):
 ```
 
 The adapter **requires** `callbackUrl` to be present and starting with
-`http`/`https`.
+`http`/`https`. The callback path is based on `proxy.internal_base_path`
+(default `/_acl-proxy`).
 
 ### 2. Adapter → TermStation: interactive notification
 
@@ -202,7 +203,7 @@ The adapter forwards the decision to `callbackUrl` from the original
 webhook:
 
 ```http
-POST /_acl-proxy/external-auth/callback HTTP/1.1
+POST /{internal_base_path}/external-auth/callback HTTP/1.1
 Host: localhost:8881
 Content-Type: application/json
 ```
@@ -275,6 +276,7 @@ the adapter and attach it to an allow rule. For example:
 ```toml
 [external_auth]
 # Required so that acl-proxy includes callbackUrl in the webhook payload.
+# Keep this in sync with proxy.internal_base_path (default /_acl-proxy).
 callback_url = "http://localhost:8881/_acl-proxy/external-auth/callback"
 
 [policy.approval_macros]
