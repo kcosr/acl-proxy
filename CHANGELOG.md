@@ -3,17 +3,17 @@
 ## [Unreleased]
 
 ### Added
-- Support IPv6 subnet matching in policy rules.
-- Add `proxy.internal_base_path` for internal endpoints (including external auth callback paths).
-- Add configurable upstream request timeouts (global and per-rule overrides).
+- Support IPv6 subnet matching in policy rules. ([#33](https://github.com/kcosr/acl-proxy/pull/33))
+- Add `proxy.internal_base_path` for internal endpoints (including external auth callback paths). ([#34](https://github.com/kcosr/acl-proxy/pull/34))
+- Add configurable upstream request timeouts (global and per-rule overrides). ([#34](https://github.com/kcosr/acl-proxy/pull/34))
 
 ### Fixed
-- Avoid request ID collisions after process restarts by adding a per-process tag.
-- Ensure the external auth status worker starts reliably under concurrent calls.
-- Log dropped external auth status webhook events at warn level.
+- Avoid request ID collisions after process restarts by adding a per-process tag. ([#33](https://github.com/kcosr/acl-proxy/pull/33))
+- Ensure the external auth status worker starts reliably under concurrent calls. ([#33](https://github.com/kcosr/acl-proxy/pull/33))
+- Log dropped external auth status webhook events at warn level. ([#34](https://github.com/kcosr/acl-proxy/pull/34))
 
 ### Changed
-- External auth demos honor `ACL_PROXY_INTERNAL_BASE_PATH` for internal endpoints.
+- External auth demos honor `ACL_PROXY_INTERNAL_BASE_PATH` for internal endpoints. ([#34](https://github.com/kcosr/acl-proxy/pull/34))
 
 ## [0.0.3] - 2026-01-09
 
