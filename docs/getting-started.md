@@ -73,7 +73,7 @@ certificate when using CONNECT or transparent HTTPS.
 
 ```bash
 curl https://upstream.internal/resource \
-  --resolve upstream.internal:443:127.0.0.1 \
+  --connect-to upstream.internal:443:127.0.0.1:8889 \
   --cacert certs/ca-cert.pem
 ```
 

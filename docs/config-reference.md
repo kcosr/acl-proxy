@@ -225,7 +225,7 @@ Fields:
     - `{kind}` – `"request"` or `"response"`.
     - `{suffix}` – `"req"` or `"res"` (the default template uses `{suffix}` so you can change file
       naming conventions without affecting the `kind` value stored in the capture record itself).
-  - If empty/whitespace, the default template is effectively `"${requestId}-${suffix}.json"`.
+  - If empty/whitespace, the default template is effectively `"{requestId}-{suffix}.json"`.
 
 ### Capture record JSON format
 
