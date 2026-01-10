@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.5] - 2026-01-10
 
 ### Changed
 - Restructure documentation and add an operator-focused docs layout ([#35](https://github.com/kcosr/acl-proxy/pull/35))
