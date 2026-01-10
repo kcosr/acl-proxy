@@ -2,7 +2,11 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Changed
+- Restructure documentation and add an operator-focused docs layout ([#35](https://github.com/kcosr/acl-proxy/pull/35))
+
+### Removed
+- Remove internal code review findings documentation ([#35](https://github.com/kcosr/acl-proxy/pull/35))
 
 ## [0.0.4] - 2026-01-10
 
