@@ -10,3 +10,4 @@ certs/
 
 # Local tooling output
 .codemap/
+logs/
