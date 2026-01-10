@@ -13,8 +13,8 @@ The configuration file is a single TOML document. It controls:
 - Upstream TLS verification.
 - The URL policy engine (rules, macros, rulesets, methods, and subnets).
 
-For a user-facing walkthrough and examples, see `README.md`. This document focuses on field-level
-details.
+For a user-facing walkthrough and examples, see `docs/getting-started.md` and `docs/README.md`.
+This document focuses on field-level details.
 
 ---
 
@@ -31,6 +31,9 @@ and policy, without starting the proxy:
 
 All of these commands share the same config-path resolution and environment overrides described
 below. `policy dump` is particularly useful for offline policy debugging and CI enforcement.
+
+When `policy dump` writes to a terminal, it defaults to the human-friendly table format; when
+stdout is not a TTY, it emits JSON unless `--format` is provided.
 
 ---
 
@@ -222,7 +225,7 @@ Fields:
     - `{kind}` – `"request"` or `"response"`.
     - `{suffix}` – `"req"` or `"res"` (the default template uses `{suffix}` so you can change file
       naming conventions without affecting the `kind` value stored in the capture record itself).
-  - If empty/whitespace, the default template is effectively `"${requestId}-${suffix}.json"`.
+  - If empty/whitespace, the default template is effectively `"{requestId}-{suffix}.json"`.
 
 ### Capture record JSON format
 
@@ -339,6 +342,7 @@ Fields:
     SNI certificate resolvers (each maintains its own LRU up to this size).
   - When a cache is full and a new host is added, the least recently used entry in that cache is
     evicted.
+  - Must be at least 1.
 
 Per-host certificates:
 
@@ -664,6 +668,9 @@ Global external auth settings are defined under `[external_auth]`:
 callback_url = "https://proxy.example.com/_acl-proxy/external-auth/callback"
 ```
 
+`callback_url` must be an absolute URL with a host. Empty or relative values
+are rejected during config validation.
+
 Profiles are defined under `[policy.external_auth_profiles]`:
 
 ```toml
@@ -795,7 +802,8 @@ Callback endpoint:
   - If no pending entry exists (unknown or already completed/timed-out `requestId`):
     - The callback responds with `404 Not Found` and JSON
       `{ "error": "RequestNotFound", "message": "No pending request for this requestId" }`.
-  - On validation failure for approval macros (missing required macro or invalid characters):
+  - On validation failure for approval macros (missing required macro, empty value, or control
+    characters):
     - The callback responds with `400 Bad Request` and an error JSON such as
       `{ "error": "MissingMacro", "message": "Missing required macro: github_token" }` or
       `{ "error": "InvalidMacroValue", "message": "Macro github_token contains invalid characters" }`.
@@ -825,7 +833,7 @@ protocol + "//" + host[:port] + path + optional "?query"
 Details:
 
 - The scheme (`protocol`) is preserved (`http:` or `https:`).
-- Host includes an explicit port if present in the URL, otherwise the default.
+- Host includes an explicit port only when present in the URL. No default port is added.
 - Path:
   - Defaults to `/` when omitted.
   - Copied as-is otherwise.
@@ -970,7 +978,9 @@ abort, leaving any previously running instance (in the case of reload) unchanged
 
 ## Further reading
 
-- `README.md` – high-level overview, quick start, proxy modes, and operational guidance.
+- `docs/README.md` – documentation index and operator guide map.
+- `docs/getting-started.md` – quick start setup.
+- `docs/proxy-modes.md` – proxy mode behavior and client setup.
 - `src/config/mod.rs` – source of the configuration structs and default values.
 - `src/policy/mod.rs` – implementation of the policy engine, including pattern compilation and
   macro/ruleset expansion.
