@@ -1,3 +1,4 @@
+use crate::auth_plugin::AuthPluginManager;
 use crate::certs::CertManager;
 use crate::config::{Config, TlsConfig};
 use crate::external_auth::ExternalAuthManager;
@@ -41,6 +42,7 @@ pub struct AppState {
     pub http_client: Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>,
     pub cert_manager: CertManager,
     pub external_auth: ExternalAuthManager,
+    pub auth_plugins: AuthPluginManager,
 }
 
 impl AppState {
@@ -56,6 +58,7 @@ impl AppState {
             config.external_auth.callback_url.clone(),
             http_client.clone(),
         );
+        let auth_plugins = AuthPluginManager::new(&config.policy.external_auth_profiles);
 
         Ok(AppState {
             config,
@@ -65,6 +68,7 @@ impl AppState {
             http_client,
             cert_manager,
             external_auth,
+            auth_plugins,
         })
     }
 

@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+### Added
+- Add stdio auth plugin support and URL allowlist demo ([#36](https://github.com/kcosr/acl-proxy/pull/36))
+
 ### Changed
 - Restructure documentation and add an operator-focused docs layout ([#35](https://github.com/kcosr/acl-proxy/pull/35))
 

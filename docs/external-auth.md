@@ -4,6 +4,10 @@ External auth turns allow rules into approval-required rules. When such a rule
 matches, the proxy pauses the request, sends a webhook to an external service,
 and waits for a callback decision.
 
+Note: external auth profiles now support `type = "http"` (this document) and
+`type = "plugin"` (stdio, sync). Plugin behavior is documented in
+`docs/design/auth-plugins-design.md`.
+
 ## Configuration overview
 
 ```toml
@@ -12,6 +16,7 @@ callback_url = "https://proxy.example.com/_acl-proxy/external-auth/callback"
 
 [policy.external_auth_profiles]
 [policy.external_auth_profiles.github_mfa]
+type = "http"  # default if omitted
 webhook_url = "https://auth.internal/github/mfa-start"
 timeout_ms = 5000
 webhook_timeout_ms = 1000

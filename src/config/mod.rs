@@ -48,6 +48,17 @@ pub struct ExternalAuthConfig {
     pub callback_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ExternalAuthProfileType {
+    Http,
+    Plugin,
+}
+
+fn default_external_auth_profile_type() -> ExternalAuthProfileType {
+    ExternalAuthProfileType::Http
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_schema_version")]
@@ -587,7 +598,11 @@ pub enum ExternalAuthWebhookFailureMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalAuthProfileConfig {
-    pub webhook_url: String,
+    #[serde(rename = "type", default = "default_external_auth_profile_type")]
+    pub profile_type: ExternalAuthProfileType,
+
+    #[serde(default)]
+    pub webhook_url: Option<String>,
     pub timeout_ms: u64,
 
     #[serde(default)]
@@ -595,6 +610,21 @@ pub struct ExternalAuthProfileConfig {
 
     #[serde(default)]
     pub on_webhook_failure: Option<ExternalAuthWebhookFailureMode>,
+
+    #[serde(default)]
+    pub command: Option<String>,
+
+    #[serde(default)]
+    pub args: Vec<String>,
+
+    #[serde(default)]
+    pub include_headers: Vec<String>,
+
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+
+    #[serde(default)]
+    pub restart_delay_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -828,6 +858,7 @@ impl Config {
         validate_logging_config(&self.logging)?;
         validate_capture_config(&self.capture)?;
         validate_external_auth_config(&self.external_auth)?;
+        validate_external_auth_profiles(&self.policy.external_auth_profiles)?;
 
         Ok(())
     }
@@ -906,6 +937,61 @@ fn validate_external_auth_config(external_auth: &ExternalAuthConfig) -> Result<(
         }
     }
 
+    Ok(())
+}
+
+fn validate_external_auth_profiles(
+    profiles: &ExternalAuthProfileConfigMap,
+) -> Result<(), ConfigError> {
+    for (name, profile) in profiles {
+        match profile.profile_type {
+            ExternalAuthProfileType::Http => {
+                let raw = profile.webhook_url.as_deref().map(str::trim).unwrap_or("");
+                if raw.is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "external_auth_profiles.{name}.webhook_url must not be empty for type=http"
+                    )));
+                }
+                let parsed = Url::parse(raw).map_err(|e| {
+                    ConfigError::Invalid(format!(
+                        "external_auth_profiles.{name}.webhook_url is not a valid URL: {e}"
+                    ))
+                })?;
+                if !parsed.has_host() {
+                    return Err(ConfigError::Invalid(format!(
+                        "external_auth_profiles.{name}.webhook_url must be an absolute URL with host"
+                    )));
+                }
+            }
+            ExternalAuthProfileType::Plugin => {
+                let cmd = profile.command.as_deref().map(str::trim).unwrap_or("");
+                if cmd.is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "external_auth_profiles.{name}.command must not be empty for type=plugin"
+                    )));
+                }
+                for pattern in &profile.include_headers {
+                    validate_header_pattern(name, pattern)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_header_pattern(profile: &str, pattern: &str) -> Result<(), ConfigError> {
+    let trimmed = pattern.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::Invalid(format!(
+            "external_auth_profiles.{profile}.include_headers entries must not be empty"
+        )));
+    }
+    if trimmed.chars().any(|c| c.is_whitespace()) {
+        return Err(ConfigError::Invalid(format!(
+            "external_auth_profiles.{profile}.include_headers entries must not contain whitespace"
+        )));
+    }
     Ok(())
 }
 
@@ -1424,6 +1510,94 @@ external_auth_profile = "example"
         let msg = format!("{err}");
         assert!(
             msg.contains("external_auth_profile is not allowed on deny rules"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn plugin_profile_requires_command() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles.example]
+type = "plugin"
+timeout_ms = 1000
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+external_auth_profile = "example"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("external_auth_profiles.example.command"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn plugin_profile_rejects_header_patterns_with_whitespace() {
+        let temp = tempfile::NamedTempFile::new().expect("temp plugin");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = temp
+                .as_file()
+                .metadata()
+                .expect("stat plugin")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(temp.path(), perms).expect("chmod plugin");
+        }
+
+        let toml = format!(
+            r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles.example]
+type = "plugin"
+command = "{command}"
+timeout_ms = 1000
+include_headers = ["authorization token"]
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+external_auth_profile = "example"
+            "#,
+            command = temp.path().to_string_lossy()
+        );
+
+        let config: Config = toml::from_str(&toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("include_headers entries must not contain whitespace"),
             "unexpected error: {msg}"
         );
     }

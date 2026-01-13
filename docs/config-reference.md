@@ -671,26 +671,40 @@ callback_url = "https://proxy.example.com/_acl-proxy/external-auth/callback"
 `callback_url` must be an absolute URL with a host. Empty or relative values
 are rejected during config validation.
 
-Profiles are defined under `[policy.external_auth_profiles]`:
+Profiles are defined under `[policy.external_auth_profiles]` and can be either
+`type = "http"` (async approval, default) or `type = "plugin"` (sync stdio).
 
 ```toml
 [policy.external_auth_profiles]
 
 [policy.external_auth_profiles.github_mfa]
+type = "http"              # default if omitted
 webhook_url = "https://auth.internal/github/mfa-start"
 timeout_ms = 5000           # approval timeout for the original client request
 webhook_timeout_ms = 1000   # optional timeout for the webhook delivery itself
 on_webhook_failure = "error"# "deny" | "error" | "timeout" (default: "error")
+
+[policy.external_auth_profiles.url_allow]
+type = "plugin"
+command = "/usr/local/bin/url-allow"
+args = ["--config", "/etc/url-allow.json"]
+timeout_ms = 1000           # per-request plugin timeout
+restart_delay_ms = 10000
 ```
 
 Fields:
 
+- `type` (`"http" | "plugin"`, optional):
+  - Selects the profile behavior. Defaults to `"http"`.
+
 - `webhook_url` (string, required):
   - URL of the external auth service that receives the initial webhook.
+  - Required for `type = "http"`.
 
 - `timeout_ms` (integer, required):
-  - How long to wait for an approval/deny callback before timing out the client with a
-    `504 Gateway Timeout`.
+  - `type = "http"`: how long to wait for an approval/deny callback before timing out
+    the client with a `504 Gateway Timeout`.
+  - `type = "plugin"`: per-request timeout waiting for the plugin decision.
 
 - `webhook_timeout_ms` (integer, optional):
   - Optional timeout (in milliseconds) for delivering the webhook itself.
@@ -706,6 +720,21 @@ Fields:
     - `"error"` – respond `503 Service Unavailable` with an external-approval error JSON.
     - `"timeout"` – behave as if approval timed out (`504`) and remove the pending entry.
   - When omitted, `"error"` is used.
+
+- `command` (string, required for `type = "plugin"`):
+  - Path to the long-running plugin executable.
+
+- `args` (array of strings, optional):
+  - Extra CLI arguments passed to the plugin.
+
+- `include_headers` (array of strings, optional):
+  - Header name globs to forward to the plugin (case-insensitive).
+
+- `env` (map of string to string, optional):
+  - Environment variables to set for the plugin process.
+
+- `restart_delay_ms` (integer, optional):
+  - Delay before restarting a crashed plugin process (default: 10000).
 
 Profiles are attached to rules via the `external_auth_profile` field:
 
@@ -734,22 +763,30 @@ Semantics:
 
 - Rules keep `action = "allow"` or `"deny"` as before.
 - When `action = "allow"` **and** `external_auth_profile` is set:
-  - The rule becomes **approval-required**.
-  - On match, the proxy:
-    - Creates a pending entry keyed by `requestId`.
-    - Sends an initial **pending** webhook to the configured profile’s `webhook_url`.
-    - Waits for a callback decision (up to `timeout_ms`).
-    - On approval: proxies the request upstream as usual (including any header actions).
-    - On deny: returns `403 Forbidden` with the standard policy-deny JSON shape.
-    - On timeout: returns `504 Gateway Timeout` with an `"ExternalApprovalTimeout"` error.
-    - On internal error (e.g., callback channel closed): returns `503 Service Unavailable`.
+  - For `type = "http"`:
+    - The rule becomes **approval-required**.
+    - On match, the proxy:
+      - Creates a pending entry keyed by `requestId`.
+      - Sends an initial **pending** webhook to the configured profile’s `webhook_url`.
+      - Waits for a callback decision (up to `timeout_ms`).
+      - On approval: proxies the request upstream as usual (including any header actions).
+      - On deny: returns `403 Forbidden` with the standard policy-deny JSON shape.
+      - On timeout: returns `504 Gateway Timeout` with an `"ExternalApprovalTimeout"` error.
+      - On internal error (e.g., callback channel closed): returns `503 Service Unavailable`.
+  - For `type = "plugin"`:
+    - The proxy sends a JSON request over stdio to the plugin and waits for an
+      allow/deny response (up to `timeout_ms`).
+    - On allow: proxies the request upstream, applying rule header actions first
+      and plugin header actions second.
+    - On deny: returns `403 Forbidden` with a plugin-denied response.
+    - On plugin failure: returns `503 Service Unavailable`.
 - When `action = "deny"` and `external_auth_profile` is set:
   - Configuration validation fails; approval-required deny rules are not allowed.
 - Rules without `external_auth_profile` behave exactly as today.
 - Ruleset templates (`[[policy.rulesets.<name>]]`) may also specify `external_auth_profile`; the
   expanded rules inherit the profile.
 
-Lifecycle status telemetry:
+Lifecycle status telemetry (type = "http" only):
 
 - All external auth webhooks are POSTed to the profile’s `webhook_url` with a JSON body and an
   `X-Acl-Proxy-Event` header:

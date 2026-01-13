@@ -28,3 +28,4 @@ proxy mode references as needed.
 - `acl-proxy.sample.toml` - comprehensive sample configuration
 - `demos/external-auth-webapp/README.md` - minimal approval web UI demo
 - `demos/external-auth-termstation-adapter/README.md` - TermStation adapter demo
+- `demos/auth-plugin-stdio/README.md` - stdio auth plugin demo

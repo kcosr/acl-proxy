@@ -17,12 +17,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use serde::Deserialize;
 
 use crate::app::{AppState, SharedAppState};
+use crate::auth_plugin::{AuthPluginHandle, PluginDecision};
 use crate::capture::{
     build_capture_record, should_capture, BodyCaptureBuffer, BodyCaptureResult, CaptureDecision,
     CaptureEndpoint, CaptureKind, CaptureMode, CaptureRecordOptions, HeaderMap,
     DEFAULT_MAX_BODY_BYTES,
 };
-use crate::config::{HeaderActionKind, HeaderDirection, HeaderWhen};
+use crate::config::{ExternalAuthProfileType, HeaderActionKind, HeaderDirection, HeaderWhen};
 use crate::external_auth::{ApprovalMacroDescriptor, ExternalAuthProfile, ExternalDecision};
 use crate::logging::PolicyDecisionLogContext;
 use crate::policy::CompiledHeaderAction;
@@ -203,43 +204,71 @@ async fn handle_http_request(
 
     if let Some(rule) = matched_rule {
         if let Some(profile_name) = rule.external_auth_profile.as_ref() {
-            if let Some(profile) = state.external_auth.get_profile(profile_name) {
-                let resp = handle_external_auth_gate(
-                    state.clone(),
-                    &request_id,
-                    &full_url,
-                    &method,
-                    &client_endpoint,
-                    target,
-                    version,
-                    req,
-                    &client_ip_for_policy,
-                    rule.index,
-                    rule.rule_id.clone(),
-                    &profile,
-                    profile_name,
-                    request_timeout_ms,
-                    header_actions,
-                )
-                .await;
-                return Ok(resp);
-            } else {
-                let resp = build_external_auth_error_response(
-                    &state,
-                    &request_id,
-                    &full_url,
-                    &method,
-                    &client_endpoint,
-                    target,
-                    version,
-                    req.headers(),
-                    CaptureMode::HttpProxy,
-                    "ExternalApprovalError",
-                    "External auth profile not found",
-                )
-                .await;
-                return Ok(resp);
+            let profile_cfg = state.config.policy.external_auth_profiles.get(profile_name);
+
+            match profile_cfg.map(|cfg| &cfg.profile_type) {
+                Some(ExternalAuthProfileType::Http) => {
+                    if let Some(profile) = state.external_auth.get_profile(profile_name) {
+                        let resp = handle_external_auth_gate(
+                            state.clone(),
+                            &request_id,
+                            &full_url,
+                            &method,
+                            &client_endpoint,
+                            target,
+                            version,
+                            req,
+                            &client_ip_for_policy,
+                            rule.index,
+                            rule.rule_id.clone(),
+                            &profile,
+                            profile_name,
+                            request_timeout_ms,
+                            header_actions,
+                        )
+                        .await;
+                        return Ok(resp);
+                    }
+                }
+                Some(ExternalAuthProfileType::Plugin) => {
+                    if let Some(handler) = state.auth_plugins.get_handler(profile_name) {
+                        let resp = handle_auth_plugin_gate(
+                            state.clone(),
+                            &request_id,
+                            &full_url,
+                            &method,
+                            &client_endpoint,
+                            target,
+                            version,
+                            req,
+                            &client_ip_for_policy,
+                            profile_name,
+                            &handler,
+                            request_timeout_ms,
+                            header_actions,
+                        )
+                        .await;
+                        return Ok(resp);
+                    }
+                }
+                None => {}
             }
+
+            let resp = build_external_auth_error_response(
+                &state,
+                &request_id,
+                &full_url,
+                &method,
+                &client_endpoint,
+                target,
+                version,
+                req.headers(),
+                CaptureMode::HttpProxy,
+                "ExternalApprovalError",
+                "External auth profile not found",
+            )
+            .await;
+            return Ok(resp);
         }
     }
 
@@ -757,6 +786,114 @@ async fn handle_external_auth_gate(
     .await
 }
 
+async fn handle_auth_plugin_gate(
+    state: Arc<AppState>,
+    request_id: &str,
+    url: &str,
+    method: &Method,
+    client: &CaptureEndpoint,
+    target: Option<CaptureEndpoint>,
+    version: Version,
+    req: Request<Body>,
+    client_ip_for_policy: &str,
+    profile_name: &str,
+    handler: &AuthPluginHandle,
+    request_timeout_ms: Option<u64>,
+    header_actions: Vec<CompiledHeaderAction>,
+) -> Response<Body> {
+    run_auth_plugin_gate_lifecycle(
+        state,
+        request_id,
+        url,
+        method,
+        client,
+        target,
+        version,
+        req,
+        client_ip_for_policy,
+        profile_name,
+        handler,
+        request_timeout_ms,
+        header_actions,
+        CaptureMode::HttpProxy,
+    )
+    .await
+}
+
+pub(crate) async fn run_auth_plugin_gate_lifecycle(
+    state: Arc<AppState>,
+    request_id: &str,
+    url: &str,
+    method: &Method,
+    client: &CaptureEndpoint,
+    target: Option<CaptureEndpoint>,
+    version: Version,
+    req: Request<Body>,
+    client_ip_for_policy: &str,
+    profile_name: &str,
+    handler: &AuthPluginHandle,
+    request_timeout_ms: Option<u64>,
+    header_actions: Vec<CompiledHeaderAction>,
+    mode: CaptureMode,
+) -> Response<Body> {
+    let decision = handler
+        .evaluate(request_id, url, method, client_ip_for_policy, req.headers())
+        .await;
+
+    match decision {
+        Ok(PluginDecision::Allow {
+            header_actions: plugin_actions,
+        }) => {
+            let mut combined = header_actions;
+            combined.extend(plugin_actions);
+            proxy_allowed_request(
+                state.clone(),
+                request_id.to_string(),
+                url.to_string(),
+                method.clone(),
+                version,
+                client.clone(),
+                target,
+                req,
+                mode,
+                request_timeout_ms,
+                combined,
+            )
+            .await
+        }
+        Ok(PluginDecision::Deny) => {
+            build_auth_plugin_denied_response(
+                &state,
+                request_id,
+                url,
+                method,
+                client,
+                target,
+                version,
+                req.headers(),
+                mode,
+            )
+            .await
+        }
+        Err(err) => {
+            let message = format!("Auth plugin '{}' failed: {}", profile_name, err.message());
+            build_auth_plugin_error_response(
+                &state,
+                request_id,
+                url,
+                method,
+                client,
+                target,
+                version,
+                req.headers(),
+                mode,
+                &message,
+            )
+            .await
+        }
+    }
+}
+
 fn build_full_url(
     req: &Request<Body>,
 ) -> Result<(String, Option<CaptureEndpoint>), Response<Body>> {
@@ -962,6 +1099,63 @@ async fn build_external_auth_response(
     .await;
 
     response
+}
+
+pub(crate) async fn build_auth_plugin_denied_response(
+    state: &AppState,
+    request_id: &str,
+    url: &str,
+    method: &Method,
+    client: &CaptureEndpoint,
+    target: Option<CaptureEndpoint>,
+    version: Version,
+    req_headers: &HttpHeaderMap,
+    mode: CaptureMode,
+) -> Response<Body> {
+    build_external_auth_response(
+        state,
+        request_id,
+        url,
+        method,
+        client,
+        target,
+        version,
+        req_headers,
+        mode,
+        StatusCode::FORBIDDEN,
+        "Forbidden",
+        "Blocked by auth plugin",
+    )
+    .await
+}
+
+pub(crate) async fn build_auth_plugin_error_response(
+    state: &AppState,
+    request_id: &str,
+    url: &str,
+    method: &Method,
+    client: &CaptureEndpoint,
+    target: Option<CaptureEndpoint>,
+    version: Version,
+    req_headers: &HttpHeaderMap,
+    mode: CaptureMode,
+    message: &str,
+) -> Response<Body> {
+    build_external_auth_response(
+        state,
+        request_id,
+        url,
+        method,
+        client,
+        target,
+        version,
+        req_headers,
+        mode,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "AuthPluginError",
+        message,
+    )
+    .await
 }
 
 pub(crate) async fn build_external_auth_denied_response(

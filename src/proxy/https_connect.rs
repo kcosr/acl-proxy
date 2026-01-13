@@ -11,10 +11,12 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::app::AppState;
 use crate::capture::{CaptureDecision, CaptureEndpoint, CaptureMode};
+use crate::config::ExternalAuthProfileType;
 use crate::logging::PolicyDecisionLogContext;
 use crate::proxy::http::{
     build_external_auth_error_response, build_loop_detected_response, generate_request_id,
-    has_loop_header, proxy_allowed_request, run_external_auth_gate_lifecycle,
+    has_loop_header, proxy_allowed_request, run_auth_plugin_gate_lifecycle,
+    run_external_auth_gate_lifecycle,
 };
 
 /// Handle an incoming CONNECT request on the HTTP listener.
@@ -277,43 +279,72 @@ async fn handle_inner_https_request(
 
     if let Some(rule) = matched_rule {
         if let Some(profile_name) = rule.external_auth_profile.as_ref() {
-            if let Some(profile) = state.external_auth.get_profile(profile_name) {
-                let resp = handle_inner_external_auth_gate(
-                    state.clone(),
-                    &request_id,
-                    &full_url,
-                    &method,
-                    &client,
-                    target,
-                    version,
-                    req,
-                    &client_ip_for_policy,
-                    rule.index,
-                    rule.rule_id.clone(),
-                    &profile,
-                    profile_name,
-                    request_timeout_ms,
-                    header_actions,
-                )
-                .await;
-                return Ok(resp);
-            } else {
-                let resp = build_external_auth_error_response(
-                    &state,
-                    &request_id,
-                    &full_url,
-                    &method,
-                    &client,
-                    Some(target),
-                    version,
-                    req.headers(),
-                    CaptureMode::HttpsConnect,
-                    "ExternalApprovalError",
-                    "External auth profile not found",
-                )
-                .await;
-                return Ok(resp);
+            let profile_cfg = state.config.policy.external_auth_profiles.get(profile_name);
+
+            match profile_cfg.map(|cfg| &cfg.profile_type) {
+                Some(ExternalAuthProfileType::Http) => {
+                    if let Some(profile) = state.external_auth.get_profile(profile_name) {
+                        let resp = handle_inner_external_auth_gate(
+                            state.clone(),
+                            &request_id,
+                            &full_url,
+                            &method,
+                            &client,
+                            target,
+                            version,
+                            req,
+                            &client_ip_for_policy,
+                            rule.index,
+                            rule.rule_id.clone(),
+                            &profile,
+                            profile_name,
+                            request_timeout_ms,
+                            header_actions,
+                        )
+                        .await;
+                        return Ok(resp);
+                    }
+                }
+                Some(ExternalAuthProfileType::Plugin) => {
+                    if let Some(handler) = state.auth_plugins.get_handler(profile_name) {
+                        let resp = run_auth_plugin_gate_lifecycle(
+                            state.clone(),
+                            &request_id,
+                            &full_url,
+                            &method,
+                            &client,
+                            Some(target),
+                            version,
+                            req,
+                            &client_ip_for_policy,
+                            profile_name,
+                            &handler,
+                            request_timeout_ms,
+                            header_actions,
+                            CaptureMode::HttpsConnect,
+                        )
+                        .await;
+                        return Ok(resp);
+                    }
+                }
+                None => {}
             }
+
+            let resp = build_external_auth_error_response(
+                &state,
+                &request_id,
+                &full_url,
+                &method,
+                &client,
+                Some(target),
+                version,
+                req.headers(),
+                CaptureMode::HttpsConnect,
+                "ExternalApprovalError",
+                "External auth profile not found",
+            )
+            .await;
+            return Ok(resp);
         }
     }
 

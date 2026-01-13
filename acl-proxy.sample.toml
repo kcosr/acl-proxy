@@ -189,6 +189,13 @@ timeout_ms = 5000
 webhook_timeout_ms = 1000
 on_webhook_failure = "error" # "deny" | "error" | "timeout"
 
+[policy.external_auth_profiles.url_allow]
+type = "plugin"
+command = "/usr/local/bin/url-allow"
+args = ["--config", "/etc/url-allow.json"]
+timeout_ms = 1000
+restart_delay_ms = 10000
+
 ###############################################################################
 # Rulesets
 ###############################################################################
@@ -254,6 +261,13 @@ direction = "request"
 action = "add"
 name = "x-approval-reason"
 value = "{{reason}}"
+
+[[policy.rules]]
+# Example: use a sync plugin to allow a set of repository URLs.
+action = "allow"
+pattern = "https://repo.internal/**"
+description = "Repo access via auth plugin"
+external_auth_profile = "url_allow"
 
 [[policy.rules]]
 # Explicitly deny access to administrative paths on the Git server,
