@@ -1,0 +1,6 @@
+{
+  "allow": [
+    "https://repo.example.com/**",
+    "https://packages.example.com/public/**"
+  ]
+}
