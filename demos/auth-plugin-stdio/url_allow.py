@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import argparse
-import base64
 import fnmatch
 import json
 import sys
@@ -41,46 +40,67 @@ def normalize_allowlist(raw):
     return normalized
 
 
-def normalize_tokens(raw):
-    if raw is None:
-        return None
+def normalize_string_list(raw, location):
     if isinstance(raw, list):
         items = raw
     elif isinstance(raw, str):
         items = [raw]
     else:
-        sys.stderr.write("tokens must be a string or list\n")
+        sys.stderr.write(f"{location} must be a string or list\n")
         sys.exit(1)
 
     normalized = []
     for item in items:
         if not isinstance(item, str):
-            sys.stderr.write("tokens must contain strings\n")
+            sys.stderr.write(f"{location} must contain strings\n")
             sys.exit(1)
         trimmed = item.strip()
         if not trimmed:
-            sys.stderr.write("tokens must not contain empty values\n")
+            sys.stderr.write(f"{location} must not contain empty values\n")
             sys.exit(1)
         normalized.append(trimmed)
     return normalized
 
 
-def extract_basic_token(auth_value):
-    if not isinstance(auth_value, str):
+def normalize_header_rules(raw):
+    if raw is None:
         return None
-    auth_value = auth_value.strip()
-    if not auth_value.lower().startswith("basic "):
-        return None
-    encoded = auth_value[6:].strip()
-    if not encoded:
-        return None
-    try:
-        decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
-    except Exception:
-        return None
-    if ":" not in decoded:
-        return None
-    return decoded.split(":", 1)[1]
+    if not isinstance(raw, dict):
+        sys.stderr.write("headers must be a map of header -> value(s)\n")
+        sys.exit(1)
+
+    normalized = {}
+    for name, values in raw.items():
+        if not isinstance(name, str) or not name.strip():
+            sys.stderr.write("headers must have non-empty string keys\n")
+            sys.exit(1)
+        header_name = name.strip().lower()
+        normalized[header_name] = set(normalize_string_list(values, f"headers.{name}"))
+    return normalized
+
+
+def collect_header_values(headers, name):
+    value = headers.get(name)
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [v for v in value if isinstance(v, str)]
+    if isinstance(value, str):
+        return [value]
+    return []
+
+
+def headers_match(headers, rules):
+    if rules is None:
+        return True
+
+    for name, allowed in rules.items():
+        values = collect_header_values(headers, name)
+        if not values:
+            return False
+        if not any(value in allowed for value in values):
+            return False
+    return True
 
 
 def is_allowed(url, allowlist):
@@ -100,7 +120,7 @@ def main():
     if not allowlist:
         sys.stderr.write("allow list must not be empty\n")
         sys.exit(1)
-    tokens = normalize_tokens(config.get("tokens"))
+    header_rules = normalize_header_rules(config.get("headers"))
 
     for line in sys.stdin:
         line = line.strip()
@@ -118,17 +138,12 @@ def main():
         request_id = msg.get("id", "")
         url = msg.get("url", "")
         headers = msg.get("headers") or {}
-
-        if tokens is None:
-            token_ok = True
+        if isinstance(headers, dict):
+            headers = {str(k).lower(): v for k, v in headers.items()}
         else:
-            auth = headers.get("authorization")
-            if isinstance(auth, list):
-                auth = auth[0] if auth else None
-            token = extract_basic_token(auth)
-            token_ok = token in tokens if token else False
+            headers = {}
 
-        decision = "allow" if token_ok and is_allowed(url, allowlist) else "deny"
+        decision = "allow" if is_allowed(url, allowlist) and headers_match(headers, header_rules) else "deny"
 
         response = {
             "id": request_id,

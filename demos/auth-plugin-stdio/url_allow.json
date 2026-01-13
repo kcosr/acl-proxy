@@ -3,8 +3,7 @@
     "https://repo.example.com/**",
     "https://packages.example.com/public/**"
   ],
-  "tokens": [
-    "token-1",
-    "token-2"
-  ]
+  "headers": {
+    "x-api-key": ["demo-key"]
+  }
 }

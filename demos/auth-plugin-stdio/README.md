@@ -1,13 +1,13 @@
 # Auth plugin (stdio) demo
 
 This demo shows a minimal stdio auth plugin that allows or denies requests
-based on URL patterns, with optional Basic auth token matching.
+based on URL patterns and header matches.
 
 ## Plugin behavior
 
 - Reads NDJSON request messages on stdin.
 - Matches the request URL against an allowlist of glob patterns.
-- Optionally decodes `Authorization: Basic ...` and matches the token.
+- Optionally matches required header values.
 - Returns `decision = "allow"` or `decision = "deny"`.
 
 ## Configure acl-proxy
@@ -18,6 +18,7 @@ type = "plugin"
 command = "/path/to/url_allow.py"
 args = ["--config", "/path/to/url_allow.json"]
 timeout_ms = 1000
+include_headers = ["x-api-key"]
 
 [[policy.rules]]
 action = "allow"
@@ -35,17 +36,15 @@ Example `url_allow.json`:
     "https://repo.example.com/**",
     "https://packages.example.com/public/**"
   ],
-  "tokens": [
-    "token-1",
-    "token-2"
-  ]
+  "headers": {
+    "x-api-key": ["demo-key"]
+  }
 }
 ```
 
 Notes:
-- Tokens are compared against the decoded Basic auth password
-  (`base64(username:token)`).
-- If `tokens` is omitted, only the URL allowlist is enforced.
+- Header names are case-insensitive.
+- If `headers` is omitted, only the URL allowlist is enforced.
 
 ## Run the plugin
 
