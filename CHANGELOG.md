@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.6] - 2026-01-13
 
 ### Added
 - Add stdio auth plugin support and URL allowlist demo ([#36](https://github.com/kcosr/acl-proxy/pull/36))
