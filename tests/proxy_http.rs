@@ -513,11 +513,11 @@ async fn auth_plugin_allows_and_applies_headers() {
     let script_path = temp_dir.path().join("auth-plugin.sh");
     let script = r#"#!/bin/sh
 while IFS= read -r line; do
-  id=$(printf "%s" "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p')
+  id=$(printf "%s" "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
   if [ -z "$id" ]; then
     continue
   fi
-  auth=$(printf "%s" "$line" | sed -n 's/.*"authorization"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p')
+  auth=$(printf "%s" "$line" | sed -n 's/.*"authorization"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
   if echo "$auth" | grep -q "allow"; then
     printf '{"id":"%s","type":"response","decision":"allow","requestHeaders":[{"action":"remove","name":"authorization","when":"if_present"}],"responseHeaders":[{"action":"set","name":"x-auth-plugin","value":"demo"}]}\n' "$id"
   else
