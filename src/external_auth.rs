@@ -12,7 +12,8 @@ use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::{
-    ExternalAuthProfileConfig, ExternalAuthProfileConfigMap, ExternalAuthWebhookFailureMode,
+    ExternalAuthProfileConfig, ExternalAuthProfileConfigMap, ExternalAuthProfileType,
+    ExternalAuthWebhookFailureMode,
 };
 
 #[derive(Debug, Clone)]
@@ -127,6 +128,16 @@ impl ExternalAuthManager {
         let mut profiles: BTreeMap<String, ExternalAuthProfile> = BTreeMap::new();
 
         for (name, profile_cfg) in cfg {
+            if profile_cfg.profile_type != ExternalAuthProfileType::Http {
+                continue;
+            }
+            let webhook_url = match profile_cfg.webhook_url.clone() {
+                Some(url) => url,
+                None => {
+                    tracing::warn!("external auth profile {name} missing webhook_url; skipping");
+                    continue;
+                }
+            };
             let timeout = Duration::from_millis(profile_cfg.timeout_ms);
             let webhook_timeout = profile_cfg.webhook_timeout_ms.map(Duration::from_millis);
             let on_webhook_failure =
@@ -135,7 +146,7 @@ impl ExternalAuthManager {
             profiles.insert(
                 name.clone(),
                 ExternalAuthProfile {
-                    webhook_url: profile_cfg.webhook_url.clone(),
+                    webhook_url,
                     timeout,
                     webhook_timeout,
                     on_webhook_failure,
@@ -542,12 +553,13 @@ impl Drop for PendingGuard {
 
 impl From<&ExternalAuthProfileConfig> for ExternalAuthProfile {
     fn from(cfg: &ExternalAuthProfileConfig) -> Self {
+        let webhook_url = cfg.webhook_url.clone().unwrap_or_default();
         let timeout = Duration::from_millis(cfg.timeout_ms);
         let webhook_timeout = cfg.webhook_timeout_ms.map(Duration::from_millis);
         let on_webhook_failure = WebhookFailureMode::from_config(cfg.on_webhook_failure.clone());
 
         ExternalAuthProfile {
-            webhook_url: cfg.webhook_url.clone(),
+            webhook_url,
             timeout,
             webhook_timeout,
             on_webhook_failure,

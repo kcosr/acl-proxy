@@ -505,6 +505,113 @@ value = "{{{{reason}}}}"
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn auth_plugin_allows_and_applies_headers() {
+    let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
+
+    let temp_dir = TempDir::new().expect("temp dir");
+    let script_path = temp_dir.path().join("auth-plugin.sh");
+    let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf "%s" "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p')
+  if [ -z "$id" ]; then
+    continue
+  fi
+  auth=$(printf "%s" "$line" | sed -n 's/.*"authorization"[[:space:]]*:[[:space:]]*"\\([^"]*\\)".*/\\1/p')
+  if echo "$auth" | grep -q "allow"; then
+    printf '{"id":"%s","type":"response","decision":"allow","requestHeaders":[{"action":"remove","name":"authorization","when":"if_present"}],"responseHeaders":[{"action":"set","name":"x-auth-plugin","value":"demo"}]}\n' "$id"
+  else
+    printf '{"id":"%s","type":"response","decision":"deny"}\n' "$id"
+  fi
+done
+"#;
+    std::fs::write(&script_path, script).expect("write plugin script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat plugin script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod plugin script");
+    }
+
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    let toml = format!(
+        r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+
+[logging]
+directory = "logs"
+level = "info"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles]
+[policy.external_auth_profiles.gitlab_acl]
+type = "plugin"
+command = "{script_path}"
+timeout_ms = 1000
+include_headers = ["authorization"]
+
+[[policy.rules]]
+action = "allow"
+pattern = "http://{host}/**"
+external_auth_profile = "gitlab_acl"
+
+[[policy.rules.header_actions]]
+direction = "response"
+action = "set"
+name = "x-auth-plugin"
+value = "static"
+"#,
+        script_path = script_path.to_string_lossy(),
+        host = host
+    );
+
+    let config: Config = toml::from_str(&toml).expect("parse config");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let raw_request = format!(
+        "GET http://{host}/repo1 HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer allow\r\nConnection: close\r\n\r\n"
+    );
+    let (response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(response
+        .to_ascii_lowercase()
+        .contains("x-auth-plugin: demo"));
+    assert!(!response
+        .to_ascii_lowercase()
+        .contains("x-auth-plugin: static"));
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let headers_guard = seen_headers.lock().unwrap();
+    let upstream_headers = headers_guard.as_ref().expect("upstream should see request");
+    assert!(upstream_headers.get("authorization").is_none());
+
+    let deny_request = format!(
+        "GET http://{host}/repo1 HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer deny\r\nConnection: close\r\n\r\n"
+    );
+    let (_deny_response, deny_status) = send_raw_http_request(proxy_addr, &deny_request).await;
+    assert_eq!(deny_status, StatusCode::FORBIDDEN);
+}
+
 fn minimal_config() -> Config {
     let toml = r#"
 schema_version = "1"

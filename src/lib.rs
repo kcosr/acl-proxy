@@ -1,4 +1,5 @@
 pub mod app;
+pub mod auth_plugin;
 pub mod capture;
 pub mod certs;
 pub mod cli;
