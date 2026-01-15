@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.7] - 2026-01-15
 
 ### Changed
 - Use `Cargo.toml` as version source instead of separate `VERSION` file ([#37](https://github.com/kcosr/acl-proxy/pull/37))
