@@ -53,7 +53,7 @@ When preparing PRs for main, open the PR first to get the PR number, then update
 ### What the Script Does
 
 1. Verifies working directory is clean (no uncommitted changes)
-2. Bumps `VERSION` file
+2. Bumps version in `Cargo.toml` (and `Cargo.lock`)
 3. Updates CHANGELOG: `## [Unreleased]` -> `## [X.Y.Z] - YYYY-MM-DD`
 4. Commits "Release vX.Y.Z" and creates git tag
 5. Pushes commit and tag to origin

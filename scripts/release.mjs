@@ -49,7 +49,13 @@ function run(cmd, options = {}) {
 }
 
 function getVersion() {
-	return readFileSync(join(ROOT, "VERSION"), "utf-8").trim();
+	const content = readFileSync(join(ROOT, "Cargo.toml"), "utf-8");
+	const match = content.match(/\[package\][\s\S]*?\nversion\s*=\s*"([^"]+)"/);
+	if (!match) {
+		console.error("Could not find version in Cargo.toml [package] section");
+		process.exit(1);
+	}
+	return match[1];
 }
 
 function updateChangelogForRelease(version) {
