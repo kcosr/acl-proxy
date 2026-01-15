@@ -2,7 +2,7 @@
 /**
  * bump-version.mjs
  *
- * Updates the VERSION file with a new semantic version.
+ * Updates the version in Cargo.toml with a new semantic version.
  *
  * Usage:
  *   node scripts/bump-version.mjs patch     # 1.0.0 -> 1.0.1
@@ -12,20 +12,23 @@
  *   node scripts/bump-version.mjs           # Show current version
  */
 
-import { readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
-const versionFilePath = join(ROOT, "VERSION");
+const cargoTomlPath = join(ROOT, "Cargo.toml");
+const cargoLockPath = join(ROOT, "Cargo.lock");
 
 function readVersion() {
-	try {
-		return readFileSync(versionFilePath, "utf8").trim();
-	} catch {
-		return "0.0.0";
+	const content = readFileSync(cargoTomlPath, "utf8");
+	const match = content.match(/\[package\][\s\S]*?\nversion\s*=\s*"([^"]+)"/);
+	if (!match) {
+		console.error("Could not find version in Cargo.toml [package] section");
+		process.exit(1);
 	}
+	return match[1];
 }
 
 function parseVersion(version) {
@@ -45,6 +48,37 @@ function formatVersion(parts) {
 	return `${parts.major}.${parts.minor}.${parts.patch}${parts.suffix}`;
 }
 
+function updateCargoTomlVersion(newVersion) {
+	let content = readFileSync(cargoTomlPath, "utf8");
+	const versionRegex =
+		/(\[package\][\s\S]*?\nversion\s*=\s*")[^"]*(")/;
+	if (!versionRegex.test(content)) {
+		console.error("Cargo.toml [package] version not found");
+		process.exit(1);
+	}
+
+	content = content.replace(versionRegex, `$1${newVersion}$2`);
+	writeFileSync(cargoTomlPath, content, "utf8");
+}
+
+function updateCargoLockVersion(newVersion) {
+	if (!existsSync(cargoLockPath)) {
+		return;
+	}
+
+	let content = readFileSync(cargoLockPath, "utf8");
+	const versionRegex =
+		/(\[\[package\]\]\nname = "acl-proxy"\nversion = ")[^"]*(")/;
+	if (!versionRegex.test(content)) {
+		console.error("Cargo.lock package entry not found for acl-proxy");
+		process.exit(1);
+	}
+
+	const updated = content.replace(versionRegex, `$1${newVersion}$2`);
+	content = updated;
+	writeFileSync(cargoLockPath, content, "utf8");
+}
+
 const currentVersion = readVersion();
 const arg = process.argv[2];
 
@@ -55,7 +89,7 @@ if (!arg) {
 
 const parts = parseVersion(currentVersion);
 if (!parts) {
-	console.error(`Current VERSION "${currentVersion}" is not valid semver (X.Y.Z)`);
+	console.error(`Current version "${currentVersion}" is not valid semver (X.Y.Z)`);
 	process.exit(1);
 }
 
@@ -90,5 +124,6 @@ switch (arg.toLowerCase()) {
 		newVersion = arg;
 }
 
-writeFileSync(versionFilePath, `${newVersion}\n`, "utf8");
+updateCargoTomlVersion(newVersion);
+updateCargoLockVersion(newVersion);
 console.log(`Version updated: ${currentVersion} -> ${newVersion}`);
