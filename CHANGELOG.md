@@ -2,7 +2,11 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+- Add repo-local build-service config for remote builds ([#38](https://github.com/kcosr/acl-proxy/pull/38)).
+
+### Fixed
+- Make transparent HTTPS H2 capture test select the request record deterministically ([#38](https://github.com/kcosr/acl-proxy/pull/38)).
 
 ## [0.0.7] - 2026-01-15
 

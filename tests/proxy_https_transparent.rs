@@ -717,21 +717,36 @@ async fn allowed_https_transparent_h2_is_proxied_and_captured() {
         "expected capture files for transparent HTTPS traffic"
     );
 
-    let mut contents = String::new();
-    std::fs::File::open(&files[0])
-        .expect("open capture")
-        .read_to_string(&mut contents)
-        .expect("read capture");
-    let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
-    assert_eq!(record.mode, CaptureMode::HttpsTransparent);
+    let mut found_request = false;
+    for path in files {
+        let mut contents = String::new();
+        std::fs::File::open(&path)
+            .expect("open capture")
+            .read_to_string(&mut contents)
+            .expect("read capture");
+        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
+        assert_eq!(record.mode, CaptureMode::HttpsTransparent);
+
+        if record.kind != CaptureKind::Request {
+            continue;
+        }
+
+        assert!(
+            record
+                .http_version
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with('2'),
+            "expected httpVersion starting with '2', got {:?}",
+            record.http_version
+        );
+        found_request = true;
+        break;
+    }
+
     assert!(
-        record
-            .http_version
-            .as_deref()
-            .unwrap_or_default()
-            .starts_with('2'),
-        "expected httpVersion starting with '2', got {:?}",
-        record.http_version
+        found_request,
+        "did not find request capture record for transparent HTTPS h2"
     );
 }
 
