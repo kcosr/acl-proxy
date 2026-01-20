@@ -11,3 +11,5 @@ certs/
 # Local tooling output
 .codemap/
 logs/
+
+.build-service/workspace-id
