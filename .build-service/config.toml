@@ -3,7 +3,7 @@ endpoint = "http://pc:8882"
 local_fallback = true
 
 [sources]
-include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock"]
+include = ["src/**", "tests/**", "acl-proxy.sample.toml", "Cargo.toml", "Cargo.lock"]
 exclude = []
 
 [artifacts]
