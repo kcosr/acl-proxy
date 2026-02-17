@@ -205,6 +205,7 @@ async fn run_tls_connect_tunnel(
         .http1_only(true)
         .http1_keep_alive(true)
         .serve_connection(tls, service)
+        .with_upgrades()
         .await?;
 
     Ok(())

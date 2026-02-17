@@ -8,6 +8,7 @@ Key capabilities:
 - HTTPS MITM via CONNECT with per-host certificates signed by a local CA.
 - Transparent HTTPS listener that terminates TLS directly.
 - HTTP/2 support on transparent HTTPS; optional HTTP/2 upstream.
+- HTTP/1.1 protocol upgrade tunneling (including WebSocket handshakes).
 - Structured logging, policy decision logging, and JSON capture files with
   size-limited bodies.
 - Loop protection with configurable header injection.

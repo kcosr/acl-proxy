@@ -11,6 +11,7 @@ use hyper::body::{Bytes, HttpBody};
 use hyper::server::conn::AddrStream;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Client, Request, Response, Server};
+use tokio::io::copy_bidirectional;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -940,6 +941,24 @@ pub(crate) fn has_loop_header(headers: &HttpHeaderMap, name: &HeaderName) -> boo
     headers.contains_key(name)
 }
 
+fn is_upgrade_request(headers: &HttpHeaderMap) -> bool {
+    let has_upgrade_token = headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
+
+    if !has_upgrade_token {
+        return false;
+    }
+
+    headers
+        .get(http::header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
 pub(crate) async fn build_loop_detected_response(
     state: &AppState,
     request_id: &str,
@@ -1346,7 +1365,7 @@ pub(crate) async fn proxy_allowed_request(
     version: Version,
     client: CaptureEndpoint,
     target: Option<CaptureEndpoint>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     mode: CaptureMode,
     request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
@@ -1371,6 +1390,11 @@ pub(crate) async fn proxy_allowed_request(
 
     let req_headers_snapshot = req.headers().clone();
     let original_request_presence = snapshot_header_presence(req.headers());
+    let downstream_upgrade = if is_upgrade_request(req.headers()) {
+        Some(hyper::upgrade::on(&mut req))
+    } else {
+        None
+    };
 
     let mut builder = Request::builder()
         .method(method.clone())
@@ -1502,6 +1526,12 @@ pub(crate) async fn proxy_allowed_request(
 
     let status = upstream_resp.status();
     let resp_version = upstream_resp.version();
+    let upstream_upgrade =
+        if downstream_upgrade.is_some() && status == StatusCode::SWITCHING_PROTOCOLS {
+            Some(hyper::upgrade::on(&mut upstream_resp))
+        } else {
+            None
+        };
 
     let (resp, resp_capture_rx) = if capture_response {
         let (parts, upstream_body) = upstream_resp.into_parts();
@@ -1620,6 +1650,40 @@ pub(crate) async fn proxy_allowed_request(
             }
         }
     });
+
+    if let (Some(downstream_upgrade), Some(upstream_upgrade)) =
+        (downstream_upgrade, upstream_upgrade)
+    {
+        let request_id_for_upgrade = request_id.clone();
+        let full_url_for_upgrade = full_url.clone();
+        tokio::spawn(async move {
+            let mut downstream = match downstream_upgrade.await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    tracing::debug!(
+                        "request upgrade failed for {request_id_for_upgrade} ({full_url_for_upgrade}): {err}"
+                    );
+                    return;
+                }
+            };
+
+            let mut upstream = match upstream_upgrade.await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    tracing::debug!(
+                        "upstream upgrade failed for {request_id_for_upgrade} ({full_url_for_upgrade}): {err}"
+                    );
+                    return;
+                }
+            };
+
+            if let Err(err) = copy_bidirectional(&mut downstream, &mut upstream).await {
+                tracing::debug!(
+                    "upgraded tunnel ended with I/O error for {request_id_for_upgrade} ({full_url_for_upgrade}): {err}"
+                );
+            }
+        });
+    }
 
     resp
 }
@@ -1980,8 +2044,8 @@ pub(crate) fn generate_request_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_request_id, is_internal_endpoint};
-    use http::Uri;
+    use super::{generate_request_id, is_internal_endpoint, is_upgrade_request};
+    use http::{header, HeaderMap, HeaderValue, Uri};
 
     #[test]
     fn request_id_includes_process_tag_and_is_unique() {
@@ -2037,5 +2101,24 @@ mod tests {
             "/internal",
             "external-auth/callback"
         ));
+    }
+
+    #[test]
+    fn upgrade_detection_requires_connection_token_and_upgrade_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONNECTION,
+            HeaderValue::from_static("keep-alive, Upgrade"),
+        );
+        headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+        assert!(is_upgrade_request(&headers));
+
+        let mut missing_connection = HeaderMap::new();
+        missing_connection.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+        assert!(!is_upgrade_request(&missing_connection));
+
+        let mut missing_upgrade = HeaderMap::new();
+        missing_upgrade.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+        assert!(!is_upgrade_request(&missing_upgrade));
     }
 }

@@ -9,6 +9,7 @@ use acl_proxy::capture::{
 use acl_proxy::config::Config;
 use acl_proxy::proxy::https_transparent::run_https_transparent_proxy_on_listener;
 use h2::client as h2_client;
+use http::header::{HeaderValue, CONNECTION, UPGRADE};
 use http::Method;
 use http::{StatusCode, Version};
 use hyper::server::conn::Http;
@@ -77,6 +78,87 @@ async fn start_upstream_https_echo_server() -> SocketAddr {
                 let _ = Http::new()
                     .http1_keep_alive(false)
                     .serve_connection(tls_stream, service)
+                    .await;
+            });
+        }
+    });
+
+    addr
+}
+
+async fn start_upstream_https_websocket_echo_server() -> SocketAddr {
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind upstream");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking upstream");
+    let addr = listener.local_addr().expect("upstream addr");
+
+    let mut params = CertificateParams::new(vec![addr.ip().to_string()]).expect("params");
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, addr.ip().to_string());
+    params.distinguished_name = dn;
+    let key = KeyPair::generate().expect("generate upstream key");
+    let cert = params.self_signed(&key).expect("self-signed upstream cert");
+
+    let cert_der: Vec<u8> = cert.der().to_vec();
+    let key_der = key.serialize_der();
+
+    let mut tls_config = ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(vec![RustlsCertificate(cert_der)], PrivateKey(key_der))
+        .expect("server config");
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
+
+    tokio::spawn(async move {
+        let listener = TcpListener::from_std(listener).expect("tokio listener");
+        loop {
+            let (socket, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let acceptor = tls_acceptor.clone();
+            tokio::spawn(async move {
+                let tls_stream = match acceptor.accept(socket).await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+
+                let service = service_fn(|mut req: HyperRequest<Body>| async move {
+                    let on_upgrade = hyper::upgrade::on(&mut req);
+                    tokio::spawn(async move {
+                        let mut upgraded = match on_upgrade.await {
+                            Ok(stream) => stream,
+                            Err(_) => return,
+                        };
+                        let mut buf = [0_u8; 1024];
+                        loop {
+                            let n = match upgraded.read(&mut buf).await {
+                                Ok(0) => break,
+                                Ok(n) => n,
+                                Err(_) => break,
+                            };
+                            if upgraded.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+
+                    let mut resp = HyperResponse::new(Body::empty());
+                    *resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+                    resp.headers_mut()
+                        .insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+                    resp.headers_mut()
+                        .insert(UPGRADE, HeaderValue::from_static("websocket"));
+                    Ok::<_, hyper::Error>(resp)
+                });
+
+                let _ = Http::new()
+                    .http1_keep_alive(false)
+                    .serve_connection(tls_stream, service)
+                    .with_upgrades()
                     .await;
             });
         }
@@ -642,6 +724,128 @@ async fn allowed_https_transparent_is_proxied_and_captured() {
         "url should be https, got {}",
         record.url
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transparent_https_websocket_upgrade_is_tunneled() {
+    use rustls_pemfile;
+
+    let upstream_addr = start_upstream_https_websocket_echo_server().await;
+
+    let mut config = minimal_https_transparent_config();
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            pattern: Some(format!(
+                "https://{}:{}/ws",
+                upstream_addr.ip(),
+                upstream_addr.port()
+            )),
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir, ca_cert_path) =
+        start_proxy_with_config(config, proxy_listener).await;
+    let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    let stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
+
+    let ca_pem = std::fs::read(&ca_cert_path).expect("read ca cert");
+    let mut reader = std::io::Cursor::new(ca_pem);
+    let mut roots = RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut reader).expect("parse ca cert") {
+        let cert = RustlsCertificate(cert.to_vec());
+        roots.add(&cert).expect("add root cert to store");
+    }
+
+    let config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    let connector = TlsConnector::from(Arc::new(config));
+    let server_name = ServerName::try_from("transparent.test").expect("server name");
+    let mut tls_stream = connector
+        .connect(server_name, stream)
+        .await
+        .expect("tls connect");
+
+    let request = format!(
+        concat!(
+            "GET /ws HTTP/1.1\r\n",
+            "Host: {host}\r\n",
+            "Connection: Upgrade\r\n",
+            "Upgrade: websocket\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "\r\n"
+        ),
+        host = host_header
+    );
+    tls_stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write websocket upgrade request");
+
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let n = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            tls_stream.read(&mut chunk),
+        )
+        .await
+        .expect("timed out waiting for websocket response")
+        .expect("read websocket response");
+        assert!(n > 0, "unexpected EOF while waiting for response headers");
+        response.extend_from_slice(&chunk[..n]);
+        if response.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let response_head = String::from_utf8_lossy(&response);
+    let status_line = response_head.lines().next().unwrap_or_default();
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    assert_eq!(status, StatusCode::SWITCHING_PROTOCOLS.as_u16());
+
+    let payload = b"ping-through-proxy";
+    tls_stream
+        .write_all(payload)
+        .await
+        .expect("write tunneled payload");
+
+    let mut echoed = vec![0_u8; payload.len()];
+    tokio::time::timeout(
+        tokio::time::Duration::from_secs(2),
+        tls_stream.read_exact(&mut echoed),
+    )
+    .await
+    .expect("timed out waiting for echoed payload")
+    .expect("read echoed payload");
+
+    assert_eq!(echoed.as_slice(), payload);
 }
 
 #[tokio::test(flavor = "multi_thread")]

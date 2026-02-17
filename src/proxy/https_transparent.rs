@@ -210,6 +210,7 @@ async fn handle_tls_connection(
     Http::new()
         .http1_keep_alive(true)
         .serve_connection(tls, service)
+        .with_upgrades()
         .await
         .map_err(HttpsTransparentError::Hyper)
 }
