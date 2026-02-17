@@ -18,7 +18,8 @@ cargo test
 The test suite includes:
 - Unit tests for config parsing, policy expansion, logging, capture, and certs.
 - Integration tests for HTTP explicit, HTTPS CONNECT MITM, and transparent HTTPS
-  (HTTP/1.1 and HTTP/2).
+  (HTTP/1.1 and HTTP/2), including HTTP/1.1 upgrade/WebSocket tunneling in
+  transparent mode.
 - Reload behavior and loop protection coverage.
 
 ## Formatting and linting

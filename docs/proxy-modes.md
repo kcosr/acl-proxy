@@ -54,6 +54,8 @@ Notes:
 - Clients must trust the proxy CA.
 - Inbound HTTP/2 is supported on the transparent listener (ALPN `h2`).
 - If the Host header is missing or invalid, the proxy returns `400 Bad Request`.
+- HTTP/1.1 upgrade requests (for example, WebSocket) are tunneled after a
+  successful `101 Switching Protocols` handshake.
 
 ## Upstream HTTP version
 
@@ -67,3 +69,12 @@ enable_http2_upstream = true
 
 When enabled, ALPN is used per origin; the proxy will use HTTP/2 where
 supported and fall back to HTTP/1.1 otherwise.
+
+## WebSocket and Upgrade Traffic
+
+- HTTP/1.1 upgrade handshakes are proxied on all HTTP/1.1 request paths
+  (explicit HTTP proxy, HTTPS CONNECT inner requests, and transparent HTTPS
+  when the client negotiates HTTP/1.1).
+- After a `101 Switching Protocols` response, acl-proxy switches to a
+  bidirectional byte tunnel between client and upstream.
+- HTTP/2 extended CONNECT / RFC 8441 is not currently implemented.

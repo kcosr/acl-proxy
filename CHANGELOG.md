@@ -4,6 +4,7 @@
 
 ### Added
 - Add repo-local build-service config for remote builds ([#38](https://github.com/kcosr/acl-proxy/pull/38)).
+- Add HTTP/1.1 protocol upgrade tunneling (including WebSocket handshakes) for proxy traffic paths ([#39](https://github.com/kcosr/acl-proxy/pull/39)).
 
 ### Fixed
 - Make transparent HTTPS H2 capture test select the request record deterministically ([#38](https://github.com/kcosr/acl-proxy/pull/38)).
