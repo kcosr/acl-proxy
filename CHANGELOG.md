@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.8] - 2026-02-17
 
 ### Added
 - Add repo-local build-service config for remote builds ([#38](https://github.com/kcosr/acl-proxy/pull/38)).
