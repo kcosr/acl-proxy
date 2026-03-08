@@ -649,6 +649,14 @@ Fields:
 - `value` / `values` (string or list, for `set`/`add`):
   - Exactly one of `value` or `values` must be provided, and at least one value overall.
   - Values must be valid HTTP header values; invalid values cause config validation to fail.
+  - Exact whole-string env placeholders of the form `${NAME}` are resolved once when the config
+    is loaded or reloaded. `NAME` must match `[A-Za-z_][A-Za-z0-9_]*`.
+  - Only exact placeholders are supported. Strings such as `Bearer ${TOKEN}` or
+    `${TOKEN}/suffix` are rejected as invalid configuration.
+  - Missing env vars fail `acl-proxy config validate`, normal startup, `policy dump`, and config
+    reload before the new config becomes active.
+  - Existing literal `${...}` strings in affected `set`/`add` fields are now reserved syntax and
+    must be migrated before enabling this feature.
 - `when` (`"always" | "if_present" | "if_absent"`, optional):
   - `always` (default) – action is always considered.
   - `if_present` – action runs only if the header was present on the **original** message for
@@ -664,6 +672,10 @@ rule. Actions are then applied in the order they appear in the configuration.
 Approval macros:
 
 - Header `value`/`values` may contain approval macros using `{{name}}` syntax (double braces).
+- Env interpolation and approval macros are separate features:
+  - `${NAME}` resolves once at config load/reload time for `set`/`add` `value` / `values[*]`.
+  - `{{name}}` remains a later approval-time substitution and is left untouched during config
+    loading.
 - Approval macros are discovered per-rule when `external_auth_profile` is set and described to
   external approvers via the initial external auth webhook.
 - On `decision: "allow"`, the external auth callback may supply a `macros` object with values

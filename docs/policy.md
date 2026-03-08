@@ -123,6 +123,8 @@ Behavior:
 - `set` replaces existing values; `add` appends; `remove` deletes.
 - `replace_substring` rewrites textual header values.
 - `when` is evaluated against the original header set before any actions run.
+- For `set` / `add`, exact whole-string `${NAME}` placeholders in `value` / `values[*]` resolve
+  once at config load/reload time. Mixed strings such as `Bearer ${TOKEN}` are rejected.
 - Header actions do not participate in rule matching. `headers_absent` is evaluated first against the inbound request headers, and actions run only after a rule matches.
 
 ## Approval macros
