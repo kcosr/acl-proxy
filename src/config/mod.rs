@@ -3,6 +3,7 @@ use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
+use http::header::{HeaderName, HeaderValue};
 use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
@@ -167,12 +168,37 @@ fn default_internal_base_path() -> String {
 pub struct ProxyEgressConfig {
     #[serde(default)]
     pub default: Option<EgressTargetConfig>,
+
+    #[serde(default)]
+    pub request_header_actions: Vec<EgressRequestHeaderActionConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EgressTargetConfig {
     pub host: String,
     pub port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EgressRequestHeaderActionConfig {
+    pub action: HeaderActionKind,
+    pub name: String,
+
+    #[serde(default)]
+    pub when: HeaderWhen,
+
+    // For set/add; allow value or values (but not both).
+    #[serde(default)]
+    pub value: Option<String>,
+    #[serde(default)]
+    pub values: Option<Vec<String>>,
+
+    // For replace_substring.
+    #[serde(default)]
+    pub search: Option<String>,
+    #[serde(default)]
+    pub replace: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -657,7 +683,7 @@ pub struct ExternalAuthProfileConfig {
     pub restart_delay_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum HeaderDirection {
     Request,
@@ -665,7 +691,7 @@ pub enum HeaderDirection {
     Both,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum HeaderActionKind {
     Remove,
@@ -674,7 +700,7 @@ pub enum HeaderActionKind {
     ReplaceSubstring,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub enum HeaderWhen {
@@ -846,6 +872,8 @@ impl Config {
             }
         }
 
+        interpolate_egress_request_header_actions(&mut self.proxy.egress.request_header_actions)?;
+
         Ok(())
     }
 
@@ -950,6 +978,36 @@ fn interpolate_header_actions(
     Ok(())
 }
 
+fn interpolate_egress_request_header_actions(
+    header_actions: &mut [EgressRequestHeaderActionConfig],
+) -> Result<(), ConfigError> {
+    for (header_action_idx, header_action) in header_actions.iter_mut().enumerate() {
+        if !matches!(
+            header_action.action,
+            HeaderActionKind::Set | HeaderActionKind::Add
+        ) {
+            continue;
+        }
+
+        let action_location = format_egress_request_header_action_location(
+            header_action_idx,
+            header_action.name.as_str(),
+        );
+
+        if let Some(value) = header_action.value.as_mut() {
+            interpolate_header_action_value(value, action_location.as_str())?;
+        }
+
+        if let Some(values) = header_action.values.as_mut() {
+            for value in values.iter_mut() {
+                interpolate_header_action_value(value, action_location.as_str())?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn interpolate_header_action_value(
     raw_value: &mut String,
     action_location: &str,
@@ -1018,6 +1076,13 @@ fn format_header_action_location(
     format!("{rule_location}.header_actions[{header_action_idx}] for header '{header_name}'")
 }
 
+fn format_egress_request_header_action_location(
+    header_action_idx: usize,
+    header_name: &str,
+) -> String {
+    format!("proxy.egress.request_header_actions[{header_action_idx}] for header '{header_name}'")
+}
+
 pub fn write_default_config(path: &Path) -> Result<(), ConfigError> {
     if let Some(parent) = path.parent() {
         if let Err(source) = fs::create_dir_all(parent) {
@@ -1064,6 +1129,8 @@ fn validate_proxy_config(proxy: &ProxyConfig) -> Result<(), ConfigError> {
     if let Some(target) = proxy.egress.default.as_ref() {
         validate_egress_target(target)?;
     }
+
+    validate_egress_request_header_action_list(&proxy.egress.request_header_actions)?;
 
     Ok(())
 }
@@ -1128,6 +1195,86 @@ fn validate_egress_host(host: &str) -> Result<(), ConfigError> {
                 .to_string(),
         )
     })
+}
+
+fn validate_egress_request_header_action_list(
+    actions: &[EgressRequestHeaderActionConfig],
+) -> Result<(), ConfigError> {
+    for (idx, action) in actions.iter().enumerate() {
+        validate_egress_request_header_action(action, idx)?;
+    }
+
+    Ok(())
+}
+
+fn validate_egress_request_header_action(
+    action_cfg: &EgressRequestHeaderActionConfig,
+    index: usize,
+) -> Result<(), ConfigError> {
+    let location = format_egress_request_header_action_location(index, action_cfg.name.as_str());
+
+    HeaderName::from_lowercase(action_cfg.name.to_ascii_lowercase().as_bytes()).map_err(|e| {
+        ConfigError::Invalid(format!(
+            "{location} has invalid header name '{}': {e}",
+            action_cfg.name
+        ))
+    })?;
+
+    match action_cfg.action {
+        HeaderActionKind::Set | HeaderActionKind::Add => {
+            let source_values = match (&action_cfg.value, &action_cfg.values) {
+                (Some(v), None) => vec![v.clone()],
+                (None, Some(vs)) if !vs.is_empty() => vs.clone(),
+                (Some(_), Some(_)) => {
+                    return Err(ConfigError::Invalid(format!(
+                        "{location} must not set both value and values"
+                    )));
+                }
+                _ => {
+                    return Err(ConfigError::Invalid(format!(
+                        "{location} must provide value or values"
+                    )));
+                }
+            };
+
+            for value in source_values {
+                HeaderValue::from_str(&value).map_err(|e| {
+                    ConfigError::Invalid(format!(
+                        "{location} has invalid header value '{}': {e}",
+                        value
+                    ))
+                })?;
+            }
+        }
+        HeaderActionKind::Remove | HeaderActionKind::ReplaceSubstring => {
+            if action_cfg.value.is_some() || action_cfg.values.is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "{location} with action {:?} must not set value/values",
+                    action_cfg.action
+                )));
+            }
+        }
+    }
+
+    if matches!(action_cfg.action, HeaderActionKind::ReplaceSubstring) {
+        let Some(search) = action_cfg.search.as_deref() else {
+            return Err(ConfigError::Invalid(format!(
+                "{location} with action replace_substring requires search"
+            )));
+        };
+        if search.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "{location} with action replace_substring requires non-empty search"
+            )));
+        }
+        if action_cfg.replace.is_none() {
+            return Err(ConfigError::Invalid(format!(
+                "{location} with action replace_substring requires replace"
+            )));
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_capture_config(capture: &CaptureConfig) -> Result<(), ConfigError> {
@@ -1400,6 +1547,80 @@ default = "deny"
         config
             .validate_basic()
             .expect("valid egress target should pass validation");
+    }
+
+    #[test]
+    fn proxy_egress_request_header_actions_default_to_empty() {
+        let config = Config::default();
+        assert!(config.proxy.egress.request_header_actions.is_empty());
+    }
+
+    #[test]
+    fn proxy_egress_request_header_actions_parse_when_valid() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[[proxy.egress.request_header_actions]]
+action = "remove"
+name = "x-aw-identity-token"
+when = "if_present"
+
+[[proxy.egress.request_header_actions]]
+action = "set"
+name = "x-egress-tag"
+value = "edge-a"
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        assert_eq!(config.proxy.egress.request_header_actions.len(), 2);
+        config
+            .validate_basic()
+            .expect("valid egress request header actions should pass validation");
+    }
+
+    #[test]
+    fn proxy_egress_request_header_actions_report_location_on_invalid_value_shape() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[[proxy.egress.request_header_actions]]
+action = "set"
+name = "x-egress-tag"
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("proxy.egress.request_header_actions[0] for header 'x-egress-tag'"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains("must provide value or values"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[test]
@@ -2551,6 +2772,85 @@ value = "${ACL_PROXY_TEST_MISSING}"
         );
         assert!(
             msg.contains("ACL_PROXY_TEST_MISSING"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn header_action_env_interpolation_resolves_egress_request_header_actions() {
+        let env_guard = HeaderActionEnvTestGuard::new(&["ACL_PROXY_TEST_EGRESS_TAG"]);
+        env_guard.set("ACL_PROXY_TEST_EGRESS_TAG", "edge-a");
+
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[[proxy.egress.request_header_actions]]
+action = "set"
+name = "x-egress-tag"
+value = "${ACL_PROXY_TEST_EGRESS_TAG}"
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+        "#;
+
+        let mut config: Config = toml::from_str(toml).expect("parse config");
+        config
+            .interpolate_header_action_env_vars()
+            .expect("interpolation should succeed");
+
+        assert_eq!(
+            config.proxy.egress.request_header_actions[0]
+                .value
+                .as_deref(),
+            Some("edge-a")
+        );
+    }
+
+    #[test]
+    fn header_action_env_interpolation_reports_egress_action_location() {
+        let env_guard = HeaderActionEnvTestGuard::new(&["ACL_PROXY_TEST_MISSING_EGRESS"]);
+        env_guard.remove("ACL_PROXY_TEST_MISSING_EGRESS");
+
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[[proxy.egress.request_header_actions]]
+action = "set"
+name = "x-egress-tag"
+value = "${ACL_PROXY_TEST_MISSING_EGRESS}"
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+        "#;
+
+        let mut config: Config = toml::from_str(toml).expect("parse config");
+        let err = config
+            .interpolate_header_action_env_vars()
+            .expect_err("missing env var should fail");
+        let msg = format!("{err}");
+
+        assert!(
+            msg.contains("proxy.egress.request_header_actions[0] for header 'x-egress-tag'"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains("ACL_PROXY_TEST_MISSING_EGRESS"),
             "unexpected error message: {msg}"
         );
     }
