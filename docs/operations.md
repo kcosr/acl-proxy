@@ -34,6 +34,9 @@ Behavior:
 - The proxy reloads config from the same sources as startup.
 - A new `AppState` is built and swapped atomically.
 - If reload fails, the previous state remains active.
+- Header-action `${NAME}` env placeholders are resolved again during reload. Changing a required
+  env var takes effect on the next successful reload; removing one causes the reload to fail and
+  keeps the previous running config active.
 
 ## Graceful shutdown
 

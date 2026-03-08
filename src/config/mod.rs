@@ -37,6 +37,13 @@ pub enum ConfigPathKind {
     Default,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderActionEnvPlaceholder<'a> {
+    None,
+    Exact { name: &'a str },
+    Invalid,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExternalAuthConfig {
     /// Full callback URL external auth services should use when
@@ -787,6 +794,7 @@ impl Config {
         })?;
 
         config.apply_env_overrides();
+        config.interpolate_header_action_env_vars()?;
         config.validate_basic()?;
 
         Ok(config)
@@ -819,6 +827,26 @@ impl Config {
                 self.logging.level = level;
             }
         }
+    }
+
+    fn interpolate_header_action_env_vars(&mut self) -> Result<(), ConfigError> {
+        for (rule_idx, rule) in self.policy.rules.iter_mut().enumerate() {
+            let PolicyRuleConfig::Direct(rule) = rule else {
+                continue;
+            };
+
+            let rule_location = format_direct_rule_location(rule_idx);
+            interpolate_header_actions(&mut rule.header_actions, rule_location.as_str())?;
+        }
+
+        for (ruleset_name, rules) in self.policy.rulesets.iter_mut() {
+            for (rule_idx, rule) in rules.iter_mut().enumerate() {
+                let rule_location = format_ruleset_template_location(ruleset_name, rule_idx);
+                interpolate_header_actions(&mut rule.header_actions, rule_location.as_str())?;
+            }
+        }
+
+        Ok(())
     }
 
     pub(crate) fn validate_basic(&self) -> Result<(), ConfigError> {
@@ -888,6 +916,106 @@ impl Config {
 
         Ok(())
     }
+}
+
+fn interpolate_header_actions(
+    header_actions: &mut [HeaderActionConfig],
+    rule_location: &str,
+) -> Result<(), ConfigError> {
+    for (header_action_idx, header_action) in header_actions.iter_mut().enumerate() {
+        if !matches!(
+            header_action.action,
+            HeaderActionKind::Set | HeaderActionKind::Add
+        ) {
+            continue;
+        }
+
+        let action_location = format_header_action_location(
+            rule_location,
+            header_action_idx,
+            header_action.name.as_str(),
+        );
+
+        if let Some(value) = header_action.value.as_mut() {
+            interpolate_header_action_value(value, action_location.as_str())?;
+        }
+
+        if let Some(values) = header_action.values.as_mut() {
+            for value in values.iter_mut() {
+                interpolate_header_action_value(value, action_location.as_str())?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn interpolate_header_action_value(
+    raw_value: &mut String,
+    action_location: &str,
+) -> Result<(), ConfigError> {
+    match classify_header_action_env_placeholder(raw_value.as_str()) {
+        HeaderActionEnvPlaceholder::None => Ok(()),
+        HeaderActionEnvPlaceholder::Invalid => Err(ConfigError::Invalid(format!(
+            "{action_location} uses invalid env interpolation syntax: '{raw_value}'"
+        ))),
+        HeaderActionEnvPlaceholder::Exact { name } => {
+            *raw_value = env::var(name).map_err(|_| {
+                ConfigError::Invalid(format!(
+                    "{action_location} references missing env var '{name}'"
+                ))
+            })?;
+            Ok(())
+        }
+    }
+}
+
+fn classify_header_action_env_placeholder(raw_value: &str) -> HeaderActionEnvPlaceholder<'_> {
+    if !raw_value.contains("${") {
+        return HeaderActionEnvPlaceholder::None;
+    }
+
+    let Some(name) = raw_value
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
+        return HeaderActionEnvPlaceholder::Invalid;
+    };
+
+    if name.is_empty() {
+        return HeaderActionEnvPlaceholder::Invalid;
+    }
+
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return HeaderActionEnvPlaceholder::Invalid;
+    };
+
+    if !matches!(first, 'A'..='Z' | 'a'..='z' | '_') {
+        return HeaderActionEnvPlaceholder::Invalid;
+    }
+
+    if !chars.all(|ch| matches!(ch, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_')) {
+        return HeaderActionEnvPlaceholder::Invalid;
+    }
+
+    HeaderActionEnvPlaceholder::Exact { name }
+}
+
+fn format_direct_rule_location(rule_idx: usize) -> String {
+    format!("policy.rules[{rule_idx}]")
+}
+
+fn format_ruleset_template_location(ruleset_name: &str, rule_idx: usize) -> String {
+    format!("policy.rulesets.{ruleset_name}[{rule_idx}]")
+}
+
+fn format_header_action_location(
+    rule_location: &str,
+    header_action_idx: usize,
+    header_name: &str,
+) -> String {
+    format!("{rule_location}.header_actions[{header_action_idx}] for header '{header_name}'")
 }
 
 pub fn write_default_config(path: &Path) -> Result<(), ConfigError> {
@@ -1123,6 +1251,69 @@ fn validate_internal_base_path(path: &str) -> Result<(), ConfigError> {
 mod tests {
     use super::*;
     use crate::config::PolicyDefaultAction;
+    use std::io::Write;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static HEADER_ACTION_ENV_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct HeaderActionEnvTestGuard {
+        _lock: MutexGuard<'static, ()>,
+        saved_vars: Vec<(String, Option<String>)>,
+    }
+
+    impl HeaderActionEnvTestGuard {
+        fn new(keys: &[&str]) -> Self {
+            let lock = HEADER_ACTION_ENV_TEST_MUTEX
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("lock env test mutex");
+
+            let mut saved_vars = Vec::with_capacity(keys.len());
+            for key in keys {
+                saved_vars.push(((*key).to_string(), env::var(key).ok()));
+            }
+
+            Self {
+                _lock: lock,
+                saved_vars,
+            }
+        }
+
+        fn set(&self, key: &str, value: &str) {
+            #[allow(unused_unsafe)]
+            unsafe {
+                env::set_var(key, value);
+            }
+        }
+
+        fn remove(&self, key: &str) {
+            #[allow(unused_unsafe)]
+            unsafe {
+                env::remove_var(key);
+            }
+        }
+    }
+
+    impl Drop for HeaderActionEnvTestGuard {
+        fn drop(&mut self) {
+            for (key, saved_value) in self.saved_vars.iter().rev() {
+                match saved_value {
+                    Some(value) => {
+                        #[allow(unused_unsafe)]
+                        unsafe {
+                            env::set_var(key, value);
+                        }
+                    }
+                    None => {
+                        #[allow(unused_unsafe)]
+                        unsafe {
+                            env::remove_var(key);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn minimal_config_round_trip() {
@@ -2004,6 +2195,590 @@ external_auth_profile = "example"
         assert!(
             msg.contains("include_headers entries must not contain whitespace"),
             "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn header_action_env_placeholder_classifier_is_exact_only() {
+        assert_eq!(
+            classify_header_action_env_placeholder("static-value"),
+            HeaderActionEnvPlaceholder::None
+        );
+        assert_eq!(
+            classify_header_action_env_placeholder("${API_TOKEN}"),
+            HeaderActionEnvPlaceholder::Exact { name: "API_TOKEN" }
+        );
+        assert_eq!(
+            classify_header_action_env_placeholder("${_TOKEN_2}"),
+            HeaderActionEnvPlaceholder::Exact { name: "_TOKEN_2" }
+        );
+
+        for raw in [
+            "Bearer ${TOKEN}",
+            "${TOKEN}/suffix",
+            "${}",
+            "${1BAD}",
+            "${BAD-NAME}",
+            "${TOKEN",
+        ] {
+            assert_eq!(
+                classify_header_action_env_placeholder(raw),
+                HeaderActionEnvPlaceholder::Invalid,
+                "expected invalid placeholder for {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_action_env_interpolation_reports_direct_rule_location() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "authorization"
+value = "Bearer ${TOKEN}"
+        "#;
+
+        let mut config: Config = toml::from_str(toml).expect("parse config");
+        let err = config
+            .interpolate_header_action_env_vars()
+            .expect_err("interpolation should fail");
+        let msg = format!("{err}");
+
+        assert!(
+            msg.contains("policy.rules[0].header_actions[0] for header 'authorization'"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains("Bearer ${TOKEN}"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn header_action_env_interpolation_reports_ruleset_location() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rulesets.api_headers]]
+action = "allow"
+pattern = "https://api.internal/**"
+
+[[policy.rulesets.api_headers.header_actions]]
+direction = "request"
+action = "add"
+name = "x-env-tag"
+values = ["${DEPLOYMENT}/prod"]
+
+[[policy.rules]]
+include = "api_headers"
+        "#;
+
+        let mut config: Config = toml::from_str(toml).expect("parse config");
+        let err = config
+            .interpolate_header_action_env_vars()
+            .expect_err("interpolation should fail");
+        let msg = format!("{err}");
+
+        assert!(
+            msg.contains("policy.rulesets.api_headers[0].header_actions[0] for header 'x-env-tag'"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains("${DEPLOYMENT}/prod"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_from_sources_invokes_header_action_env_interpolation() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp config");
+        write!(
+            file,
+            r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "authorization"
+value = "Bearer ${{TOKEN}}"
+            "#
+        )
+        .expect("write config");
+
+        let err = Config::load_from_sources(Some(file.path()))
+            .expect_err("load should fail on invalid interpolation syntax");
+        let msg = format!("{err}");
+
+        assert!(
+            msg.contains("policy.rules[0].header_actions[0] for header 'authorization'"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn header_action_env_interpolation_resolves_exact_value_placeholder() {
+        let env_guard = HeaderActionEnvTestGuard::new(&["ACL_PROXY_TEST_API_TOKEN"]);
+        env_guard.set("ACL_PROXY_TEST_API_TOKEN", "Bearer abc123");
+
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "authorization"
+value = "${ACL_PROXY_TEST_API_TOKEN}"
+        "#;
+
+        let mut config: Config = toml::from_str(toml).expect("parse config");
+        config
+            .interpolate_header_action_env_vars()
+            .expect("interpolation should succeed");
+
+        let PolicyRuleConfig::Direct(rule) = &config.policy.rules[0] else {
+            panic!("expected direct rule");
+        };
+        assert_eq!(
+            rule.header_actions[0].value.as_deref(),
+            Some("Bearer abc123"),
+            "expected resolved header action value"
+        );
+    }
+
+    #[test]
+    fn header_action_env_interpolation_resolves_mixed_values_and_repeated_placeholder() {
+        let env_guard =
+            HeaderActionEnvTestGuard::new(&["ACL_PROXY_TEST_DEPLOYMENT", "ACL_PROXY_TEST_REGION"]);
+        env_guard.set("ACL_PROXY_TEST_DEPLOYMENT", "prod");
+        env_guard.set("ACL_PROXY_TEST_REGION", "us-central1");
+
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "add"
+name = "x-env-tag"
+values = ["static", "${ACL_PROXY_TEST_DEPLOYMENT}", "${ACL_PROXY_TEST_REGION}", "${ACL_PROXY_TEST_DEPLOYMENT}"]
+        "#;
+
+        let mut config: Config = toml::from_str(toml).expect("parse config");
+        config
+            .interpolate_header_action_env_vars()
+            .expect("interpolation should succeed");
+
+        let PolicyRuleConfig::Direct(rule) = &config.policy.rules[0] else {
+            panic!("expected direct rule");
+        };
+        assert_eq!(
+            rule.header_actions[0]
+                .values
+                .as_ref()
+                .expect("expected resolved values"),
+            &vec![
+                "static".to_string(),
+                "prod".to_string(),
+                "us-central1".to_string(),
+                "prod".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn header_action_env_interpolation_resolves_ruleset_template_placeholders() {
+        let env_guard = HeaderActionEnvTestGuard::new(&["ACL_PROXY_TEST_RULESET_TOKEN"]);
+        env_guard.set("ACL_PROXY_TEST_RULESET_TOKEN", "token-123");
+
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rulesets.api_headers]]
+action = "allow"
+pattern = "https://api.internal/**"
+
+[[policy.rulesets.api_headers.header_actions]]
+direction = "request"
+action = "set"
+name = "authorization"
+value = "${ACL_PROXY_TEST_RULESET_TOKEN}"
+
+[[policy.rules]]
+include = "api_headers"
+        "#;
+
+        let mut config: Config = toml::from_str(toml).expect("parse config");
+        config
+            .interpolate_header_action_env_vars()
+            .expect("interpolation should succeed");
+
+        let ruleset = config
+            .policy
+            .rulesets
+            .get("api_headers")
+            .expect("ruleset should exist");
+        assert_eq!(
+            ruleset[0].header_actions[0].value.as_deref(),
+            Some("token-123"),
+            "expected resolved ruleset header action value"
+        );
+    }
+
+    #[test]
+    fn header_action_env_interpolation_reports_missing_env_var() {
+        let env_guard = HeaderActionEnvTestGuard::new(&["ACL_PROXY_TEST_MISSING"]);
+        env_guard.remove("ACL_PROXY_TEST_MISSING");
+
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "authorization"
+value = "${ACL_PROXY_TEST_MISSING}"
+        "#;
+
+        let mut config: Config = toml::from_str(toml).expect("parse config");
+        let err = config
+            .interpolate_header_action_env_vars()
+            .expect_err("missing env var should fail");
+        let msg = format!("{err}");
+
+        assert!(
+            msg.contains("policy.rules[0].header_actions[0] for header 'authorization'"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains("ACL_PROXY_TEST_MISSING"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn header_action_env_interpolation_leaves_static_and_approval_macro_values_unchanged() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "x-static"
+value = "static-value"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "x-approval"
+value = "{{github_token}}"
+        "#;
+
+        let mut config: Config = toml::from_str(toml).expect("parse config");
+        config
+            .interpolate_header_action_env_vars()
+            .expect("interpolation should succeed");
+
+        let PolicyRuleConfig::Direct(rule) = &config.policy.rules[0] else {
+            panic!("expected direct rule");
+        };
+        assert_eq!(
+            rule.header_actions[0].value.as_deref(),
+            Some("static-value")
+        );
+        assert_eq!(
+            rule.header_actions[1].value.as_deref(),
+            Some("{{github_token}}")
+        );
+    }
+
+    #[test]
+    fn header_action_env_interpolation_skips_non_set_add_actions() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "replace_substring"
+name = "authorization"
+search = "${ACL_PROXY_TEST_SEARCH}"
+replace = "${ACL_PROXY_TEST_REPLACE}"
+        "#;
+
+        let mut config: Config = toml::from_str(toml).expect("parse config");
+        config
+            .interpolate_header_action_env_vars()
+            .expect("replace_substring fields should be untouched");
+
+        let PolicyRuleConfig::Direct(rule) = &config.policy.rules[0] else {
+            panic!("expected direct rule");
+        };
+        assert_eq!(
+            rule.header_actions[0].search.as_deref(),
+            Some("${ACL_PROXY_TEST_SEARCH}")
+        );
+        assert_eq!(
+            rule.header_actions[0].replace.as_deref(),
+            Some("${ACL_PROXY_TEST_REPLACE}")
+        );
+    }
+
+    #[test]
+    fn header_action_env_interpolation_skips_remove_actions() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "remove"
+name = "authorization"
+        "#;
+
+        let mut config: Config = toml::from_str(toml).expect("parse config");
+        config
+            .interpolate_header_action_env_vars()
+            .expect("remove actions should be untouched");
+
+        let PolicyRuleConfig::Direct(rule) = &config.policy.rules[0] else {
+            panic!("expected direct rule");
+        };
+        assert!(matches!(
+            rule.header_actions[0].action,
+            HeaderActionKind::Remove
+        ));
+        assert!(rule.header_actions[0].value.is_none());
+        assert!(rule.header_actions[0].values.is_none());
+    }
+
+    #[test]
+    fn header_action_env_interpolation_allows_empty_resolved_value() {
+        let env_guard = HeaderActionEnvTestGuard::new(&["ACL_PROXY_TEST_EMPTY"]);
+        env_guard.set("ACL_PROXY_TEST_EMPTY", "");
+
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "x-empty"
+value = "${ACL_PROXY_TEST_EMPTY}"
+        "#;
+
+        let mut config: Config = toml::from_str(toml).expect("parse config");
+        config
+            .interpolate_header_action_env_vars()
+            .expect("empty env var should still interpolate");
+
+        let PolicyRuleConfig::Direct(rule) = &config.policy.rules[0] else {
+            panic!("expected direct rule");
+        };
+        assert_eq!(rule.header_actions[0].value.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn load_from_sources_resolves_header_action_env_placeholders() {
+        let env_guard = HeaderActionEnvTestGuard::new(&["ACL_PROXY_TEST_LOAD_TOKEN"]);
+        env_guard.set("ACL_PROXY_TEST_LOAD_TOKEN", "load-token");
+
+        let mut file = tempfile::NamedTempFile::new().expect("create temp config");
+        write!(
+            file,
+            r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "authorization"
+value = "${{ACL_PROXY_TEST_LOAD_TOKEN}}"
+            "#
+        )
+        .expect("write config");
+
+        let config = Config::load_from_sources(Some(file.path()))
+            .expect("load should resolve header action placeholder");
+        let PolicyRuleConfig::Direct(rule) = &config.policy.rules[0] else {
+            panic!("expected direct rule");
+        };
+        assert_eq!(
+            rule.header_actions[0].value.as_deref(),
+            Some("load-token"),
+            "expected resolved value after load_from_sources"
         );
     }
 }

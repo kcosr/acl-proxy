@@ -279,6 +279,19 @@ action = "add"
 name = "x-approval-reason"
 value = "{{reason}}"
 
+# To source a static deployment token from the service environment at config
+# load/reload time, use an exact whole-string placeholder in a set/add
+# header action value:
+#
+# [[policy.rules.header_actions]]
+# direction = "request"
+# action = "set"
+# name = "authorization"
+# value = "${GITHUB_API_TOKEN}"
+#
+# Mixed strings like "Bearer ${GITHUB_API_TOKEN}" are rejected, and existing
+# literal ${...} strings in affected set/add values must be migrated.
+
 [[policy.rules]]
 # Example: use a sync plugin to allow a set of repository URLs.
 action = "allow"

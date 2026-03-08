@@ -26,6 +26,30 @@ After parsing the file, these overrides are applied:
 - `PROXY_HOST` - overrides `[proxy].bind_address` when non-empty
 - `LOG_LEVEL` - overrides `[logging].level` when non-empty
 
+## Header-action env placeholders
+
+Policy header actions also support a separate load-time env interpolation path for `set` / `add`
+`value` and `values[*]` entries:
+
+```toml
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "authorization"
+value = "${API_TOKEN}"
+```
+
+Rules:
+
+- Interpolation happens once when the config is loaded or reloaded.
+- Only exact whole-string placeholders are supported: `${NAME}`.
+- `NAME` must match `[A-Za-z_][A-Za-z0-9_]*`.
+- Mixed strings such as `Bearer ${TOKEN}` are rejected instead of partially interpolated.
+- Missing env vars fail `acl-proxy config validate`, startup, `policy dump`, and reload.
+- Approval macros using `{{name}}` are a separate feature and are not rewritten by this pass.
+- Existing literal `${...}` strings in affected `set` / `add` header-action fields are now
+  reserved syntax and must be migrated before rollout.
+
 ## Minimal configuration
 
 The generated default config is intentionally small:

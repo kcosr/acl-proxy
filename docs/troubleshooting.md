@@ -55,3 +55,15 @@ If you see "No configuration file found", create one with:
 ```bash
 acl-proxy config init config/acl-proxy.toml
 ```
+
+## Config validation fails on `${...}` header-action values
+
+Common messages:
+- `references missing env var 'NAME'`
+- `uses invalid env interpolation syntax`
+
+Checks:
+- Export required env vars in the same environment used for `acl-proxy config validate`,
+  startup, and reload.
+- Use exact whole-string placeholders only: `${NAME}`.
+- Do not use mixed strings such as `Bearer ${TOKEN}` in `set` / `add` header-action values.
