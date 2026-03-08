@@ -164,6 +164,28 @@ Use one evidence block per phase.
 - Go/No-Go decision: `GO`
 - Notes: `H1 forwards only allowed proxied request paths. Policy evaluation, capture metadata, and Host-header semantics remain tied to the original target, outer CONNECT handshake stays unchanged, and external-auth transport remains isolated from forwarding override.`
 
+- Phase: `H2`
+- Completion date: `2026-03-08`
+- Commit hash(es): `9d74c0f`
+- Acceptance evidence:
+  - `cargo test --test egress_forwarding_chain` -> `PASS; offline integration coverage verifies inner->outer->upstream forwarding, header-action trust propagation, unavailable-egress 502 mapping, and the supported chained loop-protection strategy`
+  - `cargo test --test config_reload egress_forwarding_enable_disable_updates_after_reload` -> `PASS; reload transitions direct -> forwarded -> direct without restart and preserves original-request routing semantics after rollback`
+  - `docs/operations.md`, `docs/proxy-modes.md`, `docs/architecture.md` -> `UPDATED; operator guidance now covers loop-header strategy, redirect/iptables bypass, plaintext inter-proxy leg risk, timeout sizing, and per-mode forwarding semantics`
+  - `cargo fmt` -> `PASS`
+  - `cargo clippy --all-targets --all-features -- -D warnings` -> `PASS`
+  - `cargo test` -> `PASS`
+  - `cargo build --release` -> `PASS; release profile built successfully`
+- Review run IDs + triage outcomes:
+  - `gemini:r_20260308030726487_2c68c52d`
+    - accept: final H2 artifact set satisfies all locked deliverables; review confirmed documentation clarity and coverage for chain, reload, and trust-boundary tests without identifying missing requirements
+  - `pi:r_20260308025352136_3c9fda3d`
+    - accept: strengthened operator docs to call out plaintext inter-proxy transport risk, provide a concrete redirect/iptables bypass example, add a timeout-sizing heuristic, and cross-reference chained-deployment guidance from `docs/proxy-modes.md`
+    - defer: add two-proxy end-to-end chaining coverage for CONNECT and transparent HTTPS modes in a follow-up expansion
+    - defer: add deny-through-chain and slow-egress timeout-path (`504`) integration coverage in a follow-up expansion
+    - defer: add alternative loop-header strategy coverage (distinct header names) and same-header negative-path (`508`) coverage in a follow-up expansion
+- Go/No-Go decision: `GO`
+- Notes: `H2 keeps forwarding optional, leaves transparent HTTP out of scope, preserves the outer CONNECT handshake behavior, and leaves external-auth transport unaffected by egress override. CHANGELOG.md was not updated because no implementation PR number exists yet.`
+
 ### Authoring-stage review evidence (spec plan stream)
 
 - Stage: `Spec authoring`
