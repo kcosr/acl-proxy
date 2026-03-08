@@ -179,7 +179,7 @@ Acceptance criteria:
 
 - Phase: `H3`
 - Completion date: `2026-03-08`
-- Commit hash(es): `TBD (to be set on H3 milestone commit)`
+- Commit hash(es): `1bfbf04`
 - Acceptance evidence:
   - `cargo fmt` -> passed.
   - `cargo clippy` -> passed.
