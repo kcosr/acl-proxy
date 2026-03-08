@@ -69,8 +69,13 @@ Notes:
 
 ## Chained proxy deployments
 
-- In phase one, the egress forwarding leg uses plain HTTP/1.1 over TCP to the
-  configured `proxy.egress.default` host:port.
+- The egress forwarding leg stays cleartext TCP to the configured
+  `proxy.egress.default` host:port.
+- Forwarding is protocol-aware per request: HTTP/2 requests use h2c on the
+  inner-to-outer hop, while HTTP/1.1 and upgrade/WebSocket flows stay
+  HTTP/1.1.
+- If an HTTP/2 chain hop cannot be established, the request fails; there is no
+  implicit downgrade for that request.
 - The recommended egress target for another `acl-proxy` instance is that
   instance's HTTP explicit listener.
 - For loop protection across multiple hops, either use different loop-header

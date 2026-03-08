@@ -26,6 +26,10 @@ Notes:
   dropped to avoid stalling requests.
 - Policy decision logs include `request_id`, `url`, `client_ip`, and rule
   metadata on the `acl_proxy::policy` target.
+- Transport logs on `acl_proxy::transport` (debug level) include per-request
+  ingress, egress-attempt, egress, and completion events with protocol fields
+  such as inbound/outbound HTTP version, chain protocol, upgrade detection, and
+  status.
 
 ## Capture
 

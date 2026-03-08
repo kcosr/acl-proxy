@@ -7,6 +7,7 @@
 - Add `headers_absent` policy predicate for missing-header deny guards, including config validation, request-header evaluation, inspection output, integration coverage, and operator docs ([#41](https://github.com/kcosr/acl-proxy/pull/41)).
 - Add an HTTP readiness probe at `{internal_base_path}/ready`, including integration coverage and operator documentation ([#42](https://github.com/kcosr/acl-proxy/pull/42)).
 - Add load-time `${NAME}` env interpolation for policy header-action `set`/`add` values, including deterministic config validation, ruleset/direct-rule coverage, CLI verification, and operator docs ([#43](https://github.com/kcosr/acl-proxy/pull/43)).
+- Preserve protocol shape for chained egress forwarding (`h2c` for inbound HTTP/2 request forwarding, `http/1.1` for HTTP/1.1 and upgrades), including diagnostics, tests, and operator docs ([#44](https://github.com/kcosr/acl-proxy/pull/44)).
 
 ## [0.0.8] - 2026-02-17
 

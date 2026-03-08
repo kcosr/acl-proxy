@@ -1,13 +1,18 @@
+use std::io::Read;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::{Arc, Mutex};
 
 use acl_proxy::app::AppState;
+use acl_proxy::capture::{CaptureKind, CaptureMode, CaptureRecord};
 use acl_proxy::config::{
     Config, EgressTargetConfig, HeaderActionConfig, HeaderActionKind, HeaderDirection, HeaderWhen,
     PolicyDefaultAction, PolicyRuleConfig, PolicyRuleDirectConfig,
 };
 use acl_proxy::proxy::http::run_http_proxy_on_listener;
-use http::StatusCode;
+use h2::client as h2_client;
+use http::header::{CONNECTION, UPGRADE};
+use http::{HeaderValue, StatusCode};
+use hyper::server::conn::Http;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server};
 use tempfile::TempDir;
@@ -52,6 +57,102 @@ async fn start_http_echo_server(body: &'static str) -> (SocketAddr, Arc<Mutex<Ve
     );
 
     (addr, seen_requests)
+}
+
+async fn start_upstream_websocket_echo_server() -> SocketAddr {
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind websocket upstream");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking websocket upstream");
+    let addr = listener.local_addr().expect("websocket upstream addr");
+
+    tokio::spawn(async move {
+        let listener =
+            tokio::net::TcpListener::from_std(listener).expect("tokio websocket listener");
+        loop {
+            let (socket, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+
+            tokio::spawn(async move {
+                let service = service_fn(|mut req: Request<Body>| async move {
+                    let on_upgrade = hyper::upgrade::on(&mut req);
+                    tokio::spawn(async move {
+                        let mut upgraded = match on_upgrade.await {
+                            Ok(stream) => stream,
+                            Err(_) => return,
+                        };
+
+                        let mut buf = [0_u8; 1024];
+                        loop {
+                            let n = match upgraded.read(&mut buf).await {
+                                Ok(0) => break,
+                                Ok(n) => n,
+                                Err(_) => break,
+                            };
+                            if upgraded.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+
+                    let mut resp = Response::new(Body::empty());
+                    *resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+                    resp.headers_mut()
+                        .insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+                    resp.headers_mut()
+                        .insert(UPGRADE, HeaderValue::from_static("websocket"));
+                    Ok::<_, hyper::Error>(resp)
+                });
+
+                let _ = Http::new()
+                    .http1_keep_alive(false)
+                    .serve_connection(socket, service)
+                    .with_upgrades()
+                    .await;
+            });
+        }
+    });
+
+    addr
+}
+
+async fn start_http1_only_probe_server() -> SocketAddr {
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind http1 probe upstream");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking http1 probe upstream");
+    let addr = listener.local_addr().expect("http1 probe upstream addr");
+
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).expect("tokio probe listener");
+        loop {
+            let (mut socket, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+
+            tokio::spawn(async move {
+                let mut prefix = [0_u8; 3];
+                if socket.read_exact(&mut prefix).await.is_err() {
+                    return;
+                }
+
+                // If the peer starts the HTTP/2 prior-knowledge preface ("PRI"),
+                // close the connection to simulate an HTTP/1.1-only egress target.
+                if &prefix == b"PRI" {
+                    return;
+                }
+
+                let response =
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                let _ = socket.write_all(response).await;
+            });
+        }
+    });
+
+    addr
 }
 
 fn minimal_config() -> Config {
@@ -153,6 +254,42 @@ async fn send_raw_http_request(addr: SocketAddr, raw_request: &str) -> (String, 
     (response, status)
 }
 
+async fn send_h2c_http_request(addr: SocketAddr, uri: &str) -> (String, StatusCode) {
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect proxy");
+    let (send_request, connection) = h2_client::handshake(stream).await.expect("h2 handshake");
+
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("h2 connection error: {err}");
+        }
+    });
+
+    let mut send_request = send_request.ready().await.expect("h2 ready");
+    let request = http::Request::builder()
+        .method("GET")
+        .uri(uri)
+        .version(http::Version::HTTP_2)
+        .body(())
+        .expect("build h2 request");
+
+    let (response_fut, _send_stream) = send_request
+        .send_request(request, true)
+        .expect("send h2 request");
+    let response = response_fut.await.expect("await h2 response");
+    let status = response.status();
+
+    let mut body = response.into_body();
+    let mut body_bytes = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.expect("h2 response chunk");
+        body_bytes.extend_from_slice(&chunk);
+    }
+
+    (String::from_utf8_lossy(&body_bytes).to_string(), status)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn two_proxy_chain_forwards_allowed_requests_end_to_end() {
     let (upstream_addr, seen_upstream) = start_http_echo_server("outer-upstream-ok").await;
@@ -194,6 +331,203 @@ async fn two_proxy_chain_forwards_allowed_requests_end_to_end() {
         .first()
         .expect("upstream should receive chained request");
     assert_eq!(request.uri, "/ok");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_proxy_chain_preserves_http2_on_inner_to_outer_hop() {
+    let (upstream_addr, seen_upstream) = start_http_echo_server("outer-upstream-h2").await;
+    let upstream_url = format!("http://{}:{}/h2", upstream_addr.ip(), upstream_addr.port());
+    let upstream_pattern = format!("http://{}:{}/**", upstream_addr.ip(), upstream_addr.port());
+
+    let mut outer_config = minimal_config();
+    outer_config.policy.default = PolicyDefaultAction::Deny;
+    outer_config.policy.rules = vec![allow_rule(upstream_pattern.clone(), Vec::new())];
+    outer_config.capture.allowed_request = true;
+    outer_config.capture.allowed_response = false;
+    let (outer_addr, outer_temp_dir) = start_proxy_with_config(outer_config).await;
+
+    let mut inner_config = minimal_config();
+    inner_config.policy.default = PolicyDefaultAction::Deny;
+    inner_config.policy.rules = vec![allow_rule(upstream_pattern, Vec::new())];
+    inner_config.loop_protection.enabled = true;
+    inner_config.loop_protection.add_header = false;
+    inner_config.proxy.egress.default = Some(EgressTargetConfig {
+        host: "127.0.0.1".to_string(),
+        port: outer_addr.port(),
+    });
+    let (inner_addr, _inner_temp_dir) = start_proxy_with_config(inner_config).await;
+
+    let (body, status) = send_h2c_http_request(inner_addr, &upstream_url).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "outer-upstream-h2");
+
+    let requests = seen_upstream.lock().unwrap();
+    let request = requests
+        .first()
+        .expect("upstream should receive chained request");
+    assert_eq!(request.uri, "/h2");
+
+    let capture_dir = outer_temp_dir.path().join("captures");
+    for _ in 0..20 {
+        if capture_dir.is_dir() {
+            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
+                .expect("read capture dir")
+                .collect();
+            if !entries.is_empty() {
+                break;
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+
+    let mut found_request_record = false;
+    for entry in std::fs::read_dir(&capture_dir).expect("read capture dir") {
+        let entry = entry.expect("capture entry");
+        if !entry.file_type().expect("capture file type").is_file() {
+            continue;
+        }
+
+        let mut contents = String::new();
+        std::fs::File::open(entry.path())
+            .expect("open capture file")
+            .read_to_string(&mut contents)
+            .expect("read capture file");
+        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
+
+        if record.kind != CaptureKind::Request || record.mode != CaptureMode::HttpProxy {
+            continue;
+        }
+        if record.url != upstream_url {
+            continue;
+        }
+
+        assert!(
+            record
+                .http_version
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with('2'),
+            "expected outer proxy to observe HTTP/2 chain hop, got {:?}",
+            record.http_version
+        );
+        found_request_record = true;
+        break;
+    }
+
+    assert!(
+        found_request_record,
+        "did not find outer proxy capture record for chained HTTP/2 request"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_proxy_chain_preserves_http1_upgrade_tunneling() {
+    let upstream_addr = start_upstream_websocket_echo_server().await;
+    let upstream_url = format!("http://{}:{}/ws", upstream_addr.ip(), upstream_addr.port());
+    let upstream_pattern = format!("http://{}:{}/**", upstream_addr.ip(), upstream_addr.port());
+    let upstream_host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    let mut outer_config = minimal_config();
+    outer_config.policy.default = PolicyDefaultAction::Deny;
+    outer_config.policy.rules = vec![allow_rule(upstream_pattern.clone(), Vec::new())];
+    let (outer_addr, _outer_temp_dir) = start_proxy_with_config(outer_config).await;
+
+    let mut inner_config = minimal_config();
+    inner_config.policy.default = PolicyDefaultAction::Deny;
+    inner_config.policy.rules = vec![allow_rule(upstream_pattern, Vec::new())];
+    inner_config.loop_protection.enabled = true;
+    inner_config.loop_protection.add_header = false;
+    inner_config.proxy.egress.default = Some(EgressTargetConfig {
+        host: "127.0.0.1".to_string(),
+        port: outer_addr.port(),
+    });
+    let (inner_addr, _inner_temp_dir) = start_proxy_with_config(inner_config).await;
+
+    let mut stream = tokio::net::TcpStream::connect(inner_addr)
+        .await
+        .expect("connect inner proxy");
+    let request = format!(
+        concat!(
+            "GET {url} HTTP/1.1\r\n",
+            "Host: {host}\r\n",
+            "Connection: Upgrade\r\n",
+            "Upgrade: websocket\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "\r\n"
+        ),
+        url = upstream_url,
+        host = upstream_host
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write websocket upgrade request");
+
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let n = tokio::time::timeout(tokio::time::Duration::from_secs(2), stream.read(&mut chunk))
+            .await
+            .expect("timed out waiting for websocket response")
+            .expect("read websocket response");
+        assert!(n > 0, "unexpected EOF while waiting for response headers");
+        response.extend_from_slice(&chunk[..n]);
+        if response.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let response_head = String::from_utf8_lossy(&response);
+    let status_line = response_head.lines().next().unwrap_or_default();
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    assert_eq!(status, StatusCode::SWITCHING_PROTOCOLS.as_u16());
+
+    let payload = b"ping-through-chain-upgrade";
+    stream
+        .write_all(payload)
+        .await
+        .expect("write tunneled payload");
+
+    let mut echoed = vec![0_u8; payload.len()];
+    tokio::time::timeout(
+        tokio::time::Duration::from_secs(2),
+        stream.read_exact(&mut echoed),
+    )
+    .await
+    .expect("timed out waiting for echoed payload")
+    .expect("read echoed payload");
+
+    assert_eq!(echoed.as_slice(), payload);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn h2_chain_hop_to_http1_only_egress_returns_bad_gateway_without_downgrade() {
+    let probe_addr = start_http1_only_probe_server().await;
+
+    let mut inner_config = minimal_config();
+    inner_config.policy.default = PolicyDefaultAction::Deny;
+    inner_config.policy.rules = vec![allow_rule(
+        "http://example.invalid/**".to_string(),
+        Vec::new(),
+    )];
+    inner_config.loop_protection.enabled = true;
+    inner_config.loop_protection.add_header = false;
+    inner_config.proxy.egress.default = Some(EgressTargetConfig {
+        host: "127.0.0.1".to_string(),
+        port: probe_addr.port(),
+    });
+    let (inner_addr, _inner_temp_dir) = start_proxy_with_config(inner_config).await;
+
+    let (_body, status) =
+        send_h2c_http_request(inner_addr, "http://example.invalid/no-downgrade").await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
 }
 
 #[tokio::test(flavor = "multi_thread")]

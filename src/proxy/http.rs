@@ -221,6 +221,7 @@ async fn handle_http_request(
     let header_actions = matched_rule
         .map(|m| m.header_actions.clone())
         .unwrap_or_default();
+    let egress_request_header_actions = state.egress_request_header_actions.clone();
     let request_timeout_ms = matched_rule.and_then(|m| m.request_timeout_ms);
 
     if let Some(rule) = matched_rule {
@@ -246,6 +247,7 @@ async fn handle_http_request(
                             profile_name,
                             request_timeout_ms,
                             header_actions,
+                            egress_request_header_actions.clone(),
                         )
                         .await;
                         return Ok(resp);
@@ -267,6 +269,7 @@ async fn handle_http_request(
                             &handler,
                             request_timeout_ms,
                             header_actions,
+                            egress_request_header_actions.clone(),
                         )
                         .await;
                         return Ok(resp);
@@ -305,6 +308,7 @@ async fn handle_http_request(
         CaptureMode::HttpProxy,
         request_timeout_ms,
         header_actions,
+        egress_request_header_actions,
     )
     .await;
 
@@ -627,6 +631,7 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
     profile_name: &str,
     request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
+    egress_request_header_actions: Vec<CompiledHeaderAction>,
     mode: CaptureMode,
 ) -> Response<Body> {
     let macro_descriptors =
@@ -741,6 +746,7 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
                 mode,
                 request_timeout_ms,
                 header_actions,
+                egress_request_header_actions,
             )
             .await
         }
@@ -814,6 +820,7 @@ async fn handle_external_auth_gate(
     profile_name: &str,
     request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
+    egress_request_header_actions: Vec<CompiledHeaderAction>,
 ) -> Response<Body> {
     run_external_auth_gate_lifecycle(
         state,
@@ -831,6 +838,7 @@ async fn handle_external_auth_gate(
         profile_name,
         request_timeout_ms,
         header_actions,
+        egress_request_header_actions,
         CaptureMode::HttpProxy,
     )
     .await
@@ -850,6 +858,7 @@ async fn handle_auth_plugin_gate(
     handler: &AuthPluginHandle,
     request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
+    egress_request_header_actions: Vec<CompiledHeaderAction>,
 ) -> Response<Body> {
     run_auth_plugin_gate_lifecycle(
         state,
@@ -865,6 +874,7 @@ async fn handle_auth_plugin_gate(
         handler,
         request_timeout_ms,
         header_actions,
+        egress_request_header_actions,
         CaptureMode::HttpProxy,
     )
     .await
@@ -884,6 +894,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
     handler: &AuthPluginHandle,
     request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
+    egress_request_header_actions: Vec<CompiledHeaderAction>,
     mode: CaptureMode,
 ) -> Response<Body> {
     let decision = handler
@@ -908,6 +919,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
                 mode,
                 request_timeout_ms,
                 combined,
+                egress_request_header_actions,
             )
             .await
         }
@@ -1418,6 +1430,7 @@ pub(crate) async fn proxy_allowed_request(
     mode: CaptureMode,
     request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
+    egress_request_header_actions: Vec<CompiledHeaderAction>,
 ) -> Response<Body> {
     let upstream_uri: Uri = match full_url.parse() {
         Ok(u) => u,
@@ -1439,7 +1452,8 @@ pub(crate) async fn proxy_allowed_request(
 
     let req_headers_snapshot = req.headers().clone();
     let original_request_presence = snapshot_header_presence(req.headers());
-    let downstream_upgrade = if is_upgrade_request(req.headers()) {
+    let request_is_upgrade = is_upgrade_request(req.headers());
+    let downstream_upgrade = if request_is_upgrade {
         Some(hyper::upgrade::on(&mut req))
     } else {
         None
@@ -1492,6 +1506,16 @@ pub(crate) async fn proxy_allowed_request(
             HeaderDirection::Request,
             &original_request_presence,
         );
+
+        // Evaluate global egress action `when` conditions against the
+        // post-rule/plugin request header state.
+        let pre_global_egress_presence = snapshot_header_presence(headers);
+        apply_header_actions(
+            headers,
+            &egress_request_header_actions,
+            HeaderDirection::Request,
+            &pre_global_egress_presence,
+        );
     }
 
     let body = req.into_body();
@@ -1513,6 +1537,17 @@ pub(crate) async fn proxy_allowed_request(
     let forwarding_target = state.config.proxy.egress.default.as_ref();
     let request_timeout =
         resolve_request_timeout_ms(request_timeout_ms, state.config.proxy.request_timeout_ms);
+    tracing::debug!(
+        target: "acl_proxy::transport",
+        request_id = %request_id,
+        mode = ?mode,
+        url = %full_url,
+        stage = "ingress",
+        inbound_http_version = %version_to_string(version),
+        upgrade_requested = request_is_upgrade,
+        egress_forwarding_enabled = forwarding_target.is_some(),
+        "transport ingress accepted"
+    );
     let upstream_resp = match request_timeout {
         Some(timeout) => {
             match tokio::time::timeout(
@@ -1520,6 +1555,8 @@ pub(crate) async fn proxy_allowed_request(
                 send_upstream_request(
                     client_http,
                     forwarding_target,
+                    version,
+                    request_is_upgrade,
                     &request_id,
                     &full_url,
                     upstream_req,
@@ -1557,6 +1594,8 @@ pub(crate) async fn proxy_allowed_request(
             send_upstream_request(
                 client_http,
                 forwarding_target,
+                version,
+                request_is_upgrade,
                 &request_id,
                 &full_url,
                 upstream_req,
@@ -1648,6 +1687,18 @@ pub(crate) async fn proxy_allowed_request(
         upstream_http_version = %version_to_string(resp_version),
         status = %status.as_u16(),
         "proxied request completed"
+    );
+    tracing::debug!(
+        target: "acl_proxy::transport",
+        request_id = %request_id,
+        mode = ?mode,
+        url = %full_url,
+        stage = "complete",
+        inbound_http_version = %version_to_string(version),
+        outbound_http_version = %version_to_string(resp_version),
+        upgrade_requested = request_is_upgrade,
+        status = %status.as_u16(),
+        "transport request completed"
     );
 
     // Spawn capture writing in the background so the proxy response can
@@ -1761,37 +1812,92 @@ pub(crate) async fn proxy_allowed_request(
 async fn send_upstream_request(
     client_http: Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>,
     forwarding_target: Option<&EgressTargetConfig>,
+    request_version: Version,
+    request_is_upgrade: bool,
     request_id: &str,
     full_url: &str,
     upstream_req: Request<Body>,
 ) -> Result<Response<Body>, UpstreamRequestError> {
     match forwarding_target {
         Some(target) => {
-            send_request_via_egress_target(target, request_id, full_url, upstream_req).await
-        }
-        None => client_http
-            .request(upstream_req)
+            send_request_via_egress_target(
+                target,
+                request_version,
+                request_is_upgrade,
+                request_id,
+                full_url,
+                upstream_req,
+            )
             .await
-            .map_err(UpstreamRequestError::from),
+        }
+        None => {
+            let outbound_http_version = version_to_string(upstream_req.version());
+            tracing::debug!(
+                target: "acl_proxy::transport",
+                request_id = %request_id,
+                url = %full_url,
+                stage = "egress",
+                egress_transport = "direct",
+                outbound_http_version = %outbound_http_version,
+                "sending request to direct upstream destination"
+            );
+            client_http
+                .request(upstream_req)
+                .await
+                .map_err(UpstreamRequestError::from)
+        }
     }
 }
 
 async fn send_request_via_egress_target(
     target: &EgressTargetConfig,
+    request_version: Version,
+    request_is_upgrade: bool,
     request_id: &str,
     full_url: &str,
-    upstream_req: Request<Body>,
+    mut upstream_req: Request<Body>,
 ) -> Result<Response<Body>, UpstreamRequestError> {
+    let use_http2 = request_version == Version::HTTP_2 && !request_is_upgrade;
+    let chain_protocol = if use_http2 { "h2c" } else { "http/1.1" };
+    let ingress_http_version = version_to_string(request_version);
+
     tracing::debug!(
+        target: "acl_proxy::transport",
         request_id = %request_id,
         url = %full_url,
+        stage = "egress_attempt",
+        egress_transport = "chain",
         egress_host = %target.host,
         egress_port = target.port,
+        chain_protocol,
         "forwarding allowed request via configured egress destination"
     );
 
     let stream = TcpStream::connect((egress_dial_host(&target.host), target.port)).await?;
-    let (mut sender, connection) = conn::handshake(stream).await?;
+    let mut conn_builder = conn::Builder::new();
+    if use_http2 {
+        conn_builder.http2_only(true);
+        *upstream_req.version_mut() = Version::HTTP_2;
+    } else {
+        *upstream_req.version_mut() = Version::HTTP_11;
+    }
+    let outbound_http_version = version_to_string(upstream_req.version());
+
+    let (mut sender, connection) = conn_builder.handshake(stream).await?;
+    tracing::debug!(
+        target: "acl_proxy::transport",
+        request_id = %request_id,
+        url = %full_url,
+        stage = "egress",
+        egress_transport = "chain",
+        chain_protocol,
+        ingress_http_version = %ingress_http_version,
+        outbound_http_version = %outbound_http_version,
+        upgrade_requested = request_is_upgrade,
+        egress_host = %target.host,
+        egress_port = target.port,
+        "sending request to configured egress destination"
+    );
 
     let request_id = request_id.to_string();
     let full_url = full_url.to_string();

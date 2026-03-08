@@ -51,6 +51,21 @@ internal_base_path = "/_acl-proxy"
 # host = "172.17.0.1"
 # port = 8889
 
+# Optional global outbound request header actions. These apply to every
+# forwarded request (explicit HTTP proxy, CONNECT inner requests, and
+# transparent HTTPS) after matched-rule/plugin request header actions.
+# They do not affect rule matching.
+#
+# [[proxy.egress.request_header_actions]]
+# action = "remove"
+# name = "x-aw-identity-token"
+# when = "if_present" # always | if_present | if_absent
+#
+# [[proxy.egress.request_header_actions]]
+# action = "set"
+# name = "x-egress-tag"
+# value = "edge-a"
+
 ###############################################################################
 # Logging
 ###############################################################################

@@ -279,6 +279,7 @@ async fn handle_inner_https_request(
     let header_actions = matched_rule
         .map(|m| m.header_actions.clone())
         .unwrap_or_default();
+    let egress_request_header_actions = state.egress_request_header_actions.clone();
     let request_timeout_ms = matched_rule.and_then(|m| m.request_timeout_ms);
 
     if let Some(rule) = matched_rule {
@@ -304,6 +305,7 @@ async fn handle_inner_https_request(
                             profile_name,
                             request_timeout_ms,
                             header_actions,
+                            egress_request_header_actions.clone(),
                         )
                         .await;
                         return Ok(resp);
@@ -325,6 +327,7 @@ async fn handle_inner_https_request(
                             &handler,
                             request_timeout_ms,
                             header_actions,
+                            egress_request_header_actions.clone(),
                             CaptureMode::HttpsConnect,
                         )
                         .await;
@@ -364,6 +367,7 @@ async fn handle_inner_https_request(
         CaptureMode::HttpsConnect,
         request_timeout_ms,
         header_actions,
+        egress_request_header_actions,
     )
     .await;
 
@@ -386,6 +390,7 @@ async fn handle_inner_external_auth_gate(
     profile_name: &str,
     request_timeout_ms: Option<u64>,
     header_actions: Vec<crate::policy::CompiledHeaderAction>,
+    egress_request_header_actions: Vec<crate::policy::CompiledHeaderAction>,
 ) -> Response<Body> {
     run_external_auth_gate_lifecycle(
         state,
@@ -403,6 +408,7 @@ async fn handle_inner_external_auth_gate(
         profile_name,
         request_timeout_ms,
         header_actions,
+        egress_request_header_actions,
         CaptureMode::HttpsConnect,
     )
     .await

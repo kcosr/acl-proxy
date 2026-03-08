@@ -64,6 +64,7 @@ schema_version = "1"
 
 [proxy]
 [proxy.egress]
+[[proxy.egress.request_header_actions]]
 [logging]
 [capture]
 [loop_protection]
@@ -77,9 +78,9 @@ schema_version = "1"
 
 The remaining sections are optional and defaulted when absent.
 
-`[proxy.egress.default]` is an additive schema v1 contract. It does not require
-changing `schema_version`; keeping the section absent preserves the existing
-direct-to-origin forwarding behavior.
+`[proxy.egress.default]` and `[[proxy.egress.request_header_actions]]` are
+additive schema v1 contracts. They do not require changing `schema_version`;
+keeping them absent preserves existing direct-to-origin behavior.
 
 ---
 
@@ -97,6 +98,11 @@ internal_base_path = "/_acl-proxy" # default
 [proxy.egress.default]
 host = "172.17.0.1"
 port = 8889
+
+[[proxy.egress.request_header_actions]]
+action = "remove"
+name = "x-aw-identity-token"
+when = "if_present"
 ```
 
 Fields:
@@ -157,6 +163,56 @@ Reload behavior:
 - A valid config reload atomically swaps in the updated egress destination for
   new requests.
 - If reload validation fails, the previous running state remains active.
+
+### `[[proxy.egress.request_header_actions]]` - global outbound request header actions
+
+This optional ordered list defines request-header actions applied to every
+forwarded upstream request after matched-rule/plugin request actions and before
+the upstream send.
+
+Scope and ordering:
+
+1. Policy matching runs first and is unchanged (first match wins).
+2. Matched rule request actions run first.
+3. Plugin request actions (when present) run next.
+4. Global egress request actions run last.
+5. Request is sent upstream.
+
+These global egress actions never participate in rule matching. They apply to
+explicit HTTP proxy requests, HTTPS CONNECT inner requests, and transparent
+HTTPS forwarding requests.
+
+Example:
+
+```toml
+[[proxy.egress.request_header_actions]]
+action = "set"                # remove | set | add | replace_substring
+name = "x-egress-tag"
+value = "edge-a"
+when = "always"               # always | if_present | if_absent
+```
+
+Fields:
+
+- `action` (`"remove" | "set" | "add" | "replace_substring"`, required):
+  - Same semantics as `[[policy.rules.header_actions]]`, but request-only.
+- `name` (string, required):
+  - Header name (case-insensitive). Must be a valid HTTP header name.
+- `value` / `values` (string or list, for `set`/`add`):
+  - Exactly one of `value` or `values` must be provided.
+  - Values must be valid HTTP header values.
+  - Exact whole-string env placeholders `${NAME}` resolve at config load/reload.
+- `when` (`"always" | "if_present" | "if_absent"`, optional):
+  - Evaluated against header presence at the start of the global egress layer
+    (after rule/plugin request actions).
+- `search` / `replace` (strings, for `replace_substring`):
+  - `search` must be non-empty; both fields are required.
+
+Validation and errors:
+
+- Invalid entries fail config validation/startup/reload with location-aware
+  context: `proxy.egress.request_header_actions[<idx>]`.
+- Existing configs without this section remain valid.
 
 ---
 
@@ -669,6 +725,10 @@ For `when` evaluation, the proxy snapshots header presence separately for the re
 before applying any header actions for that side, and uses that snapshot for all actions in the
 rule. Actions are then applied in the order they appear in the configuration.
 
+After rule/plugin request actions complete, a separate global egress request
+layer may run from `[[proxy.egress.request_header_actions]]`; its `when`
+evaluation uses a fresh snapshot taken at the start of that global layer.
+
 Approval macros:
 
 - Header `value`/`values` may contain approval macros using `{{name}}` syntax (double braces).
@@ -844,8 +904,9 @@ Semantics:
   - For `type = "plugin"`:
     - The proxy sends a JSON request over stdio to the plugin and waits for an
       allow/deny response (up to `timeout_ms`).
-    - On allow: proxies the request upstream, applying rule header actions first
-      and plugin header actions second.
+    - On allow: proxies the request upstream, applying rule header actions
+      first, plugin header actions second, and global egress request actions
+      third.
     - On deny: returns `403 Forbidden` with a plugin-denied response.
     - On plugin failure: returns `503 Service Unavailable`.
 - When `action = "deny"` and `external_auth_profile` is set:
