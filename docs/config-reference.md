@@ -534,6 +534,8 @@ Fields:
 - `description` (`string`, optional) – may also contain `{placeholder}` names.
 - `methods` (string or list of strings, optional) – HTTP methods (normalized to uppercase).
 - `subnets` (`["192.168.0.0/16", ...]`, optional) – list of IPv4/IPv6 CIDR subnets.
+- `headers_absent` (`["header-name", ...]`, optional) – same semantics as direct rules; when the
+  ruleset is included, the expanded rule matches if any listed inbound request header is missing.
 - `request_timeout_ms` (integer, optional) – override the upstream timeout for matching requests
   (`0` disables the timeout for those requests).
 
@@ -552,6 +554,12 @@ Example:
 
 ```toml
 [[policy.rules]]
+action = "deny"
+pattern = "**"
+headers_absent = ["x-workload-id"]
+description = "Deny requests missing workload identity"
+
+[[policy.rules]]
 action = "allow"
 pattern = "https://api.internal.example.com/v1/**"
 methods = ["GET", "POST"]
@@ -566,6 +574,12 @@ Fields:
 - `description` (`string`, optional).
 - `methods` (string or list, optional) – allowed HTTP methods (normalized to uppercase).
 - `subnets` (`["CIDR", ...]`, optional) – allowed client IP subnets (IPv4 or IPv6 CIDR ranges).
+- `headers_absent` (`["header-name", ...]`, optional) – match when any listed inbound request
+  header is missing:
+  - Header names are matched case-insensitively and normalized to lowercase for validation.
+  - The list must be non-empty, each name must be a valid HTTP header name, and duplicates after
+    normalization are rejected.
+  - A header present with an empty value still counts as present.
 - `request_timeout_ms` (integer, optional) – override the upstream timeout for this rule
   (`0` disables the timeout for this rule).
 - `with` (map from macro name to single string or list of strings, optional):
@@ -576,8 +590,8 @@ Fields:
     using both raw and URL-encoded values.
   - When a list of names, only those placeholders get URL-encoded variants.
 
-At least one of `pattern`, `methods`, or `subnets` must be present; otherwise the rule is rejected
-as invalid.
+At least one of `pattern`, `methods`, `subnets`, or `headers_absent` must be present; otherwise
+the rule is rejected as invalid.
 
 Rules without `pattern` but with subnets and/or methods are allowed (e.g., “allow POST requests
 from `10.0.0.0/8` to any URL”).
@@ -678,6 +692,8 @@ Fields:
 - `methods` / `subnets` (optional) – rule-level overrides:
   - If provided, override template-level `methods` / `subnets` in the referenced ruleset.
   - If omitted, the template’s `methods` / `subnets` are used.
+- `headers_absent` is inherited from the referenced ruleset template when present; include rules do
+  not override it in this release.
 - `request_timeout_ms` (integer, optional):
   - Overrides the template’s `request_timeout_ms` for all rules produced by this include
     (`0` disables the timeout for those rules).

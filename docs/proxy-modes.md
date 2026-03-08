@@ -28,6 +28,8 @@ curl -x http://127.0.0.1:8881 http://example.com/
 - Decrypted requests inside the tunnel are processed as HTTP/1.1.
 - Policy is evaluated on each decrypted request; the CONNECT request itself is
   only used to establish the tunnel.
+- Request-header predicates such as `headers_absent` apply only to the
+  decrypted inner requests, not to the outer CONNECT establishment request.
 
 Example:
 

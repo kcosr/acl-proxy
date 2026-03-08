@@ -15,6 +15,7 @@ This doc focuses on behavior and concepts. For field-level details, see
    - Pattern match (if set)
    - Subnet match (if set)
    - Method match (if set)
+   - `headers_absent` match (if set)
 5. First match wins.
 6. If nothing matches, apply `policy.default`.
 
@@ -86,6 +87,25 @@ all placeholders used in the rule or ruleset.
 
 Rules may omit `pattern` and match only on methods and/or subnets.
 
+## Header-absence predicate
+
+Rules can also match on missing inbound request headers:
+
+```toml
+[[policy.rules]]
+action = "deny"
+pattern = "**"
+headers_absent = ["x-workload-id"]
+description = "Deny requests missing workload identity"
+```
+
+Behavior:
+- `headers_absent` matches when any listed request header is missing.
+- Header-name lookup is case-insensitive.
+- A header present with an empty value still counts as present.
+- When all listed headers are present, the rule falls through to the next rule.
+- On HTTPS over CONNECT, this predicate applies to the decrypted inner request, not the outer CONNECT tunnel-establishment request.
+
 ## Header actions
 
 Rules can modify headers on matching requests/responses:
@@ -103,6 +123,7 @@ Behavior:
 - `set` replaces existing values; `add` appends; `remove` deletes.
 - `replace_substring` rewrites textual header values.
 - `when` is evaluated against the original header set before any actions run.
+- Header actions do not participate in rule matching. `headers_absent` is evaluated first against the inbound request headers, and actions run only after a rule matches.
 
 ## Approval macros
 

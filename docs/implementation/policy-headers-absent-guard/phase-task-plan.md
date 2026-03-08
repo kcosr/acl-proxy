@@ -112,6 +112,72 @@ Acceptance criteria:
 - Go/No-Go decision: `GO|NO-GO`
 - Notes: `<caveats/deferred items>`
 
+### Execution-stage evidence
+
+- Phase: `H0`
+- Completion date: `2026-03-08`
+- Commit hash(es): `416252e`
+- Acceptance evidence:
+  - `cargo test headers_absent --lib` -> passed (`6 passed; 0 failed`) covering empty-list rejection, invalid-header rejection, duplicate-after-normalization rejection, `headers_absent`-only match criteria, template validation, and positive normalization.
+  - `rg -n "headers_absent" docs/config-reference.md acl-proxy.sample.toml src/config/mod.rs src/policy/mod.rs` -> confirmed config-model fields, `has_match_criteria` wiring, validation helper/tests, ruleset/direct-rule docs, include inheritance note, and sample usage are present.
+- Review run IDs + triage outcomes:
+  - `gemini:r_20260308033027172_e1f21047`
+    - accept: H0 deliverables and targeted coverage are complete.
+    - reject: include-rule override symmetry for `headers_absent` is outside the locked minimal scope.
+    - reject: templated header-name placeholders are outside the locked contract.
+  - `pi:r_20260308033027199_8a5ad453`
+    - accept: add `headers_absent` to the ruleset-template field listing in `docs/config-reference.md`.
+    - accept: document that include rules inherit `headers_absent` from referenced templates and do not override it in this release.
+    - accept: add a positive normalization assertion for valid `headers_absent` input.
+    - defer: effective policy / inspection output remains an H1 deliverable.
+    - reject: duplicate empty-list validation in `validate_basic()` is unnecessary because the policy validation path already returns a clear deterministic error.
+- Go/No-Go decision: `GO`
+- Notes: Both required reviews completed from live session streams with no fallback. The only deferred item is the effective-policy output update, which is explicitly scoped to H1.
+
+- Phase: `H1`
+- Completion date: `2026-03-08`
+- Commit hash(es): `859736c`
+- Acceptance evidence:
+  - `cargo test headers_absent --lib` -> passed (`13 passed; 0 failed`) covering absent/present/empty behavior, case-insensitive lookup, method+subnet `AND` semantics, validation, normalization, and effective-policy output.
+  - `cargo test policy_dump --test policy_cli` -> passed (`4 passed; 0 failed`) confirming JSON and table inspection output both include `headers_absent`.
+- Review run IDs + triage outcomes:
+  - `gemini:r_20260308033714556_bd797e9b`
+    - accept: H1 deliverables are implemented cleanly across engine compilation, evaluation, call sites, and inspection output.
+    - defer: clarify in H2 docs that `headers_absent` applies to decrypted inner requests, not CONNECT tunnel establishment metadata.
+  - `pi:r_20260308033714564_29a5eeb6`
+    - accept: add explicit subnet `AND` semantics coverage for `headers_absent`.
+    - defer: multi-header `any`-absent semantics test remains scheduled for H2 per the locked phase plan.
+    - defer: CONNECT outer-vs-inner request-header behavior should be clarified in H2 docs.
+    - reject: narrowing `is_allowed_with_headers` to a test-only API is stylistic and not required.
+    - reject: keeping both validation-time normalization and compile-time `HeaderName` conversion is intentional separation of concerns.
+- Go/No-Go decision: `GO`
+- Notes: Both required reviews completed from live session streams with no fallback. The only deferred items are H2-scoped docs/integration coverage additions.
+
+- Phase: `H2`
+- Completion date: `2026-03-08`
+- Commit hash(es): `502ea25`
+- Acceptance evidence:
+  - `cargo test headers_absent --lib` -> passed (`14 passed; 0 failed`) covering absent/present/empty behavior, case-insensitive lookup, method+subnet `AND` semantics, and multi-header `any`-absent matching including the both-missing case.
+  - `cargo test headers_absent_top_deny_guard_falls_through_to_allow_rule --test proxy_http` -> passed, confirming top deny guard behavior, fall-through to an allow rule when the header is present, denial before upstream forwarding when the header is missing, and empty-value headers are treated as present.
+  - `cargo test method_scoped_headers_absent_guard_only_blocks_matching_methods --test proxy_http` -> passed, confirming `methods` + `headers_absent` `AND` semantics in the live HTTP proxy path.
+  - `cargo fmt` -> passed.
+  - `cargo clippy` -> passed.
+  - `cargo test` -> passed.
+  - `cargo build --release` -> passed.
+  - `rg -n "headers_absent|Header-absence predicate|CONNECT establishment|inbound request-header predicates" docs/policy.md docs/architecture.md docs/proxy-modes.md` -> confirmed docs distinguish request-header predicates from header actions and clarify CONNECT inner-request scope.
+- Review run IDs + triage outcomes:
+  - `gemini:r_20260308034729082_89f099b1`
+    - accept: H2 integration coverage and doc updates satisfy the locked deliverables and acceptance criteria.
+    - accept: add the H2 Section 9 evidence block.
+    - defer: add the `CHANGELOG.md` `Unreleased` entry once a PR number exists, per repo release rules.
+  - `pi:r_20260308034729082_24e21da6`
+    - accept: add an explicit both-missing assertion to the multi-header `headers_absent` unit test for self-contained `any`-absent coverage.
+    - defer: CONNECT-path integration coverage is a follow-up risk reduction item, not required for the locked minimal scope because the same request-evaluation path is already exercised by unit coverage and documented clearly.
+    - defer: add the `CHANGELOG.md` `Unreleased` entry once a PR number exists, per repo release rules.
+    - reject: replacing the local `MethodList` deserialization helper in the integration test is cosmetic and not required without a public constructor.
+- Go/No-Go decision: `GO`
+- Notes: Full project verification completed successfully after the H2 implementation changes. `CHANGELOG.md` remains intentionally unchanged until a PR number exists, matching the repo instructions in `AGENTS.md`.
+
 ### Authoring-stage review evidence (spec plan stream)
 
 - Stage: `Spec authoring`

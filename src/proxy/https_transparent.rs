@@ -254,6 +254,7 @@ async fn handle_inner_https_request(
         &full_url,
         Some(&client_ip_for_policy),
         Some(method.as_str()),
+        req.headers(),
     );
 
     state.logging.log_policy_decision(PolicyDecisionLogContext {
