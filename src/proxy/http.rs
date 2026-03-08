@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err, clippy::too_many_arguments)]
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::convert::Infallible;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
@@ -1974,12 +1976,12 @@ fn apply_header_actions(
     original_present: &HashSet<HeaderName>,
 ) {
     for action in actions {
-        let applies_to_direction = match (&action.direction, &direction) {
-            (HeaderDirection::Request, HeaderDirection::Request) => true,
-            (HeaderDirection::Response, HeaderDirection::Response) => true,
-            (HeaderDirection::Both, _) => true,
-            _ => false,
-        };
+        let applies_to_direction = matches!(
+            (&action.direction, &direction),
+            (HeaderDirection::Request, HeaderDirection::Request)
+                | (HeaderDirection::Response, HeaderDirection::Response)
+                | (HeaderDirection::Both, _)
+        );
         if !applies_to_direction {
             continue;
         }

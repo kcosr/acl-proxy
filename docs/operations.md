@@ -49,6 +49,50 @@ requests, and transparent HTTPS requests.
 
 When the timeout expires, the proxy responds with `504 Gateway Timeout`.
 
+## Chained egress forwarding
+
+When `[proxy.egress.default]` is configured, allowed proxied requests are sent
+to the configured egress host:port instead of dialing the original target
+directly.
+
+Operational expectations:
+
+- In phase one, the inter-proxy forwarding leg is plain HTTP/1.1 over TCP.
+  Deploy the egress destination on a trusted/local network path.
+- The forwarded request keeps the original absolute URI and original `Host`
+  header, so the outer proxy still evaluates policy against the real target.
+- The usual target for chained deployments is the outer proxy's HTTP explicit
+  listener (`proxy.http_port`), not the transparent HTTPS listener.
+
+Loop-prevention guidance:
+
+- If both hops use loop protection, either configure different
+  `loop_protection.header_name` values per hop, or disable outbound loop-header
+  injection on the inner proxy with `loop_protection.add_header = false`.
+- Exempt the outer proxy's listener address/port from any redirect/iptables
+  rules that feed traffic into the inner proxy, or the chain can loop back into
+  itself before policy is evaluated. For example, if the outer proxy listens on
+  `127.0.0.1:8881`, exclude that destination from the inner proxy's REDIRECT
+  rules.
+
+TLS and trust guidance:
+
+- Clients still need to trust the proxy CA that terminates their TLS
+  connection for CONNECT and transparent HTTPS flows.
+- Phase-one egress forwarding does not add TLS on the inter-proxy hop; CA trust
+  does not protect the inner-to-outer forwarding leg. Request bodies and any
+  sensitive headers injected by inner-proxy header actions travel in cleartext
+  on that hop.
+
+Timeout guidance:
+
+- Two-hop forwarding adds an extra connection and policy decision point. If the
+  outer proxy performs additional checks or upstreams are slow, raise
+  `proxy.request_timeout_ms` (or per-rule `request_timeout_ms`) accordingly.
+- As a starting point, set the inner proxy timeout high enough to cover the
+  outer proxy timeout plus its upstream work so the inner hop does not mask the
+  outer proxy's own timeout/error response.
+
 ## External auth timeouts
 
 External auth profiles define `timeout_ms` (decision timeout) and optional

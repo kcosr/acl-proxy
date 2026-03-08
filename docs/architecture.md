@@ -9,6 +9,7 @@ for operators who want to understand how requests flow through the system.
 - Transparent HTTPS listener (`proxy.https_port`)
 - Shared application state (`AppState`) that contains:
   - Config and policy engine
+  - Optional default egress forwarding destination
   - Certificate manager (CA + per-host certs)
   - Loop protection settings
   - Logging settings
@@ -26,7 +27,10 @@ State is wrapped in `ArcSwap` to allow atomic reloads.
 3. Evaluate policy (URL, client IP, method).
 4. Optional external auth gate.
 5. Apply header actions and forward to upstream.
-6. Capture/log as configured.
+6. When `proxy.egress.default` is set, dial the configured egress destination
+   instead of the original target while preserving the original URI and `Host`
+   header.
+7. Capture/log as configured.
 
 ### HTTPS CONNECT (MITM)
 
@@ -35,6 +39,8 @@ State is wrapped in `ArcSwap` to allow atomic reloads.
 3. Establish TLS tunnel using per-host certificate.
 4. Parse inner HTTP/1.1 requests.
 5. Apply policy/external auth/header actions per request.
+6. If egress forwarding is enabled, apply it only to the decrypted inner
+   requests. The outer CONNECT handshake is unchanged.
 
 ### Transparent HTTPS
 
@@ -42,6 +48,9 @@ State is wrapped in `ArcSwap` to allow atomic reloads.
 2. Select certificate by SNI.
 3. Parse decrypted HTTP/1.1 or HTTP/2 requests.
 4. Apply policy/external auth/header actions per request.
+5. If egress forwarding is enabled, dial the configured egress destination for
+   allowed requests while keeping policy/capture metadata tied to the original
+   target.
 
 ## Reload and shutdown
 

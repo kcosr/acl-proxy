@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_lock, clippy::while_let_on_iterator)]
+
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::{Arc, Mutex};

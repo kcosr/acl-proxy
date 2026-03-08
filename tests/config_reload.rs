@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_lock)]
+
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::{Arc, Mutex};
 
@@ -8,6 +10,12 @@ use http::StatusCode;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[derive(Clone, Debug)]
+struct ObservedRequest {
+    uri: String,
+    headers: hyper::HeaderMap,
+}
 
 async fn start_upstream_echo_server() -> (SocketAddr, Arc<Mutex<Option<hyper::HeaderMap>>>) {
     let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind upstream");
@@ -38,6 +46,42 @@ async fn start_upstream_echo_server() -> (SocketAddr, Arc<Mutex<Option<hyper::He
     tokio::spawn(server);
 
     (addr, seen_headers)
+}
+
+async fn start_observed_echo_server(
+    body: &'static str,
+) -> (SocketAddr, Arc<Mutex<Vec<ObservedRequest>>>) {
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind upstream");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking upstream");
+    let addr = listener.local_addr().expect("upstream addr");
+
+    let observed: Arc<Mutex<Vec<ObservedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let observed_clone = observed.clone();
+
+    let make_svc = make_service_fn(move |_conn| {
+        let observed = observed_clone.clone();
+        async move {
+            Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
+                let observed = observed.clone();
+                async move {
+                    observed.lock().unwrap().push(ObservedRequest {
+                        uri: req.uri().to_string(),
+                        headers: req.headers().clone(),
+                    });
+                    Ok::<_, hyper::Error>(Response::new(Body::from(body)))
+                }
+            }))
+        }
+    });
+
+    let server = Server::from_tcp(listener)
+        .expect("server from tcp")
+        .serve(make_svc);
+    tokio::spawn(server);
+
+    (addr, observed)
 }
 
 fn minimal_config() -> Config {
@@ -349,4 +393,96 @@ fn invalid_egress_forwarding_config_is_rejected_on_reload() {
         shared_state.load().config.proxy.egress.default.is_none(),
         "failed reload should preserve the previous state"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn egress_forwarding_enable_disable_updates_after_reload() {
+    let (direct_addr, direct_requests) = start_observed_echo_server("direct").await;
+    let (forward_addr, forward_requests) = start_observed_echo_server("forwarded").await;
+
+    let mut config = minimal_config();
+    let temp = tempfile::tempdir().expect("temp certs dir");
+    prepare_app_config_for_reload_tests(&mut config, temp.path());
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            pattern: Some(format!(
+                "http://{}:{}/**",
+                direct_addr.ip(),
+                direct_addr.port()
+            )),
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let shared_state = AppState::shared_from_config(config.clone()).expect("app state");
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let proxy_addr =
+        start_proxy_with_shared_state(shared_state.clone(), listener, shutdown.clone()).await;
+
+    let direct_host = format!("{}:{}", direct_addr.ip(), direct_addr.port());
+    let raw_request =
+        format!("GET http://{direct_host}/reload HTTP/1.1\r\nHost: {direct_host}\r\nConnection: close\r\n\r\n");
+
+    let (response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        response.contains("\r\n\r\ndirect"),
+        "expected direct upstream response before reload: {response}"
+    );
+    assert_eq!(direct_requests.lock().unwrap().len(), 1);
+    assert_eq!(forward_requests.lock().unwrap().len(), 0);
+
+    let mut enabled = config.clone();
+    enabled.proxy.egress.default = Some(EgressTargetConfig {
+        host: "127.0.0.1".to_string(),
+        port: forward_addr.port(),
+    });
+    AppState::reload_shared_from_config(&shared_state, enabled).expect("reload config");
+
+    let (response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        response.contains("\r\n\r\nforwarded"),
+        "expected forwarding response after enable reload: {response}"
+    );
+    assert_eq!(direct_requests.lock().unwrap().len(), 1);
+    let forwarded = forward_requests.lock().unwrap();
+    assert_eq!(forwarded.len(), 1);
+    assert_eq!(forwarded[0].uri, format!("http://{direct_host}/reload"));
+    assert_eq!(
+        forwarded[0]
+            .headers
+            .get("host")
+            .and_then(|value| value.to_str().ok()),
+        Some(direct_host.as_str())
+    );
+    drop(forwarded);
+
+    AppState::reload_shared_from_config(&shared_state, config).expect("reload config");
+
+    let (response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        response.contains("\r\n\r\ndirect"),
+        "expected direct upstream response after disable reload: {response}"
+    );
+    assert_eq!(direct_requests.lock().unwrap().len(), 2);
+    assert_eq!(forward_requests.lock().unwrap().len(), 1);
+
+    shutdown.notify_waiters();
 }
