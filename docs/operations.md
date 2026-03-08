@@ -73,8 +73,13 @@ directly.
 
 Operational expectations:
 
-- In phase one, the inter-proxy forwarding leg is plain HTTP/1.1 over TCP.
-  Deploy the egress destination on a trusted/local network path.
+- The inter-proxy forwarding leg remains cleartext TCP. Deploy the egress
+  destination on a trusted/local network path.
+- Forwarding is protocol-aware per request:
+  - HTTP/2 requests use h2c on the inner-to-outer hop.
+  - HTTP/1.1 requests (including upgrade/WebSocket flows) stay HTTP/1.1.
+  - HTTP/2 requests do not silently downgrade when the outer hop cannot
+    negotiate HTTP/2.
 - The forwarded request keeps the original absolute URI and original `Host`
   header, so the outer proxy still evaluates policy against the real target.
 - The usual target for chained deployments is the outer proxy's HTTP explicit
@@ -95,7 +100,7 @@ TLS and trust guidance:
 
 - Clients still need to trust the proxy CA that terminates their TLS
   connection for CONNECT and transparent HTTPS flows.
-- Phase-one egress forwarding does not add TLS on the inter-proxy hop; CA trust
+- Current egress forwarding does not add TLS on the inter-proxy hop; CA trust
   does not protect the inner-to-outer forwarding leg. Request bodies and any
   sensitive headers injected by inner-proxy header actions travel in cleartext
   on that hop.

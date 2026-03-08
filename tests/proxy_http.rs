@@ -8,6 +8,7 @@ use std::time::Duration;
 use acl_proxy::app::AppState;
 use acl_proxy::config::Config;
 use acl_proxy::proxy::http::run_http_proxy_on_listener;
+use h2::client as h2_client;
 use http::header::HeaderValue;
 use http::StatusCode;
 use hyper::service::{make_service_fn, service_fn};
@@ -1034,6 +1035,84 @@ async fn send_raw_http_request(addr: SocketAddr, raw_request: &str) -> (String, 
     };
 
     (response, status)
+}
+
+async fn send_h2c_http_request(addr: SocketAddr, uri: &str) -> (String, StatusCode) {
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect proxy");
+    let (send_request, connection) = h2_client::handshake(stream).await.expect("h2 handshake");
+
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("h2 connection error: {err}");
+        }
+    });
+
+    let mut send_request = send_request.ready().await.expect("h2 ready");
+    let request = http::Request::builder()
+        .method("GET")
+        .uri(uri)
+        .version(http::Version::HTTP_2)
+        .body(())
+        .expect("build h2 request");
+
+    let (response_fut, _send_stream) = send_request
+        .send_request(request, true)
+        .expect("send h2 request");
+    let response = response_fut.await.expect("await h2 response");
+    let status = response.status();
+
+    let mut body = response.into_body();
+    let mut body_bytes = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.expect("h2 response chunk");
+        body_bytes.extend_from_slice(&chunk);
+    }
+
+    (String::from_utf8_lossy(&body_bytes).to_string(), status)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http_explicit_listener_accepts_h2c_prior_knowledge_requests() {
+    let (upstream_addr, _seen_headers) = start_upstream_echo_server().await;
+
+    let mut config = minimal_config();
+    config.capture.allowed_request = false;
+    config.capture.allowed_response = false;
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            pattern: Some(format!(
+                "http://{}:{}/**",
+                upstream_addr.ip(),
+                upstream_addr.port()
+            )),
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let uri = format!("http://{}:{}/h2c", upstream_addr.ip(), upstream_addr.port());
+    let (body, status) = send_h2c_http_request(proxy_addr, &uri).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "ok");
 }
 
 #[tokio::test(flavor = "multi_thread")]
