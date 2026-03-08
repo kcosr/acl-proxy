@@ -37,6 +37,13 @@ pub enum ConfigPathKind {
     Default,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderActionEnvPlaceholder<'a> {
+    None,
+    Exact { name: &'a str },
+    Invalid,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ExternalAuthConfig {
     /// Full callback URL external auth services should use when
@@ -787,6 +794,7 @@ impl Config {
         })?;
 
         config.apply_env_overrides();
+        config.interpolate_header_action_env_vars()?;
         config.validate_basic()?;
 
         Ok(config)
@@ -819,6 +827,26 @@ impl Config {
                 self.logging.level = level;
             }
         }
+    }
+
+    fn interpolate_header_action_env_vars(&mut self) -> Result<(), ConfigError> {
+        for (rule_idx, rule) in self.policy.rules.iter_mut().enumerate() {
+            let PolicyRuleConfig::Direct(rule) = rule else {
+                continue;
+            };
+
+            let rule_location = format_direct_rule_location(rule_idx);
+            interpolate_header_actions(&mut rule.header_actions, rule_location.as_str())?;
+        }
+
+        for (ruleset_name, rules) in self.policy.rulesets.iter_mut() {
+            for (rule_idx, rule) in rules.iter_mut().enumerate() {
+                let rule_location = format_ruleset_template_location(ruleset_name, rule_idx);
+                interpolate_header_actions(&mut rule.header_actions, rule_location.as_str())?;
+            }
+        }
+
+        Ok(())
     }
 
     pub(crate) fn validate_basic(&self) -> Result<(), ConfigError> {
@@ -888,6 +916,99 @@ impl Config {
 
         Ok(())
     }
+}
+
+fn interpolate_header_actions(
+    header_actions: &mut [HeaderActionConfig],
+    rule_location: &str,
+) -> Result<(), ConfigError> {
+    for (header_action_idx, header_action) in header_actions.iter_mut().enumerate() {
+        if !matches!(
+            header_action.action,
+            HeaderActionKind::Set | HeaderActionKind::Add
+        ) {
+            continue;
+        }
+
+        let action_location = format_header_action_location(
+            rule_location,
+            header_action_idx,
+            header_action.name.as_str(),
+        );
+
+        if let Some(value) = header_action.value.as_mut() {
+            interpolate_header_action_value(value, action_location.as_str())?;
+        }
+
+        if let Some(values) = header_action.values.as_mut() {
+            for value in values.iter_mut() {
+                interpolate_header_action_value(value, action_location.as_str())?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn interpolate_header_action_value(
+    raw_value: &mut String,
+    action_location: &str,
+) -> Result<(), ConfigError> {
+    match classify_header_action_env_placeholder(raw_value.as_str()) {
+        HeaderActionEnvPlaceholder::None => Ok(()),
+        HeaderActionEnvPlaceholder::Invalid => Err(ConfigError::Invalid(format!(
+            "{action_location} uses invalid env interpolation syntax: '{raw_value}'"
+        ))),
+        HeaderActionEnvPlaceholder::Exact { .. } => Ok(()),
+    }
+}
+
+fn classify_header_action_env_placeholder(raw_value: &str) -> HeaderActionEnvPlaceholder<'_> {
+    if !raw_value.contains("${") {
+        return HeaderActionEnvPlaceholder::None;
+    }
+
+    let Some(name) = raw_value
+        .strip_prefix("${")
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
+        return HeaderActionEnvPlaceholder::Invalid;
+    };
+
+    if name.is_empty() {
+        return HeaderActionEnvPlaceholder::Invalid;
+    }
+
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return HeaderActionEnvPlaceholder::Invalid;
+    };
+
+    if !matches!(first, 'A'..='Z' | 'a'..='z' | '_') {
+        return HeaderActionEnvPlaceholder::Invalid;
+    }
+
+    if !chars.all(|ch| matches!(ch, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_')) {
+        return HeaderActionEnvPlaceholder::Invalid;
+    }
+
+    HeaderActionEnvPlaceholder::Exact { name }
+}
+
+fn format_direct_rule_location(rule_idx: usize) -> String {
+    format!("policy.rules[{rule_idx}]")
+}
+
+fn format_ruleset_template_location(ruleset_name: &str, rule_idx: usize) -> String {
+    format!("policy.rulesets.{ruleset_name}[{rule_idx}]")
+}
+
+fn format_header_action_location(
+    rule_location: &str,
+    header_action_idx: usize,
+    header_name: &str,
+) -> String {
+    format!("{rule_location}.header_actions[{header_action_idx}] for header '{header_name}'")
 }
 
 pub fn write_default_config(path: &Path) -> Result<(), ConfigError> {
@@ -1123,6 +1244,7 @@ fn validate_internal_base_path(path: &str) -> Result<(), ConfigError> {
 mod tests {
     use super::*;
     use crate::config::PolicyDefaultAction;
+    use std::io::Write;
 
     #[test]
     fn minimal_config_round_trip() {
@@ -2004,6 +2126,168 @@ external_auth_profile = "example"
         assert!(
             msg.contains("include_headers entries must not contain whitespace"),
             "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn header_action_env_placeholder_classifier_is_exact_only() {
+        assert_eq!(
+            classify_header_action_env_placeholder("static-value"),
+            HeaderActionEnvPlaceholder::None
+        );
+        assert_eq!(
+            classify_header_action_env_placeholder("${API_TOKEN}"),
+            HeaderActionEnvPlaceholder::Exact { name: "API_TOKEN" }
+        );
+        assert_eq!(
+            classify_header_action_env_placeholder("${_TOKEN_2}"),
+            HeaderActionEnvPlaceholder::Exact { name: "_TOKEN_2" }
+        );
+
+        for raw in [
+            "Bearer ${TOKEN}",
+            "${TOKEN}/suffix",
+            "${}",
+            "${1BAD}",
+            "${BAD-NAME}",
+            "${TOKEN",
+        ] {
+            assert_eq!(
+                classify_header_action_env_placeholder(raw),
+                HeaderActionEnvPlaceholder::Invalid,
+                "expected invalid placeholder for {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_action_env_interpolation_reports_direct_rule_location() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "authorization"
+value = "Bearer ${TOKEN}"
+        "#;
+
+        let mut config: Config = toml::from_str(toml).expect("parse config");
+        let err = config
+            .interpolate_header_action_env_vars()
+            .expect_err("interpolation should fail");
+        let msg = format!("{err}");
+
+        assert!(
+            msg.contains("policy.rules[0].header_actions[0] for header 'authorization'"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains("Bearer ${TOKEN}"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn header_action_env_interpolation_reports_ruleset_location() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rulesets.api_headers]]
+action = "allow"
+pattern = "https://api.internal/**"
+
+[[policy.rulesets.api_headers.header_actions]]
+direction = "request"
+action = "add"
+name = "x-env-tag"
+values = ["${DEPLOYMENT}/prod"]
+
+[[policy.rules]]
+include = "api_headers"
+        "#;
+
+        let mut config: Config = toml::from_str(toml).expect("parse config");
+        let err = config
+            .interpolate_header_action_env_vars()
+            .expect_err("interpolation should fail");
+        let msg = format!("{err}");
+
+        assert!(
+            msg.contains("policy.rulesets.api_headers[0].header_actions[0] for header 'x-env-tag'"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains("${DEPLOYMENT}/prod"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_from_sources_invokes_header_action_env_interpolation() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp config");
+        write!(
+            file,
+            r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "authorization"
+value = "Bearer ${{TOKEN}}"
+            "#
+        )
+        .expect("write config");
+
+        let err = Config::load_from_sources(Some(file.path()))
+            .expect_err("load should fail on invalid interpolation syntax");
+        let msg = format!("{err}");
+
+        assert!(
+            msg.contains("policy.rules[0].header_actions[0] for header 'authorization'"),
+            "unexpected error message: {msg}"
         );
     }
 }
