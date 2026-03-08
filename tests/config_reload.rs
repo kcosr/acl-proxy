@@ -2,7 +2,7 @@ use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::{Arc, Mutex};
 
 use acl_proxy::app::AppState;
-use acl_proxy::config::Config;
+use acl_proxy::config::{Config, EgressTargetConfig};
 use acl_proxy::proxy::http::run_http_proxy_on_listener;
 use http::StatusCode;
 use hyper::service::{make_service_fn, service_fn};
@@ -64,6 +64,11 @@ default = "deny"
     "#;
 
     toml::from_str(toml).expect("parse config")
+}
+
+fn prepare_app_config_for_reload_tests(config: &mut Config, certs_dir: &std::path::Path) {
+    config.logging.directory = None;
+    config.certificates.certs_dir = certs_dir.display().to_string();
 }
 
 async fn start_proxy_with_shared_state(
@@ -283,4 +288,65 @@ async fn failed_reload_keeps_previous_state() {
     );
 
     shutdown.notify_waiters();
+}
+
+#[test]
+fn egress_forwarding_config_updates_after_reload() {
+    let temp = tempfile::tempdir().expect("temp certs dir");
+
+    let mut config = minimal_config();
+    prepare_app_config_for_reload_tests(&mut config, temp.path());
+
+    let shared_state = AppState::shared_from_config(config.clone()).expect("app state");
+    assert!(
+        shared_state.load().config.proxy.egress.default.is_none(),
+        "egress target should be absent before reload"
+    );
+
+    let mut updated = config.clone();
+    updated.proxy.egress.default = Some(EgressTargetConfig {
+        host: "proxy.internal".to_string(),
+        port: 9443,
+    });
+
+    AppState::reload_shared_from_config(&shared_state, updated).expect("reload config");
+
+    let current = shared_state.load();
+    let target = current
+        .config
+        .proxy
+        .egress
+        .default
+        .as_ref()
+        .expect("egress target should exist after reload");
+    assert_eq!(target.host, "proxy.internal");
+    assert_eq!(target.port, 9443);
+}
+
+#[test]
+fn invalid_egress_forwarding_config_is_rejected_on_reload() {
+    let temp = tempfile::tempdir().expect("temp certs dir");
+
+    let mut config = minimal_config();
+    prepare_app_config_for_reload_tests(&mut config, temp.path());
+
+    let shared_state = AppState::shared_from_config(config.clone()).expect("app state");
+
+    let mut invalid = config.clone();
+    invalid.proxy.egress.default = Some(EgressTargetConfig {
+        host: "proxy.internal:9443".to_string(),
+        port: 9443,
+    });
+
+    let err = AppState::reload_shared_from_config(&shared_state, invalid)
+        .expect_err("reload should fail");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("proxy.egress.default.host must not include a port suffix"),
+        "unexpected reload error: {msg}"
+    );
+    assert!(
+        shared_state.load().config.proxy.egress.default.is_none(),
+        "failed reload should preserve the previous state"
+    );
 }

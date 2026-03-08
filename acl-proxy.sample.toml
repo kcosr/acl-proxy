@@ -41,6 +41,16 @@ request_timeout_ms = 30000
 # Base path for internal endpoints (external auth callbacks).
 internal_base_path = "/_acl-proxy"
 
+# Optional default egress forwarding destination. Leave this section absent to
+# preserve the default direct-to-origin behavior. When enabled, allowed proxy
+# request-forwarding paths dial this host/port instead of the original target,
+# while policy matching and Host header semantics stay tied to the original
+# request destination.
+#
+# [proxy.egress.default]
+# host = "172.17.0.1"
+# port = 8889
+
 ###############################################################################
 # Logging
 ###############################################################################

@@ -1,7 +1,8 @@
 # Configuration
 
 acl-proxy is configured using a single TOML file. The configuration controls
-listeners, logging, capture, certificates, TLS, and the policy engine.
+listeners, optional egress forwarding, logging, capture, certificates, TLS,
+and the policy engine.
 
 ## Config file location
 
@@ -55,6 +56,7 @@ Start with this and expand as needed.
 schema_version = "1"
 
 [proxy]
+[proxy.egress]
 [logging]
 [capture]
 [loop_protection]
@@ -63,5 +65,10 @@ schema_version = "1"
 [external_auth]
 [policy]
 ```
+
+`[proxy.egress.default]` is an additive schema v1 section. Adding it does not
+change `schema_version`; omitting it keeps direct-to-origin forwarding behavior.
+When enabled, it sends allowed proxied traffic to a fixed forwarding
+destination instead of dialing the original target directly.
 
 See `docs/config-reference.md` for full field-level details.

@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
 use ipnet::IpNet;
@@ -112,6 +113,9 @@ pub struct ProxyConfig {
 
     #[serde(default = "default_internal_base_path")]
     pub internal_base_path: String,
+
+    #[serde(default)]
+    pub egress: ProxyEgressConfig,
 }
 
 impl Default for ProxyConfig {
@@ -123,6 +127,7 @@ impl Default for ProxyConfig {
             https_port: default_https_port(),
             request_timeout_ms: default_request_timeout_ms(),
             internal_base_path: default_internal_base_path(),
+            egress: ProxyEgressConfig::default(),
         }
     }
 }
@@ -149,6 +154,18 @@ fn default_request_timeout_ms() -> u64 {
 
 fn default_internal_base_path() -> String {
     "/_acl-proxy".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ProxyEgressConfig {
+    #[serde(default)]
+    pub default: Option<EgressTargetConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EgressTargetConfig {
+    pub host: String,
+    pub port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -798,7 +815,7 @@ impl Config {
         }
     }
 
-    fn validate_basic(&self) -> Result<(), ConfigError> {
+    pub(crate) fn validate_basic(&self) -> Result<(), ConfigError> {
         if self.schema_version != DEFAULT_SCHEMA_VERSION {
             return Err(ConfigError::Invalid(format!(
                 "unsupported schema_version {}, expected {}",
@@ -849,7 +866,7 @@ impl Config {
             ));
         }
 
-        validate_internal_base_path(&self.proxy.internal_base_path)?;
+        validate_proxy_config(&self.proxy)?;
 
         // Validate policy semantics (macros, rulesets, includes).
         crate::policy::PolicyEngine::from_config(&self.policy)
@@ -902,6 +919,78 @@ fn validate_logging_config(logging: &LoggingConfig) -> Result<(), ConfigError> {
         return Err(ConfigError::Invalid(format!("{e}")));
     }
     Ok(())
+}
+
+fn validate_proxy_config(proxy: &ProxyConfig) -> Result<(), ConfigError> {
+    validate_internal_base_path(&proxy.internal_base_path)?;
+
+    if let Some(target) = proxy.egress.default.as_ref() {
+        validate_egress_target(target)?;
+    }
+
+    Ok(())
+}
+
+fn validate_egress_target(target: &EgressTargetConfig) -> Result<(), ConfigError> {
+    validate_egress_host(&target.host)?;
+
+    if target.port == 0 {
+        return Err(ConfigError::Invalid(
+            "proxy.egress.default.port must be in the inclusive range 1..65535".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_egress_host(host: &str) -> Result<(), ConfigError> {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::Invalid(
+            "proxy.egress.default.host must not be empty".to_string(),
+        ));
+    }
+    if trimmed != host {
+        return Err(ConfigError::Invalid(
+            "proxy.egress.default.host must not include leading or trailing whitespace".to_string(),
+        ));
+    }
+
+    if trimmed.starts_with('[') || trimmed.ends_with(']') {
+        let inner = trimmed
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .ok_or_else(|| {
+                ConfigError::Invalid(
+                    "proxy.egress.default.host must be a valid DNS hostname or IP literal without a port suffix"
+                        .to_string(),
+                )
+            })?;
+
+        return inner.parse::<IpAddr>().map(|_| ()).map_err(|_| {
+            ConfigError::Invalid(
+                "proxy.egress.default.host must be a valid DNS hostname or IP literal without a port suffix"
+                    .to_string(),
+            )
+        });
+    }
+
+    if trimmed.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+
+    if trimmed.contains(':') {
+        return Err(ConfigError::Invalid(
+            "proxy.egress.default.host must not include a port suffix".to_string(),
+        ));
+    }
+
+    url::Host::parse(trimmed).map(|_| ()).map_err(|_| {
+        ConfigError::Invalid(
+            "proxy.egress.default.host must be a valid DNS hostname or IP literal without a port suffix"
+                .to_string(),
+        )
+    })
 }
 
 fn validate_capture_config(capture: &CaptureConfig) -> Result<(), ConfigError> {
@@ -1073,6 +1162,47 @@ default = "deny"
     }
 
     #[test]
+    fn proxy_egress_default_is_optional() {
+        let config = Config::default();
+        assert!(config.proxy.egress.default.is_none());
+    }
+
+    #[test]
+    fn proxy_egress_default_parses_when_valid() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[proxy.egress.default]
+host = "proxy.internal"
+port = 9443
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let target = config
+            .proxy
+            .egress
+            .default
+            .as_ref()
+            .expect("egress target should exist");
+        assert_eq!(target.host, "proxy.internal");
+        assert_eq!(target.port, 9443);
+        config
+            .validate_basic()
+            .expect("valid egress target should pass validation");
+    }
+
+    #[test]
     fn proxy_internal_base_path_requires_leading_slash() {
         let toml = r#"
 schema_version = "1"
@@ -1122,6 +1252,214 @@ default = "deny"
         let msg = format!("{err}");
         assert!(
             msg.contains("proxy.internal_base_path"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn proxy_egress_default_rejects_blank_host() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[proxy.egress.default]
+host = "   "
+port = 8889
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("proxy.egress.default.host must not be empty"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn proxy_egress_default_rejects_host_with_surrounding_whitespace() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[proxy.egress.default]
+host = " proxy.internal "
+port = 8889
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(
+                "proxy.egress.default.host must not include leading or trailing whitespace"
+            ),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn proxy_egress_default_rejects_host_with_port_suffix() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[proxy.egress.default]
+host = "proxy.internal:8889"
+port = 8889
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("proxy.egress.default.host must not include a port suffix"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn proxy_egress_default_accepts_ip_literals() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[proxy.egress.default]
+host = "::1"
+port = 8889
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        config
+            .validate_basic()
+            .expect("IPv6 literals should pass validation");
+    }
+
+    #[test]
+    fn proxy_egress_default_accepts_bracketed_ipv6_literals() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[proxy.egress.default]
+host = "[::1]"
+port = 8889
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        config
+            .validate_basic()
+            .expect("bracketed IPv6 literals should pass validation");
+    }
+
+    #[test]
+    fn proxy_egress_default_rejects_malformed_bracketed_host() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[proxy.egress.default]
+host = "[not-an-ip]"
+port = 8889
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(
+                "proxy.egress.default.host must be a valid DNS hostname or IP literal without a port suffix"
+            ),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn proxy_egress_default_rejects_zero_port() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[proxy.egress.default]
+host = "proxy.internal"
+port = 0
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("proxy.egress.default.port must be in the inclusive range 1..65535"),
             "unexpected error message: {msg}"
         );
     }
