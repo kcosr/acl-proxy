@@ -1036,6 +1036,172 @@ async fn allowed_request_is_proxied_and_loop_header_added() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn headers_absent_top_deny_guard_falls_through_to_allow_rule() {
+    let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
+
+    let mut config = minimal_config();
+    config.capture.allowed_request = false;
+    config.capture.allowed_response = false;
+
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![
+        acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Deny,
+            pattern: Some(format!("http://{host}/**")),
+            description: Some("Deny requests missing identity".to_string()),
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: Some(vec!["x-workload-id".to_string()]),
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        }),
+        acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            pattern: Some(format!("http://{host}/**")),
+            description: Some("Allow upstream traffic".to_string()),
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        }),
+    ];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let missing_header_request =
+        format!("GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let (_response, deny_status) = send_raw_http_request(proxy_addr, &missing_header_request).await;
+    assert_eq!(deny_status, StatusCode::FORBIDDEN);
+    assert!(
+        seen_headers.lock().unwrap().is_none(),
+        "denied guard request must not reach upstream"
+    );
+
+    let empty_header_request = format!(
+        "GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nX-Workload-Id:\r\nConnection: close\r\n\r\n"
+    );
+    let (response, allow_status) = send_raw_http_request(proxy_addr, &empty_header_request).await;
+    assert_eq!(allow_status, StatusCode::OK);
+    assert!(
+        response.contains("\r\n\r\nok"),
+        "response body should contain 'ok', got: {response}"
+    );
+
+    let headers_guard = seen_headers.lock().unwrap();
+    let upstream_headers = headers_guard
+        .as_ref()
+        .expect("upstream should see allowed request");
+    assert_eq!(
+        upstream_headers
+            .get("x-workload-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn method_scoped_headers_absent_guard_only_blocks_matching_methods() {
+    let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
+
+    let mut config = minimal_config();
+    config.capture.allowed_request = false;
+    config.capture.allowed_response = false;
+
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![
+        acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Deny,
+            pattern: Some(format!("http://{host}/**")),
+            description: Some("Deny POSTs missing identity".to_string()),
+            methods: Some({
+                #[derive(serde::Deserialize)]
+                struct MethodListWrapper {
+                    methods: acl_proxy::config::MethodList,
+                }
+
+                toml::from_str::<MethodListWrapper>("methods = [\"POST\"]")
+                    .expect("parse methods")
+                    .methods
+            }),
+            subnets: Vec::new(),
+            headers_absent: Some(vec!["x-workload-id".to_string()]),
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        }),
+        acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            pattern: Some(format!("http://{host}/**")),
+            description: Some("Allow upstream traffic".to_string()),
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        }),
+    ];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let post_missing_header =
+        format!("POST http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    let (_response, post_deny_status) =
+        send_raw_http_request(proxy_addr, &post_missing_header).await;
+    assert_eq!(post_deny_status, StatusCode::FORBIDDEN);
+
+    let get_missing_header =
+        format!("GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let (_response, get_allow_status) =
+        send_raw_http_request(proxy_addr, &get_missing_header).await;
+    assert_eq!(get_allow_status, StatusCode::OK);
+
+    let post_with_header = format!(
+        "POST http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nX-Workload-Id: worker-123\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    );
+    let (_response, post_allow_status) = send_raw_http_request(proxy_addr, &post_with_header).await;
+    assert_eq!(post_allow_status, StatusCode::OK);
+
+    let headers_guard = seen_headers.lock().unwrap();
+    let upstream_headers = headers_guard
+        .as_ref()
+        .expect("upstream should see allowed request");
+    assert_eq!(
+        upstream_headers
+            .get("x-workload-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("worker-123")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn loop_header_not_added_when_disabled() {
     let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
 

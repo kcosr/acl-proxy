@@ -234,7 +234,8 @@ impl PolicyEngine {
                 }
             }
 
-            if !rule.headers_absent.is_empty() && !any_header_absent(headers, &rule.headers_absent) {
+            if !rule.headers_absent.is_empty() && !any_header_absent(headers, &rule.headers_absent)
+            {
                 continue;
             }
 
@@ -434,8 +435,9 @@ fn expand_direct_rule(
     if !has_pattern {
         return Err(PolicyError::RuleInvalid {
             index,
-            reason: "policy rule must define at least a pattern, subnets, methods, or headers_absent"
-                .to_string(),
+            reason:
+                "policy rule must define at least a pattern, subnets, methods, or headers_absent"
+                    .to_string(),
         });
     }
 
@@ -553,7 +555,8 @@ fn expand_include_rule(
 
     if placeholders.is_empty() {
         for template in templates {
-            let headers_absent = validate_headers_absent(template.headers_absent.as_deref(), index)?;
+            let headers_absent =
+                validate_headers_absent(template.headers_absent.as_deref(), index)?;
             let methods = rule
                 .methods
                 .as_ref()
@@ -594,7 +597,8 @@ fn expand_include_rule(
 
     for combo in combos {
         for template in templates {
-            let headers_absent = validate_headers_absent(template.headers_absent.as_deref(), index)?;
+            let headers_absent =
+                validate_headers_absent(template.headers_absent.as_deref(), index)?;
             let methods = rule
                 .methods
                 .as_ref()
@@ -856,11 +860,12 @@ fn validate_headers_absent(
 
     for name in headers_absent {
         let lowered = name.to_ascii_lowercase();
-        let parsed =
-            HeaderName::from_lowercase(lowered.as_bytes()).map_err(|err| PolicyError::RuleInvalid {
+        let parsed = HeaderName::from_lowercase(lowered.as_bytes()).map_err(|err| {
+            PolicyError::RuleInvalid {
                 index,
                 reason: format!("invalid header name '{}' in headers_absent: {err}", name),
-            })?;
+            }
+        })?;
         let normalized_name = parsed.as_str().to_string();
 
         if !seen.insert(normalized_name.clone()) {
@@ -1602,7 +1607,8 @@ headers_absent = ["x-workload-id"]
         let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
         let headers = HeaderMap::new();
 
-        let deny_decision = engine.evaluate("https://example.com/path", None, Some("POST"), &headers);
+        let deny_decision =
+            engine.evaluate("https://example.com/path", None, Some("POST"), &headers);
         let allow_decision =
             engine.evaluate("https://example.com/path", None, Some("GET"), &headers);
 
@@ -1626,8 +1632,12 @@ headers_absent = ["x-workload-id"]
         let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
         let headers = HeaderMap::new();
 
-        let deny_decision =
-            engine.evaluate("https://example.com/path", Some("10.1.2.3"), Some("GET"), &headers);
+        let deny_decision = engine.evaluate(
+            "https://example.com/path",
+            Some("10.1.2.3"),
+            Some("GET"),
+            &headers,
+        );
         let allow_decision = engine.evaluate(
             "https://example.com/path",
             Some("192.168.1.10"),
@@ -1637,6 +1647,57 @@ headers_absent = ["x-workload-id"]
 
         assert!(!deny_decision.allowed);
         assert!(allow_decision.allowed);
+    }
+
+    #[test]
+    fn headers_absent_matches_when_any_listed_header_is_missing() {
+        let toml = r#"
+default = "allow"
+
+[[rules]]
+action = "deny"
+headers_absent = ["x-workload-id", "x-trace-id"]
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        let both_missing = HeaderMap::new();
+        let both_present =
+            header_map(&[("x-workload-id", "worker-123"), ("x-trace-id", "trace-456")]);
+        let missing_workload = header_map(&[("x-trace-id", "trace-456")]);
+        let missing_trace = header_map(&[("x-workload-id", "worker-123")]);
+
+        assert!(
+            !engine
+                .evaluate("https://example.com/path", None, Some("GET"), &both_missing)
+                .allowed
+        );
+        assert!(
+            engine
+                .evaluate("https://example.com/path", None, Some("GET"), &both_present)
+                .allowed
+        );
+        assert!(
+            !engine
+                .evaluate(
+                    "https://example.com/path",
+                    None,
+                    Some("GET"),
+                    &missing_workload
+                )
+                .allowed
+        );
+        assert!(
+            !engine
+                .evaluate(
+                    "https://example.com/path",
+                    None,
+                    Some("GET"),
+                    &missing_trace
+                )
+                .allowed
+        );
     }
 
     #[test]
@@ -1782,8 +1843,11 @@ headers_absent = ["X-Workload-Id", "x-workload-id"]
         let err = PolicyEngine::from_config(&cfg).expect_err("expected error");
         let msg = format!("{err}");
         assert!(
-            msg.contains("duplicate header name 'x-workload-id' in headers_absent after normalization")
-                || msg.contains("duplicate header name 'X-Workload-Id' in headers_absent after normalization"),
+            msg.contains(
+                "duplicate header name 'x-workload-id' in headers_absent after normalization"
+            ) || msg.contains(
+                "duplicate header name 'X-Workload-Id' in headers_absent after normalization"
+            ),
             "unexpected error message: {msg}"
         );
     }
@@ -1827,10 +1891,7 @@ headers_absent = ["X-Workload-Id", "X-Trace-Id"]
         assert_eq!(expanded.rules.len(), 1);
         assert_eq!(
             expanded.rules[0].headers_absent,
-            Some(vec![
-                "x-workload-id".to_string(),
-                "x-trace-id".to_string()
-            ])
+            Some(vec!["x-workload-id".to_string(), "x-trace-id".to_string()])
         );
     }
 }
