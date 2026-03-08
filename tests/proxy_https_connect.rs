@@ -452,6 +452,72 @@ async fn configured_egress_forwarding_applies_to_https_connect_inner_requests() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn global_egress_request_actions_apply_to_https_connect_inner_requests() {
+    let (forward_addr, seen_requests) = start_forwarding_echo_server().await;
+
+    let mut config = minimal_connect_config();
+    config.capture.allowed_request = false;
+    config.capture.allowed_response = false;
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            pattern: Some("https://connect-target.test:9443/**".to_string()),
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
+        host: "127.0.0.1".to_string(),
+        port: forward_addr.port(),
+    });
+    config.proxy.egress.request_header_actions =
+        vec![acl_proxy::config::EgressRequestHeaderActionConfig {
+            action: acl_proxy::config::HeaderActionKind::Set,
+            name: "x-egress-tag".to_string(),
+            when: acl_proxy::config::HeaderWhen::Always,
+            value: Some("connect".to_string()),
+            values: None,
+            search: None,
+            replace: None,
+        }];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+    let ca_cert_path = temp_dir.path().join("certs").join("ca-cert.pem");
+
+    let (status, body) =
+        send_https_via_connect(proxy_addr, &ca_cert_path, "connect-target.test:9443", "/ok").await;
+
+    assert_eq!(status, StatusCode::OK.as_u16());
+    assert_eq!(body, "forwarded");
+
+    let requests = seen_requests.lock().unwrap();
+    let forwarded = requests
+        .first()
+        .expect("forwarding destination should see request");
+    assert_eq!(
+        forwarded
+            .headers
+            .get("x-egress-tag")
+            .and_then(|value| value.to_str().ok()),
+        Some("connect")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn denied_https_via_connect_returns_403() {
     let upstream_addr = start_upstream_https_echo_server().await;
 

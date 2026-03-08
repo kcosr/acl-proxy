@@ -808,6 +808,315 @@ async fn allowed_request_uses_configured_egress_forwarding_destination() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn global_egress_request_actions_are_applied_after_rule_actions_without_affecting_matching() {
+    let (forward_addr, seen_requests) = start_forwarding_echo_server().await;
+
+    let mut config = minimal_config();
+    config.capture.allowed_request = false;
+    config.capture.allowed_response = false;
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![
+        acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Deny,
+            pattern: Some("http://example.invalid/**".to_string()),
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: Some(vec!["x-gate".to_string()]),
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        }),
+        acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            pattern: Some("http://example.invalid/**".to_string()),
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: vec![
+                acl_proxy::config::HeaderActionConfig {
+                    direction: acl_proxy::config::HeaderDirection::Request,
+                    action: acl_proxy::config::HeaderActionKind::Set,
+                    name: "x-layer".to_string(),
+                    when: acl_proxy::config::HeaderWhen::Always,
+                    value: Some("rule-layer".to_string()),
+                    values: None,
+                    search: None,
+                    replace: None,
+                },
+                acl_proxy::config::HeaderActionConfig {
+                    direction: acl_proxy::config::HeaderDirection::Request,
+                    action: acl_proxy::config::HeaderActionKind::Set,
+                    name: "x-conditional".to_string(),
+                    when: acl_proxy::config::HeaderWhen::Always,
+                    value: Some("rule-set".to_string()),
+                    values: None,
+                    search: None,
+                    replace: None,
+                },
+            ],
+            external_auth_profile: None,
+            rule_id: None,
+        }),
+    ];
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
+        host: "127.0.0.1".to_string(),
+        port: forward_addr.port(),
+    });
+    config.proxy.egress.request_header_actions = vec![
+        acl_proxy::config::EgressRequestHeaderActionConfig {
+            action: acl_proxy::config::HeaderActionKind::ReplaceSubstring,
+            name: "x-layer".to_string(),
+            when: acl_proxy::config::HeaderWhen::IfPresent,
+            value: None,
+            values: None,
+            search: Some("rule".to_string()),
+            replace: Some("global".to_string()),
+        },
+        acl_proxy::config::EgressRequestHeaderActionConfig {
+            action: acl_proxy::config::HeaderActionKind::Remove,
+            name: "x-conditional".to_string(),
+            when: acl_proxy::config::HeaderWhen::IfPresent,
+            value: None,
+            values: None,
+            search: None,
+            replace: None,
+        },
+        acl_proxy::config::EgressRequestHeaderActionConfig {
+            action: acl_proxy::config::HeaderActionKind::Set,
+            name: "x-conditional".to_string(),
+            when: acl_proxy::config::HeaderWhen::IfAbsent,
+            value: Some("should-not-appear".to_string()),
+            values: None,
+            search: None,
+            replace: None,
+        },
+        acl_proxy::config::EgressRequestHeaderActionConfig {
+            action: acl_proxy::config::HeaderActionKind::Set,
+            name: "host".to_string(),
+            when: acl_proxy::config::HeaderWhen::Always,
+            value: Some("rewritten.invalid".to_string()),
+            values: None,
+            search: None,
+            replace: None,
+        },
+        acl_proxy::config::EgressRequestHeaderActionConfig {
+            action: acl_proxy::config::HeaderActionKind::Remove,
+            name: "x-gate".to_string(),
+            when: acl_proxy::config::HeaderWhen::IfPresent,
+            value: None,
+            values: None,
+            search: None,
+            replace: None,
+        },
+    ];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let raw_request = "GET http://example.invalid/ok HTTP/1.1\r\nHost: example.invalid\r\nX-Gate: present\r\nConnection: close\r\n\r\n";
+    let (response, status) = send_raw_http_request(proxy_addr, raw_request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        response.contains("\r\n\r\nforwarded"),
+        "unexpected response body: {response}"
+    );
+
+    let requests = seen_requests.lock().unwrap();
+    let forwarded = requests
+        .first()
+        .expect("forwarding destination should see request");
+
+    assert_eq!(
+        forwarded.uri, "http://example.invalid/ok",
+        "host header mutation must not rewrite request target"
+    );
+    assert_eq!(
+        forwarded
+            .headers
+            .get("host")
+            .and_then(|value| value.to_str().ok()),
+        Some("rewritten.invalid")
+    );
+    assert_eq!(
+        forwarded
+            .headers
+            .get("x-layer")
+            .and_then(|value| value.to_str().ok()),
+        Some("global-layer")
+    );
+    assert!(
+        forwarded.headers.get("x-conditional").is_none(),
+        "if_absent should be evaluated against pre-global-action presence snapshot"
+    );
+    assert!(
+        forwarded.headers.get("x-gate").is_none(),
+        "global egress remove should mutate outbound request headers"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn global_egress_request_actions_respect_intra_layer_order() {
+    let (forward_addr, seen_requests) = start_forwarding_echo_server().await;
+
+    let mut config = minimal_config();
+    config.capture.allowed_request = false;
+    config.capture.allowed_response = false;
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            pattern: Some("http://example.invalid/**".to_string()),
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
+        host: "127.0.0.1".to_string(),
+        port: forward_addr.port(),
+    });
+    config.proxy.egress.request_header_actions = vec![
+        acl_proxy::config::EgressRequestHeaderActionConfig {
+            action: acl_proxy::config::HeaderActionKind::Set,
+            name: "x-order".to_string(),
+            when: acl_proxy::config::HeaderWhen::Always,
+            value: Some("rule".to_string()),
+            values: None,
+            search: None,
+            replace: None,
+        },
+        acl_proxy::config::EgressRequestHeaderActionConfig {
+            action: acl_proxy::config::HeaderActionKind::ReplaceSubstring,
+            name: "x-order".to_string(),
+            when: acl_proxy::config::HeaderWhen::IfPresent,
+            value: None,
+            values: None,
+            search: Some("rule".to_string()),
+            replace: Some("global".to_string()),
+        },
+        acl_proxy::config::EgressRequestHeaderActionConfig {
+            action: acl_proxy::config::HeaderActionKind::Remove,
+            name: "x-order".to_string(),
+            when: acl_proxy::config::HeaderWhen::IfPresent,
+            value: None,
+            values: None,
+            search: None,
+            replace: None,
+        },
+        acl_proxy::config::EgressRequestHeaderActionConfig {
+            action: acl_proxy::config::HeaderActionKind::Set,
+            name: "x-order".to_string(),
+            when: acl_proxy::config::HeaderWhen::IfAbsent,
+            value: Some("should-not-reappear".to_string()),
+            values: None,
+            search: None,
+            replace: None,
+        },
+    ];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let raw_request = "GET http://example.invalid/ok HTTP/1.1\r\nHost: example.invalid\r\nX-Order: inbound\r\nConnection: close\r\n\r\n";
+    let (_response, status) = send_raw_http_request(proxy_addr, raw_request).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let requests = seen_requests.lock().unwrap();
+    let forwarded = requests
+        .first()
+        .expect("forwarding destination should see request");
+    assert!(
+        forwarded.headers.get("x-order").is_none(),
+        "global action order must be deterministic and if_absent should use pre-global snapshot"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_global_egress_actions_preserve_existing_rule_header_behavior() {
+    let (forward_addr, seen_requests) = start_forwarding_echo_server().await;
+
+    let mut config = minimal_config();
+    config.capture.allowed_request = false;
+    config.capture.allowed_response = false;
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            pattern: Some("http://example.invalid/**".to_string()),
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: vec![acl_proxy::config::HeaderActionConfig {
+                direction: acl_proxy::config::HeaderDirection::Request,
+                action: acl_proxy::config::HeaderActionKind::Set,
+                name: "x-rule-only".to_string(),
+                when: acl_proxy::config::HeaderWhen::Always,
+                value: Some("rule-applied".to_string()),
+                values: None,
+                search: None,
+                replace: None,
+            }],
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
+        host: "127.0.0.1".to_string(),
+        port: forward_addr.port(),
+    });
+    config.proxy.egress.request_header_actions = Vec::new();
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let raw_request =
+        "GET http://example.invalid/ok HTTP/1.1\r\nHost: example.invalid\r\nConnection: close\r\n\r\n";
+    let (_response, status) = send_raw_http_request(proxy_addr, raw_request).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let requests = seen_requests.lock().unwrap();
+    let forwarded = requests
+        .first()
+        .expect("forwarding destination should see request");
+    assert_eq!(
+        forwarded
+            .headers
+            .get("x-rule-only")
+            .and_then(|value| value.to_str().ok()),
+        Some("rule-applied")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn external_auth_webhook_transport_is_not_redirected_by_egress_forwarding() {
     let (forward_addr, seen_forwarded_requests) = start_forwarding_echo_server().await;
 
