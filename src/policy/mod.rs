@@ -91,6 +91,8 @@ struct ExpandedRule {
     rule_id: Option<String>,
     subnets: Vec<IpNet>,
     methods: Vec<String>,
+    #[allow(dead_code)]
+    headers_absent: Option<Vec<String>>,
     request_timeout_ms: Option<u64>,
     header_actions: Vec<HeaderActionConfig>,
     external_auth_profile: Option<String>,
@@ -389,8 +391,10 @@ fn expand_direct_rule(
     let has_pattern = pattern.is_some();
     let has_subnets = !rule.subnets.is_empty();
     let has_methods = !methods.is_empty();
+    let headers_absent = validate_headers_absent(rule.headers_absent.as_deref(), index)?;
+    let has_headers_absent = headers_absent.is_some();
 
-    if !has_pattern && (has_subnets || has_methods) {
+    if !has_pattern && (has_subnets || has_methods || has_headers_absent) {
         out.push(ExpandedRule {
             action: rule.action,
             pattern: None,
@@ -398,6 +402,7 @@ fn expand_direct_rule(
             rule_id: rule.rule_id.clone(),
             subnets: rule.subnets.clone(),
             methods,
+            headers_absent,
             request_timeout_ms: rule.request_timeout_ms,
             header_actions: rule.header_actions.clone(),
             external_auth_profile: rule.external_auth_profile.clone(),
@@ -408,7 +413,8 @@ fn expand_direct_rule(
     if !has_pattern {
         return Err(PolicyError::RuleInvalid {
             index,
-            reason: "policy rule must define at least a pattern, subnets, or methods".to_string(),
+            reason: "policy rule must define at least a pattern, subnets, methods, or headers_absent"
+                .to_string(),
         });
     }
 
@@ -431,6 +437,7 @@ fn expand_direct_rule(
             rule_id: rule.rule_id.clone(),
             subnets: rule.subnets.clone(),
             methods,
+            headers_absent,
             request_timeout_ms: rule.request_timeout_ms,
             header_actions: rule.header_actions.clone(),
             external_auth_profile: rule.external_auth_profile.clone(),
@@ -469,6 +476,7 @@ fn expand_direct_rule(
             rule_id: rule_id_interp,
             subnets: rule.subnets.clone(),
             methods: methods.clone(),
+            headers_absent: headers_absent.clone(),
             request_timeout_ms: rule.request_timeout_ms,
             header_actions: rule.header_actions.clone(),
             external_auth_profile: rule.external_auth_profile.clone(),
@@ -524,6 +532,7 @@ fn expand_include_rule(
 
     if placeholders.is_empty() {
         for template in templates {
+            let headers_absent = validate_headers_absent(template.headers_absent.as_deref(), index)?;
             let methods = rule
                 .methods
                 .as_ref()
@@ -543,6 +552,7 @@ fn expand_include_rule(
                     template.subnets.clone()
                 },
                 methods,
+                headers_absent,
                 request_timeout_ms,
                 header_actions: template.header_actions.clone(),
                 external_auth_profile: template.external_auth_profile.clone(),
@@ -563,6 +573,7 @@ fn expand_include_rule(
 
     for combo in combos {
         for template in templates {
+            let headers_absent = validate_headers_absent(template.headers_absent.as_deref(), index)?;
             let methods = rule
                 .methods
                 .as_ref()
@@ -592,6 +603,7 @@ fn expand_include_rule(
                     template.subnets.clone()
                 },
                 methods,
+                headers_absent,
                 request_timeout_ms,
                 header_actions: template.header_actions.clone(),
                 external_auth_profile: template.external_auth_profile.clone(),
@@ -782,6 +794,49 @@ fn compile_header_actions(
     }
 
     Ok(compiled)
+}
+
+fn validate_headers_absent(
+    headers_absent: Option<&[String]>,
+    index: usize,
+) -> Result<Option<Vec<String>>, PolicyError> {
+    let Some(headers_absent) = headers_absent else {
+        return Ok(None);
+    };
+
+    if headers_absent.is_empty() {
+        return Err(PolicyError::RuleInvalid {
+            index,
+            reason: "headers_absent must not be empty".to_string(),
+        });
+    }
+
+    let mut normalized = Vec::with_capacity(headers_absent.len());
+    let mut seen = BTreeSet::new();
+
+    for name in headers_absent {
+        let lowered = name.to_ascii_lowercase();
+        let parsed =
+            HeaderName::from_lowercase(lowered.as_bytes()).map_err(|err| PolicyError::RuleInvalid {
+                index,
+                reason: format!("invalid header name '{}' in headers_absent: {err}", name),
+            })?;
+        let normalized_name = parsed.as_str().to_string();
+
+        if !seen.insert(normalized_name.clone()) {
+            return Err(PolicyError::RuleInvalid {
+                index,
+                reason: format!(
+                    "duplicate header name '{}' in headers_absent after normalization",
+                    name
+                ),
+            });
+        }
+
+        normalized.push(normalized_name);
+    }
+
+    Ok(Some(normalized))
 }
 
 fn keys_for_url_variants(
@@ -1091,6 +1146,7 @@ mod tests {
                 description: None,
                 methods: None,
                 subnets: vec!["192.168.0.0/16".parse::<IpNet>().unwrap()],
+                headers_absent: None,
                 request_timeout_ms: None,
                 with: None,
                 add_url_enc_variants: None,
@@ -1119,6 +1175,7 @@ mod tests {
                 description: None,
                 methods: None,
                 subnets: vec!["2001:db8::/32".parse::<IpNet>().unwrap()],
+                headers_absent: None,
                 request_timeout_ms: None,
                 with: None,
                 add_url_enc_variants: None,
@@ -1154,6 +1211,7 @@ mod tests {
                     description: None,
                     methods: None,
                     subnets: Vec::new(),
+                    headers_absent: None,
                     request_timeout_ms: None,
                     header_actions: Vec::new(),
                     external_auth_profile: None,
@@ -1165,6 +1223,7 @@ mod tests {
                     description: None,
                     methods: None,
                     subnets: Vec::new(),
+                    headers_absent: None,
                     request_timeout_ms: None,
                     header_actions: Vec::new(),
                     external_auth_profile: None,
@@ -1226,6 +1285,7 @@ mod tests {
                     description: None,
                     methods: None,
                     subnets: Vec::new(),
+                    headers_absent: None,
                     request_timeout_ms: None,
                     header_actions: Vec::new(),
                     external_auth_profile: None,
@@ -1471,5 +1531,90 @@ external_auth_profile = "example"
             .expect("external_auth metadata should be present");
         assert_eq!(ext.profile, "example");
         assert_eq!(ext.timeout_ms, 5000);
+    }
+
+    #[test]
+    fn headers_absent_rejects_invalid_header_names() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+headers_absent = ["bad header"]
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let err = PolicyEngine::from_config(&cfg).expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid header name 'bad header' in headers_absent"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn headers_absent_rejects_duplicates_after_normalization() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+headers_absent = ["X-Workload-Id", "x-workload-id"]
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let err = PolicyEngine::from_config(&cfg).expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("duplicate header name 'x-workload-id' in headers_absent after normalization")
+                || msg.contains("duplicate header name 'X-Workload-Id' in headers_absent after normalization"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn ruleset_template_headers_absent_is_validated() {
+        let toml = r#"
+default = "deny"
+
+[[rulesets.guard]]
+action = "deny"
+pattern = "https://example.com/**"
+headers_absent = ["x-workload-id", "X-Workload-Id"]
+
+[[rules]]
+include = "guard"
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let err = PolicyEngine::from_config(&cfg).expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("duplicate header name"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn headers_absent_valid_names_are_normalized() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+headers_absent = ["X-Workload-Id", "X-Trace-Id"]
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let expanded = expand_policy(&cfg).expect("expand policy");
+
+        assert_eq!(expanded.rules.len(), 1);
+        assert_eq!(
+            expanded.rules[0].headers_absent,
+            Some(vec![
+                "x-workload-id".to_string(),
+                "x-trace-id".to_string()
+            ])
+        );
     }
 }

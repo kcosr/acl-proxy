@@ -459,6 +459,9 @@ pub struct PolicyRuleTemplateConfig {
     pub subnets: Vec<IpNet>,
 
     #[serde(default)]
+    pub headers_absent: Option<Vec<String>>,
+
+    #[serde(default)]
     pub request_timeout_ms: Option<u64>,
 
     #[serde(default)]
@@ -515,6 +518,9 @@ pub struct PolicyRuleDirectConfig {
 
     #[serde(default)]
     pub subnets: Vec<IpNet>,
+
+    #[serde(default)]
+    pub headers_absent: Option<Vec<String>>,
 
     #[serde(default)]
     pub request_timeout_ms: Option<u64>,
@@ -827,14 +833,17 @@ impl Config {
         for (idx, rule) in self.policy.rules.iter().enumerate() {
             let has_match_criteria = match rule {
                 PolicyRuleConfig::Direct(d) => {
-                    d.pattern.is_some() || !d.subnets.is_empty() || d.methods.is_some()
+                    d.pattern.is_some()
+                        || !d.subnets.is_empty()
+                        || d.methods.is_some()
+                        || d.headers_absent.is_some()
                 }
                 PolicyRuleConfig::Include(i) => !i.include.trim().is_empty(),
             };
 
             if !has_match_criteria {
                 return Err(ConfigError::Invalid(format!(
-                    "policy.rules[{idx}] must specify at least one of pattern, subnets, methods, or include"
+                    "policy.rules[{idx}] must specify at least one of pattern, subnets, methods, headers_absent, or include"
                 )));
             }
         }
@@ -1599,6 +1608,64 @@ action = "allow"
         let msg = format!("{err}");
         assert!(
             msg.contains("policy.rules[0]"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn direct_rule_with_headers_absent_counts_as_match_criteria() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "deny"
+headers_absent = ["x-workload-id"]
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        assert!(
+            config.validate_basic().is_ok(),
+            "validation should succeed for headers_absent-only rule"
+        );
+    }
+
+    #[test]
+    fn headers_absent_must_not_be_empty_when_configured() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "deny"
+headers_absent = []
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("headers_absent must not be empty"),
             "unexpected error message: {msg}"
         );
     }

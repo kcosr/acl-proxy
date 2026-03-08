@@ -229,6 +229,13 @@ description = "Git API for {repo}"
 ###############################################################################
 
 [[policy.rules]]
+# Example: fail closed when an expected identity header is missing.
+action = "deny"
+pattern = "**"
+headers_absent = ["x-workload-id"]
+description = "Deny requests missing workload identity"
+
+[[policy.rules]]
 # Allow Git traffic (HTTP(S) and API) for repositories listed in
 # [policy.macros].repo from the 10.0.0.0/8 network, including URL
 # encoded variants of the {repo} placeholder.
