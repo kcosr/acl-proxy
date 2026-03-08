@@ -6,6 +6,7 @@ implementation in more detail than the README.
 The configuration file is a single TOML document. It controls:
 
 - Listener addresses and ports.
+- Optional outbound egress forwarding destination.
 - Logging behavior and policy decision logging.
 - Capture of requests/responses to JSON files.
 - Loop protection behavior.
@@ -62,6 +63,7 @@ a helpful message including a suggested `acl-proxy config init` command.
 schema_version = "1"
 
 [proxy]
+[proxy.egress]
 [logging]
 [capture]
 [loop_protection]
@@ -75,6 +77,10 @@ schema_version = "1"
 
 The remaining sections are optional and defaulted when absent.
 
+`[proxy.egress.default]` is an additive schema v1 contract. It does not require
+changing `schema_version`; keeping the section absent preserves the existing
+direct-to-origin forwarding behavior.
+
 ---
 
 ## `[proxy]` – listeners and ports
@@ -87,6 +93,10 @@ https_bind_address = "0.0.0.0"# default
 https_port = 8889             # default (0 disables transparent HTTPS)
 request_timeout_ms = 30000    # default (0 disables upstream timeout)
 internal_base_path = "/_acl-proxy" # default
+
+[proxy.egress.default]
+host = "172.17.0.1"
+port = 8889
 ```
 
 Fields:
@@ -117,6 +127,36 @@ Fields:
   - Must start with `/` and must not end with `/` (except for the root path `/`).
   - Internal endpoints are only matched for origin-form (direct) requests, not proxy-style
     absolute-form requests.
+
+### `[proxy.egress.default]` - optional forwarding destination
+
+This nested section is optional. When it is absent, the proxy preserves the
+current behavior and connects directly to each request's original target.
+
+When present, allowed request-forwarding paths use the configured egress
+destination as the outbound TCP dial target while policy matching, logging, and
+the forwarded `Host` header remain bound to the original request target.
+
+Fields:
+
+- `host` (string, required):
+  - DNS hostname or IP literal for the forwarding destination.
+  - IPv6 literals may be provided either bare (for example `::1`) or bracketed
+    (for example `[::1]`).
+  - Must not be blank.
+  - Must not include leading/trailing whitespace.
+  - Must not include a port suffix; specify the port separately.
+  - Environment-variable overrides are intentionally not supported in phase one.
+
+- `port` (integer, required):
+  - TCP port for the forwarding destination.
+  - Must be in the inclusive range `1..65535`.
+
+Reload behavior:
+
+- A valid config reload atomically swaps in the updated egress destination for
+  new requests.
+- If reload validation fails, the previous running state remains active.
 
 ---
 

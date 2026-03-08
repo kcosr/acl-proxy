@@ -483,8 +483,10 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let certs_dir = tmp.path().join("certs");
 
-        let mut cfg = CertificatesConfig::default();
-        cfg.certs_dir = certs_dir.to_string_lossy().to_string();
+        let cfg = CertificatesConfig {
+            certs_dir: certs_dir.to_string_lossy().to_string(),
+            ..CertificatesConfig::default()
+        };
 
         let mgr1 = CertManager::from_config(&cfg).expect("first cert manager");
         let ca_cert_path = mgr1.ca_cert_path().to_path_buf();
@@ -503,8 +505,10 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let certs_dir = tmp.path().join("certs");
 
-        let mut cfg = CertificatesConfig::default();
-        cfg.certs_dir = certs_dir.to_string_lossy().to_string();
+        let cfg = CertificatesConfig {
+            certs_dir: certs_dir.to_string_lossy().to_string(),
+            ..CertificatesConfig::default()
+        };
 
         let mgr = CertManager::from_config(&cfg).expect("cert manager");
 
@@ -526,9 +530,11 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let certs_dir = tmp.path().join("certs");
 
-        let mut cfg = CertificatesConfig::default();
-        cfg.certs_dir = certs_dir.to_string_lossy().to_string();
-        cfg.max_cached_certs = 1;
+        let cfg = CertificatesConfig {
+            certs_dir: certs_dir.to_string_lossy().to_string(),
+            max_cached_certs: 1,
+            ..CertificatesConfig::default()
+        };
 
         let mgr = CertManager::from_config(&cfg).expect("cert manager");
 
@@ -573,10 +579,12 @@ mod tests {
         generate_ca(&ca_key_path, &ca_cert_path).expect("generate ca");
         let ca_cert_pem = fs::read_to_string(&ca_cert_path).expect("read ca cert");
 
-        let mut cfg = CertificatesConfig::default();
-        cfg.certs_dir = certs_dir.to_string_lossy().to_string();
-        cfg.ca_key_path = Some(ca_key_path.to_string_lossy().to_string());
-        cfg.ca_cert_path = Some(ca_cert_path.to_string_lossy().to_string());
+        let cfg = CertificatesConfig {
+            certs_dir: certs_dir.to_string_lossy().to_string(),
+            ca_key_path: Some(ca_key_path.to_string_lossy().to_string()),
+            ca_cert_path: Some(ca_cert_path.to_string_lossy().to_string()),
+            ..CertificatesConfig::default()
+        };
 
         let mgr = CertManager::from_config(&cfg).expect("cert manager");
 
@@ -599,20 +607,22 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let certs_dir = tmp.path().join("certs");
 
-        let mut cfg = CertificatesConfig::default();
-        cfg.certs_dir = certs_dir.to_string_lossy().to_string();
-        cfg.ca_key_path = Some(
-            certs_dir
-                .join("nonexistent-ca-key.pem")
-                .to_string_lossy()
-                .to_string(),
-        );
-        cfg.ca_cert_path = Some(
-            certs_dir
-                .join("nonexistent-ca-cert.pem")
-                .to_string_lossy()
-                .to_string(),
-        );
+        let cfg = CertificatesConfig {
+            certs_dir: certs_dir.to_string_lossy().to_string(),
+            ca_key_path: Some(
+                certs_dir
+                    .join("nonexistent-ca-key.pem")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            ca_cert_path: Some(
+                certs_dir
+                    .join("nonexistent-ca-cert.pem")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+            ..CertificatesConfig::default()
+        };
 
         let err = CertManager::from_config(&cfg)
             .err()

@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_lock, clippy::while_let_on_iterator)]
+
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::{Arc, Mutex};
@@ -13,6 +15,12 @@ use hyper::{Body, Request, Response, Server};
 use serde_json::Value as JsonValue;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[derive(Clone, Debug)]
+struct SeenForwardedRequest {
+    uri: String,
+    headers: hyper::HeaderMap,
+}
 
 async fn start_upstream_echo_server() -> (SocketAddr, Arc<Mutex<Option<hyper::HeaderMap>>>) {
     let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind upstream");
@@ -46,6 +54,40 @@ async fn start_upstream_echo_server() -> (SocketAddr, Arc<Mutex<Option<hyper::He
     tokio::spawn(server);
 
     (addr, seen_headers)
+}
+
+async fn start_forwarding_echo_server() -> (SocketAddr, Arc<Mutex<Vec<SeenForwardedRequest>>>) {
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind forwarding upstream");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking forwarding upstream");
+    let addr = listener.local_addr().expect("forwarding upstream addr");
+
+    let seen_requests: Arc<Mutex<Vec<SeenForwardedRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_requests_clone = seen_requests.clone();
+
+    let make_svc = make_service_fn(move |_conn| {
+        let seen_requests = seen_requests_clone.clone();
+        async move {
+            Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
+                let seen_requests = seen_requests.clone();
+                async move {
+                    seen_requests.lock().unwrap().push(SeenForwardedRequest {
+                        uri: req.uri().to_string(),
+                        headers: req.headers().clone(),
+                    });
+                    Ok::<_, hyper::Error>(Response::new(Body::from("forwarded")))
+                }
+            }))
+        }
+    });
+
+    let server = Server::from_tcp(listener)
+        .expect("server from tcp")
+        .serve(make_svc);
+    tokio::spawn(server);
+
+    (addr, seen_requests)
 }
 
 async fn start_upstream_delayed_server(delay: Duration) -> SocketAddr {
@@ -636,6 +678,243 @@ default = "deny"
     "#;
 
     toml::from_str(toml).expect("parse config")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn allowed_request_uses_configured_egress_forwarding_destination() {
+    let (forward_addr, seen_requests) = start_forwarding_echo_server().await;
+
+    let mut config = minimal_config();
+    config.capture.allowed_request = false;
+    config.capture.allowed_response = false;
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            pattern: Some("http://example.invalid/**".to_string()),
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
+        host: "127.0.0.1".to_string(),
+        port: forward_addr.port(),
+    });
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let raw_request = "GET http://example.invalid/ok HTTP/1.1\r\nHost: example.invalid\r\nConnection: close\r\n\r\n";
+    let (response, status) = send_raw_http_request(proxy_addr, raw_request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        response.contains("\r\n\r\nforwarded"),
+        "unexpected response body: {response}"
+    );
+
+    let requests = seen_requests.lock().unwrap();
+    let forwarded = requests
+        .first()
+        .expect("forwarding destination should see request");
+    assert_eq!(forwarded.uri, "http://example.invalid/ok");
+    assert_eq!(
+        forwarded
+            .headers
+            .get("host")
+            .and_then(|value| value.to_str().ok()),
+        Some("example.invalid")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn external_auth_webhook_transport_is_not_redirected_by_egress_forwarding() {
+    let (forward_addr, seen_forwarded_requests) = start_forwarding_echo_server().await;
+
+    #[derive(Clone, Debug)]
+    struct ReceivedEvent {
+        event_header: String,
+        path: String,
+    }
+
+    let received_events: Arc<Mutex<Vec<ReceivedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_events_clone = received_events.clone();
+    let proxy_addr_shared: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let proxy_addr_for_svc = proxy_addr_shared.clone();
+
+    let make_svc = make_service_fn(move |_conn| {
+        let received_events = received_events_clone.clone();
+        let proxy_addr_for_svc = proxy_addr_for_svc.clone();
+        async move {
+            Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
+                let received_events = received_events.clone();
+                let proxy_addr_for_svc = proxy_addr_for_svc.clone();
+                async move {
+                    let event_header = req
+                        .headers()
+                        .get("x-acl-proxy-event")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    let path = req.uri().path().to_string();
+                    let body_bytes = hyper::body::to_bytes(req.into_body())
+                        .await
+                        .unwrap_or_default();
+                    let body: serde_json::Value = serde_json::from_slice(&body_bytes)
+                        .unwrap_or_else(|_| serde_json::json!({}));
+
+                    received_events.lock().unwrap().push(ReceivedEvent {
+                        event_header: event_header.clone(),
+                        path,
+                    });
+
+                    if event_header == "pending" {
+                        let request_id = body["requestId"]
+                            .as_str()
+                            .expect("pending event request id")
+                            .to_string();
+                        let proxy_addr = proxy_addr_for_svc
+                            .lock()
+                            .unwrap()
+                            .expect("proxy address should be set");
+
+                        tokio::spawn(async move {
+                            let callback = serde_json::json!({
+                                "requestId": request_id,
+                                "decision": "allow"
+                            });
+                            let req = Request::builder()
+                                .method("POST")
+                                .uri(format!(
+                                    "http://{}/_acl-proxy/external-auth/callback",
+                                    proxy_addr
+                                ))
+                                .header(
+                                    http::header::CONTENT_TYPE,
+                                    HeaderValue::from_static("application/json"),
+                                )
+                                .body(Body::from(
+                                    serde_json::to_vec(&callback)
+                                        .unwrap_or_else(|_| b"{}".to_vec()),
+                                ))
+                                .expect("build callback request");
+
+                            let _ = hyper::Client::new().request(req).await;
+                        });
+                    }
+
+                    Ok::<_, hyper::Error>(Response::new(Body::from("ok")))
+                }
+            }))
+        }
+    });
+
+    let webhook_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind webhook");
+    webhook_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking webhook");
+    let webhook_addr = webhook_listener.local_addr().expect("webhook addr");
+
+    tokio::spawn(
+        Server::from_tcp(webhook_listener)
+            .expect("server from tcp")
+            .serve(make_svc),
+    );
+
+    let toml = format!(
+        r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+
+[proxy.egress.default]
+host = "127.0.0.1"
+port = {forward_port}
+
+[logging]
+directory = "logs"
+level = "info"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles]
+[policy.external_auth_profiles.test_profile]
+webhook_url = "http://127.0.0.1:{webhook_port}/webhook"
+timeout_ms = 1000
+webhook_timeout_ms = 1000
+on_webhook_failure = "error"
+
+[[policy.rules]]
+action = "allow"
+pattern = "http://example.invalid/**"
+external_auth_profile = "test_profile"
+        "#,
+        forward_port = forward_addr.port(),
+        webhook_port = webhook_addr.port()
+    );
+
+    let config: Config = toml::from_str(&toml).expect("parse config");
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+    *proxy_addr_shared.lock().unwrap() = Some(proxy_addr);
+
+    let raw_request = "GET http://example.invalid/ok HTTP/1.1\r\nHost: example.invalid\r\nConnection: close\r\n\r\n";
+    let (response, status) = send_raw_http_request(proxy_addr, raw_request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        response.contains("\r\n\r\nforwarded"),
+        "unexpected response body: {response}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let events = received_events.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event.event_header == "pending" && event.path == "/webhook"),
+        "webhook server should receive the pending external-auth request directly"
+    );
+
+    let forwarded_requests = seen_forwarded_requests.lock().unwrap();
+    let forwarded = forwarded_requests
+        .first()
+        .expect("forwarding destination should see proxied request");
+    assert_eq!(forwarded.uri, "http://example.invalid/ok");
+    assert_eq!(
+        forwarded
+            .headers
+            .get("host")
+            .and_then(|value| value.to_str().ok()),
+        Some("example.invalid")
+    );
 }
 
 async fn start_proxy_with_config(

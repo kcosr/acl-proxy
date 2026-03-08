@@ -1,3 +1,5 @@
+#![allow(clippy::needless_borrow, clippy::while_let_on_iterator)]
+
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::Arc;
@@ -29,6 +31,12 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 // truncation logic without introducing excessively large in-memory
 // payloads that could slow down tests.
 const LARGE_BODY_BYTES: usize = DEFAULT_MAX_BODY_BYTES + 1024;
+
+#[derive(Clone, Debug)]
+struct SeenForwardedRequest {
+    uri: String,
+    headers: hyper::HeaderMap,
+}
 
 async fn start_upstream_https_echo_server() -> SocketAddr {
     let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind upstream");
@@ -84,6 +92,40 @@ async fn start_upstream_https_echo_server() -> SocketAddr {
     });
 
     addr
+}
+
+async fn start_forwarding_echo_server(
+) -> (SocketAddr, Arc<std::sync::Mutex<Vec<SeenForwardedRequest>>>) {
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind forwarding upstream");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking forwarding upstream");
+    let addr = listener.local_addr().expect("forwarding upstream addr");
+
+    let seen_requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let seen_requests_clone = seen_requests.clone();
+
+    tokio::spawn(
+        hyper::Server::from_tcp(listener)
+            .expect("server from tcp")
+            .serve(hyper::service::make_service_fn(move |_conn| {
+                let seen_requests = seen_requests_clone.clone();
+                async move {
+                    Ok::<_, hyper::Error>(service_fn(move |req: HyperRequest<Body>| {
+                        let seen_requests = seen_requests.clone();
+                        async move {
+                            seen_requests.lock().unwrap().push(SeenForwardedRequest {
+                                uri: req.uri().to_string(),
+                                headers: req.headers().clone(),
+                            });
+                            Ok::<_, hyper::Error>(HyperResponse::new(Body::from("forwarded")))
+                        }
+                    }))
+                }
+            })),
+    );
+
+    (addr, seen_requests)
 }
 
 async fn start_upstream_https_websocket_echo_server() -> SocketAddr {
@@ -723,6 +765,69 @@ async fn allowed_https_transparent_is_proxied_and_captured() {
         record.url.starts_with("https://"),
         "url should be https, got {}",
         record.url
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn configured_egress_forwarding_applies_to_https_transparent_requests() {
+    let (forward_addr, seen_requests) = start_forwarding_echo_server().await;
+
+    let mut config = minimal_https_transparent_config();
+    config.capture.allowed_request = false;
+    config.capture.allowed_response = false;
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            pattern: Some("https://transparent-target.test:9443/**".to_string()),
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
+        host: "127.0.0.1".to_string(),
+        port: forward_addr.port(),
+    });
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir, ca_cert_path) =
+        start_proxy_with_config(config, proxy_listener).await;
+
+    let (status, body) = send_https_request_via_transparent(
+        proxy_addr,
+        &ca_cert_path,
+        "transparent.test",
+        "transparent-target.test:9443",
+        "/ok",
+        &[],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK.as_u16());
+    assert_eq!(body, "forwarded");
+
+    let requests = seen_requests.lock().unwrap();
+    let forwarded = requests
+        .first()
+        .expect("forwarding destination should see request");
+    assert_eq!(forwarded.uri, "https://transparent-target.test:9443/ok");
+    assert_eq!(
+        forwarded
+            .headers
+            .get("host")
+            .and_then(|value| value.to_str().ok()),
+        Some("transparent-target.test:9443")
     );
 }
 

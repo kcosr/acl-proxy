@@ -906,20 +906,16 @@ pub fn pattern_to_regex(pattern: &str) -> String {
     }
 
     let lower = raw.to_ascii_lowercase();
-    let (has_scheme, rest) = if lower.starts_with("http://") {
-        (true, &raw[7..])
+    let rest = if lower.starts_with("http://") {
+        &raw[7..]
     } else if lower.starts_with("https://") {
-        (true, &raw[8..])
+        &raw[8..]
     } else {
         let trimmed = raw.trim_start_matches('/');
-        (false, trimmed)
+        trimmed
     };
 
-    let mut rest = if has_scheme {
-        rest.to_string()
-    } else {
-        rest.to_string()
-    };
+    let mut rest = rest.to_string();
 
     let slash_idx = rest.find('/');
     let path_part = slash_idx

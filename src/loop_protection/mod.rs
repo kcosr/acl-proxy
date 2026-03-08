@@ -65,8 +65,10 @@ mod tests {
 
     #[test]
     fn disabled_loop_protection_disables_header_injection() {
-        let mut cfg = LoopProtectionConfig::default();
-        cfg.enabled = false;
+        let cfg = LoopProtectionConfig {
+            enabled: false,
+            ..LoopProtectionConfig::default()
+        };
         let settings = LoopProtectionSettings::from_config(&cfg).expect("settings");
         assert!(!settings.enabled);
         assert!(!settings.add_header);
@@ -74,8 +76,10 @@ mod tests {
 
     #[test]
     fn invalid_header_name_returns_error() {
-        let mut cfg = LoopProtectionConfig::default();
-        cfg.header_name = "invalid header".to_string();
+        let cfg = LoopProtectionConfig {
+            header_name: "invalid header".to_string(),
+            ..LoopProtectionConfig::default()
+        };
         let err = LoopProtectionSettings::from_config(&cfg).expect_err("error");
         let msg = format!("{err}");
         assert!(msg.contains("invalid loop protection header name"));

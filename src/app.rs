@@ -1,6 +1,6 @@
 use crate::auth_plugin::AuthPluginManager;
 use crate::certs::CertManager;
-use crate::config::{Config, TlsConfig};
+use crate::config::{Config, ConfigError, TlsConfig};
 use crate::external_auth::ExternalAuthManager;
 use crate::logging::{LoggingError, LoggingSettings};
 use crate::loop_protection::{LoopProtectionError, LoopProtectionSettings};
@@ -15,6 +15,8 @@ use std::time::SystemTime;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppStateError {
+    #[error(transparent)]
+    Config(#[from] ConfigError),
     #[error(transparent)]
     Logging(#[from] LoggingError),
     #[error(transparent)]
@@ -47,6 +49,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn from_config(config: Config) -> Result<Self, AppStateError> {
+        config.validate_basic()?;
         let logging = LoggingSettings::from_config(&config.logging)?;
         let policy = PolicyEngine::from_config(&config.policy)?;
         let loop_protection = LoopProtectionSettings::from_config(&config.loop_protection)?;

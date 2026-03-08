@@ -3,6 +3,11 @@
 acl-proxy supports three request paths. All modes apply the same policy engine,
 logging, capture, and header actions.
 
+When `[proxy.egress.default]` is configured, allowed proxied requests from all
+supported modes use the configured egress destination as the outbound TCP dial
+target. Policy matching, capture metadata, and the forwarded `Host` header stay
+bound to the original request target.
+
 ## HTTP explicit proxy (HTTP/1.1)
 
 - Listener: `proxy.bind_address:proxy.http_port`.
@@ -34,6 +39,9 @@ curl -x http://127.0.0.1:8881 https://example.com/ \
 Notes:
 - Clients must trust the proxy CA (`certs/ca-cert.pem` by default).
 - Loop protection runs on both the CONNECT request and the inner requests.
+- The outer CONNECT handshake remains local to the first proxy hop. If egress
+  forwarding is enabled, only the decrypted inner HTTPS requests use the egress
+  destination.
 
 ## Transparent HTTPS listener (TLS terminating)
 
@@ -56,6 +64,16 @@ Notes:
 - If the Host header is missing or invalid, the proxy returns `400 Bad Request`.
 - HTTP/1.1 upgrade requests (for example, WebSocket) are tunneled after a
   successful `101 Switching Protocols` handshake.
+
+## Chained proxy deployments
+
+- In phase one, the egress forwarding leg uses plain HTTP/1.1 over TCP to the
+  configured `proxy.egress.default` host:port.
+- The recommended egress target for another `acl-proxy` instance is that
+  instance's HTTP explicit listener.
+- For loop protection across multiple hops, either use different loop-header
+  names per hop or disable `loop_protection.add_header` on the inner proxy.
+- See `docs/operations.md` for deployment warnings and recovery guidance.
 
 ## Upstream HTTP version
 

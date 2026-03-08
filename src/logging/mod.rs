@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};

@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err, clippy::too_many_arguments)]
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::convert::Infallible;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
@@ -8,10 +10,12 @@ use chrono::Utc;
 use http::header::{HeaderMap as HttpHeaderMap, HeaderName, HeaderValue, HOST};
 use http::{Method, StatusCode, Uri, Version};
 use hyper::body::{Bytes, HttpBody};
+use hyper::client::conn;
 use hyper::server::conn::AddrStream;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Client, Request, Response, Server};
 use tokio::io::copy_bidirectional;
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -24,7 +28,9 @@ use crate::capture::{
     CaptureEndpoint, CaptureKind, CaptureMode, CaptureRecordOptions, HeaderMap,
     DEFAULT_MAX_BODY_BYTES,
 };
-use crate::config::{ExternalAuthProfileType, HeaderActionKind, HeaderDirection, HeaderWhen};
+use crate::config::{
+    EgressTargetConfig, ExternalAuthProfileType, HeaderActionKind, HeaderDirection, HeaderWhen,
+};
 use crate::external_auth::{ApprovalMacroDescriptor, ExternalAuthProfile, ExternalDecision};
 use crate::logging::PolicyDecisionLogContext;
 use crate::policy::CompiledHeaderAction;
@@ -51,6 +57,14 @@ pub enum HttpProxyError {
 
     #[error("hyper server error: {0}")]
     Hyper(#[from] hyper::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum UpstreamRequestError {
+    #[error(transparent)]
+    Hyper(#[from] hyper::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 /// Run the HTTP/1.1 proxy listener using the configured bind address/port.
@@ -1461,11 +1475,23 @@ pub(crate) async fn proxy_allowed_request(
     };
 
     let client_http: Client<_> = state.http_client.clone();
+    let forwarding_target = state.config.proxy.egress.default.as_ref();
     let request_timeout =
         resolve_request_timeout_ms(request_timeout_ms, state.config.proxy.request_timeout_ms);
     let upstream_resp = match request_timeout {
         Some(timeout) => {
-            match tokio::time::timeout(timeout, client_http.request(upstream_req)).await {
+            match tokio::time::timeout(
+                timeout,
+                send_upstream_request(
+                    client_http,
+                    forwarding_target,
+                    &request_id,
+                    &full_url,
+                    upstream_req,
+                ),
+            )
+            .await
+            {
                 Ok(resp) => resp,
                 Err(_) => {
                     tracing::debug!("upstream request timed out after {:?}", timeout);
@@ -1492,7 +1518,16 @@ pub(crate) async fn proxy_allowed_request(
                 }
             }
         }
-        None => client_http.request(upstream_req).await,
+        None => {
+            send_upstream_request(
+                client_http,
+                forwarding_target,
+                &request_id,
+                &full_url,
+                upstream_req,
+            )
+            .await
+        }
     };
 
     let mut upstream_resp = match upstream_resp {
@@ -1686,6 +1721,63 @@ pub(crate) async fn proxy_allowed_request(
     }
 
     resp
+}
+
+async fn send_upstream_request(
+    client_http: Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>,
+    forwarding_target: Option<&EgressTargetConfig>,
+    request_id: &str,
+    full_url: &str,
+    upstream_req: Request<Body>,
+) -> Result<Response<Body>, UpstreamRequestError> {
+    match forwarding_target {
+        Some(target) => {
+            send_request_via_egress_target(target, request_id, full_url, upstream_req).await
+        }
+        None => client_http
+            .request(upstream_req)
+            .await
+            .map_err(UpstreamRequestError::from),
+    }
+}
+
+async fn send_request_via_egress_target(
+    target: &EgressTargetConfig,
+    request_id: &str,
+    full_url: &str,
+    upstream_req: Request<Body>,
+) -> Result<Response<Body>, UpstreamRequestError> {
+    tracing::debug!(
+        request_id = %request_id,
+        url = %full_url,
+        egress_host = %target.host,
+        egress_port = target.port,
+        "forwarding allowed request via configured egress destination"
+    );
+
+    let stream = TcpStream::connect((egress_dial_host(&target.host), target.port)).await?;
+    let (mut sender, connection) = conn::handshake(stream).await?;
+
+    let request_id = request_id.to_string();
+    let full_url = full_url.to_string();
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            tracing::debug!(
+                "egress forwarding connection ended for {request_id} ({full_url}): {err}"
+            );
+        }
+    });
+
+    sender
+        .send_request(upstream_req)
+        .await
+        .map_err(UpstreamRequestError::from)
+}
+
+fn egress_dial_host(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|value| value.strip_suffix(']'))
+        .unwrap_or(host)
 }
 
 pub(crate) fn headers_to_capture_map(headers: &HttpHeaderMap) -> HeaderMap {
@@ -1884,12 +1976,12 @@ fn apply_header_actions(
     original_present: &HashSet<HeaderName>,
 ) {
     for action in actions {
-        let applies_to_direction = match (&action.direction, &direction) {
-            (HeaderDirection::Request, HeaderDirection::Request) => true,
-            (HeaderDirection::Response, HeaderDirection::Response) => true,
-            (HeaderDirection::Both, _) => true,
-            _ => false,
-        };
+        let applies_to_direction = matches!(
+            (&action.direction, &direction),
+            (HeaderDirection::Request, HeaderDirection::Request)
+                | (HeaderDirection::Response, HeaderDirection::Response)
+                | (HeaderDirection::Both, _)
+        );
         if !applies_to_direction {
             continue;
         }

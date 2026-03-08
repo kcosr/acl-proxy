@@ -1,3 +1,5 @@
+#![allow(clippy::result_large_err, clippy::too_many_arguments)]
+
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::Arc;
 
