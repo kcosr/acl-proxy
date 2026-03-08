@@ -4,7 +4,9 @@ use crate::config::{Config, ConfigError, TlsConfig};
 use crate::external_auth::ExternalAuthManager;
 use crate::logging::{LoggingError, LoggingSettings};
 use crate::loop_protection::{LoopProtectionError, LoopProtectionSettings};
-use crate::policy::{PolicyEngine, PolicyError};
+use crate::policy::{
+    compile_egress_request_header_actions, CompiledHeaderAction, PolicyEngine, PolicyError,
+};
 use arc_swap::ArcSwap;
 use hyper::Client;
 use hyper_rustls::{ConfigBuilderExt, HttpsConnectorBuilder};
@@ -40,6 +42,7 @@ pub struct AppState {
     pub config: Config,
     pub logging: LoggingSettings,
     pub policy: PolicyEngine,
+    pub egress_request_header_actions: Vec<CompiledHeaderAction>,
     pub loop_protection: LoopProtectionSettings,
     pub http_client: Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>,
     pub cert_manager: CertManager,
@@ -52,6 +55,8 @@ impl AppState {
         config.validate_basic()?;
         let logging = LoggingSettings::from_config(&config.logging)?;
         let policy = PolicyEngine::from_config(&config.policy)?;
+        let egress_request_header_actions =
+            compile_egress_request_header_actions(&config.proxy.egress.request_header_actions)?;
         let loop_protection = LoopProtectionSettings::from_config(&config.loop_protection)?;
 
         let http_client = build_http_client(&config.tls);
@@ -67,6 +72,7 @@ impl AppState {
             config,
             logging,
             policy,
+            egress_request_header_actions,
             loop_protection,
             http_client,
             cert_manager,

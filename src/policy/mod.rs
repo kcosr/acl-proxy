@@ -10,9 +10,10 @@ use thiserror::Error;
 use url::Url;
 
 use crate::config::{
-    ExternalAuthProfileConfigMap, HeaderActionConfig, HeaderActionKind, HeaderDirection,
-    HeaderWhen, MacroMap, MacroOverrideMap, MacroValues, PolicyConfig, PolicyDefaultAction,
-    PolicyRuleConfig, PolicyRuleDirectConfig, PolicyRuleIncludeConfig, RulesetMap, UrlEncVariants,
+    EgressRequestHeaderActionConfig, ExternalAuthProfileConfigMap, HeaderActionConfig,
+    HeaderActionKind, HeaderDirection, HeaderWhen, MacroMap, MacroOverrideMap, MacroValues,
+    PolicyConfig, PolicyDefaultAction, PolicyRuleConfig, PolicyRuleDirectConfig,
+    PolicyRuleIncludeConfig, RulesetMap, UrlEncVariants,
 };
 
 #[derive(Debug, Error)]
@@ -25,6 +26,9 @@ pub enum PolicyError {
 
     #[error("Invalid policy rule at index {index}: {reason}")]
     RuleInvalid { index: usize, reason: String },
+
+    #[error("Invalid proxy.egress.request_header_actions entry at index {index}: {reason}")]
+    EgressRequestHeaderActionInvalid { index: usize, reason: String },
 
     #[error("Failed to compile pattern for rule at index {index}: {source}")]
     PatternCompile {
@@ -706,113 +710,148 @@ fn compile_header_actions(
     actions: &[HeaderActionConfig],
     index: usize,
 ) -> Result<Vec<CompiledHeaderAction>, PolicyError> {
+    compile_header_actions_with_context(
+        actions,
+        |action_cfg| HeaderActionCompileInput {
+            direction: action_cfg.direction.clone(),
+            action: &action_cfg.action,
+            name: &action_cfg.name,
+            when: action_cfg.when.clone(),
+            value: action_cfg.value.as_ref(),
+            values: action_cfg.values.as_ref(),
+            search: action_cfg.search.as_ref(),
+            replace: action_cfg.replace.as_ref(),
+        },
+        |reason| PolicyError::RuleInvalid { index, reason },
+    )
+}
+
+pub fn compile_egress_request_header_actions(
+    actions: &[EgressRequestHeaderActionConfig],
+) -> Result<Vec<CompiledHeaderAction>, PolicyError> {
+    let mut compiled = Vec::with_capacity(actions.len());
+
+    for (index, action_cfg) in actions.iter().enumerate() {
+        let one = compile_header_actions_with_context(
+            std::slice::from_ref(action_cfg),
+            |action_cfg| HeaderActionCompileInput {
+                direction: HeaderDirection::Request,
+                action: &action_cfg.action,
+                name: &action_cfg.name,
+                when: action_cfg.when.clone(),
+                value: action_cfg.value.as_ref(),
+                values: action_cfg.values.as_ref(),
+                search: action_cfg.search.as_ref(),
+                replace: action_cfg.replace.as_ref(),
+            },
+            |reason| PolicyError::EgressRequestHeaderActionInvalid { index, reason },
+        )?;
+        compiled.extend(one);
+    }
+
+    Ok(compiled)
+}
+
+struct HeaderActionCompileInput<'a> {
+    direction: HeaderDirection,
+    action: &'a HeaderActionKind,
+    name: &'a str,
+    when: HeaderWhen,
+    value: Option<&'a String>,
+    values: Option<&'a Vec<String>>,
+    search: Option<&'a String>,
+    replace: Option<&'a String>,
+}
+
+fn compile_header_actions_with_context<T, I, E>(
+    actions: &[T],
+    make_input: I,
+    make_error: E,
+) -> Result<Vec<CompiledHeaderAction>, PolicyError>
+where
+    I: Fn(&T) -> HeaderActionCompileInput<'_>,
+    E: Fn(String) -> PolicyError,
+{
     let mut compiled = Vec::with_capacity(actions.len());
 
     for action_cfg in actions {
-        let name = HeaderName::from_lowercase(action_cfg.name.to_ascii_lowercase().as_bytes())
-            .map_err(|e| PolicyError::RuleInvalid {
-                index,
-                reason: format!(
-                    "invalid header name '{}' in header action: {e}",
-                    action_cfg.name
-                ),
-            })?;
+        let input = make_input(action_cfg);
 
-        let when = action_cfg.when.clone();
+        let name = HeaderName::from_lowercase(input.name.to_ascii_lowercase().as_bytes())
+            .map_err(|e| make_error(format!("invalid header name '{}': {e}", input.name)))?;
+
         let mut values: Vec<HeaderValue> = Vec::new();
 
-        match action_cfg.action {
+        match input.action {
             HeaderActionKind::Set | HeaderActionKind::Add => {
-                let source_values = match (&action_cfg.value, &action_cfg.values) {
+                let source_values = match (input.value, input.values) {
                     (Some(v), None) => vec![v.clone()],
                     (None, Some(vs)) if !vs.is_empty() => vs.clone(),
                     (Some(_), Some(_)) => {
-                        return Err(PolicyError::RuleInvalid {
-                            index,
-                            reason: format!(
-                                "header action for '{}' must not set both value and values",
-                                action_cfg.name
-                            ),
-                        })
+                        return Err(make_error(format!(
+                            "header action for '{}' must not set both value and values",
+                            input.name
+                        )));
                     }
                     _ => {
-                        return Err(PolicyError::RuleInvalid {
-                            index,
-                            reason: format!(
-                                "header action for '{}' must provide value or values",
-                                action_cfg.name
-                            ),
-                        })
+                        return Err(make_error(format!(
+                            "header action for '{}' must provide value or values",
+                            input.name
+                        )));
                     }
                 };
 
                 for v in source_values {
-                    let hv = HeaderValue::from_str(&v).map_err(|e| PolicyError::RuleInvalid {
-                        index,
-                        reason: format!(
+                    let hv = HeaderValue::from_str(&v).map_err(|e| {
+                        make_error(format!(
                             "invalid header value for '{}': {} ({e})",
-                            action_cfg.name, v
-                        ),
+                            input.name, v
+                        ))
                     })?;
                     values.push(hv);
                 }
             }
             HeaderActionKind::Remove | HeaderActionKind::ReplaceSubstring => {
-                if action_cfg.value.is_some() || action_cfg.values.is_some() {
-                    return Err(PolicyError::RuleInvalid {
-                        index,
-                        reason: format!(
-                            "header action for '{}' with action {:?} must not set value/values",
-                            action_cfg.name, action_cfg.action
-                        ),
-                    });
+                if input.value.is_some() || input.values.is_some() {
+                    return Err(make_error(format!(
+                        "header action for '{}' with action {:?} must not set value/values",
+                        input.name, input.action
+                    )));
                 }
             }
         }
 
-        let (search, replace) = match action_cfg.action {
+        let (search, replace) = match input.action {
             HeaderActionKind::ReplaceSubstring => {
-                let search = action_cfg
-                    .search
-                    .clone()
-                    .ok_or_else(|| PolicyError::RuleInvalid {
-                        index,
-                        reason: format!(
-                            "header action for '{}' with action replace_substring requires search",
-                            action_cfg.name
-                        ),
-                    })?;
+                let search = input.search.cloned().ok_or_else(|| {
+                    make_error(format!(
+                        "header action for '{}' with action replace_substring requires search",
+                        input.name
+                    ))
+                })?;
                 if search.is_empty() {
-                    return Err(PolicyError::RuleInvalid {
-                        index,
-                        reason: format!(
-                            "header action for '{}' with action replace_substring requires non-empty search",
-                            action_cfg.name
-                        ),
-                    });
+                    return Err(make_error(format!(
+                        "header action for '{}' with action replace_substring requires non-empty search",
+                        input.name
+                    )));
                 }
-                let replace =
-                    action_cfg
-                        .replace
-                        .clone()
-                        .ok_or_else(|| PolicyError::RuleInvalid {
-                            index,
-                            reason: format!(
-                            "header action for '{}' with action replace_substring requires replace",
-                            action_cfg.name
-                        ),
-                        })?;
+                let replace = input.replace.cloned().ok_or_else(|| {
+                    make_error(format!(
+                        "header action for '{}' with action replace_substring requires replace",
+                        input.name
+                    ))
+                })?;
                 (Some(search), Some(replace))
             }
             _ => (None, None),
         };
 
         compiled.push(CompiledHeaderAction {
-            direction: action_cfg.direction.clone(),
-            action: action_cfg.action.clone(),
+            direction: input.direction,
+            action: input.action.clone(),
             name,
             values,
-            when,
+            when: input.when,
             search,
             replace,
         });
@@ -1139,7 +1178,7 @@ fn client_in_any_subnet(raw_ip: Option<&str>, subnets: &[IpNet]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::PolicyRuleTemplateConfig;
+    use crate::config::{EgressRequestHeaderActionConfig, PolicyRuleTemplateConfig};
     use toml;
 
     fn allow_action() -> PolicyDefaultAction {
@@ -1156,6 +1195,51 @@ mod tests {
             );
         }
         headers
+    }
+
+    #[test]
+    fn compile_egress_request_header_actions_sets_request_direction() {
+        let actions = vec![EgressRequestHeaderActionConfig {
+            action: HeaderActionKind::Set,
+            name: "x-egress-tag".to_string(),
+            when: HeaderWhen::Always,
+            value: Some("edge-a".to_string()),
+            values: None,
+            search: None,
+            replace: None,
+        }];
+
+        let compiled =
+            compile_egress_request_header_actions(&actions).expect("compile egress actions");
+
+        assert_eq!(compiled.len(), 1);
+        assert!(matches!(compiled[0].direction, HeaderDirection::Request));
+    }
+
+    #[test]
+    fn compile_egress_request_header_actions_reports_egress_specific_error_context() {
+        let actions = vec![EgressRequestHeaderActionConfig {
+            action: HeaderActionKind::Set,
+            name: "x-egress-tag".to_string(),
+            when: HeaderWhen::Always,
+            value: None,
+            values: None,
+            search: None,
+            replace: None,
+        }];
+
+        let err =
+            compile_egress_request_header_actions(&actions).expect_err("expected compile error");
+
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("proxy.egress.request_header_actions entry at index 0"),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            msg.contains("must provide value or values"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[test]

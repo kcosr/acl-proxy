@@ -221,6 +221,7 @@ async fn handle_http_request(
     let header_actions = matched_rule
         .map(|m| m.header_actions.clone())
         .unwrap_or_default();
+    let egress_request_header_actions = state.egress_request_header_actions.clone();
     let request_timeout_ms = matched_rule.and_then(|m| m.request_timeout_ms);
 
     if let Some(rule) = matched_rule {
@@ -246,6 +247,7 @@ async fn handle_http_request(
                             profile_name,
                             request_timeout_ms,
                             header_actions,
+                            egress_request_header_actions.clone(),
                         )
                         .await;
                         return Ok(resp);
@@ -267,6 +269,7 @@ async fn handle_http_request(
                             &handler,
                             request_timeout_ms,
                             header_actions,
+                            egress_request_header_actions.clone(),
                         )
                         .await;
                         return Ok(resp);
@@ -305,6 +308,7 @@ async fn handle_http_request(
         CaptureMode::HttpProxy,
         request_timeout_ms,
         header_actions,
+        egress_request_header_actions,
     )
     .await;
 
@@ -627,6 +631,7 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
     profile_name: &str,
     request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
+    egress_request_header_actions: Vec<CompiledHeaderAction>,
     mode: CaptureMode,
 ) -> Response<Body> {
     let macro_descriptors =
@@ -741,6 +746,7 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
                 mode,
                 request_timeout_ms,
                 header_actions,
+                egress_request_header_actions,
             )
             .await
         }
@@ -814,6 +820,7 @@ async fn handle_external_auth_gate(
     profile_name: &str,
     request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
+    egress_request_header_actions: Vec<CompiledHeaderAction>,
 ) -> Response<Body> {
     run_external_auth_gate_lifecycle(
         state,
@@ -831,6 +838,7 @@ async fn handle_external_auth_gate(
         profile_name,
         request_timeout_ms,
         header_actions,
+        egress_request_header_actions,
         CaptureMode::HttpProxy,
     )
     .await
@@ -850,6 +858,7 @@ async fn handle_auth_plugin_gate(
     handler: &AuthPluginHandle,
     request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
+    egress_request_header_actions: Vec<CompiledHeaderAction>,
 ) -> Response<Body> {
     run_auth_plugin_gate_lifecycle(
         state,
@@ -865,6 +874,7 @@ async fn handle_auth_plugin_gate(
         handler,
         request_timeout_ms,
         header_actions,
+        egress_request_header_actions,
         CaptureMode::HttpProxy,
     )
     .await
@@ -884,6 +894,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
     handler: &AuthPluginHandle,
     request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
+    egress_request_header_actions: Vec<CompiledHeaderAction>,
     mode: CaptureMode,
 ) -> Response<Body> {
     let decision = handler
@@ -908,6 +919,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
                 mode,
                 request_timeout_ms,
                 combined,
+                egress_request_header_actions,
             )
             .await
         }
@@ -1418,6 +1430,7 @@ pub(crate) async fn proxy_allowed_request(
     mode: CaptureMode,
     request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
+    egress_request_header_actions: Vec<CompiledHeaderAction>,
 ) -> Response<Body> {
     let upstream_uri: Uri = match full_url.parse() {
         Ok(u) => u,
@@ -1492,6 +1505,16 @@ pub(crate) async fn proxy_allowed_request(
             &header_actions,
             HeaderDirection::Request,
             &original_request_presence,
+        );
+
+        // Evaluate global egress action `when` conditions against the
+        // post-rule/plugin request header state.
+        let pre_global_egress_presence = snapshot_header_presence(headers);
+        apply_header_actions(
+            headers,
+            &egress_request_header_actions,
+            HeaderDirection::Request,
+            &pre_global_egress_presence,
         );
     }
 
