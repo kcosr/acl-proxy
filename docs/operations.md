@@ -9,6 +9,19 @@ incident response.
 - If logging initialization fails, the proxy still starts but reports the
   logging error to stderr.
 
+## Readiness probe
+
+The HTTP listener exposes a simple readiness endpoint at:
+
+- `GET /{proxy.internal_base_path}/ready`
+
+Behavior:
+
+- Returns `200 OK` with JSON body `{ "status": "ready" }` when the process is
+  running and the HTTP listener is reachable.
+- The default path is `/_acl-proxy/ready`.
+- This endpoint is internal to the proxy and does not require a policy match.
+
 ## Reloading configuration
 
 On Unix systems, sending SIGHUP triggers a reload:

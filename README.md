@@ -36,6 +36,12 @@ Run the proxy:
 acl-proxy --config config/acl-proxy.toml
 ```
 
+Probe readiness:
+
+```bash
+curl http://127.0.0.1:8881/_acl-proxy/ready
+```
+
 Send traffic:
 
 ```bash

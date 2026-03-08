@@ -149,6 +149,11 @@ async fn handle_http_request(
         return Ok(resp);
     }
 
+    if is_internal_endpoint(req.uri(), &state.config.proxy.internal_base_path, "ready") {
+        let resp = handle_ready_request(req);
+        return Ok(resp);
+    }
+
     let request_id = generate_request_id();
     let method = req.method().clone();
     let version = req.version();
@@ -328,6 +333,35 @@ fn is_internal_endpoint(uri: &Uri, base: &str, suffix: &str) -> bool {
     }
 
     &remainder[1..] == suffix
+}
+
+fn handle_ready_request(req: Request<Body>) -> Response<Body> {
+    if req.method() != Method::GET {
+        let payload = serde_json::json!({
+            "error": "MethodNotAllowed",
+            "message": "Ready probe must use GET",
+        });
+        let body_bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+
+        let mut resp = Response::new(Body::from(body_bytes));
+        *resp.status_mut() = StatusCode::METHOD_NOT_ALLOWED;
+        resp.headers_mut().insert(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        return resp;
+    }
+
+    let payload = serde_json::json!({ "status": "ready" });
+    let body_bytes = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+
+    let mut resp = Response::new(Body::from(body_bytes));
+    *resp.status_mut() = StatusCode::OK;
+    resp.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    resp
 }
 
 #[derive(Debug, Deserialize)]

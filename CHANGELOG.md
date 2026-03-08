@@ -5,6 +5,7 @@
 ### Added
 - Add default egress destination forwarding for chained proxy deployments, including config validation, transport wiring, integration coverage, and operator guidance ([#40](https://github.com/kcosr/acl-proxy/pull/40)).
 - Add `headers_absent` policy predicate for missing-header deny guards, including config validation, request-header evaluation, inspection output, integration coverage, and operator docs ([#41](https://github.com/kcosr/acl-proxy/pull/41)).
+- Add an HTTP readiness probe at `{internal_base_path}/ready`, including integration coverage and operator documentation ([#42](https://github.com/kcosr/acl-proxy/pull/42)).
 
 ## [0.0.8] - 2026-02-17
 

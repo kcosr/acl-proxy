@@ -681,6 +681,73 @@ default = "deny"
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn ready_probe_returns_ready_json_without_policy_match() {
+    let config = minimal_config();
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let (response, status) = send_raw_http_request(
+        proxy_addr,
+        "GET /_acl-proxy/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        response
+            .to_ascii_lowercase()
+            .contains("content-type: application/json"),
+        "response should include JSON content type, got: {response}"
+    );
+    assert!(
+        response.ends_with("\r\n\r\n{\"status\":\"ready\"}"),
+        "response should include ready JSON body, got: {response}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ready_probe_uses_configured_internal_base_path_and_requires_get() {
+    let mut config = minimal_config();
+    config.proxy.internal_base_path = "/internal".to_string();
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let (ready_response, ready_status) = send_raw_http_request(
+        proxy_addr,
+        "GET /internal/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+    assert_eq!(ready_status, StatusCode::OK);
+    assert!(
+        ready_response.ends_with("\r\n\r\n{\"status\":\"ready\"}"),
+        "response should include ready JSON body, got: {ready_response}"
+    );
+
+    let (method_response, method_status) = send_raw_http_request(
+        proxy_addr,
+        "POST /internal/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+    )
+    .await;
+    assert_eq!(method_status, StatusCode::METHOD_NOT_ALLOWED);
+    assert!(
+        method_response.ends_with(
+            "\r\n\r\n{\"error\":\"MethodNotAllowed\",\"message\":\"Ready probe must use GET\"}"
+        ),
+        "response should include method error JSON body, got: {method_response}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn allowed_request_uses_configured_egress_forwarding_destination() {
     let (forward_addr, seen_requests) = start_forwarding_echo_server().await;
 
