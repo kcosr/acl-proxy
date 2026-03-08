@@ -123,7 +123,7 @@ Fields:
   - When a policy rule sets `request_timeout_ms`, that value overrides this default.
 
 - `internal_base_path` (string, default `"/_acl-proxy"`):
-  - Base path for internal HTTP endpoints (for example, external auth callbacks).
+  - Base path for internal HTTP endpoints (for example, readiness probes and external auth callbacks).
   - Must start with `/` and must not end with `/` (except for the root path `/`).
   - Internal endpoints are only matched for origin-form (direct) requests, not proxy-style
     absolute-form requests.
@@ -867,6 +867,15 @@ The proxy may emit at most one terminal status event per `requestId` in addition
 logged but never affect the allow/deny decision or the client’s HTTP response.
 
 Callback endpoint:
+
+- The proxy exposes a simple readiness endpoint on the HTTP listener:
+
+  ```http
+  GET /{internal_base_path}/ready
+  ```
+
+  - Returns `200 OK` with body `{ "status": "ready" }`.
+  - This is intended for local/load-balancer health checks and does not require a policy match.
 
 - The proxy exposes a dedicated callback path on the HTTP listener:
 

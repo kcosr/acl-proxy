@@ -63,7 +63,13 @@ outcome.
 
 ## Callback endpoint
 
-The proxy exposes a callback endpoint on the HTTP listener:
+The proxy exposes internal HTTP endpoints on the HTTP listener:
+
+- `GET /{internal_base_path}/ready` for readiness checks, returning
+  `200 OK` with `{ "status": "ready" }`.
+- `POST /{internal_base_path}/external-auth/callback` for approval callbacks.
+
+Callback requests use:
 
 ```
 POST /{internal_base_path}/external-auth/callback

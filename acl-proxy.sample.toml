@@ -38,7 +38,7 @@ https_port = 8889
 # Timeout (ms) for upstream responses (0 disables).
 request_timeout_ms = 30000
 
-# Base path for internal endpoints (external auth callbacks).
+# Base path for internal endpoints (readiness probe and external auth callbacks).
 internal_base_path = "/_acl-proxy"
 
 # Optional default egress forwarding destination. Leave this section absent to
