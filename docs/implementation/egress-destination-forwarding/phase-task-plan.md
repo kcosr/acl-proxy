@@ -119,6 +119,28 @@ Use one evidence block per phase.
 - Go/No-Go decision: `GO|NO-GO`
 - Notes: `<rollout caveats, deferred items>`
 
+### Execution evidence
+
+- Phase: `H0`
+- Completion date: `2026-03-08`
+- Commit hash(es): `5977b46`
+- Acceptance evidence:
+  - `cargo test proxy_egress --lib` -> `PASS (9 tests); config parsing/validation covers absent config, valid config, blank/whitespace host rejection, port-suffix rejection, IPv6 literals, bracketed IPv6 handling, malformed bracket rejection, and port=0 rejection`
+  - `cargo test sample_config_in_repo_root_is_valid --lib` -> `PASS; sample config remains valid with forwarding config documented as optional`
+  - `cargo test --test config_reload egress_forwarding` -> `PASS (2 tests); valid forwarding config applies on reload and invalid forwarding config is rejected without replacing the active state`
+  - `docs/config-reference.md`, `docs/configuration.md`, `acl-proxy.sample.toml` -> `UPDATED; additive schema-v1 contract documented, reload behavior noted, and no schema_version bump required when adding [proxy.egress.default]`
+- Review run IDs + triage outcomes:
+  - `gemini:r_20260308022747464_d720241a`
+    - accept: `port = 0` violated the locked `1..65535` contract; fixed with explicit validation in `validate_egress_target`
+    - accept: added unit coverage for `port = 0` rejection
+  - `pi:r_20260308022747472_260109cf`
+    - accept: added bracketed IPv6 documentation and test coverage for valid and malformed bracketed hosts
+    - accept: expanded `docs/configuration.md` with a brief forwarding-behavior summary
+    - defer: add reload coverage for `Some(target) -> None` transition in `H2` alongside the phase-planned enable/disable reload test
+    - reject: no changes to `AppState::from_config` were needed; rejected because startup/reload needed direct validation parity and `AppState::from_config` now enforces `config.validate_basic()`
+- Go/No-Go decision: `GO`
+- Notes: `H0 preserves default behavior when forwarding config is absent. External-auth transport and CONNECT outer-handshake behavior remain untouched in this phase.`
+
 ### Authoring-stage review evidence (spec plan stream)
 
 - Stage: `Spec authoring`
