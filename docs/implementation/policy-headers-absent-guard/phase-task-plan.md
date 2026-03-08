@@ -134,6 +134,25 @@ Acceptance criteria:
 - Go/No-Go decision: `GO`
 - Notes: Both required reviews completed from live session streams with no fallback. The only deferred item is the effective-policy output update, which is explicitly scoped to H1.
 
+- Phase: `H1`
+- Completion date: `2026-03-08`
+- Commit hash(es): `859736c`
+- Acceptance evidence:
+  - `cargo test headers_absent --lib` -> passed (`13 passed; 0 failed`) covering absent/present/empty behavior, case-insensitive lookup, method+subnet `AND` semantics, validation, normalization, and effective-policy output.
+  - `cargo test policy_dump --test policy_cli` -> passed (`4 passed; 0 failed`) confirming JSON and table inspection output both include `headers_absent`.
+- Review run IDs + triage outcomes:
+  - `gemini:r_20260308033714556_bd797e9b`
+    - accept: H1 deliverables are implemented cleanly across engine compilation, evaluation, call sites, and inspection output.
+    - defer: clarify in H2 docs that `headers_absent` applies to decrypted inner requests, not CONNECT tunnel establishment metadata.
+  - `pi:r_20260308033714564_29a5eeb6`
+    - accept: add explicit subnet `AND` semantics coverage for `headers_absent`.
+    - defer: multi-header `any`-absent semantics test remains scheduled for H2 per the locked phase plan.
+    - defer: CONNECT outer-vs-inner request-header behavior should be clarified in H2 docs.
+    - reject: narrowing `is_allowed_with_headers` to a test-only API is stylistic and not required.
+    - reject: keeping both validation-time normalization and compile-time `HeaderName` conversion is intentional separation of concerns.
+- Go/No-Go decision: `GO`
+- Notes: Both required reviews completed from live session streams with no fallback. The only deferred items are H2-scoped docs/integration coverage additions.
+
 ### Authoring-stage review evidence (spec plan stream)
 
 - Stage: `Spec authoring`
