@@ -156,15 +156,22 @@ Acceptance criteria:
 - Notes: Both required reviews completed from the live session stream with no fallback. The exact-placeholder branch intentionally remains a no-op in H0 so env resolution and missing-env failures can land cleanly in H1 without widening the current phase scope.
 
 - Phase: `H1`
-- Completion date: `TBD`
-- Commit hash(es): `TBD`
+- Completion date: `2026-03-08`
+- Commit hash(es): `b1a33da`
 - Acceptance evidence:
-  - `TBD`
+  - `cargo test header_action_env --lib` -> passed (`13 passed; 0 failed`) covering exact `value` resolution, ruleset-template resolution, mixed static/dynamic `values`, repeated placeholders, missing-env failure, static values, approval-macro coexistence, non-`set`/`add` behavior, empty resolved values, invalid syntax, and both load-path success/failure cases.
+  - `rg -n "HeaderActionEnvTestGuard|header_action_env_interpolation_allows_empty_resolved_value|header_action_env_interpolation_skips_remove_actions|header_action_env_interpolation_resolves_mixed_values_and_repeated_placeholder|load_from_sources_resolves_header_action_env_placeholders" src/config/mod.rs` -> confirmed serialized env-state guard/restore coverage plus explicit tests for mixed values, remove-action passthrough, empty resolved values, and end-to-end `load_from_sources()` success.
 - Review run IDs + triage outcomes:
-  - `gemini:TBD`
-  - `pi:TBD`
-- Go/No-Go decision: `TBD`
-- Notes: `TBD`
+  - `gemini:r_20260308044046216_fe1f7df4`
+    - accept: H1 implementation satisfies the locked behavior and test requirements.
+    - accept: add an explicit empty-resolved-value test to lock the documented interpolation behavior; applied before phase close.
+  - `pi:r_20260308044046216_b7bb5256`
+    - accept: H1 resolution behavior, missing-env failures, env-test guard, and end-to-end load wiring are implemented correctly.
+    - accept: add explicit `remove`-action passthrough coverage and an empty-resolved-value test; both applied before phase close.
+    - reject: ruleset iteration nondeterminism is not a real risk here because `RulesetMap` is a `BTreeMap`, not a hash map.
+    - reject: locking first-error ordering across mixed invalid entries is unnecessary for the current contract and outside the phase acceptance criteria.
+- Go/No-Go decision: `GO`
+- Notes: Both required reviews completed from the live session stream with no fallback. Accepted review follow-ups were limited to additional deterministic tests; no runtime behavior changed after the initial H1 implementation.
 
 - Phase: `H2`
 - Completion date: `TBD`
