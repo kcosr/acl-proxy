@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
 use http::header::{HeaderName, HeaderValue};
+use http::HeaderMap;
 use ipnet::IpNet;
 use regex::{Regex, RegexBuilder};
 use serde::Serialize;
@@ -72,6 +73,7 @@ struct CompiledRule {
     rule_id: Option<String>,
     subnets: Vec<IpNet>,
     methods: Vec<String>,
+    headers_absent: Vec<HeaderName>,
     request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
     external_auth_profile: Option<String>,
@@ -91,7 +93,6 @@ struct ExpandedRule {
     rule_id: Option<String>,
     subnets: Vec<IpNet>,
     methods: Vec<String>,
-    #[allow(dead_code)]
     headers_absent: Option<Vec<String>>,
     request_timeout_ms: Option<u64>,
     header_actions: Vec<HeaderActionConfig>,
@@ -113,6 +114,7 @@ pub struct EffectiveRule {
     pub rule_id: Option<String>,
     pub subnets: Vec<IpNet>,
     pub methods: Vec<String>,
+    pub headers_absent: Vec<String>,
     pub request_timeout_ms: Option<u64>,
     pub header_actions: Vec<EffectiveHeaderAction>,
     pub external_auth: Option<EffectiveExternalAuth>,
@@ -152,6 +154,7 @@ impl PolicyEngine {
         let mut compiled_rules = Vec::with_capacity(expanded.rules.len());
 
         for (idx, rule) in expanded.rules.into_iter().enumerate() {
+            let headers_absent = compile_headers_absent(rule.headers_absent.as_deref(), idx)?;
             let header_actions = compile_header_actions(&rule.header_actions, idx)?;
 
             let regex = if let Some(ref pattern) = rule.pattern {
@@ -175,6 +178,7 @@ impl PolicyEngine {
                 rule_id: rule.rule_id,
                 subnets: rule.subnets,
                 methods: rule.methods,
+                headers_absent,
                 request_timeout_ms: rule.request_timeout_ms,
                 header_actions,
                 external_auth_profile: rule.external_auth_profile,
@@ -192,6 +196,7 @@ impl PolicyEngine {
         url_str: &str,
         client_ip: Option<&str>,
         method: Option<&str>,
+        headers: &HeaderMap<HeaderValue>,
     ) -> PolicyDecision {
         let normalized_url = match normalize_url(url_str) {
             Ok(u) => u,
@@ -229,6 +234,10 @@ impl PolicyEngine {
                 }
             }
 
+            if !rule.headers_absent.is_empty() && !any_header_absent(headers, &rule.headers_absent) {
+                continue;
+            }
+
             let matched = MatchedRule {
                 index: rule.index,
                 action: rule.action,
@@ -257,7 +266,18 @@ impl PolicyEngine {
     }
 
     pub fn is_allowed(&self, url_str: &str, client_ip: Option<&str>, method: Option<&str>) -> bool {
-        self.evaluate(url_str, client_ip, method).allowed
+        let headers = HeaderMap::new();
+        self.evaluate(url_str, client_ip, method, &headers).allowed
+    }
+
+    pub fn is_allowed_with_headers(
+        &self,
+        url_str: &str,
+        client_ip: Option<&str>,
+        method: Option<&str>,
+        headers: &HeaderMap<HeaderValue>,
+    ) -> bool {
+        self.evaluate(url_str, client_ip, method, headers).allowed
     }
 }
 
@@ -309,6 +329,7 @@ impl EffectivePolicy {
                     rule_id: rule.rule_id,
                     subnets: rule.subnets,
                     methods: rule.methods,
+                    headers_absent: rule.headers_absent.unwrap_or_default(),
                     request_timeout_ms: rule.request_timeout_ms,
                     header_actions,
                     external_auth,
@@ -796,6 +817,25 @@ fn compile_header_actions(
     Ok(compiled)
 }
 
+fn compile_headers_absent(
+    headers_absent: Option<&[String]>,
+    index: usize,
+) -> Result<Vec<HeaderName>, PolicyError> {
+    let Some(headers_absent) = headers_absent else {
+        return Ok(Vec::new());
+    };
+
+    headers_absent
+        .iter()
+        .map(|name| {
+            HeaderName::from_lowercase(name.as_bytes()).map_err(|err| PolicyError::RuleInvalid {
+                index,
+                reason: format!("invalid header name '{}' in headers_absent: {err}", name),
+            })
+        })
+        .collect()
+}
+
 fn validate_headers_absent(
     headers_absent: Option<&[String]>,
     index: usize,
@@ -837,6 +877,12 @@ fn validate_headers_absent(
     }
 
     Ok(Some(normalized))
+}
+
+fn any_header_absent(headers: &HeaderMap<HeaderValue>, headers_absent: &[HeaderName]) -> bool {
+    headers_absent
+        .iter()
+        .any(|header_name| !headers.contains_key(header_name))
 }
 
 fn keys_for_url_variants(
@@ -1093,6 +1139,18 @@ mod tests {
 
     fn allow_action() -> PolicyDefaultAction {
         PolicyDefaultAction::Allow
+    }
+
+    fn header_map(entries: &[(&str, &str)]) -> HeaderMap<HeaderValue> {
+        let mut headers = HeaderMap::new();
+        for (name, value) in entries {
+            headers.insert(
+                HeaderName::from_lowercase(name.to_ascii_lowercase().as_bytes())
+                    .expect("valid header name"),
+                HeaderValue::from_str(value).expect("valid header value"),
+            );
+        }
+        headers
     }
 
     #[test]
@@ -1445,6 +1503,143 @@ default = "allow"
     }
 
     #[test]
+    fn headers_absent_matches_when_header_is_missing() {
+        let toml = r#"
+default = "allow"
+
+[[rules]]
+action = "deny"
+headers_absent = ["x-workload-id"]
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+        let headers = HeaderMap::new();
+
+        let decision = engine.evaluate("https://example.com/path", None, Some("GET"), &headers);
+
+        assert!(!decision.allowed);
+        assert_eq!(decision.matched.as_ref().map(|rule| rule.index), Some(0));
+    }
+
+    #[test]
+    fn headers_absent_falls_through_when_header_is_present() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+headers_absent = ["x-workload-id"]
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/**"
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+        let headers = header_map(&[("X-Workload-Id", "worker-123")]);
+
+        let decision = engine.evaluate("https://example.com/path", None, Some("GET"), &headers);
+
+        assert!(decision.allowed);
+        assert_eq!(decision.matched.as_ref().map(|rule| rule.index), Some(1));
+    }
+
+    #[test]
+    fn headers_absent_treats_empty_values_as_present() {
+        let toml = r#"
+default = "allow"
+
+[[rules]]
+action = "deny"
+headers_absent = ["x-workload-id"]
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+        let headers = header_map(&[("x-workload-id", "")]);
+
+        let decision = engine.evaluate("https://example.com/path", None, Some("GET"), &headers);
+
+        assert!(decision.allowed);
+        assert!(decision.matched.is_none());
+    }
+
+    #[test]
+    fn headers_absent_lookup_is_case_insensitive() {
+        let toml = r#"
+default = "allow"
+
+[[rules]]
+action = "deny"
+headers_absent = ["X-Workload-Id"]
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+        let headers = header_map(&[("x-workload-id", "worker-123")]);
+
+        let decision = engine.evaluate("https://example.com/path", None, Some("GET"), &headers);
+
+        assert!(decision.allowed);
+        assert!(decision.matched.is_none());
+    }
+
+    #[test]
+    fn headers_absent_combines_with_methods_using_and_semantics() {
+        let toml = r#"
+default = "allow"
+
+[[rules]]
+action = "deny"
+pattern = "https://example.com/**"
+methods = ["POST"]
+headers_absent = ["x-workload-id"]
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+        let headers = HeaderMap::new();
+
+        let deny_decision = engine.evaluate("https://example.com/path", None, Some("POST"), &headers);
+        let allow_decision =
+            engine.evaluate("https://example.com/path", None, Some("GET"), &headers);
+
+        assert!(!deny_decision.allowed);
+        assert!(allow_decision.allowed);
+    }
+
+    #[test]
+    fn headers_absent_combines_with_subnets_using_and_semantics() {
+        let toml = r#"
+default = "allow"
+
+[[rules]]
+action = "deny"
+pattern = "https://example.com/**"
+subnets = ["10.0.0.0/8"]
+headers_absent = ["x-workload-id"]
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+        let headers = HeaderMap::new();
+
+        let deny_decision =
+            engine.evaluate("https://example.com/path", Some("10.1.2.3"), Some("GET"), &headers);
+        let allow_decision = engine.evaluate(
+            "https://example.com/path",
+            Some("192.168.1.10"),
+            Some("GET"),
+            &headers,
+        );
+
+        assert!(!deny_decision.allowed);
+        assert!(allow_decision.allowed);
+    }
+
+    #[test]
     fn invalid_urls_are_denied() {
         let toml = r#"
 default = "allow"
@@ -1531,6 +1726,27 @@ external_auth_profile = "example"
             .expect("external_auth metadata should be present");
         assert_eq!(ext.profile, "example");
         assert_eq!(ext.timeout_ms, 5000);
+    }
+
+    #[test]
+    fn effective_policy_includes_headers_absent() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+pattern = "**"
+headers_absent = ["x-workload-id"]
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let effective = EffectivePolicy::from_config(&cfg).expect("build effective policy");
+
+        assert_eq!(effective.rules.len(), 1);
+        assert_eq!(
+            effective.rules[0].headers_absent,
+            vec!["x-workload-id".to_string()]
+        );
     }
 
     #[test]
