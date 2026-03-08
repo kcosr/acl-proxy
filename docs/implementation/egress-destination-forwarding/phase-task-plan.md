@@ -141,6 +141,29 @@ Use one evidence block per phase.
 - Go/No-Go decision: `GO`
 - Notes: `H0 preserves default behavior when forwarding config is absent. External-auth transport and CONNECT outer-handshake behavior remain untouched in this phase.`
 
+- Phase: `H1`
+- Completion date: `2026-03-08`
+- Commit hash(es): `788fa20`
+- Acceptance evidence:
+  - `cargo test --test proxy_http allowed_request_is_proxied_and_loop_header_added` -> `PASS; feature-off explicit HTTP path still proxies directly and preserves existing loop-header behavior`
+  - `cargo test --test proxy_http allowed_request_uses_configured_egress_forwarding_destination` -> `PASS; explicit HTTP path dials the configured egress destination while preserving absolute-form URI and original Host header`
+  - `cargo test --test proxy_http external_auth_webhook_transport_is_not_redirected_by_egress_forwarding` -> `PASS; external-auth webhook transport still reaches the configured webhook directly while the allowed proxied request goes to the forwarding destination`
+  - `cargo test --test proxy_https_connect allowed_https_via_connect_is_proxied_and_captured` -> `PASS; feature-off CONNECT outer/inner behavior remains on the existing path`
+  - `cargo test --test proxy_https_connect configured_egress_forwarding_applies_to_https_connect_inner_requests` -> `PASS; CONNECT outer handshake remains unchanged and decrypted inner HTTPS requests forward through the configured egress destination with original Host/URI semantics preserved`
+  - `cargo test --test proxy_https_transparent allowed_https_transparent_is_proxied_and_captured` -> `PASS; feature-off transparent HTTPS path remains on the existing direct-origin behavior`
+  - `cargo test --test proxy_https_transparent configured_egress_forwarding_applies_to_https_transparent_requests` -> `PASS; transparent HTTPS requests forward through the configured egress destination with original Host/URI semantics preserved`
+- Review run IDs + triage outcomes:
+  - `gemini:r_20260308023829702_530052f1`
+    - defer: document plaintext egress-leg transport expectations in operator guidance during `H2`
+    - reject: elevate background egress-connection logs from `debug`; rejected for phase one because it is an observability preference, not a correctness defect
+  - `pi:r_20260308023829724_28b90b92`
+    - defer: add unavailable-egress and timeout-path coverage in `H2`, which already owns the failure-path test deliverables
+    - defer: add forwarding-path header-action and operator TLS guidance in `H2`, which already owns trust-header and operator-doc stabilization
+    - reject: add connection pooling now; rejected because it is outside the locked phase-one transport scope and not required for correctness
+    - reject: require CONNECT/transparent-specific external-auth isolation duplicates now; rejected because all allowed paths converge through the same `proxy_allowed_request` transport seam and the explicit integration test already proves the isolation boundary
+- Go/No-Go decision: `GO`
+- Notes: `H1 forwards only allowed proxied request paths. Policy evaluation, capture metadata, and Host-header semantics remain tied to the original target, outer CONNECT handshake stays unchanged, and external-auth transport remains isolated from forwarding override.`
+
 ### Authoring-stage review evidence (spec plan stream)
 
 - Stage: `Spec authoring`
