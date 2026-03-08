@@ -153,6 +153,31 @@ Acceptance criteria:
 - Go/No-Go decision: `GO`
 - Notes: Both required reviews completed from live session streams with no fallback. The only deferred items are H2-scoped docs/integration coverage additions.
 
+- Phase: `H2`
+- Completion date: `2026-03-08`
+- Commit hash(es): `502ea25`
+- Acceptance evidence:
+  - `cargo test headers_absent --lib` -> passed (`14 passed; 0 failed`) covering absent/present/empty behavior, case-insensitive lookup, method+subnet `AND` semantics, and multi-header `any`-absent matching including the both-missing case.
+  - `cargo test headers_absent_top_deny_guard_falls_through_to_allow_rule --test proxy_http` -> passed, confirming top deny guard behavior, fall-through to an allow rule when the header is present, denial before upstream forwarding when the header is missing, and empty-value headers are treated as present.
+  - `cargo test method_scoped_headers_absent_guard_only_blocks_matching_methods --test proxy_http` -> passed, confirming `methods` + `headers_absent` `AND` semantics in the live HTTP proxy path.
+  - `cargo fmt` -> passed.
+  - `cargo clippy` -> passed.
+  - `cargo test` -> passed.
+  - `cargo build --release` -> passed.
+  - `rg -n "headers_absent|Header-absence predicate|CONNECT establishment|inbound request-header predicates" docs/policy.md docs/architecture.md docs/proxy-modes.md` -> confirmed docs distinguish request-header predicates from header actions and clarify CONNECT inner-request scope.
+- Review run IDs + triage outcomes:
+  - `gemini:r_20260308034729082_89f099b1`
+    - accept: H2 integration coverage and doc updates satisfy the locked deliverables and acceptance criteria.
+    - accept: add the H2 Section 9 evidence block.
+    - defer: add the `CHANGELOG.md` `Unreleased` entry once a PR number exists, per repo release rules.
+  - `pi:r_20260308034729082_24e21da6`
+    - accept: add an explicit both-missing assertion to the multi-header `headers_absent` unit test for self-contained `any`-absent coverage.
+    - defer: CONNECT-path integration coverage is a follow-up risk reduction item, not required for the locked minimal scope because the same request-evaluation path is already exercised by unit coverage and documented clearly.
+    - defer: add the `CHANGELOG.md` `Unreleased` entry once a PR number exists, per repo release rules.
+    - reject: replacing the local `MethodList` deserialization helper in the integration test is cosmetic and not required without a public constructor.
+- Go/No-Go decision: `GO`
+- Notes: Full project verification completed successfully after the H2 implementation changes. `CHANGELOG.md` remains intentionally unchanged until a PR number exists, matching the repo instructions in `AGENTS.md`.
+
 ### Authoring-stage review evidence (spec plan stream)
 
 - Stage: `Spec authoring`
