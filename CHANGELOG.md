@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.9] - 2026-03-08
 
 ### Added
 - Add default egress destination forwarding for chained proxy deployments, including config validation, transport wiring, integration coverage, and operator guidance ([#40](https://github.com/kcosr/acl-proxy/pull/40)).
