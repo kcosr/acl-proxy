@@ -112,6 +112,28 @@ Acceptance criteria:
 - Go/No-Go decision: `GO|NO-GO`
 - Notes: `<caveats/deferred items>`
 
+### Execution-stage evidence
+
+- Phase: `H0`
+- Completion date: `2026-03-08`
+- Commit hash(es): `416252e`
+- Acceptance evidence:
+  - `cargo test headers_absent --lib` -> passed (`6 passed; 0 failed`) covering empty-list rejection, invalid-header rejection, duplicate-after-normalization rejection, `headers_absent`-only match criteria, template validation, and positive normalization.
+  - `rg -n "headers_absent" docs/config-reference.md acl-proxy.sample.toml src/config/mod.rs src/policy/mod.rs` -> confirmed config-model fields, `has_match_criteria` wiring, validation helper/tests, ruleset/direct-rule docs, include inheritance note, and sample usage are present.
+- Review run IDs + triage outcomes:
+  - `gemini:r_20260308033027172_e1f21047`
+    - accept: H0 deliverables and targeted coverage are complete.
+    - reject: include-rule override symmetry for `headers_absent` is outside the locked minimal scope.
+    - reject: templated header-name placeholders are outside the locked contract.
+  - `pi:r_20260308033027199_8a5ad453`
+    - accept: add `headers_absent` to the ruleset-template field listing in `docs/config-reference.md`.
+    - accept: document that include rules inherit `headers_absent` from referenced templates and do not override it in this release.
+    - accept: add a positive normalization assertion for valid `headers_absent` input.
+    - defer: effective policy / inspection output remains an H1 deliverable.
+    - reject: duplicate empty-list validation in `validate_basic()` is unnecessary because the policy validation path already returns a clear deterministic error.
+- Go/No-Go decision: `GO`
+- Notes: Both required reviews completed from live session streams with no fallback. The only deferred item is the effective-policy output update, which is explicitly scoped to H1.
+
 ### Authoring-stage review evidence (spec plan stream)
 
 - Stage: `Spec authoring`
