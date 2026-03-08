@@ -127,6 +127,26 @@ Behavior:
   once at config load/reload time. Mixed strings such as `Bearer ${TOKEN}` are rejected.
 - Header actions do not participate in rule matching. `headers_absent` is evaluated first against the inbound request headers, and actions run only after a rule matches.
 
+## Global egress request header actions
+
+You can define a global request-only egress layer under
+`[[proxy.egress.request_header_actions]]` to apply the same outbound mutations
+to every forwarded request (explicit HTTP, CONNECT inner requests, and
+transparent HTTPS).
+
+Ordering for outbound requests:
+
+1. Evaluate policy and match the first rule.
+2. Apply matched-rule and plugin request header actions.
+3. Apply global egress request header actions.
+4. Send upstream.
+
+Notes:
+- Global egress actions never affect rule matching.
+- Global `when` conditions are evaluated against header presence at the start of
+  the global layer (after rule/plugin request actions).
+- Global response-header actions are not supported in this stream.
+
 ## Approval macros
 
 When an allow rule uses `external_auth_profile`, header actions can reference

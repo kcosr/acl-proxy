@@ -28,8 +28,8 @@ After parsing the file, these overrides are applied:
 
 ## Header-action env placeholders
 
-Policy header actions also support a separate load-time env interpolation path for `set` / `add`
-`value` and `values[*]` entries:
+Policy header actions and global egress request header actions also support a separate load-time
+env interpolation path for `set` / `add` `value` and `values[*]` entries:
 
 ```toml
 [[policy.rules.header_actions]]
@@ -94,5 +94,10 @@ schema_version = "1"
 change `schema_version`; omitting it keeps direct-to-origin forwarding behavior.
 When enabled, it sends allowed proxied traffic to a fixed forwarding
 destination instead of dialing the original target directly.
+
+`[[proxy.egress.request_header_actions]]` is also additive in schema v1. It
+defines request-only header mutations applied to every forwarded upstream
+request after matched-rule/plugin request actions and before the upstream send.
+These global egress actions do not participate in policy matching.
 
 See `docs/config-reference.md` for full field-level details.
