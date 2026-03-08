@@ -141,15 +141,19 @@ Acceptance criteria:
 ### Planned execution evidence blocks
 
 - Phase: `H0`
-- Completion date: `TBD`
-- Commit hash(es): `TBD`
+- Completion date: `2026-03-08`
+- Commit hash(es): `8b504d5`
 - Acceptance evidence:
-  - `TBD`
+  - `cargo test header_action_env --lib` -> passed (`4 passed; 0 failed`) covering the exact-placeholder classifier, direct-rule and ruleset location errors, and `load_from_sources()` wiring for invalid marker syntax.
+  - `rg -n "interpolate_header_action_env_vars|classify_header_action_env_placeholder|format_direct_rule_location|format_ruleset_template_location|format_header_action_location" src/config/mod.rs` -> confirmed the dedicated load-path hook, centralized placeholder classifier, and stable direct-rule / ruleset / header-action location helpers are all present in one module.
 - Review run IDs + triage outcomes:
-  - `gemini:TBD`
-  - `pi:TBD`
-- Go/No-Go decision: `TBD`
-- Notes: `TBD`
+  - `gemini:r_20260308043637316_9f6ebc7d`
+    - accept: H0 deliverables, strict marker detection, direct-rule/ruleset traversal, and load-path wiring are complete and aligned with the locked design.
+  - `pi:r_20260308043637316_f6627fbb`
+    - accept: H0 helper factoring, location formatting, and exact-placeholder classification match the phase contract.
+    - defer: add explicit passthrough coverage for `remove` / `replace_substring` and valid exact-placeholder/static happy paths in H1, where behavior tests are in scope.
+- Go/No-Go decision: `GO`
+- Notes: Both required reviews completed from the live session stream with no fallback. The exact-placeholder branch intentionally remains a no-op in H0 so env resolution and missing-env failures can land cleanly in H1 without widening the current phase scope.
 
 - Phase: `H1`
 - Completion date: `TBD`
