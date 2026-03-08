@@ -174,15 +174,28 @@ Acceptance criteria:
 - Notes: Both required reviews completed from the live session stream with no fallback. Accepted review follow-ups were limited to additional deterministic tests; no runtime behavior changed after the initial H1 implementation.
 
 - Phase: `H2`
-- Completion date: `TBD`
-- Commit hash(es): `TBD`
+- Completion date: `2026-03-08`
+- Commit hash(es): `ade0ccc`
 - Acceptance evidence:
-  - `TBD`
+  - `cargo fmt` -> passed.
+  - `cargo clippy` -> passed.
+  - `cargo test` -> passed (`103 unit tests`, `68 integration/doc tests`; `0 failed`).
+  - `cargo build --release` -> passed.
+  - `./target/release/acl-proxy config validate --config <temp>` with `${ACL_PROXY_TEST_CLI_TOKEN}` unset -> failed as expected with `policy.rules[0].header_actions[0] for header 'authorization' references missing env var 'ACL_PROXY_TEST_CLI_TOKEN'`.
+  - `ACL_PROXY_TEST_CLI_TOKEN=cli-token ./target/release/acl-proxy policy dump --config <temp> | rg -n 'authorization|cli-token'` -> passed, confirming `policy dump` shows the resolved header-action value.
+  - `rg -n "Header-action env placeholders|Exact whole-string env placeholders|policy dump prints the resolved effective policy|references missing env var|Mixed strings such as|GITHUB_API_TOKEN|resolved again during reload" docs/configuration.md docs/config-reference.md docs/cli.md docs/policy.md docs/operations.md docs/troubleshooting.md acl-proxy.sample.toml` -> confirmed operator docs and sample cover exact syntax, failure behavior, sensitive `policy dump` output, reload timing, troubleshooting guidance, and the `${...}` migration warning.
 - Review run IDs + triage outcomes:
-  - `gemini:TBD`
-  - `pi:TBD`
-- Go/No-Go decision: `TBD`
-- Notes: `TBD`
+  - `gemini:r_20260308044655934_1037f419`
+    - accept: the H2 docs, sample config guidance, and verification expectations satisfy the locked deliverables and acceptance criteria.
+  - `pi:r_20260308044655934_6966835d`
+    - accept: add an explicit warning that `policy dump` exposes resolved env-sourced values; applied in `docs/cli.md`.
+    - accept: add reload guidance for `${NAME}` env placeholders; applied in `docs/operations.md`.
+    - accept: add troubleshooting guidance for missing/malformed env interpolation; applied in `docs/troubleshooting.md`.
+    - accept: add a brief policy-level cross-reference for load-time `${NAME}` placeholders; applied in `docs/policy.md`.
+    - defer: add the `CHANGELOG.md` `Unreleased` entry after a PR number exists, per repo rules.
+    - reject: changing `policy dump` to redact env-sourced values would alter the locked H2 verification contract and is outside this stream's scope.
+- Go/No-Go decision: `GO`
+- Notes: Both required reviews completed from the live session stream with no fallback. `CHANGELOG.md` remains intentionally unchanged because the repo instructions require a PR number before adding the `Unreleased` entry for this feature.
 
 ### Authoring-stage review evidence (spec plan stream)
 
