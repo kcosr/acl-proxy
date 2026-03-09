@@ -975,10 +975,60 @@ fn build_full_url(
         return Ok((normalized, target));
     }
 
-    // For now, treat non-absolute-form as a client error.
-    let mut resp = Response::new(Body::from("Bad Request"));
-    *resp.status_mut() = StatusCode::BAD_REQUEST;
-    Err(resp)
+    // Origin-form requests are accepted on the HTTP listener to support
+    // transparent HTTP interception (for example, port-80 redirects).
+    build_http_url_from_origin_form(req)
+}
+
+fn build_http_url_from_origin_form(
+    req: &Request<Body>,
+) -> Result<(String, Option<CaptureEndpoint>), Response<Body>> {
+    let headers = req.headers();
+
+    let host_raw = if let Some(host_header) = headers.get(HOST) {
+        match host_header.to_str() {
+            Ok(h) => h.trim(),
+            Err(_) => {
+                let mut resp = Response::new(Body::from("Bad Request: invalid Host header"));
+                *resp.status_mut() = StatusCode::BAD_REQUEST;
+                return Err(resp);
+            }
+        }
+    } else if let Some(auth) = req.uri().authority() {
+        auth.as_str()
+    } else {
+        let mut resp = Response::new(Body::from("Bad Request: missing Host header"));
+        *resp.status_mut() = StatusCode::BAD_REQUEST;
+        return Err(resp);
+    };
+
+    if host_raw.is_empty() {
+        let mut resp = Response::new(Body::from("Bad Request: empty Host header"));
+        *resp.status_mut() = StatusCode::BAD_REQUEST;
+        return Err(resp);
+    }
+
+    let path_and_query = req
+        .uri()
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+
+    let path = if path_and_query.starts_with('/') {
+        path_and_query.to_string()
+    } else {
+        format!("/{}", path_and_query)
+    };
+
+    let full_url = format!("http://{host}{path}", host = host_raw, path = path);
+    let (target_host, target_port) = split_host_and_port_with_default(host_raw, 80);
+
+    let target = CaptureEndpoint {
+        address: Some(target_host.to_string()),
+        port: Some(target_port),
+    };
+
+    Ok((full_url, Some(target)))
 }
 
 fn extract_target_from_uri(uri: &Uri) -> Option<CaptureEndpoint> {
@@ -996,6 +1046,29 @@ fn extract_target_from_uri(uri: &Uri) -> Option<CaptureEndpoint> {
         address: Some(host),
         port: Some(port),
     })
+}
+
+fn split_host_and_port_with_default(host: &str, default_port: u16) -> (&str, u16) {
+    // Bracketed IPv6: [::1]:80
+    if let Some(idx) = host.rfind(']') {
+        if host.starts_with('[') {
+            let host_part = &host[..=idx];
+            if let Some(port_str) = host[idx + 1..].strip_prefix(':') {
+                if let Ok(port) = port_str.parse::<u16>() {
+                    return (host_part, port);
+                }
+            }
+            return (host_part, default_port);
+        }
+    }
+
+    if let Some((name, port_str)) = host.rsplit_once(':') {
+        if let Ok(port) = port_str.parse::<u16>() {
+            return (name, port);
+        }
+    }
+
+    (host, default_port)
 }
 
 pub(crate) fn has_loop_header(headers: &HttpHeaderMap, name: &HeaderName) -> bool {
@@ -2277,8 +2350,10 @@ pub(crate) fn generate_request_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{generate_request_id, is_internal_endpoint, is_upgrade_request};
-    use http::{header, HeaderMap, HeaderValue, Uri};
+    use super::{build_full_url, generate_request_id, is_internal_endpoint, is_upgrade_request};
+    use http::header::HOST;
+    use http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
+    use hyper::{Body, Request};
 
     #[test]
     fn request_id_includes_process_tag_and_is_unique() {
@@ -2353,5 +2428,102 @@ mod tests {
         let mut missing_upgrade = HeaderMap::new();
         missing_upgrade.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
         assert!(!is_upgrade_request(&missing_upgrade));
+    }
+
+    #[test]
+    fn build_full_url_accepts_absolute_form() {
+        let req = Request::builder()
+            .uri("http://example.com/path?q=1")
+            .body(Body::empty())
+            .expect("request");
+
+        let (url, target) = build_full_url(&req).expect("full url");
+        assert_eq!(url, "http://example.com/path?q=1");
+        let target = target.expect("target");
+        assert_eq!(target.address.as_deref(), Some("example.com"));
+        assert_eq!(target.port, Some(80));
+    }
+
+    #[test]
+    fn build_full_url_accepts_origin_form_with_host_header() {
+        let req = Request::builder()
+            .uri("/relative/path?q=1")
+            .header(HOST, "example.com:8080")
+            .body(Body::empty())
+            .expect("request");
+
+        let (url, target) = build_full_url(&req).expect("full url");
+        assert_eq!(url, "http://example.com:8080/relative/path?q=1");
+        let target = target.expect("target");
+        assert_eq!(target.address.as_deref(), Some("example.com"));
+        assert_eq!(target.port, Some(8080));
+    }
+
+    #[test]
+    fn build_full_url_accepts_origin_form_with_ipv6_host_header() {
+        let req = Request::builder()
+            .uri("/relative/path")
+            .header(HOST, "[::1]:8080")
+            .body(Body::empty())
+            .expect("request");
+
+        let (url, target) = build_full_url(&req).expect("full url");
+        assert_eq!(url, "http://[::1]:8080/relative/path");
+        let target = target.expect("target");
+        assert_eq!(target.address.as_deref(), Some("[::1]"));
+        assert_eq!(target.port, Some(8080));
+    }
+
+    #[test]
+    fn build_full_url_defaults_origin_form_host_port_to_80() {
+        let req = Request::builder()
+            .uri("/relative/path")
+            .header(HOST, "example.com")
+            .body(Body::empty())
+            .expect("request");
+
+        let (url, target) = build_full_url(&req).expect("full url");
+        assert_eq!(url, "http://example.com/relative/path");
+        let target = target.expect("target");
+        assert_eq!(target.address.as_deref(), Some("example.com"));
+        assert_eq!(target.port, Some(80));
+    }
+
+    #[test]
+    fn build_full_url_rejects_origin_form_without_host() {
+        let req = Request::builder()
+            .uri("/relative/path")
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = build_full_url(&req).expect_err("missing host should fail");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn build_full_url_rejects_origin_form_with_empty_host() {
+        let req = Request::builder()
+            .uri("/relative/path")
+            .header(HOST, "")
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = build_full_url(&req).expect_err("empty host should fail");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn build_full_url_rejects_origin_form_with_invalid_host() {
+        let req = Request::builder()
+            .uri("/relative/path")
+            .header(
+                HOST,
+                HeaderValue::from_bytes(&[0xFF]).expect("invalid host value"),
+            )
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = build_full_url(&req).expect_err("invalid host should fail");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }

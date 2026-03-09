@@ -23,8 +23,9 @@ schema_version = "1"
 ###############################################################################
 
 [proxy]
-# HTTP explicit proxy listener. Clients send absolute-form HTTP/1.1
-# requests to this address (e.g. via curl -x).
+# HTTP listener. Supports both explicit-proxy absolute-form HTTP/1.1
+# requests (e.g. via curl -x) and transparent HTTP origin-form requests
+# redirected from port 80.
 bind_address = "0.0.0.0"
 http_port = 8881
 

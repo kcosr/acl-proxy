@@ -47,7 +47,7 @@ acl-proxy --config config/acl-proxy.toml
 ```
 
 The proxy starts:
-- The HTTP explicit proxy listener on `proxy.bind_address:proxy.http_port`.
+- The HTTP listener on `proxy.bind_address:proxy.http_port` (explicit proxy and transparent HTTP interception).
 - The transparent HTTPS listener on `proxy.https_bind_address:proxy.https_port` if
   `https_port` is non-zero.
 
@@ -57,6 +57,13 @@ The proxy starts:
 
 ```bash
 curl -x http://127.0.0.1:8881 http://example.com/
+```
+
+### Transparent HTTP interception (HTTP/1.1)
+
+```bash
+curl http://example.com/resource \
+  --connect-to example.com:80:127.0.0.1:8881
 ```
 
 ### HTTPS over CONNECT (MITM)

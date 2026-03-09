@@ -10,7 +10,7 @@ proxy mode references as needed.
 - `docs/configuration.md` - config file location, overrides, and defaults
 - `docs/config-reference.md` - complete configuration reference
 - `docs/policy.md` - policy engine concepts, rules, macros, and header actions
-- `docs/proxy-modes.md` - HTTP explicit proxy, HTTPS CONNECT MITM, and transparent HTTPS
+- `docs/proxy-modes.md` - HTTP listener modes (explicit + transparent HTTP), HTTPS CONNECT MITM, and transparent HTTPS
 - `docs/tls-and-certificates.md` - CA behavior, per-host certs, and client trust
 - `docs/logging-and-capture.md` - logging, capture files, and body extraction
 - `docs/external-auth.md` - approval workflows, webhooks, and callbacks

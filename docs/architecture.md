@@ -5,7 +5,7 @@ for operators who want to understand how requests flow through the system.
 
 ## Components
 
-- HTTP explicit proxy listener (`proxy.http_port`)
+- HTTP listener (`proxy.http_port`) for explicit proxy and transparent HTTP interception
 - Transparent HTTPS listener (`proxy.https_port`)
 - Shared application state (`AppState`) that contains:
   - Config and policy engine
@@ -20,9 +20,10 @@ State is wrapped in `ArcSwap` to allow atomic reloads.
 
 ## Request flow (summary)
 
-### HTTP explicit
+### HTTP listener (explicit + transparent HTTP)
 
-1. Accept HTTP/1.1 request (absolute-form).
+1. Accept HTTP/1.1 request (absolute-form for explicit proxy, or origin-form
+   with `Host` for transparent HTTP interception).
 2. Check loop protection header.
 3. Evaluate policy (URL, client IP, method, and inbound request-header predicates such as `headers_absent`).
 4. Optional external auth gate.

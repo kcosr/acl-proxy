@@ -54,8 +54,9 @@ Loop protection rejects any request that already contains the configured header
 - Status: `508 Loop Detected`
 - JSON body: `{ "error": "LoopDetected", "message": "Proxy loop detected via loop protection header" }`
 
-Loop checks run on HTTP explicit requests, CONNECT requests, decrypted CONNECT
-requests, and transparent HTTPS requests.
+Loop checks run on HTTP listener requests (explicit proxy and transparent
+HTTP), CONNECT requests, decrypted CONNECT requests, and transparent HTTPS
+requests.
 
 ## Upstream timeouts
 
@@ -80,10 +81,10 @@ Operational expectations:
   - HTTP/1.1 requests (including upgrade/WebSocket flows) stay HTTP/1.1.
   - HTTP/2 requests do not silently downgrade when the outer hop cannot
     negotiate HTTP/2.
-- The forwarded request keeps the original absolute URI and original `Host`
+- The forwarded request keeps the original target URI and original `Host`
   header, so the outer proxy still evaluates policy against the real target.
-- The usual target for chained deployments is the outer proxy's HTTP explicit
-  listener (`proxy.http_port`), not the transparent HTTPS listener.
+- The usual target for chained deployments is the outer proxy's HTTP listener
+  (`proxy.http_port`), not the transparent HTTPS listener.
 
 Loop-prevention guidance:
 
