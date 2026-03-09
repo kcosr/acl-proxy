@@ -108,11 +108,11 @@ when = "if_present"
 Fields:
 
 - `bind_address` (string, default `"0.0.0.0"`):
-  - The IP or hostname on which the HTTP explicit proxy listener binds.
+  - The IP or hostname on which the HTTP listener binds (explicit proxy and transparent HTTP interception).
   - Environment override: `PROXY_HOST`.
 
 - `http_port` (integer, default `8881`):
-  - Port for the HTTP explicit proxy.
+  - Port for the HTTP listener (explicit proxy and transparent HTTP interception).
   - Setting `0` requests an ephemeral port from the OS (used primarily in tests).
   - Environment override: `PROXY_PORT`.
 
@@ -396,7 +396,7 @@ Behavior:
 
 Loop detection is applied:
 
-- On HTTP explicit proxy requests.
+- On HTTP listener requests (explicit proxy and transparent HTTP interception).
 - On the initial CONNECT request.
 - On decrypted HTTPS requests inside CONNECT tunnels.
 - On decrypted requests received by the transparent HTTPS listener.

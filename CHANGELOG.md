@@ -2,7 +2,8 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+- Add transparent HTTP interception support on the HTTP listener by accepting origin-form requests with `Host`, including forwarding/policy integration, expanded edge-case tests, and updated operator documentation ([#45](https://github.com/kcosr/acl-proxy/pull/45)).
 
 ## [0.0.9] - 2026-03-08
 

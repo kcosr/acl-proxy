@@ -1812,7 +1812,50 @@ async fn loop_detected_returns_508() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn non_absolute_form_request_returns_400() {
+async fn origin_form_request_with_host_is_forwarded() {
+    let (upstream_addr, _seen_headers) = start_upstream_echo_server().await;
+
+    let mut config = minimal_config();
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            pattern: Some(format!("http://{host}/**")),
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let raw_request =
+        format!("GET /relative/path HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+    let (response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        response.contains("\r\n\r\nok"),
+        "unexpected response body: {response}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn origin_form_request_with_empty_host_returns_400() {
     let mut config = minimal_config();
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Allow;
 
@@ -1823,10 +1866,7 @@ async fn non_absolute_form_request_returns_400() {
 
     let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
 
-    // Origin-form request (no absolute URL) should be rejected with 400.
-    let raw_request =
-        "GET /relative/path HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
-
+    let raw_request = "GET /relative/path HTTP/1.1\r\nHost:\r\nConnection: close\r\n\r\n";
     let (_response, status) = send_raw_http_request(proxy_addr, raw_request).await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);

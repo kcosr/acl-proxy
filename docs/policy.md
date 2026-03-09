@@ -131,7 +131,7 @@ Behavior:
 
 You can define a global request-only egress layer under
 `[[proxy.egress.request_header_actions]]` to apply the same outbound mutations
-to every forwarded request (explicit HTTP, CONNECT inner requests, and
+to every forwarded request (HTTP listener requests, CONNECT inner requests, and
 transparent HTTPS).
 
 Ordering for outbound requests:

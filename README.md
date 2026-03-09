@@ -4,7 +4,7 @@ Rust-based ACL-aware HTTP/HTTPS proxy with a TOML configuration file and a
 flexible URL policy engine.
 
 Key capabilities:
-- HTTP/1.1 explicit proxy (absolute-form requests).
+- HTTP/1.1 listener for explicit proxy (absolute-form) and transparent HTTP interception (origin-form + Host).
 - HTTPS MITM via CONNECT with per-host certificates signed by a local CA.
 - Transparent HTTPS listener that terminates TLS directly.
 - HTTP/2 support on transparent HTTPS; optional HTTP/2 upstream.

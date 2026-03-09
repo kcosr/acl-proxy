@@ -3,8 +3,8 @@
 ## HTTP 400 Bad Request
 
 Common causes:
-- HTTP explicit proxy received origin-form requests. Use absolute-form URLs:
-  `GET http://host/path HTTP/1.1` (configure your client with `-x`).
+- HTTP listener received an origin-form request without a valid `Host` header.
+- HTTP explicit-proxy clients sent an invalid request-target (for example, missing scheme/host).
 - Transparent HTTPS requests missing or invalid `Host` header.
 - CONNECT requests missing a valid `host:port` authority.
 
