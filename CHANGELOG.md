@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.11] - 2026-03-13
 
 ### Added
 - Add `headers_match` policy predicate support (config validation, exact-match policy evaluation, inspection output, and HTTP/CONNECT integration coverage) ([#46](https://github.com/kcosr/acl-proxy/pull/46)).
