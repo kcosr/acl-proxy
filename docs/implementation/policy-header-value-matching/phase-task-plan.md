@@ -202,6 +202,30 @@ Acceptance criteria:
 - Go/No-Go decision: `GO`
 - Notes: `Both execution-stage reviews completed via live session terminal events without fallback.`
 
+- Phase: `H2`
+- Completion date: `2026-03-13`
+- Commit hash(es): `ca06cb5`
+- Acceptance evidence:
+  - `cargo test headers_match_top_guard_denies_non_matching_value_and_allows_matching_value --test proxy_http` -> passed (`1 passed; 0 failed`) proving deny-before-forward for non-matching value and allow-forward for matching value in HTTP proxy flow.
+  - `cargo test headers_match_http_regressions_cover_repeated_values_comma_literals_and_case_insensitive_names --test proxy_http` -> passed (`1 passed; 0 failed`) covering repeated inbound values, comma-literal exact matching, and case-insensitive header-name lookup in proxy integration.
+  - `cargo test headers_match_is_evaluated_on_decrypted_inner_connect_requests --test proxy_https_connect` -> passed (`1 passed; 0 failed`) proving `headers_match` evaluation on decrypted CONNECT inner requests before forwarding.
+  - `cargo fmt -- --check` -> passed.
+  - `cargo clippy` -> passed.
+  - `cargo test` -> passed (`142 unit + 37 integration; 0 failed`).
+  - `cargo build --release` -> passed.
+  - `rg -n "headers_match|sensitive|policy dump|decrypted inner|headers_absent and headers_match" docs/policy.md docs/config-reference.md docs/architecture.md` -> confirmed finalized docs for exact-match semantics, predicate ordering, CONNECT inner-request scope, and sensitive-value visibility in policy dump outputs.
+- Review run IDs + triage outcomes:
+  - `gemini:r_20260313140229185_602a5eaf`
+    - accept: H2 integration/doc deliverables are present with required CONNECT-path coverage.
+    - defer: `capture.max_body_bytes` upper-bound validation remains outside this topic stream.
+    - defer: non-default proxy integration assertion for `capture.max_body_bytes` remains outside this topic stream.
+  - `pi:r_20260313140504929_3e13af6a`
+    - reject: claim that H2 proxy integration tests are missing is incorrect; committed tests `headers_match_top_guard_denies_non_matching_value_and_allows_matching_value`, `headers_match_http_regressions_cover_repeated_values_comma_literals_and_case_insensitive_names`, and `headers_match_is_evaluated_on_decrypted_inner_connect_requests` provide the required coverage and passed in gate runs.
+    - defer: `capture.max_body_bytes` upper-bound validation remains outside this topic stream.
+    - defer: non-default proxy integration assertion for `capture.max_body_bytes` remains outside this topic stream.
+- Go/No-Go decision: `GO`
+- Notes: `CHANGELOG.md update is pending PR creation per repository policy requiring inline PR links under Unreleased.`
+
 ## 10. Execution handoff contract
 
 1. Required read order:
