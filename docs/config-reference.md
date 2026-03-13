@@ -661,6 +661,8 @@ Fields:
     rejected, each value list must be non-empty, and empty-string configured values are rejected.
   - Value matching is exact and case-sensitive; values are compared as received with no trimming
     and no comma splitting.
+  - `acl-proxy policy dump` includes configured `headers_match` values in both JSON and table
+    output; treat these values as sensitive when they represent credentials or identity tokens.
 - `request_timeout_ms` (integer, optional) – override the upstream timeout for this rule
   (`0` disables the timeout for this rule).
 - `with` (map from macro name to single string or list of strings, optional):

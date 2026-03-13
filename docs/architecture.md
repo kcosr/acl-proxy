@@ -25,7 +25,7 @@ State is wrapped in `ArcSwap` to allow atomic reloads.
 1. Accept HTTP/1.1 request (absolute-form for explicit proxy, or origin-form
    with `Host` for transparent HTTP interception).
 2. Check loop protection header.
-3. Evaluate policy (URL, client IP, method, and inbound request-header predicates such as `headers_absent`).
+3. Evaluate policy (URL, client IP, method, and inbound request-header predicates such as `headers_absent` and `headers_match`).
 4. Optional external auth gate.
 5. Apply matched-rule/plugin request header actions, then global egress request
    header actions, then forward to upstream.
@@ -44,7 +44,8 @@ State is wrapped in `ArcSwap` to allow atomic reloads.
    request actions first, then global egress request actions).
 6. If egress forwarding is enabled, apply it only to the decrypted inner
    requests. The outer CONNECT handshake is unchanged, so request-header
-   predicates such as `headers_absent` apply only to the inner requests.
+   predicates such as `headers_absent` and `headers_match` apply only to the
+   inner requests.
 
 ### Transparent HTTPS
 

@@ -189,3 +189,5 @@ acl-proxy policy dump --config config/acl-proxy.toml
 ```
 
 Add `--format table` or `--format json` to control output.
+`policy dump` includes configured `headers_match` values, so restrict access when those values are
+sensitive.

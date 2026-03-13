@@ -1,5 +1,6 @@
 #![allow(clippy::await_holding_lock, clippy::while_let_on_iterator)]
 
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::{Arc, Mutex};
@@ -1664,6 +1665,172 @@ async fn method_scoped_headers_absent_guard_only_blocks_matching_methods() {
             .get("x-workload-id")
             .and_then(|value| value.to_str().ok()),
         Some("worker-123")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn headers_match_top_guard_denies_non_matching_value_and_allows_matching_value() {
+    let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
+
+    let mut config = minimal_config();
+    config.capture.allowed_request = false;
+    config.capture.allowed_response = false;
+
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![
+        acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            pattern: Some(format!("http://{host}/**")),
+            description: Some("Allow trusted identity header".to_string()),
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: Some(BTreeMap::from([(
+                "x-workload-id".to_string(),
+                acl_proxy::config::HeaderMatchValueConfig::Single("worker-123".to_string()),
+            )])),
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        }),
+        acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Deny,
+            pattern: Some(format!("http://{host}/**")),
+            description: Some("Deny all other traffic".to_string()),
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: None,
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        }),
+    ];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let blocked_request = format!(
+        "GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nX-Workload-Id: worker-999\r\nConnection: close\r\n\r\n"
+    );
+    let (_response, deny_status) = send_raw_http_request(proxy_addr, &blocked_request).await;
+    assert_eq!(deny_status, StatusCode::FORBIDDEN);
+    assert!(
+        seen_headers.lock().unwrap().is_none(),
+        "non-matching request must not reach upstream"
+    );
+
+    let allowed_request = format!(
+        "GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nX-Workload-Id: worker-123\r\nConnection: close\r\n\r\n"
+    );
+    let (_response, allow_status) = send_raw_http_request(proxy_addr, &allowed_request).await;
+    assert_eq!(allow_status, StatusCode::OK);
+
+    let headers_guard = seen_headers.lock().unwrap();
+    let upstream_headers = headers_guard
+        .as_ref()
+        .expect("matching request should reach upstream");
+    assert_eq!(
+        upstream_headers
+            .get("x-workload-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("worker-123")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn headers_match_http_regressions_cover_repeated_values_comma_literals_and_case_insensitive_names(
+) {
+    let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
+
+    let mut config = minimal_config();
+    config.capture.allowed_request = false;
+    config.capture.allowed_response = false;
+
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            pattern: Some(format!("http://{host}/**")),
+            description: Some("Allow only exact trusted header values".to_string()),
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: Some(BTreeMap::from([
+                (
+                    "x-workload-id".to_string(),
+                    acl_proxy::config::HeaderMatchValueConfig::Many(vec![
+                        "worker-123".to_string(),
+                        "worker-456".to_string(),
+                    ]),
+                ),
+                (
+                    "x-comma".to_string(),
+                    acl_proxy::config::HeaderMatchValueConfig::Single("a,b".to_string()),
+                ),
+            ])),
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let repeated_value_request = format!(
+        "GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nX-Workload-Id: worker-999\r\nX-Workload-Id: worker-456\r\nX-Comma: a,b\r\nConnection: close\r\n\r\n"
+    );
+    let (_response, repeated_status) =
+        send_raw_http_request(proxy_addr, &repeated_value_request).await;
+    assert_eq!(repeated_status, StatusCode::OK);
+
+    let comma_spacing_request = format!(
+        "GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nX-Workload-Id: worker-123\r\nX-Comma: a, b\r\nConnection: close\r\n\r\n"
+    );
+    let (_response, comma_spacing_status) =
+        send_raw_http_request(proxy_addr, &comma_spacing_request).await;
+    assert_eq!(
+        comma_spacing_status,
+        StatusCode::FORBIDDEN,
+        "comma-containing values must be compared exactly without tokenization"
+    );
+
+    let case_insensitive_name_request = format!(
+        "GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nx-workload-id: worker-123\r\nx-comma: a,b\r\nConnection: close\r\n\r\n"
+    );
+    let (_response, case_insensitive_status) =
+        send_raw_http_request(proxy_addr, &case_insensitive_name_request).await;
+    assert_eq!(case_insensitive_status, StatusCode::OK);
+
+    let headers_guard = seen_headers.lock().unwrap();
+    let upstream_headers = headers_guard
+        .as_ref()
+        .expect("upstream should see matching request");
+    assert_eq!(
+        upstream_headers
+            .get("x-comma")
+            .and_then(|value| value.to_str().ok()),
+        Some("a,b")
     );
 }
 

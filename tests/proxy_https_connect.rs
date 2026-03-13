@@ -178,9 +178,19 @@ async fn start_proxy_with_config(
 
 async fn send_https_via_connect(
     proxy_addr: SocketAddr,
-    _ca_cert_path: &std::path::Path,
+    ca_cert_path: &std::path::Path,
     target_host: &str,
     path: &str,
+) -> (u16, String) {
+    send_https_via_connect_with_headers(proxy_addr, ca_cert_path, target_host, path, &[]).await
+}
+
+async fn send_https_via_connect_with_headers(
+    proxy_addr: SocketAddr,
+    ca_cert_path: &std::path::Path,
+    target_host: &str,
+    path: &str,
+    extra_headers: &[(&str, &str)],
 ) -> (u16, String) {
     use rustls_pemfile;
 
@@ -223,7 +233,7 @@ async fn send_https_via_connect(
     }
 
     // Wrap the stream in TLS using the proxy's CA cert.
-    let ca_pem = std::fs::read(_ca_cert_path).expect("read ca cert");
+    let ca_pem = std::fs::read(ca_cert_path).expect("read ca cert");
     let mut reader = std::io::Cursor::new(ca_pem);
     let mut roots = RootCertStore::empty();
     for cert in rustls_pemfile::certs(&mut reader).expect("parse ca cert") {
@@ -246,8 +256,18 @@ async fn send_https_via_connect(
         .expect("tls connect");
 
     // Send inner HTTPS request.
-    let request =
-        format!("GET {path} HTTP/1.1\r\nHost: {target_host}\r\nConnection: close\r\n\r\n");
+    let extra_header_lines = if extra_headers.is_empty() {
+        String::new()
+    } else {
+        extra_headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>()
+    };
+
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {target_host}\r\n{extra_header_lines}Connection: close\r\n\r\n"
+    );
     tls_stream
         .write_all(request.as_bytes())
         .await
@@ -567,6 +587,91 @@ async fn denied_https_via_connect_returns_403() {
     assert!(
         body.contains("Blocked by URL policy"),
         "unexpected body: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn headers_match_is_evaluated_on_decrypted_inner_connect_requests() {
+    let (forward_addr, seen_requests) = start_forwarding_echo_server().await;
+
+    let mut config = minimal_connect_config();
+    config.capture.allowed_request = false;
+    config.capture.allowed_response = false;
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            pattern: Some("https://connect-target.test:9443/**".to_string()),
+            description: Some("Allow trusted workload identities".to_string()),
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: Some(std::collections::BTreeMap::from([(
+                "x-workload-id".to_string(),
+                acl_proxy::config::HeaderMatchValueConfig::Single("worker-123".to_string()),
+            )])),
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
+        host: "127.0.0.1".to_string(),
+        port: forward_addr.port(),
+    });
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+    let ca_cert_path = temp_dir.path().join("certs").join("ca-cert.pem");
+
+    let (denied_status, denied_body) = send_https_via_connect_with_headers(
+        proxy_addr,
+        &ca_cert_path,
+        "connect-target.test:9443",
+        "/ok",
+        &[("x-workload-id", "worker-999")],
+    )
+    .await;
+
+    assert_eq!(denied_status, StatusCode::FORBIDDEN.as_u16());
+    assert!(
+        denied_body.contains("Blocked by URL policy"),
+        "unexpected denied body: {denied_body}"
+    );
+    assert!(
+        seen_requests.lock().unwrap().is_empty(),
+        "non-matching CONNECT inner request must not be forwarded"
+    );
+
+    let (allowed_status, allowed_body) = send_https_via_connect_with_headers(
+        proxy_addr,
+        &ca_cert_path,
+        "connect-target.test:9443",
+        "/ok",
+        &[("X-Workload-Id", "worker-123")],
+    )
+    .await;
+
+    assert_eq!(allowed_status, StatusCode::OK.as_u16());
+    assert_eq!(allowed_body, "forwarded");
+
+    let requests = seen_requests.lock().unwrap();
+    let forwarded = requests
+        .first()
+        .expect("forwarding destination should see allowed inner request");
+    assert_eq!(
+        forwarded
+            .headers
+            .get("x-workload-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("worker-123")
     );
 }
 
