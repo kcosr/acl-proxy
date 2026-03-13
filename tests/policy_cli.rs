@@ -269,6 +269,13 @@ headers_absent = ["x-workload-id"]
     let rules = value["rules"].as_array().expect("rules is an array");
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0]["headers_absent"][0], "x-workload-id");
+    assert_eq!(
+        rules[0]["headers_match"]
+            .as_object()
+            .expect("headers_match is object")
+            .len(),
+        0
+    );
 }
 
 #[test]
@@ -309,6 +316,94 @@ description = "Deny missing identity"
     cmd.assert()
         .success()
         .stdout(contains("HEADERS_ABSENT"))
+        .stdout(contains("HEADERS_MATCH"))
         .stdout(contains("x-workload-id"))
         .stdout(contains("Deny missing identity"));
+}
+
+#[test]
+fn policy_dump_json_includes_headers_match_values() {
+    let mut file = NamedTempFile::new().expect("create temp config");
+    file.write_all(
+        br#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+headers_match = { "x-workload-id" = ["worker-123", "worker-456"], "x-tenant-id" = "tenant-a" }
+        "#,
+    )
+    .expect("write config");
+
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
+    cmd.arg("policy")
+        .arg("dump")
+        .arg("--config")
+        .arg(file.path());
+
+    let assert = cmd.assert().success();
+    let stdout =
+        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is valid UTF-8");
+
+    let value: Value = serde_json::from_str(&stdout).expect("output is valid JSON");
+    let rules = value["rules"].as_array().expect("rules is an array");
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0]["headers_match"]["x-tenant-id"][0], "tenant-a");
+    assert_eq!(rules[0]["headers_match"]["x-workload-id"][0], "worker-123");
+    assert_eq!(rules[0]["headers_match"]["x-workload-id"][1], "worker-456");
+}
+
+#[test]
+fn policy_dump_table_includes_headers_match_column_values() {
+    let mut file = NamedTempFile::new().expect("create temp config");
+    file.write_all(
+        br#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+headers_match = { "x-workload-id" = ["worker-123", "worker-456"], "x-tenant-id" = "tenant-a" }
+description = "Allow trusted identity values"
+        "#,
+    )
+    .expect("write config");
+
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
+    cmd.arg("policy")
+        .arg("dump")
+        .arg("--format")
+        .arg("table")
+        .arg("--config")
+        .arg(file.path());
+
+    cmd.assert()
+        .success()
+        .stdout(contains("HEADERS_MATCH"))
+        .stdout(contains("x-tenant-id=tenant-a"))
+        .stdout(contains("x-workload-id=worker-123|worker-456"))
+        .stdout(contains("Allow trusted identity values"));
 }

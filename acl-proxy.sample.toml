@@ -115,6 +115,11 @@ directory = "logs-capture"
 # {requestId}, {kind}, {suffix}. The default is "{requestId}-{suffix}.json".
 filename = "{requestId}-{kind}.json"
 
+# Maximum captured body bytes per request/response record. The full
+# logical length is still stored in body.length. Set to 0 to omit body
+# payload bytes while preserving metadata.
+max_body_bytes = 65536
+
 ###############################################################################
 # Loop protection
 ###############################################################################
@@ -250,6 +255,14 @@ action = "deny"
 pattern = "**"
 headers_absent = ["x-workload-id"]
 description = "Deny requests missing workload identity"
+
+[[policy.rules]]
+# Example: require specific trusted header values before allowing API access.
+action = "allow"
+pattern = "https://api.internal.example.com/v1/**"
+headers_match = { "x-workload-id" = ["worker-123", "worker-456"], "x-tenant-id" = "tenant-a" }
+description = "Allow trusted workload identities"
+methods = ["GET", "POST"]
 
 [[policy.rules]]
 # Allow Git traffic (HTTP(S) and API) for repositories listed in

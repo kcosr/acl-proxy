@@ -26,7 +26,6 @@ use crate::auth_plugin::{AuthPluginHandle, PluginDecision};
 use crate::capture::{
     build_capture_record, should_capture, BodyCaptureBuffer, BodyCaptureResult, CaptureDecision,
     CaptureEndpoint, CaptureKind, CaptureMode, CaptureRecordOptions, HeaderMap,
-    DEFAULT_MAX_BODY_BYTES,
 };
 use crate::config::{
     EgressTargetConfig, ExternalAuthProfileType, HeaderActionKind, HeaderDirection, HeaderWhen,
@@ -1454,7 +1453,7 @@ pub(crate) async fn maybe_capture_static_response(
         let body_capture = if body.is_empty() {
             None
         } else {
-            let mut buf = BodyCaptureBuffer::new(DEFAULT_MAX_BODY_BYTES);
+            let mut buf = BodyCaptureBuffer::new(state.config.capture.max_body_bytes);
             buf.push(body);
             Some(buf.finish())
         };
@@ -1594,7 +1593,7 @@ pub(crate) async fn proxy_allowed_request(
     let body = req.into_body();
 
     let (upstream_req, req_capture_rx) = if capture_request {
-        let (body, handle) = tee_body(body).await;
+        let (body, handle) = tee_body(body, state.config.capture.max_body_bytes).await;
         let upstream_req = builder
             .body(body)
             .unwrap_or_else(|_| Request::new(Body::empty()));
@@ -1717,7 +1716,7 @@ pub(crate) async fn proxy_allowed_request(
 
     let (resp, resp_capture_rx) = if capture_response {
         let (parts, upstream_body) = upstream_resp.into_parts();
-        let (body, handle) = tee_body(upstream_body).await;
+        let (body, handle) = tee_body(upstream_body, state.config.capture.max_body_bytes).await;
 
         let mut out = Response::builder().status(status).version(resp_version);
         {
@@ -2289,12 +2288,15 @@ fn log_header_action(action: &CompiledHeaderAction, direction: &HeaderDirection)
     );
 }
 
-pub(crate) async fn tee_body(mut body: Body) -> (Body, oneshot::Receiver<BodyCaptureResult>) {
+pub(crate) async fn tee_body(
+    mut body: Body,
+    max_body_bytes: usize,
+) -> (Body, oneshot::Receiver<BodyCaptureResult>) {
     let (tx, rx) = mpsc::channel::<Result<Bytes, hyper::Error>>(16);
     let (capture_tx, capture_rx) = oneshot::channel();
 
     tokio::spawn(async move {
-        let mut buf = BodyCaptureBuffer::new(DEFAULT_MAX_BODY_BYTES);
+        let mut buf = BodyCaptureBuffer::new(max_body_bytes);
         while let Some(chunk) = body.data().await {
             match chunk {
                 Ok(bytes) => {
@@ -2350,7 +2352,9 @@ pub(crate) fn generate_request_id() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_full_url, generate_request_id, is_internal_endpoint, is_upgrade_request};
+    use super::{
+        build_full_url, generate_request_id, is_internal_endpoint, is_upgrade_request, tee_body,
+    };
     use http::header::HOST;
     use http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
     use hyper::{Body, Request};
@@ -2525,5 +2529,18 @@ mod tests {
 
         let resp = build_full_url(&req).expect_err("invalid host should fail");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn tee_body_respects_custom_capture_limit() {
+        let payload = vec![b'a'; 32];
+        let (tee, capture_rx) = tee_body(Body::from(payload.clone()), 8).await;
+
+        let replayed = hyper::body::to_bytes(tee).await.expect("tee body bytes");
+        assert_eq!(replayed.as_ref(), payload.as_slice());
+
+        let captured = capture_rx.await.expect("capture result");
+        assert_eq!(captured.total_len, payload.len());
+        assert_eq!(captured.captured.len(), 8);
     }
 }

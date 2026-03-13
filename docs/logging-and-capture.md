@@ -41,14 +41,15 @@ denied_request = false
 denied_response = false
 directory = "logs-capture"
 filename = "{requestId}-{suffix}.json"
+max_body_bytes = 65536
 ```
 
 Capture behavior:
 - Each captured request and response is written as a JSON file.
 - `mode` indicates `http_proxy`, `https_connect`, or `https_transparent`.
 - `decision` indicates `allow` or `deny`.
-- Bodies are recorded up to 64 KiB; the full logical length is stored in
-  `body.length` even when truncated.
+- Bodies are recorded up to `capture.max_body_bytes` (default 64 KiB); the
+  full logical length is stored in `body.length` even when truncated.
 
 Capture happens for:
 - Allowed requests/responses when the corresponding flags are enabled.

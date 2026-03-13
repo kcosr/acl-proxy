@@ -294,6 +294,7 @@ denied_request = false
 denied_response = false
 directory = "logs-capture"
 filename = "{requestId}-{suffix}.json"
+max_body_bytes = 65536
 ```
 
 Fields:
@@ -322,6 +323,11 @@ Fields:
     - `{suffix}` – `"req"` or `"res"` (the default template uses `{suffix}` so you can change file
       naming conventions without affecting the `kind` value stored in the capture record itself).
   - If empty/whitespace, the default template is effectively `"{requestId}-{suffix}.json"`.
+
+- `max_body_bytes` (integer, default `65536`):
+  - Maximum number of body bytes to serialize into `body.data` for each captured request/response.
+  - `body.length` still records the full logical body length even when `body.data` is truncated.
+  - Set to `0` to capture no body payload bytes while keeping body length metadata.
 
 ### Capture record JSON format
 
@@ -353,9 +359,10 @@ optional):
   - `data` (`string`) – base64-encoded captured bytes.
   - `contentType` (`string`, optional) – content type inferred from headers.
 
-Bodies are captured into an in-memory buffer up to 64 KiB per request/response. The full logical
-length is still recorded in `body.length`, but only the first 64 KiB are serialized into `body.data`.
-When capture is disabled for a given kind/decision, no file is written for that record.
+Bodies are captured into an in-memory buffer up to `capture.max_body_bytes` per request/response
+(default `64 KiB`). The full logical length is still recorded in `body.length`, but only the first
+`max_body_bytes` are serialized into `body.data`. When capture is disabled for a given
+kind/decision, no file is written for that record.
 
 ---
 
@@ -592,6 +599,14 @@ Fields:
 - `subnets` (`["192.168.0.0/16", ...]`, optional) – list of IPv4/IPv6 CIDR subnets.
 - `headers_absent` (`["header-name", ...]`, optional) – same semantics as direct rules; when the
   ruleset is included, the expanded rule matches if any listed inbound request header is missing.
+- `headers_match` (`{ "header-name" = "value" | ["value", ...], ... }`, optional) – require exact
+  inbound request-header values:
+  - Across header keys: `AND` semantics.
+  - Within one key's allowed values: `OR` semantics.
+  - Header-name lookup is case-insensitive and normalized to lowercase.
+  - Matching is exact and case-sensitive with no trimming and no comma tokenization.
+  - The map must be non-empty; each key must be a valid HTTP header name; duplicates after
+    normalization are rejected; each configured value must be non-empty.
 - `request_timeout_ms` (integer, optional) – override the upstream timeout for matching requests
   (`0` disables the timeout for those requests).
 
@@ -620,6 +635,7 @@ action = "allow"
 pattern = "https://api.internal.example.com/v1/**"
 methods = ["GET", "POST"]
 subnets = ["10.0.0.0/8"]
+headers_match = { "x-workload-id" = ["worker-123", "worker-456"], "x-tenant-id" = "tenant-a" }
 description = "API from internal network"
 ```
 
@@ -636,6 +652,17 @@ Fields:
   - The list must be non-empty, each name must be a valid HTTP header name, and duplicates after
     normalization are rejected.
   - A header present with an empty value still counts as present.
+- `headers_match` (`{ "header-name" = "value" | ["value", ...], ... }`, optional) – require
+  inbound request headers to have exact configured values:
+  - Across header keys: `AND` semantics.
+  - Within one key's values: `OR` semantics.
+  - Header names are matched case-insensitively and normalized to lowercase for validation.
+  - The map must be non-empty, each header key must be valid, duplicates after normalization are
+    rejected, each value list must be non-empty, and empty-string configured values are rejected.
+  - Value matching is exact and case-sensitive; values are compared as received with no trimming
+    and no comma splitting.
+  - `acl-proxy policy dump` includes configured `headers_match` values in both JSON and table
+    output; treat these values as sensitive when they represent credentials or identity tokens.
 - `request_timeout_ms` (integer, optional) – override the upstream timeout for this rule
   (`0` disables the timeout for this rule).
 - `with` (map from macro name to single string or list of strings, optional):
@@ -646,8 +673,8 @@ Fields:
     using both raw and URL-encoded values.
   - When a list of names, only those placeholders get URL-encoded variants.
 
-At least one of `pattern`, `methods`, `subnets`, or `headers_absent` must be present; otherwise
-the rule is rejected as invalid.
+At least one of `pattern`, `methods`, `subnets`, `headers_absent`, or `headers_match` must be
+present; otherwise the rule is rejected as invalid.
 
 Rules without `pattern` but with subnets and/or methods are allowed (e.g., “allow POST requests
 from `10.0.0.0/8` to any URL”).
@@ -764,8 +791,8 @@ Fields:
 - `methods` / `subnets` (optional) – rule-level overrides:
   - If provided, override template-level `methods` / `subnets` in the referenced ruleset.
   - If omitted, the template’s `methods` / `subnets` are used.
-- `headers_absent` is inherited from the referenced ruleset template when present; include rules do
-  not override it in this release.
+- `headers_absent` and `headers_match` are inherited from the referenced ruleset template when
+  present; include rules do not override either field in this release.
 - `request_timeout_ms` (integer, optional):
   - Overrides the template’s `request_timeout_ms` for all rules produced by this include
     (`0` disables the timeout for those rules).

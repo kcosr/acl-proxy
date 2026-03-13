@@ -2,7 +2,9 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+- Add `headers_match` policy predicate support (config validation, exact-match policy evaluation, inspection output, and HTTP/CONNECT integration coverage) ([#46](https://github.com/kcosr/acl-proxy/pull/46)).
+- Add configurable capture body limit support via `capture.max_body_bytes` and apply it in proxy capture buffering paths ([#46](https://github.com/kcosr/acl-proxy/pull/46)).
 
 ## [0.0.10] - 2026-03-09
 

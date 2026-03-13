@@ -16,6 +16,7 @@ This doc focuses on behavior and concepts. For field-level details, see
    - Subnet match (if set)
    - Method match (if set)
    - `headers_absent` match (if set)
+   - `headers_match` match (if set)
 5. First match wins.
 6. If nothing matches, apply `policy.default`.
 
@@ -106,6 +107,29 @@ Behavior:
 - When all listed headers are present, the rule falls through to the next rule.
 - On HTTPS over CONNECT, this predicate applies to the decrypted inner request, not the outer CONNECT tunnel-establishment request.
 
+## Header-value predicate
+
+Rules can require inbound request-header values exactly:
+
+```toml
+[[policy.rules]]
+action = "allow"
+pattern = "https://api.internal.example.com/**"
+headers_match = { "x-workload-id" = ["worker-123", "worker-456"], "x-tenant-id" = "tenant-a" }
+description = "Allow trusted workload identities"
+```
+
+Behavior:
+- `headers_match` evaluates before forwarding and before header actions.
+- Across configured header keys, matching uses `AND` semantics.
+- For one header key, multiple configured values use `OR` semantics.
+- Header names are matched case-insensitively.
+- Value matching is exact and case-sensitive with no trimming and no comma splitting.
+- Repeated inbound header values are supported; any exact match satisfies that header key.
+- Empty configured values are rejected during config validation.
+- When both `headers_absent` and `headers_match` are configured on one rule, both predicates must pass.
+- On HTTPS over CONNECT, this predicate applies to decrypted inner requests, not outer CONNECT tunnel-establishment metadata.
+
 ## Header actions
 
 Rules can modify headers on matching requests/responses:
@@ -125,7 +149,7 @@ Behavior:
 - `when` is evaluated against the original header set before any actions run.
 - For `set` / `add`, exact whole-string `${NAME}` placeholders in `value` / `values[*]` resolve
   once at config load/reload time. Mixed strings such as `Bearer ${TOKEN}` are rejected.
-- Header actions do not participate in rule matching. `headers_absent` is evaluated first against the inbound request headers, and actions run only after a rule matches.
+- Header actions do not participate in rule matching. `headers_absent` and `headers_match` are evaluated against inbound request headers first, and actions run only after a rule matches.
 
 ## Global egress request header actions
 
@@ -165,3 +189,5 @@ acl-proxy policy dump --config config/acl-proxy.toml
 ```
 
 Add `--format table` or `--format json` to control output.
+`policy dump` includes configured `headers_match` values, so restrict access when those values are
+sensitive.
