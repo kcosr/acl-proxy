@@ -184,6 +184,24 @@ Acceptance criteria:
 - Go/No-Go decision: `GO`
 - Notes: `Gemini and PI execution-stage reviews were completed via live session stream terminal events; one earlier Gemini attempt (r_20260313133823206_8d69967e) was interrupted during a stream stall retry and not used for gate evidence.`
 
+- Phase: `H1`
+- Completion date: `2026-03-13`
+- Commit hash(es): `130c046`
+- Acceptance evidence:
+  - `cargo test headers_match --lib` -> passed (`22 passed; 0 failed`) covering single-key and multi-key semantics, repeated inbound values, case-insensitive name lookup, exact value matching (case-sensitive/no trim/no comma split), `headers_absent` conjunction, methods/subnets conjunction, external-auth fallthrough ordering, and effective-policy empty-object serialization.
+  - `cargo test policy_dump --test policy_cli` -> passed (`6 passed; 0 failed`) confirming JSON/table output includes `headers_match` with configured values and `{}` when unset, plus `HEADERS_MATCH` table column rendering.
+- Review run IDs + triage outcomes:
+  - `gemini:r_20260313135500989_cd2ca515`
+    - accept: H1 matching/output requirements are implemented with correct `AND`/`OR`/exact semantics and external-auth short-circuit behavior.
+    - defer: `capture.max_body_bytes` upper-bound validation is outside this topic stream.
+    - defer: non-default proxy integration assertion for `capture.max_body_bytes` remains outside this topic stream.
+  - `pi:r_20260313135632318_590e4cd5`
+    - accept: H1 deliverables and acceptance criteria are complete with strong targeted unit/CLI coverage.
+    - defer: integration-path `headers_match` HTTP/CONNECT behavior is planned for H2 by design.
+    - defer: `capture.max_body_bytes` upper-bound guard is outside this topic stream.
+- Go/No-Go decision: `GO`
+- Notes: `Both execution-stage reviews completed via live session terminal events without fallback.`
+
 ## 10. Execution handoff contract
 
 1. Required read order:
