@@ -323,6 +323,14 @@ pub struct CaptureConfig {
 
     #[serde(default = "default_capture_filename")]
     pub filename: String,
+
+    /// Maximum number of body bytes to store per captured request/response.
+    ///
+    /// The capture record still stores full logical body length in
+    /// `body.length`; this limit only bounds bytes serialized in `body.data`.
+    /// Set to `0` to skip body payload bytes while preserving metadata.
+    #[serde(default = "default_capture_max_body_bytes")]
+    pub max_body_bytes: usize,
 }
 
 impl Default for CaptureConfig {
@@ -334,6 +342,7 @@ impl Default for CaptureConfig {
             denied_response: false,
             directory: default_capture_directory(),
             filename: default_capture_filename(),
+            max_body_bytes: default_capture_max_body_bytes(),
         }
     }
 }
@@ -344,6 +353,10 @@ fn default_capture_directory() -> String {
 
 fn default_capture_filename() -> String {
     "{requestId}-{suffix}.json".to_string()
+}
+
+fn default_capture_max_body_bytes() -> usize {
+    crate::capture::DEFAULT_MAX_BODY_BYTES
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -495,6 +508,9 @@ pub struct PolicyRuleTemplateConfig {
     pub headers_absent: Option<Vec<String>>,
 
     #[serde(default)]
+    pub headers_match: Option<HeaderMatchMap>,
+
+    #[serde(default)]
     pub request_timeout_ms: Option<u64>,
 
     #[serde(default)]
@@ -554,6 +570,9 @@ pub struct PolicyRuleDirectConfig {
 
     #[serde(default)]
     pub headers_absent: Option<Vec<String>>,
+
+    #[serde(default)]
+    pub headers_match: Option<HeaderMatchMap>,
 
     #[serde(default)]
     pub request_timeout_ms: Option<u64>,
@@ -622,6 +641,7 @@ impl Default for PolicyConfig {
 pub type MacroMap = std::collections::BTreeMap<String, MacroValues>;
 pub type RulesetMap = std::collections::BTreeMap<String, Vec<PolicyRuleTemplateConfig>>;
 pub type MacroOverrideMap = std::collections::BTreeMap<String, MacroValues>;
+pub type HeaderMatchMap = std::collections::BTreeMap<String, HeaderMatchValueConfig>;
 
 pub type ApprovalMacroConfigMap = std::collections::BTreeMap<String, ApprovalMacroConfig>;
 
@@ -745,6 +765,22 @@ pub enum MacroValues {
 pub enum UrlEncVariants {
     All(bool),
     Names(Vec<String>),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum HeaderMatchValueConfig {
+    Single(String),
+    Many(Vec<String>),
+}
+
+impl HeaderMatchValueConfig {
+    pub fn values(&self) -> Vec<String> {
+        match self {
+            HeaderMatchValueConfig::Single(value) => vec![value.clone()],
+            HeaderMatchValueConfig::Many(values) => values.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -893,13 +929,14 @@ impl Config {
                         || !d.subnets.is_empty()
                         || d.methods.is_some()
                         || d.headers_absent.is_some()
+                        || d.headers_match.is_some()
                 }
                 PolicyRuleConfig::Include(i) => !i.include.trim().is_empty(),
             };
 
             if !has_match_criteria {
                 return Err(ConfigError::Invalid(format!(
-                    "policy.rules[{idx}] must specify at least one of pattern, subnets, methods, headers_absent, or include"
+                    "policy.rules[{idx}] must specify at least one of pattern, subnets, methods, headers_absent, headers_match, or include"
                 )));
             }
         }
@@ -2053,6 +2090,34 @@ headers_absent = ["x-workload-id"]
     }
 
     #[test]
+    fn direct_rule_with_headers_match_counts_as_match_criteria() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "deny"
+headers_match = { "x-workload-id" = "worker-123" }
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        assert!(
+            config.validate_basic().is_ok(),
+            "validation should succeed for headers_match-only rule"
+        );
+    }
+
+    #[test]
     fn headers_absent_must_not_be_empty_when_configured() {
         let toml = r#"
 schema_version = "1"
@@ -2078,6 +2143,126 @@ headers_absent = []
         let msg = format!("{err}");
         assert!(
             msg.contains("headers_absent must not be empty"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn headers_match_must_not_be_empty_when_configured() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "deny"
+headers_match = {}
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("headers_match must not be empty"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn headers_match_rejects_invalid_header_names() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "deny"
+headers_match = { "bad header" = "worker-123" }
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid header name 'bad header' in headers_match"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn headers_match_rejects_duplicates_after_normalization() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "deny"
+headers_match = { "X-Workload-Id" = "worker-123", "x-workload-id" = "worker-456" }
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("duplicate header name"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn headers_match_rejects_empty_values() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "deny"
+headers_match = { "x-workload-id" = "" }
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("must not include empty-string values"),
             "unexpected error message: {msg}"
         );
     }
@@ -2182,6 +2367,54 @@ level = "info"
         let config: Config = toml::from_str(toml).expect("parse config");
         // Empty filename is allowed; resolve_capture_path will fall back
         // to the default template.
+        assert!(config.validate_basic().is_ok());
+    }
+
+    #[test]
+    fn capture_max_body_bytes_defaults_to_64k() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        assert_eq!(config.capture.max_body_bytes, 64 * 1024);
+        assert!(config.validate_basic().is_ok());
+    }
+
+    #[test]
+    fn capture_max_body_bytes_can_be_set_to_zero() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[capture]
+directory = "logs-capture"
+max_body_bytes = 0
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        assert_eq!(config.capture.max_body_bytes, 0);
         assert!(config.validate_basic().is_ok());
     }
 

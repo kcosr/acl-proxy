@@ -11,9 +11,9 @@ use url::Url;
 
 use crate::config::{
     EgressRequestHeaderActionConfig, ExternalAuthProfileConfigMap, HeaderActionConfig,
-    HeaderActionKind, HeaderDirection, HeaderWhen, MacroMap, MacroOverrideMap, MacroValues,
-    PolicyConfig, PolicyDefaultAction, PolicyRuleConfig, PolicyRuleDirectConfig,
-    PolicyRuleIncludeConfig, RulesetMap, UrlEncVariants,
+    HeaderActionKind, HeaderDirection, HeaderMatchValueConfig, HeaderWhen, MacroMap,
+    MacroOverrideMap, MacroValues, PolicyConfig, PolicyDefaultAction, PolicyRuleConfig,
+    PolicyRuleDirectConfig, PolicyRuleIncludeConfig, RulesetMap, UrlEncVariants,
 };
 
 #[derive(Debug, Error)]
@@ -98,6 +98,7 @@ struct ExpandedRule {
     subnets: Vec<IpNet>,
     methods: Vec<String>,
     headers_absent: Option<Vec<String>>,
+    headers_match: Option<BTreeMap<String, Vec<String>>>,
     request_timeout_ms: Option<u64>,
     header_actions: Vec<HeaderActionConfig>,
     external_auth_profile: Option<String>,
@@ -419,8 +420,10 @@ fn expand_direct_rule(
     let has_methods = !methods.is_empty();
     let headers_absent = validate_headers_absent(rule.headers_absent.as_deref(), index)?;
     let has_headers_absent = headers_absent.is_some();
+    let headers_match = validate_headers_match(rule.headers_match.as_ref(), index)?;
+    let has_headers_match = headers_match.is_some();
 
-    if !has_pattern && (has_subnets || has_methods || has_headers_absent) {
+    if !has_pattern && (has_subnets || has_methods || has_headers_absent || has_headers_match) {
         out.push(ExpandedRule {
             action: rule.action,
             pattern: None,
@@ -429,6 +432,7 @@ fn expand_direct_rule(
             subnets: rule.subnets.clone(),
             methods,
             headers_absent,
+            headers_match,
             request_timeout_ms: rule.request_timeout_ms,
             header_actions: rule.header_actions.clone(),
             external_auth_profile: rule.external_auth_profile.clone(),
@@ -440,7 +444,7 @@ fn expand_direct_rule(
         return Err(PolicyError::RuleInvalid {
             index,
             reason:
-                "policy rule must define at least a pattern, subnets, methods, or headers_absent"
+                "policy rule must define at least a pattern, subnets, methods, headers_absent, or headers_match"
                     .to_string(),
         });
     }
@@ -465,6 +469,7 @@ fn expand_direct_rule(
             subnets: rule.subnets.clone(),
             methods,
             headers_absent,
+            headers_match,
             request_timeout_ms: rule.request_timeout_ms,
             header_actions: rule.header_actions.clone(),
             external_auth_profile: rule.external_auth_profile.clone(),
@@ -504,6 +509,7 @@ fn expand_direct_rule(
             subnets: rule.subnets.clone(),
             methods: methods.clone(),
             headers_absent: headers_absent.clone(),
+            headers_match: headers_match.clone(),
             request_timeout_ms: rule.request_timeout_ms,
             header_actions: rule.header_actions.clone(),
             external_auth_profile: rule.external_auth_profile.clone(),
@@ -561,6 +567,7 @@ fn expand_include_rule(
         for template in templates {
             let headers_absent =
                 validate_headers_absent(template.headers_absent.as_deref(), index)?;
+            let headers_match = validate_headers_match(template.headers_match.as_ref(), index)?;
             let methods = rule
                 .methods
                 .as_ref()
@@ -581,6 +588,7 @@ fn expand_include_rule(
                 },
                 methods,
                 headers_absent,
+                headers_match,
                 request_timeout_ms,
                 header_actions: template.header_actions.clone(),
                 external_auth_profile: template.external_auth_profile.clone(),
@@ -603,6 +611,7 @@ fn expand_include_rule(
         for template in templates {
             let headers_absent =
                 validate_headers_absent(template.headers_absent.as_deref(), index)?;
+            let headers_match = validate_headers_match(template.headers_match.as_ref(), index)?;
             let methods = rule
                 .methods
                 .as_ref()
@@ -633,6 +642,7 @@ fn expand_include_rule(
                 },
                 methods,
                 headers_absent,
+                headers_match,
                 request_timeout_ms,
                 header_actions: template.header_actions.clone(),
                 external_auth_profile: template.external_auth_profile.clone(),
@@ -918,6 +928,71 @@ fn validate_headers_absent(
         }
 
         normalized.push(normalized_name);
+    }
+
+    Ok(Some(normalized))
+}
+
+fn validate_headers_match(
+    headers_match: Option<&BTreeMap<String, HeaderMatchValueConfig>>,
+    index: usize,
+) -> Result<Option<BTreeMap<String, Vec<String>>>, PolicyError> {
+    let Some(headers_match) = headers_match else {
+        return Ok(None);
+    };
+
+    if headers_match.is_empty() {
+        return Err(PolicyError::RuleInvalid {
+            index,
+            reason: "headers_match must not be empty".to_string(),
+        });
+    }
+
+    let mut normalized = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+
+    for (name, raw_values) in headers_match {
+        let lowered = name.to_ascii_lowercase();
+        let parsed = HeaderName::from_lowercase(lowered.as_bytes()).map_err(|err| {
+            PolicyError::RuleInvalid {
+                index,
+                reason: format!("invalid header name '{}' in headers_match: {err}", name),
+            }
+        })?;
+        let normalized_name = parsed.as_str().to_string();
+
+        if !seen.insert(normalized_name.clone()) {
+            return Err(PolicyError::RuleInvalid {
+                index,
+                reason: format!(
+                    "duplicate header name '{}' in headers_match after normalization",
+                    name
+                ),
+            });
+        }
+
+        let values = raw_values.values();
+        if values.is_empty() {
+            return Err(PolicyError::RuleInvalid {
+                index,
+                reason: format!(
+                    "headers_match entry '{}' must include at least one allowed value",
+                    name
+                ),
+            });
+        }
+
+        if values.iter().any(|value| value.is_empty()) {
+            return Err(PolicyError::RuleInvalid {
+                index,
+                reason: format!(
+                    "headers_match entry '{}' must not include empty-string values",
+                    name
+                ),
+            });
+        }
+
+        normalized.insert(normalized_name, values);
     }
 
     Ok(Some(normalized))
@@ -1294,6 +1369,7 @@ mod tests {
                 methods: None,
                 subnets: vec!["192.168.0.0/16".parse::<IpNet>().unwrap()],
                 headers_absent: None,
+                headers_match: None,
                 request_timeout_ms: None,
                 with: None,
                 add_url_enc_variants: None,
@@ -1323,6 +1399,7 @@ mod tests {
                 methods: None,
                 subnets: vec!["2001:db8::/32".parse::<IpNet>().unwrap()],
                 headers_absent: None,
+                headers_match: None,
                 request_timeout_ms: None,
                 with: None,
                 add_url_enc_variants: None,
@@ -1359,6 +1436,7 @@ mod tests {
                     methods: None,
                     subnets: Vec::new(),
                     headers_absent: None,
+                    headers_match: None,
                     request_timeout_ms: None,
                     header_actions: Vec::new(),
                     external_auth_profile: None,
@@ -1371,6 +1449,7 @@ mod tests {
                     methods: None,
                     subnets: Vec::new(),
                     headers_absent: None,
+                    headers_match: None,
                     request_timeout_ms: None,
                     header_actions: Vec::new(),
                     external_auth_profile: None,
@@ -1433,6 +1512,7 @@ mod tests {
                     methods: None,
                     subnets: Vec::new(),
                     headers_absent: None,
+                    headers_match: None,
                     request_timeout_ms: None,
                     header_actions: Vec::new(),
                     external_auth_profile: None,
@@ -1785,6 +1865,22 @@ headers_absent = ["x-workload-id", "x-trace-id"]
     }
 
     #[test]
+    fn headers_match_only_rule_is_valid_match_criteria() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "allow"
+headers_match = { "x-workload-id" = "worker-123" }
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        assert_eq!(engine.rules.len(), 1);
+    }
+
+    #[test]
     fn invalid_urls_are_denied() {
         let toml = r#"
 default = "allow"
@@ -1976,6 +2072,156 @@ headers_absent = ["X-Workload-Id", "X-Trace-Id"]
         assert_eq!(
             expanded.rules[0].headers_absent,
             Some(vec!["x-workload-id".to_string(), "x-trace-id".to_string()])
+        );
+    }
+
+    #[test]
+    fn headers_match_rejects_empty_map() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+headers_match = {}
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let err = PolicyEngine::from_config(&cfg).expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("headers_match must not be empty"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn headers_match_rejects_invalid_header_names() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+headers_match = { "bad header" = "worker-123" }
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let err = PolicyEngine::from_config(&cfg).expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid header name 'bad header' in headers_match"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn headers_match_rejects_duplicates_after_normalization() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+headers_match = { "X-Workload-Id" = "worker-123", "x-workload-id" = "worker-456" }
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let err = PolicyEngine::from_config(&cfg).expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("duplicate header name"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn headers_match_rejects_empty_values_or_value_lists() {
+        let empty_value_toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+headers_match = { "x-workload-id" = "" }
+        "#;
+
+        let empty_list_toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+headers_match = { "x-workload-id" = [] }
+        "#;
+
+        let empty_value_cfg: PolicyConfig =
+            toml::from_str(empty_value_toml).expect("parse policy config");
+        let empty_list_cfg: PolicyConfig =
+            toml::from_str(empty_list_toml).expect("parse policy config");
+
+        let empty_value_msg = format!(
+            "{}",
+            PolicyEngine::from_config(&empty_value_cfg).expect_err("expected err")
+        );
+        let empty_list_msg = format!(
+            "{}",
+            PolicyEngine::from_config(&empty_list_cfg).expect_err("expected err")
+        );
+
+        assert!(
+            empty_value_msg.contains("must not include empty-string values"),
+            "unexpected error message: {empty_value_msg}"
+        );
+        assert!(
+            empty_list_msg.contains("must include at least one allowed value"),
+            "unexpected error message: {empty_list_msg}"
+        );
+    }
+
+    #[test]
+    fn headers_match_valid_names_and_values_are_normalized() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+headers_match = { "X-Workload-Id" = ["worker-123", "worker-456"], "x-tenant-id" = "tenant-a" }
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let expanded = expand_policy(&cfg).expect("expand policy");
+
+        assert_eq!(expanded.rules.len(), 1);
+        assert_eq!(
+            expanded.rules[0].headers_match,
+            Some(BTreeMap::from([
+                ("x-tenant-id".to_string(), vec!["tenant-a".to_string()]),
+                (
+                    "x-workload-id".to_string(),
+                    vec!["worker-123".to_string(), "worker-456".to_string()]
+                ),
+            ]))
+        );
+    }
+
+    #[test]
+    fn ruleset_template_headers_match_is_validated() {
+        let toml = r#"
+default = "deny"
+
+[[rulesets.guard]]
+action = "deny"
+pattern = "https://example.com/**"
+headers_match = { "x-workload-id" = [], "x-tenant-id" = "tenant-a" }
+
+[[rules]]
+include = "guard"
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let err = PolicyEngine::from_config(&cfg).expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(
+                "headers_match entry 'x-workload-id' must include at least one allowed value"
+            ),
+            "unexpected error message: {msg}"
         );
     }
 }
