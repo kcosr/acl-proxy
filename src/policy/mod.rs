@@ -78,9 +78,16 @@ struct CompiledRule {
     subnets: Vec<IpNet>,
     methods: Vec<String>,
     headers_absent: Vec<HeaderName>,
+    headers_match: Vec<CompiledHeaderMatch>,
     request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
     external_auth_profile: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CompiledHeaderMatch {
+    name: HeaderName,
+    values: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +127,7 @@ pub struct EffectiveRule {
     pub subnets: Vec<IpNet>,
     pub methods: Vec<String>,
     pub headers_absent: Vec<String>,
+    pub headers_match: BTreeMap<String, Vec<String>>,
     pub request_timeout_ms: Option<u64>,
     pub header_actions: Vec<EffectiveHeaderAction>,
     pub external_auth: Option<EffectiveExternalAuth>,
@@ -160,6 +168,7 @@ impl PolicyEngine {
 
         for (idx, rule) in expanded.rules.into_iter().enumerate() {
             let headers_absent = compile_headers_absent(rule.headers_absent.as_deref(), idx)?;
+            let headers_match = compile_headers_match(rule.headers_match.as_ref(), idx)?;
             let header_actions = compile_header_actions(&rule.header_actions, idx)?;
 
             let regex = if let Some(ref pattern) = rule.pattern {
@@ -184,6 +193,7 @@ impl PolicyEngine {
                 subnets: rule.subnets,
                 methods: rule.methods,
                 headers_absent,
+                headers_match,
                 request_timeout_ms: rule.request_timeout_ms,
                 header_actions,
                 external_auth_profile: rule.external_auth_profile,
@@ -241,6 +251,10 @@ impl PolicyEngine {
 
             if !rule.headers_absent.is_empty() && !any_header_absent(headers, &rule.headers_absent)
             {
+                continue;
+            }
+
+            if !rule.headers_match.is_empty() && !all_headers_match(headers, &rule.headers_match) {
                 continue;
             }
 
@@ -336,6 +350,7 @@ impl EffectivePolicy {
                     subnets: rule.subnets,
                     methods: rule.methods,
                     headers_absent: rule.headers_absent.unwrap_or_default(),
+                    headers_match: rule.headers_match.unwrap_or_default(),
                     request_timeout_ms: rule.request_timeout_ms,
                     header_actions,
                     external_auth,
@@ -889,6 +904,36 @@ fn compile_headers_absent(
         .collect()
 }
 
+fn compile_headers_match(
+    headers_match: Option<&BTreeMap<String, Vec<String>>>,
+    index: usize,
+) -> Result<Vec<CompiledHeaderMatch>, PolicyError> {
+    let Some(headers_match) = headers_match else {
+        return Ok(Vec::new());
+    };
+
+    let mut compiled = Vec::with_capacity(headers_match.len());
+
+    for (name, values) in headers_match {
+        let header_name = HeaderName::from_lowercase(name.as_bytes()).map_err(|err| {
+            PolicyError::RuleInvalid {
+                index,
+                reason: format!("invalid header name '{}' in headers_match: {err}", name),
+            }
+        })?;
+
+        compiled.push(CompiledHeaderMatch {
+            name: header_name,
+            values: values
+                .iter()
+                .map(|value| value.as_bytes().to_vec())
+                .collect(),
+        });
+    }
+
+    Ok(compiled)
+}
+
 fn validate_headers_absent(
     headers_absent: Option<&[String]>,
     index: usize,
@@ -1002,6 +1047,20 @@ fn any_header_absent(headers: &HeaderMap<HeaderValue>, headers_absent: &[HeaderN
     headers_absent
         .iter()
         .any(|header_name| !headers.contains_key(header_name))
+}
+
+fn all_headers_match(
+    headers: &HeaderMap<HeaderValue>,
+    headers_match: &[CompiledHeaderMatch],
+) -> bool {
+    headers_match.iter().all(|matcher| {
+        headers.get_all(&matcher.name).iter().any(|actual| {
+            matcher
+                .values
+                .iter()
+                .any(|expected| actual.as_bytes() == expected.as_slice())
+        })
+    })
 }
 
 fn keys_for_url_variants(
@@ -1865,6 +1924,344 @@ headers_absent = ["x-workload-id", "x-trace-id"]
     }
 
     #[test]
+    fn headers_match_single_key_single_value_match_and_fallthrough() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/**"
+headers_match = { "x-workload-id" = "worker-123" }
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        let matching_headers = header_map(&[("x-workload-id", "worker-123")]);
+        let non_matching_headers = header_map(&[("x-workload-id", "worker-456")]);
+
+        assert!(
+            engine
+                .evaluate(
+                    "https://example.com/path",
+                    None,
+                    Some("GET"),
+                    &matching_headers
+                )
+                .allowed
+        );
+        assert!(
+            !engine
+                .evaluate(
+                    "https://example.com/path",
+                    None,
+                    Some("GET"),
+                    &non_matching_headers
+                )
+                .allowed
+        );
+    }
+
+    #[test]
+    fn headers_match_single_key_multi_value_uses_or_semantics() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/**"
+headers_match = { "x-workload-id" = ["worker-123", "worker-456"] }
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        let first_match = header_map(&[("x-workload-id", "worker-123")]);
+        let second_match = header_map(&[("x-workload-id", "worker-456")]);
+        let miss = header_map(&[("x-workload-id", "worker-789")]);
+
+        assert!(
+            engine
+                .evaluate("https://example.com/path", None, Some("GET"), &first_match)
+                .allowed
+        );
+        assert!(
+            engine
+                .evaluate("https://example.com/path", None, Some("GET"), &second_match)
+                .allowed
+        );
+        assert!(
+            !engine
+                .evaluate("https://example.com/path", None, Some("GET"), &miss)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn headers_match_multi_key_uses_and_semantics() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/**"
+headers_match = { "x-workload-id" = "worker-123", "x-tenant-id" = "tenant-a" }
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        let both = header_map(&[("x-workload-id", "worker-123"), ("x-tenant-id", "tenant-a")]);
+        let one_missing = header_map(&[("x-workload-id", "worker-123")]);
+        let one_wrong = header_map(&[("x-workload-id", "worker-123"), ("x-tenant-id", "tenant-b")]);
+
+        assert!(
+            engine
+                .evaluate("https://example.com/path", None, Some("GET"), &both)
+                .allowed
+        );
+        assert!(
+            !engine
+                .evaluate("https://example.com/path", None, Some("GET"), &one_missing)
+                .allowed
+        );
+        assert!(
+            !engine
+                .evaluate("https://example.com/path", None, Some("GET"), &one_wrong)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn headers_match_lookup_is_case_insensitive_for_header_names() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/**"
+headers_match = { "X-Workload-Id" = "worker-123" }
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+        let headers = header_map(&[("x-workload-id", "worker-123")]);
+
+        assert!(
+            engine
+                .evaluate("https://example.com/path", None, Some("GET"), &headers)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn headers_match_uses_exact_case_sensitive_value_semantics_without_trimming_or_comma_split() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/**"
+headers_match = { "x-workload-id" = "worker-123", "x-comma" = "a,b" }
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        let exact = header_map(&[("x-workload-id", "worker-123"), ("x-comma", "a,b")]);
+        let different_case = header_map(&[("x-workload-id", "Worker-123"), ("x-comma", "a,b")]);
+        let trimmed = header_map(&[("x-workload-id", " worker-123 "), ("x-comma", "a,b")]);
+        let comma_split_like = header_map(&[("x-workload-id", "worker-123"), ("x-comma", "a, b")]);
+
+        assert!(
+            engine
+                .evaluate("https://example.com/path", None, Some("GET"), &exact)
+                .allowed
+        );
+        assert!(
+            !engine
+                .evaluate(
+                    "https://example.com/path",
+                    None,
+                    Some("GET"),
+                    &different_case
+                )
+                .allowed
+        );
+        assert!(
+            !engine
+                .evaluate("https://example.com/path", None, Some("GET"), &trimmed)
+                .allowed
+        );
+        assert!(
+            !engine
+                .evaluate(
+                    "https://example.com/path",
+                    None,
+                    Some("GET"),
+                    &comma_split_like
+                )
+                .allowed
+        );
+    }
+
+    #[test]
+    fn headers_match_succeeds_when_any_repeated_header_value_matches() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/**"
+headers_match = { "x-workload-id" = "worker-123" }
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        let mut headers = HeaderMap::new();
+        headers.append(
+            HeaderName::from_static("x-workload-id"),
+            HeaderValue::from_static("worker-456"),
+        );
+        headers.append(
+            HeaderName::from_static("x-workload-id"),
+            HeaderValue::from_static("worker-123"),
+        );
+
+        assert!(
+            engine
+                .evaluate("https://example.com/path", None, Some("GET"), &headers)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn headers_match_combines_with_methods_and_subnets_using_and_semantics() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/**"
+methods = ["POST"]
+subnets = ["10.0.0.0/8"]
+headers_match = { "x-workload-id" = "worker-123" }
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+        let headers = header_map(&[("x-workload-id", "worker-123")]);
+
+        let allowed = engine.evaluate(
+            "https://example.com/path",
+            Some("10.1.2.3"),
+            Some("POST"),
+            &headers,
+        );
+        let wrong_method = engine.evaluate(
+            "https://example.com/path",
+            Some("10.1.2.3"),
+            Some("GET"),
+            &headers,
+        );
+        let wrong_subnet = engine.evaluate(
+            "https://example.com/path",
+            Some("192.168.1.10"),
+            Some("POST"),
+            &headers,
+        );
+
+        assert!(allowed.allowed);
+        assert!(!wrong_method.allowed);
+        assert!(!wrong_subnet.allowed);
+    }
+
+    #[test]
+    fn headers_absent_and_headers_match_combine_conjunctively() {
+        let toml = r#"
+default = "allow"
+
+[[rules]]
+action = "deny"
+pattern = "https://example.com/**"
+headers_absent = ["x-trace-id"]
+headers_match = { "x-workload-id" = "worker-123" }
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        let both = header_map(&[("x-workload-id", "worker-123")]);
+        let absent_only = HeaderMap::new();
+        let match_only = header_map(&[("x-workload-id", "worker-123"), ("x-trace-id", "trace-1")]);
+
+        assert!(
+            !engine
+                .evaluate("https://example.com/path", None, Some("GET"), &both)
+                .allowed
+        );
+        assert!(
+            engine
+                .evaluate("https://example.com/path", None, Some("GET"), &absent_only)
+                .allowed
+        );
+        assert!(
+            engine
+                .evaluate("https://example.com/path", None, Some("GET"), &match_only)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn headers_match_failure_falls_through_before_external_auth_rule() {
+        let toml = r#"
+default = "deny"
+
+[external_auth_profiles.example]
+webhook_url = "https://auth.internal/start"
+timeout_ms = 5000
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/**"
+headers_match = { "x-workload-id" = "worker-123" }
+external_auth_profile = "example"
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/**"
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        let miss_headers = header_map(&[("x-workload-id", "worker-999")]);
+        let hit_headers = header_map(&[("x-workload-id", "worker-123")]);
+
+        let miss = engine.evaluate("https://example.com/path", None, Some("GET"), &miss_headers);
+        let hit = engine.evaluate("https://example.com/path", None, Some("GET"), &hit_headers);
+
+        assert!(miss.allowed);
+        assert_eq!(miss.matched.as_ref().map(|rule| rule.index), Some(1));
+        assert_eq!(
+            miss.matched
+                .as_ref()
+                .and_then(|rule| rule.external_auth_profile.as_deref()),
+            None
+        );
+
+        assert!(hit.allowed);
+        assert_eq!(hit.matched.as_ref().map(|rule| rule.index), Some(0));
+        assert_eq!(
+            hit.matched
+                .as_ref()
+                .and_then(|rule| rule.external_auth_profile.as_deref()),
+            Some("example")
+        );
+    }
+
+    #[test]
     fn headers_match_only_rule_is_valid_match_criteria() {
         let toml = r#"
 default = "deny"
@@ -1987,6 +2384,49 @@ headers_absent = ["x-workload-id"]
         assert_eq!(
             effective.rules[0].headers_absent,
             vec!["x-workload-id".to_string()]
+        );
+    }
+
+    #[test]
+    fn effective_policy_includes_headers_match_and_defaults_to_empty_object() {
+        let configured_toml = r#"
+default = "deny"
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/**"
+headers_match = { "x-workload-id" = ["worker-123", "worker-456"], "x-tenant-id" = "tenant-a" }
+        "#;
+
+        let unset_toml = r#"
+default = "deny"
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/**"
+        "#;
+
+        let configured_cfg: PolicyConfig =
+            toml::from_str(configured_toml).expect("parse policy config");
+        let unset_cfg: PolicyConfig = toml::from_str(unset_toml).expect("parse policy config");
+
+        let configured =
+            EffectivePolicy::from_config(&configured_cfg).expect("build effective policy");
+        let unset = EffectivePolicy::from_config(&unset_cfg).expect("build effective policy");
+
+        assert_eq!(
+            configured.rules[0].headers_match,
+            BTreeMap::from([
+                ("x-tenant-id".to_string(), vec!["tenant-a".to_string()]),
+                (
+                    "x-workload-id".to_string(),
+                    vec!["worker-123".to_string(), "worker-456".to_string()]
+                ),
+            ])
+        );
+        assert!(
+            unset.rules[0].headers_match.is_empty(),
+            "headers_match should be serialized as empty object when unset"
         );
     }
 

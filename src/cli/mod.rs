@@ -211,7 +211,9 @@ fn print_policy_table(policy: &crate::policy::EffectivePolicy) {
             crate::config::PolicyDefaultAction::Deny => "deny",
         }
     );
-    println!("INDEX\tACTION\tPATTERN\tMETHODS\tSUBNETS\tHEADERS_ABSENT\tDESCRIPTION");
+    println!(
+        "INDEX\tACTION\tPATTERN\tMETHODS\tSUBNETS\tHEADERS_ABSENT\tHEADERS_MATCH\tDESCRIPTION"
+    );
 
     for rule in &policy.rules {
         let action = match rule.action {
@@ -239,11 +241,27 @@ fn print_policy_table(policy: &crate::policy::EffectivePolicy) {
         } else {
             rule.headers_absent.join(",")
         };
+        let headers_match = if rule.headers_match.is_empty() {
+            "-".to_string()
+        } else {
+            rule.headers_match
+                .iter()
+                .map(|(name, values)| format!("{name}={}", values.join("|")))
+                .collect::<Vec<_>>()
+                .join(";")
+        };
         let description = rule.description.as_deref().unwrap_or("-");
 
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            rule.index, action, pattern, methods, subnets, headers_absent, description
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            rule.index,
+            action,
+            pattern,
+            methods,
+            subnets,
+            headers_absent,
+            headers_match,
+            description
         );
     }
 }

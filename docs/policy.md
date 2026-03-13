@@ -127,6 +127,7 @@ Behavior:
 - Value matching is exact and case-sensitive with no trimming and no comma splitting.
 - Repeated inbound header values are supported; any exact match satisfies that header key.
 - Empty configured values are rejected during config validation.
+- When both `headers_absent` and `headers_match` are configured on one rule, both predicates must pass.
 - On HTTPS over CONNECT, this predicate applies to decrypted inner requests, not outer CONNECT tunnel-establishment metadata.
 
 ## Header actions
