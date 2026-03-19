@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+_No unreleased changes._
+
 ## [0.0.12] - 2026-03-19
 
 ### Changed
