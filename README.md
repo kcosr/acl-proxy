@@ -145,18 +145,18 @@ acl-proxy supports four request paths. All modes apply the same policy engine, l
 sequenceDiagram
     participant Client
     participant Listener as HTTP/HTTPS Listener
-    participant Loop as Loop Protection
+    participant LP as Loop Protection
     participant Policy as Policy Engine
     participant Auth as External Auth
     participant Headers as Header Actions
     participant Upstream
 
     Client->>Listener: HTTP request / TLS connection
-    Listener->>Loop: Check loop header
-    alt Loop detected
-        Loop-->>Client: 508 Loop Detected
+    Listener->>LP: Check loop header
+    alt Loopback detected
+        LP-->>Client: 508 Loop Detected
     end
-    Loop->>Policy: Evaluate rules (pattern, subnet, method, headers)
+    LP->>Policy: Evaluate rules (pattern, subnet, method, headers)
 
     alt No rule matches
         Policy->>Policy: Apply default action
