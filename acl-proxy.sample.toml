@@ -14,7 +14,7 @@
 #   3. Validate with:
 #        acl-proxy config validate --config config/acl-proxy.toml
 #
-# For a full schema reference, see docs/config-reference.md.
+# For a full schema reference, see README.md.
 
 schema_version = "1"
 

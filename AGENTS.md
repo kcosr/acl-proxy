@@ -1,8 +1,53 @@
-## Development guidelines
+# Repository Conventions (acl-proxy)
 
-- For any new feature or behavior change, add or update tests and run `cargo test` before opening a PR (once the Rust project exists); tests must be deterministic and offline.
-- For any new feature or behavior change, update documentation appropriately. See docs and README.md.
-- When updating Rust code in this project, always run `cargo fmt`, `cargo clippy`, `cargo test`, and `cargo build --release` before committing and pushing.
+## What This Repo Is
+
+`acl-proxy` is a Rust-based ACL-aware HTTP/HTTPS proxy with a TOML configuration file and a flexible URL policy engine. It supports explicit HTTP proxying, transparent HTTP interception, HTTPS CONNECT MITM, and transparent HTTPS termination with HTTP/2.
+
+## Fast Bootstrap
+
+1. Build: `cargo build`
+2. Format: `cargo fmt`
+3. Lint: `cargo clippy`
+4. Test: `cargo test`
+5. Release build: `cargo build --release`
+6. Run: `cargo run -- --config config/acl-proxy.toml`
+
+## Source Map (Start Here)
+
+- `src/main.rs` — Entry point, delegates to CLI.
+- `src/cli/mod.rs` — CLI parsing, config validate/init, policy dump.
+- `src/config/mod.rs` — Configuration structs, TOML loading, validation, env overrides.
+- `src/policy/mod.rs` — Policy engine: rule compilation, pattern matching, macro/ruleset expansion.
+- `src/app.rs` — `AppState` and shared state management (`ArcSwap`).
+- `src/proxy/http.rs` — HTTP listener (explicit proxy + transparent HTTP interception).
+- `src/proxy/https_connect.rs` — HTTPS CONNECT MITM handler.
+- `src/proxy/https_transparent.rs` — Transparent HTTPS listener (HTTP/1.1 + HTTP/2).
+- `src/external_auth.rs` — External auth webhooks, callbacks, approval lifecycle.
+- `src/auth_plugin.rs` — Stdio plugin lifecycle management.
+- `src/capture/mod.rs` — Request/response capture to JSON files.
+- `src/certs/mod.rs` — CA and per-host certificate generation and caching.
+- `src/logging/mod.rs` — Structured logging with file rotation.
+- `src/loop_protection/mod.rs` — Loop detection and header injection.
+- `src/bin/extract-capture-body.rs` — Helper CLI to decode captured bodies.
+
+## Working Rules
+
+1. Tests must be deterministic and offline — no network calls, no flaky timing.
+2. For any new feature or behavior change, add or update tests and run `cargo test`.
+3. For any new feature or behavior change, update `README.md` (the single source of user-facing docs).
+4. Always run `cargo fmt`, `cargo clippy`, `cargo test`, and `cargo build --release` before committing.
+5. Keep `docs/design/` and `docs/implementation/` for internal design records only — user-facing docs live in `README.md`.
+
+## Commands You'll Use Often
+
+- Build: `cargo build`
+- Test: `cargo test`
+- Lint: `cargo clippy`
+- Format: `cargo fmt`
+- Validate config: `cargo run -- config validate --config config/acl-proxy.toml`
+- Dump policy: `cargo run -- policy dump --config config/acl-proxy.toml`
+- Release build: `cargo build --release`
 
 ## Changelog
 
