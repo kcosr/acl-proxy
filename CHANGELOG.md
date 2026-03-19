@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.12] - 2026-03-19
 
 ### Changed
 - Consolidate 13 individual doc files into comprehensive README with mermaid diagrams, reference tables, and full configuration reference ([#47](https://github.com/kcosr/acl-proxy/pull/47)).
