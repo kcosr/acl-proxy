@@ -265,6 +265,18 @@ description = "Allow trusted workload identities"
 methods = ["GET", "POST"]
 
 [[policy.rules]]
+# Example: group several URL patterns that share the same rule attributes.
+action = "allow"
+patterns = [
+  "https://developers.openai.com/**",
+  "https://github.com/openai/**",
+  "https://raw.githubusercontent.com/openai/**",
+  "https://api.github.com/repos/openai/**",
+]
+description = "OpenAI docs and repositories"
+methods = ["GET"]
+
+[[policy.rules]]
 # Allow Git traffic (HTTP(S) and API) for repositories listed in
 # [policy.macros].repo from the 10.0.0.0/8 network, including URL
 # encoded variants of the {repo} placeholder.

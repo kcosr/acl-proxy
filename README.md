@@ -343,6 +343,31 @@ description = "Allow trusted workload identities"
 - Empty configured values are rejected during config validation.
 - When both `headers_absent` and `headers_match` are configured, both predicates must pass.
 
+### Multiple URL Patterns
+
+Use `patterns = [...]` when several URL patterns should share identical rule attributes:
+
+```toml
+[[policy.rules]]
+action = "allow"
+patterns = [
+  "https://developers.openai.com/**",
+  "https://github.com/openai/**",
+  "https://raw.githubusercontent.com/openai/**",
+  "https://api.github.com/repos/openai/**",
+]
+methods = ["GET"]
+description = "OpenAI docs and repositories"
+```
+
+- Use `pattern = "..."` for one URL pattern and `patterns = ["...", "..."]` for several.
+- `pattern` and `patterns` are mutually exclusive.
+- `patterns` must include at least one non-empty pattern; entries are trimmed before expansion.
+- A multi-pattern rule expands into one effective rule per pattern, preserving configured pattern order and first-match-wins behavior.
+- `policy dump` shows the expanded effective rules with singular `pattern` values.
+- Policy decision logs report the specific matched effective `rule_pattern`, not the original `patterns` array.
+- `rule_id` is rejected on multi-pattern rules because copied IDs would not be unique.
+
 ### Macros and Rulesets
 
 Macros are named placeholders expanded before patterns are compiled:
@@ -357,6 +382,8 @@ pattern = "https://git.internal/{repo}.git/**"
 description = "Git HTTP(S) for {repo}"
 methods = ["GET", "POST"]
 ```
+
+Ruleset templates can also use `patterns = [...]`; include expansion emits one concrete rule for each template pattern.
 
 Include rules expand a ruleset into concrete rules:
 
@@ -445,6 +472,7 @@ acl-proxy policy dump --format json
 ```
 
 `policy dump` defaults to table output on a TTY and JSON otherwise. It includes `headers_match` values — treat output as sensitive when those values represent credentials.
+When a rule uses `patterns`, the dump shows one effective row/object per expanded pattern with a singular `pattern` field.
 
 ## Configuration Reference
 
@@ -654,6 +682,7 @@ See [Policy Engine](#policy-engine) for full details on rules, macros, rulesets,
 [[policy.rules]]
 action = "allow"                    # required: "allow" | "deny"
 pattern = "https://example.com/**"  # optional: URL pattern
+# patterns = ["https://a/**"]       # optional alternative: multiple URL patterns
 description = "Example rule"        # optional
 methods = ["GET", "POST"]           # optional: HTTP methods
 subnets = ["10.0.0.0/8"]           # optional: client IP CIDRs
@@ -664,7 +693,7 @@ rule_id = "stable-id"             # optional: stable ID for webhooks
 external_auth_profile = "name"     # optional: approval gate (allow rules only)
 ```
 
-At least one of `pattern`, `methods`, `subnets`, `headers_absent`, or `headers_match` must be present.
+At least one of `pattern`, `patterns`, `methods`, `subnets`, `headers_absent`, or `headers_match` must be present.
 
 #### Include Rule Fields
 
@@ -737,7 +766,9 @@ The repository includes [`acl-proxy.sample.toml`](acl-proxy.sample.toml) as a co
 The config loader performs validation beyond basic TOML parsing:
 
 - `schema_version` must equal `"1"`.
-- Direct rules must have at least one of `pattern`, `methods`, `subnets`, `headers_absent`, or `headers_match`.
+- Direct rules must have at least one of `pattern`, `patterns`, `methods`, `subnets`, `headers_absent`, or `headers_match`.
+- Direct rules and ruleset templates must not define both `pattern` and `patterns`.
+- `patterns` must include at least one non-empty pattern.
 - Include rules must reference an existing ruleset.
 - Macro placeholders (`{name}`) must resolve from `policy.macros` or `with` overrides.
 - `ca_key_path` and `ca_cert_path` must be both set or both omitted.

@@ -185,6 +185,7 @@ fn allow_rule(pattern: String, header_actions: Vec<HeaderActionConfig>) -> Polic
     PolicyRuleConfig::Direct(PolicyRuleDirectConfig {
         action: PolicyDefaultAction::Allow,
         pattern: Some(pattern),
+        patterns: None,
         description: None,
         methods: None,
         subnets: Vec::new(),

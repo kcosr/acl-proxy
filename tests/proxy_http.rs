@@ -761,6 +761,7 @@ async fn allowed_request_uses_configured_egress_forwarding_destination() {
         acl_proxy::config::PolicyRuleDirectConfig {
             action: acl_proxy::config::PolicyDefaultAction::Allow,
             pattern: Some("http://example.invalid/**".to_string()),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -821,6 +822,7 @@ async fn global_egress_request_actions_are_applied_after_rule_actions_without_af
         acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
             action: acl_proxy::config::PolicyDefaultAction::Deny,
             pattern: Some("http://example.invalid/**".to_string()),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -836,6 +838,7 @@ async fn global_egress_request_actions_are_applied_after_rule_actions_without_af
         acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
             action: acl_proxy::config::PolicyDefaultAction::Allow,
             pattern: Some("http://example.invalid/**".to_string()),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -982,6 +985,7 @@ async fn global_egress_request_actions_respect_intra_layer_order() {
         acl_proxy::config::PolicyRuleDirectConfig {
             action: acl_proxy::config::PolicyDefaultAction::Allow,
             pattern: Some("http://example.invalid/**".to_string()),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -1070,6 +1074,7 @@ async fn empty_global_egress_actions_preserve_existing_rule_header_behavior() {
         acl_proxy::config::PolicyRuleDirectConfig {
             action: acl_proxy::config::PolicyDefaultAction::Allow,
             pattern: Some("http://example.invalid/**".to_string()),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -1404,6 +1409,7 @@ async fn http_explicit_listener_accepts_h2c_prior_knowledge_requests() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -1449,6 +1455,7 @@ async fn allowed_request_is_proxied_and_loop_header_added() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -1512,6 +1519,7 @@ async fn headers_absent_top_deny_guard_falls_through_to_allow_rule() {
         acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
             action: acl_proxy::config::PolicyDefaultAction::Deny,
             pattern: Some(format!("http://{host}/**")),
+            patterns: None,
             description: Some("Deny requests missing identity".to_string()),
             methods: None,
             subnets: Vec::new(),
@@ -1527,6 +1535,7 @@ async fn headers_absent_top_deny_guard_falls_through_to_allow_rule() {
         acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
             action: acl_proxy::config::PolicyDefaultAction::Allow,
             pattern: Some(format!("http://{host}/**")),
+            patterns: None,
             description: Some("Allow upstream traffic".to_string()),
             methods: None,
             subnets: Vec::new(),
@@ -1593,6 +1602,7 @@ async fn method_scoped_headers_absent_guard_only_blocks_matching_methods() {
         acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
             action: acl_proxy::config::PolicyDefaultAction::Deny,
             pattern: Some(format!("http://{host}/**")),
+            patterns: None,
             description: Some("Deny POSTs missing identity".to_string()),
             methods: Some({
                 #[derive(serde::Deserialize)]
@@ -1617,6 +1627,7 @@ async fn method_scoped_headers_absent_guard_only_blocks_matching_methods() {
         acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
             action: acl_proxy::config::PolicyDefaultAction::Allow,
             pattern: Some(format!("http://{host}/**")),
+            patterns: None,
             description: Some("Allow upstream traffic".to_string()),
             methods: None,
             subnets: Vec::new(),
@@ -1682,6 +1693,7 @@ async fn headers_match_top_guard_denies_non_matching_value_and_allows_matching_v
         acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
             action: acl_proxy::config::PolicyDefaultAction::Allow,
             pattern: Some(format!("http://{host}/**")),
+            patterns: None,
             description: Some("Allow trusted identity header".to_string()),
             methods: None,
             subnets: Vec::new(),
@@ -1700,6 +1712,7 @@ async fn headers_match_top_guard_denies_non_matching_value_and_allows_matching_v
         acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
             action: acl_proxy::config::PolicyDefaultAction::Deny,
             pattern: Some(format!("http://{host}/**")),
+            patterns: None,
             description: Some("Deny all other traffic".to_string()),
             methods: None,
             subnets: Vec::new(),
@@ -1764,6 +1777,7 @@ async fn headers_match_http_regressions_cover_repeated_values_comma_literals_and
         acl_proxy::config::PolicyRuleDirectConfig {
             action: acl_proxy::config::PolicyDefaultAction::Allow,
             pattern: Some(format!("http://{host}/**")),
+            patterns: None,
             description: Some("Allow only exact trusted header values".to_string()),
             methods: None,
             subnets: Vec::new(),
@@ -1852,6 +1866,7 @@ async fn loop_header_not_added_when_disabled() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -2001,6 +2016,7 @@ async fn origin_form_request_with_host_is_forwarded() {
         acl_proxy::config::PolicyRuleDirectConfig {
             action: acl_proxy::config::PolicyDefaultAction::Allow,
             pattern: Some(format!("http://{host}/**")),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -2064,6 +2080,7 @@ async fn upstream_connection_failure_returns_502() {
         acl_proxy::config::PolicyRuleDirectConfig {
             action: acl_proxy::config::PolicyDefaultAction::Allow,
             pattern: Some("http://127.0.0.1:1/**".to_string()),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -2113,6 +2130,7 @@ async fn upstream_request_timeout_returns_504() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),

@@ -13,7 +13,8 @@ use crate::config::{
     EgressRequestHeaderActionConfig, ExternalAuthProfileConfigMap, HeaderActionConfig,
     HeaderActionKind, HeaderDirection, HeaderMatchValueConfig, HeaderWhen, MacroMap,
     MacroOverrideMap, MacroValues, PolicyConfig, PolicyDefaultAction, PolicyRuleConfig,
-    PolicyRuleDirectConfig, PolicyRuleIncludeConfig, RulesetMap, UrlEncVariants,
+    PolicyRuleDirectConfig, PolicyRuleIncludeConfig, PolicyRuleTemplateConfig, RulesetMap,
+    UrlEncVariants,
 };
 
 #[derive(Debug, Error)]
@@ -109,6 +110,11 @@ struct ExpandedRule {
     request_timeout_ms: Option<u64>,
     header_actions: Vec<HeaderActionConfig>,
     external_auth_profile: Option<String>,
+}
+
+struct TemplatePatterns<'a> {
+    template: &'a PolicyRuleTemplateConfig,
+    patterns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -401,12 +407,14 @@ fn expand_direct_rule(
     index: usize,
     out: &mut Vec<ExpandedRule>,
 ) -> Result<(), PolicyError> {
-    let pattern = rule
-        .pattern
-        .as_ref()
-        .map(|p| p.trim())
-        .filter(|p| !p.is_empty())
-        .map(|p| p.to_string());
+    let patterns = normalize_patterns(
+        rule.pattern.as_ref(),
+        rule.patterns.as_deref(),
+        index,
+        "policy rule",
+        false,
+    )?;
+    reject_multi_pattern_rule_id(patterns.as_deref(), rule.rule_id.as_ref(), index)?;
 
     let methods = rule
         .methods
@@ -430,7 +438,7 @@ fn expand_direct_rule(
         }
     }
 
-    let has_pattern = pattern.is_some();
+    let has_pattern = patterns.is_some();
     let has_subnets = !rule.subnets.is_empty();
     let has_methods = !methods.is_empty();
     let headers_absent = validate_headers_absent(rule.headers_absent.as_deref(), index)?;
@@ -464,9 +472,11 @@ fn expand_direct_rule(
         });
     }
 
-    let pattern_str = pattern.unwrap();
+    let patterns = patterns.unwrap();
     let mut placeholders = BTreeSet::new();
-    collect_placeholders(&pattern_str, &mut placeholders);
+    for pattern in &patterns {
+        collect_placeholders(pattern, &mut placeholders);
+    }
     if let Some(desc) = &rule.description {
         collect_placeholders(desc, &mut placeholders);
     }
@@ -476,26 +486,28 @@ fn expand_direct_rule(
     }
 
     if placeholders.is_empty() {
-        out.push(ExpandedRule {
-            action: rule.action,
-            pattern: Some(pattern_str),
-            description: rule.description.clone(),
-            rule_id: rule.rule_id.clone(),
-            subnets: rule.subnets.clone(),
-            methods,
-            headers_absent,
-            headers_match,
-            request_timeout_ms: rule.request_timeout_ms,
-            header_actions: rule.header_actions.clone(),
-            external_auth_profile: rule.external_auth_profile.clone(),
-        });
+        for pattern in patterns {
+            out.push(ExpandedRule {
+                action: rule.action,
+                pattern: Some(pattern),
+                description: rule.description.clone(),
+                rule_id: rule.rule_id.clone(),
+                subnets: rule.subnets.clone(),
+                methods: methods.clone(),
+                headers_absent: headers_absent.clone(),
+                headers_match: headers_match.clone(),
+                request_timeout_ms: rule.request_timeout_ms,
+                header_actions: rule.header_actions.clone(),
+                external_auth_profile: rule.external_auth_profile.clone(),
+            });
+        }
         return Ok(());
     }
 
     let resolved = resolve_placeholders(rule.with.as_ref(), macros, &placeholders, |_| {
         format!(
             " (required by direct rule pattern {pattern})",
-            pattern = pattern_str
+            pattern = patterns.join(", ")
         )
     })?;
 
@@ -506,7 +518,6 @@ fn expand_direct_rule(
     }
 
     for combo in combos {
-        let pattern_interp = interpolate_template(&pattern_str, &combo);
         let description_interp = rule
             .description
             .as_ref()
@@ -516,18 +527,90 @@ fn expand_direct_rule(
             .as_ref()
             .map(|id| interpolate_template(id, &combo));
 
-        out.push(ExpandedRule {
-            action: rule.action,
-            pattern: Some(pattern_interp),
-            description: description_interp,
-            rule_id: rule_id_interp,
-            subnets: rule.subnets.clone(),
-            methods: methods.clone(),
-            headers_absent: headers_absent.clone(),
-            headers_match: headers_match.clone(),
-            request_timeout_ms: rule.request_timeout_ms,
-            header_actions: rule.header_actions.clone(),
-            external_auth_profile: rule.external_auth_profile.clone(),
+        for pattern in &patterns {
+            let pattern_interp = interpolate_template(pattern, &combo);
+            out.push(ExpandedRule {
+                action: rule.action,
+                pattern: Some(pattern_interp),
+                description: description_interp.clone(),
+                rule_id: rule_id_interp.clone(),
+                subnets: rule.subnets.clone(),
+                methods: methods.clone(),
+                headers_absent: headers_absent.clone(),
+                headers_match: headers_match.clone(),
+                request_timeout_ms: rule.request_timeout_ms,
+                header_actions: rule.header_actions.clone(),
+                external_auth_profile: rule.external_auth_profile.clone(),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn normalize_patterns(
+    pattern: Option<&String>,
+    patterns: Option<&[String]>,
+    index: usize,
+    context: &str,
+    require_pattern: bool,
+) -> Result<Option<Vec<String>>, PolicyError> {
+    if pattern.is_some() && patterns.is_some() {
+        return Err(PolicyError::RuleInvalid {
+            index,
+            reason: format!("{context} must not define both pattern and patterns"),
+        });
+    }
+
+    if let Some(patterns) = patterns {
+        if patterns.is_empty() {
+            return Err(PolicyError::RuleInvalid {
+                index,
+                reason: "patterns must include at least one pattern".to_string(),
+            });
+        }
+
+        let mut normalized = Vec::with_capacity(patterns.len());
+        for (entry_idx, pattern) in patterns.iter().enumerate() {
+            let trimmed = pattern.trim();
+            if trimmed.is_empty() {
+                return Err(PolicyError::RuleInvalid {
+                    index,
+                    reason: format!("patterns entry at index {entry_idx} must not be empty"),
+                });
+            }
+            normalized.push(trimmed.to_string());
+        }
+
+        return Ok(Some(normalized));
+    }
+
+    let pattern = pattern
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .map(|p| p.to_string());
+
+    if pattern.is_none() && require_pattern {
+        return Err(PolicyError::RuleInvalid {
+            index,
+            reason: format!("{context} must define either pattern or patterns"),
+        });
+    }
+
+    Ok(pattern.map(|p| vec![p]))
+}
+
+fn reject_multi_pattern_rule_id(
+    patterns: Option<&[String]>,
+    rule_id: Option<&String>,
+    index: usize,
+) -> Result<(), PolicyError> {
+    if rule_id.is_some() && patterns.is_some_and(|patterns| patterns.len() > 1) {
+        return Err(PolicyError::RuleInvalid {
+            index,
+            reason:
+                "rule_id is not allowed on multi-pattern rules unless unique effective rule IDs are configured"
+                    .to_string(),
         });
     }
 
@@ -567,9 +650,26 @@ fn expand_include_rule(
         }
     }
 
-    let mut placeholders = BTreeSet::new();
+    let mut template_patterns = Vec::with_capacity(templates.len());
     for template in templates {
-        collect_placeholders(&template.pattern, &mut placeholders);
+        let patterns = normalize_patterns(
+            template.pattern.as_ref(),
+            template.patterns.as_deref(),
+            index,
+            "policy ruleset template",
+            true,
+        )?
+        .expect("ruleset template normalization requires patterns");
+        reject_multi_pattern_rule_id(Some(patterns.as_slice()), template.rule_id.as_ref(), index)?;
+        template_patterns.push(TemplatePatterns { template, patterns });
+    }
+
+    let mut placeholders = BTreeSet::new();
+    for template_patterns in &template_patterns {
+        for pattern in &template_patterns.patterns {
+            collect_placeholders(pattern, &mut placeholders);
+        }
+        let template = template_patterns.template;
         if let Some(desc) = &template.description {
             collect_placeholders(desc, &mut placeholders);
         }
@@ -579,7 +679,8 @@ fn expand_include_rule(
     }
 
     if placeholders.is_empty() {
-        for template in templates {
+        for template_patterns in &template_patterns {
+            let template = template_patterns.template;
             let headers_absent =
                 validate_headers_absent(template.headers_absent.as_deref(), index)?;
             let headers_match = validate_headers_match(template.headers_match.as_ref(), index)?;
@@ -591,23 +692,25 @@ fn expand_include_rule(
                 .unwrap_or_default();
             let request_timeout_ms = rule.request_timeout_ms.or(template.request_timeout_ms);
 
-            out.push(ExpandedRule {
-                action: template.action,
-                pattern: Some(template.pattern.clone()),
-                description: template.description.clone(),
-                rule_id: template.rule_id.clone(),
-                subnets: if !rule.subnets.is_empty() {
-                    rule.subnets.clone()
-                } else {
-                    template.subnets.clone()
-                },
-                methods,
-                headers_absent,
-                headers_match,
-                request_timeout_ms,
-                header_actions: template.header_actions.clone(),
-                external_auth_profile: template.external_auth_profile.clone(),
-            });
+            for pattern in &template_patterns.patterns {
+                out.push(ExpandedRule {
+                    action: template.action,
+                    pattern: Some(pattern.clone()),
+                    description: template.description.clone(),
+                    rule_id: template.rule_id.clone(),
+                    subnets: if !rule.subnets.is_empty() {
+                        rule.subnets.clone()
+                    } else {
+                        template.subnets.clone()
+                    },
+                    methods: methods.clone(),
+                    headers_absent: headers_absent.clone(),
+                    headers_match: headers_match.clone(),
+                    request_timeout_ms,
+                    header_actions: template.header_actions.clone(),
+                    external_auth_profile: template.external_auth_profile.clone(),
+                });
+            }
         }
         return Ok(());
     }
@@ -623,7 +726,8 @@ fn expand_include_rule(
     }
 
     for combo in combos {
-        for template in templates {
+        for template_patterns in &template_patterns {
+            let template = template_patterns.template;
             let headers_absent =
                 validate_headers_absent(template.headers_absent.as_deref(), index)?;
             let headers_match = validate_headers_match(template.headers_match.as_ref(), index)?;
@@ -635,7 +739,6 @@ fn expand_include_rule(
                 .unwrap_or_default();
             let request_timeout_ms = rule.request_timeout_ms.or(template.request_timeout_ms);
 
-            let pattern_interp = interpolate_template(&template.pattern, &combo);
             let description_interp = template
                 .description
                 .as_ref()
@@ -645,23 +748,26 @@ fn expand_include_rule(
                 .as_ref()
                 .map(|id| interpolate_template(id, &combo));
 
-            out.push(ExpandedRule {
-                action: template.action,
-                pattern: Some(pattern_interp),
-                description: description_interp,
-                rule_id: rule_id_interp,
-                subnets: if !rule.subnets.is_empty() {
-                    rule.subnets.clone()
-                } else {
-                    template.subnets.clone()
-                },
-                methods,
-                headers_absent,
-                headers_match,
-                request_timeout_ms,
-                header_actions: template.header_actions.clone(),
-                external_auth_profile: template.external_auth_profile.clone(),
-            });
+            for pattern in &template_patterns.patterns {
+                let pattern_interp = interpolate_template(pattern, &combo);
+                out.push(ExpandedRule {
+                    action: template.action,
+                    pattern: Some(pattern_interp),
+                    description: description_interp.clone(),
+                    rule_id: rule_id_interp.clone(),
+                    subnets: if !rule.subnets.is_empty() {
+                        rule.subnets.clone()
+                    } else {
+                        template.subnets.clone()
+                    },
+                    methods: methods.clone(),
+                    headers_absent: headers_absent.clone(),
+                    headers_match: headers_match.clone(),
+                    request_timeout_ms,
+                    header_actions: template.header_actions.clone(),
+                    external_auth_profile: template.external_auth_profile.clone(),
+                });
+            }
         }
     }
 
@@ -1424,6 +1530,7 @@ mod tests {
             rules: vec![PolicyRuleConfig::Direct(PolicyRuleDirectConfig {
                 action: PolicyDefaultAction::Allow,
                 pattern: None,
+                patterns: None,
                 description: None,
                 methods: None,
                 subnets: vec!["192.168.0.0/16".parse::<IpNet>().unwrap()],
@@ -1454,6 +1561,7 @@ mod tests {
             rules: vec![PolicyRuleConfig::Direct(PolicyRuleDirectConfig {
                 action: PolicyDefaultAction::Allow,
                 pattern: None,
+                patterns: None,
                 description: None,
                 methods: None,
                 subnets: vec!["2001:db8::/32".parse::<IpNet>().unwrap()],
@@ -1490,7 +1598,8 @@ mod tests {
             vec![
                 PolicyRuleTemplateConfig {
                     action: allow_action(),
-                    pattern: "https://gitlab.internal/api/v4/projects/{repo}?**".to_string(),
+                    pattern: Some("https://gitlab.internal/api/v4/projects/{repo}?**".to_string()),
+                    patterns: None,
                     description: None,
                     methods: None,
                     subnets: Vec::new(),
@@ -1503,7 +1612,8 @@ mod tests {
                 },
                 PolicyRuleTemplateConfig {
                     action: allow_action(),
-                    pattern: "https://gitlab.internal/{repo}.git/**".to_string(),
+                    pattern: Some("https://gitlab.internal/{repo}.git/**".to_string()),
+                    patterns: None,
                     description: None,
                     methods: None,
                     subnets: Vec::new(),
@@ -1566,7 +1676,8 @@ mod tests {
                 "needsRepo".to_string(),
                 vec![PolicyRuleTemplateConfig {
                     action: allow_action(),
-                    pattern: "https://gitlab.internal/api/v4/projects/{repo}?**".to_string(),
+                    pattern: Some("https://gitlab.internal/api/v4/projects/{repo}?**".to_string()),
+                    patterns: None,
                     description: None,
                     methods: None,
                     subnets: Vec::new(),
@@ -2307,6 +2418,340 @@ add_url_enc_variants = true
         let msg = format!("{err}");
         assert!(
             msg.contains("Policy macro not found: repo"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn direct_patterns_expand_and_report_matched_effective_pattern() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "allow"
+patterns = [
+  "https://example.com/docs/**",
+  "https://example.com/api/**",
+]
+description = "Example grouped rule"
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        assert!(engine.is_allowed("https://example.com/docs/index.html", None, None));
+        let decision = engine.evaluate("https://example.com/api/v1", None, None, &HeaderMap::new());
+
+        assert!(decision.allowed);
+        let matched = decision.matched.expect("matched rule");
+        assert_eq!(matched.index, 1);
+        assert_eq!(
+            matched.pattern.as_deref(),
+            Some("https://example.com/api/**")
+        );
+        assert_eq!(matched.description.as_deref(), Some("Example grouped rule"));
+        assert!(!engine.is_allowed("https://example.com/other", None, None));
+    }
+
+    #[test]
+    fn direct_patterns_preserve_order_and_first_match_wins() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+patterns = [
+  "https://example.com/admin/**",
+  "https://example.com/private/**",
+]
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/**"
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        assert!(!engine.is_allowed("https://example.com/admin/settings", None, None));
+        assert!(!engine.is_allowed("https://example.com/private/data", None, None));
+        assert!(engine.is_allowed("https://example.com/public", None, None));
+    }
+
+    #[test]
+    fn direct_patterns_copy_predicates_header_actions_and_external_auth_metadata() {
+        let toml = r#"
+default = "deny"
+
+[external_auth_profiles.example]
+webhook_url = "https://auth.internal/start"
+timeout_ms = 5000
+
+[[rules]]
+action = "allow"
+patterns = [
+  "https://example.com/api/**",
+  "https://example.com/files/**",
+]
+methods = ["GET"]
+headers_absent = ["x-blocked"]
+headers_match = { "x-workload-id" = "worker-123" }
+external_auth_profile = "example"
+request_timeout_ms = 1500
+
+[[rules.header_actions]]
+direction = "request"
+action = "set"
+name = "x-test"
+value = "one"
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+        let headers = header_map(&[("x-workload-id", "worker-123")]);
+        let decision = engine.evaluate(
+            "https://example.com/files/report",
+            None,
+            Some("GET"),
+            &headers,
+        );
+
+        assert!(decision.allowed);
+        let matched = decision.matched.expect("matched rule");
+        assert_eq!(
+            matched.pattern.as_deref(),
+            Some("https://example.com/files/**")
+        );
+        assert_eq!(matched.methods, vec!["GET".to_string()]);
+        assert_eq!(matched.request_timeout_ms, Some(1500));
+        assert_eq!(matched.header_actions.len(), 1);
+        assert_eq!(matched.external_auth_profile.as_deref(), Some("example"));
+
+        let effective = EffectivePolicy::from_config(&cfg).expect("build effective policy");
+        assert_eq!(effective.rules.len(), 2);
+        assert_eq!(
+            effective.rules[0].pattern.as_deref(),
+            Some("https://example.com/api/**")
+        );
+        assert_eq!(
+            effective.rules[1].pattern.as_deref(),
+            Some("https://example.com/files/**")
+        );
+        assert_eq!(effective.rules[1].header_actions.len(), 1);
+        assert_eq!(
+            effective.rules[1]
+                .external_auth
+                .as_ref()
+                .map(|external| external.profile.as_str()),
+            Some("example")
+        );
+    }
+
+    #[test]
+    fn direct_patterns_validation_rejects_invalid_shapes() {
+        let cases = [
+            (
+                r#"
+default = "deny"
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/**"
+patterns = ["https://example.org/**"]
+                "#,
+                "policy rule must not define both pattern and patterns",
+            ),
+            (
+                r#"
+default = "deny"
+
+[[rules]]
+action = "allow"
+patterns = []
+                "#,
+                "patterns must include at least one pattern",
+            ),
+            (
+                r#"
+default = "deny"
+
+[[rules]]
+action = "allow"
+patterns = ["https://example.com/**", "   "]
+                "#,
+                "patterns entry at index 1 must not be empty",
+            ),
+            (
+                r#"
+default = "deny"
+
+[[rules]]
+action = "allow"
+patterns = ["https://example.com/**", "https://example.org/**"]
+rule_id = "duplicate"
+                "#,
+                "rule_id is not allowed on multi-pattern rules",
+            ),
+        ];
+
+        for (toml, expected) in cases {
+            let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+            let err = PolicyEngine::from_config(&cfg).expect_err("expected validation error");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(expected),
+                "expected {expected:?} in error message: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_patterns_trim_entries_and_allow_patternless_header_rules() {
+        let patternless_toml = r#"
+default = "deny"
+
+[[rules]]
+action = "allow"
+headers_match = { "x-workload-id" = "worker-123" }
+        "#;
+        let patternless_cfg: PolicyConfig =
+            toml::from_str(patternless_toml).expect("parse policy config");
+        let patternless =
+            PolicyEngine::from_config(&patternless_cfg).expect("header-only rule remains valid");
+        assert!(patternless.is_allowed_with_headers(
+            "https://example.com/anything",
+            None,
+            None,
+            &header_map(&[("x-workload-id", "worker-123")])
+        ));
+
+        let trimmed_toml = r#"
+default = "deny"
+
+[[rules]]
+action = "allow"
+patterns = ["  https://example.com/docs/**  "]
+        "#;
+        let trimmed_cfg: PolicyConfig = toml::from_str(trimmed_toml).expect("parse policy config");
+        let effective = EffectivePolicy::from_config(&trimmed_cfg).expect("effective policy");
+        assert_eq!(
+            effective.rules[0].pattern.as_deref(),
+            Some("https://example.com/docs/**")
+        );
+    }
+
+    #[test]
+    fn direct_patterns_expand_macros_and_url_encoded_variants() {
+        let toml = r#"
+default = "deny"
+
+[macros]
+repo = ["sip/sipsource", "sip/sipsink"]
+
+[[rules]]
+action = "allow"
+patterns = [
+  "https://gitlab.internal/{repo}.git/**",
+  "https://gitlab.internal/api/v4/projects/{repo}?**",
+]
+add_url_enc_variants = ["repo"]
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        assert!(engine.is_allowed(
+            "https://gitlab.internal/sip/sipsource.git/info/refs",
+            None,
+            None
+        ));
+        assert!(engine.is_allowed(
+            "https://gitlab.internal/api/v4/projects/sip%2Fsipsink?statistics=true",
+            None,
+            None
+        ));
+
+        let effective = EffectivePolicy::from_config(&cfg).expect("effective policy");
+        let patterns = effective
+            .rules
+            .iter()
+            .map(|rule| rule.pattern.as_deref().expect("pattern"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            patterns,
+            vec![
+                "https://gitlab.internal/sip/sipsource.git/**",
+                "https://gitlab.internal/api/v4/projects/sip/sipsource?**",
+                "https://gitlab.internal/sip%2Fsipsource.git/**",
+                "https://gitlab.internal/api/v4/projects/sip%2Fsipsource?**",
+                "https://gitlab.internal/sip/sipsink.git/**",
+                "https://gitlab.internal/api/v4/projects/sip/sipsink?**",
+                "https://gitlab.internal/sip%2Fsipsink.git/**",
+                "https://gitlab.internal/api/v4/projects/sip%2Fsipsink?**",
+            ]
+        );
+    }
+
+    #[test]
+    fn ruleset_template_patterns_expand_and_validate() {
+        let toml = r#"
+default = "deny"
+
+[macros]
+repo = ["sip/sipsource"]
+
+[[rulesets.gitlab]]
+action = "allow"
+patterns = [
+  "https://gitlab.internal/{repo}.git/**",
+  "https://gitlab.internal/api/v4/projects/{repo}?**",
+]
+methods = ["GET"]
+
+[[rules]]
+include = "gitlab"
+add_url_enc_variants = ["repo"]
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let effective = EffectivePolicy::from_config(&cfg).expect("effective policy");
+
+        assert_eq!(effective.rules.len(), 4);
+        assert_eq!(
+            effective.rules[0].pattern.as_deref(),
+            Some("https://gitlab.internal/sip/sipsource.git/**")
+        );
+        assert_eq!(
+            effective.rules[1].pattern.as_deref(),
+            Some("https://gitlab.internal/api/v4/projects/sip/sipsource?**")
+        );
+        assert_eq!(
+            effective.rules[2].pattern.as_deref(),
+            Some("https://gitlab.internal/sip%2Fsipsource.git/**")
+        );
+        assert_eq!(
+            effective.rules[3].pattern.as_deref(),
+            Some("https://gitlab.internal/api/v4/projects/sip%2Fsipsource?**")
+        );
+        assert_eq!(effective.rules[0].methods, vec!["GET".to_string()]);
+
+        let invalid_toml = r#"
+default = "deny"
+
+[[rulesets.bad]]
+action = "allow"
+pattern = "https://example.com/**"
+patterns = ["https://example.org/**"]
+
+[[rules]]
+include = "bad"
+        "#;
+        let invalid_cfg: PolicyConfig = toml::from_str(invalid_toml).expect("parse policy config");
+        let err = EffectivePolicy::from_config(&invalid_cfg).expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("policy ruleset template must not define both pattern and patterns"),
             "unexpected error message: {msg}"
         );
     }
