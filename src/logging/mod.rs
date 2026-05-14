@@ -12,7 +12,7 @@ use std::thread;
 use tracing::Level;
 use tracing_subscriber::fmt::SubscriberBuilder;
 
-use crate::config::{LoggingConfig, LoggingPolicyDecisionsConfig, PolicyDefaultAction};
+use crate::config::{LoggingConfig, LoggingPolicyDecisionsConfig, PolicyRuleAction};
 use crate::policy::PolicyDecision;
 
 const LOG_FILENAME: &str = "acl-proxy.log";
@@ -182,8 +182,9 @@ impl LoggingSettings {
         let (rule_action, rule_pattern, rule_description) = match ctx.decision.matched.as_ref() {
             Some(m) => {
                 let action = match m.action {
-                    PolicyDefaultAction::Allow => "allow",
-                    PolicyDefaultAction::Deny => "deny",
+                    PolicyRuleAction::Allow => "allow",
+                    PolicyRuleAction::Deny => "deny",
+                    PolicyRuleAction::Delegate => "delegate",
                 };
                 (Some(action), m.pattern.as_deref(), m.description.as_deref())
             }

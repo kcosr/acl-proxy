@@ -335,7 +335,7 @@ async fn allowed_https_via_connect_is_proxied_and_captured() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "https://{}:{}/**",
                 upstream_addr.ip(),
@@ -426,7 +426,7 @@ async fn configured_egress_forwarding_applies_to_https_connect_inner_requests() 
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some("https://connect-target.test:9443/**".to_string()),
             patterns: None,
             description: None,
@@ -485,7 +485,7 @@ async fn global_egress_request_actions_apply_to_https_connect_inner_requests() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some("https://connect-target.test:9443/**".to_string()),
             patterns: None,
             description: None,
@@ -552,7 +552,7 @@ async fn denied_https_via_connect_returns_403() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "https://{}:{}/ok",
                 upstream_addr.ip(),
@@ -604,7 +604,7 @@ async fn headers_match_is_evaluated_on_decrypted_inner_connect_requests() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some("https://connect-target.test:9443/**".to_string()),
             patterns: None,
             description: Some("Allow trusted workload identities".to_string()),
@@ -689,7 +689,7 @@ async fn loop_detected_on_connect_returns_508() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "https://{}:{}/**",
                 upstream_addr.ip(),

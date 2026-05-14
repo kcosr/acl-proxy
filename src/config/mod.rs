@@ -490,9 +490,17 @@ pub enum PolicyDefaultAction {
     Deny,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PolicyRuleAction {
+    Allow,
+    Deny,
+    Delegate,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyRuleTemplateConfig {
-    pub action: PolicyDefaultAction,
+    pub action: PolicyRuleAction,
 
     #[serde(default)]
     pub pattern: Option<String>,
@@ -559,7 +567,7 @@ pub struct PolicyRuleIncludeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyRuleDirectConfig {
-    pub action: PolicyDefaultAction,
+    pub action: PolicyRuleAction,
 
     #[serde(default)]
     pub pattern: Option<String>,
@@ -2524,7 +2532,7 @@ level = "info"
 default = "deny"
 
 [[policy.rules]]
-action = "allow"
+action = "delegate"
 pattern = "https://example.com/**"
 external_auth_profile = "missing_profile"
         "#;
@@ -2536,6 +2544,35 @@ external_auth_profile = "missing_profile"
             msg.contains("external_auth_profile 'missing_profile' not found"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn delegate_rule_with_external_auth_profile_is_valid() {
+        let toml = r#"
+schema_version = "1"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles.example]
+webhook_url = "https://auth.internal/start"
+timeout_ms = 1000
+
+[[policy.rules]]
+action = "delegate"
+pattern = "https://example.com/**"
+external_auth_profile = "example"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        config
+            .validate_basic()
+            .expect("delegate rule should validate");
+        let rule = match &config.policy.rules[0] {
+            PolicyRuleConfig::Direct(rule) => rule,
+            PolicyRuleConfig::Include(_) => panic!("expected direct rule"),
+        };
+        assert!(matches!(rule.action, PolicyRuleAction::Delegate));
     }
 
     #[test]
@@ -2568,7 +2605,99 @@ external_auth_profile = "example"
         let err = config.validate_basic().expect_err("validation should fail");
         let msg = format!("{err}");
         assert!(
-            msg.contains("external_auth_profile is not allowed on deny rules"),
+            msg.contains("external_auth_profile is only allowed on delegate rules"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn external_auth_profile_not_allowed_on_allow_rule() {
+        let toml = r#"
+schema_version = "1"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles.example]
+webhook_url = "https://auth.internal/start"
+timeout_ms = 1000
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+external_auth_profile = "example"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("external_auth_profile is only allowed on delegate rules"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn delegate_rule_requires_external_auth_profile() {
+        let toml = r#"
+schema_version = "1"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "delegate"
+pattern = "https://example.com/**"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("external_auth_profile is required on delegate rules"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn ruleset_delegate_template_requires_external_auth_profile() {
+        let toml = r#"
+schema_version = "1"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+include = "delegated"
+
+[[policy.rulesets.delegated]]
+action = "delegate"
+pattern = "https://example.com/**"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("external_auth_profile is required on delegate rules"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn policy_default_rejects_delegate() {
+        let toml = r#"
+schema_version = "1"
+
+[policy]
+default = "delegate"
+        "#;
+
+        let err =
+            ::toml::from_str::<Config>(toml).expect_err("parse should reject delegate default");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("delegate"),
             "unexpected error: {msg}"
         );
     }
@@ -2594,7 +2723,7 @@ type = "plugin"
 timeout_ms = 1000
 
 [[policy.rules]]
-action = "allow"
+action = "delegate"
 pattern = "https://example.com/**"
 external_auth_profile = "example"
         "#;
@@ -2645,7 +2774,7 @@ timeout_ms = 1000
 include_headers = ["authorization token"]
 
 [[policy.rules]]
-action = "allow"
+action = "delegate"
 pattern = "https://example.com/**"
 external_auth_profile = "example"
             "#,

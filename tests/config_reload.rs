@@ -173,7 +173,7 @@ async fn loop_header_injection_updates_after_reload() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "http://{}:{}/**",
                 upstream_addr.ip(),
@@ -259,7 +259,7 @@ async fn failed_reload_keeps_previous_state() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "http://{}:{}/**",
                 upstream_addr.ip(),
@@ -412,7 +412,7 @@ async fn egress_forwarding_enable_disable_updates_after_reload() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "http://{}:{}/**",
                 direct_addr.ip(),

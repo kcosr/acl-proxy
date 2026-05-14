@@ -12,9 +12,9 @@ use url::Url;
 use crate::config::{
     EgressRequestHeaderActionConfig, ExternalAuthProfileConfigMap, HeaderActionConfig,
     HeaderActionKind, HeaderDirection, HeaderMatchValueConfig, HeaderWhen, MacroMap,
-    MacroOverrideMap, MacroValues, PolicyConfig, PolicyDefaultAction, PolicyRuleConfig,
-    PolicyRuleDirectConfig, PolicyRuleIncludeConfig, PolicyRuleTemplateConfig, RulesetMap,
-    UrlEncVariants,
+    MacroOverrideMap, MacroValues, PolicyConfig, PolicyDefaultAction, PolicyRuleAction,
+    PolicyRuleConfig, PolicyRuleDirectConfig, PolicyRuleIncludeConfig, PolicyRuleTemplateConfig,
+    RulesetMap, UrlEncVariants,
 };
 
 #[derive(Debug, Error)]
@@ -51,7 +51,7 @@ pub struct PolicyDecision {
 #[derive(Debug, Clone)]
 pub struct MatchedRule {
     pub index: usize,
-    pub action: PolicyDefaultAction,
+    pub action: PolicyRuleAction,
     pub pattern: Option<String>,
     pub description: Option<String>,
     pub rule_id: Option<String>,
@@ -71,7 +71,7 @@ pub struct PolicyEngine {
 #[derive(Debug, Clone)]
 struct CompiledRule {
     index: usize,
-    action: PolicyDefaultAction,
+    action: PolicyRuleAction,
     pattern: Option<String>,
     regex: Option<Regex>,
     description: Option<String>,
@@ -99,7 +99,7 @@ struct ExpandedPolicy {
 
 #[derive(Debug, Clone)]
 struct ExpandedRule {
-    action: PolicyDefaultAction,
+    action: PolicyRuleAction,
     pattern: Option<String>,
     description: Option<String>,
     rule_id: Option<String>,
@@ -126,7 +126,7 @@ pub struct EffectivePolicy {
 #[derive(Debug, Clone, Serialize)]
 pub struct EffectiveRule {
     pub index: usize,
-    pub action: PolicyDefaultAction,
+    pub action: PolicyRuleAction,
     pub pattern: Option<String>,
     pub description: Option<String>,
     pub rule_id: Option<String>,
@@ -219,6 +219,17 @@ impl PolicyEngine {
         method: Option<&str>,
         headers: &HeaderMap<HeaderValue>,
     ) -> PolicyDecision {
+        self.evaluate_from(0, url_str, client_ip, method, headers)
+    }
+
+    pub fn evaluate_from(
+        &self,
+        start_index: usize,
+        url_str: &str,
+        client_ip: Option<&str>,
+        method: Option<&str>,
+        headers: &HeaderMap<HeaderValue>,
+    ) -> PolicyDecision {
         let normalized_url = match normalize_url(url_str) {
             Ok(u) => u,
             Err(_) => {
@@ -232,7 +243,7 @@ impl PolicyEngine {
         let normalized_ip = normalize_client_ip(client_ip);
         let method_upper = method.map(|m| m.to_ascii_uppercase());
 
-        for rule in &self.rules {
+        for rule in self.rules.iter().skip(start_index) {
             if let Some(ref re) = rule.regex {
                 if !re.is_match(&normalized_url) {
                     continue;
@@ -277,7 +288,7 @@ impl PolicyEngine {
                 external_auth_profile: rule.external_auth_profile.clone(),
             };
 
-            let allowed = matches!(rule.action, PolicyDefaultAction::Allow);
+            let allowed = matches!(rule.action, PolicyRuleAction::Allow);
 
             return PolicyDecision {
                 allowed,
@@ -422,22 +433,6 @@ fn expand_direct_rule(
         .map(|m| m.as_slice().to_vec())
         .unwrap_or_default();
 
-    if rule.external_auth_profile.is_some() && matches!(rule.action, PolicyDefaultAction::Deny) {
-        return Err(PolicyError::RuleInvalid {
-            index,
-            reason: "external_auth_profile is not allowed on deny rules".to_string(),
-        });
-    }
-
-    if let Some(name) = &rule.external_auth_profile {
-        if !external_profiles.contains_key(name) {
-            return Err(PolicyError::RuleInvalid {
-                index,
-                reason: format!("external_auth_profile '{}' not found", name),
-            });
-        }
-    }
-
     let has_pattern = patterns.is_some();
     let has_subnets = !rule.subnets.is_empty();
     let has_methods = !methods.is_empty();
@@ -445,6 +440,13 @@ fn expand_direct_rule(
     let has_headers_absent = headers_absent.is_some();
     let headers_match = validate_headers_match(rule.headers_match.as_ref(), index)?;
     let has_headers_match = headers_match.is_some();
+
+    validate_rule_external_auth(
+        rule.action,
+        rule.external_auth_profile.as_ref(),
+        external_profiles,
+        index,
+    )?;
 
     if !has_pattern && (has_subnets || has_methods || has_headers_absent || has_headers_match) {
         out.push(ExpandedRule {
@@ -543,6 +545,41 @@ fn expand_direct_rule(
     Ok(())
 }
 
+fn validate_rule_external_auth(
+    action: PolicyRuleAction,
+    external_auth_profile: Option<&String>,
+    external_profiles: &ExternalAuthProfileConfigMap,
+    index: usize,
+) -> Result<(), PolicyError> {
+    match action {
+        PolicyRuleAction::Delegate => {
+            let Some(name) = external_auth_profile else {
+                return Err(PolicyError::RuleInvalid {
+                    index,
+                    reason: "external_auth_profile is required on delegate rules".to_string(),
+                });
+            };
+
+            if !external_profiles.contains_key(name) {
+                return Err(PolicyError::RuleInvalid {
+                    index,
+                    reason: format!("external_auth_profile '{}' not found", name),
+                });
+            }
+        }
+        PolicyRuleAction::Allow | PolicyRuleAction::Deny => {
+            if external_auth_profile.is_some() {
+                return Err(PolicyError::RuleInvalid {
+                    index,
+                    reason: "external_auth_profile is only allowed on delegate rules".to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn normalize_patterns(
     pattern: Option<&String>,
     patterns: Option<&[String]>,
@@ -633,22 +670,12 @@ fn expand_include_rule(
         })?;
 
     for template in templates {
-        if template.external_auth_profile.is_some()
-            && matches!(template.action, PolicyDefaultAction::Deny)
-        {
-            return Err(PolicyError::RuleInvalid {
-                index,
-                reason: "external_auth_profile is not allowed on deny rules".to_string(),
-            });
-        }
-        if let Some(name) = &template.external_auth_profile {
-            if !external_profiles.contains_key(name) {
-                return Err(PolicyError::RuleInvalid {
-                    index,
-                    reason: format!("external_auth_profile '{}' not found", name),
-                });
-            }
-        }
+        validate_rule_external_auth(
+            template.action,
+            template.external_auth_profile.as_ref(),
+            external_profiles,
+            index,
+        )?;
     }
 
     let mut template_patterns = Vec::with_capacity(templates.len());
@@ -1411,8 +1438,8 @@ mod tests {
     use crate::config::{EgressRequestHeaderActionConfig, PolicyRuleTemplateConfig};
     use toml;
 
-    fn allow_action() -> PolicyDefaultAction {
-        PolicyDefaultAction::Allow
+    fn allow_action() -> PolicyRuleAction {
+        PolicyRuleAction::Allow
     }
 
     fn header_map(entries: &[(&str, &str)]) -> HeaderMap<HeaderValue> {
@@ -1518,7 +1545,7 @@ mod tests {
             rulesets: RulesetMap::default(),
             external_auth_profiles: ExternalAuthProfileConfigMap::default(),
             rules: vec![PolicyRuleConfig::Direct(PolicyRuleDirectConfig {
-                action: PolicyDefaultAction::Allow,
+                action: PolicyRuleAction::Allow,
                 pattern: None,
                 patterns: None,
                 description: None,
@@ -1549,7 +1576,7 @@ mod tests {
             rulesets: RulesetMap::default(),
             external_auth_profiles: ExternalAuthProfileConfigMap::default(),
             rules: vec![PolicyRuleConfig::Direct(PolicyRuleDirectConfig {
-                action: PolicyDefaultAction::Allow,
+                action: PolicyRuleAction::Allow,
                 pattern: None,
                 patterns: None,
                 description: None,
@@ -1712,7 +1739,7 @@ mod tests {
 default = "deny"
 
 [[rules]]
-action = "allow"
+	action = "allow"
 pattern = "https://example.com/**"
 methods = ["GET", "HEAD"]
         "#;
@@ -2324,7 +2351,7 @@ webhook_url = "https://auth.internal/start"
 timeout_ms = 5000
 
 [[rules]]
-action = "allow"
+action = "delegate"
 pattern = "https://example.com/**"
 headers_match = { "x-workload-id" = "worker-123" }
 external_auth_profile = "example"
@@ -2352,7 +2379,7 @@ pattern = "https://example.com/**"
             None
         );
 
-        assert!(hit.allowed);
+        assert!(!hit.allowed);
         assert_eq!(hit.matched.as_ref().map(|rule| rule.index), Some(0));
         assert_eq!(
             hit.matched
@@ -2363,12 +2390,74 @@ pattern = "https://example.com/**"
     }
 
     #[test]
+    fn evaluate_from_resumes_after_delegate_rule() {
+        let toml = r#"
+default = "deny"
+
+[external_auth_profiles.example]
+webhook_url = "https://auth.internal/start"
+timeout_ms = 5000
+
+[[rules]]
+action = "delegate"
+pattern = "https://example.com/**"
+external_auth_profile = "example"
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/public/**"
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+        let headers = HeaderMap::new();
+
+        let first = engine.evaluate("https://example.com/public/index", None, Some("GET"), &headers);
+        assert!(!first.allowed);
+        assert_eq!(first.matched.as_ref().map(|rule| rule.index), Some(0));
+        assert!(matches!(
+            first.matched.as_ref().map(|rule| rule.action),
+            Some(PolicyRuleAction::Delegate)
+        ));
+
+        let resumed =
+            engine.evaluate_from(1, "https://example.com/public/index", None, Some("GET"), &headers);
+        assert!(resumed.allowed);
+        assert_eq!(resumed.matched.as_ref().map(|rule| rule.index), Some(1));
+    }
+
+    #[test]
+    fn evaluate_from_after_delegate_uses_default_when_no_later_match() {
+        let toml = r#"
+default = "deny"
+
+[external_auth_profiles.example]
+webhook_url = "https://auth.internal/start"
+timeout_ms = 5000
+
+[[rules]]
+action = "delegate"
+pattern = "https://example.com/**"
+external_auth_profile = "example"
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+        let headers = HeaderMap::new();
+
+        let resumed =
+            engine.evaluate_from(1, "https://example.com/path", None, Some("GET"), &headers);
+        assert!(!resumed.allowed);
+        assert!(resumed.matched.is_none());
+    }
+
+    #[test]
     fn headers_match_only_rule_is_valid_match_criteria() {
         let toml = r#"
 default = "deny"
 
 [[rules]]
-action = "allow"
+	action = "allow"
 headers_match = { "x-workload-id" = "worker-123" }
         "#;
 
@@ -2456,7 +2545,7 @@ patterns = [
 ]
 
 [[rules]]
-action = "allow"
+	action = "allow"
 pattern = "https://example.com/**"
         "#;
 
@@ -2478,7 +2567,7 @@ webhook_url = "https://auth.internal/start"
 timeout_ms = 5000
 
 [[rules]]
-action = "allow"
+action = "delegate"
 patterns = [
   "https://example.com/api/**",
   "https://example.com/files/**",
@@ -2506,7 +2595,7 @@ value = "one"
             &headers,
         );
 
-        assert!(decision.allowed);
+        assert!(!decision.allowed);
         let matched = decision.matched.expect("matched rule");
         assert_eq!(
             matched.pattern.as_deref(),
@@ -2857,7 +2946,7 @@ webhook_url = "https://auth.internal/start"
 timeout_ms = 5000
 
 [[rules]]
-action = "allow"
+action = "delegate"
 pattern = "https://example.com/**"
 external_auth_profile = "example"
         "#;

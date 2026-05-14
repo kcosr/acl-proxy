@@ -217,8 +217,9 @@ fn print_policy_table(policy: &crate::policy::EffectivePolicy) {
 
     for rule in &policy.rules {
         let action = match rule.action {
-            crate::config::PolicyDefaultAction::Allow => "allow",
-            crate::config::PolicyDefaultAction::Deny => "deny",
+            crate::config::PolicyRuleAction::Allow => "allow",
+            crate::config::PolicyRuleAction::Deny => "deny",
+            crate::config::PolicyRuleAction::Delegate => "delegate",
         };
 
         let pattern = rule.pattern.as_deref().unwrap_or("-");

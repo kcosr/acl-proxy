@@ -2,23 +2,23 @@
 
 ## Overview
 
-External auth profiles now support two modes:
+External auth profiles support two modes:
 
 - `http`: the existing async approval flow (webhook + callback).
-- `plugin`: a long-running stdio process that returns allow/deny with optional
+- `plugin`: a long-running stdio process that returns allow/deny/pass with optional
   request/response header actions.
 
-This keeps the existing `external_auth_profile` rule wiring intact while
+This keeps the existing `external_auth_profile` profile wiring intact while
 introducing a synchronous, per-request authorization plugin for cases like
 URL allowlists or repo ACLs.
 
 ## Goals
 
 - Preserve current async HTTP external auth behavior and configuration.
-- Add a sync, stdio-based plugin that returns allow/deny.
-- Reuse `policy.external_auth_profiles` and `external_auth_profile` in rules.
+- Add a sync, stdio-based plugin that returns allow/deny/pass.
+- Reuse `policy.external_auth_profiles` and `external_auth_profile` in delegate rules.
 - Support full header action outputs from plugins (request + response).
-- Keep the change minimal and backwards compatible.
+- Keep the protocol explicit: `pass` continues policy evaluation without header actions.
 
 ## Non-goals
 
@@ -76,16 +76,16 @@ restart_delay_ms = 10000
 
 ### Rule usage
 
-Rules continue to use `external_auth_profile` and `action = "allow"`:
+Rules use `action = "delegate"` with `external_auth_profile`:
 
 ```toml
 [[policy.rules]]
-action = "allow"
+action = "delegate"
 pattern = "https://repo.example.com/**"
 external_auth_profile = "url_allow"
 ```
 
-Rules must not set `external_auth_profile` on deny rules.
+Rules must not set `external_auth_profile` on `allow` or `deny` rules.
 
 ### Header action precedence
 
@@ -95,6 +95,10 @@ For allow decisions, apply header actions in this order:
 2. Plugin `requestHeaders` / `responseHeaders`
 
 This lets the plugin override or remove static defaults when needed.
+
+For pass decisions, do not apply rule or plugin header actions. A plugin response
+with `decision = "pass"` and non-empty `requestHeaders` or `responseHeaders` is
+a protocol error.
 
 ### Failure behavior
 
@@ -159,8 +163,11 @@ The plugin communicates via NDJSON (one JSON object per line).
 
 Notes:
 
+- `decision` is `"allow"`, `"deny"`, or `"pass"`.
 - `headers` may be empty or omitted when no headers are included.
 - Header values may be strings; repeated headers may be encoded as arrays.
+- `requestHeaders` and `responseHeaders` are valid only with `decision = "allow"`;
+  they must be empty or omitted with `decision = "pass"`.
 - Plugins should write only JSON responses to stdout.
 
 ## Runtime behavior
@@ -177,7 +184,7 @@ Log entries include:
 - Profile name
 - Request ID
 - URL, method, client IP
-- Decision (allow/deny)
+- Decision (allow/deny/pass)
 - Failure reason (when applicable)
 
 ## Demo
@@ -189,9 +196,9 @@ A reference plugin (`url_allow`) lives in `demos/auth-plugin-stdio`.
 Decisions captured in this revision:
 
 - Keep async HTTP external auth unchanged; add a sync stdio plugin mode only.
-- Reuse `external_auth_profiles` + `external_auth_profile` on allow rules.
+- Reuse `external_auth_profiles` + `external_auth_profile` on delegate rules.
 - Apply rule `header_actions` first, then plugin header actions (plugin can override).
-- Treat plugin failures as 503 errors (deny is only on explicit `decision = "deny"`).
+- Treat plugin failures as 503 errors (deny is only on explicit `decision = "deny"`; pass continues policy evaluation).
 
 Open questions and gaps:
 

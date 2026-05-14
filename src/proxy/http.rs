@@ -29,6 +29,7 @@ use crate::capture::{
 };
 use crate::config::{
     EgressTargetConfig, ExternalAuthProfileType, HeaderActionKind, HeaderDirection, HeaderWhen,
+    PolicyRuleAction,
 };
 use crate::external_auth::{ApprovalMacroDescriptor, ExternalAuthProfile, ExternalDecision};
 use crate::logging::PolicyDecisionLogContext;
@@ -64,6 +65,11 @@ enum UpstreamRequestError {
     Hyper(#[from] hyper::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+pub(crate) enum ExternalAuthGateResult {
+    Response(Response<Body>),
+    Pass(Request<Body>),
 }
 
 /// Run the HTTP/1.1 proxy listener using the configured bind address/port.
@@ -130,7 +136,7 @@ where
 async fn handle_http_request(
     state: Arc<AppState>,
     remote_addr: SocketAddr,
-    req: Request<Body>,
+    mut req: Request<Body>,
 ) -> Result<Response<Body>, Infallible> {
     // Special-case HTTPS CONNECT requests, which are handled via a dedicated
     // MITM path in `https_connect`.
@@ -186,132 +192,222 @@ async fn handle_http_request(
         return Ok(resp);
     }
 
-    let policy = &state.policy;
-    let decision = policy.evaluate(
-        &full_url,
-        Some(&client_ip_for_policy),
-        Some(method.as_str()),
-        req.headers(),
-    );
-
-    state.logging.log_policy_decision(PolicyDecisionLogContext {
-        request_id: &request_id,
-        url: &full_url,
-        method: Some(method.as_str()),
-        client_ip: Some(&client_ip_for_policy),
-        decision: &decision,
-    });
-
-    if !decision.allowed {
-        let resp = build_policy_denied_response(
-            &state,
-            &request_id,
+    let mut start_index = 0;
+    loop {
+        let decision = state.policy.evaluate_from(
+            start_index,
             &full_url,
-            &method,
-            &client_endpoint,
-            version,
+            Some(&client_ip_for_policy),
+            Some(method.as_str()),
             req.headers(),
-        )
-        .await;
-        return Ok(resp);
-    }
+        );
 
-    let matched_rule = decision.matched.as_ref();
-    let header_actions = matched_rule
-        .map(|m| m.header_actions.clone())
-        .unwrap_or_default();
-    let egress_request_header_actions = state.egress_request_header_actions.clone();
-    let request_timeout_ms = matched_rule.and_then(|m| m.request_timeout_ms);
+        if !matches!(
+            decision.matched.as_ref().map(|rule| rule.action),
+            Some(PolicyRuleAction::Delegate)
+        ) {
+            state.logging.log_policy_decision(PolicyDecisionLogContext {
+                request_id: &request_id,
+                url: &full_url,
+                method: Some(method.as_str()),
+                client_ip: Some(&client_ip_for_policy),
+                decision: &decision,
+            });
+        }
 
-    if let Some(rule) = matched_rule {
-        if let Some(profile_name) = rule.external_auth_profile.as_ref() {
-            let profile_cfg = state.config.policy.external_auth_profiles.get(profile_name);
-
-            match profile_cfg.map(|cfg| &cfg.profile_type) {
-                Some(ExternalAuthProfileType::Http) => {
-                    if let Some(profile) = state.external_auth.get_profile(profile_name) {
-                        let resp = handle_external_auth_gate(
-                            state.clone(),
-                            &request_id,
-                            &full_url,
-                            &method,
-                            &client_endpoint,
-                            target,
-                            version,
-                            req,
-                            &client_ip_for_policy,
-                            rule.index,
-                            rule.rule_id.clone(),
-                            &profile,
-                            profile_name,
-                            request_timeout_ms,
-                            header_actions,
-                            egress_request_header_actions.clone(),
-                        )
-                        .await;
-                        return Ok(resp);
-                    }
-                }
-                Some(ExternalAuthProfileType::Plugin) => {
-                    if let Some(handler) = state.auth_plugins.get_handler(profile_name) {
-                        let resp = handle_auth_plugin_gate(
-                            state.clone(),
-                            &request_id,
-                            &full_url,
-                            &method,
-                            &client_endpoint,
-                            target,
-                            version,
-                            req,
-                            &client_ip_for_policy,
-                            profile_name,
-                            &handler,
-                            request_timeout_ms,
-                            header_actions,
-                            egress_request_header_actions.clone(),
-                        )
-                        .await;
-                        return Ok(resp);
-                    }
-                }
-                None => {}
+        let Some(rule) = decision.matched.as_ref() else {
+            if decision.allowed {
+                let response = proxy_allowed_request(
+                    state.clone(),
+                    request_id,
+                    full_url,
+                    method,
+                    version,
+                    client_endpoint,
+                    target,
+                    req,
+                    CaptureMode::HttpProxy,
+                    None,
+                    Vec::new(),
+                    state.egress_request_header_actions.clone(),
+                )
+                .await;
+                return Ok(response);
             }
 
-            let resp = build_external_auth_error_response(
+            let resp = build_policy_denied_response(
                 &state,
                 &request_id,
                 &full_url,
                 &method,
                 &client_endpoint,
-                target,
                 version,
                 req.headers(),
-                CaptureMode::HttpProxy,
-                "ExternalApprovalError",
-                "External auth profile not found",
             )
             .await;
             return Ok(resp);
+        };
+
+        match rule.action {
+            PolicyRuleAction::Deny => {
+                let resp = build_policy_denied_response(
+                    &state,
+                    &request_id,
+                    &full_url,
+                    &method,
+                    &client_endpoint,
+                    version,
+                    req.headers(),
+                )
+                .await;
+                return Ok(resp);
+            }
+            PolicyRuleAction::Allow => {
+                let response = proxy_allowed_request(
+                    state.clone(),
+                    request_id,
+                    full_url,
+                    method,
+                    version,
+                    client_endpoint,
+                    target,
+                    req,
+                    CaptureMode::HttpProxy,
+                    rule.request_timeout_ms,
+                    rule.header_actions.clone(),
+                    state.egress_request_header_actions.clone(),
+                )
+                .await;
+                return Ok(response);
+            }
+            PolicyRuleAction::Delegate => {
+                let Some(profile_name) = rule.external_auth_profile.as_ref() else {
+                    let resp = build_external_auth_error_response(
+                        &state,
+                        &request_id,
+                        &full_url,
+                        &method,
+                        &client_endpoint,
+                        target,
+                        version,
+                        req.headers(),
+                        CaptureMode::HttpProxy,
+                        "ExternalApprovalError",
+                        "External auth profile not found",
+                    )
+                    .await;
+                    return Ok(resp);
+                };
+
+                let profile_cfg = state.config.policy.external_auth_profiles.get(profile_name);
+                let gate_result = match profile_cfg.map(|cfg| &cfg.profile_type) {
+                    Some(ExternalAuthProfileType::Http) => {
+                        if let Some(profile) = state.external_auth.get_profile(profile_name) {
+                            run_external_auth_gate_lifecycle(
+                                state.clone(),
+                                &request_id,
+                                &full_url,
+                                &method,
+                                &client_endpoint,
+                                target.clone(),
+                                version,
+                                req,
+                                &client_ip_for_policy,
+                                rule.index,
+                                rule.rule_id.clone(),
+                                &profile,
+                                profile_name,
+                                rule.request_timeout_ms,
+                                rule.header_actions.clone(),
+                                state.egress_request_header_actions.clone(),
+                                CaptureMode::HttpProxy,
+                            )
+                            .await
+                        } else {
+                            let resp = build_external_auth_error_response(
+                                &state,
+                                &request_id,
+                                &full_url,
+                                &method,
+                                &client_endpoint,
+                                target,
+                                version,
+                                req.headers(),
+                                CaptureMode::HttpProxy,
+                                "ExternalApprovalError",
+                                "External auth profile not found",
+                            )
+                            .await;
+                            return Ok(resp);
+                        }
+                    }
+                    Some(ExternalAuthProfileType::Plugin) => {
+                        if let Some(handler) = state.auth_plugins.get_handler(profile_name) {
+                            run_auth_plugin_gate_lifecycle(
+                                state.clone(),
+                                &request_id,
+                                &full_url,
+                                &method,
+                                &client_endpoint,
+                                target.clone(),
+                                version,
+                                req,
+                                &client_ip_for_policy,
+                                profile_name,
+                                &handler,
+                                rule.request_timeout_ms,
+                                rule.header_actions.clone(),
+                                state.egress_request_header_actions.clone(),
+                                CaptureMode::HttpProxy,
+                            )
+                            .await
+                        } else {
+                            let resp = build_external_auth_error_response(
+                                &state,
+                                &request_id,
+                                &full_url,
+                                &method,
+                                &client_endpoint,
+                                target,
+                                version,
+                                req.headers(),
+                                CaptureMode::HttpProxy,
+                                "ExternalApprovalError",
+                                "External auth profile not found",
+                            )
+                            .await;
+                            return Ok(resp);
+                        }
+                    }
+                    None => {
+                        let resp = build_external_auth_error_response(
+                            &state,
+                            &request_id,
+                            &full_url,
+                            &method,
+                            &client_endpoint,
+                            target,
+                            version,
+                            req.headers(),
+                            CaptureMode::HttpProxy,
+                            "ExternalApprovalError",
+                            "External auth profile not found",
+                        )
+                        .await;
+                        return Ok(resp);
+                    }
+                };
+
+                match gate_result {
+                    ExternalAuthGateResult::Response(resp) => return Ok(resp),
+                    ExternalAuthGateResult::Pass(original_req) => {
+                        req = original_req;
+                        start_index = rule.index + 1;
+                    }
+                }
+            }
         }
     }
-
-    let response = proxy_allowed_request(
-        state.clone(),
-        request_id,
-        full_url,
-        method,
-        version,
-        client_endpoint,
-        target,
-        req,
-        CaptureMode::HttpProxy,
-        request_timeout_ms,
-        header_actions,
-        egress_request_header_actions,
-    )
-    .await;
-
-    Ok(response)
 }
 
 fn is_internal_endpoint(uri: &Uri, base: &str, suffix: &str) -> bool {
@@ -377,11 +473,12 @@ struct ExternalAuthCallbackBody {
     macros: Option<BTreeMap<String, String>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum ExternalAuthCallbackDecision {
     Allow,
     Deny,
+    Pass,
 }
 
 async fn handle_external_auth_callback_request(
@@ -584,6 +681,7 @@ async fn handle_external_auth_callback_request(
     let decision = match payload.decision {
         ExternalAuthCallbackDecision::Allow => ExternalDecision::Allow,
         ExternalAuthCallbackDecision::Deny => ExternalDecision::Deny,
+        ExternalAuthCallbackDecision::Pass => ExternalDecision::Pass,
     };
 
     let found = state.external_auth.resolve(&payload.request_id, decision);
@@ -632,7 +730,7 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
     header_actions: Vec<CompiledHeaderAction>,
     egress_request_header_actions: Vec<CompiledHeaderAction>,
     mode: CaptureMode,
-) -> Response<Body> {
+) -> ExternalAuthGateResult {
     let macro_descriptors =
         discover_approval_macros(&state.config.policy.approval_macros, &header_actions);
 
@@ -656,7 +754,7 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
 
         drop(guard);
 
-        return match profile.on_webhook_failure {
+        return ExternalAuthGateResult::Response(match profile.on_webhook_failure {
             crate::external_auth::WebhookFailureMode::Deny => {
                 build_external_auth_denied_response(
                     &state,
@@ -701,13 +799,21 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
                 )
                 .await
             }
-        };
+        });
     }
 
     let decision = tokio::time::timeout(profile.timeout, decision_rx).await;
 
     match decision {
         Ok(Ok(ExternalDecision::Allow)) => {
+            tracing::info!(
+                request_id = %request_id,
+                action = "delegate",
+                external_decision = "allow",
+                final_outcome = "allow",
+                rule_index,
+                "delegate policy decision"
+            );
             let macro_values = state.external_auth.take_macro_values(request_id);
             let header_actions = match interpolate_header_actions(header_actions, &macro_values) {
                 Ok(actions) => actions,
@@ -716,7 +822,7 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
                         .external_auth
                         .finalize_internal_error(request_id, &msg);
                     drop(guard);
-                    return build_external_auth_error_response(
+                    return ExternalAuthGateResult::Response(build_external_auth_error_response(
                         &state,
                         request_id,
                         url,
@@ -729,11 +835,11 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
                         "ExternalApprovalError",
                         "External approval macro interpolation failed",
                     )
-                    .await;
+                    .await);
                 }
             };
             drop(guard);
-            proxy_allowed_request(
+            ExternalAuthGateResult::Response(proxy_allowed_request(
                 state.clone(),
                 request_id.to_string(),
                 url.to_string(),
@@ -747,11 +853,19 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
                 header_actions,
                 egress_request_header_actions,
             )
-            .await
+            .await)
         }
         Ok(Ok(ExternalDecision::Deny)) => {
+            tracing::info!(
+                request_id = %request_id,
+                action = "delegate",
+                external_decision = "deny",
+                final_outcome = "deny",
+                rule_index,
+                "delegate policy decision"
+            );
             drop(guard);
-            build_external_auth_denied_response(
+            ExternalAuthGateResult::Response(build_external_auth_denied_response(
                 &state,
                 request_id,
                 url,
@@ -762,14 +876,26 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
                 req.headers(),
                 mode,
             )
-            .await
+            .await)
+        }
+        Ok(Ok(ExternalDecision::Pass)) => {
+            tracing::info!(
+                request_id = %request_id,
+                action = "delegate",
+                external_decision = "pass",
+                final_outcome = "continued",
+                rule_index,
+                "delegate policy decision"
+            );
+            drop(guard);
+            ExternalAuthGateResult::Pass(req)
         }
         Ok(Err(_recv_closed)) => {
             state
                 .external_auth
                 .finalize_internal_error(request_id, "External approval channel closed");
             drop(guard);
-            build_external_auth_error_response(
+            ExternalAuthGateResult::Response(build_external_auth_error_response(
                 &state,
                 request_id,
                 url,
@@ -782,12 +908,12 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
                 "ExternalApprovalError",
                 "External approval channel closed",
             )
-            .await
+            .await)
         }
         Err(_elapsed) => {
             state.external_auth.finalize_timed_out(request_id);
             drop(guard);
-            build_external_auth_timeout_response(
+            ExternalAuthGateResult::Response(build_external_auth_timeout_response(
                 &state,
                 request_id,
                 url,
@@ -798,85 +924,9 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
                 req.headers(),
                 mode,
             )
-            .await
+            .await)
         }
     }
-}
-
-async fn handle_external_auth_gate(
-    state: Arc<AppState>,
-    request_id: &str,
-    url: &str,
-    method: &Method,
-    client: &CaptureEndpoint,
-    target: Option<CaptureEndpoint>,
-    version: Version,
-    req: Request<Body>,
-    client_ip_for_policy: &str,
-    rule_index: usize,
-    rule_id: Option<String>,
-    profile: &ExternalAuthProfile,
-    profile_name: &str,
-    request_timeout_ms: Option<u64>,
-    header_actions: Vec<CompiledHeaderAction>,
-    egress_request_header_actions: Vec<CompiledHeaderAction>,
-) -> Response<Body> {
-    run_external_auth_gate_lifecycle(
-        state,
-        request_id,
-        url,
-        method,
-        client,
-        target,
-        version,
-        req,
-        client_ip_for_policy,
-        rule_index,
-        rule_id,
-        profile,
-        profile_name,
-        request_timeout_ms,
-        header_actions,
-        egress_request_header_actions,
-        CaptureMode::HttpProxy,
-    )
-    .await
-}
-
-async fn handle_auth_plugin_gate(
-    state: Arc<AppState>,
-    request_id: &str,
-    url: &str,
-    method: &Method,
-    client: &CaptureEndpoint,
-    target: Option<CaptureEndpoint>,
-    version: Version,
-    req: Request<Body>,
-    client_ip_for_policy: &str,
-    profile_name: &str,
-    handler: &AuthPluginHandle,
-    request_timeout_ms: Option<u64>,
-    header_actions: Vec<CompiledHeaderAction>,
-    egress_request_header_actions: Vec<CompiledHeaderAction>,
-) -> Response<Body> {
-    run_auth_plugin_gate_lifecycle(
-        state,
-        request_id,
-        url,
-        method,
-        client,
-        target,
-        version,
-        req,
-        client_ip_for_policy,
-        profile_name,
-        handler,
-        request_timeout_ms,
-        header_actions,
-        egress_request_header_actions,
-        CaptureMode::HttpProxy,
-    )
-    .await
 }
 
 pub(crate) async fn run_auth_plugin_gate_lifecycle(
@@ -895,7 +945,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
     header_actions: Vec<CompiledHeaderAction>,
     egress_request_header_actions: Vec<CompiledHeaderAction>,
     mode: CaptureMode,
-) -> Response<Body> {
+) -> ExternalAuthGateResult {
     let decision = handler
         .evaluate(request_id, url, method, client_ip_for_policy, req.headers())
         .await;
@@ -904,9 +954,16 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
         Ok(PluginDecision::Allow {
             header_actions: plugin_actions,
         }) => {
+            tracing::info!(
+                request_id = %request_id,
+                action = "delegate",
+                external_decision = "allow",
+                final_outcome = "allow",
+                "delegate policy decision"
+            );
             let mut combined = header_actions;
             combined.extend(plugin_actions);
-            proxy_allowed_request(
+            ExternalAuthGateResult::Response(proxy_allowed_request(
                 state.clone(),
                 request_id.to_string(),
                 url.to_string(),
@@ -920,10 +977,17 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
                 combined,
                 egress_request_header_actions,
             )
-            .await
+            .await)
         }
         Ok(PluginDecision::Deny) => {
-            build_auth_plugin_denied_response(
+            tracing::info!(
+                request_id = %request_id,
+                action = "delegate",
+                external_decision = "deny",
+                final_outcome = "deny",
+                "delegate policy decision"
+            );
+            ExternalAuthGateResult::Response(build_auth_plugin_denied_response(
                 &state,
                 request_id,
                 url,
@@ -934,11 +998,21 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
                 req.headers(),
                 mode,
             )
-            .await
+            .await)
+        }
+        Ok(PluginDecision::Pass) => {
+            tracing::info!(
+                request_id = %request_id,
+                action = "delegate",
+                external_decision = "pass",
+                final_outcome = "continued",
+                "delegate policy decision"
+            );
+            ExternalAuthGateResult::Pass(req)
         }
         Err(err) => {
             let message = format!("Auth plugin '{}' failed: {}", profile_name, err.message());
-            build_auth_plugin_error_response(
+            ExternalAuthGateResult::Response(build_auth_plugin_error_response(
                 &state,
                 request_id,
                 url,
@@ -950,7 +1024,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
                 mode,
                 &message,
             )
-            .await
+            .await)
         }
     }
 }
