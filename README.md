@@ -769,6 +769,7 @@ The config loader performs validation beyond basic TOML parsing:
 - Direct rules must have at least one of `pattern`, `patterns`, `methods`, `subnets`, `headers_absent`, or `headers_match`.
 - Direct rules and ruleset templates must not define both `pattern` and `patterns`.
 - `patterns` must include at least one non-empty pattern.
+- Duplicate `patterns` entries are rejected after trimming.
 - Include rules must reference an existing ruleset.
 - Macro placeholders (`{name}`) must resolve from `policy.macros` or `with` overrides.
 - `ca_key_path` and `ca_cert_path` must be both set or both omitted.
