@@ -682,7 +682,7 @@ async fn allowed_https_transparent_is_proxied_and_captured() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "https://{}:{}/**",
                 upstream_addr.ip(),
@@ -781,7 +781,7 @@ async fn configured_egress_forwarding_applies_to_https_transparent_requests() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some("https://transparent-target.test:9443/**".to_string()),
             patterns: None,
             description: None,
@@ -847,7 +847,7 @@ async fn global_egress_request_actions_apply_to_https_transparent_requests() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some("https://transparent-target.test:9443/**".to_string()),
             patterns: None,
             description: None,
@@ -922,7 +922,7 @@ async fn transparent_https_websocket_upgrade_is_tunneled() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "https://{}:{}/ws",
                 upstream_addr.ip(),
@@ -1046,7 +1046,7 @@ async fn allowed_https_transparent_h2_is_proxied_and_captured() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "https://{}:{}/**",
                 upstream_addr.ip(),
@@ -1161,7 +1161,7 @@ async fn upstream_failure_https_transparent_is_captured() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "https://{}:{}/**",
                 upstream_addr.ip(),
@@ -1273,7 +1273,7 @@ async fn concurrent_h2_streams_share_connection_and_are_captured() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "https://{}:{}/**",
                 upstream_addr.ip(),
@@ -1473,7 +1473,7 @@ async fn concurrent_h2_streams_mixed_allow_and_deny() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "https://{}:{}/ok",
                 upstream_addr.ip(),
@@ -1686,7 +1686,7 @@ async fn large_h2_request_body_is_truncated_in_capture() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "https://{}:{}/large-request",
                 upstream_addr.ip(),
@@ -1813,7 +1813,7 @@ async fn large_h2_response_body_is_truncated_in_capture() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "https://{}:{}/large-response",
                 upstream_addr.ip(),
@@ -1944,7 +1944,7 @@ async fn h2_client_to_http1_only_upstream_preserves_versions_in_capture() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "https://{}:{}/ok",
                 upstream_addr.ip(),
@@ -2066,7 +2066,7 @@ async fn h2_client_to_h2_capable_upstream_preserves_h2_in_capture() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "https://{}:{}/ok",
                 upstream_addr.ip(),
@@ -2184,7 +2184,7 @@ async fn denied_https_transparent_returns_403() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "https://{}:{}/ok",
                 upstream_addr.ip(),
@@ -2306,6 +2306,103 @@ async fn denied_https_transparent_returns_403() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn delegate_plugin_pass_falls_through_for_transparent_https_request() {
+    let upstream_addr = start_upstream_https_echo_server().await;
+
+    let plugin_temp_dir = TempDir::new().expect("temp dir");
+    let script_path = plugin_temp_dir.path().join("auth-plugin-pass.sh");
+    let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf "%s" "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  if [ -n "$id" ]; then
+    printf '{"id":"%s","type":"response","decision":"pass"}\n' "$id"
+  fi
+done
+"#;
+    std::fs::write(&script_path, script).expect("write plugin script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat plugin script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod plugin script");
+    }
+
+    let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    let toml = format!(
+        r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+https_bind_address = "127.0.0.1"
+https_port = 0
+
+[logging]
+directory = "logs"
+level = "info"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[certificates]
+certs_dir = "certs"
+
+[tls]
+verify_upstream = false
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles]
+[policy.external_auth_profiles.pass_plugin]
+type = "plugin"
+command = "{script_path}"
+timeout_ms = 1000
+
+[[policy.rules]]
+action = "delegate"
+pattern = "https://{host_header}/**"
+external_auth_profile = "pass_plugin"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://{host_header}/**"
+"#,
+        script_path = script_path.to_string_lossy(),
+        host_header = host_header
+    );
+    let config: Config = toml::from_str(&toml).expect("parse config");
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir, ca_cert_path) =
+        start_proxy_with_config(config, proxy_listener).await;
+
+    let (status, body) = send_https_request_via_transparent(
+        proxy_addr,
+        &ca_cert_path,
+        "transparent.test",
+        &host_header,
+        "/ok",
+        &[],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK.as_u16());
+    assert_eq!(body, "ok");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn denied_https_transparent_h2_returns_403() {
     let upstream_addr = start_upstream_https_echo_server().await;
 
@@ -2314,7 +2411,7 @@ async fn denied_https_transparent_h2_returns_403() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "https://{}:{}/ok",
                 upstream_addr.ip(),

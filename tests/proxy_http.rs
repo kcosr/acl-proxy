@@ -223,7 +223,7 @@ webhook_timeout_ms = 200
 on_webhook_failure = "error"
 
 [[policy.rules]]
-action = "allow"
+action = "delegate"
 pattern = "http://example.com/**"
 description = "External auth test rule"
 external_auth_profile = "test_profile"
@@ -435,7 +435,7 @@ webhook_timeout_ms = 1000
 on_webhook_failure = "error"
 
 [[policy.rules]]
-action = "allow"
+action = "delegate"
 pattern = "http://{host}/**"
 description = "External auth with macros"
 external_auth_profile = "test_profile"
@@ -611,7 +611,7 @@ timeout_ms = 1000
 include_headers = ["authorization"]
 
 [[policy.rules]]
-action = "allow"
+action = "delegate"
 pattern = "http://{host}/**"
 external_auth_profile = "gitlab_acl"
 
@@ -654,6 +654,241 @@ value = "static"
     );
     let (_deny_response, deny_status) = send_raw_http_request(proxy_addr, &deny_request).await;
     assert_eq!(deny_status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn external_auth_callback_pass_falls_through_to_later_allow() {
+    let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
+
+    let proxy_addr_shared: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let proxy_addr_for_svc = proxy_addr_shared.clone();
+
+    let make_svc = make_service_fn(move |_conn| {
+        let proxy_addr_for_svc = proxy_addr_for_svc.clone();
+        async move {
+            Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
+                let proxy_addr_for_svc = proxy_addr_for_svc.clone();
+                async move {
+                    let event_header = req
+                        .headers()
+                        .get("x-acl-proxy-event")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+
+                    let bytes = hyper::body::to_bytes(req.into_body())
+                        .await
+                        .unwrap_or_default();
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&bytes).unwrap_or_else(|_| serde_json::json!({}));
+
+                    if event_header == "pending" {
+                        if let Some(request_id) = body
+                            .get("requestId")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                        {
+                            if let Some(proxy_addr) = *proxy_addr_for_svc.lock().unwrap() {
+                                let callback_body = serde_json::json!({
+                                    "requestId": request_id,
+                                    "decision": "pass"
+                                });
+                                let client = hyper::Client::new();
+                                let uri = format!(
+                                    "http://{}/_acl-proxy/external-auth/callback",
+                                    proxy_addr
+                                );
+                                tokio::spawn(async move {
+                                    let req = Request::builder()
+                                        .method("POST")
+                                        .uri(uri)
+                                        .header(
+                                            http::header::CONTENT_TYPE,
+                                            HeaderValue::from_static("application/json"),
+                                        )
+                                        .body(Body::from(
+                                            serde_json::to_vec(&callback_body)
+                                                .unwrap_or_else(|_| b"{}".to_vec()),
+                                        ))
+                                        .unwrap();
+                                    let _ = client.request(req).await;
+                                });
+                            }
+                        }
+                    }
+
+                    Ok::<_, hyper::Error>(Response::new(Body::from("ok")))
+                }
+            }))
+        }
+    });
+
+    let webhook_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind webhook");
+    webhook_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking webhook");
+    let webhook_addr = webhook_listener.local_addr().expect("webhook addr");
+    tokio::spawn(
+        Server::from_tcp(webhook_listener)
+            .expect("server from tcp")
+            .serve(make_svc),
+    );
+
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    let toml = format!(
+        r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+
+[logging]
+directory = "logs"
+level = "info"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles]
+[policy.external_auth_profiles.pass_profile]
+webhook_url = "http://{webhook_addr}/webhook"
+timeout_ms = 5000
+webhook_timeout_ms = 1000
+on_webhook_failure = "error"
+
+[[policy.rules]]
+action = "delegate"
+pattern = "http://{host}/**"
+external_auth_profile = "pass_profile"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "x-delegate-pass"
+value = "should-not-apply"
+
+[[policy.rules]]
+action = "allow"
+pattern = "http://{host}/**"
+"#,
+        webhook_addr = webhook_addr,
+        host = host
+    );
+
+    let config: Config = toml::from_str(&toml).expect("parse config");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+    *proxy_addr_shared.lock().unwrap() = Some(proxy_addr);
+
+    let raw_request =
+        format!("GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let (_response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let headers_guard = seen_headers.lock().unwrap();
+    let upstream_headers = headers_guard.as_ref().expect("upstream should see request");
+    assert!(upstream_headers.get("x-delegate-pass").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auth_plugin_pass_falls_through_to_later_allow() {
+    let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
+
+    let temp_dir = TempDir::new().expect("temp dir");
+    let script_path = temp_dir.path().join("auth-plugin-pass.sh");
+    let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf "%s" "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  if [ -n "$id" ]; then
+    printf '{"id":"%s","type":"response","decision":"pass"}\n' "$id"
+  fi
+done
+"#;
+    std::fs::write(&script_path, script).expect("write plugin script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat plugin script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod plugin script");
+    }
+
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    let toml = format!(
+        r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+
+[logging]
+directory = "logs"
+level = "info"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles]
+[policy.external_auth_profiles.pass_plugin]
+type = "plugin"
+command = "{script_path}"
+timeout_ms = 1000
+
+[[policy.rules]]
+action = "delegate"
+pattern = "http://{host}/**"
+external_auth_profile = "pass_plugin"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "x-delegate-pass"
+value = "should-not-apply"
+
+[[policy.rules]]
+action = "allow"
+pattern = "http://{host}/**"
+"#,
+        script_path = script_path.to_string_lossy(),
+        host = host
+    );
+
+    let config: Config = toml::from_str(&toml).expect("parse config");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let raw_request =
+        format!("GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let (_response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let headers_guard = seen_headers.lock().unwrap();
+    let upstream_headers = headers_guard.as_ref().expect("upstream should see request");
+    assert!(upstream_headers.get("x-delegate-pass").is_none());
 }
 
 fn minimal_config() -> Config {
@@ -759,7 +994,7 @@ async fn allowed_request_uses_configured_egress_forwarding_destination() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some("http://example.invalid/**".to_string()),
             patterns: None,
             description: None,
@@ -820,7 +1055,7 @@ async fn global_egress_request_actions_are_applied_after_rule_actions_without_af
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![
         acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Deny,
+            action: acl_proxy::config::PolicyRuleAction::Deny,
             pattern: Some("http://example.invalid/**".to_string()),
             patterns: None,
             description: None,
@@ -836,7 +1071,7 @@ async fn global_egress_request_actions_are_applied_after_rule_actions_without_af
             rule_id: None,
         }),
         acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some("http://example.invalid/**".to_string()),
             patterns: None,
             description: None,
@@ -983,7 +1218,7 @@ async fn global_egress_request_actions_respect_intra_layer_order() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some("http://example.invalid/**".to_string()),
             patterns: None,
             description: None,
@@ -1072,7 +1307,7 @@ async fn empty_global_egress_actions_preserve_existing_rule_header_behavior() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some("http://example.invalid/**".to_string()),
             patterns: None,
             description: None,
@@ -1255,7 +1490,7 @@ webhook_timeout_ms = 1000
 on_webhook_failure = "error"
 
 [[policy.rules]]
-action = "allow"
+action = "delegate"
 pattern = "http://example.invalid/**"
 external_auth_profile = "test_profile"
         "#,
@@ -1403,7 +1638,7 @@ async fn http_explicit_listener_accepts_h2c_prior_knowledge_requests() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "http://{}:{}/**",
                 upstream_addr.ip(),
@@ -1449,7 +1684,7 @@ async fn allowed_request_is_proxied_and_loop_header_added() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "http://{}:{}/**",
                 upstream_addr.ip(),
@@ -1517,7 +1752,7 @@ async fn headers_absent_top_deny_guard_falls_through_to_allow_rule() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![
         acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Deny,
+            action: acl_proxy::config::PolicyRuleAction::Deny,
             pattern: Some(format!("http://{host}/**")),
             patterns: None,
             description: Some("Deny requests missing identity".to_string()),
@@ -1533,7 +1768,7 @@ async fn headers_absent_top_deny_guard_falls_through_to_allow_rule() {
             rule_id: None,
         }),
         acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!("http://{host}/**")),
             patterns: None,
             description: Some("Allow upstream traffic".to_string()),
@@ -1600,7 +1835,7 @@ async fn method_scoped_headers_absent_guard_only_blocks_matching_methods() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![
         acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Deny,
+            action: acl_proxy::config::PolicyRuleAction::Deny,
             pattern: Some(format!("http://{host}/**")),
             patterns: None,
             description: Some("Deny POSTs missing identity".to_string()),
@@ -1625,7 +1860,7 @@ async fn method_scoped_headers_absent_guard_only_blocks_matching_methods() {
             rule_id: None,
         }),
         acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!("http://{host}/**")),
             patterns: None,
             description: Some("Allow upstream traffic".to_string()),
@@ -1691,7 +1926,7 @@ async fn headers_match_top_guard_denies_non_matching_value_and_allows_matching_v
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![
         acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!("http://{host}/**")),
             patterns: None,
             description: Some("Allow trusted identity header".to_string()),
@@ -1710,7 +1945,7 @@ async fn headers_match_top_guard_denies_non_matching_value_and_allows_matching_v
             rule_id: None,
         }),
         acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Deny,
+            action: acl_proxy::config::PolicyRuleAction::Deny,
             pattern: Some(format!("http://{host}/**")),
             patterns: None,
             description: Some("Deny all other traffic".to_string()),
@@ -1775,7 +2010,7 @@ async fn headers_match_http_regressions_cover_repeated_values_comma_literals_and
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!("http://{host}/**")),
             patterns: None,
             description: Some("Allow only exact trusted header values".to_string()),
@@ -1860,7 +2095,7 @@ async fn loop_header_not_added_when_disabled() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "http://{}:{}/**",
                 upstream_addr.ip(),
@@ -2014,7 +2249,7 @@ async fn origin_form_request_with_host_is_forwarded() {
     let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!("http://{host}/**")),
             patterns: None,
             description: None,
@@ -2078,7 +2313,7 @@ async fn upstream_connection_failure_returns_502() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some("http://127.0.0.1:1/**".to_string()),
             patterns: None,
             description: None,
@@ -2124,7 +2359,7 @@ async fn upstream_request_timeout_returns_504() {
     config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
     config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
         acl_proxy::config::PolicyRuleDirectConfig {
-            action: acl_proxy::config::PolicyDefaultAction::Allow,
+            action: acl_proxy::config::PolicyRuleAction::Allow,
             pattern: Some(format!(
                 "http://{}:{}/**",
                 upstream_addr.ip(),

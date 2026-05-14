@@ -49,6 +49,7 @@ pub enum PluginDecision {
         header_actions: Vec<CompiledHeaderAction>,
     },
     Deny,
+    Pass,
 }
 
 #[derive(Clone)]
@@ -231,11 +232,12 @@ struct PluginResponse {
     response_headers: Vec<PluginHeaderAction>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum PluginDecisionKind {
     Allow,
     Deny,
+    Pass,
 }
 
 #[derive(Debug, Deserialize)]
@@ -476,6 +478,21 @@ fn handle_plugin_response(
             );
             Ok(PluginDecision::Deny)
         }
+        PluginDecisionKind::Pass => {
+            tracing::debug!(
+                handler = %config.name,
+                request_id = %response.id,
+                decision = "pass",
+                "auth plugin decision"
+            );
+            if !response.request_headers.is_empty() || !response.response_headers.is_empty() {
+                Err(PluginError::new(
+                    "auth plugin pass decision must not include header actions",
+                ))
+            } else {
+                Ok(PluginDecision::Pass)
+            }
+        }
     };
 
     let _ = sender.send(result);
@@ -709,5 +726,59 @@ fn drain_pending(
 ) {
     for (_id, sender) in pending.drain() {
         let _ = sender.send(Err(PluginError::new(err.message())));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> AuthPluginConfig {
+        AuthPluginConfig {
+            name: "test_plugin".to_string(),
+            command: "unused".to_string(),
+            args: Vec::new(),
+            timeout: Duration::from_millis(1000),
+            include_headers: Vec::new(),
+            env: BTreeMap::new(),
+            restart_delay: Duration::from_millis(10),
+        }
+    }
+
+    fn parse_response(line: &str) -> Result<PluginDecision, PluginError> {
+        let config = test_config();
+        let (tx, mut rx) = oneshot::channel();
+        let mut pending = HashMap::new();
+        pending.insert("req-1".to_string(), tx);
+
+        handle_plugin_response(&config, line.to_string(), &mut pending);
+
+        rx.try_recv()
+            .expect("plugin response should resolve pending request")
+    }
+
+    #[test]
+    fn plugin_pass_without_header_actions_is_accepted() {
+        let decision = parse_response(
+            r#"{"id":"req-1","type":"response","decision":"pass"}"#,
+        )
+        .expect("pass should parse");
+
+        assert!(matches!(decision, PluginDecision::Pass));
+    }
+
+    #[test]
+    fn plugin_pass_with_request_header_actions_is_rejected() {
+        let err = parse_response(
+            r#"{"id":"req-1","type":"response","decision":"pass","requestHeaders":[{"action":"set","name":"x-test","value":"one"}]}"#,
+        )
+        .expect_err("pass with header actions should fail");
+
+        assert!(
+            err.message()
+                .contains("pass decision must not include header actions"),
+            "unexpected error: {}",
+            err.message()
+        );
     }
 }

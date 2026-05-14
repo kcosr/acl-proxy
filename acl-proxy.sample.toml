@@ -303,7 +303,7 @@ subnets = ["127.0.0.0/8"]
 
 [[policy.rules]]
 # Example: require external approval for GitHub API access.
-action = "allow"
+action = "delegate"
 pattern = "https://api.github.com/**"
 description = "GitHub API with external MFA"
 external_auth_profile = "github_mfa"
@@ -335,7 +335,7 @@ value = "{{reason}}"
 
 [[policy.rules]]
 # Example: use a sync plugin to allow a set of repository URLs.
-action = "allow"
+action = "delegate"
 pattern = "https://repo.internal/**"
 description = "Repo access via auth plugin"
 external_auth_profile = "url_allow"

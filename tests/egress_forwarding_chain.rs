@@ -6,7 +6,7 @@ use acl_proxy::app::AppState;
 use acl_proxy::capture::{CaptureKind, CaptureMode, CaptureRecord};
 use acl_proxy::config::{
     Config, EgressTargetConfig, HeaderActionConfig, HeaderActionKind, HeaderDirection, HeaderWhen,
-    PolicyDefaultAction, PolicyRuleConfig, PolicyRuleDirectConfig,
+    PolicyDefaultAction, PolicyRuleAction, PolicyRuleConfig, PolicyRuleDirectConfig,
 };
 use acl_proxy::proxy::http::run_http_proxy_on_listener;
 use h2::client as h2_client;
@@ -183,7 +183,7 @@ default = "deny"
 
 fn allow_rule(pattern: String, header_actions: Vec<HeaderActionConfig>) -> PolicyRuleConfig {
     PolicyRuleConfig::Direct(PolicyRuleDirectConfig {
-        action: PolicyDefaultAction::Allow,
+        action: PolicyRuleAction::Allow,
         pattern: Some(pattern),
         patterns: None,
         description: None,

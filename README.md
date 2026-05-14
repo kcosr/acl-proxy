@@ -1,6 +1,6 @@
 # acl-proxy
 
-A Rust-based ACL-aware HTTP/HTTPS proxy with a TOML configuration file and a flexible URL policy engine. Evaluate every request against ordered rules matching on URL patterns, HTTP methods, client subnets, and headers — then allow, deny, or gate behind an external approval workflow.
+A Rust-based ACL-aware HTTP/HTTPS proxy with a TOML configuration file and a flexible URL policy engine. Evaluate every request against ordered rules matching on URL patterns, HTTP methods, client subnets, and headers — then allow, deny, or delegate to an external auth workflow.
 
 ## Table of Contents
 
@@ -33,7 +33,7 @@ graph TB
         HTTPS["Transparent HTTPS Listener<br/>:8889"]
         LP["Loop Protection"]
         PE["Policy Engine<br/>pattern · method · subnet · headers"]
-        EA["External Auth<br/>(optional approval gate)"]
+        EA["External Auth<br/>(delegate rules)"]
         HA["Header Actions<br/>request · response mutations"]
         EF["Egress Forwarding<br/>(optional chained proxy)"]
     end
@@ -45,14 +45,17 @@ graph TB
     HTTP --> LP
     HTTPS --> LP
     LP --> PE
-    PE -->|allow| EA
+    PE -->|allow| HA
+    PE -->|delegate| EA
     PE -->|deny| Deny["403 Forbidden"]
-    EA -->|approved| HA
+    EA -->|allow| HA
+    EA -->|deny| Deny
+    EA -.->|pass: continue rules| PE
     HA --> EF
     EF --> Upstream
 ```
 
-**Policy evaluation order** for each rule: pattern → subnets → methods → `headers_absent` → `headers_match`. First match wins; if nothing matches, `policy.default` applies.
+**Policy evaluation order** for each rule: pattern → subnets → methods → `headers_absent` → `headers_match`. Local `allow`/`deny` matches are terminal. A matched `delegate` rule calls external auth; external `pass` continues with the next rule, and if nothing later matches, `policy.default` applies.
 
 ## Quick Start
 
@@ -166,13 +169,16 @@ sequenceDiagram
         Policy-->>Client: 403 Forbidden (+ capture if configured)
     end
 
-    alt Allowed + external auth gate
-        Policy->>Auth: Send approval webhook
-        Auth-->>Policy: Callback with decision
+    alt Delegate rule
+        Policy->>Auth: Send webhook or plugin request
+        Auth-->>Policy: allow / deny / pass
+        opt pass
+            Policy->>Policy: Resume at next rule
+        end
     end
 
-    Policy->>Headers: Apply rule request header actions
-    Headers->>Headers: Apply plugin request header actions (if any)
+    Policy->>Headers: Apply rule request header actions on allow
+    Headers->>Headers: Apply provider/plugin request header actions on external allow
     Headers->>Headers: Apply global egress request header actions
     Headers->>Upstream: Forward request
     Upstream-->>Headers: Response
@@ -231,7 +237,7 @@ When `[proxy.egress.default]` is configured, allowed proxied requests from all m
 
 ## Policy Engine
 
-The policy engine evaluates each request against an ordered list of rules and returns the first match. If no rule matches, `policy.default` applies. Invalid or unparseable URLs are always denied.
+The policy engine evaluates each request against an ordered list of rules. `allow` and `deny` rules are terminal local decisions. `delegate` rules call an external auth profile, whose decision can allow, deny, or pass so evaluation continues at the next rule. If no rule matches, `policy.default` applies. Invalid or unparseable URLs are always denied.
 
 ### Rule Evaluation Order
 
@@ -244,7 +250,7 @@ The policy engine evaluates each request against an ordered list of rules and re
    - Method match (if set)
    - `headers_absent` match (if set)
    - `headers_match` match (if set)
-5. First match wins.
+5. The first `allow` or `deny` match wins. A matched `delegate` rule wins only when the external auth provider returns `allow` or `deny`.
 6. If nothing matches, apply `policy.default`.
 
 All predicates use AND semantics — a rule matches only when every predicate passes.
@@ -454,12 +460,12 @@ when = "always"
 
 Ordering for outbound requests:
 1. Evaluate policy and match the first rule.
-2. Apply matched-rule request header actions.
-3. Apply plugin request header actions (when present).
+2. For a local `allow`, apply matched-rule request header actions. For `delegate`, apply matched-rule request header actions only if the provider returns `allow`.
+3. Apply provider/plugin request header actions only on external `allow`.
 4. Apply global egress request header actions.
 5. Send upstream.
 
-Global egress actions never affect rule matching. Their `when` conditions are evaluated against header presence at the start of the global layer (after rule/plugin actions). Global response-header actions are not supported — only request-direction actions are available in this layer.
+Global egress actions never affect rule matching. Their `when` conditions are evaluated against header presence at the start of the global layer (after rule/provider actions). On external `pass`, no rule or provider header actions are applied and later policy rules evaluate the original request headers. Global response-header actions are not supported — only request-direction actions are available in this layer.
 
 ### Debugging Policies
 
@@ -680,7 +686,7 @@ See [Policy Engine](#policy-engine) for full details on rules, macros, rulesets,
 
 ```toml
 [[policy.rules]]
-action = "allow"                    # required: "allow" | "deny"
+action = "allow"                    # required: "allow" | "deny" | "delegate"
 pattern = "https://example.com/**"  # optional: URL pattern
 # patterns = ["https://a/**"]       # optional alternative: multiple URL patterns
 description = "Example rule"        # optional
@@ -690,10 +696,11 @@ headers_absent = ["x-id"]          # optional: missing-header check
 headers_match = { "x-id" = "v1" }  # optional: exact header match
 request_timeout_ms = 5000          # optional: override upstream timeout
 rule_id = "stable-id"             # optional: stable ID for webhooks
-external_auth_profile = "name"     # optional: approval gate (allow rules only)
+external_auth_profile = "name"     # required for delegate; invalid for allow/deny
 ```
 
 At least one of `pattern`, `patterns`, `methods`, `subnets`, `headers_absent`, or `headers_match` must be present.
+`allow` and `deny` are terminal local decisions. `delegate` invokes the named HTTP or plugin external auth profile; the provider can return `allow` or `deny` as terminal decisions, or `pass` to continue policy evaluation at the next rule.
 
 #### Include Rule Fields
 
@@ -775,13 +782,15 @@ The config loader performs validation beyond basic TOML parsing:
 - `ca_key_path` and `ca_cert_path` must be both set or both omitted.
 - `loop_protection.header_name` must be a valid HTTP header name.
 - `${NAME}` env placeholders must resolve at validation/startup/reload time. Existing literal `${...}` strings in `set`/`add` header-action values are reserved syntax and must be migrated.
-- `external_auth_profile` on `action = "deny"` rules is rejected — approval-required deny rules are not allowed.
+- `policy.default` must be `allow` or `deny`; `delegate` is valid only on rules and ruleset templates.
+- `action = "delegate"` requires `external_auth_profile`.
+- `external_auth_profile` on `action = "allow"` or `action = "deny"` rules is rejected.
 
 On validation failure, `config validate` and startup report a human-readable error and abort, leaving any previously running instance (in the case of reload) unchanged.
 
 ## External Auth
 
-External auth turns `allow` rules into approval-required gates. When a matching request hits an approval-gated rule, acl-proxy pauses the request, sends a webhook to an external service, and waits for a callback decision.
+External auth is invoked by `delegate` policy rules. When a matching request hits a delegate rule, acl-proxy pauses the request, sends a webhook to an HTTP external auth service or invokes a stdio plugin, and waits for a decision.
 
 ```mermaid
 sequenceDiagram
@@ -790,14 +799,16 @@ sequenceDiagram
     participant Approver as External Auth Service
 
     Client->>Proxy: HTTPS request
-    Proxy->>Proxy: Policy match → approval required
+    Proxy->>Proxy: Policy match → delegate
     Proxy->>Approver: POST webhook (X-Acl-Proxy-Event: pending)
     Note over Proxy: Waiting for callback...
     Approver->>Proxy: POST /_acl-proxy/external-auth/callback
-    Note over Approver: approve / deny
-    alt Approved
+    Note over Approver: allow / deny / pass
+    alt Allowed
         Proxy->>Proxy: Interpolate approval macros into headers
         Proxy-->>Client: Forward upstream response
+    else Passed
+        Proxy->>Proxy: Continue policy evaluation at next rule
     else Denied / Timeout
         Proxy-->>Client: 403 Forbidden / 504 Timeout
     end
@@ -805,7 +816,7 @@ sequenceDiagram
 
 ### Webhook Format
 
-When a rule with `external_auth_profile` matches, the proxy POSTs a webhook:
+When a `delegate` rule with `external_auth_profile` matches an HTTP profile, the proxy POSTs a webhook:
 
 - **URL**: `policy.external_auth_profiles.<name>.webhook_url`
 - **Header**: `X-Acl-Proxy-Event: pending`
@@ -828,7 +839,7 @@ Content-Type: application/json
 
 {
   "requestId": "req-...",
-  "decision": "allow" | "deny",
+  "decision": "allow" | "deny" | "pass",
   "macros": {
     "github_token": "ghp_...",
     "reason": "Approving for test"
@@ -842,11 +853,11 @@ Content-Type: application/json
 | `404 Not Found` | Unknown or already completed `requestId` |
 | `400 Bad Request` | Invalid body or missing required macros |
 
-**Macro validation**: Required macros must be present and non-empty. Values must not contain control characters (ASCII < 0x20 or DEL). Optional macros may be omitted or empty.
+**Macro validation**: Required macros must be present and non-empty for `allow` decisions. Values must not contain control characters (ASCII < 0x20 or DEL). Optional macros may be omitted or empty. `pass` decisions do not apply approval macro substitutions or header actions; policy evaluation resumes at the rule after the matched delegate rule.
 
 ### Plugin Mode (type = "plugin")
 
-Stdio-based synchronous auth. The proxy spawns a long-running plugin process and sends JSON requests over stdin, waiting for allow/deny JSON responses from stdout (newline-delimited). On allow, the proxy applies rule header actions first, plugin header actions second, and global egress request actions third. Plugins can also return response header actions. See [`docs/design/auth-plugins-design.md`](docs/design/auth-plugins-design.md) for the full protocol specification.
+Stdio-based synchronous auth. The proxy spawns a long-running plugin process and sends JSON requests over stdin, waiting for `allow`, `deny`, or `pass` JSON responses from stdout (newline-delimited). On `allow`, the proxy applies rule header actions first, plugin header actions second, and global egress request actions third. On `pass`, the plugin must not return request or response header actions, and policy evaluation resumes at the rule after the matched delegate rule. Plugins can also return response header actions on `allow`. See [`docs/design/auth-plugins-design.md`](docs/design/auth-plugins-design.md) for the full protocol specification.
 
 ### Failure Handling
 

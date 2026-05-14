@@ -14,12 +14,13 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::app::{AppState, SharedAppState};
 use crate::capture::{CaptureEndpoint, CaptureMode};
-use crate::config::ExternalAuthProfileType;
+use crate::config::{ExternalAuthProfileType, PolicyRuleAction};
 use crate::logging::PolicyDecisionLogContext;
 use crate::proxy::http::{
     build_external_auth_error_response, build_loop_detected_response,
     build_policy_denied_response_with_mode, generate_request_id, has_loop_header,
     proxy_allowed_request, run_auth_plugin_gate_lifecycle, run_external_auth_gate_lifecycle,
+    ExternalAuthGateResult,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -221,7 +222,7 @@ async fn handle_inner_https_request(
     state: Arc<AppState>,
     client: CaptureEndpoint,
     client_ip_for_policy: String,
-    req: Request<Body>,
+    mut req: Request<Body>,
 ) -> Result<Response<Body>, hyper::Error> {
     let request_id = generate_request_id();
     let method = req.method().clone();
@@ -250,59 +251,146 @@ async fn handle_inner_https_request(
         return Ok(resp);
     }
 
-    let decision = state.policy.evaluate(
-        &full_url,
-        Some(&client_ip_for_policy),
-        Some(method.as_str()),
-        req.headers(),
-    );
-
-    state.logging.log_policy_decision(PolicyDecisionLogContext {
-        request_id: &request_id,
-        url: &full_url,
-        method: Some(method.as_str()),
-        client_ip: Some(&client_ip_for_policy),
-        decision: &decision,
-    });
-
-    if !decision.allowed {
-        let resp = build_policy_denied_response_with_mode(
-            &state,
-            &request_id,
+    let mut start_index = 0;
+    loop {
+        let decision = state.policy.evaluate_from(
+            start_index,
             &full_url,
-            &method,
-            &client,
-            target.clone(),
-            version,
+            Some(&client_ip_for_policy),
+            Some(method.as_str()),
             req.headers(),
-            CaptureMode::HttpsTransparent,
-        )
-        .await;
-        return Ok(resp);
-    }
+        );
 
-    let matched_rule = decision.matched.as_ref();
-    let header_actions = matched_rule
-        .map(|m| m.header_actions.clone())
-        .unwrap_or_default();
-    let egress_request_header_actions = state.egress_request_header_actions.clone();
-    let request_timeout_ms = matched_rule.and_then(|m| m.request_timeout_ms);
+        if !matches!(
+            decision.matched.as_ref().map(|rule| rule.action),
+            Some(PolicyRuleAction::Delegate)
+        ) {
+            state.logging.log_policy_decision(PolicyDecisionLogContext {
+                request_id: &request_id,
+                url: &full_url,
+                method: Some(method.as_str()),
+                client_ip: Some(&client_ip_for_policy),
+                decision: &decision,
+            });
+        }
 
-    if let Some(rule) = matched_rule {
-        if let Some(profile_name) = rule.external_auth_profile.as_ref() {
-            let profile_cfg = state.config.policy.external_auth_profiles.get(profile_name);
+        let Some(rule) = decision.matched.as_ref() else {
+            if decision.allowed {
+                let resp = proxy_allowed_request(
+                    state.clone(),
+                    request_id,
+                    full_url,
+                    method,
+                    version,
+                    client,
+                    target,
+                    req,
+                    CaptureMode::HttpsTransparent,
+                    None,
+                    Vec::new(),
+                    state.egress_request_header_actions.clone(),
+                )
+                .await;
+                return Ok(resp);
+            }
 
-            match profile_cfg.map(|cfg| &cfg.profile_type) {
-                Some(ExternalAuthProfileType::Http) => {
-                    if let Some(profile) = state.external_auth.get_profile(profile_name) {
-                        if let Some(target_endpoint) = target.clone() {
-                            let resp = handle_https_transparent_external_auth_gate(
+            let resp = build_policy_denied_response_with_mode(
+                &state,
+                &request_id,
+                &full_url,
+                &method,
+                &client,
+                target.clone(),
+                version,
+                req.headers(),
+                CaptureMode::HttpsTransparent,
+            )
+            .await;
+            return Ok(resp);
+        };
+
+        match rule.action {
+            PolicyRuleAction::Deny => {
+                let resp = build_policy_denied_response_with_mode(
+                    &state,
+                    &request_id,
+                    &full_url,
+                    &method,
+                    &client,
+                    target.clone(),
+                    version,
+                    req.headers(),
+                    CaptureMode::HttpsTransparent,
+                )
+                .await;
+                return Ok(resp);
+            }
+            PolicyRuleAction::Allow => {
+                let resp = proxy_allowed_request(
+                    state.clone(),
+                    request_id,
+                    full_url,
+                    method,
+                    version,
+                    client,
+                    target,
+                    req,
+                    CaptureMode::HttpsTransparent,
+                    rule.request_timeout_ms,
+                    rule.header_actions.clone(),
+                    state.egress_request_header_actions.clone(),
+                )
+                .await;
+                return Ok(resp);
+            }
+            PolicyRuleAction::Delegate => {
+                let Some(profile_name) = rule.external_auth_profile.as_ref() else {
+                    let resp = build_external_auth_error_response(
+                        &state,
+                        &request_id,
+                        &full_url,
+                        &method,
+                        &client,
+                        target,
+                        version,
+                        req.headers(),
+                        CaptureMode::HttpsTransparent,
+                        "ExternalApprovalError",
+                        "External auth profile not found",
+                    )
+                    .await;
+                    return Ok(resp);
+                };
+
+                let Some(target_endpoint) = target.clone() else {
+                    let resp = build_external_auth_error_response(
+                        &state,
+                        &request_id,
+                        &full_url,
+                        &method,
+                        &client,
+                        target,
+                        version,
+                        req.headers(),
+                        CaptureMode::HttpsTransparent,
+                        "ExternalApprovalError",
+                        "Missing target for transparent HTTPS request",
+                    )
+                    .await;
+                    return Ok(resp);
+                };
+
+                let profile_cfg = state.config.policy.external_auth_profiles.get(profile_name);
+                let gate_result = match profile_cfg.map(|cfg| &cfg.profile_type) {
+                    Some(ExternalAuthProfileType::Http) => {
+                        if let Some(profile) = state.external_auth.get_profile(profile_name) {
+                            run_external_auth_gate_lifecycle(
                                 state.clone(),
                                 &request_id,
                                 &full_url,
                                 &method,
                                 &client,
-                                target_endpoint,
+                                Some(target_endpoint),
                                 version,
                                 req,
                                 &client_ip_for_policy,
@@ -310,12 +398,12 @@ async fn handle_inner_https_request(
                                 rule.rule_id.clone(),
                                 &profile,
                                 profile_name,
-                                request_timeout_ms,
-                                header_actions,
-                                egress_request_header_actions.clone(),
+                                rule.request_timeout_ms,
+                                rule.header_actions.clone(),
+                                state.egress_request_header_actions.clone(),
+                                CaptureMode::HttpsTransparent,
                             )
-                            .await;
-                            return Ok(resp);
+                            .await
                         } else {
                             let resp = build_external_auth_error_response(
                                 &state,
@@ -328,17 +416,15 @@ async fn handle_inner_https_request(
                                 req.headers(),
                                 CaptureMode::HttpsTransparent,
                                 "ExternalApprovalError",
-                                "Missing target for transparent HTTPS request",
+                                "External auth profile not found",
                             )
                             .await;
                             return Ok(resp);
                         }
                     }
-                }
-                Some(ExternalAuthProfileType::Plugin) => {
-                    if let Some(handler) = state.auth_plugins.get_handler(profile_name) {
-                        if let Some(target_endpoint) = target.clone() {
-                            let resp = run_auth_plugin_gate_lifecycle(
+                    Some(ExternalAuthProfileType::Plugin) => {
+                        if let Some(handler) = state.auth_plugins.get_handler(profile_name) {
+                            run_auth_plugin_gate_lifecycle(
                                 state.clone(),
                                 &request_id,
                                 &full_url,
@@ -350,13 +436,12 @@ async fn handle_inner_https_request(
                                 &client_ip_for_policy,
                                 profile_name,
                                 &handler,
-                                request_timeout_ms,
-                                header_actions,
-                                egress_request_header_actions.clone(),
+                                rule.request_timeout_ms,
+                                rule.header_actions.clone(),
+                                state.egress_request_header_actions.clone(),
                                 CaptureMode::HttpsTransparent,
                             )
-                            .await;
-                            return Ok(resp);
+                            .await
                         } else {
                             let resp = build_external_auth_error_response(
                                 &state,
@@ -369,91 +454,41 @@ async fn handle_inner_https_request(
                                 req.headers(),
                                 CaptureMode::HttpsTransparent,
                                 "ExternalApprovalError",
-                                "Missing target for transparent HTTPS request",
+                                "External auth profile not found",
                             )
                             .await;
                             return Ok(resp);
                         }
                     }
-                }
-                None => {}
-            }
+                    None => {
+                        let resp = build_external_auth_error_response(
+                            &state,
+                            &request_id,
+                            &full_url,
+                            &method,
+                            &client,
+                            target,
+                            version,
+                            req.headers(),
+                            CaptureMode::HttpsTransparent,
+                            "ExternalApprovalError",
+                            "External auth profile not found",
+                        )
+                        .await;
+                        return Ok(resp);
+                    }
+                };
 
-            let resp = build_external_auth_error_response(
-                &state,
-                &request_id,
-                &full_url,
-                &method,
-                &client,
-                target,
-                version,
-                req.headers(),
-                CaptureMode::HttpsTransparent,
-                "ExternalApprovalError",
-                "External auth profile not found",
-            )
-            .await;
-            return Ok(resp);
+                match gate_result {
+                    ExternalAuthGateResult::Response(resp) => return Ok(resp),
+                    ExternalAuthGateResult::Pass(original_req) => {
+                        req = original_req;
+                        start_index = rule.index + 1;
+                    }
+                }
+            }
         }
     }
-
-    let resp = proxy_allowed_request(
-        state.clone(),
-        request_id,
-        full_url,
-        method,
-        version,
-        client,
-        target,
-        req,
-        CaptureMode::HttpsTransparent,
-        request_timeout_ms,
-        header_actions,
-        egress_request_header_actions,
-    )
-    .await;
-
-    Ok(resp)
-}
-
-async fn handle_https_transparent_external_auth_gate(
-    state: Arc<AppState>,
-    request_id: &str,
-    url: &str,
-    method: &http::Method,
-    client: &CaptureEndpoint,
-    target: CaptureEndpoint,
-    version: http::Version,
-    req: Request<Body>,
-    client_ip_for_policy: &str,
-    rule_index: usize,
-    rule_id: Option<String>,
-    profile: &crate::external_auth::ExternalAuthProfile,
-    profile_name: &str,
-    request_timeout_ms: Option<u64>,
-    header_actions: Vec<crate::policy::CompiledHeaderAction>,
-    egress_request_header_actions: Vec<crate::policy::CompiledHeaderAction>,
-) -> Response<Body> {
-    run_external_auth_gate_lifecycle(
-        state,
-        request_id,
-        url,
-        method,
-        client,
-        Some(target),
-        version,
-        req,
-        client_ip_for_policy,
-        rule_index,
-        rule_id,
-        profile,
-        profile_name,
-        request_timeout_ms,
-        header_actions,
-        egress_request_header_actions,
-        CaptureMode::HttpsTransparent,
-    )
-    .await
 }
 
 fn build_https_url_for_transparent(

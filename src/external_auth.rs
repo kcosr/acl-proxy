@@ -22,6 +22,7 @@ use crate::config::{
 pub enum ExternalDecision {
     Allow,
     Deny,
+    Pass,
 }
 
 /// Behavior to apply when the **initial** webhook fails.

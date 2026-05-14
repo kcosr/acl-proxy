@@ -2,8 +2,12 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+- Require external authorization rules to use `action = "delegate"`; `external_auth_profile` is now rejected on local `allow` and `deny` rules ([#49](https://github.com/kcosr/acl-proxy/pull/49)).
+
 ### Added
 - Add `patterns = [...]` policy rule support for expanding several URL patterns with shared rule attributes into singular effective rules ([#48](https://github.com/kcosr/acl-proxy/pull/48)).
+- Add first-class `delegate` policy rules and `pass` external-auth decisions so HTTP and plugin providers can continue evaluation at the next policy rule ([#49](https://github.com/kcosr/acl-proxy/pull/49)).
 
 ## [0.0.12] - 2026-03-19
 
