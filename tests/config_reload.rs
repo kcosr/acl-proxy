@@ -179,6 +179,7 @@ async fn loop_header_injection_updates_after_reload() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -264,6 +265,7 @@ async fn failed_reload_keeps_previous_state() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -416,6 +418,7 @@ async fn egress_forwarding_enable_disable_updates_after_reload() {
                 direct_addr.ip(),
                 direct_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),

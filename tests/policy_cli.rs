@@ -230,6 +230,106 @@ subnets = ["10.0.0.0/8"]
 }
 
 #[test]
+fn policy_dump_json_expands_patterns_to_singular_effective_rules() {
+    let mut file = NamedTempFile::new().expect("create temp config");
+    file.write_all(
+        br#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+patterns = [
+  "https://developers.openai.com/**",
+  "https://github.com/openai/**",
+]
+methods = ["GET"]
+description = "OpenAI docs and repositories"
+        "#,
+    )
+    .expect("write config");
+
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
+    cmd.arg("policy")
+        .arg("dump")
+        .arg("--format")
+        .arg("json")
+        .arg("--config")
+        .arg(file.path());
+
+    let assert = cmd.assert().success();
+    let stdout =
+        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is valid UTF-8");
+    let value: Value = serde_json::from_str(&stdout).expect("output is valid JSON");
+    let rules = value["rules"].as_array().expect("rules is an array");
+
+    assert_eq!(rules.len(), 2);
+    assert_eq!(rules[0]["index"], 0);
+    assert_eq!(rules[0]["pattern"], "https://developers.openai.com/**");
+    assert_eq!(rules[0]["description"], "OpenAI docs and repositories");
+    assert_eq!(rules[1]["index"], 1);
+    assert_eq!(rules[1]["pattern"], "https://github.com/openai/**");
+    assert_eq!(rules[1]["description"], "OpenAI docs and repositories");
+    assert!(rules[0].get("patterns").is_none());
+}
+
+#[test]
+fn policy_dump_table_expands_patterns_to_rows() {
+    let mut file = NamedTempFile::new().expect("create temp config");
+    file.write_all(
+        br#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+patterns = [
+  "https://developers.openai.com/**",
+  "https://github.com/openai/**",
+]
+headers_match = { "x-workload-id" = "worker-123" }
+description = "OpenAI docs and repositories"
+        "#,
+    )
+    .expect("write config");
+
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
+    cmd.arg("policy")
+        .arg("dump")
+        .arg("--format")
+        .arg("table")
+        .arg("--config")
+        .arg(file.path());
+
+    cmd.assert()
+        .success()
+        .stdout(contains("https://developers.openai.com/**"))
+        .stdout(contains("https://github.com/openai/**"))
+        .stdout(contains("x-workload-id=worker-123"))
+        .stdout(contains("OpenAI docs and repositories"));
+}
+
+#[test]
 fn policy_dump_json_includes_headers_absent() {
     let mut file = NamedTempFile::new().expect("create temp config");
     file.write_all(

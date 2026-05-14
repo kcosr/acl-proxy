@@ -493,7 +493,12 @@ pub enum PolicyDefaultAction {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PolicyRuleTemplateConfig {
     pub action: PolicyDefaultAction,
-    pub pattern: String,
+
+    #[serde(default)]
+    pub pattern: Option<String>,
+
+    #[serde(default)]
+    pub patterns: Option<Vec<String>>,
 
     #[serde(default)]
     pub description: Option<String>,
@@ -558,6 +563,9 @@ pub struct PolicyRuleDirectConfig {
 
     #[serde(default)]
     pub pattern: Option<String>,
+
+    #[serde(default)]
+    pub patterns: Option<Vec<String>>,
 
     #[serde(default)]
     pub description: Option<String>,
@@ -926,6 +934,7 @@ impl Config {
             let has_match_criteria = match rule {
                 PolicyRuleConfig::Direct(d) => {
                     d.pattern.is_some()
+                        || d.patterns.is_some()
                         || !d.subnets.is_empty()
                         || d.methods.is_some()
                         || d.headers_absent.is_some()
@@ -936,7 +945,7 @@ impl Config {
 
             if !has_match_criteria {
                 return Err(ConfigError::Invalid(format!(
-                    "policy.rules[{idx}] must specify at least one of pattern, subnets, methods, headers_absent, headers_match, or include"
+                    "policy.rules[{idx}] must specify at least one of pattern, patterns, subnets, methods, headers_absent, headers_match, or include"
                 )));
             }
         }

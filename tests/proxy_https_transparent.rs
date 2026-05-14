@@ -688,6 +688,7 @@ async fn allowed_https_transparent_is_proxied_and_captured() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -782,6 +783,7 @@ async fn configured_egress_forwarding_applies_to_https_transparent_requests() {
         acl_proxy::config::PolicyRuleDirectConfig {
             action: acl_proxy::config::PolicyDefaultAction::Allow,
             pattern: Some("https://transparent-target.test:9443/**".to_string()),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -847,6 +849,7 @@ async fn global_egress_request_actions_apply_to_https_transparent_requests() {
         acl_proxy::config::PolicyRuleDirectConfig {
             action: acl_proxy::config::PolicyDefaultAction::Allow,
             pattern: Some("https://transparent-target.test:9443/**".to_string()),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -925,6 +928,7 @@ async fn transparent_https_websocket_upgrade_is_tunneled() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -1048,6 +1052,7 @@ async fn allowed_https_transparent_h2_is_proxied_and_captured() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -1162,6 +1167,7 @@ async fn upstream_failure_https_transparent_is_captured() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -1273,6 +1279,7 @@ async fn concurrent_h2_streams_share_connection_and_are_captured() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -1472,6 +1479,7 @@ async fn concurrent_h2_streams_mixed_allow_and_deny() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -1684,6 +1692,7 @@ async fn large_h2_request_body_is_truncated_in_capture() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -1810,6 +1819,7 @@ async fn large_h2_response_body_is_truncated_in_capture() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -1940,6 +1950,7 @@ async fn h2_client_to_http1_only_upstream_preserves_versions_in_capture() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -2061,6 +2072,7 @@ async fn h2_client_to_h2_capable_upstream_preserves_h2_in_capture() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -2178,6 +2190,7 @@ async fn denied_https_transparent_returns_403() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -2307,6 +2320,7 @@ async fn denied_https_transparent_h2_returns_403() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),

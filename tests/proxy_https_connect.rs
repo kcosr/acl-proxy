@@ -341,6 +341,7 @@ async fn allowed_https_via_connect_is_proxied_and_captured() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -427,6 +428,7 @@ async fn configured_egress_forwarding_applies_to_https_connect_inner_requests() 
         acl_proxy::config::PolicyRuleDirectConfig {
             action: acl_proxy::config::PolicyDefaultAction::Allow,
             pattern: Some("https://connect-target.test:9443/**".to_string()),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -485,6 +487,7 @@ async fn global_egress_request_actions_apply_to_https_connect_inner_requests() {
         acl_proxy::config::PolicyRuleDirectConfig {
             action: acl_proxy::config::PolicyDefaultAction::Allow,
             pattern: Some("https://connect-target.test:9443/**".to_string()),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -555,6 +558,7 @@ async fn denied_https_via_connect_returns_403() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
@@ -602,6 +606,7 @@ async fn headers_match_is_evaluated_on_decrypted_inner_connect_requests() {
         acl_proxy::config::PolicyRuleDirectConfig {
             action: acl_proxy::config::PolicyDefaultAction::Allow,
             pattern: Some("https://connect-target.test:9443/**".to_string()),
+            patterns: None,
             description: Some("Allow trusted workload identities".to_string()),
             methods: None,
             subnets: Vec::new(),
@@ -690,6 +695,7 @@ async fn loop_detected_on_connect_returns_508() {
                 upstream_addr.ip(),
                 upstream_addr.port()
             )),
+            patterns: None,
             description: None,
             methods: None,
             subnets: Vec::new(),
