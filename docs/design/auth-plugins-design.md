@@ -166,8 +166,9 @@ Notes:
 - `decision` is `"allow"`, `"deny"`, or `"pass"`.
 - `headers` may be empty or omitted when no headers are included.
 - Header values may be strings; repeated headers may be encoded as arrays.
-- `requestHeaders` and `responseHeaders` are valid only with `decision = "allow"`;
-  they must be empty or omitted with `decision = "pass"`.
+- `requestHeaders` and `responseHeaders` are applied with `decision = "allow"`;
+  they are ignored with `decision = "deny"` and must be empty or omitted with
+  `decision = "pass"`.
 - Plugins should write only JSON responses to stdout.
 
 ## Runtime behavior

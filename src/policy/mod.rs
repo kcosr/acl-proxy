@@ -2452,6 +2452,42 @@ external_auth_profile = "example"
     }
 
     #[test]
+    fn static_deny_before_delegate_is_terminal() {
+        let toml = r#"
+default = "allow"
+
+[external_auth_profiles.example]
+webhook_url = "https://auth.internal/start"
+timeout_ms = 5000
+
+[[rules]]
+action = "deny"
+pattern = "https://example.com/private/**"
+
+[[rules]]
+action = "delegate"
+pattern = "https://example.com/**"
+external_auth_profile = "example"
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+        let headers = HeaderMap::new();
+
+        let decision = engine.evaluate(
+            "https://example.com/private/secret",
+            None,
+            Some("GET"),
+            &headers,
+        );
+
+        assert!(!decision.allowed);
+        let matched = decision.matched.expect("matched rule");
+        assert_eq!(matched.index, 0);
+        assert!(matches!(matched.action, PolicyRuleAction::Deny));
+    }
+
+    #[test]
     fn headers_match_only_rule_is_valid_match_criteria() {
         let toml = r#"
 default = "deny"

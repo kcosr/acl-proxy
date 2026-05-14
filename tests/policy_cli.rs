@@ -284,6 +284,59 @@ description = "OpenAI docs and repositories"
 }
 
 #[test]
+fn policy_dump_json_renders_delegate_action_and_external_auth_profile() {
+    let mut file = NamedTempFile::new().expect("create temp config");
+    file.write_all(
+        br#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles.example_delegate]
+webhook_url = "https://auth.internal/start"
+timeout_ms = 5000
+
+[[policy.rules]]
+action = "delegate"
+pattern = "https://example.com/**"
+external_auth_profile = "example_delegate"
+description = "Delegate example"
+        "#,
+    )
+    .expect("write config");
+
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
+    cmd.arg("policy")
+        .arg("dump")
+        .arg("--format")
+        .arg("json")
+        .arg("--config")
+        .arg(file.path());
+
+    let assert = cmd.assert().success();
+    let stdout =
+        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is valid UTF-8");
+    let value: Value = serde_json::from_str(&stdout).expect("output is valid JSON");
+    let rules = value["rules"].as_array().expect("rules is an array");
+    assert_eq!(rules.len(), 1);
+
+    let rule = &rules[0];
+    assert_eq!(rule["action"], "delegate");
+    assert_eq!(rule["pattern"], "https://example.com/**");
+    assert_eq!(rule["description"], "Delegate example");
+    assert_eq!(rule["external_auth"]["profile"], "example_delegate");
+}
+
+#[test]
 fn policy_dump_table_expands_patterns_to_rows() {
     let mut file = NamedTempFile::new().expect("create temp config");
     file.write_all(
