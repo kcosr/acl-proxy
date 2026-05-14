@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.13] - 2026-05-14
 
 ### Breaking Changes
 - Require external authorization rules to use `action = "delegate"`; `external_auth_profile` is now rejected on local `allow` and `deny` rules ([#49](https://github.com/kcosr/acl-proxy/pull/49)).
