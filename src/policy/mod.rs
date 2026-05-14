@@ -467,26 +467,26 @@ fn expand_direct_rule(
         return Err(PolicyError::RuleInvalid {
             index,
             reason:
-                "policy rule must define at least a pattern, subnets, methods, headers_absent, or headers_match"
+                "policy rule must define at least a pattern, patterns, subnets, methods, headers_absent, or headers_match"
                     .to_string(),
         });
     }
 
     let patterns = patterns.unwrap();
-    let mut placeholders = BTreeSet::new();
-    for pattern in &patterns {
-        collect_placeholders(pattern, &mut placeholders);
-    }
+    let mut extra_placeholders = BTreeSet::new();
     if let Some(desc) = &rule.description {
-        collect_placeholders(desc, &mut placeholders);
+        collect_placeholders(desc, &mut extra_placeholders);
     }
 
     if let Some(rule_id) = &rule.rule_id {
-        collect_placeholders(rule_id, &mut placeholders);
+        collect_placeholders(rule_id, &mut extra_placeholders);
     }
 
-    if placeholders.is_empty() {
-        for pattern in patterns {
+    for pattern in patterns {
+        let mut placeholders = extra_placeholders.clone();
+        collect_placeholders(&pattern, &mut placeholders);
+
+        if placeholders.is_empty() {
             out.push(ExpandedRule {
                 action: rule.action,
                 pattern: Some(pattern),
@@ -500,40 +500,35 @@ fn expand_direct_rule(
                 header_actions: rule.header_actions.clone(),
                 external_auth_profile: rule.external_auth_profile.clone(),
             });
+            continue;
         }
-        return Ok(());
-    }
 
-    let resolved = resolve_placeholders(rule.with.as_ref(), macros, &placeholders, |_| {
-        format!(
-            " (required by direct rule pattern {pattern})",
-            pattern = patterns.join(", ")
-        )
-    })?;
+        let resolved = resolve_placeholders(rule.with.as_ref(), macros, &placeholders, |_| {
+            format!(" (required by direct rule pattern {pattern})")
+        })?;
 
-    let mut combos = cartesian_product(&resolved);
-    let keys_to_vary = keys_for_url_variants(rule.add_url_enc_variants.as_ref(), &placeholders);
-    if !keys_to_vary.is_empty() {
-        combos = add_url_encoded_variants(combos, &keys_to_vary);
-    }
+        let mut combos = cartesian_product(&resolved);
+        let keys_to_vary = keys_for_url_variants(rule.add_url_enc_variants.as_ref(), &placeholders);
+        if !keys_to_vary.is_empty() {
+            combos = add_url_encoded_variants(combos, &keys_to_vary);
+        }
 
-    for combo in combos {
-        let description_interp = rule
-            .description
-            .as_ref()
-            .map(|d| interpolate_template(d, &combo));
-        let rule_id_interp = rule
-            .rule_id
-            .as_ref()
-            .map(|id| interpolate_template(id, &combo));
+        for combo in combos {
+            let pattern_interp = interpolate_template(&pattern, &combo);
+            let description_interp = rule
+                .description
+                .as_ref()
+                .map(|d| interpolate_template(d, &combo));
+            let rule_id_interp = rule
+                .rule_id
+                .as_ref()
+                .map(|id| interpolate_template(id, &combo));
 
-        for pattern in &patterns {
-            let pattern_interp = interpolate_template(pattern, &combo);
             out.push(ExpandedRule {
                 action: rule.action,
                 pattern: Some(pattern_interp),
-                description: description_interp.clone(),
-                rule_id: rule_id_interp.clone(),
+                description: description_interp,
+                rule_id: rule_id_interp,
                 subnets: rule.subnets.clone(),
                 methods: methods.clone(),
                 headers_absent: headers_absent.clone(),
@@ -571,12 +566,19 @@ fn normalize_patterns(
         }
 
         let mut normalized = Vec::with_capacity(patterns.len());
+        let mut seen = BTreeSet::new();
         for (entry_idx, pattern) in patterns.iter().enumerate() {
             let trimmed = pattern.trim();
             if trimmed.is_empty() {
                 return Err(PolicyError::RuleInvalid {
                     index,
                     reason: format!("patterns entry at index {entry_idx} must not be empty"),
+                });
+            }
+            if !seen.insert(trimmed.to_string()) {
+                return Err(PolicyError::RuleInvalid {
+                    index,
+                    reason: format!("patterns entry at index {entry_idx} duplicates an earlier pattern"),
                 });
             }
             normalized.push(trimmed.to_string());
@@ -608,9 +610,8 @@ fn reject_multi_pattern_rule_id(
     if rule_id.is_some() && patterns.is_some_and(|patterns| patterns.len() > 1) {
         return Err(PolicyError::RuleInvalid {
             index,
-            reason:
-                "rule_id is not allowed on multi-pattern rules unless unique effective rule IDs are configured"
-                    .to_string(),
+            reason: "rule_id is not allowed on multi-pattern rules; use one rule per pattern when rule_id is required"
+                .to_string(),
         });
     }
 
@@ -664,11 +665,9 @@ fn expand_include_rule(
         template_patterns.push(TemplatePatterns { template, patterns });
     }
 
-    let mut placeholders = BTreeSet::new();
+    let mut template_extra_placeholders = Vec::with_capacity(template_patterns.len());
     for template_patterns in &template_patterns {
-        for pattern in &template_patterns.patterns {
-            collect_placeholders(pattern, &mut placeholders);
-        }
+        let mut placeholders = BTreeSet::new();
         let template = template_patterns.template;
         if let Some(desc) = &template.description {
             collect_placeholders(desc, &mut placeholders);
@@ -676,23 +675,29 @@ fn expand_include_rule(
         if let Some(rule_id) = &template.rule_id {
             collect_placeholders(rule_id, &mut placeholders);
         }
+        template_extra_placeholders.push(placeholders);
     }
 
-    if placeholders.is_empty() {
-        for template_patterns in &template_patterns {
-            let template = template_patterns.template;
-            let headers_absent =
-                validate_headers_absent(template.headers_absent.as_deref(), index)?;
-            let headers_match = validate_headers_match(template.headers_match.as_ref(), index)?;
-            let methods = rule
-                .methods
-                .as_ref()
-                .map(|m| m.as_slice().to_vec())
-                .or_else(|| template.methods.as_ref().map(|m| m.as_slice().to_vec()))
-                .unwrap_or_default();
-            let request_timeout_ms = rule.request_timeout_ms.or(template.request_timeout_ms);
+    for (template_patterns, extra_placeholders) in template_patterns
+        .iter()
+        .zip(template_extra_placeholders.iter())
+    {
+        let template = template_patterns.template;
+        let headers_absent = validate_headers_absent(template.headers_absent.as_deref(), index)?;
+        let headers_match = validate_headers_match(template.headers_match.as_ref(), index)?;
+        let methods = rule
+            .methods
+            .as_ref()
+            .map(|m| m.as_slice().to_vec())
+            .or_else(|| template.methods.as_ref().map(|m| m.as_slice().to_vec()))
+            .unwrap_or_default();
+        let request_timeout_ms = rule.request_timeout_ms.or(template.request_timeout_ms);
 
-            for pattern in &template_patterns.patterns {
+        for pattern in &template_patterns.patterns {
+            let mut placeholders = extra_placeholders.clone();
+            collect_placeholders(pattern, &mut placeholders);
+
+            if placeholders.is_empty() {
                 out.push(ExpandedRule {
                     action: template.action,
                     pattern: Some(pattern.clone()),
@@ -710,51 +715,36 @@ fn expand_include_rule(
                     header_actions: template.header_actions.clone(),
                     external_auth_profile: template.external_auth_profile.clone(),
                 });
+                continue;
             }
-        }
-        return Ok(());
-    }
 
-    let resolved = resolve_placeholders(rule.with.as_ref(), macros, &placeholders, |_| {
-        format!(" (required by ruleset {ruleset})", ruleset = rule.include)
-    })?;
+            let resolved = resolve_placeholders(rule.with.as_ref(), macros, &placeholders, |_| {
+                format!(" (required by ruleset {ruleset})", ruleset = rule.include)
+            })?;
 
-    let mut combos = cartesian_product(&resolved);
-    let keys_to_vary = keys_for_url_variants(rule.add_url_enc_variants.as_ref(), &placeholders);
-    if !keys_to_vary.is_empty() {
-        combos = add_url_encoded_variants(combos, &keys_to_vary);
-    }
+            let mut combos = cartesian_product(&resolved);
+            let keys_to_vary =
+                keys_for_url_variants(rule.add_url_enc_variants.as_ref(), &placeholders);
+            if !keys_to_vary.is_empty() {
+                combos = add_url_encoded_variants(combos, &keys_to_vary);
+            }
 
-    for combo in combos {
-        for template_patterns in &template_patterns {
-            let template = template_patterns.template;
-            let headers_absent =
-                validate_headers_absent(template.headers_absent.as_deref(), index)?;
-            let headers_match = validate_headers_match(template.headers_match.as_ref(), index)?;
-            let methods = rule
-                .methods
-                .as_ref()
-                .map(|m| m.as_slice().to_vec())
-                .or_else(|| template.methods.as_ref().map(|m| m.as_slice().to_vec()))
-                .unwrap_or_default();
-            let request_timeout_ms = rule.request_timeout_ms.or(template.request_timeout_ms);
-
-            let description_interp = template
-                .description
-                .as_ref()
-                .map(|d| interpolate_template(d, &combo));
-            let rule_id_interp = template
-                .rule_id
-                .as_ref()
-                .map(|id| interpolate_template(id, &combo));
-
-            for pattern in &template_patterns.patterns {
+            for combo in combos {
                 let pattern_interp = interpolate_template(pattern, &combo);
+                let description_interp = template
+                    .description
+                    .as_ref()
+                    .map(|d| interpolate_template(d, &combo));
+                let rule_id_interp = template
+                    .rule_id
+                    .as_ref()
+                    .map(|id| interpolate_template(id, &combo));
+
                 out.push(ExpandedRule {
                     action: template.action,
                     pattern: Some(pattern_interp),
-                    description: description_interp.clone(),
-                    rule_id: rule_id_interp.clone(),
+                    description: description_interp,
+                    rule_id: rule_id_interp,
                     subnets: if !rule.subnets.is_empty() {
                         rule.subnets.clone()
                     } else {
@@ -2587,6 +2577,16 @@ default = "deny"
 
 [[rules]]
 action = "allow"
+patterns = ["https://example.com/**", " https://example.com/** "]
+                "#,
+                "patterns entry at index 1 duplicates an earlier pattern",
+            ),
+            (
+                r#"
+default = "deny"
+
+[[rules]]
+action = "allow"
 patterns = ["https://example.com/**", "https://example.org/**"]
 rule_id = "duplicate"
                 "#,
@@ -2682,13 +2682,48 @@ add_url_enc_variants = ["repo"]
             patterns,
             vec![
                 "https://gitlab.internal/sip/sipsource.git/**",
-                "https://gitlab.internal/api/v4/projects/sip/sipsource?**",
                 "https://gitlab.internal/sip%2Fsipsource.git/**",
-                "https://gitlab.internal/api/v4/projects/sip%2Fsipsource?**",
                 "https://gitlab.internal/sip/sipsink.git/**",
-                "https://gitlab.internal/api/v4/projects/sip/sipsink?**",
                 "https://gitlab.internal/sip%2Fsipsink.git/**",
+                "https://gitlab.internal/api/v4/projects/sip/sipsource?**",
+                "https://gitlab.internal/api/v4/projects/sip%2Fsipsource?**",
+                "https://gitlab.internal/api/v4/projects/sip/sipsink?**",
                 "https://gitlab.internal/api/v4/projects/sip%2Fsipsink?**",
+            ]
+        );
+    }
+
+    #[test]
+    fn direct_patterns_with_divergent_placeholders_match_duplicated_rule_behavior() {
+        let toml = r#"
+default = "deny"
+
+[macros]
+tenant = ["tenant-a"]
+repo = ["service-a", "service-b"]
+
+[[rules]]
+action = "allow"
+patterns = [
+  "https://example.com/static/{tenant}/**",
+  "https://example.com/repos/{repo}/**",
+]
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let effective = EffectivePolicy::from_config(&cfg).expect("effective policy");
+        let patterns = effective
+            .rules
+            .iter()
+            .map(|rule| rule.pattern.as_deref().expect("pattern"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            patterns,
+            vec![
+                "https://example.com/static/tenant-a/**",
+                "https://example.com/repos/service-a/**",
+                "https://example.com/repos/service-b/**",
             ]
         );
     }
@@ -2712,6 +2747,9 @@ methods = ["GET"]
 [[rules]]
 include = "gitlab"
 add_url_enc_variants = ["repo"]
+methods = ["POST"]
+subnets = ["10.0.0.0/8"]
+request_timeout_ms = 2500
         "#;
 
         let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
@@ -2724,17 +2762,24 @@ add_url_enc_variants = ["repo"]
         );
         assert_eq!(
             effective.rules[1].pattern.as_deref(),
-            Some("https://gitlab.internal/api/v4/projects/sip/sipsource?**")
+            Some("https://gitlab.internal/sip%2Fsipsource.git/**")
         );
         assert_eq!(
             effective.rules[2].pattern.as_deref(),
-            Some("https://gitlab.internal/sip%2Fsipsource.git/**")
+            Some("https://gitlab.internal/api/v4/projects/sip/sipsource?**")
         );
         assert_eq!(
             effective.rules[3].pattern.as_deref(),
             Some("https://gitlab.internal/api/v4/projects/sip%2Fsipsource?**")
         );
-        assert_eq!(effective.rules[0].methods, vec!["GET".to_string()]);
+        for rule in &effective.rules {
+            assert_eq!(rule.methods, vec!["POST".to_string()]);
+            assert_eq!(
+                rule.subnets.iter().map(|subnet| subnet.to_string()).collect::<Vec<_>>(),
+                vec!["10.0.0.0/8".to_string()]
+            );
+            assert_eq!(rule.request_timeout_ms, Some(2500));
+        }
 
         let invalid_toml = r#"
 default = "deny"
@@ -2752,6 +2797,25 @@ include = "bad"
         let msg = format!("{err}");
         assert!(
             msg.contains("policy ruleset template must not define both pattern and patterns"),
+            "unexpected error message: {msg}"
+        );
+
+        let rule_id_toml = r#"
+default = "deny"
+
+[[rulesets.bad]]
+action = "allow"
+patterns = ["https://example.com/**", "https://example.org/**"]
+rule_id = "duplicate"
+
+[[rules]]
+include = "bad"
+        "#;
+        let rule_id_cfg: PolicyConfig = toml::from_str(rule_id_toml).expect("parse policy config");
+        let err = EffectivePolicy::from_config(&rule_id_cfg).expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("rule_id is not allowed on multi-pattern rules"),
             "unexpected error message: {msg}"
         );
     }

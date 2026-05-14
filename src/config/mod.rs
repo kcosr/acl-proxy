@@ -945,7 +945,7 @@ impl Config {
 
             if !has_match_criteria {
                 return Err(ConfigError::Invalid(format!(
-                    "policy.rules[{idx}] must specify at least one of pattern, subnets, methods, headers_absent, headers_match, or include"
+                    "policy.rules[{idx}] must specify at least one of pattern, patterns, subnets, methods, headers_absent, headers_match, or include"
                 )));
             }
         }
