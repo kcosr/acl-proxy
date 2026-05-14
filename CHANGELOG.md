@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 ### Added
-- Add `patterns = [...]` policy rule support for expanding several URL patterns with shared rule attributes into singular effective rules.
+- Add `patterns = [...]` policy rule support for expanding several URL patterns with shared rule attributes into singular effective rules ([#48](https://github.com/kcosr/acl-proxy/pull/48)).
 
 ## [0.0.12] - 2026-03-19
 
