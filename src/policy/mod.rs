@@ -2552,6 +2552,76 @@ headers_match = { "x-workload-id" = "worker-123" }
     }
 
     #[test]
+    fn headers_match_and_headers_not_match_combine_conjunctively() {
+        let toml = r#"
+default = "allow"
+
+[[rules]]
+action = "deny"
+pattern = "https://example.com/**"
+headers_match = { "x-tenant-id" = "tenant-a" }
+headers_not_match = { "x-aw-policy-context" = "internal" }
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        let both_pass = header_map(&[
+            ("x-tenant-id", "tenant-a"),
+            ("x-aw-policy-context", "default"),
+        ]);
+        let only_headers_match_passes = header_map(&[
+            ("x-tenant-id", "tenant-a"),
+            ("x-aw-policy-context", "internal"),
+        ]);
+        let only_headers_not_match_passes = header_map(&[
+            ("x-tenant-id", "tenant-b"),
+            ("x-aw-policy-context", "default"),
+        ]);
+        let neither_passes = header_map(&[
+            ("x-tenant-id", "tenant-b"),
+            ("x-aw-policy-context", "internal"),
+        ]);
+
+        assert!(
+            !engine
+                .evaluate("https://example.com/path", None, Some("GET"), &both_pass)
+                .allowed,
+            "rule should deny only when both header predicates pass"
+        );
+        assert!(
+            engine
+                .evaluate(
+                    "https://example.com/path",
+                    None,
+                    Some("GET"),
+                    &only_headers_match_passes
+                )
+                .allowed
+        );
+        assert!(
+            engine
+                .evaluate(
+                    "https://example.com/path",
+                    None,
+                    Some("GET"),
+                    &only_headers_not_match_passes
+                )
+                .allowed
+        );
+        assert!(
+            engine
+                .evaluate(
+                    "https://example.com/path",
+                    None,
+                    Some("GET"),
+                    &neither_passes
+                )
+                .allowed
+        );
+    }
+
+    #[test]
     fn headers_match_failure_falls_through_before_external_auth_rule() {
         let toml = r#"
 default = "deny"
