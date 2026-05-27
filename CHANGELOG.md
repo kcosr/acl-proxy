@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.0.14] - 2026-05-27
 
 ### Added
 - Add `headers_not_match` policy predicate for excluding exact request-header values while matching missing or non-excluded values ([#50](https://github.com/kcosr/acl-proxy/pull/50)).
