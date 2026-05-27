@@ -80,6 +80,7 @@ struct CompiledRule {
     methods: Vec<String>,
     headers_absent: Vec<HeaderName>,
     headers_match: Vec<CompiledHeaderMatch>,
+    headers_not_match: Vec<CompiledHeaderMatch>,
     request_timeout_ms: Option<u64>,
     header_actions: Vec<CompiledHeaderAction>,
     external_auth_profile: Option<String>,
@@ -107,6 +108,7 @@ struct ExpandedRule {
     methods: Vec<String>,
     headers_absent: Option<Vec<String>>,
     headers_match: Option<BTreeMap<String, Vec<String>>>,
+    headers_not_match: Option<BTreeMap<String, Vec<String>>>,
     request_timeout_ms: Option<u64>,
     header_actions: Vec<HeaderActionConfig>,
     external_auth_profile: Option<String>,
@@ -134,6 +136,7 @@ pub struct EffectiveRule {
     pub methods: Vec<String>,
     pub headers_absent: Vec<String>,
     pub headers_match: BTreeMap<String, Vec<String>>,
+    pub headers_not_match: BTreeMap<String, Vec<String>>,
     pub request_timeout_ms: Option<u64>,
     pub header_actions: Vec<EffectiveHeaderAction>,
     pub external_auth: Option<EffectiveExternalAuth>,
@@ -174,7 +177,13 @@ impl PolicyEngine {
 
         for (idx, rule) in expanded.rules.into_iter().enumerate() {
             let headers_absent = compile_headers_absent(rule.headers_absent.as_deref(), idx)?;
-            let headers_match = compile_headers_match(rule.headers_match.as_ref(), idx)?;
+            let headers_match =
+                compile_header_value_match(rule.headers_match.as_ref(), idx, "headers_match")?;
+            let headers_not_match = compile_header_value_match(
+                rule.headers_not_match.as_ref(),
+                idx,
+                "headers_not_match",
+            )?;
             let header_actions = compile_header_actions(&rule.header_actions, idx)?;
 
             let regex = if let Some(ref pattern) = rule.pattern {
@@ -200,6 +209,7 @@ impl PolicyEngine {
                 methods: rule.methods,
                 headers_absent,
                 headers_match,
+                headers_not_match,
                 request_timeout_ms: rule.request_timeout_ms,
                 header_actions,
                 external_auth_profile: rule.external_auth_profile,
@@ -272,6 +282,12 @@ impl PolicyEngine {
             }
 
             if !rule.headers_match.is_empty() && !all_headers_match(headers, &rule.headers_match) {
+                continue;
+            }
+
+            if !rule.headers_not_match.is_empty()
+                && !all_headers_not_match(headers, &rule.headers_not_match)
+            {
                 continue;
             }
 
@@ -368,6 +384,7 @@ impl EffectivePolicy {
                     methods: rule.methods,
                     headers_absent: rule.headers_absent.unwrap_or_default(),
                     headers_match: rule.headers_match.unwrap_or_default(),
+                    headers_not_match: rule.headers_not_match.unwrap_or_default(),
                     request_timeout_ms: rule.request_timeout_ms,
                     header_actions,
                     external_auth,
@@ -438,8 +455,12 @@ fn expand_direct_rule(
     let has_methods = !methods.is_empty();
     let headers_absent = validate_headers_absent(rule.headers_absent.as_deref(), index)?;
     let has_headers_absent = headers_absent.is_some();
-    let headers_match = validate_headers_match(rule.headers_match.as_ref(), index)?;
+    let headers_match =
+        validate_header_value_match(rule.headers_match.as_ref(), index, "headers_match")?;
     let has_headers_match = headers_match.is_some();
+    let headers_not_match =
+        validate_header_value_match(rule.headers_not_match.as_ref(), index, "headers_not_match")?;
+    let has_headers_not_match = headers_not_match.is_some();
 
     validate_rule_external_auth(
         rule.action,
@@ -448,7 +469,13 @@ fn expand_direct_rule(
         index,
     )?;
 
-    if !has_pattern && (has_subnets || has_methods || has_headers_absent || has_headers_match) {
+    if !has_pattern
+        && (has_subnets
+            || has_methods
+            || has_headers_absent
+            || has_headers_match
+            || has_headers_not_match)
+    {
         out.push(ExpandedRule {
             action: rule.action,
             pattern: None,
@@ -458,6 +485,7 @@ fn expand_direct_rule(
             methods,
             headers_absent,
             headers_match,
+            headers_not_match,
             request_timeout_ms: rule.request_timeout_ms,
             header_actions: rule.header_actions.clone(),
             external_auth_profile: rule.external_auth_profile.clone(),
@@ -469,7 +497,7 @@ fn expand_direct_rule(
         return Err(PolicyError::RuleInvalid {
             index,
             reason:
-                "policy rule must define at least a pattern, patterns, subnets, methods, headers_absent, or headers_match"
+                "policy rule must define at least a pattern, patterns, subnets, methods, headers_absent, headers_match, or headers_not_match"
                     .to_string(),
         });
     }
@@ -498,6 +526,7 @@ fn expand_direct_rule(
                 methods: methods.clone(),
                 headers_absent: headers_absent.clone(),
                 headers_match: headers_match.clone(),
+                headers_not_match: headers_not_match.clone(),
                 request_timeout_ms: rule.request_timeout_ms,
                 header_actions: rule.header_actions.clone(),
                 external_auth_profile: rule.external_auth_profile.clone(),
@@ -535,6 +564,7 @@ fn expand_direct_rule(
                 methods: methods.clone(),
                 headers_absent: headers_absent.clone(),
                 headers_match: headers_match.clone(),
+                headers_not_match: headers_not_match.clone(),
                 request_timeout_ms: rule.request_timeout_ms,
                 header_actions: rule.header_actions.clone(),
                 external_auth_profile: rule.external_auth_profile.clone(),
@@ -615,7 +645,9 @@ fn normalize_patterns(
             if !seen.insert(trimmed.to_string()) {
                 return Err(PolicyError::RuleInvalid {
                     index,
-                    reason: format!("patterns entry at index {entry_idx} duplicates an earlier pattern"),
+                    reason: format!(
+                        "patterns entry at index {entry_idx} duplicates an earlier pattern"
+                    ),
                 });
             }
             normalized.push(trimmed.to_string());
@@ -711,7 +743,13 @@ fn expand_include_rule(
     {
         let template = template_patterns.template;
         let headers_absent = validate_headers_absent(template.headers_absent.as_deref(), index)?;
-        let headers_match = validate_headers_match(template.headers_match.as_ref(), index)?;
+        let headers_match =
+            validate_header_value_match(template.headers_match.as_ref(), index, "headers_match")?;
+        let headers_not_match = validate_header_value_match(
+            template.headers_not_match.as_ref(),
+            index,
+            "headers_not_match",
+        )?;
         let methods = rule
             .methods
             .as_ref()
@@ -738,6 +776,7 @@ fn expand_include_rule(
                     methods: methods.clone(),
                     headers_absent: headers_absent.clone(),
                     headers_match: headers_match.clone(),
+                    headers_not_match: headers_not_match.clone(),
                     request_timeout_ms,
                     header_actions: template.header_actions.clone(),
                     external_auth_profile: template.external_auth_profile.clone(),
@@ -780,6 +819,7 @@ fn expand_include_rule(
                     methods: methods.clone(),
                     headers_absent: headers_absent.clone(),
                     headers_match: headers_match.clone(),
+                    headers_not_match: headers_not_match.clone(),
                     request_timeout_ms,
                     header_actions: template.header_actions.clone(),
                     external_auth_profile: template.external_auth_profile.clone(),
@@ -1027,9 +1067,10 @@ fn compile_headers_absent(
         .collect()
 }
 
-fn compile_headers_match(
+fn compile_header_value_match(
     headers_match: Option<&BTreeMap<String, Vec<String>>>,
     index: usize,
+    field_name: &str,
 ) -> Result<Vec<CompiledHeaderMatch>, PolicyError> {
     let Some(headers_match) = headers_match else {
         return Ok(Vec::new());
@@ -1041,7 +1082,7 @@ fn compile_headers_match(
         let header_name = HeaderName::from_lowercase(name.as_bytes()).map_err(|err| {
             PolicyError::RuleInvalid {
                 index,
-                reason: format!("invalid header name '{}' in headers_match: {err}", name),
+                reason: format!("invalid header name '{}' in {field_name}: {err}", name),
             }
         })?;
 
@@ -1101,9 +1142,10 @@ fn validate_headers_absent(
     Ok(Some(normalized))
 }
 
-fn validate_headers_match(
+fn validate_header_value_match(
     headers_match: Option<&BTreeMap<String, HeaderMatchValueConfig>>,
     index: usize,
+    field_name: &str,
 ) -> Result<Option<BTreeMap<String, Vec<String>>>, PolicyError> {
     let Some(headers_match) = headers_match else {
         return Ok(None);
@@ -1112,7 +1154,7 @@ fn validate_headers_match(
     if headers_match.is_empty() {
         return Err(PolicyError::RuleInvalid {
             index,
-            reason: "headers_match must not be empty".to_string(),
+            reason: format!("{field_name} must not be empty"),
         });
     }
 
@@ -1124,7 +1166,7 @@ fn validate_headers_match(
         let parsed = HeaderName::from_lowercase(lowered.as_bytes()).map_err(|err| {
             PolicyError::RuleInvalid {
                 index,
-                reason: format!("invalid header name '{}' in headers_match: {err}", name),
+                reason: format!("invalid header name '{}' in {field_name}: {err}", name),
             }
         })?;
         let normalized_name = parsed.as_str().to_string();
@@ -1133,19 +1175,24 @@ fn validate_headers_match(
             return Err(PolicyError::RuleInvalid {
                 index,
                 reason: format!(
-                    "duplicate header name '{}' in headers_match after normalization",
-                    name
+                    "duplicate header name '{}' in {field_name} after normalization",
+                    name,
                 ),
             });
         }
 
         let values = raw_values.values();
         if values.is_empty() {
+            let value_label = if field_name == "headers_match" {
+                "allowed value"
+            } else {
+                "configured value"
+            };
             return Err(PolicyError::RuleInvalid {
                 index,
                 reason: format!(
-                    "headers_match entry '{}' must include at least one allowed value",
-                    name
+                    "{field_name} entry '{}' must include at least one {value_label}",
+                    name,
                 ),
             });
         }
@@ -1154,8 +1201,8 @@ fn validate_headers_match(
             return Err(PolicyError::RuleInvalid {
                 index,
                 reason: format!(
-                    "headers_match entry '{}' must not include empty-string values",
-                    name
+                    "{field_name} entry '{}' must not include empty-string values",
+                    name,
                 ),
             });
         }
@@ -1178,6 +1225,20 @@ fn all_headers_match(
 ) -> bool {
     headers_match.iter().all(|matcher| {
         headers.get_all(&matcher.name).iter().any(|actual| {
+            matcher
+                .values
+                .iter()
+                .any(|expected| actual.as_bytes() == expected.as_slice())
+        })
+    })
+}
+
+fn all_headers_not_match(
+    headers: &HeaderMap<HeaderValue>,
+    headers_not_match: &[CompiledHeaderMatch],
+) -> bool {
+    headers_not_match.iter().all(|matcher| {
+        !headers.get_all(&matcher.name).iter().any(|actual| {
             matcher
                 .values
                 .iter()
@@ -1553,6 +1614,7 @@ mod tests {
                 subnets: vec!["192.168.0.0/16".parse::<IpNet>().unwrap()],
                 headers_absent: None,
                 headers_match: None,
+                headers_not_match: None,
                 request_timeout_ms: None,
                 with: None,
                 add_url_enc_variants: None,
@@ -1584,6 +1646,7 @@ mod tests {
                 subnets: vec!["2001:db8::/32".parse::<IpNet>().unwrap()],
                 headers_absent: None,
                 headers_match: None,
+                headers_not_match: None,
                 request_timeout_ms: None,
                 with: None,
                 add_url_enc_variants: None,
@@ -1622,6 +1685,7 @@ mod tests {
                     subnets: Vec::new(),
                     headers_absent: None,
                     headers_match: None,
+                    headers_not_match: None,
                     request_timeout_ms: None,
                     header_actions: Vec::new(),
                     external_auth_profile: None,
@@ -1636,6 +1700,7 @@ mod tests {
                     subnets: Vec::new(),
                     headers_absent: None,
                     headers_match: None,
+                    headers_not_match: None,
                     request_timeout_ms: None,
                     header_actions: Vec::new(),
                     external_auth_profile: None,
@@ -1700,6 +1765,7 @@ mod tests {
                     subnets: Vec::new(),
                     headers_absent: None,
                     headers_match: None,
+                    headers_not_match: None,
                     request_timeout_ms: None,
                     header_actions: Vec::new(),
                     external_auth_profile: None,
@@ -2265,6 +2331,150 @@ headers_match = { "x-workload-id" = "worker-123" }
     }
 
     #[test]
+    fn headers_not_match_matches_missing_and_non_matching_values_but_falls_through_on_match() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+pattern = "https://example.com/**"
+headers_not_match = { "x-aw-policy-context" = ["internal"] }
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/**"
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        let missing = HeaderMap::new();
+        let default_context = header_map(&[("x-aw-policy-context", "default")]);
+        let internal_context = header_map(&[("x-aw-policy-context", "internal")]);
+
+        assert!(
+            !engine
+                .evaluate("https://example.com/path", None, Some("GET"), &missing)
+                .allowed,
+            "missing header should match the deny guard"
+        );
+        assert!(
+            !engine
+                .evaluate(
+                    "https://example.com/path",
+                    None,
+                    Some("GET"),
+                    &default_context
+                )
+                .allowed,
+            "non-excluded value should match the deny guard"
+        );
+        assert!(
+            engine
+                .evaluate(
+                    "https://example.com/path",
+                    None,
+                    Some("GET"),
+                    &internal_context
+                )
+                .allowed,
+            "excluded value should not match the deny guard and should fall through"
+        );
+    }
+
+    #[test]
+    fn headers_not_match_fails_when_any_repeated_header_value_matches() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+pattern = "https://example.com/**"
+headers_not_match = { "x-aw-policy-context" = "internal" }
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/**"
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        let mut has_internal = HeaderMap::new();
+        has_internal.append(
+            HeaderName::from_static("x-aw-policy-context"),
+            HeaderValue::from_static("default"),
+        );
+        has_internal.append(
+            HeaderName::from_static("x-aw-policy-context"),
+            HeaderValue::from_static("internal"),
+        );
+
+        let mut no_internal = HeaderMap::new();
+        no_internal.append(
+            HeaderName::from_static("x-aw-policy-context"),
+            HeaderValue::from_static("default"),
+        );
+        no_internal.append(
+            HeaderName::from_static("x-aw-policy-context"),
+            HeaderValue::from_static("external"),
+        );
+
+        assert!(
+            engine
+                .evaluate("https://example.com/path", None, Some("GET"), &has_internal)
+                .allowed,
+            "any repeated excluded value should make the deny guard fall through"
+        );
+        assert!(
+            !engine
+                .evaluate("https://example.com/path", None, Some("GET"), &no_internal)
+                .allowed,
+            "repeated non-excluded values should match the deny guard"
+        );
+    }
+
+    #[test]
+    fn headers_not_match_multi_key_uses_and_semantics() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+pattern = "https://example.com/**"
+headers_not_match = { "x-aw-policy-context" = "internal", "x-channel" = "trusted" }
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/**"
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        let neither_excluded =
+            header_map(&[("x-aw-policy-context", "default"), ("x-channel", "public")]);
+        let one_excluded =
+            header_map(&[("x-aw-policy-context", "internal"), ("x-channel", "public")]);
+
+        assert!(
+            !engine
+                .evaluate(
+                    "https://example.com/path",
+                    None,
+                    Some("GET"),
+                    &neither_excluded
+                )
+                .allowed
+        );
+        assert!(
+            engine
+                .evaluate("https://example.com/path", None, Some("GET"), &one_excluded)
+                .allowed
+        );
+    }
+
+    #[test]
     fn headers_match_combines_with_methods_and_subnets_using_and_semantics() {
         let toml = r#"
 default = "deny"
@@ -2342,6 +2552,76 @@ headers_match = { "x-workload-id" = "worker-123" }
     }
 
     #[test]
+    fn headers_match_and_headers_not_match_combine_conjunctively() {
+        let toml = r#"
+default = "allow"
+
+[[rules]]
+action = "deny"
+pattern = "https://example.com/**"
+headers_match = { "x-tenant-id" = "tenant-a" }
+headers_not_match = { "x-aw-policy-context" = "internal" }
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        let both_pass = header_map(&[
+            ("x-tenant-id", "tenant-a"),
+            ("x-aw-policy-context", "default"),
+        ]);
+        let only_headers_match_passes = header_map(&[
+            ("x-tenant-id", "tenant-a"),
+            ("x-aw-policy-context", "internal"),
+        ]);
+        let only_headers_not_match_passes = header_map(&[
+            ("x-tenant-id", "tenant-b"),
+            ("x-aw-policy-context", "default"),
+        ]);
+        let neither_passes = header_map(&[
+            ("x-tenant-id", "tenant-b"),
+            ("x-aw-policy-context", "internal"),
+        ]);
+
+        assert!(
+            !engine
+                .evaluate("https://example.com/path", None, Some("GET"), &both_pass)
+                .allowed,
+            "rule should deny only when both header predicates pass"
+        );
+        assert!(
+            engine
+                .evaluate(
+                    "https://example.com/path",
+                    None,
+                    Some("GET"),
+                    &only_headers_match_passes
+                )
+                .allowed
+        );
+        assert!(
+            engine
+                .evaluate(
+                    "https://example.com/path",
+                    None,
+                    Some("GET"),
+                    &only_headers_not_match_passes
+                )
+                .allowed
+        );
+        assert!(
+            engine
+                .evaluate(
+                    "https://example.com/path",
+                    None,
+                    Some("GET"),
+                    &neither_passes
+                )
+                .allowed
+        );
+    }
+
+    #[test]
     fn headers_match_failure_falls_through_before_external_auth_rule() {
         let toml = r#"
 default = "deny"
@@ -2412,7 +2692,12 @@ pattern = "https://example.com/public/**"
         let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
         let headers = HeaderMap::new();
 
-        let first = engine.evaluate("https://example.com/public/index", None, Some("GET"), &headers);
+        let first = engine.evaluate(
+            "https://example.com/public/index",
+            None,
+            Some("GET"),
+            &headers,
+        );
         assert!(!first.allowed);
         assert_eq!(first.matched.as_ref().map(|rule| rule.index), Some(0));
         assert!(matches!(
@@ -2420,8 +2705,13 @@ pattern = "https://example.com/public/**"
             Some(PolicyRuleAction::Delegate)
         ));
 
-        let resumed =
-            engine.evaluate_from(1, "https://example.com/public/index", None, Some("GET"), &headers);
+        let resumed = engine.evaluate_from(
+            1,
+            "https://example.com/public/index",
+            None,
+            Some("GET"),
+            &headers,
+        );
         assert!(resumed.allowed);
         assert_eq!(resumed.matched.as_ref().map(|rule| rule.index), Some(1));
     }
@@ -2900,7 +3190,10 @@ request_timeout_ms = 2500
         for rule in &effective.rules {
             assert_eq!(rule.methods, vec!["POST".to_string()]);
             assert_eq!(
-                rule.subnets.iter().map(|subnet| subnet.to_string()).collect::<Vec<_>>(),
+                rule.subnets
+                    .iter()
+                    .map(|subnet| subnet.to_string())
+                    .collect::<Vec<_>>(),
                 vec!["10.0.0.0/8".to_string()]
             );
             assert_eq!(rule.request_timeout_ms, Some(2500));
@@ -3061,6 +3354,49 @@ pattern = "https://example.com/**"
         assert!(
             unset.rules[0].headers_match.is_empty(),
             "headers_match should be serialized as empty object when unset"
+        );
+    }
+
+    #[test]
+    fn effective_policy_includes_headers_not_match_and_defaults_to_empty_object() {
+        let configured_toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+pattern = "https://example.com/**"
+headers_not_match = { "x-aw-policy-context" = ["internal"], "x-channel" = "trusted" }
+        "#;
+
+        let unset_toml = r#"
+default = "deny"
+
+[[rules]]
+action = "allow"
+pattern = "https://example.com/**"
+        "#;
+
+        let configured_cfg: PolicyConfig =
+            toml::from_str(configured_toml).expect("parse policy config");
+        let unset_cfg: PolicyConfig = toml::from_str(unset_toml).expect("parse policy config");
+
+        let configured =
+            EffectivePolicy::from_config(&configured_cfg).expect("build effective policy");
+        let unset = EffectivePolicy::from_config(&unset_cfg).expect("build effective policy");
+
+        assert_eq!(
+            configured.rules[0].headers_not_match,
+            BTreeMap::from([
+                (
+                    "x-aw-policy-context".to_string(),
+                    vec!["internal".to_string()]
+                ),
+                ("x-channel".to_string(), vec!["trusted".to_string()]),
+            ])
+        );
+        assert!(
+            unset.rules[0].headers_not_match.is_empty(),
+            "headers_not_match should be serialized as empty object when unset"
         );
     }
 
@@ -3294,6 +3630,132 @@ include = "guard"
         assert!(
             msg.contains(
                 "headers_match entry 'x-workload-id' must include at least one allowed value"
+            ),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn headers_not_match_rejects_empty_map() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+headers_not_match = {}
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let err = PolicyEngine::from_config(&cfg).expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("headers_not_match must not be empty"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn headers_not_match_rejects_invalid_header_names() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+headers_not_match = { "bad header" = "internal" }
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let err = PolicyEngine::from_config(&cfg).expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid header name 'bad header' in headers_not_match"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn headers_not_match_rejects_duplicates_after_normalization() {
+        let toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+headers_not_match = { "X-AW-Policy-Context" = "internal", "x-aw-policy-context" = "trusted" }
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let err = PolicyEngine::from_config(&cfg).expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("duplicate header name"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn headers_not_match_rejects_empty_values_or_value_lists() {
+        let empty_value_toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+headers_not_match = { "x-aw-policy-context" = "" }
+        "#;
+
+        let empty_list_toml = r#"
+default = "deny"
+
+[[rules]]
+action = "deny"
+headers_not_match = { "x-aw-policy-context" = [] }
+        "#;
+
+        let empty_value_cfg: PolicyConfig =
+            toml::from_str(empty_value_toml).expect("parse policy config");
+        let empty_list_cfg: PolicyConfig =
+            toml::from_str(empty_list_toml).expect("parse policy config");
+
+        let empty_value_msg = format!(
+            "{}",
+            PolicyEngine::from_config(&empty_value_cfg).expect_err("expected err")
+        );
+        let empty_list_msg = format!(
+            "{}",
+            PolicyEngine::from_config(&empty_list_cfg).expect_err("expected err")
+        );
+
+        assert!(
+            empty_value_msg.contains("headers_not_match entry 'x-aw-policy-context' must not include empty-string values"),
+            "unexpected error message: {empty_value_msg}"
+        );
+        assert!(
+            empty_list_msg.contains(
+                "headers_not_match entry 'x-aw-policy-context' must include at least one configured value"
+            ),
+            "unexpected error message: {empty_list_msg}"
+        );
+    }
+
+    #[test]
+    fn ruleset_template_headers_not_match_is_validated() {
+        let toml = r#"
+default = "deny"
+
+[[rulesets.guard]]
+action = "deny"
+pattern = "https://example.com/**"
+headers_not_match = { "x-aw-policy-context" = [] }
+
+[[rules]]
+include = "guard"
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let err = PolicyEngine::from_config(&cfg).expect_err("expected error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(
+                "headers_not_match entry 'x-aw-policy-context' must include at least one configured value"
             ),
             "unexpected error message: {msg}"
         );

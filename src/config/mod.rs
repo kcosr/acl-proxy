@@ -524,6 +524,9 @@ pub struct PolicyRuleTemplateConfig {
     pub headers_match: Option<HeaderMatchMap>,
 
     #[serde(default)]
+    pub headers_not_match: Option<HeaderMatchMap>,
+
+    #[serde(default)]
     pub request_timeout_ms: Option<u64>,
 
     #[serde(default)]
@@ -591,6 +594,9 @@ pub struct PolicyRuleDirectConfig {
     pub headers_match: Option<HeaderMatchMap>,
 
     #[serde(default)]
+    pub headers_not_match: Option<HeaderMatchMap>,
+
+    #[serde(default)]
     pub request_timeout_ms: Option<u64>,
 
     #[serde(default)]
@@ -615,6 +621,7 @@ pub struct PolicyRuleDirectConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+#[allow(clippy::large_enum_variant)]
 pub enum PolicyRuleConfig {
     Direct(PolicyRuleDirectConfig),
     Include(PolicyRuleIncludeConfig),
@@ -947,13 +954,14 @@ impl Config {
                         || d.methods.is_some()
                         || d.headers_absent.is_some()
                         || d.headers_match.is_some()
+                        || d.headers_not_match.is_some()
                 }
                 PolicyRuleConfig::Include(i) => !i.include.trim().is_empty(),
             };
 
             if !has_match_criteria {
                 return Err(ConfigError::Invalid(format!(
-                    "policy.rules[{idx}] must specify at least one of pattern, patterns, subnets, methods, headers_absent, headers_match, or include"
+                    "policy.rules[{idx}] must specify at least one of pattern, patterns, subnets, methods, headers_absent, headers_match, headers_not_match, or include"
                 )));
             }
         }
@@ -2135,6 +2143,34 @@ headers_match = { "x-workload-id" = "worker-123" }
     }
 
     #[test]
+    fn direct_rule_with_headers_not_match_counts_as_match_criteria() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "deny"
+headers_not_match = { "x-aw-policy-context" = "internal" }
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        assert!(
+            config.validate_basic().is_ok(),
+            "validation should succeed for headers_not_match-only rule"
+        );
+    }
+
+    #[test]
     fn headers_absent_must_not_be_empty_when_configured() {
         let toml = r#"
 schema_version = "1"
@@ -2280,6 +2316,126 @@ headers_match = { "x-workload-id" = "" }
         let msg = format!("{err}");
         assert!(
             msg.contains("must not include empty-string values"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn headers_not_match_must_not_be_empty_when_configured() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "deny"
+headers_not_match = {}
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("headers_not_match must not be empty"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn headers_not_match_rejects_invalid_header_names() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "deny"
+headers_not_match = { "bad header" = "internal" }
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("invalid header name 'bad header' in headers_not_match"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn headers_not_match_rejects_duplicates_after_normalization() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "deny"
+headers_not_match = { "X-AW-Policy-Context" = "internal", "x-aw-policy-context" = "trusted" }
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("duplicate header name"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn headers_not_match_rejects_empty_values() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "deny"
+headers_not_match = { "x-aw-policy-context" = "" }
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("headers_not_match entry 'x-aw-policy-context' must not include empty-string values"),
             "unexpected error message: {msg}"
         );
     }
@@ -2696,10 +2852,7 @@ default = "delegate"
         let err =
             ::toml::from_str::<Config>(toml).expect_err("parse should reject delegate default");
         let msg = format!("{err}");
-        assert!(
-            msg.contains("delegate"),
-            "unexpected error: {msg}"
-        );
+        assert!(msg.contains("delegate"), "unexpected error: {msg}");
     }
 
     #[test]

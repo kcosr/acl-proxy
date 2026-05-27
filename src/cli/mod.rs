@@ -212,7 +212,7 @@ fn print_policy_table(policy: &crate::policy::EffectivePolicy) {
         }
     );
     println!(
-        "INDEX\tACTION\tPATTERN\tMETHODS\tSUBNETS\tHEADERS_ABSENT\tHEADERS_MATCH\tDESCRIPTION"
+        "INDEX\tACTION\tPATTERN\tMETHODS\tSUBNETS\tHEADERS_ABSENT\tHEADERS_MATCH\tHEADERS_NOT_MATCH\tDESCRIPTION"
     );
 
     for rule in &policy.rules {
@@ -251,10 +251,19 @@ fn print_policy_table(policy: &crate::policy::EffectivePolicy) {
                 .collect::<Vec<_>>()
                 .join(";")
         };
+        let headers_not_match = if rule.headers_not_match.is_empty() {
+            "-".to_string()
+        } else {
+            rule.headers_not_match
+                .iter()
+                .map(|(name, values)| format!("{name}!={}", values.join("|")))
+                .collect::<Vec<_>>()
+                .join(";")
+        };
         let description = rule.description.as_deref().unwrap_or("-");
 
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             rule.index,
             action,
             pattern,
@@ -262,6 +271,7 @@ fn print_policy_table(policy: &crate::policy::EffectivePolicy) {
             subnets,
             headers_absent,
             headers_match,
+            headers_not_match,
             description
         );
     }
