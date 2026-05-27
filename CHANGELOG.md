@@ -2,7 +2,8 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+- Add `headers_not_match` policy predicate for excluding exact request-header values while matching missing or non-excluded values.
 
 ## [0.0.13] - 2026-05-14
 

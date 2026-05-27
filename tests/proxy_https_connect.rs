@@ -347,6 +347,7 @@ async fn allowed_https_via_connect_is_proxied_and_captured() {
             subnets: Vec::new(),
             headers_absent: None,
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -434,6 +435,7 @@ async fn configured_egress_forwarding_applies_to_https_connect_inner_requests() 
             subnets: Vec::new(),
             headers_absent: None,
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -493,6 +495,7 @@ async fn global_egress_request_actions_apply_to_https_connect_inner_requests() {
             subnets: Vec::new(),
             headers_absent: None,
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -564,6 +567,7 @@ async fn denied_https_via_connect_returns_403() {
             subnets: Vec::new(),
             headers_absent: None,
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -675,8 +679,7 @@ pattern = "https://{host}/**"
     let (proxy_addr, proxy_temp_dir) = start_proxy_with_config(config, proxy_listener).await;
     let ca_cert_path = proxy_temp_dir.path().join("certs").join("ca-cert.pem");
 
-    let (status, body) =
-        send_https_via_connect(proxy_addr, &ca_cert_path, &host, "/ok").await;
+    let (status, body) = send_https_via_connect(proxy_addr, &ca_cert_path, &host, "/ok").await;
 
     assert_eq!(status, StatusCode::OK.as_u16());
     assert_eq!(body, "ok");
@@ -703,6 +706,7 @@ async fn headers_match_is_evaluated_on_decrypted_inner_connect_requests() {
                 "x-workload-id".to_string(),
                 acl_proxy::config::HeaderMatchValueConfig::Single("worker-123".to_string()),
             )])),
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -769,6 +773,110 @@ async fn headers_match_is_evaluated_on_decrypted_inner_connect_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn headers_not_match_is_evaluated_on_decrypted_inner_connect_requests() {
+    let (forward_addr, seen_requests) = start_forwarding_echo_server().await;
+
+    let mut config = minimal_connect_config();
+    config.capture.allowed_request = false;
+    config.capture.allowed_response = false;
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![
+        acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyRuleAction::Deny,
+            pattern: Some("https://connect-target.test:9443/**".to_string()),
+            patterns: None,
+            description: Some("Deny non-internal contexts".to_string()),
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: None,
+            headers_not_match: Some(std::collections::BTreeMap::from([(
+                "x-aw-policy-context".to_string(),
+                acl_proxy::config::HeaderMatchValueConfig::Single("internal".to_string()),
+            )])),
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        }),
+        acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyRuleAction::Allow,
+            pattern: Some("https://connect-target.test:9443/**".to_string()),
+            patterns: None,
+            description: Some("Allow upstream traffic".to_string()),
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: None,
+            headers_not_match: None,
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        }),
+    ];
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
+        host: "127.0.0.1".to_string(),
+        port: forward_addr.port(),
+    });
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+    let ca_cert_path = temp_dir.path().join("certs").join("ca-cert.pem");
+
+    let (denied_status, denied_body) = send_https_via_connect_with_headers(
+        proxy_addr,
+        &ca_cert_path,
+        "connect-target.test:9443",
+        "/ok",
+        &[("x-aw-policy-context", "default")],
+    )
+    .await;
+
+    assert_eq!(denied_status, StatusCode::FORBIDDEN.as_u16());
+    assert!(
+        denied_body.contains("Blocked by URL policy"),
+        "unexpected denied body: {denied_body}"
+    );
+    assert!(
+        seen_requests.lock().unwrap().is_empty(),
+        "non-internal CONNECT inner request must not be forwarded"
+    );
+
+    let (allowed_status, allowed_body) = send_https_via_connect_with_headers(
+        proxy_addr,
+        &ca_cert_path,
+        "connect-target.test:9443",
+        "/ok",
+        &[("X-AW-Policy-Context", "internal")],
+    )
+    .await;
+
+    assert_eq!(allowed_status, StatusCode::OK.as_u16());
+    assert_eq!(allowed_body, "forwarded");
+
+    let requests = seen_requests.lock().unwrap();
+    let forwarded = requests
+        .first()
+        .expect("forwarding destination should see allowed inner request");
+    assert_eq!(
+        forwarded
+            .headers
+            .get("x-aw-policy-context")
+            .and_then(|value| value.to_str().ok()),
+        Some("internal")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn loop_detected_on_connect_returns_508() {
     let upstream_addr = start_upstream_https_echo_server().await;
     let mut config = minimal_connect_config();
@@ -789,6 +897,7 @@ async fn loop_detected_on_connect_returns_508() {
             subnets: Vec::new(),
             headers_absent: None,
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,

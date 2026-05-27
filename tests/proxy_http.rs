@@ -1002,6 +1002,7 @@ async fn allowed_request_uses_configured_egress_forwarding_destination() {
             subnets: Vec::new(),
             headers_absent: None,
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -1063,6 +1064,7 @@ async fn global_egress_request_actions_are_applied_after_rule_actions_without_af
             subnets: Vec::new(),
             headers_absent: Some(vec!["x-gate".to_string()]),
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -1079,6 +1081,7 @@ async fn global_egress_request_actions_are_applied_after_rule_actions_without_af
             subnets: Vec::new(),
             headers_absent: None,
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -1226,6 +1229,7 @@ async fn global_egress_request_actions_respect_intra_layer_order() {
             subnets: Vec::new(),
             headers_absent: None,
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -1315,6 +1319,7 @@ async fn empty_global_egress_actions_preserve_existing_rule_header_behavior() {
             subnets: Vec::new(),
             headers_absent: None,
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -1650,6 +1655,7 @@ async fn http_explicit_listener_accepts_h2c_prior_knowledge_requests() {
             subnets: Vec::new(),
             headers_absent: None,
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -1696,6 +1702,7 @@ async fn allowed_request_is_proxied_and_loop_header_added() {
             subnets: Vec::new(),
             headers_absent: None,
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -1760,6 +1767,7 @@ async fn headers_absent_top_deny_guard_falls_through_to_allow_rule() {
             subnets: Vec::new(),
             headers_absent: Some(vec!["x-workload-id".to_string()]),
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -1776,6 +1784,7 @@ async fn headers_absent_top_deny_guard_falls_through_to_allow_rule() {
             subnets: Vec::new(),
             headers_absent: None,
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -1852,6 +1861,7 @@ async fn method_scoped_headers_absent_guard_only_blocks_matching_methods() {
             subnets: Vec::new(),
             headers_absent: Some(vec!["x-workload-id".to_string()]),
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -1868,6 +1878,7 @@ async fn method_scoped_headers_absent_guard_only_blocks_matching_methods() {
             subnets: Vec::new(),
             headers_absent: None,
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -1937,6 +1948,7 @@ async fn headers_match_top_guard_denies_non_matching_value_and_allows_matching_v
                 "x-workload-id".to_string(),
                 acl_proxy::config::HeaderMatchValueConfig::Single("worker-123".to_string()),
             )])),
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -1953,6 +1965,7 @@ async fn headers_match_top_guard_denies_non_matching_value_and_allows_matching_v
             subnets: Vec::new(),
             headers_absent: None,
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -2030,6 +2043,7 @@ async fn headers_match_http_regressions_cover_repeated_values_comma_literals_and
                     acl_proxy::config::HeaderMatchValueConfig::Single("a,b".to_string()),
                 ),
             ])),
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -2084,6 +2098,103 @@ async fn headers_match_http_regressions_cover_repeated_values_comma_literals_and
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn headers_not_match_top_deny_guard_blocks_non_internal_and_allows_internal() {
+    let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
+
+    let mut config = minimal_config();
+    config.capture.allowed_request = false;
+    config.capture.allowed_response = false;
+
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![
+        acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyRuleAction::Deny,
+            pattern: Some(format!("http://{host}/**")),
+            patterns: None,
+            description: Some("Deny non-internal contexts".to_string()),
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: None,
+            headers_not_match: Some(BTreeMap::from([(
+                "x-aw-policy-context".to_string(),
+                acl_proxy::config::HeaderMatchValueConfig::Many(vec!["internal".to_string()]),
+            )])),
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        }),
+        acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyRuleAction::Allow,
+            pattern: Some(format!("http://{host}/**")),
+            patterns: None,
+            description: Some("Allow upstream traffic".to_string()),
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: None,
+            headers_not_match: None,
+            request_timeout_ms: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        }),
+    ];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let missing_header_request =
+        format!("GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let (_response, missing_status) =
+        send_raw_http_request(proxy_addr, &missing_header_request).await;
+    assert_eq!(missing_status, StatusCode::FORBIDDEN);
+
+    let default_context_request = format!(
+        "GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nX-AW-Policy-Context: default\r\nConnection: close\r\n\r\n"
+    );
+    let (_response, default_status) =
+        send_raw_http_request(proxy_addr, &default_context_request).await;
+    assert_eq!(default_status, StatusCode::FORBIDDEN);
+    assert!(
+        seen_headers.lock().unwrap().is_none(),
+        "denied requests must not reach upstream"
+    );
+
+    let internal_context_request = format!(
+        "GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nX-AW-Policy-Context: default\r\nX-AW-Policy-Context: internal\r\nConnection: close\r\n\r\n"
+    );
+    let (response, internal_status) =
+        send_raw_http_request(proxy_addr, &internal_context_request).await;
+    assert_eq!(internal_status, StatusCode::OK);
+    assert!(
+        response.contains("\r\n\r\nok"),
+        "response body should contain 'ok', got: {response}"
+    );
+
+    let headers_guard = seen_headers.lock().unwrap();
+    let upstream_headers = headers_guard
+        .as_ref()
+        .expect("internal request should reach upstream");
+    let values = upstream_headers
+        .get_all("x-aw-policy-context")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>();
+    assert!(values.contains(&"internal"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn loop_header_not_added_when_disabled() {
     let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
 
@@ -2107,6 +2218,7 @@ async fn loop_header_not_added_when_disabled() {
             subnets: Vec::new(),
             headers_absent: None,
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -2257,6 +2369,7 @@ async fn origin_form_request_with_host_is_forwarded() {
             subnets: Vec::new(),
             headers_absent: None,
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -2321,6 +2434,7 @@ async fn upstream_connection_failure_returns_502() {
             subnets: Vec::new(),
             headers_absent: None,
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: None,
             with: None,
             add_url_enc_variants: None,
@@ -2371,6 +2485,7 @@ async fn upstream_request_timeout_returns_504() {
             subnets: Vec::new(),
             headers_absent: None,
             headers_match: None,
+            headers_not_match: None,
             request_timeout_ms: Some(150),
             with: None,
             add_url_enc_variants: None,

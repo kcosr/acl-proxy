@@ -55,7 +55,7 @@ graph TB
     EF --> Upstream
 ```
 
-**Policy evaluation order** for each rule: pattern → subnets → methods → `headers_absent` → `headers_match`. Local `allow`/`deny` matches are terminal. A matched `delegate` rule calls external auth; external `pass` continues with the next rule, and if nothing later matches, `policy.default` applies.
+**Policy evaluation order** for each rule: pattern → subnets → methods → `headers_absent` → `headers_match` → `headers_not_match`. Local `allow`/`deny` matches are terminal. A matched `delegate` rule calls external auth; external `pass` continues with the next rule, and if nothing later matches, `policy.default` applies.
 
 ## Quick Start
 
@@ -193,7 +193,7 @@ In transparent HTTP mode, upstream target selection is based on the inbound `Hos
 ### HTTPS CONNECT (MITM)
 
 - Policy is evaluated on each decrypted request; the CONNECT request itself is only used to establish the tunnel.
-- Request-header predicates (`headers_absent`, `headers_match`) apply only to decrypted inner requests, not to the outer CONNECT establishment request.
+- Request-header predicates (`headers_absent`, `headers_match`, `headers_not_match`) apply only to decrypted inner requests, not to the outer CONNECT establishment request.
 - Loop protection runs on both the CONNECT request and the inner requests.
 - The outer CONNECT handshake remains local to the first proxy hop. If egress forwarding is enabled, only the decrypted inner HTTPS requests use the egress destination.
 - Clients must trust the proxy CA (`certs/ca-cert.pem` by default).
@@ -250,6 +250,7 @@ The policy engine evaluates each request against an ordered list of rules. `allo
    - Method match (if set)
    - `headers_absent` match (if set)
    - `headers_match` match (if set)
+   - `headers_not_match` match (if set)
 5. The first `allow` or `deny` match wins. A matched `delegate` rule wins only when the external auth provider returns `allow` or `deny`.
 6. If nothing matches, apply `policy.default`.
 
@@ -349,6 +350,28 @@ description = "Allow trusted workload identities"
 - Empty configured values are rejected during config validation.
 - When both `headers_absent` and `headers_match` are configured, both predicates must pass.
 
+### Header-Value Exclusion Predicate
+
+Rules can match when inbound request headers are missing or do not contain specific exact values:
+
+```toml
+[[policy.rules]]
+action = "deny"
+pattern = "https://pi.dev/**"
+headers_not_match = { "x-aw-policy-context" = ["internal"] }
+description = "Deny non-internal contexts"
+```
+
+- Across header keys: `AND` semantics.
+- Within one key's configured values: no received value may exactly match any configured value.
+- Header names are case-insensitive.
+- Value matching is exact and case-sensitive — no trimming, no comma splitting.
+- A missing header satisfies `headers_not_match`.
+- Repeated inbound header values are supported; any exact excluded value makes that key fail the predicate.
+- Empty configured values are rejected during config validation.
+- `headers_not_match` combines with `headers_absent` and `headers_match` conjunctively.
+- Header values used for policy must be trusted before acl-proxy receives the request; rule and global header actions run after matching and do not make client-supplied headers authoritative.
+
 ### Multiple URL Patterns
 
 Use `patterns = [...]` when several URL patterns should share identical rule attributes:
@@ -404,7 +427,7 @@ subnets = ["10.0.0.0/8"]           # overrides template subnets
 - `with` provides macro overrides specific to this include.
 - `add_url_enc_variants = true` generates both raw and URL-encoded variants for all placeholders.
 - `methods` and `subnets` on the include override the template values; when omitted, template values are used.
-- `headers_absent` and `headers_match` are inherited from the template, not overridden.
+- `headers_absent`, `headers_match`, and `headers_not_match` are inherited from the template, not overridden.
 - Missing macros required by a ruleset cause validation failure.
 
 ### Header Actions
@@ -477,7 +500,7 @@ acl-proxy policy dump --format table
 acl-proxy policy dump --format json
 ```
 
-`policy dump` defaults to table output on a TTY and JSON otherwise. It includes `headers_match` values — treat output as sensitive when those values represent credentials.
+`policy dump` defaults to table output on a TTY and JSON otherwise. It includes `headers_match` and `headers_not_match` values — treat output as sensitive when those values represent credentials.
 When a rule uses `patterns`, the dump shows one effective row/object per expanded pattern with a singular `pattern` field.
 
 ## Configuration Reference
@@ -694,12 +717,13 @@ methods = ["GET", "POST"]           # optional: HTTP methods
 subnets = ["10.0.0.0/8"]           # optional: client IP CIDRs
 headers_absent = ["x-id"]          # optional: missing-header check
 headers_match = { "x-id" = "v1" }  # optional: exact header match
+headers_not_match = { "x-id" = "internal" } # optional: exact header exclusion
 request_timeout_ms = 5000          # optional: override upstream timeout
 rule_id = "stable-id"             # optional: stable ID for webhooks
 external_auth_profile = "name"     # required for delegate; invalid for allow/deny
 ```
 
-At least one of `pattern`, `patterns`, `methods`, `subnets`, `headers_absent`, or `headers_match` must be present.
+At least one of `pattern`, `patterns`, `methods`, `subnets`, `headers_absent`, `headers_match`, or `headers_not_match` must be present.
 `allow` and `deny` are terminal local decisions. `delegate` invokes the named HTTP or plugin external auth profile; the provider can return `allow` or `deny` as terminal decisions, or `pass` to continue policy evaluation at the next rule.
 
 #### Include Rule Fields
@@ -773,7 +797,7 @@ The repository includes [`acl-proxy.sample.toml`](acl-proxy.sample.toml) as a co
 The config loader performs validation beyond basic TOML parsing:
 
 - `schema_version` must equal `"1"`.
-- Direct rules must have at least one of `pattern`, `patterns`, `methods`, `subnets`, `headers_absent`, or `headers_match`.
+- Direct rules must have at least one of `pattern`, `patterns`, `methods`, `subnets`, `headers_absent`, `headers_match`, or `headers_not_match`.
 - Direct rules and ruleset templates must not define both `pattern` and `patterns`.
 - `patterns` must include at least one non-empty pattern.
 - Duplicate `patterns` entries are rejected after trimming.

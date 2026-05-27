@@ -191,6 +191,7 @@ fn allow_rule(pattern: String, header_actions: Vec<HeaderActionConfig>) -> Polic
         subnets: Vec::new(),
         headers_absent: None,
         headers_match: None,
+        headers_not_match: None,
         request_timeout_ms: None,
         with: None,
         add_url_enc_variants: None,

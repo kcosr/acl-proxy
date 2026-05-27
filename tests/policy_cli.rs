@@ -560,3 +560,92 @@ description = "Allow trusted identity values"
         .stdout(contains("x-workload-id=worker-123|worker-456"))
         .stdout(contains("Allow trusted identity values"));
 }
+
+#[test]
+fn policy_dump_json_includes_headers_not_match_values() {
+    let mut file = NamedTempFile::new().expect("create temp config");
+    file.write_all(
+        br#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "deny"
+pattern = "https://example.com/**"
+headers_not_match = { "x-aw-policy-context" = ["internal"], "x-channel" = "trusted" }
+        "#,
+    )
+    .expect("write config");
+
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
+    cmd.arg("policy")
+        .arg("dump")
+        .arg("--config")
+        .arg(file.path());
+
+    let assert = cmd.assert().success();
+    let stdout =
+        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is valid UTF-8");
+
+    let value: Value = serde_json::from_str(&stdout).expect("output is valid JSON");
+    let rules = value["rules"].as_array().expect("rules is an array");
+    assert_eq!(rules.len(), 1);
+    assert_eq!(
+        rules[0]["headers_not_match"]["x-aw-policy-context"][0],
+        "internal"
+    );
+    assert_eq!(rules[0]["headers_not_match"]["x-channel"][0], "trusted");
+}
+
+#[test]
+fn policy_dump_table_includes_headers_not_match_column_values() {
+    let mut file = NamedTempFile::new().expect("create temp config");
+    file.write_all(
+        br#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "deny"
+pattern = "https://example.com/**"
+headers_not_match = { "x-aw-policy-context" = ["internal"], "x-channel" = "trusted" }
+description = "Deny non-internal contexts"
+        "#,
+    )
+    .expect("write config");
+
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
+    cmd.arg("policy")
+        .arg("dump")
+        .arg("--format")
+        .arg("table")
+        .arg("--config")
+        .arg(file.path());
+
+    cmd.assert()
+        .success()
+        .stdout(contains("HEADERS_NOT_MATCH"))
+        .stdout(contains("x-aw-policy-context!=internal"))
+        .stdout(contains("x-channel!=trusted"))
+        .stdout(contains("Deny non-internal contexts"));
+}
