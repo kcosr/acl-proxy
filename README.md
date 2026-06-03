@@ -1177,14 +1177,15 @@ The test suite includes:
 ## Release
 
 Releases are driven from `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md`.
-Use `current` when `Cargo.toml` already has the intended release version, or
-use `patch`, `minor`, or `major`:
+Use `current` when `Cargo.toml` already has the intended release version, use
+`patch`, `minor`, or `major`, or pass an explicit version:
 
 ```bash
 node scripts/release.mjs current
 node scripts/release.mjs patch
 node scripts/release.mjs minor
 node scripts/release.mjs major
+node scripts/release.mjs 0.1.0
 ```
 
 The script stamps the changelog, commits `Release vX.Y.Z`, creates and pushes a

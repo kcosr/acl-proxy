@@ -93,12 +93,13 @@ When preparing PRs for main, open the PR first to get the PR number, then update
    node scripts/release.mjs patch    # Bug fixes (0.0.3 -> 0.0.4)
    node scripts/release.mjs minor    # New features (0.0.4 -> 0.1.0)
    node scripts/release.mjs major    # Breaking changes (0.1.0 -> 1.0.0)
+   node scripts/release.mjs 0.1.0    # Explicit version
    ```
 
 ### What the Script Does
 
 1. Verifies working directory is clean on `main`
-2. Bumps version in `Cargo.toml` (and `Cargo.lock`)
+2. Optionally bumps version in `Cargo.toml` (and `Cargo.lock`) and verifies it with `cargo check`
 3. Updates CHANGELOG: `## [Unreleased]` -> `## [X.Y.Z] - YYYY-MM-DD`
 4. Commits "Release vX.Y.Z" and creates git tag
 5. Pushes commit and tag to origin
