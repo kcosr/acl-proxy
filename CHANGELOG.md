@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+
+- Fixed release script cleanup handling after successful GitHub release creation.
+
 ## [0.0.15] - 2026-06-03
 
 ### Changed

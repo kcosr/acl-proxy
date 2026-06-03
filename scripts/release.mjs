@@ -321,7 +321,7 @@ try {
 				"--notes-file",
 				notesFile,
 			],
-			{ ignoreError: true }
+			{ ignoreError: true, silent: true }
 		) !== null;
 } finally {
 	if (existsSync(notesFile)) {
