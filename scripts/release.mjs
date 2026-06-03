@@ -178,6 +178,7 @@ function ensureTools() {
 	run("node --version", { silent: true });
 	run("cargo --version", { silent: true });
 	run("gh --version", { silent: true });
+	run("gh auth status --hostname github.com", { silent: true });
 }
 
 function ensureTagAvailable(version) {
@@ -200,10 +201,8 @@ function ensureTagAvailable(version) {
 	}
 }
 
-function updateChangelogForRelease(version) {
-	const date = new Date().toISOString().split("T")[0];
-	let content = readFileSync(changelogPath, "utf-8");
-
+function readValidatedChangelogForRelease(version) {
+	const content = readFileSync(changelogPath, "utf-8");
 	if (!content.includes("## [Unreleased]")) {
 		console.error("Error: No [Unreleased] section found in CHANGELOG.md");
 		process.exit(1);
@@ -218,7 +217,16 @@ function updateChangelogForRelease(version) {
 		console.error("Error: CHANGELOG.md has no release notes under [Unreleased]");
 		process.exit(1);
 	}
+	return content;
+}
 
+function validateChangelogForRelease(version) {
+	readValidatedChangelogForRelease(version);
+}
+
+function updateChangelogForRelease(version) {
+	const date = new Date().toISOString().split("T")[0];
+	let content = readValidatedChangelogForRelease(version);
 	content = content.replace(/## \[Unreleased\]/, `## [${version}] - ${date}`);
 	writeFileSync(changelogPath, content, "utf-8");
 }
@@ -257,6 +265,7 @@ if (!VERSION_ARG.test(version)) {
 ensureCleanMain();
 ensureTools();
 ensureTagAvailable(version);
+validateChangelogForRelease(version);
 run("cargo check");
 
 if (version !== currentVersion) {
@@ -270,10 +279,9 @@ if (existsSync(cargoLockPath)) {
 	releaseCommitPaths.splice(1, 0, "Cargo.lock");
 }
 runFile("git", ["add", ...releaseCommitPaths]);
-run(`git commit -m "Release v${version}"`);
-run(`git tag v${version}`);
-run("git push origin main");
-run(`git push origin v${version}`);
+runFile("git", ["commit", "-m", `Release v${version}`]);
+runFile("git", ["tag", `v${version}`]);
+runFile("git", ["push", "--atomic", "origin", "main", `v${version}`]);
 
 const notesFile = join(ROOT, ".release-notes-tmp.md");
 writeFileSync(notesFile, extractReleaseNotes(version), "utf-8");

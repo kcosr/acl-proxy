@@ -1215,7 +1215,6 @@ Each archive should contain one top-level directory named
 - `LICENSE`
 - `CHANGELOG.md`
 - `acl-proxy.sample.toml`
-- `scripts/`
 
 Example packaging flow:
 
@@ -1231,7 +1230,6 @@ install -m 755 target/release/acl-proxy "$OUT/$ROOT/bin/acl-proxy"
 install -m 755 target/release/acl-proxy-extract-capture-body \
   "$OUT/$ROOT/bin/acl-proxy-extract-capture-body"
 cp README.md LICENSE CHANGELOG.md acl-proxy.sample.toml "$OUT/$ROOT/"
-cp -R scripts "$OUT/$ROOT/"
 tar -C "$OUT" -czf "$OUT/${ROOT}.tar.gz" "$ROOT"
 ```
 

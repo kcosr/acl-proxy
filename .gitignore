@@ -10,6 +10,7 @@ certs/
 
 # Local tooling output
 .codemap/
+.release-notes-tmp.md
 logs/
 
 .build-service/workspace-id

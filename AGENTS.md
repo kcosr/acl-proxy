@@ -98,11 +98,11 @@ When preparing PRs for main, open the PR first to get the PR number, then update
 
 ### What the Script Does
 
-1. Verifies working directory is clean on `main`
+1. Verifies the current branch is `main`, the working tree is clean, required tools are available, GitHub CLI is authenticated, and the local/remote tag is free
 2. Verifies the Rust project with `cargo check` and optionally bumps version in `Cargo.toml` (and `Cargo.lock`)
 3. Updates CHANGELOG: `## [Unreleased]` -> `## [X.Y.Z] - YYYY-MM-DD`
 4. Commits "Release vX.Y.Z" and creates git tag
-5. Pushes commit and tag to origin
+5. Pushes commit and tag atomically to origin
 6. Creates GitHub release with notes extracted from CHANGELOG
 7. Adds new `## [Unreleased]` section with `_No unreleased changes._` placeholder
 8. Commits "Prepare for next release" and pushes
