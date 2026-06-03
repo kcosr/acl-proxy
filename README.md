@@ -72,8 +72,8 @@ Supported release platforms are currently:
 - `macos-arm64`
 
 Extract the archive on the host that will run `acl-proxy`. The archive contains
-the optimized proxy binary, capture-body helper, sample config, release
-tooling, and project documentation.
+the optimized proxy binary, capture-body helper, sample config, README, and
+changelog.
 
 Install on the host:
 
@@ -1222,7 +1222,7 @@ Each archive should contain one top-level directory named
 Example packaging flow:
 
 ```bash
-VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "acl-proxy") | .version')
+VERSION=$(sed -n '/^\[package\]/,/^\[/ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
 PLATFORM=linux-x86_64 # or macos-arm64
 OUT=/tmp/acl-proxy-release-${VERSION}
 ROOT="acl-proxy-${VERSION}-${PLATFORM}"

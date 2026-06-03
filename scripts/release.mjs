@@ -285,22 +285,31 @@ runFile("git", ["push", "--atomic", "origin", "main", `v${version}`]);
 
 const notesFile = join(ROOT, ".release-notes-tmp.md");
 writeFileSync(notesFile, extractReleaseNotes(version), "utf-8");
+let releaseCreated = false;
 try {
-	runFile("gh", [
-		"release",
-		"create",
-		`v${version}`,
-		"--repo",
-		REPO,
-		"--title",
-		`v${version}`,
-		"--notes-file",
-		notesFile,
-	]);
+	releaseCreated =
+		runFile(
+			"gh",
+			[
+				"release",
+				"create",
+				`v${version}`,
+				"--repo",
+				REPO,
+				"--title",
+				`v${version}`,
+				"--notes-file",
+				notesFile,
+			],
+			{ ignoreError: true }
+		) !== null;
 } finally {
 	if (existsSync(notesFile)) {
 		unlinkSync(notesFile);
 	}
+}
+if (!releaseCreated) {
+	process.exit(1);
 }
 
 addUnreleasedSection();
