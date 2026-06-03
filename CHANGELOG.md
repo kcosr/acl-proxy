@@ -5,6 +5,7 @@
 ### Fixed
 
 - Fixed release script cleanup handling after successful GitHub release creation.
+- Improved release-script diagnostics and changelog validation edge cases.
 
 ## [0.0.15] - 2026-06-03
 

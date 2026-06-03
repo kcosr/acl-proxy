@@ -232,7 +232,11 @@ function readValidatedChangelogForRelease(version) {
 	}
 
 	const unreleasedMatch = content.match(/## \[Unreleased\]\n([\s\S]*?)(?=\n## \[|$)/);
-	if (!unreleasedMatch || unreleasedMatch[1].trim() === "_No unreleased changes._") {
+	if (
+		!unreleasedMatch ||
+		!unreleasedMatch[1].trim() ||
+		unreleasedMatch[1].trim() === "_No unreleased changes._"
+	) {
 		console.error("Error: CHANGELOG.md has no release notes under [Unreleased]");
 		process.exit(1);
 	}
@@ -266,10 +270,15 @@ function extractReleaseNotes(version) {
 
 function addUnreleasedSection() {
 	let content = readFileSync(changelogPath, "utf-8");
+	const original = content;
 	content = content.replace(
 		"# Changelog\n\n",
 		"# Changelog\n\n## [Unreleased]\n\n_No unreleased changes._\n\n"
 	);
+	if (content === original) {
+		console.error("Error: Could not add [Unreleased] section to CHANGELOG.md");
+		process.exit(1);
+	}
 	writeFileSync(changelogPath, content, "utf-8");
 }
 
@@ -301,7 +310,7 @@ if (existsSync(cargoLockPath)) {
 runFile("git", ["add", ...releaseCommitPaths]);
 runFile("git", ["commit", "-m", `Release v${version}`]);
 runFile("git", ["tag", `v${version}`]);
-runFile("git", ["push", "--atomic", "origin", "main", `v${version}`]);
+runFile("git", ["push", "--atomic", "origin", RELEASE_BRANCH, `v${version}`]);
 
 const notesFile = join(ROOT, ".release-notes-tmp.md");
 writeFileSync(notesFile, extractReleaseNotes(version), "utf-8");
@@ -329,13 +338,16 @@ try {
 	}
 }
 if (!releaseCreated) {
+	console.error(
+		`Error: GitHub release v${version} was not created. The release commit and tag are already pushed; create the GitHub release manually for v${version}, then add the next [Unreleased] section as documented.`
+	);
 	process.exit(1);
 }
 
 addUnreleasedSection();
 runFile("git", ["add", "CHANGELOG.md"]);
 runFile("git", ["commit", "-m", "Prepare for next release"]);
-runFile("git", ["push", "origin", "main"]);
+runFile("git", ["push", "origin", RELEASE_BRANCH]);
 
 console.log(`=== Released v${version} ===`);
 console.log(`https://github.com/${REPO}/releases/tag/v${version}`);
