@@ -4,9 +4,9 @@
 
 ### Changed
 
-- Release automation now creates normal GitHub releases.
+- Release automation now creates normal GitHub releases. ([#51](https://github.com/kcosr/acl-proxy/pull/51))
 - Documented release download/install guidance and Linux x86_64 archive
-  packaging, with source builds moved to the development workflow.
+  packaging, with source builds moved to the development workflow. ([#51](https://github.com/kcosr/acl-proxy/pull/51))
 
 ## [0.0.14] - 2026-05-27
 
