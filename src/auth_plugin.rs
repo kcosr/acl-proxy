@@ -759,10 +759,8 @@ mod tests {
 
     #[test]
     fn plugin_pass_without_header_actions_is_accepted() {
-        let decision = parse_response(
-            r#"{"id":"req-1","type":"response","decision":"pass"}"#,
-        )
-        .expect("pass should parse");
+        let decision = parse_response(r#"{"id":"req-1","type":"response","decision":"pass"}"#)
+            .expect("pass should parse");
 
         assert!(matches!(decision, PluginDecision::Pass));
     }

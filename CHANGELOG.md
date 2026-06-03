@@ -2,7 +2,11 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Changed
+
+- Release automation now creates normal GitHub releases.
+- Documented release download/install guidance and Linux x86_64 archive
+  packaging, with source builds moved to the development workflow.
 
 ## [0.0.14] - 2026-05-27
 

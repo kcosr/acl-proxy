@@ -5,6 +5,7 @@ A Rust-based ACL-aware HTTP/HTTPS proxy with a TOML configuration file and a fle
 ## Table of Contents
 
 - [How It Works](#how-it-works)
+- [Install](#install)
 - [Quick Start](#quick-start)
 - [Proxy Modes](#proxy-modes)
 - [Policy Engine](#policy-engine)
@@ -57,29 +58,52 @@ graph TB
 
 **Policy evaluation order** for each rule: pattern → subnets → methods → `headers_absent` → `headers_match` → `headers_not_match`. Local `allow`/`deny` matches are terminal. A matched `delegate` rule calls external auth; external `pass` continues with the next rule, and if nothing later matches, `policy.default` applies.
 
+## Install
+
+Download the latest archive for your platform from GitHub Releases:
+
+```text
+https://github.com/kcosr/acl-proxy/releases
+```
+
+Supported release platforms are currently:
+
+- `linux-x86_64`
+
+Extract the archive on the host that will run `acl-proxy`. The archive contains
+the optimized proxy binary, capture-body helper, sample config, sample
+certificates, release tooling, and project documentation.
+
+Install on the host:
+
+```bash
+RELEASE_ROOT=/path/to/acl-proxy-VERSION-linux-x86_64
+
+sudo install -m 0755 "$RELEASE_ROOT/bin/acl-proxy" /usr/local/bin/acl-proxy
+sudo install -m 0755 "$RELEASE_ROOT/bin/acl-proxy-extract-capture-body" \
+  /usr/local/bin/acl-proxy-extract-capture-body
+sudo install -d -m 0755 /etc/acl-proxy
+sudo install -m 0644 "$RELEASE_ROOT/acl-proxy.sample.toml" \
+  /etc/acl-proxy/acl-proxy.toml
+```
+
+For unsupported platforms or local development, build from source in the
+[Development](#development) section.
+
 ## Quick Start
 
-### Prerequisites
+### 1. Create a Configuration
 
-- **Rust toolchain** (2021 edition) — [install](https://rustup.rs/)
-
-### 1. Build
-
-```bash
-git clone https://github.com/kcosr/acl-proxy.git
-cd acl-proxy
-cargo build --release
-```
-
-### 2. Create a Configuration
-
-Generate a minimal config:
+The install step copies the sample config to `/etc/acl-proxy/acl-proxy.toml`.
+Edit that file for the policy you want to run. To replace it with a minimal
+deny-all config:
 
 ```bash
-acl-proxy config init config/acl-proxy.toml
+sudo acl-proxy config init /etc/acl-proxy/acl-proxy.toml
 ```
 
-Or copy the sample and edit it:
+If you are developing from a source checkout, you can also work with a local
+config file:
 
 ```bash
 mkdir -p config
@@ -88,21 +112,21 @@ cp acl-proxy.sample.toml config/acl-proxy.toml
 
 The generated minimal config defaults to deny-all and disables capture.
 
-### 3. Validate & Run
+### 2. Validate & Run
 
 ```bash
 # Validate configuration
-acl-proxy config validate --config config/acl-proxy.toml
+acl-proxy config validate --config /etc/acl-proxy/acl-proxy.toml
 
 # Start the proxy
-acl-proxy --config config/acl-proxy.toml
+acl-proxy --config /etc/acl-proxy/acl-proxy.toml
 ```
 
 The proxy starts:
 - The HTTP listener on `proxy.bind_address:proxy.http_port` (explicit proxy and transparent HTTP interception).
 - The transparent HTTPS listener on `proxy.https_bind_address:proxy.https_port` if `https_port` is non-zero.
 
-### 4. Send Traffic
+### 3. Send Traffic
 
 ```bash
 # Check readiness
@@ -1150,7 +1174,65 @@ The test suite includes:
 - Unit tests for config parsing, policy expansion, logging, capture, and certs.
 - Integration tests for HTTP listener modes (explicit + transparent), HTTPS CONNECT MITM, transparent HTTPS (HTTP/1.1 and HTTP/2), HTTP/1.1 upgrade/WebSocket tunneling, reload behavior, egress forwarding, and loop protection.
 
-Release tooling: see `scripts/release.mjs` and `scripts/bump-version.mjs`.
+## Release
+
+Releases are driven from `Cargo.toml`, `Cargo.lock`, and `CHANGELOG.md`.
+Use `current` when `Cargo.toml` already has the intended release version, or
+use `patch`, `minor`, or `major`:
+
+```bash
+node scripts/release.mjs current
+node scripts/release.mjs patch
+node scripts/release.mjs minor
+node scripts/release.mjs major
+```
+
+The script stamps the changelog, commits `Release vX.Y.Z`, creates and pushes a
+matching git tag, creates a GitHub release with notes from the changelog,
+then commits a fresh `Unreleased` section for the next cycle.
+
+If GitHub release creation fails after the commit and tag are pushed, recover
+by creating the release manually for the existing tag instead of rerunning the
+script.
+
+Release binaries are packaged separately after the Linux x86_64 binaries have
+been built by the release operator. Supported release archives currently use
+this name:
+
+```text
+acl-proxy-VERSION-linux-x86_64.tar.gz
+```
+
+Each archive should contain one top-level directory named
+`acl-proxy-VERSION-linux-x86_64` with:
+
+- `bin/acl-proxy` - proxy daemon.
+- `bin/acl-proxy-extract-capture-body` - capture decoding helper.
+- `README.md`
+- `LICENSE`
+- `CHANGELOG.md`
+- `acl-proxy.sample.toml`
+- `certs/`
+- `docs/`
+- `scripts/`
+
+Example packaging flow:
+
+```bash
+VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "acl-proxy") | .version')
+PLATFORM=linux-x86_64
+OUT=/tmp/acl-proxy-release-${VERSION}
+ROOT="acl-proxy-${VERSION}-${PLATFORM}"
+
+rm -rf "$OUT/$ROOT" "$OUT/${ROOT}.tar.gz"
+mkdir -p "$OUT/$ROOT/bin"
+install -m 755 target/release/acl-proxy "$OUT/$ROOT/bin/acl-proxy"
+install -m 755 target/release/acl-proxy-extract-capture-body \
+  "$OUT/$ROOT/bin/acl-proxy-extract-capture-body"
+cp README.md LICENSE CHANGELOG.md acl-proxy.sample.toml "$OUT/$ROOT/"
+cp -R certs docs scripts "$OUT/$ROOT/"
+tar -C "$OUT" -czf "$OUT/${ROOT}.tar.gz" "$ROOT"
+```
 
 ## Demos
 

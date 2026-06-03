@@ -822,38 +822,42 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
                         .external_auth
                         .finalize_internal_error(request_id, &msg);
                     drop(guard);
-                    return ExternalAuthGateResult::Response(build_external_auth_error_response(
-                        &state,
-                        request_id,
-                        url,
-                        method,
-                        client,
-                        target,
-                        version,
-                        req.headers(),
-                        mode,
-                        "ExternalApprovalError",
-                        "External approval macro interpolation failed",
-                    )
-                    .await);
+                    return ExternalAuthGateResult::Response(
+                        build_external_auth_error_response(
+                            &state,
+                            request_id,
+                            url,
+                            method,
+                            client,
+                            target,
+                            version,
+                            req.headers(),
+                            mode,
+                            "ExternalApprovalError",
+                            "External approval macro interpolation failed",
+                        )
+                        .await,
+                    );
                 }
             };
             drop(guard);
-            ExternalAuthGateResult::Response(proxy_allowed_request(
-                state.clone(),
-                request_id.to_string(),
-                url.to_string(),
-                method.clone(),
-                version,
-                client.clone(),
-                target,
-                req,
-                mode,
-                request_timeout_ms,
-                header_actions,
-                egress_request_header_actions,
+            ExternalAuthGateResult::Response(
+                proxy_allowed_request(
+                    state.clone(),
+                    request_id.to_string(),
+                    url.to_string(),
+                    method.clone(),
+                    version,
+                    client.clone(),
+                    target,
+                    req,
+                    mode,
+                    request_timeout_ms,
+                    header_actions,
+                    egress_request_header_actions,
+                )
+                .await,
             )
-            .await)
         }
         Ok(Ok(ExternalDecision::Deny)) => {
             tracing::info!(
@@ -865,18 +869,20 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
                 "delegate policy decision"
             );
             drop(guard);
-            ExternalAuthGateResult::Response(build_external_auth_denied_response(
-                &state,
-                request_id,
-                url,
-                method,
-                client,
-                target,
-                version,
-                req.headers(),
-                mode,
+            ExternalAuthGateResult::Response(
+                build_external_auth_denied_response(
+                    &state,
+                    request_id,
+                    url,
+                    method,
+                    client,
+                    target,
+                    version,
+                    req.headers(),
+                    mode,
+                )
+                .await,
             )
-            .await)
         }
         Ok(Ok(ExternalDecision::Pass)) => {
             tracing::info!(
@@ -895,36 +901,40 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
                 .external_auth
                 .finalize_internal_error(request_id, "External approval channel closed");
             drop(guard);
-            ExternalAuthGateResult::Response(build_external_auth_error_response(
-                &state,
-                request_id,
-                url,
-                method,
-                client,
-                target,
-                version,
-                req.headers(),
-                mode,
-                "ExternalApprovalError",
-                "External approval channel closed",
+            ExternalAuthGateResult::Response(
+                build_external_auth_error_response(
+                    &state,
+                    request_id,
+                    url,
+                    method,
+                    client,
+                    target,
+                    version,
+                    req.headers(),
+                    mode,
+                    "ExternalApprovalError",
+                    "External approval channel closed",
+                )
+                .await,
             )
-            .await)
         }
         Err(_elapsed) => {
             state.external_auth.finalize_timed_out(request_id);
             drop(guard);
-            ExternalAuthGateResult::Response(build_external_auth_timeout_response(
-                &state,
-                request_id,
-                url,
-                method,
-                client,
-                target,
-                version,
-                req.headers(),
-                mode,
+            ExternalAuthGateResult::Response(
+                build_external_auth_timeout_response(
+                    &state,
+                    request_id,
+                    url,
+                    method,
+                    client,
+                    target,
+                    version,
+                    req.headers(),
+                    mode,
+                )
+                .await,
             )
-            .await)
         }
     }
 }
@@ -963,21 +973,23 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
             );
             let mut combined = header_actions;
             combined.extend(plugin_actions);
-            ExternalAuthGateResult::Response(proxy_allowed_request(
-                state.clone(),
-                request_id.to_string(),
-                url.to_string(),
-                method.clone(),
-                version,
-                client.clone(),
-                target,
-                req,
-                mode,
-                request_timeout_ms,
-                combined,
-                egress_request_header_actions,
+            ExternalAuthGateResult::Response(
+                proxy_allowed_request(
+                    state.clone(),
+                    request_id.to_string(),
+                    url.to_string(),
+                    method.clone(),
+                    version,
+                    client.clone(),
+                    target,
+                    req,
+                    mode,
+                    request_timeout_ms,
+                    combined,
+                    egress_request_header_actions,
+                )
+                .await,
             )
-            .await)
         }
         Ok(PluginDecision::Deny) => {
             tracing::info!(
@@ -987,18 +999,20 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
                 final_outcome = "deny",
                 "delegate policy decision"
             );
-            ExternalAuthGateResult::Response(build_auth_plugin_denied_response(
-                &state,
-                request_id,
-                url,
-                method,
-                client,
-                target,
-                version,
-                req.headers(),
-                mode,
+            ExternalAuthGateResult::Response(
+                build_auth_plugin_denied_response(
+                    &state,
+                    request_id,
+                    url,
+                    method,
+                    client,
+                    target,
+                    version,
+                    req.headers(),
+                    mode,
+                )
+                .await,
             )
-            .await)
         }
         Ok(PluginDecision::Pass) => {
             tracing::info!(
@@ -1012,19 +1026,21 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
         }
         Err(err) => {
             let message = format!("Auth plugin '{}' failed: {}", profile_name, err.message());
-            ExternalAuthGateResult::Response(build_auth_plugin_error_response(
-                &state,
-                request_id,
-                url,
-                method,
-                client,
-                target,
-                version,
-                req.headers(),
-                mode,
-                &message,
+            ExternalAuthGateResult::Response(
+                build_auth_plugin_error_response(
+                    &state,
+                    request_id,
+                    url,
+                    method,
+                    client,
+                    target,
+                    version,
+                    req.headers(),
+                    mode,
+                    &message,
+                )
+                .await,
             )
-            .await)
         }
     }
 }

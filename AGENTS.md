@@ -89,6 +89,7 @@ When preparing PRs for main, open the PR first to get the PR number, then update
 2. Verify `## [Unreleased]` in CHANGELOG.md has all changes documented
 3. Run the release script:
    ```bash
+   node scripts/release.mjs current  # Release current Cargo.toml version
    node scripts/release.mjs patch    # Bug fixes (0.0.3 -> 0.0.4)
    node scripts/release.mjs minor    # New features (0.0.4 -> 0.1.0)
    node scripts/release.mjs major    # Breaking changes (0.1.0 -> 1.0.0)
@@ -96,11 +97,20 @@ When preparing PRs for main, open the PR first to get the PR number, then update
 
 ### What the Script Does
 
-1. Verifies working directory is clean (no uncommitted changes)
+1. Verifies working directory is clean on `main`
 2. Bumps version in `Cargo.toml` (and `Cargo.lock`)
 3. Updates CHANGELOG: `## [Unreleased]` -> `## [X.Y.Z] - YYYY-MM-DD`
 4. Commits "Release vX.Y.Z" and creates git tag
 5. Pushes commit and tag to origin
-6. Creates GitHub prerelease with notes extracted from CHANGELOG
+6. Creates GitHub release with notes extracted from CHANGELOG
 7. Adds new `## [Unreleased]` section with `_No unreleased changes._` placeholder
 8. Commits "Prepare for next release" and pushes
+
+If GitHub release creation fails after the commit and tag are pushed, create
+the GitHub release manually for the existing tag instead of rerunning the
+script.
+
+Release archives are packaged separately after the GitHub release exists. Use
+the README release section as the source of truth for archive names and
+contents. The supported release platform is currently `linux-x86_64`, with
+`bin/acl-proxy` and `bin/acl-proxy-extract-capture-body` in the archive.
