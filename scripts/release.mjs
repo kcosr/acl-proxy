@@ -22,7 +22,7 @@ const REPO = "kcosr/acl-proxy";
 const RELEASE_BRANCH = "main";
 const RELEASE_ARG = process.argv[2];
 const BUMP_ARGS = new Set(["major", "minor", "patch"]);
-const VERSION_ARG = /^\d+\.\d+\.\d+(-[\w.]+)?$/;
+const VERSION_ARG = /^\d+\.\d+\.\d+$/;
 const cargoTomlPath = join(ROOT, "Cargo.toml");
 const cargoLockPath = join(ROOT, "Cargo.lock");
 const changelogPath = join(ROOT, "CHANGELOG.md");
@@ -176,6 +176,7 @@ function ensureCleanMain() {
 function ensureTools() {
 	run("git --version", { silent: true });
 	run("node --version", { silent: true });
+	run("cargo --version", { silent: true });
 	run("gh --version", { silent: true });
 }
 
@@ -186,6 +187,15 @@ function ensureTagAvailable(version) {
 	});
 	if (tagExists) {
 		console.error(`Error: tag v${version} already exists.`);
+		process.exit(1);
+	}
+
+	const remoteTagExists = run(`git ls-remote --tags origin refs/tags/v${version}`, {
+		silent: true,
+		ignoreError: true,
+	});
+	if (remoteTagExists && remoteTagExists.trim()) {
+		console.error(`Error: tag v${version} already exists on origin.`);
 		process.exit(1);
 	}
 }
@@ -215,7 +225,7 @@ function updateChangelogForRelease(version) {
 
 function extractReleaseNotes(version) {
 	const content = readFileSync(changelogPath, "utf-8");
-	const versionEscaped = version.replace(/\./g, "\\.");
+	const versionEscaped = escapeRegex(version);
 	const regex = new RegExp(
 		`## \\[${versionEscaped}\\][^\\n]*\\n([\\s\\S]*?)(?=\\n## \\[|$)`
 	);
@@ -239,18 +249,27 @@ function addUnreleasedSection() {
 const currentVersion = getVersion();
 const version = RELEASE_ARG === "current" ? currentVersion : bumpVersion(currentVersion, RELEASE_ARG);
 
+if (!VERSION_ARG.test(version)) {
+	console.error(`Release version "${version}" must be stable semver (X.Y.Z)`);
+	process.exit(1);
+}
+
 ensureCleanMain();
 ensureTools();
 ensureTagAvailable(version);
+run("cargo check");
 
 if (version !== currentVersion) {
 	updateCargoTomlVersion(version);
 	updateCargoLockVersion(version);
-	run("cargo check");
 }
 
 updateChangelogForRelease(version);
-run("git add Cargo.toml Cargo.lock CHANGELOG.md");
+const releaseCommitPaths = ["Cargo.toml", "CHANGELOG.md"];
+if (existsSync(cargoLockPath)) {
+	releaseCommitPaths.splice(1, 0, "Cargo.lock");
+}
+runFile("git", ["add", ...releaseCommitPaths]);
 run(`git commit -m "Release v${version}"`);
 run(`git tag v${version}`);
 run("git push origin main");
@@ -258,18 +277,23 @@ run(`git push origin v${version}`);
 
 const notesFile = join(ROOT, ".release-notes-tmp.md");
 writeFileSync(notesFile, extractReleaseNotes(version), "utf-8");
-runFile("gh", [
-	"release",
-	"create",
-	`v${version}`,
-	"--repo",
-	REPO,
-	"--title",
-	`v${version}`,
-	"--notes-file",
-	notesFile,
-]);
-unlinkSync(notesFile);
+try {
+	runFile("gh", [
+		"release",
+		"create",
+		`v${version}`,
+		"--repo",
+		REPO,
+		"--title",
+		`v${version}`,
+		"--notes-file",
+		notesFile,
+	]);
+} finally {
+	if (existsSync(notesFile)) {
+		unlinkSync(notesFile);
+	}
+}
 
 addUnreleasedSection();
 run("git add CHANGELOG.md");

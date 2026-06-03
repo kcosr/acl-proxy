@@ -99,7 +99,7 @@ When preparing PRs for main, open the PR first to get the PR number, then update
 ### What the Script Does
 
 1. Verifies working directory is clean on `main`
-2. Optionally bumps version in `Cargo.toml` (and `Cargo.lock`) and verifies it with `cargo check`
+2. Verifies the Rust project with `cargo check` and optionally bumps version in `Cargo.toml` (and `Cargo.lock`)
 3. Updates CHANGELOG: `## [Unreleased]` -> `## [X.Y.Z] - YYYY-MM-DD`
 4. Commits "Release vX.Y.Z" and creates git tag
 5. Pushes commit and tag to origin
@@ -109,7 +109,9 @@ When preparing PRs for main, open the PR first to get the PR number, then update
 
 If GitHub release creation fails after the commit and tag are pushed, create
 the GitHub release manually for the existing tag instead of rerunning the
-script.
+script. Then add a fresh `## [Unreleased]` section with the standard
+`_No unreleased changes._` placeholder, commit it as
+`Prepare for next release`, and push `main`.
 
 Release archives are packaged separately after the GitHub release exists. Use
 the README release section as the source of truth for archive names and

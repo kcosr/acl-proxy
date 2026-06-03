@@ -71,8 +71,8 @@ Supported release platforms are currently:
 - `linux-x86_64`
 
 Extract the archive on the host that will run `acl-proxy`. The archive contains
-the optimized proxy binary, capture-body helper, sample config, sample
-certificates, release tooling, and project documentation.
+the optimized proxy binary, capture-body helper, sample config, release
+tooling, and project documentation.
 
 Install on the host:
 
@@ -1194,7 +1194,9 @@ then commits a fresh `Unreleased` section for the next cycle.
 
 If GitHub release creation fails after the commit and tag are pushed, recover
 by creating the release manually for the existing tag instead of rerunning the
-script.
+script. Then add a fresh `## [Unreleased]` section with the standard
+`_No unreleased changes._` placeholder, commit it as
+`Prepare for next release`, and push `main`.
 
 Release binaries are packaged separately after the Linux x86_64 binaries have
 been built by the release operator. Supported release archives currently use
@@ -1213,8 +1215,6 @@ Each archive should contain one top-level directory named
 - `LICENSE`
 - `CHANGELOG.md`
 - `acl-proxy.sample.toml`
-- `certs/`
-- `docs/`
 - `scripts/`
 
 Example packaging flow:
@@ -1231,7 +1231,7 @@ install -m 755 target/release/acl-proxy "$OUT/$ROOT/bin/acl-proxy"
 install -m 755 target/release/acl-proxy-extract-capture-body \
   "$OUT/$ROOT/bin/acl-proxy-extract-capture-body"
 cp README.md LICENSE CHANGELOG.md acl-proxy.sample.toml "$OUT/$ROOT/"
-cp -R certs docs scripts "$OUT/$ROOT/"
+cp -R scripts "$OUT/$ROOT/"
 tar -C "$OUT" -czf "$OUT/${ROOT}.tar.gz" "$ROOT"
 ```
 
