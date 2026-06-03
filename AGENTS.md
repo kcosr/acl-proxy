@@ -89,18 +89,32 @@ When preparing PRs for main, open the PR first to get the PR number, then update
 2. Verify `## [Unreleased]` in CHANGELOG.md has all changes documented
 3. Run the release script:
    ```bash
+   node scripts/release.mjs current  # Release current Cargo.toml version
    node scripts/release.mjs patch    # Bug fixes (0.0.3 -> 0.0.4)
    node scripts/release.mjs minor    # New features (0.0.4 -> 0.1.0)
    node scripts/release.mjs major    # Breaking changes (0.1.0 -> 1.0.0)
+   node scripts/release.mjs 0.1.0    # Explicit version
    ```
 
 ### What the Script Does
 
-1. Verifies working directory is clean (no uncommitted changes)
-2. Bumps version in `Cargo.toml` (and `Cargo.lock`)
+1. Verifies the current branch is `main`, the working tree is clean, local `main` matches `origin/main`, required tools are available, GitHub CLI is authenticated, and the local/remote tag is free
+2. Verifies the Rust project with `cargo check` and optionally bumps version in `Cargo.toml` (and `Cargo.lock`)
 3. Updates CHANGELOG: `## [Unreleased]` -> `## [X.Y.Z] - YYYY-MM-DD`
 4. Commits "Release vX.Y.Z" and creates git tag
-5. Pushes commit and tag to origin
-6. Creates GitHub prerelease with notes extracted from CHANGELOG
+5. Pushes commit and tag atomically to origin
+6. Creates GitHub release with notes extracted from CHANGELOG
 7. Adds new `## [Unreleased]` section with `_No unreleased changes._` placeholder
 8. Commits "Prepare for next release" and pushes
+
+If GitHub release creation fails after the commit and tag are pushed, create
+the GitHub release manually for the existing tag instead of rerunning the
+script. Then add a fresh `## [Unreleased]` section with the standard
+`_No unreleased changes._` placeholder, commit it as
+`Prepare for next release`, and push `main`.
+
+Release archives are packaged separately after the GitHub release exists. Use
+the README release section as the source of truth for archive names and
+contents. The supported release platforms are currently `linux-x86_64` and
+`macos-arm64`, with `bin/acl-proxy` and
+`bin/acl-proxy-extract-capture-body` in the archive.
