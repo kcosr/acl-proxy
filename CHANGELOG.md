@@ -6,7 +6,7 @@
 
 - Release automation now creates normal GitHub releases. ([#51](https://github.com/kcosr/acl-proxy/pull/51))
 - Release version bumping is now handled inside the single release script, matching sibling Rust release tooling. ([#51](https://github.com/kcosr/acl-proxy/pull/51))
-- Release script now supports `current` and explicit stable version arguments, with clean-main, authenticated GitHub CLI, and free-tag preconditions. ([#51](https://github.com/kcosr/acl-proxy/pull/51))
+- Release script now supports `current` and explicit stable version arguments, with clean-main, origin/main sync, authenticated GitHub CLI, and free-tag preconditions. ([#51](https://github.com/kcosr/acl-proxy/pull/51))
 - Hardened release version validation, tag checks, release recovery instructions, and release-script cleanup paths. ([#51](https://github.com/kcosr/acl-proxy/pull/51))
 - Documented release download/install guidance and Linux x86_64 plus macOS ARM64 archive
   packaging, with source builds moved to the development workflow. ([#51](https://github.com/kcosr/acl-proxy/pull/51))

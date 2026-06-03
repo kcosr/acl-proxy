@@ -84,7 +84,7 @@ function getVersion() {
 }
 
 function parseVersion(version) {
-	const match = version.match(/^(\d+)\.(\d+)\.(\d+)(.*)$/);
+	const match = version.match(/^(\d+)\.(\d+)\.(\d+)$/);
 	if (!match) {
 		return null;
 	}
@@ -92,12 +92,11 @@ function parseVersion(version) {
 		major: Number.parseInt(match[1], 10),
 		minor: Number.parseInt(match[2], 10),
 		patch: Number.parseInt(match[3], 10),
-		suffix: match[4] || "",
 	};
 }
 
 function formatVersion(parts) {
-	return `${parts.major}.${parts.minor}.${parts.patch}${parts.suffix}`;
+	return `${parts.major}.${parts.minor}.${parts.patch}`;
 }
 
 function bumpVersion(currentVersion, releaseArg) {
@@ -121,7 +120,6 @@ function bumpVersion(currentVersion, releaseArg) {
 		parts.minor = 0;
 		parts.patch = 0;
 	}
-	parts.suffix = "";
 	return formatVersion(parts);
 }
 
@@ -181,6 +179,28 @@ function ensureTools() {
 	run("gh auth status --hostname github.com", { silent: true });
 }
 
+function ensureSyncedMain() {
+	runFile(
+		"git",
+		[
+			"fetch",
+			"origin",
+			`refs/heads/${RELEASE_BRANCH}:refs/remotes/origin/${RELEASE_BRANCH}`,
+		],
+		{ silent: true }
+	);
+	const local = runFile("git", ["rev-parse", RELEASE_BRANCH], { silent: true }).trim();
+	const remote = runFile("git", ["rev-parse", `origin/${RELEASE_BRANCH}`], {
+		silent: true,
+	}).trim();
+	if (local !== remote) {
+		console.error(
+			`Error: ${RELEASE_BRANCH} must match origin/${RELEASE_BRANCH}. Run git pull --ff-only first.`
+		);
+		process.exit(1);
+	}
+}
+
 function ensureTagAvailable(version) {
 	const tagExists = run(`git rev-parse -q --verify refs/tags/v${version}`, {
 		silent: true,
@@ -193,7 +213,6 @@ function ensureTagAvailable(version) {
 
 	const remoteTagExists = run(`git ls-remote --tags origin refs/tags/v${version}`, {
 		silent: true,
-		ignoreError: true,
 	});
 	if (remoteTagExists && remoteTagExists.trim()) {
 		console.error(`Error: tag v${version} already exists on origin.`);
@@ -264,6 +283,7 @@ if (!VERSION_ARG.test(version)) {
 
 ensureCleanMain();
 ensureTools();
+ensureSyncedMain();
 ensureTagAvailable(version);
 validateChangelogForRelease(version);
 run("cargo check");
@@ -313,9 +333,9 @@ if (!releaseCreated) {
 }
 
 addUnreleasedSection();
-run("git add CHANGELOG.md");
-run('git commit -m "Prepare for next release"');
-run("git push origin main");
+runFile("git", ["add", "CHANGELOG.md"]);
+runFile("git", ["commit", "-m", "Prepare for next release"]);
+runFile("git", ["push", "origin", "main"]);
 
 console.log(`=== Released v${version} ===`);
 console.log(`https://github.com/${REPO}/releases/tag/v${version}`);
