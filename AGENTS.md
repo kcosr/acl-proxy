@@ -115,5 +115,6 @@ script. Then add a fresh `## [Unreleased]` section with the standard
 
 Release archives are packaged separately after the GitHub release exists. Use
 the README release section as the source of truth for archive names and
-contents. The supported release platform is currently `linux-x86_64`, with
-`bin/acl-proxy` and `bin/acl-proxy-extract-capture-body` in the archive.
+contents. The supported release platforms are currently `linux-x86_64` and
+`macos-arm64`, with `bin/acl-proxy` and
+`bin/acl-proxy-extract-capture-body` in the archive.
