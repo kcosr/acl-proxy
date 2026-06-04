@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use flate2::read::GzDecoder;
-use flate2::write::GzEncoder;
+use flate2::read::{GzDecoder, ZlibDecoder};
+use flate2::write::{GzEncoder, ZlibEncoder};
 use flate2::Compression;
 use http::header::{
     HeaderMap as HttpHeaderMap, HeaderName, HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH,
@@ -82,11 +82,11 @@ enum RequestBodyProcessingError {
     BodyTooLarge { limit: usize },
     #[error("unsupported request content-encoding '{encoding}'")]
     UnsupportedContentEncoding { encoding: String },
-    #[error("failed to decompress gzip request body: {0}")]
+    #[error("failed to decompress encoded request body: {0}")]
     Decompress(std::io::Error),
     #[error("decompressed request body exceeded configured limit of {limit} bytes")]
     DecompressedBodyTooLarge { limit: usize },
-    #[error("failed to recompress gzip request body: {0}")]
+    #[error("failed to recompress encoded request body: {0}")]
     Recompress(std::io::Error),
     #[error("invalid rewritten content-type returned by plugin: {0}")]
     InvalidContentType(#[from] http::header::InvalidHeaderValue),
@@ -1300,14 +1300,14 @@ async fn prepare_request_body_for_plugin(
     );
 
     let decoded = match content_encoding.as_deref() {
-        Some("gzip") => {
-            let decoded = decompress_gzip_limited(&encoded, max_decompressed_body_bytes)?;
+        Some(encoding) => {
+            let decoded = decompress_body_limited(encoding, &encoded, max_decompressed_body_bytes)?;
             tracing::debug!(
                 target: "acl_proxy::body_policy",
                 request_id = %request_id,
                 url = %url,
                 profile = %profile_name,
-                encoding = "gzip",
+                encoding = %encoding,
                 encoded_size = encoded.len(),
                 decoded_size = decoded.len(),
                 "request body decompressed"
@@ -1315,11 +1315,6 @@ async fn prepare_request_body_for_plugin(
             decoded
         }
         None => encoded.clone(),
-        Some(other) => {
-            return Err(RequestBodyProcessingError::UnsupportedContentEncoding {
-                encoding: other.to_string(),
-            })
-        }
     };
 
     set_body_headers(
@@ -1350,24 +1345,19 @@ fn rebuild_request_with_plugin_body(
     let content_encoding = prepared.content_encoding.clone();
     let decoded_len = mutation.decoded_body.len();
     let encoded = match content_encoding.as_deref() {
-        Some("gzip") => {
-            let encoded = compress_gzip(&mutation.decoded_body)?;
+        Some(encoding) => {
+            let encoded = compress_body(encoding, &mutation.decoded_body)?;
             tracing::debug!(
                 target: "acl_proxy::body_policy",
                 request_id = %request_id,
                 url = %url,
                 profile = %profile_name,
-                encoding = "gzip",
+                encoding = %encoding,
                 decoded_size = decoded_len,
                 encoded_size = encoded.len(),
                 "request body recompressed"
             );
             encoded
-        }
-        Some(other) => {
-            return Err(RequestBodyProcessingError::UnsupportedContentEncoding {
-                encoding: other.to_string(),
-            })
         }
         None => mutation.decoded_body,
     };
@@ -1418,8 +1408,10 @@ fn normalized_content_encoding(
     if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("identity") {
         return Ok(None);
     }
-    if trimmed.eq_ignore_ascii_case("gzip") {
-        return Ok(Some("gzip".to_string()));
+    for supported in ["gzip", "deflate", "br", "zstd"] {
+        if trimmed.eq_ignore_ascii_case(supported) {
+            return Ok(Some(supported.to_string()));
+        }
     }
     Err(RequestBodyProcessingError::UnsupportedContentEncoding {
         encoding: trimmed.to_string(),
@@ -1433,11 +1425,30 @@ fn header_to_string(headers: &HttpHeaderMap, name: &HeaderName) -> Option<String
         .map(|value| value.to_string())
 }
 
-fn decompress_gzip_limited(
+fn decompress_body_limited(
+    encoding: &str,
     encoded: &[u8],
     limit: usize,
 ) -> Result<Vec<u8>, RequestBodyProcessingError> {
-    let mut decoder = GzDecoder::new(encoded);
+    match encoding {
+        "gzip" => read_decoder_limited(GzDecoder::new(encoded), limit),
+        "deflate" => read_decoder_limited(ZlibDecoder::new(encoded), limit),
+        "br" => read_decoder_limited(brotli::Decompressor::new(encoded, 4096), limit),
+        "zstd" => {
+            let decoder = zstd::stream::read::Decoder::new(encoded)
+                .map_err(RequestBodyProcessingError::Decompress)?;
+            read_decoder_limited(decoder, limit)
+        }
+        other => Err(RequestBodyProcessingError::UnsupportedContentEncoding {
+            encoding: other.to_string(),
+        }),
+    }
+}
+
+fn read_decoder_limited<R: Read>(
+    mut decoder: R,
+    limit: usize,
+) -> Result<Vec<u8>, RequestBodyProcessingError> {
     let mut decoded = Vec::new();
     decoder
         .by_ref()
@@ -1450,6 +1461,20 @@ fn decompress_gzip_limited(
     Ok(decoded)
 }
 
+fn compress_body(encoding: &str, decoded: &[u8]) -> Result<Vec<u8>, RequestBodyProcessingError> {
+    match encoding {
+        "gzip" => compress_gzip(decoded),
+        "deflate" => compress_deflate(decoded),
+        "br" => compress_brotli(decoded),
+        "zstd" => {
+            zstd::stream::encode_all(decoded, 0).map_err(RequestBodyProcessingError::Recompress)
+        }
+        other => Err(RequestBodyProcessingError::UnsupportedContentEncoding {
+            encoding: other.to_string(),
+        }),
+    }
+}
+
 fn compress_gzip(decoded: &[u8]) -> Result<Vec<u8>, RequestBodyProcessingError> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder
@@ -1458,6 +1483,27 @@ fn compress_gzip(decoded: &[u8]) -> Result<Vec<u8>, RequestBodyProcessingError> 
     encoder
         .finish()
         .map_err(RequestBodyProcessingError::Recompress)
+}
+
+fn compress_deflate(decoded: &[u8]) -> Result<Vec<u8>, RequestBodyProcessingError> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(decoded)
+        .map_err(RequestBodyProcessingError::Recompress)?;
+    encoder
+        .finish()
+        .map_err(RequestBodyProcessingError::Recompress)
+}
+
+fn compress_brotli(decoded: &[u8]) -> Result<Vec<u8>, RequestBodyProcessingError> {
+    let mut encoder = brotli::CompressorWriter::new(Vec::new(), 4096, 5, 22);
+    encoder
+        .write_all(decoded)
+        .map_err(RequestBodyProcessingError::Recompress)?;
+    encoder
+        .flush()
+        .map_err(RequestBodyProcessingError::Recompress)?;
+    Ok(encoder.into_inner())
 }
 
 fn set_body_headers(

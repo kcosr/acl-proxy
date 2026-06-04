@@ -799,7 +799,7 @@ restart_delay_ms = 10000            # delay before restarting crashed plugin
 include_headers = ["x-*"]           # header name globs to forward
 include_request_body = false        # optional body-aware plugin delegation
 max_request_body_bytes = 10485760   # encoded limit, 10 MiB
-max_decompressed_request_body_bytes = 52428800 # decoded gzip limit, 50 MiB
+max_decompressed_request_body_bytes = 52428800 # decoded body limit, 50 MiB
 env = { KEY = "value" }             # env vars for the plugin process
 ```
 
@@ -930,7 +930,7 @@ max_request_body_bytes = 10485760
 max_decompressed_request_body_bytes = 52428800
 ```
 
-When `include_request_body = true`, acl-proxy buffers the outbound request body before forwarding, decompresses `Content-Encoding: gzip` bodies, sends the decoded body to the plugin as base64, and can apply an optional `requestBody` replacement returned by an `allow` decision. The default encoded limit is 10 MiB and the default decompressed limit is 50 MiB. Plugin-returned replacement bodies are also capped by the decoded limit. If the original request was gzip-compressed, the replacement body is recompressed before egress and `Content-Length` is rebuilt. Unsupported content encodings, body read failures, oversize encoded bodies, and oversize decoded bodies fail the delegated request with an auth-plugin error response. Plugin `deny` responses may include `denyMessage` to replace the client-visible JSON `message`; status remains `403` and JSON `error` remains `Forbidden`. `denyMessage` is valid only on `deny`; returning it on `allow` or `pass` is a protocol error.
+When `include_request_body = true`, acl-proxy buffers the outbound request body before forwarding, decompresses supported `Content-Encoding` bodies (`gzip`, `deflate`, `br`, and `zstd`), sends the decoded body to the plugin as base64, and can apply an optional `requestBody` replacement returned by an `allow` decision. The default encoded limit is 10 MiB and the default decompressed limit is 50 MiB. Plugin-returned replacement bodies are also capped by the decoded limit. If the original request used a supported content encoding, the replacement body is recompressed with the same encoding before egress and `Content-Length` is rebuilt. Unsupported or stacked content encodings, body read failures, oversize encoded bodies, and oversize decoded bodies fail the delegated request with an auth-plugin error response. Plugin `deny` responses may include `denyMessage` to replace the client-visible JSON `message`; status remains `403` and JSON `error` remains `Forbidden`. `denyMessage` is valid only on `deny`; returning it on `allow` or `pass` is a protocol error.
 
 Body-aware plugin delegation runs only when a request matches a `delegate` rule whose plugin profile has `include_request_body = true`. It works on all HTTP request-forwarding paths, including explicit HTTP proxying, transparent HTTP, CONNECT MITM inner requests, and transparent HTTPS after TLS termination. HTTP/1.1 upgrade/WebSocket traffic is not body-buffered; use `allow_upgrades = false` on protected rules when upgrade tunnels should be blocked before plugin invocation or upstream forwarding.
 
