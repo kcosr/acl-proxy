@@ -129,17 +129,21 @@ If unset or empty, no headers are sent to the plugin.
 ### Request body inclusion
 
 When `include_request_body = true`, acl-proxy buffers the outbound request body
-before forwarding it upstream. If the request uses `Content-Encoding: gzip`, the
-body is decompressed before being sent to the plugin. The plugin receives the
-decoded body as base64. On `allow`, the plugin may return a replacement decoded
-body; acl-proxy recompresses it when the original request was gzip-compressed and
-rebuilds `Content-Length`. Replacement bodies returned by the plugin are capped
-by `max_decompressed_request_body_bytes`.
+before forwarding it upstream. If the request uses a supported
+`Content-Encoding` (`gzip`, `deflate`, `br`, or `zstd`), the body is decompressed
+before being sent to the plugin. The plugin receives the decoded body as base64.
+On `allow`, the plugin may return a replacement decoded body; acl-proxy
+recompresses it with the original encoding when the original request used a
+supported content encoding and rebuilds `Content-Length`. Replacement bodies
+returned by the plugin are capped by `max_decompressed_request_body_bytes`.
+`deflate` ingress accepts both zlib-wrapped and raw DEFLATE bodies; rewritten
+`deflate` bodies are emitted as zlib-wrapped DEFLATE. `zstd` decoding caps the
+accepted frame window based on the decompressed body limit.
 
-Unsupported request encodings, body read failures, and configured size-limit
-violations fail the delegated request before upstream egress. Body-aware
-delegation is supported only for synchronous plugin profiles, not HTTP webhook
-callback profiles.
+Unsupported or stacked request encodings, body read failures, and configured
+size-limit violations fail the delegated request before upstream egress.
+Body-aware delegation is supported only for synchronous plugin profiles, not HTTP
+webhook callback profiles.
 
 Body-aware delegation runs only after a request matches a `delegate` rule whose
 plugin profile has `include_request_body = true`. HTTP/1.1 upgrade tunnels are

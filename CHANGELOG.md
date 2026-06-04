@@ -2,7 +2,9 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Add body-aware plugin support for `Content-Encoding: deflate`, `br`, and `zstd` request bodies. ([#53](https://github.com/kcosr/acl-proxy/pull/53))
 
 ## [0.1.0] - 2026-06-04
 
