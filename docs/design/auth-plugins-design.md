@@ -72,8 +72,8 @@ restart_delay_ms = 10000
 - `timeout_ms` (integer, required)
 - `include_headers` (array of strings, optional)
 - `include_request_body` (boolean, optional, default false)
-- `max_request_body_bytes` (integer, optional, default 10485760)
-- `max_decompressed_request_body_bytes` (integer, optional, default 52428800)
+- `max_request_body_bytes` (integer, optional, default 10485760 / 10 MiB)
+- `max_decompressed_request_body_bytes` (integer, optional, default 52428800 / 50 MiB)
 - `env` (map of string to string, optional)
 - `restart_delay_ms` (integer, optional, default 10000)
 
@@ -108,7 +108,8 @@ replacement. `decision = "pass"` must not include `requestBody`.
 
 For deny decisions, plugins may include `denyMessage` to replace the
 client-visible JSON `message` in the 403 response. The HTTP status remains fixed
-at 403 and the JSON `error` remains `Forbidden`.
+at 403 and the JSON `error` remains `Forbidden`. `denyMessage` is valid only on
+deny decisions.
 
 ### Failure behavior
 
@@ -138,6 +139,11 @@ Unsupported request encodings, body read failures, and configured size-limit
 violations fail the delegated request before upstream egress. Body-aware
 delegation is supported only for synchronous plugin profiles, not HTTP webhook
 callback profiles.
+
+Body-aware delegation runs only after a request matches a `delegate` rule whose
+plugin profile has `include_request_body = true`. HTTP/1.1 upgrade tunnels are
+not body-buffered; rules can use `allow_upgrades = false` to reject those
+handshakes before plugin invocation.
 
 ## Plugin Protocol (stdio)
 

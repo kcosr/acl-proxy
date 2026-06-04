@@ -2588,7 +2588,7 @@ level = "info"
     }
 
     #[test]
-    fn capture_max_body_bytes_defaults_to_64k() {
+    fn capture_max_body_bytes_defaults_to_1mib() {
         let toml = r#"
 schema_version = "1"
 
@@ -2605,7 +2605,7 @@ default = "deny"
         "#;
 
         let config: Config = toml::from_str(toml).expect("parse config");
-        assert_eq!(config.capture.max_body_bytes, 64 * 1024);
+        assert_eq!(config.capture.max_body_bytes, 1024 * 1024);
         assert!(config.validate_basic().is_ok());
     }
 

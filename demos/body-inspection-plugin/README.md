@@ -36,7 +36,13 @@ max_decompressed_request_body_bytes = 52428800
 action = "delegate"
 pattern = "https://api.example-ai.com/**"
 external_auth_profile = "body_guard"
+allow_upgrades = false
 ```
+
+The body guard runs only for requests that match this `delegate` rule. The
+profile limits default to 10 MiB for the encoded request body and 50 MiB after
+gzip decompression. `allow_upgrades = false` blocks HTTP/1.1 upgrade handshakes
+for the protected endpoint before the plugin or upstream receives them.
 
 ## Plugin config
 

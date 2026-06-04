@@ -436,6 +436,7 @@ action = "allow"
 pattern = "https://git.internal/{repo}.git/**"
 description = "Git HTTP(S) for {repo}"
 methods = ["GET", "POST"]
+allow_upgrades = false              # optional: inherited by includes
 ```
 
 Ruleset templates can also use `patterns = [...]`; include expansion emits one concrete rule for each template pattern.
@@ -453,7 +454,7 @@ subnets = ["10.0.0.0/8"]           # overrides template subnets
 - `with` provides macro overrides specific to this include.
 - `add_url_enc_variants = true` generates both raw and URL-encoded variants for all placeholders.
 - `methods` and `subnets` on the include override the template values; when omitted, template values are used.
-- `headers_absent`, `headers_match`, and `headers_not_match` are inherited from the template, not overridden.
+- `headers_absent`, `headers_match`, `headers_not_match`, and `allow_upgrades` are inherited from the template, not overridden.
 - Missing macros required by a ruleset cause validation failure.
 
 ### Header Actions
@@ -631,7 +632,7 @@ denied_request = false              # capture denied request records
 denied_response = false             # capture denied response records
 directory = "logs-capture"          # base directory for capture files
 filename = "{requestId}-{suffix}.json"   # template ({requestId}, {kind}, {suffix})
-max_body_bytes = 65536              # max body bytes to serialize (0 = skip body)
+max_body_bytes = 1048576            # max body bytes to serialize (1 MiB; 0 = skip body)
 ```
 
 Capture happens for:
@@ -796,8 +797,8 @@ timeout_ms = 1000
 restart_delay_ms = 10000            # delay before restarting crashed plugin
 include_headers = ["x-*"]           # header name globs to forward
 include_request_body = false        # optional body-aware plugin delegation
-max_request_body_bytes = 10485760
-max_decompressed_request_body_bytes = 52428800
+max_request_body_bytes = 10485760   # encoded limit, 10 MiB
+max_decompressed_request_body_bytes = 52428800 # decoded gzip limit, 50 MiB
 env = { KEY = "value" }             # env vars for the plugin process
 ```
 
@@ -928,9 +929,9 @@ max_request_body_bytes = 10485760
 max_decompressed_request_body_bytes = 52428800
 ```
 
-When `include_request_body = true`, acl-proxy buffers the outbound request body before forwarding, decompresses `Content-Encoding: gzip` bodies, sends the decoded body to the plugin as base64, and can apply an optional `requestBody` replacement returned by an `allow` decision. If the original request was gzip-compressed, the replacement body is recompressed before egress. Unsupported content encodings, body read failures, oversize encoded bodies, and oversize decoded bodies fail the delegated request with an auth-plugin error response. Plugin `deny` responses may include `denyMessage` to replace the client-visible JSON `message`; status remains `403` and JSON `error` remains `Forbidden`.
+When `include_request_body = true`, acl-proxy buffers the outbound request body before forwarding, decompresses `Content-Encoding: gzip` bodies, sends the decoded body to the plugin as base64, and can apply an optional `requestBody` replacement returned by an `allow` decision. The default encoded limit is 10 MiB and the default decompressed limit is 50 MiB. If the original request was gzip-compressed, the replacement body is recompressed before egress and `Content-Length` is rebuilt. Unsupported content encodings, body read failures, oversize encoded bodies, and oversize decoded bodies fail the delegated request with an auth-plugin error response. Plugin `deny` responses may include `denyMessage` to replace the client-visible JSON `message`; status remains `403` and JSON `error` remains `Forbidden`. `denyMessage` is valid only on `deny`; returning it on `allow` or `pass` is a protocol error.
 
-Body-aware plugin delegation works on all HTTP request-forwarding paths, including explicit HTTP proxying, transparent HTTP, CONNECT MITM inner requests, and transparent HTTPS after TLS termination. HTTP/1.1 upgrade/WebSocket traffic is not body-buffered; use `allow_upgrades = false` on protected rules when upgrade tunnels should be blocked.
+Body-aware plugin delegation runs only when a request matches a `delegate` rule whose plugin profile has `include_request_body = true`. It works on all HTTP request-forwarding paths, including explicit HTTP proxying, transparent HTTP, CONNECT MITM inner requests, and transparent HTTPS after TLS termination. HTTP/1.1 upgrade/WebSocket traffic is not body-buffered; use `allow_upgrades = false` on protected rules when upgrade tunnels should be blocked before plugin invocation or upstream forwarding.
 
 Body-processing diagnostics are emitted with structured fields on the `acl_proxy::body_policy` tracing target at `debug` level. Logs include request ID, URL, profile, sizes, encoding, and decision metadata, but never log body contents.
 
@@ -1074,7 +1075,7 @@ Separate control for allow vs. deny decisions with configurable log levels. Even
 
 ### Request/Response Capture
 
-JSON capture files with request metadata, headers, and base64-encoded bodies. Enable independently for allowed/denied requests/responses. Body size capped at `capture.max_body_bytes` (default 64 KiB); full logical length always recorded in `body.length`.
+JSON capture files with request metadata, headers, and base64-encoded bodies. Enable independently for allowed/denied requests/responses. Body size capped at `capture.max_body_bytes` (default 1 MiB); full logical length always recorded in `body.length`.
 
 ### Body Extraction
 
