@@ -792,6 +792,9 @@ args = ["--config", "/etc/url-allow.json"]
 timeout_ms = 1000
 restart_delay_ms = 10000            # delay before restarting crashed plugin
 include_headers = ["x-*"]           # header name globs to forward
+include_request_body = false        # optional body-aware plugin delegation
+max_request_body_bytes = 10485760
+max_decompressed_request_body_bytes = 52428800
 env = { KEY = "value" }             # env vars for the plugin process
 ```
 
@@ -834,6 +837,7 @@ The config loader performs validation beyond basic TOML parsing:
 - `policy.default` must be `allow` or `deny`; `delegate` is valid only on rules and ruleset templates.
 - `action = "delegate"` requires `external_auth_profile`.
 - `external_auth_profile` on `action = "allow"` or `action = "deny"` rules is rejected.
+- `include_request_body = true` is supported only for `type = "plugin"` external auth profiles, and its body-size limits must be non-zero.
 
 On validation failure, `config validate` and startup report a human-readable error and abort, leaving any previously running instance (in the case of reload) unchanged.
 
@@ -907,6 +911,25 @@ Content-Type: application/json
 ### Plugin Mode (type = "plugin")
 
 Stdio-based synchronous auth. The proxy spawns a long-running plugin process and sends JSON requests over stdin, waiting for `allow`, `deny`, or `pass` JSON responses from stdout (newline-delimited). On `allow`, the proxy applies rule header actions first, plugin header actions second, and global egress request actions third. On `pass`, the plugin must not return request or response header actions, and policy evaluation resumes at the rule after the matched delegate rule. Plugins can also return response header actions on `allow`. See [`docs/design/auth-plugins-design.md`](docs/design/auth-plugins-design.md) for the full protocol specification.
+
+Plugin profiles can opt into request-body inspection and mutation:
+
+```toml
+[policy.external_auth_profiles.ai_guard]
+type = "plugin"
+command = "/usr/local/bin/ai-guard"
+timeout_ms = 3000
+include_headers = ["content-type", "authorization"]
+include_request_body = true
+max_request_body_bytes = 10485760
+max_decompressed_request_body_bytes = 52428800
+```
+
+When `include_request_body = true`, acl-proxy buffers the outbound request body before forwarding, decompresses `Content-Encoding: gzip` bodies, sends the decoded body to the plugin as base64, and can apply an optional `requestBody` replacement returned by an `allow` decision. If the original request was gzip-compressed, the replacement body is recompressed before egress. Unsupported content encodings, body read failures, oversize encoded bodies, and oversize decoded bodies fail the delegated request with an auth-plugin error response.
+
+Body-aware plugin delegation works on all HTTP request-forwarding paths, including explicit HTTP proxying, transparent HTTP, CONNECT MITM inner requests, and transparent HTTPS after TLS termination. HTTP/1.1 upgrade/WebSocket traffic is not body-buffered; screen upgrades at the handshake/policy level instead.
+
+Body-processing diagnostics are emitted with structured fields on the `acl_proxy::body_policy` tracing target at `debug` level. Logs include request ID, URL, profile, sizes, encoding, and decision metadata, but never log body contents.
 
 ### Failure Handling
 

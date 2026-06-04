@@ -1,7 +1,7 @@
 #![allow(clippy::await_holding_lock, clippy::while_let_on_iterator)]
 
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,6 +9,11 @@ use std::time::Duration;
 use acl_proxy::app::AppState;
 use acl_proxy::config::Config;
 use acl_proxy::proxy::http::run_http_proxy_on_listener;
+use base64::engine::general_purpose;
+use base64::Engine;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
 use h2::client as h2_client;
 use http::header::HeaderValue;
 use http::StatusCode;
@@ -22,6 +27,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 struct SeenForwardedRequest {
     uri: String,
     headers: hyper::HeaderMap,
+}
+
+#[derive(Clone, Debug)]
+struct SeenBodyRequest {
+    headers: hyper::HeaderMap,
+    body: Vec<u8>,
 }
 
 async fn start_upstream_echo_server() -> (SocketAddr, Arc<Mutex<Option<hyper::HeaderMap>>>) {
@@ -79,6 +90,42 @@ async fn start_forwarding_echo_server() -> (SocketAddr, Arc<Mutex<Vec<SeenForwar
                         headers: req.headers().clone(),
                     });
                     Ok::<_, hyper::Error>(Response::new(Body::from("forwarded")))
+                }
+            }))
+        }
+    });
+
+    let server = Server::from_tcp(listener)
+        .expect("server from tcp")
+        .serve(make_svc);
+    tokio::spawn(server);
+
+    (addr, seen_requests)
+}
+
+async fn start_upstream_body_echo_server() -> (SocketAddr, Arc<Mutex<Vec<SeenBodyRequest>>>) {
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind body upstream");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking body upstream");
+    let addr = listener.local_addr().expect("body upstream addr");
+
+    let seen_requests: Arc<Mutex<Vec<SeenBodyRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_requests_clone = seen_requests.clone();
+
+    let make_svc = make_service_fn(move |_conn| {
+        let seen_requests = seen_requests_clone.clone();
+        async move {
+            Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
+                let seen_requests = seen_requests.clone();
+                async move {
+                    let headers = req.headers().clone();
+                    let body = hyper::body::to_bytes(req.into_body()).await?.to_vec();
+                    seen_requests
+                        .lock()
+                        .unwrap()
+                        .push(SeenBodyRequest { headers, body });
+                    Ok::<_, hyper::Error>(Response::new(Body::from("body-forwarded")))
                 }
             }))
         }
@@ -1570,6 +1617,45 @@ async fn start_proxy_with_config(
     (addr, temp_dir)
 }
 
+fn write_body_rewrite_plugin(dir: &TempDir, body: &[u8]) -> std::path::PathBuf {
+    let script_path = dir.path().join("body-rewrite-plugin.sh");
+    let encoded = general_purpose::STANDARD.encode(body);
+    let script = format!(
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf "%s" "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  if [ -n "$id" ]; then
+    printf '{{"id":"%s","type":"response","decision":"allow","requestBody":{{"encoding":"base64","contentType":"application/json","data":"{encoded}"}}}}\n' "$id"
+  fi
+done
+"#
+    );
+    std::fs::write(&script_path, script).expect("write body rewrite plugin");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat plugin script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod plugin script");
+    }
+    script_path
+}
+
+fn gzip_bytes(body: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(body).expect("write gzip body");
+    encoder.finish().expect("finish gzip body")
+}
+
+fn gunzip_bytes(body: &[u8]) -> Vec<u8> {
+    let mut decoder = GzDecoder::new(body);
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded).expect("decode gzip body");
+    decoded
+}
+
 async fn send_raw_http_request(addr: SocketAddr, raw_request: &str) -> (String, StatusCode) {
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
@@ -1676,6 +1762,191 @@ async fn http_explicit_listener_accepts_h2c_prior_knowledge_requests() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "ok");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn body_aware_auth_plugin_rewrites_http_request_body() {
+    let (upstream_addr, seen_requests) = start_upstream_body_echo_server().await;
+    let plugin_temp_dir = TempDir::new().expect("plugin temp dir");
+    let replacement = br#"{"prompt":"redacted"}"#;
+    let script_path = write_body_rewrite_plugin(&plugin_temp_dir, replacement);
+
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    let toml = format!(
+        r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+
+[logging]
+directory = "logs"
+level = "debug"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles.body_guard]
+type = "plugin"
+command = "{script_path}"
+timeout_ms = 1000
+include_request_body = true
+max_request_body_bytes = 4096
+max_decompressed_request_body_bytes = 4096
+include_headers = ["content-type"]
+
+[[policy.rules]]
+action = "delegate"
+pattern = "http://{host}/**"
+external_auth_profile = "body_guard"
+"#,
+        script_path = script_path.to_string_lossy(),
+        host = host
+    );
+    let config: Config = toml::from_str(&toml).expect("parse config");
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let original = br#"{"prompt":"secret"}"#;
+    let raw_request = format!(
+        "POST http://{host}/chat HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        original.len(),
+        String::from_utf8_lossy(original)
+    );
+    let (response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        response.contains("\r\n\r\nbody-forwarded"),
+        "unexpected response body: {response}"
+    );
+    let seen = seen_requests.lock().unwrap();
+    let request = seen.first().expect("upstream should see request");
+    assert_eq!(request.body, replacement);
+    let content_length = request
+        .headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    assert_eq!(content_length, Some(replacement.len().to_string()));
+    assert_eq!(
+        request
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    assert!(request.headers.get("content-encoding").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn body_aware_auth_plugin_recompresses_gzip_request_body() {
+    let (upstream_addr, seen_requests) = start_upstream_body_echo_server().await;
+    let plugin_temp_dir = TempDir::new().expect("plugin temp dir");
+    let replacement = br#"{"prompt":"redacted gzip"}"#;
+    let script_path = write_body_rewrite_plugin(&plugin_temp_dir, replacement);
+
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    let toml = format!(
+        r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+
+[logging]
+directory = "logs"
+level = "debug"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles.body_guard]
+type = "plugin"
+command = "{script_path}"
+timeout_ms = 1000
+include_request_body = true
+max_request_body_bytes = 4096
+max_decompressed_request_body_bytes = 4096
+
+[[policy.rules]]
+action = "delegate"
+pattern = "http://{host}/**"
+external_auth_profile = "body_guard"
+"#,
+        script_path = script_path.to_string_lossy(),
+        host = host
+    );
+    let config: Config = toml::from_str(&toml).expect("parse config");
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let original_encoded = gzip_bytes(br#"{"prompt":"secret gzip"}"#);
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
+    let request_head = format!(
+        "POST http://{host}/chat HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        original_encoded.len()
+    );
+    stream
+        .write_all(request_head.as_bytes())
+        .await
+        .expect("write request head");
+    stream
+        .write_all(&original_encoded)
+        .await
+        .expect("write request body");
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.expect("read response");
+    let response = String::from_utf8_lossy(&buf).to_string();
+    let status_line = response.lines().next().unwrap_or_default();
+    assert!(
+        status_line.contains(" 200 "),
+        "unexpected response: {response}"
+    );
+
+    let seen = seen_requests.lock().unwrap();
+    let request = seen.first().expect("upstream should see request");
+    assert_eq!(
+        request
+            .headers
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok()),
+        Some("gzip")
+    );
+    assert_eq!(gunzip_bytes(&request.body), replacement);
+    let content_length = request
+        .headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    assert_eq!(content_length, Some(request.body.len().to_string()));
 }
 
 #[tokio::test(flavor = "multi_thread")]

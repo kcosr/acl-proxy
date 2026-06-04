@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose;
+use base64::Engine;
 use http::header::{HeaderName, HeaderValue};
 use http::HeaderMap as HttpHeaderMap;
 use serde::{Deserialize, Serialize};
@@ -47,9 +49,23 @@ impl std::error::Error for PluginError {}
 pub enum PluginDecision {
     Allow {
         header_actions: Vec<CompiledHeaderAction>,
+        request_body: Option<PluginBodyMutation>,
     },
     Deny,
     Pass,
+}
+
+#[derive(Debug, Clone)]
+pub struct PluginBodyInput {
+    pub content_type: Option<String>,
+    pub content_encoding: Option<String>,
+    pub decoded_body: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PluginBodyMutation {
+    pub content_type: Option<String>,
+    pub decoded_body: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -86,6 +102,9 @@ impl AuthPluginManager {
                 args: profile.args.clone(),
                 timeout: Duration::from_millis(profile.timeout_ms),
                 include_headers: profile.include_headers.clone(),
+                include_request_body: profile.include_request_body,
+                max_request_body_bytes: profile.max_request_body_bytes,
+                max_decompressed_request_body_bytes: profile.max_decompressed_request_body_bytes,
                 env: profile.env.clone(),
                 restart_delay: Duration::from_millis(
                     profile.restart_delay_ms.unwrap_or(DEFAULT_RESTART_DELAY_MS),
@@ -117,8 +136,15 @@ impl AuthPluginHandle {
         method: &http::Method,
         client_ip: &str,
         headers: &HttpHeaderMap,
+        body: Option<PluginBodyInput>,
     ) -> Result<PluginDecision, PluginError> {
         let headers = collect_included_headers(headers, &self.config.include_headers);
+        let body = body.map(|body| PluginRequestBody {
+            encoding: "base64",
+            content_type: body.content_type,
+            content_encoding: body.content_encoding,
+            data: general_purpose::STANDARD.encode(body.decoded_body),
+        });
 
         let payload = PluginRequest {
             id: request_id,
@@ -127,6 +153,7 @@ impl AuthPluginHandle {
             method: method.as_str(),
             client_ip,
             headers,
+            body,
         };
 
         let message = serde_json::to_string(&payload).map_err(|err| {
@@ -194,6 +221,22 @@ impl AuthPluginHandle {
         let mut guard = self.runtime.lock().await;
         *guard = None;
     }
+
+    pub fn include_request_body(&self) -> bool {
+        self.config.include_request_body
+    }
+
+    pub fn max_request_body_bytes(&self) -> usize {
+        self.config.max_request_body_bytes
+    }
+
+    pub fn max_decompressed_request_body_bytes(&self) -> usize {
+        self.config.max_decompressed_request_body_bytes
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.config.timeout
+    }
 }
 
 #[derive(Clone)]
@@ -203,6 +246,9 @@ struct AuthPluginConfig {
     args: Vec<String>,
     timeout: Duration,
     include_headers: Vec<String>,
+    include_request_body: bool,
+    max_request_body_bytes: usize,
+    max_decompressed_request_body_bytes: usize,
     env: BTreeMap<String, String>,
     restart_delay: Duration,
 }
@@ -218,6 +264,8 @@ struct PluginRequest<'a> {
     client_ip: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     headers: Option<HeaderMap>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<PluginRequestBody>,
 }
 
 #[derive(Deserialize)]
@@ -230,6 +278,26 @@ struct PluginResponse {
     request_headers: Vec<PluginHeaderAction>,
     #[serde(default, rename = "responseHeaders")]
     response_headers: Vec<PluginHeaderAction>,
+    #[serde(default, rename = "requestBody")]
+    request_body: Option<PluginResponseBody>,
+}
+
+#[derive(Debug, Serialize)]
+struct PluginRequestBody {
+    encoding: &'static str,
+    #[serde(rename = "contentType", skip_serializing_if = "Option::is_none")]
+    content_type: Option<String>,
+    #[serde(rename = "contentEncoding", skip_serializing_if = "Option::is_none")]
+    content_encoding: Option<String>,
+    data: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginResponseBody {
+    encoding: String,
+    #[serde(default, rename = "contentType")]
+    content_type: Option<String>,
+    data: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -466,8 +534,21 @@ fn handle_plugin_response(
                     return;
                 }
             }
+            let request_body = match response.request_body {
+                Some(body) => match decode_plugin_response_body(body) {
+                    Ok(body) => Some(body),
+                    Err(err) => {
+                        let _ = sender.send(Err(err));
+                        return;
+                    }
+                },
+                None => None,
+            };
 
-            Ok(PluginDecision::Allow { header_actions })
+            Ok(PluginDecision::Allow {
+                header_actions,
+                request_body,
+            })
         }
         PluginDecisionKind::Deny => {
             tracing::debug!(
@@ -485,9 +566,12 @@ fn handle_plugin_response(
                 decision = "pass",
                 "auth plugin decision"
             );
-            if !response.request_headers.is_empty() || !response.response_headers.is_empty() {
+            if !response.request_headers.is_empty()
+                || !response.response_headers.is_empty()
+                || response.request_body.is_some()
+            {
                 Err(PluginError::new(
-                    "auth plugin pass decision must not include header actions",
+                    "auth plugin pass decision must not include header actions or requestBody",
                 ))
             } else {
                 Ok(PluginDecision::Pass)
@@ -496,6 +580,26 @@ fn handle_plugin_response(
     };
 
     let _ = sender.send(result);
+}
+
+fn decode_plugin_response_body(
+    body: PluginResponseBody,
+) -> Result<PluginBodyMutation, PluginError> {
+    if body.encoding != "base64" {
+        return Err(PluginError::new(format!(
+            "unsupported requestBody encoding '{}'; expected base64",
+            body.encoding
+        )));
+    }
+
+    let decoded_body = general_purpose::STANDARD
+        .decode(body.data)
+        .map_err(|err| PluginError::new(format!("requestBody data is not valid base64: {err}")))?;
+
+    Ok(PluginBodyMutation {
+        content_type: body.content_type,
+        decoded_body,
+    })
 }
 
 fn compile_plugin_actions(
@@ -740,6 +844,9 @@ mod tests {
             args: Vec::new(),
             timeout: Duration::from_millis(1000),
             include_headers: Vec::new(),
+            include_request_body: false,
+            max_request_body_bytes: 10 * 1024 * 1024,
+            max_decompressed_request_body_bytes: 50 * 1024 * 1024,
             env: BTreeMap::new(),
             restart_delay: Duration::from_millis(10),
         }
@@ -775,6 +882,36 @@ mod tests {
         assert!(
             err.message()
                 .contains("pass decision must not include header actions"),
+            "unexpected error: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn plugin_allow_can_return_request_body_mutation() {
+        let decision = parse_response(
+            r#"{"id":"req-1","type":"response","decision":"allow","requestBody":{"encoding":"base64","contentType":"application/json","data":"eyJvayI6dHJ1ZX0="}}"#,
+        )
+        .expect("allow with request body should parse");
+
+        let PluginDecision::Allow { request_body, .. } = decision else {
+            panic!("expected allow decision");
+        };
+        let body = request_body.expect("request body mutation");
+        assert_eq!(body.content_type.as_deref(), Some("application/json"));
+        assert_eq!(body.decoded_body, br#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn plugin_pass_with_request_body_is_rejected() {
+        let err = parse_response(
+            r#"{"id":"req-1","type":"response","decision":"pass","requestBody":{"encoding":"base64","data":"eA=="}}"#,
+        )
+        .expect_err("pass with request body should fail");
+
+        assert!(
+            err.message()
+                .contains("pass decision must not include header actions or requestBody"),
             "unexpected error: {}",
             err.message()
         );

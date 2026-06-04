@@ -2,7 +2,7 @@
 
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use acl_proxy::app::AppState;
 use acl_proxy::capture::{
@@ -10,6 +10,8 @@ use acl_proxy::capture::{
 };
 use acl_proxy::config::Config;
 use acl_proxy::proxy::https_transparent::run_https_transparent_proxy_on_listener;
+use base64::engine::general_purpose;
+use base64::Engine;
 use h2::client as h2_client;
 use http::header::{HeaderValue, CONNECTION, UPGRADE};
 use http::Method;
@@ -36,6 +38,12 @@ const LARGE_BODY_BYTES: usize = DEFAULT_MAX_BODY_BYTES + 1024;
 struct SeenForwardedRequest {
     uri: String,
     headers: hyper::HeaderMap,
+}
+
+#[derive(Clone, Debug)]
+struct SeenBodyRequest {
+    headers: hyper::HeaderMap,
+    body: Vec<u8>,
 }
 
 async fn start_upstream_https_echo_server() -> SocketAddr {
@@ -92,6 +100,73 @@ async fn start_upstream_https_echo_server() -> SocketAddr {
     });
 
     addr
+}
+
+async fn start_upstream_https_body_echo_server() -> (SocketAddr, Arc<Mutex<Vec<SeenBodyRequest>>>) {
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind body upstream");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking body upstream");
+    let addr = listener.local_addr().expect("body upstream addr");
+
+    let mut params = CertificateParams::new(vec![addr.ip().to_string()]).expect("params");
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, addr.ip().to_string());
+    params.distinguished_name = dn;
+    let key = KeyPair::generate().expect("generate upstream key");
+    let cert = params.self_signed(&key).expect("self-signed upstream cert");
+
+    let cert_der: Vec<u8> = cert.der().to_vec();
+    let key_der = key.serialize_der();
+
+    let mut tls_config = ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(vec![RustlsCertificate(cert_der)], PrivateKey(key_der))
+        .expect("server config");
+    tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+    let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
+    let seen_requests: Arc<Mutex<Vec<SeenBodyRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_requests_clone = seen_requests.clone();
+
+    tokio::spawn(async move {
+        let listener = TcpListener::from_std(listener).expect("tokio listener");
+        loop {
+            let (socket, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let acceptor = tls_acceptor.clone();
+            let seen_requests = seen_requests_clone.clone();
+            tokio::spawn(async move {
+                let tls_stream = match acceptor.accept(socket).await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+
+                let service = service_fn(move |req: HyperRequest<Body>| {
+                    let seen_requests = seen_requests.clone();
+                    async move {
+                        let headers = req.headers().clone();
+                        let body = hyper::body::to_bytes(req.into_body()).await?.to_vec();
+                        seen_requests
+                            .lock()
+                            .unwrap()
+                            .push(SeenBodyRequest { headers, body });
+                        Ok::<_, hyper::Error>(HyperResponse::new(Body::from("body-forwarded")))
+                    }
+                });
+
+                let _ = Http::new()
+                    .http1_keep_alive(false)
+                    .serve_connection(tls_stream, service)
+                    .await;
+            });
+        }
+    });
+
+    (addr, seen_requests)
 }
 
 async fn start_forwarding_echo_server(
@@ -460,6 +535,104 @@ async fn send_https_request_via_transparent(
         .to_string();
 
     (status_code, body)
+}
+
+async fn send_https_request_with_body_via_transparent(
+    proxy_addr: SocketAddr,
+    ca_cert_path: &std::path::Path,
+    sni_host: &str,
+    host_header: &str,
+    path: &str,
+    body_bytes: &[u8],
+) -> (u16, String) {
+    use rustls_pemfile;
+
+    let stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
+
+    let ca_pem = std::fs::read(ca_cert_path).expect("read ca cert");
+    let mut reader = std::io::Cursor::new(ca_pem);
+    let mut roots = RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut reader).expect("parse ca cert") {
+        let cert = RustlsCertificate(cert.to_vec());
+        roots.add(&cert).expect("add root cert to store");
+    }
+
+    let config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+
+    let connector = TlsConnector::from(Arc::new(config));
+    let server_name = ServerName::try_from(sni_host).expect("server name");
+    let mut tls_stream = connector
+        .connect(server_name, stream)
+        .await
+        .expect("tls connect");
+
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+        path = path,
+        host = host_header,
+        len = body_bytes.len(),
+    );
+
+    tls_stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write HTTPS request head");
+    tls_stream
+        .write_all(body_bytes)
+        .await
+        .expect("write HTTPS request body");
+
+    let mut resp_buf = Vec::new();
+    tls_stream
+        .read_to_end(&mut resp_buf)
+        .await
+        .expect("read HTTPS response");
+
+    let resp_str = String::from_utf8_lossy(&resp_buf).to_string();
+    let status_line = resp_str.lines().next().unwrap_or_default();
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    let body = resp_str
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or_default()
+        .to_string();
+
+    (status_code, body)
+}
+
+fn write_body_rewrite_plugin(dir: &TempDir, body: &[u8]) -> std::path::PathBuf {
+    let script_path = dir.path().join("transparent-body-rewrite-plugin.sh");
+    let encoded = general_purpose::STANDARD.encode(body);
+    let script = format!(
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf "%s" "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  if [ -n "$id" ]; then
+    printf '{{"id":"%s","type":"response","decision":"allow","requestBody":{{"encoding":"base64","contentType":"application/json","data":"{encoded}"}}}}\n' "$id"
+  fi
+done
+"#
+    );
+    std::fs::write(&script_path, script).expect("write body rewrite plugin");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat plugin script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod plugin script");
+    }
+    script_path
 }
 
 async fn send_h2_https_request_via_transparent(
@@ -2413,6 +2586,99 @@ pattern = "https://{host_header}/**"
 
     assert_eq!(status, StatusCode::OK.as_u16());
     assert_eq!(body, "ok");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn body_aware_auth_plugin_rewrites_transparent_https_request_body() {
+    let (upstream_addr, seen_requests) = start_upstream_https_body_echo_server().await;
+    let plugin_temp_dir = TempDir::new().expect("plugin temp dir");
+    let replacement = br#"{"prompt":"transparent-redacted"}"#;
+    let script_path = write_body_rewrite_plugin(&plugin_temp_dir, replacement);
+
+    let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    let toml = format!(
+        r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+https_bind_address = "127.0.0.1"
+https_port = 0
+
+[logging]
+directory = "logs"
+level = "debug"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[certificates]
+certs_dir = "certs"
+
+[tls]
+verify_upstream = false
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles.body_guard]
+type = "plugin"
+command = "{script_path}"
+timeout_ms = 1000
+include_request_body = true
+max_request_body_bytes = 4096
+max_decompressed_request_body_bytes = 4096
+
+[[policy.rules]]
+action = "delegate"
+pattern = "https://{host_header}/**"
+external_auth_profile = "body_guard"
+"#,
+        script_path = script_path.to_string_lossy(),
+        host_header = host_header
+    );
+    let config: Config = toml::from_str(&toml).expect("parse config");
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir, ca_cert_path) =
+        start_proxy_with_config(config, proxy_listener).await;
+
+    let (status, body) = send_https_request_with_body_via_transparent(
+        proxy_addr,
+        &ca_cert_path,
+        "transparent.test",
+        host_header.as_str(),
+        "/chat",
+        br#"{"prompt":"transparent-secret"}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK.as_u16());
+    assert_eq!(body, "body-forwarded");
+    let seen = seen_requests.lock().unwrap();
+    let request = seen.first().expect("upstream should see request");
+    assert_eq!(request.body, replacement);
+    let content_length = request
+        .headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    assert_eq!(content_length, Some(replacement.len().to_string()));
+    assert_eq!(
+        request
+            .headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

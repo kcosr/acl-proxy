@@ -71,6 +71,9 @@ restart_delay_ms = 10000
 - `args` (array of strings, optional)
 - `timeout_ms` (integer, required)
 - `include_headers` (array of strings, optional)
+- `include_request_body` (boolean, optional, default false)
+- `max_request_body_bytes` (integer, optional, default 10485760)
+- `max_decompressed_request_body_bytes` (integer, optional, default 52428800)
 - `env` (map of string to string, optional)
 - `restart_delay_ms` (integer, optional, default 10000)
 
@@ -100,6 +103,9 @@ For pass decisions, do not apply rule or plugin header actions. A plugin respons
 with `decision = "pass"` and non-empty `requestHeaders` or `responseHeaders` is
 a protocol error.
 
+For body-aware plugin profiles, `decision = "allow"` may include a `requestBody`
+replacement. `decision = "pass"` must not include `requestBody`.
+
 ### Failure behavior
 
 - Plugin failures (timeout, crash, invalid response) return a 503 error response.
@@ -115,6 +121,20 @@ a protocol error.
 
 If unset or empty, no headers are sent to the plugin.
 
+### Request body inclusion
+
+When `include_request_body = true`, acl-proxy buffers the outbound request body
+before forwarding it upstream. If the request uses `Content-Encoding: gzip`, the
+body is decompressed before being sent to the plugin. The plugin receives the
+decoded body as base64. On `allow`, the plugin may return a replacement decoded
+body; acl-proxy recompresses it when the original request was gzip-compressed and
+rebuilds `Content-Length`.
+
+Unsupported request encodings, body read failures, and configured size-limit
+violations fail the delegated request before upstream egress. Body-aware
+delegation is supported only for synchronous plugin profiles, not HTTP webhook
+callback profiles.
+
 ## Plugin Protocol (stdio)
 
 The plugin communicates via NDJSON (one JSON object per line).
@@ -129,6 +149,12 @@ The plugin communicates via NDJSON (one JSON object per line).
   "clientIp": "192.168.1.100",
   "headers": {
     "authorization": "Bearer token"
+  },
+  "body": {
+    "encoding": "base64",
+    "contentType": "application/json",
+    "contentEncoding": "gzip",
+    "data": "eyJwcm9tcHQiOiJkZWNvZGVkIGJvZHkifQ=="
   }
 }
 ```
@@ -139,6 +165,11 @@ The plugin communicates via NDJSON (one JSON object per line).
   "id": "req-abc123",
   "type": "response",
   "decision": "allow",
+  "requestBody": {
+    "encoding": "base64",
+    "contentType": "application/json",
+    "data": "eyJwcm9tcHQiOiJyZWRhY3RlZCBib2R5In0="
+  },
   "requestHeaders": [
     {"action": "remove", "name": "authorization", "when": "if_present"}
   ],
@@ -169,6 +200,9 @@ Notes:
 - `requestHeaders` and `responseHeaders` are applied with `decision = "allow"`;
   they are ignored with `decision = "deny"` and must be empty or omitted with
   `decision = "pass"`.
+- `requestBody` is applied only with `decision = "allow"` and must use
+  `encoding = "base64"`. It is a decoded replacement body; acl-proxy handles
+  recompression and `Content-Length` rebuilding.
 - Plugins should write only JSON responses to stdout.
 
 ## Runtime behavior
