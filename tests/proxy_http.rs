@@ -12,7 +12,7 @@ use acl_proxy::proxy::http::run_http_proxy_on_listener;
 use base64::engine::general_purpose;
 use base64::Engine;
 use flate2::read::{GzDecoder, ZlibDecoder};
-use flate2::write::{GzEncoder, ZlibEncoder};
+use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
 use flate2::Compression;
 use h2::client as h2_client;
 use http::header::HeaderValue;
@@ -1893,6 +1893,12 @@ fn deflate_bytes(body: &[u8]) -> Vec<u8> {
     encoder.finish().expect("finish deflate body")
 }
 
+fn raw_deflate_bytes(body: &[u8]) -> Vec<u8> {
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(body).expect("write raw deflate body");
+    encoder.finish().expect("finish raw deflate body")
+}
+
 fn inflate_bytes(body: &[u8]) -> Vec<u8> {
     let mut decoder = ZlibDecoder::new(body);
     let mut decoded = Vec::new();
@@ -1905,7 +1911,6 @@ fn inflate_bytes(body: &[u8]) -> Vec<u8> {
 fn brotli_bytes(body: &[u8]) -> Vec<u8> {
     let mut encoder = brotli::CompressorWriter::new(Vec::new(), 4096, 5, 22);
     encoder.write_all(body).expect("write brotli body");
-    encoder.flush().expect("flush brotli body");
     encoder.into_inner()
 }
 
@@ -1920,6 +1925,13 @@ fn unbrotli_bytes(body: &[u8]) -> Vec<u8> {
 
 fn zstd_bytes(body: &[u8]) -> Vec<u8> {
     zstd::stream::encode_all(body, 0).expect("encode zstd body")
+}
+
+fn zstd_bytes_with_window_log(body: &[u8], window_log: u32) -> Vec<u8> {
+    let mut encoder = zstd::stream::Encoder::new(Vec::new(), 0).expect("create zstd encoder");
+    encoder.window_log(window_log).expect("set zstd window log");
+    encoder.write_all(body).expect("write zstd body");
+    encoder.finish().expect("finish zstd body")
 }
 
 fn unzstd_bytes(body: &[u8]) -> Vec<u8> {
@@ -1985,7 +1997,7 @@ async fn assert_body_aware_recompresses_request_body_encoding(
     let script_path = write_body_rewrite_plugin(&plugin_temp_dir, replacement);
 
     let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
-    let config = body_plugin_config(&host, &script_path, true, 4096, 4096);
+    let config = body_plugin_config(&host, &script_path, true, 4096, 8 * 1024 * 1024);
 
     let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
@@ -2270,6 +2282,59 @@ async fn body_aware_auth_plugin_recompresses_common_encoded_request_bodies() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn body_aware_auth_plugin_accepts_raw_deflate_request_body() {
+    let (upstream_addr, seen_requests) = start_upstream_body_echo_server().await;
+    let plugin_temp_dir = TempDir::new().expect("plugin temp dir");
+    let replacement = br#"{"prompt":"redacted raw deflate"}"#;
+    let script_path = write_body_rewrite_plugin(&plugin_temp_dir, replacement);
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    let config = body_plugin_config(&host, &script_path, true, 4096, 4096);
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let original_encoded = raw_deflate_bytes(br#"{"prompt":"raw deflate"}"#);
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
+    let request_head = format!(
+        "POST http://{host}/chat HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Encoding: deflate\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        original_encoded.len()
+    );
+    stream
+        .write_all(request_head.as_bytes())
+        .await
+        .expect("write request head");
+    stream
+        .write_all(&original_encoded)
+        .await
+        .expect("write request body");
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.expect("read response");
+    let response = String::from_utf8_lossy(&buf).to_string();
+    let status_line = response.lines().next().unwrap_or_default();
+    assert!(
+        status_line.contains(" 200 "),
+        "unexpected response: {response}"
+    );
+
+    let seen = seen_requests.lock().unwrap();
+    let request = seen.first().expect("upstream should see request");
+    assert_eq!(
+        request
+            .headers
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok()),
+        Some("deflate")
+    );
+    assert_eq!(inflate_bytes(&request.body), replacement);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn body_aware_auth_plugin_rejects_encoded_body_over_limit() {
     let (upstream_addr, seen_requests) = start_upstream_body_echo_server().await;
     let plugin_temp_dir = TempDir::new().expect("plugin temp dir");
@@ -2339,6 +2404,51 @@ async fn body_aware_auth_plugin_rejects_decompressed_body_over_limit() {
     assert!(
         seen_requests.lock().unwrap().is_empty(),
         "oversized decompressed body must not reach upstream"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn body_aware_auth_plugin_rejects_zstd_window_over_limit() {
+    let (upstream_addr, seen_requests) = start_upstream_body_echo_server().await;
+    let plugin_temp_dir = TempDir::new().expect("plugin temp dir");
+    let script_path = write_allow_plugin(&plugin_temp_dir);
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    let config = body_plugin_config(&host, &script_path, true, 4096, 4096);
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let encoded = zstd_bytes_with_window_log(b"small decoded body", 20);
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
+    let request_head = format!(
+        "POST http://{host}/chat HTTP/1.1\r\nHost: {host}\r\nContent-Encoding: zstd\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        encoded.len()
+    );
+    stream
+        .write_all(request_head.as_bytes())
+        .await
+        .expect("write request head");
+    stream
+        .write_all(&encoded)
+        .await
+        .expect("write request body");
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.expect("read response");
+    let response = String::from_utf8_lossy(&buf).to_string();
+    let status_line = response.lines().next().unwrap_or_default();
+    assert!(
+        status_line.contains(" 503 "),
+        "unexpected response: {response}"
+    );
+    assert!(
+        seen_requests.lock().unwrap().is_empty(),
+        "zstd body with over-limit window must not reach upstream"
     );
 }
 

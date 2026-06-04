@@ -232,6 +232,8 @@ restart_delay_ms = 10000
 # decompresses supported content encodings (gzip, deflate, br, zstd) before
 # sending decoded base64 content to the plugin, and recompresses an optional
 # plugin-provided replacement body with the original encoding before forwarding.
+# Deflate ingress accepts zlib-wrapped or raw DEFLATE; rewritten deflate egress
+# is zlib-wrapped. Zstd frame windows are capped by the decoded body limit.
 # Unsupported encodings and body-size limit failures fail the delegated request.
 #
 # include_request_body = true

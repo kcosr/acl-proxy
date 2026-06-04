@@ -136,6 +136,9 @@ On `allow`, the plugin may return a replacement decoded body; acl-proxy
 recompresses it with the original encoding when the original request used a
 supported content encoding and rebuilds `Content-Length`. Replacement bodies
 returned by the plugin are capped by `max_decompressed_request_body_bytes`.
+`deflate` ingress accepts both zlib-wrapped and raw DEFLATE bodies; rewritten
+`deflate` bodies are emitted as zlib-wrapped DEFLATE. `zstd` decoding caps the
+accepted frame window based on the decompressed body limit.
 
 Unsupported or stacked request encodings, body read failures, and configured
 size-limit violations fail the delegated request before upstream egress.
