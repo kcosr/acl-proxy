@@ -234,10 +234,7 @@ async fn handle_http_request(
             req.headers(),
         );
 
-        if !matches!(
-            decision.matched.as_ref().map(|rule| rule.action),
-            Some(PolicyRuleAction::Delegate)
-        ) {
+        let Some(rule) = decision.matched.as_ref() else {
             state.logging.log_policy_decision(PolicyDecisionLogContext {
                 request_id: &request_id,
                 url: &full_url,
@@ -245,9 +242,7 @@ async fn handle_http_request(
                 client_ip: Some(&client_ip_for_policy),
                 decision: &decision,
             });
-        }
 
-        let Some(rule) = decision.matched.as_ref() else {
             if decision.allowed {
                 let response = proxy_allowed_request(
                     state.clone(),
@@ -281,15 +276,15 @@ async fn handle_http_request(
         };
 
         if request_is_upgrade && !rule.allow_upgrades {
-            if matches!(rule.action, PolicyRuleAction::Delegate) {
-                state.logging.log_policy_decision(PolicyDecisionLogContext {
+            state
+                .logging
+                .log_policy_upgrade_denied(PolicyDecisionLogContext {
                     request_id: &request_id,
                     url: &full_url,
                     method: Some(method.as_str()),
                     client_ip: Some(&client_ip_for_policy),
                     decision: &decision,
                 });
-            }
             let resp = build_policy_denied_response(
                 &state,
                 &request_id,
@@ -301,6 +296,16 @@ async fn handle_http_request(
             )
             .await;
             return Ok(resp);
+        }
+
+        if !matches!(rule.action, PolicyRuleAction::Delegate) {
+            state.logging.log_policy_decision(PolicyDecisionLogContext {
+                request_id: &request_id,
+                url: &full_url,
+                method: Some(method.as_str()),
+                client_ip: Some(&client_ip_for_policy),
+                decision: &decision,
+            });
         }
 
         match rule.action {
@@ -2055,7 +2060,7 @@ pub(crate) async fn proxy_allowed_request(
 
     let req_headers_snapshot = req.headers().clone();
     let original_request_presence = snapshot_header_presence(req.headers());
-    let request_is_upgrade = is_upgrade_request(req.headers());
+    let request_is_upgrade = version == Version::HTTP_11 && is_upgrade_request(req.headers());
     let downstream_upgrade = if request_is_upgrade {
         Some(hyper::upgrade::on(&mut req))
     } else {

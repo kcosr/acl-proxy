@@ -235,6 +235,7 @@ In transparent HTTP mode, upstream target selection is based on the inbound `Hos
 - HTTP/1.1 upgrade handshakes are proxied on all HTTP/1.1 request paths (HTTP listener, CONNECT inner, transparent HTTPS when HTTP/1.1 is negotiated).
 - After a `101 Switching Protocols` response, acl-proxy switches to a bidirectional byte tunnel between client and upstream.
 - Matching policy rules can set `allow_upgrades = false` to deny HTTP/1.1 upgrade handshakes, including WebSocket handshakes, before delegate/plugin invocation or upstream forwarding.
+- `allow_upgrades` is a rule-level control; requests that match no rule and fall through to `policy.default = "allow"` keep the default upgrade tunneling behavior.
 - HTTP/2 extended CONNECT / RFC 8441 is not currently implemented.
 
 ### Upstream HTTP Version
@@ -620,7 +621,7 @@ level_allows = "info"               # log level for allows
 level_denies = "warn"               # log level for denies
 ```
 
-Policy decision events are emitted to the `acl_proxy::policy` target with structured fields: `request_id`, `allowed`, `url`, `method`, `client_ip`, `rule_action`, `rule_pattern`, `rule_description`.
+Policy decision events are emitted to the `acl_proxy::policy` target with structured fields: `request_id`, `allowed`, `url`, `method`, `client_ip`, `rule_action`, `rule_pattern`, `rule_description`, and optional `reason`.
 
 ### `[capture]` — Request/Response Capture
 
@@ -1071,7 +1072,7 @@ Outgoing TLS from the proxy to upstream is verified against system root certific
 
 ### Policy Decision Logging
 
-Separate control for allow vs. deny decisions with configurable log levels. Events are emitted to the `acl_proxy::policy` target with structured fields: `request_id`, `allowed`, `url`, `method`, `client_ip`, and rule metadata.
+Separate control for allow vs. deny decisions with configurable log levels. Events are emitted to the `acl_proxy::policy` target with structured fields: `request_id`, `allowed`, `url`, `method`, `client_ip`, rule metadata, and optional `reason`.
 
 ### Request/Response Capture
 

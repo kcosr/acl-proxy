@@ -516,10 +516,17 @@ async fn send_https_request_via_transparent(
         .expect("write HTTPS request");
 
     let mut resp_buf = Vec::new();
-    tls_stream
-        .read_to_end(&mut resp_buf)
-        .await
-        .expect("read HTTPS response");
+    let mut tmp = [0u8; 1024];
+    loop {
+        match tls_stream.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(n) => resp_buf.extend_from_slice(&tmp[..n]),
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof && !resp_buf.is_empty() => {
+                break;
+            }
+            Err(err) => panic!("read HTTPS response: {err:?}"),
+        }
+    }
 
     let resp_str = String::from_utf8_lossy(&resp_buf).to_string();
     let status_line = resp_str.lines().next().unwrap_or_default();
@@ -1216,6 +1223,64 @@ async fn transparent_https_websocket_upgrade_is_tunneled() {
     .expect("read echoed payload");
 
     assert_eq!(echoed.as_slice(), payload);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn allow_upgrades_false_blocks_transparent_https_upgrade() {
+    let upstream_addr = start_upstream_https_echo_server().await;
+
+    let mut config = minimal_https_transparent_config();
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyRuleAction::Allow,
+            pattern: Some(format!(
+                "https://{}:{}/ws",
+                upstream_addr.ip(),
+                upstream_addr.port()
+            )),
+            patterns: None,
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: None,
+            headers_not_match: None,
+            request_timeout_ms: None,
+            allow_upgrades: false,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir, ca_cert_path) =
+        start_proxy_with_config(config, proxy_listener).await;
+    let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    let (status, _body) = send_https_request_via_transparent(
+        proxy_addr,
+        &ca_cert_path,
+        "transparent.test",
+        &host_header,
+        "/ws",
+        &[
+            ("Connection", "Upgrade"),
+            ("Upgrade", "websocket"),
+            ("Sec-WebSocket-Version", "13"),
+            ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN.as_u16());
 }
 
 #[tokio::test(flavor = "multi_thread")]

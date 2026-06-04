@@ -256,10 +256,7 @@ async fn handle_inner_https_request(
             req.headers(),
         );
 
-        if !matches!(
-            decision.matched.as_ref().map(|rule| rule.action),
-            Some(PolicyRuleAction::Delegate)
-        ) {
+        let Some(rule) = decision.matched.as_ref() else {
             state.logging.log_policy_decision(PolicyDecisionLogContext {
                 request_id: &request_id,
                 url: &full_url,
@@ -267,9 +264,7 @@ async fn handle_inner_https_request(
                 client_ip: Some(&client_ip_for_policy),
                 decision: &decision,
             });
-        }
 
-        let Some(rule) = decision.matched.as_ref() else {
             if decision.allowed {
                 let resp = proxy_allowed_request(
                     state.clone(),
@@ -304,15 +299,15 @@ async fn handle_inner_https_request(
         };
 
         if request_is_upgrade && !rule.allow_upgrades {
-            if matches!(rule.action, PolicyRuleAction::Delegate) {
-                state.logging.log_policy_decision(PolicyDecisionLogContext {
+            state
+                .logging
+                .log_policy_upgrade_denied(PolicyDecisionLogContext {
                     request_id: &request_id,
                     url: &full_url,
                     method: Some(method.as_str()),
                     client_ip: Some(&client_ip_for_policy),
                     decision: &decision,
                 });
-            }
             let resp = build_connect_policy_denied_response(
                 &state,
                 &request_id,
@@ -325,6 +320,16 @@ async fn handle_inner_https_request(
             )
             .await;
             return Ok(resp);
+        }
+
+        if !matches!(rule.action, PolicyRuleAction::Delegate) {
+            state.logging.log_policy_decision(PolicyDecisionLogContext {
+                request_id: &request_id,
+                url: &full_url,
+                method: Some(method.as_str()),
+                client_ip: Some(&client_ip_for_policy),
+                decision: &decision,
+            });
         }
 
         match rule.action {
