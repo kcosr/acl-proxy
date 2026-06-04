@@ -925,11 +925,13 @@ max_request_body_bytes = 10485760
 max_decompressed_request_body_bytes = 52428800
 ```
 
-When `include_request_body = true`, acl-proxy buffers the outbound request body before forwarding, decompresses `Content-Encoding: gzip` bodies, sends the decoded body to the plugin as base64, and can apply an optional `requestBody` replacement returned by an `allow` decision. If the original request was gzip-compressed, the replacement body is recompressed before egress. Unsupported content encodings, body read failures, oversize encoded bodies, and oversize decoded bodies fail the delegated request with an auth-plugin error response.
+When `include_request_body = true`, acl-proxy buffers the outbound request body before forwarding, decompresses `Content-Encoding: gzip` bodies, sends the decoded body to the plugin as base64, and can apply an optional `requestBody` replacement returned by an `allow` decision. If the original request was gzip-compressed, the replacement body is recompressed before egress. Unsupported content encodings, body read failures, oversize encoded bodies, and oversize decoded bodies fail the delegated request with an auth-plugin error response. Plugin `deny` responses may include `denyMessage` to replace the client-visible JSON `message`; status remains `403` and JSON `error` remains `Forbidden`.
 
 Body-aware plugin delegation works on all HTTP request-forwarding paths, including explicit HTTP proxying, transparent HTTP, CONNECT MITM inner requests, and transparent HTTPS after TLS termination. HTTP/1.1 upgrade/WebSocket traffic is not body-buffered; screen upgrades at the handshake/policy level instead.
 
 Body-processing diagnostics are emitted with structured fields on the `acl_proxy::body_policy` tracing target at `debug` level. Logs include request ID, URL, profile, sizes, encoding, and decision metadata, but never log body contents.
+
+The [`demos/body-inspection-plugin/`](demos/body-inspection-plugin/) directory includes a prototype plugin that applies literal and regex body rules, blocks matching requests, or returns same-length redactions through `requestBody`.
 
 ### Failure Handling
 
@@ -1263,6 +1265,7 @@ tar -C "$OUT" -czf "$OUT/${ROOT}.tar.gz" "$ROOT"
 
 - [`demos/external-auth-webapp/`](demos/external-auth-webapp/) — Minimal approval web UI
 - [`demos/auth-plugin-stdio/`](demos/auth-plugin-stdio/) — Stdio-based auth plugin
+- [`demos/body-inspection-plugin/`](demos/body-inspection-plugin/) — Body-aware plugin with literal and regex rules
 - [`demos/external-auth-termstation-adapter/`](demos/external-auth-termstation-adapter/) — TermStation integration
 
 ## License

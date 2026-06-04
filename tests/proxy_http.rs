@@ -704,6 +704,108 @@ value = "static"
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn auth_plugin_deny_message_customizes_json_response_message() {
+    let (upstream_addr, _seen_headers) = start_upstream_echo_server().await;
+
+    let temp_dir = TempDir::new().expect("temp dir");
+    let script_path = temp_dir.path().join("auth-plugin-deny-message.sh");
+    let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf "%s" "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  if [ -z "$id" ]; then
+    continue
+  fi
+  auth=$(printf "%s" "$line" | sed -n 's/.*"authorization"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  if echo "$auth" | grep -q "custom"; then
+    printf '{"id":"%s","type":"response","decision":"deny","denyMessage":"Request blocked by body policy"}\n' "$id"
+  elif echo "$auth" | grep -q "invalid"; then
+    printf '{"id":"%s","type":"response","decision":"deny","denyMessage":"bad\\u0007message"}\n' "$id"
+  else
+    printf '{"id":"%s","type":"response","decision":"deny"}\n' "$id"
+  fi
+done
+"#;
+    std::fs::write(&script_path, script).expect("write plugin script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat plugin script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod plugin script");
+    }
+
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    let toml = format!(
+        r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+
+[logging]
+directory = "logs"
+level = "info"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles]
+[policy.external_auth_profiles.body_guard]
+type = "plugin"
+command = "{script_path}"
+timeout_ms = 1000
+include_headers = ["authorization"]
+
+[[policy.rules]]
+action = "delegate"
+pattern = "http://{host}/**"
+external_auth_profile = "body_guard"
+"#,
+        script_path = script_path.to_string_lossy(),
+        host = host
+    );
+
+    let config: Config = toml::from_str(&toml).expect("parse config");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    for (authorization, expected_message) in [
+        ("Bearer custom", "Request blocked by body policy"),
+        ("Bearer default", "Blocked by auth plugin"),
+        ("Bearer invalid", "Blocked by auth plugin"),
+    ] {
+        let raw_request = format!(
+            "GET http://{host}/repo1 HTTP/1.1\r\nHost: {host}\r\nAuthorization: {authorization}\r\nConnection: close\r\n\r\n"
+        );
+        let (response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let body = response.split("\r\n\r\n").nth(1).expect("response body");
+        let payload: JsonValue = serde_json::from_str(body).expect("json response");
+        assert_eq!(
+            payload.get("error").and_then(|v| v.as_str()),
+            Some("Forbidden")
+        );
+        assert_eq!(
+            payload.get("message").and_then(|v| v.as_str()),
+            Some(expected_message)
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn external_auth_callback_pass_falls_through_to_later_allow() {
     let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
 

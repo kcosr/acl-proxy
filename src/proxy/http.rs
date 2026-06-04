@@ -1168,7 +1168,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
                 .await,
             )
         }
-        Ok(PluginDecision::Deny) => {
+        Ok(PluginDecision::Deny { message }) => {
             tracing::debug!(
                 target: "acl_proxy::body_policy",
                 request_id = %request_id,
@@ -1195,6 +1195,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
                     version,
                     req.headers(),
                     mode,
+                    message.as_deref(),
                 )
                 .await,
             )
@@ -1768,6 +1769,7 @@ pub(crate) async fn build_auth_plugin_denied_response(
     version: Version,
     req_headers: &HttpHeaderMap,
     mode: CaptureMode,
+    message: Option<&str>,
 ) -> Response<Body> {
     build_external_auth_response(
         state,
@@ -1781,7 +1783,7 @@ pub(crate) async fn build_auth_plugin_denied_response(
         mode,
         StatusCode::FORBIDDEN,
         "Forbidden",
-        "Blocked by auth plugin",
+        message.unwrap_or("Blocked by auth plugin"),
     )
     .await
 }

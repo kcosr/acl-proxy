@@ -19,6 +19,7 @@ use crate::config::{
 use crate::policy::CompiledHeaderAction;
 
 const DEFAULT_RESTART_DELAY_MS: u64 = 10_000;
+const MAX_DENY_MESSAGE_LEN: usize = 1024;
 
 #[derive(Debug)]
 pub struct PluginError {
@@ -51,7 +52,9 @@ pub enum PluginDecision {
         header_actions: Vec<CompiledHeaderAction>,
         request_body: Option<PluginBodyMutation>,
     },
-    Deny,
+    Deny {
+        message: Option<String>,
+    },
     Pass,
 }
 
@@ -280,6 +283,8 @@ struct PluginResponse {
     response_headers: Vec<PluginHeaderAction>,
     #[serde(default, rename = "requestBody")]
     request_body: Option<PluginResponseBody>,
+    #[serde(default, rename = "denyMessage")]
+    deny_message: Option<JsonValue>,
 }
 
 #[derive(Debug, Serialize)]
@@ -519,6 +524,12 @@ fn handle_plugin_response(
                 decision = "allow",
                 "auth plugin decision"
             );
+            if response.deny_message.is_some() {
+                let _ = sender.send(Err(PluginError::new(
+                    "auth plugin allow decision must not include denyMessage",
+                )));
+                return;
+            }
             let mut header_actions = Vec::new();
             match compile_plugin_actions(&response.request_headers, HeaderDirection::Request) {
                 Ok(actions) => header_actions.extend(actions),
@@ -557,7 +568,9 @@ fn handle_plugin_response(
                 decision = "deny",
                 "auth plugin decision"
             );
-            Ok(PluginDecision::Deny)
+            Ok(PluginDecision::Deny {
+                message: normalize_deny_message(response.deny_message),
+            })
         }
         PluginDecisionKind::Pass => {
             tracing::debug!(
@@ -569,9 +582,10 @@ fn handle_plugin_response(
             if !response.request_headers.is_empty()
                 || !response.response_headers.is_empty()
                 || response.request_body.is_some()
+                || response.deny_message.is_some()
             {
                 Err(PluginError::new(
-                    "auth plugin pass decision must not include header actions or requestBody",
+                    "auth plugin pass decision must not include header actions, requestBody, or denyMessage",
                 ))
             } else {
                 Ok(PluginDecision::Pass)
@@ -580,6 +594,21 @@ fn handle_plugin_response(
     };
 
     let _ = sender.send(result);
+}
+
+fn normalize_deny_message(message: Option<JsonValue>) -> Option<String> {
+    let message = message?;
+    let JsonValue::String(message) = message else {
+        return None;
+    };
+    let message = message.trim();
+    if message.is_empty()
+        || message.len() > MAX_DENY_MESSAGE_LEN
+        || message.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(message.to_string())
 }
 
 fn decode_plugin_response_body(
@@ -888,6 +917,89 @@ mod tests {
     }
 
     #[test]
+    fn plugin_deny_can_return_custom_message() {
+        let decision = parse_response(
+            r#"{"id":"req-1","type":"response","decision":"deny","denyMessage":"Request blocked by body policy"}"#,
+        )
+        .expect("deny with message should parse");
+
+        let PluginDecision::Deny { message } = decision else {
+            panic!("expected deny decision");
+        };
+        assert_eq!(message.as_deref(), Some("Request blocked by body policy"));
+    }
+
+    #[test]
+    fn plugin_deny_blank_control_non_string_or_oversized_message_falls_back() {
+        let blank = parse_response(
+            r#"{"id":"req-1","type":"response","decision":"deny","denyMessage":"   "}"#,
+        )
+        .expect("blank deny message should parse");
+        let PluginDecision::Deny { message } = blank else {
+            panic!("expected deny decision");
+        };
+        assert!(message.is_none());
+
+        let control = parse_response(
+            r#"{"id":"req-1","type":"response","decision":"deny","denyMessage":"bad\u0007message"}"#,
+        )
+        .expect("control deny message should parse");
+        let PluginDecision::Deny { message } = control else {
+            panic!("expected deny decision");
+        };
+        assert!(message.is_none());
+
+        let non_string = parse_response(
+            r#"{"id":"req-1","type":"response","decision":"deny","denyMessage":123}"#,
+        )
+        .expect("non-string deny message should parse");
+        let PluginDecision::Deny { message } = non_string else {
+            panic!("expected deny decision");
+        };
+        assert!(message.is_none());
+
+        let oversized_line = format!(
+            r#"{{"id":"req-1","type":"response","decision":"deny","denyMessage":"{}"}}"#,
+            "x".repeat(MAX_DENY_MESSAGE_LEN + 1)
+        );
+        let oversized =
+            parse_response(&oversized_line).expect("oversized deny message should parse");
+        let PluginDecision::Deny { message } = oversized else {
+            panic!("expected deny decision");
+        };
+        assert!(message.is_none());
+    }
+
+    #[test]
+    fn plugin_allow_with_deny_message_is_rejected() {
+        let err = parse_response(
+            r#"{"id":"req-1","type":"response","decision":"allow","denyMessage":"not valid here"}"#,
+        )
+        .expect_err("allow with denyMessage should fail");
+
+        assert!(
+            err.message()
+                .contains("allow decision must not include denyMessage"),
+            "unexpected error: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn plugin_pass_with_deny_message_is_rejected() {
+        let err = parse_response(
+            r#"{"id":"req-1","type":"response","decision":"pass","denyMessage":"not valid here"}"#,
+        )
+        .expect_err("pass with denyMessage should fail");
+
+        assert!(
+            err.message().contains("pass decision must not include"),
+            "unexpected error: {}",
+            err.message()
+        );
+    }
+
+    #[test]
     fn plugin_allow_can_return_request_body_mutation() {
         let decision = parse_response(
             r#"{"id":"req-1","type":"response","decision":"allow","requestBody":{"encoding":"base64","contentType":"application/json","data":"eyJvayI6dHJ1ZX0="}}"#,
@@ -911,7 +1023,7 @@ mod tests {
 
         assert!(
             err.message()
-                .contains("pass decision must not include header actions or requestBody"),
+                .contains("pass decision must not include header actions"),
             "unexpected error: {}",
             err.message()
         );

@@ -106,6 +106,10 @@ a protocol error.
 For body-aware plugin profiles, `decision = "allow"` may include a `requestBody`
 replacement. `decision = "pass"` must not include `requestBody`.
 
+For deny decisions, plugins may include `denyMessage` to replace the
+client-visible JSON `message` in the 403 response. The HTTP status remains fixed
+at 403 and the JSON `error` remains `Forbidden`.
+
 ### Failure behavior
 
 - Plugin failures (timeout, crash, invalid response) return a 503 error response.
@@ -203,6 +207,9 @@ Notes:
 - `requestBody` is applied only with `decision = "allow"` and must use
   `encoding = "base64"`. It is a decoded replacement body; acl-proxy handles
   recompression and `Content-Length` rebuilding.
+- `denyMessage` is applied only with `decision = "deny"`. Blank, oversized, or
+  control-character messages fall back to acl-proxy's default plugin-deny
+  message.
 - Plugins should write only JSON responses to stdout.
 
 ## Runtime behavior
@@ -224,7 +231,8 @@ Log entries include:
 
 ## Demo
 
-A reference plugin (`url_allow`) lives in `demos/auth-plugin-stdio`.
+Reference plugins live in `demos/auth-plugin-stdio` and
+`demos/body-inspection-plugin`.
 
 ## Review
 

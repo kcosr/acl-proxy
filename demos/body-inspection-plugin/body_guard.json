@@ -1,0 +1,29 @@
+{
+  "binaryDecision": "allow",
+  "rules": [
+    {
+      "name": "deny-api-key",
+      "action": "deny",
+      "type": "regex",
+      "value": "(?i)\\b(api[_-]?key|secret[_-]?key)\\b\\s*[:=]",
+      "denyMessage": "Request blocked because it appears to contain an API key."
+    },
+    {
+      "name": "redact-password",
+      "action": "redact",
+      "type": "regex",
+      "value": "(?i)\\bpassword\\b\\s*[:=]\\s*[^\\s,}\"]+",
+      "preserveLength": true,
+      "redactionChar": "*"
+    },
+    {
+      "name": "redact-internal-codename",
+      "action": "redact",
+      "type": "literal",
+      "value": "Project Vulcan",
+      "caseSensitive": false,
+      "preserveLength": true,
+      "redactionChar": "#"
+    }
+  ]
+}
