@@ -234,6 +234,7 @@ In transparent HTTP mode, upstream target selection is based on the inbound `Hos
 
 - HTTP/1.1 upgrade handshakes are proxied on all HTTP/1.1 request paths (HTTP listener, CONNECT inner, transparent HTTPS when HTTP/1.1 is negotiated).
 - After a `101 Switching Protocols` response, acl-proxy switches to a bidirectional byte tunnel between client and upstream.
+- Matching policy rules can set `allow_upgrades = false` to deny HTTP/1.1 upgrade handshakes, including WebSocket handshakes, before delegate/plugin invocation or upstream forwarding.
 - HTTP/2 extended CONNECT / RFC 8441 is not currently implemented.
 
 ### Upstream HTTP Version
@@ -744,12 +745,14 @@ headers_absent = ["x-id"]          # optional: missing-header check
 headers_match = { "x-id" = "v1" }  # optional: exact header match
 headers_not_match = { "x-id" = "internal" } # optional: exact header exclusion
 request_timeout_ms = 5000          # optional: override upstream timeout
+allow_upgrades = true              # optional: deny HTTP/1.1 upgrades when false
 rule_id = "stable-id"             # optional: stable ID for webhooks
 external_auth_profile = "name"     # required for delegate; invalid for allow/deny
 ```
 
 At least one of `pattern`, `patterns`, `methods`, `subnets`, `headers_absent`, `headers_match`, or `headers_not_match` must be present.
 `allow` and `deny` are terminal local decisions. `delegate` invokes the named HTTP or plugin external auth profile; the provider can return `allow` or `deny` as terminal decisions, or `pass` to continue policy evaluation at the next rule.
+When a matched rule has `allow_upgrades = false`, HTTP/1.1 upgrade requests are denied locally with `403 Forbidden` before the rule action runs. Normal HTTP requests matching the same rule continue through `allow`, `deny`, or `delegate` behavior as usual.
 
 #### Include Rule Fields
 
@@ -927,7 +930,7 @@ max_decompressed_request_body_bytes = 52428800
 
 When `include_request_body = true`, acl-proxy buffers the outbound request body before forwarding, decompresses `Content-Encoding: gzip` bodies, sends the decoded body to the plugin as base64, and can apply an optional `requestBody` replacement returned by an `allow` decision. If the original request was gzip-compressed, the replacement body is recompressed before egress. Unsupported content encodings, body read failures, oversize encoded bodies, and oversize decoded bodies fail the delegated request with an auth-plugin error response. Plugin `deny` responses may include `denyMessage` to replace the client-visible JSON `message`; status remains `403` and JSON `error` remains `Forbidden`.
 
-Body-aware plugin delegation works on all HTTP request-forwarding paths, including explicit HTTP proxying, transparent HTTP, CONNECT MITM inner requests, and transparent HTTPS after TLS termination. HTTP/1.1 upgrade/WebSocket traffic is not body-buffered; screen upgrades at the handshake/policy level instead.
+Body-aware plugin delegation works on all HTTP request-forwarding paths, including explicit HTTP proxying, transparent HTTP, CONNECT MITM inner requests, and transparent HTTPS after TLS termination. HTTP/1.1 upgrade/WebSocket traffic is not body-buffered; use `allow_upgrades = false` on protected rules when upgrade tunnels should be blocked.
 
 Body-processing diagnostics are emitted with structured fields on the `acl_proxy::body_policy` tracing target at `debug` level. Logs include request ID, URL, profile, sizes, encoding, and decision metadata, but never log body contents.
 

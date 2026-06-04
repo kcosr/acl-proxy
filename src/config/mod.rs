@@ -529,6 +529,9 @@ pub struct PolicyRuleTemplateConfig {
     #[serde(default)]
     pub request_timeout_ms: Option<u64>,
 
+    #[serde(default = "default_allow_upgrades")]
+    pub allow_upgrades: bool,
+
     #[serde(default)]
     pub header_actions: Vec<HeaderActionConfig>,
 
@@ -599,6 +602,9 @@ pub struct PolicyRuleDirectConfig {
     #[serde(default)]
     pub request_timeout_ms: Option<u64>,
 
+    #[serde(default = "default_allow_upgrades")]
+    pub allow_upgrades: bool,
+
     #[serde(default)]
     pub with: Option<MacroOverrideMap>,
 
@@ -625,6 +631,10 @@ pub struct PolicyRuleDirectConfig {
 pub enum PolicyRuleConfig {
     Direct(PolicyRuleDirectConfig),
     Include(PolicyRuleIncludeConfig),
+}
+
+fn default_allow_upgrades() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

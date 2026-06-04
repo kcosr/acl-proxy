@@ -17,7 +17,7 @@ use crate::config::{ExternalAuthProfileType, PolicyRuleAction};
 use crate::logging::PolicyDecisionLogContext;
 use crate::proxy::http::{
     build_external_auth_error_response, build_loop_detected_response, generate_request_id,
-    has_loop_header, proxy_allowed_request, run_auth_plugin_gate_lifecycle,
+    has_loop_header, is_upgrade_request, proxy_allowed_request, run_auth_plugin_gate_lifecycle,
     run_external_auth_gate_lifecycle, ExternalAuthGateResult,
 };
 
@@ -246,6 +246,7 @@ async fn handle_inner_https_request(
     }
 
     let mut start_index = 0;
+    let request_is_upgrade = version == Version::HTTP_11 && is_upgrade_request(req.headers());
     loop {
         let decision = state.policy.evaluate_from(
             start_index,
@@ -301,6 +302,30 @@ async fn handle_inner_https_request(
             .await;
             return Ok(resp);
         };
+
+        if request_is_upgrade && !rule.allow_upgrades {
+            if matches!(rule.action, PolicyRuleAction::Delegate) {
+                state.logging.log_policy_decision(PolicyDecisionLogContext {
+                    request_id: &request_id,
+                    url: &full_url,
+                    method: Some(method.as_str()),
+                    client_ip: Some(&client_ip_for_policy),
+                    decision: &decision,
+                });
+            }
+            let resp = build_connect_policy_denied_response(
+                &state,
+                &request_id,
+                &full_url,
+                &method,
+                &client,
+                target,
+                version,
+                req.headers(),
+            )
+            .await;
+            return Ok(resp);
+        }
 
         match rule.action {
             PolicyRuleAction::Deny => {

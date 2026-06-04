@@ -349,6 +349,9 @@ action = "delegate"
 pattern = "https://repo.internal/**"
 description = "Repo access via auth plugin"
 external_auth_profile = "url_allow"
+# Set allow_upgrades = false on protected HTTP/1.1 endpoints when WebSocket or
+# other upgrade tunnels should be denied before plugin/upstream forwarding.
+# allow_upgrades = false
 
 [[policy.rules]]
 # Explicitly deny access to administrative paths on the Git server,

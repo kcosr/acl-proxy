@@ -806,6 +806,107 @@ external_auth_profile = "body_guard"
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn allow_upgrades_false_blocks_upgrade_before_delegate_plugin() {
+    let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
+
+    let temp_dir = TempDir::new().expect("temp dir");
+    let script_path = temp_dir.path().join("auth-plugin-upgrade-guard.sh");
+    let marker_path = temp_dir.path().join("plugin-invoked");
+    let script = format!(
+        r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf "%s" "$line" | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  if [ -n "$id" ]; then
+    printf '%s\n' "$id" >> "{marker_path}"
+    printf '{{"id":"%s","type":"response","decision":"allow"}}\n' "$id"
+  fi
+done
+"#,
+        marker_path = marker_path.to_string_lossy()
+    );
+    std::fs::write(&script_path, script).expect("write plugin script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path)
+            .expect("stat plugin script")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).expect("chmod plugin script");
+    }
+
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    let toml = format!(
+        r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+
+[logging]
+directory = "logs"
+level = "info"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles]
+[policy.external_auth_profiles.upgrade_guard]
+type = "plugin"
+command = "{script_path}"
+timeout_ms = 1000
+
+[[policy.rules]]
+action = "delegate"
+pattern = "http://{host}/**"
+external_auth_profile = "upgrade_guard"
+allow_upgrades = false
+"#,
+        script_path = script_path.to_string_lossy(),
+        host = host
+    );
+
+    let config: Config = toml::from_str(&toml).expect("parse config");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let upgrade_request = format!(
+        "GET http://{host}/chat HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive, Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nConnection: close\r\n\r\n"
+    );
+    let (_response, status) = send_raw_http_request(proxy_addr, &upgrade_request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        !marker_path.exists(),
+        "upgrade deny should happen before plugin invocation"
+    );
+
+    let normal_request =
+        format!("GET http://{host}/chat HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let (_response, status) = send_raw_http_request(proxy_addr, &normal_request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        marker_path.exists(),
+        "normal request should still invoke plugin"
+    );
+    let headers_guard = seen_headers.lock().unwrap();
+    assert!(
+        headers_guard.is_some(),
+        "normal request should reach upstream"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn external_auth_callback_pass_falls_through_to_later_allow() {
     let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
 
@@ -1153,6 +1254,7 @@ async fn allowed_request_uses_configured_egress_forwarding_destination() {
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -1215,6 +1317,7 @@ async fn global_egress_request_actions_are_applied_after_rule_actions_without_af
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -1232,6 +1335,7 @@ async fn global_egress_request_actions_are_applied_after_rule_actions_without_af
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: vec![
@@ -1380,6 +1484,7 @@ async fn global_egress_request_actions_respect_intra_layer_order() {
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -1470,6 +1575,7 @@ async fn empty_global_egress_actions_preserve_existing_rule_header_behavior() {
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: vec![acl_proxy::config::HeaderActionConfig {
@@ -1845,6 +1951,7 @@ async fn http_explicit_listener_accepts_h2c_prior_knowledge_requests() {
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2077,6 +2184,7 @@ async fn allowed_request_is_proxied_and_loop_header_added() {
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2142,6 +2250,7 @@ async fn headers_absent_top_deny_guard_falls_through_to_allow_rule() {
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2159,6 +2268,7 @@ async fn headers_absent_top_deny_guard_falls_through_to_allow_rule() {
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2236,6 +2346,7 @@ async fn method_scoped_headers_absent_guard_only_blocks_matching_methods() {
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2253,6 +2364,7 @@ async fn method_scoped_headers_absent_guard_only_blocks_matching_methods() {
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2323,6 +2435,7 @@ async fn headers_match_top_guard_denies_non_matching_value_and_allows_matching_v
             )])),
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2340,6 +2453,7 @@ async fn headers_match_top_guard_denies_non_matching_value_and_allows_matching_v
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2418,6 +2532,7 @@ async fn headers_match_http_regressions_cover_repeated_values_comma_literals_and
             ])),
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2495,6 +2610,7 @@ async fn headers_not_match_top_deny_guard_blocks_non_internal_and_allows_interna
                 acl_proxy::config::HeaderMatchValueConfig::Many(vec!["internal".to_string()]),
             )])),
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2512,6 +2628,7 @@ async fn headers_not_match_top_deny_guard_blocks_non_internal_and_allows_interna
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2593,6 +2710,7 @@ async fn loop_header_not_added_when_disabled() {
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2744,6 +2862,7 @@ async fn origin_form_request_with_host_is_forwarded() {
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2809,6 +2928,7 @@ async fn upstream_connection_failure_returns_502() {
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2860,6 +2980,7 @@ async fn upstream_request_timeout_returns_504() {
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: Some(150),
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),

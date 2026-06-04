@@ -224,6 +224,7 @@ async fn handle_http_request(
     }
 
     let mut start_index = 0;
+    let request_is_upgrade = version == Version::HTTP_11 && is_upgrade_request(req.headers());
     loop {
         let decision = state.policy.evaluate_from(
             start_index,
@@ -278,6 +279,29 @@ async fn handle_http_request(
             .await;
             return Ok(resp);
         };
+
+        if request_is_upgrade && !rule.allow_upgrades {
+            if matches!(rule.action, PolicyRuleAction::Delegate) {
+                state.logging.log_policy_decision(PolicyDecisionLogContext {
+                    request_id: &request_id,
+                    url: &full_url,
+                    method: Some(method.as_str()),
+                    client_ip: Some(&client_ip_for_policy),
+                    decision: &decision,
+                });
+            }
+            let resp = build_policy_denied_response(
+                &state,
+                &request_id,
+                &full_url,
+                &method,
+                &client_endpoint,
+                version,
+                req.headers(),
+            )
+            .await;
+            return Ok(resp);
+        }
 
         match rule.action {
             PolicyRuleAction::Deny => {
@@ -1580,7 +1604,7 @@ pub(crate) fn has_loop_header(headers: &HttpHeaderMap, name: &HeaderName) -> boo
     headers.contains_key(name)
 }
 
-fn is_upgrade_request(headers: &HttpHeaderMap) -> bool {
+pub(crate) fn is_upgrade_request(headers: &HttpHeaderMap) -> bool {
     let has_upgrade_token = headers
         .get_all(http::header::CONNECTION)
         .iter()
