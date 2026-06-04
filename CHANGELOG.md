@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add body-aware stdio plugin delegation with bounded request-body buffering, gzip decompress/recompress, and optional plugin-provided request body mutation. ([#52](https://github.com/kcosr/acl-proxy/pull/52))
+- Add plugin deny message overrides and a body-inspection demo plugin with literal/regex deny and redaction rules. ([#52](https://github.com/kcosr/acl-proxy/pull/52))
+
 ### Fixed
 
 - Fixed release script cleanup handling after successful GitHub release creation.
