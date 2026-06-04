@@ -13,7 +13,7 @@ use crate::config::{CaptureConfig, Config};
 /// The legacy Node.js implementation captured full bodies. The Rust
 /// implementation intentionally limits in-memory buffering to this value
 /// while still recording the full logical length separately.
-pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024;
+pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

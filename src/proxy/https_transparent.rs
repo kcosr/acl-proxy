@@ -4,7 +4,7 @@ use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::Arc;
 
 use http::header::HOST;
-use http::StatusCode;
+use http::{StatusCode, Version};
 use hyper::body::Body;
 use hyper::server::conn::Http;
 use hyper::service::service_fn;
@@ -19,8 +19,8 @@ use crate::logging::PolicyDecisionLogContext;
 use crate::proxy::http::{
     build_external_auth_error_response, build_loop_detected_response,
     build_policy_denied_response_with_mode, generate_request_id, has_loop_header,
-    proxy_allowed_request, run_auth_plugin_gate_lifecycle, run_external_auth_gate_lifecycle,
-    ExternalAuthGateResult,
+    is_upgrade_request, proxy_allowed_request, run_auth_plugin_gate_lifecycle,
+    run_external_auth_gate_lifecycle, ExternalAuthGateResult,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -252,6 +252,7 @@ async fn handle_inner_https_request(
     }
 
     let mut start_index = 0;
+    let request_is_upgrade = version == Version::HTTP_11 && is_upgrade_request(req.headers());
     loop {
         let decision = state.policy.evaluate_from(
             start_index,
@@ -261,10 +262,7 @@ async fn handle_inner_https_request(
             req.headers(),
         );
 
-        if !matches!(
-            decision.matched.as_ref().map(|rule| rule.action),
-            Some(PolicyRuleAction::Delegate)
-        ) {
+        let Some(rule) = decision.matched.as_ref() else {
             state.logging.log_policy_decision(PolicyDecisionLogContext {
                 request_id: &request_id,
                 url: &full_url,
@@ -272,9 +270,7 @@ async fn handle_inner_https_request(
                 client_ip: Some(&client_ip_for_policy),
                 decision: &decision,
             });
-        }
 
-        let Some(rule) = decision.matched.as_ref() else {
             if decision.allowed {
                 let resp = proxy_allowed_request(
                     state.clone(),
@@ -308,6 +304,41 @@ async fn handle_inner_https_request(
             .await;
             return Ok(resp);
         };
+
+        if request_is_upgrade && !rule.allow_upgrades {
+            state
+                .logging
+                .log_policy_upgrade_denied(PolicyDecisionLogContext {
+                    request_id: &request_id,
+                    url: &full_url,
+                    method: Some(method.as_str()),
+                    client_ip: Some(&client_ip_for_policy),
+                    decision: &decision,
+                });
+            let resp = build_policy_denied_response_with_mode(
+                &state,
+                &request_id,
+                &full_url,
+                &method,
+                &client,
+                target.clone(),
+                version,
+                req.headers(),
+                CaptureMode::HttpsTransparent,
+            )
+            .await;
+            return Ok(resp);
+        }
+
+        if !matches!(rule.action, PolicyRuleAction::Delegate) {
+            state.logging.log_policy_decision(PolicyDecisionLogContext {
+                request_id: &request_id,
+                url: &full_url,
+                method: Some(method.as_str()),
+                client_ip: Some(&client_ip_for_policy),
+                decision: &decision,
+            });
+        }
 
         match rule.action {
             PolicyRuleAction::Deny => {

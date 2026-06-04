@@ -234,6 +234,8 @@ In transparent HTTP mode, upstream target selection is based on the inbound `Hos
 
 - HTTP/1.1 upgrade handshakes are proxied on all HTTP/1.1 request paths (HTTP listener, CONNECT inner, transparent HTTPS when HTTP/1.1 is negotiated).
 - After a `101 Switching Protocols` response, acl-proxy switches to a bidirectional byte tunnel between client and upstream.
+- Matching policy rules can set `allow_upgrades = false` to deny HTTP/1.1 upgrade handshakes, including WebSocket handshakes, before delegate/plugin invocation or upstream forwarding.
+- `allow_upgrades` is a rule-level control; requests that match no rule and fall through to `policy.default = "allow"` keep the default upgrade tunneling behavior.
 - HTTP/2 extended CONNECT / RFC 8441 is not currently implemented.
 
 ### Upstream HTTP Version
@@ -435,6 +437,7 @@ action = "allow"
 pattern = "https://git.internal/{repo}.git/**"
 description = "Git HTTP(S) for {repo}"
 methods = ["GET", "POST"]
+allow_upgrades = false              # optional: inherited by includes
 ```
 
 Ruleset templates can also use `patterns = [...]`; include expansion emits one concrete rule for each template pattern.
@@ -452,7 +455,7 @@ subnets = ["10.0.0.0/8"]           # overrides template subnets
 - `with` provides macro overrides specific to this include.
 - `add_url_enc_variants = true` generates both raw and URL-encoded variants for all placeholders.
 - `methods` and `subnets` on the include override the template values; when omitted, template values are used.
-- `headers_absent`, `headers_match`, and `headers_not_match` are inherited from the template, not overridden.
+- `headers_absent`, `headers_match`, `headers_not_match`, and `allow_upgrades` are inherited from the template, not overridden.
 - Missing macros required by a ruleset cause validation failure.
 
 ### Header Actions
@@ -618,7 +621,7 @@ level_allows = "info"               # log level for allows
 level_denies = "warn"               # log level for denies
 ```
 
-Policy decision events are emitted to the `acl_proxy::policy` target with structured fields: `request_id`, `allowed`, `url`, `method`, `client_ip`, `rule_action`, `rule_pattern`, `rule_description`.
+Policy decision events are emitted to the `acl_proxy::policy` target with structured fields: `request_id`, `allowed`, `url`, `method`, `client_ip`, `rule_action`, `rule_pattern`, `rule_description`, and optional `reason`.
 
 ### `[capture]` — Request/Response Capture
 
@@ -630,7 +633,7 @@ denied_request = false              # capture denied request records
 denied_response = false             # capture denied response records
 directory = "logs-capture"          # base directory for capture files
 filename = "{requestId}-{suffix}.json"   # template ({requestId}, {kind}, {suffix})
-max_body_bytes = 65536              # max body bytes to serialize (0 = skip body)
+max_body_bytes = 1048576            # max body bytes to serialize (1 MiB; 0 = skip body)
 ```
 
 Capture happens for:
@@ -744,12 +747,14 @@ headers_absent = ["x-id"]          # optional: missing-header check
 headers_match = { "x-id" = "v1" }  # optional: exact header match
 headers_not_match = { "x-id" = "internal" } # optional: exact header exclusion
 request_timeout_ms = 5000          # optional: override upstream timeout
+allow_upgrades = true              # optional: deny HTTP/1.1 upgrades when false
 rule_id = "stable-id"             # optional: stable ID for webhooks
 external_auth_profile = "name"     # required for delegate; invalid for allow/deny
 ```
 
 At least one of `pattern`, `patterns`, `methods`, `subnets`, `headers_absent`, `headers_match`, or `headers_not_match` must be present.
 `allow` and `deny` are terminal local decisions. `delegate` invokes the named HTTP or plugin external auth profile; the provider can return `allow` or `deny` as terminal decisions, or `pass` to continue policy evaluation at the next rule.
+When a matched rule has `allow_upgrades = false`, HTTP/1.1 upgrade requests are denied locally with `403 Forbidden` before the rule action runs. Normal HTTP requests matching the same rule continue through `allow`, `deny`, or `delegate` behavior as usual.
 
 #### Include Rule Fields
 
@@ -792,6 +797,9 @@ args = ["--config", "/etc/url-allow.json"]
 timeout_ms = 1000
 restart_delay_ms = 10000            # delay before restarting crashed plugin
 include_headers = ["x-*"]           # header name globs to forward
+include_request_body = false        # optional body-aware plugin delegation
+max_request_body_bytes = 10485760   # encoded limit, 10 MiB
+max_decompressed_request_body_bytes = 52428800 # decoded gzip limit, 50 MiB
 env = { KEY = "value" }             # env vars for the plugin process
 ```
 
@@ -834,6 +842,7 @@ The config loader performs validation beyond basic TOML parsing:
 - `policy.default` must be `allow` or `deny`; `delegate` is valid only on rules and ruleset templates.
 - `action = "delegate"` requires `external_auth_profile`.
 - `external_auth_profile` on `action = "allow"` or `action = "deny"` rules is rejected.
+- `include_request_body = true` is supported only for `type = "plugin"` external auth profiles, and its body-size limits must be non-zero.
 
 On validation failure, `config validate` and startup report a human-readable error and abort, leaving any previously running instance (in the case of reload) unchanged.
 
@@ -907,6 +916,27 @@ Content-Type: application/json
 ### Plugin Mode (type = "plugin")
 
 Stdio-based synchronous auth. The proxy spawns a long-running plugin process and sends JSON requests over stdin, waiting for `allow`, `deny`, or `pass` JSON responses from stdout (newline-delimited). On `allow`, the proxy applies rule header actions first, plugin header actions second, and global egress request actions third. On `pass`, the plugin must not return request or response header actions, and policy evaluation resumes at the rule after the matched delegate rule. Plugins can also return response header actions on `allow`. See [`docs/design/auth-plugins-design.md`](docs/design/auth-plugins-design.md) for the full protocol specification.
+
+Plugin profiles can opt into request-body inspection and mutation:
+
+```toml
+[policy.external_auth_profiles.ai_guard]
+type = "plugin"
+command = "/usr/local/bin/ai-guard"
+timeout_ms = 3000
+include_headers = ["content-type", "authorization"]
+include_request_body = true
+max_request_body_bytes = 10485760
+max_decompressed_request_body_bytes = 52428800
+```
+
+When `include_request_body = true`, acl-proxy buffers the outbound request body before forwarding, decompresses `Content-Encoding: gzip` bodies, sends the decoded body to the plugin as base64, and can apply an optional `requestBody` replacement returned by an `allow` decision. The default encoded limit is 10 MiB and the default decompressed limit is 50 MiB. Plugin-returned replacement bodies are also capped by the decoded limit. If the original request was gzip-compressed, the replacement body is recompressed before egress and `Content-Length` is rebuilt. Unsupported content encodings, body read failures, oversize encoded bodies, and oversize decoded bodies fail the delegated request with an auth-plugin error response. Plugin `deny` responses may include `denyMessage` to replace the client-visible JSON `message`; status remains `403` and JSON `error` remains `Forbidden`. `denyMessage` is valid only on `deny`; returning it on `allow` or `pass` is a protocol error.
+
+Body-aware plugin delegation runs only when a request matches a `delegate` rule whose plugin profile has `include_request_body = true`. It works on all HTTP request-forwarding paths, including explicit HTTP proxying, transparent HTTP, CONNECT MITM inner requests, and transparent HTTPS after TLS termination. HTTP/1.1 upgrade/WebSocket traffic is not body-buffered; use `allow_upgrades = false` on protected rules when upgrade tunnels should be blocked before plugin invocation or upstream forwarding.
+
+Body-processing diagnostics are emitted with structured fields on the `acl_proxy::body_policy` tracing target at `debug` level. Logs include request ID, URL, profile, sizes, encoding, and decision metadata, but never log body contents.
+
+The [`demos/body-inspection-plugin/`](demos/body-inspection-plugin/) directory includes a prototype plugin that applies literal and regex body rules, blocks matching requests, or returns same-length redactions through `requestBody`.
 
 ### Failure Handling
 
@@ -1042,11 +1072,11 @@ Outgoing TLS from the proxy to upstream is verified against system root certific
 
 ### Policy Decision Logging
 
-Separate control for allow vs. deny decisions with configurable log levels. Events are emitted to the `acl_proxy::policy` target with structured fields: `request_id`, `allowed`, `url`, `method`, `client_ip`, and rule metadata.
+Separate control for allow vs. deny decisions with configurable log levels. Events are emitted to the `acl_proxy::policy` target with structured fields: `request_id`, `allowed`, `url`, `method`, `client_ip`, rule metadata, and optional `reason`.
 
 ### Request/Response Capture
 
-JSON capture files with request metadata, headers, and base64-encoded bodies. Enable independently for allowed/denied requests/responses. Body size capped at `capture.max_body_bytes` (default 64 KiB); full logical length always recorded in `body.length`.
+JSON capture files with request metadata, headers, and base64-encoded bodies. Enable independently for allowed/denied requests/responses. Body size capped at `capture.max_body_bytes` (default 1 MiB); full logical length always recorded in `body.length`.
 
 ### Body Extraction
 
@@ -1240,6 +1270,7 @@ tar -C "$OUT" -czf "$OUT/${ROOT}.tar.gz" "$ROOT"
 
 - [`demos/external-auth-webapp/`](demos/external-auth-webapp/) — Minimal approval web UI
 - [`demos/auth-plugin-stdio/`](demos/auth-plugin-stdio/) — Stdio-based auth plugin
+- [`demos/body-inspection-plugin/`](demos/body-inspection-plugin/) — Body-aware plugin with literal and regex rules
 - [`demos/external-auth-termstation-adapter/`](demos/external-auth-termstation-adapter/) — TermStation integration
 
 ## License

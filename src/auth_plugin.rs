@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose;
+use base64::Engine;
 use http::header::{HeaderName, HeaderValue};
 use http::HeaderMap as HttpHeaderMap;
 use serde::{Deserialize, Serialize};
@@ -17,6 +19,7 @@ use crate::config::{
 use crate::policy::CompiledHeaderAction;
 
 const DEFAULT_RESTART_DELAY_MS: u64 = 10_000;
+const MAX_DENY_MESSAGE_LEN: usize = 1024;
 
 #[derive(Debug)]
 pub struct PluginError {
@@ -47,9 +50,25 @@ impl std::error::Error for PluginError {}
 pub enum PluginDecision {
     Allow {
         header_actions: Vec<CompiledHeaderAction>,
+        request_body: Option<PluginBodyMutation>,
     },
-    Deny,
+    Deny {
+        message: Option<String>,
+    },
     Pass,
+}
+
+#[derive(Debug, Clone)]
+pub struct PluginBodyInput {
+    pub content_type: Option<String>,
+    pub content_encoding: Option<String>,
+    pub decoded_body: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PluginBodyMutation {
+    pub content_type: Option<String>,
+    pub decoded_body: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -86,6 +105,9 @@ impl AuthPluginManager {
                 args: profile.args.clone(),
                 timeout: Duration::from_millis(profile.timeout_ms),
                 include_headers: profile.include_headers.clone(),
+                include_request_body: profile.include_request_body,
+                max_request_body_bytes: profile.max_request_body_bytes,
+                max_decompressed_request_body_bytes: profile.max_decompressed_request_body_bytes,
                 env: profile.env.clone(),
                 restart_delay: Duration::from_millis(
                     profile.restart_delay_ms.unwrap_or(DEFAULT_RESTART_DELAY_MS),
@@ -117,8 +139,15 @@ impl AuthPluginHandle {
         method: &http::Method,
         client_ip: &str,
         headers: &HttpHeaderMap,
+        body: Option<PluginBodyInput>,
     ) -> Result<PluginDecision, PluginError> {
         let headers = collect_included_headers(headers, &self.config.include_headers);
+        let body = body.map(|body| PluginRequestBody {
+            encoding: "base64",
+            content_type: body.content_type,
+            content_encoding: body.content_encoding,
+            data: general_purpose::STANDARD.encode(body.decoded_body),
+        });
 
         let payload = PluginRequest {
             id: request_id,
@@ -127,6 +156,7 @@ impl AuthPluginHandle {
             method: method.as_str(),
             client_ip,
             headers,
+            body,
         };
 
         let message = serde_json::to_string(&payload).map_err(|err| {
@@ -194,6 +224,22 @@ impl AuthPluginHandle {
         let mut guard = self.runtime.lock().await;
         *guard = None;
     }
+
+    pub fn include_request_body(&self) -> bool {
+        self.config.include_request_body
+    }
+
+    pub fn max_request_body_bytes(&self) -> usize {
+        self.config.max_request_body_bytes
+    }
+
+    pub fn max_decompressed_request_body_bytes(&self) -> usize {
+        self.config.max_decompressed_request_body_bytes
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.config.timeout
+    }
 }
 
 #[derive(Clone)]
@@ -203,6 +249,9 @@ struct AuthPluginConfig {
     args: Vec<String>,
     timeout: Duration,
     include_headers: Vec<String>,
+    include_request_body: bool,
+    max_request_body_bytes: usize,
+    max_decompressed_request_body_bytes: usize,
     env: BTreeMap<String, String>,
     restart_delay: Duration,
 }
@@ -218,6 +267,8 @@ struct PluginRequest<'a> {
     client_ip: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     headers: Option<HeaderMap>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<PluginRequestBody>,
 }
 
 #[derive(Deserialize)]
@@ -230,6 +281,28 @@ struct PluginResponse {
     request_headers: Vec<PluginHeaderAction>,
     #[serde(default, rename = "responseHeaders")]
     response_headers: Vec<PluginHeaderAction>,
+    #[serde(default, rename = "requestBody")]
+    request_body: Option<PluginResponseBody>,
+    #[serde(default, rename = "denyMessage")]
+    deny_message: Option<JsonValue>,
+}
+
+#[derive(Debug, Serialize)]
+struct PluginRequestBody {
+    encoding: &'static str,
+    #[serde(rename = "contentType", skip_serializing_if = "Option::is_none")]
+    content_type: Option<String>,
+    #[serde(rename = "contentEncoding", skip_serializing_if = "Option::is_none")]
+    content_encoding: Option<String>,
+    data: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PluginResponseBody {
+    encoding: String,
+    #[serde(default, rename = "contentType")]
+    content_type: Option<String>,
+    data: String,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -451,6 +524,12 @@ fn handle_plugin_response(
                 decision = "allow",
                 "auth plugin decision"
             );
+            if response.deny_message.is_some() {
+                let _ = sender.send(Err(PluginError::new(
+                    "auth plugin allow decision must not include denyMessage",
+                )));
+                return;
+            }
             let mut header_actions = Vec::new();
             match compile_plugin_actions(&response.request_headers, HeaderDirection::Request) {
                 Ok(actions) => header_actions.extend(actions),
@@ -466,8 +545,24 @@ fn handle_plugin_response(
                     return;
                 }
             }
+            let request_body = match response.request_body {
+                Some(body) => match decode_plugin_response_body(
+                    body,
+                    config.max_decompressed_request_body_bytes,
+                ) {
+                    Ok(body) => Some(body),
+                    Err(err) => {
+                        let _ = sender.send(Err(err));
+                        return;
+                    }
+                },
+                None => None,
+            };
 
-            Ok(PluginDecision::Allow { header_actions })
+            Ok(PluginDecision::Allow {
+                header_actions,
+                request_body,
+            })
         }
         PluginDecisionKind::Deny => {
             tracing::debug!(
@@ -476,7 +571,9 @@ fn handle_plugin_response(
                 decision = "deny",
                 "auth plugin decision"
             );
-            Ok(PluginDecision::Deny)
+            Ok(PluginDecision::Deny {
+                message: normalize_deny_message(response.deny_message),
+            })
         }
         PluginDecisionKind::Pass => {
             tracing::debug!(
@@ -485,9 +582,13 @@ fn handle_plugin_response(
                 decision = "pass",
                 "auth plugin decision"
             );
-            if !response.request_headers.is_empty() || !response.response_headers.is_empty() {
+            if !response.request_headers.is_empty()
+                || !response.response_headers.is_empty()
+                || response.request_body.is_some()
+                || response.deny_message.is_some()
+            {
                 Err(PluginError::new(
-                    "auth plugin pass decision must not include header actions",
+                    "auth plugin pass decision must not include header actions, requestBody, or denyMessage",
                 ))
             } else {
                 Ok(PluginDecision::Pass)
@@ -496,6 +597,59 @@ fn handle_plugin_response(
     };
 
     let _ = sender.send(result);
+}
+
+fn normalize_deny_message(message: Option<JsonValue>) -> Option<String> {
+    let message = message?;
+    let JsonValue::String(message) = message else {
+        return None;
+    };
+    let message = message.trim();
+    if message.is_empty()
+        || message.len() > MAX_DENY_MESSAGE_LEN
+        || message.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(message.to_string())
+}
+
+fn decode_plugin_response_body(
+    body: PluginResponseBody,
+    max_decoded_body_bytes: usize,
+) -> Result<PluginBodyMutation, PluginError> {
+    if body.encoding != "base64" {
+        return Err(PluginError::new(format!(
+            "unsupported requestBody encoding '{}'; expected base64",
+            body.encoding
+        )));
+    }
+
+    let max_encoded_len = max_base64_len_for_decoded_limit(max_decoded_body_bytes);
+    if body.data.len() > max_encoded_len {
+        return Err(PluginError::new(format!(
+            "requestBody decoded data exceeds configured limit of {max_decoded_body_bytes} bytes"
+        )));
+    }
+
+    let decoded_body = general_purpose::STANDARD
+        .decode(body.data)
+        .map_err(|err| PluginError::new(format!("requestBody data is not valid base64: {err}")))?;
+
+    if decoded_body.len() > max_decoded_body_bytes {
+        return Err(PluginError::new(format!(
+            "requestBody decoded data exceeds configured limit of {max_decoded_body_bytes} bytes"
+        )));
+    }
+
+    Ok(PluginBodyMutation {
+        content_type: body.content_type,
+        decoded_body,
+    })
+}
+
+fn max_base64_len_for_decoded_limit(limit: usize) -> usize {
+    limit.saturating_add(2).saturating_div(3).saturating_mul(4)
 }
 
 fn compile_plugin_actions(
@@ -740,6 +894,9 @@ mod tests {
             args: Vec::new(),
             timeout: Duration::from_millis(1000),
             include_headers: Vec::new(),
+            include_request_body: false,
+            max_request_body_bytes: 10 * 1024 * 1024,
+            max_decompressed_request_body_bytes: 50 * 1024 * 1024,
             env: BTreeMap::new(),
             restart_delay: Duration::from_millis(10),
         }
@@ -747,6 +904,13 @@ mod tests {
 
     fn parse_response(line: &str) -> Result<PluginDecision, PluginError> {
         let config = test_config();
+        parse_response_with_config(line, config)
+    }
+
+    fn parse_response_with_config(
+        line: &str,
+        config: AuthPluginConfig,
+    ) -> Result<PluginDecision, PluginError> {
         let (tx, mut rx) = oneshot::channel();
         let mut pending = HashMap::new();
         pending.insert("req-1".to_string(), tx);
@@ -771,6 +935,138 @@ mod tests {
             r#"{"id":"req-1","type":"response","decision":"pass","requestHeaders":[{"action":"set","name":"x-test","value":"one"}]}"#,
         )
         .expect_err("pass with header actions should fail");
+
+        assert!(
+            err.message()
+                .contains("pass decision must not include header actions"),
+            "unexpected error: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn plugin_deny_can_return_custom_message() {
+        let decision = parse_response(
+            r#"{"id":"req-1","type":"response","decision":"deny","denyMessage":"Request blocked by body policy"}"#,
+        )
+        .expect("deny with message should parse");
+
+        let PluginDecision::Deny { message } = decision else {
+            panic!("expected deny decision");
+        };
+        assert_eq!(message.as_deref(), Some("Request blocked by body policy"));
+    }
+
+    #[test]
+    fn plugin_deny_blank_control_non_string_or_oversized_message_falls_back() {
+        let blank = parse_response(
+            r#"{"id":"req-1","type":"response","decision":"deny","denyMessage":"   "}"#,
+        )
+        .expect("blank deny message should parse");
+        let PluginDecision::Deny { message } = blank else {
+            panic!("expected deny decision");
+        };
+        assert!(message.is_none());
+
+        let control = parse_response(
+            r#"{"id":"req-1","type":"response","decision":"deny","denyMessage":"bad\u0007message"}"#,
+        )
+        .expect("control deny message should parse");
+        let PluginDecision::Deny { message } = control else {
+            panic!("expected deny decision");
+        };
+        assert!(message.is_none());
+
+        let non_string = parse_response(
+            r#"{"id":"req-1","type":"response","decision":"deny","denyMessage":123}"#,
+        )
+        .expect("non-string deny message should parse");
+        let PluginDecision::Deny { message } = non_string else {
+            panic!("expected deny decision");
+        };
+        assert!(message.is_none());
+
+        let oversized_line = format!(
+            r#"{{"id":"req-1","type":"response","decision":"deny","denyMessage":"{}"}}"#,
+            "x".repeat(MAX_DENY_MESSAGE_LEN + 1)
+        );
+        let oversized =
+            parse_response(&oversized_line).expect("oversized deny message should parse");
+        let PluginDecision::Deny { message } = oversized else {
+            panic!("expected deny decision");
+        };
+        assert!(message.is_none());
+    }
+
+    #[test]
+    fn plugin_allow_with_deny_message_is_rejected() {
+        let err = parse_response(
+            r#"{"id":"req-1","type":"response","decision":"allow","denyMessage":"not valid here"}"#,
+        )
+        .expect_err("allow with denyMessage should fail");
+
+        assert!(
+            err.message()
+                .contains("allow decision must not include denyMessage"),
+            "unexpected error: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn plugin_pass_with_deny_message_is_rejected() {
+        let err = parse_response(
+            r#"{"id":"req-1","type":"response","decision":"pass","denyMessage":"not valid here"}"#,
+        )
+        .expect_err("pass with denyMessage should fail");
+
+        assert!(
+            err.message().contains("pass decision must not include"),
+            "unexpected error: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn plugin_allow_can_return_request_body_mutation() {
+        let decision = parse_response(
+            r#"{"id":"req-1","type":"response","decision":"allow","requestBody":{"encoding":"base64","contentType":"application/json","data":"eyJvayI6dHJ1ZX0="}}"#,
+        )
+        .expect("allow with request body should parse");
+
+        let PluginDecision::Allow { request_body, .. } = decision else {
+            panic!("expected allow decision");
+        };
+        let body = request_body.expect("request body mutation");
+        assert_eq!(body.content_type.as_deref(), Some("application/json"));
+        assert_eq!(body.decoded_body, br#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn plugin_allow_request_body_mutation_respects_decoded_limit() {
+        let mut config = test_config();
+        config.max_decompressed_request_body_bytes = 3;
+
+        let err = parse_response_with_config(
+            r#"{"id":"req-1","type":"response","decision":"allow","requestBody":{"encoding":"base64","data":"Zm91cg=="}}"#,
+            config,
+        )
+        .expect_err("oversized request body mutation should fail");
+
+        assert!(
+            err.message()
+                .contains("requestBody decoded data exceeds configured limit of 3 bytes"),
+            "unexpected error: {}",
+            err.message()
+        );
+    }
+
+    #[test]
+    fn plugin_pass_with_request_body_is_rejected() {
+        let err = parse_response(
+            r#"{"id":"req-1","type":"response","decision":"pass","requestBody":{"encoding":"base64","data":"eA=="}}"#,
+        )
+        .expect_err("pass with request body should fail");
 
         assert!(
             err.message()

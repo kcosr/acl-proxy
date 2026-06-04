@@ -58,6 +58,7 @@ pub struct MatchedRule {
     pub subnets: Vec<IpNet>,
     pub methods: Vec<String>,
     pub request_timeout_ms: Option<u64>,
+    pub allow_upgrades: bool,
     pub header_actions: Vec<CompiledHeaderAction>,
     pub external_auth_profile: Option<String>,
 }
@@ -82,6 +83,7 @@ struct CompiledRule {
     headers_match: Vec<CompiledHeaderMatch>,
     headers_not_match: Vec<CompiledHeaderMatch>,
     request_timeout_ms: Option<u64>,
+    allow_upgrades: bool,
     header_actions: Vec<CompiledHeaderAction>,
     external_auth_profile: Option<String>,
 }
@@ -110,6 +112,7 @@ struct ExpandedRule {
     headers_match: Option<BTreeMap<String, Vec<String>>>,
     headers_not_match: Option<BTreeMap<String, Vec<String>>>,
     request_timeout_ms: Option<u64>,
+    allow_upgrades: bool,
     header_actions: Vec<HeaderActionConfig>,
     external_auth_profile: Option<String>,
 }
@@ -138,6 +141,7 @@ pub struct EffectiveRule {
     pub headers_match: BTreeMap<String, Vec<String>>,
     pub headers_not_match: BTreeMap<String, Vec<String>>,
     pub request_timeout_ms: Option<u64>,
+    pub allow_upgrades: bool,
     pub header_actions: Vec<EffectiveHeaderAction>,
     pub external_auth: Option<EffectiveExternalAuth>,
 }
@@ -211,6 +215,7 @@ impl PolicyEngine {
                 headers_match,
                 headers_not_match,
                 request_timeout_ms: rule.request_timeout_ms,
+                allow_upgrades: rule.allow_upgrades,
                 header_actions,
                 external_auth_profile: rule.external_auth_profile,
             });
@@ -300,6 +305,7 @@ impl PolicyEngine {
                 subnets: rule.subnets.clone(),
                 methods: rule.methods.clone(),
                 request_timeout_ms: rule.request_timeout_ms,
+                allow_upgrades: rule.allow_upgrades,
                 header_actions: rule.header_actions.clone(),
                 external_auth_profile: rule.external_auth_profile.clone(),
             };
@@ -386,6 +392,7 @@ impl EffectivePolicy {
                     headers_match: rule.headers_match.unwrap_or_default(),
                     headers_not_match: rule.headers_not_match.unwrap_or_default(),
                     request_timeout_ms: rule.request_timeout_ms,
+                    allow_upgrades: rule.allow_upgrades,
                     header_actions,
                     external_auth,
                 }
@@ -487,6 +494,7 @@ fn expand_direct_rule(
             headers_match,
             headers_not_match,
             request_timeout_ms: rule.request_timeout_ms,
+            allow_upgrades: rule.allow_upgrades,
             header_actions: rule.header_actions.clone(),
             external_auth_profile: rule.external_auth_profile.clone(),
         });
@@ -528,6 +536,7 @@ fn expand_direct_rule(
                 headers_match: headers_match.clone(),
                 headers_not_match: headers_not_match.clone(),
                 request_timeout_ms: rule.request_timeout_ms,
+                allow_upgrades: rule.allow_upgrades,
                 header_actions: rule.header_actions.clone(),
                 external_auth_profile: rule.external_auth_profile.clone(),
             });
@@ -566,6 +575,7 @@ fn expand_direct_rule(
                 headers_match: headers_match.clone(),
                 headers_not_match: headers_not_match.clone(),
                 request_timeout_ms: rule.request_timeout_ms,
+                allow_upgrades: rule.allow_upgrades,
                 header_actions: rule.header_actions.clone(),
                 external_auth_profile: rule.external_auth_profile.clone(),
             });
@@ -778,6 +788,7 @@ fn expand_include_rule(
                     headers_match: headers_match.clone(),
                     headers_not_match: headers_not_match.clone(),
                     request_timeout_ms,
+                    allow_upgrades: template.allow_upgrades,
                     header_actions: template.header_actions.clone(),
                     external_auth_profile: template.external_auth_profile.clone(),
                 });
@@ -821,6 +832,7 @@ fn expand_include_rule(
                     headers_match: headers_match.clone(),
                     headers_not_match: headers_not_match.clone(),
                     request_timeout_ms,
+                    allow_upgrades: template.allow_upgrades,
                     header_actions: template.header_actions.clone(),
                     external_auth_profile: template.external_auth_profile.clone(),
                 });
@@ -1616,6 +1628,7 @@ mod tests {
                 headers_match: None,
                 headers_not_match: None,
                 request_timeout_ms: None,
+                allow_upgrades: true,
                 with: None,
                 add_url_enc_variants: None,
                 header_actions: Vec::new(),
@@ -1648,6 +1661,7 @@ mod tests {
                 headers_match: None,
                 headers_not_match: None,
                 request_timeout_ms: None,
+                allow_upgrades: true,
                 with: None,
                 add_url_enc_variants: None,
                 header_actions: Vec::new(),
@@ -1687,6 +1701,7 @@ mod tests {
                     headers_match: None,
                     headers_not_match: None,
                     request_timeout_ms: None,
+                    allow_upgrades: true,
                     header_actions: Vec::new(),
                     external_auth_profile: None,
                     rule_id: None,
@@ -1702,6 +1717,7 @@ mod tests {
                     headers_match: None,
                     headers_not_match: None,
                     request_timeout_ms: None,
+                    allow_upgrades: true,
                     header_actions: Vec::new(),
                     external_auth_profile: None,
                     rule_id: None,
@@ -1767,6 +1783,7 @@ mod tests {
                     headers_match: None,
                     headers_not_match: None,
                     request_timeout_ms: None,
+                    allow_upgrades: true,
                     header_actions: Vec::new(),
                     external_auth_profile: None,
                     rule_id: None,

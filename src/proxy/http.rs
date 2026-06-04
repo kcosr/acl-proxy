@@ -2,12 +2,19 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::convert::Infallible;
+use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use http::header::{HeaderMap as HttpHeaderMap, HeaderName, HeaderValue, HOST};
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use http::header::{
+    HeaderMap as HttpHeaderMap, HeaderName, HeaderValue, CONTENT_ENCODING, CONTENT_LENGTH,
+    CONTENT_TYPE, HOST, TRANSFER_ENCODING,
+};
 use http::{Method, StatusCode, Uri, Version};
 use hyper::body::{Bytes, HttpBody};
 use hyper::client::conn;
@@ -22,7 +29,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use serde::Deserialize;
 
 use crate::app::{AppState, SharedAppState};
-use crate::auth_plugin::{AuthPluginHandle, PluginDecision};
+use crate::auth_plugin::{AuthPluginHandle, PluginBodyInput, PluginBodyMutation, PluginDecision};
 use crate::capture::{
     build_capture_record, should_capture, BodyCaptureBuffer, BodyCaptureResult, CaptureDecision,
     CaptureEndpoint, CaptureKind, CaptureMode, CaptureRecordOptions, HeaderMap,
@@ -65,6 +72,30 @@ enum UpstreamRequestError {
     Hyper(#[from] hyper::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum RequestBodyProcessingError {
+    #[error("failed to read request body: {0}")]
+    Read(#[from] hyper::Error),
+    #[error("request body exceeded configured limit of {limit} bytes")]
+    BodyTooLarge { limit: usize },
+    #[error("unsupported request content-encoding '{encoding}'")]
+    UnsupportedContentEncoding { encoding: String },
+    #[error("failed to decompress gzip request body: {0}")]
+    Decompress(std::io::Error),
+    #[error("decompressed request body exceeded configured limit of {limit} bytes")]
+    DecompressedBodyTooLarge { limit: usize },
+    #[error("failed to recompress gzip request body: {0}")]
+    Recompress(std::io::Error),
+    #[error("invalid rewritten content-type returned by plugin: {0}")]
+    InvalidContentType(#[from] http::header::InvalidHeaderValue),
+}
+
+struct PreparedPluginRequestBody {
+    decoded_len: usize,
+    content_type: Option<String>,
+    content_encoding: Option<String>,
 }
 
 pub(crate) enum ExternalAuthGateResult {
@@ -193,6 +224,7 @@ async fn handle_http_request(
     }
 
     let mut start_index = 0;
+    let request_is_upgrade = version == Version::HTTP_11 && is_upgrade_request(req.headers());
     loop {
         let decision = state.policy.evaluate_from(
             start_index,
@@ -202,10 +234,7 @@ async fn handle_http_request(
             req.headers(),
         );
 
-        if !matches!(
-            decision.matched.as_ref().map(|rule| rule.action),
-            Some(PolicyRuleAction::Delegate)
-        ) {
+        let Some(rule) = decision.matched.as_ref() else {
             state.logging.log_policy_decision(PolicyDecisionLogContext {
                 request_id: &request_id,
                 url: &full_url,
@@ -213,9 +242,7 @@ async fn handle_http_request(
                 client_ip: Some(&client_ip_for_policy),
                 decision: &decision,
             });
-        }
 
-        let Some(rule) = decision.matched.as_ref() else {
             if decision.allowed {
                 let response = proxy_allowed_request(
                     state.clone(),
@@ -247,6 +274,39 @@ async fn handle_http_request(
             .await;
             return Ok(resp);
         };
+
+        if request_is_upgrade && !rule.allow_upgrades {
+            state
+                .logging
+                .log_policy_upgrade_denied(PolicyDecisionLogContext {
+                    request_id: &request_id,
+                    url: &full_url,
+                    method: Some(method.as_str()),
+                    client_ip: Some(&client_ip_for_policy),
+                    decision: &decision,
+                });
+            let resp = build_policy_denied_response(
+                &state,
+                &request_id,
+                &full_url,
+                &method,
+                &client_endpoint,
+                version,
+                req.headers(),
+            )
+            .await;
+            return Ok(resp);
+        }
+
+        if !matches!(rule.action, PolicyRuleAction::Delegate) {
+            state.logging.log_policy_decision(PolicyDecisionLogContext {
+                request_id: &request_id,
+                url: &full_url,
+                method: Some(method.as_str()),
+                client_ip: Some(&client_ip_for_policy),
+                decision: &decision,
+            });
+        }
 
         match rule.action {
             PolicyRuleAction::Deny => {
@@ -956,14 +1016,94 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
     egress_request_header_actions: Vec<CompiledHeaderAction>,
     mode: CaptureMode,
 ) -> ExternalAuthGateResult {
+    let req_headers_for_error = req.headers().clone();
+    let mut prepared_body = None;
+    let mut plugin_body = None;
+    let req = if handler.include_request_body() {
+        match prepare_request_body_for_plugin(
+            request_id,
+            url,
+            profile_name,
+            req,
+            handler.max_request_body_bytes(),
+            handler.max_decompressed_request_body_bytes(),
+        )
+        .await
+        {
+            Ok((req, body, decoded_body)) => {
+                tracing::debug!(
+                    target: "acl_proxy::body_policy",
+                    request_id = %request_id,
+                    url = %url,
+                    profile = %profile_name,
+                    decoded_size = body.decoded_len,
+                    timeout_ms = handler.timeout().as_millis() as u64,
+                    "sending decoded request body to auth plugin"
+                );
+                plugin_body = Some(PluginBodyInput {
+                    content_type: body.content_type.clone(),
+                    content_encoding: body.content_encoding.clone(),
+                    decoded_body,
+                });
+                prepared_body = Some(body);
+                req
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "acl_proxy::body_policy",
+                    request_id = %request_id,
+                    url = %url,
+                    profile = %profile_name,
+                    error = %err,
+                    "request body processing failed before auth plugin evaluation"
+                );
+                return ExternalAuthGateResult::Response(
+                    build_auth_plugin_error_response(
+                        &state,
+                        request_id,
+                        url,
+                        method,
+                        client,
+                        target,
+                        version,
+                        &req_headers_for_error,
+                        mode,
+                        "Auth plugin request body processing failed",
+                    )
+                    .await,
+                );
+            }
+        }
+    } else {
+        req
+    };
+
     let decision = handler
-        .evaluate(request_id, url, method, client_ip_for_policy, req.headers())
+        .evaluate(
+            request_id,
+            url,
+            method,
+            client_ip_for_policy,
+            req.headers(),
+            plugin_body,
+        )
         .await;
 
     match decision {
         Ok(PluginDecision::Allow {
             header_actions: plugin_actions,
+            request_body,
         }) => {
+            tracing::debug!(
+                target: "acl_proxy::body_policy",
+                request_id = %request_id,
+                url = %url,
+                profile = %profile_name,
+                decision = "allow",
+                body_modified = request_body.is_some(),
+                plugin_header_actions = plugin_actions.len(),
+                "auth plugin body-aware decision received"
+            );
             tracing::info!(
                 request_id = %request_id,
                 action = "delegate",
@@ -973,6 +1113,69 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
             );
             let mut combined = header_actions;
             combined.extend(plugin_actions);
+            let req = if let Some(body) = request_body {
+                let Some(prepared) = prepared_body.as_ref() else {
+                    tracing::warn!(
+                        target: "acl_proxy::body_policy",
+                        request_id = %request_id,
+                        url = %url,
+                        profile = %profile_name,
+                        "auth plugin returned requestBody for a profile without include_request_body"
+                    );
+                    return ExternalAuthGateResult::Response(
+                        build_auth_plugin_error_response(
+                            &state,
+                            request_id,
+                            url,
+                            method,
+                            client,
+                            target,
+                            version,
+                            &req_headers_for_error,
+                            mode,
+                            "Auth plugin request body mutation failed",
+                        )
+                        .await,
+                    );
+                };
+                match rebuild_request_with_plugin_body(
+                    request_id,
+                    url,
+                    profile_name,
+                    req,
+                    prepared,
+                    body,
+                ) {
+                    Ok(req) => req,
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "acl_proxy::body_policy",
+                            request_id = %request_id,
+                            url = %url,
+                            profile = %profile_name,
+                            error = %err,
+                            "auth plugin returned invalid request body mutation"
+                        );
+                        return ExternalAuthGateResult::Response(
+                            build_auth_plugin_error_response(
+                                &state,
+                                request_id,
+                                url,
+                                method,
+                                client,
+                                target,
+                                version,
+                                &req_headers_for_error,
+                                mode,
+                                "Auth plugin request body mutation failed",
+                            )
+                            .await,
+                        );
+                    }
+                }
+            } else {
+                req
+            };
             ExternalAuthGateResult::Response(
                 proxy_allowed_request(
                     state.clone(),
@@ -991,7 +1194,15 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
                 .await,
             )
         }
-        Ok(PluginDecision::Deny) => {
+        Ok(PluginDecision::Deny { message }) => {
+            tracing::debug!(
+                target: "acl_proxy::body_policy",
+                request_id = %request_id,
+                url = %url,
+                profile = %profile_name,
+                decision = "deny",
+                "auth plugin body-aware decision received"
+            );
             tracing::info!(
                 request_id = %request_id,
                 action = "delegate",
@@ -1010,11 +1221,20 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
                     version,
                     req.headers(),
                     mode,
+                    message.as_deref(),
                 )
                 .await,
             )
         }
         Ok(PluginDecision::Pass) => {
+            tracing::debug!(
+                target: "acl_proxy::body_policy",
+                request_id = %request_id,
+                url = %url,
+                profile = %profile_name,
+                decision = "pass",
+                "auth plugin body-aware decision received"
+            );
             tracing::info!(
                 request_id = %request_id,
                 action = "delegate",
@@ -1043,6 +1263,228 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
             )
         }
     }
+}
+
+async fn prepare_request_body_for_plugin(
+    request_id: &str,
+    url: &str,
+    profile_name: &str,
+    req: Request<Body>,
+    max_body_bytes: usize,
+    max_decompressed_body_bytes: usize,
+) -> Result<(Request<Body>, PreparedPluginRequestBody, Vec<u8>), RequestBodyProcessingError> {
+    let (mut parts, body) = req.into_parts();
+    let content_type = header_to_string(&parts.headers, &CONTENT_TYPE);
+    let content_encoding = normalized_content_encoding(&parts.headers)?;
+
+    tracing::debug!(
+        target: "acl_proxy::body_policy",
+        request_id = %request_id,
+        url = %url,
+        profile = %profile_name,
+        max_body_bytes,
+        max_decompressed_body_bytes,
+        content_type = %content_type.as_deref().unwrap_or(""),
+        content_encoding = %content_encoding.as_deref().unwrap_or("identity"),
+        "request body processing enabled for auth plugin"
+    );
+
+    let encoded = read_limited_body(body, max_body_bytes).await?;
+    tracing::debug!(
+        target: "acl_proxy::body_policy",
+        request_id = %request_id,
+        url = %url,
+        profile = %profile_name,
+        encoded_size = encoded.len(),
+        "request body buffered"
+    );
+
+    let decoded = match content_encoding.as_deref() {
+        Some("gzip") => {
+            let decoded = decompress_gzip_limited(&encoded, max_decompressed_body_bytes)?;
+            tracing::debug!(
+                target: "acl_proxy::body_policy",
+                request_id = %request_id,
+                url = %url,
+                profile = %profile_name,
+                encoding = "gzip",
+                encoded_size = encoded.len(),
+                decoded_size = decoded.len(),
+                "request body decompressed"
+            );
+            decoded
+        }
+        None => encoded.clone(),
+        Some(other) => {
+            return Err(RequestBodyProcessingError::UnsupportedContentEncoding {
+                encoding: other.to_string(),
+            })
+        }
+    };
+
+    set_body_headers(
+        &mut parts.headers,
+        encoded.len(),
+        content_encoding.as_deref(),
+        None,
+    )?;
+    let req = Request::from_parts(parts, Body::from(encoded.clone()));
+    let prepared = PreparedPluginRequestBody {
+        decoded_len: decoded.len(),
+        content_type,
+        content_encoding,
+    };
+
+    Ok((req, prepared, decoded))
+}
+
+fn rebuild_request_with_plugin_body(
+    request_id: &str,
+    url: &str,
+    profile_name: &str,
+    req: Request<Body>,
+    prepared: &PreparedPluginRequestBody,
+    mutation: PluginBodyMutation,
+) -> Result<Request<Body>, RequestBodyProcessingError> {
+    let (mut parts, _body) = req.into_parts();
+    let content_encoding = prepared.content_encoding.clone();
+    let decoded_len = mutation.decoded_body.len();
+    let encoded = match content_encoding.as_deref() {
+        Some("gzip") => {
+            let encoded = compress_gzip(&mutation.decoded_body)?;
+            tracing::debug!(
+                target: "acl_proxy::body_policy",
+                request_id = %request_id,
+                url = %url,
+                profile = %profile_name,
+                encoding = "gzip",
+                decoded_size = decoded_len,
+                encoded_size = encoded.len(),
+                "request body recompressed"
+            );
+            encoded
+        }
+        Some(other) => {
+            return Err(RequestBodyProcessingError::UnsupportedContentEncoding {
+                encoding: other.to_string(),
+            })
+        }
+        None => mutation.decoded_body,
+    };
+
+    set_body_headers(
+        &mut parts.headers,
+        encoded.len(),
+        content_encoding.as_deref(),
+        mutation.content_type.as_deref(),
+    )?;
+    tracing::debug!(
+        target: "acl_proxy::body_policy",
+        request_id = %request_id,
+        url = %url,
+        profile = %profile_name,
+        decoded_size = decoded_len,
+        final_body_size = encoded.len(),
+        content_encoding = %content_encoding.as_deref().unwrap_or("identity"),
+        "outbound request rebuilt after auth plugin body mutation"
+    );
+
+    Ok(Request::from_parts(parts, Body::from(encoded)))
+}
+
+async fn read_limited_body(
+    mut body: Body,
+    limit: usize,
+) -> Result<Vec<u8>, RequestBodyProcessingError> {
+    let mut out = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk?;
+        let next_len = out.len().saturating_add(chunk.len());
+        if next_len > limit {
+            return Err(RequestBodyProcessingError::BodyTooLarge { limit });
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
+fn normalized_content_encoding(
+    headers: &HttpHeaderMap,
+) -> Result<Option<String>, RequestBodyProcessingError> {
+    let Some(raw) = header_to_string(headers, &CONTENT_ENCODING) else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("identity") {
+        return Ok(None);
+    }
+    if trimmed.eq_ignore_ascii_case("gzip") {
+        return Ok(Some("gzip".to_string()));
+    }
+    Err(RequestBodyProcessingError::UnsupportedContentEncoding {
+        encoding: trimmed.to_string(),
+    })
+}
+
+fn header_to_string(headers: &HttpHeaderMap, name: &HeaderName) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_string())
+}
+
+fn decompress_gzip_limited(
+    encoded: &[u8],
+    limit: usize,
+) -> Result<Vec<u8>, RequestBodyProcessingError> {
+    let mut decoder = GzDecoder::new(encoded);
+    let mut decoded = Vec::new();
+    decoder
+        .by_ref()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut decoded)
+        .map_err(RequestBodyProcessingError::Decompress)?;
+    if decoded.len() > limit {
+        return Err(RequestBodyProcessingError::DecompressedBodyTooLarge { limit });
+    }
+    Ok(decoded)
+}
+
+fn compress_gzip(decoded: &[u8]) -> Result<Vec<u8>, RequestBodyProcessingError> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(decoded)
+        .map_err(RequestBodyProcessingError::Recompress)?;
+    encoder
+        .finish()
+        .map_err(RequestBodyProcessingError::Recompress)
+}
+
+fn set_body_headers(
+    headers: &mut HttpHeaderMap,
+    body_len: usize,
+    content_encoding: Option<&str>,
+    content_type: Option<&str>,
+) -> Result<(), RequestBodyProcessingError> {
+    headers.remove(TRANSFER_ENCODING);
+    headers.insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&body_len.to_string())
+            .expect("decimal content length is a valid header value"),
+    );
+    if let Some(encoding) = content_encoding {
+        headers.insert(
+            CONTENT_ENCODING,
+            HeaderValue::from_str(encoding)
+                .expect("validated content encoding is a valid header value"),
+        );
+    } else {
+        headers.remove(CONTENT_ENCODING);
+    }
+    if let Some(content_type) = content_type {
+        headers.insert(CONTENT_TYPE, HeaderValue::from_str(content_type)?);
+    }
+    Ok(())
 }
 
 fn build_full_url(
@@ -1164,7 +1606,7 @@ pub(crate) fn has_loop_header(headers: &HttpHeaderMap, name: &HeaderName) -> boo
     headers.contains_key(name)
 }
 
-fn is_upgrade_request(headers: &HttpHeaderMap) -> bool {
+pub(crate) fn is_upgrade_request(headers: &HttpHeaderMap) -> bool {
     let has_upgrade_token = headers
         .get_all(http::header::CONNECTION)
         .iter()
@@ -1353,6 +1795,7 @@ pub(crate) async fn build_auth_plugin_denied_response(
     version: Version,
     req_headers: &HttpHeaderMap,
     mode: CaptureMode,
+    message: Option<&str>,
 ) -> Response<Body> {
     build_external_auth_response(
         state,
@@ -1366,7 +1809,7 @@ pub(crate) async fn build_auth_plugin_denied_response(
         mode,
         StatusCode::FORBIDDEN,
         "Forbidden",
-        "Blocked by auth plugin",
+        message.unwrap_or("Blocked by auth plugin"),
     )
     .await
 }
@@ -1614,7 +2057,7 @@ pub(crate) async fn proxy_allowed_request(
 
     let req_headers_snapshot = req.headers().clone();
     let original_request_presence = snapshot_header_presence(req.headers());
-    let request_is_upgrade = is_upgrade_request(req.headers());
+    let request_is_upgrade = version == Version::HTTP_11 && is_upgrade_request(req.headers());
     let downstream_upgrade = if request_is_upgrade {
         Some(hyper::upgrade::on(&mut req))
     } else {

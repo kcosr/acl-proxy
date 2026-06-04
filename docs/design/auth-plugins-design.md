@@ -71,6 +71,9 @@ restart_delay_ms = 10000
 - `args` (array of strings, optional)
 - `timeout_ms` (integer, required)
 - `include_headers` (array of strings, optional)
+- `include_request_body` (boolean, optional, default false)
+- `max_request_body_bytes` (integer, optional, default 10485760 / 10 MiB)
+- `max_decompressed_request_body_bytes` (integer, optional, default 52428800 / 50 MiB)
 - `env` (map of string to string, optional)
 - `restart_delay_ms` (integer, optional, default 10000)
 
@@ -100,6 +103,14 @@ For pass decisions, do not apply rule or plugin header actions. A plugin respons
 with `decision = "pass"` and non-empty `requestHeaders` or `responseHeaders` is
 a protocol error.
 
+For body-aware plugin profiles, `decision = "allow"` may include a `requestBody`
+replacement. `decision = "pass"` must not include `requestBody`.
+
+For deny decisions, plugins may include `denyMessage` to replace the
+client-visible JSON `message` in the 403 response. The HTTP status remains fixed
+at 403 and the JSON `error` remains `Forbidden`. `denyMessage` is valid only on
+deny decisions.
+
 ### Failure behavior
 
 - Plugin failures (timeout, crash, invalid response) return a 503 error response.
@@ -115,6 +126,26 @@ a protocol error.
 
 If unset or empty, no headers are sent to the plugin.
 
+### Request body inclusion
+
+When `include_request_body = true`, acl-proxy buffers the outbound request body
+before forwarding it upstream. If the request uses `Content-Encoding: gzip`, the
+body is decompressed before being sent to the plugin. The plugin receives the
+decoded body as base64. On `allow`, the plugin may return a replacement decoded
+body; acl-proxy recompresses it when the original request was gzip-compressed and
+rebuilds `Content-Length`. Replacement bodies returned by the plugin are capped
+by `max_decompressed_request_body_bytes`.
+
+Unsupported request encodings, body read failures, and configured size-limit
+violations fail the delegated request before upstream egress. Body-aware
+delegation is supported only for synchronous plugin profiles, not HTTP webhook
+callback profiles.
+
+Body-aware delegation runs only after a request matches a `delegate` rule whose
+plugin profile has `include_request_body = true`. HTTP/1.1 upgrade tunnels are
+not body-buffered; rules can use `allow_upgrades = false` to reject those
+handshakes before plugin invocation.
+
 ## Plugin Protocol (stdio)
 
 The plugin communicates via NDJSON (one JSON object per line).
@@ -129,6 +160,12 @@ The plugin communicates via NDJSON (one JSON object per line).
   "clientIp": "192.168.1.100",
   "headers": {
     "authorization": "Bearer token"
+  },
+  "body": {
+    "encoding": "base64",
+    "contentType": "application/json",
+    "contentEncoding": "gzip",
+    "data": "eyJwcm9tcHQiOiJkZWNvZGVkIGJvZHkifQ=="
   }
 }
 ```
@@ -139,6 +176,11 @@ The plugin communicates via NDJSON (one JSON object per line).
   "id": "req-abc123",
   "type": "response",
   "decision": "allow",
+  "requestBody": {
+    "encoding": "base64",
+    "contentType": "application/json",
+    "data": "eyJwcm9tcHQiOiJyZWRhY3RlZCBib2R5In0="
+  },
   "requestHeaders": [
     {"action": "remove", "name": "authorization", "when": "if_present"}
   ],
@@ -169,6 +211,13 @@ Notes:
 - `requestHeaders` and `responseHeaders` are applied with `decision = "allow"`;
   they are ignored with `decision = "deny"` and must be empty or omitted with
   `decision = "pass"`.
+- `requestBody` is applied only with `decision = "allow"` and must use
+  `encoding = "base64"`. It is a decoded replacement body; acl-proxy handles
+  recompression and `Content-Length` rebuilding. The decoded replacement must
+  not exceed the profile's `max_decompressed_request_body_bytes`.
+- `denyMessage` is applied only with `decision = "deny"`. Blank, oversized, or
+  control-character messages fall back to acl-proxy's default plugin-deny
+  message.
 - Plugins should write only JSON responses to stdout.
 
 ## Runtime behavior
@@ -190,7 +239,8 @@ Log entries include:
 
 ## Demo
 
-A reference plugin (`url_allow`) lives in `demos/auth-plugin-stdio`.
+Reference plugins live in `demos/auth-plugin-stdio` and
+`demos/body-inspection-plugin`.
 
 ## Review
 

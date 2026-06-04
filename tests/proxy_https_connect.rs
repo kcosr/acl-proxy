@@ -274,10 +274,17 @@ async fn send_https_via_connect_with_headers(
         .expect("write HTTPS request");
 
     let mut resp_buf = Vec::new();
-    tls_stream
-        .read_to_end(&mut resp_buf)
-        .await
-        .expect("read HTTPS response");
+    let mut tmp = [0u8; 1024];
+    loop {
+        match tls_stream.read(&mut tmp).await {
+            Ok(0) => break,
+            Ok(n) => resp_buf.extend_from_slice(&tmp[..n]),
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof && !resp_buf.is_empty() => {
+                break;
+            }
+            Err(err) => panic!("read HTTPS response: {err:?}"),
+        }
+    }
 
     let resp_str = String::from_utf8_lossy(&resp_buf).to_string();
     let status_line = resp_str.lines().next().unwrap_or_default();
@@ -349,6 +356,7 @@ async fn allowed_https_via_connect_is_proxied_and_captured() {
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -418,6 +426,63 @@ async fn allowed_https_via_connect_is_proxied_and_captured() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn allow_upgrades_false_blocks_connect_inner_upgrade() {
+    let upstream_addr = start_upstream_https_echo_server().await;
+
+    let mut config = minimal_connect_config();
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyRuleAction::Allow,
+            pattern: Some(format!(
+                "https://{}:{}/ws",
+                upstream_addr.ip(),
+                upstream_addr.port()
+            )),
+            patterns: None,
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: None,
+            headers_not_match: None,
+            request_timeout_ms: None,
+            allow_upgrades: false,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+    let ca_cert_path = temp_dir.path().join("certs").join("ca-cert.pem");
+    let target_host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    let (status, _body) = send_https_via_connect_with_headers(
+        proxy_addr,
+        &ca_cert_path,
+        &target_host,
+        "/ws",
+        &[
+            ("Connection", "Upgrade"),
+            ("Upgrade", "websocket"),
+            ("Sec-WebSocket-Version", "13"),
+            ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+        ],
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN.as_u16());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn configured_egress_forwarding_applies_to_https_connect_inner_requests() {
     let (forward_addr, seen_requests) = start_forwarding_echo_server().await;
 
@@ -437,6 +502,7 @@ async fn configured_egress_forwarding_applies_to_https_connect_inner_requests() 
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -497,6 +563,7 @@ async fn global_egress_request_actions_apply_to_https_connect_inner_requests() {
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -569,6 +636,7 @@ async fn denied_https_via_connect_returns_403() {
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -708,6 +776,7 @@ async fn headers_match_is_evaluated_on_decrypted_inner_connect_requests() {
             )])),
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -795,6 +864,7 @@ async fn headers_not_match_is_evaluated_on_decrypted_inner_connect_requests() {
                 acl_proxy::config::HeaderMatchValueConfig::Single("internal".to_string()),
             )])),
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -812,6 +882,7 @@ async fn headers_not_match_is_evaluated_on_decrypted_inner_connect_requests() {
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -899,6 +970,7 @@ async fn loop_detected_on_connect_returns_508() {
             headers_match: None,
             headers_not_match: None,
             request_timeout_ms: None,
+            allow_upgrades: true,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),

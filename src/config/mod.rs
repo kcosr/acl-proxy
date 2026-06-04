@@ -529,6 +529,9 @@ pub struct PolicyRuleTemplateConfig {
     #[serde(default)]
     pub request_timeout_ms: Option<u64>,
 
+    #[serde(default = "default_allow_upgrades")]
+    pub allow_upgrades: bool,
+
     #[serde(default)]
     pub header_actions: Vec<HeaderActionConfig>,
 
@@ -599,6 +602,9 @@ pub struct PolicyRuleDirectConfig {
     #[serde(default)]
     pub request_timeout_ms: Option<u64>,
 
+    #[serde(default = "default_allow_upgrades")]
+    pub allow_upgrades: bool,
+
     #[serde(default)]
     pub with: Option<MacroOverrideMap>,
 
@@ -625,6 +631,10 @@ pub struct PolicyRuleDirectConfig {
 pub enum PolicyRuleConfig {
     Direct(PolicyRuleDirectConfig),
     Include(PolicyRuleIncludeConfig),
+}
+
+fn default_allow_upgrades() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -720,10 +730,27 @@ pub struct ExternalAuthProfileConfig {
     pub include_headers: Vec<String>,
 
     #[serde(default)]
+    pub include_request_body: bool,
+
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_request_body_bytes: usize,
+
+    #[serde(default = "default_max_decompressed_request_body_bytes")]
+    pub max_decompressed_request_body_bytes: usize,
+
+    #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
 
     #[serde(default)]
     pub restart_delay_ms: Option<u64>,
+}
+
+fn default_max_request_body_bytes() -> usize {
+    10 * 1024 * 1024
+}
+
+fn default_max_decompressed_request_body_bytes() -> usize {
+    50 * 1024 * 1024
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1381,6 +1408,11 @@ fn validate_external_auth_profiles(
     for (name, profile) in profiles {
         match profile.profile_type {
             ExternalAuthProfileType::Http => {
+                if profile.include_request_body {
+                    return Err(ConfigError::Invalid(format!(
+                        "external_auth_profiles.{name}.include_request_body is only supported for type=plugin"
+                    )));
+                }
                 let raw = profile.webhook_url.as_deref().map(str::trim).unwrap_or("");
                 if raw.is_empty() {
                     return Err(ConfigError::Invalid(format!(
@@ -1407,6 +1439,18 @@ fn validate_external_auth_profiles(
                 }
                 for pattern in &profile.include_headers {
                     validate_header_pattern(name, pattern)?;
+                }
+                if profile.include_request_body {
+                    if profile.max_request_body_bytes == 0 {
+                        return Err(ConfigError::Invalid(format!(
+                            "external_auth_profiles.{name}.max_request_body_bytes must be at least 1 when include_request_body is true"
+                        )));
+                    }
+                    if profile.max_decompressed_request_body_bytes == 0 {
+                        return Err(ConfigError::Invalid(format!(
+                            "external_auth_profiles.{name}.max_decompressed_request_body_bytes must be at least 1 when include_request_body is true"
+                        )));
+                    }
                 }
             }
         }
@@ -2544,7 +2588,7 @@ level = "info"
     }
 
     #[test]
-    fn capture_max_body_bytes_defaults_to_64k() {
+    fn capture_max_body_bytes_defaults_to_1mib() {
         let toml = r#"
 schema_version = "1"
 
@@ -2561,7 +2605,7 @@ default = "deny"
         "#;
 
         let config: Config = toml::from_str(toml).expect("parse config");
-        assert_eq!(config.capture.max_body_bytes, 64 * 1024);
+        assert_eq!(config.capture.max_body_bytes, 1024 * 1024);
         assert!(config.validate_basic().is_ok());
     }
 
@@ -2789,6 +2833,126 @@ external_auth_profile = "example"
         let msg = format!("{err}");
         assert!(
             msg.contains("external_auth_profile is only allowed on delegate rules"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn plugin_external_auth_profile_can_include_request_body() {
+        let toml = r#"
+schema_version = "1"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles.body_guard]
+type = "plugin"
+command = "/bin/true"
+timeout_ms = 1000
+include_request_body = true
+max_request_body_bytes = 1024
+max_decompressed_request_body_bytes = 4096
+
+[[policy.rules]]
+action = "delegate"
+pattern = "https://example.com/**"
+external_auth_profile = "body_guard"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        config.validate_basic().expect("body-aware plugin config");
+        let profile = config
+            .policy
+            .external_auth_profiles
+            .get("body_guard")
+            .expect("profile");
+        assert!(profile.include_request_body);
+        assert_eq!(profile.max_request_body_bytes, 1024);
+        assert_eq!(profile.max_decompressed_request_body_bytes, 4096);
+    }
+
+    #[test]
+    fn http_external_auth_profile_rejects_request_body_inclusion() {
+        let toml = r#"
+schema_version = "1"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles.body_guard]
+type = "http"
+webhook_url = "https://auth.example/start"
+timeout_ms = 1000
+include_request_body = true
+
+[[policy.rules]]
+action = "delegate"
+pattern = "https://example.com/**"
+external_auth_profile = "body_guard"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("include_request_body is only supported for type=plugin"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn body_aware_plugin_profile_rejects_zero_body_limits() {
+        let toml = r#"
+schema_version = "1"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles.body_guard]
+type = "plugin"
+command = "/bin/true"
+timeout_ms = 1000
+include_request_body = true
+max_request_body_bytes = 0
+
+[[policy.rules]]
+action = "delegate"
+pattern = "https://example.com/**"
+external_auth_profile = "body_guard"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("max_request_body_bytes must be at least 1"),
+            "unexpected error: {msg}"
+        );
+
+        let toml = r#"
+schema_version = "1"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles.body_guard]
+type = "plugin"
+command = "/bin/true"
+timeout_ms = 1000
+include_request_body = true
+max_decompressed_request_body_bytes = 0
+
+[[policy.rules]]
+action = "delegate"
+pattern = "https://example.com/**"
+external_auth_profile = "body_guard"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("max_decompressed_request_body_bytes must be at least 1"),
             "unexpected error: {msg}"
         );
     }

@@ -2,8 +2,21 @@
 
 ## [Unreleased]
 
+### Added
+
+- Add body-aware stdio plugin delegation with bounded request-body buffering, gzip decompress/recompress, and optional plugin-provided request body mutation. ([#52](https://github.com/kcosr/acl-proxy/pull/52))
+- Add plugin deny message overrides and a body-inspection demo plugin with literal/regex deny and redaction rules. ([#52](https://github.com/kcosr/acl-proxy/pull/52))
+- Add per-rule `allow_upgrades` control for denying HTTP/1.1 upgrade handshakes before delegate/plugin invocation or upstream forwarding. ([#52](https://github.com/kcosr/acl-proxy/pull/52))
+
+### Changed
+
+- Increase the default capture body serialization cap from 64 KiB to 1 MiB. ([#52](https://github.com/kcosr/acl-proxy/pull/52))
+
 ### Fixed
 
+- Bound plugin-returned request body mutations by the body-aware profile's decoded body limit. ([#52](https://github.com/kcosr/acl-proxy/pull/52))
+- Reduce peak memory usage for body-aware plugin requests by avoiding a redundant decoded-body clone. ([#52](https://github.com/kcosr/acl-proxy/pull/52))
+- Fix `allow_upgrades = false` audit logging so blocked HTTP upgrade handshakes are recorded as denies. ([#52](https://github.com/kcosr/acl-proxy/pull/52))
 - Fixed release script cleanup handling after successful GitHub release creation.
 - Improved release-script diagnostics and changelog validation edge cases.
 

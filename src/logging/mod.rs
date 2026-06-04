@@ -203,6 +203,40 @@ impl LoggingSettings {
             rule_action,
             rule_pattern,
             rule_description,
+            None,
+        );
+    }
+
+    pub fn log_policy_upgrade_denied<'a>(&self, ctx: PolicyDecisionLogContext<'a>) {
+        if !self.policy_decisions.log_denies {
+            return;
+        }
+
+        let (rule_action, rule_pattern, rule_description) = match ctx.decision.matched.as_ref() {
+            Some(m) => {
+                let action = match m.action {
+                    PolicyRuleAction::Allow => "allow",
+                    PolicyRuleAction::Deny => "deny",
+                    PolicyRuleAction::Delegate => "delegate",
+                };
+                (Some(action), m.pattern.as_deref(), m.description.as_deref())
+            }
+            None => (None, None, None),
+        };
+
+        let method = ctx.method.unwrap_or_default();
+        let client_ip = ctx.client_ip.unwrap_or_default();
+        emit_policy_event(
+            self.policy_decisions.level_denies,
+            ctx.request_id,
+            false,
+            ctx.url,
+            method,
+            client_ip,
+            rule_action,
+            rule_pattern,
+            rule_description,
+            Some("http_upgrade_blocked"),
         );
     }
 }
@@ -445,6 +479,7 @@ fn emit_policy_event(
     rule_action: Option<&str>,
     rule_pattern: Option<&str>,
     rule_description: Option<&str>,
+    reason: Option<&str>,
 ) {
     match level {
         Level::TRACE => tracing::event!(
@@ -458,6 +493,7 @@ fn emit_policy_event(
             rule_action,
             rule_pattern,
             rule_description,
+            reason,
             "policy decision"
         ),
         Level::DEBUG => tracing::event!(
@@ -471,6 +507,7 @@ fn emit_policy_event(
             rule_action,
             rule_pattern,
             rule_description,
+            reason,
             "policy decision"
         ),
         Level::INFO => tracing::event!(
@@ -484,6 +521,7 @@ fn emit_policy_event(
             rule_action,
             rule_pattern,
             rule_description,
+            reason,
             "policy decision"
         ),
         Level::WARN => tracing::event!(
@@ -497,6 +535,7 @@ fn emit_policy_event(
             rule_action,
             rule_pattern,
             rule_description,
+            reason,
             "policy decision"
         ),
         Level::ERROR => tracing::event!(
@@ -510,6 +549,7 @@ fn emit_policy_event(
             rule_action,
             rule_pattern,
             rule_description,
+            reason,
             "policy decision"
         ),
     }
