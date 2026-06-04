@@ -2928,6 +2928,33 @@ external_auth_profile = "body_guard"
             msg.contains("max_request_body_bytes must be at least 1"),
             "unexpected error: {msg}"
         );
+
+        let toml = r#"
+schema_version = "1"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles.body_guard]
+type = "plugin"
+command = "/bin/true"
+timeout_ms = 1000
+include_request_body = true
+max_decompressed_request_body_bytes = 0
+
+[[policy.rules]]
+action = "delegate"
+pattern = "https://example.com/**"
+external_auth_profile = "body_guard"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("max_decompressed_request_body_bytes must be at least 1"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]

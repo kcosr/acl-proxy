@@ -133,7 +133,8 @@ before forwarding it upstream. If the request uses `Content-Encoding: gzip`, the
 body is decompressed before being sent to the plugin. The plugin receives the
 decoded body as base64. On `allow`, the plugin may return a replacement decoded
 body; acl-proxy recompresses it when the original request was gzip-compressed and
-rebuilds `Content-Length`.
+rebuilds `Content-Length`. Replacement bodies returned by the plugin are capped
+by `max_decompressed_request_body_bytes`.
 
 Unsupported request encodings, body read failures, and configured size-limit
 violations fail the delegated request before upstream egress. Body-aware
@@ -212,7 +213,8 @@ Notes:
   `decision = "pass"`.
 - `requestBody` is applied only with `decision = "allow"` and must use
   `encoding = "base64"`. It is a decoded replacement body; acl-proxy handles
-  recompression and `Content-Length` rebuilding.
+  recompression and `Content-Length` rebuilding. The decoded replacement must
+  not exceed the profile's `max_decompressed_request_body_bytes`.
 - `denyMessage` is applied only with `decision = "deny"`. Blank, oversized, or
   control-character messages fall back to acl-proxy's default plugin-deny
   message.

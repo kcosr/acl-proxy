@@ -93,7 +93,7 @@ enum RequestBodyProcessingError {
 }
 
 struct PreparedPluginRequestBody {
-    decoded_body: Vec<u8>,
+    decoded_len: usize,
     content_type: Option<String>,
     content_encoding: Option<String>,
 }
@@ -1018,6 +1018,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
 ) -> ExternalAuthGateResult {
     let req_headers_for_error = req.headers().clone();
     let mut prepared_body = None;
+    let mut plugin_body = None;
     let req = if handler.include_request_body() {
         match prepare_request_body_for_plugin(
             request_id,
@@ -1029,7 +1030,21 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
         )
         .await
         {
-            Ok((req, body)) => {
+            Ok((req, body, decoded_body)) => {
+                tracing::debug!(
+                    target: "acl_proxy::body_policy",
+                    request_id = %request_id,
+                    url = %url,
+                    profile = %profile_name,
+                    decoded_size = body.decoded_len,
+                    timeout_ms = handler.timeout().as_millis() as u64,
+                    "sending decoded request body to auth plugin"
+                );
+                plugin_body = Some(PluginBodyInput {
+                    content_type: body.content_type.clone(),
+                    content_encoding: body.content_encoding.clone(),
+                    decoded_body,
+                });
                 prepared_body = Some(body);
                 req
             }
@@ -1062,24 +1077,6 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
     } else {
         req
     };
-
-    let plugin_body = prepared_body.as_ref().map(|body| PluginBodyInput {
-        content_type: body.content_type.clone(),
-        content_encoding: body.content_encoding.clone(),
-        decoded_body: body.decoded_body.clone(),
-    });
-
-    if let Some(body) = prepared_body.as_ref() {
-        tracing::debug!(
-            target: "acl_proxy::body_policy",
-            request_id = %request_id,
-            url = %url,
-            profile = %profile_name,
-            decoded_size = body.decoded_body.len(),
-            timeout_ms = handler.timeout().as_millis() as u64,
-            "sending decoded request body to auth plugin"
-        );
-    }
 
     let decision = handler
         .evaluate(
@@ -1275,7 +1272,7 @@ async fn prepare_request_body_for_plugin(
     req: Request<Body>,
     max_body_bytes: usize,
     max_decompressed_body_bytes: usize,
-) -> Result<(Request<Body>, PreparedPluginRequestBody), RequestBodyProcessingError> {
+) -> Result<(Request<Body>, PreparedPluginRequestBody, Vec<u8>), RequestBodyProcessingError> {
     let (mut parts, body) = req.into_parts();
     let content_type = header_to_string(&parts.headers, &CONTENT_TYPE);
     let content_encoding = normalized_content_encoding(&parts.headers)?;
@@ -1333,12 +1330,12 @@ async fn prepare_request_body_for_plugin(
     )?;
     let req = Request::from_parts(parts, Body::from(encoded.clone()));
     let prepared = PreparedPluginRequestBody {
-        decoded_body: decoded,
+        decoded_len: decoded.len(),
         content_type,
         content_encoding,
     };
 
-    Ok((req, prepared))
+    Ok((req, prepared, decoded))
 }
 
 fn rebuild_request_with_plugin_body(

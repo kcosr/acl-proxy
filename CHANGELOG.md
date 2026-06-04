@@ -14,6 +14,8 @@
 
 ### Fixed
 
+- Bound plugin-returned request body mutations by the body-aware profile's decoded body limit. ([#52](https://github.com/kcosr/acl-proxy/pull/52))
+- Reduce peak memory usage for body-aware plugin requests by avoiding a redundant decoded-body clone. ([#52](https://github.com/kcosr/acl-proxy/pull/52))
 - Fix `allow_upgrades = false` audit logging so blocked HTTP upgrade handshakes are recorded as denies. ([#52](https://github.com/kcosr/acl-proxy/pull/52))
 - Fixed release script cleanup handling after successful GitHub release creation.
 - Improved release-script diagnostics and changelog validation edge cases.

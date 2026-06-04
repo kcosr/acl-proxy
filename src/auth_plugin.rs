@@ -546,7 +546,10 @@ fn handle_plugin_response(
                 }
             }
             let request_body = match response.request_body {
-                Some(body) => match decode_plugin_response_body(body) {
+                Some(body) => match decode_plugin_response_body(
+                    body,
+                    config.max_decompressed_request_body_bytes,
+                ) {
                     Ok(body) => Some(body),
                     Err(err) => {
                         let _ = sender.send(Err(err));
@@ -613,6 +616,7 @@ fn normalize_deny_message(message: Option<JsonValue>) -> Option<String> {
 
 fn decode_plugin_response_body(
     body: PluginResponseBody,
+    max_decoded_body_bytes: usize,
 ) -> Result<PluginBodyMutation, PluginError> {
     if body.encoding != "base64" {
         return Err(PluginError::new(format!(
@@ -621,14 +625,31 @@ fn decode_plugin_response_body(
         )));
     }
 
+    let max_encoded_len = max_base64_len_for_decoded_limit(max_decoded_body_bytes);
+    if body.data.len() > max_encoded_len {
+        return Err(PluginError::new(format!(
+            "requestBody decoded data exceeds configured limit of {max_decoded_body_bytes} bytes"
+        )));
+    }
+
     let decoded_body = general_purpose::STANDARD
         .decode(body.data)
         .map_err(|err| PluginError::new(format!("requestBody data is not valid base64: {err}")))?;
+
+    if decoded_body.len() > max_decoded_body_bytes {
+        return Err(PluginError::new(format!(
+            "requestBody decoded data exceeds configured limit of {max_decoded_body_bytes} bytes"
+        )));
+    }
 
     Ok(PluginBodyMutation {
         content_type: body.content_type,
         decoded_body,
     })
+}
+
+fn max_base64_len_for_decoded_limit(limit: usize) -> usize {
+    limit.saturating_add(2).saturating_div(3).saturating_mul(4)
 }
 
 fn compile_plugin_actions(
@@ -883,6 +904,13 @@ mod tests {
 
     fn parse_response(line: &str) -> Result<PluginDecision, PluginError> {
         let config = test_config();
+        parse_response_with_config(line, config)
+    }
+
+    fn parse_response_with_config(
+        line: &str,
+        config: AuthPluginConfig,
+    ) -> Result<PluginDecision, PluginError> {
         let (tx, mut rx) = oneshot::channel();
         let mut pending = HashMap::new();
         pending.insert("req-1".to_string(), tx);
@@ -1012,6 +1040,25 @@ mod tests {
         let body = request_body.expect("request body mutation");
         assert_eq!(body.content_type.as_deref(), Some("application/json"));
         assert_eq!(body.decoded_body, br#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn plugin_allow_request_body_mutation_respects_decoded_limit() {
+        let mut config = test_config();
+        config.max_decompressed_request_body_bytes = 3;
+
+        let err = parse_response_with_config(
+            r#"{"id":"req-1","type":"response","decision":"allow","requestBody":{"encoding":"base64","data":"Zm91cg=="}}"#,
+            config,
+        )
+        .expect_err("oversized request body mutation should fail");
+
+        assert!(
+            err.message()
+                .contains("requestBody decoded data exceeds configured limit of 3 bytes"),
+            "unexpected error: {}",
+            err.message()
+        );
     }
 
     #[test]
