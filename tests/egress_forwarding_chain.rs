@@ -194,6 +194,7 @@ fn allow_rule(pattern: String, header_actions: Vec<HeaderActionConfig>) -> Polic
         headers_not_match: None,
         request_timeout_ms: None,
         allow_upgrades: true,
+        redaction_profile: None,
         with: None,
         add_url_enc_variants: None,
         header_actions,

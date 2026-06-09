@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use http::header::{HeaderName, HeaderValue};
 use ipnet::IpNet;
+use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 
@@ -81,6 +82,9 @@ pub struct Config {
 
     #[serde(default)]
     pub capture: CaptureConfig,
+
+    #[serde(default)]
+    pub redaction: RedactionConfig,
 
     #[serde(default)]
     pub loop_protection: LoopProtectionConfig,
@@ -333,6 +337,95 @@ pub struct CaptureConfig {
     pub max_body_bytes: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RedactionConfig {
+    #[serde(default)]
+    pub profiles: std::collections::BTreeMap<String, RedactionProfileConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedactionProfileConfig {
+    #[serde(default = "default_redaction_replacement")]
+    pub replacement: String,
+
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_body_bytes: usize,
+
+    #[serde(default = "default_max_decompressed_request_body_bytes")]
+    pub max_decoded_body_bytes: usize,
+
+    #[serde(default = "default_websocket_max_frame_bytes")]
+    pub max_frame_bytes: usize,
+
+    #[serde(default = "default_websocket_max_message_bytes")]
+    pub max_message_bytes: usize,
+
+    #[serde(default)]
+    pub allow_permessage_deflate: bool,
+
+    #[serde(default)]
+    pub unsupported_extensions: RedactionUnsupportedExtensions,
+
+    #[serde(default)]
+    pub rules: Vec<RedactionRuleConfig>,
+}
+
+impl Default for RedactionProfileConfig {
+    fn default() -> Self {
+        Self {
+            replacement: default_redaction_replacement(),
+            max_body_bytes: default_max_request_body_bytes(),
+            max_decoded_body_bytes: default_max_decompressed_request_body_bytes(),
+            max_frame_bytes: default_websocket_max_frame_bytes(),
+            max_message_bytes: default_websocket_max_message_bytes(),
+            allow_permessage_deflate: false,
+            unsupported_extensions: RedactionUnsupportedExtensions::default(),
+            rules: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RedactionRuleConfig {
+    #[serde(default)]
+    pub literals: Vec<String>,
+
+    #[serde(default)]
+    pub expressions: Vec<String>,
+
+    #[serde(default, rename = "match")]
+    pub match_mode: RedactionMatch,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RedactionUnsupportedExtensions {
+    #[default]
+    Deny,
+    Strip,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RedactionMatch {
+    #[default]
+    Text,
+    Binary,
+    Both,
+}
+
+fn default_websocket_max_frame_bytes() -> usize {
+    256 * 1024
+}
+
+fn default_websocket_max_message_bytes() -> usize {
+    1024 * 1024
+}
+
+fn default_redaction_replacement() -> String {
+    "[REDACTED]".to_string()
+}
+
 impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
@@ -472,6 +565,7 @@ impl Default for Config {
             proxy: ProxyConfig::default(),
             logging: LoggingConfig::default(),
             capture: CaptureConfig::default(),
+            redaction: RedactionConfig::default(),
             loop_protection: LoopProtectionConfig::default(),
             certificates: CertificatesConfig::default(),
             tls: TlsConfig::default(),
@@ -531,6 +625,9 @@ pub struct PolicyRuleTemplateConfig {
 
     #[serde(default = "default_allow_upgrades")]
     pub allow_upgrades: bool,
+
+    #[serde(default)]
+    pub redaction_profile: Option<String>,
 
     #[serde(default)]
     pub header_actions: Vec<HeaderActionConfig>,
@@ -604,6 +701,9 @@ pub struct PolicyRuleDirectConfig {
 
     #[serde(default = "default_allow_upgrades")]
     pub allow_upgrades: bool,
+
+    #[serde(default)]
+    pub redaction_profile: Option<String>,
 
     #[serde(default)]
     pub with: Option<MacroOverrideMap>,
@@ -1028,6 +1128,8 @@ impl Config {
 
         validate_logging_config(&self.logging)?;
         validate_capture_config(&self.capture)?;
+        validate_redaction_config(&self.redaction)?;
+        validate_redaction_policy_refs(&self.policy, &self.redaction)?;
         validate_external_auth_config(&self.external_auth)?;
         validate_external_auth_profiles(&self.policy.external_auth_profiles)?;
 
@@ -1377,6 +1479,119 @@ fn validate_capture_config(capture: &CaptureConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_redaction_config(config: &RedactionConfig) -> Result<(), ConfigError> {
+    for (profile_name, profile) in &config.profiles {
+        if profile.max_body_bytes == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "redaction.profiles.{profile_name}.max_body_bytes must be at least 1"
+            )));
+        }
+        if profile.max_decoded_body_bytes == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "redaction.profiles.{profile_name}.max_decoded_body_bytes must be at least 1"
+            )));
+        }
+        if profile.max_frame_bytes == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "redaction.profiles.{profile_name}.max_frame_bytes must be at least 1"
+            )));
+        }
+        if profile.max_message_bytes == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "redaction.profiles.{profile_name}.max_message_bytes must be at least 1"
+            )));
+        }
+        if profile.rules.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "redaction.profiles.{profile_name}.rules must include at least one rule"
+            )));
+        }
+
+        for (rule_idx, rule) in profile.rules.iter().enumerate() {
+            if rule.literals.is_empty() && rule.expressions.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "redaction.profiles.{profile_name}.rules[{rule_idx}] must include at least one literal or expression"
+                )));
+            }
+            for (literal_idx, literal) in rule.literals.iter().enumerate() {
+                if literal.is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "redaction.profiles.{profile_name}.rules[{rule_idx}].literals[{literal_idx}] must not be empty"
+                    )));
+                }
+            }
+            for (expression_idx, expression) in rule.expressions.iter().enumerate() {
+                if expression.is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "redaction.profiles.{profile_name}.rules[{rule_idx}].expressions[{expression_idx}] must not be empty"
+                    )));
+                }
+                Regex::new(expression).map_err(|err| {
+                    ConfigError::Invalid(format!(
+                        "redaction.profiles.{profile_name}.rules[{rule_idx}].expressions[{expression_idx}] is not a valid regex: {err}"
+                    ))
+                })?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_redaction_policy_refs(
+    policy: &PolicyConfig,
+    redaction: &RedactionConfig,
+) -> Result<(), ConfigError> {
+    for (idx, rule) in policy.rules.iter().enumerate() {
+        if let PolicyRuleConfig::Direct(rule) = rule {
+            validate_redaction_rule_ref(
+                &format!("policy.rules[{idx}]"),
+                rule.action,
+                rule.redaction_profile.as_deref(),
+                redaction,
+            )?;
+        }
+    }
+
+    for (ruleset_name, rules) in &policy.rulesets {
+        for (idx, rule) in rules.iter().enumerate() {
+            validate_redaction_rule_ref(
+                &format!("policy.rulesets.{ruleset_name}[{idx}]"),
+                rule.action,
+                rule.redaction_profile.as_deref(),
+                redaction,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_redaction_rule_ref(
+    location: &str,
+    action: PolicyRuleAction,
+    profile: Option<&str>,
+    redaction: &RedactionConfig,
+) -> Result<(), ConfigError> {
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+
+    if matches!(action, PolicyRuleAction::Deny) {
+        return Err(ConfigError::Invalid(format!(
+            "{location}.redaction_profile is only allowed on allow or delegate rules"
+        )));
+    }
+
+    if !redaction.profiles.contains_key(profile) {
+        return Err(ConfigError::Invalid(format!(
+            "{location}.redaction_profile references unknown profile '{profile}'"
+        )));
+    }
+
+    Ok(())
+}
+
 fn validate_external_auth_config(external_auth: &ExternalAuthConfig) -> Result<(), ConfigError> {
     if let Some(raw) = external_auth.callback_url.as_deref() {
         let trimmed = raw.trim();
@@ -1590,6 +1805,156 @@ default = "deny"
         assert_eq!(config.proxy.http_port, 8080);
         assert_eq!(config.logging.level, "debug");
         assert!(matches!(config.policy.default, PolicyDefaultAction::Deny));
+    }
+
+    #[test]
+    fn redaction_profile_reference_validates() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "debug"
+
+	[redaction.profiles.secrets]
+	replacement = "[REDACTED]"
+	max_body_bytes = 2048
+	max_decoded_body_bytes = 8192
+	max_frame_bytes = 1024
+	max_message_bytes = 4096
+	allow_permessage_deflate = true
+	unsupported_extensions = "strip"
+	
+	[[redaction.profiles.secrets.rules]]
+	literals = ["password", "token"]
+	expressions = ["(?i)bearer\\s+[a-z0-9._-]+"]
+	match = "text"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/ws/**"
+redaction_profile = "secrets"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        config
+            .validate_basic()
+            .expect("valid websocket redaction profile should pass");
+        let profile = config.redaction.profiles.get("secrets").expect("profile");
+        assert_eq!(profile.replacement, "[REDACTED]");
+        assert_eq!(profile.max_body_bytes, 2048);
+        assert_eq!(profile.max_decoded_body_bytes, 8192);
+        assert!(profile.allow_permessage_deflate);
+        assert!(matches!(
+            profile.unsupported_extensions,
+            RedactionUnsupportedExtensions::Strip
+        ));
+    }
+
+    #[test]
+    fn redaction_profile_reference_must_exist() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "debug"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/ws/**"
+redaction_profile = "missing"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("references unknown profile 'missing'"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn redaction_profile_is_invalid_on_deny_rules() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "debug"
+
+	[redaction.profiles.secrets]
+	replacement = "[REDACTED]"
+	
+	[[redaction.profiles.secrets.rules]]
+	literals = ["password"]
+
+[policy]
+default = "allow"
+
+[[policy.rules]]
+action = "deny"
+pattern = "https://example.com/ws/**"
+redaction_profile = "secrets"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("redaction_profile is only allowed on allow or delegate rules"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn redaction_expression_must_compile() {
+        let toml = r#"
+	schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "debug"
+
+	[redaction.profiles.secrets]
+	
+	[[redaction.profiles.secrets.rules]]
+	expressions = ["["]
+	
+	[policy]
+	default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("is not a valid regex"),
+            "unexpected error message: {msg}"
+        );
     }
 
     #[test]

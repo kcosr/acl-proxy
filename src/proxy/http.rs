@@ -42,6 +42,8 @@ use crate::external_auth::{ApprovalMacroDescriptor, ExternalAuthProfile, Externa
 use crate::logging::PolicyDecisionLogContext;
 use crate::policy::CompiledHeaderAction;
 use crate::proxy::https_connect;
+use crate::proxy::websocket;
+use crate::redaction::RedactionProfile;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HttpProxyError {
@@ -88,6 +90,8 @@ enum RequestBodyProcessingError {
     DecompressedBodyTooLarge { limit: usize },
     #[error("failed to recompress encoded request body: {0}")]
     Recompress(std::io::Error),
+    #[error("failed to redact request body: {0}")]
+    Redaction(String),
     #[error("invalid rewritten content-type returned by plugin: {0}")]
     InvalidContentType(#[from] http::header::InvalidHeaderValue),
 }
@@ -288,6 +292,7 @@ async fn handle_http_request(
                     req,
                     CaptureMode::HttpProxy,
                     None,
+                    None,
                     Vec::new(),
                     state.egress_request_header_actions.clone(),
                 )
@@ -367,6 +372,7 @@ async fn handle_http_request(
                     req,
                     CaptureMode::HttpProxy,
                     rule.request_timeout_ms,
+                    rule.redaction_profile.clone(),
                     rule.header_actions.clone(),
                     state.egress_request_header_actions.clone(),
                 )
@@ -411,6 +417,7 @@ async fn handle_http_request(
                                 &profile,
                                 profile_name,
                                 rule.request_timeout_ms,
+                                rule.redaction_profile.clone(),
                                 rule.header_actions.clone(),
                                 state.egress_request_header_actions.clone(),
                                 CaptureMode::HttpProxy,
@@ -449,6 +456,7 @@ async fn handle_http_request(
                                 profile_name,
                                 &handler,
                                 rule.request_timeout_ms,
+                                rule.redaction_profile.clone(),
                                 rule.header_actions.clone(),
                                 state.egress_request_header_actions.clone(),
                                 CaptureMode::HttpProxy,
@@ -820,6 +828,7 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
     profile: &ExternalAuthProfile,
     profile_name: &str,
     request_timeout_ms: Option<u64>,
+    redaction_profile: Option<String>,
     header_actions: Vec<CompiledHeaderAction>,
     egress_request_header_actions: Vec<CompiledHeaderAction>,
     mode: CaptureMode,
@@ -946,6 +955,7 @@ pub(crate) async fn run_external_auth_gate_lifecycle(
                     req,
                     mode,
                     request_timeout_ms,
+                    redaction_profile,
                     header_actions,
                     egress_request_header_actions,
                 )
@@ -1045,6 +1055,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
     profile_name: &str,
     handler: &AuthPluginHandle,
     request_timeout_ms: Option<u64>,
+    redaction_profile: Option<String>,
     header_actions: Vec<CompiledHeaderAction>,
     egress_request_header_actions: Vec<CompiledHeaderAction>,
     mode: CaptureMode,
@@ -1223,6 +1234,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
                     req,
                     mode,
                     request_timeout_ms,
+                    redaction_profile,
                     combined,
                     egress_request_header_actions,
                 )
@@ -1412,6 +1424,109 @@ fn rebuild_request_with_plugin_body(
         final_body_size = encoded.len(),
         content_encoding = %content_encoding.map(BodyContentEncoding::as_str).unwrap_or("identity"),
         "outbound request rebuilt after auth plugin body mutation"
+    );
+
+    Ok(Request::from_parts(parts, Body::from(encoded)))
+}
+
+async fn redact_request_body(
+    request_id: &str,
+    url: &str,
+    req: Request<Body>,
+    profile: &RedactionProfile,
+) -> Result<Request<Body>, RequestBodyProcessingError> {
+    let (req, prepared, decoded) = prepare_request_body_for_plugin(
+        request_id,
+        url,
+        &profile.name,
+        req,
+        profile.max_body_bytes,
+        profile.max_decoded_body_bytes,
+    )
+    .await?;
+
+    let is_text = std::str::from_utf8(&decoded).is_ok();
+    let (redacted, redactions) = crate::redaction::redact_payload(&decoded, is_text, profile)
+        .map_err(|err| match err {
+            crate::redaction::RedactionError::InvalidUtf8 => RequestBodyProcessingError::Redaction(
+                "redaction expression requires valid UTF-8".to_string(),
+            ),
+        })?;
+
+    if redacted.len() > profile.max_decoded_body_bytes {
+        return Err(RequestBodyProcessingError::DecompressedBodyTooLarge {
+            limit: profile.max_decoded_body_bytes,
+        });
+    }
+
+    if redactions > 0 {
+        tracing::debug!(
+            target: "acl_proxy::redaction",
+            request_id = %request_id,
+            url = %url,
+            profile = %profile.name,
+            redactions,
+            decoded_size = redacted.len(),
+            "http request body redacted"
+        );
+    }
+
+    rebuild_request_with_decoded_body(
+        request_id,
+        url,
+        &profile.name,
+        req,
+        &prepared,
+        redacted,
+        None,
+    )
+}
+
+fn rebuild_request_with_decoded_body(
+    request_id: &str,
+    url: &str,
+    profile_name: &str,
+    req: Request<Body>,
+    prepared: &PreparedPluginRequestBody,
+    decoded_body: Vec<u8>,
+    content_type: Option<&str>,
+) -> Result<Request<Body>, RequestBodyProcessingError> {
+    let (mut parts, _body) = req.into_parts();
+    let content_encoding = prepared.content_encoding;
+    let decoded_len = decoded_body.len();
+    let encoded = match content_encoding {
+        Some(encoding) => {
+            let encoded = compress_body(encoding, &decoded_body)?;
+            tracing::debug!(
+                target: "acl_proxy::body_policy",
+                request_id = %request_id,
+                url = %url,
+                profile = %profile_name,
+                encoding = %encoding.as_str(),
+                decoded_size = decoded_len,
+                encoded_size = encoded.len(),
+                "request body recompressed"
+            );
+            encoded
+        }
+        None => decoded_body,
+    };
+
+    set_body_headers(
+        &mut parts.headers,
+        encoded.len(),
+        content_encoding.map(BodyContentEncoding::as_str),
+        content_type,
+    )?;
+    tracing::debug!(
+        target: "acl_proxy::body_policy",
+        request_id = %request_id,
+        url = %url,
+        profile = %profile_name,
+        decoded_size = decoded_len,
+        final_body_size = encoded.len(),
+        content_encoding = %content_encoding.map(BodyContentEncoding::as_str).unwrap_or("identity"),
+        "outbound request rebuilt after body mutation"
     );
 
     Ok(Request::from_parts(parts, Body::from(encoded)))
@@ -2133,6 +2248,7 @@ pub(crate) async fn proxy_allowed_request(
     mut req: Request<Body>,
     mode: CaptureMode,
     request_timeout_ms: Option<u64>,
+    redaction_profile: Option<String>,
     header_actions: Vec<CompiledHeaderAction>,
     egress_request_header_actions: Vec<CompiledHeaderAction>,
 ) -> Response<Body> {
@@ -2157,6 +2273,72 @@ pub(crate) async fn proxy_allowed_request(
     let req_headers_snapshot = req.headers().clone();
     let original_request_presence = snapshot_header_presence(req.headers());
     let request_is_upgrade = version == Version::HTTP_11 && is_upgrade_request(req.headers());
+    let redaction = match redaction_profile.as_deref() {
+        Some(profile_name) => match state.config.redaction.profiles.get(profile_name) {
+            Some(profile) => Some(RedactionProfile::from_config(profile_name, profile)),
+            None => {
+                tracing::error!(
+                    target: "acl_proxy::redaction",
+                    request_id = %request_id,
+                    url = %full_url,
+                    profile = %profile_name,
+                    "matched websocket redaction profile is not configured"
+                );
+                let body_bytes = b"Internal Server Error".to_vec();
+                let mut resp = Response::new(Body::from(body_bytes.clone()));
+                *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                maybe_capture_static_response(
+                    &state,
+                    &request_id,
+                    &full_url,
+                    &method,
+                    &client,
+                    target.clone(),
+                    version,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Internal Server Error",
+                    &body_bytes,
+                    CaptureDecision::Allow,
+                    Some(&req_headers_snapshot),
+                    mode,
+                )
+                .await;
+                return resp;
+            }
+        },
+        None => None,
+    };
+
+    if redaction.is_some() && request_is_upgrade && !websocket::is_websocket_upgrade(req.headers())
+    {
+        tracing::warn!(
+            target: "acl_proxy::redaction",
+            request_id = %request_id,
+            url = %full_url,
+            "protected upgrade request is not a WebSocket upgrade"
+        );
+        let body_bytes = b"Forbidden".to_vec();
+        let mut resp = Response::new(Body::from(body_bytes.clone()));
+        *resp.status_mut() = StatusCode::FORBIDDEN;
+        maybe_capture_static_response(
+            &state,
+            &request_id,
+            &full_url,
+            &method,
+            &client,
+            target.clone(),
+            version,
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            &body_bytes,
+            CaptureDecision::Allow,
+            Some(&req_headers_snapshot),
+            mode,
+        )
+        .await;
+        return resp;
+    }
+
     let downstream_upgrade = if request_is_upgrade {
         Some(hyper::upgrade::on(&mut req))
     } else {
@@ -2171,6 +2353,7 @@ pub(crate) async fn proxy_allowed_request(
     let decision = CaptureDecision::Allow;
     let capture_request = should_capture(cfg, decision, CaptureKind::Request);
     let capture_response = should_capture(cfg, decision, CaptureKind::Response);
+    let mut websocket_extension_offer = None;
 
     let req_headers_for_capture = if capture_request {
         Some(headers_to_capture_map(req.headers()))
@@ -2220,21 +2403,95 @@ pub(crate) async fn proxy_allowed_request(
             HeaderDirection::Request,
             &pre_global_egress_presence,
         );
+
+        if request_is_upgrade {
+            if let Some(profile) = redaction.as_ref() {
+                match websocket::sanitize_request_extensions(headers, profile) {
+                    Ok(offer) => websocket_extension_offer = Some(offer),
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "acl_proxy::redaction",
+                            request_id = %request_id,
+                            url = %full_url,
+                            profile = %profile.name,
+                            error = %err,
+                            "websocket request extension negotiation rejected"
+                        );
+                        let body_bytes = b"Forbidden".to_vec();
+                        let mut resp = Response::new(Body::from(body_bytes.clone()));
+                        *resp.status_mut() = StatusCode::FORBIDDEN;
+                        maybe_capture_static_response(
+                            &state,
+                            &request_id,
+                            &full_url,
+                            &method,
+                            &client,
+                            target.clone(),
+                            version,
+                            StatusCode::FORBIDDEN,
+                            "Forbidden",
+                            &body_bytes,
+                            decision,
+                            Some(&req_headers_snapshot),
+                            mode,
+                        )
+                        .await;
+                        return resp;
+                    }
+                }
+            }
+        }
     }
 
     let body = req.into_body();
+    let mut upstream_req = builder
+        .body(body)
+        .unwrap_or_else(|_| Request::new(Body::empty()));
 
+    if !request_is_upgrade {
+        if let Some(profile) = redaction.as_ref() {
+            match redact_request_body(&request_id, &full_url, upstream_req, profile).await {
+                Ok(req) => upstream_req = req,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "acl_proxy::redaction",
+                        request_id = %request_id,
+                        url = %full_url,
+                        profile = %profile.name,
+                        error = %err,
+                        "request body redaction failed before upstream forwarding"
+                    );
+                    let body_bytes = b"Internal Server Error".to_vec();
+                    let mut resp = Response::new(Body::from(body_bytes.clone()));
+                    *resp.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+                    maybe_capture_static_response(
+                        &state,
+                        &request_id,
+                        &full_url,
+                        &method,
+                        &client,
+                        target.clone(),
+                        version,
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "Internal Server Error",
+                        &body_bytes,
+                        decision,
+                        Some(&req_headers_snapshot),
+                        mode,
+                    )
+                    .await;
+                    return resp;
+                }
+            }
+        }
+    }
+
+    let (parts, body) = upstream_req.into_parts();
     let (upstream_req, req_capture_rx) = if capture_request {
         let (body, handle) = tee_body(body, state.config.capture.max_body_bytes).await;
-        let upstream_req = builder
-            .body(body)
-            .unwrap_or_else(|_| Request::new(Body::empty()));
-        (upstream_req, Some(handle))
+        (Request::from_parts(parts, body), Some(handle))
     } else {
-        let upstream_req = builder
-            .body(body)
-            .unwrap_or_else(|_| Request::new(Body::empty()));
-        (upstream_req, None)
+        (Request::from_parts(parts, body), None)
     };
 
     let client_http: Client<_> = state.http_client.clone();
@@ -2339,6 +2596,47 @@ pub(crate) async fn proxy_allowed_request(
 
     let status = upstream_resp.status();
     let resp_version = upstream_resp.version();
+    let mut websocket_session_extensions = None;
+    if let Some(profile) = redaction.as_ref() {
+        if request_is_upgrade && status == StatusCode::SWITCHING_PROTOCOLS {
+            let offer = websocket_extension_offer.unwrap_or(websocket::ClientExtensionOffer {
+                permessage_deflate: false,
+            });
+            match websocket::validate_response_extensions(upstream_resp.headers(), profile, offer) {
+                Ok(extensions) => websocket_session_extensions = Some(extensions),
+                Err(err) => {
+                    tracing::warn!(
+                        target: "acl_proxy::redaction",
+                        request_id = %request_id,
+                        url = %full_url,
+                        profile = %profile.name,
+                        error = %err,
+                        "websocket response extension negotiation rejected"
+                    );
+                    let body_bytes = b"Bad Gateway".to_vec();
+                    let mut resp = Response::new(Body::from(body_bytes.clone()));
+                    *resp.status_mut() = StatusCode::BAD_GATEWAY;
+                    maybe_capture_static_response(
+                        &state,
+                        &request_id,
+                        &full_url,
+                        &method,
+                        &client,
+                        target.clone(),
+                        version,
+                        StatusCode::BAD_GATEWAY,
+                        "Bad Gateway",
+                        &body_bytes,
+                        decision,
+                        Some(&req_headers_snapshot),
+                        mode,
+                    )
+                    .await;
+                    return resp;
+                }
+            }
+        }
+    }
     let upstream_upgrade =
         if downstream_upgrade.is_some() && status == StatusCode::SWITCHING_PROTOCOLS {
             Some(hyper::upgrade::on(&mut upstream_resp))
@@ -2481,6 +2779,8 @@ pub(crate) async fn proxy_allowed_request(
     {
         let request_id_for_upgrade = request_id.clone();
         let full_url_for_upgrade = full_url.clone();
+        let redaction_for_upgrade = redaction.clone();
+        let websocket_session_extensions_for_upgrade = websocket_session_extensions;
         tokio::spawn(async move {
             let mut downstream = match downstream_upgrade.await {
                 Ok(stream) => stream,
@@ -2502,10 +2802,30 @@ pub(crate) async fn proxy_allowed_request(
                 }
             };
 
-            if let Err(err) = copy_bidirectional(&mut downstream, &mut upstream).await {
-                tracing::debug!(
-                    "upgraded tunnel ended with I/O error for {request_id_for_upgrade} ({full_url_for_upgrade}): {err}"
-                );
+            if let (Some(profile), Some(extensions)) = (
+                redaction_for_upgrade,
+                websocket_session_extensions_for_upgrade,
+            ) {
+                if let Err(err) = websocket::relay_websocket(
+                    downstream,
+                    upstream,
+                    request_id_for_upgrade.clone(),
+                    full_url_for_upgrade.clone(),
+                    profile,
+                    extensions,
+                )
+                .await
+                {
+                    tracing::debug!(
+                        "websocket redaction tunnel ended for {request_id_for_upgrade} ({full_url_for_upgrade}): {err}"
+                    );
+                }
+            } else {
+                if let Err(err) = copy_bidirectional(&mut downstream, &mut upstream).await {
+                    tracing::debug!(
+                        "upgraded tunnel ended with I/O error for {request_id_for_upgrade} ({full_url_for_upgrade}): {err}"
+                    );
+                }
             }
         });
     }

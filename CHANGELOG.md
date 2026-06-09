@@ -2,7 +2,9 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Add native redaction profiles for outbound HTTP request bodies and client-to-upstream WebSocket messages.
 
 ## [0.1.1] - 2026-06-04
 

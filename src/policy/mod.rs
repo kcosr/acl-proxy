@@ -59,6 +59,7 @@ pub struct MatchedRule {
     pub methods: Vec<String>,
     pub request_timeout_ms: Option<u64>,
     pub allow_upgrades: bool,
+    pub redaction_profile: Option<String>,
     pub header_actions: Vec<CompiledHeaderAction>,
     pub external_auth_profile: Option<String>,
 }
@@ -84,6 +85,7 @@ struct CompiledRule {
     headers_not_match: Vec<CompiledHeaderMatch>,
     request_timeout_ms: Option<u64>,
     allow_upgrades: bool,
+    redaction_profile: Option<String>,
     header_actions: Vec<CompiledHeaderAction>,
     external_auth_profile: Option<String>,
 }
@@ -113,6 +115,7 @@ struct ExpandedRule {
     headers_not_match: Option<BTreeMap<String, Vec<String>>>,
     request_timeout_ms: Option<u64>,
     allow_upgrades: bool,
+    redaction_profile: Option<String>,
     header_actions: Vec<HeaderActionConfig>,
     external_auth_profile: Option<String>,
 }
@@ -142,6 +145,7 @@ pub struct EffectiveRule {
     pub headers_not_match: BTreeMap<String, Vec<String>>,
     pub request_timeout_ms: Option<u64>,
     pub allow_upgrades: bool,
+    pub redaction_profile: Option<String>,
     pub header_actions: Vec<EffectiveHeaderAction>,
     pub external_auth: Option<EffectiveExternalAuth>,
 }
@@ -216,6 +220,7 @@ impl PolicyEngine {
                 headers_not_match,
                 request_timeout_ms: rule.request_timeout_ms,
                 allow_upgrades: rule.allow_upgrades,
+                redaction_profile: rule.redaction_profile,
                 header_actions,
                 external_auth_profile: rule.external_auth_profile,
             });
@@ -306,6 +311,7 @@ impl PolicyEngine {
                 methods: rule.methods.clone(),
                 request_timeout_ms: rule.request_timeout_ms,
                 allow_upgrades: rule.allow_upgrades,
+                redaction_profile: rule.redaction_profile.clone(),
                 header_actions: rule.header_actions.clone(),
                 external_auth_profile: rule.external_auth_profile.clone(),
             };
@@ -393,6 +399,7 @@ impl EffectivePolicy {
                     headers_not_match: rule.headers_not_match.unwrap_or_default(),
                     request_timeout_ms: rule.request_timeout_ms,
                     allow_upgrades: rule.allow_upgrades,
+                    redaction_profile: rule.redaction_profile,
                     header_actions,
                     external_auth,
                 }
@@ -495,6 +502,7 @@ fn expand_direct_rule(
             headers_not_match,
             request_timeout_ms: rule.request_timeout_ms,
             allow_upgrades: rule.allow_upgrades,
+            redaction_profile: rule.redaction_profile.clone(),
             header_actions: rule.header_actions.clone(),
             external_auth_profile: rule.external_auth_profile.clone(),
         });
@@ -537,6 +545,7 @@ fn expand_direct_rule(
                 headers_not_match: headers_not_match.clone(),
                 request_timeout_ms: rule.request_timeout_ms,
                 allow_upgrades: rule.allow_upgrades,
+                redaction_profile: rule.redaction_profile.clone(),
                 header_actions: rule.header_actions.clone(),
                 external_auth_profile: rule.external_auth_profile.clone(),
             });
@@ -576,6 +585,7 @@ fn expand_direct_rule(
                 headers_not_match: headers_not_match.clone(),
                 request_timeout_ms: rule.request_timeout_ms,
                 allow_upgrades: rule.allow_upgrades,
+                redaction_profile: rule.redaction_profile.clone(),
                 header_actions: rule.header_actions.clone(),
                 external_auth_profile: rule.external_auth_profile.clone(),
             });
@@ -789,6 +799,7 @@ fn expand_include_rule(
                     headers_not_match: headers_not_match.clone(),
                     request_timeout_ms,
                     allow_upgrades: template.allow_upgrades,
+                    redaction_profile: template.redaction_profile.clone(),
                     header_actions: template.header_actions.clone(),
                     external_auth_profile: template.external_auth_profile.clone(),
                 });
@@ -833,6 +844,7 @@ fn expand_include_rule(
                     headers_not_match: headers_not_match.clone(),
                     request_timeout_ms,
                     allow_upgrades: template.allow_upgrades,
+                    redaction_profile: template.redaction_profile.clone(),
                     header_actions: template.header_actions.clone(),
                     external_auth_profile: template.external_auth_profile.clone(),
                 });
@@ -1493,10 +1505,8 @@ fn client_in_any_subnet(raw_ip: Option<&str>, subnets: &[IpNet]) -> bool {
                     return true;
                 }
             }
-            (IpNet::V6(v6net), IpAddr::V6(v6)) => {
-                if v6net.contains(v6) {
-                    return true;
-                }
+            (IpNet::V6(v6net), IpAddr::V6(v6)) if v6net.contains(v6) => {
+                return true;
             }
             _ => {}
         }
@@ -1629,6 +1639,7 @@ mod tests {
                 headers_not_match: None,
                 request_timeout_ms: None,
                 allow_upgrades: true,
+                redaction_profile: None,
                 with: None,
                 add_url_enc_variants: None,
                 header_actions: Vec::new(),
@@ -1662,6 +1673,7 @@ mod tests {
                 headers_not_match: None,
                 request_timeout_ms: None,
                 allow_upgrades: true,
+                redaction_profile: None,
                 with: None,
                 add_url_enc_variants: None,
                 header_actions: Vec::new(),
@@ -1702,6 +1714,7 @@ mod tests {
                     headers_not_match: None,
                     request_timeout_ms: None,
                     allow_upgrades: true,
+                    redaction_profile: None,
                     header_actions: Vec::new(),
                     external_auth_profile: None,
                     rule_id: None,
@@ -1718,6 +1731,7 @@ mod tests {
                     headers_not_match: None,
                     request_timeout_ms: None,
                     allow_upgrades: true,
+                    redaction_profile: None,
                     header_actions: Vec::new(),
                     external_auth_profile: None,
                     rule_id: None,
@@ -1784,6 +1798,7 @@ mod tests {
                     headers_not_match: None,
                     request_timeout_ms: None,
                     allow_upgrades: true,
+                    redaction_profile: None,
                     header_actions: Vec::new(),
                     external_auth_profile: None,
                     rule_id: None,
@@ -2920,6 +2935,7 @@ headers_absent = ["x-blocked"]
 headers_match = { "x-workload-id" = "worker-123" }
 external_auth_profile = "example"
 request_timeout_ms = 1500
+redaction_profile = "secrets"
 
 [[rules.header_actions]]
 direction = "request"
@@ -2948,6 +2964,7 @@ value = "one"
         assert_eq!(matched.request_timeout_ms, Some(1500));
         assert_eq!(matched.header_actions.len(), 1);
         assert_eq!(matched.external_auth_profile.as_deref(), Some("example"));
+        assert_eq!(matched.redaction_profile.as_deref(), Some("secrets"));
 
         let effective = EffectivePolicy::from_config(&cfg).expect("build effective policy");
         assert_eq!(effective.rules.len(), 2);
@@ -2966,6 +2983,10 @@ value = "one"
                 .as_ref()
                 .map(|external| external.profile.as_str()),
             Some("example")
+        );
+        assert_eq!(
+            effective.rules[1].redaction_profile.as_deref(),
+            Some("secrets")
         );
     }
 

@@ -277,6 +277,7 @@ async fn handle_inner_https_request(
                     req,
                     CaptureMode::HttpsConnect,
                     None,
+                    None,
                     Vec::new(),
                     state.egress_request_header_actions.clone(),
                 )
@@ -359,6 +360,7 @@ async fn handle_inner_https_request(
                     req,
                     CaptureMode::HttpsConnect,
                     rule.request_timeout_ms,
+                    rule.redaction_profile.clone(),
                     rule.header_actions.clone(),
                     state.egress_request_header_actions.clone(),
                 )
@@ -403,6 +405,7 @@ async fn handle_inner_https_request(
                                 &profile,
                                 profile_name,
                                 rule.request_timeout_ms,
+                                rule.redaction_profile.clone(),
                                 rule.header_actions.clone(),
                                 state.egress_request_header_actions.clone(),
                                 CaptureMode::HttpsConnect,
@@ -441,6 +444,7 @@ async fn handle_inner_https_request(
                                 profile_name,
                                 &handler,
                                 rule.request_timeout_ms,
+                                rule.redaction_profile.clone(),
                                 rule.header_actions.clone(),
                                 state.egress_request_header_actions.clone(),
                                 CaptureMode::HttpsConnect,
