@@ -1521,16 +1521,26 @@ fn validate_redaction_config(config: &RedactionConfig) -> Result<(), ConfigError
                 }
             }
             for (expression_idx, expression) in rule.expressions.iter().enumerate() {
+                if matches!(rule.match_mode, RedactionMatch::Binary) {
+                    return Err(ConfigError::Invalid(format!(
+                        "redaction.profiles.{profile_name}.rules[{rule_idx}].expressions[{expression_idx}] cannot be used with match = \"binary\""
+                    )));
+                }
                 if expression.is_empty() {
                     return Err(ConfigError::Invalid(format!(
                         "redaction.profiles.{profile_name}.rules[{rule_idx}].expressions[{expression_idx}] must not be empty"
                     )));
                 }
-                Regex::new(expression).map_err(|err| {
+                let regex = Regex::new(expression).map_err(|_| {
                     ConfigError::Invalid(format!(
-                        "redaction.profiles.{profile_name}.rules[{rule_idx}].expressions[{expression_idx}] is not a valid regex: {err}"
+                        "redaction.profiles.{profile_name}.rules[{rule_idx}].expressions[{expression_idx}] is not a valid regex"
                     ))
                 })?;
+                if regex.find("").is_some_and(|matched| matched.is_empty()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "redaction.profiles.{profile_name}.rules[{rule_idx}].expressions[{expression_idx}] must not match empty text"
+                    )));
+                }
             }
         }
     }
@@ -1953,6 +1963,69 @@ level = "debug"
         let msg = format!("{err}");
         assert!(
             msg.contains("is not a valid regex"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn redaction_expression_is_invalid_for_binary_only_rule() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "debug"
+
+[redaction.profiles.secrets]
+
+[[redaction.profiles.secrets.rules]]
+expressions = ["token-[0-9]+"]
+match = "binary"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("cannot be used with match = \"binary\""),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn redaction_expression_must_not_match_empty_text() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "debug"
+
+[redaction.profiles.secrets]
+
+[[redaction.profiles.secrets.rules]]
+expressions = ["a*"]
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("must not match empty text"),
             "unexpected error message: {msg}"
         );
     }

@@ -37,6 +37,7 @@ redaction_profile = "secrets"
 - Rules can contain `literals`, `expressions`, or both; at least one matcher is required per rule.
 - Literals are exact byte/string matches.
 - Expressions use Rust `regex` syntax and are compiled during config validation.
+- Expressions are text-only. `expressions` with `match = "binary"` are invalid, and expressions that can match empty text are rejected.
 - `replacement` is fixed per profile and may have any length. Replacements are no longer required to match the matched text length because both HTTP request bodies and WebSocket data messages are fully buffered before rewriting.
 - For text matches, the decoded payload must be valid UTF-8 before expression matching. Literal matching may still operate on bytes.
 
@@ -50,7 +51,7 @@ Unsupported encodings, oversized encoded bodies, oversized decoded bodies, inval
 
 For a matched HTTP/1.1 WebSocket upgrade, acl-proxy validates/sanitizes the handshake, then runs a frame-aware relay after `101 Switching Protocols`. Only client-to-upstream text/binary data messages are redacted. Upstream-to-client data and all control frames are forwarded without redaction.
 
-The relay buffers one complete data message at a time, decompresses `permessage-deflate` messages when negotiated, applies the shared redaction profile, recompresses if needed, and reframes before forwarding upstream.
+The relay buffers one complete client-to-upstream data message at a time, decompresses `permessage-deflate` messages when negotiated, applies the shared redaction profile, recompresses if needed, and reframes before forwarding upstream. Upstream-to-client data frames are forwarded without redaction or message reassembly, though the per-frame safety limit still applies in both directions.
 
 `permessage-deflate` remains opt-in. When enabled, acl-proxy only permits the no-context-takeover subset so each message is independently decompressible/recompressible. Unsupported extension negotiation is denied or stripped according to the profile.
 

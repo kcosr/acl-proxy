@@ -234,7 +234,7 @@ In transparent HTTP mode, upstream target selection is based on the inbound `Hos
 
 - HTTP/1.1 upgrade handshakes are proxied on all HTTP/1.1 request paths (HTTP listener, CONNECT inner, transparent HTTPS when HTTP/1.1 is negotiated).
 - After a `101 Switching Protocols` response, acl-proxy switches to a bidirectional byte tunnel between client and upstream unless the matched rule names a `redaction_profile`.
-- A matched redaction profile parses WebSocket frames, buffers one complete client-to-upstream data message at a time up to the configured limit, applies native redaction, and then reframes the message. Upstream-to-client messages and ping, pong, and close control frames are forwarded promptly and are not redacted.
+- A matched redaction profile parses WebSocket frames, buffers one complete client-to-upstream data message at a time up to the configured limit, applies native redaction, and then reframes the message. Upstream-to-client messages and ping, pong, and close control frames are forwarded promptly and are not redacted; the configured per-frame safety limit still applies in both directions.
 - Redacted WebSocket rules can optionally allow `permessage-deflate`; acl-proxy requires no-context-takeover parameters, decompresses client-to-upstream messages for redaction, and recompresses them before forwarding. Unsupported extensions are denied or stripped according to the profile.
 - Matching policy rules can set `allow_upgrades = false` to deny HTTP/1.1 upgrade handshakes, including WebSocket handshakes, before delegate/plugin invocation or upstream forwarding.
 - `allow_upgrades` is a rule-level control; requests that match no rule and fall through to `policy.default = "allow"` keep the default upgrade tunneling behavior.
@@ -751,7 +751,7 @@ headers_match = { "x-id" = "v1" }  # optional: exact header match
 headers_not_match = { "x-id" = "internal" } # optional: exact header exclusion
 request_timeout_ms = 5000          # optional: override upstream timeout
 allow_upgrades = true              # optional: deny HTTP/1.1 upgrades when false
-	redaction_profile = "secrets"      # optional: native request/WebSocket redaction profile for allow/delegate
+redaction_profile = "secrets"      # optional: native request/WebSocket redaction profile for allow/delegate
 rule_id = "stable-id"             # optional: stable ID for webhooks
 external_auth_profile = "name"     # required for delegate; invalid for allow/deny
 ```
@@ -779,9 +779,11 @@ expressions = ["(?i)bearer\\s+[a-z0-9._-]+"]
 match = "text"                    # text | binary | both
 ```
 
-Profiles redact outbound/request-side data only. For normal HTTP requests, acl-proxy buffers the request body, decompresses supported `Content-Encoding` values, applies literal and regex redaction in-process, recompresses with the original encoding, updates body headers, and forwards upstream. For HTTP/1.1 WebSocket upgrades, acl-proxy applies the same profile to client-to-upstream data messages after an allowed `101 Switching Protocols`; upstream-to-client messages are not redacted.
+Profiles redact outbound/request-side data only. For normal HTTP requests with a body, acl-proxy buffers the request body, decompresses supported `Content-Encoding` values, applies literal and regex redaction in-process, recompresses with the original encoding, updates body headers, and forwards upstream. Bodyless requests are forwarded without body-header rewrites. For HTTP/1.1 WebSocket upgrades, acl-proxy applies the same profile to client-to-upstream data messages after an allowed `101 Switching Protocols`; upstream-to-client messages are not redacted or message-buffered.
 
 Profiles are intended for short, known secrets such as fixed passwords or tokens. `replacement` is fixed per profile and can have any length. A redacted upgrade whose `Upgrade` header is not `websocket` is rejected before upstream forwarding. If the upstream negotiates unsupported WebSocket extensions, acl-proxy returns `502 Bad Gateway` before delivering `101 Switching Protocols` to the client.
+
+Regex `expressions` use Rust regex syntax, are text-only, and cannot be used with `match = "binary"`. Expressions that can match empty text are rejected to avoid unbounded replacement expansion.
 
 #### Include Rule Fields
 

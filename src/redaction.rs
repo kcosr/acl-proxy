@@ -86,7 +86,7 @@ pub fn redact_payload(
             redactions += replace_literal(&mut output, literal, &profile.replacement);
         }
 
-        if !rule.expressions.is_empty() {
+        if is_text && !rule.expressions.is_empty() {
             let text = std::str::from_utf8(&output).map_err(|_| RedactionError::InvalidUtf8)?;
             let mut replaced = text.to_string();
             for expression in &rule.expressions {

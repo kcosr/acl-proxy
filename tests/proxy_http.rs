@@ -2939,6 +2939,66 @@ redaction_profile = "secrets"
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn native_redaction_leaves_bodyless_http_request_headers_unchanged() {
+    let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    let mut config = minimal_config();
+    config.redaction.profiles.insert(
+        "secrets".to_string(),
+        acl_proxy::config::RedactionProfileConfig {
+            replacement: "[REDACTED]".to_string(),
+            rules: vec![acl_proxy::config::RedactionRuleConfig {
+                literals: vec!["password".to_string()],
+                expressions: Vec::new(),
+                match_mode: acl_proxy::config::RedactionMatch::Text,
+            }],
+            ..Default::default()
+        },
+    );
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyRuleAction::Allow,
+            pattern: Some(format!("http://{host}/**")),
+            patterns: None,
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: None,
+            headers_not_match: None,
+            request_timeout_ms: None,
+            allow_upgrades: true,
+            redaction_profile: Some("secrets".to_string()),
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let raw_request =
+        format!("GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let (_response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let headers = seen_headers
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream headers");
+    assert!(headers.get("content-length").is_none());
+    assert!(headers.get("transfer-encoding").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn native_redaction_recompresses_gzip_request_body() {
     let (upstream_addr, seen_requests) = start_upstream_body_echo_server().await;
     let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());

@@ -4,7 +4,7 @@
 
 ### Added
 
-- Add native redaction profiles for outbound HTTP request bodies and client-to-upstream WebSocket messages.
+- Add native redaction profiles for outbound HTTP request bodies and client-to-upstream WebSocket messages. ([#54](https://github.com/kcosr/acl-proxy/pull/54))
 
 ## [0.1.1] - 2026-06-04
 

@@ -141,7 +141,7 @@ max_body_bytes = 1048576
 # [[redaction.profiles.secrets.rules]]
 # literals = ["password", "api-token"]
 # expressions = ["(?i)bearer\\s+[a-z0-9._-]+"]
-# match = "text" # text | binary | both
+# match = "text" # text | binary | both; expressions are text-only
 
 ###############################################################################
 # Loop protection

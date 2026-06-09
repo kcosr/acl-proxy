@@ -383,6 +383,25 @@ where
             return Err(err);
         }
 
+        if direction == Direction::UpstreamToClient {
+            if frame.rsv1 && !extensions.permessage_deflate {
+                let err = WebSocketRelayError::Protocol(
+                    "compressed message without negotiated extension",
+                );
+                let _ = write_close(&mut writer, false, CLOSE_PROTOCOL_ERROR).await;
+                log_close(&request_id, &url, &profile.name, direction, &err);
+                return Err(err);
+            }
+            if frame.opcode == OpCode::Continuation && frame.rsv1 {
+                let err = WebSocketRelayError::Protocol("reserved bit on continuation frame");
+                let _ = write_close(&mut writer, false, CLOSE_PROTOCOL_ERROR).await;
+                log_close(&request_id, &url, &profile.name, direction, &err);
+                return Err(err);
+            }
+            write_frame(&mut writer, frame, false).await?;
+            continue;
+        }
+
         if frame.opcode.is_data() {
             if pending.is_some() {
                 let err =
@@ -1047,6 +1066,92 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), relay)
             .await
             .expect("relay should finish after close handshake")
+            .expect("relay task should not panic")
+            .expect("relay should finish cleanly");
+    }
+
+    #[tokio::test]
+    async fn relay_preserves_upstream_fragmented_messages() {
+        let (mut client, downstream) = tokio::io::duplex(1024);
+        let (upstream, mut server) = tokio::io::duplex(1024);
+
+        let relay = tokio::spawn(relay_websocket(
+            downstream,
+            upstream,
+            "test-request".to_string(),
+            "ws://example.test/chat".to_string(),
+            profile(),
+            SessionExtensions {
+                permessage_deflate: false,
+            },
+        ));
+
+        write_frame(
+            &mut server,
+            Frame {
+                fin: false,
+                rsv1: false,
+                rsv2: false,
+                rsv3: false,
+                opcode: OpCode::Text,
+                payload: b"upstream pass".to_vec(),
+            },
+            false,
+        )
+        .await
+        .expect("write first upstream fragment");
+        write_frame(
+            &mut server,
+            Frame {
+                fin: true,
+                rsv1: false,
+                rsv2: false,
+                rsv3: false,
+                opcode: OpCode::Continuation,
+                payload: b"word".to_vec(),
+            },
+            false,
+        )
+        .await
+        .expect("write upstream continuation");
+
+        let first = read_frame(&mut client, false, 128)
+            .await
+            .expect("read first frame")
+            .expect("first frame");
+        assert!(!first.fin);
+        assert_eq!(first.opcode, OpCode::Text);
+        assert_eq!(first.payload, b"upstream pass");
+
+        let second = read_frame(&mut client, false, 128)
+            .await
+            .expect("read second frame")
+            .expect("second frame");
+        assert!(second.fin);
+        assert_eq!(second.opcode, OpCode::Continuation);
+        assert_eq!(second.payload, b"word");
+
+        write_close(&mut server, false, 1000)
+            .await
+            .expect("server close");
+        let client_close = read_frame(&mut client, false, 128)
+            .await
+            .expect("client reads close")
+            .expect("close frame");
+        assert_eq!(client_close.opcode, OpCode::Close);
+
+        write_close(&mut client, true, 1000)
+            .await
+            .expect("client close response");
+        let server_close = read_frame(&mut server, true, 128)
+            .await
+            .expect("server reads close")
+            .expect("close frame");
+        assert_eq!(server_close.opcode, OpCode::Close);
+
+        tokio::time::timeout(Duration::from_secs(1), relay)
+            .await
+            .expect("relay should finish after close")
             .expect("relay task should not panic")
             .expect("relay should finish cleanly");
     }
