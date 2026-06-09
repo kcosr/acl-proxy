@@ -2732,6 +2732,50 @@ async fn send_h2c_http_request(addr: SocketAddr, uri: &str) -> (String, StatusCo
     (String::from_utf8_lossy(&body_bytes).to_string(), status)
 }
 
+async fn send_h2c_http_request_with_body(
+    addr: SocketAddr,
+    method: &str,
+    uri: &str,
+    payload: &[u8],
+) -> (String, StatusCode) {
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect proxy");
+    let (send_request, connection) = h2_client::handshake(stream).await.expect("h2 handshake");
+
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("h2 connection error: {err}");
+        }
+    });
+
+    let mut send_request = send_request.ready().await.expect("h2 ready");
+    let request = http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .version(http::Version::HTTP_2)
+        .body(())
+        .expect("build h2 request");
+
+    let (response_fut, mut send_stream) = send_request
+        .send_request(request, false)
+        .expect("send h2 request");
+    send_stream
+        .send_data(payload.to_vec().into(), true)
+        .expect("send h2 request body");
+    let response = response_fut.await.expect("await h2 response");
+    let status = response.status();
+
+    let mut body = response.into_body();
+    let mut body_bytes = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.expect("h2 response chunk");
+        body_bytes.extend_from_slice(&chunk);
+    }
+
+    (String::from_utf8_lossy(&body_bytes).to_string(), status)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn http_explicit_listener_accepts_h2c_prior_knowledge_requests() {
     let (upstream_addr, _seen_headers) = start_upstream_echo_server().await;
@@ -2996,6 +3040,69 @@ async fn native_redaction_leaves_bodyless_http_request_headers_unchanged() {
         .expect("upstream headers");
     assert!(headers.get("content-length").is_none());
     assert!(headers.get("transfer-encoding").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_redaction_redacts_h2c_body_without_content_length() {
+    let (upstream_addr, seen_requests) = start_upstream_body_echo_server().await;
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    let mut config = minimal_config();
+    config.redaction.profiles.insert(
+        "secrets".to_string(),
+        acl_proxy::config::RedactionProfileConfig {
+            replacement: "[REDACTED]".to_string(),
+            rules: vec![acl_proxy::config::RedactionRuleConfig {
+                literals: vec!["password".to_string()],
+                expressions: Vec::new(),
+                match_mode: acl_proxy::config::RedactionMatch::Text,
+            }],
+            ..Default::default()
+        },
+    );
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyRuleAction::Allow,
+            pattern: Some(format!("http://{host}/**")),
+            patterns: None,
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: None,
+            headers_not_match: None,
+            request_timeout_ms: None,
+            allow_upgrades: true,
+            redaction_profile: Some("secrets".to_string()),
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let uri = format!("http://{host}/chat");
+    let (_response, status) =
+        send_h2c_http_request_with_body(proxy_addr, "POST", &uri, b"password").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let seen = seen_requests.lock().unwrap();
+    let request = seen.first().expect("upstream should see request");
+    assert_eq!(request.body, b"[REDACTED]");
+    let content_length = request
+        .headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    assert_eq!(content_length, Some("[REDACTED]".len().to_string()));
 }
 
 #[tokio::test(flavor = "multi_thread")]

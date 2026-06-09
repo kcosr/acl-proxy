@@ -1435,7 +1435,7 @@ async fn redact_request_body(
     req: Request<Body>,
     profile: &RedactionProfile,
 ) -> Result<Request<Body>, RequestBodyProcessingError> {
-    if !request_has_body_signal(req.headers()) {
+    if req.body().is_end_stream() {
         return Ok(req);
     }
 
@@ -1484,18 +1484,6 @@ async fn redact_request_body(
         redacted,
         None,
     )
-}
-
-fn request_has_body_signal(headers: &HttpHeaderMap) -> bool {
-    if headers.contains_key(TRANSFER_ENCODING) {
-        return true;
-    }
-
-    headers
-        .get(CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .is_some_and(|len| len > 0)
 }
 
 fn rebuild_request_with_decoded_body(
