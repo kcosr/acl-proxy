@@ -2,7 +2,9 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Added
+
+- Support environment variable interpolation for redaction profile replacements and literal rules. ([#55](https://github.com/kcosr/acl-proxy/pull/55))
 
 ## [0.1.2] - 2026-06-09
 
