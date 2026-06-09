@@ -496,7 +496,7 @@ pattern = "https://github.com/**"
 
 **`value` / `values`**: Exactly one must be provided for `set`/`add`. Values must be valid HTTP header values.
 
-**Environment variable interpolation**: Exact whole-string `${NAME}` placeholders in `value`/`values` resolve once at config load/reload time. `NAME` must match `[A-Za-z_][A-Za-z0-9_]*`. Mixed strings like `Bearer ${TOKEN}` are rejected. Missing env vars fail validation, startup, and reload.
+**Environment variable interpolation**: Exact whole-string `${NAME}` placeholders in header action `value`/`values`, redaction profile `replacement`, and redaction rule `literals` resolve once at config load/reload time. `NAME` must match `[A-Za-z_][A-Za-z0-9_]*`. Mixed strings like `Bearer ${TOKEN}` are rejected. Missing env vars fail validation, startup, and reload.
 
 **Approval macros**: `{{name}}` placeholders are a separate feature for external auth workflows — they are not resolved at config load time. See [External Auth](#external-auth).
 
@@ -782,6 +782,8 @@ match = "text"                    # text | binary | both
 Profiles redact outbound/request-side data only. For normal HTTP requests with a body, acl-proxy buffers the request body, decompresses supported `Content-Encoding` values, applies literal and regex redaction in-process, recompresses with the original encoding, updates body headers, and forwards upstream. Bodyless requests are forwarded without body-header rewrites. For HTTP/1.1 WebSocket upgrades, acl-proxy applies the same profile to client-to-upstream data messages after an allowed `101 Switching Protocols`; upstream-to-client messages are not redacted or message-buffered.
 
 Profiles are intended for short, known secrets such as fixed passwords or tokens. `replacement` is fixed per profile and can have any length. A redacted upgrade whose `Upgrade` header is not `websocket` is rejected before upstream forwarding. If the upstream negotiates unsupported WebSocket extensions, acl-proxy returns `502 Bad Gateway` before delivering `101 Switching Protocols` to the client.
+
+Redaction `replacement` and `literals` support exact whole-string `${NAME}` environment placeholders. Placeholders are resolved during config load and reload; missing variables or mixed literal/env strings fail validation. Regex `expressions` do not support environment interpolation.
 
 Regex `expressions` use Rust regex syntax, are text-only, and cannot be used with `match = "binary"`. Expressions that can match empty text are rejected to avoid unbounded replacement expansion.
 
