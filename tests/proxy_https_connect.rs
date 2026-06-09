@@ -2,12 +2,13 @@
 
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use acl_proxy::app::AppState;
 use acl_proxy::capture::{CaptureMode, CaptureRecord};
 use acl_proxy::config::Config;
 use acl_proxy::proxy::http::run_http_proxy_on_listener;
+use http::header::{HeaderValue, CONNECTION, UPGRADE};
 use http::StatusCode;
 use hyper::server::conn::Http;
 use hyper::service::service_fn;
@@ -26,6 +27,12 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 struct SeenForwardedRequest {
     uri: String,
     headers: hyper::HeaderMap,
+}
+
+#[derive(Debug)]
+struct TestWebSocketFrame {
+    opcode: u8,
+    payload: Vec<u8>,
 }
 
 async fn start_upstream_https_echo_server() -> SocketAddr {
@@ -82,6 +89,90 @@ async fn start_upstream_https_echo_server() -> SocketAddr {
     });
 
     addr
+}
+
+async fn start_upstream_https_redaction_server() -> (SocketAddr, Arc<Mutex<Vec<TestWebSocketFrame>>>)
+{
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind websocket upstream");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking websocket upstream");
+    let addr = listener.local_addr().expect("websocket upstream addr");
+    let seen_payloads = Arc::new(Mutex::new(Vec::new()));
+    let seen_payloads_clone = seen_payloads.clone();
+
+    let mut params = CertificateParams::new(vec![addr.ip().to_string()]).expect("params");
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, addr.ip().to_string());
+    params.distinguished_name = dn;
+    let key = KeyPair::generate().expect("generate upstream key");
+    let cert = params.self_signed(&key).expect("self-signed upstream cert");
+
+    let cert_der: Vec<u8> = cert.der().to_vec();
+    let key_der = key.serialize_der();
+
+    let mut tls_config = ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(vec![RustlsCertificate(cert_der)], PrivateKey(key_der))
+        .expect("server config");
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+
+    let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
+
+    tokio::spawn(async move {
+        let listener = TcpListener::from_std(listener).expect("tokio listener");
+        loop {
+            let (socket, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let acceptor = tls_acceptor.clone();
+            let seen_payloads = seen_payloads_clone.clone();
+            tokio::spawn(async move {
+                let tls_stream = match acceptor.accept(socket).await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+
+                let service = service_fn(move |mut req: HyperRequest<Body>| {
+                    let seen_payloads = seen_payloads.clone();
+                    async move {
+                        let on_upgrade = hyper::upgrade::on(&mut req);
+                        tokio::spawn(async move {
+                            let mut upgraded = match on_upgrade.await {
+                                Ok(stream) => stream,
+                                Err(_) => return,
+                            };
+                            let frame = read_websocket_frame(&mut upgraded)
+                                .await
+                                .expect("read upstream websocket frame");
+                            seen_payloads.lock().unwrap().push(frame);
+                            write_websocket_frame(&mut upgraded, 0x1, b"upstream password", false)
+                                .await
+                                .expect("write upstream websocket frame");
+                        });
+
+                        let mut resp = HyperResponse::new(Body::empty());
+                        *resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+                        resp.headers_mut()
+                            .insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+                        resp.headers_mut()
+                            .insert(UPGRADE, HeaderValue::from_static("websocket"));
+                        Ok::<_, hyper::Error>(resp)
+                    }
+                });
+
+                let _ = Http::new()
+                    .http1_keep_alive(false)
+                    .serve_connection(tls_stream, service)
+                    .with_upgrades()
+                    .await;
+            });
+        }
+    });
+
+    (addr, seen_payloads)
 }
 
 async fn start_forwarding_echo_server(
@@ -332,6 +423,106 @@ async fn send_raw_connect_request(
     (response, status)
 }
 
+fn build_websocket_frame(opcode: u8, payload: &[u8], masked: bool) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.push(0x80 | (opcode & 0x0f));
+    let mask_bit = if masked { 0x80 } else { 0x00 };
+    if payload.len() < 126 {
+        frame.push(mask_bit | payload.len() as u8);
+    } else if payload.len() <= u16::MAX as usize {
+        frame.push(mask_bit | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push(mask_bit | 127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+
+    if masked {
+        let mask = [0x55, 0x66, 0x77, 0x88];
+        frame.extend_from_slice(&mask);
+        for (idx, byte) in payload.iter().enumerate() {
+            frame.push(byte ^ mask[idx % mask.len()]);
+        }
+    } else {
+        frame.extend_from_slice(payload);
+    }
+    frame
+}
+
+async fn write_websocket_frame<W>(
+    writer: &mut W,
+    opcode: u8,
+    payload: &[u8],
+    masked: bool,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    writer
+        .write_all(&build_websocket_frame(opcode, payload, masked))
+        .await
+}
+
+async fn read_websocket_frame<R>(reader: &mut R) -> std::io::Result<TestWebSocketFrame>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut header = [0_u8; 2];
+    reader.read_exact(&mut header).await?;
+    let opcode = header[0] & 0x0f;
+    let masked = header[1] & 0x80 != 0;
+    let mut len = u64::from(header[1] & 0x7f);
+    if len == 126 {
+        let mut extended = [0_u8; 2];
+        reader.read_exact(&mut extended).await?;
+        len = u64::from(u16::from_be_bytes(extended));
+    } else if len == 127 {
+        let mut extended = [0_u8; 8];
+        reader.read_exact(&mut extended).await?;
+        len = u64::from_be_bytes(extended);
+    }
+
+    let mut mask = [0_u8; 4];
+    if masked {
+        reader.read_exact(&mut mask).await?;
+    }
+
+    let mut payload = vec![0_u8; len as usize];
+    reader.read_exact(&mut payload).await?;
+    if masked {
+        for (idx, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[idx % mask.len()];
+        }
+    }
+
+    Ok(TestWebSocketFrame { opcode, payload })
+}
+
+async fn read_http_response_head<R>(reader: &mut R) -> std::io::Result<(String, u16)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        reader.read_exact(&mut byte).await?;
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let response = String::from_utf8_lossy(&buf).to_string();
+    let status = response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(0);
+
+    Ok((response, status))
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn allowed_https_via_connect_is_proxied_and_captured() {
     let upstream_addr = start_upstream_https_echo_server().await;
@@ -357,6 +548,7 @@ async fn allowed_https_via_connect_is_proxied_and_captured() {
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -448,6 +640,7 @@ async fn allow_upgrades_false_blocks_connect_inner_upgrade() {
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: false,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -483,6 +676,131 @@ async fn allow_upgrades_false_blocks_connect_inner_upgrade() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn redaction_profile_redacts_connect_inner_messages() {
+    use rustls_pemfile;
+
+    let (upstream_addr, seen_payloads) = start_upstream_https_redaction_server().await;
+
+    let mut config = minimal_connect_config();
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.redaction.profiles.insert(
+        "secrets".to_string(),
+        acl_proxy::config::RedactionProfileConfig {
+            replacement: "[REDACTED]".to_string(),
+            rules: vec![acl_proxy::config::RedactionRuleConfig {
+                literals: vec!["password".to_string()],
+                expressions: Vec::new(),
+                match_mode: acl_proxy::config::RedactionMatch::Both,
+            }],
+            ..Default::default()
+        },
+    );
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyRuleAction::Allow,
+            pattern: Some(format!(
+                "https://{}:{}/ws",
+                upstream_addr.ip(),
+                upstream_addr.port()
+            )),
+            patterns: None,
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: None,
+            headers_not_match: None,
+            request_timeout_ms: None,
+            allow_upgrades: true,
+            redaction_profile: Some("secrets".to_string()),
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+    let ca_cert_path = temp_dir.path().join("certs").join("ca-cert.pem");
+    let target_host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
+    let connect_req = format!(
+        "CONNECT {target_host} HTTP/1.1\r\nHost: {target_host}\r\nConnection: keep-alive\r\n\r\n"
+    );
+    stream
+        .write_all(connect_req.as_bytes())
+        .await
+        .expect("write CONNECT");
+    let (_connect_head, connect_status) = read_http_response_head(&mut stream)
+        .await
+        .expect("read CONNECT response");
+    assert_eq!(connect_status, StatusCode::OK.as_u16());
+
+    let ca_pem = std::fs::read(&ca_cert_path).expect("read ca cert");
+    let mut reader = std::io::Cursor::new(ca_pem);
+    let mut roots = RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut reader).expect("parse ca cert") {
+        let cert = RustlsCertificate(cert.to_vec());
+        roots.add(&cert).expect("add root cert to store");
+    }
+    let config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+    let upstream_ip = upstream_addr.ip().to_string();
+    let server_name = ServerName::try_from(upstream_ip.as_str()).expect("server name");
+    let mut tls_stream = connector
+        .connect(server_name, stream)
+        .await
+        .expect("tls connect");
+
+    let request = format!(
+        concat!(
+            "GET /ws HTTP/1.1\r\n",
+            "Host: {target_host}\r\n",
+            "Connection: Upgrade\r\n",
+            "Upgrade: websocket\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "\r\n"
+        ),
+        target_host = target_host
+    );
+    tls_stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write websocket upgrade request");
+
+    let (_head, status) = read_http_response_head(&mut tls_stream)
+        .await
+        .expect("read websocket response");
+    assert_eq!(status, StatusCode::SWITCHING_PROTOCOLS.as_u16());
+
+    write_websocket_frame(&mut tls_stream, 0x1, b"client password", true)
+        .await
+        .expect("write websocket frame");
+    let frame = read_websocket_frame(&mut tls_stream)
+        .await
+        .expect("read websocket frame");
+    assert_eq!(frame.opcode, 0x1);
+    assert_eq!(frame.payload, b"upstream password");
+
+    let seen = seen_payloads.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].payload, b"client [REDACTED]");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn configured_egress_forwarding_applies_to_https_connect_inner_requests() {
     let (forward_addr, seen_requests) = start_forwarding_echo_server().await;
 
@@ -503,6 +821,7 @@ async fn configured_egress_forwarding_applies_to_https_connect_inner_requests() 
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -564,6 +883,7 @@ async fn global_egress_request_actions_apply_to_https_connect_inner_requests() {
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -637,6 +957,7 @@ async fn denied_https_via_connect_returns_403() {
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -777,6 +1098,7 @@ async fn headers_match_is_evaluated_on_decrypted_inner_connect_requests() {
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -865,6 +1187,7 @@ async fn headers_not_match_is_evaluated_on_decrypted_inner_connect_requests() {
             )])),
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -883,6 +1206,7 @@ async fn headers_not_match_is_evaluated_on_decrypted_inner_connect_requests() {
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -971,6 +1295,7 @@ async fn loop_detected_on_connect_returns_508() {
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),

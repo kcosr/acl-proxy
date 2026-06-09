@@ -233,9 +233,12 @@ In transparent HTTP mode, upstream target selection is based on the inbound `Hos
 ### WebSocket and Upgrade Traffic
 
 - HTTP/1.1 upgrade handshakes are proxied on all HTTP/1.1 request paths (HTTP listener, CONNECT inner, transparent HTTPS when HTTP/1.1 is negotiated).
-- After a `101 Switching Protocols` response, acl-proxy switches to a bidirectional byte tunnel between client and upstream.
+- After a `101 Switching Protocols` response, acl-proxy switches to a bidirectional byte tunnel between client and upstream unless the matched rule names a `redaction_profile`.
+- A matched redaction profile parses WebSocket frames, buffers one complete client-to-upstream data message at a time up to the configured limit, applies native redaction, and then reframes the message. Upstream-to-client messages and ping, pong, and close control frames are forwarded promptly and are not redacted; the configured per-frame safety limit still applies in both directions.
+- Redacted WebSocket rules can optionally allow `permessage-deflate`; acl-proxy requires no-context-takeover parameters, decompresses client-to-upstream messages for redaction, and recompresses them before forwarding. Unsupported extensions are denied or stripped according to the profile.
 - Matching policy rules can set `allow_upgrades = false` to deny HTTP/1.1 upgrade handshakes, including WebSocket handshakes, before delegate/plugin invocation or upstream forwarding.
 - `allow_upgrades` is a rule-level control; requests that match no rule and fall through to `policy.default = "allow"` keep the default upgrade tunneling behavior.
+- WebSocket payloads are not captured to disk. Existing request/response capture can still record handshake metadata.
 - HTTP/2 extended CONNECT / RFC 8441 is not currently implemented.
 
 ### Upstream HTTP Version
@@ -748,6 +751,7 @@ headers_match = { "x-id" = "v1" }  # optional: exact header match
 headers_not_match = { "x-id" = "internal" } # optional: exact header exclusion
 request_timeout_ms = 5000          # optional: override upstream timeout
 allow_upgrades = true              # optional: deny HTTP/1.1 upgrades when false
+redaction_profile = "secrets"      # optional: native request/WebSocket redaction profile for allow/delegate
 rule_id = "stable-id"             # optional: stable ID for webhooks
 external_auth_profile = "name"     # required for delegate; invalid for allow/deny
 ```
@@ -755,6 +759,31 @@ external_auth_profile = "name"     # required for delegate; invalid for allow/de
 At least one of `pattern`, `patterns`, `methods`, `subnets`, `headers_absent`, `headers_match`, or `headers_not_match` must be present.
 `allow` and `deny` are terminal local decisions. `delegate` invokes the named HTTP or plugin external auth profile; the provider can return `allow` or `deny` as terminal decisions, or `pass` to continue policy evaluation at the next rule.
 When a matched rule has `allow_upgrades = false`, HTTP/1.1 upgrade requests are denied locally with `403 Forbidden` before the rule action runs. Normal HTTP requests matching the same rule continue through `allow`, `deny`, or `delegate` behavior as usual.
+`redaction_profile` is valid only on `allow` and `delegate` rules. The named profile must exist under `[redaction.profiles.<name>]`; denied rules cannot name a profile because they never forward payload data.
+
+#### Native Redaction Profiles
+
+```toml
+[redaction.profiles.secrets]
+replacement = "[REDACTED]"
+max_body_bytes = 10485760
+max_decoded_body_bytes = 52428800
+max_frame_bytes = 262144
+max_message_bytes = 1048576
+allow_permessage_deflate = false
+unsupported_extensions = "deny" # deny | strip
+
+[[redaction.profiles.secrets.rules]]
+literals = ["password", "api-token"]
+expressions = ["(?i)bearer\\s+[a-z0-9._-]+"]
+match = "text"                    # text | binary | both
+```
+
+Profiles redact outbound/request-side data only. For normal HTTP requests with a body, acl-proxy buffers the request body, decompresses supported `Content-Encoding` values, applies literal and regex redaction in-process, recompresses with the original encoding, updates body headers, and forwards upstream. Bodyless requests are forwarded without body-header rewrites. For HTTP/1.1 WebSocket upgrades, acl-proxy applies the same profile to client-to-upstream data messages after an allowed `101 Switching Protocols`; upstream-to-client messages are not redacted or message-buffered.
+
+Profiles are intended for short, known secrets such as fixed passwords or tokens. `replacement` is fixed per profile and can have any length. A redacted upgrade whose `Upgrade` header is not `websocket` is rejected before upstream forwarding. If the upstream negotiates unsupported WebSocket extensions, acl-proxy returns `502 Bad Gateway` before delivering `101 Switching Protocols` to the client.
+
+Regex `expressions` use Rust regex syntax, are text-only, and cannot be used with `match = "binary"`. Expressions that can match empty text are rejected to avoid unbounded replacement expansion.
 
 #### Include Rule Fields
 
@@ -932,7 +961,7 @@ max_decompressed_request_body_bytes = 52428800
 
 When `include_request_body = true`, acl-proxy buffers the outbound request body before forwarding, decompresses supported `Content-Encoding` bodies (`gzip`, `deflate`, `br`, and `zstd`), sends the decoded body to the plugin as base64, and can apply an optional `requestBody` replacement returned by an `allow` decision. The default encoded limit is 10 MiB and the default decompressed limit is 50 MiB. Plugin-returned replacement bodies are also capped by the decoded limit. `deflate` ingress accepts both zlib-wrapped and raw DEFLATE bodies; rewritten `deflate` bodies are emitted as zlib-wrapped DEFLATE. `zstd` decoding caps the accepted frame window based on the decompressed body limit. If the original request used a supported content encoding, the replacement body is recompressed with the same encoding before egress and `Content-Length` is rebuilt. Unsupported or stacked content encodings, body read failures, oversize encoded bodies, and oversize decoded bodies fail the delegated request with an auth-plugin error response. Plugin `deny` responses may include `denyMessage` to replace the client-visible JSON `message`; status remains `403` and JSON `error` remains `Forbidden`. `denyMessage` is valid only on `deny`; returning it on `allow` or `pass` is a protocol error.
 
-Body-aware plugin delegation runs only when a request matches a `delegate` rule whose plugin profile has `include_request_body = true`. It works on all HTTP request-forwarding paths, including explicit HTTP proxying, transparent HTTP, CONNECT MITM inner requests, and transparent HTTPS after TLS termination. HTTP/1.1 upgrade/WebSocket traffic is not body-buffered; use `allow_upgrades = false` on protected rules when upgrade tunnels should be blocked before plugin invocation or upstream forwarding.
+Body-aware plugin delegation runs only when a request matches a `delegate` rule whose plugin profile has `include_request_body = true`. It works on all HTTP request-forwarding paths, including explicit HTTP proxying, transparent HTTP, CONNECT MITM inner requests, and transparent HTTPS after TLS termination. HTTP/1.1 upgrade/WebSocket traffic is not body-buffered for plugins. Use `allow_upgrades = false` when upgrade tunnels should be blocked before plugin invocation or upstream forwarding, or use native `redaction_profile` rules when known request/WebSocket message secrets should be redacted without a plugin.
 
 Body-processing diagnostics are emitted with structured fields on the `acl_proxy::body_policy` tracing target at `debug` level. Logs include request ID, URL, profile, sizes, encoding, and decision metadata, but never log body contents.
 

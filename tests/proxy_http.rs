@@ -11,17 +11,18 @@ use acl_proxy::config::Config;
 use acl_proxy::proxy::http::run_http_proxy_on_listener;
 use base64::engine::general_purpose;
 use base64::Engine;
-use flate2::read::{GzDecoder, ZlibDecoder};
+use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
 use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
-use flate2::Compression;
+use flate2::{Compress, Compression, FlushCompress};
 use h2::client as h2_client;
-use http::header::HeaderValue;
+use http::header::{HeaderValue, CONNECTION, UPGRADE};
 use http::StatusCode;
+use hyper::server::conn::Http;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server};
 use serde_json::Value as JsonValue;
 use tempfile::TempDir;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(Clone, Debug)]
 struct SeenForwardedRequest {
@@ -33,6 +34,14 @@ struct SeenForwardedRequest {
 struct SeenBodyRequest {
     headers: hyper::HeaderMap,
     body: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct TestWebSocketFrame {
+    fin: bool,
+    rsv1: bool,
+    opcode: u8,
+    payload: Vec<u8>,
 }
 
 async fn start_upstream_echo_server() -> (SocketAddr, Arc<Mutex<Option<hyper::HeaderMap>>>) {
@@ -137,6 +146,92 @@ async fn start_upstream_body_echo_server() -> (SocketAddr, Arc<Mutex<Vec<SeenBod
     tokio::spawn(server);
 
     (addr, seen_requests)
+}
+
+async fn start_upstream_redaction_server(
+    use_permessage_deflate: bool,
+) -> (SocketAddr, Arc<Mutex<Vec<TestWebSocketFrame>>>) {
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind websocket upstream");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking websocket upstream");
+    let addr = listener.local_addr().expect("websocket upstream addr");
+    let seen_payloads = Arc::new(Mutex::new(Vec::new()));
+    let seen_payloads_clone = seen_payloads.clone();
+
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
+        loop {
+            let (socket, _) = match listener.accept().await {
+                Ok(socket) => socket,
+                Err(_) => break,
+            };
+            let seen_payloads = seen_payloads_clone.clone();
+
+            tokio::spawn(async move {
+                let service = service_fn(move |mut req: Request<Body>| {
+                    let seen_payloads = seen_payloads.clone();
+                    async move {
+                        let on_upgrade = hyper::upgrade::on(&mut req);
+                        tokio::spawn(async move {
+                            let mut upgraded = match on_upgrade.await {
+                                Ok(upgraded) => upgraded,
+                                Err(_) => return,
+                            };
+
+                            let frame = read_websocket_frame(&mut upgraded)
+                                .await
+                                .expect("read upstream websocket frame");
+                            seen_payloads.lock().unwrap().push(frame);
+
+                            if use_permessage_deflate {
+                                let compressed = websocket_deflate_compress(b"upstream password");
+                                write_websocket_frame_with_bits(
+                                    &mut upgraded,
+                                    true,
+                                    true,
+                                    0x1,
+                                    &compressed,
+                                    false,
+                                )
+                                .await
+                                .expect("write compressed upstream websocket frame");
+                            } else {
+                                write_websocket_frame(
+                                    &mut upgraded,
+                                    0x1,
+                                    b"upstream password",
+                                    false,
+                                )
+                                .await
+                                .expect("write upstream websocket frame");
+                            }
+                        });
+
+                        let mut builder = Response::builder()
+                            .status(StatusCode::SWITCHING_PROTOCOLS)
+                            .header(CONNECTION, "Upgrade")
+                            .header(UPGRADE, "websocket");
+                        if use_permessage_deflate {
+                            builder = builder.header(
+                                "sec-websocket-extensions",
+                                "permessage-deflate; client_no_context_takeover; server_no_context_takeover",
+                            );
+                        }
+                        Ok::<_, hyper::Error>(builder.body(Body::empty()).unwrap())
+                    }
+                });
+
+                let _ = Http::new()
+                    .http1_keep_alive(false)
+                    .serve_connection(socket, service)
+                    .with_upgrades()
+                    .await;
+            });
+        }
+    });
+
+    (addr, seen_payloads)
 }
 
 async fn start_upstream_delayed_server(delay: Duration) -> SocketAddr {
@@ -907,6 +1002,351 @@ allow_upgrades = false
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn redaction_profile_redacts_client_messages_only() {
+    let (upstream_addr, seen_payloads) = start_upstream_redaction_server(false).await;
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    let mut config = minimal_config();
+    config.redaction.profiles.insert(
+        "secrets".to_string(),
+        acl_proxy::config::RedactionProfileConfig {
+            replacement: "[REDACTED]".to_string(),
+            rules: vec![acl_proxy::config::RedactionRuleConfig {
+                literals: vec!["password".to_string()],
+                expressions: Vec::new(),
+                match_mode: acl_proxy::config::RedactionMatch::Both,
+            }],
+            ..Default::default()
+        },
+    );
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyRuleAction::Allow,
+            pattern: Some(format!("http://{host}/**")),
+            patterns: None,
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: None,
+            headers_not_match: None,
+            request_timeout_ms: None,
+            allow_upgrades: true,
+            redaction_profile: Some("secrets".to_string()),
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
+    let request = format!(
+        concat!(
+            "GET http://{host}/chat HTTP/1.1\r\n",
+            "Host: {host}\r\n",
+            "Connection: Upgrade\r\n",
+            "Upgrade: websocket\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "\r\n"
+        ),
+        host = host
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write websocket upgrade request");
+
+    let (_head, status) = read_http_response_head(&mut stream)
+        .await
+        .expect("read websocket response head");
+    assert_eq!(status, StatusCode::SWITCHING_PROTOCOLS);
+
+    write_websocket_frame(&mut stream, 0x1, b"client password", true)
+        .await
+        .expect("write client websocket frame");
+    let frame = read_websocket_frame(&mut stream)
+        .await
+        .expect("read upstream websocket frame");
+    assert_eq!(frame.opcode, 0x1);
+    assert_eq!(frame.payload, b"upstream password");
+
+    let seen = seen_payloads.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].opcode, 0x1);
+    assert_eq!(seen[0].payload, b"client [REDACTED]");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn redaction_buffers_fragmented_messages_before_forwarding() {
+    let (upstream_addr, seen_payloads) = start_upstream_redaction_server(false).await;
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    let mut config = minimal_config();
+    config.redaction.profiles.insert(
+        "secrets".to_string(),
+        acl_proxy::config::RedactionProfileConfig {
+            replacement: "[REDACTED]".to_string(),
+            rules: vec![acl_proxy::config::RedactionRuleConfig {
+                literals: vec!["password".to_string()],
+                expressions: Vec::new(),
+                match_mode: acl_proxy::config::RedactionMatch::Both,
+            }],
+            ..Default::default()
+        },
+    );
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyRuleAction::Allow,
+            pattern: Some(format!("http://{host}/**")),
+            patterns: None,
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: None,
+            headers_not_match: None,
+            request_timeout_ms: None,
+            allow_upgrades: true,
+            redaction_profile: Some("secrets".to_string()),
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
+    let request = format!(
+        concat!(
+            "GET http://{host}/chat HTTP/1.1\r\n",
+            "Host: {host}\r\n",
+            "Connection: Upgrade\r\n",
+            "Upgrade: websocket\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "\r\n"
+        ),
+        host = host
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write websocket upgrade request");
+
+    let (_head, status) = read_http_response_head(&mut stream)
+        .await
+        .expect("read websocket response head");
+    assert_eq!(status, StatusCode::SWITCHING_PROTOCOLS);
+
+    write_websocket_frame_with_bits(&mut stream, false, false, 0x1, b"client pass", true)
+        .await
+        .expect("write first fragment");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        seen_payloads.lock().unwrap().is_empty(),
+        "partial fragmented message must not be forwarded"
+    );
+
+    write_websocket_frame_with_bits(&mut stream, true, false, 0x0, b"word", true)
+        .await
+        .expect("write continuation");
+    let frame = read_websocket_frame(&mut stream)
+        .await
+        .expect("read upstream websocket frame");
+    assert_eq!(frame.payload, b"upstream password");
+
+    let seen = seen_payloads.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].fin);
+    assert_eq!(seen[0].opcode, 0x1);
+    assert_eq!(seen[0].payload, b"client [REDACTED]");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn redaction_recompresses_permessage_deflate_messages() {
+    let (upstream_addr, seen_payloads) = start_upstream_redaction_server(true).await;
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    let mut config = minimal_config();
+    config.redaction.profiles.insert(
+        "secrets".to_string(),
+        acl_proxy::config::RedactionProfileConfig {
+            replacement: "[REDACTED]".to_string(),
+            allow_permessage_deflate: true,
+            rules: vec![acl_proxy::config::RedactionRuleConfig {
+                literals: vec!["password".to_string()],
+                expressions: Vec::new(),
+                match_mode: acl_proxy::config::RedactionMatch::Both,
+            }],
+            ..Default::default()
+        },
+    );
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyRuleAction::Allow,
+            pattern: Some(format!("http://{host}/**")),
+            patterns: None,
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: None,
+            headers_not_match: None,
+            request_timeout_ms: None,
+            allow_upgrades: true,
+            redaction_profile: Some("secrets".to_string()),
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
+    let request = format!(
+        concat!(
+            "GET http://{host}/chat HTTP/1.1\r\n",
+            "Host: {host}\r\n",
+            "Connection: Upgrade\r\n",
+            "Upgrade: websocket\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "Sec-WebSocket-Extensions: permessage-deflate\r\n",
+            "\r\n"
+        ),
+        host = host
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write websocket upgrade request");
+
+    let (head, status) = read_http_response_head(&mut stream)
+        .await
+        .expect("read websocket response head");
+    assert_eq!(status, StatusCode::SWITCHING_PROTOCOLS);
+    assert!(
+        head.to_ascii_lowercase()
+            .contains("sec-websocket-extensions: permessage-deflate"),
+        "response should negotiate permessage-deflate: {head}"
+    );
+
+    let compressed = websocket_deflate_compress(b"client password");
+    write_websocket_frame_with_bits(&mut stream, true, true, 0x1, &compressed, true)
+        .await
+        .expect("write compressed client websocket frame");
+    let frame = read_websocket_frame(&mut stream)
+        .await
+        .expect("read compressed upstream websocket frame");
+    assert!(frame.rsv1, "upstream response should remain compressed");
+    assert_eq!(
+        websocket_deflate_decompress(&frame.payload),
+        b"upstream password"
+    );
+
+    let seen = seen_payloads.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].rsv1, "upstream should receive compressed frame");
+    assert_eq!(
+        websocket_deflate_decompress(&seen[0].payload),
+        b"client [REDACTED]"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn redaction_profile_rejects_non_websocket_upgrades() {
+    let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    let mut config = minimal_config();
+    config.redaction.profiles.insert(
+        "secrets".to_string(),
+        acl_proxy::config::RedactionProfileConfig {
+            replacement: "[REDACTED]".to_string(),
+            rules: vec![acl_proxy::config::RedactionRuleConfig {
+                literals: vec!["password".to_string()],
+                expressions: Vec::new(),
+                match_mode: acl_proxy::config::RedactionMatch::Both,
+            }],
+            ..Default::default()
+        },
+    );
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyRuleAction::Allow,
+            pattern: Some(format!("http://{host}/**")),
+            patterns: None,
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: None,
+            headers_not_match: None,
+            request_timeout_ms: None,
+            allow_upgrades: true,
+            redaction_profile: Some("secrets".to_string()),
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let request = format!(
+        concat!(
+            "GET http://{host}/chat HTTP/1.1\r\n",
+            "Host: {host}\r\n",
+            "Connection: Upgrade, close\r\n",
+            "Upgrade: h2c\r\n",
+            "\r\n"
+        ),
+        host = host
+    );
+    let (_response, status) = send_raw_http_request(proxy_addr, &request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        seen_headers.lock().unwrap().is_none(),
+        "protected non-WebSocket upgrade should not reach upstream"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn external_auth_callback_pass_falls_through_to_later_allow() {
     let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
 
@@ -1255,6 +1695,7 @@ async fn allowed_request_uses_configured_egress_forwarding_destination() {
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -1318,6 +1759,7 @@ async fn global_egress_request_actions_are_applied_after_rule_actions_without_af
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -1336,6 +1778,7 @@ async fn global_egress_request_actions_are_applied_after_rule_actions_without_af
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: vec![
@@ -1485,6 +1928,7 @@ async fn global_egress_request_actions_respect_intra_layer_order() {
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -1576,6 +2020,7 @@ async fn empty_global_egress_actions_preserve_existing_rule_header_behavior() {
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: vec![acl_proxy::config::HeaderActionConfig {
@@ -1823,6 +2268,181 @@ async fn start_proxy_with_config(
     });
 
     (addr, temp_dir)
+}
+
+fn build_websocket_frame(opcode: u8, payload: &[u8], masked: bool) -> Vec<u8> {
+    build_websocket_frame_with_bits(true, false, opcode, payload, masked)
+}
+
+fn build_websocket_frame_with_bits(
+    fin: bool,
+    rsv1: bool,
+    opcode: u8,
+    payload: &[u8],
+    masked: bool,
+) -> Vec<u8> {
+    let mut frame = Vec::new();
+    let mut first = opcode & 0x0f;
+    if fin {
+        first |= 0x80;
+    }
+    if rsv1 {
+        first |= 0x40;
+    }
+    frame.push(first);
+    let mask_bit = if masked { 0x80 } else { 0x00 };
+    if payload.len() < 126 {
+        frame.push(mask_bit | payload.len() as u8);
+    } else if payload.len() <= u16::MAX as usize {
+        frame.push(mask_bit | 126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push(mask_bit | 127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+
+    if masked {
+        let mask = [0x11, 0x22, 0x33, 0x44];
+        frame.extend_from_slice(&mask);
+        for (idx, byte) in payload.iter().enumerate() {
+            frame.push(byte ^ mask[idx % mask.len()]);
+        }
+    } else {
+        frame.extend_from_slice(payload);
+    }
+    frame
+}
+
+async fn write_websocket_frame<W>(
+    writer: &mut W,
+    opcode: u8,
+    payload: &[u8],
+    masked: bool,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer
+        .write_all(&build_websocket_frame(opcode, payload, masked))
+        .await
+}
+
+async fn write_websocket_frame_with_bits<W>(
+    writer: &mut W,
+    fin: bool,
+    rsv1: bool,
+    opcode: u8,
+    payload: &[u8],
+    masked: bool,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer
+        .write_all(&build_websocket_frame_with_bits(
+            fin, rsv1, opcode, payload, masked,
+        ))
+        .await
+}
+
+async fn read_websocket_frame<R>(reader: &mut R) -> std::io::Result<TestWebSocketFrame>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0_u8; 2];
+    reader.read_exact(&mut header).await?;
+    let fin = header[0] & 0x80 != 0;
+    let rsv1 = header[0] & 0x40 != 0;
+    let opcode = header[0] & 0x0f;
+    let masked = header[1] & 0x80 != 0;
+    let mut len = u64::from(header[1] & 0x7f);
+    if len == 126 {
+        let mut extended = [0_u8; 2];
+        reader.read_exact(&mut extended).await?;
+        len = u64::from(u16::from_be_bytes(extended));
+    } else if len == 127 {
+        let mut extended = [0_u8; 8];
+        reader.read_exact(&mut extended).await?;
+        len = u64::from_be_bytes(extended);
+    }
+
+    let mut mask = [0_u8; 4];
+    if masked {
+        reader.read_exact(&mut mask).await?;
+    }
+
+    let mut payload = vec![0_u8; len as usize];
+    reader.read_exact(&mut payload).await?;
+    if masked {
+        for (idx, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[idx % mask.len()];
+        }
+    }
+
+    Ok(TestWebSocketFrame {
+        fin,
+        rsv1,
+        opcode,
+        payload,
+    })
+}
+
+fn websocket_deflate_compress(payload: &[u8]) -> Vec<u8> {
+    let tail = [0x00, 0x00, 0xff, 0xff];
+    let mut encoder = Compress::new(Compression::default(), false);
+    let mut output = Vec::with_capacity(payload.len() + (payload.len() / 16) + 64);
+
+    for _ in 0..8 {
+        if output.capacity() == output.len() {
+            output.reserve(payload.len().max(64));
+        }
+        let consumed = encoder.total_in() as usize;
+        encoder
+            .compress_vec(&payload[consumed..], &mut output, FlushCompress::Sync)
+            .expect("compress websocket message");
+        if encoder.total_in() == payload.len() as u64 && output.ends_with(&tail) {
+            output.truncate(output.len() - tail.len());
+            return output;
+        }
+    }
+
+    panic!("websocket deflate encoder did not produce sync flush tail");
+}
+
+fn websocket_deflate_decompress(payload: &[u8]) -> Vec<u8> {
+    let mut encoded = payload.to_vec();
+    encoded.extend_from_slice(&[0x00, 0x00, 0xff, 0xff]);
+    let mut decoder = DeflateDecoder::new(encoded.as_slice());
+    let mut decoded = Vec::new();
+    decoder
+        .read_to_end(&mut decoded)
+        .expect("decompress websocket message");
+    decoded
+}
+
+async fn read_http_response_head(
+    stream: &mut tokio::net::TcpStream,
+) -> std::io::Result<(String, StatusCode)> {
+    let mut buf = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        stream.read_exact(&mut byte).await?;
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let response = String::from_utf8_lossy(&buf).to_string();
+    let status = response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .and_then(|code| StatusCode::from_u16(code).ok())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+    Ok((response, status))
 }
 
 fn write_body_rewrite_plugin(dir: &TempDir, body: &[u8]) -> std::path::PathBuf {
@@ -2112,6 +2732,50 @@ async fn send_h2c_http_request(addr: SocketAddr, uri: &str) -> (String, StatusCo
     (String::from_utf8_lossy(&body_bytes).to_string(), status)
 }
 
+async fn send_h2c_http_request_with_body(
+    addr: SocketAddr,
+    method: &str,
+    uri: &str,
+    payload: &[u8],
+) -> (String, StatusCode) {
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect proxy");
+    let (send_request, connection) = h2_client::handshake(stream).await.expect("h2 handshake");
+
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("h2 connection error: {err}");
+        }
+    });
+
+    let mut send_request = send_request.ready().await.expect("h2 ready");
+    let request = http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .version(http::Version::HTTP_2)
+        .body(())
+        .expect("build h2 request");
+
+    let (response_fut, mut send_stream) = send_request
+        .send_request(request, false)
+        .expect("send h2 request");
+    send_stream
+        .send_data(payload.to_vec().into(), true)
+        .expect("send h2 request body");
+    let response = response_fut.await.expect("await h2 response");
+    let status = response.status();
+
+    let mut body = response.into_body();
+    let mut body_bytes = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.expect("h2 response chunk");
+        body_bytes.extend_from_slice(&chunk);
+    }
+
+    (String::from_utf8_lossy(&body_bytes).to_string(), status)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn http_explicit_listener_accepts_h2c_prior_knowledge_requests() {
     let (upstream_addr, _seen_headers) = start_upstream_echo_server().await;
@@ -2137,6 +2801,7 @@ async fn http_explicit_listener_accepts_h2c_prior_knowledge_requests() {
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2243,6 +2908,298 @@ external_auth_profile = "body_guard"
         Some("application/json")
     );
     assert!(request.headers.get("content-encoding").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_redaction_rewrites_http_request_body() {
+    let (upstream_addr, seen_requests) = start_upstream_body_echo_server().await;
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    let toml = format!(
+        r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+
+[logging]
+directory = "logs"
+level = "debug"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[redaction.profiles.secrets]
+replacement = "[REDACTED]"
+max_body_bytes = 4096
+max_decoded_body_bytes = 4096
+
+[[redaction.profiles.secrets.rules]]
+literals = ["password"]
+expressions = ["token-[0-9]+"]
+match = "text"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "http://{host}/**"
+redaction_profile = "secrets"
+"#,
+        host = host
+    );
+    let config: Config = toml::from_str(&toml).expect("parse config");
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let original = br#"{"prompt":"password token-123"}"#;
+    let expected = br#"{"prompt":"[REDACTED] [REDACTED]"}"#;
+    let raw_request = format!(
+        "POST http://{host}/chat HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        original.len(),
+        String::from_utf8_lossy(original)
+    );
+    let (_response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let seen = seen_requests.lock().unwrap();
+    let request = seen.first().expect("upstream should see request");
+    assert_eq!(request.body, expected);
+    let content_length = request
+        .headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    assert_eq!(content_length, Some(expected.len().to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_redaction_leaves_bodyless_http_request_headers_unchanged() {
+    let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    let mut config = minimal_config();
+    config.redaction.profiles.insert(
+        "secrets".to_string(),
+        acl_proxy::config::RedactionProfileConfig {
+            replacement: "[REDACTED]".to_string(),
+            rules: vec![acl_proxy::config::RedactionRuleConfig {
+                literals: vec!["password".to_string()],
+                expressions: Vec::new(),
+                match_mode: acl_proxy::config::RedactionMatch::Text,
+            }],
+            ..Default::default()
+        },
+    );
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyRuleAction::Allow,
+            pattern: Some(format!("http://{host}/**")),
+            patterns: None,
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: None,
+            headers_not_match: None,
+            request_timeout_ms: None,
+            allow_upgrades: true,
+            redaction_profile: Some("secrets".to_string()),
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let raw_request =
+        format!("GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let (_response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    let headers = seen_headers
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("upstream headers");
+    assert!(headers.get("content-length").is_none());
+    assert!(headers.get("transfer-encoding").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_redaction_redacts_h2c_body_without_content_length() {
+    let (upstream_addr, seen_requests) = start_upstream_body_echo_server().await;
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    let mut config = minimal_config();
+    config.redaction.profiles.insert(
+        "secrets".to_string(),
+        acl_proxy::config::RedactionProfileConfig {
+            replacement: "[REDACTED]".to_string(),
+            rules: vec![acl_proxy::config::RedactionRuleConfig {
+                literals: vec!["password".to_string()],
+                expressions: Vec::new(),
+                match_mode: acl_proxy::config::RedactionMatch::Text,
+            }],
+            ..Default::default()
+        },
+    );
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyRuleAction::Allow,
+            pattern: Some(format!("http://{host}/**")),
+            patterns: None,
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: None,
+            headers_not_match: None,
+            request_timeout_ms: None,
+            allow_upgrades: true,
+            redaction_profile: Some("secrets".to_string()),
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let uri = format!("http://{host}/chat");
+    let (_response, status) =
+        send_h2c_http_request_with_body(proxy_addr, "POST", &uri, b"password").await;
+
+    assert_eq!(status, StatusCode::OK);
+    let seen = seen_requests.lock().unwrap();
+    let request = seen.first().expect("upstream should see request");
+    assert_eq!(request.body, b"[REDACTED]");
+    let content_length = request
+        .headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    assert_eq!(content_length, Some("[REDACTED]".len().to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn native_redaction_recompresses_gzip_request_body() {
+    let (upstream_addr, seen_requests) = start_upstream_body_echo_server().await;
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    let toml = format!(
+        r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+
+[logging]
+directory = "logs"
+level = "debug"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[redaction.profiles.secrets]
+replacement = "[REDACTED]"
+max_body_bytes = 4096
+max_decoded_body_bytes = 4096
+
+[[redaction.profiles.secrets.rules]]
+literals = ["password"]
+match = "text"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "http://{host}/**"
+redaction_profile = "secrets"
+"#,
+        host = host
+    );
+    let config: Config = toml::from_str(&toml).expect("parse config");
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let original_encoded = gzip_bytes(br#"{"prompt":"password"}"#);
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
+    let request_head = format!(
+        "POST http://{host}/chat HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        original_encoded.len()
+    );
+    stream
+        .write_all(request_head.as_bytes())
+        .await
+        .expect("write request head");
+    stream
+        .write_all(&original_encoded)
+        .await
+        .expect("write request body");
+
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.expect("read response");
+    let response = String::from_utf8_lossy(&buf);
+    assert!(
+        response
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .contains(" 200 "),
+        "unexpected response: {response}"
+    );
+
+    let seen = seen_requests.lock().unwrap();
+    let request = seen.first().expect("upstream should see request");
+    assert_eq!(
+        request
+            .headers
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok()),
+        Some("gzip")
+    );
+    assert_eq!(gunzip_bytes(&request.body), br#"{"prompt":"[REDACTED]"}"#);
+    let content_length = request
+        .headers
+        .get("content-length")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    assert_eq!(content_length, Some(request.body.len().to_string()));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2535,6 +3492,7 @@ async fn allowed_request_is_proxied_and_loop_header_added() {
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2601,6 +3559,7 @@ async fn headers_absent_top_deny_guard_falls_through_to_allow_rule() {
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2619,6 +3578,7 @@ async fn headers_absent_top_deny_guard_falls_through_to_allow_rule() {
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2697,6 +3657,7 @@ async fn method_scoped_headers_absent_guard_only_blocks_matching_methods() {
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2715,6 +3676,7 @@ async fn method_scoped_headers_absent_guard_only_blocks_matching_methods() {
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2786,6 +3748,7 @@ async fn headers_match_top_guard_denies_non_matching_value_and_allows_matching_v
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2804,6 +3767,7 @@ async fn headers_match_top_guard_denies_non_matching_value_and_allows_matching_v
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2883,6 +3847,7 @@ async fn headers_match_http_regressions_cover_repeated_values_comma_literals_and
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2961,6 +3926,7 @@ async fn headers_not_match_top_deny_guard_blocks_non_internal_and_allows_interna
             )])),
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -2979,6 +3945,7 @@ async fn headers_not_match_top_deny_guard_blocks_non_internal_and_allows_interna
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -3061,6 +4028,7 @@ async fn loop_header_not_added_when_disabled() {
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -3213,6 +4181,7 @@ async fn origin_form_request_with_host_is_forwarded() {
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -3279,6 +4248,7 @@ async fn upstream_connection_failure_returns_502() {
             headers_not_match: None,
             request_timeout_ms: None,
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),
@@ -3331,6 +4301,7 @@ async fn upstream_request_timeout_returns_504() {
             headers_not_match: None,
             request_timeout_ms: Some(150),
             allow_upgrades: true,
+            redaction_profile: None,
             with: None,
             add_url_enc_variants: None,
             header_actions: Vec::new(),

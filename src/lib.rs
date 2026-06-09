@@ -9,3 +9,4 @@ pub mod logging;
 pub mod loop_protection;
 pub mod policy;
 pub mod proxy;
+pub mod redaction;
