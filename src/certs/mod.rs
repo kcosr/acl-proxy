@@ -386,23 +386,22 @@ fn load_ca_from_files(ca_key_path: &Path, ca_cert_path: &Path) -> Result<CaMater
     let key_pair =
         KeyPair::from_pem(&key_pem).map_err(|e| CertError::ParseCaKey(format!("{e}")))?;
 
-    let params = CertificateParams::from_ca_cert_pem(&cert_pem)
+    let mut reader = Cursor::new(cert_pem.as_bytes());
+    let mut certs =
+        rustls_pemfile::certs(&mut reader).map_err(|e| CertError::ParseCaCert(format!("{e}")))?;
+    let cert_der = if certs.is_empty() {
+        return Err(CertError::ParseCaCert(
+            "expected at least one CA certificate".to_string(),
+        ));
+    } else {
+        certs.remove(0)
+    };
+
+    let params = CertificateParams::from_ca_cert_der(&cert_der.as_slice().into())
         .map_err(|e| CertError::ParseCaCert(format!("{e}")))?;
     let ca_cert = params
         .self_signed(&key_pair)
         .map_err(|e| CertError::ParseCaCert(format!("{e}")))?;
-
-    let mut reader = Cursor::new(cert_pem.as_bytes());
-    let mut certs =
-        rustls_pemfile::certs(&mut reader).map_err(|e| CertError::ParseCaCert(format!("{e}")))?;
-    let cert_der = if certs.len() == 1 {
-        certs.remove(0)
-    } else {
-        return Err(CertError::ParseCaCert(format!(
-            "expected exactly one CA certificate, found {}",
-            certs.len()
-        )));
-    };
 
     Ok(CaMaterial {
         cert: ca_cert,
@@ -814,6 +813,47 @@ mod tests {
             chain_certs.last() == Some(ca_cert),
             "host chain should end with the configured CA cert",
         );
+    }
+
+    #[test]
+    fn configured_ca_bundle_uses_first_certificate() {
+        let tmp = TempDir::new().expect("tempdir");
+        let certs_dir = tmp.path().join("certs");
+        fs::create_dir_all(&certs_dir).expect("create certs dir");
+
+        let ca_key_path = certs_dir.join("custom-ca-key.pem");
+        let ca_cert_path = certs_dir.join("custom-ca-cert.pem");
+        let extra_key_path = certs_dir.join("extra-ca-key.pem");
+        let extra_cert_path = certs_dir.join("extra-ca-cert.pem");
+
+        generate_ca(&ca_key_path, &ca_cert_path).expect("generate ca");
+        generate_ca(&extra_key_path, &extra_cert_path).expect("generate extra ca");
+        let extra_cert_pem = fs::read_to_string(&extra_cert_path).expect("read extra cert");
+        fs::write(
+            &ca_cert_path,
+            format!(
+                "{}{}",
+                fs::read_to_string(&ca_cert_path).expect("read ca cert"),
+                extra_cert_pem
+            ),
+        )
+        .expect("write bundle");
+
+        let cfg = CertificatesConfig {
+            certs_dir: certs_dir.to_string_lossy().to_string(),
+            ca_key_path: Some(ca_key_path.to_string_lossy().to_string()),
+            ca_cert_path: Some(ca_cert_path.to_string_lossy().to_string()),
+            ..CertificatesConfig::default()
+        };
+
+        let mut reader =
+            std::io::Cursor::new(fs::read_to_string(&ca_cert_path).expect("read bundle"));
+        let bundle_certs = rustls_pemfile::certs(&mut reader).expect("parse bundle");
+        assert_eq!(bundle_certs.len(), 2);
+
+        let mgr = CertManager::from_config(&cfg).expect("cert manager");
+
+        assert_eq!(mgr.inner.ca_cert_der, bundle_certs[0]);
     }
 
     #[test]

@@ -1110,7 +1110,7 @@ graph LR
 ### CA Behavior
 
 - **Default CA** (no explicit paths): Auto-generated at `certs/ca-key.pem` and `certs/ca-cert.pem`. If valid files exist, they are reused; otherwise a new CA is generated and written.
-- **External CA** (`ca_key_path` + `ca_cert_path`): Used as-is. Missing/invalid files cause startup/reload failure. Both must be set or both omitted.
+- **External CA** (`ca_key_path` + `ca_cert_path`): Used as-is. Missing/invalid files cause startup/reload failure. Both must be set or both omitted. If `ca_cert_path` contains multiple PEM certificates, the first certificate is used as the signing CA and live TLS chain CA; the full PEM file is preserved in optional persisted debug chain files.
 
 On Unix, certificate directories are created or tightened to owner-only (`0700`) and generated CA/per-host PEM files are created or tightened to owner-only (`0600`).
 
