@@ -211,6 +211,8 @@ sequenceDiagram
     Headers-->>Client: Forward response (+ capture/log)
 ```
 
+Forwarded requests and responses strip hop-by-hop and proxy-control headers, including headers named by `Connection`, `Proxy-Authorization`, and `Proxy-Connection`. Rule/plugin/global header actions run after request filtering, and response header actions run after response filtering.
+
 ### Transparent HTTP Interception
 
 In transparent HTTP mode, upstream target selection is based on the inbound `Host` header (`:80` when no port is present). Use restrictive policy rules for the destinations you intend to allow.

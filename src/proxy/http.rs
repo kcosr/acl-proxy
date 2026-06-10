@@ -2345,11 +2345,9 @@ pub(crate) async fn proxy_allowed_request(
 
     {
         let headers = builder.headers_mut().expect("headers mut");
-        for (name, value) in req.headers().iter() {
-            if name == HOST {
-                continue;
-            }
-            headers.append(name, value.clone());
+        copy_end_to_end_headers(req.headers(), headers, true);
+        if request_is_upgrade {
+            copy_required_upgrade_headers(req.headers(), headers);
         }
 
         headers.insert(
@@ -2625,6 +2623,7 @@ pub(crate) async fn proxy_allowed_request(
         } else {
             None
         };
+    let response_is_upgrade = upstream_upgrade.is_some();
 
     let (resp, resp_capture_rx) = if capture_response {
         let (parts, upstream_body) = upstream_resp.into_parts();
@@ -2633,8 +2632,9 @@ pub(crate) async fn proxy_allowed_request(
         let mut out = Response::builder().status(status).version(resp_version);
         {
             let headers = out.headers_mut().expect("headers mut");
-            for (name, value) in parts.headers.iter() {
-                headers.append(name.clone(), value.clone());
+            copy_end_to_end_headers(&parts.headers, headers, false);
+            if response_is_upgrade {
+                copy_required_upgrade_headers(&parts.headers, headers);
             }
             apply_header_actions(
                 headers,
@@ -2648,6 +2648,11 @@ pub(crate) async fn proxy_allowed_request(
             .unwrap_or_else(|_| Response::new(Body::empty()));
         (resp, Some(handle))
     } else {
+        if response_is_upgrade {
+            strip_hop_by_hop_headers_preserving_upgrade(upstream_resp.headers_mut());
+        } else {
+            strip_hop_by_hop_headers(upstream_resp.headers_mut());
+        }
         apply_header_actions(
             upstream_resp.headers_mut(),
             &header_actions,
@@ -2963,6 +2968,98 @@ fn snapshot_header_presence(headers: &HttpHeaderMap) -> HashSet<HeaderName> {
         set.insert(name.clone());
     }
     set
+}
+
+fn copy_end_to_end_headers(
+    source: &HttpHeaderMap,
+    destination: &mut HttpHeaderMap,
+    skip_host: bool,
+) {
+    let connection_tokens = connection_header_tokens(source);
+    for (name, value) in source.iter() {
+        if skip_host && name == HOST {
+            continue;
+        }
+        if should_strip_hop_by_hop_header(name, &connection_tokens) {
+            continue;
+        }
+        destination.append(name.clone(), value.clone());
+    }
+}
+
+fn strip_hop_by_hop_headers(headers: &mut HttpHeaderMap) {
+    let connection_tokens = connection_header_tokens(headers);
+    let names_to_remove: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| should_strip_hop_by_hop_header(name, &connection_tokens))
+        .cloned()
+        .collect();
+    for name in names_to_remove {
+        headers.remove(name);
+    }
+}
+
+fn strip_hop_by_hop_headers_preserving_upgrade(headers: &mut HttpHeaderMap) {
+    let upgrade = headers.get(http::header::UPGRADE).cloned();
+    strip_hop_by_hop_headers(headers);
+    if let Some(upgrade) = upgrade {
+        headers.insert(http::header::UPGRADE, upgrade);
+        headers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("upgrade"),
+        );
+    }
+}
+
+fn copy_required_upgrade_headers(source: &HttpHeaderMap, destination: &mut HttpHeaderMap) {
+    if let Some(upgrade) = source.get(http::header::UPGRADE) {
+        destination.insert(http::header::UPGRADE, upgrade.clone());
+        destination.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("upgrade"),
+        );
+    }
+}
+
+fn connection_header_tokens(headers: &HttpHeaderMap) -> HashSet<HeaderName> {
+    let mut tokens = HashSet::new();
+    for value in headers.get_all(http::header::CONNECTION).iter() {
+        let Ok(raw) = value.to_str() else {
+            continue;
+        };
+        for token in raw.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            if let Ok(name) = HeaderName::from_bytes(token.as_bytes()) {
+                tokens.insert(name);
+            }
+        }
+    }
+    tokens
+}
+
+fn should_strip_hop_by_hop_header(
+    name: &HeaderName,
+    connection_tokens: &HashSet<HeaderName>,
+) -> bool {
+    is_standard_hop_by_hop_header(name) || connection_tokens.contains(name)
+}
+
+fn is_standard_hop_by_hop_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
 }
 
 fn collect_approval_macros_from_str(s: &str, out: &mut BTreeSet<String>) {
@@ -3287,11 +3384,12 @@ pub(crate) fn generate_request_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_full_url, generate_request_id, headers_to_capture_map, is_internal_endpoint,
-        is_upgrade_request, tee_body,
+        build_full_url, copy_end_to_end_headers, copy_required_upgrade_headers,
+        generate_request_id, headers_to_capture_map, is_internal_endpoint, is_upgrade_request,
+        strip_hop_by_hop_headers, strip_hop_by_hop_headers_preserving_upgrade, tee_body,
     };
     use http::header::HOST;
-    use http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
+    use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
     use hyper::{Body, Request};
 
     #[test]
@@ -3385,6 +3483,116 @@ mod tests {
         assert_eq!(
             captured.get("content-type"),
             Some(&serde_json::Value::String("text/plain".to_string()))
+        );
+    }
+
+    #[test]
+    fn copy_end_to_end_headers_strips_proxy_and_hop_headers() {
+        let x_remove = HeaderName::from_static("x-remove");
+        let proxy_connection = HeaderName::from_static("proxy-connection");
+        let mut source = HeaderMap::new();
+        source.insert(HOST, HeaderValue::from_static("example.com"));
+        source.insert(
+            header::CONNECTION,
+            HeaderValue::from_static("keep-alive, x-remove"),
+        );
+        source.insert(x_remove.clone(), HeaderValue::from_static("remove-me"));
+        source.insert(
+            header::PROXY_AUTHORIZATION,
+            HeaderValue::from_static("Basic secret"),
+        );
+        source.insert(proxy_connection.clone(), HeaderValue::from_static("close"));
+        source.insert(header::TE, HeaderValue::from_static("trailers"));
+        source.insert(header::TRAILER, HeaderValue::from_static("expires"));
+        source.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+        source.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+
+        let mut destination = HeaderMap::new();
+        copy_end_to_end_headers(&source, &mut destination, true);
+
+        assert!(!destination.contains_key(HOST));
+        assert!(!destination.contains_key(header::CONNECTION));
+        assert!(!destination.contains_key(&x_remove));
+        assert!(!destination.contains_key(header::PROXY_AUTHORIZATION));
+        assert!(!destination.contains_key(&proxy_connection));
+        assert!(!destination.contains_key(header::TE));
+        assert!(!destination.contains_key(header::TRAILER));
+        assert!(!destination.contains_key(header::UPGRADE));
+        assert_eq!(
+            destination.get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/plain"))
+        );
+    }
+
+    #[test]
+    fn strip_hop_by_hop_headers_removes_connection_named_headers() {
+        let x_hop = HeaderName::from_static("x-hop");
+        let proxy_connection = HeaderName::from_static("proxy-connection");
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONNECTION, HeaderValue::from_static("x-hop"));
+        headers.insert(x_hop.clone(), HeaderValue::from_static("remove-me"));
+        headers.insert(
+            header::PROXY_AUTHENTICATE,
+            HeaderValue::from_static("Basic realm=\"proxy\""),
+        );
+        headers.insert(proxy_connection.clone(), HeaderValue::from_static("close"));
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+
+        strip_hop_by_hop_headers(&mut headers);
+
+        assert!(!headers.contains_key(header::CONNECTION));
+        assert!(!headers.contains_key(&x_hop));
+        assert!(!headers.contains_key(header::PROXY_AUTHENTICATE));
+        assert!(!headers.contains_key(&proxy_connection));
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/plain"))
+        );
+    }
+
+    #[test]
+    fn upgrade_filtering_keeps_only_required_upgrade_headers() {
+        let x_hop = HeaderName::from_static("x-hop");
+        let mut source = HeaderMap::new();
+        source.insert(
+            header::CONNECTION,
+            HeaderValue::from_static("keep-alive, upgrade, x-hop"),
+        );
+        source.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+        source.insert(x_hop.clone(), HeaderValue::from_static("remove-me"));
+        source.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+
+        let mut copied = HeaderMap::new();
+        copy_end_to_end_headers(&source, &mut copied, false);
+        copy_required_upgrade_headers(&source, &mut copied);
+
+        assert_eq!(
+            copied.get(header::CONNECTION),
+            Some(&HeaderValue::from_static("upgrade"))
+        );
+        assert_eq!(
+            copied.get(header::UPGRADE),
+            Some(&HeaderValue::from_static("websocket"))
+        );
+        assert!(!copied.contains_key(&x_hop));
+        assert_eq!(
+            copied.get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/plain"))
+        );
+
+        strip_hop_by_hop_headers_preserving_upgrade(&mut source);
+        assert_eq!(
+            source.get(header::CONNECTION),
+            Some(&HeaderValue::from_static("upgrade"))
+        );
+        assert_eq!(
+            source.get(header::UPGRADE),
+            Some(&HeaderValue::from_static("websocket"))
+        );
+        assert!(!source.contains_key(&x_hop));
+        assert_eq!(
+            source.get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/plain"))
         );
     }
 
