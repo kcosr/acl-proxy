@@ -1423,16 +1423,17 @@ pub fn pattern_to_regex(pattern: &str) -> String {
     }
 
     let lower = raw.to_ascii_lowercase();
-    let rest = if lower.starts_with("http://") {
-        &raw[7..]
+    let (scheme, rest) = if lower.starts_with("http://") {
+        (Some("http"), &raw[7..])
     } else if lower.starts_with("https://") {
-        &raw[8..]
+        (Some("https"), &raw[8..])
     } else {
         let trimmed = raw.trim_start_matches('/');
-        trimmed
+        (None, trimmed)
     };
 
     let mut rest = rest.to_string();
+    strip_default_port_from_pattern_authority(&mut rest, scheme);
 
     let slash_idx = rest.find('/');
     let path_part = slash_idx
@@ -1455,6 +1456,23 @@ pub fn pattern_to_regex(pattern: &str) -> String {
 
     let scheme_regex = "https?://";
     format!("^{}{}$", scheme_regex, s)
+}
+
+fn strip_default_port_from_pattern_authority(rest: &mut String, scheme: Option<&str>) {
+    let default_port = match scheme {
+        Some("http") => ":80",
+        Some("https") => ":443",
+        _ => return,
+    };
+
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    if rest[..authority_end]
+        .to_ascii_lowercase()
+        .ends_with(default_port)
+    {
+        let port_start = authority_end - default_port.len();
+        rest.replace_range(port_start..authority_end, "");
+    }
 }
 
 fn normalize_url(raw: &str) -> Result<String, PolicyError> {
@@ -1595,6 +1613,17 @@ mod tests {
     }
 
     #[test]
+    fn pattern_to_regex_strips_scheme_default_ports() {
+        let https_re = Regex::new(&pattern_to_regex("https://example.com:443/secret/**")).unwrap();
+        assert!(https_re.is_match("https://example.com/secret/path"));
+        assert!(!https_re.is_match("https://example.com:443/secret/path"));
+
+        let http_re = Regex::new(&pattern_to_regex("http://example.com:80")).unwrap();
+        assert!(http_re.is_match("http://example.com/"));
+        assert!(!http_re.is_match("http://example.com:80/"));
+    }
+
+    #[test]
     fn pattern_to_regex_wildcards() {
         let re =
             Regex::new(&pattern_to_regex("https://example.com/api/**")).expect("compile regex");
@@ -1625,12 +1654,29 @@ pattern = "https://example.com/admin/**"
             None,
             Some("GET")
         ));
+        assert!(!engine.is_allowed("https://example.com/%61dmin/panel", None, Some("GET")));
         assert!(!engine.is_allowed(
             "https://user:pass@example.com/admin/panel",
             None,
             Some("GET")
         ));
         assert!(!engine.is_allowed("ftp://example.com/admin/panel", None, Some("GET")));
+    }
+
+    #[test]
+    fn policy_default_port_patterns_match_canonical_urls() {
+        let toml = r#"
+default = "allow"
+
+[[rules]]
+action = "deny"
+pattern = "https://example.com:443/secret/**"
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        assert!(!engine.is_allowed("https://example.com/secret/panel", None, Some("GET")));
     }
 
     #[test]

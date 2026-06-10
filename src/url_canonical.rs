@@ -44,11 +44,11 @@ pub(crate) fn canonicalize_http_url(raw: &str) -> Result<CanonicalUrl, Canonical
         None => host_for_url.clone(),
     };
 
-    let path = if url.path().is_empty() {
+    let path = normalize_path_percent_encoding(if url.path().is_empty() {
         "/"
     } else {
         url.path()
-    };
+    });
     let query = match url.query() {
         Some(query) => format!("?{query}"),
         None => String::new(),
@@ -68,6 +68,45 @@ fn canonical_host(raw_host: &str) -> Result<String, CanonicalUrlError> {
         return Err(CanonicalUrlError::EmptyHost);
     }
     Ok(host.to_ascii_lowercase())
+}
+
+fn normalize_path_percent_encoding(path: &str) -> String {
+    let bytes = path.as_bytes();
+    let mut normalized = String::with_capacity(path.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
+            {
+                let decoded = (high << 4) | low;
+                if is_unreserved(decoded) {
+                    normalized.push(decoded as char);
+                    index += 3;
+                    continue;
+                }
+            }
+        }
+
+        normalized.push(bytes[index] as char);
+        index += 1;
+    }
+
+    normalized
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn is_unreserved(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~')
 }
 
 fn host_for_url_authority(host: &str) -> String {
@@ -102,6 +141,14 @@ mod tests {
         assert_eq!(canonical.authority, "[::1]:8080");
         assert_eq!(canonical.host_for_capture, "[::1]");
         assert_eq!(canonical.port, 8080);
+    }
+
+    #[test]
+    fn decodes_unreserved_path_percent_encoding_only() {
+        let canonical = canonicalize_http_url("https://example.com/%61dmin/%7Eme/%2F?q=%61")
+            .expect("canonical");
+
+        assert_eq!(canonical.url, "https://example.com/admin/~me/%2F?q=%61");
     }
 
     #[test]
