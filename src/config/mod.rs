@@ -47,6 +47,7 @@ enum ConfigEnvPlaceholder<'a> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalAuthConfig {
     /// Full callback URL external auth services should use when
     /// delivering approval decisions back to this proxy instance.
@@ -70,6 +71,7 @@ fn default_external_auth_profile_type() -> ExternalAuthProfileType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(skip)]
     pub load_warnings: Vec<String>,
@@ -110,6 +112,7 @@ fn default_schema_version() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
@@ -172,6 +175,7 @@ fn default_internal_base_path() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyEgressConfig {
     #[serde(default)]
     pub default: Option<EgressTargetConfig>,
@@ -181,6 +185,7 @@ pub struct ProxyEgressConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct EgressTargetConfig {
     pub host: String,
     pub port: u16,
@@ -209,6 +214,7 @@ pub struct EgressRequestHeaderActionConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingPolicyDecisionsConfig {
     #[serde(default)]
     pub log_allows: bool,
@@ -247,6 +253,7 @@ fn default_policy_deny_level() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     #[serde(default, deserialize_with = "deserialize_optional_path")]
     pub directory: Option<PathBuf>,
@@ -312,6 +319,7 @@ where
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaptureConfig {
     #[serde(default)]
     pub allowed_request: bool,
@@ -341,12 +349,14 @@ pub struct CaptureConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RedactionConfig {
     #[serde(default)]
     pub profiles: std::collections::BTreeMap<String, RedactionProfileConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RedactionProfileConfig {
     #[serde(default = "default_redaction_replacement")]
     pub replacement: String,
@@ -389,6 +399,7 @@ impl Default for RedactionProfileConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RedactionRuleConfig {
     #[serde(default)]
     pub literals: Vec<String>,
@@ -456,6 +467,7 @@ fn default_capture_max_body_bytes() -> usize {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoopProtectionConfig {
     #[serde(default = "default_loop_enabled")]
     pub enabled: bool,
@@ -490,6 +502,7 @@ fn default_loop_header_name() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CertificatesConfig {
     #[serde(default = "default_certs_dir")]
     pub certs_dir: String,
@@ -528,6 +541,7 @@ fn default_max_cached_certs() -> usize {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     #[serde(default = "default_verify_upstream")]
     pub verify_upstream: bool,
@@ -597,6 +611,7 @@ pub enum PolicyRuleAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyRuleTemplateConfig {
     pub action: PolicyRuleAction,
 
@@ -648,6 +663,7 @@ pub struct PolicyRuleTemplateConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyRuleIncludeConfig {
     /// Name of the ruleset to include.
     pub include: String,
@@ -673,6 +689,7 @@ pub struct PolicyRuleIncludeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyRuleDirectConfig {
     pub action: PolicyRuleAction,
 
@@ -742,6 +759,7 @@ fn default_allow_upgrades() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
     #[serde(default)]
     pub default: PolicyDefaultAction,
@@ -786,6 +804,7 @@ pub type ExternalAuthProfileConfigMap =
     std::collections::BTreeMap<String, ExternalAuthProfileConfig>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalMacroConfig {
     #[serde(default)]
     pub label: Option<String>,
@@ -810,6 +829,7 @@ pub enum ExternalAuthWebhookFailureMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalAuthProfileConfig {
     #[serde(rename = "type", default = "default_external_auth_profile_type")]
     pub profile_type: ExternalAuthProfileType,
@@ -1889,6 +1909,74 @@ default = "deny"
         assert_eq!(config.proxy.http_port, 8080);
         assert_eq!(config.logging.level, "debug");
         assert!(matches!(config.policy.default, PolicyDefaultAction::Deny));
+    }
+
+    #[test]
+    fn unknown_section_fields_are_rejected() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_ports = 8080
+
+[policy]
+default = "deny"
+        "#;
+
+        let err = toml::from_str::<Config>(toml).expect_err("unknown field should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown field") && msg.contains("http_ports"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn policy_rule_typo_fields_are_rejected() {
+        let toml = r#"
+schema_version = "1"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+method = "GET"
+        "#;
+
+        let err = toml::from_str::<Config>(toml).expect_err("unknown rule field should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown field") || msg.contains("data did not match any variant"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn ruleset_template_typo_fields_are_rejected() {
+        let toml = r#"
+schema_version = "1"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+include = "restricted"
+
+[[policy.rulesets.restricted]]
+action = "allow"
+pattern = "https://example.com/**"
+subnet = "10.0.0.0/8"
+        "#;
+
+        let err = toml::from_str::<Config>(toml).expect_err("unknown template field should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown field") && msg.contains("subnet"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]

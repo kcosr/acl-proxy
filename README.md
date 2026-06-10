@@ -576,7 +576,7 @@ schema_version = "1"          # required; only "1" is supported
 [policy]
 ```
 
-All sections except `schema_version` and `[policy].default` are optional with sensible defaults.
+All sections except `schema_version` and `[policy].default` are optional with sensible defaults. Unknown keys in structured config sections, rules, ruleset templates, and profiles are rejected so typos such as `method` instead of `methods` do not silently weaken policy.
 
 ### `[proxy]` — Listeners and Ports
 
@@ -869,6 +869,7 @@ The repository includes [`acl-proxy.sample.toml`](acl-proxy.sample.toml) as a co
 The config loader performs validation beyond basic TOML parsing:
 
 - `schema_version` must equal `"1"`.
+- Unknown keys in structured tables are rejected during TOML parsing.
 - Direct rules must have at least one of `pattern`, `patterns`, `methods`, `subnets`, `headers_absent`, `headers_match`, or `headers_not_match`.
 - Direct rules and ruleset templates must not define both `pattern` and `patterns`.
 - `patterns` must include at least one non-empty pattern.
