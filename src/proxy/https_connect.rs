@@ -13,6 +13,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::app::AppState;
 use crate::capture::{CaptureDecision, CaptureEndpoint, CaptureMode};
+use crate::certs::CertError;
 use crate::config::{ExternalAuthProfileType, PolicyRuleAction};
 use crate::logging::PolicyDecisionLogContext;
 use crate::proxy::http::{
@@ -86,6 +87,17 @@ pub async fn handle_connect_request(
     // Prepare TLS acceptor for the CONNECT target host.
     let tls_acceptor = match state.cert_manager.tls_acceptor_for_host(&host) {
         Ok(a) => a,
+        Err(CertError::GenerationBusy) => {
+            tracing::warn!(
+                target: "acl_proxy::certs",
+                host,
+                port,
+                "CONNECT target certificate generation is already in progress"
+            );
+            let mut resp = Response::new(Body::from("Service Unavailable"));
+            *resp.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            return resp;
+        }
         Err(err) => {
             tracing::error!("failed to build TLS acceptor for {host}: {err}");
             let mut resp = Response::new(Body::from("Internal Server Error"));

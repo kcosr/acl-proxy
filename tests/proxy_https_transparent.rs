@@ -29,12 +29,16 @@ use rustls::{
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 // Use a body slightly larger than DEFAULT_MAX_BODY_BYTES to exercise
 // truncation logic without introducing excessively large in-memory
 // payloads that could slow down tests.
 const LARGE_BODY_BYTES: usize = DEFAULT_MAX_BODY_BYTES + 1024;
+
+static TRANSPARENT_H2_TEST_LOCK: once_cell::sync::Lazy<AsyncMutex<()>> =
+    once_cell::sync::Lazy::new(|| AsyncMutex::new(()));
 
 #[derive(Clone, Debug)]
 struct SeenForwardedRequest {
@@ -52,6 +56,10 @@ struct SeenBodyRequest {
 struct TestWebSocketFrame {
     opcode: u8,
     payload: Vec<u8>,
+}
+
+async fn transparent_h2_test_guard() -> AsyncMutexGuard<'static, ()> {
+    TRANSPARENT_H2_TEST_LOCK.lock().await
 }
 
 async fn wait_for_single_allow_capture_version_pair(
@@ -1693,6 +1701,7 @@ async fn allow_upgrades_false_blocks_transparent_https_upgrade() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn allowed_https_transparent_h2_is_proxied_and_captured() {
+    let _h2_guard = transparent_h2_test_guard().await;
     let upstream_addr = start_upstream_https_echo_server().await;
 
     let mut config = minimal_https_transparent_config();
@@ -1927,6 +1936,7 @@ async fn upstream_failure_https_transparent_is_captured() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_h2_streams_share_connection_and_are_captured() {
+    let _h2_guard = transparent_h2_test_guard().await;
     let upstream_addr = start_upstream_https_echo_server().await;
 
     let mut config = minimal_https_transparent_config();
@@ -2129,6 +2139,7 @@ async fn concurrent_h2_streams_share_connection_and_are_captured() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_h2_streams_mixed_allow_and_deny() {
+    let _h2_guard = transparent_h2_test_guard().await;
     let upstream_addr = start_upstream_https_echo_server().await;
 
     let mut config = minimal_https_transparent_config();
@@ -2346,6 +2357,7 @@ async fn concurrent_h2_streams_mixed_allow_and_deny() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn large_h2_request_body_is_truncated_in_capture() {
+    let _h2_guard = transparent_h2_test_guard().await;
     let upstream_addr = start_upstream_https_echo_server().await;
 
     let mut config = minimal_https_transparent_config();
@@ -2475,6 +2487,7 @@ async fn large_h2_request_body_is_truncated_in_capture() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn large_h2_response_body_is_truncated_in_capture() {
+    let _h2_guard = transparent_h2_test_guard().await;
     eprintln!("large_h2_response: starting upstream server");
     let upstream_addr = start_upstream_https_large_response_server().await;
 
@@ -2605,6 +2618,7 @@ async fn large_h2_response_body_is_truncated_in_capture() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn h2_client_to_http1_only_upstream_preserves_versions_in_capture() {
+    let _h2_guard = transparent_h2_test_guard().await;
     let upstream_addr = start_upstream_https_http1_only_echo_server().await;
 
     let mut config = minimal_https_transparent_config();
@@ -2675,6 +2689,7 @@ async fn h2_client_to_http1_only_upstream_preserves_versions_in_capture() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn h2_client_to_h2_capable_upstream_preserves_h2_in_capture() {
+    let _h2_guard = transparent_h2_test_guard().await;
     let upstream_addr = start_upstream_https_echo_server().await;
 
     let mut config = minimal_https_transparent_config();
@@ -3069,6 +3084,7 @@ external_auth_profile = "body_guard"
 
 #[tokio::test(flavor = "multi_thread")]
 async fn denied_https_transparent_h2_returns_403() {
+    let _h2_guard = transparent_h2_test_guard().await;
     let upstream_addr = start_upstream_https_echo_server().await;
 
     let mut config = minimal_https_transparent_config();

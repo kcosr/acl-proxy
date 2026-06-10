@@ -12,6 +12,7 @@ use rcgen::{
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::{any_supported_type, CertifiedKey};
 use rustls::{Certificate as RustlsCertificate, PrivateKey, ServerConfig};
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::CertificatesConfig;
@@ -58,6 +59,9 @@ pub enum CertError {
 
     #[error("invalid max_cached_certs ({value}); must be at least 1")]
     InvalidCacheSize { value: usize },
+
+    #[error("certificate generation is already in progress")]
+    GenerationBusy,
 }
 
 struct CaMaterial {
@@ -76,6 +80,7 @@ struct Inner {
     ca_cert_pem: String,
     ca_cert_der: Vec<u8>,
     cache_capacity: NonZeroUsize,
+    generation_permits: Semaphore,
     server_configs: Mutex<LruCache<String, Arc<ServerConfig>>>,
     sni_acceptor: Mutex<Option<TlsAcceptor>>,
 }
@@ -136,6 +141,7 @@ impl CertManager {
             ca_cert_pem: ca_material.cert_pem,
             ca_cert_der: ca_material.cert_der,
             cache_capacity,
+            generation_permits: Semaphore::new(1),
             server_configs: Mutex::new(LruCache::new(cache_capacity)),
             sni_acceptor: Mutex::new(None),
         };
@@ -197,6 +203,19 @@ impl CertManager {
 
     fn server_config_for_host(&self, host: &str) -> Result<Arc<ServerConfig>, CertError> {
         let host = host.to_ascii_lowercase();
+        {
+            let mut cache = self.inner.server_configs.lock().unwrap();
+            if let Some(cfg) = cache.get(&host) {
+                return Ok(cfg.clone());
+            }
+        }
+
+        let _generation_permit = self
+            .inner
+            .generation_permits
+            .try_acquire()
+            .map_err(|_| CertError::GenerationBusy)?;
+
         {
             let mut cache = self.inner.server_configs.lock().unwrap();
             if let Some(cfg) = cache.get(&host) {
@@ -711,6 +730,45 @@ mod tests {
         assert!(
             !std::sync::Arc::ptr_eq(&cfg1, &cfg1_new),
             "host1 should be regenerated after eviction when capacity is 1"
+        );
+    }
+
+    #[test]
+    fn uncached_host_generation_fails_fast_when_generation_is_busy() {
+        let tmp = TempDir::new().expect("tempdir");
+        let certs_dir = tmp.path().join("certs");
+
+        let cfg = CertificatesConfig {
+            certs_dir: certs_dir.to_string_lossy().to_string(),
+            ..CertificatesConfig::default()
+        };
+
+        let mgr = CertManager::from_config(&cfg).expect("cert manager");
+        let cached_host = "cached.example.com";
+        let cached_config = mgr
+            .server_config_for_host(cached_host)
+            .expect("prime cached host");
+
+        let _permit = mgr
+            .inner
+            .generation_permits
+            .try_acquire()
+            .expect("hold generation permit");
+
+        let cached_again = mgr
+            .server_config_for_host(cached_host)
+            .expect("cached host should not need generation permit");
+        assert!(
+            Arc::ptr_eq(&cached_config, &cached_again),
+            "cached host should reuse existing server config"
+        );
+
+        let err = mgr
+            .server_config_for_host("uncached.example.com")
+            .expect_err("uncached host should fail while generation is busy");
+        assert!(
+            matches!(err, CertError::GenerationBusy),
+            "unexpected error: {err}"
         );
     }
 

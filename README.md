@@ -223,6 +223,7 @@ In transparent HTTP mode, upstream target selection is based on the inbound `Hos
 - Request-header predicates (`headers_absent`, `headers_match`, `headers_not_match`) apply only to decrypted inner requests, not to the outer CONNECT establishment request.
 - Loop protection runs on both the CONNECT request and the inner requests.
 - The outer CONNECT handshake remains local to the first proxy hop. If egress forwarding is enabled, only the decrypted inner HTTPS requests use the egress destination.
+- CONNECT-target certificate generation is bounded to one uncached host at a time. If another uncached CONNECT target arrives while a certificate is being minted, the proxy returns `503 Service Unavailable` before establishing the tunnel; cached hosts are unaffected.
 - Clients must trust the proxy CA (`certs/ca-cert.pem` by default).
 
 ### Transparent HTTPS
@@ -729,6 +730,7 @@ persist_dynamic_certs = false       # write per-host debug PEMs under certs_dir/
 - When both are provided, the proxy uses them as-is; invalid/unreadable files cause a startup error.
 - When only one is provided, validation fails — both must be set or both omitted.
 - Per-host certificates are generated on demand and cached in memory (LRU). By default they are not written to disk, which keeps attacker-supplied hostnames from growing `certs_dir/dynamic/` without bound.
+- CONNECT-target certificate generation for uncached hosts is serialized per proxy instance. Cached hosts are served immediately; additional uncached CONNECT targets are rejected while generation is already in progress.
 - When `persist_dynamic_certs = true`, generated per-host debug PEMs are written to `certs_dir/dynamic/` as `<host>.crt`, `<host>.key`, and `<host>-chain.crt`. These files are not reloaded on startup.
 - On Unix, certificate directories are created or tightened to owner-only (`0700`) and generated CA/per-host PEM files that are written to disk are created or tightened to owner-only (`0600`).
 
@@ -1113,7 +1115,7 @@ On Unix, certificate directories are created or tightened to owner-only (`0700`)
 
 ### Per-Host Certificates
 
-Generated on demand for each host (SNI or CONNECT target). Cached in memory with LRU eviction (configurable `max_cached_certs`, default 1024). When `persist_dynamic_certs = true`, also written to disk for debugging:
+Generated on demand for each host (SNI or CONNECT target). Cached in memory with LRU eviction (configurable `max_cached_certs`, default 1024). CONNECT-target generation for uncached hosts is serialized so a burst of distinct CONNECT hostnames cannot force concurrent key generation. When `persist_dynamic_certs = true`, also written to disk for debugging:
 - `certs/dynamic/<host>.crt` — leaf certificate
 - `certs/dynamic/<host>.key` — private key
 - `certs/dynamic/<host>-chain.crt` — leaf + CA chain
