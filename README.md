@@ -229,6 +229,7 @@ In transparent HTTP mode, upstream target selection is based on the inbound `Hos
 
 - Set `https_port = 0` to disable this listener.
 - URL construction is based on the Host header or the request URI authority and uses the same canonicalization as policy matching.
+- TLS SNI is used only to select the inbound certificate presented to the client. It is not treated as a policy or routing authority and is not required to match the decrypted HTTP `Host` header.
 - Inbound HTTP/2 is supported via ALPN negotiation.
 - If the Host header is missing or invalid, the proxy returns `400 Bad Request`.
 
