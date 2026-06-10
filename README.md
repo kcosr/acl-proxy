@@ -303,7 +303,7 @@ protocol + "//" + host[:port] + path + optional "?query"
 - Hostnames are lowercased and a trailing DNS dot is removed.
 - Default ports (`:80` for HTTP, `:443` for HTTPS) are omitted in both requests and rule patterns; non-default ports are preserved.
 - Dot segments in the path are resolved before matching or forwarding.
-- Percent-encoded unreserved path characters are decoded before matching or forwarding (for example `%61` becomes `a`); encoded path separators such as `%2F` and `%5C` are rejected; other reserved encodings are preserved.
+- Percent-encoded unreserved path characters are decoded before matching or forwarding (for example `%61` becomes `a`); reserved encodings such as `%2F` are preserved so existing URL-encoded path parameters continue to work.
 - The path defaults to `/` when empty.
 - Query strings are preserved; fragments are ignored.
 - IPv6 hostnames use standard bracket notation (e.g., `https://[::1]:8443/path`).

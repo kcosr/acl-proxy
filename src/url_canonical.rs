@@ -20,8 +20,6 @@ pub(crate) enum CanonicalUrlError {
     EmptyHost,
     #[error("URL userinfo is not allowed")]
     UserInfo,
-    #[error("URL path contains an encoded path separator")]
-    EncodedPathSeparator,
 }
 
 pub(crate) fn canonicalize_http_url(raw: &str) -> Result<CanonicalUrl, CanonicalUrlError> {
@@ -50,7 +48,7 @@ pub(crate) fn canonicalize_http_url(raw: &str) -> Result<CanonicalUrl, Canonical
         "/"
     } else {
         url.path()
-    })?;
+    });
     let query = match url.query() {
         Some(query) => format!("?{query}"),
         None => String::new(),
@@ -72,7 +70,7 @@ fn canonical_host(raw_host: &str) -> Result<String, CanonicalUrlError> {
     Ok(host.to_ascii_lowercase())
 }
 
-fn normalize_path_percent_encoding(path: &str) -> Result<String, CanonicalUrlError> {
+fn normalize_path_percent_encoding(path: &str) -> String {
     let bytes = path.as_bytes();
     let mut normalized = String::with_capacity(path.len());
     let mut index = 0;
@@ -83,9 +81,6 @@ fn normalize_path_percent_encoding(path: &str) -> Result<String, CanonicalUrlErr
                 (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
             {
                 let decoded = (high << 4) | low;
-                if matches!(decoded, b'/' | b'\\') {
-                    return Err(CanonicalUrlError::EncodedPathSeparator);
-                }
                 if is_unreserved(decoded) {
                     normalized.push(decoded as char);
                     index += 3;
@@ -98,7 +93,7 @@ fn normalize_path_percent_encoding(path: &str) -> Result<String, CanonicalUrlErr
         index += 1;
     }
 
-    Ok(normalized)
+    normalized
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -154,18 +149,6 @@ mod tests {
             .expect("canonical");
 
         assert_eq!(canonical.url, "https://example.com/admin/~me/%3A?q=%61");
-    }
-
-    #[test]
-    fn rejects_encoded_path_separators() {
-        assert!(matches!(
-            canonicalize_http_url("https://example.com/admin%2fsecret"),
-            Err(CanonicalUrlError::EncodedPathSeparator)
-        ));
-        assert!(matches!(
-            canonicalize_http_url("https://example.com/admin%5csecret"),
-            Err(CanonicalUrlError::EncodedPathSeparator)
-        ));
     }
 
     #[test]
