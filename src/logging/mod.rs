@@ -13,7 +13,9 @@ use tracing::Level;
 use tracing_subscriber::fmt::SubscriberBuilder;
 
 use crate::config::{LoggingConfig, LoggingPolicyDecisionsConfig, PolicyRuleAction};
-use crate::filesystem::{create_private_dir_all, open_private_file_for_append};
+use crate::filesystem::{
+    create_private_dir_all, open_private_file_for_append, open_private_file_for_write,
+};
 use crate::policy::PolicyDecision;
 use crate::sensitive::redact_url_for_sink;
 
@@ -381,6 +383,7 @@ impl RotatingFileWriter {
 
     fn rotate(&mut self) -> io::Result<()> {
         self.file.flush()?;
+        let mut rotation_error = None;
 
         for index in (1..=self.max_files).rev() {
             let destination = self.rotated_path(index);
@@ -392,14 +395,23 @@ impl RotatingFileWriter {
 
             if source.exists() {
                 if destination.exists() {
-                    fs::remove_file(&destination)?;
+                    if let Err(err) = fs::remove_file(&destination) {
+                        rotation_error.get_or_insert(err);
+                        continue;
+                    }
                 }
-                fs::rename(source, destination)?;
+                if let Err(err) = fs::rename(source, destination) {
+                    rotation_error.get_or_insert(err);
+                }
             }
         }
 
-        self.file = open_private_file_for_append(&self.base_path)?;
+        self.file = open_private_file_for_write(&self.base_path)?;
         self.size = 0;
+
+        if let Some(err) = rotation_error {
+            eprintln!("log rotation completed with errors; opened fresh log file: {err}");
+        }
 
         Ok(())
     }
@@ -672,5 +684,28 @@ mod tests {
             assert_eq!(mode(&base_path), 0o600);
             assert_eq!(mode(&rotated), 0o600);
         }
+    }
+
+    #[test]
+    fn rotating_file_writer_recovers_when_archive_path_cannot_be_replaced() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let base_path = temp_dir.path().join("acl-proxy.log");
+        let rotated = PathBuf::from(format!("{}.1", base_path.display()));
+        let mut writer = RotatingFileWriter::new(base_path.clone(), 3, 1).expect("writer");
+
+        writer.write_all(b"abc").expect("write initial line");
+        std::fs::create_dir(&rotated).expect("create blocking rotated path");
+
+        writer.write_all(b"d").expect("write through failed rotate");
+        let current = std::fs::read_to_string(&base_path).expect("read current");
+        assert_eq!(current, "d");
+
+        writer.write_all(b"ef").expect("fill current log");
+        writer
+            .write_all(b"g")
+            .expect("write through repeated failed rotate");
+        let current = std::fs::read_to_string(&base_path).expect("read current after retry");
+        assert_eq!(current, "g");
+        assert!(rotated.is_dir(), "blocking rotated path should remain");
     }
 }

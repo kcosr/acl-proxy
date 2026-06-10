@@ -42,7 +42,7 @@ fn apply_private_file_create_mode(options: &mut OpenOptions) {
 #[cfg(not(unix))]
 fn apply_private_file_create_mode(_options: &mut OpenOptions) {}
 
-fn open_private_file_for_write(path: &Path) -> io::Result<File> {
+pub(crate) fn open_private_file_for_write(path: &Path) -> io::Result<File> {
     let mut options = OpenOptions::new();
     options.create(true).truncate(true).write(true);
     apply_private_file_create_mode(&mut options);
