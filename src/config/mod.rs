@@ -551,6 +551,9 @@ pub struct CertificatesConfig {
     /// entry is evicted.
     #[serde(default = "default_max_cached_certs")]
     pub max_cached_certs: usize,
+
+    #[serde(default)]
+    pub persist_dynamic_certs: bool,
 }
 
 impl Default for CertificatesConfig {
@@ -560,6 +563,7 @@ impl Default for CertificatesConfig {
             ca_key_path: None,
             ca_cert_path: None,
             max_cached_certs: default_max_cached_certs(),
+            persist_dynamic_certs: false,
         }
     }
 }
@@ -2985,6 +2989,33 @@ max_cached_certs = 0
             msg.contains("certificates.max_cached_certs"),
             "unexpected error message: {msg}"
         );
+    }
+
+    #[test]
+    fn certificate_dynamic_persistence_defaults_false_and_parses() {
+        assert!(!CertificatesConfig::default().persist_dynamic_certs);
+
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[certificates]
+persist_dynamic_certs = true
+"#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        assert!(config.certificates.persist_dynamic_certs);
+        config.validate_basic().expect("config should validate");
     }
 
     #[test]

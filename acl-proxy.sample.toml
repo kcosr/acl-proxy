@@ -191,6 +191,11 @@ certs_dir = "certs"
 # evicted.
 max_cached_certs = 1024
 
+# Optional: persist generated per-host certificates under certs/dynamic/
+# for debugging. Disabled by default to avoid unbounded disk growth from
+# attacker-supplied hostnames.
+persist_dynamic_certs = false
+
 [tls]
 # Verify upstream HTTPS certificates by default. Set to false only in
 # controlled testing environments.

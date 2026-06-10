@@ -711,13 +711,15 @@ certs_dir = "certs"                 # base directory for certificate material
 ca_key_path = "/path/to/ca-key.pem"   # optional external CA key
 ca_cert_path = "/path/to/ca-cert.pem" # optional external CA cert
 max_cached_certs = 1024             # LRU cache size (min 1)
+persist_dynamic_certs = false       # write per-host debug PEMs under certs_dir/dynamic
 ```
 
 - When both `ca_key_path` and `ca_cert_path` are absent, the proxy auto-generates a CA in `certs_dir` and reuses it if valid files already exist.
 - When both are provided, the proxy uses them as-is; invalid/unreadable files cause a startup error.
 - When only one is provided, validation fails — both must be set or both omitted.
-- Per-host certificates are generated on demand, cached in memory (LRU), and also written to `certs_dir/dynamic/` as `<host>.crt`, `<host>.key`, and `<host>-chain.crt` for debugging transparency. On-disk files are not reloaded on startup.
-- On Unix, certificate directories are created or tightened to owner-only (`0700`) and generated CA/per-host PEM files are created or tightened to owner-only (`0600`).
+- Per-host certificates are generated on demand and cached in memory (LRU). By default they are not written to disk, which keeps attacker-supplied hostnames from growing `certs_dir/dynamic/` without bound.
+- When `persist_dynamic_certs = true`, generated per-host debug PEMs are written to `certs_dir/dynamic/` as `<host>.crt`, `<host>.key`, and `<host>-chain.crt`. These files are not reloaded on startup.
+- On Unix, certificate directories are created or tightened to owner-only (`0700`) and generated CA/per-host PEM files that are written to disk are created or tightened to owner-only (`0600`).
 
 ### `[tls]` — Upstream TLS Behavior
 
@@ -1096,7 +1098,7 @@ On Unix, certificate directories are created or tightened to owner-only (`0700`)
 
 ### Per-Host Certificates
 
-Generated on demand for each host (SNI or CONNECT target). Cached in memory with LRU eviction (configurable `max_cached_certs`, default 1024). Also written to disk for debugging:
+Generated on demand for each host (SNI or CONNECT target). Cached in memory with LRU eviction (configurable `max_cached_certs`, default 1024). When `persist_dynamic_certs = true`, also written to disk for debugging:
 - `certs/dynamic/<host>.crt` — leaf certificate
 - `certs/dynamic/<host>.key` — private key
 - `certs/dynamic/<host>-chain.crt` — leaf + CA chain

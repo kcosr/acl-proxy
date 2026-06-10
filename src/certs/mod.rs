@@ -63,6 +63,7 @@ pub enum CertError {
 struct Inner {
     ca_cert_path: PathBuf,
     dynamic_dir: PathBuf,
+    persist_dynamic_certs: bool,
     ca_cert: RcgenCertificate,
     ca_key: KeyPair,
     cache_capacity: NonZeroUsize,
@@ -102,10 +103,12 @@ impl CertManager {
             path: certs_dir.clone(),
             source,
         })?;
-        create_private_dir_all(&dynamic_dir).map_err(|source| CertError::CreateDir {
-            path: dynamic_dir.clone(),
-            source,
-        })?;
+        if cfg.persist_dynamic_certs {
+            create_private_dir_all(&dynamic_dir).map_err(|source| CertError::CreateDir {
+                path: dynamic_dir.clone(),
+                source,
+            })?;
+        }
 
         let (ca_cert, ca_key) =
             load_or_generate_ca(&ca_key_path, &ca_cert_path, explicit_ca_paths)?;
@@ -118,6 +121,7 @@ impl CertManager {
         let inner = Inner {
             ca_cert_path,
             dynamic_dir,
+            persist_dynamic_certs: cfg.persist_dynamic_certs,
             ca_cert,
             ca_key,
             cache_capacity,
@@ -143,6 +147,7 @@ impl CertManager {
             &self.inner.ca_key,
             &self.inner.ca_cert_path,
             &self.inner.dynamic_dir,
+            self.inner.persist_dynamic_certs,
             "default",
         )?;
 
@@ -178,6 +183,7 @@ impl CertManager {
             &self.inner.ca_key,
             &self.inner.ca_cert_path,
             &self.inner.dynamic_dir,
+            self.inner.persist_dynamic_certs,
             &host,
         )?;
 
@@ -228,6 +234,7 @@ impl SniResolver {
             &self.inner.ca_key,
             &self.inner.ca_cert_path,
             &self.inner.dynamic_dir,
+            self.inner.persist_dynamic_certs,
             &host,
         ) {
             Ok(v) => v,
@@ -388,6 +395,7 @@ fn generate_host_certificate(
     ca_key: &KeyPair,
     ca_cert_path: &Path,
     dynamic_dir: &Path,
+    persist_dynamic_certs: bool,
     host: &str,
 ) -> Result<(Vec<RustlsCertificate>, PrivateKey), CertError> {
     let mut params = CertificateParams::new(vec![host.to_string()])
@@ -424,40 +432,41 @@ fn generate_host_certificate(
         .ok_or_else(|| CertError::ParseCaCert("no CA certificate found in PEM".to_string()))?;
     let ca_cert_rls = RustlsCertificate(ca_der);
 
-    // Persist PEM files on disk for transparency and debugging.
-    //
-    // The active certificates used for TLS handshakes are generated on
-    // demand from the in-memory CA and cached in this process; the
-    // per-host PEM files under `certs/dynamic/` are not currently
-    // reloaded on startup and should be treated as an audit/debug view,
-    // not as the authoritative runtime cache.
-    create_private_dir_all(dynamic_dir).map_err(|source| CertError::CreateDir {
-        path: dynamic_dir.to_path_buf(),
-        source,
-    })?;
-
-    let leaf_pem = leaf_cert.pem();
-    let key_pem = leaf_key.serialize_pem();
-    let chain_pem = format!("{leaf_pem}{ca_pem}");
-
-    let leaf_path = dynamic_dir.join(format!("{host}.crt"));
-    let key_path = dynamic_dir.join(format!("{host}.key"));
-    let chain_path = dynamic_dir.join(format!("{host}-chain.crt"));
-
-    write_private_file(&leaf_path, leaf_pem.as_bytes()).map_err(|source| CertError::WriteFile {
-        path: leaf_path,
-        source,
-    })?;
-    write_private_file(&key_path, key_pem.as_bytes()).map_err(|source| CertError::WriteFile {
-        path: key_path,
-        source,
-    })?;
-    write_private_file(&chain_path, chain_pem.as_bytes()).map_err(|source| {
-        CertError::WriteFile {
-            path: chain_path,
+    if persist_dynamic_certs {
+        // Optional debug/audit view. Runtime TLS uses the bounded in-memory
+        // cache, and these files are not reloaded on startup.
+        create_private_dir_all(dynamic_dir).map_err(|source| CertError::CreateDir {
+            path: dynamic_dir.to_path_buf(),
             source,
-        }
-    })?;
+        })?;
+
+        let leaf_pem = leaf_cert.pem();
+        let key_pem = leaf_key.serialize_pem();
+        let chain_pem = format!("{leaf_pem}{ca_pem}");
+
+        let leaf_path = dynamic_dir.join(format!("{host}.crt"));
+        let key_path = dynamic_dir.join(format!("{host}.key"));
+        let chain_path = dynamic_dir.join(format!("{host}-chain.crt"));
+
+        write_private_file(&leaf_path, leaf_pem.as_bytes()).map_err(|source| {
+            CertError::WriteFile {
+                path: leaf_path,
+                source,
+            }
+        })?;
+        write_private_file(&key_path, key_pem.as_bytes()).map_err(|source| {
+            CertError::WriteFile {
+                path: key_path,
+                source,
+            }
+        })?;
+        write_private_file(&chain_path, chain_pem.as_bytes()).map_err(|source| {
+            CertError::WriteFile {
+                path: chain_path,
+                source,
+            }
+        })?;
+    }
 
     Ok((vec![leaf, ca_cert_rls], PrivateKey(key_der)))
 }
@@ -507,7 +516,6 @@ mod tests {
         #[cfg(unix)]
         {
             assert_eq!(mode(&certs_dir), 0o700);
-            assert_eq!(mode(&certs_dir.join("dynamic")), 0o700);
             assert_eq!(mode(&certs_dir.join("ca-key.pem")), 0o600);
             assert_eq!(mode(&ca_cert_path), 0o600);
         }
@@ -521,12 +529,35 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_certificates_are_created_for_hosts() {
+    fn dynamic_certificates_stay_in_memory_by_default() {
         let tmp = TempDir::new().expect("tempdir");
         let certs_dir = tmp.path().join("certs");
 
         let cfg = CertificatesConfig {
             certs_dir: certs_dir.to_string_lossy().to_string(),
+            ..CertificatesConfig::default()
+        };
+
+        let mgr = CertManager::from_config(&cfg).expect("cert manager");
+
+        let host = "example.com";
+        let _acceptor = mgr.tls_acceptor_for_host(host).expect("tls acceptor");
+
+        let dynamic_dir = certs_dir.join("dynamic");
+        assert!(
+            !dynamic_dir.exists(),
+            "dynamic cert directory should not be created by default"
+        );
+    }
+
+    #[test]
+    fn dynamic_certificates_are_persisted_when_enabled() {
+        let tmp = TempDir::new().expect("tempdir");
+        let certs_dir = tmp.path().join("certs");
+
+        let cfg = CertificatesConfig {
+            certs_dir: certs_dir.to_string_lossy().to_string(),
+            persist_dynamic_certs: true,
             ..CertificatesConfig::default()
         };
 
@@ -611,6 +642,7 @@ mod tests {
             certs_dir: certs_dir.to_string_lossy().to_string(),
             ca_key_path: Some(ca_key_path.to_string_lossy().to_string()),
             ca_cert_path: Some(ca_cert_path.to_string_lossy().to_string()),
+            persist_dynamic_certs: true,
             ..CertificatesConfig::default()
         };
 
