@@ -2,6 +2,7 @@ use std::io::Write;
 use std::process::Command;
 
 use assert_cmd::prelude::*;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use serde_json::Value;
 use tempfile::NamedTempFile;
@@ -183,6 +184,54 @@ subnets = ["10.0.0.0/8"]
     let subnets = rule["subnets"].as_array().expect("subnets is an array");
     assert_eq!(subnets.len(), 1);
     assert_eq!(subnets[0], "10.0.0.0/8");
+}
+
+#[test]
+fn policy_dump_prints_config_load_warnings_to_stderr() {
+    let mut file = NamedTempFile::new().expect("create temp config");
+    file.write_all(
+        br#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[redaction.profiles.secrets]
+
+[[redaction.profiles.secrets.rules]]
+literals = ["pass${word"]
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/api/**"
+        "#,
+    )
+    .expect("write config");
+
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
+    cmd.arg("policy")
+        .arg("dump")
+        .arg("--config")
+        .arg(file.path());
+
+    let assert = cmd.assert().success().stderr(
+        contains(
+            "warning: redaction.profiles.secrets.rules[0].literals[0] contains '${' but is not a complete placeholder",
+        )
+        .and(contains("pass${word").not()),
+    );
+    let stdout =
+        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is valid UTF-8");
+    let value: Value = serde_json::from_str(&stdout).expect("output is valid JSON");
+    assert_eq!(value["default"], "deny");
 }
 
 #[test]

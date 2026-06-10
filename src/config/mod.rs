@@ -40,7 +40,7 @@ pub enum ConfigPathKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HeaderActionEnvPlaceholder<'a> {
+enum ConfigEnvPlaceholder<'a> {
     None,
     Exact { name: &'a str },
     Invalid,
@@ -71,6 +71,9 @@ fn default_external_auth_profile_type() -> ExternalAuthProfileType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(skip)]
+    pub load_warnings: Vec<String>,
+
     #[serde(default = "default_schema_version")]
     pub schema_version: String,
 
@@ -561,6 +564,7 @@ fn default_verify_upstream() -> bool {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            load_warnings: Vec::new(),
             schema_version: default_schema_version(),
             proxy: ProxyConfig::default(),
             logging: LoggingConfig::default(),
@@ -1007,6 +1011,7 @@ impl Config {
 
         config.apply_env_overrides();
         config.interpolate_header_action_env_vars()?;
+        config.interpolate_redaction_env_vars()?;
         config.validate_basic()?;
 
         Ok(config)
@@ -1059,6 +1064,33 @@ impl Config {
         }
 
         interpolate_egress_request_header_actions(&mut self.proxy.egress.request_header_actions)?;
+
+        Ok(())
+    }
+
+    fn interpolate_redaction_env_vars(&mut self) -> Result<(), ConfigError> {
+        let load_warnings = &mut self.load_warnings;
+
+        for (profile_name, profile) in self.redaction.profiles.iter_mut() {
+            interpolate_redaction_env_value(
+                &mut profile.replacement,
+                format!("redaction.profiles.{profile_name}.replacement").as_str(),
+                load_warnings,
+            )?;
+
+            for (rule_idx, rule) in profile.rules.iter_mut().enumerate() {
+                for (literal_idx, literal) in rule.literals.iter_mut().enumerate() {
+                    interpolate_redaction_env_value(
+                        literal,
+                        format!(
+                            "redaction.profiles.{profile_name}.rules[{rule_idx}].literals[{literal_idx}]"
+                        )
+                        .as_str(),
+                        load_warnings,
+                    )?;
+                }
+            }
+        }
 
         Ok(())
     }
@@ -1203,15 +1235,45 @@ fn interpolate_header_action_value(
     raw_value: &mut String,
     action_location: &str,
 ) -> Result<(), ConfigError> {
-    match classify_header_action_env_placeholder(raw_value.as_str()) {
-        HeaderActionEnvPlaceholder::None => Ok(()),
-        HeaderActionEnvPlaceholder::Invalid => Err(ConfigError::Invalid(format!(
-            "{action_location} uses invalid env interpolation syntax: '{raw_value}'"
-        ))),
-        HeaderActionEnvPlaceholder::Exact { name } => {
+    interpolate_config_env_value(raw_value, action_location, true)
+}
+
+fn interpolate_redaction_env_value(
+    raw_value: &mut String,
+    value_location: &str,
+    load_warnings: &mut Vec<String>,
+) -> Result<(), ConfigError> {
+    if has_incomplete_config_env_marker(raw_value) {
+        load_warnings.push(format!(
+            "{value_location} contains '${{' but is not a complete placeholder; treating as literal text"
+        ));
+    }
+
+    interpolate_config_env_value(raw_value, value_location, false)
+}
+
+fn interpolate_config_env_value(
+    raw_value: &mut String,
+    value_location: &str,
+    include_invalid_value: bool,
+) -> Result<(), ConfigError> {
+    match classify_config_env_placeholder(raw_value.as_str()) {
+        ConfigEnvPlaceholder::None => Ok(()),
+        ConfigEnvPlaceholder::Invalid => {
+            if include_invalid_value {
+                Err(ConfigError::Invalid(format!(
+                    "{value_location} uses invalid env interpolation syntax: '{raw_value}'"
+                )))
+            } else {
+                Err(ConfigError::Invalid(format!(
+                    "{value_location} uses invalid env interpolation syntax"
+                )))
+            }
+        }
+        ConfigEnvPlaceholder::Exact { name } => {
             *raw_value = env::var(name).map_err(|_| {
                 ConfigError::Invalid(format!(
-                    "{action_location} references missing env var '{name}'"
+                    "{value_location} references missing env var '{name}'"
                 ))
             })?;
             Ok(())
@@ -1219,36 +1281,48 @@ fn interpolate_header_action_value(
     }
 }
 
-fn classify_header_action_env_placeholder(raw_value: &str) -> HeaderActionEnvPlaceholder<'_> {
-    if !raw_value.contains("${") {
-        return HeaderActionEnvPlaceholder::None;
+fn has_incomplete_config_env_marker(raw_value: &str) -> bool {
+    let Some(open_idx) = raw_value.find("${") else {
+        return false;
+    };
+
+    !raw_value[open_idx + 2..].contains('}')
+}
+
+fn classify_config_env_placeholder(raw_value: &str) -> ConfigEnvPlaceholder<'_> {
+    let Some(open_idx) = raw_value.find("${") else {
+        return ConfigEnvPlaceholder::None;
+    };
+
+    if !raw_value[open_idx + 2..].contains('}') {
+        return ConfigEnvPlaceholder::None;
     }
 
     let Some(name) = raw_value
         .strip_prefix("${")
         .and_then(|rest| rest.strip_suffix('}'))
     else {
-        return HeaderActionEnvPlaceholder::Invalid;
+        return ConfigEnvPlaceholder::Invalid;
     };
 
     if name.is_empty() {
-        return HeaderActionEnvPlaceholder::Invalid;
+        return ConfigEnvPlaceholder::Invalid;
     }
 
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
-        return HeaderActionEnvPlaceholder::Invalid;
+        return ConfigEnvPlaceholder::Invalid;
     };
 
     if !matches!(first, 'A'..='Z' | 'a'..='z' | '_') {
-        return HeaderActionEnvPlaceholder::Invalid;
+        return ConfigEnvPlaceholder::Invalid;
     }
 
     if !chars.all(|ch| matches!(ch, 'A'..='Z' | 'a'..='z' | '0'..='9' | '_')) {
-        return HeaderActionEnvPlaceholder::Invalid;
+        return ConfigEnvPlaceholder::Invalid;
     }
 
-    HeaderActionEnvPlaceholder::Exact { name }
+    ConfigEnvPlaceholder::Exact { name }
 }
 
 fn format_direct_rule_location(rule_idx: usize) -> String {
@@ -1732,16 +1806,16 @@ mod tests {
     use std::io::Write;
     use std::sync::{Mutex, MutexGuard, OnceLock};
 
-    static HEADER_ACTION_ENV_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    static CONFIG_ENV_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
-    struct HeaderActionEnvTestGuard {
+    struct ConfigEnvTestGuard {
         _lock: MutexGuard<'static, ()>,
         saved_vars: Vec<(String, Option<String>)>,
     }
 
-    impl HeaderActionEnvTestGuard {
+    impl ConfigEnvTestGuard {
         fn new(keys: &[&str]) -> Self {
-            let lock = HEADER_ACTION_ENV_TEST_MUTEX
+            let lock = CONFIG_ENV_TEST_MUTEX
                 .get_or_init(|| Mutex::new(()))
                 .lock()
                 .expect("lock env test mutex");
@@ -1772,7 +1846,7 @@ mod tests {
         }
     }
 
-    impl Drop for HeaderActionEnvTestGuard {
+    impl Drop for ConfigEnvTestGuard {
         fn drop(&mut self) {
             for (key, saved_value) in self.saved_vars.iter().rev() {
                 match saved_value {
@@ -2027,6 +2101,225 @@ default = "deny"
         assert!(
             msg.contains("must not match empty text"),
             "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn redaction_env_interpolation_resolves_replacement_and_literals() {
+        let env_guard = ConfigEnvTestGuard::new(&[
+            "ACL_PROXY_TEST_REDACTION_REPLACEMENT",
+            "ACL_PROXY_TEST_REDACTION_LITERAL",
+        ]);
+        env_guard.set("ACL_PROXY_TEST_REDACTION_REPLACEMENT", "[MASKED]");
+        env_guard.set("ACL_PROXY_TEST_REDACTION_LITERAL", "secret-token");
+
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "debug"
+
+[redaction.profiles.secrets]
+replacement = "${ACL_PROXY_TEST_REDACTION_REPLACEMENT}"
+
+[[redaction.profiles.secrets.rules]]
+literals = ["${ACL_PROXY_TEST_REDACTION_LITERAL}", "static-secret"]
+match = "text"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+redaction_profile = "secrets"
+        "#;
+
+        let mut config: Config = toml::from_str(toml).expect("parse config");
+        config
+            .interpolate_redaction_env_vars()
+            .expect("interpolation should succeed");
+        config.validate_basic().expect("config should validate");
+
+        let profile = config.redaction.profiles.get("secrets").expect("profile");
+        assert_eq!(profile.replacement, "[MASKED]");
+        assert_eq!(
+            profile.rules[0].literals,
+            vec!["secret-token".to_string(), "static-secret".to_string()]
+        );
+    }
+
+    #[test]
+    fn redaction_env_interpolation_reports_missing_literal_env_var() {
+        let env_guard = ConfigEnvTestGuard::new(&["ACL_PROXY_TEST_MISSING_REDACTION"]);
+        env_guard.remove("ACL_PROXY_TEST_MISSING_REDACTION");
+
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "debug"
+
+[redaction.profiles.secrets]
+
+[[redaction.profiles.secrets.rules]]
+literals = ["${ACL_PROXY_TEST_MISSING_REDACTION}"]
+
+[policy]
+default = "deny"
+        "#;
+
+        let mut config: Config = toml::from_str(toml).expect("parse config");
+        let err = config
+            .interpolate_redaction_env_vars()
+            .expect_err("missing env var should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(
+                "redaction.profiles.secrets.rules[0].literals[0] references missing env var 'ACL_PROXY_TEST_MISSING_REDACTION'"
+            ),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn redaction_env_interpolation_rejects_mixed_literal_placeholder() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "debug"
+
+[redaction.profiles.secrets]
+
+[[redaction.profiles.secrets.rules]]
+literals = ["secret-prefix-${ACL_PROXY_TEST_REDACTION_LITERAL}"]
+
+[policy]
+default = "deny"
+        "#;
+
+        let mut config: Config = toml::from_str(toml).expect("parse config");
+        let err = config
+            .interpolate_redaction_env_vars()
+            .expect_err("mixed placeholder should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(
+                "redaction.profiles.secrets.rules[0].literals[0] uses invalid env interpolation syntax"
+            ),
+            "unexpected error message: {msg}"
+        );
+        assert!(
+            !msg.contains("secret-prefix"),
+            "error message should not echo redaction literal: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_from_sources_resolves_redaction_env_placeholders() {
+        let env_guard = ConfigEnvTestGuard::new(&[
+            "ACL_PROXY_TEST_LOAD_REDACTION_REPLACEMENT",
+            "ACL_PROXY_TEST_LOAD_REDACTION_LITERAL",
+        ]);
+        env_guard.set("ACL_PROXY_TEST_LOAD_REDACTION_REPLACEMENT", "[MASKED]");
+        env_guard.set("ACL_PROXY_TEST_LOAD_REDACTION_LITERAL", "load-secret");
+
+        let mut file = tempfile::NamedTempFile::new().expect("create temp config");
+        write!(
+            file,
+            r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[redaction.profiles.secrets]
+replacement = "${{ACL_PROXY_TEST_LOAD_REDACTION_REPLACEMENT}}"
+
+[[redaction.profiles.secrets.rules]]
+literals = ["${{ACL_PROXY_TEST_LOAD_REDACTION_LITERAL}}"]
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+redaction_profile = "secrets"
+            "#
+        )
+        .expect("write config");
+
+        let config = Config::load_from_sources(Some(file.path()))
+            .expect("load should resolve redaction placeholders");
+        let profile = config.redaction.profiles.get("secrets").expect("profile");
+        assert_eq!(profile.replacement, "[MASKED]");
+        assert_eq!(profile.rules[0].literals, vec!["load-secret".to_string()]);
+    }
+
+    #[test]
+    fn load_from_sources_preserves_incomplete_redaction_env_marker_literals() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp config");
+        write!(
+            file,
+            r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[redaction.profiles.secrets]
+
+[[redaction.profiles.secrets.rules]]
+literals = ["pass${{word"]
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+redaction_profile = "secrets"
+            "#
+        )
+        .expect("write config");
+
+        let config = Config::load_from_sources(Some(file.path()))
+            .expect("load should preserve incomplete marker literal");
+        let profile = config.redaction.profiles.get("secrets").expect("profile");
+        assert_eq!(profile.rules[0].literals, vec!["pass${word".to_string()]);
+        assert_eq!(
+            config.load_warnings,
+            vec![
+                "redaction.profiles.secrets.rules[0].literals[0] contains '${' but is not a complete placeholder; treating as literal text"
+                    .to_string()
+            ]
         );
     }
 
@@ -3546,18 +3839,26 @@ external_auth_profile = "example"
     }
 
     #[test]
-    fn header_action_env_placeholder_classifier_is_exact_only() {
+    fn config_env_placeholder_classifier_is_exact_only() {
         assert_eq!(
-            classify_header_action_env_placeholder("static-value"),
-            HeaderActionEnvPlaceholder::None
+            classify_config_env_placeholder("static-value"),
+            ConfigEnvPlaceholder::None
         );
         assert_eq!(
-            classify_header_action_env_placeholder("${API_TOKEN}"),
-            HeaderActionEnvPlaceholder::Exact { name: "API_TOKEN" }
+            classify_config_env_placeholder("${API_TOKEN}"),
+            ConfigEnvPlaceholder::Exact { name: "API_TOKEN" }
         );
         assert_eq!(
-            classify_header_action_env_placeholder("${_TOKEN_2}"),
-            HeaderActionEnvPlaceholder::Exact { name: "_TOKEN_2" }
+            classify_config_env_placeholder("${_TOKEN_2}"),
+            ConfigEnvPlaceholder::Exact { name: "_TOKEN_2" }
+        );
+        assert_eq!(
+            classify_config_env_placeholder("pass${word"),
+            ConfigEnvPlaceholder::None
+        );
+        assert_eq!(
+            classify_config_env_placeholder("${TOKEN"),
+            ConfigEnvPlaceholder::None
         );
 
         for raw in [
@@ -3566,11 +3867,10 @@ external_auth_profile = "example"
             "${}",
             "${1BAD}",
             "${BAD-NAME}",
-            "${TOKEN",
         ] {
             assert_eq!(
-                classify_header_action_env_placeholder(raw),
-                HeaderActionEnvPlaceholder::Invalid,
+                classify_config_env_placeholder(raw),
+                ConfigEnvPlaceholder::Invalid,
                 "expected invalid placeholder for {raw}"
             );
         }
@@ -3709,7 +4009,7 @@ value = "Bearer ${{TOKEN}}"
 
     #[test]
     fn header_action_env_interpolation_resolves_exact_value_placeholder() {
-        let env_guard = HeaderActionEnvTestGuard::new(&["ACL_PROXY_TEST_API_TOKEN"]);
+        let env_guard = ConfigEnvTestGuard::new(&["ACL_PROXY_TEST_API_TOKEN"]);
         env_guard.set("ACL_PROXY_TEST_API_TOKEN", "Bearer abc123");
 
         let toml = r#"
@@ -3755,7 +4055,7 @@ value = "${ACL_PROXY_TEST_API_TOKEN}"
     #[test]
     fn header_action_env_interpolation_resolves_mixed_values_and_repeated_placeholder() {
         let env_guard =
-            HeaderActionEnvTestGuard::new(&["ACL_PROXY_TEST_DEPLOYMENT", "ACL_PROXY_TEST_REGION"]);
+            ConfigEnvTestGuard::new(&["ACL_PROXY_TEST_DEPLOYMENT", "ACL_PROXY_TEST_REGION"]);
         env_guard.set("ACL_PROXY_TEST_DEPLOYMENT", "prod");
         env_guard.set("ACL_PROXY_TEST_REGION", "us-central1");
 
@@ -3808,7 +4108,7 @@ values = ["static", "${ACL_PROXY_TEST_DEPLOYMENT}", "${ACL_PROXY_TEST_REGION}", 
 
     #[test]
     fn header_action_env_interpolation_resolves_ruleset_template_placeholders() {
-        let env_guard = HeaderActionEnvTestGuard::new(&["ACL_PROXY_TEST_RULESET_TOKEN"]);
+        let env_guard = ConfigEnvTestGuard::new(&["ACL_PROXY_TEST_RULESET_TOKEN"]);
         env_guard.set("ACL_PROXY_TEST_RULESET_TOKEN", "token-123");
 
         let toml = r#"
@@ -3858,7 +4158,7 @@ include = "api_headers"
 
     #[test]
     fn header_action_env_interpolation_reports_missing_env_var() {
-        let env_guard = HeaderActionEnvTestGuard::new(&["ACL_PROXY_TEST_MISSING"]);
+        let env_guard = ConfigEnvTestGuard::new(&["ACL_PROXY_TEST_MISSING"]);
         env_guard.remove("ACL_PROXY_TEST_MISSING");
 
         let toml = r#"
@@ -3904,7 +4204,7 @@ value = "${ACL_PROXY_TEST_MISSING}"
 
     #[test]
     fn header_action_env_interpolation_resolves_egress_request_header_actions() {
-        let env_guard = HeaderActionEnvTestGuard::new(&["ACL_PROXY_TEST_EGRESS_TAG"]);
+        let env_guard = ConfigEnvTestGuard::new(&["ACL_PROXY_TEST_EGRESS_TAG"]);
         env_guard.set("ACL_PROXY_TEST_EGRESS_TAG", "edge-a");
 
         let toml = r#"
@@ -3942,7 +4242,7 @@ default = "deny"
 
     #[test]
     fn header_action_env_interpolation_reports_egress_action_location() {
-        let env_guard = HeaderActionEnvTestGuard::new(&["ACL_PROXY_TEST_MISSING_EGRESS"]);
+        let env_guard = ConfigEnvTestGuard::new(&["ACL_PROXY_TEST_MISSING_EGRESS"]);
         env_guard.remove("ACL_PROXY_TEST_MISSING_EGRESS");
 
         let toml = r#"
@@ -4122,7 +4422,7 @@ name = "authorization"
 
     #[test]
     fn header_action_env_interpolation_allows_empty_resolved_value() {
-        let env_guard = HeaderActionEnvTestGuard::new(&["ACL_PROXY_TEST_EMPTY"]);
+        let env_guard = ConfigEnvTestGuard::new(&["ACL_PROXY_TEST_EMPTY"]);
         env_guard.set("ACL_PROXY_TEST_EMPTY", "");
 
         let toml = r#"
@@ -4163,7 +4463,7 @@ value = "${ACL_PROXY_TEST_EMPTY}"
 
     #[test]
     fn load_from_sources_resolves_header_action_env_placeholders() {
-        let env_guard = HeaderActionEnvTestGuard::new(&["ACL_PROXY_TEST_LOAD_TOKEN"]);
+        let env_guard = ConfigEnvTestGuard::new(&["ACL_PROXY_TEST_LOAD_TOKEN"]);
         env_guard.set("ACL_PROXY_TEST_LOAD_TOKEN", "load-token");
 
         let mut file = tempfile::NamedTempFile::new().expect("create temp config");
