@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use base64::{engine::general_purpose, Engine as _};
@@ -7,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::config::{CaptureConfig, Config};
+use crate::filesystem::write_private_file;
 
 /// Maximum number of body bytes to buffer per request/response for capture.
 ///
@@ -365,15 +365,8 @@ pub fn write_capture_record(
 ) -> Result<PathBuf, CaptureError> {
     let path = resolve_capture_path(config, record);
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| CaptureError::CreateDir {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-
     let json = serde_json::to_string_pretty(record)?;
-    fs::write(&path, format!("{json}\n")).map_err(|source| CaptureError::WriteFile {
+    write_private_file(&path, format!("{json}\n")).map_err(|source| CaptureError::WriteFile {
         path: path.clone(),
         source,
     })?;

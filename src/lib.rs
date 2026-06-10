@@ -5,6 +5,7 @@ pub mod certs;
 pub mod cli;
 pub mod config;
 pub mod external_auth;
+mod filesystem;
 pub mod logging;
 pub mod loop_protection;
 pub mod policy;

@@ -15,6 +15,7 @@ use rustls::{Certificate as RustlsCertificate, PrivateKey, ServerConfig};
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::CertificatesConfig;
+use crate::filesystem::{create_private_dir_all, write_private_file};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CertError {
@@ -97,11 +98,11 @@ impl CertManager {
 
         let dynamic_dir = certs_dir.join("dynamic");
 
-        fs::create_dir_all(&certs_dir).map_err(|source| CertError::CreateDir {
+        create_private_dir_all(&certs_dir).map_err(|source| CertError::CreateDir {
             path: certs_dir.clone(),
             source,
         })?;
-        fs::create_dir_all(&dynamic_dir).map_err(|source| CertError::CreateDir {
+        create_private_dir_all(&dynamic_dir).map_err(|source| CertError::CreateDir {
             path: dynamic_dir.clone(),
             source,
         })?;
@@ -362,17 +363,19 @@ fn generate_ca(
     let key_pem = key_pair.serialize_pem();
 
     if let Some(parent) = ca_cert_path.parent() {
-        fs::create_dir_all(parent).map_err(|source| CertError::CreateDir {
+        create_private_dir_all(parent).map_err(|source| CertError::CreateDir {
             path: parent.to_path_buf(),
             source,
         })?;
     }
 
-    fs::write(ca_cert_path, cert_pem.as_bytes()).map_err(|source| CertError::WriteFile {
-        path: ca_cert_path.to_path_buf(),
-        source,
+    write_private_file(ca_cert_path, cert_pem.as_bytes()).map_err(|source| {
+        CertError::WriteFile {
+            path: ca_cert_path.to_path_buf(),
+            source,
+        }
     })?;
-    fs::write(ca_key_path, key_pem.as_bytes()).map_err(|source| CertError::WriteFile {
+    write_private_file(ca_key_path, key_pem.as_bytes()).map_err(|source| CertError::WriteFile {
         path: ca_key_path.to_path_buf(),
         source,
     })?;
@@ -428,7 +431,7 @@ fn generate_host_certificate(
     // per-host PEM files under `certs/dynamic/` are not currently
     // reloaded on startup and should be treated as an audit/debug view,
     // not as the authoritative runtime cache.
-    fs::create_dir_all(dynamic_dir).map_err(|source| CertError::CreateDir {
+    create_private_dir_all(dynamic_dir).map_err(|source| CertError::CreateDir {
         path: dynamic_dir.to_path_buf(),
         source,
     })?;
@@ -441,17 +444,19 @@ fn generate_host_certificate(
     let key_path = dynamic_dir.join(format!("{host}.key"));
     let chain_path = dynamic_dir.join(format!("{host}-chain.crt"));
 
-    fs::write(&leaf_path, leaf_pem.as_bytes()).map_err(|source| CertError::WriteFile {
+    write_private_file(&leaf_path, leaf_pem.as_bytes()).map_err(|source| CertError::WriteFile {
         path: leaf_path,
         source,
     })?;
-    fs::write(&key_path, key_pem.as_bytes()).map_err(|source| CertError::WriteFile {
+    write_private_file(&key_path, key_pem.as_bytes()).map_err(|source| CertError::WriteFile {
         path: key_path,
         source,
     })?;
-    fs::write(&chain_path, chain_pem.as_bytes()).map_err(|source| CertError::WriteFile {
-        path: chain_path,
-        source,
+    write_private_file(&chain_path, chain_pem.as_bytes()).map_err(|source| {
+        CertError::WriteFile {
+            path: chain_path,
+            source,
+        }
     })?;
 
     Ok((vec![leaf, ca_cert_rls], PrivateKey(key_der)))
@@ -478,6 +483,13 @@ mod tests {
     use crate::config::CertificatesConfig;
     use tempfile::TempDir;
 
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+    }
+
     #[test]
     fn ca_is_generated_and_reused_in_tempdir() {
         let tmp = TempDir::new().expect("tempdir");
@@ -491,6 +503,14 @@ mod tests {
         let mgr1 = CertManager::from_config(&cfg).expect("first cert manager");
         let ca_cert_path = mgr1.ca_cert_path().to_path_buf();
         assert!(ca_cert_path.exists());
+
+        #[cfg(unix)]
+        {
+            assert_eq!(mode(&certs_dir), 0o700);
+            assert_eq!(mode(&certs_dir.join("dynamic")), 0o700);
+            assert_eq!(mode(&certs_dir.join("ca-key.pem")), 0o600);
+            assert_eq!(mode(&ca_cert_path), 0o600);
+        }
 
         // Second manager should reuse existing CA.
         let mgr2 = CertManager::from_config(&cfg).expect("second cert manager");
@@ -523,6 +543,14 @@ mod tests {
         assert!(leaf.exists(), "leaf cert should exist");
         assert!(key.exists(), "key should exist");
         assert!(chain.exists(), "chain cert should exist");
+
+        #[cfg(unix)]
+        {
+            assert_eq!(mode(&dynamic_dir), 0o700);
+            assert_eq!(mode(&leaf), 0o600);
+            assert_eq!(mode(&key), 0o600);
+            assert_eq!(mode(&chain), 0o600);
+        }
     }
 
     #[test]

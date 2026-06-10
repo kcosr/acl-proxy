@@ -626,6 +626,8 @@ level_denies = "warn"               # log level for denies
 
 Policy decision events are emitted to the `acl_proxy::policy` target with structured fields: `request_id`, `allowed`, `url`, `method`, `client_ip`, `rule_action`, `rule_pattern`, `rule_description`, and optional `reason`.
 
+On Unix, log directories are created or tightened to owner-only (`0700`) and log files are created or tightened to owner-only (`0600`).
+
 ### `[capture]` — Request/Response Capture
 
 ```toml
@@ -645,6 +647,8 @@ Capture happens for:
 - Upstream failures (502/504) as allowed traffic when capture is enabled.
 
 `body.length` always records the full logical body length even when `body.data` is truncated.
+
+On Unix, capture directories are created or tightened to owner-only (`0700`) and capture JSON files are created or tightened to owner-only (`0600`). Capture files can contain decrypted headers and bodies; treat them as sensitive.
 
 #### Capture Record Format
 
@@ -704,6 +708,7 @@ max_cached_certs = 1024             # LRU cache size (min 1)
 - When both are provided, the proxy uses them as-is; invalid/unreadable files cause a startup error.
 - When only one is provided, validation fails — both must be set or both omitted.
 - Per-host certificates are generated on demand, cached in memory (LRU), and also written to `certs_dir/dynamic/` as `<host>.crt`, `<host>.key`, and `<host>-chain.crt` for debugging transparency. On-disk files are not reloaded on startup.
+- On Unix, certificate directories are created or tightened to owner-only (`0700`) and generated CA/per-host PEM files are created or tightened to owner-only (`0600`).
 
 ### `[tls]` — Upstream TLS Behavior
 
@@ -1072,6 +1077,8 @@ graph LR
 - **Default CA** (no explicit paths): Auto-generated at `certs/ca-key.pem` and `certs/ca-cert.pem`. If valid files exist, they are reused; otherwise a new CA is generated and written.
 - **External CA** (`ca_key_path` + `ca_cert_path`): Used as-is. Missing/invalid files cause startup/reload failure. Both must be set or both omitted.
 
+On Unix, certificate directories are created or tightened to owner-only (`0700`) and generated CA/per-host PEM files are created or tightened to owner-only (`0600`).
+
 ### Per-Host Certificates
 
 Generated on demand for each host (SNI or CONNECT target). Cached in memory with LRU eviction (configurable `max_cached_certs`, default 1024). Also written to disk for debugging:
@@ -1100,6 +1107,7 @@ Outgoing TLS from the proxy to upstream is verified against system root certific
 - Optional file rotation by size (default 100 MB, 5 files) when `logging.directory` is set.
 - Non-blocking — entries are dropped when the buffer is full (never stalls requests).
 - Console output controlled by `logging.console` (default `true`).
+- On Unix, log directories are owner-only (`0700`) and log files are owner-only (`0600`).
 
 ### Policy Decision Logging
 
@@ -1108,6 +1116,8 @@ Separate control for allow vs. deny decisions with configurable log levels. Even
 ### Request/Response Capture
 
 JSON capture files with request metadata, headers, and base64-encoded bodies. Enable independently for allowed/denied requests/responses. Body size capped at `capture.max_body_bytes` (default 1 MiB); full logical length always recorded in `body.length`.
+
+On Unix, capture directories are owner-only (`0700`) and capture files are owner-only (`0600`). Capture files can contain decrypted request/response data; treat them as sensitive.
 
 ### Body Extraction
 

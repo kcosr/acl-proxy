@@ -8,6 +8,13 @@ use acl_proxy::capture::{
 };
 use acl_proxy::config::Config;
 
+#[cfg(unix)]
+fn mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+}
+
 #[test]
 fn capture_write_creates_expected_file_and_json() {
     let temp_dir = TempDir::new().expect("create temp dir");
@@ -57,6 +64,12 @@ fn capture_write_creates_expected_file_and_json() {
     assert_eq!(decoded.request_id, "req-1");
     assert_eq!(decoded.method, "POST");
     assert!(decoded.body.is_some());
+
+    #[cfg(unix)]
+    {
+        assert_eq!(mode(&capture_dir), 0o700);
+        assert_eq!(mode(&path), 0o600);
+    }
 }
 
 #[test]
