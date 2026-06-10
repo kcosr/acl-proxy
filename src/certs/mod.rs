@@ -60,14 +60,24 @@ pub enum CertError {
     InvalidCacheSize { value: usize },
 }
 
+struct CaMaterial {
+    cert: RcgenCertificate,
+    key: KeyPair,
+    cert_pem: String,
+    cert_der: Vec<u8>,
+}
+
 struct Inner {
     ca_cert_path: PathBuf,
     dynamic_dir: PathBuf,
     persist_dynamic_certs: bool,
     ca_cert: RcgenCertificate,
     ca_key: KeyPair,
+    ca_cert_pem: String,
+    ca_cert_der: Vec<u8>,
     cache_capacity: NonZeroUsize,
     server_configs: Mutex<LruCache<String, Arc<ServerConfig>>>,
+    sni_acceptor: Mutex<Option<TlsAcceptor>>,
 }
 
 #[derive(Clone)]
@@ -110,8 +120,7 @@ impl CertManager {
             })?;
         }
 
-        let (ca_cert, ca_key) =
-            load_or_generate_ca(&ca_key_path, &ca_cert_path, explicit_ca_paths)?;
+        let ca_material = load_or_generate_ca(&ca_key_path, &ca_cert_path, explicit_ca_paths)?;
 
         let cache_capacity =
             NonZeroUsize::new(cfg.max_cached_certs).ok_or(CertError::InvalidCacheSize {
@@ -122,10 +131,13 @@ impl CertManager {
             ca_cert_path,
             dynamic_dir,
             persist_dynamic_certs: cfg.persist_dynamic_certs,
-            ca_cert,
-            ca_key,
+            ca_cert: ca_material.cert,
+            ca_key: ca_material.key,
+            ca_cert_pem: ca_material.cert_pem,
+            ca_cert_der: ca_material.cert_der,
             cache_capacity,
             server_configs: Mutex::new(LruCache::new(cache_capacity)),
+            sni_acceptor: Mutex::new(None),
         };
 
         Ok(CertManager {
@@ -139,13 +151,21 @@ impl CertManager {
     /// proxy terminates TLS directly from clients and must choose a
     /// certificate matching the requested hostname.
     pub fn tls_acceptor_with_sni(&self) -> Result<TlsAcceptor, CertError> {
+        {
+            let guard = self.inner.sni_acceptor.lock().unwrap();
+            if let Some(acceptor) = guard.as_ref() {
+                return Ok(acceptor.clone());
+            }
+        }
+
         // Seed the config with a placeholder certificate; the dynamic
         // `cert_resolver` below will be responsible for choosing the real
         // certificate based on SNI.
         let (cert_chain, key) = generate_host_certificate(
             &self.inner.ca_cert,
             &self.inner.ca_key,
-            &self.inner.ca_cert_path,
+            &self.inner.ca_cert_pem,
+            &self.inner.ca_cert_der,
             &self.inner.dynamic_dir,
             self.inner.persist_dynamic_certs,
             "default",
@@ -159,7 +179,13 @@ impl CertManager {
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         config.cert_resolver = Arc::new(SniResolver::new(self.inner.clone()));
 
-        Ok(TlsAcceptor::from(Arc::new(config)))
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let mut guard = self.inner.sni_acceptor.lock().unwrap();
+        if let Some(existing) = guard.as_ref() {
+            return Ok(existing.clone());
+        }
+        *guard = Some(acceptor.clone());
+        Ok(acceptor)
     }
 
     /// Build a `TlsAcceptor` for the given host, generating and caching a
@@ -181,7 +207,8 @@ impl CertManager {
         let (cert_chain, key) = generate_host_certificate(
             &self.inner.ca_cert,
             &self.inner.ca_key,
-            &self.inner.ca_cert_path,
+            &self.inner.ca_cert_pem,
+            &self.inner.ca_cert_der,
             &self.inner.dynamic_dir,
             self.inner.persist_dynamic_certs,
             &host,
@@ -232,7 +259,8 @@ impl SniResolver {
         let (cert_chain, key) = match generate_host_certificate(
             &self.inner.ca_cert,
             &self.inner.ca_key,
-            &self.inner.ca_cert_path,
+            &self.inner.ca_cert_pem,
+            &self.inner.ca_cert_der,
             &self.inner.dynamic_dir,
             self.inner.persist_dynamic_certs,
             &host,
@@ -282,7 +310,7 @@ fn load_or_generate_ca(
     ca_key_path: &Path,
     ca_cert_path: &Path,
     explicit: bool,
-) -> Result<(RcgenCertificate, KeyPair), CertError> {
+) -> Result<CaMaterial, CertError> {
     let key_exists = ca_key_path.exists();
     let cert_exists = ca_cert_path.exists();
 
@@ -326,10 +354,7 @@ fn load_or_generate_ca(
     generate_ca(ca_key_path, ca_cert_path)
 }
 
-fn load_ca_from_files(
-    ca_key_path: &Path,
-    ca_cert_path: &Path,
-) -> Result<(RcgenCertificate, KeyPair), CertError> {
+fn load_ca_from_files(ca_key_path: &Path, ca_cert_path: &Path) -> Result<CaMaterial, CertError> {
     let key_pem = fs::read_to_string(ca_key_path).map_err(|source| CertError::ReadCaKey {
         path: ca_key_path.to_path_buf(),
         source,
@@ -348,13 +373,27 @@ fn load_ca_from_files(
         .self_signed(&key_pair)
         .map_err(|e| CertError::ParseCaCert(format!("{e}")))?;
 
-    Ok((ca_cert, key_pair))
+    let mut reader = Cursor::new(cert_pem.as_bytes());
+    let mut certs =
+        rustls_pemfile::certs(&mut reader).map_err(|e| CertError::ParseCaCert(format!("{e}")))?;
+    let cert_der = if certs.len() == 1 {
+        certs.remove(0)
+    } else {
+        return Err(CertError::ParseCaCert(format!(
+            "expected exactly one CA certificate, found {}",
+            certs.len()
+        )));
+    };
+
+    Ok(CaMaterial {
+        cert: ca_cert,
+        key: key_pair,
+        cert_pem,
+        cert_der,
+    })
 }
 
-fn generate_ca(
-    ca_key_path: &Path,
-    ca_cert_path: &Path,
-) -> Result<(RcgenCertificate, KeyPair), CertError> {
+fn generate_ca(ca_key_path: &Path, ca_cert_path: &Path) -> Result<CaMaterial, CertError> {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let mut dn = DistinguishedName::new();
@@ -387,13 +426,21 @@ fn generate_ca(
         source,
     })?;
 
-    Ok((ca_cert, key_pair))
+    let cert_der = ca_cert.der().to_vec();
+
+    Ok(CaMaterial {
+        cert: ca_cert,
+        key: key_pair,
+        cert_pem,
+        cert_der,
+    })
 }
 
 fn generate_host_certificate(
     ca_cert: &RcgenCertificate,
     ca_key: &KeyPair,
-    ca_cert_path: &Path,
+    ca_cert_pem: &str,
+    ca_cert_der: &[u8],
     dynamic_dir: &Path,
     persist_dynamic_certs: bool,
     host: &str,
@@ -419,18 +466,7 @@ fn generate_host_certificate(
     let key_der = leaf_key.serialize_der();
 
     let leaf = RustlsCertificate(cert_der);
-    let ca_pem = fs::read_to_string(ca_cert_path).map_err(|source| CertError::ReadCaCert {
-        path: ca_cert_path.to_path_buf(),
-        source,
-    })?;
-
-    let mut reader = Cursor::new(ca_pem.as_bytes());
-    let ca_der = rustls_pemfile::certs(&mut reader)
-        .map_err(|e| CertError::ParseCaCert(format!("{e}")))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| CertError::ParseCaCert("no CA certificate found in PEM".to_string()))?;
-    let ca_cert_rls = RustlsCertificate(ca_der);
+    let ca_cert_rls = RustlsCertificate(ca_cert_der.to_vec());
 
     if persist_dynamic_certs {
         // Optional debug/audit view. Runtime TLS uses the bounded in-memory
@@ -442,7 +478,7 @@ fn generate_host_certificate(
 
         let leaf_pem = leaf_cert.pem();
         let key_pem = leaf_key.serialize_pem();
-        let chain_pem = format!("{leaf_pem}{ca_pem}");
+        let chain_pem = format!("{leaf_pem}{ca_cert_pem}");
 
         let leaf_path = dynamic_dir.join(format!("{host}.crt"));
         let key_path = dynamic_dir.join(format!("{host}.key"));
@@ -585,6 +621,60 @@ mod tests {
     }
 
     #[test]
+    fn host_generation_uses_in_memory_ca_after_startup() {
+        let tmp = TempDir::new().expect("tempdir");
+        let certs_dir = tmp.path().join("certs");
+
+        let cfg = CertificatesConfig {
+            certs_dir: certs_dir.to_string_lossy().to_string(),
+            persist_dynamic_certs: true,
+            ..CertificatesConfig::default()
+        };
+
+        let mgr = CertManager::from_config(&cfg).expect("cert manager");
+        fs::remove_file(mgr.ca_cert_path()).expect("remove ca cert after startup");
+
+        let host = "example.com";
+        let _acceptor = mgr
+            .tls_acceptor_for_host(host)
+            .expect("host cert should use in-memory CA");
+
+        let chain = certs_dir.join("dynamic").join(format!("{host}-chain.crt"));
+        assert!(chain.exists(), "chain cert should still be persisted");
+        let chain_pem = fs::read_to_string(chain).expect("read chain pem");
+        assert!(
+            chain_pem.contains("-----BEGIN CERTIFICATE-----"),
+            "chain should contain PEM certificates"
+        );
+    }
+
+    #[test]
+    fn sni_acceptor_reuses_default_placeholder_certificate() {
+        let tmp = TempDir::new().expect("tempdir");
+        let certs_dir = tmp.path().join("certs");
+
+        let cfg = CertificatesConfig {
+            certs_dir: certs_dir.to_string_lossy().to_string(),
+            persist_dynamic_certs: true,
+            ..CertificatesConfig::default()
+        };
+
+        let mgr = CertManager::from_config(&cfg).expect("cert manager");
+        let _first = mgr.tls_acceptor_with_sni().expect("first acceptor");
+
+        let default_key = certs_dir.join("dynamic").join("default.key");
+        let first_key_pem = fs::read_to_string(&default_key).expect("read first default key");
+
+        let _second = mgr.tls_acceptor_with_sni().expect("second acceptor");
+        let second_key_pem = fs::read_to_string(default_key).expect("read second default key");
+
+        assert_eq!(
+            first_key_pem, second_key_pem,
+            "cached SNI acceptor should not regenerate the default placeholder key"
+        );
+    }
+
+    #[test]
     fn server_config_cache_uses_lru_eviction() {
         let tmp = TempDir::new().expect("tempdir");
         let certs_dir = tmp.path().join("certs");
@@ -656,9 +746,15 @@ mod tests {
         assert!(chain.exists(), "chain cert should exist");
 
         let chain_pem = fs::read_to_string(chain).expect("read chain pem");
+        let mut ca_reader = std::io::Cursor::new(ca_cert_pem.as_bytes());
+        let ca_certs = rustls_pemfile::certs(&mut ca_reader).expect("parse ca cert");
+        let ca_cert = ca_certs.last().expect("ca cert");
+
+        let mut chain_reader = std::io::Cursor::new(chain_pem.as_bytes());
+        let chain_certs = rustls_pemfile::certs(&mut chain_reader).expect("parse chain certs");
         assert!(
-            chain_pem.ends_with(&ca_cert_pem),
-            "host chain should end with the configured CA cert PEM",
+            chain_certs.last() == Some(ca_cert),
+            "host chain should end with the configured CA cert",
         );
     }
 
