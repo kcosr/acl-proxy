@@ -595,6 +595,7 @@ internal_base_path = "/_acl-proxy"  # base path for internal endpoints
 ```
 
 - `internal_base_path` must start with `/` and must not end with `/` (except root `/`). Internal endpoints are only matched for origin-form (direct) requests, not proxy-style absolute-form requests.
+- Listener bind addresses must be IP literals. If both HTTP and transparent HTTPS listeners use fixed non-zero ports, overlapping bind addresses cannot use the same port.
 - The transparent HTTPS timeout and connection-cap settings apply at the listener boundary before request policy is evaluated.
 
 ### `[proxy.egress.default]` — Optional Forwarding Destination
@@ -889,11 +890,13 @@ The config loader performs validation beyond basic TOML parsing:
 - Include rules must reference an existing ruleset.
 - Macro placeholders (`{name}`) must resolve from `policy.macros` or `with` overrides.
 - `ca_key_path` and `ca_cert_path` must be both set or both omitted.
+- Listener bind addresses must parse as IP addresses, and overlapping HTTP/HTTPS listener binds must not use the same fixed port.
 - `loop_protection.header_name` must be a valid HTTP header name.
 - `${NAME}` env placeholders must resolve at validation/startup/reload time. Existing literal `${...}` strings in `set`/`add` header-action values are reserved syntax and must be migrated.
 - `policy.default` must be `allow` or `deny`; `delegate` is valid only on rules and ruleset templates.
 - `action = "delegate"` requires `external_auth_profile`.
 - `external_auth_profile` on `action = "allow"` or `action = "deny"` rules is rejected.
+- External auth `timeout_ms` and configured `webhook_timeout_ms` values must be non-zero.
 - `include_request_body = true` is supported only for `type = "plugin"` external auth profiles, and its body-size limits must be non-zero.
 
 On validation failure, `config validate` and startup report a human-readable error and abort, leaving any previously running instance (in the case of reload) unchanged.

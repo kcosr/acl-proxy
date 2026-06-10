@@ -1209,6 +1209,7 @@ impl Config {
         }
 
         validate_proxy_config(&self.proxy)?;
+        validate_loop_protection_config(&self.loop_protection)?;
 
         // Validate policy semantics (macros, rulesets, includes).
         crate::policy::PolicyEngine::from_config(&self.policy)
@@ -1449,6 +1450,20 @@ fn validate_logging_config(logging: &LoggingConfig) -> Result<(), ConfigError> {
 }
 
 fn validate_proxy_config(proxy: &ProxyConfig) -> Result<(), ConfigError> {
+    let bind_ip = parse_bind_address("proxy.bind_address", &proxy.bind_address)?;
+    let https_bind_ip = parse_bind_address("proxy.https_bind_address", &proxy.https_bind_address)?;
+
+    if proxy.http_port != 0
+        && proxy.https_port != 0
+        && proxy.http_port == proxy.https_port
+        && listener_bind_addresses_overlap(bind_ip, https_bind_ip)
+    {
+        return Err(ConfigError::Invalid(format!(
+            "proxy.http_port and proxy.https_port must not both be {} when bind addresses overlap",
+            proxy.http_port
+        )));
+    }
+
     validate_internal_base_path(&proxy.internal_base_path)?;
 
     if let Some(target) = proxy.egress.default.as_ref() {
@@ -1456,6 +1471,43 @@ fn validate_proxy_config(proxy: &ProxyConfig) -> Result<(), ConfigError> {
     }
 
     validate_egress_request_header_action_list(&proxy.egress.request_header_actions)?;
+
+    Ok(())
+}
+
+fn parse_bind_address(location: &str, value: &str) -> Result<IpAddr, ConfigError> {
+    value.parse::<IpAddr>().map_err(|err| {
+        ConfigError::Invalid(format!("{location} must be a valid IP address: {err}"))
+    })
+}
+
+fn listener_bind_addresses_overlap(left: IpAddr, right: IpAddr) -> bool {
+    match (left, right) {
+        (IpAddr::V4(left), IpAddr::V4(right)) => {
+            left == right || left.is_unspecified() || right.is_unspecified()
+        }
+        (IpAddr::V6(left), IpAddr::V6(right)) => {
+            left == right || left.is_unspecified() || right.is_unspecified()
+        }
+        _ => false,
+    }
+}
+
+fn validate_loop_protection_config(
+    loop_protection: &LoopProtectionConfig,
+) -> Result<(), ConfigError> {
+    let raw = loop_protection.header_name.trim();
+    if raw.is_empty() {
+        return Err(ConfigError::Invalid(
+            "loop_protection.header_name must not be empty".to_string(),
+        ));
+    }
+
+    HeaderName::from_bytes(raw.as_bytes()).map_err(|_| {
+        ConfigError::Invalid(format!(
+            "loop_protection.header_name must be a valid HTTP header name: {raw}"
+        ))
+    })?;
 
     Ok(())
 }
@@ -1765,6 +1817,17 @@ fn validate_external_auth_profiles(
     profiles: &ExternalAuthProfileConfigMap,
 ) -> Result<(), ConfigError> {
     for (name, profile) in profiles {
+        if profile.timeout_ms == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "external_auth_profiles.{name}.timeout_ms must be at least 1"
+            )));
+        }
+        if matches!(profile.webhook_timeout_ms, Some(0)) {
+            return Err(ConfigError::Invalid(format!(
+                "external_auth_profiles.{name}.webhook_timeout_ms must be at least 1 when set"
+            )));
+        }
+
         match profile.profile_type {
             ExternalAuthProfileType::Http => {
                 if profile.include_request_body {
@@ -2508,6 +2571,112 @@ default = "deny"
         assert_eq!(config.proxy.https_max_connections, 8);
         assert_eq!(config.proxy.https_http2_max_concurrent_streams, 16);
         config.validate_basic().expect("config should validate");
+    }
+
+    #[test]
+    fn proxy_listener_bind_addresses_must_parse() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "localhost"
+http_port = 8080
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("proxy.bind_address must be a valid IP address"),
+            "unexpected error: {msg}"
+        );
+
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+https_bind_address = "not-an-ip"
+https_port = 8443
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("proxy.https_bind_address must be a valid IP address"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn proxy_listener_ports_must_not_collide_on_overlapping_binds() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "0.0.0.0"
+http_port = 8443
+https_bind_address = "127.0.0.1"
+https_port = 8443
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("proxy.http_port and proxy.https_port must not both be 8443"),
+            "unexpected error: {msg}"
+        );
+
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8443
+https_bind_address = "127.0.0.2"
+https_port = 8443
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        config
+            .validate_basic()
+            .expect("distinct listener bind addresses may share a port");
+    }
+
+    #[test]
+    fn loop_protection_header_name_is_validated() {
+        let toml = r#"
+schema_version = "1"
+
+[loop_protection]
+header_name = "invalid header"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("loop_protection.header_name must be a valid HTTP header name"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
@@ -3813,6 +3982,48 @@ external_auth_profile = "body_guard"
         let msg = format!("{err}");
         assert!(
             msg.contains("include_request_body is only supported for type=plugin"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn external_auth_profiles_reject_zero_timeouts() {
+        let toml = r#"
+schema_version = "1"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles.example]
+webhook_url = "https://auth.example/start"
+timeout_ms = 0
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("external_auth_profiles.example.timeout_ms must be at least 1"),
+            "unexpected error: {msg}"
+        );
+
+        let toml = r#"
+schema_version = "1"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles.example]
+webhook_url = "https://auth.example/start"
+timeout_ms = 1000
+webhook_timeout_ms = 0
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("external_auth_profiles.example.webhook_timeout_ms must be at least 1"),
             "unexpected error: {msg}"
         );
     }

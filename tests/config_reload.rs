@@ -325,7 +325,7 @@ async fn failed_reload_keeps_previous_state() {
         .expect_err("reload should fail");
     let msg = format!("{err}");
     assert!(
-        msg.contains("invalid loop protection header name"),
+        msg.contains("loop_protection.header_name must be a valid HTTP header name"),
         "unexpected reload error: {msg}"
     );
 

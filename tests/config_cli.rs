@@ -122,6 +122,34 @@ default = "deny"
 }
 
 #[test]
+fn config_validate_fails_for_invalid_loop_protection_header_name() {
+    let mut file = NamedTempFile::new().expect("create temp config");
+    writeln!(
+        file,
+        r#"
+schema_version = "1"
+
+[loop_protection]
+header_name = "invalid header"
+
+[policy]
+default = "deny"
+        "#
+    )
+    .expect("write config");
+
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
+    cmd.arg("config")
+        .arg("validate")
+        .arg("--config")
+        .arg(file.path());
+
+    cmd.assert().failure().stderr(contains(
+        "loop_protection.header_name must be a valid HTTP header name",
+    ));
+}
+
+#[test]
 fn env_overrides_are_applied() {
     let mut file = NamedTempFile::new().expect("create temp config");
     writeln!(
