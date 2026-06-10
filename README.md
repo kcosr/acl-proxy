@@ -990,7 +990,7 @@ The [`demos/body-inspection-plugin/`](demos/body-inspection-plugin/) directory i
 
 ### Security Note
 
-The callback endpoint does not authenticate requests. Restrict access to `/{internal_base_path}/external-auth/callback` using network policy or firewall rules.
+Callback decisions are authorized by the pending request's unguessable `requestId`, which is a bearer capability included in the pending webhook. Treat webhook payloads and callback URLs as sensitive, and restrict access to `/{internal_base_path}/external-auth/callback` using network policy or firewall rules.
 
 ## Operations
 

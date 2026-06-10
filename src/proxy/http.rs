@@ -3264,23 +3264,18 @@ pub(crate) fn version_to_string(version: Version) -> String {
 }
 
 pub(crate) fn generate_request_id() -> String {
-    use once_cell::sync::Lazy;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use std::{process, time::Duration};
+    use rand::RngCore;
+    use std::fmt::Write;
 
-    static COUNTER: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
-    static PROCESS_TAG: Lazy<String> = Lazy::new(|| {
-        let pid = process::id();
-        let started = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_nanos();
-        format!("{pid:x}_{started:x}")
-    });
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let ts = Utc::now().timestamp_millis();
-    format!("req-{}-{}-{}", PROCESS_TAG.as_str(), ts, seq)
+    let mut token = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut token);
+
+    let mut id = String::with_capacity(36);
+    id.push_str("req-");
+    for byte in token {
+        let _ = write!(&mut id, "{byte:02x}");
+    }
+    id
 }
 
 #[cfg(test)]
@@ -3293,20 +3288,13 @@ mod tests {
     use hyper::{Body, Request};
 
     #[test]
-    fn request_id_includes_process_tag_and_is_unique() {
+    fn request_id_is_random_capability_token() {
         let first = generate_request_id();
         let second = generate_request_id();
         assert_ne!(first, second);
-
-        let mut parts = first.splitn(4, '-');
-        assert_eq!(parts.next(), Some("req"));
-        let tag = parts.next().unwrap_or("");
-        assert!(
-            tag.contains('_'),
-            "process tag should include an underscore separator"
-        );
-        assert!(parts.next().unwrap_or("").parse::<i64>().is_ok());
-        assert!(!parts.next().unwrap_or("").is_empty());
+        assert_eq!(first.len(), 36);
+        assert!(first.starts_with("req-"));
+        assert!(first[4..].chars().all(|ch| ch.is_ascii_hexdigit()));
     }
 
     #[test]
