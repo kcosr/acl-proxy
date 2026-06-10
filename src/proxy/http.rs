@@ -2948,11 +2948,12 @@ async fn send_request_via_egress_target(
     );
 
     let request_id = request_id.to_string();
-    let full_url = full_url.to_string();
+    let log_url = redact_url_for_sink(full_url);
     tokio::spawn(async move {
         if let Err(err) = connection.await {
             tracing::debug!(
-                "egress forwarding connection ended for {request_id} ({full_url}): {err}"
+                url = %log_url,
+                "egress forwarding connection ended for {request_id} ({log_url}): {err}"
             );
         }
     });
