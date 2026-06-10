@@ -71,6 +71,9 @@ fn default_external_auth_profile_type() -> ExternalAuthProfileType {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(skip)]
+    pub load_warnings: Vec<String>,
+
     #[serde(default = "default_schema_version")]
     pub schema_version: String,
 
@@ -561,6 +564,7 @@ fn default_verify_upstream() -> bool {
 impl Default for Config {
     fn default() -> Self {
         Config {
+            load_warnings: Vec::new(),
             schema_version: default_schema_version(),
             proxy: ProxyConfig::default(),
             logging: LoggingConfig::default(),
@@ -1065,10 +1069,13 @@ impl Config {
     }
 
     fn interpolate_redaction_env_vars(&mut self) -> Result<(), ConfigError> {
+        let load_warnings = &mut self.load_warnings;
+
         for (profile_name, profile) in self.redaction.profiles.iter_mut() {
             interpolate_redaction_env_value(
                 &mut profile.replacement,
                 format!("redaction.profiles.{profile_name}.replacement").as_str(),
+                load_warnings,
             )?;
 
             for (rule_idx, rule) in profile.rules.iter_mut().enumerate() {
@@ -1079,6 +1086,7 @@ impl Config {
                             "redaction.profiles.{profile_name}.rules[{rule_idx}].literals[{literal_idx}]"
                         )
                         .as_str(),
+                        load_warnings,
                     )?;
                 }
             }
@@ -1233,13 +1241,12 @@ fn interpolate_header_action_value(
 fn interpolate_redaction_env_value(
     raw_value: &mut String,
     value_location: &str,
+    load_warnings: &mut Vec<String>,
 ) -> Result<(), ConfigError> {
     if has_incomplete_config_env_marker(raw_value) {
-        tracing::warn!(
-            target: "acl_proxy::config",
-            location = %value_location,
-            "redaction value contains '${{' but is not a complete placeholder; treating as literal text"
-        );
+        load_warnings.push(format!(
+            "{value_location} contains '${{' but is not a complete placeholder; treating as literal text"
+        ));
     }
 
     interpolate_config_env_value(raw_value, value_location, false)
@@ -1283,7 +1290,11 @@ fn has_incomplete_config_env_marker(raw_value: &str) -> bool {
 }
 
 fn classify_config_env_placeholder(raw_value: &str) -> ConfigEnvPlaceholder<'_> {
-    if has_incomplete_config_env_marker(raw_value) || !raw_value.contains("${") {
+    let Some(open_idx) = raw_value.find("${") else {
+        return ConfigEnvPlaceholder::None;
+    };
+
+    if !raw_value[open_idx + 2..].contains('}') {
         return ConfigEnvPlaceholder::None;
     }
 
@@ -2303,6 +2314,13 @@ redaction_profile = "secrets"
             .expect("load should preserve incomplete marker literal");
         let profile = config.redaction.profiles.get("secrets").expect("profile");
         assert_eq!(profile.rules[0].literals, vec!["pass${word".to_string()]);
+        assert_eq!(
+            config.load_warnings,
+            vec![
+                "redaction.profiles.secrets.rules[0].literals[0] contains '${' but is not a complete placeholder; treating as literal text"
+                    .to_string()
+            ]
+        );
     }
 
     #[test]

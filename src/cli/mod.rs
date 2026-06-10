@@ -125,7 +125,9 @@ pub fn run() -> Result<ExitCode, CliError> {
 
             let _logging_guards = match shared_state.load().logging.init_tracing() {
                 Ok(guards) => {
-                    log_startup(shared_state.load().as_ref());
+                    let state = shared_state.load();
+                    log_config_load_warnings(&state.config);
+                    log_startup(state.as_ref());
                     Some(guards)
                 }
                 Err(err) => {
@@ -151,7 +153,8 @@ pub fn run() -> Result<ExitCode, CliError> {
         }
         Command::Config { command } => match command {
             ConfigCommand::Validate => {
-                let _config = load_config_for_cli(config_path)?;
+                let config = load_config_for_cli(config_path)?;
+                print_config_load_warnings(&config);
                 println!("Configuration is valid");
                 Ok(ExitCode::from(0))
             }
@@ -388,7 +391,26 @@ fn spawn_signal_handlers(
 
 fn reload_from_sources(state: &SharedAppState, config_path: Option<&Path>) -> Result<(), String> {
     let config = Config::load_from_sources(config_path).map_err(|e| e.to_string())?;
-    AppState::reload_shared_from_config(state, config).map_err(|e| e.to_string())
+    let load_warnings = config.load_warnings.clone();
+    AppState::reload_shared_from_config(state, config).map_err(|e| e.to_string())?;
+    log_config_load_warning_messages(&load_warnings);
+    Ok(())
+}
+
+fn log_config_load_warnings(config: &Config) {
+    log_config_load_warning_messages(&config.load_warnings);
+}
+
+fn log_config_load_warning_messages(warnings: &[String]) {
+    for warning in warnings {
+        tracing::warn!(target: "acl_proxy::config", "{warning}");
+    }
+}
+
+fn print_config_load_warnings(config: &Config) {
+    for warning in &config.load_warnings {
+        eprintln!("warning: {warning}");
+    }
 }
 
 fn log_startup(state: &AppState) {

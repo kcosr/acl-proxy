@@ -2,6 +2,7 @@ use std::io::Write;
 use std::process::Command;
 
 use assert_cmd::prelude::*;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use tempfile::{NamedTempFile, TempDir};
 
@@ -36,6 +37,55 @@ default = "deny"
     cmd.assert()
         .success()
         .stdout(contains("Configuration is valid"));
+}
+
+#[test]
+fn config_validate_warns_for_incomplete_redaction_env_marker() {
+    let mut file = NamedTempFile::new().expect("create temp config");
+    writeln!(
+        file,
+        r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[redaction.profiles.secrets]
+
+[[redaction.profiles.secrets.rules]]
+literals = ["pass${{word"]
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+redaction_profile = "secrets"
+        "#
+    )
+    .expect("write config");
+
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
+    cmd.arg("config")
+        .arg("validate")
+        .arg("--config")
+        .arg(file.path());
+
+    cmd.assert()
+        .success()
+        .stdout(contains("Configuration is valid"))
+        .stderr(
+            contains(
+                "warning: redaction.profiles.secrets.rules[0].literals[0] contains '${' but is not a complete placeholder",
+            )
+            .and(contains("pass${word").not()),
+        );
 }
 
 #[test]
