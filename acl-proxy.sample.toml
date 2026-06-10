@@ -127,6 +127,11 @@ filename = "{requestId}-{kind}.json"
 # payload bytes while preserving metadata.
 max_body_bytes = 1048576
 
+# Capture retention limits. After each capture write, older regular files in
+# the capture directory are pruned until both limits are satisfied.
+max_files = 10000
+max_total_bytes = 1073741824
+
 ###############################################################################
 # Native redaction (optional)
 ###############################################################################

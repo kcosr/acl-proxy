@@ -15,6 +15,40 @@ fn mode(path: &std::path::Path) -> u32 {
     fs::metadata(path).expect("metadata").permissions().mode() & 0o777
 }
 
+fn capture_record(request_id: &str) -> acl_proxy::capture::CaptureRecord {
+    build_capture_record(CaptureRecordOptions {
+        timestamp: "2024-01-01T00:00:00Z".to_string(),
+        request_id: request_id.to_string(),
+        kind: CaptureKind::Request,
+        decision: CaptureDecision::Allow,
+        mode: CaptureMode::HttpProxy,
+        url: "http://example.com/echo".to_string(),
+        method: Some("GET".to_string()),
+        client: CaptureEndpoint::default(),
+        target: None,
+        http_version: Some("1.1".to_string()),
+        headers: None,
+        status_code: None,
+        status_message: None,
+        body: None,
+    })
+}
+
+fn capture_file_names(capture_dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<_> = fs::read_dir(capture_dir)
+        .expect("read capture dir")
+        .map(|entry| {
+            entry
+                .expect("capture entry")
+                .file_name()
+                .to_string_lossy()
+                .to_string()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
 #[test]
 fn capture_write_creates_expected_file_and_json() {
     let temp_dir = TempDir::new().expect("create temp dir");
@@ -70,6 +104,49 @@ fn capture_write_creates_expected_file_and_json() {
         assert_eq!(mode(&capture_dir), 0o700);
         assert_eq!(mode(&path), 0o600);
     }
+}
+
+#[test]
+fn capture_write_prunes_by_max_files() {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let capture_dir = temp_dir.path().join("captures");
+
+    let mut config = Config::default();
+    config.capture.directory = capture_dir.to_string_lossy().to_string();
+    config.capture.filename = "{requestId}.json".to_string();
+    config.capture.max_files = 2;
+
+    for request_id in ["req-001", "req-002", "req-003"] {
+        let record = capture_record(request_id);
+        acl_proxy::capture::write_capture_record(&config, &record).unwrap();
+    }
+
+    assert_eq!(
+        capture_file_names(&capture_dir),
+        vec!["req-002.json".to_string(), "req-003.json".to_string()]
+    );
+}
+
+#[test]
+fn capture_write_prunes_by_max_total_bytes() {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let capture_dir = temp_dir.path().join("captures");
+
+    let mut config = Config::default();
+    config.capture.directory = capture_dir.to_string_lossy().to_string();
+    config.capture.filename = "{requestId}.json".to_string();
+    config.capture.max_files = 10;
+    config.capture.max_total_bytes = 1;
+
+    for request_id in ["req-001", "req-002", "req-003"] {
+        let record = capture_record(request_id);
+        acl_proxy::capture::write_capture_record(&config, &record).unwrap();
+    }
+
+    assert_eq!(
+        capture_file_names(&capture_dir),
+        vec!["req-003.json".to_string()]
+    );
 }
 
 #[test]

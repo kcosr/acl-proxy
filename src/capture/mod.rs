@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
+use std::fs;
+use std::io::ErrorKind as IoErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
@@ -190,6 +193,34 @@ pub enum CaptureError {
         source: std::io::Error,
     },
 
+    #[error("failed to read capture directory {path}: {source}")]
+    ReadDir {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to read capture directory entry in {path}: {source}")]
+    ReadDirEntry {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to stat capture file {path}: {source}")]
+    Metadata {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to remove old capture file {path}: {source}")]
+    RemoveFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("failed to serialize capture record as JSON: {0}")]
     Serialize(#[from] serde_json::Error),
 }
@@ -360,6 +391,13 @@ fn effective_capture_directory(capture: &CaptureConfig) -> String {
     "logs-capture".to_string()
 }
 
+struct CaptureFileEntry {
+    path: PathBuf,
+    len: u64,
+    modified: SystemTime,
+    is_written_file: bool,
+}
+
 pub fn write_capture_record(
     config: &Config,
     record: &CaptureRecord,
@@ -371,8 +409,76 @@ pub fn write_capture_record(
         path: path.clone(),
         source,
     })?;
+    prune_capture_directory(config, &path)?;
 
     Ok(path)
+}
+
+fn prune_capture_directory(config: &Config, written_path: &Path) -> Result<(), CaptureError> {
+    let directory = PathBuf::from(effective_capture_directory(&config.capture));
+    let read_dir = fs::read_dir(&directory).map_err(|source| CaptureError::ReadDir {
+        path: directory.clone(),
+        source,
+    })?;
+
+    let mut entries = Vec::new();
+    for entry in read_dir {
+        let entry = entry.map_err(|source| CaptureError::ReadDirEntry {
+            path: directory.clone(),
+            source,
+        })?;
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == IoErrorKind::NotFound => continue,
+            Err(source) => return Err(CaptureError::Metadata { path, source }),
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+
+        entries.push(CaptureFileEntry {
+            is_written_file: path == written_path,
+            path,
+            len: metadata.len(),
+            modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        });
+    }
+
+    entries.sort_by(|a, b| {
+        b.is_written_file
+            .cmp(&a.is_written_file)
+            .then_with(|| b.modified.cmp(&a.modified))
+            .then_with(|| b.path.cmp(&a.path))
+    });
+
+    let mut kept_files = 0usize;
+    let mut kept_bytes = 0u64;
+
+    for entry in entries {
+        let is_first = kept_files == 0;
+        let within_count = kept_files < config.capture.max_files;
+        let next_bytes = kept_bytes.saturating_add(entry.len);
+        let within_bytes = next_bytes <= config.capture.max_total_bytes;
+        if is_first || (within_count && within_bytes) {
+            kept_files += 1;
+            kept_bytes = next_bytes;
+            continue;
+        }
+
+        match fs::remove_file(&entry.path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == IoErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(CaptureError::RemoveFile {
+                    path: entry.path,
+                    source,
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

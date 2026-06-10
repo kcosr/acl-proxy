@@ -378,6 +378,14 @@ pub struct CaptureConfig {
     /// Set to `0` to skip body payload bytes while preserving metadata.
     #[serde(default = "default_capture_max_body_bytes")]
     pub max_body_bytes: usize,
+
+    /// Maximum regular files to keep in the capture directory.
+    #[serde(default = "default_capture_max_files")]
+    pub max_files: usize,
+
+    /// Maximum total bytes of regular files to keep in the capture directory.
+    #[serde(default = "default_capture_max_total_bytes")]
+    pub max_total_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -482,6 +490,8 @@ impl Default for CaptureConfig {
             directory: default_capture_directory(),
             filename: default_capture_filename(),
             max_body_bytes: default_capture_max_body_bytes(),
+            max_files: default_capture_max_files(),
+            max_total_bytes: default_capture_max_total_bytes(),
         }
     }
 }
@@ -496,6 +506,14 @@ fn default_capture_filename() -> String {
 
 fn default_capture_max_body_bytes() -> usize {
     crate::capture::DEFAULT_MAX_BODY_BYTES
+}
+
+fn default_capture_max_files() -> usize {
+    10_000
+}
+
+fn default_capture_max_total_bytes() -> u64 {
+    1024 * 1024 * 1024
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1663,6 +1681,18 @@ fn validate_capture_config(capture: &CaptureConfig) -> Result<(), ConfigError> {
     }
 
     validate_capture_filename_template(&capture.filename)?;
+
+    if capture.max_files == 0 {
+        return Err(ConfigError::Invalid(
+            "capture.max_files must be at least 1".to_string(),
+        ));
+    }
+
+    if capture.max_total_bytes == 0 {
+        return Err(ConfigError::Invalid(
+            "capture.max_total_bytes must be at least 1".to_string(),
+        ));
+    }
 
     Ok(())
 }
@@ -3758,6 +3788,8 @@ default = "deny"
 
         let config: Config = toml::from_str(toml).expect("parse config");
         assert_eq!(config.capture.max_body_bytes, 1024 * 1024);
+        assert_eq!(config.capture.max_files, 10_000);
+        assert_eq!(config.capture.max_total_bytes, 1024 * 1024 * 1024);
         assert!(config.validate_basic().is_ok());
     }
 
@@ -3785,6 +3817,42 @@ default = "deny"
         let config: Config = toml::from_str(toml).expect("parse config");
         assert_eq!(config.capture.max_body_bytes, 0);
         assert!(config.validate_basic().is_ok());
+    }
+
+    #[test]
+    fn capture_retention_limits_must_be_nonzero() {
+        for field in ["max_files", "max_total_bytes"] {
+            let toml = format!(
+                r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[capture]
+directory = "logs-capture"
+{field} = 0
+
+[policy]
+default = "deny"
+"#
+            );
+
+            let config: Config = toml::from_str(&toml).expect("parse config");
+            let err = config
+                .validate_basic()
+                .expect_err("zero retention limit should be rejected");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(&format!("capture.{field} must be at least 1")),
+                "unexpected error for {field}: {msg}"
+            );
+        }
     }
 
     #[test]

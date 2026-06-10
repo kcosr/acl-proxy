@@ -651,6 +651,8 @@ denied_response = false             # capture denied response records
 directory = "logs-capture"          # base directory for capture files
 filename = "{requestId}-{suffix}.json"   # template ({requestId}, {kind}, {suffix})
 max_body_bytes = 1048576            # max body bytes to serialize (1 MiB; 0 = skip body)
+max_files = 10000                   # max capture files to retain
+max_total_bytes = 1073741824        # max total capture directory bytes to retain (1 GiB)
 ```
 
 Capture happens for:
@@ -661,6 +663,8 @@ Capture happens for:
 `body.length` always records the full logical body length even when `body.data` is truncated.
 
 `capture.filename` must be a filename template, not a path. Use `capture.directory` to choose the output directory; templates containing path separators, absolute paths, or `..` path segments are rejected.
+
+After each capture write, acl-proxy prunes older regular files in `capture.directory` until both `capture.max_files` and `capture.max_total_bytes` are satisfied. The newest just-written capture file is retained even if a single file exceeds the byte cap.
 
 On Unix, capture directories are created or tightened to owner-only (`0700`) and capture JSON files are created or tightened to owner-only (`0600`). Capture URLs have userinfo removed and query strings replaced with `REDACTED`; `Authorization`, `Proxy-Authorization`, `Cookie`, and `Set-Cookie` header values are replaced with `[REDACTED]`. Capture bodies and other headers can still contain sensitive decrypted data; treat capture files as sensitive.
 
@@ -1139,7 +1143,7 @@ Separate control for allow vs. deny decisions with configurable log levels. Even
 
 ### Request/Response Capture
 
-JSON capture files with request metadata, headers, and base64-encoded bodies. Enable independently for allowed/denied requests/responses. Body size capped at `capture.max_body_bytes` (default 1 MiB); full logical length always recorded in `body.length`.
+JSON capture files with request metadata, headers, and base64-encoded bodies. Enable independently for allowed/denied requests/responses. Body size capped at `capture.max_body_bytes` (default 1 MiB); full logical length always recorded in `body.length`. Capture retention is bounded by `capture.max_files` (default 10000) and `capture.max_total_bytes` (default 1 GiB).
 
 On Unix, capture directories are owner-only (`0700`) and capture files are owner-only (`0600`). Capture URLs and common credential headers are redacted, but bodies and other decrypted request/response data may still be sensitive; treat capture files as sensitive.
 
