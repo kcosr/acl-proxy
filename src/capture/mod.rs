@@ -60,6 +60,9 @@ pub struct CaptureBody {
 
     #[serde(rename = "contentType", skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
+
+    #[serde(rename = "contentEncoding", skip_serializing_if = "Option::is_none")]
+    pub content_encoding: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,7 +160,7 @@ impl BodyCaptureBuffer {
     /// All bytes contribute to `total_len`, but only the first
     /// `max_bytes` bytes across all calls are retained in `captured`.
     pub fn push(&mut self, chunk: &[u8]) {
-        self.total_len += chunk.len();
+        self.total_len = self.total_len.saturating_add(chunk.len());
         if self.captured.len() >= self.max_bytes {
             return;
         }
@@ -305,21 +308,8 @@ fn build_body(headers: Option<&HeaderMap>, body: &BodyCaptureResult) -> Option<C
         return None;
     }
 
-    let content_type = headers.and_then(|map| {
-        map.iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-            .and_then(|(_, v)| match v {
-                JsonValue::String(s) => Some(s.clone()),
-                JsonValue::Array(arr) => arr.iter().find_map(|v| {
-                    if let JsonValue::String(s) = v {
-                        Some(s.clone())
-                    } else {
-                        None
-                    }
-                }),
-                _ => None,
-            })
-    });
+    let content_type = headers.and_then(|map| first_header_string(map, "content-type"));
+    let content_encoding = headers.and_then(|map| first_header_string(map, "content-encoding"));
 
     let data = general_purpose::STANDARD.encode(&body.captured);
 
@@ -328,7 +318,25 @@ fn build_body(headers: Option<&HeaderMap>, body: &BodyCaptureResult) -> Option<C
         length: body.total_len,
         data,
         content_type,
+        content_encoding,
     })
+}
+
+fn first_header_string(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .and_then(|(_, v)| match v {
+            JsonValue::String(s) => Some(s.clone()),
+            JsonValue::Array(arr) => arr.iter().find_map(|v| {
+                if let JsonValue::String(s) = v {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            }),
+            _ => None,
+        })
 }
 
 fn sanitize_path_component(input: &str) -> String {
@@ -580,6 +588,21 @@ default = "deny"
     }
 
     #[test]
+    fn body_capture_length_saturates_on_overflow() {
+        let mut buf = BodyCaptureBuffer {
+            max_bytes: 0,
+            captured: Vec::new(),
+            total_len: usize::MAX - 1,
+        };
+
+        buf.push(&[1, 2, 3, 4]);
+
+        let result = buf.finish();
+        assert_eq!(result.total_len, usize::MAX);
+        assert!(result.captured.is_empty());
+    }
+
+    #[test]
     fn decode_body_bytes_succeeds_for_base64_body() {
         let body_bytes = b"hello world";
         let encoded = general_purpose::STANDARD.encode(body_bytes);
@@ -589,6 +612,7 @@ default = "deny"
             length: body_bytes.len(),
             data: encoded,
             content_type: Some("text/plain".to_string()),
+            content_encoding: None,
         };
 
         let record = sample_record_with_body(Some(body));
@@ -613,6 +637,7 @@ default = "deny"
             length: 0,
             data: "".to_string(),
             content_type: None,
+            content_encoding: None,
         };
 
         let record = sample_record_with_body(Some(body));
@@ -632,6 +657,7 @@ default = "deny"
             length: 10,
             data: "!!!not-base64!!!".to_string(),
             content_type: None,
+            content_encoding: None,
         };
 
         let record = sample_record_with_body(Some(body));
@@ -677,6 +703,10 @@ default = "deny"
             "Content-Type".to_string(),
             JsonValue::String("text/plain".to_string()),
         );
+        headers.insert(
+            "Content-Encoding".to_string(),
+            JsonValue::String("gzip".to_string()),
+        );
 
         let body_bytes = b"hello world";
         let body_result = sample_body_result(body_bytes);
@@ -717,6 +747,7 @@ default = "deny"
         assert_eq!(body.encoding, "base64");
         assert_eq!(body.length, body_bytes.len());
         assert_eq!(body.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(body.content_encoding.as_deref(), Some("gzip"));
 
         let data = general_purpose::STANDARD
             .decode(body.data)

@@ -39,6 +39,7 @@ fn cli_outputs_decoded_body_for_valid_capture() {
         length: body_bytes.len(),
         data: encoded,
         content_type: Some("text/plain".to_string()),
+        content_encoding: None,
     };
 
     let record = sample_record(Some(body));
@@ -51,6 +52,37 @@ fn cli_outputs_decoded_body_for_valid_capture() {
     cmd.arg(file.path());
 
     cmd.assert().success().stdout(contains("hello world"));
+}
+
+#[test]
+fn cli_warns_when_capture_body_remains_content_encoded() {
+    let body_bytes = b"compressed bytes";
+    use base64::engine::general_purpose;
+    use base64::Engine as _;
+
+    let encoded = general_purpose::STANDARD.encode(body_bytes);
+
+    let body = CaptureBody {
+        encoding: "base64".to_string(),
+        length: body_bytes.len(),
+        data: encoded,
+        content_type: Some("application/octet-stream".to_string()),
+        content_encoding: Some("gzip".to_string()),
+    };
+
+    let record = sample_record(Some(body));
+    let json = serde_json::to_string(&record).expect("serialize record");
+
+    let mut file = NamedTempFile::new().expect("create temp capture file");
+    write!(file, "{json}").expect("write capture json");
+
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy-extract-capture-body"));
+    cmd.arg(file.path());
+
+    cmd.assert()
+        .success()
+        .stdout(contains("compressed bytes"))
+        .stderr(contains("Content-Encoding \"gzip\""));
 }
 
 #[test]
@@ -88,6 +120,7 @@ fn cli_fails_for_unsupported_encoding() {
         length: 0,
         data: "".to_string(),
         content_type: None,
+        content_encoding: None,
     };
 
     let record = sample_record(Some(body));

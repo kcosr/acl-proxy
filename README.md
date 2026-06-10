@@ -660,7 +660,7 @@ Capture happens for:
 - Denied requests/responses for policy or loop protection when denied flags are enabled.
 - Upstream failures (502/504) as allowed traffic when capture is enabled.
 
-`body.length` always records the full logical body length even when `body.data` is truncated.
+`body.length` always records the full on-wire body length even when `body.data` is truncated. When a captured body has an HTTP `Content-Encoding`, the raw captured bytes remain content-encoded and the body object records `contentEncoding`.
 
 `capture.filename` must be a filename template, not a path. Use `capture.directory` to choose the output directory; templates containing path separators, absolute paths, or `..` path segments are rejected.
 
@@ -687,7 +687,7 @@ Each JSON file contains a single object:
 | `client` | object | `address` (string), `port` (number) |
 | `target` | object | Upstream `address` and `port` (when available) |
 | `headers` | object | Lowercase keys; values are string or string array; common credential headers are redacted |
-| `body` | object | `encoding` (`"base64"`), `length` (full), `data` (base64), `contentType` |
+| `body` | object | `encoding` (`"base64"`), `length` (full on-wire length), `data` (base64), `contentType`, `contentEncoding` |
 
 #### Extract Captured Bodies
 
@@ -695,7 +695,7 @@ Each JSON file contains a single object:
 acl-proxy-extract-capture-body logs-capture/req-123-res.json > body.bin
 ```
 
-Reports errors for invalid JSON, missing bodies, or unsupported encodings.
+Reports errors for invalid JSON, missing bodies, or unsupported capture encodings. If the capture body has an HTTP `contentEncoding`, the tool prints a warning because stdout contains the still-content-encoded bytes after base64 decoding.
 
 ### `[loop_protection]` — Loop Detection
 
@@ -1187,7 +1187,7 @@ acl-proxy policy dump --format json
 acl-proxy-extract-capture-body <capture-file.json> > body.bin
 ```
 
-Decodes the base64 body payload from a capture JSON file. Reports errors for invalid JSON, missing bodies, or unsupported encodings.
+Decodes the base64 body payload from a capture JSON file. Reports errors for invalid JSON, missing bodies, or unsupported capture encodings, and warns when the output remains HTTP content-encoded.
 
 ## Troubleshooting
 
