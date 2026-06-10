@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use http::header::{HeaderName, HeaderValue};
 use ipnet::IpNet;
@@ -1662,7 +1662,30 @@ fn validate_capture_config(capture: &CaptureConfig) -> Result<(), ConfigError> {
         ));
     }
 
+    validate_capture_filename_template(&capture.filename)?;
+
     Ok(())
+}
+
+fn validate_capture_filename_template(filename: &str) -> Result<(), ConfigError> {
+    let template = filename.trim();
+    if template.is_empty() {
+        return Ok(());
+    }
+
+    if template.contains('/') || template.contains('\\') {
+        return Err(ConfigError::Invalid(
+            "capture.filename must be a filename template, not a path".to_string(),
+        ));
+    }
+
+    let mut components = Path::new(template).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(()),
+        _ => Err(ConfigError::Invalid(
+            "capture.filename must be a filename template, not a path".to_string(),
+        )),
+    }
 }
 
 fn validate_redaction_config(config: &RedactionConfig) -> Result<(), ConfigError> {
@@ -3647,7 +3670,7 @@ default = "deny"
     }
 
     #[test]
-    fn empty_capture_filename_fails_validation() {
+    fn empty_capture_filename_uses_default_template() {
         let toml = r#"
 schema_version = "1"
 
@@ -3671,6 +3694,49 @@ level = "info"
         // Empty filename is allowed; resolve_capture_path will fall back
         // to the default template.
         assert!(config.validate_basic().is_ok());
+    }
+
+    #[test]
+    fn capture_filename_template_must_be_filename_only() {
+        for filename in [
+            "../outside-{suffix}.json",
+            "/tmp/{requestId}.json",
+            "nested/{requestId}.json",
+            r"nested\{requestId}.json",
+            "..",
+            ".",
+        ] {
+            let toml = format!(
+                r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[capture]
+directory = "logs-capture"
+filename = {filename:?}
+
+[policy]
+default = "deny"
+"#
+            );
+
+            let config: Config = toml::from_str(&toml).expect("parse config");
+            let err = config
+                .validate_basic()
+                .expect_err("filename path should be rejected");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("capture.filename must be a filename template, not a path"),
+                "unexpected error for {filename:?}: {msg}"
+            );
+        }
     }
 
     #[test]
