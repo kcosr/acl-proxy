@@ -175,6 +175,7 @@ pub fn run() -> Result<ExitCode, CliError> {
         Command::Policy { command } => match command {
             PolicyCommand::Dump { format } => {
                 let config = load_config_for_cli(config_path)?;
+                print_config_load_warnings(&config);
                 let effective = crate::policy::EffectivePolicy::from_config(&config.policy)
                     .map_err(|e| {
                         CliError::Config(crate::config::ConfigError::Invalid(e.to_string()))

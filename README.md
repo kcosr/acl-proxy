@@ -496,7 +496,7 @@ pattern = "https://github.com/**"
 
 **`value` / `values`**: Exactly one must be provided for `set`/`add`. Values must be valid HTTP header values.
 
-**Environment variable interpolation**: Exact whole-string `${NAME}` placeholders in header action `value`/`values`, redaction profile `replacement`, and redaction rule `literals` resolve once at config load/reload time. `NAME` must match `[A-Za-z_][A-Za-z0-9_]*`. Complete `${...}` sequences trigger interpolation validation; mixed strings like `Bearer ${TOKEN}` are rejected, while incomplete markers like `${TOKEN` are treated as literal text. Missing env vars fail validation, startup, and reload.
+**Environment variable interpolation**: Exact whole-string `${NAME}` placeholders in header action `value`/`values`, redaction profile `replacement`, and redaction rule `literals` resolve once at config load/reload time. `NAME` must match `[A-Za-z_][A-Za-z0-9_]*`. Complete `${...}` sequences trigger interpolation validation; mixed strings like `Bearer ${TOKEN}` are rejected, while incomplete markers like `${TOKEN` are treated as literal text with a warning. Missing env vars fail validation, startup, and reload.
 
 **Approval macros**: `{{name}}` placeholders are a separate feature for external auth workflows — they are not resolved at config load time. See [External Auth](#external-auth).
 
