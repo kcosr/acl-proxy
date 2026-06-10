@@ -194,7 +194,7 @@ impl ExternalAuthManager {
             http_client,
             previous.pending.clone(),
             previous.macro_values.clone(),
-            Some((previous.status_tx.clone(), previous.status_rx.clone())),
+            None,
         )
     }
 

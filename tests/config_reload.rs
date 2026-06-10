@@ -12,8 +12,9 @@ use acl_proxy::external_auth::ExternalDecision;
 use acl_proxy::proxy::http::run_http_proxy_on_listener;
 use http::StatusCode;
 use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Request, Response, Server};
+use hyper::{body, Body, Request, Response, Server};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 #[derive(Clone, Debug)]
 struct ObservedRequest {
@@ -86,6 +87,39 @@ async fn start_observed_echo_server(
     tokio::spawn(server);
 
     (addr, observed)
+}
+
+async fn start_status_webhook_server() -> (SocketAddr, mpsc::Receiver<serde_json::Value>) {
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind webhook");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking webhook");
+    let addr = listener.local_addr().expect("webhook addr");
+    let (tx, rx) = mpsc::channel::<serde_json::Value>(8);
+
+    let make_svc = make_service_fn(move |_conn| {
+        let tx = tx.clone();
+        async move {
+            Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
+                let tx = tx.clone();
+                async move {
+                    let bytes = body::to_bytes(req.into_body()).await?;
+                    let payload: serde_json::Value =
+                        serde_json::from_slice(&bytes).expect("status webhook json");
+                    let _ = tx.send(payload).await;
+                    Ok::<_, hyper::Error>(Response::new(Body::from("ok")))
+                }
+            }))
+        }
+    });
+
+    tokio::spawn(
+        Server::from_tcp(listener)
+            .expect("server from tcp")
+            .serve(make_svc),
+    );
+
+    (addr, rx)
 }
 
 fn minimal_config() -> Config {
@@ -481,6 +515,74 @@ async fn reload_preserves_pending_external_auth_approvals() {
     );
     assert_eq!(reloaded.external_auth.pending_count(), 0);
     assert_eq!(reloaded.external_auth.stored_macro_count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn external_auth_status_webhook_config_updates_after_reload() {
+    let temp = tempfile::tempdir().expect("temp certs dir");
+    let (first_addr, mut first_rx) = start_status_webhook_server().await;
+    let (second_addr, mut second_rx) = start_status_webhook_server().await;
+
+    let mut config = minimal_config();
+    prepare_app_config_for_reload_tests(&mut config, temp.path());
+    let mut profile = http_external_auth_profile();
+    profile.webhook_url = Some(format!("http://{first_addr}/status"));
+    config
+        .policy
+        .external_auth_profiles
+        .insert("approval".to_string(), profile);
+
+    let shared_state = AppState::shared_from_config(config.clone()).expect("initial state");
+    let initial = shared_state.load_full();
+    let (_guard, _decision_rx) = initial.external_auth.start_pending(
+        "req-before-reload".to_string(),
+        0,
+        None,
+        "approval".to_string(),
+        "http://example.com/".to_string(),
+        Some("GET".to_string()),
+        Some("127.0.0.1".to_string()),
+        Vec::new(),
+    );
+    initial
+        .external_auth
+        .finalize_timed_out("req-before-reload");
+
+    let first_event = tokio::time::timeout(std::time::Duration::from_secs(2), first_rx.recv())
+        .await
+        .expect("first status webhook timed out")
+        .expect("first status webhook channel closed");
+    assert_eq!(first_event["requestId"], "req-before-reload");
+
+    let mut updated = config;
+    updated
+        .policy
+        .external_auth_profiles
+        .get_mut("approval")
+        .expect("profile")
+        .webhook_url = Some(format!("http://{second_addr}/status"));
+    AppState::reload_shared_from_config(&shared_state, updated).expect("reload config");
+
+    let reloaded = shared_state.load_full();
+    let (_guard, _decision_rx) = reloaded.external_auth.start_pending(
+        "req-after-reload".to_string(),
+        0,
+        None,
+        "approval".to_string(),
+        "http://example.com/".to_string(),
+        Some("GET".to_string()),
+        Some("127.0.0.1".to_string()),
+        Vec::new(),
+    );
+    reloaded
+        .external_auth
+        .finalize_timed_out("req-after-reload");
+
+    let second_event = tokio::time::timeout(std::time::Duration::from_secs(2), second_rx.recv())
+        .await
+        .expect("second status webhook timed out")
+        .expect("second status webhook channel closed");
+    assert_eq!(second_event["requestId"], "req-after-reload");
 }
 
 #[tokio::test]
