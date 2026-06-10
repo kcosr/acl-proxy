@@ -783,7 +783,7 @@ Profiles redact outbound/request-side data only. For normal HTTP requests with a
 
 Profiles are intended for short, known secrets such as fixed passwords or tokens. `replacement` is fixed per profile and can have any length. A redacted upgrade whose `Upgrade` header is not `websocket` is rejected before upstream forwarding. If the upstream negotiates unsupported WebSocket extensions, acl-proxy returns `502 Bad Gateway` before delivering `101 Switching Protocols` to the client.
 
-Redaction `replacement` and `literals` support exact whole-string `${NAME}` environment placeholders. Placeholders are resolved during config load and reload; missing variables or mixed literal/env strings fail validation. Regex `expressions` do not support environment interpolation.
+Redaction `replacement` and `literals` support exact whole-string `${NAME}` environment placeholders. Placeholders are resolved during config load and reload; missing variables or mixed literal/env strings fail validation. Literal redaction strings containing `${` are treated as interpolation attempts; supply those values through an exact env placeholder. Regex `expressions` do not support environment interpolation.
 
 Regex `expressions` use Rust regex syntax, are text-only, and cannot be used with `match = "binary"`. Expressions that can match empty text are rejected to avoid unbounded replacement expansion.
 

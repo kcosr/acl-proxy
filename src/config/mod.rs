@@ -1069,6 +1069,7 @@ impl Config {
             interpolate_config_env_value(
                 &mut profile.replacement,
                 format!("redaction.profiles.{profile_name}.replacement").as_str(),
+                false,
             )?;
 
             for (rule_idx, rule) in profile.rules.iter_mut().enumerate() {
@@ -1079,6 +1080,7 @@ impl Config {
                             "redaction.profiles.{profile_name}.rules[{rule_idx}].literals[{literal_idx}]"
                         )
                         .as_str(),
+                        false,
                     )?;
                 }
             }
@@ -1227,18 +1229,27 @@ fn interpolate_header_action_value(
     raw_value: &mut String,
     action_location: &str,
 ) -> Result<(), ConfigError> {
-    interpolate_config_env_value(raw_value, action_location)
+    interpolate_config_env_value(raw_value, action_location, true)
 }
 
 fn interpolate_config_env_value(
     raw_value: &mut String,
     value_location: &str,
+    include_invalid_value: bool,
 ) -> Result<(), ConfigError> {
     match classify_config_env_placeholder(raw_value.as_str()) {
         ConfigEnvPlaceholder::None => Ok(()),
-        ConfigEnvPlaceholder::Invalid => Err(ConfigError::Invalid(format!(
-            "{value_location} uses invalid env interpolation syntax: '{raw_value}'"
-        ))),
+        ConfigEnvPlaceholder::Invalid => {
+            if include_invalid_value {
+                Err(ConfigError::Invalid(format!(
+                    "{value_location} uses invalid env interpolation syntax: '{raw_value}'"
+                )))
+            } else {
+                Err(ConfigError::Invalid(format!(
+                    "{value_location} uses invalid env interpolation syntax"
+                )))
+            }
+        }
         ConfigEnvPlaceholder::Exact { name } => {
             *raw_value = env::var(name).map_err(|_| {
                 ConfigError::Invalid(format!(
@@ -2165,7 +2176,7 @@ level = "debug"
 [redaction.profiles.secrets]
 
 [[redaction.profiles.secrets.rules]]
-literals = ["prefix-${ACL_PROXY_TEST_REDACTION_LITERAL}"]
+literals = ["secret-prefix-${ACL_PROXY_TEST_REDACTION_LITERAL}"]
 
 [policy]
 default = "deny"
@@ -2182,6 +2193,57 @@ default = "deny"
             ),
             "unexpected error message: {msg}"
         );
+        assert!(
+            !msg.contains("secret-prefix"),
+            "error message should not echo redaction literal: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_from_sources_resolves_redaction_env_placeholders() {
+        let env_guard = ConfigEnvTestGuard::new(&[
+            "ACL_PROXY_TEST_LOAD_REDACTION_REPLACEMENT",
+            "ACL_PROXY_TEST_LOAD_REDACTION_LITERAL",
+        ]);
+        env_guard.set("ACL_PROXY_TEST_LOAD_REDACTION_REPLACEMENT", "[MASKED]");
+        env_guard.set("ACL_PROXY_TEST_LOAD_REDACTION_LITERAL", "load-secret");
+
+        let mut file = tempfile::NamedTempFile::new().expect("create temp config");
+        write!(
+            file,
+            r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[redaction.profiles.secrets]
+replacement = "${{ACL_PROXY_TEST_LOAD_REDACTION_REPLACEMENT}}"
+
+[[redaction.profiles.secrets.rules]]
+literals = ["${{ACL_PROXY_TEST_LOAD_REDACTION_LITERAL}}"]
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+redaction_profile = "secrets"
+            "#
+        )
+        .expect("write config");
+
+        let config = Config::load_from_sources(Some(file.path()))
+            .expect("load should resolve redaction placeholders");
+        let profile = config.redaction.profiles.get("secrets").expect("profile");
+        assert_eq!(profile.replacement, "[MASKED]");
+        assert_eq!(profile.rules[0].literals, vec!["load-secret".to_string()]);
     }
 
     #[test]
