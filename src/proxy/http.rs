@@ -640,8 +640,11 @@ async fn handle_external_auth_callback_request(
         }
     };
 
-    // For allow decisions, validate and (if applicable) store approval macros
-    // before delivering the decision to the pending request.
+    let mut macro_values = None;
+
+    // For allow decisions, validate approval macros before delivering the
+    // decision. The manager stores them only if the pending request is still
+    // live, immediately before waking the waiter.
     if let ExternalAuthCallbackDecision::Allow = payload.decision {
         let descriptors_opt = state
             .external_auth
@@ -775,9 +778,7 @@ async fn handle_external_auth_callback_request(
             }
 
             // Ignore extra keys not listed in descriptors.
-            state
-                .external_auth
-                .store_macro_values(&payload.request_id, filtered);
+            macro_values = Some(filtered);
         }
     }
 
@@ -787,7 +788,10 @@ async fn handle_external_auth_callback_request(
         ExternalAuthCallbackDecision::Pass => ExternalDecision::Pass,
     };
 
-    let found = state.external_auth.resolve(&payload.request_id, decision);
+    let found =
+        state
+            .external_auth
+            .resolve_with_macro_values(&payload.request_id, decision, macro_values);
 
     if !found {
         let payload = serde_json::json!({
@@ -3193,9 +3197,8 @@ fn interpolate_header_actions(
                         Ok(parsed) => new_values.push(parsed),
                         Err(e) => {
                             tracing::debug!(
-                                "invalid header value after macro interpolation for {}: {} ({})",
+                                "invalid header value after macro interpolation for {}: {}",
                                 action.name,
-                                interpolated,
                                 e
                             );
                             return Err(format!(
@@ -3385,12 +3388,16 @@ pub(crate) fn generate_request_id() -> String {
 mod tests {
     use super::{
         build_full_url, copy_end_to_end_headers, copy_required_upgrade_headers,
-        generate_request_id, headers_to_capture_map, is_internal_endpoint, is_upgrade_request,
-        strip_hop_by_hop_headers, strip_hop_by_hop_headers_preserving_upgrade, tee_body,
+        generate_request_id, headers_to_capture_map, interpolate_header_actions,
+        is_internal_endpoint, is_upgrade_request, strip_hop_by_hop_headers,
+        strip_hop_by_hop_headers_preserving_upgrade, tee_body,
     };
+    use crate::config::{HeaderActionKind, HeaderDirection, HeaderWhen};
+    use crate::policy::CompiledHeaderAction;
     use http::header::HOST;
     use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
     use hyper::{Body, Request};
+    use std::collections::BTreeMap;
 
     #[test]
     fn request_id_is_random_capability_token() {
@@ -3484,6 +3491,28 @@ mod tests {
             captured.get("content-type"),
             Some(&serde_json::Value::String("text/plain".to_string()))
         );
+    }
+
+    #[test]
+    fn macro_interpolation_error_does_not_echo_value() {
+        let action = CompiledHeaderAction {
+            direction: HeaderDirection::Request,
+            action: HeaderActionKind::Set,
+            name: HeaderName::from_static("authorization"),
+            values: vec![HeaderValue::from_static("Bearer {{token}}")],
+            when: HeaderWhen::Always,
+            search: None,
+            replace: None,
+        };
+        let mut macros = BTreeMap::new();
+        macros.insert("token".to_string(), "secret\nvalue".to_string());
+
+        let err = interpolate_header_actions(vec![action], &macros)
+            .expect_err("control character should produce invalid header");
+
+        assert!(err.contains("invalid header value after macro interpolation"));
+        assert!(!err.contains("secret"));
+        assert!(!err.contains("secret\nvalue"));
     }
 
     #[test]

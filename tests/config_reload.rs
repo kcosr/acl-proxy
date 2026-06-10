@@ -483,6 +483,52 @@ async fn reload_preserves_pending_external_auth_approvals() {
     assert_eq!(reloaded.external_auth.stored_macro_count(), 0);
 }
 
+#[tokio::test]
+async fn late_external_auth_macro_values_are_not_orphaned() {
+    let temp = tempfile::tempdir().expect("temp certs dir");
+
+    let mut config = minimal_config();
+    prepare_app_config_for_reload_tests(&mut config, temp.path());
+    config
+        .policy
+        .external_auth_profiles
+        .insert("approval".to_string(), http_external_auth_profile());
+
+    let state = AppState::from_config(config).expect("state");
+
+    let (_guard, _decision_rx) = state.external_auth.start_pending(
+        "req-late-macro".to_string(),
+        0,
+        None,
+        "approval".to_string(),
+        "http://example.com/".to_string(),
+        Some("GET".to_string()),
+        Some("127.0.0.1".to_string()),
+        Vec::new(),
+    );
+    assert_eq!(state.external_auth.pending_count(), 1);
+
+    state.external_auth.finalize_timed_out("req-late-macro");
+    assert_eq!(state.external_auth.pending_count(), 0);
+
+    let mut macro_values = BTreeMap::new();
+    macro_values.insert("token".to_string(), "late-secret".to_string());
+    assert!(
+        !state.external_auth.resolve_with_macro_values(
+            "req-late-macro",
+            ExternalDecision::Allow,
+            Some(macro_values),
+        ),
+        "late callback should not resolve a finalized request"
+    );
+
+    assert_eq!(state.external_auth.stored_macro_count(), 0);
+    assert!(state
+        .external_auth
+        .take_macro_values("req-late-macro")
+        .is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn egress_forwarding_enable_disable_updates_after_reload() {
     let (direct_addr, direct_requests) = start_observed_echo_server("direct").await;

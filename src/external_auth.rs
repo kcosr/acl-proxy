@@ -281,10 +281,31 @@ impl ExternalAuthManager {
     ///
     /// This removes the pending entry and wakes the waiting request task.
     pub fn resolve(&self, request_id: &str, decision: ExternalDecision) -> bool {
+        self.resolve_with_macro_values(request_id, decision, None)
+    }
+
+    /// Deliver an external decision callback and, for successful allow
+    /// decisions, publish validated macro values before waking the waiter.
+    pub fn resolve_with_macro_values(
+        &self,
+        request_id: &str,
+        decision: ExternalDecision,
+        macro_values: Option<BTreeMap<String, String>>,
+    ) -> bool {
         if let Some((_key, pending)) = self.pending.remove(request_id) {
+            if decision == ExternalDecision::Allow {
+                if let Some(macros) = macro_values {
+                    if !macros.is_empty() {
+                        self.macro_values.insert(request_id.to_string(), macros);
+                    }
+                }
+            } else {
+                self.macro_values.remove(request_id);
+            }
             let _ = pending.decision_tx.send(decision);
             true
         } else {
+            self.macro_values.remove(request_id);
             false
         }
     }
