@@ -60,6 +60,12 @@ pub struct ExternalAuthProfile {
     pub on_webhook_failure: WebhookFailureMode,
 }
 
+impl ExternalAuthProfile {
+    fn webhook_delivery_timeout(&self) -> Duration {
+        self.webhook_timeout.unwrap_or(self.timeout)
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ApprovalMacroDescriptor {
     pub name: String,
@@ -402,15 +408,13 @@ impl ExternalAuthManager {
         let client_http: SharedHttpClient = self.http_client.clone();
         let send_fut = client_http.request(req);
 
-        let result = match profile.webhook_timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, send_fut).await {
-                Ok(res) => res,
-                Err(_elapsed) => {
-                    tracing::warn!("external auth webhook timed out after {:?}", timeout);
-                    return Err((WebhookFailureKind::Timeout, None));
-                }
-            },
-            None => send_fut.await,
+        let timeout = profile.webhook_delivery_timeout();
+        let result = match tokio::time::timeout(timeout, send_fut).await {
+            Ok(res) => res,
+            Err(_elapsed) => {
+                tracing::warn!("external auth webhook timed out after {:?}", timeout);
+                return Err((WebhookFailureKind::Timeout, None));
+            }
         };
 
         match result {
@@ -726,15 +730,13 @@ async fn run_status_worker(
 
         let send_fut = client.request(req);
 
-        let result = match profile.webhook_timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, send_fut).await {
-                Ok(res) => res,
-                Err(_elapsed) => {
-                    tracing::debug!("external auth status webhook timed out after {:?}", timeout);
-                    continue;
-                }
-            },
-            None => send_fut.await,
+        let timeout = profile.webhook_delivery_timeout();
+        let result = match tokio::time::timeout(timeout, send_fut).await {
+            Ok(res) => res,
+            Err(_elapsed) => {
+                tracing::debug!("external auth status webhook timed out after {:?}", timeout);
+                continue;
+            }
         };
 
         if let Err(err) = result {

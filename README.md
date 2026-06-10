@@ -843,7 +843,7 @@ reason       = { label = "Approval reason", required = false, secret = false }
 type = "http"                       # "http" (default) | "plugin"
 webhook_url = "https://..."         # required for type = "http"
 timeout_ms = 5000                   # required: approval/plugin timeout
-webhook_timeout_ms = 1000           # optional: webhook delivery timeout
+webhook_timeout_ms = 1000           # optional: webhook delivery timeout; defaults to timeout_ms
 on_webhook_failure = "error"        # "deny" | "error" | "timeout"
 
 [policy.external_auth_profiles.url_allow]

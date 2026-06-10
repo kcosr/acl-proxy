@@ -434,6 +434,60 @@ rule_id = "external-auth-test-rule"
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn external_auth_webhook_uses_approval_timeout_when_webhook_timeout_is_unset() {
+    let webhook_addr = start_upstream_delayed_server(Duration::from_secs(5)).await;
+
+    let toml = format!(
+        r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+
+[logging]
+directory = "logs"
+level = "info"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles]
+[policy.external_auth_profiles.test_profile]
+webhook_url = "http://{webhook_addr}/webhook"
+timeout_ms = 100
+on_webhook_failure = "timeout"
+
+[[policy.rules]]
+action = "delegate"
+pattern = "http://example.com/**"
+external_auth_profile = "test_profile"
+    "#
+    );
+
+    let config: Config = toml::from_str(&toml).expect("parse config");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+    let raw_request =
+        "GET http://example.com/ok HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+
+    let (_response, status) = send_raw_http_request(proxy_addr, raw_request).await;
+
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn approval_macros_are_exposed_and_applied() {
     use hyper::service::{make_service_fn, service_fn};
     use hyper::{Body, Request, Response, Server};
