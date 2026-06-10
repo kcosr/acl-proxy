@@ -631,6 +631,49 @@ async fn late_external_auth_macro_values_are_not_orphaned() {
         .is_empty());
 }
 
+#[tokio::test]
+async fn approval_macro_values_are_removed_when_waiter_is_gone() {
+    let temp = tempfile::tempdir().expect("temp certs dir");
+
+    let mut config = minimal_config();
+    prepare_app_config_for_reload_tests(&mut config, temp.path());
+    config
+        .policy
+        .external_auth_profiles
+        .insert("approval".to_string(), http_external_auth_profile());
+
+    let state = AppState::from_config(config).expect("state");
+
+    let (_guard, decision_rx) = state.external_auth.start_pending(
+        "req-dropped-waiter".to_string(),
+        0,
+        None,
+        "approval".to_string(),
+        "http://example.com/".to_string(),
+        Some("GET".to_string()),
+        Some("127.0.0.1".to_string()),
+        Vec::new(),
+    );
+    drop(decision_rx);
+
+    let mut macro_values = BTreeMap::new();
+    macro_values.insert("token".to_string(), "late-secret".to_string());
+    assert!(
+        state.external_auth.resolve_with_macro_values(
+            "req-dropped-waiter",
+            ExternalDecision::Allow,
+            Some(macro_values),
+        ),
+        "pending request should still be found"
+    );
+
+    assert_eq!(state.external_auth.stored_macro_count(), 0);
+    assert!(state
+        .external_auth
+        .take_macro_values("req-dropped-waiter")
+        .is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn egress_forwarding_enable_disable_updates_after_reload() {
     let (direct_addr, direct_requests) = start_observed_echo_server("direct").await;

@@ -293,16 +293,20 @@ impl ExternalAuthManager {
         macro_values: Option<BTreeMap<String, String>>,
     ) -> bool {
         if let Some((_key, pending)) = self.pending.remove(request_id) {
+            let mut stored_macro_values = false;
             if decision == ExternalDecision::Allow {
                 if let Some(macros) = macro_values {
                     if !macros.is_empty() {
                         self.macro_values.insert(request_id.to_string(), macros);
+                        stored_macro_values = true;
                     }
                 }
             } else {
                 self.macro_values.remove(request_id);
             }
-            let _ = pending.decision_tx.send(decision);
+            if pending.decision_tx.send(decision).is_err() && stored_macro_values {
+                self.macro_values.remove(request_id);
+            }
             true
         } else {
             self.macro_values.remove(request_id);
