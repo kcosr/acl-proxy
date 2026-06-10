@@ -223,7 +223,7 @@ In transparent HTTP mode, upstream target selection is based on the inbound `Hos
 - Request-header predicates (`headers_absent`, `headers_match`, `headers_not_match`) apply only to decrypted inner requests, not to the outer CONNECT establishment request.
 - Loop protection runs on both the CONNECT request and the inner requests.
 - The outer CONNECT handshake remains local to the first proxy hop. If egress forwarding is enabled, only the decrypted inner HTTPS requests use the egress destination.
-- CONNECT-target certificate generation is bounded to one uncached host at a time. If another uncached CONNECT target arrives while a certificate is being minted, the proxy returns `503 Service Unavailable` before establishing the tunnel; cached hosts are unaffected.
+- CONNECT-target certificate generation is bounded to one uncached host at a time. If another uncached CONNECT target arrives while a certificate is being minted, the proxy returns `503 Service Unavailable` before establishing the tunnel; cached hosts can proceed when their generated certificate is still in the in-memory cache.
 - Clients must trust the proxy CA (`certs/ca-cert.pem` by default).
 
 ### Transparent HTTPS
@@ -303,7 +303,7 @@ protocol + "//" + host[:port] + path + optional "?query"
 - Hostnames are lowercased and a trailing DNS dot is removed.
 - Default ports (`:80` for HTTP, `:443` for HTTPS) are omitted in both requests and rule patterns; non-default ports are preserved.
 - Dot segments in the path are resolved before matching or forwarding.
-- Percent-encoded unreserved path characters are decoded before matching or forwarding (for example `%61` becomes `a`); reserved encodings such as `%2F` are preserved.
+- Percent-encoded unreserved path characters are decoded before matching or forwarding (for example `%61` becomes `a`); encoded path separators such as `%2F` and `%5C` are rejected; other reserved encodings are preserved.
 - The path defaults to `/` when empty.
 - Query strings are preserved; fragments are ignored.
 - IPv6 hostnames use standard bracket notation (e.g., `https://[::1]:8443/path`).
@@ -655,8 +655,8 @@ denied_response = false             # capture denied response records
 directory = "logs-capture"          # base directory for capture files
 filename = "{requestId}-{suffix}.json"   # template ({requestId}, {kind}, {suffix})
 max_body_bytes = 1048576            # max body bytes to serialize (1 MiB; 0 = skip body)
-max_files = 10000                   # max capture files to retain
-max_total_bytes = 1073741824        # max total capture directory bytes to retain (1 GiB)
+max_files = 10000                   # max capture files to retain; must be at least 1
+max_total_bytes = 1073741824        # max total capture directory bytes to retain (1 GiB); must be at least 1
 ```
 
 Capture happens for:
@@ -668,7 +668,7 @@ Capture happens for:
 
 `capture.filename` must be a filename template, not a path. Use `capture.directory` to choose the output directory; templates containing path separators, absolute paths, or `..` path segments are rejected.
 
-After each capture write, acl-proxy prunes older regular files in `capture.directory` until both `capture.max_files` and `capture.max_total_bytes` are satisfied. The newest just-written capture file is retained even if a single file exceeds the byte cap.
+After each capture write, acl-proxy prunes older regular files in `capture.directory` until both `capture.max_files` and `capture.max_total_bytes` are satisfied. Both limits must be at least `1`. The newest just-written capture file is retained even if a single file exceeds the byte cap.
 
 On Unix, capture directories are created or tightened to owner-only (`0700`) and capture JSON files are created or tightened to owner-only (`0600`). Capture URLs have userinfo removed and query strings replaced with `REDACTED`; `Authorization`, `Proxy-Authorization`, `Cookie`, and `Set-Cookie` header values are replaced with `[REDACTED]`. Capture bodies and other headers can still contain sensitive decrypted data; treat capture files as sensitive.
 

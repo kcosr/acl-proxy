@@ -20,6 +20,8 @@ pub(crate) enum CanonicalUrlError {
     EmptyHost,
     #[error("URL userinfo is not allowed")]
     UserInfo,
+    #[error("URL path contains an encoded path separator")]
+    EncodedPathSeparator,
 }
 
 pub(crate) fn canonicalize_http_url(raw: &str) -> Result<CanonicalUrl, CanonicalUrlError> {
@@ -48,7 +50,7 @@ pub(crate) fn canonicalize_http_url(raw: &str) -> Result<CanonicalUrl, Canonical
         "/"
     } else {
         url.path()
-    });
+    })?;
     let query = match url.query() {
         Some(query) => format!("?{query}"),
         None => String::new(),
@@ -70,7 +72,7 @@ fn canonical_host(raw_host: &str) -> Result<String, CanonicalUrlError> {
     Ok(host.to_ascii_lowercase())
 }
 
-fn normalize_path_percent_encoding(path: &str) -> String {
+fn normalize_path_percent_encoding(path: &str) -> Result<String, CanonicalUrlError> {
     let bytes = path.as_bytes();
     let mut normalized = String::with_capacity(path.len());
     let mut index = 0;
@@ -81,6 +83,9 @@ fn normalize_path_percent_encoding(path: &str) -> String {
                 (hex_value(bytes[index + 1]), hex_value(bytes[index + 2]))
             {
                 let decoded = (high << 4) | low;
+                if matches!(decoded, b'/' | b'\\') {
+                    return Err(CanonicalUrlError::EncodedPathSeparator);
+                }
                 if is_unreserved(decoded) {
                     normalized.push(decoded as char);
                     index += 3;
@@ -93,7 +98,7 @@ fn normalize_path_percent_encoding(path: &str) -> String {
         index += 1;
     }
 
-    normalized
+    Ok(normalized)
 }
 
 fn hex_value(byte: u8) -> Option<u8> {
@@ -145,10 +150,22 @@ mod tests {
 
     #[test]
     fn decodes_unreserved_path_percent_encoding_only() {
-        let canonical = canonicalize_http_url("https://example.com/%61dmin/%7Eme/%2F?q=%61")
+        let canonical = canonicalize_http_url("https://example.com/%61dmin/%7Eme/%3A?q=%61")
             .expect("canonical");
 
-        assert_eq!(canonical.url, "https://example.com/admin/~me/%2F?q=%61");
+        assert_eq!(canonical.url, "https://example.com/admin/~me/%3A?q=%61");
+    }
+
+    #[test]
+    fn rejects_encoded_path_separators() {
+        assert!(matches!(
+            canonicalize_http_url("https://example.com/admin%2fsecret"),
+            Err(CanonicalUrlError::EncodedPathSeparator)
+        ));
+        assert!(matches!(
+            canonicalize_http_url("https://example.com/admin%5csecret"),
+            Err(CanonicalUrlError::EncodedPathSeparator)
+        ));
     }
 
     #[test]
