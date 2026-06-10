@@ -536,7 +536,7 @@ acl-proxy policy dump --format table
 acl-proxy policy dump --format json
 ```
 
-`policy dump` defaults to table output on a TTY and JSON otherwise. It includes `headers_match` and `headers_not_match` values — treat output as sensitive when those values represent credentials.
+`policy dump` defaults to table output on a TTY and JSON otherwise. It includes `headers_match` and `headers_not_match` values — treat output as sensitive when those values represent credentials. Header action values loaded from `${NAME}` env placeholders are shown as `[REDACTED]`.
 When a rule uses `patterns`, the dump shows one effective row/object per expanded pattern with a singular `pattern` field.
 
 ## Configuration Reference
@@ -1179,7 +1179,7 @@ acl-proxy policy dump --format json
 
 **Warnings**:
 - `config validate` uses the same `${NAME}` env interpolation as startup — missing/malformed placeholders fail validation.
-- `policy dump` prints resolved values. If a header action loaded a secret from an env var, the resolved value appears in output. Treat redirected output and CI logs as sensitive.
+- `policy dump` masks header action values loaded from `${NAME}` env placeholders as `[REDACTED]`. Other configured match values remain visible, so treat redirected output and CI logs as sensitive when policy match values include credentials.
 
 ### `acl-proxy-extract-capture-body`
 

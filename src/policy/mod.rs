@@ -16,6 +16,8 @@ use regex::{Regex, RegexBuilder};
 use serde::Serialize;
 use thiserror::Error;
 
+const REDACTED_ENV_VALUE: &str = "[REDACTED]";
+
 #[derive(Debug, Error)]
 pub enum PolicyError {
     #[error("Policy macro not found: {name}{context}")]
@@ -358,11 +360,12 @@ impl EffectivePolicy {
                     .header_actions
                     .iter()
                     .map(|cfg| {
-                        let values = cfg
-                            .values
-                            .clone()
-                            .or_else(|| cfg.value.as_ref().map(|v| vec![v.clone()]))
-                            .unwrap_or_default();
+                        let values = effective_header_action_values(
+                            cfg.value.as_deref(),
+                            cfg.values.as_deref(),
+                            cfg.value_from_env,
+                            &cfg.values_from_env,
+                        );
 
                         EffectiveHeaderAction {
                             direction: cfg.direction.clone(),
@@ -410,6 +413,37 @@ impl EffectivePolicy {
             rules,
         })
     }
+}
+
+fn effective_header_action_values(
+    value: Option<&str>,
+    values: Option<&[String]>,
+    value_from_env: bool,
+    values_from_env: &[bool],
+) -> Vec<String> {
+    if let Some(values) = values {
+        return values
+            .iter()
+            .enumerate()
+            .map(|(idx, value)| {
+                if values_from_env.get(idx).copied().unwrap_or(false) {
+                    REDACTED_ENV_VALUE.to_string()
+                } else {
+                    value.clone()
+                }
+            })
+            .collect();
+    }
+
+    if let Some(value) = value {
+        return vec![if value_from_env {
+            REDACTED_ENV_VALUE.to_string()
+        } else {
+            value.to_string()
+        }];
+    }
+
+    Vec::new()
 }
 
 fn expand_policy(cfg: &PolicyConfig) -> Result<ExpandedPolicy, PolicyError> {
@@ -1014,10 +1048,7 @@ where
 
                 for v in source_values {
                     let hv = HeaderValue::from_str(&v).map_err(|e| {
-                        make_error(format!(
-                            "invalid header value for '{}': {} ({e})",
-                            input.name, v
-                        ))
+                        make_error(format!("invalid header value for '{}': {e}", input.name))
                     })?;
                     values.push(hv);
                 }
@@ -1514,6 +1545,8 @@ mod tests {
             when: HeaderWhen::Always,
             value: Some("edge-a".to_string()),
             values: None,
+            value_from_env: false,
+            values_from_env: Vec::new(),
             search: None,
             replace: None,
         }];
@@ -1533,6 +1566,8 @@ mod tests {
             when: HeaderWhen::Always,
             value: None,
             values: None,
+            value_from_env: false,
+            values_from_env: Vec::new(),
             search: None,
             replace: None,
         }];

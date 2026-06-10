@@ -237,6 +237,10 @@ pub struct EgressRequestHeaderActionConfig {
     pub value: Option<String>,
     #[serde(default)]
     pub values: Option<Vec<String>>,
+    #[serde(skip)]
+    pub value_from_env: bool,
+    #[serde(skip)]
+    pub values_from_env: Vec<bool>,
 
     // For replace_substring.
     #[serde(default)]
@@ -973,6 +977,10 @@ pub struct HeaderActionConfig {
     pub value: Option<String>,
     #[serde(default)]
     pub values: Option<Vec<String>>,
+    #[serde(skip)]
+    pub value_from_env: bool,
+    #[serde(skip)]
+    pub values_from_env: Vec<bool>,
 
     // For replace_substring.
     #[serde(default)]
@@ -1263,13 +1271,23 @@ fn interpolate_header_actions(
         );
 
         if let Some(value) = header_action.value.as_mut() {
-            interpolate_header_action_value(value, action_location.as_str())?;
+            header_action.value_from_env =
+                interpolate_header_action_value(value, action_location.as_str())?;
+        } else {
+            header_action.value_from_env = false;
         }
 
         if let Some(values) = header_action.values.as_mut() {
+            let mut values_from_env = Vec::with_capacity(values.len());
             for value in values.iter_mut() {
-                interpolate_header_action_value(value, action_location.as_str())?;
+                values_from_env.push(interpolate_header_action_value(
+                    value,
+                    action_location.as_str(),
+                )?);
             }
+            header_action.values_from_env = values_from_env;
+        } else {
+            header_action.values_from_env.clear();
         }
     }
 
@@ -1293,13 +1311,23 @@ fn interpolate_egress_request_header_actions(
         );
 
         if let Some(value) = header_action.value.as_mut() {
-            interpolate_header_action_value(value, action_location.as_str())?;
+            header_action.value_from_env =
+                interpolate_header_action_value(value, action_location.as_str())?;
+        } else {
+            header_action.value_from_env = false;
         }
 
         if let Some(values) = header_action.values.as_mut() {
+            let mut values_from_env = Vec::with_capacity(values.len());
             for value in values.iter_mut() {
-                interpolate_header_action_value(value, action_location.as_str())?;
+                values_from_env.push(interpolate_header_action_value(
+                    value,
+                    action_location.as_str(),
+                )?);
             }
+            header_action.values_from_env = values_from_env;
+        } else {
+            header_action.values_from_env.clear();
         }
     }
 
@@ -1309,8 +1337,8 @@ fn interpolate_egress_request_header_actions(
 fn interpolate_header_action_value(
     raw_value: &mut String,
     action_location: &str,
-) -> Result<(), ConfigError> {
-    interpolate_config_env_value(raw_value, action_location, true)
+) -> Result<bool, ConfigError> {
+    interpolate_config_env_value(raw_value, action_location)
 }
 
 fn interpolate_redaction_env_value(
@@ -1324,34 +1352,26 @@ fn interpolate_redaction_env_value(
         ));
     }
 
-    interpolate_config_env_value(raw_value, value_location, false)
+    interpolate_config_env_value(raw_value, value_location)?;
+    Ok(())
 }
 
 fn interpolate_config_env_value(
     raw_value: &mut String,
     value_location: &str,
-    include_invalid_value: bool,
-) -> Result<(), ConfigError> {
+) -> Result<bool, ConfigError> {
     match classify_config_env_placeholder(raw_value.as_str()) {
-        ConfigEnvPlaceholder::None => Ok(()),
-        ConfigEnvPlaceholder::Invalid => {
-            if include_invalid_value {
-                Err(ConfigError::Invalid(format!(
-                    "{value_location} uses invalid env interpolation syntax: '{raw_value}'"
-                )))
-            } else {
-                Err(ConfigError::Invalid(format!(
-                    "{value_location} uses invalid env interpolation syntax"
-                )))
-            }
-        }
+        ConfigEnvPlaceholder::None => Ok(false),
+        ConfigEnvPlaceholder::Invalid => Err(ConfigError::Invalid(format!(
+            "{value_location} uses invalid env interpolation syntax"
+        ))),
         ConfigEnvPlaceholder::Exact { name } => {
             *raw_value = env::var(name).map_err(|_| {
                 ConfigError::Invalid(format!(
                     "{value_location} references missing env var '{name}'"
                 ))
             })?;
-            Ok(())
+            Ok(true)
         }
     }
 }
@@ -1634,10 +1654,7 @@ fn validate_egress_request_header_action(
 
             for value in source_values {
                 HeaderValue::from_str(&value).map_err(|e| {
-                    ConfigError::Invalid(format!(
-                        "{location} has invalid header value '{}': {e}",
-                        value
-                    ))
+                    ConfigError::Invalid(format!("{location} has invalid header value: {e}"))
                 })?;
             }
         }
@@ -4445,8 +4462,8 @@ value = "Bearer ${TOKEN}"
             "unexpected error message: {msg}"
         );
         assert!(
-            msg.contains("Bearer ${TOKEN}"),
-            "unexpected error message: {msg}"
+            !msg.contains("Bearer ${TOKEN}"),
+            "error message should not echo configured header value: {msg}"
         );
     }
 
@@ -4491,8 +4508,8 @@ include = "api_headers"
             "unexpected error message: {msg}"
         );
         assert!(
-            msg.contains("${DEPLOYMENT}/prod"),
-            "unexpected error message: {msg}"
+            !msg.contains("${DEPLOYMENT}/prod"),
+            "error message should not echo configured header value: {msg}"
         );
     }
 
@@ -5037,5 +5054,108 @@ value = "${{ACL_PROXY_TEST_LOAD_TOKEN}}"
             Some("load-token"),
             "expected resolved value after load_from_sources"
         );
+    }
+
+    #[test]
+    fn policy_dump_masks_env_sourced_header_action_values() {
+        let env_guard =
+            ConfigEnvTestGuard::new(&["ACL_PROXY_TEST_DUMP_TOKEN", "ACL_PROXY_TEST_DUMP_REGION"]);
+        env_guard.set("ACL_PROXY_TEST_DUMP_TOKEN", "secret-token");
+        env_guard.set("ACL_PROXY_TEST_DUMP_REGION", "us-central1");
+
+        let mut file = tempfile::NamedTempFile::new().expect("create temp config");
+        write!(
+            file,
+            r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "authorization"
+value = "${{ACL_PROXY_TEST_DUMP_TOKEN}}"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "add"
+name = "x-region"
+values = ["static", "${{ACL_PROXY_TEST_DUMP_REGION}}"]
+            "#
+        )
+        .expect("write config");
+
+        let config = Config::load_from_sources(Some(file.path()))
+            .expect("load should resolve header action placeholders");
+        let effective = crate::policy::EffectivePolicy::from_config(&config.policy)
+            .expect("build effective policy");
+
+        let actions = &effective.rules[0].header_actions;
+        assert_eq!(actions[0].values, vec!["[REDACTED]".to_string()]);
+        assert_eq!(
+            actions[1].values,
+            vec!["static".to_string(), "[REDACTED]".to_string()]
+        );
+
+        let serialized = serde_json::to_string(&effective).expect("serialize effective policy");
+        assert!(!serialized.contains("secret-token"));
+        assert!(!serialized.contains("us-central1"));
+    }
+
+    #[test]
+    fn resolved_env_header_validation_error_does_not_echo_value() {
+        let env_guard = ConfigEnvTestGuard::new(&["ACL_PROXY_TEST_BAD_HEADER_VALUE"]);
+        env_guard.set("ACL_PROXY_TEST_BAD_HEADER_VALUE", "secret\nvalue");
+
+        let mut file = tempfile::NamedTempFile::new().expect("create temp config");
+        write!(
+            file,
+            r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "authorization"
+value = "${{ACL_PROXY_TEST_BAD_HEADER_VALUE}}"
+            "#
+        )
+        .expect("write config");
+
+        let err = Config::load_from_sources(Some(file.path()))
+            .expect_err("invalid resolved header value should fail validation");
+        let msg = format!("{err}");
+        assert!(msg.contains("invalid header value"));
+        assert!(!msg.contains("secret"));
+        assert!(!msg.contains("secret\nvalue"));
     }
 }

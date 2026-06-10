@@ -1290,6 +1290,8 @@ async fn global_egress_request_actions_apply_to_https_transparent_requests() {
             when: acl_proxy::config::HeaderWhen::Always,
             value: Some("transparent".to_string()),
             values: None,
+            value_from_env: false,
+            values_from_env: Vec::new(),
             search: None,
             replace: None,
         }];
