@@ -593,7 +593,7 @@ https_bind_address = "0.0.0.0"     # IP for the transparent HTTPS listener
 https_port = 8889                   # port for HTTPS listener (0 = disabled)
 request_timeout_ms = 30000          # upstream timeout; 0 = disabled
 https_handshake_timeout_ms = 10000  # transparent HTTPS TLS handshake timeout; 0 = disabled
-https_request_header_timeout_ms = 10000 # transparent HTTPS HTTP/1 header timeout; 0 = disabled
+https_request_header_timeout_ms = 10000 # transparent HTTPS HTTP/1 header timeout and HTTP/2 keepalive interval/timeout; 0 = disabled
 https_max_connections = 1024        # active transparent HTTPS connections; 0 = unlimited
 https_http2_max_concurrent_streams = 128 # per-connection HTTP/2 stream cap; 0 = unlimited
 internal_base_path = "/_acl-proxy"  # base path for internal endpoints
@@ -1048,7 +1048,7 @@ kill -HUP $(pidof acl-proxy)
 - Pending external-auth approvals survive reload; callbacks after reload can still resolve requests that became pending before reload.
 - If reload fails, the previous state remains active.
 - `${NAME}` env placeholders are resolved again during reload. Changing a required env var takes effect on the next successful reload; removing one causes the reload to fail.
-- Listener bind addresses/ports and the enabled/disabled listener set are fixed at startup; changing those fields requires restart. Base logging sink settings (`logging.level`, `directory`, `max_bytes`, `max_files`, `console`) are also fixed at startup, while policy-decision logging flags and levels are read from the reloaded config.
+- Listener bind addresses/ports, transparent HTTPS connection caps (`https_max_connections`, `https_http2_max_concurrent_streams`), and the enabled/disabled listener set are fixed at startup; changing those fields requires restart. Base logging sink settings (`logging.level`, `directory`, `max_bytes`, `max_files`, `console`) are also fixed at startup, while policy-decision logging flags and levels are read from the reloaded config.
 
 ### Graceful Shutdown
 
@@ -1068,7 +1068,7 @@ Capture logging for loop-detected requests follows the `[capture]` flags for den
 - Rules can override with `request_timeout_ms`.
 - `0` disables the timeout.
 - When the timeout expires, the proxy responds with `504 Gateway Timeout`.
-- For the transparent HTTPS listener, `proxy.https_handshake_timeout_ms` bounds idle TLS handshakes, `proxy.https_request_header_timeout_ms` bounds HTTP/1 header reads after TLS, `proxy.https_max_connections` caps active accepted TLS connections, and `proxy.https_http2_max_concurrent_streams` caps active HTTP/2 streams per connection. Set any of these to `0` to disable that limit.
+- For the transparent HTTPS listener, `proxy.https_handshake_timeout_ms` bounds idle TLS handshakes, `proxy.https_request_header_timeout_ms` bounds HTTP/1 header reads after TLS and HTTP/2 idle/half-open connections via keepalive pings, `proxy.https_max_connections` caps active accepted TLS connections, and `proxy.https_http2_max_concurrent_streams` caps active HTTP/2 streams per connection. Set any of these to `0` to disable that limit.
 
 ### Egress Forwarding
 

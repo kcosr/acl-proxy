@@ -300,6 +300,8 @@ async fn handle_tls_connection(
     http.http1_keep_alive(true);
     if let Some(timeout) = limits.request_header_timeout {
         http.http1_header_read_timeout(timeout);
+        http.http2_keep_alive_interval(timeout);
+        http.http2_keep_alive_timeout(timeout);
     }
     http.http2_max_concurrent_streams(limits.http2_max_concurrent_streams);
 
