@@ -599,6 +599,7 @@ internal_base_path = "/_acl-proxy"  # base path for internal endpoints
 
 - `internal_base_path` must start with `/` and must not end with `/` (except root `/`). Internal endpoints are only matched for origin-form (direct) requests, not proxy-style absolute-form requests.
 - Listener bind addresses must be IP literals. If both HTTP and transparent HTTPS listeners use fixed non-zero ports, overlapping bind addresses cannot use the same port.
+- The default bind addresses listen on all interfaces. Set `bind_address` and `https_bind_address` to loopback addresses, or restrict access with firewall rules, when the proxy should be local-only.
 - The transparent HTTPS timeout and connection-cap settings apply at the listener boundary before request policy is evaluated.
 
 ### `[proxy.egress.default]` — Optional Forwarding Destination
@@ -1020,7 +1021,7 @@ Callback decisions are authorized by the pending request's unguessable `requestI
 
 ### Startup
 
-`acl-proxy` validates configuration at startup. If logging initialization fails, the proxy still starts but reports the error to stderr.
+`acl-proxy` validates configuration at startup. If logging initialization fails, startup aborts with a non-zero exit instead of running without an audit/log sink.
 
 ### Readiness Probe
 

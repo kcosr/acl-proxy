@@ -215,6 +215,42 @@ http_port = 8080
 }
 
 #[test]
+fn run_fails_when_logging_directory_cannot_initialize() {
+    let temp_dir = TempDir::new().expect("create temp dir");
+    let log_file = temp_dir.path().join("not-a-directory");
+    std::fs::write(&log_file, "not a directory").expect("write log path file");
+
+    let mut file = NamedTempFile::new().expect("create temp config");
+    writeln!(
+        file,
+        r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+https_port = 0
+
+[logging]
+directory = "{}"
+level = "info"
+
+[policy]
+default = "deny"
+        "#,
+        log_file.display()
+    )
+    .expect("write config");
+
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
+    cmd.arg("--config").arg(file.path());
+
+    cmd.assert()
+        .failure()
+        .stderr(contains("failed to create logging directory"));
+}
+
+#[test]
 fn missing_default_config_suggests_init() {
     let temp_dir = TempDir::new().expect("create temp dir");
     let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));

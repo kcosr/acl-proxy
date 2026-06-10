@@ -1,4 +1,5 @@
 use std::io::IsTerminal;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -20,6 +21,9 @@ pub enum CliError {
 
     #[error("failed to initialize async runtime: {0}")]
     Runtime(String),
+
+    #[error(transparent)]
+    Logging(#[from] crate::logging::LoggingError),
 
     #[error(transparent)]
     Proxy(#[from] HttpProxyError),
@@ -131,8 +135,7 @@ pub fn run() -> Result<ExitCode, CliError> {
                     Some(guards)
                 }
                 Err(err) => {
-                    eprintln!("failed to initialize logging: {err}");
-                    None
+                    return Err(CliError::Logging(err));
                 }
             };
 
@@ -441,6 +444,15 @@ fn log_startup(state: &AppState) {
     let loop_cfg = &cfg.loop_protection;
     let capture_cfg = &cfg.capture;
 
+    warn_on_unspecified_bind("http", &cfg.proxy.bind_address, cfg.proxy.http_port);
+    if cfg.proxy.https_port != 0 {
+        warn_on_unspecified_bind(
+            "transparent_https",
+            &cfg.proxy.https_bind_address,
+            cfg.proxy.https_port,
+        );
+    }
+
     tracing::info!(
         target: "acl_proxy::startup",
         http_bind = %http_bind,
@@ -458,4 +470,20 @@ fn log_startup(state: &AppState) {
         ca_certs_dir = %certs.certs_dir,
         "acl-proxy starting"
     );
+}
+
+fn warn_on_unspecified_bind(listener: &str, bind_address: &str, port: u16) {
+    let Ok(ip) = bind_address.parse::<IpAddr>() else {
+        return;
+    };
+
+    if ip.is_unspecified() {
+        tracing::warn!(
+            target: "acl_proxy::startup",
+            listener,
+            bind_address,
+            port,
+            "proxy listener is bound to all interfaces; restrict bind_address or firewall access when exposure is not intended"
+        );
+    }
 }
