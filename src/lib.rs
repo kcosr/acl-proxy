@@ -11,3 +11,4 @@ pub mod loop_protection;
 pub mod policy;
 pub mod proxy;
 pub mod redaction;
+mod url_canonical;

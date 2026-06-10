@@ -1,14 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
-use http::header::{HeaderName, HeaderValue};
-use http::HeaderMap;
-use ipnet::IpNet;
-use regex::{Regex, RegexBuilder};
-use serde::Serialize;
-use thiserror::Error;
-use url::Url;
-
 use crate::config::{
     EgressRequestHeaderActionConfig, ExternalAuthProfileConfigMap, HeaderActionConfig,
     HeaderActionKind, HeaderDirection, HeaderMatchValueConfig, HeaderWhen, MacroMap,
@@ -16,6 +8,13 @@ use crate::config::{
     PolicyRuleConfig, PolicyRuleDirectConfig, PolicyRuleIncludeConfig, PolicyRuleTemplateConfig,
     RulesetMap, UrlEncVariants,
 };
+use crate::url_canonical::canonicalize_http_url;
+use http::header::{HeaderName, HeaderValue};
+use http::HeaderMap;
+use ipnet::IpNet;
+use regex::{Regex, RegexBuilder};
+use serde::Serialize;
+use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum PolicyError {
@@ -1428,39 +1427,9 @@ pub fn pattern_to_regex(pattern: &str) -> String {
 }
 
 fn normalize_url(raw: &str) -> Result<String, PolicyError> {
-    let url = Url::parse(raw).map_err(|e| PolicyError::UrlParse(e.to_string()))?;
-
-    let scheme = url.scheme();
-    let protocol = format!("{scheme}:");
-
-    let host = match url.host_str() {
-        Some(h) => {
-            if let Some(port) = url.port() {
-                format!("{h}:{port}")
-            } else {
-                h.to_string()
-            }
-        }
-        None => return Err(PolicyError::UrlParse("URL is missing host".to_string())),
-    };
-
-    let path = if url.path().is_empty() {
-        "/"
-    } else {
-        url.path()
-    };
-
-    let search = match url.query() {
-        Some(q) => {
-            let mut s = String::with_capacity(q.len() + 1);
-            s.push('?');
-            s.push_str(q);
-            s
-        }
-        None => String::new(),
-    };
-
-    Ok(format!("{protocol}//{host}{path}{search}"))
+    canonicalize_http_url(raw)
+        .map(|canonical| canonical.url)
+        .map_err(|e| PolicyError::UrlParse(e.to_string()))
 }
 
 pub fn normalize_client_ip(raw: Option<&str>) -> Option<String> {
@@ -1601,6 +1570,32 @@ mod tests {
             .expect("compile regex");
         assert!(re2.is_match("https://example.com/api/v1/resource"));
         assert!(!re2.is_match("https://example.com/api/v1/v2/resource"));
+    }
+
+    #[test]
+    fn policy_uses_canonical_http_url_for_matching() {
+        let toml = r#"
+default = "allow"
+
+[[rules]]
+action = "deny"
+pattern = "https://example.com/admin/**"
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        assert!(!engine.is_allowed(
+            "https://EXAMPLE.COM.:443/a/../admin/panel",
+            None,
+            Some("GET")
+        ));
+        assert!(!engine.is_allowed(
+            "https://user:pass@example.com/admin/panel",
+            None,
+            Some("GET")
+        ));
+        assert!(!engine.is_allowed("ftp://example.com/admin/panel", None, Some("GET")));
     }
 
     #[test]

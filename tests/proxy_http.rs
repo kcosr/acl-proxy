@@ -1739,6 +1739,74 @@ async fn allowed_request_uses_configured_egress_forwarding_destination() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn explicit_http_canonicalizes_url_before_policy_and_egress_forwarding() {
+    let (forward_addr, seen_requests) = start_forwarding_echo_server().await;
+    let target = format!("127.0.0.1:{}", forward_addr.port());
+
+    let mut config = minimal_config();
+    config.capture.allowed_request = false;
+    config.capture.allowed_response = false;
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyRuleAction::Allow,
+            pattern: Some(format!("http://{target}/ok")),
+            patterns: None,
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: None,
+            headers_not_match: None,
+            request_timeout_ms: None,
+            allow_upgrades: true,
+            redaction_profile: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
+        host: "127.0.0.1".to_string(),
+        port: forward_addr.port(),
+    });
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let raw_request = format!(
+        "GET http://127.0.0.1.:{port}/a/../ok HTTP/1.1\r\nHost: 127.0.0.1.:{port}\r\nConnection: close\r\n\r\n",
+        port = forward_addr.port()
+    );
+    let (response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        response.contains("\r\n\r\nforwarded"),
+        "unexpected response body: {response}"
+    );
+
+    let requests = seen_requests.lock().unwrap();
+    let forwarded = requests
+        .first()
+        .expect("forwarding destination should see request");
+    assert_eq!(forwarded.uri, format!("http://{target}/ok"));
+    assert_eq!(
+        forwarded
+            .headers
+            .get("host")
+            .and_then(|value| value.to_str().ok()),
+        Some(target.as_str())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn global_egress_request_actions_are_applied_after_rule_actions_without_affecting_matching() {
     let (forward_addr, seen_requests) = start_forwarding_echo_server().await;
 

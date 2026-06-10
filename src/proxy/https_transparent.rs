@@ -18,8 +18,8 @@ use crate::config::{ExternalAuthProfileType, PolicyRuleAction};
 use crate::logging::PolicyDecisionLogContext;
 use crate::proxy::http::{
     build_external_auth_error_response, build_loop_detected_response,
-    build_policy_denied_response_with_mode, generate_request_id, has_loop_header,
-    is_upgrade_request, proxy_allowed_request, run_auth_plugin_gate_lifecycle,
+    build_policy_denied_response_with_mode, canonicalize_proxy_url, generate_request_id,
+    has_loop_header, is_upgrade_request, proxy_allowed_request, run_auth_plugin_gate_lifecycle,
     run_external_auth_gate_lifecycle, ExternalAuthGateResult,
 };
 
@@ -566,39 +566,8 @@ fn build_https_url_for_transparent(
         format!("/{}", path_and_query)
     };
 
-    let full_url = format!("https://{host}{path}", host = host_raw, path = path);
-
-    let (target_host, target_port) = split_host_and_port(host_raw);
-
-    let target = CaptureEndpoint {
-        address: Some(target_host.to_string()),
-        port: Some(target_port),
-    };
-
-    Ok((full_url, Some(target)))
-}
-
-fn split_host_and_port(host: &str) -> (&str, u16) {
-    // Bracketed IPv6: [::1]:443
-    if let Some(idx) = host.rfind(']') {
-        if host.starts_with('[') {
-            let host_part = &host[..=idx];
-            if let Some(port_str) = host[idx + 1..].strip_prefix(':') {
-                if let Ok(port) = port_str.parse::<u16>() {
-                    return (host_part, port);
-                }
-            }
-            return (host_part, 443);
-        }
-    }
-
-    if let Some((name, port_str)) = host.rsplit_once(':') {
-        if let Ok(port) = port_str.parse::<u16>() {
-            return (name, port);
-        }
-    }
-
-    (host, 443)
+    let raw_url = format!("https://{host}{path}", host = host_raw, path = path);
+    canonicalize_proxy_url(&raw_url)
 }
 
 #[cfg(test)]
@@ -611,13 +580,13 @@ mod tests {
     fn builds_https_url_from_host_and_path() {
         let req = Request::builder()
             .method(Method::GET)
-            .uri("/foo/bar?x=1")
-            .header(HOST, "example.com")
+            .uri("/foo/../bar?x=1")
+            .header(HOST, "EXAMPLE.COM.:443")
             .body(Body::empty())
             .expect("request");
 
         let (url, target) = build_https_url_for_transparent(&req).expect("url");
-        assert_eq!(url, "https://example.com/foo/bar?x=1");
+        assert_eq!(url, "https://example.com/bar?x=1");
 
         let target = target.expect("target");
         assert_eq!(target.address.as_deref(), Some("example.com"));
@@ -659,13 +628,19 @@ mod tests {
     }
 
     #[test]
-    fn split_host_and_port_handles_ipv6() {
-        let (host, port) = split_host_and_port("[::1]:8443");
-        assert_eq!(host, "[::1]");
-        assert_eq!(port, 8443);
+    fn canonicalizes_transparent_https_ipv6_host() {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/foo")
+            .header(HOST, "[::1]:8443")
+            .body(Body::empty())
+            .expect("request");
 
-        let (host2, port2) = split_host_and_port("[::1]");
-        assert_eq!(host2, "[::1]");
-        assert_eq!(port2, 443);
+        let (url, target) = build_https_url_for_transparent(&req).expect("url");
+        assert_eq!(url, "https://[::1]:8443/foo");
+
+        let target = target.expect("target");
+        assert_eq!(target.address.as_deref(), Some("[::1]"));
+        assert_eq!(target.port, Some(8443));
     }
 }

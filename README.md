@@ -226,7 +226,7 @@ In transparent HTTP mode, upstream target selection is based on the inbound `Hos
 ### Transparent HTTPS
 
 - Set `https_port = 0` to disable this listener.
-- URL construction is based on the Host header or the request URI authority.
+- URL construction is based on the Host header or the request URI authority and uses the same canonicalization as policy matching.
 - Inbound HTTP/2 is supported via ALPN negotiation.
 - If the Host header is missing or invalid, the proxy returns `400 Bad Request`.
 
@@ -288,14 +288,17 @@ All predicates use AND semantics — a rule matches only when every predicate pa
 
 ### URL Normalization
 
-Before applying rules, the engine normalizes input URLs to:
+Before applying rules or forwarding the request upstream, acl-proxy canonicalizes input URLs to:
 
 ```
 protocol + "//" + host[:port] + path + optional "?query"
 ```
 
 - The scheme is preserved (`http:` or `https:`).
-- The host includes a port only when it was explicit in the URL. No default port is added.
+- Only `http` and `https` URLs are accepted. URLs with userinfo are rejected.
+- Hostnames are lowercased and a trailing DNS dot is removed.
+- Default ports (`:80` for HTTP, `:443` for HTTPS) are omitted; non-default ports are preserved.
+- Dot segments in the path are resolved before matching or forwarding.
 - The path defaults to `/` when empty.
 - Query strings are preserved; fragments are ignored.
 - IPv6 hostnames use standard bracket notation (e.g., `https://[::1]:8443/path`).

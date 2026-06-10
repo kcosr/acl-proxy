@@ -44,6 +44,7 @@ use crate::policy::CompiledHeaderAction;
 use crate::proxy::https_connect;
 use crate::proxy::websocket;
 use crate::redaction::RedactionProfile;
+use crate::url_canonical::{canonicalize_http_url, CanonicalUrl};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HttpProxyError {
@@ -1714,14 +1715,13 @@ fn build_full_url(
     if let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) {
         let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
-        let normalized = if path_and_query.starts_with('/') {
+        let raw_url = if path_and_query.starts_with('/') {
             format!("{scheme}://{authority}{path}", path = path_and_query)
         } else {
             format!("{scheme}://{authority}/{path}", path = path_and_query)
         };
 
-        let target = extract_target_from_uri(uri);
-        return Ok((normalized, target));
+        return canonicalize_proxy_url(&raw_url);
     }
 
     // Origin-form requests are accepted on the HTTP listener to support
@@ -1769,55 +1769,32 @@ fn build_http_url_from_origin_form(
         format!("/{}", path_and_query)
     };
 
-    let full_url = format!("http://{host}{path}", host = host_raw, path = path);
-    let (target_host, target_port) = split_host_and_port_with_default(host_raw, 80);
-
-    let target = CaptureEndpoint {
-        address: Some(target_host.to_string()),
-        port: Some(target_port),
-    };
-
-    Ok((full_url, Some(target)))
+    let raw_url = format!("http://{host}{path}", host = host_raw, path = path);
+    canonicalize_proxy_url(&raw_url)
 }
 
-fn extract_target_from_uri(uri: &Uri) -> Option<CaptureEndpoint> {
-    let authority = uri.authority()?;
-    let host = authority.host().to_string();
-    let port = authority.port_u16().unwrap_or_else(|| {
-        if uri.scheme_str() == Some("https") {
-            443
-        } else {
-            80
-        }
-    });
-
-    Some(CaptureEndpoint {
-        address: Some(host),
-        port: Some(port),
-    })
+pub(crate) fn canonicalize_proxy_url(
+    raw_url: &str,
+) -> Result<(String, Option<CaptureEndpoint>), Response<Body>> {
+    canonicalize_http_url(raw_url)
+        .map(|canonical| {
+            let target = canonical_capture_endpoint(&canonical);
+            (canonical.url, Some(target))
+        })
+        .map_err(|_| bad_request("Bad Request: invalid request target"))
 }
 
-fn split_host_and_port_with_default(host: &str, default_port: u16) -> (&str, u16) {
-    // Bracketed IPv6: [::1]:80
-    if let Some(idx) = host.rfind(']') {
-        if host.starts_with('[') {
-            let host_part = &host[..=idx];
-            if let Some(port_str) = host[idx + 1..].strip_prefix(':') {
-                if let Ok(port) = port_str.parse::<u16>() {
-                    return (host_part, port);
-                }
-            }
-            return (host_part, default_port);
-        }
+pub(crate) fn canonical_capture_endpoint(canonical: &CanonicalUrl) -> CaptureEndpoint {
+    CaptureEndpoint {
+        address: Some(canonical.host_for_capture.clone()),
+        port: Some(canonical.port),
     }
+}
 
-    if let Some((name, port_str)) = host.rsplit_once(':') {
-        if let Ok(port) = port_str.parse::<u16>() {
-            return (name, port);
-        }
-    }
-
-    (host, default_port)
+pub(crate) fn bad_request(message: &'static str) -> Response<Body> {
+    let mut resp = Response::new(Body::from(message));
+    *resp.status_mut() = StatusCode::BAD_REQUEST;
+    resp
 }
 
 pub(crate) fn has_loop_header(headers: &HttpHeaderMap, name: &HeaderName) -> bool {
@@ -3393,7 +3370,7 @@ mod tests {
     #[test]
     fn build_full_url_accepts_absolute_form() {
         let req = Request::builder()
-            .uri("http://example.com/path?q=1")
+            .uri("http://EXAMPLE.COM.:80/a/../path?q=1")
             .body(Body::empty())
             .expect("request");
 
@@ -3405,15 +3382,26 @@ mod tests {
     }
 
     #[test]
+    fn build_full_url_rejects_absolute_form_with_userinfo() {
+        let req = Request::builder()
+            .uri("http://user:pass@example.com/path")
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = build_full_url(&req).expect_err("userinfo should fail");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn build_full_url_accepts_origin_form_with_host_header() {
         let req = Request::builder()
-            .uri("/relative/path?q=1")
-            .header(HOST, "example.com:8080")
+            .uri("/relative/../path?q=1")
+            .header(HOST, "EXAMPLE.COM.:8080")
             .body(Body::empty())
             .expect("request");
 
         let (url, target) = build_full_url(&req).expect("full url");
-        assert_eq!(url, "http://example.com:8080/relative/path?q=1");
+        assert_eq!(url, "http://example.com:8080/path?q=1");
         let target = target.expect("target");
         assert_eq!(target.address.as_deref(), Some("example.com"));
         assert_eq!(target.port, Some(8080));

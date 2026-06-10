@@ -16,9 +16,10 @@ use crate::capture::{CaptureDecision, CaptureEndpoint, CaptureMode};
 use crate::config::{ExternalAuthProfileType, PolicyRuleAction};
 use crate::logging::PolicyDecisionLogContext;
 use crate::proxy::http::{
-    build_external_auth_error_response, build_loop_detected_response, generate_request_id,
-    has_loop_header, is_upgrade_request, proxy_allowed_request, run_auth_plugin_gate_lifecycle,
-    run_external_auth_gate_lifecycle, ExternalAuthGateResult,
+    bad_request, build_external_auth_error_response, build_loop_detected_response,
+    canonicalize_proxy_url, generate_request_id, has_loop_header, is_upgrade_request,
+    proxy_allowed_request, run_auth_plugin_gate_lifecycle, run_external_auth_gate_lifecycle,
+    ExternalAuthGateResult,
 };
 
 /// Handle an incoming CONNECT request on the HTTP listener.
@@ -225,7 +226,10 @@ async fn handle_inner_https_request(
     let version = req.version();
     let uri = req.uri().clone();
 
-    let full_url = build_https_url_for_inner_request(&target, &uri);
+    let full_url = match build_https_url_for_inner_request(&target, &uri) {
+        Ok(full_url) => full_url,
+        Err(()) => return Ok(bad_request("Bad Request: invalid request target")),
+    };
 
     // Loop protection inside the tunnel.
     let loop_settings = &state.loop_protection;
@@ -499,7 +503,7 @@ async fn handle_inner_https_request(
     }
 }
 
-fn build_https_url_for_inner_request(target: &CaptureEndpoint, uri: &Uri) -> String {
+fn build_https_url_for_inner_request(target: &CaptureEndpoint, uri: &Uri) -> Result<String, ()> {
     let host = target.address.as_deref().unwrap_or("unknown-host");
     let host_with_port = match target.port {
         Some(443) | None => host.to_string(),
@@ -507,11 +511,14 @@ fn build_https_url_for_inner_request(target: &CaptureEndpoint, uri: &Uri) -> Str
     };
     let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
-    format!(
+    let raw_url = format!(
         "https://{host}{path}",
         host = host_with_port,
         path = path_and_query
-    )
+    );
+    canonicalize_proxy_url(&raw_url)
+        .map(|(url, _target)| url)
+        .map_err(|_| ())
 }
 
 async fn build_connect_policy_denied_response(
@@ -565,7 +572,7 @@ mod tests {
         };
 
         let uri: Uri = "/foo/bar?x=1".parse().expect("uri parse");
-        let url = build_https_url_for_inner_request(&target, &uri);
+        let url = build_https_url_for_inner_request(&target, &uri).expect("url");
         assert_eq!(url, "https://example.com/foo/bar?x=1");
     }
 
@@ -577,7 +584,19 @@ mod tests {
         };
 
         let uri: Uri = "/".parse().expect("uri parse");
-        let url = build_https_url_for_inner_request(&target, &uri);
+        let url = build_https_url_for_inner_request(&target, &uri).expect("url");
         assert_eq!(url, "https://example.com/");
+    }
+
+    #[test]
+    fn canonicalizes_https_url_from_target_and_path() {
+        let target = CaptureEndpoint {
+            address: Some("EXAMPLE.COM.".to_string()),
+            port: Some(443),
+        };
+
+        let uri: Uri = "/a/../admin?x=1".parse().expect("uri parse");
+        let url = build_https_url_for_inner_request(&target, &uri).expect("url");
+        assert_eq!(url, "https://example.com/admin?x=1");
     }
 }
