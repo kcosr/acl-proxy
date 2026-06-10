@@ -364,12 +364,22 @@ fn spawn_signal_handlers(
             };
 
             while hup_stream.recv().await.is_some() {
-                match reload_from_sources(&state_for_reload, config_path_for_reload.as_deref()) {
-                    Ok(()) => {
+                let state = state_for_reload.clone();
+                let config_path = config_path_for_reload.clone();
+                let reload_result = tokio::task::spawn_blocking(move || {
+                    reload_from_sources(&state, config_path.as_deref())
+                })
+                .await;
+
+                match reload_result {
+                    Ok(Ok(())) => {
                         tracing::info!("configuration reload completed successfully");
                     }
-                    Err(err) => {
+                    Ok(Err(err)) => {
                         tracing::error!("configuration reload failed: {err}");
+                    }
+                    Err(err) => {
+                        tracing::error!("configuration reload task failed: {err}");
                     }
                 }
             }
