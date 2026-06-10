@@ -1262,7 +1262,12 @@ fn interpolate_config_env_value(
 }
 
 fn classify_config_env_placeholder(raw_value: &str) -> ConfigEnvPlaceholder<'_> {
-    if !raw_value.contains("${") {
+    let Some(open_idx) = raw_value.find("${") else {
+        return ConfigEnvPlaceholder::None;
+    };
+
+    let has_closing_brace = raw_value[open_idx + 2..].contains('}');
+    if !has_closing_brace {
         return ConfigEnvPlaceholder::None;
     }
 
@@ -3775,6 +3780,14 @@ external_auth_profile = "example"
             classify_config_env_placeholder("${_TOKEN_2}"),
             ConfigEnvPlaceholder::Exact { name: "_TOKEN_2" }
         );
+        assert_eq!(
+            classify_config_env_placeholder("pass${word"),
+            ConfigEnvPlaceholder::None
+        );
+        assert_eq!(
+            classify_config_env_placeholder("${TOKEN"),
+            ConfigEnvPlaceholder::None
+        );
 
         for raw in [
             "Bearer ${TOKEN}",
@@ -3782,7 +3795,6 @@ external_auth_profile = "example"
             "${}",
             "${1BAD}",
             "${BAD-NAME}",
-            "${TOKEN",
         ] {
             assert_eq!(
                 classify_config_env_placeholder(raw),
