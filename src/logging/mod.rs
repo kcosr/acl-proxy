@@ -384,6 +384,7 @@ impl RotatingFileWriter {
     fn rotate(&mut self) -> io::Result<()> {
         self.file.flush()?;
         let mut rotation_error = None;
+        let mut base_rotated = false;
 
         for index in (1..=self.max_files).rev() {
             let destination = self.rotated_path(index);
@@ -402,15 +403,26 @@ impl RotatingFileWriter {
                 }
                 if let Err(err) = fs::rename(source, destination) {
                     rotation_error.get_or_insert(err);
+                } else if index == 1 {
+                    base_rotated = true;
                 }
             }
         }
 
-        self.file = open_private_file_for_write(&self.base_path)?;
-        self.size = 0;
+        if base_rotated || !self.base_path.exists() {
+            self.file = open_private_file_for_write(&self.base_path)?;
+            self.size = 0;
+        } else {
+            self.file = open_private_file_for_append(&self.base_path)?;
+            self.size = self
+                .file
+                .metadata()
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+        }
 
         if let Some(err) = rotation_error {
-            eprintln!("log rotation completed with errors; opened fresh log file: {err}");
+            eprintln!("log rotation completed with errors; continuing with active log file: {err}");
         }
 
         Ok(())
@@ -698,14 +710,14 @@ mod tests {
 
         writer.write_all(b"d").expect("write through failed rotate");
         let current = std::fs::read_to_string(&base_path).expect("read current");
-        assert_eq!(current, "d");
+        assert_eq!(current, "abcd");
 
         writer.write_all(b"ef").expect("fill current log");
         writer
             .write_all(b"g")
             .expect("write through repeated failed rotate");
         let current = std::fs::read_to_string(&base_path).expect("read current after retry");
-        assert_eq!(current, "g");
+        assert_eq!(current, "abcdefg");
         assert!(rotated.is_dir(), "blocking rotated path should remain");
     }
 }
