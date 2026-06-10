@@ -1,10 +1,14 @@
 #![allow(clippy::await_holding_lock)]
 
+use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::{Arc, Mutex};
 
 use acl_proxy::app::AppState;
-use acl_proxy::config::{Config, EgressTargetConfig};
+use acl_proxy::config::{
+    Config, EgressTargetConfig, ExternalAuthProfileConfig, ExternalAuthProfileType,
+};
+use acl_proxy::external_auth::ExternalDecision;
 use acl_proxy::proxy::http::run_http_proxy_on_listener;
 use http::StatusCode;
 use hyper::service::{make_service_fn, service_fn};
@@ -113,6 +117,24 @@ default = "deny"
 fn prepare_app_config_for_reload_tests(config: &mut Config, certs_dir: &std::path::Path) {
     config.logging.directory = None;
     config.certificates.certs_dir = certs_dir.display().to_string();
+}
+
+fn http_external_auth_profile() -> ExternalAuthProfileConfig {
+    ExternalAuthProfileConfig {
+        profile_type: ExternalAuthProfileType::Http,
+        webhook_url: Some("http://127.0.0.1:9/webhook".to_string()),
+        timeout_ms: 60_000,
+        webhook_timeout_ms: Some(1_000),
+        on_webhook_failure: None,
+        command: None,
+        args: Vec::new(),
+        include_headers: Vec::new(),
+        include_request_body: false,
+        max_request_body_bytes: 10 * 1024 * 1024,
+        max_decompressed_request_body_bytes: 50 * 1024 * 1024,
+        env: std::collections::BTreeMap::new(),
+        restart_delay_ms: None,
+    }
 }
 
 async fn start_proxy_with_shared_state(
@@ -405,6 +427,60 @@ fn invalid_egress_forwarding_config_is_rejected_on_reload() {
         shared_state.load().config.proxy.egress.default.is_none(),
         "failed reload should preserve the previous state"
     );
+}
+
+#[tokio::test]
+async fn reload_preserves_pending_external_auth_approvals() {
+    let temp = tempfile::tempdir().expect("temp certs dir");
+
+    let mut config = minimal_config();
+    prepare_app_config_for_reload_tests(&mut config, temp.path());
+    config
+        .policy
+        .external_auth_profiles
+        .insert("approval".to_string(), http_external_auth_profile());
+
+    let shared_state = AppState::shared_from_config(config.clone()).expect("initial state");
+    let initial = shared_state.load_full();
+
+    let (_guard, decision_rx) = initial.external_auth.start_pending(
+        "req-reload".to_string(),
+        0,
+        None,
+        "approval".to_string(),
+        "http://example.com/".to_string(),
+        Some("GET".to_string()),
+        Some("127.0.0.1".to_string()),
+        Vec::new(),
+    );
+    assert_eq!(initial.external_auth.pending_count(), 1);
+
+    let mut updated = config;
+    updated.loop_protection.enabled = true;
+    AppState::reload_shared_from_config(&shared_state, updated).expect("reload config");
+
+    let reloaded = shared_state.load_full();
+    assert_eq!(reloaded.external_auth.pending_count(), 1);
+    let mut macro_values = BTreeMap::new();
+    macro_values.insert("token".to_string(), "from-reloaded-callback".to_string());
+    reloaded
+        .external_auth
+        .store_macro_values("req-reload", macro_values);
+    assert_eq!(initial.external_auth.stored_macro_count(), 1);
+    assert!(
+        reloaded
+            .external_auth
+            .resolve("req-reload", ExternalDecision::Allow),
+        "post-reload manager should resolve pre-reload pending request"
+    );
+    assert_eq!(decision_rx.await, Ok(ExternalDecision::Allow));
+    let taken_macros = initial.external_auth.take_macro_values("req-reload");
+    assert_eq!(
+        taken_macros.get("token").map(String::as_str),
+        Some("from-reloaded-callback")
+    );
+    assert_eq!(reloaded.external_auth.pending_count(), 0);
+    assert_eq!(reloaded.external_auth.stored_macro_count(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

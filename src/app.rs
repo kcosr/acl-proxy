@@ -52,6 +52,13 @@ pub struct AppState {
 
 impl AppState {
     pub fn from_config(config: Config) -> Result<Self, AppStateError> {
+        Self::from_config_with_previous(config, None)
+    }
+
+    fn from_config_with_previous(
+        config: Config,
+        previous: Option<&AppState>,
+    ) -> Result<Self, AppStateError> {
         config.validate_basic()?;
         let logging = LoggingSettings::from_config(&config.logging)?;
         let policy = PolicyEngine::from_config(&config.policy)?;
@@ -61,11 +68,20 @@ impl AppState {
 
         let http_client = build_http_client(&config.tls);
         let cert_manager = CertManager::from_config(&config.certificates)?;
-        let external_auth = ExternalAuthManager::new_with_callback(
-            &config.policy.external_auth_profiles,
-            config.external_auth.callback_url.clone(),
-            http_client.clone(),
-        );
+        let external_auth = if let Some(previous) = previous {
+            ExternalAuthManager::reconfigured_from(
+                &config.policy.external_auth_profiles,
+                config.external_auth.callback_url.clone(),
+                http_client.clone(),
+                &previous.external_auth,
+            )
+        } else {
+            ExternalAuthManager::new_with_callback(
+                &config.policy.external_auth_profiles,
+                config.external_auth.callback_url.clone(),
+                http_client.clone(),
+            )
+        };
         let auth_plugins = AuthPluginManager::new(&config.policy.external_auth_profiles);
 
         Ok(AppState {
@@ -96,7 +112,8 @@ impl AppState {
         shared: &SharedAppState,
         config: Config,
     ) -> Result<(), AppStateError> {
-        let new_state = AppState::from_config(config)?;
+        let previous = shared.load_full();
+        let new_state = AppState::from_config_with_previous(config, Some(previous.as_ref()))?;
         shared.store(Arc::new(new_state));
         Ok(())
     }

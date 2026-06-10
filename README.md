@@ -1040,8 +1040,10 @@ kill -HUP $(pidof acl-proxy)
 
 - A new `AppState` is built and swapped atomically via `ArcSwap`.
 - New connections use the new config immediately. In-flight requests complete with the previous config.
+- Pending external-auth approvals survive reload; callbacks after reload can still resolve requests that became pending before reload.
 - If reload fails, the previous state remains active.
 - `${NAME}` env placeholders are resolved again during reload. Changing a required env var takes effect on the next successful reload; removing one causes the reload to fail.
+- Listener bind addresses/ports and the enabled/disabled listener set are fixed at startup; changing those fields requires restart. Base logging sink settings (`logging.level`, `directory`, `max_bytes`, `max_files`, `console`) are also fixed at startup, while policy-decision logging flags and levels are read from the reloaded config.
 
 ### Graceful Shutdown
 
