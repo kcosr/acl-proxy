@@ -39,6 +39,13 @@ https_port = 8889
 # Timeout (ms) for upstream responses (0 disables).
 request_timeout_ms = 30000
 
+# Transparent HTTPS listener slow-client protections. Set a value to 0 to
+# disable that limit.
+https_handshake_timeout_ms = 10000
+https_request_header_timeout_ms = 10000
+https_max_connections = 1024
+https_http2_max_concurrent_streams = 128
+
 # Base path for internal endpoints (readiness probe and external auth callbacks).
 internal_base_path = "/_acl-proxy"
 

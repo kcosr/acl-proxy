@@ -587,10 +587,15 @@ http_port = 8881                    # port for HTTP listener (0 = ephemeral)
 https_bind_address = "0.0.0.0"     # IP for the transparent HTTPS listener
 https_port = 8889                   # port for HTTPS listener (0 = disabled)
 request_timeout_ms = 30000          # upstream timeout; 0 = disabled
+https_handshake_timeout_ms = 10000  # transparent HTTPS TLS handshake timeout; 0 = disabled
+https_request_header_timeout_ms = 10000 # transparent HTTPS HTTP/1 header timeout; 0 = disabled
+https_max_connections = 1024        # active transparent HTTPS connections; 0 = unlimited
+https_http2_max_concurrent_streams = 128 # per-connection HTTP/2 stream cap; 0 = unlimited
 internal_base_path = "/_acl-proxy"  # base path for internal endpoints
 ```
 
 - `internal_base_path` must start with `/` and must not end with `/` (except root `/`). Internal endpoints are only matched for origin-form (direct) requests, not proxy-style absolute-form requests.
+- The transparent HTTPS timeout and connection-cap settings apply at the listener boundary before request policy is evaluated.
 
 ### `[proxy.egress.default]` — Optional Forwarding Destination
 
@@ -854,6 +859,10 @@ http_port = 8881
 https_bind_address = "0.0.0.0"
 https_port = 8889
 request_timeout_ms = 30000
+https_handshake_timeout_ms = 10000
+https_request_header_timeout_ms = 10000
+https_max_connections = 1024
+https_http2_max_concurrent_streams = 128
 internal_base_path = "/_acl-proxy"
 
 [logging]
@@ -1039,6 +1048,7 @@ Capture logging for loop-detected requests follows the `[capture]` flags for den
 - Rules can override with `request_timeout_ms`.
 - `0` disables the timeout.
 - When the timeout expires, the proxy responds with `504 Gateway Timeout`.
+- For the transparent HTTPS listener, `proxy.https_handshake_timeout_ms` bounds idle TLS handshakes, `proxy.https_request_header_timeout_ms` bounds HTTP/1 header reads after TLS, `proxy.https_max_connections` caps active accepted TLS connections, and `proxy.https_http2_max_concurrent_streams` caps active HTTP/2 streams per connection. Set any of these to `0` to disable that limit.
 
 ### Egress Forwarding
 

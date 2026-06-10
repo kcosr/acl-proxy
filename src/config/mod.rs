@@ -129,6 +129,18 @@ pub struct ProxyConfig {
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
 
+    #[serde(default = "default_https_handshake_timeout_ms")]
+    pub https_handshake_timeout_ms: u64,
+
+    #[serde(default = "default_https_request_header_timeout_ms")]
+    pub https_request_header_timeout_ms: u64,
+
+    #[serde(default = "default_https_max_connections")]
+    pub https_max_connections: usize,
+
+    #[serde(default = "default_https_http2_max_concurrent_streams")]
+    pub https_http2_max_concurrent_streams: u32,
+
     #[serde(default = "default_internal_base_path")]
     pub internal_base_path: String,
 
@@ -144,6 +156,10 @@ impl Default for ProxyConfig {
             https_bind_address: default_https_bind_address(),
             https_port: default_https_port(),
             request_timeout_ms: default_request_timeout_ms(),
+            https_handshake_timeout_ms: default_https_handshake_timeout_ms(),
+            https_request_header_timeout_ms: default_https_request_header_timeout_ms(),
+            https_max_connections: default_https_max_connections(),
+            https_http2_max_concurrent_streams: default_https_http2_max_concurrent_streams(),
             internal_base_path: default_internal_base_path(),
             egress: ProxyEgressConfig::default(),
         }
@@ -168,6 +184,22 @@ fn default_https_port() -> u16 {
 
 fn default_request_timeout_ms() -> u64 {
     30_000
+}
+
+fn default_https_handshake_timeout_ms() -> u64 {
+    10_000
+}
+
+fn default_https_request_header_timeout_ms() -> u64 {
+    10_000
+}
+
+fn default_https_max_connections() -> usize {
+    1024
+}
+
+fn default_https_http2_max_concurrent_streams() -> u32 {
+    128
 }
 
 fn default_internal_base_path() -> String {
@@ -1386,6 +1418,10 @@ http_port = 8881
 https_bind_address = "0.0.0.0"
 https_port = 8889
 request_timeout_ms = 30000
+https_handshake_timeout_ms = 10000
+https_request_header_timeout_ms = 10000
+https_max_connections = 1024
+https_http2_max_concurrent_streams = 128
 internal_base_path = "/_acl-proxy"
 
 [logging]
@@ -2437,6 +2473,37 @@ default = "deny"
     fn proxy_egress_default_is_optional() {
         let config = Config::default();
         assert!(config.proxy.egress.default.is_none());
+    }
+
+    #[test]
+    fn proxy_transparent_https_slow_client_limits_default_and_parse() {
+        let default = ProxyConfig::default();
+        assert_eq!(default.https_handshake_timeout_ms, 10_000);
+        assert_eq!(default.https_request_header_timeout_ms, 10_000);
+        assert_eq!(default.https_max_connections, 1024);
+        assert_eq!(default.https_http2_max_concurrent_streams, 128);
+
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+https_handshake_timeout_ms = 250
+https_request_header_timeout_ms = 500
+https_max_connections = 8
+https_http2_max_concurrent_streams = 16
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        assert_eq!(config.proxy.https_handshake_timeout_ms, 250);
+        assert_eq!(config.proxy.https_request_header_timeout_ms, 500);
+        assert_eq!(config.proxy.https_max_connections, 8);
+        assert_eq!(config.proxy.https_http2_max_concurrent_streams, 16);
+        config.validate_basic().expect("config should validate");
     }
 
     #[test]

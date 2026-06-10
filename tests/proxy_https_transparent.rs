@@ -555,6 +555,41 @@ async fn start_proxy_with_config(
     (addr, temp_dir, ca_cert_path)
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn transparent_https_listener_times_out_idle_tls_handshake() {
+    let mut config = minimal_https_transparent_config();
+    config.proxy.https_handshake_timeout_ms = 50;
+    config.proxy.https_request_header_timeout_ms = 500;
+    config.proxy.https_max_connections = 16;
+
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir, _ca_cert_path) = start_proxy_with_config(config, listener).await;
+
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect to proxy");
+    let mut buf = [0u8; 1];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
+        .await
+        .expect("idle TLS connection should close after handshake timeout");
+
+    match read {
+        Ok(0) => {}
+        Ok(n) => panic!("expected closed TLS connection, read {n} bytes"),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::BrokenPipe
+            ) => {}
+        Err(err) => panic!("unexpected read error after TLS handshake timeout: {err}"),
+    }
+}
+
 async fn send_https_request_via_transparent(
     proxy_addr: SocketAddr,
     ca_cert_path: &std::path::Path,
