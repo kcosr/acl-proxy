@@ -1066,21 +1066,19 @@ impl Config {
 
     fn interpolate_redaction_env_vars(&mut self) -> Result<(), ConfigError> {
         for (profile_name, profile) in self.redaction.profiles.iter_mut() {
-            interpolate_config_env_value(
+            interpolate_redaction_env_value(
                 &mut profile.replacement,
                 format!("redaction.profiles.{profile_name}.replacement").as_str(),
-                false,
             )?;
 
             for (rule_idx, rule) in profile.rules.iter_mut().enumerate() {
                 for (literal_idx, literal) in rule.literals.iter_mut().enumerate() {
-                    interpolate_config_env_value(
+                    interpolate_redaction_env_value(
                         literal,
                         format!(
                             "redaction.profiles.{profile_name}.rules[{rule_idx}].literals[{literal_idx}]"
                         )
                         .as_str(),
-                        false,
                     )?;
                 }
             }
@@ -1232,6 +1230,21 @@ fn interpolate_header_action_value(
     interpolate_config_env_value(raw_value, action_location, true)
 }
 
+fn interpolate_redaction_env_value(
+    raw_value: &mut String,
+    value_location: &str,
+) -> Result<(), ConfigError> {
+    if has_incomplete_config_env_marker(raw_value) {
+        tracing::warn!(
+            target: "acl_proxy::config",
+            location = %value_location,
+            "redaction value contains '${{' but is not a complete placeholder; treating as literal text"
+        );
+    }
+
+    interpolate_config_env_value(raw_value, value_location, false)
+}
+
 fn interpolate_config_env_value(
     raw_value: &mut String,
     value_location: &str,
@@ -1261,13 +1274,16 @@ fn interpolate_config_env_value(
     }
 }
 
-fn classify_config_env_placeholder(raw_value: &str) -> ConfigEnvPlaceholder<'_> {
+fn has_incomplete_config_env_marker(raw_value: &str) -> bool {
     let Some(open_idx) = raw_value.find("${") else {
-        return ConfigEnvPlaceholder::None;
+        return false;
     };
 
-    let has_closing_brace = raw_value[open_idx + 2..].contains('}');
-    if !has_closing_brace {
+    !raw_value[open_idx + 2..].contains('}')
+}
+
+fn classify_config_env_placeholder(raw_value: &str) -> ConfigEnvPlaceholder<'_> {
+    if has_incomplete_config_env_marker(raw_value) || !raw_value.contains("${") {
         return ConfigEnvPlaceholder::None;
     }
 
@@ -2249,6 +2265,44 @@ redaction_profile = "secrets"
         let profile = config.redaction.profiles.get("secrets").expect("profile");
         assert_eq!(profile.replacement, "[MASKED]");
         assert_eq!(profile.rules[0].literals, vec!["load-secret".to_string()]);
+    }
+
+    #[test]
+    fn load_from_sources_preserves_incomplete_redaction_env_marker_literals() {
+        let mut file = tempfile::NamedTempFile::new().expect("create temp config");
+        write!(
+            file,
+            r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[redaction.profiles.secrets]
+
+[[redaction.profiles.secrets.rules]]
+literals = ["pass${{word"]
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+redaction_profile = "secrets"
+            "#
+        )
+        .expect("write config");
+
+        let config = Config::load_from_sources(Some(file.path()))
+            .expect("load should preserve incomplete marker literal");
+        let profile = config.redaction.profiles.get("secrets").expect("profile");
+        assert_eq!(profile.rules[0].literals, vec!["pass${word".to_string()]);
     }
 
     #[test]
