@@ -32,11 +32,11 @@ use crate::app::{AppState, SharedAppState};
 use crate::auth_plugin::{AuthPluginHandle, PluginBodyInput, PluginBodyMutation, PluginDecision};
 use crate::capture::{
     build_capture_record, should_capture, BodyCaptureBuffer, BodyCaptureResult, CaptureDecision,
-    CaptureEndpoint, CaptureKind, CaptureMode, CaptureRecordOptions, HeaderMap,
+    CaptureEndpoint, CaptureKind, CaptureMode, CaptureRecord, CaptureRecordOptions, HeaderMap,
 };
 use crate::config::{
-    EgressTargetConfig, ExternalAuthProfileType, HeaderActionKind, HeaderDirection, HeaderWhen,
-    PolicyRuleAction,
+    Config, EgressTargetConfig, ExternalAuthProfileType, HeaderActionKind, HeaderDirection,
+    HeaderWhen, PolicyRuleAction,
 };
 use crate::external_auth::{ApprovalMacroDescriptor, ExternalAuthProfile, ExternalDecision};
 use crate::logging::PolicyDecisionLogContext;
@@ -2146,13 +2146,14 @@ pub(crate) async fn maybe_capture_static_response(
 ) {
     let cfg = &state.config;
     let decision_label = decision;
+    let mut records = Vec::new();
 
     if should_capture(cfg, decision_label, CaptureKind::Request) {
         let headers = req_headers
             .map(headers_to_capture_map)
             .unwrap_or_else(HeaderMap::new);
 
-        let record = build_capture_record(CaptureRecordOptions {
+        records.push(build_capture_record(CaptureRecordOptions {
             timestamp: Utc::now().to_rfc3339(),
             request_id: request_id.to_string(),
             kind: CaptureKind::Request,
@@ -2167,9 +2168,7 @@ pub(crate) async fn maybe_capture_static_response(
             status_code: None,
             status_message: None,
             body: None,
-        });
-
-        let _ = crate::capture::write_capture_record(cfg, &record);
+        }));
     }
 
     if should_capture(cfg, decision_label, CaptureKind::Response) {
@@ -2191,7 +2190,7 @@ pub(crate) async fn maybe_capture_static_response(
             Some(buf.finish())
         };
 
-        let record = build_capture_record(CaptureRecordOptions {
+        records.push(build_capture_record(CaptureRecordOptions {
             timestamp: Utc::now().to_rfc3339(),
             request_id: request_id.to_string(),
             kind: CaptureKind::Response,
@@ -2206,9 +2205,41 @@ pub(crate) async fn maybe_capture_static_response(
             status_code: Some(status.as_u16()),
             status_message: Some(status_message.to_string()),
             body: body_capture,
-        });
+        }));
+    }
 
-        let _ = crate::capture::write_capture_record(cfg, &record);
+    write_capture_records_blocking(cfg.clone(), records).await;
+}
+
+async fn write_capture_records_blocking(config: Config, records: Vec<CaptureRecord>) {
+    if records.is_empty() {
+        return;
+    }
+
+    let result = tokio::task::spawn_blocking(move || {
+        records
+            .into_iter()
+            .filter_map(|record| crate::capture::write_capture_record(&config, &record).err())
+            .map(|err| err.to_string())
+            .collect::<Vec<_>>()
+    })
+    .await;
+
+    match result {
+        Ok(errors) => {
+            for err in errors {
+                tracing::warn!(
+                    target: "acl_proxy::capture",
+                    "failed to write capture record: {err}"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "acl_proxy::capture",
+                "capture write task failed: {err}"
+            );
+        }
     }
 }
 
@@ -2705,6 +2736,7 @@ pub(crate) async fn proxy_allowed_request(
     let req_headers_for_capture_clone = req_headers_for_capture.clone();
     let resp_headers_for_capture_clone = resp_headers_for_capture.clone();
     tokio::spawn(async move {
+        let mut records = Vec::new();
         let req_body = match req_capture_rx {
             Some(handle) => handle.await.ok(),
             None => None,
@@ -2719,7 +2751,7 @@ pub(crate) async fn proxy_allowed_request(
                 let headers = req_headers_for_capture_clone
                     .clone()
                     .unwrap_or_else(HeaderMap::new);
-                let record = build_capture_record(CaptureRecordOptions {
+                records.push(build_capture_record(CaptureRecordOptions {
                     timestamp: Utc::now().to_rfc3339(),
                     request_id: request_id_clone.clone(),
                     kind: CaptureKind::Request,
@@ -2734,8 +2766,7 @@ pub(crate) async fn proxy_allowed_request(
                     status_code: None,
                     status_message: None,
                     body: Some(body),
-                });
-                let _ = crate::capture::write_capture_record(&cfg, &record);
+                }));
             }
         }
 
@@ -2744,7 +2775,7 @@ pub(crate) async fn proxy_allowed_request(
                 let headers = resp_headers_for_capture_clone
                     .clone()
                     .unwrap_or_else(HeaderMap::new);
-                let record = build_capture_record(CaptureRecordOptions {
+                records.push(build_capture_record(CaptureRecordOptions {
                     timestamp: Utc::now().to_rfc3339(),
                     request_id: request_id_clone,
                     kind: CaptureKind::Response,
@@ -2759,10 +2790,11 @@ pub(crate) async fn proxy_allowed_request(
                     status_code: Some(status.as_u16()),
                     status_message: None,
                     body: Some(body),
-                });
-                let _ = crate::capture::write_capture_record(&cfg, &record);
+                }));
             }
         }
+
+        write_capture_records_blocking(cfg, records).await;
     });
 
     if let (Some(downstream_upgrade), Some(upstream_upgrade)) =

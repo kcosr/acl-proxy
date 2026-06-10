@@ -2,6 +2,7 @@
 
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use acl_proxy::app::AppState;
@@ -51,6 +52,64 @@ struct SeenBodyRequest {
 struct TestWebSocketFrame {
     opcode: u8,
     payload: Vec<u8>,
+}
+
+async fn wait_for_single_allow_capture_version_pair(
+    capture_dir: &Path,
+    context: &str,
+) -> (Option<String>, Option<String>) {
+    use std::collections::HashMap;
+    use tokio::time::{sleep, Duration};
+
+    let mut last_by_id: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+
+    for _ in 0..20 {
+        let mut by_id: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+
+        if capture_dir.is_dir() {
+            let entries = std::fs::read_dir(capture_dir).expect("read capture dir");
+            for entry in entries {
+                let entry = entry.expect("dir entry");
+                if !entry.file_type().expect("file type").is_file() {
+                    continue;
+                }
+
+                let mut contents = String::new();
+                if std::fs::File::open(entry.path())
+                    .and_then(|mut file| file.read_to_string(&mut contents))
+                    .is_err()
+                {
+                    continue;
+                }
+
+                let Ok(record) = serde_json::from_str::<CaptureRecord>(&contents) else {
+                    continue;
+                };
+                assert_eq!(record.mode, CaptureMode::HttpsTransparent);
+                assert_eq!(record.decision, CaptureDecision::Allow);
+
+                let entry = by_id
+                    .entry(record.request_id.clone())
+                    .or_insert((None, None));
+                match record.kind {
+                    CaptureKind::Request => entry.0 = record.http_version.clone(),
+                    CaptureKind::Response => entry.1 = record.http_version.clone(),
+                }
+            }
+        }
+
+        if by_id.len() == 1 {
+            let pair = by_id.values().next().expect("single entry");
+            if pair.0.is_some() && pair.1.is_some() {
+                return pair.clone();
+            }
+        }
+
+        last_by_id = by_id;
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    panic!("expected one complete request/response capture pair for {context}; last seen {last_by_id:?}");
 }
 
 async fn start_upstream_https_echo_server() -> SocketAddr {
@@ -2599,64 +2658,9 @@ async fn h2_client_to_http1_only_upstream_preserves_versions_in_capture() {
     assert_eq!(status, StatusCode::OK.as_u16());
     assert_eq!(body, "ok");
 
-    use tokio::time::{sleep, Duration};
-
     let capture_dir = temp_dir.path().join("captures");
-    for _ in 0..10 {
-        if capture_dir.is_dir() {
-            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
-                .expect("read capture dir")
-                .collect();
-            if !entries.is_empty() {
-                break;
-            }
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-
-    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
-    let mut files = Vec::new();
-    while let Some(entry) = entries.next() {
-        let entry = entry.expect("dir entry");
-        if entry.file_type().expect("file type").is_file() {
-            files.push(entry.path());
-        }
-    }
-    assert!(
-        !files.is_empty(),
-        "expected capture files for downgrade scenario"
-    );
-
-    use std::collections::HashMap;
-
-    let mut by_id: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
-
-    for path in files {
-        let mut contents = String::new();
-        std::fs::File::open(&path)
-            .expect("open capture")
-            .read_to_string(&mut contents)
-            .expect("read capture");
-        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
-        assert_eq!(record.mode, CaptureMode::HttpsTransparent);
-        assert_eq!(record.decision, CaptureDecision::Allow);
-
-        let entry = by_id
-            .entry(record.request_id.clone())
-            .or_insert((None, None));
-        match record.kind {
-            CaptureKind::Request => entry.0 = record.http_version.clone(),
-            CaptureKind::Response => entry.1 = record.http_version.clone(),
-        }
-    }
-
-    assert_eq!(
-        by_id.len(),
-        1,
-        "expected a single logical requestId for downgrade test"
-    );
-
-    let (req_version, resp_version) = by_id.into_iter().next().unwrap().1;
+    let (req_version, resp_version) =
+        wait_for_single_allow_capture_version_pair(&capture_dir, "downgrade test").await;
     assert_eq!(
         req_version.as_deref(),
         Some("2"),
@@ -2724,64 +2728,10 @@ async fn h2_client_to_h2_capable_upstream_preserves_h2_in_capture() {
     assert_eq!(status, StatusCode::OK.as_u16());
     assert_eq!(body, "ok");
 
-    use tokio::time::{sleep, Duration};
-
     let capture_dir = temp_dir.path().join("captures");
-    for _ in 0..10 {
-        if capture_dir.is_dir() {
-            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
-                .expect("read capture dir")
-                .collect();
-            if !entries.is_empty() {
-                break;
-            }
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-
-    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
-    let mut files = Vec::new();
-    while let Some(entry) = entries.next() {
-        let entry = entry.expect("dir entry");
-        if entry.file_type().expect("file type").is_file() {
-            files.push(entry.path());
-        }
-    }
-    assert!(
-        !files.is_empty(),
-        "expected capture files for HTTP/2-capable upstream scenario"
-    );
-
-    use std::collections::HashMap;
-
-    let mut by_id: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
-
-    for path in files {
-        let mut contents = String::new();
-        std::fs::File::open(&path)
-            .expect("open capture")
-            .read_to_string(&mut contents)
-            .expect("read capture");
-        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
-        assert_eq!(record.mode, CaptureMode::HttpsTransparent);
-        assert_eq!(record.decision, CaptureDecision::Allow);
-
-        let entry = by_id
-            .entry(record.request_id.clone())
-            .or_insert((None, None));
-        match record.kind {
-            CaptureKind::Request => entry.0 = record.http_version.clone(),
-            CaptureKind::Response => entry.1 = record.http_version.clone(),
-        }
-    }
-
-    assert_eq!(
-        by_id.len(),
-        1,
-        "expected a single logical requestId for upgrade test"
-    );
-
-    let (req_version, resp_version) = by_id.into_iter().next().unwrap().1;
+    let (req_version, resp_version) =
+        wait_for_single_allow_capture_version_pair(&capture_dir, "HTTP/2-capable upstream test")
+            .await;
     assert_eq!(
         req_version.as_deref(),
         Some("2"),
