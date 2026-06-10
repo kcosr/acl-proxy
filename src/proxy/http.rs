@@ -44,6 +44,7 @@ use crate::policy::CompiledHeaderAction;
 use crate::proxy::https_connect;
 use crate::proxy::websocket;
 use crate::redaction::RedactionProfile;
+use crate::sensitive::{is_sensitive_header_name, redact_url_for_sink, REDACTED};
 use crate::url_canonical::{canonicalize_http_url, CanonicalUrl};
 
 #[derive(Debug, thiserror::Error)]
@@ -1079,7 +1080,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
                 tracing::debug!(
                     target: "acl_proxy::body_policy",
                     request_id = %request_id,
-                    url = %url,
+                    url = %redact_url_for_sink(url),
                     profile = %profile_name,
                     decoded_size = body.decoded_len,
                     timeout_ms = handler.timeout().as_millis() as u64,
@@ -1099,7 +1100,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
                 tracing::warn!(
                     target: "acl_proxy::body_policy",
                     request_id = %request_id,
-                    url = %url,
+                    url = %redact_url_for_sink(url),
                     profile = %profile_name,
                     error = %err,
                     "request body processing failed before auth plugin evaluation"
@@ -1144,7 +1145,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
             tracing::debug!(
                 target: "acl_proxy::body_policy",
                 request_id = %request_id,
-                url = %url,
+                url = %redact_url_for_sink(url),
                 profile = %profile_name,
                 decision = "allow",
                 body_modified = request_body.is_some(),
@@ -1165,7 +1166,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
                     tracing::warn!(
                         target: "acl_proxy::body_policy",
                         request_id = %request_id,
-                        url = %url,
+                        url = %redact_url_for_sink(url),
                         profile = %profile_name,
                         "auth plugin returned requestBody for a profile without include_request_body"
                     );
@@ -1198,7 +1199,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
                         tracing::warn!(
                             target: "acl_proxy::body_policy",
                             request_id = %request_id,
-                            url = %url,
+                            url = %redact_url_for_sink(url),
                             profile = %profile_name,
                             error = %err,
                             "auth plugin returned invalid request body mutation"
@@ -1246,7 +1247,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
             tracing::debug!(
                 target: "acl_proxy::body_policy",
                 request_id = %request_id,
-                url = %url,
+                url = %redact_url_for_sink(url),
                 profile = %profile_name,
                 decision = "deny",
                 "auth plugin body-aware decision received"
@@ -1278,7 +1279,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
             tracing::debug!(
                 target: "acl_proxy::body_policy",
                 request_id = %request_id,
-                url = %url,
+                url = %redact_url_for_sink(url),
                 profile = %profile_name,
                 decision = "pass",
                 "auth plugin body-aware decision received"
@@ -1328,7 +1329,7 @@ async fn prepare_request_body_for_plugin(
     tracing::debug!(
         target: "acl_proxy::body_policy",
         request_id = %request_id,
-        url = %url,
+        url = %redact_url_for_sink(url),
         profile = %profile_name,
         max_body_bytes,
         max_decompressed_body_bytes,
@@ -1341,7 +1342,7 @@ async fn prepare_request_body_for_plugin(
     tracing::debug!(
         target: "acl_proxy::body_policy",
         request_id = %request_id,
-        url = %url,
+        url = %redact_url_for_sink(url),
         profile = %profile_name,
         encoded_size = encoded.len(),
         "request body buffered"
@@ -1353,7 +1354,7 @@ async fn prepare_request_body_for_plugin(
             tracing::debug!(
                 target: "acl_proxy::body_policy",
                 request_id = %request_id,
-                url = %url,
+                url = %redact_url_for_sink(url),
                 profile = %profile_name,
                 encoding = %encoding.as_str(),
                 encoded_size = encoded.len(),
@@ -1398,7 +1399,7 @@ fn rebuild_request_with_plugin_body(
             tracing::debug!(
                 target: "acl_proxy::body_policy",
                 request_id = %request_id,
-                url = %url,
+                url = %redact_url_for_sink(url),
                 profile = %profile_name,
                 encoding = %encoding.as_str(),
                 decoded_size = decoded_len,
@@ -1419,7 +1420,7 @@ fn rebuild_request_with_plugin_body(
     tracing::debug!(
         target: "acl_proxy::body_policy",
         request_id = %request_id,
-        url = %url,
+        url = %redact_url_for_sink(url),
         profile = %profile_name,
         decoded_size = decoded_len,
         final_body_size = encoded.len(),
@@ -1468,7 +1469,7 @@ async fn redact_request_body(
         tracing::debug!(
             target: "acl_proxy::redaction",
             request_id = %request_id,
-            url = %url,
+            url = %redact_url_for_sink(url),
             profile = %profile.name,
             redactions,
             decoded_size = redacted.len(),
@@ -1505,7 +1506,7 @@ fn rebuild_request_with_decoded_body(
             tracing::debug!(
                 target: "acl_proxy::body_policy",
                 request_id = %request_id,
-                url = %url,
+                url = %redact_url_for_sink(url),
                 profile = %profile_name,
                 encoding = %encoding.as_str(),
                 decoded_size = decoded_len,
@@ -1526,7 +1527,7 @@ fn rebuild_request_with_decoded_body(
     tracing::debug!(
         target: "acl_proxy::body_policy",
         request_id = %request_id,
-        url = %url,
+        url = %redact_url_for_sink(url),
         profile = %profile_name,
         decoded_size = decoded_len,
         final_body_size = encoded.len(),
@@ -2261,7 +2262,7 @@ pub(crate) async fn proxy_allowed_request(
                 tracing::error!(
                     target: "acl_proxy::redaction",
                     request_id = %request_id,
-                    url = %full_url,
+                    url = %redact_url_for_sink(&full_url),
                     profile = %profile_name,
                     "matched websocket redaction profile is not configured"
                 );
@@ -2295,7 +2296,7 @@ pub(crate) async fn proxy_allowed_request(
         tracing::warn!(
             target: "acl_proxy::redaction",
             request_id = %request_id,
-            url = %full_url,
+            url = %redact_url_for_sink(&full_url),
             "protected upgrade request is not a WebSocket upgrade"
         );
         let body_bytes = b"Forbidden".to_vec();
@@ -2393,7 +2394,7 @@ pub(crate) async fn proxy_allowed_request(
                         tracing::warn!(
                             target: "acl_proxy::redaction",
                             request_id = %request_id,
-                            url = %full_url,
+                            url = %redact_url_for_sink(&full_url),
                             profile = %profile.name,
                             error = %err,
                             "websocket request extension negotiation rejected"
@@ -2437,7 +2438,7 @@ pub(crate) async fn proxy_allowed_request(
                     tracing::warn!(
                         target: "acl_proxy::redaction",
                         request_id = %request_id,
-                        url = %full_url,
+                        url = %redact_url_for_sink(&full_url),
                         profile = %profile.name,
                         error = %err,
                         "request body redaction failed before upstream forwarding"
@@ -2483,7 +2484,7 @@ pub(crate) async fn proxy_allowed_request(
         target: "acl_proxy::transport",
         request_id = %request_id,
         mode = ?mode,
-        url = %full_url,
+        url = %redact_url_for_sink(&full_url),
         stage = "ingress",
         inbound_http_version = %version_to_string(version),
         upgrade_requested = request_is_upgrade,
@@ -2589,7 +2590,7 @@ pub(crate) async fn proxy_allowed_request(
                     tracing::warn!(
                         target: "acl_proxy::redaction",
                         request_id = %request_id,
-                        url = %full_url,
+                        url = %redact_url_for_sink(&full_url),
                         profile = %profile.name,
                         error = %err,
                         "websocket response extension negotiation rejected"
@@ -2665,7 +2666,7 @@ pub(crate) async fn proxy_allowed_request(
     tracing::debug!(
         target: "acl_proxy::http_versions",
         request_id = %request_id,
-        url = %full_url,
+        url = %redact_url_for_sink(&full_url),
         client_http_version = %version_to_string(version),
         upstream_http_version = %version_to_string(resp_version),
         status = %status.as_u16(),
@@ -2675,7 +2676,7 @@ pub(crate) async fn proxy_allowed_request(
         target: "acl_proxy::transport",
         request_id = %request_id,
         mode = ?mode,
-        url = %full_url,
+        url = %redact_url_for_sink(&full_url),
         stage = "complete",
         inbound_http_version = %version_to_string(version),
         outbound_http_version = %version_to_string(resp_version),
@@ -2760,6 +2761,7 @@ pub(crate) async fn proxy_allowed_request(
     {
         let request_id_for_upgrade = request_id.clone();
         let full_url_for_upgrade = full_url.clone();
+        let log_url_for_upgrade = redact_url_for_sink(&full_url_for_upgrade);
         let redaction_for_upgrade = redaction.clone();
         let websocket_session_extensions_for_upgrade = websocket_session_extensions;
         tokio::spawn(async move {
@@ -2767,7 +2769,7 @@ pub(crate) async fn proxy_allowed_request(
                 Ok(stream) => stream,
                 Err(err) => {
                     tracing::debug!(
-                        "request upgrade failed for {request_id_for_upgrade} ({full_url_for_upgrade}): {err}"
+                        "request upgrade failed for {request_id_for_upgrade} ({log_url_for_upgrade}): {err}"
                     );
                     return;
                 }
@@ -2777,7 +2779,7 @@ pub(crate) async fn proxy_allowed_request(
                 Ok(stream) => stream,
                 Err(err) => {
                     tracing::debug!(
-                        "upstream upgrade failed for {request_id_for_upgrade} ({full_url_for_upgrade}): {err}"
+                        "upstream upgrade failed for {request_id_for_upgrade} ({log_url_for_upgrade}): {err}"
                     );
                     return;
                 }
@@ -2798,13 +2800,13 @@ pub(crate) async fn proxy_allowed_request(
                 .await
                 {
                     tracing::debug!(
-                        "websocket redaction tunnel ended for {request_id_for_upgrade} ({full_url_for_upgrade}): {err}"
+                        "websocket redaction tunnel ended for {request_id_for_upgrade} ({log_url_for_upgrade}): {err}"
                     );
                 }
             } else {
                 if let Err(err) = copy_bidirectional(&mut downstream, &mut upstream).await {
                     tracing::debug!(
-                        "upgraded tunnel ended with I/O error for {request_id_for_upgrade} ({full_url_for_upgrade}): {err}"
+                        "upgraded tunnel ended with I/O error for {request_id_for_upgrade} ({log_url_for_upgrade}): {err}"
                     );
                 }
             }
@@ -2840,7 +2842,7 @@ async fn send_upstream_request(
             tracing::debug!(
                 target: "acl_proxy::transport",
                 request_id = %request_id,
-                url = %full_url,
+                url = %redact_url_for_sink(full_url),
                 stage = "egress",
                 egress_transport = "direct",
                 outbound_http_version = %outbound_http_version,
@@ -2869,7 +2871,7 @@ async fn send_request_via_egress_target(
     tracing::debug!(
         target: "acl_proxy::transport",
         request_id = %request_id,
-        url = %full_url,
+        url = %redact_url_for_sink(full_url),
         stage = "egress_attempt",
         egress_transport = "chain",
         egress_host = %target.host,
@@ -2892,7 +2894,7 @@ async fn send_request_via_egress_target(
     tracing::debug!(
         target: "acl_proxy::transport",
         request_id = %request_id,
-        url = %full_url,
+        url = %redact_url_for_sink(full_url),
         stage = "egress",
         egress_transport = "chain",
         chain_protocol,
@@ -2930,6 +2932,10 @@ pub(crate) fn headers_to_capture_map(headers: &HttpHeaderMap) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in headers.iter() {
         let key = name.as_str().to_ascii_lowercase();
+        if is_sensitive_header_name(&key) {
+            out.insert(key, serde_json::Value::String(REDACTED.to_string()));
+            continue;
+        }
         if let Ok(val_str) = value.to_str() {
             use serde_json::Value;
             match out.get_mut(&key) {
@@ -3281,7 +3287,8 @@ pub(crate) fn generate_request_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_full_url, generate_request_id, is_internal_endpoint, is_upgrade_request, tee_body,
+        build_full_url, generate_request_id, headers_to_capture_map, is_internal_endpoint,
+        is_upgrade_request, tee_body,
     };
     use http::header::HOST;
     use http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
@@ -3353,6 +3360,32 @@ mod tests {
         let mut missing_upgrade = HeaderMap::new();
         missing_upgrade.insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
         assert!(!is_upgrade_request(&missing_upgrade));
+    }
+
+    #[test]
+    fn headers_to_capture_map_redacts_sensitive_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret-token"),
+        );
+        headers.insert(header::COOKIE, HeaderValue::from_static("session=secret"));
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+
+        let captured = headers_to_capture_map(&headers);
+
+        assert_eq!(
+            captured.get("authorization"),
+            Some(&serde_json::Value::String("[REDACTED]".to_string()))
+        );
+        assert_eq!(
+            captured.get("cookie"),
+            Some(&serde_json::Value::String("[REDACTED]".to_string()))
+        );
+        assert_eq!(
+            captured.get("content-type"),
+            Some(&serde_json::Value::String("text/plain".to_string()))
+        );
     }
 
     #[test]

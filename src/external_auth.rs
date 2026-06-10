@@ -17,6 +17,7 @@ use crate::config::{
     ExternalAuthProfileConfig, ExternalAuthProfileConfigMap, ExternalAuthProfileType,
     ExternalAuthWebhookFailureMode,
 };
+use crate::sensitive::redact_url_for_sink;
 
 #[derive(Debug, Clone)]
 pub enum ExternalDecision {
@@ -278,6 +279,7 @@ impl ExternalAuthManager {
 
         let (profile_name, rule_index, rule_id, url, method, client_ip, created_at, macros) =
             snapshot;
+        let url = redact_url_for_sink(&url);
 
         let profile = if let Some(p) = self.profiles.get(&profile_name) {
             p.clone()
@@ -622,7 +624,7 @@ async fn run_status_worker(
             "profile": event.profile_name,
             "ruleIndex": event.rule_index,
             "ruleId": event.rule_id,
-            "url": event.url,
+            "url": redact_url_for_sink(&event.url),
             "method": event.method,
             "clientIp": event.client_ip,
             "status": status_str,

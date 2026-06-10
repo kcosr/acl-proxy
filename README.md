@@ -616,6 +616,7 @@ console = true                      # also write to stdout
 - When `directory` is set, logs go to `{directory}/acl-proxy.log` and rotate by size.
 - Log writing is non-blocking; when the internal buffer fills, entries are dropped to avoid stalling requests.
 - Transport logs on `acl_proxy::transport` (debug level) include per-request ingress, egress-attempt, egress, and completion events.
+- URLs emitted to policy-decision and proxy debug logs have userinfo removed and query strings replaced with `REDACTED`.
 
 ### `[logging.policy_decisions]` — Policy Decision Logging
 
@@ -627,7 +628,7 @@ level_allows = "info"               # log level for allows
 level_denies = "warn"               # log level for denies
 ```
 
-Policy decision events are emitted to the `acl_proxy::policy` target with structured fields: `request_id`, `allowed`, `url`, `method`, `client_ip`, `rule_action`, `rule_pattern`, `rule_description`, and optional `reason`.
+Policy decision events are emitted to the `acl_proxy::policy` target with structured fields: `request_id`, `allowed`, `url`, `method`, `client_ip`, `rule_action`, `rule_pattern`, `rule_description`, and optional `reason`. The `url` field is sanitized before logging.
 
 On Unix, log directories are created or tightened to owner-only (`0700`) and log files are created or tightened to owner-only (`0600`).
 
@@ -651,7 +652,7 @@ Capture happens for:
 
 `body.length` always records the full logical body length even when `body.data` is truncated.
 
-On Unix, capture directories are created or tightened to owner-only (`0700`) and capture JSON files are created or tightened to owner-only (`0600`). Capture files can contain decrypted headers and bodies; treat them as sensitive.
+On Unix, capture directories are created or tightened to owner-only (`0700`) and capture JSON files are created or tightened to owner-only (`0600`). Capture URLs have userinfo removed and query strings replaced with `REDACTED`; `Authorization`, `Proxy-Authorization`, `Cookie`, and `Set-Cookie` header values are replaced with `[REDACTED]`. Capture bodies and other headers can still contain sensitive decrypted data; treat capture files as sensitive.
 
 #### Capture Record Format
 
@@ -664,14 +665,14 @@ Each JSON file contains a single object:
 | `kind` | string | `"request"` or `"response"` |
 | `decision` | string | `"allow"` or `"deny"` |
 | `mode` | string | `"http_proxy"`, `"https_connect"`, or `"https_transparent"` |
-| `url` | string | Normalized URL (no fragment) |
+| `url` | string | Normalized URL with userinfo removed, query redacted, and no fragment |
 | `method` | string | HTTP method |
 | `httpVersion` | string | e.g., `"1.1"`, `"2"` |
 | `statusCode` | number | HTTP status code (responses only) |
 | `statusMessage` | string | Status message (responses only) |
 | `client` | object | `address` (string), `port` (number) |
 | `target` | object | Upstream `address` and `port` (when available) |
-| `headers` | object | Lowercase keys; values are string or string array |
+| `headers` | object | Lowercase keys; values are string or string array; common credential headers are redacted |
 | `body` | object | `encoding` (`"base64"`), `length` (full), `data` (base64), `contentType` |
 
 #### Extract Captured Bodies
@@ -918,14 +919,14 @@ When a `delegate` rule with `external_auth_profile` matches an HTTP profile, the
 
 - **URL**: `policy.external_auth_profiles.<name>.webhook_url`
 - **Header**: `X-Acl-Proxy-Event: pending`
-- **Payload fields**: `requestId`, `profile`, `ruleIndex`, optional `ruleId`, `url`, `method`, `clientIp`, `status: "pending"`, `terminal: false`, `timestamp` (RFC3339), `elapsedMs`, `eventId`, `callbackUrl` (when configured), and `macros` (approval macro descriptors).
+- **Payload fields**: `requestId`, `profile`, `ruleIndex`, optional `ruleId`, `url`, `method`, `clientIp`, `status: "pending"`, `terminal: false`, `timestamp` (RFC3339), `elapsedMs`, `eventId`, `callbackUrl` (when configured), and `macros` (approval macro descriptors). The `url` field has userinfo removed and query strings replaced with `REDACTED`.
 
 ### Terminal Status Webhook
 
 For lifecycle events (webhook failure, timeout, error, cancellation), the proxy emits a best-effort status webhook:
 
 - **Header**: `X-Acl-Proxy-Event: status`
-- **Fields**: `status` (`webhook_failed` | `timed_out` | `error` | `cancelled`), `terminal: true`, `reason`, optional `failureKind` and `httpStatus`.
+- **Fields**: `status` (`webhook_failed` | `timed_out` | `error` | `cancelled`), `terminal: true`, `reason`, sanitized `url`, optional `failureKind` and `httpStatus`.
 - At most one terminal event per `requestId`.
 - Status webhooks are **telemetry only** — delivery failures never affect the allow/deny decision.
 
@@ -1121,7 +1122,7 @@ Separate control for allow vs. deny decisions with configurable log levels. Even
 
 JSON capture files with request metadata, headers, and base64-encoded bodies. Enable independently for allowed/denied requests/responses. Body size capped at `capture.max_body_bytes` (default 1 MiB); full logical length always recorded in `body.length`.
 
-On Unix, capture directories are owner-only (`0700`) and capture files are owner-only (`0600`). Capture files can contain decrypted request/response data; treat them as sensitive.
+On Unix, capture directories are owner-only (`0700`) and capture files are owner-only (`0600`). Capture URLs and common credential headers are redacted, but bodies and other decrypted request/response data may still be sensitive; treat capture files as sensitive.
 
 ### Body Extraction
 

@@ -15,6 +15,7 @@ use tracing_subscriber::fmt::SubscriberBuilder;
 use crate::config::{LoggingConfig, LoggingPolicyDecisionsConfig, PolicyRuleAction};
 use crate::filesystem::{create_private_dir_all, open_private_file_for_append};
 use crate::policy::PolicyDecision;
+use crate::sensitive::redact_url_for_sink;
 
 const LOG_FILENAME: &str = "acl-proxy.log";
 const LOG_QUEUE_CAPACITY: usize = 8192;
@@ -476,6 +477,9 @@ fn emit_policy_event(
     rule_description: Option<&str>,
     reason: Option<&str>,
 ) {
+    let safe_url = redact_url_for_sink(url);
+    let url = safe_url.as_str();
+
     match level {
         Level::TRACE => tracing::event!(
             target: "acl_proxy::policy",

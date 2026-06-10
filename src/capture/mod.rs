@@ -7,6 +7,7 @@ use serde_json::Value as JsonValue;
 
 use crate::config::{CaptureConfig, Config};
 use crate::filesystem::write_private_file;
+use crate::sensitive::redact_url_for_sink;
 
 /// Maximum number of body bytes to buffer per request/response for capture.
 ///
@@ -231,7 +232,7 @@ pub fn build_capture_record(opts: CaptureRecordOptions) -> CaptureRecord {
         kind,
         decision,
         mode,
-        url,
+        url: redact_url_for_sink(&url),
         method: method.unwrap_or_default(),
         status_code,
         status_message,
@@ -615,6 +616,28 @@ default = "deny"
             .decode(body.data)
             .expect("decode base64");
         assert_eq!(data, body_bytes);
+    }
+
+    #[test]
+    fn build_capture_record_redacts_sensitive_url_parts() {
+        let record = build_capture_record(CaptureRecordOptions {
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            request_id: "req-1".to_string(),
+            kind: CaptureKind::Request,
+            decision: CaptureDecision::Allow,
+            mode: CaptureMode::HttpProxy,
+            url: "http://user:pass@example.com/echo?token=secret".to_string(),
+            method: Some("GET".to_string()),
+            client: CaptureEndpoint::default(),
+            target: None,
+            http_version: Some("1.1".to_string()),
+            headers: None,
+            status_code: None,
+            status_message: None,
+            body: None,
+        });
+
+        assert_eq!(record.url, "http://example.com/echo?REDACTED");
     }
 
     #[test]

@@ -384,8 +384,7 @@ rule_id = "external-auth-test-rule"
 
     let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
 
-    let raw_request =
-        "GET http://example.com/ok HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    let raw_request = "GET http://example.com/ok?token=secret HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
 
     let (_response, status) = send_raw_http_request(proxy_addr, raw_request).await;
 
@@ -415,6 +414,14 @@ rule_id = "external-auth-test-rule"
     assert_eq!(
         status_event.body["ruleId"],
         serde_json::Value::String("external-auth-test-rule".to_string())
+    );
+    assert_eq!(
+        pending_event.body["url"],
+        serde_json::Value::String("http://example.com/ok?REDACTED".to_string())
+    );
+    assert_eq!(
+        status_event.body["url"],
+        serde_json::Value::String("http://example.com/ok?REDACTED".to_string())
     );
     assert_eq!(
         pending_event.body["callbackUrl"],
@@ -611,8 +618,9 @@ value = "{{{{reason}}}}"
         *guard = Some(proxy_addr);
     }
 
-    let raw_request =
-        format!("GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let raw_request = format!(
+        "GET http://{host}/ok?token=secret HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    );
 
     let (_response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
     assert_eq!(status, StatusCode::OK);
@@ -665,6 +673,12 @@ value = "{{{{reason}}}}"
     assert!(
         pending.body.get("callbackUrl").is_none(),
         "callbackUrl should be omitted when no external_auth.callback_url is configured"
+    );
+    assert_eq!(
+        pending.body.get("url"),
+        Some(&serde_json::Value::String(format!(
+            "http://{host}/ok?REDACTED"
+        )))
     );
 
     for m in macros {
