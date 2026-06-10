@@ -967,7 +967,7 @@ Content-Type: application/json
 
 ### Plugin Mode (type = "plugin")
 
-Stdio-based synchronous auth. The proxy spawns a long-running plugin process and sends JSON requests over stdin, waiting for `allow`, `deny`, or `pass` JSON responses from stdout (newline-delimited). On `allow`, the proxy applies rule header actions first, plugin header actions second, and global egress request actions third. On `pass`, the plugin must not return request or response header actions, and policy evaluation resumes at the rule after the matched delegate rule. Plugins can also return response header actions on `allow`. See [`docs/design/auth-plugins-design.md`](docs/design/auth-plugins-design.md) for the full protocol specification.
+Stdio-based synchronous auth. The proxy spawns a long-running plugin process and sends JSON requests over stdin, waiting for `allow`, `deny`, or `pass` JSON responses from stdout (newline-delimited). Plugin stdin writes are bounded by `timeout_ms`, stdout response lines are capped at 1 MiB, and protocol I/O failures restart the plugin after `restart_delay_ms`. On `allow`, the proxy applies rule header actions first, plugin header actions second, and global egress request actions third. On `pass`, the plugin must not return request or response header actions, and policy evaluation resumes at the rule after the matched delegate rule. Plugins can also return response header actions on `allow`. See [`docs/design/auth-plugins-design.md`](docs/design/auth-plugins-design.md) for the full protocol specification.
 
 Plugin profiles can opt into request-body inspection and mutation:
 
