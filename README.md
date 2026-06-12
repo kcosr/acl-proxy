@@ -308,6 +308,8 @@ protocol + "//" + host[:port] + path + optional "?query"
 - Query strings are preserved; fragments are ignored.
 - IPv6 hostnames use standard bracket notation (e.g., `https://[::1]:8443/path`).
 
+> **Security note on encoded path separators.** acl-proxy deliberately preserves `%2F` (and other reserved encodings) rather than decoding them, so that URL-encoded path parameters keep working. The proxy matches policy on, and forwards upstream, the same byte-for-byte path — so the proxy itself is internally consistent. However, an upstream that *decodes* `%2F` and then resolves `..` segments can still interpret a path differently from the proxy. For example, with an `allow` rule for `https://host/api/v1/**`, a request to `https://host/api/v1/..%2f..%2finternal` matches the allow rule (the encoded slashes are not path separators to the proxy) but may resolve to `/internal` on a decoding upstream. If your upstreams decode `%2F`, prefer `deny`-based rules for sensitive prefixes, or terminate/normalize encoded slashes at the upstream. This is the residual portion of finding XACL-2; the dot-segment half (literal `..`) is resolved by the canonicalizer.
+
 ### Pattern Syntax
 
 Patterns are matched case-insensitively against normalized URLs.

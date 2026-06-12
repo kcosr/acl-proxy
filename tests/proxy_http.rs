@@ -1560,6 +1560,69 @@ pattern = "http://{host}/**"
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn external_auth_callback_unknown_request_id_returns_404() {
+    let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+
+[logging]
+directory = "logs"
+level = "info"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[policy]
+default = "deny"
+"#;
+
+    let config: Config = toml::from_str(toml).expect("parse config");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    // The callback endpoint is the only authorization gate for an approval:
+    // its requestId is a bearer capability. A POST bearing an unknown/forged
+    // requestId must be rejected with 404 RequestNotFound and resolve nothing.
+    let callback_body = serde_json::json!({
+        "requestId": "req-forged-0000000000000000",
+        "decision": "allow",
+    });
+    let uri = format!("http://{proxy_addr}/_acl-proxy/external-auth/callback");
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )
+        .body(Body::from(serde_json::to_vec(&callback_body).unwrap()))
+        .expect("build callback request");
+
+    let resp = hyper::Client::new()
+        .request(req)
+        .await
+        .expect("callback request");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let bytes = hyper::body::to_bytes(resp.into_body())
+        .await
+        .expect("read callback response body");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("callback response is json");
+    assert_eq!(payload["error"], "RequestNotFound");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn auth_plugin_pass_falls_through_to_later_allow() {
     let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
 

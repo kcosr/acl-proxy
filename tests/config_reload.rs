@@ -674,6 +674,68 @@ async fn approval_macro_values_are_removed_when_waiter_is_gone() {
         .is_empty());
 }
 
+#[tokio::test]
+async fn forged_request_id_callback_is_rejected_and_pending_request_unaffected() {
+    let temp = tempfile::tempdir().expect("temp certs dir");
+
+    let mut config = minimal_config();
+    prepare_app_config_for_reload_tests(&mut config, temp.path());
+    config
+        .policy
+        .external_auth_profiles
+        .insert("approval".to_string(), http_external_auth_profile());
+
+    let state = AppState::from_config(config).expect("state");
+
+    // A genuine request is pending, awaiting an approval callback.
+    let (_guard, decision_rx) = state.external_auth.start_pending(
+        "req-genuine".to_string(),
+        0,
+        None,
+        "approval".to_string(),
+        "http://example.com/".to_string(),
+        Some("GET".to_string()),
+        Some("127.0.0.1".to_string()),
+        Vec::new(),
+    );
+    assert_eq!(state.external_auth.pending_count(), 1);
+
+    // A callback bearing a forged/unknown requestId must not resolve anything:
+    // the requestId is the only bearer capability, so an attacker that cannot
+    // guess it gets nothing, and the genuine pending request is left intact.
+    assert!(
+        !state
+            .external_auth
+            .resolve("req-forged-0000000000000000", ExternalDecision::Allow),
+        "callback with an unknown requestId must not resolve a request"
+    );
+    assert!(
+        !state
+            .external_auth
+            .resolve("req-forged-0000000000000000", ExternalDecision::Deny),
+        "callback with an unknown requestId must not resolve a request"
+    );
+    assert_eq!(
+        state.external_auth.pending_count(),
+        1,
+        "the genuine pending request must survive forged callbacks"
+    );
+
+    // The genuine request still resolves on its real id, and its waiter wakes
+    // with the delivered decision.
+    assert!(
+        state
+            .external_auth
+            .resolve("req-genuine", ExternalDecision::Allow),
+        "the genuine requestId must still resolve its pending request"
+    );
+    assert_eq!(
+        decision_rx.await.expect("waiter should receive a decision"),
+        ExternalDecision::Allow
+    );
+    assert_eq!(state.external_auth.pending_count(), 0);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn egress_forwarding_enable_disable_updates_after_reload() {
     let (direct_addr, direct_requests) = start_observed_echo_server("direct").await;
