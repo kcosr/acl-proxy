@@ -1,4 +1,5 @@
 use crate::redaction::{self, RedactionProfile, RedactionUnsupportedExtensions};
+use crate::sensitive::redact_url_for_sink;
 use flate2::read::DeflateDecoder;
 use flate2::{Compress, Compression, FlushCompress};
 use http::header::{HeaderName, HeaderValue};
@@ -218,7 +219,7 @@ where
     tracing::debug!(
         target: "acl_proxy::redaction",
         request_id = %request_id,
-        url = %url,
+        url = %redact_url_for_sink(&url),
         profile = %profile.name,
         permessage_deflate = extensions.permessage_deflate,
         "websocket redaction relay started"
@@ -296,7 +297,7 @@ async fn await_peer_relay(
             tracing::debug!(
                 target: "acl_proxy::redaction",
                 request_id = %request_id,
-                url = %url,
+                url = %redact_url_for_sink(url),
                 profile = %profile,
                 direction = %direction,
                 timeout_ms = CLOSE_DRAIN_TIMEOUT.as_millis() as u64,
@@ -600,7 +601,7 @@ where
         tracing::debug!(
             target: "acl_proxy::redaction",
             request_id = %request_id,
-            url = %url,
+            url = %redact_url_for_sink(url),
             profile = %profile.name,
             direction = %direction,
             redactions,
@@ -849,7 +850,7 @@ fn log_close(
     tracing::debug!(
         target: "acl_proxy::redaction",
         request_id = %request_id,
-        url = %url,
+        url = %redact_url_for_sink(url),
         profile = %profile,
         direction = %direction,
         reason = %err,

@@ -17,8 +17,9 @@ use crate::config::{
     ExternalAuthProfileConfig, ExternalAuthProfileConfigMap, ExternalAuthProfileType,
     ExternalAuthWebhookFailureMode,
 };
+use crate::sensitive::redact_url_for_sink;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExternalDecision {
     Allow,
     Deny,
@@ -57,6 +58,12 @@ pub struct ExternalAuthProfile {
     pub timeout: Duration,
     pub webhook_timeout: Option<Duration>,
     pub on_webhook_failure: WebhookFailureMode,
+}
+
+impl ExternalAuthProfile {
+    fn webhook_delivery_timeout(&self) -> Duration {
+        self.webhook_timeout.unwrap_or(self.timeout)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -106,6 +113,43 @@ struct StatusWebhookEvent {
 }
 
 type SharedHttpClient = Client<HttpsConnector<HttpConnector>>;
+type StatusChannel = (
+    mpsc::Sender<StatusWebhookEvent>,
+    Arc<Mutex<Option<mpsc::Receiver<StatusWebhookEvent>>>>,
+);
+
+fn build_profiles(cfg: &ExternalAuthProfileConfigMap) -> BTreeMap<String, ExternalAuthProfile> {
+    let mut profiles = BTreeMap::new();
+
+    for (name, profile_cfg) in cfg {
+        if profile_cfg.profile_type != ExternalAuthProfileType::Http {
+            continue;
+        }
+        let webhook_url = match profile_cfg.webhook_url.clone() {
+            Some(url) => url,
+            None => {
+                tracing::warn!("external auth profile {name} missing webhook_url; skipping");
+                continue;
+            }
+        };
+        let timeout = Duration::from_millis(profile_cfg.timeout_ms);
+        let webhook_timeout = profile_cfg.webhook_timeout_ms.map(Duration::from_millis);
+        let on_webhook_failure =
+            WebhookFailureMode::from_config(profile_cfg.on_webhook_failure.clone());
+
+        profiles.insert(
+            name.clone(),
+            ExternalAuthProfile {
+                webhook_url,
+                timeout,
+                webhook_timeout,
+                on_webhook_failure,
+            },
+        );
+    }
+
+    profiles
+}
 
 #[derive(Clone)]
 pub struct ExternalAuthManager {
@@ -128,46 +172,62 @@ impl ExternalAuthManager {
         callback_url: Option<String>,
         http_client: SharedHttpClient,
     ) -> Self {
-        let mut profiles: BTreeMap<String, ExternalAuthProfile> = BTreeMap::new();
+        Self::from_parts(
+            build_profiles(cfg),
+            callback_url,
+            http_client,
+            Arc::new(DashMap::new()),
+            Arc::new(DashMap::new()),
+            None,
+        )
+    }
 
-        for (name, profile_cfg) in cfg {
-            if profile_cfg.profile_type != ExternalAuthProfileType::Http {
-                continue;
-            }
-            let webhook_url = match profile_cfg.webhook_url.clone() {
-                Some(url) => url,
-                None => {
-                    tracing::warn!("external auth profile {name} missing webhook_url; skipping");
-                    continue;
-                }
-            };
-            let timeout = Duration::from_millis(profile_cfg.timeout_ms);
-            let webhook_timeout = profile_cfg.webhook_timeout_ms.map(Duration::from_millis);
-            let on_webhook_failure =
-                WebhookFailureMode::from_config(profile_cfg.on_webhook_failure.clone());
+    pub fn reconfigured_from(
+        cfg: &ExternalAuthProfileConfigMap,
+        callback_url: Option<String>,
+        http_client: SharedHttpClient,
+        previous: &Self,
+    ) -> Self {
+        Self::from_parts(
+            build_profiles(cfg),
+            callback_url,
+            http_client,
+            previous.pending.clone(),
+            previous.macro_values.clone(),
+            None,
+        )
+    }
 
-            profiles.insert(
-                name.clone(),
-                ExternalAuthProfile {
-                    webhook_url,
-                    timeout,
-                    webhook_timeout,
-                    on_webhook_failure,
-                },
-            );
-        }
-
-        let (status_tx, status_rx) = mpsc::channel::<StatusWebhookEvent>(1024);
+    fn from_parts(
+        profiles: BTreeMap<String, ExternalAuthProfile>,
+        callback_url: Option<String>,
+        http_client: SharedHttpClient,
+        pending: Arc<DashMap<String, PendingRequest>>,
+        macro_values: Arc<DashMap<String, BTreeMap<String, String>>>,
+        status_channel: Option<StatusChannel>,
+    ) -> Self {
+        let (status_tx, status_rx) = status_channel.unwrap_or_else(|| {
+            let (status_tx, status_rx) = mpsc::channel::<StatusWebhookEvent>(1024);
+            (status_tx, Arc::new(Mutex::new(Some(status_rx))))
+        });
 
         ExternalAuthManager {
-            pending: Arc::new(DashMap::new()),
-            macro_values: Arc::new(DashMap::new()),
+            pending,
+            macro_values,
             profiles: Arc::new(profiles),
             callback_url,
             http_client,
             status_tx,
-            status_rx: Arc::new(Mutex::new(Some(status_rx))),
+            status_rx,
         }
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn stored_macro_count(&self) -> usize {
+        self.macro_values.len()
     }
 
     pub fn get_profile(&self, name: &str) -> Option<ExternalAuthProfile> {
@@ -221,10 +281,35 @@ impl ExternalAuthManager {
     ///
     /// This removes the pending entry and wakes the waiting request task.
     pub fn resolve(&self, request_id: &str, decision: ExternalDecision) -> bool {
+        self.resolve_with_macro_values(request_id, decision, None)
+    }
+
+    /// Deliver an external decision callback and, for successful allow
+    /// decisions, publish validated macro values before waking the waiter.
+    pub fn resolve_with_macro_values(
+        &self,
+        request_id: &str,
+        decision: ExternalDecision,
+        macro_values: Option<BTreeMap<String, String>>,
+    ) -> bool {
         if let Some((_key, pending)) = self.pending.remove(request_id) {
-            let _ = pending.decision_tx.send(decision);
+            let mut stored_macro_values = false;
+            if decision == ExternalDecision::Allow {
+                if let Some(macros) = macro_values {
+                    if !macros.is_empty() {
+                        self.macro_values.insert(request_id.to_string(), macros);
+                        stored_macro_values = true;
+                    }
+                }
+            } else {
+                self.macro_values.remove(request_id);
+            }
+            if pending.decision_tx.send(decision).is_err() && stored_macro_values {
+                self.macro_values.remove(request_id);
+            }
             true
         } else {
+            self.macro_values.remove(request_id);
             false
         }
     }
@@ -278,6 +363,7 @@ impl ExternalAuthManager {
 
         let (profile_name, rule_index, rule_id, url, method, client_ip, created_at, macros) =
             snapshot;
+        let url = redact_url_for_sink(&url);
 
         let profile = if let Some(p) = self.profiles.get(&profile_name) {
             p.clone()
@@ -347,15 +433,13 @@ impl ExternalAuthManager {
         let client_http: SharedHttpClient = self.http_client.clone();
         let send_fut = client_http.request(req);
 
-        let result = match profile.webhook_timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, send_fut).await {
-                Ok(res) => res,
-                Err(_elapsed) => {
-                    tracing::warn!("external auth webhook timed out after {:?}", timeout);
-                    return Err((WebhookFailureKind::Timeout, None));
-                }
-            },
-            None => send_fut.await,
+        let timeout = profile.webhook_delivery_timeout();
+        let result = match tokio::time::timeout(timeout, send_fut).await {
+            Ok(res) => res,
+            Err(_elapsed) => {
+                tracing::warn!("external auth webhook timed out after {:?}", timeout);
+                return Err((WebhookFailureKind::Timeout, None));
+            }
         };
 
         match result {
@@ -622,7 +706,7 @@ async fn run_status_worker(
             "profile": event.profile_name,
             "ruleIndex": event.rule_index,
             "ruleId": event.rule_id,
-            "url": event.url,
+            "url": redact_url_for_sink(&event.url),
             "method": event.method,
             "clientIp": event.client_ip,
             "status": status_str,
@@ -671,15 +755,13 @@ async fn run_status_worker(
 
         let send_fut = client.request(req);
 
-        let result = match profile.webhook_timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, send_fut).await {
-                Ok(res) => res,
-                Err(_elapsed) => {
-                    tracing::debug!("external auth status webhook timed out after {:?}", timeout);
-                    continue;
-                }
-            },
-            None => send_fut.await,
+        let timeout = profile.webhook_delivery_timeout();
+        let result = match tokio::time::timeout(timeout, send_fut).await {
+            Ok(res) => res,
+            Err(_elapsed) => {
+                tracing::debug!("external auth status webhook timed out after {:?}", timeout);
+                continue;
+            }
         };
 
         if let Err(err) = result {

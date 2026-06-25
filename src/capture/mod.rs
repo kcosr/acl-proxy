@@ -1,12 +1,16 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::ErrorKind as IoErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::config::{CaptureConfig, Config};
+use crate::filesystem::write_private_file;
+use crate::sensitive::redact_url_for_sink;
 
 /// Maximum number of body bytes to buffer per request/response for capture.
 ///
@@ -56,6 +60,9 @@ pub struct CaptureBody {
 
     #[serde(rename = "contentType", skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
+
+    #[serde(rename = "contentEncoding", skip_serializing_if = "Option::is_none")]
+    pub content_encoding: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,7 +160,7 @@ impl BodyCaptureBuffer {
     /// All bytes contribute to `total_len`, but only the first
     /// `max_bytes` bytes across all calls are retained in `captured`.
     pub fn push(&mut self, chunk: &[u8]) {
-        self.total_len += chunk.len();
+        self.total_len = self.total_len.saturating_add(chunk.len());
         if self.captured.len() >= self.max_bytes {
             return;
         }
@@ -184,6 +191,34 @@ pub enum CaptureError {
 
     #[error("failed to write capture file {path}: {source}")]
     WriteFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to read capture directory {path}: {source}")]
+    ReadDir {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to read capture directory entry in {path}: {source}")]
+    ReadDirEntry {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to stat capture file {path}: {source}")]
+    Metadata {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to remove old capture file {path}: {source}")]
+    RemoveFile {
         path: PathBuf,
         #[source]
         source: std::io::Error,
@@ -231,7 +266,7 @@ pub fn build_capture_record(opts: CaptureRecordOptions) -> CaptureRecord {
         kind,
         decision,
         mode,
-        url,
+        url: redact_url_for_sink(&url),
         method: method.unwrap_or_default(),
         status_code,
         status_message,
@@ -273,21 +308,8 @@ fn build_body(headers: Option<&HeaderMap>, body: &BodyCaptureResult) -> Option<C
         return None;
     }
 
-    let content_type = headers.and_then(|map| {
-        map.iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-            .and_then(|(_, v)| match v {
-                JsonValue::String(s) => Some(s.clone()),
-                JsonValue::Array(arr) => arr.iter().find_map(|v| {
-                    if let JsonValue::String(s) = v {
-                        Some(s.clone())
-                    } else {
-                        None
-                    }
-                }),
-                _ => None,
-            })
-    });
+    let content_type = headers.and_then(|map| first_header_string(map, "content-type"));
+    let content_encoding = headers.and_then(|map| first_header_string(map, "content-encoding"));
 
     let data = general_purpose::STANDARD.encode(&body.captured);
 
@@ -296,7 +318,25 @@ fn build_body(headers: Option<&HeaderMap>, body: &BodyCaptureResult) -> Option<C
         length: body.total_len,
         data,
         content_type,
+        content_encoding,
     })
+}
+
+fn first_header_string(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .and_then(|(_, v)| match v {
+            JsonValue::String(s) => Some(s.clone()),
+            JsonValue::Array(arr) => arr.iter().find_map(|v| {
+                if let JsonValue::String(s) = v {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            }),
+            _ => None,
+        })
 }
 
 fn sanitize_path_component(input: &str) -> String {
@@ -359,26 +399,94 @@ fn effective_capture_directory(capture: &CaptureConfig) -> String {
     "logs-capture".to_string()
 }
 
+struct CaptureFileEntry {
+    path: PathBuf,
+    len: u64,
+    modified: SystemTime,
+    is_written_file: bool,
+}
+
 pub fn write_capture_record(
     config: &Config,
     record: &CaptureRecord,
 ) -> Result<PathBuf, CaptureError> {
     let path = resolve_capture_path(config, record);
 
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|source| CaptureError::CreateDir {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-
     let json = serde_json::to_string_pretty(record)?;
-    fs::write(&path, format!("{json}\n")).map_err(|source| CaptureError::WriteFile {
+    write_private_file(&path, format!("{json}\n")).map_err(|source| CaptureError::WriteFile {
         path: path.clone(),
         source,
     })?;
+    prune_capture_directory(config, &path)?;
 
     Ok(path)
+}
+
+fn prune_capture_directory(config: &Config, written_path: &Path) -> Result<(), CaptureError> {
+    let directory = PathBuf::from(effective_capture_directory(&config.capture));
+    let read_dir = fs::read_dir(&directory).map_err(|source| CaptureError::ReadDir {
+        path: directory.clone(),
+        source,
+    })?;
+
+    let mut entries = Vec::new();
+    for entry in read_dir {
+        let entry = entry.map_err(|source| CaptureError::ReadDirEntry {
+            path: directory.clone(),
+            source,
+        })?;
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(source) if source.kind() == IoErrorKind::NotFound => continue,
+            Err(source) => return Err(CaptureError::Metadata { path, source }),
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+
+        entries.push(CaptureFileEntry {
+            is_written_file: path == written_path,
+            path,
+            len: metadata.len(),
+            modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        });
+    }
+
+    entries.sort_by(|a, b| {
+        b.is_written_file
+            .cmp(&a.is_written_file)
+            .then_with(|| b.modified.cmp(&a.modified))
+            .then_with(|| b.path.cmp(&a.path))
+    });
+
+    let mut kept_files = 0usize;
+    let mut kept_bytes = 0u64;
+
+    for entry in entries {
+        let is_first = kept_files == 0;
+        let within_count = kept_files < config.capture.max_files;
+        let next_bytes = kept_bytes.saturating_add(entry.len);
+        let within_bytes = next_bytes <= config.capture.max_total_bytes;
+        if is_first || (within_count && within_bytes) {
+            kept_files += 1;
+            kept_bytes = next_bytes;
+            continue;
+        }
+
+        match fs::remove_file(&entry.path) {
+            Ok(()) => {}
+            Err(source) if source.kind() == IoErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(CaptureError::RemoveFile {
+                    path: entry.path,
+                    source,
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -480,6 +588,21 @@ default = "deny"
     }
 
     #[test]
+    fn body_capture_length_saturates_on_overflow() {
+        let mut buf = BodyCaptureBuffer {
+            max_bytes: 0,
+            captured: Vec::new(),
+            total_len: usize::MAX - 1,
+        };
+
+        buf.push(&[1, 2, 3, 4]);
+
+        let result = buf.finish();
+        assert_eq!(result.total_len, usize::MAX);
+        assert!(result.captured.is_empty());
+    }
+
+    #[test]
     fn decode_body_bytes_succeeds_for_base64_body() {
         let body_bytes = b"hello world";
         let encoded = general_purpose::STANDARD.encode(body_bytes);
@@ -489,6 +612,7 @@ default = "deny"
             length: body_bytes.len(),
             data: encoded,
             content_type: Some("text/plain".to_string()),
+            content_encoding: None,
         };
 
         let record = sample_record_with_body(Some(body));
@@ -513,6 +637,7 @@ default = "deny"
             length: 0,
             data: "".to_string(),
             content_type: None,
+            content_encoding: None,
         };
 
         let record = sample_record_with_body(Some(body));
@@ -532,6 +657,7 @@ default = "deny"
             length: 10,
             data: "!!!not-base64!!!".to_string(),
             content_type: None,
+            content_encoding: None,
         };
 
         let record = sample_record_with_body(Some(body));
@@ -577,6 +703,10 @@ default = "deny"
             "Content-Type".to_string(),
             JsonValue::String("text/plain".to_string()),
         );
+        headers.insert(
+            "Content-Encoding".to_string(),
+            JsonValue::String("gzip".to_string()),
+        );
 
         let body_bytes = b"hello world";
         let body_result = sample_body_result(body_bytes);
@@ -617,11 +747,34 @@ default = "deny"
         assert_eq!(body.encoding, "base64");
         assert_eq!(body.length, body_bytes.len());
         assert_eq!(body.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(body.content_encoding.as_deref(), Some("gzip"));
 
         let data = general_purpose::STANDARD
             .decode(body.data)
             .expect("decode base64");
         assert_eq!(data, body_bytes);
+    }
+
+    #[test]
+    fn build_capture_record_redacts_sensitive_url_parts() {
+        let record = build_capture_record(CaptureRecordOptions {
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            request_id: "req-1".to_string(),
+            kind: CaptureKind::Request,
+            decision: CaptureDecision::Allow,
+            mode: CaptureMode::HttpProxy,
+            url: "http://user:pass@example.com/echo?token=secret".to_string(),
+            method: Some("GET".to_string()),
+            client: CaptureEndpoint::default(),
+            target: None,
+            http_version: Some("1.1".to_string()),
+            headers: None,
+            status_code: None,
+            status_message: None,
+            body: None,
+        });
+
+        assert_eq!(record.url, "http://example.com/echo?REDACTED");
     }
 
     #[test]

@@ -12,9 +12,11 @@ use rcgen::{
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::{any_supported_type, CertifiedKey};
 use rustls::{Certificate as RustlsCertificate, PrivateKey, ServerConfig};
+use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::CertificatesConfig;
+use crate::filesystem::{create_private_dir_all, write_private_file};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CertError {
@@ -57,15 +59,30 @@ pub enum CertError {
 
     #[error("invalid max_cached_certs ({value}); must be at least 1")]
     InvalidCacheSize { value: usize },
+
+    #[error("certificate generation is already in progress")]
+    GenerationBusy,
+}
+
+struct CaMaterial {
+    cert: RcgenCertificate,
+    key: KeyPair,
+    cert_pem: String,
+    cert_der: Vec<u8>,
 }
 
 struct Inner {
     ca_cert_path: PathBuf,
     dynamic_dir: PathBuf,
+    persist_dynamic_certs: bool,
     ca_cert: RcgenCertificate,
     ca_key: KeyPair,
+    ca_cert_pem: String,
+    ca_cert_der: Vec<u8>,
     cache_capacity: NonZeroUsize,
+    generation_permits: Semaphore,
     server_configs: Mutex<LruCache<String, Arc<ServerConfig>>>,
+    sni_acceptor: Mutex<Option<TlsAcceptor>>,
 }
 
 #[derive(Clone)]
@@ -97,17 +114,18 @@ impl CertManager {
 
         let dynamic_dir = certs_dir.join("dynamic");
 
-        fs::create_dir_all(&certs_dir).map_err(|source| CertError::CreateDir {
+        create_private_dir_all(&certs_dir).map_err(|source| CertError::CreateDir {
             path: certs_dir.clone(),
             source,
         })?;
-        fs::create_dir_all(&dynamic_dir).map_err(|source| CertError::CreateDir {
-            path: dynamic_dir.clone(),
-            source,
-        })?;
+        if cfg.persist_dynamic_certs {
+            create_private_dir_all(&dynamic_dir).map_err(|source| CertError::CreateDir {
+                path: dynamic_dir.clone(),
+                source,
+            })?;
+        }
 
-        let (ca_cert, ca_key) =
-            load_or_generate_ca(&ca_key_path, &ca_cert_path, explicit_ca_paths)?;
+        let ca_material = load_or_generate_ca(&ca_key_path, &ca_cert_path, explicit_ca_paths)?;
 
         let cache_capacity =
             NonZeroUsize::new(cfg.max_cached_certs).ok_or(CertError::InvalidCacheSize {
@@ -117,10 +135,15 @@ impl CertManager {
         let inner = Inner {
             ca_cert_path,
             dynamic_dir,
-            ca_cert,
-            ca_key,
+            persist_dynamic_certs: cfg.persist_dynamic_certs,
+            ca_cert: ca_material.cert,
+            ca_key: ca_material.key,
+            ca_cert_pem: ca_material.cert_pem,
+            ca_cert_der: ca_material.cert_der,
             cache_capacity,
+            generation_permits: Semaphore::new(1),
             server_configs: Mutex::new(LruCache::new(cache_capacity)),
+            sni_acceptor: Mutex::new(None),
         };
 
         Ok(CertManager {
@@ -134,14 +157,23 @@ impl CertManager {
     /// proxy terminates TLS directly from clients and must choose a
     /// certificate matching the requested hostname.
     pub fn tls_acceptor_with_sni(&self) -> Result<TlsAcceptor, CertError> {
+        {
+            let guard = self.inner.sni_acceptor.lock().unwrap();
+            if let Some(acceptor) = guard.as_ref() {
+                return Ok(acceptor.clone());
+            }
+        }
+
         // Seed the config with a placeholder certificate; the dynamic
         // `cert_resolver` below will be responsible for choosing the real
         // certificate based on SNI.
         let (cert_chain, key) = generate_host_certificate(
             &self.inner.ca_cert,
             &self.inner.ca_key,
-            &self.inner.ca_cert_path,
+            &self.inner.ca_cert_pem,
+            &self.inner.ca_cert_der,
             &self.inner.dynamic_dir,
+            self.inner.persist_dynamic_certs,
             "default",
         )?;
 
@@ -153,7 +185,13 @@ impl CertManager {
         config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         config.cert_resolver = Arc::new(SniResolver::new(self.inner.clone()));
 
-        Ok(TlsAcceptor::from(Arc::new(config)))
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let mut guard = self.inner.sni_acceptor.lock().unwrap();
+        if let Some(existing) = guard.as_ref() {
+            return Ok(existing.clone());
+        }
+        *guard = Some(acceptor.clone());
+        Ok(acceptor)
     }
 
     /// Build a `TlsAcceptor` for the given host, generating and caching a
@@ -172,11 +210,26 @@ impl CertManager {
             }
         }
 
+        let _generation_permit = self
+            .inner
+            .generation_permits
+            .try_acquire()
+            .map_err(|_| CertError::GenerationBusy)?;
+
+        {
+            let mut cache = self.inner.server_configs.lock().unwrap();
+            if let Some(cfg) = cache.get(&host) {
+                return Ok(cfg.clone());
+            }
+        }
+
         let (cert_chain, key) = generate_host_certificate(
             &self.inner.ca_cert,
             &self.inner.ca_key,
-            &self.inner.ca_cert_path,
+            &self.inner.ca_cert_pem,
+            &self.inner.ca_cert_der,
             &self.inner.dynamic_dir,
+            self.inner.persist_dynamic_certs,
             &host,
         )?;
 
@@ -225,8 +278,10 @@ impl SniResolver {
         let (cert_chain, key) = match generate_host_certificate(
             &self.inner.ca_cert,
             &self.inner.ca_key,
-            &self.inner.ca_cert_path,
+            &self.inner.ca_cert_pem,
+            &self.inner.ca_cert_der,
             &self.inner.dynamic_dir,
+            self.inner.persist_dynamic_certs,
             &host,
         ) {
             Ok(v) => v,
@@ -274,7 +329,7 @@ fn load_or_generate_ca(
     ca_key_path: &Path,
     ca_cert_path: &Path,
     explicit: bool,
-) -> Result<(RcgenCertificate, KeyPair), CertError> {
+) -> Result<CaMaterial, CertError> {
     let key_exists = ca_key_path.exists();
     let cert_exists = ca_cert_path.exists();
 
@@ -318,10 +373,7 @@ fn load_or_generate_ca(
     generate_ca(ca_key_path, ca_cert_path)
 }
 
-fn load_ca_from_files(
-    ca_key_path: &Path,
-    ca_cert_path: &Path,
-) -> Result<(RcgenCertificate, KeyPair), CertError> {
+fn load_ca_from_files(ca_key_path: &Path, ca_cert_path: &Path) -> Result<CaMaterial, CertError> {
     let key_pem = fs::read_to_string(ca_key_path).map_err(|source| CertError::ReadCaKey {
         path: ca_key_path.to_path_buf(),
         source,
@@ -334,19 +386,32 @@ fn load_ca_from_files(
     let key_pair =
         KeyPair::from_pem(&key_pem).map_err(|e| CertError::ParseCaKey(format!("{e}")))?;
 
-    let params = CertificateParams::from_ca_cert_pem(&cert_pem)
+    let mut reader = Cursor::new(cert_pem.as_bytes());
+    let mut certs =
+        rustls_pemfile::certs(&mut reader).map_err(|e| CertError::ParseCaCert(format!("{e}")))?;
+    let cert_der = if certs.is_empty() {
+        return Err(CertError::ParseCaCert(
+            "expected at least one CA certificate".to_string(),
+        ));
+    } else {
+        certs.remove(0)
+    };
+
+    let params = CertificateParams::from_ca_cert_der(&cert_der.as_slice().into())
         .map_err(|e| CertError::ParseCaCert(format!("{e}")))?;
     let ca_cert = params
         .self_signed(&key_pair)
         .map_err(|e| CertError::ParseCaCert(format!("{e}")))?;
 
-    Ok((ca_cert, key_pair))
+    Ok(CaMaterial {
+        cert: ca_cert,
+        key: key_pair,
+        cert_pem,
+        cert_der,
+    })
 }
 
-fn generate_ca(
-    ca_key_path: &Path,
-    ca_cert_path: &Path,
-) -> Result<(RcgenCertificate, KeyPair), CertError> {
+fn generate_ca(ca_key_path: &Path, ca_cert_path: &Path) -> Result<CaMaterial, CertError> {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let mut dn = DistinguishedName::new();
@@ -362,29 +427,40 @@ fn generate_ca(
     let key_pem = key_pair.serialize_pem();
 
     if let Some(parent) = ca_cert_path.parent() {
-        fs::create_dir_all(parent).map_err(|source| CertError::CreateDir {
+        create_private_dir_all(parent).map_err(|source| CertError::CreateDir {
             path: parent.to_path_buf(),
             source,
         })?;
     }
 
-    fs::write(ca_cert_path, cert_pem.as_bytes()).map_err(|source| CertError::WriteFile {
-        path: ca_cert_path.to_path_buf(),
-        source,
+    write_private_file(ca_cert_path, cert_pem.as_bytes()).map_err(|source| {
+        CertError::WriteFile {
+            path: ca_cert_path.to_path_buf(),
+            source,
+        }
     })?;
-    fs::write(ca_key_path, key_pem.as_bytes()).map_err(|source| CertError::WriteFile {
+    write_private_file(ca_key_path, key_pem.as_bytes()).map_err(|source| CertError::WriteFile {
         path: ca_key_path.to_path_buf(),
         source,
     })?;
 
-    Ok((ca_cert, key_pair))
+    let cert_der = ca_cert.der().to_vec();
+
+    Ok(CaMaterial {
+        cert: ca_cert,
+        key: key_pair,
+        cert_pem,
+        cert_der,
+    })
 }
 
 fn generate_host_certificate(
     ca_cert: &RcgenCertificate,
     ca_key: &KeyPair,
-    ca_cert_path: &Path,
+    ca_cert_pem: &str,
+    ca_cert_der: &[u8],
     dynamic_dir: &Path,
+    persist_dynamic_certs: bool,
     host: &str,
 ) -> Result<(Vec<RustlsCertificate>, PrivateKey), CertError> {
     let mut params = CertificateParams::new(vec![host.to_string()])
@@ -408,51 +484,43 @@ fn generate_host_certificate(
     let key_der = leaf_key.serialize_der();
 
     let leaf = RustlsCertificate(cert_der);
-    let ca_pem = fs::read_to_string(ca_cert_path).map_err(|source| CertError::ReadCaCert {
-        path: ca_cert_path.to_path_buf(),
-        source,
-    })?;
+    let ca_cert_rls = RustlsCertificate(ca_cert_der.to_vec());
 
-    let mut reader = Cursor::new(ca_pem.as_bytes());
-    let ca_der = rustls_pemfile::certs(&mut reader)
-        .map_err(|e| CertError::ParseCaCert(format!("{e}")))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| CertError::ParseCaCert("no CA certificate found in PEM".to_string()))?;
-    let ca_cert_rls = RustlsCertificate(ca_der);
+    if persist_dynamic_certs {
+        // Optional debug/audit view. Runtime TLS uses the bounded in-memory
+        // cache, and these files are not reloaded on startup.
+        create_private_dir_all(dynamic_dir).map_err(|source| CertError::CreateDir {
+            path: dynamic_dir.to_path_buf(),
+            source,
+        })?;
 
-    // Persist PEM files on disk for transparency and debugging.
-    //
-    // The active certificates used for TLS handshakes are generated on
-    // demand from the in-memory CA and cached in this process; the
-    // per-host PEM files under `certs/dynamic/` are not currently
-    // reloaded on startup and should be treated as an audit/debug view,
-    // not as the authoritative runtime cache.
-    fs::create_dir_all(dynamic_dir).map_err(|source| CertError::CreateDir {
-        path: dynamic_dir.to_path_buf(),
-        source,
-    })?;
+        let leaf_pem = leaf_cert.pem();
+        let key_pem = leaf_key.serialize_pem();
+        let chain_pem = format!("{leaf_pem}{ca_cert_pem}");
 
-    let leaf_pem = leaf_cert.pem();
-    let key_pem = leaf_key.serialize_pem();
-    let chain_pem = format!("{leaf_pem}{ca_pem}");
+        let leaf_path = dynamic_dir.join(format!("{host}.crt"));
+        let key_path = dynamic_dir.join(format!("{host}.key"));
+        let chain_path = dynamic_dir.join(format!("{host}-chain.crt"));
 
-    let leaf_path = dynamic_dir.join(format!("{host}.crt"));
-    let key_path = dynamic_dir.join(format!("{host}.key"));
-    let chain_path = dynamic_dir.join(format!("{host}-chain.crt"));
-
-    fs::write(&leaf_path, leaf_pem.as_bytes()).map_err(|source| CertError::WriteFile {
-        path: leaf_path,
-        source,
-    })?;
-    fs::write(&key_path, key_pem.as_bytes()).map_err(|source| CertError::WriteFile {
-        path: key_path,
-        source,
-    })?;
-    fs::write(&chain_path, chain_pem.as_bytes()).map_err(|source| CertError::WriteFile {
-        path: chain_path,
-        source,
-    })?;
+        write_private_file(&leaf_path, leaf_pem.as_bytes()).map_err(|source| {
+            CertError::WriteFile {
+                path: leaf_path,
+                source,
+            }
+        })?;
+        write_private_file(&key_path, key_pem.as_bytes()).map_err(|source| {
+            CertError::WriteFile {
+                path: key_path,
+                source,
+            }
+        })?;
+        write_private_file(&chain_path, chain_pem.as_bytes()).map_err(|source| {
+            CertError::WriteFile {
+                path: chain_path,
+                source,
+            }
+        })?;
+    }
 
     Ok((vec![leaf, ca_cert_rls], PrivateKey(key_der)))
 }
@@ -478,6 +546,13 @@ mod tests {
     use crate::config::CertificatesConfig;
     use tempfile::TempDir;
 
+    #[cfg(unix)]
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+    }
+
     #[test]
     fn ca_is_generated_and_reused_in_tempdir() {
         let tmp = TempDir::new().expect("tempdir");
@@ -492,6 +567,13 @@ mod tests {
         let ca_cert_path = mgr1.ca_cert_path().to_path_buf();
         assert!(ca_cert_path.exists());
 
+        #[cfg(unix)]
+        {
+            assert_eq!(mode(&certs_dir), 0o700);
+            assert_eq!(mode(&certs_dir.join("ca-key.pem")), 0o600);
+            assert_eq!(mode(&ca_cert_path), 0o600);
+        }
+
         // Second manager should reuse existing CA.
         let mgr2 = CertManager::from_config(&cfg).expect("second cert manager");
         assert_eq!(
@@ -501,12 +583,35 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_certificates_are_created_for_hosts() {
+    fn dynamic_certificates_stay_in_memory_by_default() {
         let tmp = TempDir::new().expect("tempdir");
         let certs_dir = tmp.path().join("certs");
 
         let cfg = CertificatesConfig {
             certs_dir: certs_dir.to_string_lossy().to_string(),
+            ..CertificatesConfig::default()
+        };
+
+        let mgr = CertManager::from_config(&cfg).expect("cert manager");
+
+        let host = "example.com";
+        let _acceptor = mgr.tls_acceptor_for_host(host).expect("tls acceptor");
+
+        let dynamic_dir = certs_dir.join("dynamic");
+        assert!(
+            !dynamic_dir.exists(),
+            "dynamic cert directory should not be created by default"
+        );
+    }
+
+    #[test]
+    fn dynamic_certificates_are_persisted_when_enabled() {
+        let tmp = TempDir::new().expect("tempdir");
+        let certs_dir = tmp.path().join("certs");
+
+        let cfg = CertificatesConfig {
+            certs_dir: certs_dir.to_string_lossy().to_string(),
+            persist_dynamic_certs: true,
             ..CertificatesConfig::default()
         };
 
@@ -523,6 +628,68 @@ mod tests {
         assert!(leaf.exists(), "leaf cert should exist");
         assert!(key.exists(), "key should exist");
         assert!(chain.exists(), "chain cert should exist");
+
+        #[cfg(unix)]
+        {
+            assert_eq!(mode(&dynamic_dir), 0o700);
+            assert_eq!(mode(&leaf), 0o600);
+            assert_eq!(mode(&key), 0o600);
+            assert_eq!(mode(&chain), 0o600);
+        }
+    }
+
+    #[test]
+    fn host_generation_uses_in_memory_ca_after_startup() {
+        let tmp = TempDir::new().expect("tempdir");
+        let certs_dir = tmp.path().join("certs");
+
+        let cfg = CertificatesConfig {
+            certs_dir: certs_dir.to_string_lossy().to_string(),
+            persist_dynamic_certs: true,
+            ..CertificatesConfig::default()
+        };
+
+        let mgr = CertManager::from_config(&cfg).expect("cert manager");
+        fs::remove_file(mgr.ca_cert_path()).expect("remove ca cert after startup");
+
+        let host = "example.com";
+        let _acceptor = mgr
+            .tls_acceptor_for_host(host)
+            .expect("host cert should use in-memory CA");
+
+        let chain = certs_dir.join("dynamic").join(format!("{host}-chain.crt"));
+        assert!(chain.exists(), "chain cert should still be persisted");
+        let chain_pem = fs::read_to_string(chain).expect("read chain pem");
+        assert!(
+            chain_pem.contains("-----BEGIN CERTIFICATE-----"),
+            "chain should contain PEM certificates"
+        );
+    }
+
+    #[test]
+    fn sni_acceptor_reuses_default_placeholder_certificate() {
+        let tmp = TempDir::new().expect("tempdir");
+        let certs_dir = tmp.path().join("certs");
+
+        let cfg = CertificatesConfig {
+            certs_dir: certs_dir.to_string_lossy().to_string(),
+            persist_dynamic_certs: true,
+            ..CertificatesConfig::default()
+        };
+
+        let mgr = CertManager::from_config(&cfg).expect("cert manager");
+        let _first = mgr.tls_acceptor_with_sni().expect("first acceptor");
+
+        let default_key = certs_dir.join("dynamic").join("default.key");
+        let first_key_pem = fs::read_to_string(&default_key).expect("read first default key");
+
+        let _second = mgr.tls_acceptor_with_sni().expect("second acceptor");
+        let second_key_pem = fs::read_to_string(default_key).expect("read second default key");
+
+        assert_eq!(
+            first_key_pem, second_key_pem,
+            "cached SNI acceptor should not regenerate the default placeholder key"
+        );
     }
 
     #[test]
@@ -566,6 +733,45 @@ mod tests {
     }
 
     #[test]
+    fn uncached_host_generation_fails_fast_when_generation_is_busy() {
+        let tmp = TempDir::new().expect("tempdir");
+        let certs_dir = tmp.path().join("certs");
+
+        let cfg = CertificatesConfig {
+            certs_dir: certs_dir.to_string_lossy().to_string(),
+            ..CertificatesConfig::default()
+        };
+
+        let mgr = CertManager::from_config(&cfg).expect("cert manager");
+        let cached_host = "cached.example.com";
+        let cached_config = mgr
+            .server_config_for_host(cached_host)
+            .expect("prime cached host");
+
+        let _permit = mgr
+            .inner
+            .generation_permits
+            .try_acquire()
+            .expect("hold generation permit");
+
+        let cached_again = mgr
+            .server_config_for_host(cached_host)
+            .expect("cached host should not need generation permit");
+        assert!(
+            Arc::ptr_eq(&cached_config, &cached_again),
+            "cached host should reuse existing server config"
+        );
+
+        let err = mgr
+            .server_config_for_host("uncached.example.com")
+            .expect_err("uncached host should fail while generation is busy");
+        assert!(
+            matches!(err, CertError::GenerationBusy),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn configured_ca_cert_bytes_are_used_in_chain() {
         let tmp = TempDir::new().expect("tempdir");
         let certs_dir = tmp.path().join("certs");
@@ -583,6 +789,7 @@ mod tests {
             certs_dir: certs_dir.to_string_lossy().to_string(),
             ca_key_path: Some(ca_key_path.to_string_lossy().to_string()),
             ca_cert_path: Some(ca_cert_path.to_string_lossy().to_string()),
+            persist_dynamic_certs: true,
             ..CertificatesConfig::default()
         };
 
@@ -596,10 +803,57 @@ mod tests {
         assert!(chain.exists(), "chain cert should exist");
 
         let chain_pem = fs::read_to_string(chain).expect("read chain pem");
+        let mut ca_reader = std::io::Cursor::new(ca_cert_pem.as_bytes());
+        let ca_certs = rustls_pemfile::certs(&mut ca_reader).expect("parse ca cert");
+        let ca_cert = ca_certs.last().expect("ca cert");
+
+        let mut chain_reader = std::io::Cursor::new(chain_pem.as_bytes());
+        let chain_certs = rustls_pemfile::certs(&mut chain_reader).expect("parse chain certs");
         assert!(
-            chain_pem.ends_with(&ca_cert_pem),
-            "host chain should end with the configured CA cert PEM",
+            chain_certs.last() == Some(ca_cert),
+            "host chain should end with the configured CA cert",
         );
+    }
+
+    #[test]
+    fn configured_ca_bundle_uses_first_certificate() {
+        let tmp = TempDir::new().expect("tempdir");
+        let certs_dir = tmp.path().join("certs");
+        fs::create_dir_all(&certs_dir).expect("create certs dir");
+
+        let ca_key_path = certs_dir.join("custom-ca-key.pem");
+        let ca_cert_path = certs_dir.join("custom-ca-cert.pem");
+        let extra_key_path = certs_dir.join("extra-ca-key.pem");
+        let extra_cert_path = certs_dir.join("extra-ca-cert.pem");
+
+        generate_ca(&ca_key_path, &ca_cert_path).expect("generate ca");
+        generate_ca(&extra_key_path, &extra_cert_path).expect("generate extra ca");
+        let extra_cert_pem = fs::read_to_string(&extra_cert_path).expect("read extra cert");
+        fs::write(
+            &ca_cert_path,
+            format!(
+                "{}{}",
+                fs::read_to_string(&ca_cert_path).expect("read ca cert"),
+                extra_cert_pem
+            ),
+        )
+        .expect("write bundle");
+
+        let cfg = CertificatesConfig {
+            certs_dir: certs_dir.to_string_lossy().to_string(),
+            ca_key_path: Some(ca_key_path.to_string_lossy().to_string()),
+            ca_cert_path: Some(ca_cert_path.to_string_lossy().to_string()),
+            ..CertificatesConfig::default()
+        };
+
+        let mut reader =
+            std::io::Cursor::new(fs::read_to_string(&ca_cert_path).expect("read bundle"));
+        let bundle_certs = rustls_pemfile::certs(&mut reader).expect("parse bundle");
+        assert_eq!(bundle_certs.len(), 2);
+
+        let mgr = CertManager::from_config(&cfg).expect("cert manager");
+
+        assert_eq!(mgr.inner.ca_cert_der, bundle_certs[0]);
     }
 
     #[test]

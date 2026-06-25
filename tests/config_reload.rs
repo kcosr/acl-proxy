@@ -1,15 +1,20 @@
 #![allow(clippy::await_holding_lock)]
 
+use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::{Arc, Mutex};
 
 use acl_proxy::app::AppState;
-use acl_proxy::config::{Config, EgressTargetConfig};
+use acl_proxy::config::{
+    Config, EgressTargetConfig, ExternalAuthProfileConfig, ExternalAuthProfileType,
+};
+use acl_proxy::external_auth::ExternalDecision;
 use acl_proxy::proxy::http::run_http_proxy_on_listener;
 use http::StatusCode;
 use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Request, Response, Server};
+use hyper::{body, Body, Request, Response, Server};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 #[derive(Clone, Debug)]
 struct ObservedRequest {
@@ -84,6 +89,39 @@ async fn start_observed_echo_server(
     (addr, observed)
 }
 
+async fn start_status_webhook_server() -> (SocketAddr, mpsc::Receiver<serde_json::Value>) {
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind webhook");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking webhook");
+    let addr = listener.local_addr().expect("webhook addr");
+    let (tx, rx) = mpsc::channel::<serde_json::Value>(8);
+
+    let make_svc = make_service_fn(move |_conn| {
+        let tx = tx.clone();
+        async move {
+            Ok::<_, hyper::Error>(service_fn(move |req: Request<Body>| {
+                let tx = tx.clone();
+                async move {
+                    let bytes = body::to_bytes(req.into_body()).await?;
+                    let payload: serde_json::Value =
+                        serde_json::from_slice(&bytes).expect("status webhook json");
+                    let _ = tx.send(payload).await;
+                    Ok::<_, hyper::Error>(Response::new(Body::from("ok")))
+                }
+            }))
+        }
+    });
+
+    tokio::spawn(
+        Server::from_tcp(listener)
+            .expect("server from tcp")
+            .serve(make_svc),
+    );
+
+    (addr, rx)
+}
+
 fn minimal_config() -> Config {
     let toml = r#"
 schema_version = "1"
@@ -113,6 +151,24 @@ default = "deny"
 fn prepare_app_config_for_reload_tests(config: &mut Config, certs_dir: &std::path::Path) {
     config.logging.directory = None;
     config.certificates.certs_dir = certs_dir.display().to_string();
+}
+
+fn http_external_auth_profile() -> ExternalAuthProfileConfig {
+    ExternalAuthProfileConfig {
+        profile_type: ExternalAuthProfileType::Http,
+        webhook_url: Some("http://127.0.0.1:9/webhook".to_string()),
+        timeout_ms: 60_000,
+        webhook_timeout_ms: Some(1_000),
+        on_webhook_failure: None,
+        command: None,
+        args: Vec::new(),
+        include_headers: Vec::new(),
+        include_request_body: false,
+        max_request_body_bytes: 10 * 1024 * 1024,
+        max_decompressed_request_body_bytes: 50 * 1024 * 1024,
+        env: std::collections::BTreeMap::new(),
+        restart_delay_ms: None,
+    }
 }
 
 async fn start_proxy_with_shared_state(
@@ -325,7 +381,7 @@ async fn failed_reload_keeps_previous_state() {
         .expect_err("reload should fail");
     let msg = format!("{err}");
     assert!(
-        msg.contains("invalid loop protection header name"),
+        msg.contains("loop_protection.header_name must be a valid HTTP header name"),
         "unexpected reload error: {msg}"
     );
 
@@ -405,6 +461,279 @@ fn invalid_egress_forwarding_config_is_rejected_on_reload() {
         shared_state.load().config.proxy.egress.default.is_none(),
         "failed reload should preserve the previous state"
     );
+}
+
+#[tokio::test]
+async fn reload_preserves_pending_external_auth_approvals() {
+    let temp = tempfile::tempdir().expect("temp certs dir");
+
+    let mut config = minimal_config();
+    prepare_app_config_for_reload_tests(&mut config, temp.path());
+    config
+        .policy
+        .external_auth_profiles
+        .insert("approval".to_string(), http_external_auth_profile());
+
+    let shared_state = AppState::shared_from_config(config.clone()).expect("initial state");
+    let initial = shared_state.load_full();
+
+    let (_guard, decision_rx) = initial.external_auth.start_pending(
+        "req-reload".to_string(),
+        0,
+        None,
+        "approval".to_string(),
+        "http://example.com/".to_string(),
+        Some("GET".to_string()),
+        Some("127.0.0.1".to_string()),
+        Vec::new(),
+    );
+    assert_eq!(initial.external_auth.pending_count(), 1);
+
+    let mut updated = config;
+    updated.loop_protection.enabled = true;
+    AppState::reload_shared_from_config(&shared_state, updated).expect("reload config");
+
+    let reloaded = shared_state.load_full();
+    assert_eq!(reloaded.external_auth.pending_count(), 1);
+    let mut macro_values = BTreeMap::new();
+    macro_values.insert("token".to_string(), "from-reloaded-callback".to_string());
+    reloaded
+        .external_auth
+        .store_macro_values("req-reload", macro_values);
+    assert_eq!(initial.external_auth.stored_macro_count(), 1);
+    assert!(
+        reloaded
+            .external_auth
+            .resolve("req-reload", ExternalDecision::Allow),
+        "post-reload manager should resolve pre-reload pending request"
+    );
+    assert_eq!(decision_rx.await, Ok(ExternalDecision::Allow));
+    let taken_macros = initial.external_auth.take_macro_values("req-reload");
+    assert_eq!(
+        taken_macros.get("token").map(String::as_str),
+        Some("from-reloaded-callback")
+    );
+    assert_eq!(reloaded.external_auth.pending_count(), 0);
+    assert_eq!(reloaded.external_auth.stored_macro_count(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn external_auth_status_webhook_config_updates_after_reload() {
+    let temp = tempfile::tempdir().expect("temp certs dir");
+    let (first_addr, mut first_rx) = start_status_webhook_server().await;
+    let (second_addr, mut second_rx) = start_status_webhook_server().await;
+
+    let mut config = minimal_config();
+    prepare_app_config_for_reload_tests(&mut config, temp.path());
+    let mut profile = http_external_auth_profile();
+    profile.webhook_url = Some(format!("http://{first_addr}/status"));
+    config
+        .policy
+        .external_auth_profiles
+        .insert("approval".to_string(), profile);
+
+    let shared_state = AppState::shared_from_config(config.clone()).expect("initial state");
+    let initial = shared_state.load_full();
+    let (_guard, _decision_rx) = initial.external_auth.start_pending(
+        "req-before-reload".to_string(),
+        0,
+        None,
+        "approval".to_string(),
+        "http://example.com/".to_string(),
+        Some("GET".to_string()),
+        Some("127.0.0.1".to_string()),
+        Vec::new(),
+    );
+    initial
+        .external_auth
+        .finalize_timed_out("req-before-reload");
+
+    let first_event = tokio::time::timeout(std::time::Duration::from_secs(2), first_rx.recv())
+        .await
+        .expect("first status webhook timed out")
+        .expect("first status webhook channel closed");
+    assert_eq!(first_event["requestId"], "req-before-reload");
+
+    let mut updated = config;
+    updated
+        .policy
+        .external_auth_profiles
+        .get_mut("approval")
+        .expect("profile")
+        .webhook_url = Some(format!("http://{second_addr}/status"));
+    AppState::reload_shared_from_config(&shared_state, updated).expect("reload config");
+
+    let reloaded = shared_state.load_full();
+    let (_guard, _decision_rx) = reloaded.external_auth.start_pending(
+        "req-after-reload".to_string(),
+        0,
+        None,
+        "approval".to_string(),
+        "http://example.com/".to_string(),
+        Some("GET".to_string()),
+        Some("127.0.0.1".to_string()),
+        Vec::new(),
+    );
+    reloaded
+        .external_auth
+        .finalize_timed_out("req-after-reload");
+
+    let second_event = tokio::time::timeout(std::time::Duration::from_secs(2), second_rx.recv())
+        .await
+        .expect("second status webhook timed out")
+        .expect("second status webhook channel closed");
+    assert_eq!(second_event["requestId"], "req-after-reload");
+}
+
+#[tokio::test]
+async fn late_external_auth_macro_values_are_not_orphaned() {
+    let temp = tempfile::tempdir().expect("temp certs dir");
+
+    let mut config = minimal_config();
+    prepare_app_config_for_reload_tests(&mut config, temp.path());
+    config
+        .policy
+        .external_auth_profiles
+        .insert("approval".to_string(), http_external_auth_profile());
+
+    let state = AppState::from_config(config).expect("state");
+
+    let (_guard, _decision_rx) = state.external_auth.start_pending(
+        "req-late-macro".to_string(),
+        0,
+        None,
+        "approval".to_string(),
+        "http://example.com/".to_string(),
+        Some("GET".to_string()),
+        Some("127.0.0.1".to_string()),
+        Vec::new(),
+    );
+    assert_eq!(state.external_auth.pending_count(), 1);
+
+    state.external_auth.finalize_timed_out("req-late-macro");
+    assert_eq!(state.external_auth.pending_count(), 0);
+
+    let mut macro_values = BTreeMap::new();
+    macro_values.insert("token".to_string(), "late-secret".to_string());
+    assert!(
+        !state.external_auth.resolve_with_macro_values(
+            "req-late-macro",
+            ExternalDecision::Allow,
+            Some(macro_values),
+        ),
+        "late callback should not resolve a finalized request"
+    );
+
+    assert_eq!(state.external_auth.stored_macro_count(), 0);
+    assert!(state
+        .external_auth
+        .take_macro_values("req-late-macro")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn approval_macro_values_are_removed_when_waiter_is_gone() {
+    let temp = tempfile::tempdir().expect("temp certs dir");
+
+    let mut config = minimal_config();
+    prepare_app_config_for_reload_tests(&mut config, temp.path());
+    config
+        .policy
+        .external_auth_profiles
+        .insert("approval".to_string(), http_external_auth_profile());
+
+    let state = AppState::from_config(config).expect("state");
+
+    let (_guard, decision_rx) = state.external_auth.start_pending(
+        "req-dropped-waiter".to_string(),
+        0,
+        None,
+        "approval".to_string(),
+        "http://example.com/".to_string(),
+        Some("GET".to_string()),
+        Some("127.0.0.1".to_string()),
+        Vec::new(),
+    );
+    drop(decision_rx);
+
+    let mut macro_values = BTreeMap::new();
+    macro_values.insert("token".to_string(), "late-secret".to_string());
+    assert!(
+        state.external_auth.resolve_with_macro_values(
+            "req-dropped-waiter",
+            ExternalDecision::Allow,
+            Some(macro_values),
+        ),
+        "pending request should still be found"
+    );
+
+    assert_eq!(state.external_auth.stored_macro_count(), 0);
+    assert!(state
+        .external_auth
+        .take_macro_values("req-dropped-waiter")
+        .is_empty());
+}
+
+#[tokio::test]
+async fn forged_request_id_callback_is_rejected_and_pending_request_unaffected() {
+    let temp = tempfile::tempdir().expect("temp certs dir");
+
+    let mut config = minimal_config();
+    prepare_app_config_for_reload_tests(&mut config, temp.path());
+    config
+        .policy
+        .external_auth_profiles
+        .insert("approval".to_string(), http_external_auth_profile());
+
+    let state = AppState::from_config(config).expect("state");
+
+    // A genuine request is pending, awaiting an approval callback.
+    let (_guard, decision_rx) = state.external_auth.start_pending(
+        "req-genuine".to_string(),
+        0,
+        None,
+        "approval".to_string(),
+        "http://example.com/".to_string(),
+        Some("GET".to_string()),
+        Some("127.0.0.1".to_string()),
+        Vec::new(),
+    );
+    assert_eq!(state.external_auth.pending_count(), 1);
+
+    // A callback bearing a forged/unknown requestId must not resolve anything:
+    // the requestId is the only bearer capability, so an attacker that cannot
+    // guess it gets nothing, and the genuine pending request is left intact.
+    assert!(
+        !state
+            .external_auth
+            .resolve("req-forged-0000000000000000", ExternalDecision::Allow),
+        "callback with an unknown requestId must not resolve a request"
+    );
+    assert!(
+        !state
+            .external_auth
+            .resolve("req-forged-0000000000000000", ExternalDecision::Deny),
+        "callback with an unknown requestId must not resolve a request"
+    );
+    assert_eq!(
+        state.external_auth.pending_count(),
+        1,
+        "the genuine pending request must survive forged callbacks"
+    );
+
+    // The genuine request still resolves on its real id, and its waiter wakes
+    // with the delivered decision.
+    assert!(
+        state
+            .external_auth
+            .resolve("req-genuine", ExternalDecision::Allow),
+        "the genuine requestId must still resolve its pending request"
+    );
+    assert_eq!(
+        decision_rx.await.expect("waiter should receive a decision"),
+        ExternalDecision::Allow
+    );
+    assert_eq!(state.external_auth.pending_count(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

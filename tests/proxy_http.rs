@@ -384,8 +384,7 @@ rule_id = "external-auth-test-rule"
 
     let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
 
-    let raw_request =
-        "GET http://example.com/ok HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    let raw_request = "GET http://example.com/ok?token=secret HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
 
     let (_response, status) = send_raw_http_request(proxy_addr, raw_request).await;
 
@@ -417,6 +416,14 @@ rule_id = "external-auth-test-rule"
         serde_json::Value::String("external-auth-test-rule".to_string())
     );
     assert_eq!(
+        pending_event.body["url"],
+        serde_json::Value::String("http://example.com/ok?REDACTED".to_string())
+    );
+    assert_eq!(
+        status_event.body["url"],
+        serde_json::Value::String("http://example.com/ok?REDACTED".to_string())
+    );
+    assert_eq!(
         pending_event.body["callbackUrl"],
         serde_json::Value::String(callback_url.to_string())
     );
@@ -424,6 +431,60 @@ rule_id = "external-auth-test-rule"
         status_event.body["callbackUrl"],
         serde_json::Value::String(callback_url.to_string())
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn external_auth_webhook_uses_approval_timeout_when_webhook_timeout_is_unset() {
+    let webhook_addr = start_upstream_delayed_server(Duration::from_secs(5)).await;
+
+    let toml = format!(
+        r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+
+[logging]
+directory = "logs"
+level = "info"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles]
+[policy.external_auth_profiles.test_profile]
+webhook_url = "http://{webhook_addr}/webhook"
+timeout_ms = 100
+on_webhook_failure = "timeout"
+
+[[policy.rules]]
+action = "delegate"
+pattern = "http://example.com/**"
+external_auth_profile = "test_profile"
+    "#
+    );
+
+    let config: Config = toml::from_str(&toml).expect("parse config");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+    let raw_request =
+        "GET http://example.com/ok HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+
+    let (_response, status) = send_raw_http_request(proxy_addr, raw_request).await;
+
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -611,8 +672,9 @@ value = "{{{{reason}}}}"
         *guard = Some(proxy_addr);
     }
 
-    let raw_request =
-        format!("GET http://{host}/ok HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let raw_request = format!(
+        "GET http://{host}/ok?token=secret HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    );
 
     let (_response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
     assert_eq!(status, StatusCode::OK);
@@ -665,6 +727,12 @@ value = "{{{{reason}}}}"
     assert!(
         pending.body.get("callbackUrl").is_none(),
         "callbackUrl should be omitted when no external_auth.callback_url is configured"
+    );
+    assert_eq!(
+        pending.body.get("url"),
+        Some(&serde_json::Value::String(format!(
+            "http://{host}/ok?REDACTED"
+        )))
     );
 
     for m in macros {
@@ -1492,6 +1560,69 @@ pattern = "http://{host}/**"
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn external_auth_callback_unknown_request_id_returns_404() {
+    let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 0
+
+[logging]
+directory = "logs"
+level = "info"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[policy]
+default = "deny"
+"#;
+
+    let config: Config = toml::from_str(toml).expect("parse config");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    // The callback endpoint is the only authorization gate for an approval:
+    // its requestId is a bearer capability. A POST bearing an unknown/forged
+    // requestId must be rejected with 404 RequestNotFound and resolve nothing.
+    let callback_body = serde_json::json!({
+        "requestId": "req-forged-0000000000000000",
+        "decision": "allow",
+    });
+    let uri = format!("http://{proxy_addr}/_acl-proxy/external-auth/callback");
+    let req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(
+            http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )
+        .body(Body::from(serde_json::to_vec(&callback_body).unwrap()))
+        .expect("build callback request");
+
+    let resp = hyper::Client::new()
+        .request(req)
+        .await
+        .expect("callback request");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let bytes = hyper::body::to_bytes(resp.into_body())
+        .await
+        .expect("read callback response body");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&bytes).expect("callback response is json");
+    assert_eq!(payload["error"], "RequestNotFound");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn auth_plugin_pass_falls_through_to_later_allow() {
     let (upstream_addr, seen_headers) = start_upstream_echo_server().await;
 
@@ -1739,6 +1870,74 @@ async fn allowed_request_uses_configured_egress_forwarding_destination() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn explicit_http_canonicalizes_url_before_policy_and_egress_forwarding() {
+    let (forward_addr, seen_requests) = start_forwarding_echo_server().await;
+    let target = format!("127.0.0.1:{}", forward_addr.port());
+
+    let mut config = minimal_config();
+    config.capture.allowed_request = false;
+    config.capture.allowed_response = false;
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyRuleAction::Allow,
+            pattern: Some(format!("http://{target}/ok")),
+            patterns: None,
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: None,
+            headers_not_match: None,
+            request_timeout_ms: None,
+            allow_upgrades: true,
+            redaction_profile: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
+        host: "127.0.0.1".to_string(),
+        port: forward_addr.port(),
+    });
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let raw_request = format!(
+        "GET http://127.0.0.1.:{port}/a/../ok HTTP/1.1\r\nHost: 127.0.0.1.:{port}\r\nConnection: close\r\n\r\n",
+        port = forward_addr.port()
+    );
+    let (response, status) = send_raw_http_request(proxy_addr, &raw_request).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        response.contains("\r\n\r\nforwarded"),
+        "unexpected response body: {response}"
+    );
+
+    let requests = seen_requests.lock().unwrap();
+    let forwarded = requests
+        .first()
+        .expect("forwarding destination should see request");
+    assert_eq!(forwarded.uri, format!("http://{target}/ok"));
+    assert_eq!(
+        forwarded
+            .headers
+            .get("host")
+            .and_then(|value| value.to_str().ok()),
+        Some(target.as_str())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn global_egress_request_actions_are_applied_after_rule_actions_without_affecting_matching() {
     let (forward_addr, seen_requests) = start_forwarding_echo_server().await;
 
@@ -1789,6 +1988,8 @@ async fn global_egress_request_actions_are_applied_after_rule_actions_without_af
                     when: acl_proxy::config::HeaderWhen::Always,
                     value: Some("rule-layer".to_string()),
                     values: None,
+                    value_from_env: false,
+                    values_from_env: Vec::new(),
                     search: None,
                     replace: None,
                 },
@@ -1799,6 +2000,8 @@ async fn global_egress_request_actions_are_applied_after_rule_actions_without_af
                     when: acl_proxy::config::HeaderWhen::Always,
                     value: Some("rule-set".to_string()),
                     values: None,
+                    value_from_env: false,
+                    values_from_env: Vec::new(),
                     search: None,
                     replace: None,
                 },
@@ -1818,6 +2021,8 @@ async fn global_egress_request_actions_are_applied_after_rule_actions_without_af
             when: acl_proxy::config::HeaderWhen::IfPresent,
             value: None,
             values: None,
+            value_from_env: false,
+            values_from_env: Vec::new(),
             search: Some("rule".to_string()),
             replace: Some("global".to_string()),
         },
@@ -1827,6 +2032,8 @@ async fn global_egress_request_actions_are_applied_after_rule_actions_without_af
             when: acl_proxy::config::HeaderWhen::IfPresent,
             value: None,
             values: None,
+            value_from_env: false,
+            values_from_env: Vec::new(),
             search: None,
             replace: None,
         },
@@ -1836,6 +2043,8 @@ async fn global_egress_request_actions_are_applied_after_rule_actions_without_af
             when: acl_proxy::config::HeaderWhen::IfAbsent,
             value: Some("should-not-appear".to_string()),
             values: None,
+            value_from_env: false,
+            values_from_env: Vec::new(),
             search: None,
             replace: None,
         },
@@ -1845,6 +2054,8 @@ async fn global_egress_request_actions_are_applied_after_rule_actions_without_af
             when: acl_proxy::config::HeaderWhen::Always,
             value: Some("rewritten.invalid".to_string()),
             values: None,
+            value_from_env: false,
+            values_from_env: Vec::new(),
             search: None,
             replace: None,
         },
@@ -1854,6 +2065,8 @@ async fn global_egress_request_actions_are_applied_after_rule_actions_without_af
             when: acl_proxy::config::HeaderWhen::IfPresent,
             value: None,
             values: None,
+            value_from_env: false,
+            values_from_env: Vec::new(),
             search: None,
             replace: None,
         },
@@ -1947,6 +2160,8 @@ async fn global_egress_request_actions_respect_intra_layer_order() {
             when: acl_proxy::config::HeaderWhen::Always,
             value: Some("rule".to_string()),
             values: None,
+            value_from_env: false,
+            values_from_env: Vec::new(),
             search: None,
             replace: None,
         },
@@ -1956,6 +2171,8 @@ async fn global_egress_request_actions_respect_intra_layer_order() {
             when: acl_proxy::config::HeaderWhen::IfPresent,
             value: None,
             values: None,
+            value_from_env: false,
+            values_from_env: Vec::new(),
             search: Some("rule".to_string()),
             replace: Some("global".to_string()),
         },
@@ -1965,6 +2182,8 @@ async fn global_egress_request_actions_respect_intra_layer_order() {
             when: acl_proxy::config::HeaderWhen::IfPresent,
             value: None,
             values: None,
+            value_from_env: false,
+            values_from_env: Vec::new(),
             search: None,
             replace: None,
         },
@@ -1974,6 +2193,8 @@ async fn global_egress_request_actions_respect_intra_layer_order() {
             when: acl_proxy::config::HeaderWhen::IfAbsent,
             value: Some("should-not-reappear".to_string()),
             values: None,
+            value_from_env: false,
+            values_from_env: Vec::new(),
             search: None,
             replace: None,
         },
@@ -2030,6 +2251,8 @@ async fn empty_global_egress_actions_preserve_existing_rule_header_behavior() {
                 when: acl_proxy::config::HeaderWhen::Always,
                 value: Some("rule-applied".to_string()),
                 values: None,
+                value_from_env: false,
+                values_from_env: Vec::new(),
                 search: None,
                 replace: None,
             }],

@@ -32,11 +32,11 @@ use crate::app::{AppState, SharedAppState};
 use crate::auth_plugin::{AuthPluginHandle, PluginBodyInput, PluginBodyMutation, PluginDecision};
 use crate::capture::{
     build_capture_record, should_capture, BodyCaptureBuffer, BodyCaptureResult, CaptureDecision,
-    CaptureEndpoint, CaptureKind, CaptureMode, CaptureRecordOptions, HeaderMap,
+    CaptureEndpoint, CaptureKind, CaptureMode, CaptureRecord, CaptureRecordOptions, HeaderMap,
 };
 use crate::config::{
-    EgressTargetConfig, ExternalAuthProfileType, HeaderActionKind, HeaderDirection, HeaderWhen,
-    PolicyRuleAction,
+    Config, EgressTargetConfig, ExternalAuthProfileType, HeaderActionKind, HeaderDirection,
+    HeaderWhen, PolicyRuleAction,
 };
 use crate::external_auth::{ApprovalMacroDescriptor, ExternalAuthProfile, ExternalDecision};
 use crate::logging::PolicyDecisionLogContext;
@@ -44,6 +44,8 @@ use crate::policy::CompiledHeaderAction;
 use crate::proxy::https_connect;
 use crate::proxy::websocket;
 use crate::redaction::RedactionProfile;
+use crate::sensitive::{is_sensitive_header_name, redact_url_for_sink, REDACTED};
+use crate::url_canonical::{canonicalize_http_url, CanonicalUrl};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HttpProxyError {
@@ -638,8 +640,11 @@ async fn handle_external_auth_callback_request(
         }
     };
 
-    // For allow decisions, validate and (if applicable) store approval macros
-    // before delivering the decision to the pending request.
+    let mut macro_values = None;
+
+    // For allow decisions, validate approval macros before delivering the
+    // decision. The manager stores them only if the pending request is still
+    // live, immediately before waking the waiter.
     if let ExternalAuthCallbackDecision::Allow = payload.decision {
         let descriptors_opt = state
             .external_auth
@@ -773,9 +778,7 @@ async fn handle_external_auth_callback_request(
             }
 
             // Ignore extra keys not listed in descriptors.
-            state
-                .external_auth
-                .store_macro_values(&payload.request_id, filtered);
+            macro_values = Some(filtered);
         }
     }
 
@@ -785,7 +788,10 @@ async fn handle_external_auth_callback_request(
         ExternalAuthCallbackDecision::Pass => ExternalDecision::Pass,
     };
 
-    let found = state.external_auth.resolve(&payload.request_id, decision);
+    let found =
+        state
+            .external_auth
+            .resolve_with_macro_values(&payload.request_id, decision, macro_values);
 
     if !found {
         let payload = serde_json::json!({
@@ -1078,7 +1084,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
                 tracing::debug!(
                     target: "acl_proxy::body_policy",
                     request_id = %request_id,
-                    url = %url,
+                    url = %redact_url_for_sink(url),
                     profile = %profile_name,
                     decoded_size = body.decoded_len,
                     timeout_ms = handler.timeout().as_millis() as u64,
@@ -1098,7 +1104,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
                 tracing::warn!(
                     target: "acl_proxy::body_policy",
                     request_id = %request_id,
-                    url = %url,
+                    url = %redact_url_for_sink(url),
                     profile = %profile_name,
                     error = %err,
                     "request body processing failed before auth plugin evaluation"
@@ -1143,7 +1149,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
             tracing::debug!(
                 target: "acl_proxy::body_policy",
                 request_id = %request_id,
-                url = %url,
+                url = %redact_url_for_sink(url),
                 profile = %profile_name,
                 decision = "allow",
                 body_modified = request_body.is_some(),
@@ -1164,7 +1170,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
                     tracing::warn!(
                         target: "acl_proxy::body_policy",
                         request_id = %request_id,
-                        url = %url,
+                        url = %redact_url_for_sink(url),
                         profile = %profile_name,
                         "auth plugin returned requestBody for a profile without include_request_body"
                     );
@@ -1197,7 +1203,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
                         tracing::warn!(
                             target: "acl_proxy::body_policy",
                             request_id = %request_id,
-                            url = %url,
+                            url = %redact_url_for_sink(url),
                             profile = %profile_name,
                             error = %err,
                             "auth plugin returned invalid request body mutation"
@@ -1245,7 +1251,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
             tracing::debug!(
                 target: "acl_proxy::body_policy",
                 request_id = %request_id,
-                url = %url,
+                url = %redact_url_for_sink(url),
                 profile = %profile_name,
                 decision = "deny",
                 "auth plugin body-aware decision received"
@@ -1277,7 +1283,7 @@ pub(crate) async fn run_auth_plugin_gate_lifecycle(
             tracing::debug!(
                 target: "acl_proxy::body_policy",
                 request_id = %request_id,
-                url = %url,
+                url = %redact_url_for_sink(url),
                 profile = %profile_name,
                 decision = "pass",
                 "auth plugin body-aware decision received"
@@ -1327,7 +1333,7 @@ async fn prepare_request_body_for_plugin(
     tracing::debug!(
         target: "acl_proxy::body_policy",
         request_id = %request_id,
-        url = %url,
+        url = %redact_url_for_sink(url),
         profile = %profile_name,
         max_body_bytes,
         max_decompressed_body_bytes,
@@ -1340,7 +1346,7 @@ async fn prepare_request_body_for_plugin(
     tracing::debug!(
         target: "acl_proxy::body_policy",
         request_id = %request_id,
-        url = %url,
+        url = %redact_url_for_sink(url),
         profile = %profile_name,
         encoded_size = encoded.len(),
         "request body buffered"
@@ -1352,7 +1358,7 @@ async fn prepare_request_body_for_plugin(
             tracing::debug!(
                 target: "acl_proxy::body_policy",
                 request_id = %request_id,
-                url = %url,
+                url = %redact_url_for_sink(url),
                 profile = %profile_name,
                 encoding = %encoding.as_str(),
                 encoded_size = encoded.len(),
@@ -1397,7 +1403,7 @@ fn rebuild_request_with_plugin_body(
             tracing::debug!(
                 target: "acl_proxy::body_policy",
                 request_id = %request_id,
-                url = %url,
+                url = %redact_url_for_sink(url),
                 profile = %profile_name,
                 encoding = %encoding.as_str(),
                 decoded_size = decoded_len,
@@ -1418,7 +1424,7 @@ fn rebuild_request_with_plugin_body(
     tracing::debug!(
         target: "acl_proxy::body_policy",
         request_id = %request_id,
-        url = %url,
+        url = %redact_url_for_sink(url),
         profile = %profile_name,
         decoded_size = decoded_len,
         final_body_size = encoded.len(),
@@ -1467,7 +1473,7 @@ async fn redact_request_body(
         tracing::debug!(
             target: "acl_proxy::redaction",
             request_id = %request_id,
-            url = %url,
+            url = %redact_url_for_sink(url),
             profile = %profile.name,
             redactions,
             decoded_size = redacted.len(),
@@ -1504,7 +1510,7 @@ fn rebuild_request_with_decoded_body(
             tracing::debug!(
                 target: "acl_proxy::body_policy",
                 request_id = %request_id,
-                url = %url,
+                url = %redact_url_for_sink(url),
                 profile = %profile_name,
                 encoding = %encoding.as_str(),
                 decoded_size = decoded_len,
@@ -1525,7 +1531,7 @@ fn rebuild_request_with_decoded_body(
     tracing::debug!(
         target: "acl_proxy::body_policy",
         request_id = %request_id,
-        url = %url,
+        url = %redact_url_for_sink(url),
         profile = %profile_name,
         decoded_size = decoded_len,
         final_body_size = encoded.len(),
@@ -1714,14 +1720,13 @@ fn build_full_url(
     if let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) {
         let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
-        let normalized = if path_and_query.starts_with('/') {
+        let raw_url = if path_and_query.starts_with('/') {
             format!("{scheme}://{authority}{path}", path = path_and_query)
         } else {
             format!("{scheme}://{authority}/{path}", path = path_and_query)
         };
 
-        let target = extract_target_from_uri(uri);
-        return Ok((normalized, target));
+        return canonicalize_proxy_url(&raw_url);
     }
 
     // Origin-form requests are accepted on the HTTP listener to support
@@ -1769,55 +1774,32 @@ fn build_http_url_from_origin_form(
         format!("/{}", path_and_query)
     };
 
-    let full_url = format!("http://{host}{path}", host = host_raw, path = path);
-    let (target_host, target_port) = split_host_and_port_with_default(host_raw, 80);
-
-    let target = CaptureEndpoint {
-        address: Some(target_host.to_string()),
-        port: Some(target_port),
-    };
-
-    Ok((full_url, Some(target)))
+    let raw_url = format!("http://{host}{path}", host = host_raw, path = path);
+    canonicalize_proxy_url(&raw_url)
 }
 
-fn extract_target_from_uri(uri: &Uri) -> Option<CaptureEndpoint> {
-    let authority = uri.authority()?;
-    let host = authority.host().to_string();
-    let port = authority.port_u16().unwrap_or_else(|| {
-        if uri.scheme_str() == Some("https") {
-            443
-        } else {
-            80
-        }
-    });
-
-    Some(CaptureEndpoint {
-        address: Some(host),
-        port: Some(port),
-    })
+pub(crate) fn canonicalize_proxy_url(
+    raw_url: &str,
+) -> Result<(String, Option<CaptureEndpoint>), Response<Body>> {
+    canonicalize_http_url(raw_url)
+        .map(|canonical| {
+            let target = canonical_capture_endpoint(&canonical);
+            (canonical.url, Some(target))
+        })
+        .map_err(|_| bad_request("Bad Request: invalid request target"))
 }
 
-fn split_host_and_port_with_default(host: &str, default_port: u16) -> (&str, u16) {
-    // Bracketed IPv6: [::1]:80
-    if let Some(idx) = host.rfind(']') {
-        if host.starts_with('[') {
-            let host_part = &host[..=idx];
-            if let Some(port_str) = host[idx + 1..].strip_prefix(':') {
-                if let Ok(port) = port_str.parse::<u16>() {
-                    return (host_part, port);
-                }
-            }
-            return (host_part, default_port);
-        }
+pub(crate) fn canonical_capture_endpoint(canonical: &CanonicalUrl) -> CaptureEndpoint {
+    CaptureEndpoint {
+        address: Some(canonical.host_for_capture.clone()),
+        port: Some(canonical.port),
     }
+}
 
-    if let Some((name, port_str)) = host.rsplit_once(':') {
-        if let Ok(port) = port_str.parse::<u16>() {
-            return (name, port);
-        }
-    }
-
-    (host, default_port)
+pub(crate) fn bad_request(message: &'static str) -> Response<Body> {
+    let mut resp = Response::new(Body::from(message));
+    *resp.status_mut() = StatusCode::BAD_REQUEST;
+    resp
 }
 
 pub(crate) fn has_loop_header(headers: &HttpHeaderMap, name: &HeaderName) -> bool {
@@ -2164,13 +2146,14 @@ pub(crate) async fn maybe_capture_static_response(
 ) {
     let cfg = &state.config;
     let decision_label = decision;
+    let mut records = Vec::new();
 
     if should_capture(cfg, decision_label, CaptureKind::Request) {
         let headers = req_headers
             .map(headers_to_capture_map)
             .unwrap_or_else(HeaderMap::new);
 
-        let record = build_capture_record(CaptureRecordOptions {
+        records.push(build_capture_record(CaptureRecordOptions {
             timestamp: Utc::now().to_rfc3339(),
             request_id: request_id.to_string(),
             kind: CaptureKind::Request,
@@ -2185,9 +2168,7 @@ pub(crate) async fn maybe_capture_static_response(
             status_code: None,
             status_message: None,
             body: None,
-        });
-
-        let _ = crate::capture::write_capture_record(cfg, &record);
+        }));
     }
 
     if should_capture(cfg, decision_label, CaptureKind::Response) {
@@ -2209,7 +2190,7 @@ pub(crate) async fn maybe_capture_static_response(
             Some(buf.finish())
         };
 
-        let record = build_capture_record(CaptureRecordOptions {
+        records.push(build_capture_record(CaptureRecordOptions {
             timestamp: Utc::now().to_rfc3339(),
             request_id: request_id.to_string(),
             kind: CaptureKind::Response,
@@ -2224,9 +2205,41 @@ pub(crate) async fn maybe_capture_static_response(
             status_code: Some(status.as_u16()),
             status_message: Some(status_message.to_string()),
             body: body_capture,
-        });
+        }));
+    }
 
-        let _ = crate::capture::write_capture_record(cfg, &record);
+    write_capture_records_blocking(cfg.clone(), records).await;
+}
+
+async fn write_capture_records_blocking(config: Config, records: Vec<CaptureRecord>) {
+    if records.is_empty() {
+        return;
+    }
+
+    let result = tokio::task::spawn_blocking(move || {
+        records
+            .into_iter()
+            .filter_map(|record| crate::capture::write_capture_record(&config, &record).err())
+            .map(|err| err.to_string())
+            .collect::<Vec<_>>()
+    })
+    .await;
+
+    match result {
+        Ok(errors) => {
+            for err in errors {
+                tracing::warn!(
+                    target: "acl_proxy::capture",
+                    "failed to write capture record: {err}"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                target: "acl_proxy::capture",
+                "capture write task failed: {err}"
+            );
+        }
     }
 }
 
@@ -2284,7 +2297,7 @@ pub(crate) async fn proxy_allowed_request(
                 tracing::error!(
                     target: "acl_proxy::redaction",
                     request_id = %request_id,
-                    url = %full_url,
+                    url = %redact_url_for_sink(&full_url),
                     profile = %profile_name,
                     "matched websocket redaction profile is not configured"
                 );
@@ -2318,7 +2331,7 @@ pub(crate) async fn proxy_allowed_request(
         tracing::warn!(
             target: "acl_proxy::redaction",
             request_id = %request_id,
-            url = %full_url,
+            url = %redact_url_for_sink(&full_url),
             "protected upgrade request is not a WebSocket upgrade"
         );
         let body_bytes = b"Forbidden".to_vec();
@@ -2367,11 +2380,9 @@ pub(crate) async fn proxy_allowed_request(
 
     {
         let headers = builder.headers_mut().expect("headers mut");
-        for (name, value) in req.headers().iter() {
-            if name == HOST {
-                continue;
-            }
-            headers.append(name, value.clone());
+        copy_end_to_end_headers(req.headers(), headers, true);
+        if request_is_upgrade {
+            copy_required_upgrade_headers(req.headers(), headers);
         }
 
         headers.insert(
@@ -2416,7 +2427,7 @@ pub(crate) async fn proxy_allowed_request(
                         tracing::warn!(
                             target: "acl_proxy::redaction",
                             request_id = %request_id,
-                            url = %full_url,
+                            url = %redact_url_for_sink(&full_url),
                             profile = %profile.name,
                             error = %err,
                             "websocket request extension negotiation rejected"
@@ -2460,7 +2471,7 @@ pub(crate) async fn proxy_allowed_request(
                     tracing::warn!(
                         target: "acl_proxy::redaction",
                         request_id = %request_id,
-                        url = %full_url,
+                        url = %redact_url_for_sink(&full_url),
                         profile = %profile.name,
                         error = %err,
                         "request body redaction failed before upstream forwarding"
@@ -2506,7 +2517,7 @@ pub(crate) async fn proxy_allowed_request(
         target: "acl_proxy::transport",
         request_id = %request_id,
         mode = ?mode,
-        url = %full_url,
+        url = %redact_url_for_sink(&full_url),
         stage = "ingress",
         inbound_http_version = %version_to_string(version),
         upgrade_requested = request_is_upgrade,
@@ -2612,7 +2623,7 @@ pub(crate) async fn proxy_allowed_request(
                     tracing::warn!(
                         target: "acl_proxy::redaction",
                         request_id = %request_id,
-                        url = %full_url,
+                        url = %redact_url_for_sink(&full_url),
                         profile = %profile.name,
                         error = %err,
                         "websocket response extension negotiation rejected"
@@ -2647,6 +2658,7 @@ pub(crate) async fn proxy_allowed_request(
         } else {
             None
         };
+    let response_is_upgrade = upstream_upgrade.is_some();
 
     let (resp, resp_capture_rx) = if capture_response {
         let (parts, upstream_body) = upstream_resp.into_parts();
@@ -2655,8 +2667,9 @@ pub(crate) async fn proxy_allowed_request(
         let mut out = Response::builder().status(status).version(resp_version);
         {
             let headers = out.headers_mut().expect("headers mut");
-            for (name, value) in parts.headers.iter() {
-                headers.append(name.clone(), value.clone());
+            copy_end_to_end_headers(&parts.headers, headers, false);
+            if response_is_upgrade {
+                copy_required_upgrade_headers(&parts.headers, headers);
             }
             apply_header_actions(
                 headers,
@@ -2670,6 +2683,11 @@ pub(crate) async fn proxy_allowed_request(
             .unwrap_or_else(|_| Response::new(Body::empty()));
         (resp, Some(handle))
     } else {
+        if response_is_upgrade {
+            strip_hop_by_hop_headers_preserving_upgrade(upstream_resp.headers_mut());
+        } else {
+            strip_hop_by_hop_headers(upstream_resp.headers_mut());
+        }
         apply_header_actions(
             upstream_resp.headers_mut(),
             &header_actions,
@@ -2688,7 +2706,7 @@ pub(crate) async fn proxy_allowed_request(
     tracing::debug!(
         target: "acl_proxy::http_versions",
         request_id = %request_id,
-        url = %full_url,
+        url = %redact_url_for_sink(&full_url),
         client_http_version = %version_to_string(version),
         upstream_http_version = %version_to_string(resp_version),
         status = %status.as_u16(),
@@ -2698,7 +2716,7 @@ pub(crate) async fn proxy_allowed_request(
         target: "acl_proxy::transport",
         request_id = %request_id,
         mode = ?mode,
-        url = %full_url,
+        url = %redact_url_for_sink(&full_url),
         stage = "complete",
         inbound_http_version = %version_to_string(version),
         outbound_http_version = %version_to_string(resp_version),
@@ -2718,6 +2736,7 @@ pub(crate) async fn proxy_allowed_request(
     let req_headers_for_capture_clone = req_headers_for_capture.clone();
     let resp_headers_for_capture_clone = resp_headers_for_capture.clone();
     tokio::spawn(async move {
+        let mut records = Vec::new();
         let req_body = match req_capture_rx {
             Some(handle) => handle.await.ok(),
             None => None,
@@ -2732,7 +2751,7 @@ pub(crate) async fn proxy_allowed_request(
                 let headers = req_headers_for_capture_clone
                     .clone()
                     .unwrap_or_else(HeaderMap::new);
-                let record = build_capture_record(CaptureRecordOptions {
+                records.push(build_capture_record(CaptureRecordOptions {
                     timestamp: Utc::now().to_rfc3339(),
                     request_id: request_id_clone.clone(),
                     kind: CaptureKind::Request,
@@ -2747,8 +2766,7 @@ pub(crate) async fn proxy_allowed_request(
                     status_code: None,
                     status_message: None,
                     body: Some(body),
-                });
-                let _ = crate::capture::write_capture_record(&cfg, &record);
+                }));
             }
         }
 
@@ -2757,7 +2775,7 @@ pub(crate) async fn proxy_allowed_request(
                 let headers = resp_headers_for_capture_clone
                     .clone()
                     .unwrap_or_else(HeaderMap::new);
-                let record = build_capture_record(CaptureRecordOptions {
+                records.push(build_capture_record(CaptureRecordOptions {
                     timestamp: Utc::now().to_rfc3339(),
                     request_id: request_id_clone,
                     kind: CaptureKind::Response,
@@ -2772,10 +2790,11 @@ pub(crate) async fn proxy_allowed_request(
                     status_code: Some(status.as_u16()),
                     status_message: None,
                     body: Some(body),
-                });
-                let _ = crate::capture::write_capture_record(&cfg, &record);
+                }));
             }
         }
+
+        write_capture_records_blocking(cfg, records).await;
     });
 
     if let (Some(downstream_upgrade), Some(upstream_upgrade)) =
@@ -2783,6 +2802,7 @@ pub(crate) async fn proxy_allowed_request(
     {
         let request_id_for_upgrade = request_id.clone();
         let full_url_for_upgrade = full_url.clone();
+        let log_url_for_upgrade = redact_url_for_sink(&full_url_for_upgrade);
         let redaction_for_upgrade = redaction.clone();
         let websocket_session_extensions_for_upgrade = websocket_session_extensions;
         tokio::spawn(async move {
@@ -2790,7 +2810,7 @@ pub(crate) async fn proxy_allowed_request(
                 Ok(stream) => stream,
                 Err(err) => {
                     tracing::debug!(
-                        "request upgrade failed for {request_id_for_upgrade} ({full_url_for_upgrade}): {err}"
+                        "request upgrade failed for {request_id_for_upgrade} ({log_url_for_upgrade}): {err}"
                     );
                     return;
                 }
@@ -2800,7 +2820,7 @@ pub(crate) async fn proxy_allowed_request(
                 Ok(stream) => stream,
                 Err(err) => {
                     tracing::debug!(
-                        "upstream upgrade failed for {request_id_for_upgrade} ({full_url_for_upgrade}): {err}"
+                        "upstream upgrade failed for {request_id_for_upgrade} ({log_url_for_upgrade}): {err}"
                     );
                     return;
                 }
@@ -2821,13 +2841,13 @@ pub(crate) async fn proxy_allowed_request(
                 .await
                 {
                     tracing::debug!(
-                        "websocket redaction tunnel ended for {request_id_for_upgrade} ({full_url_for_upgrade}): {err}"
+                        "websocket redaction tunnel ended for {request_id_for_upgrade} ({log_url_for_upgrade}): {err}"
                     );
                 }
             } else {
                 if let Err(err) = copy_bidirectional(&mut downstream, &mut upstream).await {
                     tracing::debug!(
-                        "upgraded tunnel ended with I/O error for {request_id_for_upgrade} ({full_url_for_upgrade}): {err}"
+                        "upgraded tunnel ended with I/O error for {request_id_for_upgrade} ({log_url_for_upgrade}): {err}"
                     );
                 }
             }
@@ -2863,7 +2883,7 @@ async fn send_upstream_request(
             tracing::debug!(
                 target: "acl_proxy::transport",
                 request_id = %request_id,
-                url = %full_url,
+                url = %redact_url_for_sink(full_url),
                 stage = "egress",
                 egress_transport = "direct",
                 outbound_http_version = %outbound_http_version,
@@ -2892,7 +2912,7 @@ async fn send_request_via_egress_target(
     tracing::debug!(
         target: "acl_proxy::transport",
         request_id = %request_id,
-        url = %full_url,
+        url = %redact_url_for_sink(full_url),
         stage = "egress_attempt",
         egress_transport = "chain",
         egress_host = %target.host,
@@ -2915,7 +2935,7 @@ async fn send_request_via_egress_target(
     tracing::debug!(
         target: "acl_proxy::transport",
         request_id = %request_id,
-        url = %full_url,
+        url = %redact_url_for_sink(full_url),
         stage = "egress",
         egress_transport = "chain",
         chain_protocol,
@@ -2928,11 +2948,12 @@ async fn send_request_via_egress_target(
     );
 
     let request_id = request_id.to_string();
-    let full_url = full_url.to_string();
+    let log_url = redact_url_for_sink(full_url);
     tokio::spawn(async move {
         if let Err(err) = connection.await {
             tracing::debug!(
-                "egress forwarding connection ended for {request_id} ({full_url}): {err}"
+                url = %log_url,
+                "egress forwarding connection ended for {request_id} ({log_url}): {err}"
             );
         }
     });
@@ -2953,6 +2974,10 @@ pub(crate) fn headers_to_capture_map(headers: &HttpHeaderMap) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in headers.iter() {
         let key = name.as_str().to_ascii_lowercase();
+        if is_sensitive_header_name(&key) {
+            out.insert(key, serde_json::Value::String(REDACTED.to_string()));
+            continue;
+        }
         if let Ok(val_str) = value.to_str() {
             use serde_json::Value;
             match out.get_mut(&key) {
@@ -2980,6 +3005,98 @@ fn snapshot_header_presence(headers: &HttpHeaderMap) -> HashSet<HeaderName> {
         set.insert(name.clone());
     }
     set
+}
+
+fn copy_end_to_end_headers(
+    source: &HttpHeaderMap,
+    destination: &mut HttpHeaderMap,
+    skip_host: bool,
+) {
+    let connection_tokens = connection_header_tokens(source);
+    for (name, value) in source.iter() {
+        if skip_host && name == HOST {
+            continue;
+        }
+        if should_strip_hop_by_hop_header(name, &connection_tokens) {
+            continue;
+        }
+        destination.append(name.clone(), value.clone());
+    }
+}
+
+fn strip_hop_by_hop_headers(headers: &mut HttpHeaderMap) {
+    let connection_tokens = connection_header_tokens(headers);
+    let names_to_remove: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| should_strip_hop_by_hop_header(name, &connection_tokens))
+        .cloned()
+        .collect();
+    for name in names_to_remove {
+        headers.remove(name);
+    }
+}
+
+fn strip_hop_by_hop_headers_preserving_upgrade(headers: &mut HttpHeaderMap) {
+    let upgrade = headers.get(http::header::UPGRADE).cloned();
+    strip_hop_by_hop_headers(headers);
+    if let Some(upgrade) = upgrade {
+        headers.insert(http::header::UPGRADE, upgrade);
+        headers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("upgrade"),
+        );
+    }
+}
+
+fn copy_required_upgrade_headers(source: &HttpHeaderMap, destination: &mut HttpHeaderMap) {
+    if let Some(upgrade) = source.get(http::header::UPGRADE) {
+        destination.insert(http::header::UPGRADE, upgrade.clone());
+        destination.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("upgrade"),
+        );
+    }
+}
+
+fn connection_header_tokens(headers: &HttpHeaderMap) -> HashSet<HeaderName> {
+    let mut tokens = HashSet::new();
+    for value in headers.get_all(http::header::CONNECTION).iter() {
+        let Ok(raw) = value.to_str() else {
+            continue;
+        };
+        for token in raw.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            if let Ok(name) = HeaderName::from_bytes(token.as_bytes()) {
+                tokens.insert(name);
+            }
+        }
+    }
+    tokens
+}
+
+fn should_strip_hop_by_hop_header(
+    name: &HeaderName,
+    connection_tokens: &HashSet<HeaderName>,
+) -> bool {
+    is_standard_hop_by_hop_header(name) || connection_tokens.contains(name)
+}
+
+fn is_standard_hop_by_hop_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
 }
 
 fn collect_approval_macros_from_str(s: &str, out: &mut BTreeSet<String>) {
@@ -3113,9 +3230,8 @@ fn interpolate_header_actions(
                         Ok(parsed) => new_values.push(parsed),
                         Err(e) => {
                             tracing::debug!(
-                                "invalid header value after macro interpolation for {}: {} ({})",
+                                "invalid header value after macro interpolation for {}: {}",
                                 action.name,
-                                interpolated,
                                 e
                             );
                             return Err(format!(
@@ -3287,49 +3403,43 @@ pub(crate) fn version_to_string(version: Version) -> String {
 }
 
 pub(crate) fn generate_request_id() -> String {
-    use once_cell::sync::Lazy;
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use std::{process, time::Duration};
+    use rand::RngCore;
+    use std::fmt::Write;
 
-    static COUNTER: Lazy<AtomicU64> = Lazy::new(|| AtomicU64::new(1));
-    static PROCESS_TAG: Lazy<String> = Lazy::new(|| {
-        let pid = process::id();
-        let started = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::from_secs(0))
-            .as_nanos();
-        format!("{pid:x}_{started:x}")
-    });
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let ts = Utc::now().timestamp_millis();
-    format!("req-{}-{}-{}", PROCESS_TAG.as_str(), ts, seq)
+    let mut token = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut token);
+
+    let mut id = String::with_capacity(36);
+    id.push_str("req-");
+    for byte in token {
+        let _ = write!(&mut id, "{byte:02x}");
+    }
+    id
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_full_url, generate_request_id, is_internal_endpoint, is_upgrade_request, tee_body,
+        build_full_url, copy_end_to_end_headers, copy_required_upgrade_headers,
+        generate_request_id, headers_to_capture_map, interpolate_header_actions,
+        is_internal_endpoint, is_upgrade_request, strip_hop_by_hop_headers,
+        strip_hop_by_hop_headers_preserving_upgrade, tee_body,
     };
+    use crate::config::{HeaderActionKind, HeaderDirection, HeaderWhen};
+    use crate::policy::CompiledHeaderAction;
     use http::header::HOST;
-    use http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
+    use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
     use hyper::{Body, Request};
+    use std::collections::BTreeMap;
 
     #[test]
-    fn request_id_includes_process_tag_and_is_unique() {
+    fn request_id_is_random_capability_token() {
         let first = generate_request_id();
         let second = generate_request_id();
         assert_ne!(first, second);
-
-        let mut parts = first.splitn(4, '-');
-        assert_eq!(parts.next(), Some("req"));
-        let tag = parts.next().unwrap_or("");
-        assert!(
-            tag.contains('_'),
-            "process tag should include an underscore separator"
-        );
-        assert!(parts.next().unwrap_or("").parse::<i64>().is_ok());
-        assert!(!parts.next().unwrap_or("").is_empty());
+        assert_eq!(first.len(), 36);
+        assert!(first.starts_with("req-"));
+        assert!(first[4..].chars().all(|ch| ch.is_ascii_hexdigit()));
     }
 
     #[test]
@@ -3391,9 +3501,167 @@ mod tests {
     }
 
     #[test]
+    fn headers_to_capture_map_redacts_sensitive_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret-token"),
+        );
+        headers.insert(header::COOKIE, HeaderValue::from_static("session=secret"));
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+
+        let captured = headers_to_capture_map(&headers);
+
+        assert_eq!(
+            captured.get("authorization"),
+            Some(&serde_json::Value::String("[REDACTED]".to_string()))
+        );
+        assert_eq!(
+            captured.get("cookie"),
+            Some(&serde_json::Value::String("[REDACTED]".to_string()))
+        );
+        assert_eq!(
+            captured.get("content-type"),
+            Some(&serde_json::Value::String("text/plain".to_string()))
+        );
+    }
+
+    #[test]
+    fn macro_interpolation_error_does_not_echo_value() {
+        let action = CompiledHeaderAction {
+            direction: HeaderDirection::Request,
+            action: HeaderActionKind::Set,
+            name: HeaderName::from_static("authorization"),
+            values: vec![HeaderValue::from_static("Bearer {{token}}")],
+            when: HeaderWhen::Always,
+            search: None,
+            replace: None,
+        };
+        let mut macros = BTreeMap::new();
+        macros.insert("token".to_string(), "secret\nvalue".to_string());
+
+        let err = interpolate_header_actions(vec![action], &macros)
+            .expect_err("control character should produce invalid header");
+
+        assert!(err.contains("invalid header value after macro interpolation"));
+        assert!(!err.contains("secret"));
+        assert!(!err.contains("secret\nvalue"));
+    }
+
+    #[test]
+    fn copy_end_to_end_headers_strips_proxy_and_hop_headers() {
+        let x_remove = HeaderName::from_static("x-remove");
+        let proxy_connection = HeaderName::from_static("proxy-connection");
+        let mut source = HeaderMap::new();
+        source.insert(HOST, HeaderValue::from_static("example.com"));
+        source.insert(
+            header::CONNECTION,
+            HeaderValue::from_static("keep-alive, x-remove"),
+        );
+        source.insert(x_remove.clone(), HeaderValue::from_static("remove-me"));
+        source.insert(
+            header::PROXY_AUTHORIZATION,
+            HeaderValue::from_static("Basic secret"),
+        );
+        source.insert(proxy_connection.clone(), HeaderValue::from_static("close"));
+        source.insert(header::TE, HeaderValue::from_static("trailers"));
+        source.insert(header::TRAILER, HeaderValue::from_static("expires"));
+        source.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+        source.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+
+        let mut destination = HeaderMap::new();
+        copy_end_to_end_headers(&source, &mut destination, true);
+
+        assert!(!destination.contains_key(HOST));
+        assert!(!destination.contains_key(header::CONNECTION));
+        assert!(!destination.contains_key(&x_remove));
+        assert!(!destination.contains_key(header::PROXY_AUTHORIZATION));
+        assert!(!destination.contains_key(&proxy_connection));
+        assert!(!destination.contains_key(header::TE));
+        assert!(!destination.contains_key(header::TRAILER));
+        assert!(!destination.contains_key(header::UPGRADE));
+        assert_eq!(
+            destination.get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/plain"))
+        );
+    }
+
+    #[test]
+    fn strip_hop_by_hop_headers_removes_connection_named_headers() {
+        let x_hop = HeaderName::from_static("x-hop");
+        let proxy_connection = HeaderName::from_static("proxy-connection");
+        let mut headers = HeaderMap::new();
+        headers.insert(header::CONNECTION, HeaderValue::from_static("x-hop"));
+        headers.insert(x_hop.clone(), HeaderValue::from_static("remove-me"));
+        headers.insert(
+            header::PROXY_AUTHENTICATE,
+            HeaderValue::from_static("Basic realm=\"proxy\""),
+        );
+        headers.insert(proxy_connection.clone(), HeaderValue::from_static("close"));
+        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+
+        strip_hop_by_hop_headers(&mut headers);
+
+        assert!(!headers.contains_key(header::CONNECTION));
+        assert!(!headers.contains_key(&x_hop));
+        assert!(!headers.contains_key(header::PROXY_AUTHENTICATE));
+        assert!(!headers.contains_key(&proxy_connection));
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/plain"))
+        );
+    }
+
+    #[test]
+    fn upgrade_filtering_keeps_only_required_upgrade_headers() {
+        let x_hop = HeaderName::from_static("x-hop");
+        let mut source = HeaderMap::new();
+        source.insert(
+            header::CONNECTION,
+            HeaderValue::from_static("keep-alive, upgrade, x-hop"),
+        );
+        source.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+        source.insert(x_hop.clone(), HeaderValue::from_static("remove-me"));
+        source.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+
+        let mut copied = HeaderMap::new();
+        copy_end_to_end_headers(&source, &mut copied, false);
+        copy_required_upgrade_headers(&source, &mut copied);
+
+        assert_eq!(
+            copied.get(header::CONNECTION),
+            Some(&HeaderValue::from_static("upgrade"))
+        );
+        assert_eq!(
+            copied.get(header::UPGRADE),
+            Some(&HeaderValue::from_static("websocket"))
+        );
+        assert!(!copied.contains_key(&x_hop));
+        assert_eq!(
+            copied.get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/plain"))
+        );
+
+        strip_hop_by_hop_headers_preserving_upgrade(&mut source);
+        assert_eq!(
+            source.get(header::CONNECTION),
+            Some(&HeaderValue::from_static("upgrade"))
+        );
+        assert_eq!(
+            source.get(header::UPGRADE),
+            Some(&HeaderValue::from_static("websocket"))
+        );
+        assert!(!source.contains_key(&x_hop));
+        assert_eq!(
+            source.get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/plain"))
+        );
+    }
+
+    #[test]
     fn build_full_url_accepts_absolute_form() {
         let req = Request::builder()
-            .uri("http://example.com/path?q=1")
+            .uri("http://EXAMPLE.COM.:80/a/../path?q=1")
             .body(Body::empty())
             .expect("request");
 
@@ -3405,15 +3673,26 @@ mod tests {
     }
 
     #[test]
+    fn build_full_url_rejects_absolute_form_with_userinfo() {
+        let req = Request::builder()
+            .uri("http://user:pass@example.com/path")
+            .body(Body::empty())
+            .expect("request");
+
+        let resp = build_full_url(&req).expect_err("userinfo should fail");
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
     fn build_full_url_accepts_origin_form_with_host_header() {
         let req = Request::builder()
-            .uri("/relative/path?q=1")
-            .header(HOST, "example.com:8080")
+            .uri("/relative/../path?q=1")
+            .header(HOST, "EXAMPLE.COM.:8080")
             .body(Body::empty())
             .expect("request");
 
         let (url, target) = build_full_url(&req).expect("full url");
-        assert_eq!(url, "http://example.com:8080/relative/path?q=1");
+        assert_eq!(url, "http://example.com:8080/path?q=1");
         let target = target.expect("target");
         assert_eq!(target.address.as_deref(), Some("example.com"));
         assert_eq!(target.port, Some(8080));

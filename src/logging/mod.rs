@@ -1,7 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::fmt;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +13,11 @@ use tracing::Level;
 use tracing_subscriber::fmt::SubscriberBuilder;
 
 use crate::config::{LoggingConfig, LoggingPolicyDecisionsConfig, PolicyRuleAction};
+use crate::filesystem::{
+    create_private_dir_all, open_private_file_for_append, open_private_file_for_write,
+};
 use crate::policy::PolicyDecision;
+use crate::sensitive::redact_url_for_sink;
 
 const LOG_FILENAME: &str = "acl-proxy.log";
 const LOG_QUEUE_CAPACITY: usize = 8192;
@@ -112,7 +116,7 @@ impl LoggingSettings {
             .with_ansi(false);
 
         if let Some(directory) = &self.directory {
-            fs::create_dir_all(directory).map_err(|source| LoggingError::CreateDir {
+            create_private_dir_all(directory).map_err(|source| LoggingError::CreateDir {
                 path: directory.clone(),
                 source,
             })?;
@@ -365,10 +369,7 @@ struct RotatingFileWriter {
 
 impl RotatingFileWriter {
     fn new(base_path: PathBuf, max_bytes: u64, max_files: usize) -> io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&base_path)?;
+        let file = open_private_file_for_append(&base_path)?;
         let size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
 
         Ok(Self {
@@ -382,6 +383,8 @@ impl RotatingFileWriter {
 
     fn rotate(&mut self) -> io::Result<()> {
         self.file.flush()?;
+        let mut rotation_error = None;
+        let mut base_rotated = false;
 
         for index in (1..=self.max_files).rev() {
             let destination = self.rotated_path(index);
@@ -393,17 +396,34 @@ impl RotatingFileWriter {
 
             if source.exists() {
                 if destination.exists() {
-                    fs::remove_file(&destination)?;
+                    if let Err(err) = fs::remove_file(&destination) {
+                        rotation_error.get_or_insert(err);
+                        continue;
+                    }
                 }
-                fs::rename(source, destination)?;
+                if let Err(err) = fs::rename(source, destination) {
+                    rotation_error.get_or_insert(err);
+                } else if index == 1 {
+                    base_rotated = true;
+                }
             }
         }
 
-        self.file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.base_path)?;
-        self.size = 0;
+        if base_rotated || !self.base_path.exists() {
+            self.file = open_private_file_for_write(&self.base_path)?;
+            self.size = 0;
+        } else {
+            self.file = open_private_file_for_append(&self.base_path)?;
+            self.size = self
+                .file
+                .metadata()
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+        }
+
+        if let Some(err) = rotation_error {
+            eprintln!("log rotation completed with errors; continuing with active log file: {err}");
+        }
 
         Ok(())
     }
@@ -481,6 +501,9 @@ fn emit_policy_event(
     rule_description: Option<&str>,
     reason: Option<&str>,
 ) {
+    let safe_url = redact_url_for_sink(url);
+    let url = safe_url.as_str();
+
     match level {
         Level::TRACE => tracing::event!(
             target: "acl_proxy::policy",
@@ -572,6 +595,17 @@ mod tests {
     use std::io::Write;
     use tempfile::TempDir;
 
+    #[cfg(unix)]
+    fn mode(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::metadata(path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
     #[test]
     fn logging_settings_parses_levels() {
         let cfg = LoggingConfig {
@@ -656,5 +690,34 @@ mod tests {
         assert!(rotated.exists(), "rotated file should exist");
         let current = std::fs::read_to_string(&base_path).expect("read current");
         assert_eq!(current, "1");
+
+        #[cfg(unix)]
+        {
+            assert_eq!(mode(&base_path), 0o600);
+            assert_eq!(mode(&rotated), 0o600);
+        }
+    }
+
+    #[test]
+    fn rotating_file_writer_recovers_when_archive_path_cannot_be_replaced() {
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let base_path = temp_dir.path().join("acl-proxy.log");
+        let rotated = PathBuf::from(format!("{}.1", base_path.display()));
+        let mut writer = RotatingFileWriter::new(base_path.clone(), 3, 1).expect("writer");
+
+        writer.write_all(b"abc").expect("write initial line");
+        std::fs::create_dir(&rotated).expect("create blocking rotated path");
+
+        writer.write_all(b"d").expect("write through failed rotate");
+        let current = std::fs::read_to_string(&base_path).expect("read current");
+        assert_eq!(current, "abcd");
+
+        writer.write_all(b"ef").expect("fill current log");
+        writer
+            .write_all(b"g")
+            .expect("write through repeated failed rotate");
+        let current = std::fs::read_to_string(&base_path).expect("read current after retry");
+        assert_eq!(current, "abcdefg");
+        assert!(rotated.is_dir(), "blocking rotated path should remain");
     }
 }

@@ -1,14 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
-use http::header::{HeaderName, HeaderValue};
-use http::HeaderMap;
-use ipnet::IpNet;
-use regex::{Regex, RegexBuilder};
-use serde::Serialize;
-use thiserror::Error;
-use url::Url;
-
 use crate::config::{
     EgressRequestHeaderActionConfig, ExternalAuthProfileConfigMap, HeaderActionConfig,
     HeaderActionKind, HeaderDirection, HeaderMatchValueConfig, HeaderWhen, MacroMap,
@@ -16,6 +8,15 @@ use crate::config::{
     PolicyRuleConfig, PolicyRuleDirectConfig, PolicyRuleIncludeConfig, PolicyRuleTemplateConfig,
     RulesetMap, UrlEncVariants,
 };
+use crate::url_canonical::canonicalize_http_url;
+use http::header::{HeaderName, HeaderValue};
+use http::HeaderMap;
+use ipnet::IpNet;
+use regex::{Regex, RegexBuilder};
+use serde::Serialize;
+use thiserror::Error;
+
+const REDACTED_ENV_VALUE: &str = "[REDACTED]";
 
 #[derive(Debug, Error)]
 pub enum PolicyError {
@@ -359,11 +360,12 @@ impl EffectivePolicy {
                     .header_actions
                     .iter()
                     .map(|cfg| {
-                        let values = cfg
-                            .values
-                            .clone()
-                            .or_else(|| cfg.value.as_ref().map(|v| vec![v.clone()]))
-                            .unwrap_or_default();
+                        let values = effective_header_action_values(
+                            cfg.value.as_deref(),
+                            cfg.values.as_deref(),
+                            cfg.value_from_env,
+                            &cfg.values_from_env,
+                        );
 
                         EffectiveHeaderAction {
                             direction: cfg.direction.clone(),
@@ -411,6 +413,37 @@ impl EffectivePolicy {
             rules,
         })
     }
+}
+
+fn effective_header_action_values(
+    value: Option<&str>,
+    values: Option<&[String]>,
+    value_from_env: bool,
+    values_from_env: &[bool],
+) -> Vec<String> {
+    if let Some(values) = values {
+        return values
+            .iter()
+            .enumerate()
+            .map(|(idx, value)| {
+                if values_from_env.get(idx).copied().unwrap_or(false) {
+                    REDACTED_ENV_VALUE.to_string()
+                } else {
+                    value.clone()
+                }
+            })
+            .collect();
+    }
+
+    if let Some(value) = value {
+        return vec![if value_from_env {
+            REDACTED_ENV_VALUE.to_string()
+        } else {
+            value.to_string()
+        }];
+    }
+
+    Vec::new()
 }
 
 fn expand_policy(cfg: &PolicyConfig) -> Result<ExpandedPolicy, PolicyError> {
@@ -1015,10 +1048,7 @@ where
 
                 for v in source_values {
                     let hv = HeaderValue::from_str(&v).map_err(|e| {
-                        make_error(format!(
-                            "invalid header value for '{}': {} ({e})",
-                            input.name, v
-                        ))
+                        make_error(format!("invalid header value for '{}': {e}", input.name))
                     })?;
                     values.push(hv);
                 }
@@ -1393,16 +1423,17 @@ pub fn pattern_to_regex(pattern: &str) -> String {
     }
 
     let lower = raw.to_ascii_lowercase();
-    let rest = if lower.starts_with("http://") {
-        &raw[7..]
+    let (scheme, rest) = if lower.starts_with("http://") {
+        (Some("http"), &raw[7..])
     } else if lower.starts_with("https://") {
-        &raw[8..]
+        (Some("https"), &raw[8..])
     } else {
         let trimmed = raw.trim_start_matches('/');
-        trimmed
+        (None, trimmed)
     };
 
     let mut rest = rest.to_string();
+    strip_default_port_from_pattern_authority(&mut rest, scheme);
 
     let slash_idx = rest.find('/');
     let path_part = slash_idx
@@ -1427,40 +1458,27 @@ pub fn pattern_to_regex(pattern: &str) -> String {
     format!("^{}{}$", scheme_regex, s)
 }
 
+fn strip_default_port_from_pattern_authority(rest: &mut String, scheme: Option<&str>) {
+    let default_port = match scheme {
+        Some("http") => ":80",
+        Some("https") => ":443",
+        _ => return,
+    };
+
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    if rest[..authority_end]
+        .to_ascii_lowercase()
+        .ends_with(default_port)
+    {
+        let port_start = authority_end - default_port.len();
+        rest.replace_range(port_start..authority_end, "");
+    }
+}
+
 fn normalize_url(raw: &str) -> Result<String, PolicyError> {
-    let url = Url::parse(raw).map_err(|e| PolicyError::UrlParse(e.to_string()))?;
-
-    let scheme = url.scheme();
-    let protocol = format!("{scheme}:");
-
-    let host = match url.host_str() {
-        Some(h) => {
-            if let Some(port) = url.port() {
-                format!("{h}:{port}")
-            } else {
-                h.to_string()
-            }
-        }
-        None => return Err(PolicyError::UrlParse("URL is missing host".to_string())),
-    };
-
-    let path = if url.path().is_empty() {
-        "/"
-    } else {
-        url.path()
-    };
-
-    let search = match url.query() {
-        Some(q) => {
-            let mut s = String::with_capacity(q.len() + 1);
-            s.push('?');
-            s.push_str(q);
-            s
-        }
-        None => String::new(),
-    };
-
-    Ok(format!("{protocol}//{host}{path}{search}"))
+    canonicalize_http_url(raw)
+        .map(|canonical| canonical.url)
+        .map_err(|e| PolicyError::UrlParse(e.to_string()))
 }
 
 pub fn normalize_client_ip(raw: Option<&str>) -> Option<String> {
@@ -1545,6 +1563,8 @@ mod tests {
             when: HeaderWhen::Always,
             value: Some("edge-a".to_string()),
             values: None,
+            value_from_env: false,
+            values_from_env: Vec::new(),
             search: None,
             replace: None,
         }];
@@ -1564,6 +1584,8 @@ mod tests {
             when: HeaderWhen::Always,
             value: None,
             values: None,
+            value_from_env: false,
+            values_from_env: Vec::new(),
             search: None,
             replace: None,
         }];
@@ -1591,6 +1613,17 @@ mod tests {
     }
 
     #[test]
+    fn pattern_to_regex_strips_scheme_default_ports() {
+        let https_re = Regex::new(&pattern_to_regex("https://example.com:443/secret/**")).unwrap();
+        assert!(https_re.is_match("https://example.com/secret/path"));
+        assert!(!https_re.is_match("https://example.com:443/secret/path"));
+
+        let http_re = Regex::new(&pattern_to_regex("http://example.com:80")).unwrap();
+        assert!(http_re.is_match("http://example.com/"));
+        assert!(!http_re.is_match("http://example.com:80/"));
+    }
+
+    #[test]
     fn pattern_to_regex_wildcards() {
         let re =
             Regex::new(&pattern_to_regex("https://example.com/api/**")).expect("compile regex");
@@ -1601,6 +1634,49 @@ mod tests {
             .expect("compile regex");
         assert!(re2.is_match("https://example.com/api/v1/resource"));
         assert!(!re2.is_match("https://example.com/api/v1/v2/resource"));
+    }
+
+    #[test]
+    fn policy_uses_canonical_http_url_for_matching() {
+        let toml = r#"
+default = "allow"
+
+[[rules]]
+action = "deny"
+pattern = "https://example.com/admin/**"
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        assert!(!engine.is_allowed(
+            "https://EXAMPLE.COM.:443/a/../admin/panel",
+            None,
+            Some("GET")
+        ));
+        assert!(!engine.is_allowed("https://example.com/%61dmin/panel", None, Some("GET")));
+        assert!(!engine.is_allowed(
+            "https://user:pass@example.com/admin/panel",
+            None,
+            Some("GET")
+        ));
+        assert!(!engine.is_allowed("ftp://example.com/admin/panel", None, Some("GET")));
+    }
+
+    #[test]
+    fn policy_default_port_patterns_match_canonical_urls() {
+        let toml = r#"
+default = "allow"
+
+[[rules]]
+action = "deny"
+pattern = "https://example.com:443/secret/**"
+        "#;
+
+        let cfg: PolicyConfig = toml::from_str(toml).expect("parse policy config");
+        let engine = PolicyEngine::from_config(&cfg).expect("build policy engine");
+
+        assert!(!engine.is_allowed("https://example.com/secret/panel", None, Some("GET")));
     }
 
     #[test]

@@ -52,6 +52,17 @@ fn run(path: &Path) -> Result<(), String> {
         }
     })?;
 
+    if let Some(content_encoding) = record
+        .body
+        .as_ref()
+        .and_then(|body| body.content_encoding.as_deref())
+        .filter(|encoding| !encoding.eq_ignore_ascii_case("identity"))
+    {
+        eprintln!(
+            "warning: capture body has Content-Encoding \"{content_encoding}\"; output remains content-encoded after base64 decoding"
+        );
+    }
+
     use std::io::{self, Write};
     let mut stdout = io::stdout();
     stdout

@@ -2,6 +2,7 @@
 
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use acl_proxy::app::AppState;
@@ -28,12 +29,16 @@ use rustls::{
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 // Use a body slightly larger than DEFAULT_MAX_BODY_BYTES to exercise
 // truncation logic without introducing excessively large in-memory
 // payloads that could slow down tests.
 const LARGE_BODY_BYTES: usize = DEFAULT_MAX_BODY_BYTES + 1024;
+
+static TRANSPARENT_H2_TEST_LOCK: once_cell::sync::Lazy<AsyncMutex<()>> =
+    once_cell::sync::Lazy::new(|| AsyncMutex::new(()));
 
 #[derive(Clone, Debug)]
 struct SeenForwardedRequest {
@@ -51,6 +56,68 @@ struct SeenBodyRequest {
 struct TestWebSocketFrame {
     opcode: u8,
     payload: Vec<u8>,
+}
+
+async fn transparent_h2_test_guard() -> AsyncMutexGuard<'static, ()> {
+    TRANSPARENT_H2_TEST_LOCK.lock().await
+}
+
+async fn wait_for_single_allow_capture_version_pair(
+    capture_dir: &Path,
+    context: &str,
+) -> (Option<String>, Option<String>) {
+    use std::collections::HashMap;
+    use tokio::time::{sleep, Duration};
+
+    let mut last_by_id: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+
+    for _ in 0..20 {
+        let mut by_id: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+
+        if capture_dir.is_dir() {
+            let entries = std::fs::read_dir(capture_dir).expect("read capture dir");
+            for entry in entries {
+                let entry = entry.expect("dir entry");
+                if !entry.file_type().expect("file type").is_file() {
+                    continue;
+                }
+
+                let mut contents = String::new();
+                if std::fs::File::open(entry.path())
+                    .and_then(|mut file| file.read_to_string(&mut contents))
+                    .is_err()
+                {
+                    continue;
+                }
+
+                let Ok(record) = serde_json::from_str::<CaptureRecord>(&contents) else {
+                    continue;
+                };
+                assert_eq!(record.mode, CaptureMode::HttpsTransparent);
+                assert_eq!(record.decision, CaptureDecision::Allow);
+
+                let entry = by_id
+                    .entry(record.request_id.clone())
+                    .or_insert((None, None));
+                match record.kind {
+                    CaptureKind::Request => entry.0 = record.http_version.clone(),
+                    CaptureKind::Response => entry.1 = record.http_version.clone(),
+                }
+            }
+        }
+
+        if by_id.len() == 1 {
+            let pair = by_id.values().next().expect("single entry");
+            if pair.0.is_some() && pair.1.is_some() {
+                return pair.clone();
+            }
+        }
+
+        last_by_id = by_id;
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    panic!("expected one complete request/response capture pair for {context}; last seen {last_by_id:?}");
 }
 
 async fn start_upstream_https_echo_server() -> SocketAddr {
@@ -553,6 +620,41 @@ async fn start_proxy_with_config(
 
     let ca_cert_path = certs_dir.join("ca-cert.pem");
     (addr, temp_dir, ca_cert_path)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transparent_https_listener_times_out_idle_tls_handshake() {
+    let mut config = minimal_https_transparent_config();
+    config.proxy.https_handshake_timeout_ms = 50;
+    config.proxy.https_request_header_timeout_ms = 500;
+    config.proxy.https_max_connections = 16;
+
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir, _ca_cert_path) = start_proxy_with_config(config, listener).await;
+
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect to proxy");
+    let mut buf = [0u8; 1];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf))
+        .await
+        .expect("idle TLS connection should close after handshake timeout");
+
+    match read {
+        Ok(0) => {}
+        Ok(n) => panic!("expected closed TLS connection, read {n} bytes"),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::BrokenPipe
+            ) => {}
+        Err(err) => panic!("unexpected read error after TLS handshake timeout: {err}"),
+    }
 }
 
 async fn send_https_request_via_transparent(
@@ -1255,6 +1357,8 @@ async fn global_egress_request_actions_apply_to_https_transparent_requests() {
             when: acl_proxy::config::HeaderWhen::Always,
             value: Some("transparent".to_string()),
             values: None,
+            value_from_env: false,
+            values_from_env: Vec::new(),
             search: None,
             replace: None,
         }];
@@ -1597,6 +1701,7 @@ async fn allow_upgrades_false_blocks_transparent_https_upgrade() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn allowed_https_transparent_h2_is_proxied_and_captured() {
+    let _h2_guard = transparent_h2_test_guard().await;
     let upstream_addr = start_upstream_https_echo_server().await;
 
     let mut config = minimal_https_transparent_config();
@@ -1831,6 +1936,7 @@ async fn upstream_failure_https_transparent_is_captured() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_h2_streams_share_connection_and_are_captured() {
+    let _h2_guard = transparent_h2_test_guard().await;
     let upstream_addr = start_upstream_https_echo_server().await;
 
     let mut config = minimal_https_transparent_config();
@@ -2033,6 +2139,7 @@ async fn concurrent_h2_streams_share_connection_and_are_captured() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_h2_streams_mixed_allow_and_deny() {
+    let _h2_guard = transparent_h2_test_guard().await;
     let upstream_addr = start_upstream_https_echo_server().await;
 
     let mut config = minimal_https_transparent_config();
@@ -2250,6 +2357,7 @@ async fn concurrent_h2_streams_mixed_allow_and_deny() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn large_h2_request_body_is_truncated_in_capture() {
+    let _h2_guard = transparent_h2_test_guard().await;
     let upstream_addr = start_upstream_https_echo_server().await;
 
     let mut config = minimal_https_transparent_config();
@@ -2379,6 +2487,7 @@ async fn large_h2_request_body_is_truncated_in_capture() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn large_h2_response_body_is_truncated_in_capture() {
+    let _h2_guard = transparent_h2_test_guard().await;
     eprintln!("large_h2_response: starting upstream server");
     let upstream_addr = start_upstream_https_large_response_server().await;
 
@@ -2509,6 +2618,7 @@ async fn large_h2_response_body_is_truncated_in_capture() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn h2_client_to_http1_only_upstream_preserves_versions_in_capture() {
+    let _h2_guard = transparent_h2_test_guard().await;
     let upstream_addr = start_upstream_https_http1_only_echo_server().await;
 
     let mut config = minimal_https_transparent_config();
@@ -2562,64 +2672,9 @@ async fn h2_client_to_http1_only_upstream_preserves_versions_in_capture() {
     assert_eq!(status, StatusCode::OK.as_u16());
     assert_eq!(body, "ok");
 
-    use tokio::time::{sleep, Duration};
-
     let capture_dir = temp_dir.path().join("captures");
-    for _ in 0..10 {
-        if capture_dir.is_dir() {
-            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
-                .expect("read capture dir")
-                .collect();
-            if !entries.is_empty() {
-                break;
-            }
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-
-    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
-    let mut files = Vec::new();
-    while let Some(entry) = entries.next() {
-        let entry = entry.expect("dir entry");
-        if entry.file_type().expect("file type").is_file() {
-            files.push(entry.path());
-        }
-    }
-    assert!(
-        !files.is_empty(),
-        "expected capture files for downgrade scenario"
-    );
-
-    use std::collections::HashMap;
-
-    let mut by_id: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
-
-    for path in files {
-        let mut contents = String::new();
-        std::fs::File::open(&path)
-            .expect("open capture")
-            .read_to_string(&mut contents)
-            .expect("read capture");
-        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
-        assert_eq!(record.mode, CaptureMode::HttpsTransparent);
-        assert_eq!(record.decision, CaptureDecision::Allow);
-
-        let entry = by_id
-            .entry(record.request_id.clone())
-            .or_insert((None, None));
-        match record.kind {
-            CaptureKind::Request => entry.0 = record.http_version.clone(),
-            CaptureKind::Response => entry.1 = record.http_version.clone(),
-        }
-    }
-
-    assert_eq!(
-        by_id.len(),
-        1,
-        "expected a single logical requestId for downgrade test"
-    );
-
-    let (req_version, resp_version) = by_id.into_iter().next().unwrap().1;
+    let (req_version, resp_version) =
+        wait_for_single_allow_capture_version_pair(&capture_dir, "downgrade test").await;
     assert_eq!(
         req_version.as_deref(),
         Some("2"),
@@ -2634,6 +2689,7 @@ async fn h2_client_to_http1_only_upstream_preserves_versions_in_capture() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn h2_client_to_h2_capable_upstream_preserves_h2_in_capture() {
+    let _h2_guard = transparent_h2_test_guard().await;
     let upstream_addr = start_upstream_https_echo_server().await;
 
     let mut config = minimal_https_transparent_config();
@@ -2687,64 +2743,10 @@ async fn h2_client_to_h2_capable_upstream_preserves_h2_in_capture() {
     assert_eq!(status, StatusCode::OK.as_u16());
     assert_eq!(body, "ok");
 
-    use tokio::time::{sleep, Duration};
-
     let capture_dir = temp_dir.path().join("captures");
-    for _ in 0..10 {
-        if capture_dir.is_dir() {
-            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
-                .expect("read capture dir")
-                .collect();
-            if !entries.is_empty() {
-                break;
-            }
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-
-    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
-    let mut files = Vec::new();
-    while let Some(entry) = entries.next() {
-        let entry = entry.expect("dir entry");
-        if entry.file_type().expect("file type").is_file() {
-            files.push(entry.path());
-        }
-    }
-    assert!(
-        !files.is_empty(),
-        "expected capture files for HTTP/2-capable upstream scenario"
-    );
-
-    use std::collections::HashMap;
-
-    let mut by_id: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
-
-    for path in files {
-        let mut contents = String::new();
-        std::fs::File::open(&path)
-            .expect("open capture")
-            .read_to_string(&mut contents)
-            .expect("read capture");
-        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
-        assert_eq!(record.mode, CaptureMode::HttpsTransparent);
-        assert_eq!(record.decision, CaptureDecision::Allow);
-
-        let entry = by_id
-            .entry(record.request_id.clone())
-            .or_insert((None, None));
-        match record.kind {
-            CaptureKind::Request => entry.0 = record.http_version.clone(),
-            CaptureKind::Response => entry.1 = record.http_version.clone(),
-        }
-    }
-
-    assert_eq!(
-        by_id.len(),
-        1,
-        "expected a single logical requestId for upgrade test"
-    );
-
-    let (req_version, resp_version) = by_id.into_iter().next().unwrap().1;
+    let (req_version, resp_version) =
+        wait_for_single_allow_capture_version_pair(&capture_dir, "HTTP/2-capable upstream test")
+            .await;
     assert_eq!(
         req_version.as_deref(),
         Some("2"),
@@ -3082,6 +3084,7 @@ external_auth_profile = "body_guard"
 
 #[tokio::test(flavor = "multi_thread")]
 async fn denied_https_transparent_h2_returns_403() {
+    let _h2_guard = transparent_h2_test_guard().await;
     let upstream_addr = start_upstream_https_echo_server().await;
 
     let mut config = minimal_https_transparent_config();

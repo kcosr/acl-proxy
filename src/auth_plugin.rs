@@ -7,9 +7,10 @@ use http::header::{HeaderName, HeaderValue};
 use http::HeaderMap as HttpHeaderMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::task::JoinHandle;
 
 use crate::capture::HeaderMap;
 use crate::config::{
@@ -20,6 +21,7 @@ use crate::policy::CompiledHeaderAction;
 
 const DEFAULT_RESTART_DELAY_MS: u64 = 10_000;
 const MAX_DENY_MESSAGE_LEN: usize = 1024;
+const MAX_PLUGIN_STDOUT_LINE_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug)]
 pub struct PluginError {
@@ -348,6 +350,20 @@ struct PluginProcess {
     stdin: tokio::process::ChildStdin,
     response_rx: mpsc::Receiver<String>,
     event_rx: mpsc::Receiver<PluginEvent>,
+    stdout_task: JoinHandle<()>,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    _wait_task: JoinHandle<()>,
+    #[cfg(test)]
+    child_id: Option<u32>,
+}
+
+impl Drop for PluginProcess {
+    fn drop(&mut self) {
+        self.stdout_task.abort();
+        if let Some(shutdown_tx) = self.shutdown_tx.take() {
+            let _ = shutdown_tx.send(());
+        }
+    }
 }
 
 async fn run_plugin_worker(config: AuthPluginConfig, mut rx: mpsc::Receiver<PluginCommand>) {
@@ -362,7 +378,11 @@ async fn run_plugin_worker(config: AuthPluginConfig, mut rx: mpsc::Receiver<Plug
                 maybe_cmd = rx.recv() => {
                     let cmd = match maybe_cmd {
                         Some(cmd) => cmd,
-                        None => break,
+                        None => {
+                            let err = PluginError::new("auth plugin worker shutting down");
+                            drain_pending(&mut pending, &err);
+                            break;
+                        }
                     };
                     handle_plugin_command(&config, cmd, &mut process, &mut pending, &mut restart_at).await;
                 }
@@ -396,7 +416,11 @@ async fn run_plugin_worker(config: AuthPluginConfig, mut rx: mpsc::Receiver<Plug
         } else {
             let cmd = match rx.recv().await {
                 Some(cmd) => cmd,
-                None => break,
+                None => {
+                    let err = PluginError::new("auth plugin worker shutting down");
+                    drain_pending(&mut pending, &err);
+                    break;
+                }
             };
             handle_plugin_command(&config, cmd, &mut process, &mut pending, &mut restart_at).await;
         }
@@ -439,10 +463,8 @@ async fn handle_plugin_command(
 
             if let Some(proc_state) = process.as_mut() {
                 pending.insert(request_id.clone(), response_tx);
-                if let Err(err) = send_plugin_request(proc_state, &message).await {
-                    if let Some(sender) = pending.remove(&request_id) {
-                        let _ = sender.send(Err(err));
-                    }
+                if let Err(err) = send_plugin_request(proc_state, &message, config.timeout).await {
+                    drain_pending(pending, &err);
                     *process = None;
                     *restart_at = Some(Instant::now() + config.restart_delay);
                 }
@@ -459,23 +481,19 @@ async fn handle_plugin_command(
 async fn send_plugin_request(
     process: &mut PluginProcess,
     message: &str,
+    timeout: Duration,
 ) -> Result<(), PluginError> {
-    process
-        .stdin
-        .write_all(message.as_bytes())
+    let write = async {
+        process.stdin.write_all(message.as_bytes()).await?;
+        process.stdin.write_all(b"\n").await?;
+        process.stdin.flush().await?;
+        Ok::<(), std::io::Error>(())
+    };
+
+    tokio::time::timeout(timeout, write)
         .await
-        .map_err(|err| PluginError::new(format!("failed to write plugin request: {err}")))?;
-    process
-        .stdin
-        .write_all(b"\n")
-        .await
-        .map_err(|err| PluginError::new(format!("failed to write plugin request: {err}")))?;
-    process
-        .stdin
-        .flush()
-        .await
-        .map_err(|err| PluginError::new(format!("failed to flush plugin request: {err}")))?;
-    Ok(())
+        .map_err(|_| PluginError::new("timed out writing plugin request"))?
+        .map_err(|err| PluginError::new(format!("failed to write plugin request: {err}")))
 }
 
 fn handle_plugin_response(
@@ -754,11 +772,14 @@ async fn start_plugin_process(config: &AuthPluginConfig) -> Result<PluginProcess
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true)
         .envs(&config.env);
 
     let mut child = cmd
         .spawn()
         .map_err(|err| PluginError::new(format!("failed to spawn auth plugin: {err}")))?;
+    #[cfg(test)]
+    let child_id = child.id();
 
     let stdin = child
         .stdin
@@ -771,26 +792,126 @@ async fn start_plugin_process(config: &AuthPluginConfig) -> Result<PluginProcess
 
     let (response_tx, response_rx) = mpsc::channel(256);
     let (event_tx, event_rx) = mpsc::channel(8);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            if response_tx.send(line).await.is_err() {
-                break;
+    let handler_name = config.name.clone();
+    let stdout_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(stdout);
+        loop {
+            match read_plugin_stdout_line(&mut reader, MAX_PLUGIN_STDOUT_LINE_BYTES).await {
+                Ok(Some(PluginStdoutLine::Line(line))) => {
+                    if response_tx.send(line).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(Some(PluginStdoutLine::TooLong)) => {
+                    tracing::warn!(
+                        handler = %handler_name,
+                        max_bytes = MAX_PLUGIN_STDOUT_LINE_BYTES,
+                        "auth plugin stdout line exceeded limit"
+                    );
+                    break;
+                }
+                Ok(Some(PluginStdoutLine::InvalidUtf8)) => {
+                    tracing::warn!(
+                        handler = %handler_name,
+                        "auth plugin stdout line was not valid UTF-8"
+                    );
+                    break;
+                }
+                Ok(None) => break,
+                Err(err) => {
+                    tracing::warn!(
+                        handler = %handler_name,
+                        error = %err,
+                        "failed reading auth plugin stdout"
+                    );
+                    break;
+                }
             }
         }
     });
 
-    tokio::spawn(async move {
-        let _ = child.wait().await;
-        let _ = event_tx.send(PluginEvent::Exited).await;
+    let wait_task = tokio::spawn(async move {
+        tokio::select! {
+            _ = child.wait() => {
+                let _ = event_tx.send(PluginEvent::Exited).await;
+            }
+            _ = shutdown_rx => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+            }
+        }
     });
 
     Ok(PluginProcess {
         stdin,
         response_rx,
         event_rx,
+        stdout_task,
+        shutdown_tx: Some(shutdown_tx),
+        _wait_task: wait_task,
+        #[cfg(test)]
+        child_id,
     })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PluginStdoutLine {
+    Line(String),
+    TooLong,
+    InvalidUtf8,
+}
+
+async fn read_plugin_stdout_line<R>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> std::io::Result<Option<PluginStdoutLine>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut line = Vec::new();
+
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+
+        if let Some(newline_idx) = available.iter().position(|byte| *byte == b'\n') {
+            let take = newline_idx + 1;
+            if line.len().saturating_add(take) > max_bytes {
+                reader.consume(take);
+                return Ok(Some(PluginStdoutLine::TooLong));
+            }
+            line.extend_from_slice(&available[..take]);
+            reader.consume(take);
+            break;
+        }
+
+        let take = available.len();
+        if line.len().saturating_add(take) > max_bytes {
+            reader.consume(take);
+            return Ok(Some(PluginStdoutLine::TooLong));
+        }
+        line.extend_from_slice(available);
+        reader.consume(take);
+    }
+
+    if line.last() == Some(&b'\n') {
+        line.pop();
+    }
+    if line.last() == Some(&b'\r') {
+        line.pop();
+    }
+
+    match String::from_utf8(line) {
+        Ok(line) => Ok(Some(PluginStdoutLine::Line(line))),
+        Err(_) => Ok(Some(PluginStdoutLine::InvalidUtf8)),
+    }
 }
 
 fn collect_included_headers(headers: &HttpHeaderMap, patterns: &[String]) -> Option<HeaderMap> {
@@ -1074,5 +1195,103 @@ mod tests {
             "unexpected error: {}",
             err.message()
         );
+    }
+
+    #[tokio::test]
+    async fn plugin_stdout_reader_strips_newline() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer
+            .write_all(b"{\"id\":\"req-1\"}\r\n")
+            .await
+            .expect("write plugin line");
+        drop(writer);
+
+        let mut reader = BufReader::new(reader);
+        assert_eq!(
+            read_plugin_stdout_line(&mut reader, 64)
+                .await
+                .expect("read line"),
+            Some(PluginStdoutLine::Line(r#"{"id":"req-1"}"#.to_string()))
+        );
+        assert_eq!(
+            read_plugin_stdout_line(&mut reader, 64)
+                .await
+                .expect("read eof"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_stdout_reader_rejects_oversize_line() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer
+            .write_all(b"abcdef\n")
+            .await
+            .expect("write plugin line");
+        drop(writer);
+
+        let mut reader = BufReader::new(reader);
+        assert_eq!(
+            read_plugin_stdout_line(&mut reader, 4)
+                .await
+                .expect("read line"),
+            Some(PluginStdoutLine::TooLong)
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_stdout_reader_rejects_invalid_utf8() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer
+            .write_all(b"\xff\n")
+            .await
+            .expect("write plugin line");
+        drop(writer);
+
+        let mut reader = BufReader::new(reader);
+        assert_eq!(
+            read_plugin_stdout_line(&mut reader, 64)
+                .await
+                .expect("read line"),
+            Some(PluginStdoutLine::InvalidUtf8)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_plugin_process_terminates_child() {
+        let mut config = test_config();
+        config.command = "/bin/sleep".to_string();
+        config.args = vec!["30".to_string()];
+
+        let process = start_plugin_process(&config)
+            .await
+            .expect("start sleep plugin process");
+        let child_id = process.child_id.expect("child id");
+        assert!(
+            process_is_alive(child_id),
+            "plugin child should be alive before drop"
+        );
+
+        drop(process);
+
+        for _ in 0..50 {
+            if !process_is_alive(child_id) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        panic!("plugin child process was still alive after drop");
+    }
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
     }
 }

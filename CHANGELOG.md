@@ -2,7 +2,9 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Changed
+
+- Harden URL canonicalization, configuration validation, capture/log redaction, external auth callbacks, certificate handling, and proxy resource bounds. ([#56](https://github.com/kcosr/acl-proxy/pull/56))
 
 ## [0.1.3] - 2026-06-10
 

@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use http::header::{HeaderName, HeaderValue};
 use ipnet::IpNet;
@@ -47,6 +47,7 @@ enum ConfigEnvPlaceholder<'a> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalAuthConfig {
     /// Full callback URL external auth services should use when
     /// delivering approval decisions back to this proxy instance.
@@ -70,6 +71,7 @@ fn default_external_auth_profile_type() -> ExternalAuthProfileType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(skip)]
     pub load_warnings: Vec<String>,
@@ -110,6 +112,7 @@ fn default_schema_version() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
@@ -126,6 +129,18 @@ pub struct ProxyConfig {
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
 
+    #[serde(default = "default_https_handshake_timeout_ms")]
+    pub https_handshake_timeout_ms: u64,
+
+    #[serde(default = "default_https_request_header_timeout_ms")]
+    pub https_request_header_timeout_ms: u64,
+
+    #[serde(default = "default_https_max_connections")]
+    pub https_max_connections: usize,
+
+    #[serde(default = "default_https_http2_max_concurrent_streams")]
+    pub https_http2_max_concurrent_streams: u32,
+
     #[serde(default = "default_internal_base_path")]
     pub internal_base_path: String,
 
@@ -141,6 +156,10 @@ impl Default for ProxyConfig {
             https_bind_address: default_https_bind_address(),
             https_port: default_https_port(),
             request_timeout_ms: default_request_timeout_ms(),
+            https_handshake_timeout_ms: default_https_handshake_timeout_ms(),
+            https_request_header_timeout_ms: default_https_request_header_timeout_ms(),
+            https_max_connections: default_https_max_connections(),
+            https_http2_max_concurrent_streams: default_https_http2_max_concurrent_streams(),
             internal_base_path: default_internal_base_path(),
             egress: ProxyEgressConfig::default(),
         }
@@ -167,11 +186,28 @@ fn default_request_timeout_ms() -> u64 {
     30_000
 }
 
+fn default_https_handshake_timeout_ms() -> u64 {
+    10_000
+}
+
+fn default_https_request_header_timeout_ms() -> u64 {
+    10_000
+}
+
+fn default_https_max_connections() -> usize {
+    1024
+}
+
+fn default_https_http2_max_concurrent_streams() -> u32 {
+    128
+}
+
 fn default_internal_base_path() -> String {
     "/_acl-proxy".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProxyEgressConfig {
     #[serde(default)]
     pub default: Option<EgressTargetConfig>,
@@ -181,6 +217,7 @@ pub struct ProxyEgressConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct EgressTargetConfig {
     pub host: String,
     pub port: u16,
@@ -200,6 +237,10 @@ pub struct EgressRequestHeaderActionConfig {
     pub value: Option<String>,
     #[serde(default)]
     pub values: Option<Vec<String>>,
+    #[serde(skip)]
+    pub value_from_env: bool,
+    #[serde(skip)]
+    pub values_from_env: Vec<bool>,
 
     // For replace_substring.
     #[serde(default)]
@@ -209,6 +250,7 @@ pub struct EgressRequestHeaderActionConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingPolicyDecisionsConfig {
     #[serde(default)]
     pub log_allows: bool,
@@ -247,6 +289,7 @@ fn default_policy_deny_level() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
     #[serde(default, deserialize_with = "deserialize_optional_path")]
     pub directory: Option<PathBuf>,
@@ -312,6 +355,7 @@ where
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CaptureConfig {
     #[serde(default)]
     pub allowed_request: bool,
@@ -338,15 +382,25 @@ pub struct CaptureConfig {
     /// Set to `0` to skip body payload bytes while preserving metadata.
     #[serde(default = "default_capture_max_body_bytes")]
     pub max_body_bytes: usize,
+
+    /// Maximum regular files to keep in the capture directory.
+    #[serde(default = "default_capture_max_files")]
+    pub max_files: usize,
+
+    /// Maximum total bytes of regular files to keep in the capture directory.
+    #[serde(default = "default_capture_max_total_bytes")]
+    pub max_total_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RedactionConfig {
     #[serde(default)]
     pub profiles: std::collections::BTreeMap<String, RedactionProfileConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RedactionProfileConfig {
     #[serde(default = "default_redaction_replacement")]
     pub replacement: String,
@@ -389,6 +443,7 @@ impl Default for RedactionProfileConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RedactionRuleConfig {
     #[serde(default)]
     pub literals: Vec<String>,
@@ -439,6 +494,8 @@ impl Default for CaptureConfig {
             directory: default_capture_directory(),
             filename: default_capture_filename(),
             max_body_bytes: default_capture_max_body_bytes(),
+            max_files: default_capture_max_files(),
+            max_total_bytes: default_capture_max_total_bytes(),
         }
     }
 }
@@ -455,7 +512,16 @@ fn default_capture_max_body_bytes() -> usize {
     crate::capture::DEFAULT_MAX_BODY_BYTES
 }
 
+fn default_capture_max_files() -> usize {
+    10_000
+}
+
+fn default_capture_max_total_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoopProtectionConfig {
     #[serde(default = "default_loop_enabled")]
     pub enabled: bool,
@@ -490,6 +556,7 @@ fn default_loop_header_name() -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CertificatesConfig {
     #[serde(default = "default_certs_dir")]
     pub certs_dir: String,
@@ -506,6 +573,9 @@ pub struct CertificatesConfig {
     /// entry is evicted.
     #[serde(default = "default_max_cached_certs")]
     pub max_cached_certs: usize,
+
+    #[serde(default)]
+    pub persist_dynamic_certs: bool,
 }
 
 impl Default for CertificatesConfig {
@@ -515,6 +585,7 @@ impl Default for CertificatesConfig {
             ca_key_path: None,
             ca_cert_path: None,
             max_cached_certs: default_max_cached_certs(),
+            persist_dynamic_certs: false,
         }
     }
 }
@@ -528,6 +599,7 @@ fn default_max_cached_certs() -> usize {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     #[serde(default = "default_verify_upstream")]
     pub verify_upstream: bool,
@@ -597,6 +669,7 @@ pub enum PolicyRuleAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyRuleTemplateConfig {
     pub action: PolicyRuleAction,
 
@@ -648,6 +721,7 @@ pub struct PolicyRuleTemplateConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyRuleIncludeConfig {
     /// Name of the ruleset to include.
     pub include: String,
@@ -673,6 +747,7 @@ pub struct PolicyRuleIncludeConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyRuleDirectConfig {
     pub action: PolicyRuleAction,
 
@@ -742,6 +817,7 @@ fn default_allow_upgrades() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyConfig {
     #[serde(default)]
     pub default: PolicyDefaultAction,
@@ -786,6 +862,7 @@ pub type ExternalAuthProfileConfigMap =
     std::collections::BTreeMap<String, ExternalAuthProfileConfig>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ApprovalMacroConfig {
     #[serde(default)]
     pub label: Option<String>,
@@ -810,6 +887,7 @@ pub enum ExternalAuthWebhookFailureMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExternalAuthProfileConfig {
     #[serde(rename = "type", default = "default_external_auth_profile_type")]
     pub profile_type: ExternalAuthProfileType,
@@ -899,6 +977,10 @@ pub struct HeaderActionConfig {
     pub value: Option<String>,
     #[serde(default)]
     pub values: Option<Vec<String>>,
+    #[serde(skip)]
+    pub value_from_env: bool,
+    #[serde(skip)]
+    pub values_from_env: Vec<bool>,
 
     // For replace_substring.
     #[serde(default)]
@@ -1153,6 +1235,7 @@ impl Config {
         }
 
         validate_proxy_config(&self.proxy)?;
+        validate_loop_protection_config(&self.loop_protection)?;
 
         // Validate policy semantics (macros, rulesets, includes).
         crate::policy::PolicyEngine::from_config(&self.policy)
@@ -1188,13 +1271,23 @@ fn interpolate_header_actions(
         );
 
         if let Some(value) = header_action.value.as_mut() {
-            interpolate_header_action_value(value, action_location.as_str())?;
+            header_action.value_from_env =
+                interpolate_header_action_value(value, action_location.as_str())?;
+        } else {
+            header_action.value_from_env = false;
         }
 
         if let Some(values) = header_action.values.as_mut() {
+            let mut values_from_env = Vec::with_capacity(values.len());
             for value in values.iter_mut() {
-                interpolate_header_action_value(value, action_location.as_str())?;
+                values_from_env.push(interpolate_header_action_value(
+                    value,
+                    action_location.as_str(),
+                )?);
             }
+            header_action.values_from_env = values_from_env;
+        } else {
+            header_action.values_from_env.clear();
         }
     }
 
@@ -1218,13 +1311,23 @@ fn interpolate_egress_request_header_actions(
         );
 
         if let Some(value) = header_action.value.as_mut() {
-            interpolate_header_action_value(value, action_location.as_str())?;
+            header_action.value_from_env =
+                interpolate_header_action_value(value, action_location.as_str())?;
+        } else {
+            header_action.value_from_env = false;
         }
 
         if let Some(values) = header_action.values.as_mut() {
+            let mut values_from_env = Vec::with_capacity(values.len());
             for value in values.iter_mut() {
-                interpolate_header_action_value(value, action_location.as_str())?;
+                values_from_env.push(interpolate_header_action_value(
+                    value,
+                    action_location.as_str(),
+                )?);
             }
+            header_action.values_from_env = values_from_env;
+        } else {
+            header_action.values_from_env.clear();
         }
     }
 
@@ -1234,8 +1337,8 @@ fn interpolate_egress_request_header_actions(
 fn interpolate_header_action_value(
     raw_value: &mut String,
     action_location: &str,
-) -> Result<(), ConfigError> {
-    interpolate_config_env_value(raw_value, action_location, true)
+) -> Result<bool, ConfigError> {
+    interpolate_config_env_value(raw_value, action_location)
 }
 
 fn interpolate_redaction_env_value(
@@ -1249,34 +1352,26 @@ fn interpolate_redaction_env_value(
         ));
     }
 
-    interpolate_config_env_value(raw_value, value_location, false)
+    interpolate_config_env_value(raw_value, value_location)?;
+    Ok(())
 }
 
 fn interpolate_config_env_value(
     raw_value: &mut String,
     value_location: &str,
-    include_invalid_value: bool,
-) -> Result<(), ConfigError> {
+) -> Result<bool, ConfigError> {
     match classify_config_env_placeholder(raw_value.as_str()) {
-        ConfigEnvPlaceholder::None => Ok(()),
-        ConfigEnvPlaceholder::Invalid => {
-            if include_invalid_value {
-                Err(ConfigError::Invalid(format!(
-                    "{value_location} uses invalid env interpolation syntax: '{raw_value}'"
-                )))
-            } else {
-                Err(ConfigError::Invalid(format!(
-                    "{value_location} uses invalid env interpolation syntax"
-                )))
-            }
-        }
+        ConfigEnvPlaceholder::None => Ok(false),
+        ConfigEnvPlaceholder::Invalid => Err(ConfigError::Invalid(format!(
+            "{value_location} uses invalid env interpolation syntax"
+        ))),
         ConfigEnvPlaceholder::Exact { name } => {
             *raw_value = env::var(name).map_err(|_| {
                 ConfigError::Invalid(format!(
                     "{value_location} references missing env var '{name}'"
                 ))
             })?;
-            Ok(())
+            Ok(true)
         }
     }
 }
@@ -1366,6 +1461,10 @@ http_port = 8881
 https_bind_address = "0.0.0.0"
 https_port = 8889
 request_timeout_ms = 30000
+https_handshake_timeout_ms = 10000
+https_request_header_timeout_ms = 10000
+https_max_connections = 1024
+https_http2_max_concurrent_streams = 128
 internal_base_path = "/_acl-proxy"
 
 [logging]
@@ -1389,6 +1488,20 @@ fn validate_logging_config(logging: &LoggingConfig) -> Result<(), ConfigError> {
 }
 
 fn validate_proxy_config(proxy: &ProxyConfig) -> Result<(), ConfigError> {
+    let bind_ip = parse_bind_address("proxy.bind_address", &proxy.bind_address)?;
+    let https_bind_ip = parse_bind_address("proxy.https_bind_address", &proxy.https_bind_address)?;
+
+    if proxy.http_port != 0
+        && proxy.https_port != 0
+        && proxy.http_port == proxy.https_port
+        && listener_bind_addresses_overlap(bind_ip, https_bind_ip)
+    {
+        return Err(ConfigError::Invalid(format!(
+            "proxy.http_port and proxy.https_port must not both be {} when bind addresses overlap",
+            proxy.http_port
+        )));
+    }
+
     validate_internal_base_path(&proxy.internal_base_path)?;
 
     if let Some(target) = proxy.egress.default.as_ref() {
@@ -1396,6 +1509,43 @@ fn validate_proxy_config(proxy: &ProxyConfig) -> Result<(), ConfigError> {
     }
 
     validate_egress_request_header_action_list(&proxy.egress.request_header_actions)?;
+
+    Ok(())
+}
+
+fn parse_bind_address(location: &str, value: &str) -> Result<IpAddr, ConfigError> {
+    value.parse::<IpAddr>().map_err(|err| {
+        ConfigError::Invalid(format!("{location} must be a valid IP address: {err}"))
+    })
+}
+
+fn listener_bind_addresses_overlap(left: IpAddr, right: IpAddr) -> bool {
+    match (left, right) {
+        (IpAddr::V4(left), IpAddr::V4(right)) => {
+            left == right || left.is_unspecified() || right.is_unspecified()
+        }
+        (IpAddr::V6(left), IpAddr::V6(right)) => {
+            left == right || left.is_unspecified() || right.is_unspecified()
+        }
+        _ => false,
+    }
+}
+
+fn validate_loop_protection_config(
+    loop_protection: &LoopProtectionConfig,
+) -> Result<(), ConfigError> {
+    let raw = loop_protection.header_name.trim();
+    if raw.is_empty() {
+        return Err(ConfigError::Invalid(
+            "loop_protection.header_name must not be empty".to_string(),
+        ));
+    }
+
+    HeaderName::from_bytes(raw.as_bytes()).map_err(|_| {
+        ConfigError::Invalid(format!(
+            "loop_protection.header_name must be a valid HTTP header name: {raw}"
+        ))
+    })?;
 
     Ok(())
 }
@@ -1504,10 +1654,7 @@ fn validate_egress_request_header_action(
 
             for value in source_values {
                 HeaderValue::from_str(&value).map_err(|e| {
-                    ConfigError::Invalid(format!(
-                        "{location} has invalid header value '{}': {e}",
-                        value
-                    ))
+                    ConfigError::Invalid(format!("{location} has invalid header value: {e}"))
                 })?;
             }
         }
@@ -1550,7 +1697,42 @@ fn validate_capture_config(capture: &CaptureConfig) -> Result<(), ConfigError> {
         ));
     }
 
+    validate_capture_filename_template(&capture.filename)?;
+
+    if capture.max_files == 0 {
+        return Err(ConfigError::Invalid(
+            "capture.max_files must be at least 1".to_string(),
+        ));
+    }
+
+    if capture.max_total_bytes == 0 {
+        return Err(ConfigError::Invalid(
+            "capture.max_total_bytes must be at least 1".to_string(),
+        ));
+    }
+
     Ok(())
+}
+
+fn validate_capture_filename_template(filename: &str) -> Result<(), ConfigError> {
+    let template = filename.trim();
+    if template.is_empty() {
+        return Ok(());
+    }
+
+    if template.contains('/') || template.contains('\\') {
+        return Err(ConfigError::Invalid(
+            "capture.filename must be a filename template, not a path".to_string(),
+        ));
+    }
+
+    let mut components = Path::new(template).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(()),
+        _ => Err(ConfigError::Invalid(
+            "capture.filename must be a filename template, not a path".to_string(),
+        )),
+    }
 }
 
 fn validate_redaction_config(config: &RedactionConfig) -> Result<(), ConfigError> {
@@ -1705,6 +1887,17 @@ fn validate_external_auth_profiles(
     profiles: &ExternalAuthProfileConfigMap,
 ) -> Result<(), ConfigError> {
     for (name, profile) in profiles {
+        if profile.timeout_ms == 0 {
+            return Err(ConfigError::Invalid(format!(
+                "external_auth_profiles.{name}.timeout_ms must be at least 1"
+            )));
+        }
+        if matches!(profile.webhook_timeout_ms, Some(0)) {
+            return Err(ConfigError::Invalid(format!(
+                "external_auth_profiles.{name}.webhook_timeout_ms must be at least 1 when set"
+            )));
+        }
+
         match profile.profile_type {
             ExternalAuthProfileType::Http => {
                 if profile.include_request_body {
@@ -1889,6 +2082,74 @@ default = "deny"
         assert_eq!(config.proxy.http_port, 8080);
         assert_eq!(config.logging.level, "debug");
         assert!(matches!(config.policy.default, PolicyDefaultAction::Deny));
+    }
+
+    #[test]
+    fn unknown_section_fields_are_rejected() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_ports = 8080
+
+[policy]
+default = "deny"
+        "#;
+
+        let err = toml::from_str::<Config>(toml).expect_err("unknown field should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown field") && msg.contains("http_ports"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn policy_rule_typo_fields_are_rejected() {
+        let toml = r#"
+schema_version = "1"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+method = "GET"
+        "#;
+
+        let err = toml::from_str::<Config>(toml).expect_err("unknown rule field should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown field") || msg.contains("data did not match any variant"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn ruleset_template_typo_fields_are_rejected() {
+        let toml = r#"
+schema_version = "1"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+include = "restricted"
+
+[[policy.rulesets.restricted]]
+action = "allow"
+pattern = "https://example.com/**"
+subnet = "10.0.0.0/8"
+        "#;
+
+        let err = toml::from_str::<Config>(toml).expect_err("unknown template field should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown field") && msg.contains("subnet"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
@@ -2349,6 +2610,143 @@ default = "deny"
     fn proxy_egress_default_is_optional() {
         let config = Config::default();
         assert!(config.proxy.egress.default.is_none());
+    }
+
+    #[test]
+    fn proxy_transparent_https_slow_client_limits_default_and_parse() {
+        let default = ProxyConfig::default();
+        assert_eq!(default.https_handshake_timeout_ms, 10_000);
+        assert_eq!(default.https_request_header_timeout_ms, 10_000);
+        assert_eq!(default.https_max_connections, 1024);
+        assert_eq!(default.https_http2_max_concurrent_streams, 128);
+
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+https_handshake_timeout_ms = 250
+https_request_header_timeout_ms = 500
+https_max_connections = 8
+https_http2_max_concurrent_streams = 16
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        assert_eq!(config.proxy.https_handshake_timeout_ms, 250);
+        assert_eq!(config.proxy.https_request_header_timeout_ms, 500);
+        assert_eq!(config.proxy.https_max_connections, 8);
+        assert_eq!(config.proxy.https_http2_max_concurrent_streams, 16);
+        config.validate_basic().expect("config should validate");
+    }
+
+    #[test]
+    fn proxy_listener_bind_addresses_must_parse() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "localhost"
+http_port = 8080
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("proxy.bind_address must be a valid IP address"),
+            "unexpected error: {msg}"
+        );
+
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+https_bind_address = "not-an-ip"
+https_port = 8443
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("proxy.https_bind_address must be a valid IP address"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn proxy_listener_ports_must_not_collide_on_overlapping_binds() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "0.0.0.0"
+http_port = 8443
+https_bind_address = "127.0.0.1"
+https_port = 8443
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("proxy.http_port and proxy.https_port must not both be 8443"),
+            "unexpected error: {msg}"
+        );
+
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8443
+https_bind_address = "127.0.0.2"
+https_port = 8443
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        config
+            .validate_basic()
+            .expect("distinct listener bind addresses may share a port");
+    }
+
+    #[test]
+    fn loop_protection_header_name_is_validated() {
+        let toml = r#"
+schema_version = "1"
+
+[loop_protection]
+header_name = "invalid header"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("loop_protection.header_name must be a valid HTTP header name"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
@@ -2833,6 +3231,33 @@ max_cached_certs = 0
     }
 
     #[test]
+    fn certificate_dynamic_persistence_defaults_false_and_parses() {
+        assert!(!CertificatesConfig::default().persist_dynamic_certs);
+
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[certificates]
+persist_dynamic_certs = true
+"#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        assert!(config.certificates.persist_dynamic_certs);
+        config.validate_basic().expect("config should validate");
+    }
+
+    #[test]
     fn direct_rule_without_match_criteria_fails() {
         let toml = r#"
 schema_version = "1"
@@ -3292,7 +3717,7 @@ default = "deny"
     }
 
     #[test]
-    fn empty_capture_filename_fails_validation() {
+    fn empty_capture_filename_uses_default_template() {
         let toml = r#"
 schema_version = "1"
 
@@ -3319,6 +3744,49 @@ level = "info"
     }
 
     #[test]
+    fn capture_filename_template_must_be_filename_only() {
+        for filename in [
+            "../outside-{suffix}.json",
+            "/tmp/{requestId}.json",
+            "nested/{requestId}.json",
+            r"nested\{requestId}.json",
+            "..",
+            ".",
+        ] {
+            let toml = format!(
+                r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[capture]
+directory = "logs-capture"
+filename = {filename:?}
+
+[policy]
+default = "deny"
+"#
+            );
+
+            let config: Config = toml::from_str(&toml).expect("parse config");
+            let err = config
+                .validate_basic()
+                .expect_err("filename path should be rejected");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("capture.filename must be a filename template, not a path"),
+                "unexpected error for {filename:?}: {msg}"
+            );
+        }
+    }
+
+    #[test]
     fn capture_max_body_bytes_defaults_to_1mib() {
         let toml = r#"
 schema_version = "1"
@@ -3337,6 +3805,8 @@ default = "deny"
 
         let config: Config = toml::from_str(toml).expect("parse config");
         assert_eq!(config.capture.max_body_bytes, 1024 * 1024);
+        assert_eq!(config.capture.max_files, 10_000);
+        assert_eq!(config.capture.max_total_bytes, 1024 * 1024 * 1024);
         assert!(config.validate_basic().is_ok());
     }
 
@@ -3364,6 +3834,42 @@ default = "deny"
         let config: Config = toml::from_str(toml).expect("parse config");
         assert_eq!(config.capture.max_body_bytes, 0);
         assert!(config.validate_basic().is_ok());
+    }
+
+    #[test]
+    fn capture_retention_limits_must_be_nonzero() {
+        for field in ["max_files", "max_total_bytes"] {
+            let toml = format!(
+                r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[capture]
+directory = "logs-capture"
+{field} = 0
+
+[policy]
+default = "deny"
+"#
+            );
+
+            let config: Config = toml::from_str(&toml).expect("parse config");
+            let err = config
+                .validate_basic()
+                .expect_err("zero retention limit should be rejected");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains(&format!("capture.{field} must be at least 1")),
+                "unexpected error for {field}: {msg}"
+            );
+        }
     }
 
     #[test]
@@ -3627,6 +4133,48 @@ external_auth_profile = "body_guard"
         let msg = format!("{err}");
         assert!(
             msg.contains("include_request_body is only supported for type=plugin"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn external_auth_profiles_reject_zero_timeouts() {
+        let toml = r#"
+schema_version = "1"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles.example]
+webhook_url = "https://auth.example/start"
+timeout_ms = 0
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("external_auth_profiles.example.timeout_ms must be at least 1"),
+            "unexpected error: {msg}"
+        );
+
+        let toml = r#"
+schema_version = "1"
+
+[policy]
+default = "deny"
+
+[policy.external_auth_profiles.example]
+webhook_url = "https://auth.example/start"
+timeout_ms = 1000
+webhook_timeout_ms = 0
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("external_auth_profiles.example.webhook_timeout_ms must be at least 1"),
             "unexpected error: {msg}"
         );
     }
@@ -3914,8 +4462,8 @@ value = "Bearer ${TOKEN}"
             "unexpected error message: {msg}"
         );
         assert!(
-            msg.contains("Bearer ${TOKEN}"),
-            "unexpected error message: {msg}"
+            !msg.contains("Bearer ${TOKEN}"),
+            "error message should not echo configured header value: {msg}"
         );
     }
 
@@ -3960,8 +4508,8 @@ include = "api_headers"
             "unexpected error message: {msg}"
         );
         assert!(
-            msg.contains("${DEPLOYMENT}/prod"),
-            "unexpected error message: {msg}"
+            !msg.contains("${DEPLOYMENT}/prod"),
+            "error message should not echo configured header value: {msg}"
         );
     }
 
@@ -4506,5 +5054,108 @@ value = "${{ACL_PROXY_TEST_LOAD_TOKEN}}"
             Some("load-token"),
             "expected resolved value after load_from_sources"
         );
+    }
+
+    #[test]
+    fn policy_dump_masks_env_sourced_header_action_values() {
+        let env_guard =
+            ConfigEnvTestGuard::new(&["ACL_PROXY_TEST_DUMP_TOKEN", "ACL_PROXY_TEST_DUMP_REGION"]);
+        env_guard.set("ACL_PROXY_TEST_DUMP_TOKEN", "secret-token");
+        env_guard.set("ACL_PROXY_TEST_DUMP_REGION", "us-central1");
+
+        let mut file = tempfile::NamedTempFile::new().expect("create temp config");
+        write!(
+            file,
+            r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "authorization"
+value = "${{ACL_PROXY_TEST_DUMP_TOKEN}}"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "add"
+name = "x-region"
+values = ["static", "${{ACL_PROXY_TEST_DUMP_REGION}}"]
+            "#
+        )
+        .expect("write config");
+
+        let config = Config::load_from_sources(Some(file.path()))
+            .expect("load should resolve header action placeholders");
+        let effective = crate::policy::EffectivePolicy::from_config(&config.policy)
+            .expect("build effective policy");
+
+        let actions = &effective.rules[0].header_actions;
+        assert_eq!(actions[0].values, vec!["[REDACTED]".to_string()]);
+        assert_eq!(
+            actions[1].values,
+            vec!["static".to_string(), "[REDACTED]".to_string()]
+        );
+
+        let serialized = serde_json::to_string(&effective).expect("serialize effective policy");
+        assert!(!serialized.contains("secret-token"));
+        assert!(!serialized.contains("us-central1"));
+    }
+
+    #[test]
+    fn resolved_env_header_validation_error_does_not_echo_value() {
+        let env_guard = ConfigEnvTestGuard::new(&["ACL_PROXY_TEST_BAD_HEADER_VALUE"]);
+        env_guard.set("ACL_PROXY_TEST_BAD_HEADER_VALUE", "secret\nvalue");
+
+        let mut file = tempfile::NamedTempFile::new().expect("create temp config");
+        write!(
+            file,
+            r#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/**"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "authorization"
+value = "${{ACL_PROXY_TEST_BAD_HEADER_VALUE}}"
+            "#
+        )
+        .expect("write config");
+
+        let err = Config::load_from_sources(Some(file.path()))
+            .expect_err("invalid resolved header value should fail validation");
+        let msg = format!("{err}");
+        assert!(msg.contains("invalid header value"));
+        assert!(!msg.contains("secret"));
+        assert!(!msg.contains("secret\nvalue"));
     }
 }

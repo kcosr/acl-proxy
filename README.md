@@ -211,6 +211,8 @@ sequenceDiagram
     Headers-->>Client: Forward response (+ capture/log)
 ```
 
+Forwarded requests and responses strip hop-by-hop and proxy-control headers, including headers named by `Connection`, `Proxy-Authorization`, and `Proxy-Connection`. Rule/plugin/global header actions run after request filtering, and response header actions run after response filtering.
+
 ### Transparent HTTP Interception
 
 In transparent HTTP mode, upstream target selection is based on the inbound `Host` header (`:80` when no port is present). Use restrictive policy rules for the destinations you intend to allow.
@@ -221,12 +223,14 @@ In transparent HTTP mode, upstream target selection is based on the inbound `Hos
 - Request-header predicates (`headers_absent`, `headers_match`, `headers_not_match`) apply only to decrypted inner requests, not to the outer CONNECT establishment request.
 - Loop protection runs on both the CONNECT request and the inner requests.
 - The outer CONNECT handshake remains local to the first proxy hop. If egress forwarding is enabled, only the decrypted inner HTTPS requests use the egress destination.
+- CONNECT-target certificate generation is bounded to one uncached host at a time. If another uncached CONNECT target arrives while a certificate is being minted, the proxy returns `503 Service Unavailable` before establishing the tunnel; cached hosts can proceed when their generated certificate is still in the in-memory cache.
 - Clients must trust the proxy CA (`certs/ca-cert.pem` by default).
 
 ### Transparent HTTPS
 
 - Set `https_port = 0` to disable this listener.
-- URL construction is based on the Host header or the request URI authority.
+- URL construction is based on the Host header or the request URI authority and uses the same canonicalization as policy matching.
+- TLS SNI is used only to select the inbound certificate presented to the client. It is not treated as a policy or routing authority and is not required to match the decrypted HTTP `Host` header.
 - Inbound HTTP/2 is supported via ALPN negotiation.
 - If the Host header is missing or invalid, the proxy returns `400 Bad Request`.
 
@@ -288,17 +292,23 @@ All predicates use AND semantics — a rule matches only when every predicate pa
 
 ### URL Normalization
 
-Before applying rules, the engine normalizes input URLs to:
+Before applying rules or forwarding the request upstream, acl-proxy canonicalizes input URLs to:
 
 ```
 protocol + "//" + host[:port] + path + optional "?query"
 ```
 
 - The scheme is preserved (`http:` or `https:`).
-- The host includes a port only when it was explicit in the URL. No default port is added.
+- Only `http` and `https` URLs are accepted. URLs with userinfo are rejected.
+- Hostnames are lowercased and a trailing DNS dot is removed.
+- Default ports (`:80` for HTTP, `:443` for HTTPS) are omitted in both requests and rule patterns; non-default ports are preserved.
+- Dot segments in the path are resolved before matching or forwarding.
+- Percent-encoded unreserved path characters are decoded before matching or forwarding (for example `%61` becomes `a`); reserved encodings such as `%2F` are preserved so existing URL-encoded path parameters continue to work.
 - The path defaults to `/` when empty.
 - Query strings are preserved; fragments are ignored.
 - IPv6 hostnames use standard bracket notation (e.g., `https://[::1]:8443/path`).
+
+> **Security note on encoded path separators.** acl-proxy deliberately preserves `%2F` (and other reserved encodings) rather than decoding them, so that URL-encoded path parameters keep working. The proxy matches policy on, and forwards upstream, the same byte-for-byte path — so the proxy itself is internally consistent. However, an upstream that *decodes* `%2F` and then resolves `..` segments can still interpret a path differently from the proxy. For example, with an `allow` rule for `https://host/api/v1/**`, a request to `https://host/api/v1/..%2f..%2finternal` matches the allow rule (the encoded slashes are not path separators to the proxy) but may resolve to `/internal` on a decoding upstream. If your upstreams decode `%2F`, reject or normalize encoded slashes before routing at the upstream, and avoid relying on allow-prefix rules to constrain those paths. This is the residual portion of finding XACL-2; the dot-segment half (literal `..`) is resolved by the canonicalizer.
 
 ### Pattern Syntax
 
@@ -531,7 +541,7 @@ acl-proxy policy dump --format table
 acl-proxy policy dump --format json
 ```
 
-`policy dump` defaults to table output on a TTY and JSON otherwise. It includes `headers_match` and `headers_not_match` values — treat output as sensitive when those values represent credentials.
+`policy dump` defaults to table output on a TTY and JSON otherwise. It includes `headers_match` and `headers_not_match` values — treat output as sensitive when those values represent credentials. Header action values loaded from `${NAME}` env placeholders are shown as `[REDACTED]`.
 When a rule uses `patterns`, the dump shows one effective row/object per expanded pattern with a singular `pattern` field.
 
 ## Configuration Reference
@@ -573,7 +583,7 @@ schema_version = "1"          # required; only "1" is supported
 [policy]
 ```
 
-All sections except `schema_version` and `[policy].default` are optional with sensible defaults.
+All sections except `schema_version` and `[policy].default` are optional with sensible defaults. Unknown keys in structured config sections, rules, ruleset templates, and profiles are rejected so typos such as `method` instead of `methods` do not silently weaken policy.
 
 ### `[proxy]` — Listeners and Ports
 
@@ -584,10 +594,17 @@ http_port = 8881                    # port for HTTP listener (0 = ephemeral)
 https_bind_address = "0.0.0.0"     # IP for the transparent HTTPS listener
 https_port = 8889                   # port for HTTPS listener (0 = disabled)
 request_timeout_ms = 30000          # upstream timeout; 0 = disabled
+https_handshake_timeout_ms = 10000  # transparent HTTPS TLS handshake timeout; 0 = disabled
+https_request_header_timeout_ms = 10000 # transparent HTTPS HTTP/1 header timeout and HTTP/2 keepalive interval/timeout; 0 = disabled
+https_max_connections = 1024        # active transparent HTTPS connections; 0 = unlimited
+https_http2_max_concurrent_streams = 128 # per-connection HTTP/2 stream cap; 0 = unlimited
 internal_base_path = "/_acl-proxy"  # base path for internal endpoints
 ```
 
 - `internal_base_path` must start with `/` and must not end with `/` (except root `/`). Internal endpoints are only matched for origin-form (direct) requests, not proxy-style absolute-form requests.
+- Listener bind addresses must be IP literals. If both HTTP and transparent HTTPS listeners use fixed non-zero ports, overlapping bind addresses cannot use the same port.
+- The default bind addresses listen on all interfaces. Set `bind_address` and `https_bind_address` to loopback addresses, or restrict access with firewall rules, when the proxy should be local-only.
+- The transparent HTTPS timeout and connection-cap settings apply at the listener boundary before request policy is evaluated.
 
 ### `[proxy.egress.default]` — Optional Forwarding Destination
 
@@ -613,6 +630,7 @@ console = true                      # also write to stdout
 - When `directory` is set, logs go to `{directory}/acl-proxy.log` and rotate by size.
 - Log writing is non-blocking; when the internal buffer fills, entries are dropped to avoid stalling requests.
 - Transport logs on `acl_proxy::transport` (debug level) include per-request ingress, egress-attempt, egress, and completion events.
+- URLs emitted to policy-decision and proxy debug logs have userinfo removed and query strings replaced with `REDACTED`.
 
 ### `[logging.policy_decisions]` — Policy Decision Logging
 
@@ -624,7 +642,9 @@ level_allows = "info"               # log level for allows
 level_denies = "warn"               # log level for denies
 ```
 
-Policy decision events are emitted to the `acl_proxy::policy` target with structured fields: `request_id`, `allowed`, `url`, `method`, `client_ip`, `rule_action`, `rule_pattern`, `rule_description`, and optional `reason`.
+Policy decision events are emitted to the `acl_proxy::policy` target with structured fields: `request_id`, `allowed`, `url`, `method`, `client_ip`, `rule_action`, `rule_pattern`, `rule_description`, and optional `reason`. The `url` field is sanitized before logging.
+
+On Unix, log directories are created or tightened to owner-only (`0700`) and log files are created or tightened to owner-only (`0600`).
 
 ### `[capture]` — Request/Response Capture
 
@@ -637,6 +657,8 @@ denied_response = false             # capture denied response records
 directory = "logs-capture"          # base directory for capture files
 filename = "{requestId}-{suffix}.json"   # template ({requestId}, {kind}, {suffix})
 max_body_bytes = 1048576            # max body bytes to serialize (1 MiB; 0 = skip body)
+max_files = 10000                   # max capture files to retain; must be at least 1
+max_total_bytes = 1073741824        # max total capture directory bytes to retain (1 GiB); must be at least 1
 ```
 
 Capture happens for:
@@ -644,7 +666,13 @@ Capture happens for:
 - Denied requests/responses for policy or loop protection when denied flags are enabled.
 - Upstream failures (502/504) as allowed traffic when capture is enabled.
 
-`body.length` always records the full logical body length even when `body.data` is truncated.
+`body.length` always records the full on-wire body length even when `body.data` is truncated. When a captured body has an HTTP `Content-Encoding`, the raw captured bytes remain content-encoded and the body object records `contentEncoding`.
+
+`capture.filename` must be a filename template, not a path. Use `capture.directory` to choose the output directory; templates containing path separators, absolute paths, or `..` path segments are rejected.
+
+After each capture write, acl-proxy prunes older regular files in `capture.directory` until both `capture.max_files` and `capture.max_total_bytes` are satisfied. Both limits must be at least `1`. The newest just-written capture file is retained even if a single file exceeds the byte cap.
+
+On Unix, capture directories are created or tightened to owner-only (`0700`) and capture JSON files are created or tightened to owner-only (`0600`). Capture URLs have userinfo removed and query strings replaced with `REDACTED`; `Authorization`, `Proxy-Authorization`, `Cookie`, and `Set-Cookie` header values are replaced with `[REDACTED]`. Capture bodies and other headers can still contain sensitive decrypted data; treat capture files as sensitive.
 
 #### Capture Record Format
 
@@ -657,15 +685,15 @@ Each JSON file contains a single object:
 | `kind` | string | `"request"` or `"response"` |
 | `decision` | string | `"allow"` or `"deny"` |
 | `mode` | string | `"http_proxy"`, `"https_connect"`, or `"https_transparent"` |
-| `url` | string | Normalized URL (no fragment) |
+| `url` | string | Normalized URL with userinfo removed, query redacted, and no fragment |
 | `method` | string | HTTP method |
 | `httpVersion` | string | e.g., `"1.1"`, `"2"` |
 | `statusCode` | number | HTTP status code (responses only) |
 | `statusMessage` | string | Status message (responses only) |
 | `client` | object | `address` (string), `port` (number) |
 | `target` | object | Upstream `address` and `port` (when available) |
-| `headers` | object | Lowercase keys; values are string or string array |
-| `body` | object | `encoding` (`"base64"`), `length` (full), `data` (base64), `contentType` |
+| `headers` | object | Lowercase keys; values are string or string array; common credential headers are redacted |
+| `body` | object | `encoding` (`"base64"`), `length` (full on-wire length), `data` (base64), `contentType`, `contentEncoding` |
 
 #### Extract Captured Bodies
 
@@ -673,7 +701,7 @@ Each JSON file contains a single object:
 acl-proxy-extract-capture-body logs-capture/req-123-res.json > body.bin
 ```
 
-Reports errors for invalid JSON, missing bodies, or unsupported encodings.
+Reports errors for invalid JSON, missing bodies, or unsupported capture encodings. If the capture body has an HTTP `contentEncoding`, the tool prints a warning because stdout contains the still-content-encoded bytes after base64 decoding.
 
 ### `[loop_protection]` — Loop Detection
 
@@ -698,12 +726,16 @@ certs_dir = "certs"                 # base directory for certificate material
 ca_key_path = "/path/to/ca-key.pem"   # optional external CA key
 ca_cert_path = "/path/to/ca-cert.pem" # optional external CA cert
 max_cached_certs = 1024             # LRU cache size (min 1)
+persist_dynamic_certs = false       # write per-host debug PEMs under certs_dir/dynamic
 ```
 
 - When both `ca_key_path` and `ca_cert_path` are absent, the proxy auto-generates a CA in `certs_dir` and reuses it if valid files already exist.
 - When both are provided, the proxy uses them as-is; invalid/unreadable files cause a startup error.
 - When only one is provided, validation fails — both must be set or both omitted.
-- Per-host certificates are generated on demand, cached in memory (LRU), and also written to `certs_dir/dynamic/` as `<host>.crt`, `<host>.key`, and `<host>-chain.crt` for debugging transparency. On-disk files are not reloaded on startup.
+- Per-host certificates are generated on demand and cached in memory (LRU). By default they are not written to disk, which keeps attacker-supplied hostnames from growing `certs_dir/dynamic/` without bound.
+- CONNECT-target certificate generation for uncached hosts is serialized per proxy instance. Cached hosts are served immediately; additional uncached CONNECT targets are rejected while generation is already in progress.
+- When `persist_dynamic_certs = true`, generated per-host debug PEMs are written to `certs_dir/dynamic/` as `<host>.crt`, `<host>.key`, and `<host>-chain.crt`. These files are not reloaded on startup.
+- On Unix, certificate directories are created or tightened to owner-only (`0700`) and generated CA/per-host PEM files that are written to disk are created or tightened to owner-only (`0600`).
 
 ### `[tls]` — Upstream TLS Behavior
 
@@ -818,7 +850,7 @@ reason       = { label = "Approval reason", required = false, secret = false }
 type = "http"                       # "http" (default) | "plugin"
 webhook_url = "https://..."         # required for type = "http"
 timeout_ms = 5000                   # required: approval/plugin timeout
-webhook_timeout_ms = 1000           # optional: webhook delivery timeout
+webhook_timeout_ms = 1000           # optional: webhook delivery timeout; defaults to timeout_ms
 on_webhook_failure = "error"        # "deny" | "error" | "timeout"
 
 [policy.external_auth_profiles.url_allow]
@@ -845,6 +877,10 @@ http_port = 8881
 https_bind_address = "0.0.0.0"
 https_port = 8889
 request_timeout_ms = 30000
+https_handshake_timeout_ms = 10000
+https_request_header_timeout_ms = 10000
+https_max_connections = 1024
+https_http2_max_concurrent_streams = 128
 internal_base_path = "/_acl-proxy"
 
 [logging]
@@ -861,6 +897,7 @@ The repository includes [`acl-proxy.sample.toml`](acl-proxy.sample.toml) as a co
 The config loader performs validation beyond basic TOML parsing:
 
 - `schema_version` must equal `"1"`.
+- Unknown keys in structured tables are rejected during TOML parsing.
 - Direct rules must have at least one of `pattern`, `patterns`, `methods`, `subnets`, `headers_absent`, `headers_match`, or `headers_not_match`.
 - Direct rules and ruleset templates must not define both `pattern` and `patterns`.
 - `patterns` must include at least one non-empty pattern.
@@ -868,11 +905,13 @@ The config loader performs validation beyond basic TOML parsing:
 - Include rules must reference an existing ruleset.
 - Macro placeholders (`{name}`) must resolve from `policy.macros` or `with` overrides.
 - `ca_key_path` and `ca_cert_path` must be both set or both omitted.
+- Listener bind addresses must parse as IP addresses, and overlapping HTTP/HTTPS listener binds must not use the same fixed port.
 - `loop_protection.header_name` must be a valid HTTP header name.
 - `${NAME}` env placeholders must resolve at validation/startup/reload time. Existing literal `${...}` strings in `set`/`add` header-action values are reserved syntax and must be migrated.
 - `policy.default` must be `allow` or `deny`; `delegate` is valid only on rules and ruleset templates.
 - `action = "delegate"` requires `external_auth_profile`.
 - `external_auth_profile` on `action = "allow"` or `action = "deny"` rules is rejected.
+- External auth `timeout_ms` and configured `webhook_timeout_ms` values must be non-zero.
 - `include_request_body = true` is supported only for `type = "plugin"` external auth profiles, and its body-size limits must be non-zero.
 
 On validation failure, `config validate` and startup report a human-readable error and abort, leaving any previously running instance (in the case of reload) unchanged.
@@ -909,14 +948,14 @@ When a `delegate` rule with `external_auth_profile` matches an HTTP profile, the
 
 - **URL**: `policy.external_auth_profiles.<name>.webhook_url`
 - **Header**: `X-Acl-Proxy-Event: pending`
-- **Payload fields**: `requestId`, `profile`, `ruleIndex`, optional `ruleId`, `url`, `method`, `clientIp`, `status: "pending"`, `terminal: false`, `timestamp` (RFC3339), `elapsedMs`, `eventId`, `callbackUrl` (when configured), and `macros` (approval macro descriptors).
+- **Payload fields**: `requestId`, `profile`, `ruleIndex`, optional `ruleId`, `url`, `method`, `clientIp`, `status: "pending"`, `terminal: false`, `timestamp` (RFC3339), `elapsedMs`, `eventId`, `callbackUrl` (when configured), and `macros` (approval macro descriptors). The `url` field has userinfo removed and query strings replaced with `REDACTED`.
 
 ### Terminal Status Webhook
 
 For lifecycle events (webhook failure, timeout, error, cancellation), the proxy emits a best-effort status webhook:
 
 - **Header**: `X-Acl-Proxy-Event: status`
-- **Fields**: `status` (`webhook_failed` | `timed_out` | `error` | `cancelled`), `terminal: true`, `reason`, optional `failureKind` and `httpStatus`.
+- **Fields**: `status` (`webhook_failed` | `timed_out` | `error` | `cancelled`), `terminal: true`, `reason`, sanitized `url`, optional `failureKind` and `httpStatus`.
 - At most one terminal event per `requestId`.
 - Status webhooks are **telemetry only** — delivery failures never affect the allow/deny decision.
 
@@ -946,7 +985,7 @@ Content-Type: application/json
 
 ### Plugin Mode (type = "plugin")
 
-Stdio-based synchronous auth. The proxy spawns a long-running plugin process and sends JSON requests over stdin, waiting for `allow`, `deny`, or `pass` JSON responses from stdout (newline-delimited). On `allow`, the proxy applies rule header actions first, plugin header actions second, and global egress request actions third. On `pass`, the plugin must not return request or response header actions, and policy evaluation resumes at the rule after the matched delegate rule. Plugins can also return response header actions on `allow`. See [`docs/design/auth-plugins-design.md`](docs/design/auth-plugins-design.md) for the full protocol specification.
+Stdio-based synchronous auth. The proxy spawns a long-running plugin process and sends JSON requests over stdin, waiting for `allow`, `deny`, or `pass` JSON responses from stdout (newline-delimited). Plugin stdin writes are bounded by `timeout_ms`, stdout response lines are capped at 1 MiB, and protocol I/O failures restart the plugin after `restart_delay_ms`. On `allow`, the proxy applies rule header actions first, plugin header actions second, and global egress request actions third. On `pass`, the plugin must not return request or response header actions, and policy evaluation resumes at the rule after the matched delegate rule. Plugins can also return response header actions on `allow`. See [`docs/design/auth-plugins-design.md`](docs/design/auth-plugins-design.md) for the full protocol specification.
 
 Plugin profiles can opt into request-body inspection and mutation:
 
@@ -981,13 +1020,13 @@ The [`demos/body-inspection-plugin/`](demos/body-inspection-plugin/) directory i
 
 ### Security Note
 
-The callback endpoint does not authenticate requests. Restrict access to `/{internal_base_path}/external-auth/callback` using network policy or firewall rules.
+Callback decisions are authorized by the pending request's unguessable `requestId`, which is a bearer capability included in the pending webhook. Treat webhook payloads and callback URLs as sensitive, and restrict access to `/{internal_base_path}/external-auth/callback` using network policy or firewall rules.
 
 ## Operations
 
 ### Startup
 
-`acl-proxy` validates configuration at startup. If logging initialization fails, the proxy still starts but reports the error to stderr.
+`acl-proxy` validates configuration at startup. If logging initialization fails, startup aborts with a non-zero exit instead of running without an audit/log sink.
 
 ### Readiness Probe
 
@@ -1008,8 +1047,10 @@ kill -HUP $(pidof acl-proxy)
 
 - A new `AppState` is built and swapped atomically via `ArcSwap`.
 - New connections use the new config immediately. In-flight requests complete with the previous config.
+- Pending external-auth approvals survive reload; callbacks after reload can still resolve requests that became pending before reload.
 - If reload fails, the previous state remains active.
 - `${NAME}` env placeholders are resolved again during reload. Changing a required env var takes effect on the next successful reload; removing one causes the reload to fail.
+- Listener bind addresses/ports, transparent HTTPS connection caps (`https_max_connections`, `https_http2_max_concurrent_streams`), and the enabled/disabled listener set are fixed at startup; changing those fields requires restart. Base logging sink settings (`logging.level`, `directory`, `max_bytes`, `max_files`, `console`) are also fixed at startup, while policy-decision logging flags and levels are read from the reloaded config.
 
 ### Graceful Shutdown
 
@@ -1029,6 +1070,7 @@ Capture logging for loop-detected requests follows the `[capture]` flags for den
 - Rules can override with `request_timeout_ms`.
 - `0` disables the timeout.
 - When the timeout expires, the proxy responds with `504 Gateway Timeout`.
+- For the transparent HTTPS listener, `proxy.https_handshake_timeout_ms` bounds idle TLS handshakes, `proxy.https_request_header_timeout_ms` bounds HTTP/1 header reads after TLS and HTTP/2 idle/half-open connections via keepalive pings, `proxy.https_max_connections` caps active accepted TLS connections, and `proxy.https_http2_max_concurrent_streams` caps active HTTP/2 streams per connection. Set any of these to `0` to disable that limit.
 
 ### Egress Forwarding
 
@@ -1070,11 +1112,13 @@ graph LR
 ### CA Behavior
 
 - **Default CA** (no explicit paths): Auto-generated at `certs/ca-key.pem` and `certs/ca-cert.pem`. If valid files exist, they are reused; otherwise a new CA is generated and written.
-- **External CA** (`ca_key_path` + `ca_cert_path`): Used as-is. Missing/invalid files cause startup/reload failure. Both must be set or both omitted.
+- **External CA** (`ca_key_path` + `ca_cert_path`): Used as-is. Missing/invalid files cause startup/reload failure. Both must be set or both omitted. If `ca_cert_path` contains multiple PEM certificates, the first certificate is used as the signing CA and live TLS chain CA; the full PEM file is preserved in optional persisted debug chain files.
+
+On Unix, certificate directories are created or tightened to owner-only (`0700`) and generated CA/per-host PEM files are created or tightened to owner-only (`0600`).
 
 ### Per-Host Certificates
 
-Generated on demand for each host (SNI or CONNECT target). Cached in memory with LRU eviction (configurable `max_cached_certs`, default 1024). Also written to disk for debugging:
+Generated on demand for each host (SNI or CONNECT target). Cached in memory with LRU eviction (configurable `max_cached_certs`, default 1024). CONNECT-target generation for uncached hosts is serialized so a burst of distinct CONNECT hostnames cannot force concurrent key generation. When `persist_dynamic_certs = true`, also written to disk for debugging:
 - `certs/dynamic/<host>.crt` — leaf certificate
 - `certs/dynamic/<host>.key` — private key
 - `certs/dynamic/<host>-chain.crt` — leaf + CA chain
@@ -1100,6 +1144,7 @@ Outgoing TLS from the proxy to upstream is verified against system root certific
 - Optional file rotation by size (default 100 MB, 5 files) when `logging.directory` is set.
 - Non-blocking — entries are dropped when the buffer is full (never stalls requests).
 - Console output controlled by `logging.console` (default `true`).
+- On Unix, log directories are owner-only (`0700`) and log files are owner-only (`0600`).
 
 ### Policy Decision Logging
 
@@ -1107,7 +1152,9 @@ Separate control for allow vs. deny decisions with configurable log levels. Even
 
 ### Request/Response Capture
 
-JSON capture files with request metadata, headers, and base64-encoded bodies. Enable independently for allowed/denied requests/responses. Body size capped at `capture.max_body_bytes` (default 1 MiB); full logical length always recorded in `body.length`.
+JSON capture files with request metadata, headers, and base64-encoded bodies. Enable independently for allowed/denied requests/responses. Body size capped at `capture.max_body_bytes` (default 1 MiB); full logical length always recorded in `body.length`. Capture retention is bounded by `capture.max_files` (default 10000) and `capture.max_total_bytes` (default 1 GiB).
+
+On Unix, capture directories are owner-only (`0700`) and capture files are owner-only (`0600`). Capture URLs and common credential headers are redacted, but bodies and other decrypted request/response data may still be sensitive; treat capture files as sensitive.
 
 ### Body Extraction
 
@@ -1139,7 +1186,7 @@ acl-proxy policy dump --format json
 
 **Warnings**:
 - `config validate` uses the same `${NAME}` env interpolation as startup — missing/malformed placeholders fail validation.
-- `policy dump` prints resolved values. If a header action loaded a secret from an env var, the resolved value appears in output. Treat redirected output and CI logs as sensitive.
+- `policy dump` masks header action values loaded from `${NAME}` env placeholders as `[REDACTED]`. Other configured match values remain visible, so treat redirected output and CI logs as sensitive when policy match values include credentials.
 
 ### `acl-proxy-extract-capture-body`
 
@@ -1147,7 +1194,7 @@ acl-proxy policy dump --format json
 acl-proxy-extract-capture-body <capture-file.json> > body.bin
 ```
 
-Decodes the base64 body payload from a capture JSON file. Reports errors for invalid JSON, missing bodies, or unsupported encodings.
+Decodes the base64 body payload from a capture JSON file. Reports errors for invalid JSON, missing bodies, or unsupported capture encodings, and warns when the output remains HTTP content-encoded.
 
 ## Troubleshooting
 

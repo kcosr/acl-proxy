@@ -1,11 +1,51 @@
+use std::env;
 use std::io::Write;
 use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
 
 use assert_cmd::prelude::*;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use serde_json::Value;
 use tempfile::NamedTempFile;
+
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+struct EnvGuard {
+    _lock: MutexGuard<'static, ()>,
+    saved: Vec<(String, Option<String>)>,
+}
+
+impl EnvGuard {
+    fn new(keys: &[&str]) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = keys
+            .iter()
+            .map(|key| ((*key).to_string(), env::var(key).ok()))
+            .collect();
+
+        Self { _lock: lock, saved }
+    }
+
+    fn set(&self, key: &str, value: &str) {
+        unsafe {
+            env::set_var(key, value);
+        }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in self.saved.iter().rev() {
+            unsafe {
+                match value {
+                    Some(value) => env::set_var(key, value),
+                    None => env::remove_var(key),
+                }
+            }
+        }
+    }
+}
 
 #[test]
 fn config_validate_succeeds_for_policy_with_macros_and_rulesets() {
@@ -184,6 +224,58 @@ subnets = ["10.0.0.0/8"]
     let subnets = rule["subnets"].as_array().expect("subnets is an array");
     assert_eq!(subnets.len(), 1);
     assert_eq!(subnets[0], "10.0.0.0/8");
+}
+
+#[test]
+fn policy_dump_masks_env_sourced_header_action_values() {
+    let env_guard = EnvGuard::new(&["ACL_PROXY_TEST_POLICY_DUMP_TOKEN"]);
+    env_guard.set("ACL_PROXY_TEST_POLICY_DUMP_TOKEN", "policy-dump-secret");
+
+    let mut file = NamedTempFile::new().expect("create temp config");
+    file.write_all(
+        br#"
+schema_version = "1"
+
+[proxy]
+bind_address = "127.0.0.1"
+http_port = 8080
+
+[logging]
+directory = "logs"
+level = "info"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://example.com/api/**"
+
+[[policy.rules.header_actions]]
+direction = "request"
+action = "set"
+name = "authorization"
+value = "${ACL_PROXY_TEST_POLICY_DUMP_TOKEN}"
+        "#,
+    )
+    .expect("write config");
+
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
+    cmd.arg("policy")
+        .arg("dump")
+        .arg("--format")
+        .arg("json")
+        .arg("--config")
+        .arg(file.path());
+
+    let assert = cmd.assert().success();
+    let stdout =
+        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is valid UTF-8");
+
+    assert!(!stdout.contains("policy-dump-secret"));
+    let value: Value = serde_json::from_str(&stdout).expect("output is valid JSON");
+    let action = &value["rules"][0]["header_actions"][0];
+    assert_eq!(action["values"][0], "[REDACTED]");
 }
 
 #[test]
