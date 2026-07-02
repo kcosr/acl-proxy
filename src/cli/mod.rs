@@ -497,6 +497,28 @@ fn log_startup(state: &AppState) {
         .as_ref()
         .map(|listener| listener.bind.as_str())
         .unwrap_or("disabled");
+    let explicit_http_http2_enabled = cfg
+        .proxy
+        .listeners
+        .explicit_http
+        .as_ref()
+        .map(|listener| listener.enable_http2)
+        .unwrap_or(false);
+    let transparent_http_http2_enabled = cfg
+        .proxy
+        .listeners
+        .transparent_http
+        .as_ref()
+        .map(|listener| listener.enable_http2)
+        .unwrap_or(false);
+    let explicit_https_http2_enabled = cfg
+        .proxy
+        .listeners
+        .explicit_https
+        .as_ref()
+        .map(|listener| listener.enable_http2)
+        .unwrap_or(false);
+    let transparent_https_http2_enabled = cfg.proxy.listeners.transparent_https.is_some();
 
     let certs = &cfg.certificates;
     let has_explicit_ca = certs
@@ -538,7 +560,10 @@ fn log_startup(state: &AppState) {
         capture_denied_request = capture_cfg.denied_request,
         capture_denied_response = capture_cfg.denied_response,
         capture_directory = %capture_cfg.directory,
-        http2_inbound_enabled = true,
+        explicit_http_http2_enabled,
+        transparent_http_http2_enabled,
+        explicit_https_http2_enabled,
+        transparent_https_http2_enabled,
         ca_mode = %if has_explicit_ca { "configured" } else { "generated" },
         ca_certs_dir = %certs.certs_dir,
         "acl-proxy starting"

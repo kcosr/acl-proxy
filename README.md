@@ -23,15 +23,17 @@ A Rust-based ACL-aware HTTP/HTTPS proxy with a TOML configuration file and a fle
 
 ## How It Works
 
-acl-proxy sits between clients and upstream services, intercepting HTTP and HTTPS traffic across four request paths. Every request is evaluated by the same policy engine regardless of how it enters the proxy.
+acl-proxy sits between clients and upstream services, intercepting HTTP and HTTPS traffic across separate listener-backed modes. Every request is evaluated by the same policy engine regardless of how it enters the proxy.
 
 ```mermaid
 graph TB
     Client["Client"]
 
     subgraph acl-proxy
-        HTTP["HTTP Listener<br/>:8881"]
-        HTTPS["Transparent HTTPS Listener<br/>:8889"]
+        ExplicitHTTP["Explicit HTTP Proxy<br/>:8881"]
+        TransparentHTTP["Transparent HTTP<br/>:8882"]
+        ExplicitHTTPS["Explicit HTTPS Proxy<br/>:8890"]
+        TransparentHTTPS["Transparent HTTPS<br/>:8889"]
         LP["Loop Protection"]
         PE["Policy Engine<br/>pattern · method · subnet · headers"]
         EA["External Auth<br/>(delegate rules)"]
@@ -41,10 +43,14 @@ graph TB
 
     Upstream["Upstream Services"]
 
-    Client -->|"explicit proxy<br/>transparent HTTP<br/>CONNECT MITM"| HTTP
-    Client -->|"transparent HTTPS<br/>HTTP/2 · WebSocket"| HTTPS
-    HTTP --> LP
-    HTTPS --> LP
+    Client -->|"absolute-form HTTP<br/>CONNECT MITM"| ExplicitHTTP
+    Client -->|"origin-form redirected HTTP"| TransparentHTTP
+    Client -->|"TLS to proxy<br/>absolute-form HTTP<br/>CONNECT MITM"| ExplicitHTTPS
+    Client -->|"target-shaped TLS<br/>HTTP/2 · WebSocket"| TransparentHTTPS
+    ExplicitHTTP --> LP
+    TransparentHTTP --> LP
+    ExplicitHTTPS --> LP
+    TransparentHTTPS --> LP
     LP --> PE
     PE -->|allow| HA
     PE -->|delegate| EA

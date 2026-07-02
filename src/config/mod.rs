@@ -1327,33 +1327,7 @@ impl Config {
                 )));
             }
         }
-        // Ensure certificate paths are configured consistently.
-        let ca_key = self
-            .certificates
-            .ca_key_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        let ca_cert = self
-            .certificates
-            .ca_cert_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-
-        match (ca_key, ca_cert) {
-            (Some(_), Some(_)) | (None, None) => Ok(()),
-            _ => Err(ConfigError::Invalid(
-                "certificates.ca_key_path and certificates.ca_cert_path must both be set or both omitted"
-                    .to_string(),
-            )),
-        }?;
-
-        if self.certificates.max_cached_certs == 0 {
-            return Err(ConfigError::Invalid(
-                "certificates.max_cached_certs must be at least 1".to_string(),
-            ));
-        }
+        validate_certificates_config(&self.certificates)?;
 
         validate_proxy_config(&self.proxy)?;
         validate_loop_protection_config(&self.loop_protection)?;
@@ -1611,6 +1585,75 @@ fn validate_logging_config(logging: &LoggingConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+fn validate_certificates_config(certificates: &CertificatesConfig) -> Result<(), ConfigError> {
+    let ca_key = certificates
+        .ca_key_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let ca_cert = certificates
+        .ca_cert_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    match (ca_key, ca_cert) {
+        (Some(key_path), Some(cert_path)) => {
+            validate_mitm_ca_material(Path::new(key_path), Path::new(cert_path))?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(ConfigError::Invalid(
+                "certificates.ca_key_path and certificates.ca_cert_path must both be set or both omitted"
+                    .to_string(),
+            ));
+        }
+    }
+
+    if certificates.max_cached_certs == 0 {
+        return Err(ConfigError::Invalid(
+            "certificates.max_cached_certs must be at least 1".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_mitm_ca_material(ca_key_path: &Path, ca_cert_path: &Path) -> Result<(), ConfigError> {
+    let key_pem = fs::read_to_string(ca_key_path).map_err(|source| ConfigError::Io {
+        path: ca_key_path.to_path_buf(),
+        source,
+    })?;
+    rcgen::KeyPair::from_pem(&key_pem).map_err(|err| {
+        ConfigError::Invalid(format!(
+            "certificates.ca_key_path must contain a valid PEM private key: {err}"
+        ))
+    })?;
+
+    let cert_pem = fs::read_to_string(ca_cert_path).map_err(|source| ConfigError::Io {
+        path: ca_cert_path.to_path_buf(),
+        source,
+    })?;
+    let mut reader = BufReader::new(cert_pem.as_bytes());
+    let certs = rustls_pemfile::certs(&mut reader).map_err(|err| {
+        ConfigError::Invalid(format!(
+            "certificates.ca_cert_path must contain valid PEM certificates: {err}"
+        ))
+    })?;
+    let Some(cert_der) = certs.first() else {
+        return Err(ConfigError::Invalid(
+            "certificates.ca_cert_path must contain at least one PEM certificate".to_string(),
+        ));
+    };
+    rcgen::CertificateParams::from_ca_cert_der(&cert_der.as_slice().into()).map_err(|err| {
+        ConfigError::Invalid(format!(
+            "certificates.ca_cert_path must contain a valid CA certificate: {err}"
+        ))
+    })?;
+
+    Ok(())
+}
+
 fn validate_proxy_config(proxy: &ProxyConfig) -> Result<(), ConfigError> {
     validate_listener_config(&proxy.listeners)?;
 
@@ -1704,7 +1747,7 @@ fn listener_bind_addresses_overlap(left: IpAddr, right: IpAddr) -> bool {
         (IpAddr::V6(left), IpAddr::V6(right)) => {
             left == right || left.is_unspecified() || right.is_unspecified()
         }
-        _ => false,
+        _ => left.is_unspecified() || right.is_unspecified(),
     }
 }
 
@@ -3117,6 +3160,27 @@ default = "deny"
         config
             .validate_basic()
             .expect("distinct listener bind addresses may share a port");
+
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+listeners.explicit_http.bind = "0.0.0.0:8443"
+listeners.transparent_https.bind = "[::]:8443"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("proxy.listeners.explicit_http.bind")
+                && msg.contains("proxy.listeners.transparent_https.bind")
+                && msg.contains("8443"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
@@ -3708,7 +3772,7 @@ ca_cert_path = "ca-cert.pem"
         let config: Config = toml::from_str(&toml_cert_only).expect("parse cert-only config");
         assert!(config.validate_basic().is_err());
 
-        // Both set is ok.
+        // Both set must point at readable, valid CA material.
         let toml_both = format!(
             r#"{base}
 
@@ -3718,7 +3782,11 @@ ca_cert_path = "ca-cert.pem"
 "#
         );
         let config: Config = toml::from_str(&toml_both).expect("parse both config");
-        assert!(config.validate_basic().is_ok());
+        let err = config.validate_basic().expect_err("validation should fail");
+        assert!(
+            format!("{err}").contains("ca-key.pem"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
