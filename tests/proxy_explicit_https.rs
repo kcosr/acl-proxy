@@ -414,6 +414,65 @@ async fn send_https_via_explicit_https_connect(
     parse_http_response(&buf)
 }
 
+async fn send_https_via_explicit_http_connect(
+    proxy_addr: SocketAddr,
+    mitm_ca_cert_path: &Path,
+    target_host: &str,
+    path: &str,
+) -> (StatusCode, String) {
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
+    let connect_req = format!(
+        "CONNECT {target_host} HTTP/1.1\r\nHost: {target_host}\r\nConnection: keep-alive\r\n\r\n"
+    );
+    stream
+        .write_all(connect_req.as_bytes())
+        .await
+        .expect("write CONNECT");
+
+    let (_head, connect_status) = read_http_response_head(&mut stream)
+        .await
+        .expect("read CONNECT response");
+    if connect_status != StatusCode::OK {
+        return (connect_status, String::new());
+    }
+
+    let ca_pem = std::fs::read(mitm_ca_cert_path).expect("read MITM CA cert");
+    let mut reader = Cursor::new(ca_pem);
+    let mut roots = RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut reader).expect("parse MITM CA cert") {
+        roots
+            .add(&RustlsCertificate(cert.to_vec()))
+            .expect("add MITM CA cert root");
+    }
+
+    let config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+    let host_only = target_host.split(':').next().expect("target host name");
+    let server_name = ServerName::try_from(host_only).expect("target server name");
+    let mut inner_tls = connector
+        .connect(server_name, stream)
+        .await
+        .expect("inner TLS connect");
+
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {target_host}\r\nConnection: close\r\n\r\n");
+    inner_tls
+        .write_all(request.as_bytes())
+        .await
+        .expect("write inner HTTPS request");
+    let mut buf = Vec::new();
+    inner_tls
+        .read_to_end(&mut buf)
+        .await
+        .expect("read inner HTTPS response");
+    parse_http_response(&buf)
+}
+
 async fn send_h2c_http_request(addr: SocketAddr, uri: &str) -> (String, StatusCode) {
     let stream = tokio::net::TcpStream::connect(addr)
         .await
@@ -756,6 +815,100 @@ async fn h2_request_to_https_parent_requires_h2_alpn_without_downgrade() {
     assert!(
         seen_requests.lock().unwrap().is_empty(),
         "HTTP/2 requests must not downgrade to HTTP/1.1 on an HTTPS parent hop"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn h2_request_can_forward_to_h2_enabled_https_parent() {
+    let (upstream_addr, seen_requests) = start_http_echo_server("h2 https parent ok").await;
+    let identity_dir = TempDir::new().expect("identity dir");
+    let (cert_path, key_path) = write_proxy_identity(&identity_dir);
+    let allow_pattern = format!("http://{}:{}/**", upstream_addr.ip(), upstream_addr.port());
+
+    let mut parent_config = explicit_https_config(&cert_path, &key_path, &allow_pattern);
+    parent_config
+        .proxy
+        .listeners
+        .explicit_https
+        .as_mut()
+        .expect("parent explicit HTTPS listener")
+        .enable_http2 = true;
+    let parent_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind parent proxy");
+    parent_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking parent proxy");
+    let (parent_addr, _parent_temp_dir) =
+        start_explicit_https_proxy(parent_config, parent_listener).await;
+
+    let mut inner_config =
+        explicit_http_config_with_https_parent(parent_addr, &cert_path, &allow_pattern);
+    inner_config.loop_protection.add_header = false;
+    let (inner_addr, _inner_temp_dir) = start_explicit_http_proxy(inner_config).await;
+
+    let absolute_url = format!(
+        "http://{}:{}/h2-parent-ok",
+        upstream_addr.ip(),
+        upstream_addr.port()
+    );
+    let (body, status) = send_h2c_http_request(inner_addr, &absolute_url).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "h2 https parent ok");
+
+    let seen = seen_requests.lock().unwrap();
+    let request = seen.first().expect("upstream request");
+    assert_eq!(request.uri, "/h2-parent-ok");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_inner_requests_can_forward_to_https_parent() {
+    let (forward_addr, seen_requests) = start_http_echo_server("connect via https parent").await;
+    let identity_dir = TempDir::new().expect("identity dir");
+    let (cert_path, key_path) = write_proxy_identity(&identity_dir);
+    let allow_pattern = "https://connect-target.test:9443/**";
+
+    let mut parent_config = explicit_https_config(&cert_path, &key_path, allow_pattern);
+    parent_config.proxy.egress.default =
+        Some(acl_proxy::config::EgressTargetConfig::explicit_http_proxy(
+            "127.0.0.1".to_string(),
+            forward_addr.port(),
+        ));
+    let parent_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind parent proxy");
+    parent_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking parent proxy");
+    let (parent_addr, _parent_temp_dir) =
+        start_explicit_https_proxy(parent_config, parent_listener).await;
+
+    let mut inner_config =
+        explicit_http_config_with_https_parent(parent_addr, &cert_path, allow_pattern);
+    inner_config.loop_protection.add_header = false;
+    let (inner_addr, inner_temp_dir) = start_explicit_http_proxy(inner_config).await;
+    let inner_ca_cert_path = inner_temp_dir.path().join("certs").join("ca-cert.pem");
+
+    let (status, body) = send_https_via_explicit_http_connect(
+        inner_addr,
+        &inner_ca_cert_path,
+        "connect-target.test:9443",
+        "/ok",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("connect via https parent"),
+        "unexpected response body: {body}"
+    );
+
+    let seen = seen_requests.lock().unwrap();
+    let forwarded = seen.first().expect("forwarding destination request");
+    assert_eq!(forwarded.uri, "https://connect-target.test:9443/ok");
+    assert_eq!(
+        forwarded
+            .headers
+            .get("host")
+            .and_then(|value| value.to_str().ok()),
+        Some("connect-target.test:9443")
     );
 }
 

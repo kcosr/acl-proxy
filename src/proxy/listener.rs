@@ -4,7 +4,6 @@ use std::time::Duration;
 use tokio::task::{JoinError, JoinSet};
 
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_secs(1);
-const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub async fn handle_accept_error(listener: &str, err: Error) {
     match err.kind() {
@@ -60,17 +59,23 @@ pub fn log_connection_task_result(listener: &str, result: Result<(), JoinError>)
     }
 }
 
-pub async fn drain_connections(listener: &str, connections: &mut JoinSet<()>) {
+pub async fn drain_connections(
+    listener: &str,
+    connections: &mut JoinSet<()>,
+    timeout: Option<Duration>,
+) {
     let drain = async {
         while let Some(join_result) = connections.join_next().await {
             log_connection_task_result(listener, join_result);
         }
     };
 
-    if tokio::time::timeout(CONNECTION_DRAIN_TIMEOUT, drain)
-        .await
-        .is_ok()
-    {
+    let Some(timeout) = timeout else {
+        drain.await;
+        return;
+    };
+
+    if tokio::time::timeout(timeout, drain).await.is_ok() {
         return;
     }
 
@@ -78,7 +83,7 @@ pub async fn drain_connections(listener: &str, connections: &mut JoinSet<()>) {
     tracing::warn!(
         listener,
         remaining_connections = remaining,
-        timeout_ms = CONNECTION_DRAIN_TIMEOUT.as_millis(),
+        timeout_ms = timeout.as_millis(),
         "timed out draining listener connections; aborting remaining tasks"
     );
     connections.abort_all();

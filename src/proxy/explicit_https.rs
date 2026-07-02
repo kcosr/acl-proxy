@@ -211,7 +211,9 @@ where
         }
     }
 
-    crate::proxy::listener::drain_connections("explicit_https", &mut connections).await;
+    let drain_timeout = state.load().config.proxy.shutdown_drain_timeout();
+    crate::proxy::listener::drain_connections("explicit_https", &mut connections, drain_timeout)
+        .await;
 
     Ok(())
 }

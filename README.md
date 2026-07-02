@@ -605,6 +605,7 @@ All sections except `schema_version` and `[policy].default` are optional with se
 ```toml
 [proxy]
 request_timeout_ms = 30000          # upstream timeout; 0 = disabled
+shutdown_drain_timeout_ms = 0       # graceful shutdown drain; 0 = wait indefinitely
 internal_base_path = "/_acl-proxy"  # base path for internal endpoints
 
 [proxy.listeners.explicit_http]
@@ -634,6 +635,7 @@ http2_max_concurrent_streams = 128
 ```
 
 - `internal_base_path` must start with `/` and must not end with `/` (except root `/`). Internal endpoints are only matched for origin-form (direct) requests, not proxy-style absolute-form requests.
+- `shutdown_drain_timeout_ms` controls how long shutdown waits for active connection tasks after listeners stop accepting. The default `0` waits indefinitely for in-flight requests to finish; a positive value aborts remaining connection tasks after that many milliseconds.
 - Listener `bind` values must be socket addresses with IP literal hosts and nonzero ports. Overlapping bind addresses cannot use the same port.
 - Missing listener sections are disabled, and at least one listener must be configured.
 - `explicit_http` and `transparent_http` are separate sockets. Explicit listeners reject non-internal origin-form requests; transparent HTTP rejects explicit absolute-form requests.
@@ -1097,7 +1099,7 @@ kill -HUP $(pidof acl-proxy)
 
 ### Graceful Shutdown
 
-`SIGTERM` or `Ctrl+C` stops accepting new connections. In-flight requests continue using existing state until they finish.
+`SIGTERM` or `Ctrl+C` stops accepting new connections. Idle keep-alive connections are closed gracefully, and in-flight requests continue using existing state until they finish. Set `proxy.shutdown_drain_timeout_ms` to a positive value to bound this drain; when that timeout expires, remaining connection tasks are aborted. The default `0` waits indefinitely.
 
 ### Loop Protection
 

@@ -3,6 +3,7 @@ use std::fs;
 use std::io::BufReader;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use http::header::{HeaderName, HeaderValue};
 use ipnet::IpNet;
@@ -118,6 +119,9 @@ pub struct ProxyConfig {
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
 
+    #[serde(default)]
+    pub shutdown_drain_timeout_ms: u64,
+
     #[serde(default = "default_internal_base_path")]
     pub internal_base_path: String,
 
@@ -132,9 +136,20 @@ impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
             request_timeout_ms: default_request_timeout_ms(),
+            shutdown_drain_timeout_ms: 0,
             internal_base_path: default_internal_base_path(),
             listeners: ProxyListenersConfig::default(),
             egress: ProxyEgressConfig::default(),
+        }
+    }
+}
+
+impl ProxyConfig {
+    pub fn shutdown_drain_timeout(&self) -> Option<Duration> {
+        if self.shutdown_drain_timeout_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(self.shutdown_drain_timeout_ms))
         }
     }
 }
@@ -2507,6 +2522,33 @@ default = "deny"
         );
         assert_eq!(config.logging.level, "debug");
         assert!(matches!(config.policy.default, PolicyDefaultAction::Deny));
+        assert_eq!(config.proxy.shutdown_drain_timeout_ms, 0);
+        assert_eq!(config.proxy.shutdown_drain_timeout(), None);
+    }
+
+    #[test]
+    fn proxy_shutdown_drain_timeout_parses_milliseconds() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
+shutdown_drain_timeout_ms = 1500
+
+[logging]
+directory = "logs"
+level = "debug"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        assert_eq!(config.proxy.shutdown_drain_timeout_ms, 1500);
+        assert_eq!(
+            config.proxy.shutdown_drain_timeout(),
+            Some(std::time::Duration::from_millis(1500))
+        );
     }
 
     #[test]

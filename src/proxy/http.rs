@@ -328,7 +328,13 @@ where
         }
     }
 
-    crate::proxy::listener::drain_connections(http_listener_name(mode), &mut connections).await;
+    let drain_timeout = state.load().config.proxy.shutdown_drain_timeout();
+    crate::proxy::listener::drain_connections(
+        http_listener_name(mode),
+        &mut connections,
+        drain_timeout,
+    )
+    .await;
 
     Ok(())
 }

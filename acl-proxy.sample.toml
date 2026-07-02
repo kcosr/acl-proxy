@@ -36,6 +36,11 @@ listeners.transparent_https.bind = "0.0.0.0:8889"
 # Timeout (ms) for upstream responses (0 disables).
 request_timeout_ms = 30000
 
+# Graceful shutdown drain timeout (ms). The default 0 waits indefinitely for
+# in-flight requests to finish; positive values abort remaining connection tasks
+# after the timeout.
+shutdown_drain_timeout_ms = 0
+
 # Transparent HTTPS listener slow-client protections. Set a value to 0 to
 # disable that limit.
 listeners.transparent_https.handshake_timeout_ms = 10000
