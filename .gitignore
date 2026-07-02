@@ -14,3 +14,8 @@ certs/
 logs/
 
 .build-service/workspace-id
+
+# Local planning and scratch work
+.specs/
+.plans/
+.scratch/
