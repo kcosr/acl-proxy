@@ -10,6 +10,7 @@ use acl_proxy::proxy::explicit_https::{
 };
 use acl_proxy::proxy::http::run_http_proxy_on_listener;
 use h2::client as h2_client;
+use http::header::{HeaderValue, CONNECTION, UPGRADE};
 use http::StatusCode;
 use hyper::server::conn::Http;
 use hyper::service::{make_service_fn, service_fn};
@@ -108,6 +109,65 @@ async fn start_https_echo_server(body: &'static str) -> SocketAddr {
                 let _ = Http::new()
                     .http1_keep_alive(false)
                     .serve_connection(tls, service)
+                    .await;
+            });
+        }
+    });
+
+    addr
+}
+
+async fn start_upstream_websocket_echo_server() -> SocketAddr {
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind websocket upstream");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking websocket upstream");
+    let addr = listener.local_addr().expect("websocket upstream addr");
+
+    tokio::spawn(async move {
+        let listener =
+            tokio::net::TcpListener::from_std(listener).expect("tokio websocket listener");
+        loop {
+            let (socket, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+
+            tokio::spawn(async move {
+                let service = service_fn(|mut req: Request<Body>| async move {
+                    let on_upgrade = hyper::upgrade::on(&mut req);
+                    tokio::spawn(async move {
+                        let mut upgraded = match on_upgrade.await {
+                            Ok(stream) => stream,
+                            Err(_) => return,
+                        };
+
+                        let mut buf = [0_u8; 1024];
+                        loop {
+                            let n = match upgraded.read(&mut buf).await {
+                                Ok(0) => break,
+                                Ok(n) => n,
+                                Err(_) => break,
+                            };
+                            if upgraded.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+
+                    let mut resp = Response::new(Body::empty());
+                    *resp.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+                    resp.headers_mut()
+                        .insert(CONNECTION, HeaderValue::from_static("Upgrade"));
+                    resp.headers_mut()
+                        .insert(UPGRADE, HeaderValue::from_static("websocket"));
+                    Ok::<_, hyper::Error>(resp)
+                });
+
+                let _ = Http::new()
+                    .http1_keep_alive(false)
+                    .serve_connection(socket, service)
+                    .with_upgrades()
                     .await;
             });
         }
@@ -329,6 +389,15 @@ async fn open_explicit_https_proxy_tls(
     proxy_addr: SocketAddr,
     ca_cert_path: &Path,
 ) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
+    open_explicit_https_proxy_tls_with_alpn(proxy_addr, ca_cert_path, vec![b"http/1.1".to_vec()])
+        .await
+}
+
+async fn open_explicit_https_proxy_tls_with_alpn(
+    proxy_addr: SocketAddr,
+    ca_cert_path: &Path,
+    alpn_protocols: Vec<Vec<u8>>,
+) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
     let stream = tokio::net::TcpStream::connect(proxy_addr)
         .await
         .expect("connect proxy");
@@ -346,7 +415,7 @@ async fn open_explicit_https_proxy_tls(
         .with_safe_defaults()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    config.alpn_protocols = alpn_protocols;
 
     let connector = TlsConnector::from(Arc::new(config));
     let server_name = ServerName::try_from("127.0.0.1").expect("server name");
@@ -504,6 +573,39 @@ async fn send_h2c_http_request(addr: SocketAddr, uri: &str) -> (String, StatusCo
     (String::from_utf8_lossy(&bytes).to_string(), status)
 }
 
+async fn send_h2_request_via_explicit_https(
+    proxy_addr: SocketAddr,
+    proxy_cert_path: &Path,
+    method: &str,
+    uri: &str,
+) -> StatusCode {
+    let tls = open_explicit_https_proxy_tls_with_alpn(
+        proxy_addr,
+        proxy_cert_path,
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+    )
+    .await;
+    assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"h2"[..]));
+
+    let (send_request, connection) = h2_client::handshake(tls).await.expect("h2 handshake");
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("h2 explicit HTTPS connection error: {err}");
+        }
+    });
+
+    let mut send_request = send_request.ready().await.expect("h2 ready");
+    let request = http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(())
+        .expect("build h2 request");
+    let (response_fut, _send_stream) = send_request
+        .send_request(request, true)
+        .expect("send h2 request");
+    response_fut.await.expect("await h2 response").status()
+}
+
 async fn read_http_response_head<R>(reader: &mut R) -> std::io::Result<(String, StatusCode)>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -627,6 +729,62 @@ async fn explicit_https_listener_accepts_absolute_form_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn explicit_https_listener_defaults_to_http1_alpn() {
+    let (upstream_addr, _seen_requests) = start_http_echo_server("unused").await;
+    let identity_dir = TempDir::new().expect("identity dir");
+    let (cert_path, key_path) = write_proxy_identity(&identity_dir);
+    let allow_pattern = format!("http://{}:{}/**", upstream_addr.ip(), upstream_addr.port());
+    let config = explicit_https_config(&cert_path, &key_path, &allow_pattern);
+
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind explicit https proxy");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _proxy_temp_dir) = start_explicit_https_proxy(config, listener).await;
+
+    let tls = open_explicit_https_proxy_tls_with_alpn(
+        proxy_addr,
+        &cert_path,
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+    )
+    .await;
+
+    assert_eq!(tls.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_https_h2_connect_returns_501() {
+    let (upstream_addr, _seen_requests) = start_http_echo_server("unused").await;
+    let identity_dir = TempDir::new().expect("identity dir");
+    let (cert_path, key_path) = write_proxy_identity(&identity_dir);
+    let allow_pattern = format!("http://{}:{}/**", upstream_addr.ip(), upstream_addr.port());
+    let mut config = explicit_https_config(&cert_path, &key_path, &allow_pattern);
+    config
+        .proxy
+        .listeners
+        .explicit_https
+        .as_mut()
+        .expect("explicit HTTPS listener")
+        .enable_http2 = true;
+
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind explicit https proxy");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _proxy_temp_dir) = start_explicit_https_proxy(config, listener).await;
+
+    let status = send_h2_request_via_explicit_https(
+        proxy_addr,
+        &cert_path,
+        "CONNECT",
+        "connect-target.test:443",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn explicit_https_listener_supports_connect_mitm_over_http1() {
     let upstream_addr = start_https_echo_server("explicit https connect ok").await;
     let identity_dir = TempDir::new().expect("identity dir");
@@ -656,6 +814,61 @@ async fn explicit_https_listener_supports_connect_mitm_over_http1() {
         body.contains("explicit https connect ok"),
         "unexpected response body: {body}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_https_listener_tunnels_websocket_upgrades() {
+    let upstream_addr = start_upstream_websocket_echo_server().await;
+    let identity_dir = TempDir::new().expect("identity dir");
+    let (cert_path, key_path) = write_proxy_identity(&identity_dir);
+    let allow_pattern = format!("http://{}:{}/**", upstream_addr.ip(), upstream_addr.port());
+    let config = explicit_https_config(&cert_path, &key_path, &allow_pattern);
+
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind explicit https proxy");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _proxy_temp_dir) = start_explicit_https_proxy(config, listener).await;
+
+    let mut tls = open_explicit_https_proxy_tls(proxy_addr, &cert_path).await;
+    let upstream_url = format!("http://{}:{}/ws", upstream_addr.ip(), upstream_addr.port());
+    let upstream_host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    let request = format!(
+        concat!(
+            "GET {url} HTTP/1.1\r\n",
+            "Host: {host}\r\n",
+            "Connection: Upgrade\r\n",
+            "Upgrade: websocket\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "\r\n"
+        ),
+        url = upstream_url,
+        host = upstream_host
+    );
+    tls.write_all(request.as_bytes())
+        .await
+        .expect("write websocket upgrade request");
+
+    let (_head, status) = read_http_response_head(&mut tls)
+        .await
+        .expect("read websocket response");
+    assert_eq!(status, StatusCode::SWITCHING_PROTOCOLS);
+
+    let payload = b"explicit-https-websocket";
+    tls.write_all(payload)
+        .await
+        .expect("write tunneled payload");
+    let mut echoed = vec![0_u8; payload.len()];
+    tokio::time::timeout(
+        tokio::time::Duration::from_secs(2),
+        tls.read_exact(&mut echoed),
+    )
+    .await
+    .expect("timed out waiting for echoed payload")
+    .expect("read echoed payload");
+
+    assert_eq!(echoed.as_slice(), payload);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -816,6 +1029,71 @@ async fn h2_request_to_https_parent_requires_h2_alpn_without_downgrade() {
         seen_requests.lock().unwrap().is_empty(),
         "HTTP/2 requests must not downgrade to HTTP/1.1 on an HTTPS parent hop"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_upgrade_can_tunnel_over_https_parent() {
+    let upstream_addr = start_upstream_websocket_echo_server().await;
+    let identity_dir = TempDir::new().expect("identity dir");
+    let (cert_path, key_path) = write_proxy_identity(&identity_dir);
+    let allow_pattern = format!("http://{}:{}/**", upstream_addr.ip(), upstream_addr.port());
+
+    let parent_config = explicit_https_config(&cert_path, &key_path, &allow_pattern);
+    let parent_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind parent proxy");
+    parent_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking parent proxy");
+    let (parent_addr, _parent_temp_dir) =
+        start_explicit_https_proxy(parent_config, parent_listener).await;
+
+    let mut inner_config =
+        explicit_http_config_with_https_parent(parent_addr, &cert_path, &allow_pattern);
+    inner_config.loop_protection.add_header = false;
+    let (inner_addr, _inner_temp_dir) = start_explicit_http_proxy(inner_config).await;
+
+    let mut stream = tokio::net::TcpStream::connect(inner_addr)
+        .await
+        .expect("connect inner proxy");
+    let upstream_url = format!("http://{}:{}/ws", upstream_addr.ip(), upstream_addr.port());
+    let upstream_host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    let request = format!(
+        concat!(
+            "GET {url} HTTP/1.1\r\n",
+            "Host: {host}\r\n",
+            "Connection: Upgrade\r\n",
+            "Upgrade: websocket\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "\r\n"
+        ),
+        url = upstream_url,
+        host = upstream_host
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write websocket upgrade request");
+
+    let (_head, status) = read_http_response_head(&mut stream)
+        .await
+        .expect("read websocket response");
+    assert_eq!(status, StatusCode::SWITCHING_PROTOCOLS);
+
+    let payload = b"https-parent-websocket";
+    stream
+        .write_all(payload)
+        .await
+        .expect("write tunneled payload");
+    let mut echoed = vec![0_u8; payload.len()];
+    tokio::time::timeout(
+        tokio::time::Duration::from_secs(2),
+        stream.read_exact(&mut echoed),
+    )
+    .await
+    .expect("timed out waiting for echoed payload")
+    .expect("read echoed payload");
+
+    assert_eq!(echoed.as_slice(), payload);
 }
 
 #[tokio::test(flavor = "multi_thread")]

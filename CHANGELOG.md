@@ -13,10 +13,12 @@
 
 - Add an explicit HTTPS proxy listener with an operator-managed static proxy certificate and key.
 - Add HTTPS parent-proxy egress forwarding with configurable TLS trust for system roots, custom CAs, combined system-plus-custom roots, or disabled verification.
+- Add `proxy.shutdown_drain_timeout_ms` to optionally bound graceful shutdown draining; the default `0` waits indefinitely for in-flight requests.
 
 ### Changed
 
 - Split explicit HTTP and transparent HTTP handling onto separate configured sockets, and reject listener topology changes during reload.
+- Graceful shutdown now closes idle keep-alive connections and drains in-flight requests across all configured listeners before exit.
 
 ## [0.2.0] - 2026-06-25
 
