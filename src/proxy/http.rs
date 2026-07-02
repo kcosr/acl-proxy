@@ -271,20 +271,17 @@ where
 {
     let listener = TcpListener::from_std(listener).map_err(HttpProxyError::FromTcp)?;
     let mut connections = JoinSet::new();
+    let (connection_shutdown, _) = crate::proxy::listener::connection_shutdown_channel();
     tokio::pin!(shutdown);
 
     loop {
         tokio::select! {
             _ = &mut shutdown => {
+                crate::proxy::listener::signal_connection_shutdown(&connection_shutdown);
                 break;
             }
             Some(join_result) = connections.join_next(), if !connections.is_empty() => {
-                if let Err(err) = join_result {
-                    tracing::debug!(
-                        listener = ?mode,
-                        "HTTP listener connection task failed: {err}"
-                    );
-                }
+                crate::proxy::listener::log_connection_task_result(http_listener_name(mode), join_result);
             }
             accept_res = listener.accept() => {
                 let (socket, remote_addr) = match accept_res {
@@ -296,6 +293,7 @@ where
                 };
 
                 let state = state.clone();
+                let mut connection_shutdown = connection_shutdown.subscribe();
                 connections.spawn(async move {
                     let service = service_fn(move |req| {
                         let state_snapshot = state.load_full();
@@ -308,8 +306,17 @@ where
                         http.http1_only(true);
                     }
 
-                    if let Err(err) = http.serve_connection(socket, service).with_upgrades().await
-                    {
+                    let conn = http.serve_connection(socket, service).with_upgrades();
+                    tokio::pin!(conn);
+                    let result = tokio::select! {
+                        result = &mut conn => result,
+                        _ = crate::proxy::listener::wait_for_connection_shutdown(&mut connection_shutdown) => {
+                            conn.as_mut().graceful_shutdown();
+                            conn.await
+                        }
+                    };
+
+                    if let Err(err) = result {
                         tracing::debug!(
                             listener = ?mode,
                             peer_addr = %remote_addr,
@@ -321,14 +328,7 @@ where
         }
     }
 
-    while let Some(join_result) = connections.join_next().await {
-        if let Err(err) = join_result {
-            tracing::debug!(
-                listener = ?mode,
-                "HTTP listener connection task failed: {err}"
-            );
-        }
-    }
+    crate::proxy::listener::drain_connections(http_listener_name(mode), &mut connections).await;
 
     Ok(())
 }

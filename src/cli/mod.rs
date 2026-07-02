@@ -2,7 +2,6 @@ use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -292,49 +291,46 @@ async fn run_proxy_with_signals(
     state: SharedAppState,
     config_path: Option<&Path>,
 ) -> Result<(), CliError> {
-    use tokio::sync::Notify;
+    use tokio::sync::watch;
     use tokio::task::JoinSet;
 
-    let shutdown = Arc::new(Notify::new());
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     // Spawn signal handlers: SIGHUP for reload (on Unix) and
     // Ctrl+C/SIGTERM for graceful shutdown.
-    spawn_signal_handlers(state.clone(), config_path, shutdown.clone());
+    spawn_signal_handlers(state.clone(), config_path, shutdown_tx.clone());
 
     let listeners = state.load().config.proxy.listeners.clone();
     let mut tasks = JoinSet::new();
 
     if listeners.explicit_http.is_some() {
         let state = state.clone();
-        let shutdown = shutdown.clone();
+        let shutdown = shutdown_rx.clone();
         tasks.spawn(async move {
-            crate::proxy::http::run_explicit_http_proxy(state, async move {
-                shutdown.notified().await;
-            })
-            .await
-            .map_err(CliError::Proxy)
+            crate::proxy::http::run_explicit_http_proxy(state, wait_for_shutdown(shutdown))
+                .await
+                .map_err(CliError::Proxy)
         });
     }
 
     if listeners.transparent_http.is_some() {
         let state = state.clone();
-        let shutdown = shutdown.clone();
+        let shutdown = shutdown_rx.clone();
         tasks.spawn(async move {
-            crate::proxy::http::run_transparent_http_proxy(state, async move {
-                shutdown.notified().await;
-            })
-            .await
-            .map_err(CliError::Proxy)
+            crate::proxy::http::run_transparent_http_proxy(state, wait_for_shutdown(shutdown))
+                .await
+                .map_err(CliError::Proxy)
         });
     }
 
     if listeners.explicit_https.is_some() {
         let state = state.clone();
-        let shutdown = shutdown.clone();
+        let shutdown = shutdown_rx.clone();
         tasks.spawn(async move {
-            crate::proxy::explicit_https::run_explicit_https_proxy(state, async move {
-                shutdown.notified().await;
-            })
+            crate::proxy::explicit_https::run_explicit_https_proxy(
+                state,
+                wait_for_shutdown(shutdown),
+            )
             .await
             .map_err(CliError::ExplicitHttps)
         });
@@ -342,39 +338,76 @@ async fn run_proxy_with_signals(
 
     if listeners.transparent_https.is_some() {
         let state = state.clone();
-        let shutdown = shutdown.clone();
+        let shutdown = shutdown_rx.clone();
         tasks.spawn(async move {
-            crate::proxy::https_transparent::run_https_transparent_proxy(state, async move {
-                shutdown.notified().await;
-            })
+            crate::proxy::https_transparent::run_https_transparent_proxy(
+                state,
+                wait_for_shutdown(shutdown),
+            )
             .await
             .map_err(CliError::HttpsTransparent)
         });
     }
 
-    match tasks.join_next().await {
-        Some(Ok(Ok(()))) => Ok(()),
-        Some(Ok(Err(err))) => Err(err),
-        Some(Err(err)) => Err(CliError::Runtime(format!(
-            "proxy listener task failed: {err}"
-        ))),
-        None => Err(CliError::Config(ConfigError::Invalid(
+    if tasks.is_empty() {
+        return Err(CliError::Config(ConfigError::Invalid(
             "proxy.listeners must enable at least one listener".to_string(),
-        ))),
+        )));
     }
+
+    let mut first_error = None;
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                signal_shutdown(&shutdown_tx);
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+            Err(err) => {
+                signal_shutdown(&shutdown_tx);
+                if first_error.is_none() {
+                    first_error = Some(CliError::Runtime(format!(
+                        "proxy listener task failed: {err}"
+                    )));
+                }
+            }
+        }
+    }
+
+    match first_error {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    if *shutdown.borrow() {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if *shutdown.borrow() {
+            return;
+        }
+    }
+}
+
+fn signal_shutdown(shutdown: &tokio::sync::watch::Sender<bool>) {
+    let _ = shutdown.send(true);
 }
 
 fn spawn_signal_handlers(
     state: SharedAppState,
     config_path: Option<&Path>,
-    shutdown: Arc<tokio::sync::Notify>,
+    shutdown: tokio::sync::watch::Sender<bool>,
 ) {
     // Graceful shutdown on Ctrl+C (cross-platform).
     let shutdown_clone = shutdown.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             tracing::info!("received interrupt (Ctrl+C); initiating graceful shutdown");
-            shutdown_clone.notify_waiters();
+            signal_shutdown(&shutdown_clone);
         }
     });
 
@@ -429,7 +462,7 @@ fn spawn_signal_handlers(
 
             if term_stream.recv().await.is_some() {
                 tracing::info!("received SIGTERM; initiating graceful shutdown");
-                shutdown_clone.notify_waiters();
+                signal_shutdown(&shutdown_clone);
             }
         });
     }

@@ -9,15 +9,19 @@ use acl_proxy::proxy::explicit_https::{
     build_static_tls_acceptor, run_explicit_https_proxy_on_listener,
 };
 use acl_proxy::proxy::http::run_http_proxy_on_listener;
+use h2::client as h2_client;
 use http::StatusCode;
+use hyper::server::conn::Http;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Request, Response, Server};
 use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 use rustls::client::ServerName;
-use rustls::{Certificate as RustlsCertificate, ClientConfig, RootCertStore};
+use rustls::{
+    Certificate as RustlsCertificate, ClientConfig, PrivateKey, RootCertStore, ServerConfig,
+};
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio_rustls::TlsConnector;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 #[derive(Clone, Debug)]
 struct SeenRequest {
@@ -58,6 +62,58 @@ async fn start_http_echo_server(body: &'static str) -> (SocketAddr, Arc<Mutex<Ve
     );
 
     (addr, seen_requests)
+}
+
+async fn start_https_echo_server(body: &'static str) -> SocketAddr {
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind HTTPS upstream");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking HTTPS upstream");
+    let addr = listener.local_addr().expect("HTTPS upstream addr");
+
+    let mut params = CertificateParams::new(vec![addr.ip().to_string()]).expect("params");
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, addr.ip().to_string());
+    params.distinguished_name = dn;
+    let key = KeyPair::generate().expect("generate upstream key");
+    let cert = params.self_signed(&key).expect("self-signed upstream cert");
+
+    let mut tls_config = ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![RustlsCertificate(cert.der().to_vec())],
+            PrivateKey(key.serialize_der()),
+        )
+        .expect("upstream server config");
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
+
+    tokio::spawn(async move {
+        let listener = tokio::net::TcpListener::from_std(listener).expect("tokio HTTPS listener");
+        loop {
+            let (socket, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let tls_acceptor = tls_acceptor.clone();
+            tokio::spawn(async move {
+                let tls = match tls_acceptor.accept(socket).await {
+                    Ok(tls) => tls,
+                    Err(_) => return,
+                };
+                let service = service_fn(move |_req: Request<Body>| async move {
+                    Ok::<_, hyper::Error>(Response::new(Body::from(body)))
+                });
+                let _ = Http::new()
+                    .http1_keep_alive(false)
+                    .serve_connection(tls, service)
+                    .await;
+            });
+        }
+    });
+
+    addr
 }
 
 fn write_proxy_identity(temp_dir: &TempDir) -> (PathBuf, PathBuf) {
@@ -247,6 +303,32 @@ async fn send_explicit_https_request(
     ca_cert_path: &Path,
     absolute_url: &str,
 ) -> (StatusCode, String) {
+    let mut tls = open_explicit_https_proxy_tls(proxy_addr, ca_cert_path).await;
+
+    let request = format!(
+        "GET {absolute_url} HTTP/1.1\r\nHost: ignored-by-explicit-proxy.test\r\nConnection: close\r\n\r\n"
+    );
+    tls.write_all(request.as_bytes())
+        .await
+        .expect("write request");
+
+    let mut buf = Vec::new();
+    tls.read_to_end(&mut buf).await.expect("read response");
+    let response = String::from_utf8_lossy(&buf).to_string();
+    let status_line = response.lines().next().unwrap_or_default();
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .and_then(|code| StatusCode::from_u16(code).ok())
+        .expect("response status");
+    (status, response)
+}
+
+async fn open_explicit_https_proxy_tls(
+    proxy_addr: SocketAddr,
+    ca_cert_path: &Path,
+) -> tokio_rustls::client::TlsStream<tokio::net::TcpStream> {
     let stream = tokio::net::TcpStream::connect(proxy_addr)
         .await
         .expect("connect proxy");
@@ -268,29 +350,160 @@ async fn send_explicit_https_request(
 
     let connector = TlsConnector::from(Arc::new(config));
     let server_name = ServerName::try_from("127.0.0.1").expect("server name");
-    let mut tls = connector
+    connector
         .connect(server_name, stream)
         .await
-        .expect("tls connect");
+        .expect("tls connect")
+}
 
-    let request = format!(
-        "GET {absolute_url} HTTP/1.1\r\nHost: ignored-by-explicit-proxy.test\r\nConnection: close\r\n\r\n"
+async fn send_https_via_explicit_https_connect(
+    proxy_addr: SocketAddr,
+    proxy_cert_path: &Path,
+    mitm_ca_cert_path: &Path,
+    target_host: &str,
+    path: &str,
+) -> (StatusCode, String) {
+    let mut outer_tls = open_explicit_https_proxy_tls(proxy_addr, proxy_cert_path).await;
+    let connect_req = format!(
+        "CONNECT {target_host} HTTP/1.1\r\nHost: {target_host}\r\nConnection: keep-alive\r\n\r\n"
     );
-    tls.write_all(request.as_bytes())
+    outer_tls
+        .write_all(connect_req.as_bytes())
         .await
-        .expect("write request");
+        .expect("write CONNECT");
 
+    let (_head, connect_status) = read_http_response_head(&mut outer_tls)
+        .await
+        .expect("read CONNECT response");
+    if connect_status != StatusCode::OK {
+        return (connect_status, String::new());
+    }
+
+    let ca_pem = std::fs::read(mitm_ca_cert_path).expect("read MITM CA cert");
+    let mut reader = Cursor::new(ca_pem);
+    let mut roots = RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut reader).expect("parse MITM CA cert") {
+        roots
+            .add(&RustlsCertificate(cert.to_vec()))
+            .expect("add MITM CA cert root");
+    }
+
+    let config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+    let host_only = target_host.split(':').next().expect("target host name");
+    let server_name = ServerName::try_from(host_only).expect("target server name");
+    let mut inner_tls = connector
+        .connect(server_name, outer_tls)
+        .await
+        .expect("inner TLS connect");
+
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {target_host}\r\nConnection: close\r\n\r\n");
+    inner_tls
+        .write_all(request.as_bytes())
+        .await
+        .expect("write inner HTTPS request");
     let mut buf = Vec::new();
-    tls.read_to_end(&mut buf).await.expect("read response");
-    let response = String::from_utf8_lossy(&buf).to_string();
-    let status_line = response.lines().next().unwrap_or_default();
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
+    inner_tls
+        .read_to_end(&mut buf)
+        .await
+        .expect("read inner HTTPS response");
+    parse_http_response(&buf)
+}
+
+async fn send_h2c_http_request(addr: SocketAddr, uri: &str) -> (String, StatusCode) {
+    let stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect h2c proxy");
+    let (send_request, connection) = h2_client::handshake(stream).await.expect("h2 handshake");
+    tokio::spawn(async move {
+        if let Err(err) = connection.await {
+            eprintln!("h2 connection error: {err}");
+        }
+    });
+
+    let mut send_request = send_request.ready().await.expect("h2 ready");
+    let request = http::Request::builder()
+        .method("GET")
+        .uri(uri)
+        .body(())
+        .expect("build h2 request");
+    let (response_fut, _send_stream) = send_request
+        .send_request(request, true)
+        .expect("send h2 request");
+    let response = response_fut.await.expect("await h2 response");
+    let status = response.status();
+    let mut body = response.into_body();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.expect("h2 response chunk");
+        bytes.extend_from_slice(&chunk);
+    }
+    (String::from_utf8_lossy(&bytes).to_string(), status)
+}
+
+async fn read_http_response_head<R>(reader: &mut R) -> std::io::Result<(String, StatusCode)>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        reader.read_exact(&mut byte).await?;
+        buf.push(byte[0]);
+        if buf.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let head = String::from_utf8_lossy(&buf).to_string();
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .and_then(|code| StatusCode::from_u16(code).ok())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    Ok((head, status))
+}
+
+async fn read_until_contains<R>(reader: &mut R, needle: &[u8]) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut buf = Vec::new();
+    let mut tmp = [0_u8; 1024];
+    loop {
+        let n = tokio::time::timeout(tokio::time::Duration::from_secs(2), reader.read(&mut tmp))
+            .await
+            .expect("timed out waiting for response")
+            .expect("read response");
+        assert!(n > 0, "unexpected EOF before response contained needle");
+        buf.extend_from_slice(&tmp[..n]);
+        if buf.windows(needle.len()).any(|window| window == needle) {
+            return buf;
+        }
+    }
+}
+
+fn parse_http_response(buf: &[u8]) -> (StatusCode, String) {
+    let response = String::from_utf8_lossy(buf).to_string();
+    let status = response
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
         .and_then(|code| StatusCode::from_u16(code).ok())
         .expect("response status");
-    (status, response)
+    let body = response
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or_default()
+        .to_string();
+    (status, body)
 }
 
 async fn send_raw_http_request(proxy_addr: SocketAddr, absolute_url: &str) -> (StatusCode, String) {
@@ -355,6 +568,112 @@ async fn explicit_https_listener_accepts_absolute_form_requests() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn explicit_https_listener_supports_connect_mitm_over_http1() {
+    let upstream_addr = start_https_echo_server("explicit https connect ok").await;
+    let identity_dir = TempDir::new().expect("identity dir");
+    let (cert_path, key_path) = write_proxy_identity(&identity_dir);
+    let allow_pattern = format!("https://{}:{}/**", upstream_addr.ip(), upstream_addr.port());
+    let config = explicit_https_config(&cert_path, &key_path, &allow_pattern);
+
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind explicit https proxy");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, proxy_temp_dir) = start_explicit_https_proxy(config, listener).await;
+
+    let target_host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    let mitm_ca_cert_path = proxy_temp_dir.path().join("certs").join("ca-cert.pem");
+    let (status, body) = send_https_via_explicit_https_connect(
+        proxy_addr,
+        &cert_path,
+        &mitm_ca_cert_path,
+        &target_host,
+        "/ok",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("explicit https connect ok"),
+        "unexpected response body: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_https_listener_shutdown_closes_idle_keep_alive_connection() {
+    let (upstream_addr, _seen_requests) = start_http_echo_server("shutdown ok").await;
+    let identity_dir = TempDir::new().expect("identity dir");
+    let (cert_path, key_path) = write_proxy_identity(&identity_dir);
+    let allow_pattern = format!("http://{}:{}/**", upstream_addr.ip(), upstream_addr.port());
+    let mut config = explicit_https_config(&cert_path, &key_path, &allow_pattern);
+
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind explicit https proxy");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let proxy_addr = listener.local_addr().expect("proxy addr");
+
+    let temp_dir = TempDir::new().expect("temp dir");
+    config.logging.directory = None;
+    config.capture.directory = temp_dir
+        .path()
+        .join("captures")
+        .to_string_lossy()
+        .to_string();
+    config.certificates.certs_dir = temp_dir.path().join("certs").to_string_lossy().to_string();
+    let listener_cfg = config
+        .proxy
+        .listeners
+        .explicit_https
+        .as_ref()
+        .expect("explicit https listener")
+        .clone();
+    let tls_acceptor = build_static_tls_acceptor(&listener_cfg).expect("static TLS acceptor");
+    let state = AppState::shared_from_config(config).expect("app state");
+
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_for_task = shutdown.clone();
+    let server_task = tokio::spawn(async move {
+        run_explicit_https_proxy_on_listener(
+            state,
+            listener,
+            tls_acceptor,
+            listener_cfg,
+            async move {
+                shutdown_for_task.notified().await;
+            },
+        )
+        .await
+    });
+
+    let absolute_url = format!(
+        "http://{}:{}/keepalive",
+        upstream_addr.ip(),
+        upstream_addr.port()
+    );
+    let mut tls = open_explicit_https_proxy_tls(proxy_addr, &cert_path).await;
+    let request = format!(
+        "GET {absolute_url} HTTP/1.1\r\nHost: ignored.test\r\nConnection: keep-alive\r\n\r\n"
+    );
+    tls.write_all(request.as_bytes())
+        .await
+        .expect("write keep-alive request");
+    let response = read_until_contains(&mut tls, b"shutdown ok").await;
+    assert!(
+        String::from_utf8_lossy(&response).contains("200 OK"),
+        "unexpected response: {}",
+        String::from_utf8_lossy(&response)
+    );
+
+    shutdown.notify_waiters();
+    tokio::time::timeout(tokio::time::Duration::from_secs(2), server_task)
+        .await
+        .expect("explicit HTTPS listener did not stop after shutdown")
+        .expect("listener task join")
+        .expect("listener shutdown result");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn explicit_http_can_forward_to_parent_explicit_proxy_over_https() {
     let (upstream_addr, seen_requests) = start_http_echo_server("https parent ok").await;
     let identity_dir = TempDir::new().expect("identity dir");
@@ -396,6 +715,47 @@ async fn explicit_http_can_forward_to_parent_explicit_proxy_over_https() {
             .get("host")
             .and_then(|value| value.to_str().ok()),
         Some(format!("{}:{}", upstream_addr.ip(), upstream_addr.port()).as_str())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn h2_request_to_https_parent_requires_h2_alpn_without_downgrade() {
+    let (upstream_addr, seen_requests) = start_http_echo_server("should not downgrade").await;
+    let identity_dir = TempDir::new().expect("identity dir");
+    let (cert_path, key_path) = write_proxy_identity(&identity_dir);
+    let allow_pattern = format!("http://{}:{}/**", upstream_addr.ip(), upstream_addr.port());
+
+    let mut parent_config = explicit_https_config(&cert_path, &key_path, &allow_pattern);
+    parent_config
+        .proxy
+        .listeners
+        .explicit_https
+        .as_mut()
+        .expect("parent explicit HTTPS listener")
+        .enable_http2 = false;
+    let parent_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind parent proxy");
+    parent_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking parent proxy");
+    let (parent_addr, _parent_temp_dir) =
+        start_explicit_https_proxy(parent_config, parent_listener).await;
+
+    let mut inner_config =
+        explicit_http_config_with_https_parent(parent_addr, &cert_path, &allow_pattern);
+    inner_config.loop_protection.add_header = false;
+    let (inner_addr, _inner_temp_dir) = start_explicit_http_proxy(inner_config).await;
+
+    let absolute_url = format!(
+        "http://{}:{}/h2-parent",
+        upstream_addr.ip(),
+        upstream_addr.port()
+    );
+    let (_body, status) = send_h2c_http_request(inner_addr, &absolute_url).await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(
+        seen_requests.lock().unwrap().is_empty(),
+        "HTTP/2 requests must not downgrade to HTTP/1.1 on an HTTPS parent hop"
     );
 }
 

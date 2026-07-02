@@ -159,21 +159,29 @@ where
         Some(Arc::new(Semaphore::new(connection_limit)))
     };
     let mut connections = JoinSet::new();
+    let (connection_shutdown, _) = crate::proxy::listener::connection_shutdown_channel();
 
     tokio::pin!(shutdown);
 
-    loop {
+    'accepting: loop {
         let connection_permit = match connection_semaphore.as_ref() {
             Some(semaphore) => {
                 let semaphore = semaphore.clone();
-                match tokio::select! {
-                    _ = &mut shutdown => {
-                        break;
+                loop {
+                    match tokio::select! {
+                        _ = &mut shutdown => {
+                            crate::proxy::listener::signal_connection_shutdown(&connection_shutdown);
+                            break 'accepting;
+                        }
+                        Some(join_result) = connections.join_next(), if !connections.is_empty() => {
+                            crate::proxy::listener::log_connection_task_result("transparent_https", join_result);
+                            continue;
+                        }
+                        permit = semaphore.clone().acquire_owned() => permit,
+                    } {
+                        Ok(permit) => break Some(permit),
+                        Err(_) => break 'accepting,
                     }
-                    permit = semaphore.acquire_owned() => permit,
-                } {
-                    Ok(permit) => Some(permit),
-                    Err(_) => break,
                 }
             }
             None => None,
@@ -181,9 +189,12 @@ where
 
         tokio::select! {
             _ = &mut shutdown => {
-                // Stop accepting new connections; in-flight TLS sessions
-                // will complete naturally.
+                crate::proxy::listener::signal_connection_shutdown(&connection_shutdown);
                 break;
+            }
+            Some(join_result) = connections.join_next(), if !connections.is_empty() => {
+                drop(connection_permit);
+                crate::proxy::listener::log_connection_task_result("transparent_https", join_result);
             }
             accept_res = listener.accept() => {
                 let (socket, remote_addr) = match accept_res {
@@ -195,6 +206,7 @@ where
                 };
 
                 let state = state.clone();
+                let connection_shutdown = connection_shutdown.subscribe();
                 connections.spawn(async move {
                     let state_snapshot = state.load_full();
                     let limits = HttpsTransparentConnectionLimits::from_state(&state_snapshot);
@@ -212,7 +224,12 @@ where
                     };
 
                     if let Err(err) = handle_tls_connection(
-                        state, tls_acceptor, socket, remote_addr, limits,
+                        state,
+                        tls_acceptor,
+                        socket,
+                        remote_addr,
+                        limits,
+                        connection_shutdown,
                     )
                     .await
                     {
@@ -227,11 +244,7 @@ where
         }
     }
 
-    while let Some(join_result) = connections.join_next().await {
-        if let Err(err) = join_result {
-            tracing::debug!("transparent HTTPS listener connection task failed: {err}");
-        }
-    }
+    crate::proxy::listener::drain_connections("transparent_https", &mut connections).await;
 
     Ok(())
 }
@@ -242,6 +255,7 @@ async fn handle_tls_connection(
     socket: tokio::net::TcpStream,
     remote_addr: SocketAddr,
     limits: HttpsTransparentConnectionLimits,
+    mut connection_shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), HttpsTransparentError> {
     let accept = tls_acceptor.accept(socket);
     let tls_result = match limits.handshake_timeout {
@@ -327,10 +341,17 @@ async fn handle_tls_connection(
     }
     http.http2_max_concurrent_streams(limits.http2_max_concurrent_streams);
 
-    http.serve_connection(tls, service)
-        .with_upgrades()
-        .await
-        .map_err(HttpsTransparentError::Hyper)
+    let conn = http.serve_connection(tls, service).with_upgrades();
+    tokio::pin!(conn);
+    let result = tokio::select! {
+        result = &mut conn => result,
+        _ = crate::proxy::listener::wait_for_connection_shutdown(&mut connection_shutdown) => {
+            conn.as_mut().graceful_shutdown();
+            conn.await
+        }
+    };
+
+    result.map_err(HttpsTransparentError::Hyper)
 }
 
 async fn handle_inner_https_request(
