@@ -28,6 +28,7 @@ dependencies = [
  "rcgen",
  "regex",
  "rustls",
+ "rustls-native-certs",
  "rustls-pemfile",
  "serde",
  "serde_json",

@@ -160,8 +160,7 @@ fn minimal_config() -> Config {
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -312,10 +311,10 @@ async fn two_proxy_chain_forwards_allowed_requests_end_to_end() {
     inner_config.policy.rules = vec![allow_rule(upstream_pattern, Vec::new())];
     inner_config.loop_protection.enabled = true;
     inner_config.loop_protection.add_header = false;
-    inner_config.proxy.egress.default = Some(EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: outer_addr.port(),
-    });
+    inner_config.proxy.egress.default = Some(EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        outer_addr.port(),
+    ));
     let (inner_addr, _inner_temp_dir) = start_proxy_with_config(inner_config).await;
 
     let raw_request = format!(
@@ -356,10 +355,10 @@ async fn two_proxy_chain_preserves_http2_on_inner_to_outer_hop() {
     inner_config.policy.rules = vec![allow_rule(upstream_pattern, Vec::new())];
     inner_config.loop_protection.enabled = true;
     inner_config.loop_protection.add_header = false;
-    inner_config.proxy.egress.default = Some(EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: outer_addr.port(),
-    });
+    inner_config.proxy.egress.default = Some(EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        outer_addr.port(),
+    ));
     let (inner_addr, _inner_temp_dir) = start_proxy_with_config(inner_config).await;
 
     let (body, status) = send_h2c_http_request(inner_addr, &upstream_url).await;
@@ -443,10 +442,10 @@ async fn two_proxy_chain_preserves_http1_upgrade_tunneling() {
     inner_config.policy.rules = vec![allow_rule(upstream_pattern, Vec::new())];
     inner_config.loop_protection.enabled = true;
     inner_config.loop_protection.add_header = false;
-    inner_config.proxy.egress.default = Some(EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: outer_addr.port(),
-    });
+    inner_config.proxy.egress.default = Some(EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        outer_addr.port(),
+    ));
     let (inner_addr, _inner_temp_dir) = start_proxy_with_config(inner_config).await;
 
     let mut stream = tokio::net::TcpStream::connect(inner_addr)
@@ -523,10 +522,10 @@ async fn h2_chain_hop_to_http1_only_egress_returns_bad_gateway_without_downgrade
     )];
     inner_config.loop_protection.enabled = true;
     inner_config.loop_protection.add_header = false;
-    inner_config.proxy.egress.default = Some(EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: probe_addr.port(),
-    });
+    inner_config.proxy.egress.default = Some(EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        probe_addr.port(),
+    ));
     let (inner_addr, _inner_temp_dir) = start_proxy_with_config(inner_config).await;
 
     let (_body, status) =
@@ -583,10 +582,10 @@ async fn header_action_trust_chain_removes_then_sets_identity_header() {
         ],
     )];
     inner_config.loop_protection.add_header = false;
-    inner_config.proxy.egress.default = Some(EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: outer_addr.port(),
-    });
+    inner_config.proxy.egress.default = Some(EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        outer_addr.port(),
+    ));
     let (inner_addr, _inner_temp_dir) = start_proxy_with_config(inner_config).await;
 
     let raw_request = format!(
@@ -625,10 +624,10 @@ async fn unavailable_egress_destination_returns_bad_gateway() {
         "http://example.invalid/**".to_string(),
         Vec::new(),
     )];
-    config.proxy.egress.default = Some(EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: 1,
-    });
+    config.proxy.egress.default = Some(EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        1,
+    ));
     let (proxy_addr, _temp_dir) = start_proxy_with_config(config).await;
 
     let raw_request =
@@ -661,10 +660,10 @@ async fn inner_proxy_can_disable_loop_header_injection_for_chained_deployments()
     inner_config.policy.rules = vec![allow_rule(upstream_pattern, Vec::new())];
     inner_config.loop_protection.enabled = true;
     inner_config.loop_protection.add_header = false;
-    inner_config.proxy.egress.default = Some(EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: outer_addr.port(),
-    });
+    inner_config.proxy.egress.default = Some(EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        outer_addr.port(),
+    ));
     let (inner_addr, _inner_temp_dir) = start_proxy_with_config(inner_config).await;
 
     let raw_request = format!(

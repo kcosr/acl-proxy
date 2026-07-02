@@ -214,8 +214,7 @@ fn minimal_connect_config() -> Config {
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -829,10 +828,10 @@ async fn configured_egress_forwarding_applies_to_https_connect_inner_requests() 
             rule_id: None,
         },
     )];
-    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: forward_addr.port(),
-    });
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        forward_addr.port(),
+    ));
 
     let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
@@ -891,10 +890,10 @@ async fn global_egress_request_actions_apply_to_https_connect_inner_requests() {
             rule_id: None,
         },
     )];
-    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: forward_addr.port(),
-    });
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        forward_addr.port(),
+    ));
     config.proxy.egress.request_header_actions =
         vec![acl_proxy::config::EgressRequestHeaderActionConfig {
             action: acl_proxy::config::HeaderActionKind::Set,
@@ -1020,8 +1019,7 @@ done
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -1047,7 +1045,7 @@ default = "deny"
 [policy.external_auth_profiles.pass_plugin]
 type = "plugin"
 command = "{script_path}"
-timeout_ms = 1000
+timeout_ms = 5000
 
 [[policy.rules]]
 action = "delegate"
@@ -1108,10 +1106,10 @@ async fn headers_match_is_evaluated_on_decrypted_inner_connect_requests() {
             rule_id: None,
         },
     )];
-    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: forward_addr.port(),
-    });
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        forward_addr.port(),
+    ));
 
     let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
@@ -1216,10 +1214,10 @@ async fn headers_not_match_is_evaluated_on_decrypted_inner_connect_requests() {
             rule_id: None,
         }),
     ];
-    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: forward_addr.port(),
-    });
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        forward_addr.port(),
+    ));
 
     let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener

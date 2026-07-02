@@ -127,8 +127,7 @@ fn minimal_config() -> Config {
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -416,10 +415,10 @@ fn egress_forwarding_config_updates_after_reload() {
     );
 
     let mut updated = config.clone();
-    updated.proxy.egress.default = Some(EgressTargetConfig {
-        host: "proxy.internal".to_string(),
-        port: 9443,
-    });
+    updated.proxy.egress.default = Some(EgressTargetConfig::explicit_http_proxy(
+        "proxy.internal".to_string(),
+        9443,
+    ));
 
     AppState::reload_shared_from_config(&shared_state, updated).expect("reload config");
 
@@ -445,10 +444,10 @@ fn invalid_egress_forwarding_config_is_rejected_on_reload() {
     let shared_state = AppState::shared_from_config(config.clone()).expect("app state");
 
     let mut invalid = config.clone();
-    invalid.proxy.egress.default = Some(EgressTargetConfig {
-        host: "proxy.internal:9443".to_string(),
-        port: 9443,
-    });
+    invalid.proxy.egress.default = Some(EgressTargetConfig::explicit_http_proxy(
+        "proxy.internal:9443".to_string(),
+        9443,
+    ));
 
     let err = AppState::reload_shared_from_config(&shared_state, invalid)
         .expect_err("reload should fail");
@@ -795,10 +794,10 @@ async fn egress_forwarding_enable_disable_updates_after_reload() {
     assert_eq!(forward_requests.lock().unwrap().len(), 0);
 
     let mut enabled = config.clone();
-    enabled.proxy.egress.default = Some(EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: forward_addr.port(),
-    });
+    enabled.proxy.egress.default = Some(EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        forward_addr.port(),
+    ));
     AppState::reload_shared_from_config(&shared_state, enabled).expect("reload config");
 
     let (response, status) = send_raw_http_request(proxy_addr, &raw_request).await;

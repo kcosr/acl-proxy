@@ -113,6 +113,12 @@ impl AppState {
         config: Config,
     ) -> Result<(), AppStateError> {
         let previous = shared.load_full();
+        if previous.config.proxy.listeners != config.proxy.listeners {
+            return Err(AppStateError::Config(ConfigError::Invalid(
+                "listener configuration changed; restart required for proxy.listeners changes"
+                    .to_string(),
+            )));
+        }
         let new_state = AppState::from_config_with_previous(config, Some(previous.as_ref()))?;
         shared.store(Arc::new(new_state));
         Ok(())

@@ -2,7 +2,19 @@
 
 ## [Unreleased]
 
-_No unreleased changes._
+### Breaking Changes
+
+- Replaced the flat proxy listener settings with `proxy.listeners.*` sections for explicit HTTP, transparent HTTP, explicit HTTPS, and transparent HTTPS listeners.
+- Changed `proxy.egress.default` to require an explicit parent-proxy `type` and `transport`.
+
+### Added
+
+- Add an explicit HTTPS proxy listener with an operator-managed static proxy certificate and key.
+- Add HTTPS parent-proxy egress forwarding with configurable TLS trust for system roots, custom CAs, combined system-plus-custom roots, or disabled verification.
+
+### Changed
+
+- Split explicit HTTP and transparent HTTP handling onto separate configured sockets, and reject listener topology changes during reload.
 
 ## [0.2.0] - 2026-06-25
 

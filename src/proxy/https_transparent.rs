@@ -16,7 +16,7 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::app::{AppState, SharedAppState};
 use crate::capture::{CaptureEndpoint, CaptureMode};
-use crate::config::{ExternalAuthProfileType, PolicyRuleAction};
+use crate::config::{parse_listener_bind, ExternalAuthProfileType, PolicyRuleAction};
 use crate::logging::PolicyDecisionLogContext;
 use crate::proxy::http::{
     build_external_auth_error_response, build_loop_detected_response,
@@ -27,12 +27,8 @@ use crate::proxy::http::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum HttpsTransparentError {
-    #[error("invalid HTTPS bind address {address}: {source}")]
-    BindAddress {
-        address: String,
-        #[source]
-        source: std::net::AddrParseError,
-    },
+    #[error("invalid HTTPS bind address {address}: {message}")]
+    BindAddress { address: String, message: String },
 
     #[error("failed to bind HTTPS transparent listener on {addr}: {source}")]
     BindListener {
@@ -70,12 +66,18 @@ struct HttpsTransparentConnectionLimits {
 
 impl HttpsTransparentConnectionLimits {
     fn from_state(state: &AppState) -> Self {
-        let proxy = &state.config.proxy;
+        let listener = state
+            .config
+            .proxy
+            .listeners
+            .transparent_https
+            .as_ref()
+            .expect("transparent_https listener must be configured before startup");
         Self {
-            handshake_timeout: duration_from_millis(proxy.https_handshake_timeout_ms),
-            handshake_timeout_ms: proxy.https_handshake_timeout_ms,
-            request_header_timeout: duration_from_millis(proxy.https_request_header_timeout_ms),
-            http2_max_concurrent_streams: nonzero_u32(proxy.https_http2_max_concurrent_streams),
+            handshake_timeout: duration_from_millis(listener.handshake_timeout_ms),
+            handshake_timeout_ms: listener.handshake_timeout_ms,
+            request_header_timeout: duration_from_millis(listener.request_header_timeout_ms),
+            http2_max_concurrent_streams: nonzero_u32(listener.http2_max_concurrent_streams),
         }
     }
 }
@@ -109,16 +111,18 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let initial = state.load();
-    let bind_ip = initial
+    let listener_cfg = initial
         .config
         .proxy
-        .https_bind_address
-        .parse()
-        .map_err(|e| HttpsTransparentError::BindAddress {
-            address: initial.config.proxy.https_bind_address.clone(),
-            source: e,
+        .listeners
+        .transparent_https
+        .as_ref()
+        .expect("transparent_https listener must be configured before startup");
+    let addr = parse_listener_bind("proxy.listeners.transparent_https.bind", &listener_cfg.bind)
+        .map_err(|err| HttpsTransparentError::BindAddress {
+            address: listener_cfg.bind.clone(),
+            message: err.to_string(),
         })?;
-    let addr = SocketAddr::new(bind_ip, initial.config.proxy.https_port);
 
     let listener = StdTcpListener::bind(addr)
         .map_err(|e| HttpsTransparentError::BindListener { addr, source: e })?;
@@ -139,7 +143,15 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let listener = TcpListener::from_std(listener).map_err(HttpsTransparentError::FromStd)?;
-    let connection_limit = state.load().config.proxy.https_max_connections;
+    let connection_limit = state
+        .load()
+        .config
+        .proxy
+        .listeners
+        .transparent_https
+        .as_ref()
+        .expect("transparent_https listener must be configured before startup")
+        .max_connections;
     let connection_semaphore = if connection_limit == 0 {
         None
     } else {

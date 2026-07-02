@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
-use std::net::IpAddr;
+use std::io::BufReader;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 
 use http::header::{HeaderName, HeaderValue};
@@ -114,35 +115,14 @@ fn default_schema_version() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
-    #[serde(default = "default_bind_address")]
-    pub bind_address: String,
-
-    #[serde(default = "default_http_port")]
-    pub http_port: u16,
-
-    #[serde(default = "default_https_bind_address")]
-    pub https_bind_address: String,
-
-    #[serde(default = "default_https_port")]
-    pub https_port: u16,
-
     #[serde(default = "default_request_timeout_ms")]
     pub request_timeout_ms: u64,
 
-    #[serde(default = "default_https_handshake_timeout_ms")]
-    pub https_handshake_timeout_ms: u64,
-
-    #[serde(default = "default_https_request_header_timeout_ms")]
-    pub https_request_header_timeout_ms: u64,
-
-    #[serde(default = "default_https_max_connections")]
-    pub https_max_connections: usize,
-
-    #[serde(default = "default_https_http2_max_concurrent_streams")]
-    pub https_http2_max_concurrent_streams: u32,
-
     #[serde(default = "default_internal_base_path")]
     pub internal_base_path: String,
+
+    #[serde(default)]
+    pub listeners: ProxyListenersConfig,
 
     #[serde(default)]
     pub egress: ProxyEgressConfig,
@@ -151,59 +131,123 @@ pub struct ProxyConfig {
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
-            bind_address: default_bind_address(),
-            http_port: default_http_port(),
-            https_bind_address: default_https_bind_address(),
-            https_port: default_https_port(),
             request_timeout_ms: default_request_timeout_ms(),
-            https_handshake_timeout_ms: default_https_handshake_timeout_ms(),
-            https_request_header_timeout_ms: default_https_request_header_timeout_ms(),
-            https_max_connections: default_https_max_connections(),
-            https_http2_max_concurrent_streams: default_https_http2_max_concurrent_streams(),
             internal_base_path: default_internal_base_path(),
+            listeners: ProxyListenersConfig::default(),
             egress: ProxyEgressConfig::default(),
         }
     }
-}
-
-fn default_bind_address() -> String {
-    "0.0.0.0".to_string()
-}
-
-fn default_http_port() -> u16 {
-    8881
-}
-
-fn default_https_bind_address() -> String {
-    "0.0.0.0".to_string()
-}
-
-fn default_https_port() -> u16 {
-    8889
 }
 
 fn default_request_timeout_ms() -> u64 {
     30_000
 }
 
-fn default_https_handshake_timeout_ms() -> u64 {
+fn default_tls_handshake_timeout_ms() -> u64 {
     10_000
 }
 
-fn default_https_request_header_timeout_ms() -> u64 {
+fn default_tls_request_header_timeout_ms() -> u64 {
     10_000
 }
 
-fn default_https_max_connections() -> usize {
+fn default_tls_max_connections() -> usize {
     1024
 }
 
-fn default_https_http2_max_concurrent_streams() -> u32 {
+fn default_tls_http2_max_concurrent_streams() -> u32 {
     128
 }
 
 fn default_internal_base_path() -> String {
     "/_acl-proxy".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyListenersConfig {
+    #[serde(default)]
+    pub explicit_http: Option<CleartextHttpListenerConfig>,
+
+    #[serde(default)]
+    pub transparent_http: Option<CleartextHttpListenerConfig>,
+
+    #[serde(default)]
+    pub explicit_https: Option<ExplicitHttpsListenerConfig>,
+
+    #[serde(default)]
+    pub transparent_https: Option<TransparentHttpsListenerConfig>,
+}
+
+impl ProxyListenersConfig {
+    pub fn enabled_count(&self) -> usize {
+        self.explicit_http.iter().count()
+            + self.transparent_http.iter().count()
+            + self.explicit_https.iter().count()
+            + self.transparent_https.iter().count()
+    }
+
+    pub fn has_connect_capable_listener(&self) -> bool {
+        self.explicit_http.is_some() || self.explicit_https.is_some()
+    }
+
+    pub fn uses_mitm_certificates(&self) -> bool {
+        self.has_connect_capable_listener() || self.transparent_https.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CleartextHttpListenerConfig {
+    pub bind: String,
+
+    #[serde(default = "default_cleartext_enable_http2")]
+    pub enable_http2: bool,
+}
+
+fn default_cleartext_enable_http2() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ExplicitHttpsListenerConfig {
+    pub bind: String,
+    pub cert_chain_path: PathBuf,
+    pub key_path: PathBuf,
+
+    #[serde(default = "default_tls_handshake_timeout_ms")]
+    pub handshake_timeout_ms: u64,
+
+    #[serde(default = "default_tls_request_header_timeout_ms")]
+    pub request_header_timeout_ms: u64,
+
+    #[serde(default = "default_tls_max_connections")]
+    pub max_connections: usize,
+
+    #[serde(default)]
+    pub enable_http2: bool,
+
+    #[serde(default = "default_tls_http2_max_concurrent_streams")]
+    pub http2_max_concurrent_streams: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TransparentHttpsListenerConfig {
+    pub bind: String,
+
+    #[serde(default = "default_tls_handshake_timeout_ms")]
+    pub handshake_timeout_ms: u64,
+
+    #[serde(default = "default_tls_request_header_timeout_ms")]
+    pub request_header_timeout_ms: u64,
+
+    #[serde(default = "default_tls_max_connections")]
+    pub max_connections: usize,
+
+    #[serde(default = "default_tls_http2_max_concurrent_streams")]
+    pub http2_max_concurrent_streams: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -219,8 +263,81 @@ pub struct ProxyEgressConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct EgressTargetConfig {
+    #[serde(rename = "type")]
+    pub target_type: EgressTargetType,
+    pub transport: EgressTransport,
     pub host: String,
     pub port: u16,
+
+    #[serde(default)]
+    pub tls: Option<EgressTlsConfig>,
+}
+
+impl EgressTargetConfig {
+    pub fn explicit_http_proxy(host: String, port: u16) -> Self {
+        Self {
+            target_type: EgressTargetType::ExplicitProxy,
+            transport: EgressTransport::Http,
+            host,
+            port,
+            tls: None,
+        }
+    }
+
+    pub fn effective_tls_trust(&self) -> EgressTlsTrust {
+        let Some(tls) = self.tls.as_ref() else {
+            return EgressTlsTrust::System;
+        };
+        tls.trust.unwrap_or_else(|| {
+            if tls.ca_cert_path.is_some() {
+                EgressTlsTrust::SystemPlusCustomCa
+            } else {
+                EgressTlsTrust::System
+            }
+        })
+    }
+
+    pub fn tls_server_name(&self) -> &str {
+        self.tls
+            .as_ref()
+            .and_then(|tls| tls.server_name.as_deref())
+            .unwrap_or(&self.host)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressTargetType {
+    ExplicitProxy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum EgressTransport {
+    Http,
+    Https,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EgressTlsConfig {
+    #[serde(default)]
+    pub trust: Option<EgressTlsTrust>,
+
+    #[serde(default)]
+    pub server_name: Option<String>,
+
+    #[serde(default)]
+    pub ca_cert_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressTlsTrust {
+    System,
+    CustomCa,
+    SystemPlusCustomCa,
+    Disabled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1111,14 +1228,18 @@ impl Config {
     }
 
     fn apply_env_overrides(&mut self) {
-        if let Ok(port) = env::var("PROXY_PORT") {
-            if let Ok(port) = port.parse::<u16>() {
-                self.proxy.http_port = port;
-            }
-        }
-        if let Ok(host) = env::var("PROXY_HOST") {
-            if !host.trim().is_empty() {
-                self.proxy.bind_address = host;
+        if let Ok(bind) = env::var("PROXY_EXPLICIT_HTTP_BIND") {
+            let bind = bind.trim();
+            if !bind.is_empty() {
+                match self.proxy.listeners.explicit_http.as_mut() {
+                    Some(listener) => listener.bind = bind.to_string(),
+                    None => {
+                        self.proxy.listeners.explicit_http = Some(CleartextHttpListenerConfig {
+                            bind: bind.to_string(),
+                            enable_http2: default_cleartext_enable_http2(),
+                        });
+                    }
+                }
             }
         }
         if let Ok(level) = env::var("LOG_LEVEL") {
@@ -1456,16 +1577,19 @@ pub fn write_default_config(path: &Path) -> Result<(), ConfigError> {
     let contents = r#"schema_version = "1"
 
 [proxy]
-bind_address = "0.0.0.0"
-http_port = 8881
-https_bind_address = "0.0.0.0"
-https_port = 8889
 request_timeout_ms = 30000
-https_handshake_timeout_ms = 10000
-https_request_header_timeout_ms = 10000
-https_max_connections = 1024
-https_http2_max_concurrent_streams = 128
 internal_base_path = "/_acl-proxy"
+
+[proxy.listeners.explicit_http]
+bind = "0.0.0.0:8881"
+enable_http2 = true
+
+[proxy.listeners.transparent_https]
+bind = "0.0.0.0:8889"
+handshake_timeout_ms = 10000
+request_header_timeout_ms = 10000
+max_connections = 1024
+http2_max_concurrent_streams = 128
 
 [logging]
 level = "info"
@@ -1488,19 +1612,7 @@ fn validate_logging_config(logging: &LoggingConfig) -> Result<(), ConfigError> {
 }
 
 fn validate_proxy_config(proxy: &ProxyConfig) -> Result<(), ConfigError> {
-    let bind_ip = parse_bind_address("proxy.bind_address", &proxy.bind_address)?;
-    let https_bind_ip = parse_bind_address("proxy.https_bind_address", &proxy.https_bind_address)?;
-
-    if proxy.http_port != 0
-        && proxy.https_port != 0
-        && proxy.http_port == proxy.https_port
-        && listener_bind_addresses_overlap(bind_ip, https_bind_ip)
-    {
-        return Err(ConfigError::Invalid(format!(
-            "proxy.http_port and proxy.https_port must not both be {} when bind addresses overlap",
-            proxy.http_port
-        )));
-    }
+    validate_listener_config(&proxy.listeners)?;
 
     validate_internal_base_path(&proxy.internal_base_path)?;
 
@@ -1513,10 +1625,75 @@ fn validate_proxy_config(proxy: &ProxyConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn parse_bind_address(location: &str, value: &str) -> Result<IpAddr, ConfigError> {
-    value.parse::<IpAddr>().map_err(|err| {
-        ConfigError::Invalid(format!("{location} must be a valid IP address: {err}"))
-    })
+fn validate_listener_config(listeners: &ProxyListenersConfig) -> Result<(), ConfigError> {
+    if listeners.enabled_count() == 0 {
+        return Err(ConfigError::Invalid(
+            "proxy.listeners must enable at least one listener".to_string(),
+        ));
+    }
+
+    let mut binds: Vec<(&'static str, SocketAddr)> = Vec::new();
+    if let Some(listener) = listeners.explicit_http.as_ref() {
+        binds.push((
+            "proxy.listeners.explicit_http.bind",
+            parse_listener_bind("proxy.listeners.explicit_http.bind", &listener.bind)?,
+        ));
+    }
+    if let Some(listener) = listeners.transparent_http.as_ref() {
+        binds.push((
+            "proxy.listeners.transparent_http.bind",
+            parse_listener_bind("proxy.listeners.transparent_http.bind", &listener.bind)?,
+        ));
+    }
+    if let Some(listener) = listeners.explicit_https.as_ref() {
+        binds.push((
+            "proxy.listeners.explicit_https.bind",
+            parse_listener_bind("proxy.listeners.explicit_https.bind", &listener.bind)?,
+        ));
+        validate_static_tls_identity(
+            "proxy.listeners.explicit_https",
+            &listener.cert_chain_path,
+            &listener.key_path,
+        )?;
+    }
+    if let Some(listener) = listeners.transparent_https.as_ref() {
+        binds.push((
+            "proxy.listeners.transparent_https.bind",
+            parse_listener_bind("proxy.listeners.transparent_https.bind", &listener.bind)?,
+        ));
+    }
+
+    for left_idx in 0..binds.len() {
+        for right_idx in (left_idx + 1)..binds.len() {
+            let (left_location, left) = binds[left_idx];
+            let (right_location, right) = binds[right_idx];
+            if left.port() == right.port() && listener_bind_addresses_overlap(left.ip(), right.ip())
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "{left_location} and {right_location} must not both bind port {} when bind addresses overlap",
+                    left.port()
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn parse_listener_bind(location: &str, value: &str) -> Result<SocketAddr, ConfigError> {
+    let addr = value.parse::<SocketAddr>().map_err(|err| {
+        ConfigError::Invalid(format!(
+            "{location} must be a valid socket address in host:port form: {err}"
+        ))
+    })?;
+
+    if addr.port() == 0 {
+        return Err(ConfigError::Invalid(format!(
+            "{location} port must be in the inclusive range 1..65535"
+        )));
+    }
+
+    Ok(addr)
 }
 
 fn listener_bind_addresses_overlap(left: IpAddr, right: IpAddr) -> bool {
@@ -1557,6 +1734,21 @@ fn validate_egress_target(target: &EgressTargetConfig) -> Result<(), ConfigError
         return Err(ConfigError::Invalid(
             "proxy.egress.default.port must be in the inclusive range 1..65535".to_string(),
         ));
+    }
+
+    match target.target_type {
+        EgressTargetType::ExplicitProxy => {}
+    }
+
+    match target.transport {
+        EgressTransport::Http => {
+            if target.tls.is_some() {
+                return Err(ConfigError::Invalid(
+                    "proxy.egress.default.tls is only valid when transport = \"https\"".to_string(),
+                ));
+            }
+        }
+        EgressTransport::Https => validate_egress_tls_config(target)?,
     }
 
     Ok(())
@@ -1610,6 +1802,189 @@ fn validate_egress_host(host: &str) -> Result<(), ConfigError> {
                 .to_string(),
         )
     })
+}
+
+fn validate_egress_tls_config(target: &EgressTargetConfig) -> Result<(), ConfigError> {
+    let Some(tls) = target.tls.as_ref() else {
+        return Ok(());
+    };
+
+    if let Some(server_name) = tls.server_name.as_deref() {
+        validate_name_without_port(
+            "proxy.egress.default.tls.server_name",
+            server_name,
+            "proxy.egress.default.tls.server_name must be a valid DNS hostname or IP literal without a port suffix",
+        )?;
+    }
+
+    let has_ca_cert_path = tls.ca_cert_path.is_some();
+    let effective_trust = target.effective_tls_trust();
+    match effective_trust {
+        EgressTlsTrust::CustomCa | EgressTlsTrust::SystemPlusCustomCa => {
+            let Some(path) = tls.ca_cert_path.as_ref() else {
+                return Err(ConfigError::Invalid(format!(
+                    "proxy.egress.default.tls.ca_cert_path is required when trust = \"{}\"",
+                    egress_tls_trust_value(effective_trust)
+                )));
+            };
+            validate_ca_cert_bundle("proxy.egress.default.tls.ca_cert_path", path)?;
+        }
+        EgressTlsTrust::System | EgressTlsTrust::Disabled => {
+            if has_ca_cert_path && tls.trust.is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "proxy.egress.default.tls.ca_cert_path must not be set when trust = \"{}\"",
+                    egress_tls_trust_value(effective_trust)
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn egress_tls_trust_value(trust: EgressTlsTrust) -> &'static str {
+    match trust {
+        EgressTlsTrust::System => "system",
+        EgressTlsTrust::CustomCa => "custom_ca",
+        EgressTlsTrust::SystemPlusCustomCa => "system_plus_custom_ca",
+        EgressTlsTrust::Disabled => "disabled",
+    }
+}
+
+fn validate_name_without_port(
+    location: &str,
+    value: &str,
+    message: &'static str,
+) -> Result<(), ConfigError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::Invalid(format!(
+            "{location} must not be empty"
+        )));
+    }
+    if trimmed != value {
+        return Err(ConfigError::Invalid(format!(
+            "{location} must not include leading or trailing whitespace"
+        )));
+    }
+
+    if trimmed.starts_with('[') || trimmed.ends_with(']') {
+        let inner = trimmed
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .ok_or_else(|| ConfigError::Invalid(message.to_string()))?;
+        return inner
+            .parse::<IpAddr>()
+            .map(|_| ())
+            .map_err(|_| ConfigError::Invalid(message.to_string()));
+    }
+
+    if trimmed.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+
+    if trimmed.contains(':') {
+        return Err(ConfigError::Invalid(format!(
+            "{location} must not include a port suffix"
+        )));
+    }
+
+    url::Host::parse(trimmed)
+        .map(|_| ())
+        .map_err(|_| ConfigError::Invalid(message.to_string()))
+}
+
+fn validate_ca_cert_bundle(location: &str, path: &Path) -> Result<(), ConfigError> {
+    let file = fs::File::open(path).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut reader = BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader).map_err(|err| {
+        ConfigError::Invalid(format!(
+            "{location} must contain valid PEM certificates: {err}"
+        ))
+    })?;
+    if certs.is_empty() {
+        return Err(ConfigError::Invalid(format!(
+            "{location} must contain at least one PEM certificate"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_static_tls_identity(
+    location: &str,
+    cert_chain_path: &Path,
+    key_path: &Path,
+) -> Result<(), ConfigError> {
+    let certs = load_pem_certs(
+        format!("{location}.cert_chain_path").as_str(),
+        cert_chain_path,
+    )?;
+    let key = load_private_key(format!("{location}.key_path").as_str(), key_path)?;
+
+    rustls::ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|err| {
+            ConfigError::Invalid(format!(
+                "{location} cert_chain_path and key_path must form a valid TLS identity: {err}"
+            ))
+        })?;
+
+    Ok(())
+}
+
+fn load_pem_certs(location: &str, path: &Path) -> Result<Vec<rustls::Certificate>, ConfigError> {
+    let file = fs::File::open(path).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut reader = BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader).map_err(|err| {
+        ConfigError::Invalid(format!(
+            "{location} must contain valid PEM certificates: {err}"
+        ))
+    })?;
+
+    if certs.is_empty() {
+        return Err(ConfigError::Invalid(format!(
+            "{location} must contain at least one PEM certificate"
+        )));
+    }
+
+    Ok(certs.into_iter().map(rustls::Certificate).collect())
+}
+
+fn load_private_key(location: &str, path: &Path) -> Result<rustls::PrivateKey, ConfigError> {
+    for loader in [
+        rustls_pemfile::pkcs8_private_keys
+            as fn(&mut dyn std::io::BufRead) -> Result<Vec<Vec<u8>>, std::io::Error>,
+        rustls_pemfile::rsa_private_keys
+            as fn(&mut dyn std::io::BufRead) -> Result<Vec<Vec<u8>>, std::io::Error>,
+        rustls_pemfile::ec_private_keys
+            as fn(&mut dyn std::io::BufRead) -> Result<Vec<Vec<u8>>, std::io::Error>,
+    ] {
+        let file = fs::File::open(path).map_err(|source| ConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let mut reader = BufReader::new(file);
+        let mut keys = loader(&mut reader).map_err(|err| {
+            ConfigError::Invalid(format!(
+                "{location} must contain a valid PEM private key: {err}"
+            ))
+        })?;
+        if !keys.is_empty() {
+            return Ok(rustls::PrivateKey(keys.remove(0)));
+        }
+    }
+
+    Err(ConfigError::Invalid(format!(
+        "{location} must contain a supported PEM private key"
+    )))
 }
 
 fn validate_egress_request_header_action_list(
@@ -2066,8 +2441,7 @@ mod tests {
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -2079,7 +2453,15 @@ default = "deny"
 
         let config: Config = toml::from_str(toml).expect("parse minimal config");
         assert_eq!(config.schema_version, "1");
-        assert_eq!(config.proxy.http_port, 8080);
+        assert_eq!(
+            config
+                .proxy
+                .listeners
+                .explicit_http
+                .as_ref()
+                .map(|listener| listener.bind.as_str()),
+            Some("127.0.0.1:8080")
+        );
         assert_eq!(config.logging.level, "debug");
         assert!(matches!(config.policy.default, PolicyDefaultAction::Deny));
     }
@@ -2090,7 +2472,7 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
+listeners.explicit_http.bind = "127.0.0.1:8080"
 http_ports = 8080
 
 [policy]
@@ -2109,6 +2491,9 @@ default = "deny"
     fn policy_rule_typo_fields_are_rejected() {
         let toml = r#"
 schema_version = "1"
+
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [policy]
 default = "deny"
@@ -2131,6 +2516,9 @@ method = "GET"
     fn ruleset_template_typo_fields_are_rejected() {
         let toml = r#"
 schema_version = "1"
+
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [policy]
 default = "deny"
@@ -2158,8 +2546,7 @@ subnet = "10.0.0.0/8"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -2209,8 +2596,7 @@ redaction_profile = "secrets"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -2240,8 +2626,7 @@ redaction_profile = "missing"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -2277,8 +2662,7 @@ redaction_profile = "secrets"
 	schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -2308,8 +2692,7 @@ level = "debug"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -2340,8 +2723,7 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -2378,8 +2760,7 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -2424,8 +2805,7 @@ redaction_profile = "secrets"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -2459,8 +2839,7 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -2508,8 +2887,7 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -2548,8 +2926,7 @@ redaction_profile = "secrets"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -2590,8 +2967,7 @@ redaction_profile = "secrets"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 internal_base_path = "/internal"
 
 [logging]
@@ -2614,32 +2990,52 @@ default = "deny"
 
     #[test]
     fn proxy_transparent_https_slow_client_limits_default_and_parse() {
-        let default = ProxyConfig::default();
-        assert_eq!(default.https_handshake_timeout_ms, 10_000);
-        assert_eq!(default.https_request_header_timeout_ms, 10_000);
-        assert_eq!(default.https_max_connections, 1024);
-        assert_eq!(default.https_http2_max_concurrent_streams, 128);
-
         let toml = r#"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
-https_handshake_timeout_ms = 250
-https_request_header_timeout_ms = 500
-https_max_connections = 8
-https_http2_max_concurrent_streams = 16
+listeners.explicit_http.bind = "127.0.0.1:8080"
+listeners.transparent_https.bind = "127.0.0.1:8443"
 
 [policy]
 default = "deny"
         "#;
 
         let config: Config = toml::from_str(toml).expect("parse config");
-        assert_eq!(config.proxy.https_handshake_timeout_ms, 250);
-        assert_eq!(config.proxy.https_request_header_timeout_ms, 500);
-        assert_eq!(config.proxy.https_max_connections, 8);
-        assert_eq!(config.proxy.https_http2_max_concurrent_streams, 16);
+        let listener = config
+            .proxy
+            .listeners
+            .transparent_https
+            .as_ref()
+            .expect("transparent https listener");
+        assert_eq!(listener.handshake_timeout_ms, 10_000);
+        assert_eq!(listener.request_header_timeout_ms, 10_000);
+        assert_eq!(listener.max_connections, 1024);
+        assert_eq!(listener.http2_max_concurrent_streams, 128);
+        config.validate_basic().expect("config should validate");
+
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
+listeners.transparent_https = { bind = "127.0.0.1:8443", handshake_timeout_ms = 250, request_header_timeout_ms = 500, max_connections = 8, http2_max_concurrent_streams = 16 }
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let listener = config
+            .proxy
+            .listeners
+            .transparent_https
+            .as_ref()
+            .expect("transparent https listener");
+        assert_eq!(listener.handshake_timeout_ms, 250);
+        assert_eq!(listener.request_header_timeout_ms, 500);
+        assert_eq!(listener.max_connections, 8);
+        assert_eq!(listener.http2_max_concurrent_streams, 16);
         config.validate_basic().expect("config should validate");
     }
 
@@ -2649,8 +3045,7 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "localhost"
-http_port = 8080
+listeners.explicit_http.bind = "localhost:8080"
 
 [policy]
 default = "deny"
@@ -2660,7 +3055,7 @@ default = "deny"
         let err = config.validate_basic().expect_err("validation should fail");
         let msg = format!("{err}");
         assert!(
-            msg.contains("proxy.bind_address must be a valid IP address"),
+            msg.contains("proxy.listeners.explicit_http.bind must be a valid socket address"),
             "unexpected error: {msg}"
         );
 
@@ -2668,10 +3063,8 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
-https_bind_address = "not-an-ip"
-https_port = 8443
+listeners.explicit_http.bind = "127.0.0.1:8080"
+listeners.transparent_http.bind = "not-an-ip:8443"
 
 [policy]
 default = "deny"
@@ -2681,7 +3074,7 @@ default = "deny"
         let err = config.validate_basic().expect_err("validation should fail");
         let msg = format!("{err}");
         assert!(
-            msg.contains("proxy.https_bind_address must be a valid IP address"),
+            msg.contains("proxy.listeners.transparent_http.bind must be a valid socket address"),
             "unexpected error: {msg}"
         );
     }
@@ -2692,10 +3085,8 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "0.0.0.0"
-http_port = 8443
-https_bind_address = "127.0.0.1"
-https_port = 8443
+listeners.explicit_http.bind = "0.0.0.0:8443"
+listeners.transparent_http.bind = "127.0.0.1:8443"
 
 [policy]
 default = "deny"
@@ -2705,7 +3096,9 @@ default = "deny"
         let err = config.validate_basic().expect_err("validation should fail");
         let msg = format!("{err}");
         assert!(
-            msg.contains("proxy.http_port and proxy.https_port must not both be 8443"),
+            msg.contains("proxy.listeners.explicit_http.bind")
+                && msg.contains("proxy.listeners.transparent_http.bind")
+                && msg.contains("8443"),
             "unexpected error: {msg}"
         );
 
@@ -2713,10 +3106,8 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8443
-https_bind_address = "127.0.0.2"
-https_port = 8443
+listeners.explicit_http.bind = "127.0.0.1:8443"
+listeners.transparent_http.bind = "127.0.0.2:8443"
 
 [policy]
 default = "deny"
@@ -2732,6 +3123,9 @@ default = "deny"
     fn loop_protection_header_name_is_validated() {
         let toml = r#"
 schema_version = "1"
+
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [loop_protection]
 header_name = "invalid header"
@@ -2755,10 +3149,11 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [proxy.egress.default]
+type = "explicit_proxy"
+transport = "http"
 host = "proxy.internal"
 port = 9443
 
@@ -2785,6 +3180,130 @@ default = "deny"
     }
 
     #[test]
+    fn proxy_egress_default_https_without_tls_table_uses_system_trust() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
+
+[proxy.egress.default]
+type = "explicit_proxy"
+transport = "https"
+host = "proxy.internal"
+port = 9443
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let target = config
+            .proxy
+            .egress
+            .default
+            .as_ref()
+            .expect("egress target should exist");
+        assert_eq!(target.transport, EgressTransport::Https);
+        assert_eq!(target.effective_tls_trust(), EgressTlsTrust::System);
+        config
+            .validate_basic()
+            .expect("HTTPS egress without tls table should use system trust");
+    }
+
+    #[test]
+    fn proxy_egress_default_rejects_tls_table_for_http_transport() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
+
+[proxy.egress.default]
+type = "explicit_proxy"
+transport = "http"
+host = "proxy.internal"
+port = 9443
+
+[proxy.egress.default.tls]
+trust = "disabled"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("proxy.egress.default.tls is only valid when transport = \"https\""),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn proxy_egress_default_custom_ca_requires_ca_cert_path() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
+
+[proxy.egress.default]
+type = "explicit_proxy"
+transport = "https"
+host = "proxy.internal"
+port = 9443
+
+[proxy.egress.default.tls]
+trust = "custom_ca"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(
+                "proxy.egress.default.tls.ca_cert_path is required when trust = \"custom_ca\""
+            ),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn proxy_egress_default_rejects_tls_server_name_with_port_suffix() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
+
+[proxy.egress.default]
+type = "explicit_proxy"
+transport = "https"
+host = "proxy.internal"
+port = 9443
+
+[proxy.egress.default.tls]
+server_name = "proxy.internal:9443"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("proxy.egress.default.tls.server_name must not include a port suffix"),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
     fn proxy_egress_request_header_actions_default_to_empty() {
         let config = Config::default();
         assert!(config.proxy.egress.request_header_actions.is_empty());
@@ -2796,8 +3315,7 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [[proxy.egress.request_header_actions]]
 action = "remove"
@@ -2830,8 +3348,7 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [[proxy.egress.request_header_actions]]
 action = "set"
@@ -2864,8 +3381,7 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 internal_base_path = "internal"
 
 [logging]
@@ -2891,8 +3407,7 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 internal_base_path = "/internal/"
 
 [logging]
@@ -2918,10 +3433,11 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [proxy.egress.default]
+type = "explicit_proxy"
+transport = "http"
 host = "   "
 port = 8889
 
@@ -2948,10 +3464,11 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [proxy.egress.default]
+type = "explicit_proxy"
+transport = "http"
 host = " proxy.internal "
 port = 8889
 
@@ -2980,10 +3497,11 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [proxy.egress.default]
+type = "explicit_proxy"
+transport = "http"
 host = "proxy.internal:8889"
 port = 8889
 
@@ -3010,10 +3528,11 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [proxy.egress.default]
+type = "explicit_proxy"
+transport = "http"
 host = "::1"
 port = 8889
 
@@ -3037,10 +3556,11 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [proxy.egress.default]
+type = "explicit_proxy"
+transport = "http"
 host = "[::1]"
 port = 8889
 
@@ -3064,10 +3584,11 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [proxy.egress.default]
+type = "explicit_proxy"
+transport = "http"
 host = "[not-an-ip]"
 port = 8889
 
@@ -3096,10 +3617,11 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [proxy.egress.default]
+type = "explicit_proxy"
+transport = "http"
 host = "proxy.internal"
 port = 0
 
@@ -3126,8 +3648,7 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3155,8 +3676,7 @@ include = ""
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3207,8 +3727,7 @@ ca_cert_path = "ca-cert.pem"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3238,8 +3757,7 @@ max_cached_certs = 0
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3263,8 +3781,7 @@ persist_dynamic_certs = true
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3292,8 +3809,7 @@ action = "allow"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3320,8 +3836,7 @@ headers_absent = ["x-workload-id"]
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3348,8 +3863,7 @@ headers_match = { "x-workload-id" = "worker-123" }
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3376,8 +3890,7 @@ headers_not_match = { "x-aw-policy-context" = "internal" }
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3406,8 +3919,7 @@ headers_absent = []
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3436,8 +3948,7 @@ headers_match = {}
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3466,8 +3977,7 @@ headers_match = { "bad header" = "worker-123" }
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3496,8 +4006,7 @@ headers_match = { "X-Workload-Id" = "worker-123", "x-workload-id" = "worker-456"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3526,8 +4035,7 @@ headers_match = { "x-workload-id" = "" }
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3556,8 +4064,7 @@ headers_not_match = {}
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3586,8 +4093,7 @@ headers_not_match = { "bad header" = "internal" }
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3616,8 +4122,7 @@ headers_not_match = { "X-AW-Policy-Context" = "internal", "x-aw-policy-context" 
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3646,8 +4151,7 @@ headers_not_match = { "x-aw-policy-context" = "" }
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3672,8 +4176,7 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = ""
@@ -3693,8 +4196,7 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3722,8 +4224,7 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3758,8 +4259,7 @@ level = "info"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3792,8 +4292,7 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3816,8 +4315,7 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3844,8 +4342,7 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3878,8 +4375,7 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3909,8 +4405,7 @@ callback_url = "/relative/path"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3958,8 +4453,7 @@ callback_url = "https://proxy.example.com/_acl-proxy/external-auth/callback"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -3987,6 +4481,9 @@ external_auth_profile = "missing_profile"
     fn delegate_rule_with_external_auth_profile_is_valid() {
         let toml = r#"
 schema_version = "1"
+
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [policy]
 default = "deny"
@@ -4018,8 +4515,7 @@ external_auth_profile = "example"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -4052,6 +4548,9 @@ external_auth_profile = "example"
         let toml = r#"
 schema_version = "1"
 
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
+
 [policy]
 default = "deny"
 
@@ -4078,6 +4577,9 @@ external_auth_profile = "example"
     fn plugin_external_auth_profile_can_include_request_body() {
         let toml = r#"
 schema_version = "1"
+
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [policy]
 default = "deny"
@@ -4113,6 +4615,9 @@ external_auth_profile = "body_guard"
         let toml = r#"
 schema_version = "1"
 
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
+
 [policy]
 default = "deny"
 
@@ -4142,6 +4647,9 @@ external_auth_profile = "body_guard"
         let toml = r#"
 schema_version = "1"
 
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
+
 [policy]
 default = "deny"
 
@@ -4160,6 +4668,9 @@ timeout_ms = 0
 
         let toml = r#"
 schema_version = "1"
+
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [policy]
 default = "deny"
@@ -4183,6 +4694,9 @@ webhook_timeout_ms = 0
     fn body_aware_plugin_profile_rejects_zero_body_limits() {
         let toml = r#"
 schema_version = "1"
+
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [policy]
 default = "deny"
@@ -4210,6 +4724,9 @@ external_auth_profile = "body_guard"
 
         let toml = r#"
 schema_version = "1"
+
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [policy]
 default = "deny"
@@ -4241,6 +4758,9 @@ external_auth_profile = "body_guard"
         let toml = r#"
 schema_version = "1"
 
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
+
 [policy]
 default = "deny"
 
@@ -4262,6 +4782,9 @@ pattern = "https://example.com/**"
     fn ruleset_delegate_template_requires_external_auth_profile() {
         let toml = r#"
 schema_version = "1"
+
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [policy]
 default = "deny"
@@ -4288,6 +4811,9 @@ pattern = "https://example.com/**"
         let toml = r#"
 schema_version = "1"
 
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
+
 [policy]
 default = "delegate"
         "#;
@@ -4304,8 +4830,7 @@ default = "delegate"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -4353,8 +4878,7 @@ external_auth_profile = "example"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -4430,8 +4954,7 @@ external_auth_profile = "example"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -4473,8 +4996,7 @@ value = "Bearer ${TOKEN}"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -4522,8 +5044,7 @@ include = "api_headers"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -4564,8 +5085,7 @@ value = "Bearer ${{TOKEN}}"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -4611,8 +5131,7 @@ value = "${ACL_PROXY_TEST_API_TOKEN}"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -4663,8 +5182,7 @@ values = ["static", "${ACL_PROXY_TEST_DEPLOYMENT}", "${ACL_PROXY_TEST_REGION}", 
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -4713,8 +5231,7 @@ include = "api_headers"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -4759,8 +5276,7 @@ value = "${ACL_PROXY_TEST_MISSING}"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [[proxy.egress.request_header_actions]]
 action = "set"
@@ -4797,8 +5313,7 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [[proxy.egress.request_header_actions]]
 action = "set"
@@ -4835,8 +5350,7 @@ default = "deny"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -4886,8 +5400,7 @@ value = "{{github_token}}"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -4932,8 +5445,7 @@ replace = "${ACL_PROXY_TEST_REPLACE}"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -4977,8 +5489,7 @@ name = "authorization"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -5021,8 +5532,7 @@ value = "${ACL_PROXY_TEST_EMPTY}"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -5070,8 +5580,7 @@ value = "${{ACL_PROXY_TEST_LOAD_TOKEN}}"
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -5128,8 +5637,7 @@ values = ["static", "${{ACL_PROXY_TEST_DUMP_REGION}}"]
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"

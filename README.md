@@ -124,8 +124,8 @@ acl-proxy --config /etc/acl-proxy/acl-proxy.toml
 ```
 
 The proxy starts:
-- The HTTP listener on `proxy.bind_address:proxy.http_port` (explicit proxy and transparent HTTP interception).
-- The transparent HTTPS listener on `proxy.https_bind_address:proxy.https_port` if `https_port` is non-zero.
+- Any listener configured under `proxy.listeners.*`. Missing listener sections are disabled.
+- The sample enables `explicit_http` on `0.0.0.0:8881` and `transparent_https` on `0.0.0.0:8889`.
 
 ### 3. Send Traffic
 
@@ -138,11 +138,16 @@ curl -x http://127.0.0.1:8881 http://example.com/
 
 # Transparent HTTP interception (local testing)
 curl http://example.com/path \
-  --connect-to example.com:80:127.0.0.1:8881
+  --connect-to example.com:80:127.0.0.1:8882
 
 # HTTPS proxy (CONNECT MITM)
 curl -x http://127.0.0.1:8881 https://example.com/ \
   --proxy-cacert certs/ca-cert.pem
+
+# Explicit HTTPS proxy (static proxy certificate)
+# Requires proxy.listeners.explicit_https to be configured.
+curl -x https://work-proxy.internal:8890 http://example.com/ \
+  --proxy-cacert /etc/acl-proxy/proxy-ca.pem
 
 # Transparent HTTPS listener
 curl https://upstream.internal/resource \
@@ -162,10 +167,11 @@ acl-proxy supports four request paths. All modes apply the same policy engine, l
 
 | Mode | Listener | Protocol | Description |
 |------|----------|----------|-------------|
-| **Explicit HTTP proxy** | `http_port` | HTTP/1.1 | Absolute-form requests via `curl -x` |
-| **Transparent HTTP** | `http_port` | HTTP/1.1 | Origin-form requests with `Host` header (e.g., iptables `REDIRECT`/DNAT from port 80) |
-| **CONNECT MITM** | `http_port` | HTTPS | TLS terminated inside tunnel with per-host CA-signed certs; inner requests processed as HTTP/1.1 |
-| **Transparent HTTPS** | `https_port` | HTTPS | Direct TLS termination; HTTP/1.1 and HTTP/2 via ALPN negotiation |
+| **Explicit HTTP proxy** | `proxy.listeners.explicit_http` | HTTP/1.1, optional h2c | Absolute-form requests via `curl -x`; HTTP/1.1 CONNECT |
+| **Transparent HTTP** | `proxy.listeners.transparent_http` | HTTP/1.1, optional h2c | Origin-form requests with `Host` header (e.g. iptables `REDIRECT`/DNAT from port 80) |
+| **Explicit HTTPS proxy** | `proxy.listeners.explicit_https` | TLS to proxy, HTTP/1.1 by default | Static proxy certificate; absolute-form proxy requests inside TLS |
+| **CONNECT MITM** | `explicit_http` / `explicit_https` | HTTPS inside CONNECT | TLS terminated inside tunnel with per-host CA-signed certs; inner requests processed as HTTP/1.1 |
+| **Transparent HTTPS** | `proxy.listeners.transparent_https` | Target-shaped TLS | Direct TLS termination; HTTP/1.1 and HTTP/2 via ALPN negotiation |
 
 ### Request Lifecycle
 
@@ -217,6 +223,10 @@ Forwarded requests and responses strip hop-by-hop and proxy-control headers, inc
 
 In transparent HTTP mode, upstream target selection is based on the inbound `Host` header (`:80` when no port is present). Use restrictive policy rules for the destinations you intend to allow.
 
+### Explicit HTTPS Proxy
+
+`proxy.listeners.explicit_https` presents a static certificate for the proxy service itself. It does not generate certificates dynamically; configure `cert_chain_path` and `key_path` with an operator-managed proxy certificate whose SAN matches the hostname or IP clients use for the proxy.
+
 ### HTTPS CONNECT (MITM)
 
 - Policy is evaluated on each decrypted request; the CONNECT request itself is only used to establish the tunnel.
@@ -228,7 +238,7 @@ In transparent HTTP mode, upstream target selection is based on the inbound `Hos
 
 ### Transparent HTTPS
 
-- Set `https_port = 0` to disable this listener.
+- Omit `proxy.listeners.transparent_https` to disable this listener.
 - URL construction is based on the Host header or the request URI authority and uses the same canonicalization as policy matching.
 - TLS SNI is used only to select the inbound certificate presented to the client. It is not treated as a policy or routing authority and is not required to match the decrypted HTTP `Host` header.
 - Inbound HTTP/2 is supported via ALPN negotiation.
@@ -260,10 +270,10 @@ When enabled, ALPN is used per origin; the proxy will use HTTP/2 where supported
 
 When `[proxy.egress.default]` is configured, allowed proxied requests from all modes are sent to the configured egress host:port instead of the original target.
 
-- The forwarding leg remains cleartext TCP — deploy on a trusted/local network path.
-- Forwarding is protocol-aware: HTTP/2 requests use h2c, HTTP/1.1 (including WebSocket) stays HTTP/1.1.
+- The forwarding leg targets a parent explicit proxy over `transport = "http"` or `transport = "https"`.
+- Forwarding is protocol-aware: HTTP/2 requests use h2c for HTTP parent hops or ALPN `h2` for HTTPS parent hops; HTTP/1.1 (including WebSocket) stays HTTP/1.1.
 - The forwarded request keeps the original target URI and `Host` header, so the outer proxy still evaluates policy against the real target.
-- The recommended egress target is the outer proxy's HTTP listener (`proxy.http_port`), not the transparent HTTPS listener.
+- The recommended egress target is the outer proxy's `explicit_http` or `explicit_https` listener, not the transparent HTTPS listener.
 
 **Loop prevention**: If both hops use loop protection, either configure different `loop_protection.header_name` values per hop, or disable outbound injection on the inner proxy with `loop_protection.add_header = false`.
 
@@ -562,8 +572,7 @@ After parsing the config file, these overrides are applied:
 
 | Variable | Config Field | Default |
 |----------|-------------|---------|
-| `PROXY_PORT` | `proxy.http_port` (valid `u16`) | `8881` |
-| `PROXY_HOST` | `proxy.bind_address` | `0.0.0.0` |
+| `PROXY_EXPLICIT_HTTP_BIND` | `proxy.listeners.explicit_http.bind` | `0.0.0.0:8881` |
 | `LOG_LEVEL` | `logging.level` | `info` |
 
 ### Top-Level Sections
@@ -585,36 +594,64 @@ schema_version = "1"          # required; only "1" is supported
 
 All sections except `schema_version` and `[policy].default` are optional with sensible defaults. Unknown keys in structured config sections, rules, ruleset templates, and profiles are rejected so typos such as `method` instead of `methods` do not silently weaken policy.
 
-### `[proxy]` — Listeners and Ports
+### `[proxy]` — Listeners
 
 ```toml
 [proxy]
-bind_address = "0.0.0.0"           # IP for the HTTP listener
-http_port = 8881                    # port for HTTP listener (0 = ephemeral)
-https_bind_address = "0.0.0.0"     # IP for the transparent HTTPS listener
-https_port = 8889                   # port for HTTPS listener (0 = disabled)
 request_timeout_ms = 30000          # upstream timeout; 0 = disabled
-https_handshake_timeout_ms = 10000  # transparent HTTPS TLS handshake timeout; 0 = disabled
-https_request_header_timeout_ms = 10000 # transparent HTTPS HTTP/1 header timeout and HTTP/2 keepalive interval/timeout; 0 = disabled
-https_max_connections = 1024        # active transparent HTTPS connections; 0 = unlimited
-https_http2_max_concurrent_streams = 128 # per-connection HTTP/2 stream cap; 0 = unlimited
 internal_base_path = "/_acl-proxy"  # base path for internal endpoints
+
+[proxy.listeners.explicit_http]
+bind = "0.0.0.0:8881"
+enable_http2 = true
+
+[proxy.listeners.transparent_http]
+bind = "0.0.0.0:8882"
+enable_http2 = true
+
+[proxy.listeners.explicit_https]
+bind = "0.0.0.0:8890"
+cert_chain_path = "/etc/acl-proxy/proxy.crt"
+key_path = "/etc/acl-proxy/proxy.key"
+handshake_timeout_ms = 10000
+request_header_timeout_ms = 10000
+max_connections = 1024
+enable_http2 = false
+http2_max_concurrent_streams = 128
+
+[proxy.listeners.transparent_https]
+bind = "0.0.0.0:8889"
+handshake_timeout_ms = 10000
+request_header_timeout_ms = 10000
+max_connections = 1024
+http2_max_concurrent_streams = 128
 ```
 
 - `internal_base_path` must start with `/` and must not end with `/` (except root `/`). Internal endpoints are only matched for origin-form (direct) requests, not proxy-style absolute-form requests.
-- Listener bind addresses must be IP literals. If both HTTP and transparent HTTPS listeners use fixed non-zero ports, overlapping bind addresses cannot use the same port.
-- The default bind addresses listen on all interfaces. Set `bind_address` and `https_bind_address` to loopback addresses, or restrict access with firewall rules, when the proxy should be local-only.
-- The transparent HTTPS timeout and connection-cap settings apply at the listener boundary before request policy is evaluated.
+- Listener `bind` values must be socket addresses with IP literal hosts and nonzero ports. Overlapping bind addresses cannot use the same port.
+- Missing listener sections are disabled, and at least one listener must be configured.
+- `explicit_http` and `transparent_http` are separate sockets. Explicit listeners reject non-internal origin-form requests; transparent HTTP rejects explicit absolute-form requests.
+- The default sample bind addresses listen on all interfaces. Use loopback binds or firewall rules when the proxy should be local-only.
+- Listener timeout and connection-cap settings apply at the listener boundary before request policy is evaluated.
 
 ### `[proxy.egress.default]` — Optional Forwarding Destination
 
 ```toml
 [proxy.egress.default]
-host = "172.17.0.1"                # DNS hostname or IP; IPv6 bare (::1) or bracketed ([::1])
-port = 8889                         # TCP port (1–65535)
+type = "explicit_proxy"
+transport = "https"
+host = "work-proxy.internal"        # DNS hostname or IP; IPv6 bare (::1) or bracketed ([::1])
+port = 8890                         # TCP port (1–65535)
+
+[proxy.egress.default.tls]
+trust = "system_plus_custom_ca"      # system | custom_ca | system_plus_custom_ca | disabled
+server_name = "work-proxy.internal" # optional SNI/cert identity override
+ca_cert_path = "/etc/acl-proxy/work-proxy-ca.pem"
 ```
 
-When present, allowed request-forwarding paths use this egress destination as the outbound TCP dial target while policy matching, logging, and the forwarded `Host` header remain bound to the original request target. When absent, the proxy connects directly to each request's original target.
+When present, allowed request-forwarding paths use this parent explicit proxy while policy matching, logging, and the forwarded `Host` header remain bound to the original request target. When absent, the proxy connects directly to each request's original target.
+
+Use `transport = "https"` to TLS-wrap the parent-proxy hop. Parent TLS trust is independent from direct-origin `[tls]` settings and from the MITM CA. For private parent certificates, set `trust = "custom_ca"` or `system_plus_custom_ca` with `ca_cert_path`; use `server_name` when the TCP dial host differs from the certificate identity. `trust = "disabled"` disables parent certificate and hostname verification and should only be used in controlled deployments. For cleartext parent-proxy forwarding, set `transport = "http"` and omit `[proxy.egress.default.tls]`.
 
 ### `[logging]` — Logging
 
@@ -748,7 +785,7 @@ enable_http2_upstream = false       # HTTP/1.1-only by default
 - `verify_upstream = false` accepts all upstream certificates regardless of host or issuer. Use only in controlled test environments.
 - `enable_http2_upstream = true` lets ALPN negotiation choose HTTP/2 per origin; the proxy falls back to HTTP/1.1 when the origin doesn't advertise `h2`.
 
-These settings affect only outbound TLS from proxy to upstream. Incoming TLS is always terminated using the proxy's CA.
+These settings affect only outbound TLS from proxy to upstream origins. They do not affect explicit HTTPS listener certificates or parent-proxy TLS verification. CONNECT MITM and transparent HTTPS use the proxy CA; explicit HTTPS proxying uses the static certificate configured under `proxy.listeners.explicit_https`.
 
 ### `[external_auth]` — External Auth Settings
 
@@ -872,16 +909,16 @@ env = { KEY = "value" }             # env vars for the plugin process
 schema_version = "1"
 
 [proxy]
-bind_address = "0.0.0.0"
-http_port = 8881
-https_bind_address = "0.0.0.0"
-https_port = 8889
+listeners.explicit_http.bind = "0.0.0.0:8881"
 request_timeout_ms = 30000
-https_handshake_timeout_ms = 10000
-https_request_header_timeout_ms = 10000
-https_max_connections = 1024
-https_http2_max_concurrent_streams = 128
 internal_base_path = "/_acl-proxy"
+
+[proxy.listeners.transparent_https]
+bind = "0.0.0.0:8889"
+handshake_timeout_ms = 10000
+request_header_timeout_ms = 10000
+max_connections = 1024
+http2_max_concurrent_streams = 128
 
 [logging]
 level = "info"
@@ -1050,7 +1087,7 @@ kill -HUP $(pidof acl-proxy)
 - Pending external-auth approvals survive reload; callbacks after reload can still resolve requests that became pending before reload.
 - If reload fails, the previous state remains active.
 - `${NAME}` env placeholders are resolved again during reload. Changing a required env var takes effect on the next successful reload; removing one causes the reload to fail.
-- Listener bind addresses/ports, transparent HTTPS connection caps (`https_max_connections`, `https_http2_max_concurrent_streams`), and the enabled/disabled listener set are fixed at startup; changing those fields requires restart. Base logging sink settings (`logging.level`, `directory`, `max_bytes`, `max_files`, `console`) are also fixed at startup, while policy-decision logging flags and levels are read from the reloaded config.
+- Listener topology and listener fields under `proxy.listeners` are fixed at startup; changing enabled listeners, bind addresses, HTTP/2 settings, timeouts, connection caps, stream caps, or explicit HTTPS cert/key paths requires restart. Base logging sink settings (`logging.level`, `directory`, `max_bytes`, `max_files`, `console`) are also fixed at startup, while policy-decision logging flags and levels are read from the reloaded config.
 
 ### Graceful Shutdown
 
@@ -1070,26 +1107,27 @@ Capture logging for loop-detected requests follows the `[capture]` flags for den
 - Rules can override with `request_timeout_ms`.
 - `0` disables the timeout.
 - When the timeout expires, the proxy responds with `504 Gateway Timeout`.
-- For the transparent HTTPS listener, `proxy.https_handshake_timeout_ms` bounds idle TLS handshakes, `proxy.https_request_header_timeout_ms` bounds HTTP/1 header reads after TLS and HTTP/2 idle/half-open connections via keepalive pings, `proxy.https_max_connections` caps active accepted TLS connections, and `proxy.https_http2_max_concurrent_streams` caps active HTTP/2 streams per connection. Set any of these to `0` to disable that limit.
+- For TLS listeners, `handshake_timeout_ms` bounds idle TLS handshakes, `request_header_timeout_ms` bounds HTTP/1 header reads after TLS and HTTP/2 idle/half-open connections via keepalive pings, `max_connections` caps active accepted TLS connections, and `http2_max_concurrent_streams` caps active HTTP/2 streams per connection. Set any of these to `0` to disable that limit.
 
 ### Egress Forwarding
 
 ```toml
 [proxy.egress.default]
+type = "explicit_proxy"
+transport = "http"
 host = "172.17.0.1"
-port = 8889
+port = 8881
 ```
 
 Operational details:
-- The inter-proxy forwarding leg remains cleartext TCP — deploy on trusted/local network.
-- Request bodies and sensitive headers injected by inner-proxy header actions travel in cleartext on that hop.
-- HTTP/2 requests do not silently downgrade; if h2c cannot be established, the request fails.
-- Exempt the outer proxy's listener from any iptables redirect rules to avoid loop-back.
+- `transport = "http"` uses cleartext TCP to the parent explicit proxy; `transport = "https"` uses TLS to the parent explicit proxy.
+- HTTP/2 requests do not silently downgrade; h2c is required for HTTP parent hops and ALPN `h2` is required for HTTPS parent hops.
+- Exempt the outer proxy's explicit listener from any iptables redirect rules to avoid loop-back.
 - A valid config reload atomically swaps in the updated egress destination.
 
 ## TLS & Certificates
 
-acl-proxy acts as a TLS man-in-the-middle for CONNECT and transparent HTTPS modes, issuing per-host certificates signed by a local CA.
+acl-proxy uses separate TLS identities for separate trust domains. CONNECT MITM and transparent HTTPS issue per-host certificates signed by the configured local CA. The explicit HTTPS proxy listener uses the static `proxy.listeners.explicit_https.cert_chain_path` and `key_path` certificate instead; that certificate represents the proxy service itself.
 
 ```mermaid
 graph LR
@@ -1200,7 +1238,7 @@ Decodes the base64 body payload from a capture JSON file. Reports errors for inv
 
 | Status | Cause | Fix |
 |--------|-------|-----|
-| **400 Bad Request** | Origin-form request without valid `Host` header; invalid request-target; transparent HTTPS missing `Host`; CONNECT missing `host:port` | Check client request format and headers |
+| **400 Bad Request** | Explicit listener received non-internal origin-form; transparent HTTP received absolute-form; origin-form request lacks valid `Host`; transparent HTTPS missing `Host`; CONNECT missing `host:port` | Check client request format, listener selection, and headers |
 | **403 Forbidden** | Policy denied the request; external auth returned deny | Check `policy.rules` ordering and patterns |
 | **502 Bad Gateway** | Proxy could not connect to upstream; upstream closed connection early | Confirm upstream reachability and DNS resolution |
 | **503 Service Unavailable** | External auth webhook failed (`on_webhook_failure = "error"`); internal auth error | Check external auth service availability |
@@ -1210,8 +1248,9 @@ Decodes the base64 body payload from a capture JSON file. Reports errors for inv
 ### TLS Errors
 
 - Clients must trust the proxy CA for CONNECT and transparent HTTPS modes.
+- Clients using `proxy.listeners.explicit_https` must trust the static proxy server certificate chain configured for that listener.
 - Use `--proxy-cacert certs/ca-cert.pem` (CONNECT) or `--cacert certs/ca-cert.pem` (transparent HTTPS).
-- If upstream TLS verification fails, check `tls.verify_upstream` and confirm upstream certificates are valid.
+- If direct-origin upstream TLS verification fails, check `tls.verify_upstream` and confirm upstream certificates are valid. If HTTPS parent egress fails, check `proxy.egress.default.tls.trust`, `server_name`, and `ca_cert_path`.
 
 ### Missing Configuration File
 

@@ -1,5 +1,5 @@
 use std::io::IsTerminal;
-use std::net::IpAddr;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::app::{AppState, SharedAppState};
 use crate::config::{Config, ConfigError, ConfigPathKind};
+use crate::proxy::explicit_https::ExplicitHttpsError;
 use crate::proxy::http::HttpProxyError;
 use crate::proxy::https_transparent::HttpsTransparentError;
 
@@ -27,6 +28,9 @@ pub enum CliError {
 
     #[error(transparent)]
     Proxy(#[from] HttpProxyError),
+
+    #[error(transparent)]
+    ExplicitHttps(#[from] ExplicitHttpsError),
 
     #[error(transparent)]
     HttpsTransparent(#[from] HttpsTransparentError),
@@ -289,46 +293,74 @@ async fn run_proxy_with_signals(
     config_path: Option<&Path>,
 ) -> Result<(), CliError> {
     use tokio::sync::Notify;
+    use tokio::task::JoinSet;
 
     let shutdown = Arc::new(Notify::new());
-    let shutdown_http = shutdown.clone();
-    let shutdown_https = shutdown.clone();
-
-    let initial = state.load();
-    let https_port = initial.config.proxy.https_port;
 
     // Spawn signal handlers: SIGHUP for reload (on Unix) and
     // Ctrl+C/SIGTERM for graceful shutdown.
     spawn_signal_handlers(state.clone(), config_path, shutdown.clone());
 
-    let http_fut = crate::proxy::http::run_http_proxy(state.clone(), async move {
-        shutdown_http.notified().await;
-    });
+    let listeners = state.load().config.proxy.listeners.clone();
+    let mut tasks = JoinSet::new();
 
-    if https_port == 0 {
-        http_fut.await.map_err(CliError::Proxy)?;
-        tracing::info!("HTTP proxy listener shut down gracefully");
-        Ok(())
-    } else {
-        let https_fut = crate::proxy::https_transparent::run_https_transparent_proxy(
-            state.clone(),
-            async move {
-                shutdown_https.notified().await;
-            },
-        );
+    if listeners.explicit_http.is_some() {
+        let state = state.clone();
+        let shutdown = shutdown.clone();
+        tasks.spawn(async move {
+            crate::proxy::http::run_explicit_http_proxy(state, async move {
+                shutdown.notified().await;
+            })
+            .await
+            .map_err(CliError::Proxy)
+        });
+    }
 
-        tokio::select! {
-            res = http_fut => {
-                res.map_err(CliError::Proxy)?;
-                tracing::info!("HTTP proxy listener shut down gracefully");
-                Ok(())
-            }
-            res = https_fut => {
-                res.map_err(CliError::HttpsTransparent)?;
-                tracing::info!("HTTPS transparent listener shut down gracefully");
-                Ok(())
-            }
-        }
+    if listeners.transparent_http.is_some() {
+        let state = state.clone();
+        let shutdown = shutdown.clone();
+        tasks.spawn(async move {
+            crate::proxy::http::run_transparent_http_proxy(state, async move {
+                shutdown.notified().await;
+            })
+            .await
+            .map_err(CliError::Proxy)
+        });
+    }
+
+    if listeners.explicit_https.is_some() {
+        let state = state.clone();
+        let shutdown = shutdown.clone();
+        tasks.spawn(async move {
+            crate::proxy::explicit_https::run_explicit_https_proxy(state, async move {
+                shutdown.notified().await;
+            })
+            .await
+            .map_err(CliError::ExplicitHttps)
+        });
+    }
+
+    if listeners.transparent_https.is_some() {
+        let state = state.clone();
+        let shutdown = shutdown.clone();
+        tasks.spawn(async move {
+            crate::proxy::https_transparent::run_https_transparent_proxy(state, async move {
+                shutdown.notified().await;
+            })
+            .await
+            .map_err(CliError::HttpsTransparent)
+        });
+    }
+
+    match tasks.join_next().await {
+        Some(Ok(Ok(()))) => Ok(()),
+        Some(Ok(Err(err))) => Err(err),
+        Some(Err(err)) => Err(CliError::Runtime(format!(
+            "proxy listener task failed: {err}"
+        ))),
+        None => Err(CliError::Config(ConfigError::Invalid(
+            "proxy.listeners must enable at least one listener".to_string(),
+        ))),
     }
 }
 
@@ -406,6 +438,13 @@ fn spawn_signal_handlers(
 fn reload_from_sources(state: &SharedAppState, config_path: Option<&Path>) -> Result<(), String> {
     let config = Config::load_from_sources(config_path).map_err(|e| e.to_string())?;
     let load_warnings = config.load_warnings.clone();
+    let active_listeners = state.load().config.proxy.listeners.clone();
+    if active_listeners != config.proxy.listeners {
+        return Err(
+            "listener configuration changed; restart required for proxy.listeners changes"
+                .to_string(),
+        );
+    }
     AppState::reload_shared_from_config(state, config).map_err(|e| e.to_string())?;
     log_config_load_warning_messages(&load_warnings);
     Ok(())
@@ -430,12 +469,34 @@ fn print_config_load_warnings(config: &Config) {
 fn log_startup(state: &AppState) {
     let cfg = &state.config;
 
-    let http_bind = format!("{}:{}", cfg.proxy.bind_address, cfg.proxy.http_port);
-    let https_bind = if cfg.proxy.https_port == 0 {
-        "disabled".to_string()
-    } else {
-        format!("{}:{}", cfg.proxy.https_bind_address, cfg.proxy.https_port)
-    };
+    let explicit_http_bind = cfg
+        .proxy
+        .listeners
+        .explicit_http
+        .as_ref()
+        .map(|listener| listener.bind.as_str())
+        .unwrap_or("disabled");
+    let transparent_http_bind = cfg
+        .proxy
+        .listeners
+        .transparent_http
+        .as_ref()
+        .map(|listener| listener.bind.as_str())
+        .unwrap_or("disabled");
+    let explicit_https_bind = cfg
+        .proxy
+        .listeners
+        .explicit_https
+        .as_ref()
+        .map(|listener| listener.bind.as_str())
+        .unwrap_or("disabled");
+    let transparent_https_bind = cfg
+        .proxy
+        .listeners
+        .transparent_https
+        .as_ref()
+        .map(|listener| listener.bind.as_str())
+        .unwrap_or("disabled");
 
     let certs = &cfg.certificates;
     let has_explicit_ca = certs
@@ -454,19 +515,21 @@ fn log_startup(state: &AppState) {
     let loop_cfg = &cfg.loop_protection;
     let capture_cfg = &cfg.capture;
 
-    warn_on_unspecified_bind("http", &cfg.proxy.bind_address, cfg.proxy.http_port);
-    if cfg.proxy.https_port != 0 {
-        warn_on_unspecified_bind(
-            "transparent_https",
-            &cfg.proxy.https_bind_address,
-            cfg.proxy.https_port,
-        );
+    for (name, bind) in [
+        ("explicit_http", explicit_http_bind),
+        ("transparent_http", transparent_http_bind),
+        ("explicit_https", explicit_https_bind),
+        ("transparent_https", transparent_https_bind),
+    ] {
+        warn_on_unspecified_bind(name, bind);
     }
 
     tracing::info!(
         target: "acl_proxy::startup",
-        http_bind = %http_bind,
-        https_bind = %https_bind,
+        explicit_http_bind = %explicit_http_bind,
+        transparent_http_bind = %transparent_http_bind,
+        explicit_https_bind = %explicit_https_bind,
+        transparent_https_bind = %transparent_https_bind,
         loop_protection_enabled = loop_cfg.enabled,
         loop_protection_add_header = loop_cfg.add_header,
         loop_protection_header = %loop_cfg.header_name,
@@ -482,17 +545,17 @@ fn log_startup(state: &AppState) {
     );
 }
 
-fn warn_on_unspecified_bind(listener: &str, bind_address: &str, port: u16) {
-    let Ok(ip) = bind_address.parse::<IpAddr>() else {
+fn warn_on_unspecified_bind(listener: &str, bind: &str) {
+    let Ok(addr) = bind.parse::<SocketAddr>() else {
         return;
     };
 
-    if ip.is_unspecified() {
+    if addr.ip().is_unspecified() {
         tracing::warn!(
             target: "acl_proxy::startup",
             listener,
-            bind_address,
-            port,
+            bind_address = %addr.ip(),
+            port = addr.port(),
             "proxy listener is bound to all interfaces; restrict bind_address or firewall access when exposure is not intended"
         );
     }

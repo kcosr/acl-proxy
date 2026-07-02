@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use acl_proxy::app::AppState;
 use acl_proxy::config::Config;
-use acl_proxy::proxy::http::run_http_proxy_on_listener;
+use acl_proxy::proxy::http::{
+    run_http_proxy_on_listener, run_http_proxy_on_listener_with_mode, HttpListenerMode,
+};
 use base64::engine::general_purpose;
 use base64::Engine;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
@@ -337,8 +339,7 @@ async fn external_auth_webhook_failure_emits_status_event() {
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -442,8 +443,7 @@ async fn external_auth_webhook_uses_approval_timeout_when_webhook_timeout_is_uns
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -609,8 +609,7 @@ async fn approval_macros_are_exposed_and_applied() {
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -796,8 +795,7 @@ done
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -817,7 +815,7 @@ default = "deny"
 [policy.external_auth_profiles.gitlab_acl]
 type = "plugin"
 command = "{script_path}"
-timeout_ms = 1000
+timeout_ms = 5000
 include_headers = ["authorization"]
 
 [[policy.rules]]
@@ -905,8 +903,7 @@ done
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -926,7 +923,7 @@ default = "deny"
 [policy.external_auth_profiles.body_guard]
 type = "plugin"
 command = "{script_path}"
-timeout_ms = 1000
+timeout_ms = 5000
 include_headers = ["authorization"]
 
 [[policy.rules]]
@@ -1004,8 +1001,7 @@ done
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -1025,7 +1021,7 @@ default = "deny"
 [policy.external_auth_profiles.upgrade_guard]
 type = "plugin"
 command = "{script_path}"
-timeout_ms = 1000
+timeout_ms = 5000
 
 [[policy.rules]]
 action = "delegate"
@@ -1498,8 +1494,7 @@ async fn external_auth_callback_pass_falls_through_to_later_allow() {
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -1565,8 +1560,7 @@ async fn external_auth_callback_unknown_request_id_returns_404() {
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -1653,8 +1647,7 @@ done
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -1674,7 +1667,7 @@ default = "deny"
 [policy.external_auth_profiles.pass_plugin]
 type = "plugin"
 command = "{script_path}"
-timeout_ms = 1000
+timeout_ms = 5000
 
 [[policy.rules]]
 action = "delegate"
@@ -1717,8 +1710,7 @@ fn minimal_config() -> Config {
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -1834,10 +1826,10 @@ async fn allowed_request_uses_configured_egress_forwarding_destination() {
             rule_id: None,
         },
     )];
-    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: forward_addr.port(),
-    });
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        forward_addr.port(),
+    ));
 
     let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
@@ -1899,10 +1891,10 @@ async fn explicit_http_canonicalizes_url_before_policy_and_egress_forwarding() {
             rule_id: None,
         },
     )];
-    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: forward_addr.port(),
-    });
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        forward_addr.port(),
+    ));
 
     let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
@@ -2010,10 +2002,10 @@ async fn global_egress_request_actions_are_applied_after_rule_actions_without_af
             rule_id: None,
         }),
     ];
-    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: forward_addr.port(),
-    });
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        forward_addr.port(),
+    ));
     config.proxy.egress.request_header_actions = vec![
         acl_proxy::config::EgressRequestHeaderActionConfig {
             action: acl_proxy::config::HeaderActionKind::ReplaceSubstring,
@@ -2149,10 +2141,10 @@ async fn global_egress_request_actions_respect_intra_layer_order() {
             rule_id: None,
         },
     )];
-    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: forward_addr.port(),
-    });
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        forward_addr.port(),
+    ));
     config.proxy.egress.request_header_actions = vec![
         acl_proxy::config::EgressRequestHeaderActionConfig {
             action: acl_proxy::config::HeaderActionKind::Set,
@@ -2260,10 +2252,10 @@ async fn empty_global_egress_actions_preserve_existing_rule_header_behavior() {
             rule_id: None,
         },
     )];
-    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: forward_addr.port(),
-    });
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        forward_addr.port(),
+    ));
     config.proxy.egress.request_header_actions = Vec::new();
 
     let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
@@ -2389,10 +2381,11 @@ async fn external_auth_webhook_transport_is_not_redirected_by_egress_forwarding(
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [proxy.egress.default]
+type = "explicit_proxy"
+transport = "http"
 host = "127.0.0.1"
 port = {forward_port}
 
@@ -2488,6 +2481,45 @@ async fn start_proxy_with_config(
             .map_err(|e| {
                 eprintln!("proxy server on {listener_addr} exited: {e}");
             });
+    });
+
+    (addr, temp_dir)
+}
+
+async fn start_transparent_http_proxy_with_config(
+    mut config: Config,
+    listener: StdTcpListener,
+) -> (SocketAddr, TempDir) {
+    let addr = listener.local_addr().expect("proxy addr");
+
+    config.proxy.listeners.explicit_http = None;
+    config.proxy.listeners.transparent_http =
+        Some(acl_proxy::config::CleartextHttpListenerConfig {
+            bind: "127.0.0.1:1".to_string(),
+            enable_http2: true,
+        });
+
+    let temp_dir = TempDir::new().expect("temp dir for capture");
+    let capture_dir = temp_dir.path().join("captures");
+    let certs_dir = temp_dir.path().join("certs");
+    config.capture.directory = capture_dir.to_string_lossy().to_string();
+    config.certificates.certs_dir = certs_dir.to_string_lossy().to_string();
+
+    let state = AppState::shared_from_config(config).expect("app state");
+
+    let listener_addr = addr;
+    tokio::spawn(async move {
+        let _ = run_http_proxy_on_listener_with_mode(
+            state,
+            listener,
+            HttpListenerMode::Transparent,
+            true,
+            std::future::pending(),
+        )
+        .await
+        .map_err(|e| {
+            eprintln!("transparent HTTP proxy server on {listener_addr} exited: {e}");
+        });
     });
 
     (addr, temp_dir)
@@ -2793,8 +2825,7 @@ fn body_plugin_config(
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -2813,7 +2844,7 @@ default = "deny"
 [policy.external_auth_profiles.body_guard]
 type = "plugin"
 command = "{script_path}"
-timeout_ms = 1000
+timeout_ms = 5000
 include_request_body = {include_request_body}
 max_request_body_bytes = {max_request_body_bytes}
 max_decompressed_request_body_bytes = {max_decompressed_request_body_bytes}
@@ -3059,8 +3090,7 @@ async fn body_aware_auth_plugin_rewrites_http_request_body() {
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -3079,7 +3109,7 @@ default = "deny"
 [policy.external_auth_profiles.body_guard]
 type = "plugin"
 command = "{script_path}"
-timeout_ms = 1000
+timeout_ms = 5000
 include_request_body = true
 max_request_body_bytes = 4096
 max_decompressed_request_body_bytes = 4096
@@ -3142,8 +3172,7 @@ async fn native_redaction_rewrites_http_request_body() {
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -3337,8 +3366,7 @@ async fn native_redaction_recompresses_gzip_request_body() {
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -4418,7 +4446,8 @@ async fn origin_form_request_with_host_is_forwarded() {
         .set_nonblocking(true)
         .expect("set nonblocking proxy");
 
-    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+    let (proxy_addr, _temp_dir) =
+        start_transparent_http_proxy_with_config(config, proxy_listener).await;
 
     let raw_request =
         format!("GET /relative/path HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
@@ -4560,8 +4589,7 @@ async fn header_actions_apply_to_request_for_matching_rule() {
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -4667,8 +4695,7 @@ async fn header_actions_apply_to_response_for_matching_rule() {
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"

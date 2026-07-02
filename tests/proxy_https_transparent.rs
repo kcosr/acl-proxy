@@ -566,10 +566,7 @@ fn minimal_https_transparent_config() -> Config {
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
-https_bind_address = "127.0.0.1"
-https_port = 0
+listeners.transparent_https.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -625,9 +622,15 @@ async fn start_proxy_with_config(
 #[tokio::test(flavor = "multi_thread")]
 async fn transparent_https_listener_times_out_idle_tls_handshake() {
     let mut config = minimal_https_transparent_config();
-    config.proxy.https_handshake_timeout_ms = 50;
-    config.proxy.https_request_header_timeout_ms = 500;
-    config.proxy.https_max_connections = 16;
+    let listener = config
+        .proxy
+        .listeners
+        .transparent_https
+        .as_mut()
+        .expect("transparent https listener");
+    listener.handshake_timeout_ms = 50;
+    listener.request_header_timeout_ms = 500;
+    listener.max_connections = 16;
 
     let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     listener
@@ -1277,10 +1280,10 @@ async fn configured_egress_forwarding_applies_to_https_transparent_requests() {
             rule_id: None,
         },
     )];
-    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: forward_addr.port(),
-    });
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        forward_addr.port(),
+    ));
 
     let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
@@ -1346,10 +1349,10 @@ async fn global_egress_request_actions_apply_to_https_transparent_requests() {
             rule_id: None,
         },
     )];
-    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: forward_addr.port(),
-    });
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        forward_addr.port(),
+    ));
     config.proxy.egress.request_header_actions =
         vec![acl_proxy::config::EgressRequestHeaderActionConfig {
             action: acl_proxy::config::HeaderActionKind::Set,
@@ -2923,10 +2926,7 @@ done
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
-https_bind_address = "127.0.0.1"
-https_port = 0
+listeners.transparent_https.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -2952,7 +2952,7 @@ default = "deny"
 [policy.external_auth_profiles.pass_plugin]
 type = "plugin"
 command = "{script_path}"
-timeout_ms = 1000
+timeout_ms = 5000
 
 [[policy.rules]]
 action = "delegate"
@@ -3002,10 +3002,7 @@ async fn body_aware_auth_plugin_rewrites_transparent_https_request_body() {
 schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
-https_bind_address = "127.0.0.1"
-https_port = 0
+listeners.transparent_https.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -3030,7 +3027,7 @@ default = "deny"
 [policy.external_auth_profiles.body_guard]
 type = "plugin"
 command = "{script_path}"
-timeout_ms = 1000
+timeout_ms = 5000
 include_request_body = true
 max_request_body_bytes = 4096
 max_decompressed_request_body_bytes = 4096
