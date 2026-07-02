@@ -3338,6 +3338,72 @@ default = "deny"
     }
 
     #[test]
+    fn proxy_egress_default_rejects_ca_cert_path_with_system_trust() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
+
+[proxy.egress.default]
+type = "explicit_proxy"
+transport = "https"
+host = "proxy.internal"
+port = 9443
+
+[proxy.egress.default.tls]
+trust = "system"
+ca_cert_path = "ignored-ca.pem"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(
+                "proxy.egress.default.tls.ca_cert_path must not be set when trust = \"system\""
+            ),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
+    fn proxy_egress_default_rejects_ca_cert_path_with_disabled_trust() {
+        let toml = r#"
+schema_version = "1"
+
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
+
+[proxy.egress.default]
+type = "explicit_proxy"
+transport = "https"
+host = "proxy.internal"
+port = 9443
+
+[proxy.egress.default.tls]
+trust = "disabled"
+ca_cert_path = "ignored-ca.pem"
+
+[policy]
+default = "deny"
+        "#;
+
+        let config: Config = toml::from_str(toml).expect("parse config");
+        let err = config.validate_basic().expect_err("validation should fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(
+                "proxy.egress.default.tls.ca_cert_path must not be set when trust = \"disabled\""
+            ),
+            "unexpected error message: {msg}"
+        );
+    }
+
+    #[test]
     fn proxy_egress_default_rejects_tls_server_name_with_port_suffix() {
         let toml = r#"
 schema_version = "1"

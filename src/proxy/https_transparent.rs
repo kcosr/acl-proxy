@@ -12,6 +12,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 use crate::app::{AppState, SharedAppState};
@@ -157,6 +158,7 @@ where
     } else {
         Some(Arc::new(Semaphore::new(connection_limit)))
     };
+    let mut connections = JoinSet::new();
 
     tokio::pin!(shutdown);
 
@@ -186,11 +188,14 @@ where
             accept_res = listener.accept() => {
                 let (socket, remote_addr) = match accept_res {
                     Ok(v) => v,
-                    Err(e) => return Err(HttpsTransparentError::Accept(e)),
+                    Err(e) => {
+                        crate::proxy::listener::handle_accept_error("transparent_https", e).await;
+                        continue;
+                    }
                 };
 
                 let state = state.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let state_snapshot = state.load_full();
                     let limits = HttpsTransparentConnectionLimits::from_state(&state_snapshot);
                     let tls_acceptor = match state_snapshot
@@ -207,7 +212,7 @@ where
                     };
 
                     if let Err(err) = handle_tls_connection(
-                        state_snapshot, tls_acceptor, socket, remote_addr, limits,
+                        state, tls_acceptor, socket, remote_addr, limits,
                     )
                     .await
                     {
@@ -222,11 +227,17 @@ where
         }
     }
 
+    while let Some(join_result) = connections.join_next().await {
+        if let Err(err) = join_result {
+            tracing::debug!("transparent HTTPS listener connection task failed: {err}");
+        }
+    }
+
     Ok(())
 }
 
 async fn handle_tls_connection(
-    state: Arc<AppState>,
+    state: SharedAppState,
     tls_acceptor: TlsAcceptor,
     socket: tokio::net::TcpStream,
     remote_addr: SocketAddr,
@@ -297,12 +308,11 @@ async fn handle_tls_connection(
         port: Some(remote_addr.port()),
     };
 
-    let state_for_svc = state.clone();
     let client_for_svc = client.clone();
     let client_ip = client_ip_for_policy.clone();
 
     let service = service_fn(move |req: Request<Body>| {
-        let state = state_for_svc.clone();
+        let state = state.load_full();
         let client = client_for_svc.clone();
         let client_ip = client_ip.clone();
         async move { handle_inner_https_request(state, client, client_ip, req).await }

@@ -119,6 +119,22 @@ fn explicit_http_config_with_https_parent(
     ca_cert_path: &Path,
     allow_pattern: &str,
 ) -> Config {
+    let tls_block = format!(
+        r#"[proxy.egress.default.tls]
+trust = "custom_ca"
+server_name = "127.0.0.1"
+ca_cert_path = {ca_cert_path:?}
+"#,
+        ca_cert_path = ca_cert_path.display().to_string(),
+    );
+    explicit_http_config_with_https_parent_tls_block(parent_addr, Some(&tls_block), allow_pattern)
+}
+
+fn explicit_http_config_with_https_parent_tls_block(
+    parent_addr: SocketAddr,
+    tls_block: Option<&str>,
+    allow_pattern: &str,
+) -> Config {
     let toml = format!(
         r#"
 schema_version = "1"
@@ -132,10 +148,7 @@ transport = "https"
 host = "127.0.0.1"
 port = {parent_port}
 
-[proxy.egress.default.tls]
-trust = "custom_ca"
-server_name = "127.0.0.1"
-ca_cert_path = {ca_cert_path:?}
+{tls_block}
 
 [logging]
 level = "info"
@@ -158,7 +171,7 @@ action = "allow"
 pattern = {allow_pattern:?}
 "#,
         parent_port = parent_addr.port(),
-        ca_cert_path = ca_cert_path.display().to_string(),
+        tls_block = tls_block.unwrap_or(""),
     );
 
     toml::from_str(&toml).expect("parse explicit http config")
@@ -384,4 +397,80 @@ async fn explicit_http_can_forward_to_parent_explicit_proxy_over_https() {
             .and_then(|value| value.to_str().ok()),
         Some(format!("{}:{}", upstream_addr.ip(), upstream_addr.port()).as_str())
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn https_parent_egress_fails_closed_when_parent_cert_is_untrusted() {
+    let (upstream_addr, seen_requests) = start_http_echo_server("should not arrive").await;
+    let identity_dir = TempDir::new().expect("identity dir");
+    let (cert_path, key_path) = write_proxy_identity(&identity_dir);
+    let allow_pattern = format!("http://{}:{}/**", upstream_addr.ip(), upstream_addr.port());
+
+    let parent_config = explicit_https_config(&cert_path, &key_path, &allow_pattern);
+    let parent_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind parent proxy");
+    parent_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking parent proxy");
+    let (parent_addr, _parent_temp_dir) =
+        start_explicit_https_proxy(parent_config, parent_listener).await;
+
+    let mut inner_config =
+        explicit_http_config_with_https_parent_tls_block(parent_addr, None, &allow_pattern);
+    inner_config.loop_protection.add_header = false;
+    let (inner_addr, _inner_temp_dir) = start_explicit_http_proxy(inner_config).await;
+
+    let absolute_url = format!(
+        "http://{}:{}/via-untrusted-parent",
+        upstream_addr.ip(),
+        upstream_addr.port()
+    );
+    let (status, _response) = send_raw_http_request(inner_addr, &absolute_url).await;
+
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(
+        seen_requests.lock().unwrap().is_empty(),
+        "untrusted parent certificate should fail before reaching upstream"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn https_parent_egress_trust_disabled_accepts_untrusted_parent_cert() {
+    let (upstream_addr, seen_requests) = start_http_echo_server("trust disabled ok").await;
+    let identity_dir = TempDir::new().expect("identity dir");
+    let (cert_path, key_path) = write_proxy_identity(&identity_dir);
+    let allow_pattern = format!("http://{}:{}/**", upstream_addr.ip(), upstream_addr.port());
+
+    let parent_config = explicit_https_config(&cert_path, &key_path, &allow_pattern);
+    let parent_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind parent proxy");
+    parent_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking parent proxy");
+    let (parent_addr, _parent_temp_dir) =
+        start_explicit_https_proxy(parent_config, parent_listener).await;
+
+    let tls_block = r#"[proxy.egress.default.tls]
+trust = "disabled"
+server_name = "127.0.0.1"
+"#;
+    let mut inner_config = explicit_http_config_with_https_parent_tls_block(
+        parent_addr,
+        Some(tls_block),
+        &allow_pattern,
+    );
+    inner_config.loop_protection.add_header = false;
+    let (inner_addr, _inner_temp_dir) = start_explicit_http_proxy(inner_config).await;
+
+    let absolute_url = format!(
+        "http://{}:{}/via-disabled-trust-parent",
+        upstream_addr.ip(),
+        upstream_addr.port()
+    );
+    let (status, response) = send_raw_http_request(inner_addr, &absolute_url).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        response.contains("\r\n\r\ntrust disabled ok"),
+        "unexpected response: {response}"
+    );
+    assert_eq!(seen_requests.lock().unwrap().len(), 1);
 }

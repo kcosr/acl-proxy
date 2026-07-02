@@ -4413,6 +4413,47 @@ async fn loop_detected_returns_508() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn explicit_http_listener_rejects_origin_form_proxy_requests() {
+    let mut config = minimal_config();
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Allow;
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) = start_proxy_with_config(config, proxy_listener).await;
+
+    let raw_request =
+        "GET /relative/path HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    let (_response, status) = send_raw_http_request(proxy_addr, raw_request).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transparent_http_listener_rejects_explicit_proxy_shapes() {
+    let mut config = minimal_config();
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Allow;
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir) =
+        start_transparent_http_proxy_with_config(config, proxy_listener).await;
+
+    let absolute_request =
+        "GET http://example.com/path HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n";
+    let (_response, status) = send_raw_http_request(proxy_addr, absolute_request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let connect_request =
+        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nConnection: close\r\n\r\n";
+    let (_response, status) = send_raw_http_request(proxy_addr, connect_request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn origin_form_request_with_host_is_forwarded() {
     let (upstream_addr, _seen_headers) = start_upstream_echo_server().await;
 

@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 
 use acl_proxy::app::AppState;
 use acl_proxy::config::{
-    Config, EgressTargetConfig, ExternalAuthProfileConfig, ExternalAuthProfileType,
+    CleartextHttpListenerConfig, Config, EgressTargetConfig, ExternalAuthProfileConfig,
+    ExternalAuthProfileType,
 };
 use acl_proxy::external_auth::ExternalDecision;
 use acl_proxy::proxy::http::run_http_proxy_on_listener;
@@ -216,6 +217,67 @@ async fn send_raw_http_request(addr: SocketAddr, raw_request: &str) -> (String, 
     };
 
     (response, status)
+}
+
+async fn read_keep_alive_http_response(stream: &mut tokio::net::TcpStream) -> (String, StatusCode) {
+    let mut buf = Vec::new();
+    while !buf.windows(4).any(|window| window == b"\r\n\r\n") {
+        let byte = stream.read_u8().await.expect("read response byte");
+        buf.push(byte);
+    }
+
+    let header_end = buf
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|idx| idx + 4)
+        .expect("header terminator");
+    let headers = String::from_utf8_lossy(&buf[..header_end]);
+    let content_length = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("content-length") {
+            value.trim().parse::<usize>().ok()
+        } else {
+            None
+        }
+    });
+    if let Some(content_length) = content_length {
+        while buf.len() - header_end < content_length {
+            let byte = stream.read_u8().await.expect("read response body byte");
+            buf.push(byte);
+        }
+    }
+
+    let response = String::from_utf8_lossy(&buf).to_string();
+    let status_line = response.lines().next().unwrap_or_default();
+    let status = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .and_then(|code| StatusCode::from_u16(code).ok())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (response, status)
+}
+
+fn allow_rule(pattern: String) -> acl_proxy::config::PolicyRuleConfig {
+    acl_proxy::config::PolicyRuleConfig::Direct(acl_proxy::config::PolicyRuleDirectConfig {
+        action: acl_proxy::config::PolicyRuleAction::Allow,
+        pattern: Some(pattern),
+        patterns: None,
+        description: None,
+        methods: None,
+        subnets: Vec::new(),
+        headers_absent: None,
+        headers_match: None,
+        headers_not_match: None,
+        request_timeout_ms: None,
+        allow_upgrades: true,
+        redaction_profile: None,
+        with: None,
+        add_url_enc_variants: None,
+        header_actions: Vec::new(),
+        external_auth_profile: None,
+        rule_id: None,
+    })
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -460,6 +522,89 @@ fn invalid_egress_forwarding_config_is_rejected_on_reload() {
         shared_state.load().config.proxy.egress.default.is_none(),
         "failed reload should preserve the previous state"
     );
+}
+
+#[test]
+fn listener_config_changes_are_rejected_on_reload() {
+    let temp = tempfile::tempdir().expect("temp certs dir");
+
+    let mut config = minimal_config();
+    prepare_app_config_for_reload_tests(&mut config, temp.path());
+
+    let shared_state = AppState::shared_from_config(config.clone()).expect("app state");
+
+    let mut updated = config.clone();
+    updated.proxy.listeners.transparent_http = Some(CleartextHttpListenerConfig {
+        bind: "127.0.0.1:8081".to_string(),
+        enable_http2: true,
+    });
+
+    let err = AppState::reload_shared_from_config(&shared_state, updated)
+        .expect_err("listener reload should fail");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("listener configuration changed"),
+        "unexpected reload error: {msg}"
+    );
+    assert!(
+        shared_state
+            .load()
+            .config
+            .proxy
+            .listeners
+            .transparent_http
+            .is_none(),
+        "failed listener reload should preserve the previous state"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn policy_reload_applies_to_existing_keep_alive_connection() {
+    let (upstream_addr, _seen_headers) = start_upstream_echo_server().await;
+    let temp = tempfile::tempdir().expect("temp certs dir");
+
+    let mut config = minimal_config();
+    prepare_app_config_for_reload_tests(&mut config, temp.path());
+    let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![allow_rule(format!("http://{host}/**"))];
+
+    let shared_state = AppState::shared_from_config(config.clone()).expect("app state");
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let proxy_addr =
+        start_proxy_with_shared_state(shared_state.clone(), proxy_listener, shutdown.clone()).await;
+
+    let mut stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
+    let raw_request = format!(
+        "GET http://{host}/reload HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n"
+    );
+    stream
+        .write_all(raw_request.as_bytes())
+        .await
+        .expect("write first request");
+    let (_response, status) = read_keep_alive_http_response(&mut stream).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let mut updated = config.clone();
+    updated.policy.rules.clear();
+    AppState::reload_shared_from_config(&shared_state, updated).expect("reload config");
+
+    let raw_request =
+        format!("GET http://{host}/reload HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream
+        .write_all(raw_request.as_bytes())
+        .await
+        .expect("write second request");
+    let (_response, status) = read_keep_alive_http_response(&mut stream).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    shutdown.notify_waiters();
 }
 
 #[tokio::test]

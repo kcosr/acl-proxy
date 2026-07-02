@@ -1,6 +1,8 @@
 use crate::auth_plugin::AuthPluginManager;
 use crate::certs::CertManager;
-use crate::config::{Config, ConfigError, TlsConfig};
+use crate::config::{
+    Config, ConfigError, EgressTargetConfig, EgressTlsTrust, EgressTransport, TlsConfig,
+};
 use crate::external_auth::ExternalAuthManager;
 use crate::logging::{LoggingError, LoggingSettings};
 use crate::loop_protection::{LoopProtectionError, LoopProtectionSettings};
@@ -11,7 +13,9 @@ use arc_swap::ArcSwap;
 use hyper::Client;
 use hyper_rustls::{ConfigBuilderExt, HttpsConnectorBuilder};
 use rustls::client::{ServerCertVerified, ServerCertVerifier};
-use rustls::{Certificate, ClientConfig, Error as RustlsError, ServerName};
+use rustls::{Certificate, ClientConfig, Error as RustlsError, RootCertStore, ServerName};
+use std::net::IpAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -38,6 +42,23 @@ pub enum AppStateError {
 pub type SharedAppState = Arc<ArcSwap<AppState>>;
 
 #[derive(Clone)]
+pub struct ParentEgressTls {
+    pub server_name: String,
+    http1_config: Arc<ClientConfig>,
+    h2_config: Arc<ClientConfig>,
+}
+
+impl ParentEgressTls {
+    pub fn client_config(&self, use_http2: bool) -> Arc<ClientConfig> {
+        if use_http2 {
+            self.h2_config.clone()
+        } else {
+            self.http1_config.clone()
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct AppState {
     pub config: Config,
     pub logging: LoggingSettings,
@@ -45,6 +66,7 @@ pub struct AppState {
     pub egress_request_header_actions: Vec<CompiledHeaderAction>,
     pub loop_protection: LoopProtectionSettings,
     pub http_client: Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>,
+    pub parent_egress_tls: Option<ParentEgressTls>,
     pub cert_manager: CertManager,
     pub external_auth: ExternalAuthManager,
     pub auth_plugins: AuthPluginManager,
@@ -67,6 +89,7 @@ impl AppState {
         let loop_protection = LoopProtectionSettings::from_config(&config.loop_protection)?;
 
         let http_client = build_http_client(&config.tls);
+        let parent_egress_tls = build_parent_egress_tls(&config)?;
         let cert_manager = CertManager::from_config(&config.certificates)?;
         let external_auth = if let Some(previous) = previous {
             ExternalAuthManager::reconfigured_from(
@@ -91,6 +114,7 @@ impl AppState {
             egress_request_header_actions,
             loop_protection,
             http_client,
+            parent_egress_tls,
             cert_manager,
             external_auth,
             auth_plugins,
@@ -106,7 +130,7 @@ impl AppState {
     /// Rebuild and atomically swap the shared application state from
     /// the provided configuration.
     ///
-    /// On success, new connections will observe the updated state,
+    /// On success, new requests will observe the updated state,
     /// while in-flight requests continue using their existing snapshot.
     pub fn reload_shared_from_config(
         shared: &SharedAppState,
@@ -123,6 +147,162 @@ impl AppState {
         shared.store(Arc::new(new_state));
         Ok(())
     }
+}
+
+fn build_parent_egress_tls(config: &Config) -> Result<Option<ParentEgressTls>, AppStateError> {
+    let Some(target) = config.proxy.egress.default.as_ref() else {
+        return Ok(None);
+    };
+    if target.transport != EgressTransport::Https {
+        return Ok(None);
+    }
+
+    let server_name = normalized_tls_server_name(target.tls_server_name());
+    ServerName::try_from(server_name.as_str()).map_err(|err| {
+        ConfigError::Invalid(format!(
+            "proxy.egress.default.tls.server_name must be a valid TLS server name: {err}"
+        ))
+    })?;
+
+    let http1_config = build_parent_tls_client_config(target, b"http/1.1")?;
+    let h2_config = build_parent_tls_client_config(target, b"h2")?;
+
+    Ok(Some(ParentEgressTls {
+        server_name,
+        http1_config: Arc::new(http1_config),
+        h2_config: Arc::new(h2_config),
+    }))
+}
+
+fn build_parent_tls_client_config(
+    target: &EgressTargetConfig,
+    alpn: &'static [u8],
+) -> Result<ClientConfig, ConfigError> {
+    let tls = target.tls.as_ref();
+    let trust = target.effective_tls_trust();
+    let mut config = match trust {
+        EgressTlsTrust::System => {
+            let roots = root_store_with_native_roots()?;
+            ClientConfig::builder()
+                .with_safe_defaults()
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        }
+        EgressTlsTrust::CustomCa => {
+            let roots = root_store_from_custom_ca(
+                tls.and_then(|tls| tls.ca_cert_path.as_deref())
+                    .ok_or_else(|| {
+                        ConfigError::Invalid(
+                            "proxy.egress.default.tls.ca_cert_path is required".to_string(),
+                        )
+                    })?,
+            )?;
+            ClientConfig::builder()
+                .with_safe_defaults()
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        }
+        EgressTlsTrust::SystemPlusCustomCa => {
+            let mut roots = root_store_with_native_roots()?;
+            let ca_path = tls
+                .and_then(|tls| tls.ca_cert_path.as_deref())
+                .ok_or_else(|| {
+                    ConfigError::Invalid(
+                        "proxy.egress.default.tls.ca_cert_path is required".to_string(),
+                    )
+                })?;
+            add_custom_ca_to_root_store(&mut roots, ca_path)?;
+            ClientConfig::builder()
+                .with_safe_defaults()
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        }
+        EgressTlsTrust::Disabled => {
+            if alpn == b"http/1.1" {
+                tracing::warn!(
+                    target: "acl_proxy::transport",
+                    egress_host = %target.host,
+                    egress_port = target.port,
+                    egress_tls_server_name = %target.tls_server_name(),
+                    "HTTPS parent egress certificate verification is disabled"
+                );
+            }
+            let mut config = ClientConfig::builder()
+                .with_safe_defaults()
+                .with_root_certificates(RootCertStore::empty())
+                .with_no_client_auth();
+            config
+                .dangerous()
+                .set_certificate_verifier(Arc::new(NoVerifyServerCert));
+            config
+        }
+    };
+
+    config.alpn_protocols = vec![alpn.to_vec()];
+    config.enable_sni = normalized_tls_server_name(target.tls_server_name())
+        .parse::<IpAddr>()
+        .is_err();
+
+    Ok(config)
+}
+
+fn root_store_with_native_roots() -> Result<RootCertStore, ConfigError> {
+    let mut roots = RootCertStore::empty();
+    let certs = rustls_native_certs::load_native_certs().map_err(|err| {
+        ConfigError::Invalid(format!("failed to load system certificate roots: {err}"))
+    })?;
+    for cert in certs {
+        roots.add(&Certificate(cert.0)).map_err(|err| {
+            ConfigError::Invalid(format!(
+                "failed to add system certificate root to HTTPS parent egress trust store: {err}"
+            ))
+        })?;
+    }
+    Ok(roots)
+}
+
+fn root_store_from_custom_ca(path: &Path) -> Result<RootCertStore, ConfigError> {
+    let mut roots = RootCertStore::empty();
+    add_custom_ca_to_root_store(&mut roots, path)?;
+    Ok(roots)
+}
+
+fn add_custom_ca_to_root_store(roots: &mut RootCertStore, path: &Path) -> Result<(), ConfigError> {
+    let file = std::fs::File::open(path).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut reader = std::io::BufReader::new(file);
+    let certs = rustls_pemfile::certs(&mut reader).map_err(|err| {
+        ConfigError::Invalid(format!(
+            "proxy.egress.default.tls.ca_cert_path {} must contain valid PEM certificates: {err}",
+            path.display()
+        ))
+    })?;
+    if certs.is_empty() {
+        return Err(ConfigError::Invalid(format!(
+            "proxy.egress.default.tls.ca_cert_path {} must contain at least one PEM certificate",
+            path.display()
+        )));
+    }
+
+    for cert in certs {
+        roots.add(&Certificate(cert)).map_err(|err| {
+            ConfigError::Invalid(format!(
+                "failed to add proxy.egress.default.tls.ca_cert_path {} certificate: {err}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn normalized_tls_server_name(value: &str) -> String {
+    value
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(value)
+        .to_string()
 }
 
 fn build_http_client(

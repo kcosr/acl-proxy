@@ -6,6 +6,8 @@
 
 - Replaced the flat proxy listener settings with `proxy.listeners.*` sections for explicit HTTP, transparent HTTP, explicit HTTPS, and transparent HTTPS listeners.
 - Changed `proxy.egress.default` to require an explicit parent-proxy `type` and `transport`.
+- Replaced the `PROXY_PORT` and `PROXY_HOST` environment overrides with `PROXY_EXPLICIT_HTTP_BIND`.
+- Replaced egress transport log value `chain` with `egress_type = "explicit_proxy"` and `egress_transport = "http"` or `"https"`.
 
 ### Added
 

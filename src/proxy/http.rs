@@ -3,10 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::convert::Infallible;
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener as StdTcpListener};
-use std::path::Path;
+use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use chrono::Utc;
 use flate2::read::{DeflateDecoder, GzDecoder, ZlibDecoder};
@@ -22,25 +21,25 @@ use hyper::client::conn;
 use hyper::server::conn::Http;
 use hyper::service::service_fn;
 use hyper::{Body, Client, Request, Response};
-use rustls::client::{ServerCertVerified, ServerCertVerifier};
-use rustls::{Certificate, ClientConfig, Error as RustlsError, RootCertStore, ServerName};
+use rustls::ServerName;
 use tokio::io::{copy_bidirectional, AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
 use tokio_rustls::TlsConnector;
 use tokio_stream::wrappers::ReceiverStream;
 
 use serde::Deserialize;
 
-use crate::app::{AppState, SharedAppState};
+use crate::app::{AppState, ParentEgressTls, SharedAppState};
 use crate::auth_plugin::{AuthPluginHandle, PluginBodyInput, PluginBodyMutation, PluginDecision};
 use crate::capture::{
     build_capture_record, should_capture, BodyCaptureBuffer, BodyCaptureResult, CaptureDecision,
     CaptureEndpoint, CaptureKind, CaptureMode, CaptureRecord, CaptureRecordOptions, HeaderMap,
 };
 use crate::config::{
-    parse_listener_bind, Config, EgressTargetConfig, EgressTlsTrust, EgressTransport,
-    ExternalAuthProfileType, HeaderActionKind, HeaderDirection, HeaderWhen, PolicyRuleAction,
+    parse_listener_bind, Config, EgressTargetConfig, EgressTransport, ExternalAuthProfileType,
+    HeaderActionKind, HeaderDirection, HeaderWhen, PolicyRuleAction,
 };
 use crate::external_auth::{ApprovalMacroDescriptor, ExternalAuthProfile, ExternalDecision};
 use crate::logging::PolicyDecisionLogContext;
@@ -155,7 +154,7 @@ pub enum HttpListenerMode {
 /// Run the explicit HTTP proxy listener using the configured bind address.
 ///
 /// The listener uses the shared, reloadable application state; new
-/// connections observe the latest configuration snapshot, while
+/// requests observe the latest configuration snapshot, while
 /// in-flight requests continue using the state captured for that
 /// request.
 pub async fn run_http_proxy<F>(state: SharedAppState, shutdown: F) -> Result<(), HttpProxyError>
@@ -271,6 +270,7 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let listener = TcpListener::from_std(listener).map_err(HttpProxyError::FromTcp)?;
+    let mut connections = JoinSet::new();
     tokio::pin!(shutdown);
 
     loop {
@@ -278,16 +278,27 @@ where
             _ = &mut shutdown => {
                 break;
             }
+            Some(join_result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(err) = join_result {
+                    tracing::debug!(
+                        listener = ?mode,
+                        "HTTP listener connection task failed: {err}"
+                    );
+                }
+            }
             accept_res = listener.accept() => {
                 let (socket, remote_addr) = match accept_res {
                     Ok(v) => v,
-                    Err(e) => return Err(HttpProxyError::FromTcp(e)),
+                    Err(e) => {
+                        crate::proxy::listener::handle_accept_error(http_listener_name(mode), e).await;
+                        continue;
+                    }
                 };
 
                 let state = state.clone();
-                tokio::spawn(async move {
-                    let state_snapshot = state.load_full();
+                connections.spawn(async move {
                     let service = service_fn(move |req| {
+                        let state_snapshot = state.load_full();
                         handle_http_request(state_snapshot.clone(), remote_addr, mode, req)
                     });
 
@@ -310,7 +321,23 @@ where
         }
     }
 
+    while let Some(join_result) = connections.join_next().await {
+        if let Err(err) = join_result {
+            tracing::debug!(
+                listener = ?mode,
+                "HTTP listener connection task failed: {err}"
+            );
+        }
+    }
+
     Ok(())
+}
+
+fn http_listener_name(mode: HttpListenerMode) -> &'static str {
+    match mode {
+        HttpListenerMode::Explicit => "explicit_http",
+        HttpListenerMode::Transparent => "transparent_http",
+    }
 }
 
 pub(crate) async fn handle_http_request(
@@ -2659,6 +2686,7 @@ pub(crate) async fn proxy_allowed_request(
 
     let client_http: Client<_> = state.http_client.clone();
     let forwarding_target = state.config.proxy.egress.default.as_ref();
+    let parent_egress_tls = state.parent_egress_tls.clone();
     let request_timeout =
         resolve_request_timeout_ms(request_timeout_ms, state.config.proxy.request_timeout_ms);
     tracing::debug!(
@@ -2679,6 +2707,7 @@ pub(crate) async fn proxy_allowed_request(
                 send_upstream_request(
                     client_http,
                     forwarding_target,
+                    parent_egress_tls.as_ref(),
                     version,
                     request_is_upgrade,
                     &request_id,
@@ -2718,6 +2747,7 @@ pub(crate) async fn proxy_allowed_request(
             send_upstream_request(
                 client_http,
                 forwarding_target,
+                parent_egress_tls.as_ref(),
                 version,
                 request_is_upgrade,
                 &request_id,
@@ -3008,6 +3038,7 @@ pub(crate) async fn proxy_allowed_request(
 async fn send_upstream_request(
     client_http: Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>,
     forwarding_target: Option<&EgressTargetConfig>,
+    parent_egress_tls: Option<&ParentEgressTls>,
     request_version: Version,
     request_is_upgrade: bool,
     request_id: &str,
@@ -3018,6 +3049,7 @@ async fn send_upstream_request(
         Some(target) => {
             send_request_via_egress_target(
                 target,
+                parent_egress_tls,
                 request_version,
                 request_is_upgrade,
                 request_id,
@@ -3047,6 +3079,7 @@ async fn send_upstream_request(
 
 async fn send_request_via_egress_target(
     target: &EgressTargetConfig,
+    parent_egress_tls: Option<&ParentEgressTls>,
     request_version: Version,
     request_is_upgrade: bool,
     request_id: &str,
@@ -3093,7 +3126,12 @@ async fn send_request_via_egress_target(
             .await
         }
         EgressTransport::Https => {
-            let tls = connect_https_parent(target, stream, use_http2).await?;
+            let parent_egress_tls = parent_egress_tls.ok_or_else(|| {
+                UpstreamRequestError::TlsConfig(
+                    "HTTPS parent egress TLS state is unavailable".to_string(),
+                )
+            })?;
+            let tls = connect_https_parent(parent_egress_tls, stream, use_http2).await?;
             send_request_via_egress_stream(
                 tls,
                 target,
@@ -3170,26 +3208,24 @@ where
 }
 
 async fn connect_https_parent(
-    target: &EgressTargetConfig,
+    parent_egress_tls: &ParentEgressTls,
     stream: TcpStream,
     use_http2: bool,
 ) -> Result<tokio_rustls::client::TlsStream<TcpStream>, UpstreamRequestError> {
-    let mut config = build_parent_tls_client_config(target)?;
     let expected_alpn = if use_http2 {
         b"h2".to_vec()
     } else {
         b"http/1.1".to_vec()
     };
-    config.alpn_protocols = vec![expected_alpn.clone()];
 
-    let server_name_value = normalized_tls_server_name(target.tls_server_name());
-    let server_name = ServerName::try_from(server_name_value.as_str()).map_err(|err| {
-        UpstreamRequestError::TlsConfig(format!(
-            "proxy.egress.default.tls.server_name must be a valid TLS server name: {err}"
-        ))
-    })?;
+    let server_name =
+        ServerName::try_from(parent_egress_tls.server_name.as_str()).map_err(|err| {
+            UpstreamRequestError::TlsConfig(format!(
+                "proxy.egress.default.tls.server_name must be a valid TLS server name: {err}"
+            ))
+        })?;
 
-    let connector = TlsConnector::from(Arc::new(config));
+    let connector = TlsConnector::from(parent_egress_tls.client_config(use_http2));
     let tls = connector.connect(server_name, stream).await?;
     let negotiated = tls.get_ref().1.alpn_protocol().map(|value| value.to_vec());
     if negotiated.as_deref() != Some(expected_alpn.as_slice()) {
@@ -3202,158 +3238,10 @@ async fn connect_https_parent(
     Ok(tls)
 }
 
-fn build_parent_tls_client_config(
-    target: &EgressTargetConfig,
-) -> Result<ClientConfig, UpstreamRequestError> {
-    let tls = target.tls.as_ref();
-    let trust = target.effective_tls_trust();
-    let mut config = match trust {
-        EgressTlsTrust::System => {
-            let roots = root_store_with_native_roots()?;
-            ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(roots)
-                .with_no_client_auth()
-        }
-        EgressTlsTrust::CustomCa => {
-            let roots = root_store_from_custom_ca(
-                tls.and_then(|tls| tls.ca_cert_path.as_deref())
-                    .ok_or_else(|| {
-                        UpstreamRequestError::TlsConfig(
-                            "proxy.egress.default.tls.ca_cert_path is required".to_string(),
-                        )
-                    })?,
-            )?;
-            ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(roots)
-                .with_no_client_auth()
-        }
-        EgressTlsTrust::SystemPlusCustomCa => {
-            let mut roots = root_store_with_native_roots()?;
-            let ca_path = tls
-                .and_then(|tls| tls.ca_cert_path.as_deref())
-                .ok_or_else(|| {
-                    UpstreamRequestError::TlsConfig(
-                        "proxy.egress.default.tls.ca_cert_path is required".to_string(),
-                    )
-                })?;
-            add_custom_ca_to_root_store(&mut roots, ca_path)?;
-            ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(roots)
-                .with_no_client_auth()
-        }
-        EgressTlsTrust::Disabled => {
-            tracing::warn!(
-                target: "acl_proxy::transport",
-                egress_host = %target.host,
-                egress_port = target.port,
-                egress_tls_server_name = %target.tls_server_name(),
-                "HTTPS parent egress certificate verification is disabled"
-            );
-            let mut config = ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(RootCertStore::empty())
-                .with_no_client_auth();
-            config
-                .dangerous()
-                .set_certificate_verifier(Arc::new(NoVerifyParentServerCert));
-            config
-        }
-    };
-
-    config.enable_sni = normalized_tls_server_name(target.tls_server_name())
-        .parse::<IpAddr>()
-        .is_err();
-
-    Ok(config)
-}
-
-fn root_store_with_native_roots() -> Result<RootCertStore, UpstreamRequestError> {
-    let mut roots = RootCertStore::empty();
-    let certs = rustls_native_certs::load_native_certs().map_err(|err| {
-        UpstreamRequestError::TlsConfig(format!("failed to load system certificate roots: {err}"))
-    })?;
-    for cert in certs {
-        roots.add(&Certificate(cert.0)).map_err(|err| {
-            UpstreamRequestError::TlsConfig(format!(
-                "failed to add system certificate root to HTTPS parent egress trust store: {err}"
-            ))
-        })?;
-    }
-    Ok(roots)
-}
-
-fn root_store_from_custom_ca(path: &Path) -> Result<RootCertStore, UpstreamRequestError> {
-    let mut roots = RootCertStore::empty();
-    add_custom_ca_to_root_store(&mut roots, path)?;
-    Ok(roots)
-}
-
-fn add_custom_ca_to_root_store(
-    roots: &mut RootCertStore,
-    path: &Path,
-) -> Result<(), UpstreamRequestError> {
-    let file = std::fs::File::open(path).map_err(|err| {
-        UpstreamRequestError::TlsConfig(format!(
-            "failed to read proxy.egress.default.tls.ca_cert_path {}: {err}",
-            path.display()
-        ))
-    })?;
-    let mut reader = std::io::BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader).map_err(|err| {
-        UpstreamRequestError::TlsConfig(format!(
-            "proxy.egress.default.tls.ca_cert_path {} must contain valid PEM certificates: {err}",
-            path.display()
-        ))
-    })?;
-    if certs.is_empty() {
-        return Err(UpstreamRequestError::TlsConfig(format!(
-            "proxy.egress.default.tls.ca_cert_path {} must contain at least one PEM certificate",
-            path.display()
-        )));
-    }
-
-    for cert in certs {
-        roots.add(&Certificate(cert)).map_err(|err| {
-            UpstreamRequestError::TlsConfig(format!(
-                "failed to add proxy.egress.default.tls.ca_cert_path {} certificate: {err}",
-                path.display()
-            ))
-        })?;
-    }
-    Ok(())
-}
-
-fn normalized_tls_server_name(value: &str) -> String {
-    value
-        .strip_prefix('[')
-        .and_then(|inner| inner.strip_suffix(']'))
-        .unwrap_or(value)
-        .to_string()
-}
-
 fn egress_transport_label(transport: EgressTransport) -> &'static str {
     match transport {
         EgressTransport::Http => "http",
         EgressTransport::Https => "https",
-    }
-}
-
-struct NoVerifyParentServerCert;
-
-impl ServerCertVerifier for NoVerifyParentServerCert {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &Certificate,
-        _intermediates: &[Certificate],
-        _server_name: &ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp_response: &[u8],
-        _now: SystemTime,
-    ) -> Result<ServerCertVerified, RustlsError> {
-        Ok(ServerCertVerified::assertion())
     }
 }
 

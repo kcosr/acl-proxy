@@ -11,9 +11,10 @@ use hyper::Request;
 use rustls::{Certificate, PrivateKey, ServerConfig};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
-use crate::app::{AppState, SharedAppState};
+use crate::app::SharedAppState;
 use crate::config::{parse_listener_bind, ExplicitHttpsListenerConfig};
 use crate::proxy::http::{handle_http_request, HttpListenerMode};
 
@@ -137,6 +138,7 @@ where
         Some(Arc::new(Semaphore::new(connection_limit)))
     };
     let limits = ExplicitHttpsConnectionLimits::from_config(&listener_cfg);
+    let mut connections = JoinSet::new();
 
     tokio::pin!(shutdown);
 
@@ -164,15 +166,17 @@ where
             accept_res = listener.accept() => {
                 let (socket, remote_addr) = match accept_res {
                     Ok(v) => v,
-                    Err(e) => return Err(ExplicitHttpsError::Accept(e)),
+                    Err(e) => {
+                        crate::proxy::listener::handle_accept_error("explicit_https", e).await;
+                        continue;
+                    }
                 };
 
                 let state = state.clone();
                 let tls_acceptor = tls_acceptor.clone();
-                tokio::spawn(async move {
-                    let state_snapshot = state.load_full();
+                connections.spawn(async move {
                     if let Err(err) =
-                        handle_tls_connection(state_snapshot, tls_acceptor, socket, remote_addr, limits).await
+                        handle_tls_connection(state, tls_acceptor, socket, remote_addr, limits).await
                     {
                         tracing::debug!(
                             "explicit HTTPS connection error from {}: {err}",
@@ -185,11 +189,17 @@ where
         }
     }
 
+    while let Some(join_result) = connections.join_next().await {
+        if let Err(err) = join_result {
+            tracing::debug!("explicit HTTPS listener connection task failed: {err}");
+        }
+    }
+
     Ok(())
 }
 
 async fn handle_tls_connection(
-    state: Arc<AppState>,
+    state: SharedAppState,
     tls_acceptor: TlsAcceptor,
     socket: tokio::net::TcpStream,
     remote_addr: SocketAddr,
@@ -242,7 +252,8 @@ async fn handle_tls_connection(
     );
 
     let service = service_fn(move |req: Request<Body>| {
-        handle_http_request(state.clone(), remote_addr, HttpListenerMode::Explicit, req)
+        let state = state.load_full();
+        handle_http_request(state, remote_addr, HttpListenerMode::Explicit, req)
     });
 
     let mut http = Http::new();
