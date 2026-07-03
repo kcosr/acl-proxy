@@ -366,11 +366,13 @@ async fn two_proxy_chain_preserves_http2_on_inner_to_outer_hop() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "outer-upstream-h2");
 
-    let requests = seen_upstream.lock().unwrap();
-    let request = requests
-        .first()
-        .expect("upstream should receive chained request");
-    assert_eq!(request.uri, "/h2");
+    {
+        let requests = seen_upstream.lock().unwrap();
+        let request = requests
+            .first()
+            .expect("upstream should receive chained request");
+        assert_eq!(request.uri, "/h2");
+    }
 
     let capture_dir = outer_temp_dir.path().join("captures");
     for _ in 0..20 {
