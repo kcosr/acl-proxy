@@ -19,6 +19,8 @@
 
 - Split explicit HTTP and transparent HTTP handling onto separate configured sockets, and reject listener topology changes during reload.
 - Graceful shutdown now closes idle keep-alive connections and drains in-flight requests across all configured listeners before exit.
+- Documented `linux-arm64` release archives and release-operator supplemental
+  build instructions.
 
 ## [0.2.0] - 2026-06-25
 
