@@ -11,11 +11,10 @@ fn config_validate_fails_for_invalid_logging_level() {
     writeln!(
         file,
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"

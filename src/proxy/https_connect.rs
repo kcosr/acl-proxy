@@ -119,7 +119,7 @@ pub async fn handle_connect_request(
     let state_clone = state.clone();
     let client_ep = client_endpoint.clone();
     let target_ep = target_endpoint.clone();
-    tokio::spawn(async move {
+    state.upgrade_sessions.spawn(async move {
         match on_upgrade.await {
             Ok(upgraded) => {
                 if let Err(err) = run_tls_connect_tunnel(

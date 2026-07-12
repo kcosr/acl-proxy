@@ -12,11 +12,10 @@ fn config_validate_succeeds_for_valid_config() {
     writeln!(
         file,
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -45,11 +44,10 @@ fn config_validate_warns_for_incomplete_redaction_env_marker() {
     writeln!(
         file,
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -89,16 +87,15 @@ redaction_profile = "secrets"
 }
 
 #[test]
-fn config_validate_fails_for_wrong_schema_version() {
+fn config_validate_rejects_schema_version_one() {
     let mut file = NamedTempFile::new().expect("create temp config");
     writeln!(
         file,
         r#"
-schema_version = "999"
+schema_version = "1"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -118,7 +115,7 @@ default = "deny"
 
     cmd.assert()
         .failure()
-        .stderr(contains("unsupported schema_version"));
+        .stderr(contains("unsupported schema_version 1, expected 2"));
 }
 
 #[test]
@@ -127,7 +124,10 @@ fn config_validate_fails_for_invalid_loop_protection_header_name() {
     writeln!(
         file,
         r#"
-schema_version = "1"
+schema_version = "2"
+
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [loop_protection]
 header_name = "invalid header"
@@ -155,11 +155,10 @@ fn env_overrides_are_applied() {
     writeln!(
         file,
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -178,8 +177,7 @@ default = "deny"
         .arg("validate")
         .arg("--config")
         .arg(file.path())
-        .env("PROXY_PORT", "9999")
-        .env("PROXY_HOST", "0.0.0.0")
+        .env("PROXY_EXPLICIT_HTTP_BIND", "0.0.0.0:9999")
         .env("LOG_LEVEL", "debug");
 
     cmd.assert()
@@ -197,8 +195,7 @@ fn config_validate_fails_for_malformed_toml() {
 schema_version =
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
         "#
     )
     .expect("write config");
@@ -224,12 +221,10 @@ fn run_fails_when_logging_directory_cannot_initialize() {
     writeln!(
         file,
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
-https_port = 0
+listeners.explicit_http.bind = "127.0.0.1:1"
 
 [logging]
 directory = "{}"

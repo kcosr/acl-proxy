@@ -16,35 +16,37 @@
 #
 # For a full schema reference, see README.md.
 
-schema_version = "1"
+schema_version = "2"
 
 ###############################################################################
 # Proxy listeners
 ###############################################################################
 
 [proxy]
-# HTTP listener. Supports both explicit-proxy absolute-form HTTP/1.1
-# requests (e.g. via curl -x) and transparent HTTP origin-form requests
-# redirected from port 80.
-bind_address = "0.0.0.0"
-http_port = 8881
+# Explicit HTTP proxy listener. Accepts absolute-form proxy requests and
+# CONNECT tunnels.
+listeners.explicit_http.bind = "0.0.0.0:8881"
 
-# Transparent HTTPS listener. When enabled (https_port != 0), the proxy
-# terminates TLS directly and applies the same policy engine to HTTPS
-# traffic. For local-only use, you may prefer "127.0.0.1" and/or
-# disable this listener by setting https_port = 0.
-https_bind_address = "0.0.0.0"
-https_port = 8889
+# Optional transparent HTTP listener for redirected port-80 traffic.
+# listeners.transparent_http.bind = "0.0.0.0:8882"
+
+# Transparent HTTPS listener. Missing listener sections are disabled.
+listeners.transparent_https.bind = "0.0.0.0:8889"
 
 # Timeout (ms) for upstream responses (0 disables).
 request_timeout_ms = 30000
 
+# Graceful shutdown drain timeout (ms). The default 0 waits indefinitely for
+# in-flight requests to finish; positive values abort remaining connection tasks
+# after the timeout.
+shutdown_drain_timeout_ms = 0
+
 # Transparent HTTPS listener slow-client protections. Set a value to 0 to
 # disable that limit.
-https_handshake_timeout_ms = 10000
-https_request_header_timeout_ms = 10000
-https_max_connections = 1024
-https_http2_max_concurrent_streams = 128
+listeners.transparent_https.handshake_timeout_ms = 10000
+listeners.transparent_https.request_header_timeout_ms = 10000
+listeners.transparent_https.max_connections = 1024
+listeners.transparent_https.http2_max_concurrent_streams = 128
 
 # Base path for internal endpoints (readiness probe and external auth callbacks).
 internal_base_path = "/_acl-proxy"
@@ -56,8 +58,10 @@ internal_base_path = "/_acl-proxy"
 # request destination.
 #
 # [proxy.egress.default]
+# type = "explicit_proxy"
+# transport = "http"
 # host = "172.17.0.1"
-# port = 8889
+# port = 8881
 
 # Optional global outbound request header actions. These apply to every
 # forwarded request (explicit HTTP proxy, CONNECT inner requests, and

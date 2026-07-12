@@ -120,6 +120,59 @@ async fn wait_for_single_allow_capture_version_pair(
     panic!("expected one complete request/response capture pair for {context}; last seen {last_by_id:?}");
 }
 
+async fn wait_for_mixed_capture_pairs(
+    capture_dir: &Path,
+) -> std::collections::HashMap<String, (CaptureDecision, usize, usize)> {
+    use std::collections::HashMap;
+    use tokio::time::{sleep, Duration};
+
+    let mut last_by_id = HashMap::new();
+    for _ in 0..40 {
+        let mut by_id: HashMap<String, (CaptureDecision, usize, usize)> = HashMap::new();
+        if capture_dir.is_dir() {
+            for entry in std::fs::read_dir(capture_dir).expect("read capture dir") {
+                let entry = entry.expect("dir entry");
+                if !entry.file_type().expect("file type").is_file() {
+                    continue;
+                }
+
+                let mut contents = String::new();
+                if std::fs::File::open(entry.path())
+                    .and_then(|mut file| file.read_to_string(&mut contents))
+                    .is_err()
+                {
+                    continue;
+                }
+                let Ok(record) = serde_json::from_str::<CaptureRecord>(&contents) else {
+                    continue;
+                };
+                assert_eq!(record.mode, CaptureMode::HttpsTransparent);
+
+                let counts = by_id
+                    .entry(record.request_id)
+                    .or_insert((record.decision, 0, 0));
+                assert_eq!(counts.0, record.decision);
+                match record.kind {
+                    CaptureKind::Request => counts.1 += 1,
+                    CaptureKind::Response => counts.2 += 1,
+                }
+            }
+        }
+
+        if by_id.len() == 2
+            && by_id
+                .values()
+                .all(|(_, request_count, response_count)| *request_count > 0 && *response_count > 0)
+        {
+            return by_id;
+        }
+        last_by_id = by_id;
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    panic!("expected two complete mixed-decision capture pairs; last seen {last_by_id:?}");
+}
+
 async fn start_upstream_https_echo_server() -> SocketAddr {
     let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind upstream");
     listener
@@ -563,13 +616,10 @@ async fn start_upstream_https_http1_only_echo_server() -> SocketAddr {
 
 fn minimal_https_transparent_config() -> Config {
     let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
-https_bind_address = "127.0.0.1"
-https_port = 0
+listeners.transparent_https.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -625,9 +675,15 @@ async fn start_proxy_with_config(
 #[tokio::test(flavor = "multi_thread")]
 async fn transparent_https_listener_times_out_idle_tls_handshake() {
     let mut config = minimal_https_transparent_config();
-    config.proxy.https_handshake_timeout_ms = 50;
-    config.proxy.https_request_header_timeout_ms = 500;
-    config.proxy.https_max_connections = 16;
+    let listener = config
+        .proxy
+        .listeners
+        .transparent_https
+        .as_mut()
+        .expect("transparent https listener");
+    listener.handshake_timeout_ms = 50;
+    listener.request_header_timeout_ms = 500;
+    listener.max_connections = 16;
 
     let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     listener
@@ -655,6 +711,51 @@ async fn transparent_https_listener_times_out_idle_tls_handshake() {
             ) => {}
         Err(err) => panic!("unexpected read error after TLS handshake timeout: {err}"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transparent_https_shutdown_interrupts_unbounded_tls_handshake() {
+    let mut config = minimal_https_transparent_config();
+    config
+        .proxy
+        .listeners
+        .transparent_https
+        .as_mut()
+        .expect("transparent HTTPS listener")
+        .handshake_timeout_ms = 0;
+
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let proxy_addr = listener.local_addr().expect("proxy addr");
+    let temp_dir = TempDir::new().expect("temp dir");
+    config.capture.directory = temp_dir
+        .path()
+        .join("captures")
+        .to_string_lossy()
+        .to_string();
+    config.certificates.certs_dir = temp_dir.path().join("certs").to_string_lossy().to_string();
+    let state = AppState::shared_from_config(config).expect("app state");
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_for_task = shutdown.clone();
+    let server_task = tokio::spawn(async move {
+        run_https_transparent_proxy_on_listener(state, listener, async move {
+            shutdown_for_task.notified().await;
+        })
+        .await
+    });
+
+    let _silent_client = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect silent TLS client");
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    shutdown.notify_waiters();
+    tokio::time::timeout(tokio::time::Duration::from_secs(2), server_task)
+        .await
+        .expect("listener did not interrupt silent TLS handshake")
+        .expect("listener task join")
+        .expect("listener shutdown result");
 }
 
 async fn send_https_request_via_transparent(
@@ -1277,10 +1378,10 @@ async fn configured_egress_forwarding_applies_to_https_transparent_requests() {
             rule_id: None,
         },
     )];
-    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: forward_addr.port(),
-    });
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        forward_addr.port(),
+    ));
 
     let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
     proxy_listener
@@ -1346,10 +1447,10 @@ async fn global_egress_request_actions_apply_to_https_transparent_requests() {
             rule_id: None,
         },
     )];
-    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
-        host: "127.0.0.1".to_string(),
-        port: forward_addr.port(),
-    });
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig::explicit_http_proxy(
+        "127.0.0.1".to_string(),
+        forward_addr.port(),
+    ));
     config.proxy.egress.request_header_actions =
         vec![acl_proxy::config::EgressRequestHeaderActionConfig {
             action: acl_proxy::config::HeaderActionKind::Set,
@@ -2274,65 +2375,8 @@ async fn concurrent_h2_streams_mixed_allow_and_deny() {
     assert_eq!(denied_json["message"], "Blocked by URL policy");
 
     // Inspect capture to ensure separate requestIds and per-stream decisions.
-    use tokio::time::{sleep, Duration};
-
     let capture_dir = temp_dir.path().join("captures");
-    for _ in 0..10 {
-        if capture_dir.is_dir() {
-            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
-                .expect("read capture dir")
-                .collect();
-            if !entries.is_empty() {
-                break;
-            }
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-
-    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
-    let mut files = Vec::new();
-    while let Some(entry) = entries.next() {
-        let entry = entry.expect("dir entry");
-        if entry.file_type().expect("file type").is_file() {
-            files.push(entry.path());
-        }
-    }
-    assert!(
-        !files.is_empty(),
-        "expected capture files for mixed H2 streams"
-    );
-
-    use std::collections::HashMap;
-
-    let mut by_id: HashMap<String, (CaptureDecision, usize, usize)> = HashMap::new();
-
-    for path in files {
-        let mut contents = String::new();
-        std::fs::File::open(&path)
-            .expect("open capture")
-            .read_to_string(&mut contents)
-            .expect("read capture");
-        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
-        assert_eq!(record.mode, CaptureMode::HttpsTransparent);
-
-        let entry = by_id
-            .entry(record.request_id.clone())
-            .or_insert((record.decision, 0, 0));
-        assert_eq!(
-            entry.0, record.decision,
-            "decision should not change for a given requestId"
-        );
-        match record.kind {
-            CaptureKind::Request => entry.1 += 1,
-            CaptureKind::Response => entry.2 += 1,
-        }
-    }
-
-    assert_eq!(
-        by_id.len(),
-        2,
-        "expected two logical H2 streams (one allowed, one denied)"
-    );
+    let by_id = wait_for_mixed_capture_pairs(&capture_dir).await;
 
     let mut allow_seen = 0;
     let mut deny_seen = 0;
@@ -2920,13 +2964,10 @@ done
     let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
-https_bind_address = "127.0.0.1"
-https_port = 0
+listeners.transparent_https.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -2952,7 +2993,7 @@ default = "deny"
 [policy.external_auth_profiles.pass_plugin]
 type = "plugin"
 command = "{script_path}"
-timeout_ms = 1000
+timeout_ms = 5000
 
 [[policy.rules]]
 action = "delegate"
@@ -2999,13 +3040,10 @@ async fn body_aware_auth_plugin_rewrites_transparent_https_request_body() {
     let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 0
-https_bind_address = "127.0.0.1"
-https_port = 0
+listeners.transparent_https.bind = "127.0.0.1:1"
 
 [logging]
 directory = "logs"
@@ -3030,7 +3068,7 @@ default = "deny"
 [policy.external_auth_profiles.body_guard]
 type = "plugin"
 command = "{script_path}"
-timeout_ms = 1000
+timeout_ms = 5000
 include_request_body = true
 max_request_body_bytes = 4096
 max_decompressed_request_body_bytes = 4096

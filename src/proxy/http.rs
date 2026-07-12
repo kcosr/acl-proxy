@@ -18,25 +18,28 @@ use http::header::{
 use http::{Method, StatusCode, Uri, Version};
 use hyper::body::{Bytes, HttpBody};
 use hyper::client::conn;
-use hyper::server::conn::AddrStream;
-use hyper::service::{make_service_fn, service_fn};
-use hyper::{Body, Client, Request, Response, Server};
-use tokio::io::copy_bidirectional;
-use tokio::net::TcpStream;
+use hyper::server::conn::Http;
+use hyper::service::service_fn;
+use hyper::{Body, Client, Request, Response};
+use rustls::ServerName;
+use tokio::io::{copy_bidirectional, AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
+use tokio_rustls::TlsConnector;
 use tokio_stream::wrappers::ReceiverStream;
 
 use serde::Deserialize;
 
-use crate::app::{AppState, SharedAppState};
+use crate::app::{AppState, ParentEgressTls, SharedAppState};
 use crate::auth_plugin::{AuthPluginHandle, PluginBodyInput, PluginBodyMutation, PluginDecision};
 use crate::capture::{
     build_capture_record, should_capture, BodyCaptureBuffer, BodyCaptureResult, CaptureDecision,
     CaptureEndpoint, CaptureKind, CaptureMode, CaptureRecord, CaptureRecordOptions, HeaderMap,
 };
 use crate::config::{
-    Config, EgressTargetConfig, ExternalAuthProfileType, HeaderActionKind, HeaderDirection,
-    HeaderWhen, PolicyRuleAction,
+    parse_listener_bind, Config, EgressTargetConfig, EgressTransport, ExternalAuthProfileType,
+    HeaderActionKind, HeaderDirection, HeaderWhen, PolicyRuleAction,
 };
 use crate::external_auth::{ApprovalMacroDescriptor, ExternalAuthProfile, ExternalDecision};
 use crate::logging::PolicyDecisionLogContext;
@@ -49,12 +52,8 @@ use crate::url_canonical::{canonicalize_http_url, CanonicalUrl};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HttpProxyError {
-    #[error("invalid bind address {address}: {source}")]
-    BindAddress {
-        address: String,
-        #[source]
-        source: std::net::AddrParseError,
-    },
+    #[error("invalid bind address {address}: {message}")]
+    BindAddress { address: String, message: String },
 
     #[error("failed to bind HTTP proxy listener on {addr}: {source}")]
     BindListener {
@@ -76,6 +75,10 @@ enum UpstreamRequestError {
     Hyper(#[from] hyper::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    #[error("egress TLS configuration error: {0}")]
+    TlsConfig(String),
+    #[error("egress protocol negotiation error: {0}")]
+    Protocol(String),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -142,28 +145,46 @@ pub(crate) enum ExternalAuthGateResult {
     Pass(Request<Body>),
 }
 
-/// Run the HTTP/1.1 proxy listener using the configured bind address/port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HttpListenerMode {
+    Explicit,
+    Transparent,
+}
+
+/// Run the explicit HTTP proxy listener using the configured bind address.
 ///
 /// The listener uses the shared, reloadable application state; new
-/// connections observe the latest configuration snapshot, while
+/// requests observe the latest configuration snapshot, while
 /// in-flight requests continue using the state captured for that
 /// request.
 pub async fn run_http_proxy<F>(state: SharedAppState, shutdown: F) -> Result<(), HttpProxyError>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    run_explicit_http_proxy(state, shutdown).await
+}
+
+pub async fn run_explicit_http_proxy<F>(
+    state: SharedAppState,
+    shutdown: F,
+) -> Result<(), HttpProxyError>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     let initial = state.load();
-    let bind_ip =
-        initial
-            .config
-            .proxy
-            .bind_address
-            .parse()
-            .map_err(|e| HttpProxyError::BindAddress {
-                address: initial.config.proxy.bind_address.clone(),
-                source: e,
-            })?;
-    let addr = SocketAddr::new(bind_ip, initial.config.proxy.http_port);
+    let listener_cfg = initial
+        .config
+        .proxy
+        .listeners
+        .explicit_http
+        .as_ref()
+        .expect("explicit_http listener must be configured before startup");
+    let addr = parse_listener_bind("proxy.listeners.explicit_http.bind", &listener_cfg.bind)
+        .map_err(|err| HttpProxyError::BindAddress {
+            address: listener_cfg.bind.clone(),
+            message: err.to_string(),
+        })?;
+    let enable_http2 = listener_cfg.enable_http2;
 
     let listener =
         StdTcpListener::bind(addr).map_err(|e| HttpProxyError::BindListener { addr, source: e })?;
@@ -171,10 +192,55 @@ where
         .set_nonblocking(true)
         .map_err(HttpProxyError::FromTcp)?;
 
-    run_http_proxy_on_listener(state, listener, shutdown).await
+    run_http_proxy_on_listener_with_mode(
+        state,
+        listener,
+        HttpListenerMode::Explicit,
+        enable_http2,
+        shutdown,
+    )
+    .await
 }
 
-/// Run the HTTP/1.1 proxy on an existing listener (useful for tests).
+pub async fn run_transparent_http_proxy<F>(
+    state: SharedAppState,
+    shutdown: F,
+) -> Result<(), HttpProxyError>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let initial = state.load();
+    let listener_cfg = initial
+        .config
+        .proxy
+        .listeners
+        .transparent_http
+        .as_ref()
+        .expect("transparent_http listener must be configured before startup");
+    let addr = parse_listener_bind("proxy.listeners.transparent_http.bind", &listener_cfg.bind)
+        .map_err(|err| HttpProxyError::BindAddress {
+            address: listener_cfg.bind.clone(),
+            message: err.to_string(),
+        })?;
+    let enable_http2 = listener_cfg.enable_http2;
+
+    let listener =
+        StdTcpListener::bind(addr).map_err(|e| HttpProxyError::BindListener { addr, source: e })?;
+    listener
+        .set_nonblocking(true)
+        .map_err(HttpProxyError::FromTcp)?;
+
+    run_http_proxy_on_listener_with_mode(
+        state,
+        listener,
+        HttpListenerMode::Transparent,
+        enable_http2,
+        shutdown,
+    )
+    .await
+}
+
+/// Run the explicit HTTP proxy on an existing listener (useful for tests).
 pub async fn run_http_proxy_on_listener<F>(
     state: SharedAppState,
     listener: StdTcpListener,
@@ -183,56 +249,144 @@ pub async fn run_http_proxy_on_listener<F>(
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let make_svc = make_service_fn(move |conn: &AddrStream| {
-        let state = state.clone();
-        let remote_addr = conn.remote_addr();
-        async move {
-            Ok::<_, Infallible>(service_fn(move |req| {
-                let state = state.clone();
-                let state_snapshot = state.load_full();
-                handle_http_request(state_snapshot, remote_addr, req)
-            }))
-        }
-    });
-
-    let server = Server::from_tcp(listener)
-        .map_err(HttpProxyError::Hyper)?
-        .serve(make_svc)
-        .with_graceful_shutdown(shutdown);
-
-    server.await.map_err(HttpProxyError::Hyper)
+    run_http_proxy_on_listener_with_mode(
+        state,
+        listener,
+        HttpListenerMode::Explicit,
+        true,
+        shutdown,
+    )
+    .await
 }
 
-async fn handle_http_request(
+pub async fn run_http_proxy_on_listener_with_mode<F>(
+    state: SharedAppState,
+    listener: StdTcpListener,
+    mode: HttpListenerMode,
+    enable_http2: bool,
+    shutdown: F,
+) -> Result<(), HttpProxyError>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let listener = TcpListener::from_std(listener).map_err(HttpProxyError::FromTcp)?;
+    let mut connections = JoinSet::new();
+    let (connection_shutdown, _) = crate::proxy::listener::connection_shutdown_channel();
+    tokio::pin!(shutdown);
+
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                crate::proxy::listener::signal_connection_shutdown(&connection_shutdown);
+                break;
+            }
+            Some(join_result) = connections.join_next(), if !connections.is_empty() => {
+                crate::proxy::listener::log_connection_task_result(http_listener_name(mode), join_result);
+            }
+            accept_res = listener.accept() => {
+                let (socket, remote_addr) = match accept_res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        crate::proxy::listener::handle_accept_error(http_listener_name(mode), e).await;
+                        continue;
+                    }
+                };
+
+                let state = state.clone();
+                let mut connection_shutdown = connection_shutdown.subscribe();
+                connections.spawn(async move {
+                    let service = service_fn(move |req| {
+                        let state_snapshot = state.load_full();
+                        handle_http_request(state_snapshot.clone(), remote_addr, mode, req)
+                    });
+
+                    let mut http = Http::new();
+                    http.http1_keep_alive(true);
+                    if !enable_http2 {
+                        http.http1_only(true);
+                    }
+
+                    let conn = http.serve_connection(socket, service).with_upgrades();
+                    tokio::pin!(conn);
+                    let result = tokio::select! {
+                        result = &mut conn => result,
+                        _ = crate::proxy::listener::wait_for_connection_shutdown(&mut connection_shutdown) => {
+                            conn.as_mut().graceful_shutdown();
+                            conn.await
+                        }
+                    };
+
+                    if let Err(err) = result {
+                        tracing::debug!(
+                            listener = ?mode,
+                            peer_addr = %remote_addr,
+                            "HTTP listener connection error: {err}"
+                        );
+                    }
+                });
+            }
+        }
+    }
+
+    let drain_timeout = state.load().config.proxy.shutdown_drain_timeout();
+    crate::proxy::listener::drain_connections(
+        http_listener_name(mode),
+        &mut connections,
+        drain_timeout,
+    )
+    .await;
+
+    Ok(())
+}
+
+fn http_listener_name(mode: HttpListenerMode) -> &'static str {
+    match mode {
+        HttpListenerMode::Explicit => "explicit_http",
+        HttpListenerMode::Transparent => "transparent_http",
+    }
+}
+
+pub(crate) async fn handle_http_request(
     state: Arc<AppState>,
     remote_addr: SocketAddr,
+    mode: HttpListenerMode,
     mut req: Request<Body>,
 ) -> Result<Response<Body>, Infallible> {
-    // Special-case HTTPS CONNECT requests, which are handled via a dedicated
-    // MITM path in `https_connect`.
     if req.method() == Method::CONNECT {
-        let resp = https_connect::handle_connect_request(state, remote_addr, req).await;
+        let resp = match mode {
+            HttpListenerMode::Explicit if req.version() == Version::HTTP_2 => {
+                not_implemented("HTTP/2 CONNECT is not supported")
+            }
+            HttpListenerMode::Explicit => {
+                https_connect::handle_connect_request(state, remote_addr, req).await
+            }
+            HttpListenerMode::Transparent => {
+                bad_request("Bad Request: CONNECT is not valid on transparent HTTP listener")
+            }
+        };
         return Ok(resp);
     }
 
-    if is_internal_endpoint(
-        req.uri(),
-        &state.config.proxy.internal_base_path,
-        "external-auth/callback",
-    ) {
-        let resp = handle_external_auth_callback_request(state, req).await;
-        return Ok(resp);
-    }
+    if mode == HttpListenerMode::Explicit {
+        if is_internal_endpoint(
+            req.uri(),
+            &state.config.proxy.internal_base_path,
+            "external-auth/callback",
+        ) {
+            let resp = handle_external_auth_callback_request(state, req).await;
+            return Ok(resp);
+        }
 
-    if is_internal_endpoint(req.uri(), &state.config.proxy.internal_base_path, "ready") {
-        let resp = handle_ready_request(req);
-        return Ok(resp);
+        if is_internal_endpoint(req.uri(), &state.config.proxy.internal_base_path, "ready") {
+            let resp = handle_ready_request(req);
+            return Ok(resp);
+        }
     }
 
     let request_id = generate_request_id();
     let method = req.method().clone();
     let version = req.version();
-    let (full_url, target) = match build_full_url(&req) {
+    let (full_url, target) = match build_full_url(&req, mode) {
         Ok(v) => v,
         Err(resp) => return Ok(resp),
     };
@@ -1713,10 +1867,19 @@ fn set_body_headers(
 
 fn build_full_url(
     req: &Request<Body>,
+    mode: HttpListenerMode,
+) -> Result<(String, Option<CaptureEndpoint>), Response<Body>> {
+    match mode {
+        HttpListenerMode::Explicit => build_explicit_proxy_url(req),
+        HttpListenerMode::Transparent => build_transparent_http_url(req),
+    }
+}
+
+fn build_explicit_proxy_url(
+    req: &Request<Body>,
 ) -> Result<(String, Option<CaptureEndpoint>), Response<Body>> {
     let uri = req.uri();
 
-    // Absolute-form URLs (standard HTTP proxy mode).
     if let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) {
         let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
@@ -1729,8 +1892,20 @@ fn build_full_url(
         return canonicalize_proxy_url(&raw_url);
     }
 
-    // Origin-form requests are accepted on the HTTP listener to support
-    // transparent HTTP interception (for example, port-80 redirects).
+    Err(bad_request(
+        "Bad Request: explicit proxy requests must use absolute-form request targets",
+    ))
+}
+
+fn build_transparent_http_url(
+    req: &Request<Body>,
+) -> Result<(String, Option<CaptureEndpoint>), Response<Body>> {
+    if req.version() != Version::HTTP_2 && req.uri().scheme().is_some() {
+        return Err(bad_request(
+            "Bad Request: transparent HTTP requests must use origin-form request targets",
+        ));
+    }
+
     build_http_url_from_origin_form(req)
 }
 
@@ -1799,6 +1974,12 @@ pub(crate) fn canonical_capture_endpoint(canonical: &CanonicalUrl) -> CaptureEnd
 pub(crate) fn bad_request(message: &'static str) -> Response<Body> {
     let mut resp = Response::new(Body::from(message));
     *resp.status_mut() = StatusCode::BAD_REQUEST;
+    resp
+}
+
+pub(crate) fn not_implemented(message: &'static str) -> Response<Body> {
+    let mut resp = Response::new(Body::from(message));
+    *resp.status_mut() = StatusCode::NOT_IMPLEMENTED;
     resp
 }
 
@@ -2511,6 +2692,7 @@ pub(crate) async fn proxy_allowed_request(
 
     let client_http: Client<_> = state.http_client.clone();
     let forwarding_target = state.config.proxy.egress.default.as_ref();
+    let parent_egress_tls = state.parent_egress_tls.clone();
     let request_timeout =
         resolve_request_timeout_ms(request_timeout_ms, state.config.proxy.request_timeout_ms);
     tracing::debug!(
@@ -2531,6 +2713,7 @@ pub(crate) async fn proxy_allowed_request(
                 send_upstream_request(
                     client_http,
                     forwarding_target,
+                    parent_egress_tls.as_ref(),
                     version,
                     request_is_upgrade,
                     &request_id,
@@ -2570,6 +2753,7 @@ pub(crate) async fn proxy_allowed_request(
             send_upstream_request(
                 client_http,
                 forwarding_target,
+                parent_egress_tls.as_ref(),
                 version,
                 request_is_upgrade,
                 &request_id,
@@ -2805,7 +2989,7 @@ pub(crate) async fn proxy_allowed_request(
         let log_url_for_upgrade = redact_url_for_sink(&full_url_for_upgrade);
         let redaction_for_upgrade = redaction.clone();
         let websocket_session_extensions_for_upgrade = websocket_session_extensions;
-        tokio::spawn(async move {
+        state.upgrade_sessions.spawn(async move {
             let mut downstream = match downstream_upgrade.await {
                 Ok(stream) => stream,
                 Err(err) => {
@@ -2860,6 +3044,7 @@ pub(crate) async fn proxy_allowed_request(
 async fn send_upstream_request(
     client_http: Client<hyper_rustls::HttpsConnector<hyper::client::HttpConnector>>,
     forwarding_target: Option<&EgressTargetConfig>,
+    parent_egress_tls: Option<&ParentEgressTls>,
     request_version: Version,
     request_is_upgrade: bool,
     request_id: &str,
@@ -2870,6 +3055,7 @@ async fn send_upstream_request(
         Some(target) => {
             send_request_via_egress_target(
                 target,
+                parent_egress_tls,
                 request_version,
                 request_is_upgrade,
                 request_id,
@@ -2899,14 +3085,20 @@ async fn send_upstream_request(
 
 async fn send_request_via_egress_target(
     target: &EgressTargetConfig,
+    parent_egress_tls: Option<&ParentEgressTls>,
     request_version: Version,
     request_is_upgrade: bool,
     request_id: &str,
     full_url: &str,
-    mut upstream_req: Request<Body>,
+    upstream_req: Request<Body>,
 ) -> Result<Response<Body>, UpstreamRequestError> {
     let use_http2 = request_version == Version::HTTP_2 && !request_is_upgrade;
-    let chain_protocol = if use_http2 { "h2c" } else { "http/1.1" };
+    let chain_protocol = match (target.transport, use_http2) {
+        (EgressTransport::Http, true) => "h2c",
+        (EgressTransport::Http, false) => "http/1.1",
+        (EgressTransport::Https, true) => "h2",
+        (EgressTransport::Https, false) => "http/1.1",
+    };
     let ingress_http_version = version_to_string(request_version);
 
     tracing::debug!(
@@ -2914,14 +3106,69 @@ async fn send_request_via_egress_target(
         request_id = %request_id,
         url = %redact_url_for_sink(full_url),
         stage = "egress_attempt",
-        egress_transport = "chain",
+        egress_type = "explicit_proxy",
+        egress_transport = %egress_transport_label(target.transport),
         egress_host = %target.host,
         egress_port = target.port,
+        egress_tls_server_name = %if target.transport == EgressTransport::Https { target.tls_server_name() } else { "" },
         chain_protocol,
         "forwarding allowed request via configured egress destination"
     );
 
     let stream = TcpStream::connect((egress_dial_host(&target.host), target.port)).await?;
+    match target.transport {
+        EgressTransport::Http => {
+            send_request_via_egress_stream(
+                stream,
+                target,
+                request_version,
+                request_is_upgrade,
+                request_id,
+                full_url,
+                upstream_req,
+                chain_protocol,
+                ingress_http_version,
+            )
+            .await
+        }
+        EgressTransport::Https => {
+            let parent_egress_tls = parent_egress_tls.ok_or_else(|| {
+                UpstreamRequestError::TlsConfig(
+                    "HTTPS parent egress TLS state is unavailable".to_string(),
+                )
+            })?;
+            let tls = connect_https_parent(parent_egress_tls, stream, use_http2).await?;
+            send_request_via_egress_stream(
+                tls,
+                target,
+                request_version,
+                request_is_upgrade,
+                request_id,
+                full_url,
+                upstream_req,
+                chain_protocol,
+                ingress_http_version,
+            )
+            .await
+        }
+    }
+}
+
+async fn send_request_via_egress_stream<S>(
+    stream: S,
+    target: &EgressTargetConfig,
+    request_version: Version,
+    request_is_upgrade: bool,
+    request_id: &str,
+    full_url: &str,
+    mut upstream_req: Request<Body>,
+    chain_protocol: &'static str,
+    ingress_http_version: String,
+) -> Result<Response<Body>, UpstreamRequestError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let use_http2 = request_version == Version::HTTP_2 && !request_is_upgrade;
     let mut conn_builder = conn::Builder::new();
     if use_http2 {
         conn_builder.http2_only(true);
@@ -2937,13 +3184,15 @@ async fn send_request_via_egress_target(
         request_id = %request_id,
         url = %redact_url_for_sink(full_url),
         stage = "egress",
-        egress_transport = "chain",
+        egress_type = "explicit_proxy",
+        egress_transport = %egress_transport_label(target.transport),
         chain_protocol,
         ingress_http_version = %ingress_http_version,
         outbound_http_version = %outbound_http_version,
         upgrade_requested = request_is_upgrade,
         egress_host = %target.host,
         egress_port = target.port,
+        egress_tls_server_name = %if target.transport == EgressTransport::Https { target.tls_server_name() } else { "" },
         "sending request to configured egress destination"
     );
 
@@ -2962,6 +3211,52 @@ async fn send_request_via_egress_target(
         .send_request(upstream_req)
         .await
         .map_err(UpstreamRequestError::from)
+}
+
+async fn connect_https_parent(
+    parent_egress_tls: &ParentEgressTls,
+    stream: TcpStream,
+    use_http2: bool,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, UpstreamRequestError> {
+    let expected_alpn = if use_http2 {
+        b"h2".to_vec()
+    } else {
+        b"http/1.1".to_vec()
+    };
+
+    let server_name =
+        ServerName::try_from(parent_egress_tls.server_name.as_str()).map_err(|err| {
+            UpstreamRequestError::TlsConfig(format!(
+                "proxy.egress.default.tls.server_name must be a valid TLS server name: {err}"
+            ))
+        })?;
+
+    let connector = TlsConnector::from(parent_egress_tls.client_config(use_http2));
+    let tls = connector.connect(server_name, stream).await?;
+    let negotiated = tls.get_ref().1.alpn_protocol().map(|value| value.to_vec());
+    if !parent_alpn_is_compatible(use_http2, negotiated.as_deref()) {
+        return Err(UpstreamRequestError::Protocol(format!(
+            "parent proxy did not negotiate required ALPN protocol {}",
+            String::from_utf8_lossy(&expected_alpn)
+        )));
+    }
+
+    Ok(tls)
+}
+
+fn parent_alpn_is_compatible(use_http2: bool, negotiated: Option<&[u8]>) -> bool {
+    if use_http2 {
+        negotiated == Some(b"h2")
+    } else {
+        negotiated.is_none() || negotiated == Some(b"http/1.1")
+    }
+}
+
+fn egress_transport_label(transport: EgressTransport) -> &'static str {
+    match transport {
+        EgressTransport::Http => "http",
+        EgressTransport::Https => "https",
+    }
 }
 
 fn egress_dial_host(host: &str) -> &str {
@@ -3423,10 +3718,19 @@ mod tests {
         build_full_url, copy_end_to_end_headers, copy_required_upgrade_headers,
         generate_request_id, headers_to_capture_map, interpolate_header_actions,
         is_internal_endpoint, is_upgrade_request, strip_hop_by_hop_headers,
-        strip_hop_by_hop_headers_preserving_upgrade, tee_body,
+        strip_hop_by_hop_headers_preserving_upgrade, tee_body, HttpListenerMode,
     };
     use crate::config::{HeaderActionKind, HeaderDirection, HeaderWhen};
     use crate::policy::CompiledHeaderAction;
+
+    #[test]
+    fn parent_http1_alpn_accepts_omitted_protocol() {
+        assert!(super::parent_alpn_is_compatible(false, None));
+        assert!(super::parent_alpn_is_compatible(false, Some(b"http/1.1")));
+        assert!(!super::parent_alpn_is_compatible(false, Some(b"h2")));
+        assert!(super::parent_alpn_is_compatible(true, Some(b"h2")));
+        assert!(!super::parent_alpn_is_compatible(true, None));
+    }
     use http::header::HOST;
     use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
     use hyper::{Body, Request};
@@ -3665,7 +3969,7 @@ mod tests {
             .body(Body::empty())
             .expect("request");
 
-        let (url, target) = build_full_url(&req).expect("full url");
+        let (url, target) = build_full_url(&req, HttpListenerMode::Explicit).expect("full url");
         assert_eq!(url, "http://example.com/path?q=1");
         let target = target.expect("target");
         assert_eq!(target.address.as_deref(), Some("example.com"));
@@ -3679,7 +3983,8 @@ mod tests {
             .body(Body::empty())
             .expect("request");
 
-        let resp = build_full_url(&req).expect_err("userinfo should fail");
+        let resp =
+            build_full_url(&req, HttpListenerMode::Explicit).expect_err("userinfo should fail");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -3691,7 +3996,7 @@ mod tests {
             .body(Body::empty())
             .expect("request");
 
-        let (url, target) = build_full_url(&req).expect("full url");
+        let (url, target) = build_full_url(&req, HttpListenerMode::Transparent).expect("full url");
         assert_eq!(url, "http://example.com:8080/path?q=1");
         let target = target.expect("target");
         assert_eq!(target.address.as_deref(), Some("example.com"));
@@ -3706,7 +4011,7 @@ mod tests {
             .body(Body::empty())
             .expect("request");
 
-        let (url, target) = build_full_url(&req).expect("full url");
+        let (url, target) = build_full_url(&req, HttpListenerMode::Transparent).expect("full url");
         assert_eq!(url, "http://[::1]:8080/relative/path");
         let target = target.expect("target");
         assert_eq!(target.address.as_deref(), Some("[::1]"));
@@ -3721,7 +4026,7 @@ mod tests {
             .body(Body::empty())
             .expect("request");
 
-        let (url, target) = build_full_url(&req).expect("full url");
+        let (url, target) = build_full_url(&req, HttpListenerMode::Transparent).expect("full url");
         assert_eq!(url, "http://example.com/relative/path");
         let target = target.expect("target");
         assert_eq!(target.address.as_deref(), Some("example.com"));
@@ -3735,7 +4040,8 @@ mod tests {
             .body(Body::empty())
             .expect("request");
 
-        let resp = build_full_url(&req).expect_err("missing host should fail");
+        let resp = build_full_url(&req, HttpListenerMode::Transparent)
+            .expect_err("missing host should fail");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -3747,7 +4053,8 @@ mod tests {
             .body(Body::empty())
             .expect("request");
 
-        let resp = build_full_url(&req).expect_err("empty host should fail");
+        let resp = build_full_url(&req, HttpListenerMode::Transparent)
+            .expect_err("empty host should fail");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -3762,7 +4069,8 @@ mod tests {
             .body(Body::empty())
             .expect("request");
 
-        let resp = build_full_url(&req).expect_err("invalid host should fail");
+        let resp = build_full_url(&req, HttpListenerMode::Transparent)
+            .expect_err("invalid host should fail");
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 

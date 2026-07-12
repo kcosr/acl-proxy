@@ -52,11 +52,10 @@ fn config_validate_succeeds_for_policy_with_macros_and_rulesets() {
     let mut file = NamedTempFile::new().expect("create temp config");
     file.write_all(
         br#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -95,11 +94,10 @@ fn config_validate_fails_for_missing_macro_in_ruleset() {
     let mut file = NamedTempFile::new().expect("create temp config");
     file.write_all(
         br#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -135,11 +133,10 @@ fn config_validate_fails_for_missing_macro_in_direct_rule() {
     let mut file = NamedTempFile::new().expect("create temp config");
     file.write_all(
         br#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -172,11 +169,10 @@ fn policy_dump_defaults_to_json_on_non_tty() {
     let mut file = NamedTempFile::new().expect("create temp config");
     file.write_all(
         br#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -234,11 +230,10 @@ fn policy_dump_masks_env_sourced_header_action_values() {
     let mut file = NamedTempFile::new().expect("create temp config");
     file.write_all(
         br#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -283,11 +278,10 @@ fn policy_dump_prints_config_load_warnings_to_stderr() {
     let mut file = NamedTempFile::new().expect("create temp config");
     file.write_all(
         br#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -331,11 +325,10 @@ fn policy_dump_table_format_contains_expected_fields() {
     let mut file = NamedTempFile::new().expect("create temp config");
     file.write_all(
         br#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -375,11 +368,10 @@ fn policy_dump_json_expands_patterns_to_singular_effective_rules() {
     let mut file = NamedTempFile::new().expect("create temp config");
     file.write_all(
         br#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -429,11 +421,10 @@ fn policy_dump_json_renders_delegate_action_and_external_auth_profile() {
     let mut file = NamedTempFile::new().expect("create temp config");
     file.write_all(
         br#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -482,11 +473,10 @@ fn policy_dump_table_expands_patterns_to_rows() {
     let mut file = NamedTempFile::new().expect("create temp config");
     file.write_all(
         br#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -528,11 +518,10 @@ fn policy_dump_json_includes_headers_absent() {
     let mut file = NamedTempFile::new().expect("create temp config");
     file.write_all(
         br#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -577,11 +566,10 @@ fn policy_dump_table_includes_headers_absent_column() {
     let mut file = NamedTempFile::new().expect("create temp config");
     file.write_all(
         br#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -620,11 +608,10 @@ fn policy_dump_json_includes_headers_match_values() {
     let mut file = NamedTempFile::new().expect("create temp config");
     file.write_all(
         br#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -664,11 +651,10 @@ fn policy_dump_table_includes_headers_match_column_values() {
     let mut file = NamedTempFile::new().expect("create temp config");
     file.write_all(
         br#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -707,11 +693,10 @@ fn policy_dump_json_includes_headers_not_match_values() {
     let mut file = NamedTempFile::new().expect("create temp config");
     file.write_all(
         br#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"
@@ -753,11 +738,10 @@ fn policy_dump_table_includes_headers_not_match_column_values() {
     let mut file = NamedTempFile::new().expect("create temp config");
     file.write_all(
         br#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
-bind_address = "127.0.0.1"
-http_port = 8080
+listeners.explicit_http.bind = "127.0.0.1:8080"
 
 [logging]
 directory = "logs"

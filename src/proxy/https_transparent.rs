@@ -12,11 +12,12 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_rustls::TlsAcceptor;
 
 use crate::app::{AppState, SharedAppState};
 use crate::capture::{CaptureEndpoint, CaptureMode};
-use crate::config::{ExternalAuthProfileType, PolicyRuleAction};
+use crate::config::{parse_listener_bind, ExternalAuthProfileType, PolicyRuleAction};
 use crate::logging::PolicyDecisionLogContext;
 use crate::proxy::http::{
     build_external_auth_error_response, build_loop_detected_response,
@@ -27,12 +28,8 @@ use crate::proxy::http::{
 
 #[derive(Debug, thiserror::Error)]
 pub enum HttpsTransparentError {
-    #[error("invalid HTTPS bind address {address}: {source}")]
-    BindAddress {
-        address: String,
-        #[source]
-        source: std::net::AddrParseError,
-    },
+    #[error("invalid HTTPS bind address {address}: {message}")]
+    BindAddress { address: String, message: String },
 
     #[error("failed to bind HTTPS transparent listener on {addr}: {source}")]
     BindListener {
@@ -70,12 +67,18 @@ struct HttpsTransparentConnectionLimits {
 
 impl HttpsTransparentConnectionLimits {
     fn from_state(state: &AppState) -> Self {
-        let proxy = &state.config.proxy;
+        let listener = state
+            .config
+            .proxy
+            .listeners
+            .transparent_https
+            .as_ref()
+            .expect("transparent_https listener must be configured before startup");
         Self {
-            handshake_timeout: duration_from_millis(proxy.https_handshake_timeout_ms),
-            handshake_timeout_ms: proxy.https_handshake_timeout_ms,
-            request_header_timeout: duration_from_millis(proxy.https_request_header_timeout_ms),
-            http2_max_concurrent_streams: nonzero_u32(proxy.https_http2_max_concurrent_streams),
+            handshake_timeout: duration_from_millis(listener.handshake_timeout_ms),
+            handshake_timeout_ms: listener.handshake_timeout_ms,
+            request_header_timeout: duration_from_millis(listener.request_header_timeout_ms),
+            http2_max_concurrent_streams: nonzero_u32(listener.http2_max_concurrent_streams),
         }
     }
 }
@@ -109,16 +112,18 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let initial = state.load();
-    let bind_ip = initial
+    let listener_cfg = initial
         .config
         .proxy
-        .https_bind_address
-        .parse()
-        .map_err(|e| HttpsTransparentError::BindAddress {
-            address: initial.config.proxy.https_bind_address.clone(),
-            source: e,
+        .listeners
+        .transparent_https
+        .as_ref()
+        .expect("transparent_https listener must be configured before startup");
+    let addr = parse_listener_bind("proxy.listeners.transparent_https.bind", &listener_cfg.bind)
+        .map_err(|err| HttpsTransparentError::BindAddress {
+            address: listener_cfg.bind.clone(),
+            message: err.to_string(),
         })?;
-    let addr = SocketAddr::new(bind_ip, initial.config.proxy.https_port);
 
     let listener = StdTcpListener::bind(addr)
         .map_err(|e| HttpsTransparentError::BindListener { addr, source: e })?;
@@ -139,27 +144,44 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     let listener = TcpListener::from_std(listener).map_err(HttpsTransparentError::FromStd)?;
-    let connection_limit = state.load().config.proxy.https_max_connections;
+    let connection_limit = state
+        .load()
+        .config
+        .proxy
+        .listeners
+        .transparent_https
+        .as_ref()
+        .expect("transparent_https listener must be configured before startup")
+        .max_connections;
     let connection_semaphore = if connection_limit == 0 {
         None
     } else {
         Some(Arc::new(Semaphore::new(connection_limit)))
     };
+    let mut connections = JoinSet::new();
+    let (connection_shutdown, _) = crate::proxy::listener::connection_shutdown_channel();
 
     tokio::pin!(shutdown);
 
-    loop {
+    'accepting: loop {
         let connection_permit = match connection_semaphore.as_ref() {
             Some(semaphore) => {
                 let semaphore = semaphore.clone();
-                match tokio::select! {
-                    _ = &mut shutdown => {
-                        break;
+                loop {
+                    match tokio::select! {
+                        _ = &mut shutdown => {
+                            crate::proxy::listener::signal_connection_shutdown(&connection_shutdown);
+                            break 'accepting;
+                        }
+                        Some(join_result) = connections.join_next(), if !connections.is_empty() => {
+                            crate::proxy::listener::log_connection_task_result("transparent_https", join_result);
+                            continue;
+                        }
+                        permit = semaphore.clone().acquire_owned() => permit,
+                    } {
+                        Ok(permit) => break Some(permit),
+                        Err(_) => break 'accepting,
                     }
-                    permit = semaphore.acquire_owned() => permit,
-                } {
-                    Ok(permit) => Some(permit),
-                    Err(_) => break,
                 }
             }
             None => None,
@@ -167,18 +189,25 @@ where
 
         tokio::select! {
             _ = &mut shutdown => {
-                // Stop accepting new connections; in-flight TLS sessions
-                // will complete naturally.
+                crate::proxy::listener::signal_connection_shutdown(&connection_shutdown);
                 break;
+            }
+            Some(join_result) = connections.join_next(), if !connections.is_empty() => {
+                drop(connection_permit);
+                crate::proxy::listener::log_connection_task_result("transparent_https", join_result);
             }
             accept_res = listener.accept() => {
                 let (socket, remote_addr) = match accept_res {
                     Ok(v) => v,
-                    Err(e) => return Err(HttpsTransparentError::Accept(e)),
+                    Err(e) => {
+                        crate::proxy::listener::handle_accept_error("transparent_https", e).await;
+                        continue;
+                    }
                 };
 
                 let state = state.clone();
-                tokio::spawn(async move {
+                let connection_shutdown = connection_shutdown.subscribe();
+                connections.spawn(async move {
                     let state_snapshot = state.load_full();
                     let limits = HttpsTransparentConnectionLimits::from_state(&state_snapshot);
                     let tls_acceptor = match state_snapshot
@@ -195,7 +224,12 @@ where
                     };
 
                     if let Err(err) = handle_tls_connection(
-                        state_snapshot, tls_acceptor, socket, remote_addr, limits,
+                        state,
+                        tls_acceptor,
+                        socket,
+                        remote_addr,
+                        limits,
+                        connection_shutdown,
                     )
                     .await
                     {
@@ -210,39 +244,43 @@ where
         }
     }
 
+    let drain_timeout = state.load().config.proxy.shutdown_drain_timeout();
+    crate::proxy::listener::drain_connections("transparent_https", &mut connections, drain_timeout)
+        .await;
+
     Ok(())
 }
 
 async fn handle_tls_connection(
-    state: Arc<AppState>,
+    state: SharedAppState,
     tls_acceptor: TlsAcceptor,
     socket: tokio::net::TcpStream,
     remote_addr: SocketAddr,
     limits: HttpsTransparentConnectionLimits,
+    mut connection_shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), HttpsTransparentError> {
-    let accept = tls_acceptor.accept(socket);
-    let tls_result = match limits.handshake_timeout {
-        Some(timeout) => match tokio::time::timeout(timeout, accept).await {
-            Ok(result) => result,
-            Err(_) => {
-                tracing::debug!(
-                    target: "acl_proxy::tls",
-                    peer_addr = %remote_addr,
-                    listener = "https_transparent",
-                    timeout_ms = limits.handshake_timeout_ms,
-                    "TLS handshake timed out"
-                );
-                return Err(HttpsTransparentError::TlsHandshakeTimeout {
-                    timeout_ms: limits.handshake_timeout_ms,
-                });
-            }
-        },
-        None => accept.await,
-    };
+    let handshake = async {
+        let accept = tls_acceptor.accept(socket);
+        let tls_result = match limits.handshake_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, accept).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::debug!(
+                        target: "acl_proxy::tls",
+                        peer_addr = %remote_addr,
+                        listener = "https_transparent",
+                        timeout_ms = limits.handshake_timeout_ms,
+                        "TLS handshake timed out"
+                    );
+                    return Err(HttpsTransparentError::TlsHandshakeTimeout {
+                        timeout_ms: limits.handshake_timeout_ms,
+                    });
+                }
+            },
+            None => accept.await,
+        };
 
-    let tls = match tls_result {
-        Ok(tls) => tls,
-        Err(e) => {
+        tls_result.map_err(|e| {
             let msg = e.to_string();
             let lower = msg.to_ascii_lowercase();
             if lower.contains("alpn") {
@@ -262,8 +300,16 @@ async fn handle_tls_connection(
                     "TLS handshake failed"
                 );
             }
-            return Err(HttpsTransparentError::TlsHandshake(e));
+            HttpsTransparentError::TlsHandshake(e)
+        })
+    };
+    tokio::pin!(handshake);
+    let tls = tokio::select! {
+        biased;
+        _ = crate::proxy::listener::wait_for_connection_shutdown(&mut connection_shutdown) => {
+            return Ok(());
         }
+        result = &mut handshake => result?,
     };
 
     let (_, conn) = tls.get_ref();
@@ -285,12 +331,11 @@ async fn handle_tls_connection(
         port: Some(remote_addr.port()),
     };
 
-    let state_for_svc = state.clone();
     let client_for_svc = client.clone();
     let client_ip = client_ip_for_policy.clone();
 
     let service = service_fn(move |req: Request<Body>| {
-        let state = state_for_svc.clone();
+        let state = state.load_full();
         let client = client_for_svc.clone();
         let client_ip = client_ip.clone();
         async move { handle_inner_https_request(state, client, client_ip, req).await }
@@ -305,10 +350,17 @@ async fn handle_tls_connection(
     }
     http.http2_max_concurrent_streams(limits.http2_max_concurrent_streams);
 
-    http.serve_connection(tls, service)
-        .with_upgrades()
-        .await
-        .map_err(HttpsTransparentError::Hyper)
+    let conn = http.serve_connection(tls, service).with_upgrades();
+    tokio::pin!(conn);
+    let result = tokio::select! {
+        result = &mut conn => result,
+        _ = crate::proxy::listener::wait_for_connection_shutdown(&mut connection_shutdown) => {
+            conn.as_mut().graceful_shutdown();
+            conn.await
+        }
+    };
+
+    result.map_err(HttpsTransparentError::Hyper)
 }
 
 async fn handle_inner_https_request(
