@@ -496,7 +496,7 @@ mod tests {
 
     fn minimal_config_with_capture() -> AppConfig {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"

@@ -12,7 +12,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
 
 const DEFAULT_CONFIG_PATH: &str = "config/acl-proxy.toml";
-const DEFAULT_SCHEMA_VERSION: &str = "1";
+const DEFAULT_SCHEMA_VERSION: &str = "2";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -1563,7 +1563,7 @@ pub fn write_default_config(path: &Path) -> Result<(), ConfigError> {
         }
     }
 
-    let contents = r#"schema_version = "1"
+    let contents = r#"schema_version = "2"
 
 [proxy]
 request_timeout_ms = 30000
@@ -1981,6 +1981,12 @@ fn validate_static_tls_identity(
         cert_chain_path,
     )?;
     let key = load_private_key(format!("{location}.key_path").as_str(), key_path)?;
+
+    crate::tls_identity::validate_certificate_key_match(&certs, &key).map_err(|err| {
+        ConfigError::Invalid(format!(
+            "{location} cert_chain_path and key_path must form a valid TLS identity: {err}"
+        ))
+    })?;
 
     rustls::ServerConfig::builder()
         .with_safe_defaults()
@@ -2496,7 +2502,7 @@ mod tests {
     #[test]
     fn minimal_config_round_trip() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -2510,7 +2516,7 @@ default = "deny"
         "#;
 
         let config: Config = toml::from_str(toml).expect("parse minimal config");
-        assert_eq!(config.schema_version, "1");
+        assert_eq!(config.schema_version, "2");
         assert_eq!(
             config
                 .proxy
@@ -2529,7 +2535,7 @@ default = "deny"
     #[test]
     fn proxy_shutdown_drain_timeout_parses_milliseconds() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -2554,7 +2560,7 @@ default = "deny"
     #[test]
     fn unknown_section_fields_are_rejected() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -2575,7 +2581,7 @@ default = "deny"
     #[test]
     fn policy_rule_typo_fields_are_rejected() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -2600,7 +2606,7 @@ method = "GET"
     #[test]
     fn ruleset_template_typo_fields_are_rejected() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -2628,7 +2634,7 @@ subnet = "10.0.0.0/8"
     #[test]
     fn redaction_profile_reference_validates() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -2678,7 +2684,7 @@ redaction_profile = "secrets"
     #[test]
     fn redaction_profile_reference_must_exist() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -2708,7 +2714,7 @@ redaction_profile = "missing"
     #[test]
     fn redaction_profile_is_invalid_on_deny_rules() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -2744,7 +2750,7 @@ redaction_profile = "secrets"
     #[test]
     fn redaction_expression_must_compile() {
         let toml = r#"
-	schema_version = "1"
+	schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -2774,7 +2780,7 @@ level = "debug"
     #[test]
     fn redaction_expression_is_invalid_for_binary_only_rule() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -2805,7 +2811,7 @@ default = "deny"
     #[test]
     fn redaction_expression_must_not_match_empty_text() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -2842,7 +2848,7 @@ default = "deny"
         env_guard.set("ACL_PROXY_TEST_REDACTION_LITERAL", "secret-token");
 
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -2887,7 +2893,7 @@ redaction_profile = "secrets"
         env_guard.remove("ACL_PROXY_TEST_MISSING_REDACTION");
 
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -2921,7 +2927,7 @@ default = "deny"
     #[test]
     fn redaction_env_interpolation_rejects_mixed_literal_placeholder() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -2969,7 +2975,7 @@ default = "deny"
         write!(
             file,
             r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3008,7 +3014,7 @@ redaction_profile = "secrets"
         write!(
             file,
             r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3049,7 +3055,7 @@ redaction_profile = "secrets"
     #[test]
     fn proxy_internal_base_path_parse() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3076,7 +3082,7 @@ default = "deny"
     #[test]
     fn proxy_transparent_https_slow_client_limits_default_and_parse() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3100,7 +3106,7 @@ default = "deny"
         config.validate_basic().expect("config should validate");
 
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3127,7 +3133,7 @@ default = "deny"
     #[test]
     fn proxy_listener_bind_addresses_must_parse() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "localhost:8080"
@@ -3145,7 +3151,7 @@ default = "deny"
         );
 
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3167,7 +3173,7 @@ default = "deny"
     #[test]
     fn proxy_listener_ports_must_not_collide_on_overlapping_binds() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "0.0.0.0:8443"
@@ -3188,7 +3194,7 @@ default = "deny"
         );
 
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8443"
@@ -3204,7 +3210,7 @@ default = "deny"
             .expect("distinct listener bind addresses may share a port");
 
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "0.0.0.0:8443"
@@ -3228,7 +3234,7 @@ default = "deny"
     #[test]
     fn loop_protection_header_name_is_validated() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3252,7 +3258,7 @@ default = "deny"
     #[test]
     fn proxy_egress_default_parses_when_valid() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3288,7 +3294,7 @@ default = "deny"
     #[test]
     fn proxy_egress_default_https_without_tls_table_uses_system_trust() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3320,7 +3326,7 @@ default = "deny"
     #[test]
     fn proxy_egress_default_rejects_tls_table_for_http_transport() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3350,7 +3356,7 @@ default = "deny"
     #[test]
     fn proxy_egress_default_custom_ca_requires_ca_cert_path() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3382,7 +3388,7 @@ default = "deny"
     #[test]
     fn proxy_egress_default_rejects_ca_cert_path_with_system_trust() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3415,7 +3421,7 @@ default = "deny"
     #[test]
     fn proxy_egress_default_rejects_ca_cert_path_with_disabled_trust() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3448,7 +3454,7 @@ default = "deny"
     #[test]
     fn proxy_egress_default_rejects_tls_server_name_with_port_suffix() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3484,7 +3490,7 @@ default = "deny"
     #[test]
     fn proxy_egress_request_header_actions_parse_when_valid() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3517,7 +3523,7 @@ default = "deny"
     #[test]
     fn proxy_egress_request_header_actions_report_location_on_invalid_value_shape() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3550,7 +3556,7 @@ default = "deny"
     #[test]
     fn proxy_internal_base_path_requires_leading_slash() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3576,7 +3582,7 @@ default = "deny"
     #[test]
     fn proxy_internal_base_path_rejects_trailing_slash() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3602,7 +3608,7 @@ default = "deny"
     #[test]
     fn proxy_egress_default_rejects_blank_host() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3633,7 +3639,7 @@ default = "deny"
     #[test]
     fn proxy_egress_default_rejects_host_with_surrounding_whitespace() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3666,7 +3672,7 @@ default = "deny"
     #[test]
     fn proxy_egress_default_rejects_host_with_port_suffix() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3697,7 +3703,7 @@ default = "deny"
     #[test]
     fn proxy_egress_default_accepts_ip_literals() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3725,7 +3731,7 @@ default = "deny"
     #[test]
     fn proxy_egress_default_accepts_bracketed_ipv6_literals() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3753,7 +3759,7 @@ default = "deny"
     #[test]
     fn proxy_egress_default_rejects_malformed_bracketed_host() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3786,7 +3792,7 @@ default = "deny"
     #[test]
     fn proxy_egress_default_rejects_zero_port() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3817,7 +3823,7 @@ default = "deny"
     #[test]
     fn include_rule_requires_non_empty_name() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3845,7 +3851,7 @@ include = ""
     #[test]
     fn certificate_paths_must_be_both_or_neither() {
         let base = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3900,7 +3906,7 @@ ca_cert_path = "ca-cert.pem"
     #[test]
     fn certificate_max_cached_certs_must_be_at_least_one() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3930,7 +3936,7 @@ max_cached_certs = 0
         assert!(!CertificatesConfig::default().persist_dynamic_certs);
 
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3954,7 +3960,7 @@ persist_dynamic_certs = true
     #[test]
     fn direct_rule_without_match_criteria_fails() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -3982,7 +3988,7 @@ action = "allow"
     #[test]
     fn direct_rule_with_headers_absent_counts_as_match_criteria() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4009,7 +4015,7 @@ headers_absent = ["x-workload-id"]
     #[test]
     fn direct_rule_with_headers_match_counts_as_match_criteria() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4036,7 +4042,7 @@ headers_match = { "x-workload-id" = "worker-123" }
     #[test]
     fn direct_rule_with_headers_not_match_counts_as_match_criteria() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4063,7 +4069,7 @@ headers_not_match = { "x-aw-policy-context" = "internal" }
     #[test]
     fn headers_absent_must_not_be_empty_when_configured() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4092,7 +4098,7 @@ headers_absent = []
     #[test]
     fn headers_match_must_not_be_empty_when_configured() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4121,7 +4127,7 @@ headers_match = {}
     #[test]
     fn headers_match_rejects_invalid_header_names() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4150,7 +4156,7 @@ headers_match = { "bad header" = "worker-123" }
     #[test]
     fn headers_match_rejects_duplicates_after_normalization() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4179,7 +4185,7 @@ headers_match = { "X-Workload-Id" = "worker-123", "x-workload-id" = "worker-456"
     #[test]
     fn headers_match_rejects_empty_values() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4208,7 +4214,7 @@ headers_match = { "x-workload-id" = "" }
     #[test]
     fn headers_not_match_must_not_be_empty_when_configured() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4237,7 +4243,7 @@ headers_not_match = {}
     #[test]
     fn headers_not_match_rejects_invalid_header_names() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4266,7 +4272,7 @@ headers_not_match = { "bad header" = "internal" }
     #[test]
     fn headers_not_match_rejects_duplicates_after_normalization() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4295,7 +4301,7 @@ headers_not_match = { "X-AW-Policy-Context" = "internal", "x-aw-policy-context" 
     #[test]
     fn headers_not_match_rejects_empty_values() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4324,7 +4330,7 @@ headers_not_match = { "x-aw-policy-context" = "" }
     #[test]
     fn invalid_logging_levels_fail_validation() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4349,7 +4355,7 @@ default = "deny"
     #[test]
     fn empty_logging_directory_is_none() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4369,7 +4375,7 @@ default = "deny"
     #[test]
     fn empty_capture_directory_fails_validation() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4397,7 +4403,7 @@ default = "deny"
     #[test]
     fn empty_capture_filename_uses_default_template() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4432,7 +4438,7 @@ level = "info"
         ] {
             let toml = format!(
                 r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4465,7 +4471,7 @@ default = "deny"
     #[test]
     fn capture_max_body_bytes_defaults_to_1mib() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4488,7 +4494,7 @@ default = "deny"
     #[test]
     fn capture_max_body_bytes_can_be_set_to_zero() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4515,7 +4521,7 @@ default = "deny"
         for field in ["max_files", "max_total_bytes"] {
             let toml = format!(
                 r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4548,7 +4554,7 @@ default = "deny"
     #[test]
     fn external_auth_callback_url_must_be_absolute_url() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4578,7 +4584,7 @@ callback_url = "/relative/path"
     #[test]
     fn external_auth_callback_url_valid_absolute_url_passes_validation() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4626,7 +4632,7 @@ callback_url = "https://proxy.example.com/_acl-proxy/external-auth/callback"
     #[test]
     fn external_auth_profile_must_exist() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4656,7 +4662,7 @@ external_auth_profile = "missing_profile"
     #[test]
     fn delegate_rule_with_external_auth_profile_is_valid() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4688,7 +4694,7 @@ external_auth_profile = "example"
     #[test]
     fn external_auth_profile_not_allowed_on_deny_rule() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4722,7 +4728,7 @@ external_auth_profile = "example"
     #[test]
     fn external_auth_profile_not_allowed_on_allow_rule() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4752,7 +4758,7 @@ external_auth_profile = "example"
     #[test]
     fn plugin_external_auth_profile_can_include_request_body() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4789,7 +4795,7 @@ external_auth_profile = "body_guard"
     #[test]
     fn http_external_auth_profile_rejects_request_body_inclusion() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4821,7 +4827,7 @@ external_auth_profile = "body_guard"
     #[test]
     fn external_auth_profiles_reject_zero_timeouts() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4843,7 +4849,7 @@ timeout_ms = 0
         );
 
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4869,7 +4875,7 @@ webhook_timeout_ms = 0
     #[test]
     fn body_aware_plugin_profile_rejects_zero_body_limits() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4899,7 +4905,7 @@ external_auth_profile = "body_guard"
         );
 
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4932,7 +4938,7 @@ external_auth_profile = "body_guard"
     #[test]
     fn delegate_rule_requires_external_auth_profile() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4957,7 +4963,7 @@ pattern = "https://example.com/**"
     #[test]
     fn ruleset_delegate_template_requires_external_auth_profile() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -4985,7 +4991,7 @@ pattern = "https://example.com/**"
     #[test]
     fn policy_default_rejects_delegate() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -5003,7 +5009,7 @@ default = "delegate"
     #[test]
     fn plugin_profile_requires_command() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -5051,7 +5057,7 @@ external_auth_profile = "example"
 
         let toml = format!(
             r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -5127,7 +5133,7 @@ external_auth_profile = "example"
     #[test]
     fn header_action_env_interpolation_reports_direct_rule_location() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -5169,7 +5175,7 @@ value = "Bearer ${TOKEN}"
     #[test]
     fn header_action_env_interpolation_reports_ruleset_location() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -5217,7 +5223,7 @@ include = "api_headers"
         write!(
             file,
             r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -5258,7 +5264,7 @@ value = "Bearer ${{TOKEN}}"
         env_guard.set("ACL_PROXY_TEST_API_TOKEN", "Bearer abc123");
 
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -5304,7 +5310,7 @@ value = "${ACL_PROXY_TEST_API_TOKEN}"
         env_guard.set("ACL_PROXY_TEST_REGION", "us-central1");
 
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -5355,7 +5361,7 @@ values = ["static", "${ACL_PROXY_TEST_DEPLOYMENT}", "${ACL_PROXY_TEST_REGION}", 
         env_guard.set("ACL_PROXY_TEST_RULESET_TOKEN", "token-123");
 
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -5404,7 +5410,7 @@ include = "api_headers"
         env_guard.remove("ACL_PROXY_TEST_MISSING");
 
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -5449,7 +5455,7 @@ value = "${ACL_PROXY_TEST_MISSING}"
         env_guard.set("ACL_PROXY_TEST_EGRESS_TAG", "edge-a");
 
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -5486,7 +5492,7 @@ default = "deny"
         env_guard.remove("ACL_PROXY_TEST_MISSING_EGRESS");
 
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -5523,7 +5529,7 @@ default = "deny"
     #[test]
     fn header_action_env_interpolation_leaves_static_and_approval_macro_values_unchanged() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -5573,7 +5579,7 @@ value = "{{github_token}}"
     #[test]
     fn header_action_env_interpolation_skips_non_set_add_actions() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -5618,7 +5624,7 @@ replace = "${ACL_PROXY_TEST_REPLACE}"
     #[test]
     fn header_action_env_interpolation_skips_remove_actions() {
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -5662,7 +5668,7 @@ name = "authorization"
         env_guard.set("ACL_PROXY_TEST_EMPTY", "");
 
         let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -5705,7 +5711,7 @@ value = "${ACL_PROXY_TEST_EMPTY}"
         write!(
             file,
             r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -5753,7 +5759,7 @@ value = "${{ACL_PROXY_TEST_LOAD_TOKEN}}"
         write!(
             file,
             r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -5810,7 +5816,7 @@ values = ["static", "${{ACL_PROXY_TEST_DUMP_REGION}}"]
         write!(
             file,
             r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"

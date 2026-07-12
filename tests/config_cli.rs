@@ -12,7 +12,7 @@ fn config_validate_succeeds_for_valid_config() {
     writeln!(
         file,
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -44,7 +44,7 @@ fn config_validate_warns_for_incomplete_redaction_env_marker() {
     writeln!(
         file,
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -87,12 +87,12 @@ redaction_profile = "secrets"
 }
 
 #[test]
-fn config_validate_fails_for_wrong_schema_version() {
+fn config_validate_rejects_schema_version_one() {
     let mut file = NamedTempFile::new().expect("create temp config");
     writeln!(
         file,
         r#"
-schema_version = "999"
+schema_version = "1"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -115,7 +115,7 @@ default = "deny"
 
     cmd.assert()
         .failure()
-        .stderr(contains("unsupported schema_version"));
+        .stderr(contains("unsupported schema_version 1, expected 2"));
 }
 
 #[test]
@@ -124,7 +124,7 @@ fn config_validate_fails_for_invalid_loop_protection_header_name() {
     writeln!(
         file,
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -155,7 +155,7 @@ fn env_overrides_are_applied() {
     writeln!(
         file,
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"
@@ -221,7 +221,7 @@ fn run_fails_when_logging_directory_cannot_initialize() {
     writeln!(
         file,
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"

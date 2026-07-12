@@ -152,7 +152,7 @@ fn capture_write_prunes_by_max_total_bytes() {
 #[test]
 fn should_capture_respects_flags_in_integration() {
     let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"

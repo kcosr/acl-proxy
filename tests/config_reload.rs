@@ -125,7 +125,7 @@ async fn start_status_webhook_server() -> (SocketAddr, mpsc::Receiver<serde_json
 
 fn minimal_config() -> Config {
     let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"

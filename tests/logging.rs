@@ -11,7 +11,7 @@ fn config_validate_fails_for_invalid_logging_level() {
     writeln!(
         file,
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:8080"

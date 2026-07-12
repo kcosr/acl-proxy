@@ -336,7 +336,7 @@ async fn external_auth_webhook_failure_emits_status_event() {
 
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"
@@ -440,7 +440,7 @@ async fn external_auth_webhook_uses_approval_timeout_when_webhook_timeout_is_uns
 
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"
@@ -606,7 +606,7 @@ async fn approval_macros_are_exposed_and_applied() {
 
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"
@@ -792,7 +792,7 @@ done
     let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"
@@ -900,7 +900,7 @@ done
     let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"
@@ -998,7 +998,7 @@ done
     let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"
@@ -1491,7 +1491,7 @@ async fn external_auth_callback_pass_falls_through_to_later_allow() {
     let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"
@@ -1557,7 +1557,7 @@ pattern = "http://{host}/**"
 #[tokio::test(flavor = "multi_thread")]
 async fn external_auth_callback_unknown_request_id_returns_404() {
     let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"
@@ -1644,7 +1644,7 @@ done
     let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"
@@ -1707,7 +1707,7 @@ pattern = "http://{host}/**"
 
 fn minimal_config() -> Config {
     let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"
@@ -2378,7 +2378,7 @@ async fn external_auth_webhook_transport_is_not_redirected_by_egress_forwarding(
 
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"
@@ -2822,7 +2822,7 @@ fn body_plugin_config(
 ) -> Config {
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"
@@ -3087,7 +3087,7 @@ async fn body_aware_auth_plugin_rewrites_http_request_body() {
     let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"
@@ -3169,7 +3169,7 @@ async fn native_redaction_rewrites_http_request_body() {
     let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"
@@ -3363,7 +3363,7 @@ async fn native_redaction_recompresses_gzip_request_body() {
     let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"
@@ -4627,7 +4627,7 @@ async fn header_actions_apply_to_request_for_matching_rule() {
 
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"
@@ -4733,7 +4733,7 @@ async fn header_actions_apply_to_response_for_matching_rule() {
 
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"

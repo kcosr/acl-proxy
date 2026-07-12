@@ -157,7 +157,7 @@ async fn start_http1_only_probe_server() -> SocketAddr {
 
 fn minimal_config() -> Config {
     let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"

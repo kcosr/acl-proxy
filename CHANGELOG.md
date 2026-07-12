@@ -4,21 +4,22 @@
 
 ### Breaking Changes
 
-- Replaced the flat proxy listener settings with `proxy.listeners.*` sections for explicit HTTP, transparent HTTP, explicit HTTPS, and transparent HTTPS listeners.
-- Changed `proxy.egress.default` to require an explicit parent-proxy `type` and `transport`.
-- Replaced the `PROXY_PORT` and `PROXY_HOST` environment overrides with `PROXY_EXPLICIT_HTTP_BIND`.
-- Replaced egress transport log value `chain` with `egress_type = "explicit_proxy"` and `egress_transport = "http"` or `"https"`.
+- Advanced `schema_version` to `"2"` for the breaking listener and parent-egress configuration redesign. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
+- Replaced the flat proxy listener settings with `proxy.listeners.*` sections for explicit HTTP, transparent HTTP, explicit HTTPS, and transparent HTTPS listeners. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
+- Changed `proxy.egress.default` to require an explicit parent-proxy `type` and `transport`. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
+- Replaced the `PROXY_PORT` and `PROXY_HOST` environment overrides with `PROXY_EXPLICIT_HTTP_BIND`. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
+- Replaced egress transport log value `chain` with `egress_type = "explicit_proxy"` and `egress_transport = "http"` or `"https"`. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
 
 ### Added
 
-- Add an explicit HTTPS proxy listener with an operator-managed static proxy certificate and key.
-- Add HTTPS parent-proxy egress forwarding with configurable TLS trust for system roots, custom CAs, combined system-plus-custom roots, or disabled verification.
-- Add `proxy.shutdown_drain_timeout_ms` to optionally bound graceful shutdown draining; the default `0` waits indefinitely for in-flight requests.
+- Added an explicit HTTPS proxy listener with an operator-managed static proxy certificate and key. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
+- Added HTTPS parent-proxy egress forwarding with configurable TLS trust for system roots, custom CAs, combined system-plus-custom roots, or disabled verification. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
+- Added `proxy.shutdown_drain_timeout_ms` to optionally bound graceful shutdown draining; the default `0` waits indefinitely for in-flight requests. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
 
 ### Changed
 
-- Split explicit HTTP and transparent HTTP handling onto separate configured sockets, and reject listener topology changes during reload.
-- Graceful shutdown now closes idle keep-alive connections and drains in-flight requests across all configured listeners before exit.
+- Split explicit HTTP and transparent HTTP handling onto separate configured sockets, and reject listener topology changes during reload. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
+- Graceful shutdown now closes idle keep-alive connections and drains in-flight requests across all configured listeners before exit. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
 
 ## [0.2.0] - 2026-06-25
 

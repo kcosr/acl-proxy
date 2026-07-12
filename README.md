@@ -572,6 +572,29 @@ The proxy resolves the config path in this order:
 
 If the default path is missing, the CLI suggests running `acl-proxy config init`.
 
+### Schema 1 To 2 Migration
+
+Schema 2 introduces the explicit listener and parent-egress model. It is an
+intentional breaking migration; schema 1 files are rejected instead of being
+interpreted under changed listener semantics.
+
+1. Change `schema_version = "1"` to `schema_version = "2"`.
+2. Replace `proxy.bind_address` plus `proxy.http_port` with
+   `proxy.listeners.explicit_http.bind = "<address>:<port>"`.
+3. If the old HTTP listener also received redirected origin-form traffic, add
+   a separate `proxy.listeners.transparent_http.bind` and update the redirect
+   to that port.
+4. Replace `proxy.https_bind_address`, `proxy.https_port`, and the old
+   `proxy.https_*` limits with `proxy.listeners.transparent_https.*`.
+5. Add `type = "explicit_proxy"` and `transport = "http"` or `"https"` to
+   `proxy.egress.default` when parent forwarding is configured.
+6. Replace `PROXY_HOST` and `PROXY_PORT` overrides with
+   `PROXY_EXPLICIT_HTTP_BIND`.
+
+The listener and egress examples below, plus `acl-proxy.sample.toml`, show the
+complete schema 2 shape. Run `acl-proxy config validate --config <path>` before
+restarting a deployed proxy.
+
 ### Environment Variable Overrides
 
 After parsing the config file, these overrides are applied:
@@ -584,7 +607,7 @@ After parsing the config file, these overrides are applied:
 ### Top-Level Sections
 
 ```toml
-schema_version = "1"          # required; only "1" is supported
+schema_version = "2"          # required; only "2" is supported
 
 [proxy]
 [proxy.egress]
@@ -914,7 +937,7 @@ env = { KEY = "value" }             # env vars for the plugin process
 ### Minimal Configuration
 
 ```toml
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "0.0.0.0:8881"
@@ -941,7 +964,7 @@ The repository includes [`acl-proxy.sample.toml`](acl-proxy.sample.toml) as a co
 
 The config loader performs validation beyond basic TOML parsing:
 
-- `schema_version` must equal `"1"`.
+- `schema_version` must equal `"2"`.
 - Unknown keys in structured tables are rejected during TOML parsing.
 - Direct rules must have at least one of `pattern`, `patterns`, `methods`, `subnets`, `headers_absent`, `headers_match`, or `headers_not_match`.
 - Direct rules and ruleset templates must not define both `pattern` and `patterns`.

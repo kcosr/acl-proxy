@@ -120,6 +120,59 @@ async fn wait_for_single_allow_capture_version_pair(
     panic!("expected one complete request/response capture pair for {context}; last seen {last_by_id:?}");
 }
 
+async fn wait_for_mixed_capture_pairs(
+    capture_dir: &Path,
+) -> std::collections::HashMap<String, (CaptureDecision, usize, usize)> {
+    use std::collections::HashMap;
+    use tokio::time::{sleep, Duration};
+
+    let mut last_by_id = HashMap::new();
+    for _ in 0..40 {
+        let mut by_id: HashMap<String, (CaptureDecision, usize, usize)> = HashMap::new();
+        if capture_dir.is_dir() {
+            for entry in std::fs::read_dir(capture_dir).expect("read capture dir") {
+                let entry = entry.expect("dir entry");
+                if !entry.file_type().expect("file type").is_file() {
+                    continue;
+                }
+
+                let mut contents = String::new();
+                if std::fs::File::open(entry.path())
+                    .and_then(|mut file| file.read_to_string(&mut contents))
+                    .is_err()
+                {
+                    continue;
+                }
+                let Ok(record) = serde_json::from_str::<CaptureRecord>(&contents) else {
+                    continue;
+                };
+                assert_eq!(record.mode, CaptureMode::HttpsTransparent);
+
+                let counts = by_id
+                    .entry(record.request_id)
+                    .or_insert((record.decision, 0, 0));
+                assert_eq!(counts.0, record.decision);
+                match record.kind {
+                    CaptureKind::Request => counts.1 += 1,
+                    CaptureKind::Response => counts.2 += 1,
+                }
+            }
+        }
+
+        if by_id.len() == 2
+            && by_id
+                .values()
+                .all(|(_, request_count, response_count)| *request_count > 0 && *response_count > 0)
+        {
+            return by_id;
+        }
+        last_by_id = by_id;
+        sleep(Duration::from_millis(50)).await;
+    }
+
+    panic!("expected two complete mixed-decision capture pairs; last seen {last_by_id:?}");
+}
+
 async fn start_upstream_https_echo_server() -> SocketAddr {
     let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind upstream");
     listener
@@ -563,7 +616,7 @@ async fn start_upstream_https_http1_only_echo_server() -> SocketAddr {
 
 fn minimal_https_transparent_config() -> Config {
     let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.transparent_https.bind = "127.0.0.1:1"
@@ -2277,65 +2330,8 @@ async fn concurrent_h2_streams_mixed_allow_and_deny() {
     assert_eq!(denied_json["message"], "Blocked by URL policy");
 
     // Inspect capture to ensure separate requestIds and per-stream decisions.
-    use tokio::time::{sleep, Duration};
-
     let capture_dir = temp_dir.path().join("captures");
-    for _ in 0..10 {
-        if capture_dir.is_dir() {
-            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
-                .expect("read capture dir")
-                .collect();
-            if !entries.is_empty() {
-                break;
-            }
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-
-    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
-    let mut files = Vec::new();
-    while let Some(entry) = entries.next() {
-        let entry = entry.expect("dir entry");
-        if entry.file_type().expect("file type").is_file() {
-            files.push(entry.path());
-        }
-    }
-    assert!(
-        !files.is_empty(),
-        "expected capture files for mixed H2 streams"
-    );
-
-    use std::collections::HashMap;
-
-    let mut by_id: HashMap<String, (CaptureDecision, usize, usize)> = HashMap::new();
-
-    for path in files {
-        let mut contents = String::new();
-        std::fs::File::open(&path)
-            .expect("open capture")
-            .read_to_string(&mut contents)
-            .expect("read capture");
-        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
-        assert_eq!(record.mode, CaptureMode::HttpsTransparent);
-
-        let entry = by_id
-            .entry(record.request_id.clone())
-            .or_insert((record.decision, 0, 0));
-        assert_eq!(
-            entry.0, record.decision,
-            "decision should not change for a given requestId"
-        );
-        match record.kind {
-            CaptureKind::Request => entry.1 += 1,
-            CaptureKind::Response => entry.2 += 1,
-        }
-    }
-
-    assert_eq!(
-        by_id.len(),
-        2,
-        "expected two logical H2 streams (one allowed, one denied)"
-    );
+    let by_id = wait_for_mixed_capture_pairs(&capture_dir).await;
 
     let mut allow_seen = 0;
     let mut deny_seen = 0;
@@ -2923,7 +2919,7 @@ done
     let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.transparent_https.bind = "127.0.0.1:1"
@@ -2999,7 +2995,7 @@ async fn body_aware_auth_plugin_rewrites_transparent_https_request_body() {
     let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.transparent_https.bind = "127.0.0.1:1"

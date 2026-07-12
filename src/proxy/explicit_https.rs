@@ -310,6 +310,8 @@ pub fn build_static_tls_acceptor(
 ) -> Result<TlsAcceptor, ExplicitHttpsError> {
     let certs = load_pem_certs(&config.cert_chain_path)?;
     let key = load_private_key(&config.key_path)?;
+    crate::tls_identity::validate_certificate_key_match(&certs, &key)
+        .map_err(ExplicitHttpsError::TlsConfig)?;
     let mut server = ServerConfig::builder()
         .with_safe_defaults()
         .with_no_client_auth()

@@ -211,7 +211,7 @@ async fn start_forwarding_echo_server(
 
 fn minimal_connect_config() -> Config {
     let toml = r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"
@@ -1016,7 +1016,7 @@ done
     let host = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"

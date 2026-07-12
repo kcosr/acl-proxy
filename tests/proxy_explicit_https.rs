@@ -196,7 +196,7 @@ fn write_proxy_identity(temp_dir: &TempDir) -> (PathBuf, PathBuf) {
 fn explicit_https_config(cert_path: &Path, key_path: &Path, allow_pattern: &str) -> Config {
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_https.bind = "127.0.0.1:1"
@@ -253,7 +253,7 @@ fn explicit_http_config_with_https_parent_tls_block(
 ) -> Config {
     let toml = format!(
         r#"
-schema_version = "1"
+schema_version = "2"
 
 [proxy]
 listeners.explicit_http.bind = "127.0.0.1:1"
@@ -363,11 +363,18 @@ async fn send_explicit_https_request(
     ca_cert_path: &Path,
     absolute_url: &str,
 ) -> (StatusCode, String) {
-    let mut tls = open_explicit_https_proxy_tls(proxy_addr, ca_cert_path).await;
-
     let request = format!(
         "GET {absolute_url} HTTP/1.1\r\nHost: ignored-by-explicit-proxy.test\r\nConnection: close\r\n\r\n"
     );
+    send_explicit_https_raw_request(proxy_addr, ca_cert_path, &request).await
+}
+
+async fn send_explicit_https_raw_request(
+    proxy_addr: SocketAddr,
+    ca_cert_path: &Path,
+    request: &str,
+) -> (StatusCode, String) {
+    let mut tls = open_explicit_https_proxy_tls(proxy_addr, ca_cert_path).await;
     tls.write_all(request.as_bytes())
         .await
         .expect("write request");
@@ -690,6 +697,63 @@ async fn send_raw_http_request(proxy_addr: SocketAddr, absolute_url: &str) -> (S
         .and_then(|code| StatusCode::from_u16(code).ok())
         .expect("response status");
     (status, response)
+}
+
+#[test]
+fn explicit_https_static_identity_rejects_malformed_and_mismatched_material() {
+    let identity_dir = TempDir::new().expect("identity dir");
+    let (cert_path, key_path) = write_proxy_identity(&identity_dir);
+    let config = explicit_https_config(&cert_path, &key_path, "http://example.test/**");
+    let listener = config
+        .proxy
+        .listeners
+        .explicit_https
+        .as_ref()
+        .expect("explicit HTTPS listener");
+
+    std::fs::write(&cert_path, "not a PEM certificate\n").expect("write malformed cert");
+    let err = build_static_tls_acceptor(listener)
+        .err()
+        .expect("malformed cert should fail");
+    assert!(err.to_string().contains("at least one PEM certificate"));
+
+    let first_identity = TempDir::new().expect("first identity dir");
+    let second_identity = TempDir::new().expect("second identity dir");
+    let (cert_path, _) = write_proxy_identity(&first_identity);
+    let (_, key_path) = write_proxy_identity(&second_identity);
+    let config = explicit_https_config(&cert_path, &key_path, "http://example.test/**");
+    let listener = config
+        .proxy
+        .listeners
+        .explicit_https
+        .as_ref()
+        .expect("explicit HTTPS listener");
+    let err = build_static_tls_acceptor(listener)
+        .err()
+        .expect("mismatched key should fail");
+    assert!(err.to_string().contains("does not match private key"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_https_serves_internal_endpoints_before_origin_form_rejection() {
+    let identity_dir = TempDir::new().expect("identity dir");
+    let (cert_path, key_path) = write_proxy_identity(&identity_dir);
+    let config = explicit_https_config(&cert_path, &key_path, "http://example.test/**");
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind explicit HTTPS proxy");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _proxy_temp_dir) = start_explicit_https_proxy(config, listener).await;
+
+    let ready_request =
+        "GET /_acl-proxy/ready HTTP/1.1\r\nHost: proxy.test\r\nConnection: close\r\n\r\n";
+    let (status, _) = send_explicit_https_raw_request(proxy_addr, &cert_path, ready_request).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let origin_request =
+        "GET /not-internal HTTP/1.1\r\nHost: proxy.test\r\nConnection: close\r\n\r\n";
+    let (status, _) = send_explicit_https_raw_request(proxy_addr, &cert_path, origin_request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test(flavor = "multi_thread")]
