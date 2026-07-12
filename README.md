@@ -75,7 +75,6 @@ https://github.com/kcosr/acl-proxy/releases
 Supported release platforms are currently:
 
 - `linux-x86_64`
-- `linux-arm64`
 - `macos-arm64`
 
 Extract the archive on the host that will run `acl-proxy`. The archive contains
@@ -1356,14 +1355,12 @@ script. Then add a fresh `## [Unreleased]` section with the standard
 `Prepare for next release`, and push `main`.
 
 Release binaries are packaged separately after the target-platform binaries
-have been built by the release operator. Build platform binaries using the
-repository build flow, native platform builds, or environment-specific
-supplemental build instructions when available. Supported release archives
-currently use these names:
+have been built by the release operator. Build Linux x86_64 on Linux, and build
+macOS ARM64 natively on Apple Silicon. Supported release archives currently use
+these names:
 
 ```text
 acl-proxy-VERSION-linux-x86_64.tar.gz
-acl-proxy-VERSION-linux-arm64.tar.gz
 acl-proxy-VERSION-macos-arm64.tar.gz
 ```
 
@@ -1381,7 +1378,7 @@ Example packaging flow:
 
 ```bash
 VERSION=$(sed -n '/^\[package\]/,/^\[/ s/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
-PLATFORM=linux-x86_64 # or linux-arm64 or macos-arm64
+PLATFORM=linux-x86_64 # or macos-arm64
 OUT=/tmp/acl-proxy-release-${VERSION}
 ROOT="acl-proxy-${VERSION}-${PLATFORM}"
 
