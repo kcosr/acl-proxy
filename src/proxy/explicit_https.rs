@@ -226,29 +226,28 @@ async fn handle_tls_connection(
     limits: ExplicitHttpsConnectionLimits,
     mut connection_shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), ExplicitHttpsError> {
-    let accept = tls_acceptor.accept(socket);
-    let tls_result = match limits.handshake_timeout {
-        Some(timeout) => match tokio::time::timeout(timeout, accept).await {
-            Ok(result) => result,
-            Err(_) => {
-                tracing::debug!(
-                    target: "acl_proxy::tls",
-                    peer_addr = %remote_addr,
-                    listener = "explicit_https",
-                    timeout_ms = limits.handshake_timeout_ms,
-                    "TLS handshake timed out"
-                );
-                return Err(ExplicitHttpsError::TlsHandshakeTimeout {
-                    timeout_ms: limits.handshake_timeout_ms,
-                });
-            }
-        },
-        None => accept.await,
-    };
+    let handshake = async {
+        let accept = tls_acceptor.accept(socket);
+        let tls_result = match limits.handshake_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, accept).await {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::debug!(
+                        target: "acl_proxy::tls",
+                        peer_addr = %remote_addr,
+                        listener = "explicit_https",
+                        timeout_ms = limits.handshake_timeout_ms,
+                        "TLS handshake timed out"
+                    );
+                    return Err(ExplicitHttpsError::TlsHandshakeTimeout {
+                        timeout_ms: limits.handshake_timeout_ms,
+                    });
+                }
+            },
+            None => accept.await,
+        };
 
-    let tls = match tls_result {
-        Ok(tls) => tls,
-        Err(e) => {
+        tls_result.map_err(|e| {
             tracing::debug!(
                 target: "acl_proxy::tls",
                 peer_addr = %remote_addr,
@@ -256,8 +255,16 @@ async fn handle_tls_connection(
                 error = %e,
                 "TLS handshake failed"
             );
-            return Err(ExplicitHttpsError::TlsHandshake(e));
+            ExplicitHttpsError::TlsHandshake(e)
+        })
+    };
+    tokio::pin!(handshake);
+    let tls = tokio::select! {
+        biased;
+        _ = crate::proxy::listener::wait_for_connection_shutdown(&mut connection_shutdown) => {
+            return Ok(());
         }
+        result = &mut handshake => result?,
     };
 
     let (_, conn) = tls.get_ref();

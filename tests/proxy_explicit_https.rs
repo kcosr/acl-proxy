@@ -717,6 +717,23 @@ fn explicit_https_static_identity_rejects_malformed_and_mismatched_material() {
         .expect("malformed cert should fail");
     assert!(err.to_string().contains("at least one PEM certificate"));
 
+    let chain_identity = TempDir::new().expect("chain identity dir");
+    let (cert_path, key_path) = write_proxy_identity(&chain_identity);
+    let mut cert_bundle = std::fs::read_to_string(&cert_path).expect("read cert bundle");
+    cert_bundle.push_str("-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n");
+    std::fs::write(&cert_path, cert_bundle).expect("write malformed intermediate");
+    let config = explicit_https_config(&cert_path, &key_path, "http://example.test/**");
+    let listener = config
+        .proxy
+        .listeners
+        .explicit_https
+        .as_ref()
+        .expect("explicit HTTPS listener");
+    let err = build_static_tls_acceptor(listener)
+        .err()
+        .expect("malformed intermediate should fail");
+    assert!(err.to_string().contains("failed to parse certificate 2"));
+
     let first_identity = TempDir::new().expect("first identity dir");
     let second_identity = TempDir::new().expect("second identity dir");
     let (cert_path, _) = write_proxy_identity(&first_identity);
@@ -1005,6 +1022,58 @@ async fn explicit_https_listener_shutdown_closes_idle_keep_alive_connection() {
     tokio::time::timeout(tokio::time::Duration::from_secs(2), server_task)
         .await
         .expect("explicit HTTPS listener did not stop after shutdown")
+        .expect("listener task join")
+        .expect("listener shutdown result");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn explicit_https_shutdown_interrupts_unbounded_tls_handshake() {
+    let identity_dir = TempDir::new().expect("identity dir");
+    let (cert_path, key_path) = write_proxy_identity(&identity_dir);
+    let mut config = explicit_https_config(&cert_path, &key_path, "http://example.test/**");
+    config
+        .proxy
+        .listeners
+        .explicit_https
+        .as_mut()
+        .expect("explicit HTTPS listener")
+        .handshake_timeout_ms = 0;
+
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind explicit HTTPS proxy");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let proxy_addr = listener.local_addr().expect("proxy addr");
+    let listener_cfg = config
+        .proxy
+        .listeners
+        .explicit_https
+        .as_ref()
+        .expect("explicit HTTPS listener")
+        .clone();
+    let tls_acceptor = build_static_tls_acceptor(&listener_cfg).expect("static TLS acceptor");
+    let state = AppState::shared_from_config(config).expect("app state");
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_for_task = shutdown.clone();
+    let server_task = tokio::spawn(async move {
+        run_explicit_https_proxy_on_listener(
+            state,
+            listener,
+            tls_acceptor,
+            listener_cfg,
+            async move { shutdown_for_task.notified().await },
+        )
+        .await
+    });
+
+    let _silent_client = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect silent TLS client");
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    shutdown.notify_waiters();
+    tokio::time::timeout(tokio::time::Duration::from_secs(2), server_task)
+        .await
+        .expect("listener did not interrupt silent TLS handshake")
         .expect("listener task join")
         .expect("listener shutdown result");
 }

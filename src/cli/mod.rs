@@ -376,6 +376,15 @@ async fn run_proxy_with_signals(
         }
     }
 
+    let (upgrade_sessions, drain_timeout) = {
+        let state = state.load();
+        (
+            state.upgrade_sessions.clone(),
+            state.config.proxy.shutdown_drain_timeout(),
+        )
+    };
+    upgrade_sessions.drain(drain_timeout).await;
+
     match first_error {
         Some(err) => Err(err),
         None => Ok(()),

@@ -2989,7 +2989,7 @@ pub(crate) async fn proxy_allowed_request(
         let log_url_for_upgrade = redact_url_for_sink(&full_url_for_upgrade);
         let redaction_for_upgrade = redaction.clone();
         let websocket_session_extensions_for_upgrade = websocket_session_extensions;
-        tokio::spawn(async move {
+        state.upgrade_sessions.spawn(async move {
             let mut downstream = match downstream_upgrade.await {
                 Ok(stream) => stream,
                 Err(err) => {
@@ -3234,7 +3234,7 @@ async fn connect_https_parent(
     let connector = TlsConnector::from(parent_egress_tls.client_config(use_http2));
     let tls = connector.connect(server_name, stream).await?;
     let negotiated = tls.get_ref().1.alpn_protocol().map(|value| value.to_vec());
-    if negotiated.as_deref() != Some(expected_alpn.as_slice()) {
+    if !parent_alpn_is_compatible(use_http2, negotiated.as_deref()) {
         return Err(UpstreamRequestError::Protocol(format!(
             "parent proxy did not negotiate required ALPN protocol {}",
             String::from_utf8_lossy(&expected_alpn)
@@ -3242,6 +3242,14 @@ async fn connect_https_parent(
     }
 
     Ok(tls)
+}
+
+fn parent_alpn_is_compatible(use_http2: bool, negotiated: Option<&[u8]>) -> bool {
+    if use_http2 {
+        negotiated == Some(b"h2")
+    } else {
+        negotiated.is_none() || negotiated == Some(b"http/1.1")
+    }
 }
 
 fn egress_transport_label(transport: EgressTransport) -> &'static str {
@@ -3714,6 +3722,15 @@ mod tests {
     };
     use crate::config::{HeaderActionKind, HeaderDirection, HeaderWhen};
     use crate::policy::CompiledHeaderAction;
+
+    #[test]
+    fn parent_http1_alpn_accepts_omitted_protocol() {
+        assert!(super::parent_alpn_is_compatible(false, None));
+        assert!(super::parent_alpn_is_compatible(false, Some(b"http/1.1")));
+        assert!(!super::parent_alpn_is_compatible(false, Some(b"h2")));
+        assert!(super::parent_alpn_is_compatible(true, Some(b"h2")));
+        assert!(!super::parent_alpn_is_compatible(true, None));
+    }
     use http::header::HOST;
     use http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
     use hyper::{Body, Request};

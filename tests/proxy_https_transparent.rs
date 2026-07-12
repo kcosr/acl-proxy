@@ -713,6 +713,51 @@ async fn transparent_https_listener_times_out_idle_tls_handshake() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn transparent_https_shutdown_interrupts_unbounded_tls_handshake() {
+    let mut config = minimal_https_transparent_config();
+    config
+        .proxy
+        .listeners
+        .transparent_https
+        .as_mut()
+        .expect("transparent HTTPS listener")
+        .handshake_timeout_ms = 0;
+
+    let listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let proxy_addr = listener.local_addr().expect("proxy addr");
+    let temp_dir = TempDir::new().expect("temp dir");
+    config.capture.directory = temp_dir
+        .path()
+        .join("captures")
+        .to_string_lossy()
+        .to_string();
+    config.certificates.certs_dir = temp_dir.path().join("certs").to_string_lossy().to_string();
+    let state = AppState::shared_from_config(config).expect("app state");
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_for_task = shutdown.clone();
+    let server_task = tokio::spawn(async move {
+        run_https_transparent_proxy_on_listener(state, listener, async move {
+            shutdown_for_task.notified().await;
+        })
+        .await
+    });
+
+    let _silent_client = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect silent TLS client");
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    shutdown.notify_waiters();
+    tokio::time::timeout(tokio::time::Duration::from_secs(2), server_task)
+        .await
+        .expect("listener did not interrupt silent TLS handshake")
+        .expect("listener task join")
+        .expect("listener shutdown result");
+}
+
 async fn send_https_request_via_transparent(
     proxy_addr: SocketAddr,
     ca_cert_path: &std::path::Path,

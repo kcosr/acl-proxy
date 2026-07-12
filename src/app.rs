@@ -16,8 +16,10 @@ use rustls::client::{ServerCertVerified, ServerCertVerifier};
 use rustls::{Certificate, ClientConfig, Error as RustlsError, RootCertStore, ServerName};
 use std::net::IpAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use std::time::SystemTime;
+use tokio::task::JoinSet;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppStateError {
@@ -40,6 +42,38 @@ pub enum AppStateError {
 /// to be atomically swapped on reload while existing requests keep
 /// using the previous snapshot.
 pub type SharedAppState = Arc<ArcSwap<AppState>>;
+
+#[derive(Clone, Default)]
+pub struct UpgradeSessionTracker {
+    tasks: Arc<Mutex<JoinSet<()>>>,
+}
+
+impl UpgradeSessionTracker {
+    pub fn spawn<F>(&self, future: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while let Some(result) = tasks.try_join_next() {
+            crate::proxy::listener::log_connection_task_result("upgraded_session", result);
+        }
+        tasks.spawn(future);
+    }
+
+    pub async fn drain(&self, timeout: Option<Duration>) {
+        let mut tasks = {
+            let mut tasks = self
+                .tasks
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *tasks)
+        };
+        crate::proxy::listener::drain_connections("upgraded_session", &mut tasks, timeout).await;
+    }
+}
 
 #[derive(Clone)]
 pub struct ParentEgressTls {
@@ -70,6 +104,7 @@ pub struct AppState {
     pub cert_manager: CertManager,
     pub external_auth: ExternalAuthManager,
     pub auth_plugins: AuthPluginManager,
+    pub upgrade_sessions: UpgradeSessionTracker,
 }
 
 impl AppState {
@@ -106,6 +141,9 @@ impl AppState {
             )
         };
         let auth_plugins = AuthPluginManager::new(&config.policy.external_auth_profiles);
+        let upgrade_sessions = previous
+            .map(|state| state.upgrade_sessions.clone())
+            .unwrap_or_default();
 
         Ok(AppState {
             config,
@@ -118,6 +156,7 @@ impl AppState {
             cert_manager,
             external_auth,
             auth_plugins,
+            upgrade_sessions,
         })
     }
 
@@ -350,5 +389,35 @@ impl ServerCertVerifier for NoVerifyServerCert {
         _now: SystemTime,
     ) -> Result<ServerCertVerified, RustlsError> {
         Ok(ServerCertVerified::assertion())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UpgradeSessionTracker;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrade_session_drain_aborts_tasks_after_timeout() {
+        let tracker = UpgradeSessionTracker::default();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let signal = DropSignal(dropped.clone());
+        tracker.spawn(async move {
+            let _signal = signal;
+            std::future::pending::<()>().await;
+        });
+
+        tracker.drain(Some(Duration::from_millis(10))).await;
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }

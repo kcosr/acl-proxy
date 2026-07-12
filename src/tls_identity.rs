@@ -4,11 +4,16 @@ pub(crate) fn validate_certificate_key_match(
     cert_chain: &[Certificate],
     private_key: &PrivateKey,
 ) -> Result<(), String> {
-    let certificate = cert_chain
-        .first()
-        .ok_or_else(|| "certificate chain is empty".to_string())?;
-    let end_entity = webpki::EndEntityCert::try_from(certificate.0.as_slice())
-        .map_err(|err| format!("failed to parse end-entity certificate: {err}"))?;
+    let mut parsed = cert_chain.iter().enumerate().map(|(index, certificate)| {
+        webpki::EndEntityCert::try_from(certificate.0.as_slice())
+            .map_err(|err| format!("failed to parse certificate {}: {err}", index + 1))
+    });
+    let end_entity = parsed
+        .next()
+        .ok_or_else(|| "certificate chain is empty".to_string())??;
+    for certificate in parsed {
+        certificate?;
+    }
     let signing_key = rustls::sign::any_supported_type(private_key)
         .map_err(|err| format!("unsupported private key: {err}"))?;
     let offered = [

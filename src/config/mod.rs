@@ -78,7 +78,6 @@ pub struct Config {
     #[serde(skip)]
     pub load_warnings: Vec<String>,
 
-    #[serde(default = "default_schema_version")]
     pub schema_version: String,
 
     #[serde(default)]
@@ -1713,12 +1712,20 @@ fn validate_listener_config(listeners: &ProxyListenersConfig) -> Result<(), Conf
             &listener.cert_chain_path,
             &listener.key_path,
         )?;
+        validate_tls_max_connections(
+            "proxy.listeners.explicit_https.max_connections",
+            listener.max_connections,
+        )?;
     }
     if let Some(listener) = listeners.transparent_https.as_ref() {
         binds.push((
             "proxy.listeners.transparent_https.bind",
             parse_listener_bind("proxy.listeners.transparent_https.bind", &listener.bind)?,
         ));
+        validate_tls_max_connections(
+            "proxy.listeners.transparent_https.max_connections",
+            listener.max_connections,
+        )?;
     }
 
     for left_idx in 0..binds.len() {
@@ -1735,6 +1742,16 @@ fn validate_listener_config(listeners: &ProxyListenersConfig) -> Result<(), Conf
         }
     }
 
+    Ok(())
+}
+
+fn validate_tls_max_connections(location: &str, value: usize) -> Result<(), ConfigError> {
+    if value > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(ConfigError::Invalid(format!(
+            "{location} must be 0 (unlimited) or at most {}",
+            tokio::sync::Semaphore::MAX_PERMITS
+        )));
+    }
     Ok(())
 }
 
@@ -2533,6 +2550,21 @@ default = "deny"
     }
 
     #[test]
+    fn schema_version_is_required() {
+        let err = toml::from_str::<Config>(
+            r#"
+[proxy]
+listeners.explicit_http.bind = "127.0.0.1:8080"
+
+[policy]
+default = "deny"
+"#,
+        )
+        .expect_err("versionless config should fail");
+        assert!(err.to_string().contains("missing field `schema_version`"));
+    }
+
+    #[test]
     fn proxy_shutdown_drain_timeout_parses_milliseconds() {
         let toml = r#"
 schema_version = "2"
@@ -3128,6 +3160,29 @@ default = "deny"
         assert_eq!(listener.max_connections, 8);
         assert_eq!(listener.http2_max_concurrent_streams, 16);
         config.validate_basic().expect("config should validate");
+    }
+
+    #[test]
+    fn tls_listener_max_connections_rejects_semaphore_overflow() {
+        let invalid = tokio::sync::Semaphore::MAX_PERMITS + 1;
+        let toml = format!(
+            r#"
+schema_version = "2"
+
+[proxy]
+listeners.transparent_https = {{ bind = "127.0.0.1:8443", max_connections = {invalid} }}
+
+[policy]
+default = "deny"
+"#
+        );
+        let config: Config = toml::from_str(&toml).expect("parse config");
+        let err = config
+            .validate_basic()
+            .expect_err("oversized connection limit should fail");
+        assert!(err.to_string().contains(
+            "proxy.listeners.transparent_https.max_connections must be 0 (unlimited) or at most"
+        ));
     }
 
     #[test]
