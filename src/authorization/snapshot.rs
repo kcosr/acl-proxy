@@ -74,11 +74,7 @@ impl ProductAuthorizationSnapshot {
         provider_registry: ProviderRegistry,
         cancellation: ActivationCancellation,
     ) -> Result<AuthorizationActivation, AuthorizationActivationError> {
-        #[cfg(test)]
-        return Self::activate_inner(plan, provider_registry, cancellation, |_| {}).await;
-
-        #[cfg(not(test))]
-        Self::activate_inner(plan, provider_registry, cancellation).await
+        Self::activate_inner(plan, provider_registry, cancellation, |_| {}).await
     }
 
     #[cfg(test)]
@@ -101,7 +97,7 @@ impl ProductAuthorizationSnapshot {
         plan: AuthorizationPlan,
         provider_registry: ProviderRegistry,
         cancellation: ActivationCancellation,
-        #[cfg(test)] mut after_provider_activation: impl FnMut(&Arc<ProcessProvider>),
+        mut after_provider_activation: impl FnMut(&Arc<ProcessProvider>),
     ) -> Result<AuthorizationActivation, AuthorizationActivationError> {
         if cancellation.is_cancelled() {
             return Err(AuthorizationActivationError::Cancelled);
@@ -148,7 +144,6 @@ impl ProductAuthorizationSnapshot {
                     }
                 };
             rollback.push(process.clone());
-            #[cfg(test)]
             after_provider_activation(&process);
             providers.push(ActiveProvider::Process(process));
         }
@@ -232,6 +227,13 @@ impl AuthorizationActivation {
         Box<[Arc<dyn GenerationOwner>]>,
     ) {
         (self.snapshot, self.provider_registry, self.owners)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn process_provider_for_test(&self, index: usize) -> Option<Arc<ProcessProvider>> {
+        match self.snapshot.providers.get(index)? {
+            ActiveProvider::Process(provider) => Some(provider.clone()),
+        }
     }
 }
 
@@ -326,6 +328,7 @@ mod tests {
     use std::fs;
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -585,22 +588,23 @@ for line in sys.stdin:
     #[tokio::test]
     async fn mismatched_provider_registry_is_rejected_before_spawn() {
         let directory = TempDir::new().unwrap();
-        let marker = directory.path().join("spawned.marker");
         let script = write_python(
             &directory,
-            "mark-spawn.py",
-            "from pathlib import Path\nimport sys\nPath(sys.argv[1]).write_text('spawned')\n",
+            "idle.py",
+            "import time\nwhile True:\n    time.sleep(1)\n",
         );
-        let mut provider = process_plan(&directory, &script);
-        provider.args.push(marker.to_string_lossy().into_owned());
         let plan = authorization_plan(BTreeMap::from([(
             "configured".to_string(),
-            AuthorizationProviderPlan::Process(provider),
+            AuthorizationProviderPlan::Process(process_plan(&directory, &script)),
         )]));
-        let result = ProductAuthorizationSnapshot::activate(
+        let activations = AtomicUsize::new(0);
+        let result = ProductAuthorizationSnapshot::activate_with_hook(
             plan,
             ProviderRegistry::from_names(["different".to_string()]),
             cancellation(),
+            |_| {
+                activations.fetch_add(1, Ordering::AcqRel);
+            },
         )
         .await;
 
@@ -608,8 +612,7 @@ for line in sys.stdin:
             result,
             Err(AuthorizationActivationError::ProviderRegistryMismatch)
         ));
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert!(!marker.exists(), "registry rejection spawned the provider");
+        assert_eq!(activations.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

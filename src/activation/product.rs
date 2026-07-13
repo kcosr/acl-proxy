@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use crate::authorization::{AuthorizationActivationError, ProductAuthorizationSnapshot};
+use crate::authorization::{
+    AuthorizationActivation, AuthorizationActivationError, ProductAuthorizationSnapshot,
+};
 use crate::config::v3_compile::ReloadableProductPlan;
 use crate::config::{StaticFingerprint, StaticFingerprintError, StaticProductConfig};
 use crate::credentials::CredentialResolverSnapshot;
@@ -49,6 +51,27 @@ impl ProductActivator {
         &self,
         plan: ReloadableProductPlan,
         cancellation: ActivationCancellation,
+    ) -> Result<ActivatedGeneration, RuntimeError> {
+        self.activate_generation_inner(plan, cancellation, |_| {})
+            .await
+    }
+
+    #[cfg(test)]
+    async fn activate_generation_with_authorization_hook(
+        &self,
+        plan: ReloadableProductPlan,
+        cancellation: ActivationCancellation,
+        after_authorization_activation: impl FnMut(&AuthorizationActivation),
+    ) -> Result<ActivatedGeneration, RuntimeError> {
+        self.activate_generation_inner(plan, cancellation, after_authorization_activation)
+            .await
+    }
+
+    async fn activate_generation_inner(
+        &self,
+        plan: ReloadableProductPlan,
+        cancellation: ActivationCancellation,
+        mut after_authorization_activation: impl FnMut(&AuthorizationActivation),
     ) -> Result<ActivatedGeneration, RuntimeError> {
         cancellation.check()?;
         let ReloadableProductPlan {
@@ -120,6 +143,7 @@ impl ProductActivator {
         )
         .await
         .map_err(|error| map_authorization_error(error, &cancellation))?;
+        after_authorization_activation(&authorization);
 
         let (authorization, _provider_registry, provider_owners) = authorization.into_parts();
         let (observation, observation_owner) = observation.into_parts();
@@ -220,6 +244,10 @@ mod tests {
     #[cfg(unix)]
     use std::fs;
     use std::path::Path;
+    #[cfg(unix)]
+    use std::sync::Mutex;
+    #[cfg(unix)]
+    use std::time::Duration;
 
     use super::*;
     use crate::config::{compile_config_text, ConfigTextInput};
@@ -373,6 +401,76 @@ default = "deny""#,
         publication.commit();
         drop(publication);
         activated.owner.cleanup(CleanupReason::Shutdown).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_after_authorization_activation_rejects_and_reaps_provider_once() {
+        let directory = TempDir::new().unwrap();
+        let script = directory.path().join("idle-until-rejected.py");
+        fs::write(&script, "import time\nwhile True:\n    time.sleep(1)\n").unwrap();
+        let text = MINIMAL.replace(
+            "[policy]\ndefault = \"deny\"",
+            &format!(
+                r#"[authorization.providers.local]
+kind = "process"
+command = "/usr/bin/python3"
+args = ["{}"]
+retire_timeout = "1s"
+
+[policy]
+default = "deny""#,
+                script.display()
+            ),
+        );
+        let source_path = directory.path().join("acl-proxy.toml");
+        let compiled = compile_config_text(ConfigTextInput {
+            text: &text,
+            source_path: &source_path,
+            config_root: directory.path(),
+        })
+        .unwrap();
+        let activator = ProductActivator::new(&compiled.static_config).unwrap();
+        let cancellation = ActivationCancellation::new_for_test();
+        let hook_cancellation = cancellation.clone();
+        let observed = Arc::new(Mutex::new(None));
+        let hook_observed = observed.clone();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            activator.activate_generation_with_authorization_hook(
+                compiled.reloadable_plan,
+                cancellation,
+                move |authorization| {
+                    let provider = authorization
+                        .process_provider_for_test(0)
+                        .expect("authorization activation owns the process provider");
+                    let pid = provider.child_id().expect("activated provider has a child");
+                    *hook_observed.lock().unwrap() = Some((provider, pid));
+                    hook_cancellation.cancel_for_test();
+                },
+            ),
+        )
+        .await
+        .expect("product cancellation cleanup completes");
+
+        assert!(matches!(result, Err(RuntimeError::ActivationCancelled)));
+        let (provider, pid) = observed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("post-authorization hook ran");
+        assert_eq!(provider.cleanup_starts(), 1);
+        assert_eq!(
+            provider.cleanup_reasons(),
+            [CleanupReason::CandidateRejected]
+        );
+        // SAFETY: signal zero only checks whether the child PID still exists.
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 
     #[tokio::test]

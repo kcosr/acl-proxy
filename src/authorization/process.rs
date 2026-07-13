@@ -54,6 +54,8 @@ struct Inner {
     cleanup: CleanupState,
     #[cfg(test)]
     cleanup_starts: AtomicUsize,
+    #[cfg(test)]
+    cleanup_reasons: Mutex<Vec<CleanupReason>>,
 }
 
 struct SpawnConfig {
@@ -284,6 +286,8 @@ impl ProcessProvider {
             },
             #[cfg(test)]
             cleanup_starts: AtomicUsize::new(0),
+            #[cfg(test)]
+            cleanup_reasons: Mutex::new(Vec::new()),
         });
         install_io_tasks(&inner, 1, spawned.stdin, spawned.stdout);
         let supervisor_inner = inner.clone();
@@ -497,13 +501,18 @@ impl ProcessProvider {
     }
 
     #[cfg(test)]
-    pub(super) fn child_id(&self) -> Option<u32> {
+    pub(crate) fn child_id(&self) -> Option<u32> {
         lock(&self.inner.state).child.as_ref().and_then(Child::id)
     }
 
     #[cfg(test)]
-    pub(super) fn cleanup_starts(&self) -> usize {
+    pub(crate) fn cleanup_starts(&self) -> usize {
         self.inner.cleanup_starts.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cleanup_reasons(&self) -> Vec<CleanupReason> {
+        lock(&self.inner.cleanup_reasons).clone()
     }
 }
 
@@ -567,7 +576,10 @@ impl GenerationOwner for ProcessProvider {
                 .is_ok()
             {
                 #[cfg(test)]
-                self.inner.cleanup_starts.fetch_add(1, Ordering::AcqRel);
+                {
+                    self.inner.cleanup_starts.fetch_add(1, Ordering::AcqRel);
+                    lock(&self.inner.cleanup_reasons).push(_reason);
+                }
                 let inner = self.inner.clone();
                 std::mem::drop(tokio::spawn(async move {
                     let _ = inner.events.send(SupervisorEvent::Stop);
