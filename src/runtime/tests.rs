@@ -19,7 +19,27 @@ impl AuthorizationSnapshot for EmptySnapshot {}
 impl CredentialResolver for EmptySnapshot {}
 impl RedactionSnapshot for EmptySnapshot {}
 impl ObservationSnapshot for EmptySnapshot {}
-impl SafetySnapshot for EmptySnapshot {}
+impl SafetySnapshot for EmptySnapshot {
+    fn contains_loop_marker(&self, _headers: &http::HeaderMap) -> bool {
+        false
+    }
+
+    fn inject_loop_marker(
+        &self,
+        _headers: &mut http::HeaderMap,
+        _request_id: &str,
+    ) -> Result<(), crate::safety::InvalidLoopMarker> {
+        Ok(())
+    }
+
+    fn begin_http_body(
+        &self,
+        _plan: crate::policy::HttpWireBodyPlanIndex,
+        quota_key: crate::safety::WireBodyQuotaKey,
+    ) -> Result<crate::safety::HttpWireBodyGuard, crate::safety::UnknownHttpWireBodyPlan> {
+        Ok(crate::safety::WireBodyPool::new(1, 1).begin_for_test(0, quota_key))
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OwnerEvent {
@@ -336,16 +356,21 @@ fn runtime_fixture(
 }
 
 async fn wait_for_retiring(runtime: &Runtime, expected: usize) {
-    for _ in 0..1000 {
-        if runtime.retiring_generations() == expected {
-            return;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            if runtime.retiring_generations() == expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
-        tokio::task::yield_now().await;
+    })
+    .await;
+    if result.is_err() {
+        panic!(
+            "retiring generation count did not reach {expected}; current={}",
+            runtime.retiring_generations()
+        );
     }
-    panic!(
-        "retiring generation count did not reach {expected}; current={}",
-        runtime.retiring_generations()
-    );
 }
 
 #[tokio::test]

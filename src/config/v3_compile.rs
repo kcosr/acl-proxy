@@ -15,6 +15,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
+use crate::safety::wire_body::guarded_body_allocation_bytes;
 use crate::url::{canonicalize_http_url, CompiledUrlPattern};
 
 use super::authoring::{
@@ -3306,59 +3307,76 @@ fn compile_http_rule_schedule(
             configured_profile_literal_scratch_bytes(profile, &format!("redaction.profiles.{name}"))
         })
         .transpose()?;
-
-    let mut initial_peak = 0usize;
-    let mut incoming_stages = Vec::with_capacity(3);
-    if let Some(provider) = process_body {
-        initial_peak = initial_peak.max(decode_peak(
-            provider.max_request_body_bytes,
-            provider.max_decoded_request_body_bytes,
-        )?);
-        initial_peak = initial_peak.max(checked_add(
-            provider.max_decoded_request_body_bytes,
-            PROVIDER_STREAM_SCRATCH_BYTES,
-            "policy.rules",
-            "HTTP provider-stream plan arithmetic overflow",
-        )?);
-        incoming_stages.push(IncomingBodyStage {
-            additional_bytes: PROVIDER_STREAM_SCRATCH_BYTES,
-        });
-        if provider.allow_request_body_replacement {
-            // The original remains live until a structurally accepted
-            // replacement irrevocably wins. Only then may replacement decode
-            // and redaction proceed without the original allocation.
-            initial_peak = initial_peak.max(checked_add(
+    let effective_process_body_limits = process_body.map(|provider| {
+        profile.map_or(
+            (
+                provider.max_request_body_bytes,
                 provider.max_decoded_request_body_bytes,
-                provider.max_stdout_line_bytes,
-                "policy.rules",
-                "HTTP provider-response framing arithmetic overflow",
-            )?);
-            incoming_stages.push(IncomingBodyStage {
-                additional_bytes: provider.max_stdout_line_bytes,
-            });
-            initial_peak = initial_peak.max(replacement_decode_peak(
-                provider.max_stdout_line_bytes,
-                provider.max_decoded_request_body_bytes,
-            )?);
-        }
-    }
-    if let Some(profile) = profile {
-        let (encoded_limit, original_limit) = process_body
-            .map(|provider| {
+            ),
+            |profile| {
                 (
                     provider.max_request_body_bytes.min(profile.max_body_bytes),
                     provider
                         .max_decoded_request_body_bytes
                         .min(profile.max_decoded_body_bytes),
                 )
-            })
+            },
+        )
+    });
+
+    let mut initial_peak = 0usize;
+    let mut incoming_stages = Vec::with_capacity(3);
+    if let Some(provider) = process_body {
+        let (encoded_limit, original_limit) = effective_process_body_limits
+            .expect("process-body limits were derived with the process provider");
+        initial_peak = initial_peak.max(decode_peak(encoded_limit, original_limit)?);
+        let provider_stream_scratch = project_guarded_body_allocation(
+            PROVIDER_STREAM_SCRATCH_BYTES,
+            "policy.rules",
+            "HTTP provider-stream plan arithmetic overflow",
+        )?;
+        initial_peak = initial_peak.max(guarded_body_stage_peak(
+            [original_limit, PROVIDER_STREAM_SCRATCH_BYTES],
+            "policy.rules",
+            "HTTP provider-stream plan arithmetic overflow",
+        )?);
+        incoming_stages.push(IncomingBodyStage {
+            additional_bytes: provider_stream_scratch,
+        });
+        if provider.allow_request_body_replacement {
+            // The original remains live until a structurally accepted
+            // replacement irrevocably wins. Only then may replacement decode
+            // and redaction proceed without the original allocation.
+            let response_framing = project_guarded_body_allocation(
+                provider.max_stdout_line_bytes,
+                "policy.rules",
+                "HTTP provider-response framing arithmetic overflow",
+            )?;
+            initial_peak = initial_peak.max(guarded_body_stage_peak(
+                [original_limit, provider.max_stdout_line_bytes],
+                "policy.rules",
+                "HTTP provider-response framing arithmetic overflow",
+            )?);
+            incoming_stages.push(IncomingBodyStage {
+                additional_bytes: response_framing,
+            });
+            initial_peak = initial_peak.max(replacement_decode_peak(
+                provider.max_stdout_line_bytes,
+                original_limit,
+            )?);
+        }
+    }
+    if let Some(profile) = profile {
+        let (encoded_limit, original_limit) = effective_process_body_limits
             .unwrap_or((profile.max_body_bytes, profile.max_decoded_body_bytes));
         if process_body.is_none() {
             initial_peak = initial_peak.max(decode_peak(encoded_limit, original_limit)?);
         }
-        let redaction_additional = checked_add(
-            profile_scratch_bytes.expect("redaction profile scratch was derived"),
-            profile.max_decoded_body_bytes,
+        let redaction_additional = guarded_body_stage_peak(
+            [
+                profile_scratch_bytes.expect("redaction profile scratch was derived"),
+                profile.max_decoded_body_bytes,
+            ],
             "policy.rules",
             "HTTP redaction plan arithmetic overflow",
         )?;
@@ -3366,9 +3384,11 @@ fn compile_http_rule_schedule(
             !rule.expressions.is_empty() && !matches!(rule.payloads, RedactionPayloads::Binary)
         });
         let regex_peak = if has_text_expressions {
-            checked_add(
-                profile.max_decoded_body_bytes,
-                profile.max_decoded_body_bytes,
+            guarded_body_stage_peak(
+                [
+                    profile.max_decoded_body_bytes,
+                    profile.max_decoded_body_bytes,
+                ],
                 "policy.rules",
                 "HTTP regex redaction plan arithmetic overflow",
             )?
@@ -3376,7 +3396,11 @@ fn compile_http_rule_schedule(
             0
         };
         let original_redaction_peak = checked_add(
-            original_limit,
+            project_guarded_body_allocation(
+                original_limit,
+                "policy.rules",
+                "HTTP redaction plan arithmetic overflow",
+            )?,
             redaction_additional,
             "policy.rules",
             "HTTP redaction plan arithmetic overflow",
@@ -3390,14 +3414,16 @@ fn compile_http_rule_schedule(
         incoming_stages.push(IncomingBodyStage {
             additional_bytes: redaction_additional,
         });
-        if let Some(provider) =
-            process_body.filter(|provider| provider.allow_request_body_replacement)
-        {
-            let replacement_limit = provider
-                .max_decoded_request_body_bytes
-                .min(profile.max_decoded_body_bytes);
+        if process_body.is_some_and(|provider| provider.allow_request_body_replacement) {
+            let replacement_limit = effective_process_body_limits
+                .expect("replacement limits were derived with the process provider")
+                .1;
             let replacement_redaction_peak = checked_add(
-                replacement_limit,
+                project_guarded_body_allocation(
+                    replacement_limit,
+                    "policy.rules",
+                    "HTTP replacement-redaction plan arithmetic overflow",
+                )?,
                 redaction_additional,
                 "policy.rules",
                 "HTTP replacement-redaction plan arithmetic overflow",
@@ -3410,7 +3436,15 @@ fn compile_http_rule_schedule(
     Ok(HttpRuleAllocationSchedule {
         initial_peak,
         retained_original_after_pass: if matches!(rule.decision, RuleDecision::Delegate) {
-            process_body.map(|provider| provider.max_decoded_request_body_bytes)
+            effective_process_body_limits
+                .map(|(_, original_limit)| {
+                    project_guarded_body_allocation(
+                        original_limit,
+                        "policy.rules",
+                        "delegate-pass body retention arithmetic overflow",
+                    )
+                })
+                .transpose()?
         } else {
             None
         },
@@ -3422,19 +3456,46 @@ fn replacement_decode_peak(
     max_stdout_line_bytes: usize,
     max_decoded_replacement_bytes: usize,
 ) -> Result<usize, V3CompileError> {
-    max_stdout_line_bytes
-        .checked_add(max_decoded_replacement_bytes)
-        .and_then(|value| value.checked_add(DECODER_SCRATCH_BYTES))
-        .ok_or_else(|| {
-            V3CompileError::at("service", "provider replacement decode arithmetic overflow")
-        })
+    guarded_body_stage_peak(
+        [
+            max_stdout_line_bytes,
+            max_decoded_replacement_bytes,
+            DECODER_SCRATCH_BYTES,
+        ],
+        "service",
+        "provider replacement decode arithmetic overflow",
+    )
 }
 
 fn decode_peak(encoded: usize, decoded: usize) -> Result<usize, V3CompileError> {
-    encoded
-        .checked_add(decoded)
-        .and_then(|value| value.checked_add(DECODER_SCRATCH_BYTES))
-        .ok_or_else(|| V3CompileError::at("service", "mandatory body-plan arithmetic overflow"))
+    guarded_body_stage_peak(
+        [encoded, decoded, DECODER_SCRATCH_BYTES],
+        "service",
+        "mandatory body-plan arithmetic overflow",
+    )
+}
+
+fn guarded_body_stage_peak<const N: usize>(
+    payload_bytes: [usize; N],
+    path: &str,
+    message: &str,
+) -> Result<usize, V3CompileError> {
+    payload_bytes.into_iter().try_fold(0usize, |peak, bytes| {
+        checked_add(
+            peak,
+            project_guarded_body_allocation(bytes, path, message)?,
+            path,
+            message,
+        )
+    })
+}
+
+fn project_guarded_body_allocation(
+    payload_bytes: usize,
+    path: &str,
+    message: &str,
+) -> Result<usize, V3CompileError> {
+    guarded_body_allocation_bytes(payload_bytes).ok_or_else(|| V3CompileError::at(path, message))
 }
 
 fn checked_add(
@@ -4699,6 +4760,181 @@ default = "deny"
         )
     }
 
+    fn guarded(payload_bytes: usize) -> usize {
+        guarded_body_allocation_bytes(payload_bytes)
+            .expect("test payload must have a guarded allocation projection")
+    }
+
+    fn one_byte_body_provider_config(service: &str) -> String {
+        resource_config(
+            service,
+            r#"
+[authorization.providers.body]
+kind = "process"
+command = "/bin/body-provider"
+include_request_body = true
+max_request_body_bytes = 1
+max_decoded_request_body_bytes = 1
+retire_timeout = "1s"
+"#,
+            r#"
+[[policy.rules]]
+id = "body"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "body"
+"#,
+        )
+    }
+
+    #[test]
+    fn guarded_stage_projects_each_partial_buffer_independently() {
+        let peak = guarded_body_stage_peak(
+            [1, 1],
+            "test",
+            "guarded stage projection arithmetic overflow",
+        )
+        .unwrap();
+
+        assert_eq!(peak, 2 * guarded(1));
+        assert!(peak > guarded(2));
+    }
+
+    #[test]
+    fn provider_schedule_projects_original_stream_scratch_and_retention() {
+        let input = one_byte_body_provider_config("");
+        let config: super::super::authoring::ConfigV3 = toml::from_str(&input).unwrap();
+        let schedule = compile_http_rule_schedule(&config, &config.policy.rules[0]).unwrap();
+
+        assert_eq!(schedule.initial_peak, 3 * guarded(1));
+        assert_eq!(
+            schedule.incoming_stages[0].additional_bytes,
+            guarded(64 * 1024)
+        );
+        assert_eq!(schedule.retained_original_after_pass, Some(guarded(1)));
+    }
+
+    #[test]
+    fn replacement_projection_charges_each_chunk_and_node_at_boundary() {
+        let line_bytes = 64 * 1024 + 1;
+        let peak = replacement_decode_peak(line_bytes, 1).unwrap();
+
+        assert_eq!(
+            peak,
+            guarded(line_bytes) + guarded(1) + guarded(DECODER_SCRATCH_BYTES)
+        );
+        assert_eq!(guarded(line_bytes), 2 * guarded(1));
+    }
+
+    #[test]
+    fn delegate_pass_retention_adds_later_partial_buffers_separately() {
+        let input = resource_config(
+            "",
+            r#"
+[authorization.providers.body]
+kind = "process"
+command = "/bin/body-provider"
+include_request_body = true
+max_request_body_bytes = 1
+max_decoded_request_body_bytes = 1
+retire_timeout = "1s"
+
+[redaction.profiles.terminal]
+max_body_bytes = 1
+max_decoded_body_bytes = 1
+rules = [{ literals = ["x"] }]
+"#,
+            r#"
+[[policy.rules]]
+id = "delegate"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "body"
+
+[[policy.rules]]
+id = "terminal"
+decision = "allow"
+methods = ["POST"]
+redaction_profile = "terminal"
+"#,
+        );
+        let config: super::super::authoring::ConfigV3 = toml::from_str(&input).unwrap();
+        let first = compile_http_rule_schedule(&config, &config.policy.rules[0]).unwrap();
+        let second = compile_http_rule_schedule(&config, &config.policy.rules[1]).unwrap();
+        let retained = first.retained_original_after_pass.unwrap();
+        let later_additional = second.max_incoming_additional_bytes();
+        let compiled = compile(&input).unwrap();
+
+        assert_eq!(retained, guarded(1));
+        assert_eq!(later_additional, 2 * guarded(1));
+        assert_eq!(
+            compiled
+                .reloadable_plan
+                .resource_plan
+                .http_wire_body_peak_bytes_by_cursor[0],
+            retained + later_additional
+        );
+    }
+
+    #[test]
+    fn minimum_concurrency_uses_the_projected_allocation_peak() {
+        let baseline = compile(&one_byte_body_provider_config("")).unwrap();
+        let peak = baseline
+            .reloadable_plan
+            .resource_plan
+            .max_reachable_http_wire_body_peak_bytes;
+        let exact_service = format!(
+            "max_inflight_wire_body_bytes = {}\nmax_inflight_wire_body_bytes_per_quota_key = {peak}\nmin_wire_body_concurrency = 5",
+            5 * peak
+        );
+        let exact = compile(&one_byte_body_provider_config(&exact_service)).unwrap();
+        assert_eq!(
+            exact
+                .reloadable_plan
+                .resource_plan
+                .wire_body_full_peak_capacity,
+            Capacity::Finite(5)
+        );
+
+        let insufficient_service = format!(
+            "max_inflight_wire_body_bytes = {}\nmax_inflight_wire_body_bytes_per_quota_key = {peak}\nmin_wire_body_concurrency = 5",
+            5 * peak - 1
+        );
+        let error = compile(&one_byte_body_provider_config(&insufficient_service))
+            .expect_err("one byte below the projected product must fail");
+        assert_eq!(error.path, "service.min_wire_body_concurrency");
+    }
+
+    #[test]
+    fn compiled_decode_peak_matches_live_chunk_charge() {
+        use crate::safety::{WireBodyPool, WireBodyQuotaKey};
+
+        let compiled = compile(&one_byte_body_provider_config("")).unwrap();
+        let peak = compiled
+            .reloadable_plan
+            .resource_plan
+            .max_reachable_http_wire_body_peak_bytes;
+        let pool = WireBodyPool::new(peak, peak);
+        let guard = pool.begin_for_test(
+            peak,
+            WireBodyQuotaKey::from_peer(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                |_| false,
+            ),
+        );
+        let mut encoded = guard.buffer();
+        let mut decoded = guard.buffer();
+        let mut decoder_scratch = guard.buffer();
+        encoded.try_extend_from_slice(&[1]).unwrap();
+        decoded.try_extend_from_slice(&[2]).unwrap();
+        decoder_scratch
+            .try_extend_from_slice(&[0; 64 * 1024])
+            .unwrap();
+
+        assert_eq!(guard.live_bytes(), peak);
+        assert_eq!(pool.global_charge(), peak);
+    }
+
     fn reloadable_ownership_observations(plan: &ReloadableProductPlan) -> Vec<String> {
         let egress_route = match plan.egress.route {
             CompiledEgressRoute::Direct => "direct",
@@ -5559,9 +5795,9 @@ redaction_profile = "large"
         );
         let compiled = compile(&input).unwrap();
         let plan = &compiled.reloadable_plan.resource_plan;
-        let decode_peak = 16 * MIB + DECODER_SCRATCH_BYTES;
-        assert_eq!(plan.http_wire_body_peak_bytes_by_cursor[0], decode_peak);
-        assert_eq!(plan.http_wire_body_peak_bytes_by_cursor[1], decode_peak);
+        let redaction_peak = 2 * guarded(8 * MIB) + guarded(DECODER_SCRATCH_BYTES);
+        assert_eq!(plan.http_wire_body_peak_bytes_by_cursor[0], redaction_peak);
+        assert_eq!(plan.http_wire_body_peak_bytes_by_cursor[1], redaction_peak);
     }
 
     #[test]
@@ -5603,7 +5839,11 @@ redaction_profile = "terminal"
                 .reloadable_plan
                 .resource_plan
                 .http_wire_body_peak_bytes_by_cursor,
-            vec![24 * MIB + scratch, 16 * MIB + scratch, 0]
+            vec![
+                guarded(16 * MIB) + guarded(8 * MIB) + guarded(scratch),
+                2 * guarded(8 * MIB) + guarded(scratch),
+                0,
+            ]
         );
     }
 
@@ -5661,9 +5901,9 @@ redaction_profile = "terminal"
                 .resource_plan
                 .http_wire_body_peak_bytes_by_cursor,
             vec![
-                24 * MIB + scratch,
-                16 * MIB + scratch,
-                16 * MIB + scratch,
+                guarded(16 * MIB) + guarded(8 * MIB) + guarded(scratch),
+                2 * guarded(8 * MIB) + guarded(scratch),
+                2 * guarded(8 * MIB) + guarded(scratch),
                 0,
             ]
         );
@@ -5698,7 +5938,53 @@ authorization_provider = "replacing"
                 .reloadable_plan
                 .resource_plan
                 .max_reachable_http_wire_body_peak_bytes,
-            32 * MIB + DECODER_SCRATCH_BYTES
+            2 * guarded(16 * MIB) + guarded(DECODER_SCRATCH_BYTES)
+        );
+    }
+
+    #[test]
+    fn stricter_profile_limits_every_combined_provider_body_stage() {
+        let peak = 3 * guarded(1);
+        let input = resource_config(
+            &format!(
+                "max_inflight_wire_body_bytes = {}\nmax_inflight_wire_body_bytes_per_quota_key = {peak}\nmin_wire_body_concurrency = 5",
+                5 * peak
+            ),
+            r#"
+[authorization.providers.large]
+kind = "process"
+command = "/bin/large-provider"
+include_request_body = true
+allow_request_body_replacement = true
+max_request_body_bytes = 16777216
+max_decoded_request_body_bytes = 16777216
+max_stdout_line_bytes = 65536
+retire_timeout = "1s"
+
+[redaction.profiles.small]
+max_body_bytes = 1
+max_decoded_body_bytes = 1
+rules = [{ literals = ["x"] }]
+"#,
+            r#"
+[[policy.rules]]
+id = "combined"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "large"
+redaction_profile = "small"
+"#,
+        );
+        let compiled = compile(&input)
+            .expect("the exact pool holds every stage reachable through the stricter profile");
+        let resources = &compiled.reloadable_plan.resource_plan;
+
+        assert_eq!(resources.max_reachable_http_wire_body_peak_bytes, peak);
+        assert_eq!(resources.http_wire_body_peak_bytes_by_cursor, [peak, 0]);
+        assert_eq!(resources.wire_body_full_peak_capacity, Capacity::Finite(5));
+        assert_eq!(
+            resources.wire_body_quota_key_full_peak_capacity,
+            Capacity::Finite(1)
         );
     }
 
@@ -5745,7 +6031,7 @@ redaction_profile = "expanding"
                 .reloadable_plan
                 .resource_plan
                 .http_wire_body_peak_bytes_by_cursor,
-            vec![16 * MIB, 16 * MIB, 0]
+            vec![2 * guarded(8 * MIB), 2 * guarded(8 * MIB), 0]
         );
     }
 

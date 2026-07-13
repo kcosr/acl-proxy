@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use http::header::HeaderMap;
+
 use tokio::sync::Notify;
 
 use crate::config::v3_compile::CompiledResourcePlan;
@@ -153,7 +155,21 @@ snapshot_handle!(AuthorizationSnapshot);
 snapshot_handle!(CredentialResolver);
 snapshot_handle!(RedactionSnapshot);
 snapshot_handle!(ObservationSnapshot);
-snapshot_handle!(SafetySnapshot);
+pub(crate) trait SafetySnapshot: Send + Sync {
+    fn contains_loop_marker(&self, headers: &HeaderMap) -> bool;
+
+    fn inject_loop_marker(
+        &self,
+        headers: &mut HeaderMap,
+        request_id: &str,
+    ) -> Result<(), crate::safety::InvalidLoopMarker>;
+
+    fn begin_http_body(
+        &self,
+        plan: crate::policy::HttpWireBodyPlanIndex,
+        quota_key: crate::safety::WireBodyQuotaKey,
+    ) -> Result<crate::safety::HttpWireBodyGuard, crate::safety::UnknownHttpWireBodyPlan>;
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CleanupReason {

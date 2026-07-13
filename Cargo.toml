@@ -25,6 +25,7 @@ regex = "1.11"
 regex-automata = { version = "0.4.13", default-features = false, features = ["std", "syntax", "dfa-build", "dfa-search", "unicode"] }
 memchr = "2.7"
 zeroize = "1.9"
+allocator-api2 = "0.2"
 url = "2.5"
 urlencoding = "2.1"
 tracing = "0.1"

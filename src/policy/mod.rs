@@ -2,8 +2,8 @@ mod snapshot;
 
 #[allow(unused_imports)]
 pub(crate) use snapshot::{
-    apply_header_effects, CompiledPolicySnapshot, HeaderEffectError, PolicyCursor,
-    PolicyEvaluation, PolicyOutcome, PolicyRuleMatch,
+    apply_header_effects, CompiledPolicySnapshot, HeaderEffectError, HttpWireBodyPlanBrand,
+    HttpWireBodyPlanIndex, PolicyCursor, PolicyEvaluation, PolicyOutcome, PolicyRuleMatch,
 };
 
 use std::collections::{BTreeMap, BTreeSet};

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::fmt;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use http::header::{HeaderMap, HeaderName, HeaderValue};
@@ -17,18 +18,67 @@ use crate::credentials::{
     resolve_credential_action, CredentialBindingError, ResolvedCredentialAction,
 };
 use crate::runtime::{
-    CredentialSourceRegistry, ProviderIndex, ProviderRegistry, RedactionProfileIndex,
-    RedactionProfileRegistry,
+    CredentialSourceIndex, CredentialSourceRegistry, ProviderIndex, ProviderRegistry,
+    RedactionProfileIndex, RedactionProfileRegistry, ResolvedBindings, ResolvedRuleBindings,
 };
 use crate::url::CanonicalUrl;
 
 const MAX_HEADER_FIELD_BYTES: usize = 64 * 1024;
 const MAX_HEADER_VALUE_BYTES: usize = 1024 * 1024;
+static NEXT_WIRE_BODY_PLAN_BRAND: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HttpWireBodyPlanIndex {
+    brand: HttpWireBodyPlanBrand,
+    ordinal: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HttpWireBodyPlanBrand(u64);
+
+impl HttpWireBodyPlanIndex {
+    fn new(brand: HttpWireBodyPlanBrand, ordinal: usize) -> Self {
+        Self { brand, ordinal }
+    }
+
+    pub(crate) fn resolve(
+        self,
+        expected_brand: HttpWireBodyPlanBrand,
+        peaks: &[usize],
+    ) -> Option<usize> {
+        (self.brand == expected_brand)
+            .then(|| peaks.get(self.ordinal).copied())
+            .flatten()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_pair(ordinal: usize) -> (HttpWireBodyPlanBrand, Self) {
+        let brand = next_wire_body_plan_brand();
+        (brand, Self::new(brand, ordinal))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_for_brand(brand: HttpWireBodyPlanBrand, ordinal: usize) -> Self {
+        Self::new(brand, ordinal)
+    }
+}
+
+fn next_wire_body_plan_brand() -> HttpWireBodyPlanBrand {
+    let brand = NEXT_WIRE_BODY_PLAN_BRAND.fetch_add(1, Ordering::Relaxed);
+    assert!(brand != 0, "HTTP wire-body plan brand overflow");
+    HttpWireBodyPlanBrand(brand)
+}
 
 /// Immutable, generation-owned policy compiled from the product configuration.
 pub(crate) struct CompiledPolicySnapshot {
     default: CompiledDefaultDecision,
     rules: Box<[ActivatedPolicyRule]>,
+    wire_body_plan_brand: HttpWireBodyPlanBrand,
+}
+
+pub(crate) struct PolicyActivation {
+    snapshot: CompiledPolicySnapshot,
+    bindings: ResolvedBindings,
 }
 
 impl fmt::Debug for CompiledPolicySnapshot {
@@ -37,6 +87,12 @@ impl fmt::Debug for CompiledPolicySnapshot {
             .debug_struct("CompiledPolicySnapshot")
             .field("rule_count", &self.rules.len())
             .finish()
+    }
+}
+
+impl fmt::Debug for PolicyActivation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.snapshot.fmt(formatter)
     }
 }
 
@@ -87,6 +143,13 @@ pub(crate) enum PolicyOutcome {
 pub(crate) struct PolicyEvaluation<'snapshot> {
     pub(crate) outcome: PolicyOutcome,
     pub(crate) matched: Option<PolicyRuleMatch<'snapshot>>,
+    wire_body_plan: HttpWireBodyPlanIndex,
+}
+
+impl PolicyEvaluation<'_> {
+    pub(crate) fn wire_body_plan(&self) -> HttpWireBodyPlanIndex {
+        self.wire_body_plan
+    }
 }
 
 pub(crate) struct PolicyRuleMatch<'snapshot> {
@@ -101,9 +164,9 @@ impl CompiledPolicySnapshot {
         provider_registry: &ProviderRegistry,
         redaction_profile_registry: &RedactionProfileRegistry,
         credential_source_registry: &CredentialSourceRegistry,
-    ) -> Result<Self, PolicyActivationError> {
-        let rules = plan
-            .rules
+    ) -> Result<PolicyActivation, PolicyActivationError> {
+        let PolicyPlan { default, rules } = plan;
+        let rules = rules
             .into_iter()
             .enumerate()
             .map(|(rule_index, rule)| {
@@ -117,9 +180,19 @@ impl CompiledPolicySnapshot {
             })
             .collect::<Result<Vec<_>, _>>()?
             .into_boxed_slice();
-        Ok(Self {
-            default: plan.default,
-            rules,
+        let bindings = resolved_bindings(
+            &rules,
+            provider_registry.len(),
+            redaction_profile_registry.len(),
+            credential_source_registry.len(),
+        );
+        Ok(PolicyActivation {
+            snapshot: Self {
+                default,
+                rules,
+                wire_body_plan_brand: next_wire_body_plan_brand(),
+            },
+            bindings,
         })
     }
 
@@ -155,6 +228,8 @@ impl CompiledPolicySnapshot {
             &credential_source_registry,
         )
         .expect("test policy bindings are complete")
+        .into_parts()
+        .0
     }
 
     pub(crate) fn evaluate<'snapshot, ExtraPresence>(
@@ -193,6 +268,10 @@ impl CompiledPolicySnapshot {
                         index,
                         rule,
                     }),
+                    wire_body_plan: HttpWireBodyPlanIndex::new(
+                        self.wire_body_plan_brand,
+                        start_index,
+                    ),
                 };
             }
         }
@@ -203,7 +282,26 @@ impl CompiledPolicySnapshot {
                 CompiledDefaultDecision::Deny => PolicyOutcome::Deny,
             },
             matched: None,
+            wire_body_plan: HttpWireBodyPlanIndex::new(self.wire_body_plan_brand, start_index),
         }
+    }
+}
+
+impl PolicyActivation {
+    pub(crate) fn wire_body_plan_brand(&self) -> HttpWireBodyPlanBrand {
+        self.snapshot.wire_body_plan_brand
+    }
+
+    pub(crate) fn into_parts(self) -> (CompiledPolicySnapshot, ResolvedBindings) {
+        (self.snapshot, self.bindings)
+    }
+}
+
+impl std::ops::Deref for PolicyActivation {
+    type Target = CompiledPolicySnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
     }
 }
 
@@ -257,6 +355,42 @@ impl<'snapshot> PolicyRuleMatch<'snapshot> {
 }
 
 impl crate::runtime::PolicySnapshot for CompiledPolicySnapshot {}
+
+fn resolved_bindings(
+    rules: &[ActivatedPolicyRule],
+    provider_count: usize,
+    redaction_profile_count: usize,
+    credential_count: usize,
+) -> ResolvedBindings {
+    let rules = rules
+        .iter()
+        .map(|rule| ResolvedRuleBindings {
+            authorization_provider: rule.authorization_provider,
+            redaction_profile: rule.redaction_profile,
+            credentials: rule
+                .credential_actions
+                .iter()
+                .map(credential_source_index)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    ResolvedBindings {
+        provider_count,
+        redaction_profile_count,
+        credential_count,
+        rules,
+    }
+}
+
+fn credential_source_index(action: &ResolvedCredentialAction) -> CredentialSourceIndex {
+    match action {
+        ResolvedCredentialAction::Bearer { source }
+        | ResolvedCredentialAction::Basic { source, .. }
+        | ResolvedCredentialAction::CustomHeader { source, .. } => *source,
+    }
+}
 
 fn activate_rule(
     rule_index: usize,
@@ -1061,6 +1195,96 @@ mod tests {
     }
 
     #[test]
+    fn skipped_rules_keep_the_evaluation_plan_at_the_starting_cursor() {
+        let skipped = rule(
+            "skipped",
+            CompiledRuleDecision::Deny,
+            "https://other.example/**",
+        );
+        let matched = rule(
+            "matched",
+            CompiledRuleDecision::Allow,
+            "https://example.com/**",
+        );
+        let snapshot = snapshot(CompiledDefaultDecision::Deny, vec![skipped, matched]);
+        let evaluation = evaluate(&snapshot, "https://example.com/path", &HeaderMap::new());
+
+        assert_eq!(evaluation.matched.as_ref().unwrap().index(), 1);
+        assert_eq!(
+            evaluation
+                .wire_body_plan()
+                .resolve(snapshot.wire_body_plan_brand, &[101, 202]),
+            Some(101)
+        );
+    }
+
+    #[test]
+    fn resumed_cursor_owns_its_branded_plan_independent_of_later_match() {
+        let delegate = rule(
+            "delegate",
+            CompiledRuleDecision::Delegate,
+            "https://example.com/**",
+        );
+        let skipped = rule(
+            "skipped",
+            CompiledRuleDecision::Deny,
+            "https://other.example/**",
+        );
+        let allow = rule(
+            "allow",
+            CompiledRuleDecision::Allow,
+            "https://example.com/**",
+        );
+        let active = snapshot(
+            CompiledDefaultDecision::Deny,
+            vec![delegate, skipped, allow],
+        );
+        let url = canonicalize_http_url("https://example.com/path").unwrap();
+        let first = active.evaluate(
+            &url,
+            "192.0.2.10".parse().unwrap(),
+            &Method::GET,
+            &HeaderMap::new(),
+            |_| false,
+        );
+        assert_eq!(
+            first
+                .wire_body_plan()
+                .resolve(active.wire_body_plan_brand, &[11, 22, 33]),
+            Some(11)
+        );
+        let resumed = first.matched.unwrap().resume_cursor().resume(
+            &url,
+            "192.0.2.10".parse().unwrap(),
+            &Method::GET,
+            &HeaderMap::new(),
+            |_| false,
+        );
+        assert_eq!(resumed.matched.as_ref().unwrap().index(), 2);
+        assert_eq!(
+            resumed
+                .wire_body_plan()
+                .resolve(active.wire_body_plan_brand, &[11, 22, 33]),
+            Some(22)
+        );
+
+        let foreign = snapshot(
+            CompiledDefaultDecision::Deny,
+            vec![rule(
+                "foreign",
+                CompiledRuleDecision::Allow,
+                "https://example.com/**",
+            )],
+        );
+        assert_eq!(
+            resumed
+                .wire_body_plan()
+                .resolve(foreign.wire_body_plan_brand, &[22]),
+            None
+        );
+    }
+
+    #[test]
     fn continuation_is_bound_to_its_originating_snapshot() {
         let first = rule(
             "delegate-old",
@@ -1468,7 +1692,7 @@ mod tests {
             "password-marker".to_string(),
             "bearer-marker".to_string(),
         ]);
-        let snapshot = CompiledPolicySnapshot::activate(
+        let activation = CompiledPolicySnapshot::activate(
             PolicyPlan {
                 default: CompiledDefaultDecision::Deny,
                 rules: vec![bound],
@@ -1478,6 +1702,7 @@ mod tests {
             &credential_registry,
         )
         .unwrap();
+        let (snapshot, bindings) = activation.into_parts();
         let matched = evaluate(&snapshot, "https://example.com/", &HeaderMap::new())
             .matched
             .unwrap();
@@ -1505,6 +1730,23 @@ mod tests {
                     source: credential_registry.get("custom-marker").unwrap(),
                 },
             ]
+        );
+        assert_eq!(bindings.provider_count, provider_registry.len());
+        assert_eq!(bindings.redaction_profile_count, profile_registry.len());
+        assert_eq!(bindings.credential_count, credential_registry.len());
+        assert_eq!(bindings.rules.len(), 1);
+        assert_eq!(
+            bindings.rules[0],
+            ResolvedRuleBindings {
+                authorization_provider: provider_registry.get("provider-marker"),
+                redaction_profile: profile_registry.get("profile-marker"),
+                credentials: vec![
+                    credential_registry.get("bearer-marker").unwrap(),
+                    credential_registry.get("password-marker").unwrap(),
+                    credential_registry.get("custom-marker").unwrap(),
+                ]
+                .into_boxed_slice(),
+            }
         );
         let rendered = format!("{snapshot:?}");
         for marker in [
