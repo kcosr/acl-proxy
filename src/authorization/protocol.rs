@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::io;
 #[cfg(test)]
-use std::io::Read;
-use std::io::{self, Write};
+use std::io::{Read, Write};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
@@ -255,21 +255,21 @@ impl<'a> ProviderRequestHeaders<'a> {
                 || !names.insert(field.name.as_str())
                 || field.values.iter().any(|value| value.to_str().is_err())
             {
-                return Err(RequestShapeError::InvalidHeaders);
+                return Err(RequestShapeError::Headers);
             }
             aggregate_bytes = aggregate_bytes
                 .checked_add(field.name.as_str().len())
-                .ok_or(RequestShapeError::InvalidHeaders)?;
+                .ok_or(RequestShapeError::Headers)?;
             for value in field.values {
                 if value.as_bytes().len() > MAX_INCLUDED_HEADER_VALUE_BYTES {
-                    return Err(RequestShapeError::InvalidHeaders);
+                    return Err(RequestShapeError::Headers);
                 }
                 aggregate_bytes = aggregate_bytes
                     .checked_add(value.as_bytes().len())
-                    .ok_or(RequestShapeError::InvalidHeaders)?;
+                    .ok_or(RequestShapeError::Headers)?;
             }
             if aggregate_bytes > MAX_INCLUDED_HEADERS_BYTES {
-                return Err(RequestShapeError::InvalidHeaders);
+                return Err(RequestShapeError::Headers);
             }
         }
         Ok(Self { fields })
@@ -325,6 +325,9 @@ pub(crate) struct ProviderRequest<'a> {
 }
 
 impl ProviderRequest<'_> {
+    /// Reference encoder used only to verify the guarded async production
+    /// framing byte-for-byte in tests.
+    #[cfg(test)]
     pub(crate) fn write_compact(
         &self,
         correlation_id: &str,
@@ -400,9 +403,9 @@ impl ProviderRequest<'_> {
                     if value_index != 0 {
                         writer.write_all(b",").await?;
                     }
-                    let value = value.to_str().map_err(|_| {
-                        RequestStreamError::Shape(RequestShapeError::InvalidHeaders)
-                    })?;
+                    let value = value
+                        .to_str()
+                        .map_err(|_| RequestStreamError::Shape(RequestShapeError::Headers))?;
                     write_json_string_async(&mut writer, value).await?;
                 }
                 writer.write_all(b"]").await?;
@@ -432,21 +435,21 @@ impl ProviderRequest<'_> {
 
     fn prevalidate(&self, correlation_id: &str) -> Result<(), RequestShapeError> {
         if self.request_id.is_empty() || self.request_id.len() > MAX_PROVIDER_REQUEST_ID_BYTES {
-            return Err(RequestShapeError::InvalidRequestId);
+            return Err(RequestShapeError::RequestId);
         }
         if correlation_id.len() != PROCESS_PROVIDER_CORRELATION_ID_BYTES
             || correlation_id
                 .bytes()
                 .any(|byte| matches!(byte, b'\\' | b'"' | 0..=31 | 127..=u8::MAX))
         {
-            return Err(RequestShapeError::InvalidRequestId);
+            return Err(RequestShapeError::RequestId);
         }
         if let Some(headers) = self.headers {
             ProviderRequestHeaders::new(headers.fields)?;
         }
         if let Some(body) = &self.body {
             validate_content_metadata(body.content_type, body.content_encoding)
-                .map_err(|_| RequestShapeError::InvalidBodyMetadata)?;
+                .map_err(|_| RequestShapeError::BodyMetadata)?;
         }
         Ok(())
     }
@@ -605,10 +608,14 @@ where
     result
 }
 
+// Reference-only synchronous framing helpers. Production framing must use the
+// guarded async path above.
+#[cfg(test)]
 fn write_json_string(writer: impl Write, value: &str) -> Result<(), RequestShapeError> {
     serde_json::to_writer(writer, value).map_err(|_| RequestShapeError::Serialization)
 }
 
+#[cfg(test)]
 fn write_base64_stream(
     writer: &mut impl Write,
     decoded: &GuardedBody,
@@ -623,12 +630,14 @@ fn write_base64_stream(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RequestShapeError {
-    InvalidRequestId,
-    InvalidHeaders,
-    InvalidBodyMetadata,
+    RequestId,
+    Headers,
+    BodyMetadata,
+    #[cfg(test)]
     Serialization,
 }
 
+#[cfg(test)]
 impl From<std::io::Error> for RequestShapeError {
     fn from(_: std::io::Error) -> Self {
         Self::Serialization
@@ -740,7 +749,7 @@ where
     expect_prefix_byte(reader, &mut consumed, prefix_limit, b':').await?;
     expect_prefix_byte(reader, &mut consumed, prefix_limit, b'\"').await?;
 
-    let mut id = [0u8; MAX_RESPONSE_ID_PREFIX_BYTES];
+    let mut id = Zeroizing::new([0u8; MAX_RESPONSE_ID_PREFIX_BYTES]);
     let mut id_len = 0usize;
     loop {
         let byte = read_prefix_byte(reader, &mut consumed, prefix_limit)
@@ -766,7 +775,6 @@ where
     let parsed_id = std::str::from_utf8(&id[..id_len])
         .map_err(|_| ResponsePrefixError::Invalid)?
         .to_owned();
-    id[..id_len].zeroize();
     Ok(Some(ProviderResponseContinuation {
         id: parsed_id,
         consumed_bytes: consumed,
@@ -1862,7 +1870,7 @@ mod tests {
             let mut output = Vec::new();
             assert_eq!(
                 request.write_compact(TEST_CORRELATION_ID, &mut output),
-                Err(RequestShapeError::InvalidBodyMetadata)
+                Err(RequestShapeError::BodyMetadata)
             );
             assert!(output.is_empty());
         }
@@ -1883,7 +1891,7 @@ mod tests {
             let mut output = Vec::new();
             assert_eq!(
                 request.write_compact(TEST_CORRELATION_ID, &mut output),
-                Err(RequestShapeError::InvalidRequestId)
+                Err(RequestShapeError::RequestId)
             );
             assert!(output.is_empty());
         }
@@ -1899,7 +1907,7 @@ mod tests {
         let mut output = Vec::new();
         assert_eq!(
             request.write_compact("unsafe", &mut output),
-            Err(RequestShapeError::InvalidRequestId)
+            Err(RequestShapeError::RequestId)
         );
         assert!(output.is_empty());
     }
@@ -1911,7 +1919,7 @@ mod tests {
         let fields = [IncludedHeader::new(&CONTENT_TYPE, &values)];
         assert!(matches!(
             ProviderRequestHeaders::new(&fields),
-            Err(RequestShapeError::InvalidHeaders)
+            Err(RequestShapeError::Headers)
         ));
         let headers = ProviderRequestHeaders { fields: &fields };
         let request = ProviderRequest {
@@ -1925,7 +1933,7 @@ mod tests {
         let mut output = Vec::new();
         assert_eq!(
             request.write_compact(TEST_CORRELATION_ID, &mut output),
-            Err(RequestShapeError::InvalidHeaders)
+            Err(RequestShapeError::Headers)
         );
         assert!(output.is_empty());
     }
@@ -1943,7 +1951,7 @@ mod tests {
         let over_fields = [IncludedHeader::new(&CONTENT_TYPE, &over_values)];
         assert!(matches!(
             ProviderRequestHeaders::new(&over_fields),
-            Err(RequestShapeError::InvalidHeaders)
+            Err(RequestShapeError::Headers)
         ));
     }
 
@@ -1981,7 +1989,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(matches!(
             ProviderRequestHeaders::new(&over_fields),
-            Err(RequestShapeError::InvalidHeaders)
+            Err(RequestShapeError::Headers)
         ));
 
         let headers = ProviderRequestHeaders {
@@ -2008,7 +2016,7 @@ mod tests {
             request
                 .stream_before_commit(TEST_CORRELATION_ID, &mut output, &mut scratch)
                 .await,
-            Err(RequestStreamError::Shape(RequestShapeError::InvalidHeaders))
+            Err(RequestStreamError::Shape(RequestShapeError::Headers))
         ));
         assert!(output.is_empty());
     }

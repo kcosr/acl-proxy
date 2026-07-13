@@ -150,7 +150,7 @@ impl AuthorizationSnapshot for ProductAuthorizationSnapshot {
         &'a self,
         provider: ProviderIndex,
         request: ProviderRequest<'a>,
-        guard: HttpWireBodyGuard,
+        guard: &'a HttpWireBodyGuard,
         request_deadline: Instant,
     ) -> BoxFuture<'a, Result<AuthorizationDecision, AuthorizationDispatchError>> {
         Box::pin(async move {
@@ -440,7 +440,7 @@ for line in sys.stdin:
                 .dispatch(
                     provider,
                     request("request-1"),
-                    body_guard(),
+                    &body_guard(),
                     Instant::now() + Duration::from_secs(5),
                 )
                 .await
@@ -456,12 +456,70 @@ for line in sys.stdin:
                 .dispatch(
                     foreign,
                     request("request-2"),
-                    body_guard(),
+                    &body_guard(),
                     Instant::now() + Duration::from_secs(5),
                 )
                 .await,
             Err(AuthorizationDispatchError::UnknownProvider)
         ));
+        cleanup(&owners).await;
+    }
+
+    #[tokio::test]
+    async fn pass_dispatch_borrows_guard_and_preserves_request_body_ownership() {
+        let directory = TempDir::new().unwrap();
+        let script = write_python(
+            &directory,
+            "pass.py",
+            r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({"id":request["id"],"type":"response","decision":"pass"}, separators=(",", ":")), flush=True)
+"#,
+        );
+        let activation = ProductAuthorizationSnapshot::activate(
+            authorization_plan(BTreeMap::from([(
+                "decision".to_string(),
+                AuthorizationProviderPlan::Process(process_plan(&directory, &script)),
+            )])),
+            cancellation(),
+        )
+        .await
+        .unwrap();
+        let provider = activation.provider_registry().get("decision").unwrap();
+        let (snapshot, _, owners) = activation.into_parts();
+        for owner in &owners {
+            let mut publication = owner.publication_guard().unwrap();
+            publication.commit();
+        }
+
+        let guard = body_guard();
+        let mut body = guard.buffer();
+        body.try_extend_from_slice(b"retained request body")
+            .unwrap();
+        let body = body.finish();
+        let body_charge = body.charged_bytes();
+        assert_eq!(guard.live_bytes(), body_charge);
+
+        let object: &dyn AuthorizationSnapshot = &snapshot;
+        assert_eq!(
+            object
+                .dispatch(
+                    provider,
+                    request("request-pass"),
+                    &guard,
+                    Instant::now() + Duration::from_secs(5),
+                )
+                .await
+                .unwrap(),
+            AuthorizationDecision::Pass
+        );
+        assert_eq!(guard.live_bytes(), body_charge);
+
+        let body = guard.transfer_body(body).unwrap();
+        assert_eq!(body.len(), b"retained request body".len());
+        drop(body);
+        assert_eq!(guard.live_bytes(), 0);
         cleanup(&owners).await;
     }
 

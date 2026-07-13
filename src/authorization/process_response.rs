@@ -5,7 +5,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use super::protocol::{AssignedResponseError, DirectProviderStdout, ProviderResponseContinuation};
 use crate::config::v3_compile::ProcessProviderPlan;
 use crate::safety::wire_body::{GuardedBodySegments, WireBodyBufferError};
-use crate::safety::{GuardedBody, HttpWireBodyGuard};
+#[cfg(test)]
+use crate::safety::HttpWireBodyGuard;
+use crate::safety::{GuardedBody, ProviderResponseCharge};
 
 const MAX_JSON_DEPTH: usize = 128;
 const MAX_JSON_KEY_BYTES: usize = 32;
@@ -61,7 +63,7 @@ pub(super) enum FatalProcessResponseError {
 pub(super) async fn read_decision_only_response(
     reader: &mut DirectProviderStdout,
     continuation: ProviderResponseContinuation,
-    guard: &HttpWireBodyGuard,
+    guard: &ProviderResponseCharge,
     _schema: &DecisionOnlyResponseSchema,
 ) -> Result<DecisionOnlyResponse, FatalProcessResponseError> {
     read_decision_only_response_from(reader, continuation, guard).await
@@ -77,13 +79,14 @@ async fn read_decision_only_response_for_test<R>(
 where
     R: AsyncRead + Unpin,
 {
-    read_decision_only_response_from(reader, continuation, guard).await
+    let response_charge = guard.provider_response_charge();
+    read_decision_only_response_from(reader, continuation, &response_charge).await
 }
 
 async fn read_decision_only_response_from<R>(
     reader: &mut R,
     continuation: ProviderResponseContinuation,
-    guard: &HttpWireBodyGuard,
+    guard: &ProviderResponseCharge,
 ) -> Result<DecisionOnlyResponse, FatalProcessResponseError>
 where
     R: AsyncRead + Unpin,
@@ -97,7 +100,7 @@ struct GuardedResponseLine(GuardedBody);
 async fn read_guarded_suffix<R>(
     reader: &mut R,
     continuation: ProviderResponseContinuation,
-    guard: &HttpWireBodyGuard,
+    guard: &ProviderResponseCharge,
 ) -> Result<GuardedResponseLine, FatalProcessResponseError>
 where
     R: AsyncRead + Unpin,
@@ -279,22 +282,26 @@ fn expect_byte(cursor: &mut SegmentCursor<'_>, expected: u8) -> Result<(), JsonE
 }
 
 fn skip_json_value(cursor: &mut SegmentCursor<'_>, depth: usize) -> Result<(), JsonError> {
-    if depth >= MAX_JSON_DEPTH {
-        return Err(JsonError::Malformed);
-    }
     match cursor.peek() {
         Some(b'"') => {
             parse_json_string::<0>(cursor)?;
             Ok(())
         }
-        Some(b'{') => skip_json_object(cursor, depth + 1),
-        Some(b'[') => skip_json_array(cursor, depth + 1),
+        Some(b'{') => skip_json_object(cursor, enter_json_container(depth)?),
+        Some(b'[') => skip_json_array(cursor, enter_json_container(depth)?),
         Some(b't') => consume_literal(cursor, b"true"),
         Some(b'f') => consume_literal(cursor, b"false"),
         Some(b'n') => consume_literal(cursor, b"null"),
         Some(b'-' | b'0'..=b'9') => skip_json_number(cursor),
         _ => Err(JsonError::Malformed),
     }
+}
+
+fn enter_json_container(depth: usize) -> Result<usize, JsonError> {
+    let depth = depth.checked_add(1).ok_or(JsonError::Malformed)?;
+    (depth < MAX_JSON_DEPTH)
+        .then_some(depth)
+        .ok_or(JsonError::Malformed)
 }
 
 fn skip_json_object(cursor: &mut SegmentCursor<'_>, depth: usize) -> Result<(), JsonError> {
@@ -921,28 +928,49 @@ mod tests {
 
     #[tokio::test]
     async fn json_depth_limit_matches_serde_at_127_and_128_total_containers() {
-        fn nested_unknown(depth: usize) -> Vec<u8> {
+        #[derive(Clone, Copy)]
+        enum Innermost {
+            Scalar,
+            EmptyArray,
+            EmptyObject,
+        }
+
+        fn nested_unknown(containers: usize, innermost: Innermost) -> Vec<u8> {
             let mut line = b"{\"id\":\"r\",\"unknown\":".to_vec();
-            line.extend(std::iter::repeat_n(b'[', depth));
-            line.extend_from_slice(b"null");
-            line.extend(std::iter::repeat_n(b']', depth));
+            let array_depth = match innermost {
+                Innermost::EmptyObject => containers - 1,
+                Innermost::Scalar | Innermost::EmptyArray => containers,
+            };
+            line.extend(std::iter::repeat_n(b'[', array_depth));
+            match innermost {
+                Innermost::Scalar => line.extend_from_slice(b"null"),
+                Innermost::EmptyArray => {}
+                Innermost::EmptyObject => line.extend_from_slice(b"{}"),
+            }
+            line.extend(std::iter::repeat_n(b']', array_depth));
             line.extend_from_slice(b"}\n");
             line
         }
 
-        let exact = nested_unknown(MAX_JSON_DEPTH - 2);
-        assert!(serde_json::from_slice::<serde_json::Value>(&exact[..exact.len() - 1]).is_ok());
-        assert_eq!(
-            run(&exact, exact.len()).await.0.unwrap(),
-            DecisionOnlyResponse::AssignedFailure(AssignedResponseError::InvalidShape)
-        );
+        for innermost in [
+            Innermost::Scalar,
+            Innermost::EmptyArray,
+            Innermost::EmptyObject,
+        ] {
+            let exact = nested_unknown(MAX_JSON_DEPTH - 2, innermost);
+            assert!(serde_json::from_slice::<serde_json::Value>(&exact[..exact.len() - 1]).is_ok());
+            assert_eq!(
+                run(&exact, exact.len()).await.0.unwrap(),
+                DecisionOnlyResponse::AssignedFailure(AssignedResponseError::InvalidShape)
+            );
 
-        let over = nested_unknown(MAX_JSON_DEPTH - 1);
-        assert!(serde_json::from_slice::<serde_json::Value>(&over[..over.len() - 1]).is_err());
-        assert!(matches!(
-            run(&over, over.len()).await.0,
-            Err(FatalProcessResponseError::MalformedJson)
-        ));
+            let over = nested_unknown(MAX_JSON_DEPTH - 1, innermost);
+            assert!(serde_json::from_slice::<serde_json::Value>(&over[..over.len() - 1]).is_err());
+            assert!(matches!(
+                run(&over, over.len()).await.0,
+                Err(FatalProcessResponseError::MalformedJson)
+            ));
+        }
     }
 
     #[tokio::test]

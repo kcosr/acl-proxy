@@ -9,7 +9,9 @@ use crate::config::v3_compile::{CompiledResourcePlan, SafetyPlan};
 use crate::policy::{HttpWireBodyPlanBrand, HttpWireBodyPlanIndex};
 use crate::runtime::SafetySnapshot;
 
-pub(crate) use wire_body::{GuardedBody, HttpWireBodyGuard, WireBodyPool, WireBodyQuotaKey};
+pub(crate) use wire_body::{
+    GuardedBody, HttpWireBodyGuard, ProviderResponseCharge, WireBodyPool, WireBodyQuotaKey,
+};
 
 pub(crate) struct ProductSafetySnapshot {
     loop_detection: LoopDetection,

@@ -258,6 +258,13 @@ pub(crate) struct HttpWireBodyGuard {
     inner: Arc<GuardInner>,
 }
 
+/// Cloneable allocation authority for a provider response. It deliberately
+/// cannot transfer request bodies or allocate request-stream scratch.
+#[derive(Clone)]
+pub(crate) struct ProviderResponseCharge {
+    inner: Arc<GuardInner>,
+}
+
 impl fmt::Debug for HttpWireBodyGuard {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -287,6 +294,12 @@ impl HttpWireBodyGuard {
         })
     }
 
+    pub(crate) fn provider_response_charge(&self) -> ProviderResponseCharge {
+        ProviderResponseCharge {
+            inner: self.inner.clone(),
+        }
+    }
+
     pub(crate) fn live_bytes(&self) -> usize {
         self.inner.live_bytes.load(Ordering::Acquire)
     }
@@ -303,6 +316,17 @@ impl HttpWireBodyGuard {
             Ok(body)
         } else {
             Err(WireBodyBufferError::ForeignGuard)
+        }
+    }
+}
+
+impl ProviderResponseCharge {
+    pub(crate) fn buffer(&self) -> GuardedBodyBuilder {
+        GuardedBodyBuilder {
+            guard: self.inner.clone(),
+            reverse: None,
+            len: 0,
+            charged_bytes: 0,
         }
     }
 }
@@ -715,6 +739,36 @@ mod linked_tests {
             guard.stream_scratch(),
             Err(WireBodyBufferError::AllocationFailed)
         ));
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+    }
+
+    #[test]
+    fn provider_response_handles_cannot_release_request_owned_body_charge() {
+        let one = allocation(1);
+        let pool = WireBodyPool::new(2 * one, 2 * one);
+        let guard = pool.begin(2 * one, key());
+        let mut original = guard.buffer();
+        original.try_extend_from_slice(b"request body").unwrap();
+        let original = original.finish();
+        assert_eq!(guard.live_bytes(), one);
+
+        let response_charge = guard.provider_response_charge();
+        let response_charge_clone = response_charge.clone();
+        let mut response = response_charge.buffer();
+        response.try_extend_from_slice(b"response suffix").unwrap();
+        let response = response.finish();
+        assert_eq!(guard.live_bytes(), 2 * one);
+
+        drop(response);
+        drop(response_charge);
+        drop(response_charge_clone);
+        assert_eq!(guard.live_bytes(), one);
+        assert_eq!(pool.global_charge(), one);
+
+        let original = guard.transfer_body(original).unwrap();
+        assert_eq!(original.len(), b"request body".len());
+        drop(original);
         assert_eq!(guard.live_bytes(), 0);
         assert_eq!(pool.global_charge(), 0);
     }

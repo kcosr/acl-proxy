@@ -159,7 +159,7 @@ pub(crate) trait AuthorizationSnapshot: Send + Sync {
         &'a self,
         provider: ProviderIndex,
         request: crate::authorization::protocol::ProviderRequest<'a>,
-        guard: crate::safety::HttpWireBodyGuard,
+        guard: &'a crate::safety::HttpWireBodyGuard,
         request_deadline: tokio::time::Instant,
     ) -> BoxFuture<
         'a,

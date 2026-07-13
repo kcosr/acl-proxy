@@ -20,7 +20,7 @@ impl AuthorizationSnapshot for EmptySnapshot {
         &'a self,
         _provider: ProviderIndex,
         _request: crate::authorization::protocol::ProviderRequest<'a>,
-        _guard: crate::safety::HttpWireBodyGuard,
+        _guard: &'a crate::safety::HttpWireBodyGuard,
         _request_deadline: tokio::time::Instant,
     ) -> BoxFuture<
         'a,

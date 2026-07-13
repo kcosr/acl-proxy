@@ -3316,22 +3316,20 @@ fn compile_http_rule_schedule(
             configured_profile_literal_scratch_bytes(profile, &format!("redaction.profiles.{name}"))
         })
         .transpose()?;
-    let effective_process_body_limits = process_body.map(|provider| {
-        profile.map_or(
-            (
-                provider.max_request_body_bytes,
-                provider.max_decoded_request_body_bytes,
-            ),
-            |profile| {
-                (
-                    provider.max_request_body_bytes.min(profile.max_body_bytes),
-                    provider
-                        .max_decoded_request_body_bytes
-                        .min(profile.max_decoded_body_bytes),
-                )
-            },
-        )
-    });
+    let effective_body_limits = match (process_body, profile) {
+        (Some(provider), Some(profile)) => Some((
+            provider.max_request_body_bytes.min(profile.max_body_bytes),
+            provider
+                .max_decoded_request_body_bytes
+                .min(profile.max_decoded_body_bytes),
+        )),
+        (Some(provider), None) => Some((
+            provider.max_request_body_bytes,
+            provider.max_decoded_request_body_bytes,
+        )),
+        (None, Some(profile)) => Some((profile.max_body_bytes, profile.max_decoded_body_bytes)),
+        (None, None) => None,
+    };
 
     let mut initial_peak = 0usize;
     let mut incoming_stages = Vec::with_capacity(4);
@@ -3351,7 +3349,17 @@ fn compile_http_rule_schedule(
         });
     }
     let response_continuation_bytes = process_provider
-        .map(|provider| provider_response_guarded_suffix_bytes(provider.max_stdout_line_bytes));
+        .map(|provider| {
+            let provider_name = rule
+                .authorization_provider
+                .as_deref()
+                .expect("process provider was resolved from the rule");
+            provider_response_guarded_suffix_bytes(
+                provider.max_stdout_line_bytes,
+                &format!("authorization.providers.{provider_name}.max_stdout_line_bytes"),
+            )
+        })
+        .transpose()?;
     let response_continuation_allocation = response_continuation_bytes
         .map(|bytes| {
             project_guarded_body_allocation(
@@ -3367,22 +3375,31 @@ fn compile_http_rule_schedule(
             additional_bytes: response_continuation_allocation,
         });
     }
-    if let Some(provider) = process_body {
-        let (encoded_limit, original_limit) = effective_process_body_limits
-            .expect("process-body limits were derived with the process provider");
+    if let Some((encoded_limit, original_limit)) = effective_body_limits {
         initial_peak = initial_peak.max(decode_peak(encoded_limit, original_limit)?);
-        initial_peak = initial_peak.max(guarded_body_stage_peak(
-            [original_limit, PROVIDER_REQUEST_STREAM_SCRATCH_BYTES],
-            "policy.rules",
-            "HTTP provider request-stream plan arithmetic overflow",
-        )?);
+        if process_provider.is_some() {
+            initial_peak = initial_peak.max(guarded_body_stage_peak(
+                [original_limit, PROVIDER_REQUEST_STREAM_SCRATCH_BYTES],
+                "policy.rules",
+                "HTTP provider request-stream plan arithmetic overflow",
+            )?);
+            initial_peak = initial_peak.max(guarded_body_stage_peak(
+                [
+                    original_limit,
+                    response_continuation_bytes
+                        .expect("process provider has a response continuation limit"),
+                ],
+                "policy.rules",
+                "HTTP provider-response continuation arithmetic overflow",
+            )?);
+        }
+    }
+    if let Some(provider) = process_body {
+        let original_limit = effective_body_limits
+            .expect("process-body limits were derived with the process provider")
+            .1;
         let response_continuation_bytes = response_continuation_bytes
             .expect("process-body provider has a response continuation limit");
-        initial_peak = initial_peak.max(guarded_body_stage_peak(
-            [original_limit, response_continuation_bytes],
-            "policy.rules",
-            "HTTP provider-response continuation arithmetic overflow",
-        )?);
         if provider.allow_request_body_replacement {
             // The original remains live until a structurally accepted
             // replacement irrevocably wins. Only then may replacement decode
@@ -3394,11 +3411,9 @@ fn compile_http_rule_schedule(
         }
     }
     if let Some(profile) = profile {
-        let (encoded_limit, original_limit) = effective_process_body_limits
-            .unwrap_or((profile.max_body_bytes, profile.max_decoded_body_bytes));
-        if process_body.is_none() {
-            initial_peak = initial_peak.max(decode_peak(encoded_limit, original_limit)?);
-        }
+        let original_limit = effective_body_limits
+            .expect("redaction profile has effective body limits")
+            .1;
         let redaction_additional = guarded_body_stage_peak(
             [
                 profile_scratch_bytes.expect("redaction profile scratch was derived"),
@@ -3442,7 +3457,7 @@ fn compile_http_rule_schedule(
             additional_bytes: redaction_additional,
         });
         if process_body.is_some_and(|provider| provider.allow_request_body_replacement) {
-            let replacement_limit = effective_process_body_limits
+            let replacement_limit = effective_body_limits
                 .expect("replacement limits were derived with the process provider")
                 .1;
             let replacement_redaction_peak = checked_add(
@@ -3463,7 +3478,7 @@ fn compile_http_rule_schedule(
     Ok(HttpRuleAllocationSchedule {
         initial_peak,
         retained_original_after_pass: if matches!(rule.decision, RuleDecision::Delegate) {
-            effective_process_body_limits
+            effective_body_limits
                 .map(|(_, original_limit)| {
                     project_guarded_body_allocation(
                         original_limit,
@@ -3479,10 +3494,20 @@ fn compile_http_rule_schedule(
     })
 }
 
-fn provider_response_guarded_suffix_bytes(max_stdout_line_bytes: usize) -> usize {
-    max_stdout_line_bytes.saturating_sub(
-        PROCESS_PROVIDER_RESPONSE_PREFIX_BYTES + PROCESS_PROVIDER_RESPONSE_TERMINATOR_BYTES,
-    )
+fn provider_response_guarded_suffix_bytes(
+    max_stdout_line_bytes: usize,
+    path: &str,
+) -> Result<usize, V3CompileError> {
+    max_stdout_line_bytes
+        .checked_sub(
+            PROCESS_PROVIDER_RESPONSE_PREFIX_BYTES + PROCESS_PROVIDER_RESPONSE_TERMINATOR_BYTES,
+        )
+        .ok_or_else(|| {
+            V3CompileError::at(
+                path,
+                "cannot hold the fixed process-provider response prefix and terminator",
+            )
+        })
 }
 
 fn replacement_decode_peak(
@@ -4892,6 +4917,143 @@ authorization_provider = "decision"
     }
 
     #[test]
+    fn redacted_original_overlaps_decision_only_request_and_response_stages() {
+        let response_bytes = 2 * 64 * 1024 + 1;
+        let max_stdout_line_bytes = response_bytes
+            + PROCESS_PROVIDER_RESPONSE_PREFIX_BYTES
+            + PROCESS_PROVIDER_RESPONSE_TERMINATOR_BYTES;
+        let input = resource_config(
+            "",
+            &format!(
+                r#"
+[authorization.providers.decision]
+kind = "process"
+command = "/bin/decision-provider"
+max_stdout_line_bytes = {max_stdout_line_bytes}
+retire_timeout = "1s"
+
+[redaction.profiles.small]
+max_body_bytes = 1
+max_decoded_body_bytes = 1
+rules = [{{ literals = ["x"] }}]
+"#
+            ),
+            r#"
+[[policy.rules]]
+id = "redacted-decision"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "decision"
+redaction_profile = "small"
+"#,
+        );
+        let config: super::super::authoring::ConfigV3 = toml::from_str(&input).unwrap();
+        let schedule = compile_http_rule_schedule(&config, &config.policy.rules[0]).unwrap();
+        let retained = guarded(1);
+        let response = guarded(response_bytes);
+
+        assert_eq!(response, 3 * guarded(1));
+        assert_eq!(schedule.initial_peak, retained + response);
+        assert_eq!(schedule.retained_original_after_pass, Some(retained));
+        assert_eq!(schedule.max_incoming_additional_bytes(), response);
+    }
+
+    #[test]
+    fn redaction_only_delegate_retains_original_for_a_later_provider() {
+        let response_bytes = 2 * 64 * 1024 + 1;
+        let max_stdout_line_bytes = response_bytes
+            + PROCESS_PROVIDER_RESPONSE_PREFIX_BYTES
+            + PROCESS_PROVIDER_RESPONSE_TERMINATOR_BYTES;
+        let input = resource_config(
+            "",
+            &format!(
+                r#"
+[authorization.providers.first]
+kind = "process"
+command = "/bin/first-provider"
+max_stdout_line_bytes = 80
+retire_timeout = "1s"
+
+[authorization.providers.later]
+kind = "process"
+command = "/bin/later-provider"
+max_stdout_line_bytes = {max_stdout_line_bytes}
+retire_timeout = "1s"
+
+[redaction.profiles.small]
+max_body_bytes = 1
+max_decoded_body_bytes = 1
+rules = [{{ literals = ["x"] }}]
+"#
+            ),
+            r#"
+[[policy.rules]]
+id = "redact-and-pass"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "first"
+redaction_profile = "small"
+
+[[policy.rules]]
+id = "later-provider"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "later"
+"#,
+        );
+        let config: super::super::authoring::ConfigV3 = toml::from_str(&input).unwrap();
+        let first = compile_http_rule_schedule(&config, &config.policy.rules[0]).unwrap();
+        let second = compile_http_rule_schedule(&config, &config.policy.rules[1]).unwrap();
+        let resources = compile(&input).unwrap().reloadable_plan.resource_plan;
+        let retained = guarded(1);
+        let response = guarded(response_bytes);
+
+        assert_eq!(first.retained_original_after_pass, Some(retained));
+        assert_eq!(second.initial_peak, response);
+        assert_eq!(second.max_incoming_additional_bytes(), response);
+        assert_eq!(
+            resources.http_wire_body_peak_bytes_by_cursor,
+            [retained + response, response, 0]
+        );
+    }
+
+    #[test]
+    fn direct_schedule_rejects_stdout_smaller_than_the_fixed_prefix() {
+        let too_small =
+            PROCESS_PROVIDER_RESPONSE_PREFIX_BYTES + PROCESS_PROVIDER_RESPONSE_TERMINATOR_BYTES - 1;
+        let input = resource_config(
+            "",
+            &format!(
+                r#"
+[authorization.providers.decision]
+kind = "process"
+command = "/bin/decision-provider"
+max_stdout_line_bytes = {too_small}
+retire_timeout = "1s"
+"#
+            ),
+            r#"
+[[policy.rules]]
+id = "decision"
+decision = "delegate"
+methods = ["GET"]
+authorization_provider = "decision"
+"#,
+        );
+        let config: super::super::authoring::ConfigV3 = toml::from_str(&input).unwrap();
+        let error = compile_http_rule_schedule(&config, &config.policy.rules[0]).unwrap_err();
+
+        assert_eq!(
+            error.path,
+            "authorization.providers.decision.max_stdout_line_bytes"
+        );
+        assert_eq!(
+            error.message,
+            "cannot hold the fixed process-provider response prefix and terminator"
+        );
+    }
+
+    #[test]
     fn retained_body_accounts_for_later_header_only_request_scratch() {
         let input = resource_config(
             "",
@@ -5091,7 +5253,10 @@ authorization_provider = "decision"
 "#,
         );
         let resources = compile(&input).unwrap().reloadable_plan.resource_plan;
-        let peak = guarded(provider_response_guarded_suffix_bytes(MIB));
+        let peak = guarded(
+            provider_response_guarded_suffix_bytes(MIB, "test.provider.max_stdout_line_bytes")
+                .unwrap(),
+        );
 
         assert_eq!(resources.http_wire_body_peak_bytes_by_cursor, [peak, 0]);
         assert_eq!(resources.max_reachable_http_wire_body_peak_bytes, peak);
