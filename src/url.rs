@@ -15,6 +15,20 @@ pub(crate) struct CanonicalUrl {
     pub query: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CanonicalAuthority {
+    pub authority: String,
+    pub host: String,
+    pub host_for_capture: String,
+    pub port: u16,
+}
+
+impl CanonicalAuthority {
+    pub(crate) fn connect_authority(&self) -> String {
+        format!("{}:{}", self.host_for_capture, self.port)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum UrlError {
     #[error("invalid absolute HTTP/HTTPS URL")]
@@ -56,16 +70,7 @@ pub(crate) fn canonicalize_http_url(raw: &str) -> Result<CanonicalUrl, UrlError>
     if raw_authority.contains('@') {
         return Err(UrlError::UserInfo);
     }
-    let (raw_host, authored_port) = split_pattern_authority(raw_authority)?;
-    let host = canonical_host(raw_host)?;
-    let default_port = if scheme == "http" { 80 } else { 443 };
-    let port = authored_port.unwrap_or(default_port);
-    let authority_host = authority_host(&host);
-    let authority = if authored_port.is_some_and(|port| port != default_port) {
-        format!("{authority_host}:{port}")
-    } else {
-        authority_host.clone()
-    };
+    let authority = canonicalize_http_authority(scheme, raw_authority)?;
 
     let target = &remainder[authority_end..];
     let (raw_path, raw_query) = match target.split_once('?') {
@@ -82,12 +87,101 @@ pub(crate) fn canonicalize_http_url(raw: &str) -> Result<CanonicalUrl, UrlError>
         .unwrap_or_default();
 
     Ok(CanonicalUrl {
-        url: format!("{scheme}://{authority}{path}{query_suffix}"),
+        url: format!("{scheme}://{}{path}{query_suffix}", authority.authority),
         scheme: scheme.to_string(),
+        authority: authority.authority,
+        host: authority.host,
+        host_for_capture: authority.host_for_capture,
+        port: authority.port,
+        path,
+        query,
+    })
+}
+
+pub(crate) fn canonicalize_http_authority(
+    scheme: &str,
+    raw: &str,
+) -> Result<CanonicalAuthority, UrlError> {
+    let scheme = canonical_scheme(&scheme.to_ascii_lowercase())?;
+    if raw.contains('@') {
+        return Err(UrlError::UserInfo);
+    }
+    if raw.contains('#') {
+        return Err(UrlError::Fragment);
+    }
+    if raw.trim() != raw
+        || raw.is_empty()
+        || raw.contains(['/', '?', '\\'])
+        || raw.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(UrlError::Host);
+    }
+
+    let (raw_host, authored_port) = split_pattern_authority(raw)?;
+    let host = canonical_host(raw_host)?;
+    let default_port = if scheme == "http" { 80 } else { 443 };
+    let port = authored_port.unwrap_or(default_port);
+    let host_for_capture = authority_host(&host);
+    let authority = if authored_port.is_some_and(|port| port != default_port) {
+        format!("{host_for_capture}:{port}")
+    } else {
+        host_for_capture.clone()
+    };
+
+    Ok(CanonicalAuthority {
         authority,
         host,
-        host_for_capture: authority_host,
+        host_for_capture,
         port,
+    })
+}
+
+pub(crate) fn canonicalize_tls_server_name(raw: &str) -> Result<String, UrlError> {
+    if raw.trim() != raw
+        || raw.is_empty()
+        || raw.contains(['/', '?', '#', '\\', '@', '[', ']', ':'])
+        || raw.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(UrlError::Host);
+    }
+    canonical_host(raw)
+}
+
+pub(crate) fn canonicalize_http_url_from_parts(
+    scheme: &str,
+    raw_authority: &str,
+    raw_path_and_query: &str,
+) -> Result<CanonicalUrl, UrlError> {
+    let scheme = canonical_scheme(&scheme.to_ascii_lowercase())?;
+    let authority = canonicalize_http_authority(scheme, raw_authority)?;
+    if raw_path_and_query.contains('#') {
+        return Err(UrlError::Fragment);
+    }
+    let target = if raw_path_and_query.is_empty() {
+        "/"
+    } else {
+        raw_path_and_query
+    };
+    let (raw_path, raw_query) = match target.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (target, None),
+    };
+    let path = normalize_path(raw_path)?;
+    let query = raw_query
+        .map(|query| normalize_component(query, ComponentKind::Query))
+        .transpose()?;
+    let query_suffix = query
+        .as_ref()
+        .map(|query| format!("?{query}"))
+        .unwrap_or_default();
+
+    Ok(CanonicalUrl {
+        url: format!("{scheme}://{}{path}{query_suffix}", authority.authority),
+        scheme: scheme.to_string(),
+        authority: authority.authority,
+        host: authority.host,
+        host_for_capture: authority.host_for_capture,
+        port: authority.port,
         path,
         query,
     })
@@ -779,6 +873,93 @@ mod tests {
             structural.url,
             "https://example.com/a%2Fb%3Fc%23d?q=%2F%3F%23"
         );
+    }
+
+    #[test]
+    fn standalone_authority_canonicalization_matches_full_urls() {
+        let cases = [
+            ("http", "EXAMPLE.com.:80", "example.com", "example.com", 80),
+            (
+                "https",
+                "b\u{fc}cher.example.:443",
+                "xn--bcher-kva.example",
+                "xn--bcher-kva.example",
+                443,
+            ),
+            (
+                "https",
+                "[2001:0db8::1]:8443",
+                "[2001:db8::1]:8443",
+                "2001:db8::1",
+                8443,
+            ),
+            (
+                "https",
+                "[::ffff:192.0.2.1]:443",
+                "192.0.2.1",
+                "192.0.2.1",
+                443,
+            ),
+        ];
+
+        for (scheme, raw, expected_authority, expected_host, expected_port) in cases {
+            let authority = canonicalize_http_authority(scheme, raw).unwrap();
+            assert_eq!(authority.authority, expected_authority);
+            assert_eq!(authority.host, expected_host);
+            assert_eq!(authority.port, expected_port);
+
+            let url = canonicalize_http_url(&format!("{scheme}://{raw}/")).unwrap();
+            assert_eq!(url.authority, authority.authority);
+            assert_eq!(url.host, authority.host);
+            assert_eq!(url.host_for_capture, authority.host_for_capture);
+            assert_eq!(url.port, authority.port);
+        }
+    }
+
+    #[test]
+    fn authority_and_sni_canonicalizers_reject_non_authority_shapes() {
+        for raw in [
+            "",
+            " example.com",
+            "example.com ",
+            "user@example.com",
+            "example.com/path",
+            "example.com?x=1",
+            "example.com#fragment",
+            "example.com:0",
+            "[2001:db8::1",
+            "127.1",
+        ] {
+            assert!(canonicalize_http_authority("https", raw).is_err(), "{raw}");
+        }
+
+        assert_eq!(
+            canonicalize_tls_server_name("B\u{dc}CHER.example.").unwrap(),
+            "xn--bcher-kva.example"
+        );
+        assert_eq!(
+            canonicalize_tls_server_name("192.0.2.1").unwrap(),
+            "192.0.2.1"
+        );
+        for raw in ["", "example.com:443", "[2001:db8::1]", "a/b", " user.test"] {
+            assert!(canonicalize_tls_server_name(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn url_from_parts_uses_the_exact_canonical_component_contract() {
+        let from_parts = canonicalize_http_url_from_parts(
+            "HTTPS",
+            "EXAMPLE.com.:443",
+            "/a/%2e%2e/b%2fc?Key=%61&x=%2f",
+        )
+        .unwrap();
+        let full =
+            canonicalize_http_url("HTTPS://EXAMPLE.com.:443/a/%2e%2e/b%2fc?Key=%61&x=%2f").unwrap();
+        assert_eq!(from_parts, full);
+
+        let ipv6 = canonicalize_http_authority("https", "[2001:db8::1]").unwrap();
+        assert_eq!(ipv6.connect_authority(), "[2001:db8::1]:443");
     }
 
     #[test]

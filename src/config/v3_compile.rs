@@ -1,12 +1,17 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind, MatchKind as AhoMatchKind};
 use http::header::{HeaderName, HeaderValue};
 use http::Method;
-use regex::Regex;
+use regex_automata::{
+    dfa::{dense, regex::Regex as DfaRegex, StartKind},
+    nfa::thompson::{self, WhichCaptures, NFA},
+    MatchKind as RegexMatchKind,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
@@ -48,6 +53,7 @@ const MAX_POLICY_RULES: usize = 100_000;
 const MAX_URLS_PER_RULE: usize = 1_024;
 const MAX_EFFECTS_PER_SCOPE: usize = 1_024;
 const MAX_HEADER_PREDICATES_PER_RULE: usize = 4_096;
+const MAX_HEADER_FIELD_BYTES: usize = 64 * 1024;
 const MAX_PROVIDER_ITEMS: usize = 256;
 const MAX_REDACTION_PROFILES: usize = 256;
 const MAX_REDACTION_RULES: usize = 1_024;
@@ -61,6 +67,11 @@ const MAX_REDACTION_ENV_BYTES: usize = MIB;
 const MAX_REDACTION_ENV_TOTAL_BYTES_PER_PROFILE: usize = 16 * MIB;
 const MAX_REDACTION_ENV_SOURCES_PER_SNAPSHOT: usize = 4_096;
 const MAX_REDACTION_ENV_BYTES_PER_SNAPSHOT: usize = 64 * MIB;
+pub(crate) const MAX_REDACTION_REGEX_DFA_BYTES: usize = MIB;
+pub(crate) const MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE: usize = 16 * MIB;
+pub(crate) const MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT: usize = 64 * MIB;
+const REDACTION_AHO_BUILD_BASE_BYTES: usize = 64 * 1024;
+const REDACTION_AHO_BUILD_BYTES_PER_INPUT_UNIT: usize = 1024;
 const MAX_TOML_REDACTION_LITERALS_PER_PROFILE: usize = 4_096;
 const MAX_TOML_REDACTION_LITERAL_BYTES_PER_PROFILE: usize = 16 * MIB;
 const MAX_LOG_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
@@ -77,104 +88,104 @@ const PROVIDER_STREAM_SCRATCH_BYTES: usize = 64 * 1024;
 /// Static, product-owned values. File paths identify material but no material is
 /// opened or parsed by this compiler.
 #[derive(Clone, PartialEq, Eq, Serialize)]
-pub(super) struct StaticProductConfig {
-    pub schema_version: u32,
-    pub config_root: PathBuf,
-    pub max_config_bytes: usize,
-    pub service: StaticServiceConfig,
-    pub control: Option<StaticControlConfig>,
-    pub listeners: StaticListenersConfig,
-    pub mitm: Option<StaticMitmConfig>,
-    pub callback_public_url: Option<String>,
-    pub logging: StaticLoggingConfig,
+pub(crate) struct StaticProductConfig {
+    pub(crate) schema_version: u32,
+    pub(crate) config_root: PathBuf,
+    pub(crate) max_config_bytes: usize,
+    pub(crate) service: StaticServiceConfig,
+    pub(crate) control: Option<StaticControlConfig>,
+    pub(crate) listeners: StaticListenersConfig,
+    pub(crate) mitm: Option<StaticMitmConfig>,
+    pub(crate) callback_public_url: Option<String>,
+    pub(crate) logging: StaticLoggingConfig,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
-pub(super) struct StaticServiceConfig {
-    pub shutdown_drain_timeout: Option<Duration>,
-    pub max_retiring_generations: usize,
-    pub max_active_upgrades: usize,
-    pub upgrade_relay_buffer_bytes: usize,
-    pub max_upgrade_buffer_bytes: usize,
-    pub max_upgrade_lifetime: Duration,
-    pub max_inflight_wire_body_bytes: usize,
-    pub max_inflight_wire_body_bytes_per_quota_key: usize,
-    pub min_wire_body_concurrency: usize,
+pub(crate) struct StaticServiceConfig {
+    pub(crate) shutdown_drain_timeout: Option<Duration>,
+    pub(crate) max_retiring_generations: usize,
+    pub(crate) max_active_upgrades: usize,
+    pub(crate) upgrade_relay_buffer_bytes: usize,
+    pub(crate) max_upgrade_buffer_bytes: usize,
+    pub(crate) max_upgrade_lifetime: Duration,
+    pub(crate) max_inflight_wire_body_bytes: usize,
+    pub(crate) max_inflight_wire_body_bytes_per_quota_key: usize,
+    pub(crate) min_wire_body_concurrency: usize,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
-pub(super) struct StaticControlConfig {
-    pub bind: SocketAddr,
-    pub base_path: String,
-    pub request_header_timeout: Duration,
-    pub max_connections: usize,
-    pub max_request_body_bytes: usize,
-    pub tls: Option<CompiledTlsIdentity>,
+pub(crate) struct StaticControlConfig {
+    pub(crate) bind: SocketAddr,
+    pub(crate) base_path: String,
+    pub(crate) request_header_timeout: Duration,
+    pub(crate) max_connections: usize,
+    pub(crate) max_request_body_bytes: usize,
+    pub(crate) tls: Option<CompiledTlsIdentity>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
-pub(super) struct CompiledTlsIdentity {
-    pub certificate_chain: PathBuf,
-    pub private_key: PathBuf,
+pub(crate) struct CompiledTlsIdentity {
+    pub(crate) certificate_chain: PathBuf,
+    pub(crate) private_key: PathBuf,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
-pub(super) struct StaticListenersConfig {
-    pub explicit_http: Option<StaticCleartextListener>,
-    pub transparent_http: Option<StaticCleartextListener>,
-    pub explicit_https: Option<StaticExplicitHttpsListener>,
-    pub transparent_https: Option<StaticTransparentHttpsListener>,
+pub(crate) struct StaticListenersConfig {
+    pub(crate) explicit_http: Option<StaticCleartextListener>,
+    pub(crate) transparent_http: Option<StaticCleartextListener>,
+    pub(crate) explicit_https: Option<StaticExplicitHttpsListener>,
+    pub(crate) transparent_https: Option<StaticTransparentHttpsListener>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
-pub(super) struct StaticCleartextListener {
-    pub bind: SocketAddr,
-    pub http_versions: Vec<CompiledHttpVersion>,
-    pub connect: Option<StaticConnectPolicy>,
+pub(crate) struct StaticCleartextListener {
+    pub(crate) bind: SocketAddr,
+    pub(crate) http_versions: Vec<CompiledHttpVersion>,
+    pub(crate) connect: Option<StaticConnectPolicy>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
-pub(super) struct StaticExplicitHttpsListener {
-    pub bind: SocketAddr,
-    pub http_versions: Vec<CompiledHttpVersion>,
-    pub handshake_timeout: Duration,
-    pub request_header_timeout: Duration,
-    pub max_connections: usize,
-    pub max_concurrent_streams: u32,
-    pub connect: StaticConnectPolicy,
-    pub tls: CompiledTlsIdentity,
+pub(crate) struct StaticExplicitHttpsListener {
+    pub(crate) bind: SocketAddr,
+    pub(crate) http_versions: Vec<CompiledHttpVersion>,
+    pub(crate) handshake_timeout: Duration,
+    pub(crate) request_header_timeout: Duration,
+    pub(crate) max_connections: usize,
+    pub(crate) max_concurrent_streams: u32,
+    pub(crate) connect: StaticConnectPolicy,
+    pub(crate) tls: CompiledTlsIdentity,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
-pub(super) struct StaticTransparentHttpsListener {
-    pub bind: SocketAddr,
-    pub http_versions: Vec<CompiledHttpVersion>,
-    pub handshake_timeout: Duration,
-    pub request_header_timeout: Duration,
-    pub max_connections: usize,
-    pub max_concurrent_streams: u32,
+pub(crate) struct StaticTransparentHttpsListener {
+    pub(crate) bind: SocketAddr,
+    pub(crate) http_versions: Vec<CompiledHttpVersion>,
+    pub(crate) handshake_timeout: Duration,
+    pub(crate) request_header_timeout: Duration,
+    pub(crate) max_connections: usize,
+    pub(crate) max_concurrent_streams: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub(super) enum CompiledHttpVersion {
+pub(crate) enum CompiledHttpVersion {
     Http1,
     Http2,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
-pub(super) struct StaticConnectPolicy {
-    pub http1: Option<CompiledHttp1ConnectPolicy>,
-    pub http2_denied: bool,
+pub(crate) struct StaticConnectPolicy {
+    pub(crate) http1: Option<CompiledHttp1ConnectPolicy>,
+    pub(crate) http2_denied: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub(super) enum CompiledHttp1ConnectPolicy {
+pub(crate) enum CompiledHttp1ConnectPolicy {
     Deny,
     Mitm,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
-pub(super) enum StaticMitmConfig {
+pub(crate) enum StaticMitmConfig {
     Generated {
         directory: PathBuf,
         max_cached_certificates: usize,
@@ -190,11 +201,11 @@ pub(super) enum StaticMitmConfig {
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
-pub(super) struct StaticLoggingConfig {
-    pub directory: Option<PathBuf>,
-    pub max_bytes: u64,
-    pub max_files: usize,
-    pub console: bool,
+pub(crate) struct StaticLoggingConfig {
+    pub(crate) directory: Option<PathBuf>,
+    pub(crate) max_bytes: u64,
+    pub(crate) max_files: usize,
+    pub(crate) console: bool,
 }
 
 /// Purely compiled, unresolved generation input. Runtime activation must turn
@@ -202,17 +213,17 @@ pub(super) struct StaticLoggingConfig {
 /// process providers. Activation consumes this plan, resolves and drops source
 /// locators (including environment variable names), and request paths never
 /// consume it directly.
-pub(super) struct ReloadableProductPlan {
-    pub request_timeout: Duration,
-    pub max_content_decoding_expansion_ratio: usize,
-    pub egress: EgressPlan,
-    pub policy: PolicyPlan,
-    pub authorization: AuthorizationPlan,
-    pub credentials: CredentialsPlan,
-    pub redaction: RedactionPlan,
-    pub observation: ObservationPlan,
-    pub safety: SafetyPlan,
-    pub resource_plan: CompiledResourcePlan,
+pub(crate) struct ReloadableProductPlan {
+    pub(crate) request_timeout: Duration,
+    pub(crate) max_content_decoding_expansion_ratio: usize,
+    pub(crate) egress: EgressPlan,
+    pub(crate) policy: PolicyPlan,
+    pub(crate) authorization: AuthorizationPlan,
+    pub(crate) credentials: CredentialsPlan,
+    pub(crate) redaction: RedactionPlan,
+    pub(crate) observation: ObservationPlan,
+    pub(crate) safety: SafetyPlan,
+    pub(crate) resource_plan: CompiledResourcePlan,
 }
 
 impl fmt::Debug for ReloadableProductPlan {
@@ -238,29 +249,29 @@ impl fmt::Debug for ReloadableProductPlan {
 }
 
 #[derive(Clone)]
-pub(super) struct EgressPlan {
-    pub route: CompiledEgressRoute,
-    pub origin_tls: TransportTlsPlan,
-    pub parent_proxy: Option<ParentProxyPlan>,
-    pub request_headers: Vec<HeaderEffectPlan>,
-    pub credential_actions: Vec<CredentialActionPlan>,
+pub(crate) struct EgressPlan {
+    pub(crate) route: CompiledEgressRoute,
+    pub(crate) origin_tls: TransportTlsPlan,
+    pub(crate) parent_proxy: Option<ParentProxyPlan>,
+    pub(crate) request_headers: Vec<HeaderEffectPlan>,
+    pub(crate) credential_actions: Vec<CredentialActionPlan>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum CompiledEgressRoute {
+pub(crate) enum CompiledEgressRoute {
     Direct,
     ParentProxy,
 }
 
 #[derive(Clone)]
-pub(super) struct TransportTlsPlan {
-    pub trust: CompiledTlsTrust,
-    pub ca_certificate: Option<PathBuf>,
-    pub http_versions: Vec<CompiledHttpVersion>,
+pub(crate) struct TransportTlsPlan {
+    pub(crate) trust: CompiledTlsTrust,
+    pub(crate) ca_certificate: Option<PathBuf>,
+    pub(crate) http_versions: Vec<CompiledHttpVersion>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum CompiledTlsTrust {
+pub(crate) enum CompiledTlsTrust {
     System,
     Custom,
     SystemPlusCustom,
@@ -268,80 +279,80 @@ pub(super) enum CompiledTlsTrust {
 }
 
 #[derive(Clone)]
-pub(super) struct ParentProxyPlan {
-    pub kind: CompiledParentProxyKind,
-    pub url: String,
-    pub host: String,
-    pub port: u16,
-    pub tls: Option<ParentProxyTlsPlan>,
+pub(crate) struct ParentProxyPlan {
+    pub(crate) kind: CompiledParentProxyKind,
+    pub(crate) url: String,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) tls: Option<ParentProxyTlsPlan>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum CompiledParentProxyKind {
+pub(crate) enum CompiledParentProxyKind {
     AclProxy,
     Generic,
 }
 
 #[derive(Clone)]
-pub(super) struct ParentProxyTlsPlan {
-    pub trust: CompiledTlsTrust,
-    pub ca_certificate: Option<PathBuf>,
-    pub server_name: String,
+pub(crate) struct ParentProxyTlsPlan {
+    pub(crate) trust: CompiledTlsTrust,
+    pub(crate) ca_certificate: Option<PathBuf>,
+    pub(crate) server_name: String,
 }
 
 #[derive(Clone)]
-pub(super) struct PolicyPlan {
-    pub default: CompiledDefaultDecision,
-    pub rules: Vec<PolicyRulePlan>,
+pub(crate) struct PolicyPlan {
+    pub(crate) default: CompiledDefaultDecision,
+    pub(crate) rules: Vec<PolicyRulePlan>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum CompiledDefaultDecision {
+pub(crate) enum CompiledDefaultDecision {
     Allow,
     Deny,
 }
 
 #[derive(Clone)]
-pub(super) struct PolicyRulePlan {
-    pub id: String,
-    pub description: Option<String>,
-    pub decision: CompiledRuleDecision,
-    pub urls: Vec<CompiledUrlPattern>,
-    pub methods: Vec<Method>,
-    pub client_cidrs: Vec<ipnet::IpNet>,
-    pub headers: HeaderPredicatesPlan,
-    pub request_timeout: Option<Duration>,
-    pub allow_upgrades: bool,
-    pub authorization_provider: Option<String>,
-    pub redaction_profile: Option<String>,
-    pub request_headers: Vec<HeaderEffectPlan>,
-    pub response_headers: Vec<HeaderEffectPlan>,
-    pub credential_actions: Vec<CredentialActionPlan>,
+pub(crate) struct PolicyRulePlan {
+    pub(crate) id: String,
+    pub(crate) description: Option<String>,
+    pub(crate) decision: CompiledRuleDecision,
+    pub(crate) urls: Vec<CompiledUrlPattern>,
+    pub(crate) methods: Vec<Method>,
+    pub(crate) client_cidrs: Vec<ipnet::IpNet>,
+    pub(crate) headers: HeaderPredicatesPlan,
+    pub(crate) request_timeout: Option<Duration>,
+    pub(crate) allow_upgrades: bool,
+    pub(crate) authorization_provider: Option<String>,
+    pub(crate) redaction_profile: Option<String>,
+    pub(crate) request_headers: Vec<HeaderEffectPlan>,
+    pub(crate) response_headers: Vec<HeaderEffectPlan>,
+    pub(crate) credential_actions: Vec<CredentialActionPlan>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum CompiledRuleDecision {
+pub(crate) enum CompiledRuleDecision {
     Allow,
     Deny,
     Delegate,
 }
 
 #[derive(Clone)]
-pub(super) struct HeaderPredicatesPlan {
-    pub absent_any: Vec<HeaderName>,
-    pub present_all: Vec<HeaderName>,
-    pub all: Vec<HeaderValuePredicatePlan>,
-    pub none: Vec<HeaderValuePredicatePlan>,
+pub(crate) struct HeaderPredicatesPlan {
+    pub(crate) absent_any: Vec<HeaderName>,
+    pub(crate) present_all: Vec<HeaderName>,
+    pub(crate) all: Vec<HeaderValuePredicatePlan>,
+    pub(crate) none: Vec<HeaderValuePredicatePlan>,
 }
 
 #[derive(Clone)]
-pub(super) struct HeaderValuePredicatePlan {
-    pub name: HeaderName,
-    pub values: Vec<HeaderValue>,
+pub(crate) struct HeaderValuePredicatePlan {
+    pub(crate) name: HeaderName,
+    pub(crate) values: Vec<HeaderValue>,
 }
 
 #[derive(Clone)]
-pub(super) enum HeaderEffectPlan {
+pub(crate) enum HeaderEffectPlan {
     Set {
         when: CompiledHeaderEffectWhen,
         name: HeaderName,
@@ -365,14 +376,14 @@ pub(super) enum HeaderEffectPlan {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum CompiledHeaderEffectWhen {
+pub(crate) enum CompiledHeaderEffectWhen {
     Always,
     IfPresent,
     IfAbsent,
 }
 
 #[derive(Clone)]
-pub(super) enum CredentialActionPlan {
+pub(crate) enum CredentialActionPlan {
     Bearer {
         credential: String,
     },
@@ -387,143 +398,275 @@ pub(super) enum CredentialActionPlan {
 }
 
 #[derive(Clone)]
-pub(super) struct AuthorizationPlan {
-    pub internal_context_headers: Vec<HeaderName>,
-    pub callback: Option<AuthorizationCallbackPlan>,
-    pub providers: BTreeMap<String, AuthorizationProviderPlan>,
+pub(crate) struct AuthorizationPlan {
+    pub(crate) internal_context_headers: Vec<HeaderName>,
+    pub(crate) callback: Option<AuthorizationCallbackPlan>,
+    pub(crate) providers: BTreeMap<String, AuthorizationProviderPlan>,
 }
 
 #[derive(Clone)]
-pub(super) struct AuthorizationCallbackPlan {
-    pub resume_token_ttl: Duration,
-    pub max_pending_operations: usize,
+pub(crate) struct AuthorizationCallbackPlan {
+    pub(crate) resume_token_ttl: Duration,
+    pub(crate) max_pending_operations: usize,
 }
 
 #[derive(Clone)]
-pub(super) enum AuthorizationProviderPlan {
+pub(crate) enum AuthorizationProviderPlan {
     Webhook(WebhookProviderPlan),
     Process(ProcessProviderPlan),
 }
 
 #[derive(Clone)]
-pub(super) struct WebhookProviderPlan {
-    pub url: String,
-    pub timeout: Duration,
-    pub on_failure: CompiledProviderFailureMode,
-    pub include_headers: Vec<HeaderName>,
-    pub max_response_bytes: usize,
-    pub outputs: BTreeMap<String, ProviderOutputPlan>,
-    pub tls: Option<WebhookTlsPlan>,
+pub(crate) struct WebhookProviderPlan {
+    pub(crate) url: String,
+    pub(crate) timeout: Duration,
+    pub(crate) on_failure: CompiledProviderFailureMode,
+    pub(crate) include_headers: Vec<HeaderName>,
+    pub(crate) max_response_bytes: usize,
+    pub(crate) outputs: BTreeMap<String, ProviderOutputPlan>,
+    pub(crate) tls: Option<WebhookTlsPlan>,
 }
 
 #[derive(Clone)]
-pub(super) struct WebhookTlsPlan {
-    pub trust: CompiledTlsTrust,
-    pub ca_certificate: Option<PathBuf>,
+pub(crate) struct WebhookTlsPlan {
+    pub(crate) trust: CompiledTlsTrust,
+    pub(crate) ca_certificate: Option<PathBuf>,
 }
 
 #[derive(Clone)]
-pub(super) struct ProcessProviderPlan {
-    pub command: PathBuf,
-    pub working_directory: PathBuf,
-    pub args: Vec<String>,
-    pub timeout: Duration,
-    pub on_failure: CompiledProviderFailureMode,
-    pub inherit_environment: bool,
-    pub pass_environment: Vec<String>,
-    pub environment: BTreeMap<String, String>,
-    pub include_headers: Vec<HeaderName>,
-    pub include_request_body: bool,
-    pub allow_request_body_replacement: bool,
-    pub max_request_body_bytes: usize,
-    pub max_decoded_request_body_bytes: usize,
-    pub max_stdout_line_bytes: usize,
-    pub max_pending_requests: usize,
-    pub restart_backoff: Duration,
-    pub retire_timeout: Duration,
-    pub outputs: BTreeMap<String, ProviderOutputPlan>,
+pub(crate) struct ProcessProviderPlan {
+    pub(crate) command: PathBuf,
+    pub(crate) working_directory: PathBuf,
+    pub(crate) args: Vec<String>,
+    pub(crate) timeout: Duration,
+    pub(crate) on_failure: CompiledProviderFailureMode,
+    pub(crate) inherit_environment: bool,
+    pub(crate) pass_environment: Vec<String>,
+    pub(crate) environment: BTreeMap<String, String>,
+    pub(crate) include_headers: Vec<HeaderName>,
+    pub(crate) include_request_body: bool,
+    pub(crate) allow_request_body_replacement: bool,
+    pub(crate) max_request_body_bytes: usize,
+    pub(crate) max_decoded_request_body_bytes: usize,
+    pub(crate) max_stdout_line_bytes: usize,
+    pub(crate) max_pending_requests: usize,
+    pub(crate) restart_backoff: Duration,
+    pub(crate) retire_timeout: Duration,
+    pub(crate) outputs: BTreeMap<String, ProviderOutputPlan>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum CompiledProviderFailureMode {
+pub(crate) enum CompiledProviderFailureMode {
     Deny,
     Error,
 }
 
 #[derive(Clone)]
-pub(super) enum ProviderOutputPlan {
+pub(crate) enum ProviderOutputPlan {
     Bearer { required: bool },
     Basic { username: String, required: bool },
     CustomHeader { header: HeaderName, required: bool },
 }
 
 #[derive(Clone)]
-pub(super) struct CredentialsPlan {
-    pub allowed_custom_headers: Vec<HeaderName>,
-    pub inbound: BTreeMap<String, InboundCredentialPlan>,
-    pub sources: BTreeMap<String, CredentialSourcePlan>,
+pub(crate) struct CredentialsPlan {
+    pub(crate) allowed_custom_headers: Vec<HeaderName>,
+    pub(crate) inbound: BTreeMap<String, InboundCredentialPlan>,
+    pub(crate) sources: BTreeMap<String, CredentialSourcePlan>,
 }
 
 #[derive(Clone)]
-pub(super) struct InboundCredentialPlan {
-    pub header: HeaderName,
-    pub process_providers: Vec<String>,
+pub(crate) struct InboundCredentialPlan {
+    pub(crate) header: HeaderName,
+    pub(crate) process_providers: Vec<String>,
 }
 
 #[derive(Clone)]
-pub(super) enum CredentialSourcePlan {
+pub(crate) enum CredentialSourcePlan {
     Environment { variable: String },
     File { path: PathBuf },
 }
 
 #[derive(Clone)]
-pub(super) struct RedactionPlan {
-    pub profiles: BTreeMap<String, RedactionProfilePlan>,
+pub(crate) struct RedactionPlan {
+    pub(crate) profiles: BTreeMap<String, RedactionProfilePlan>,
 }
 
 #[derive(Clone)]
-pub(super) struct RedactionProfilePlan {
-    pub replacement: Vec<u8>,
-    pub max_body_bytes: usize,
-    pub max_decoded_body_bytes: usize,
-    pub max_frame_bytes: usize,
-    pub max_message_bytes: usize,
-    pub allow_permessage_deflate: bool,
-    pub max_environment_literal_sources: usize,
-    pub max_environment_literal_bytes: usize,
-    pub max_environment_literal_total_bytes: usize,
-    pub rules: Vec<RedactionRulePlan>,
+pub(crate) struct RedactionProfilePlan {
+    pub(crate) replacement: Vec<u8>,
+    pub(crate) max_body_bytes: usize,
+    pub(crate) max_decoded_body_bytes: usize,
+    pub(crate) max_frame_bytes: usize,
+    pub(crate) max_message_bytes: usize,
+    pub(crate) allow_permessage_deflate: bool,
+    pub(crate) max_environment_literal_sources: usize,
+    pub(crate) max_environment_literal_bytes: usize,
+    pub(crate) max_environment_literal_total_bytes: usize,
+    pub(crate) rules: Vec<RedactionRulePlan>,
 }
 
 #[derive(Clone)]
-pub(super) struct RedactionRulePlan {
-    pub literals: Vec<Vec<u8>>,
-    pub literal_environment_variables: Vec<String>,
-    pub expressions: Vec<Regex>,
-    pub payloads: CompiledRedactionPayloads,
+pub(crate) struct RedactionRulePlan {
+    pub(crate) literals: Vec<Vec<u8>>,
+    pub(crate) literal_environment_variables: Vec<String>,
+    pub(crate) expressions: Vec<String>,
+    pub(crate) payloads: CompiledRedactionPayloads,
+}
+
+pub(crate) fn build_redaction_regex(
+    expression: &str,
+    remaining_matcher_budget: usize,
+) -> Result<DfaRegex, ()> {
+    // This ceiling covers the compiler's accounted NFA, DFA, and determinizer
+    // state. Parser/finalization auxiliaries, Vec capacity, and allocator
+    // metadata are outside regex-automata's public size accounting.
+    let forward_limit = MAX_REDACTION_REGEX_DFA_BYTES.min(remaining_matcher_budget / 3);
+    if forward_limit == 0 {
+        return Err(());
+    }
+    let forward_nfa = build_redaction_nfa(expression, false, forward_limit)?;
+    let forward = build_redaction_dfa(&forward_nfa, false, forward_limit)?;
+    drop(forward_nfa);
+
+    let forward_bytes = forward.memory_usage();
+    let reverse_budget = remaining_matcher_budget
+        .checked_sub(forward_bytes)
+        .ok_or(())?;
+    let reverse_limit = MAX_REDACTION_REGEX_DFA_BYTES.min(reverse_budget / 3);
+    if reverse_limit == 0 {
+        return Err(());
+    }
+    let reverse_nfa = build_redaction_nfa(expression, true, reverse_limit)?;
+    let reverse = build_redaction_dfa(&reverse_nfa, true, reverse_limit)?;
+    drop(reverse_nfa);
+
+    let resident_bytes = forward_bytes
+        .checked_add(reverse.memory_usage())
+        .ok_or(())?;
+    if resident_bytes > remaining_matcher_budget {
+        return Err(());
+    }
+    Ok(DfaRegex::builder().build_from_dfas(forward, reverse))
+}
+
+fn build_redaction_nfa(expression: &str, reverse: bool, limit: usize) -> Result<NFA, ()> {
+    let mut compiler = NFA::compiler();
+    compiler.configure(
+        thompson::Config::new()
+            .utf8(true)
+            .reverse(reverse)
+            .shrink(false)
+            .which_captures(WhichCaptures::None)
+            .nfa_size_limit(Some(limit)),
+    );
+    compiler.build(expression).map_err(|_| ())
+}
+
+fn build_redaction_dfa(nfa: &NFA, reverse: bool, limit: usize) -> Result<dense::DFA<Vec<u32>>, ()> {
+    let config = dense::Config::new()
+        .accelerate(false)
+        .minimize(false)
+        .prefilter(None)
+        .dfa_size_limit(Some(limit))
+        .determinize_size_limit(Some(limit));
+    let config = if reverse {
+        config
+            .specialize_start_states(false)
+            .start_kind(StartKind::Anchored)
+            .match_kind(RegexMatchKind::All)
+    } else {
+        config
+            .specialize_start_states(true)
+            .start_kind(StartKind::Both)
+            .match_kind(RegexMatchKind::LeftmostFirst)
+    };
+    dense::Builder::new()
+        .configure(config)
+        .build_from_nfa(nfa)
+        .map_err(|_| ())
+}
+
+pub(crate) fn redaction_regex_resident_bytes(expression: &DfaRegex) -> Option<usize> {
+    expression
+        .forward()
+        .memory_usage()
+        .checked_add(expression.reverse().memory_usage())
+}
+
+pub(crate) fn build_redaction_literal_automaton(
+    patterns: Vec<&[u8]>,
+    build_budget: usize,
+) -> Result<Option<AhoCorasick>, ()> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let input_units = patterns.iter().try_fold(1usize, |units, pattern| {
+        units.checked_add(pattern.len())?.checked_add(1)
+    });
+    // The fixed sparse representation plus this deliberately conservative
+    // input multiplier bounds the dependency's candidate build allocations.
+    let projected_build_bytes = input_units
+        .and_then(|units| units.checked_mul(REDACTION_AHO_BUILD_BYTES_PER_INPUT_UNIT))
+        .and_then(|bytes| bytes.checked_add(REDACTION_AHO_BUILD_BASE_BYTES))
+        .ok_or(())?;
+    if projected_build_bytes > build_budget {
+        return Err(());
+    }
+    AhoCorasickBuilder::new()
+        .kind(Some(AhoCorasickKind::NoncontiguousNFA))
+        .match_kind(AhoMatchKind::LeftmostLongest)
+        .dense_depth(0)
+        .prefilter(false)
+        .build(patterns)
+        .map(Some)
+        .map_err(|_| ())
+}
+
+pub(crate) fn checked_redaction_matcher_resident_bytes(
+    profile_bytes: usize,
+    snapshot_bytes: usize,
+    additional_bytes: usize,
+) -> Option<(usize, usize)> {
+    let profile_bytes = profile_bytes.checked_add(additional_bytes)?;
+    let snapshot_bytes = snapshot_bytes.checked_add(additional_bytes)?;
+    (profile_bytes <= MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE
+        && snapshot_bytes <= MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT)
+        .then_some((profile_bytes, snapshot_bytes))
+}
+
+pub(crate) fn remaining_redaction_matcher_resident_bytes(
+    profile_bytes: usize,
+    snapshot_bytes: usize,
+) -> Option<usize> {
+    let profile_remaining =
+        MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE.checked_sub(profile_bytes)?;
+    let snapshot_remaining =
+        MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT.checked_sub(snapshot_bytes)?;
+    Some(profile_remaining.min(snapshot_remaining))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum CompiledRedactionPayloads {
+pub(crate) enum CompiledRedactionPayloads {
     Text,
     Binary,
     Both,
 }
 
 #[derive(Clone)]
-pub(super) struct ObservationPlan {
-    pub logging: ReloadableLoggingPlan,
-    pub capture: Option<CapturePlan>,
+pub(crate) struct ObservationPlan {
+    pub(crate) logging: ReloadableLoggingPlan,
+    pub(crate) capture: Option<CapturePlan>,
 }
 
 #[derive(Clone)]
-pub(super) struct ReloadableLoggingPlan {
-    pub level: CompiledLogLevel,
-    pub policy_decisions: PolicyDecisionLoggingPlan,
+pub(crate) struct ReloadableLoggingPlan {
+    pub(crate) level: CompiledLogLevel,
+    pub(crate) policy_decisions: PolicyDecisionLoggingPlan,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum CompiledLogLevel {
+pub(crate) enum CompiledLogLevel {
     Trace,
     Debug,
     Info,
@@ -532,27 +675,27 @@ pub(super) enum CompiledLogLevel {
 }
 
 #[derive(Clone)]
-pub(super) struct PolicyDecisionLoggingPlan {
-    pub allows: bool,
-    pub denies: bool,
-    pub allow_level: CompiledLogLevel,
-    pub deny_level: CompiledLogLevel,
+pub(crate) struct PolicyDecisionLoggingPlan {
+    pub(crate) allows: bool,
+    pub(crate) denies: bool,
+    pub(crate) allow_level: CompiledLogLevel,
+    pub(crate) deny_level: CompiledLogLevel,
 }
 
 #[derive(Clone)]
-pub(super) struct CapturePlan {
-    pub events: Vec<CompiledCaptureEvent>,
-    pub redaction_profile: String,
-    pub directory: PathBuf,
-    pub filename: String,
-    pub max_body_bytes: usize,
-    pub max_inflight_body_bytes: usize,
-    pub max_files: usize,
-    pub max_total_bytes: u64,
+pub(crate) struct CapturePlan {
+    pub(crate) events: Vec<CompiledCaptureEvent>,
+    pub(crate) redaction_profile: String,
+    pub(crate) directory: PathBuf,
+    pub(crate) filename: String,
+    pub(crate) max_body_bytes: usize,
+    pub(crate) max_inflight_body_bytes: usize,
+    pub(crate) max_files: usize,
+    pub(crate) max_total_bytes: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum CompiledCaptureEvent {
+pub(crate) enum CompiledCaptureEvent {
     RequestAllowed,
     ResponseAllowed,
     RequestDenied,
@@ -560,35 +703,35 @@ pub(super) enum CompiledCaptureEvent {
 }
 
 #[derive(Clone)]
-pub(super) struct SafetyPlan {
-    pub loop_detection: LoopDetectionPlan,
+pub(crate) struct SafetyPlan {
+    pub(crate) loop_detection: LoopDetectionPlan,
 }
 
 #[derive(Clone)]
-pub(super) struct LoopDetectionPlan {
-    pub inject: bool,
-    pub header: HeaderName,
+pub(crate) struct LoopDetectionPlan {
+    pub(crate) inject: bool,
+    pub(crate) header: HeaderName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct CompiledResourcePlan {
-    pub http_wire_body_peak_bytes_by_cursor: Vec<usize>,
-    pub max_reachable_http_wire_body_peak_bytes: usize,
-    pub wire_body_full_peak_capacity: Capacity,
-    pub wire_body_quota_key_full_peak_capacity: Capacity,
-    pub upgrade_allocation_bytes_by_rule: Vec<Option<usize>>,
-    pub max_upgrade_allocation_per_stream: usize,
-    pub max_upgrade_allocation_all_streams: usize,
+pub(crate) struct CompiledResourcePlan {
+    pub(crate) http_wire_body_peak_bytes_by_cursor: Vec<usize>,
+    pub(crate) max_reachable_http_wire_body_peak_bytes: usize,
+    pub(crate) wire_body_full_peak_capacity: Capacity,
+    pub(crate) wire_body_quota_key_full_peak_capacity: Capacity,
+    pub(crate) upgrade_allocation_bytes_by_rule: Vec<Option<usize>>,
+    pub(crate) max_upgrade_allocation_per_stream: usize,
+    pub(crate) max_upgrade_allocation_all_streams: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Capacity {
+pub(crate) enum Capacity {
     Unbounded,
     Finite(usize),
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub(super) struct StaticFingerprint([u8; 32]);
+pub(crate) struct StaticFingerprint([u8; 32]);
 
 impl fmt::Debug for StaticFingerprint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -601,9 +744,9 @@ impl fmt::Debug for StaticFingerprint {
 }
 
 pub(super) struct CompiledProductConfig {
-    pub static_config: StaticProductConfig,
-    pub static_fingerprint: StaticFingerprint,
-    pub reloadable_plan: ReloadableProductPlan,
+    pub(super) static_config: StaticProductConfig,
+    pub(super) static_fingerprint: StaticFingerprint,
+    pub(super) reloadable_plan: ReloadableProductPlan,
 }
 
 impl fmt::Debug for CompiledProductConfig {
@@ -2312,6 +2455,12 @@ fn validate_literal_effects(
                     }
                 };
                 for value in values {
+                    if value.len() > MAX_HEADER_FIELD_BYTES {
+                        return Err(V3CompileError::at(
+                            format!("{path}[{index}]"),
+                            "header value exceeds the 64 KiB field limit",
+                        ));
+                    }
                     if value.contains("${") {
                         return Err(V3CompileError::at(
                             format!("{path}[{index}]"),
@@ -2328,6 +2477,14 @@ fn validate_literal_effects(
             }
             HeaderEffectConfig::Remove(_) => {}
             HeaderEffectConfig::Replace(value) => {
+                if value.search.len() > MAX_HEADER_FIELD_BYTES
+                    || value.replace.len() > MAX_HEADER_FIELD_BYTES
+                {
+                    return Err(V3CompileError::at(
+                        format!("{path}[{index}]"),
+                        "header search or replacement text exceeds the 64 KiB field limit",
+                    ));
+                }
                 if value.search.is_empty() {
                     return Err(V3CompileError::at(
                         format!("{path}[{index}].search"),
@@ -3281,7 +3438,7 @@ fn compile_policy_rule_plan(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?,
-        client_cidrs: value.client_cidrs.clone(),
+        client_cidrs: compile_client_cidrs(&value.client_cidrs, &format!("{prefix}.client_cidrs"))?,
         headers: compile_header_predicates_plan(&value.headers, &prefix)?,
         request_timeout: value.request_timeout.as_ref().map(|timeout| timeout.get()),
         allow_upgrades: value.allow_upgrades,
@@ -3300,6 +3457,45 @@ fn compile_policy_rule_plan(
             &format!("{prefix}.credential_actions"),
         )?,
     })
+}
+
+/// Policy peers canonicalize IPv4-mapped socket addresses to IPv4. Authored
+/// CIDRs wholly inside the mapped `/96` follow the same representation. A
+/// broader IPv6 CIDR containing mapped space is rejected because it mixes
+/// canonical IPv4 peers with native IPv6 addresses under one authored range.
+fn compile_client_cidrs(
+    values: &[ipnet::IpNet],
+    path: &str,
+) -> Result<Vec<ipnet::IpNet>, V3CompileError> {
+    let mapped_base = std::net::Ipv4Addr::UNSPECIFIED.to_ipv6_mapped();
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, network)| match network {
+            ipnet::IpNet::V4(network) => Ok(ipnet::IpNet::V4(*network)),
+            ipnet::IpNet::V6(network) => {
+                if network.prefix_len() < 96 && network.contains(&mapped_base) {
+                    return Err(V3CompileError::at(
+                        format!("{path}[{index}]"),
+                        "IPv6 CIDR ambiguously mixes mapped IPv4 and native IPv6 addresses",
+                    ));
+                }
+                let Some(mapped) = network.network().to_ipv4_mapped() else {
+                    return Ok(ipnet::IpNet::V6(*network));
+                };
+                let prefix = network.prefix_len().checked_sub(96).ok_or_else(|| {
+                    V3CompileError::at(
+                        format!("{path}[{index}]"),
+                        "invalid mapped IPv4 CIDR prefix",
+                    )
+                })?;
+                let canonical = ipnet::Ipv4Net::new(mapped, prefix).map_err(|_| {
+                    V3CompileError::at(format!("{path}[{index}]"), "invalid mapped IPv4 CIDR")
+                })?;
+                Ok(ipnet::IpNet::V4(canonical))
+            }
+        })
+        .collect()
 }
 
 fn compile_header_predicates_plan(
@@ -3602,12 +3798,93 @@ fn compile_credentials_plan(value: &CredentialsConfig) -> Result<CredentialsPlan
     })
 }
 
+fn authored_literal_resident_bytes(
+    value: &super::authoring::RedactionProfileConfig,
+    class: CompiledRedactionPayloads,
+    build_budget: usize,
+) -> Result<usize, ()> {
+    let mut unique = HashSet::new();
+    let mut patterns = Vec::new();
+    for rule in &value.rules {
+        let applies = matches!(
+            (rule.payloads, class),
+            (RedactionPayloads::Text, CompiledRedactionPayloads::Text)
+                | (RedactionPayloads::Binary, CompiledRedactionPayloads::Binary)
+                | (RedactionPayloads::Both, _)
+        );
+        if !applies {
+            continue;
+        }
+        for literal in &rule.literals {
+            if unique.insert(literal.as_bytes()) {
+                patterns.push(literal.as_bytes());
+            }
+        }
+    }
+    let resident_bytes = build_redaction_literal_automaton(patterns, build_budget)?
+        .map_or(0, |matcher| matcher.memory_usage());
+    (resident_bytes <= build_budget)
+        .then_some(resident_bytes)
+        .ok_or(())
+}
+
 fn compile_redaction_plan(value: &RedactionConfig) -> Result<RedactionPlan, V3CompileError> {
+    let mut snapshot_matcher_resident_bytes = 0usize;
     let profiles = value
         .profiles
         .iter()
         .map(|(name, value)| {
             let prefix = format!("redaction.profiles.{name}");
+            let snapshot_remaining = MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT
+                .checked_sub(snapshot_matcher_resident_bytes)
+                .ok_or_else(|| {
+                    V3CompileError::at(&prefix, "compiled matcher snapshot memory ceiling exceeded")
+                })?;
+            let text_literal_bytes = authored_literal_resident_bytes(
+                value,
+                CompiledRedactionPayloads::Text,
+                MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE.min(snapshot_remaining),
+            )
+            .map_err(|_| {
+                V3CompileError::at(
+                    &prefix,
+                    "bounded text literal matcher build ceiling exceeded",
+                )
+            })?;
+            let binary_literal_budget = MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE
+                .checked_sub(text_literal_bytes)
+                .map(|profile_remaining| {
+                    profile_remaining.min(snapshot_remaining.saturating_sub(text_literal_bytes))
+                })
+                .ok_or_else(|| {
+                    V3CompileError::at(&prefix, "compiled matcher profile memory ceiling exceeded")
+                })?;
+            let binary_literal_bytes = authored_literal_resident_bytes(
+                value,
+                CompiledRedactionPayloads::Binary,
+                binary_literal_budget,
+            )
+            .map_err(|_| {
+                V3CompileError::at(
+                    &prefix,
+                    "bounded binary literal matcher build ceiling exceeded",
+                )
+            })?;
+            let literal_bytes = text_literal_bytes
+                .checked_add(binary_literal_bytes)
+                .ok_or_else(|| {
+                    V3CompileError::at(&prefix, "compiled matcher size accounting overflow")
+                })?;
+            let (mut profile_matcher_resident_bytes, new_snapshot_bytes) =
+                checked_redaction_matcher_resident_bytes(
+                    0,
+                    snapshot_matcher_resident_bytes,
+                    literal_bytes,
+                )
+                .ok_or_else(|| {
+                    V3CompileError::at(&prefix, "compiled matcher memory ceiling exceeded")
+                })?;
+            snapshot_matcher_resident_bytes = new_snapshot_bytes;
             let rules = value
                 .rules
                 .iter()
@@ -3624,13 +3901,50 @@ fn compile_redaction_plan(value: &RedactionConfig) -> Result<RedactionPlan, V3Co
                         expressions: rule
                             .expressions
                             .iter()
-                            .map(|expression| {
-                                Regex::new(expression).map_err(|error| {
-                                    V3CompileError::at(
-                                        &path,
-                                        format!("invalid expression after validation: {error}"),
+                            .enumerate()
+                            .map(|(expression_index, expression)| {
+                                let expression_path =
+                                    format!("{path}.expressions[{expression_index}]");
+                                let remaining_budget =
+                                    remaining_redaction_matcher_resident_bytes(
+                                        profile_matcher_resident_bytes,
+                                        snapshot_matcher_resident_bytes,
                                     )
-                                })
+                                    .ok_or_else(|| {
+                                        V3CompileError::at(
+                                            &expression_path,
+                                            "compiled matcher memory ceiling exceeded",
+                                        )
+                                    })?;
+                                let matcher = build_redaction_regex(expression, remaining_budget)
+                                    .map_err(|_| {
+                                    V3CompileError::at(
+                                        &expression_path,
+                                        "invalid regular expression or unsupported by the bounded matcher",
+                                    )
+                                })?;
+                                let bytes = redaction_regex_resident_bytes(&matcher)
+                                    .ok_or_else(|| {
+                                        V3CompileError::at(
+                                            &expression_path,
+                                            "bounded regular-expression size accounting overflow",
+                                        )
+                                    })?;
+                                let (profile_bytes, snapshot_bytes) =
+                                    checked_redaction_matcher_resident_bytes(
+                                        profile_matcher_resident_bytes,
+                                        snapshot_matcher_resident_bytes,
+                                        bytes,
+                                    )
+                                    .ok_or_else(|| {
+                                        V3CompileError::at(
+                                            &expression_path,
+                                            "compiled matcher memory ceiling exceeded",
+                                        )
+                                    })?;
+                                profile_matcher_resident_bytes = profile_bytes;
+                                snapshot_matcher_resident_bytes = snapshot_bytes;
+                                Ok(expression.clone())
                             })
                             .collect::<Result<Vec<_>, _>>()?,
                         payloads: match rule.payloads {
@@ -3979,6 +4293,90 @@ default = "deny"
         let config: super::super::authoring::ConfigV3 =
             toml::from_str(toml).expect("test input should deserialize");
         compile_v3(config, Path::new("/etc/acl-proxy"))
+    }
+
+    #[test]
+    fn pure_compiler_rejects_regexes_outside_the_bounded_dfa_subset() {
+        let input = format!(
+            r#"{MINIMAL}
+
+[redaction.profiles.secrets]
+rules = [{{ expressions = ['\bsecret-marker\b'] }}]
+"#
+        );
+        let error = compile(&input).expect_err("Unicode word boundaries require runtime caches");
+        let rendered = format!("{error:?} {error}");
+        assert!(rendered.contains("redaction.profiles.secrets.rules[0].expressions[0]"));
+        assert!(rendered.contains("unsupported by the bounded matcher"));
+        assert!(!rendered.contains("secret-marker"));
+    }
+
+    #[test]
+    fn compiled_matcher_accounting_aggregates_across_profiles() {
+        let mut snapshot_bytes = 0usize;
+        for _ in 0..4 {
+            let (profile_bytes, next_snapshot_bytes) = checked_redaction_matcher_resident_bytes(
+                0,
+                snapshot_bytes,
+                MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE,
+            )
+            .expect("four full profile budgets fit the snapshot ceiling");
+            assert_eq!(
+                profile_bytes,
+                MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE
+            );
+            snapshot_bytes = next_snapshot_bytes;
+        }
+        assert_eq!(
+            snapshot_bytes,
+            MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT
+        );
+        assert!(checked_redaction_matcher_resident_bytes(0, snapshot_bytes, 1).is_none());
+        assert!(checked_redaction_matcher_resident_bytes(usize::MAX, 0, 1).is_none());
+    }
+
+    #[test]
+    fn regex_build_is_bounded_by_matcher_budget_remaining_after_prior_state() {
+        let after_earlier_profiles = remaining_redaction_matcher_resident_bytes(
+            0,
+            MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT - 2,
+        )
+        .unwrap();
+        assert_eq!(after_earlier_profiles, 2);
+        assert!(build_redaction_regex("token-[0-9]+", after_earlier_profiles).is_err());
+
+        let after_earlier_profile_matchers = remaining_redaction_matcher_resident_bytes(
+            MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE - 2,
+            0,
+        )
+        .unwrap();
+        assert_eq!(after_earlier_profile_matchers, 2);
+        assert!(build_redaction_regex("token-[0-9]+", after_earlier_profile_matchers).is_err());
+
+        let matcher = build_redaction_regex("token-[0-9]+", 3 * 1024 * 1024)
+            .expect("the absolute one-MiB direction cap remains usable");
+        assert!(redaction_regex_resident_bytes(&matcher).unwrap() <= 2 * 1024 * 1024);
+
+        assert!(build_redaction_regex(r"\w{100}", 96 * 1024).is_err());
+        let large_expression = "a".repeat(32 * 1024);
+        assert!(build_redaction_regex(&large_expression, 96 * 1024).is_err());
+    }
+
+    #[test]
+    fn authored_literal_candidate_is_rejected_before_an_oversized_aho_build() {
+        let literal = "x".repeat(17 * 1024);
+        let input = format!(
+            r#"{MINIMAL}
+
+[redaction.profiles.secrets]
+rules = [{{ literals = ["{literal}"] }}]
+"#
+        );
+        let error = compile(&input).expect_err("the conservative build projection exceeds 16 MiB");
+        let rendered = format!("{error:?} {error}");
+        assert!(rendered.contains("redaction.profiles.secrets"));
+        assert!(rendered.contains("bounded text literal matcher build ceiling exceeded"));
+        assert!(!rendered.contains(&literal));
     }
 
     fn resource_config(service: &str, definitions: &str, rules: &str) -> String {
@@ -5270,6 +5668,156 @@ credential = "password"
                 error.to_string().contains("credential destination"),
                 "{name}: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn literal_header_effect_strings_respect_per_field_limit() {
+        let oversized = "x".repeat(MAX_HEADER_FIELD_BYTES + 1);
+        let cases = [
+            format!(
+                r#"[[egress.request_headers]]
+operation = "set"
+when = "always"
+name = "x-limit"
+value = {oversized:?}
+"#
+            ),
+            format!(
+                r#"[[egress.request_headers]]
+operation = "append"
+when = "always"
+name = "x-limit"
+values = [{oversized:?}]
+"#
+            ),
+            format!(
+                r#"[[egress.request_headers]]
+operation = "replace"
+when = "always"
+name = "x-limit"
+search = {oversized:?}
+replace = "x"
+"#
+            ),
+            format!(
+                r#"[[egress.request_headers]]
+operation = "replace"
+when = "always"
+name = "x-limit"
+search = "x"
+replace = {oversized:?}
+"#
+            ),
+        ];
+
+        for effect in cases {
+            let error = compile(&format!("{MINIMAL}\n{effect}"))
+                .expect_err("oversized static header text must fail");
+            assert!(error.to_string().contains("64 KiB"), "{error}");
+        }
+
+        let boundary = "x".repeat(MAX_HEADER_FIELD_BYTES);
+        compile(&format!(
+            r#"{MINIMAL}
+[[egress.request_headers]]
+operation = "set"
+when = "always"
+name = "x-limit"
+value = {boundary:?}
+"#
+        ))
+        .expect("the exact per-field boundary is valid");
+    }
+
+    #[test]
+    fn mapped_ipv6_cidr_compiles_to_ipv4_and_allows_both_peer_forms() {
+        let input = format!(
+            r#"{MINIMAL}
+[[policy.rules]]
+id = "mapped-allow"
+decision = "allow"
+client_cidrs = ["::ffff:192.0.2.0/120"]
+"#
+        );
+        let compiled = compile(&input).expect("mapped CIDR should compile");
+        assert_eq!(
+            compiled.reloadable_plan.policy.rules[0].client_cidrs,
+            vec!["192.0.2.0/24".parse::<ipnet::IpNet>().unwrap()]
+        );
+        let snapshot =
+            crate::policy::CompiledPolicySnapshot::from_plan(compiled.reloadable_plan.policy);
+        let url = canonicalize_http_url("https://example.com/").unwrap();
+        for peer in ["192.0.2.44", "::ffff:192.0.2.44"] {
+            let decision = snapshot.evaluate(
+                &url,
+                peer.parse().unwrap(),
+                &Method::GET,
+                &http::HeaderMap::new(),
+                |_| false,
+            );
+            assert_eq!(decision.outcome, crate::policy::PolicyOutcome::Allow);
+        }
+        let outside = snapshot.evaluate(
+            &url,
+            "198.51.100.44".parse().unwrap(),
+            &Method::GET,
+            &http::HeaderMap::new(),
+            |_| false,
+        );
+        assert_eq!(outside.outcome, crate::policy::PolicyOutcome::Deny);
+    }
+
+    #[test]
+    fn mapped_ipv6_cidr_denies_both_peer_forms_before_allow_default() {
+        let input = MINIMAL.replace("default = \"deny\"", "default = \"allow\"");
+        let input = format!(
+            r#"{input}
+[[policy.rules]]
+id = "mapped-deny"
+decision = "deny"
+client_cidrs = ["::ffff:192.0.2.0/120"]
+"#
+        );
+        let compiled = compile(&input).expect("mapped CIDR should compile");
+        let snapshot =
+            crate::policy::CompiledPolicySnapshot::from_plan(compiled.reloadable_plan.policy);
+        let url = canonicalize_http_url("https://example.com/").unwrap();
+        for peer in ["192.0.2.44", "::ffff:192.0.2.44"] {
+            let decision = snapshot.evaluate(
+                &url,
+                peer.parse().unwrap(),
+                &Method::GET,
+                &http::HeaderMap::new(),
+                |_| false,
+            );
+            assert_eq!(decision.outcome, crate::policy::PolicyOutcome::Deny);
+            assert_eq!(decision.matched.as_ref().unwrap().id(), "mapped-deny");
+        }
+        let outside = snapshot.evaluate(
+            &url,
+            "198.51.100.44".parse().unwrap(),
+            &Method::GET,
+            &http::HeaderMap::new(),
+            |_| false,
+        );
+        assert_eq!(outside.outcome, crate::policy::PolicyOutcome::Allow);
+        assert!(outside.matched.is_none());
+    }
+
+    #[test]
+    fn ipv6_cidr_spanning_mapped_and_native_space_is_rejected() {
+        for cidr in ["::/0", "::fffe:0:0/95"] {
+            let input = format!(
+                r#"{MINIMAL}
+[[policy.rules]]
+id = "mixed"
+decision = "allow"
+client_cidrs = [{cidr:?}]
+"#
+            );
+            let error = compile(&input).expect_err("mixed mapped/native CIDR must fail");
+            assert!(error.to_string().contains("ambiguously mixes"), "{error}");
         }
     }
 

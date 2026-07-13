@@ -1,3 +1,11 @@
+mod snapshot;
+
+#[allow(unused_imports)]
+pub(crate) use snapshot::{
+    apply_header_effects, CompiledPolicySnapshot, HeaderEffectError, PolicyCursor,
+    PolicyEvaluation, PolicyOutcome, PolicyRuleMatch,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 

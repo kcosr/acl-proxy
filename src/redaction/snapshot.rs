@@ -1,0 +1,1727 @@
+use std::collections::{BTreeMap, HashSet};
+use std::env;
+use std::fmt;
+use std::sync::Arc;
+
+use aho_corasick::AhoCorasick;
+use regex_automata::dfa::regex::Regex as DfaRegex;
+
+use crate::config::v3_compile::{
+    build_redaction_literal_automaton, build_redaction_regex,
+    checked_redaction_matcher_resident_bytes, redaction_regex_resident_bytes,
+    remaining_redaction_matcher_resident_bytes, CompiledRedactionPayloads, RedactionPlan,
+    RedactionProfilePlan, RedactionRulePlan,
+};
+
+const MAX_MATCHER_SCRATCH_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PayloadClass {
+    Text,
+    Binary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PayloadLimit {
+    EncodedHttpBody,
+    DecodedHttpBody,
+    WebSocketFrame,
+    WebSocketMessage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RedactionLimits {
+    pub(crate) max_body_bytes: usize,
+    pub(crate) max_decoded_body_bytes: usize,
+    pub(crate) max_frame_bytes: usize,
+    pub(crate) max_message_bytes: usize,
+    pub(crate) allow_permessage_deflate: bool,
+    pub(crate) matcher_scratch_bytes: usize,
+    pub(crate) compiled_matcher_resident_bytes: usize,
+}
+
+#[derive(PartialEq, Eq)]
+pub(crate) struct RedactedPayload {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) replacements: usize,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum SnapshotError {
+    #[error("redaction profile {profile_index} has too many environment literal sources")]
+    SourceCount { profile_index: usize },
+
+    #[error(
+        "redaction environment literal source {source_index} in rule {rule_index} of profile {profile_index} is unavailable"
+    )]
+    SourceUnavailable {
+        profile_index: usize,
+        rule_index: usize,
+        source_index: usize,
+    },
+
+    #[error(
+        "redaction environment literal source {source_index} in rule {rule_index} of profile {profile_index} is empty"
+    )]
+    SourceEmpty {
+        profile_index: usize,
+        rule_index: usize,
+        source_index: usize,
+    },
+
+    #[error(
+        "redaction environment literal source {source_index} in rule {rule_index} of profile {profile_index} is not valid UTF-8"
+    )]
+    SourceInvalidUtf8 {
+        profile_index: usize,
+        rule_index: usize,
+        source_index: usize,
+    },
+
+    #[error(
+        "redaction environment literal source {source_index} in rule {rule_index} of profile {profile_index} exceeds its byte limit"
+    )]
+    SourceTooLarge {
+        profile_index: usize,
+        rule_index: usize,
+        source_index: usize,
+    },
+
+    #[error("redaction profile {profile_index} exceeds its environment literal byte limit")]
+    AggregateTooLarge { profile_index: usize },
+
+    #[error("redaction profile {profile_index} could not compile its literal matcher")]
+    MatcherBuild { profile_index: usize },
+
+    #[error("redaction profile {profile_index} exceeds the compiled matcher memory ceiling")]
+    CompiledMatcherTooLarge { profile_index: usize },
+
+    #[error(
+        "redaction expression {expression_index} in rule {rule_index} of profile {profile_index} is not supported by the bounded matcher"
+    )]
+    ExpressionBuild {
+        profile_index: usize,
+        rule_index: usize,
+        expression_index: usize,
+    },
+
+    #[error("redaction payload exceeds the configured {payload:?} byte limit of {limit}")]
+    PayloadTooLarge { payload: PayloadLimit, limit: usize },
+
+    #[error("redaction text payload is not valid UTF-8")]
+    InvalidText,
+
+    #[error("redaction matcher allocation failed")]
+    AllocationFailed,
+
+    #[error("redaction matcher scratch exceeds its {limit}-byte ceiling")]
+    MatcherScratchExceeded { limit: usize },
+}
+
+pub(crate) struct RedactionSnapshot {
+    profiles: BTreeMap<String, ProfileHandle>,
+    compiled_matcher_resident_bytes: usize,
+}
+
+impl fmt::Debug for RedactionSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RedactionSnapshot")
+            .field("profile_count", &self.profiles.len())
+            .finish()
+    }
+}
+
+impl RedactionSnapshot {
+    pub(crate) fn activate(plan: RedactionPlan) -> Result<Self, SnapshotError> {
+        let mut profiles = BTreeMap::new();
+        let mut compiled_matcher_resident_bytes = 0usize;
+        for (profile_index, (name, profile)) in plan.profiles.into_iter().enumerate() {
+            profiles.insert(
+                name,
+                ProfileHandle::activate(
+                    profile,
+                    profile_index,
+                    &mut compiled_matcher_resident_bytes,
+                )?,
+            );
+        }
+        Ok(Self {
+            profiles,
+            compiled_matcher_resident_bytes,
+        })
+    }
+
+    pub(crate) fn profile(&self, name: &str) -> Option<ProfileHandle> {
+        self.profiles.get(name).cloned()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.profiles.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.profiles.is_empty()
+    }
+
+    pub(crate) fn compiled_matcher_resident_bytes(&self) -> usize {
+        self.compiled_matcher_resident_bytes
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ProfileHandle(Arc<ProfileSnapshot>);
+
+impl fmt::Debug for ProfileHandle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RedactionProfileHandle")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProfileHandle {
+    fn activate(
+        plan: RedactionProfilePlan,
+        profile_index: usize,
+        snapshot_matcher_resident_bytes: &mut usize,
+    ) -> Result<Self, SnapshotError> {
+        Ok(Self(Arc::new(ProfileSnapshot::activate(
+            plan,
+            profile_index,
+            snapshot_matcher_resident_bytes,
+        )?)))
+    }
+
+    pub(crate) fn limits(&self) -> RedactionLimits {
+        self.0.limits
+    }
+
+    pub(crate) fn validate_encoded_http_body_size(
+        &self,
+        bytes: usize,
+    ) -> Result<(), SnapshotError> {
+        check_size(
+            bytes,
+            self.0.limits.max_body_bytes,
+            PayloadLimit::EncodedHttpBody,
+        )
+    }
+
+    pub(crate) fn validate_websocket_frame_size(&self, bytes: usize) -> Result<(), SnapshotError> {
+        check_size(
+            bytes,
+            self.0.limits.max_frame_bytes,
+            PayloadLimit::WebSocketFrame,
+        )
+    }
+
+    pub(crate) fn validate_encoded_websocket_message_size(
+        &self,
+        bytes: usize,
+    ) -> Result<(), SnapshotError> {
+        check_size(
+            bytes,
+            self.0.limits.max_message_bytes,
+            PayloadLimit::WebSocketMessage,
+        )
+    }
+
+    pub(crate) fn redact_decoded_http_body(
+        &self,
+        payload: Vec<u8>,
+    ) -> Result<RedactedPayload, SnapshotError> {
+        let class = if std::str::from_utf8(&payload).is_ok() {
+            PayloadClass::Text
+        } else {
+            PayloadClass::Binary
+        };
+        self.0.redact_complete(
+            payload,
+            class,
+            self.0.limits.max_decoded_body_bytes,
+            PayloadLimit::DecodedHttpBody,
+        )
+    }
+
+    pub(crate) fn redact_websocket_message(
+        &self,
+        payload: Vec<u8>,
+        class: PayloadClass,
+    ) -> Result<RedactedPayload, SnapshotError> {
+        self.0.redact_complete(
+            payload,
+            class,
+            self.0.limits.max_message_bytes,
+            PayloadLimit::WebSocketMessage,
+        )
+    }
+}
+
+struct ProfileSnapshot {
+    replacement: Vec<u8>,
+    limits: RedactionLimits,
+    text_literals: LiteralMatcher,
+    binary_literals: LiteralMatcher,
+    text_expressions: Vec<DfaRegex>,
+}
+
+impl ProfileSnapshot {
+    fn activate(
+        plan: RedactionProfilePlan,
+        profile_index: usize,
+        snapshot_matcher_resident_bytes: &mut usize,
+    ) -> Result<Self, SnapshotError> {
+        let source_count = plan
+            .rules
+            .iter()
+            .map(|rule| rule.literal_environment_variables.len())
+            .try_fold(0usize, usize::checked_add)
+            .unwrap_or(usize::MAX);
+        if source_count > plan.max_environment_literal_sources {
+            return Err(SnapshotError::SourceCount { profile_index });
+        }
+
+        let matcher_scratch_bytes = if source_count == 0 {
+            0
+        } else {
+            MAX_MATCHER_SCRATCH_BYTES
+        };
+        let mut limits = RedactionLimits {
+            max_body_bytes: plan.max_body_bytes,
+            max_decoded_body_bytes: plan.max_decoded_body_bytes,
+            max_frame_bytes: plan.max_frame_bytes,
+            max_message_bytes: plan.max_message_bytes,
+            allow_permessage_deflate: plan.allow_permessage_deflate,
+            matcher_scratch_bytes,
+            compiled_matcher_resident_bytes: 0,
+        };
+        debug_assert!(limits.matcher_scratch_bytes <= MAX_MATCHER_SCRATCH_BYTES);
+
+        let mut aggregate_bytes = 0usize;
+        let mut rules = Vec::with_capacity(plan.rules.len());
+        for (rule_index, rule) in plan.rules.into_iter().enumerate() {
+            rules.push(ResolvedRule::activate(
+                rule,
+                profile_index,
+                rule_index,
+                plan.max_environment_literal_bytes,
+                plan.max_environment_literal_total_bytes,
+                &mut aggregate_bytes,
+            )?);
+        }
+
+        let text_budget = remaining_matcher_resident_budget(
+            limits.compiled_matcher_resident_bytes,
+            *snapshot_matcher_resident_bytes,
+            profile_index,
+        )?;
+        let (text_literals, text_literal_bytes) =
+            LiteralMatcher::build(&rules, PayloadClass::Text, profile_index, text_budget)?;
+        let (profile_bytes, snapshot_bytes) = checked_redaction_matcher_resident_bytes(
+            limits.compiled_matcher_resident_bytes,
+            *snapshot_matcher_resident_bytes,
+            text_literal_bytes,
+        )
+        .ok_or(SnapshotError::CompiledMatcherTooLarge { profile_index })?;
+        limits.compiled_matcher_resident_bytes = profile_bytes;
+        *snapshot_matcher_resident_bytes = snapshot_bytes;
+
+        let binary_budget = remaining_matcher_resident_budget(
+            limits.compiled_matcher_resident_bytes,
+            *snapshot_matcher_resident_bytes,
+            profile_index,
+        )?;
+        let (binary_literals, binary_literal_bytes) =
+            LiteralMatcher::build(&rules, PayloadClass::Binary, profile_index, binary_budget)?;
+        let (profile_bytes, snapshot_bytes) = checked_redaction_matcher_resident_bytes(
+            limits.compiled_matcher_resident_bytes,
+            *snapshot_matcher_resident_bytes,
+            binary_literal_bytes,
+        )
+        .ok_or(SnapshotError::CompiledMatcherTooLarge { profile_index })?;
+        limits.compiled_matcher_resident_bytes = profile_bytes;
+        *snapshot_matcher_resident_bytes = snapshot_bytes;
+
+        let mut text_expressions = Vec::new();
+        for (rule_index, rule) in rules.iter_mut().enumerate() {
+            if !rule.applies_to(PayloadClass::Text) {
+                continue;
+            }
+            for (expression_index, expression) in std::mem::take(&mut rule.expressions)
+                .into_iter()
+                .enumerate()
+            {
+                let remaining_budget = remaining_matcher_resident_budget(
+                    limits.compiled_matcher_resident_bytes,
+                    *snapshot_matcher_resident_bytes,
+                    profile_index,
+                )?;
+                let expression = build_redaction_regex(expression.as_str(), remaining_budget)
+                    .map_err(|_| SnapshotError::ExpressionBuild {
+                        profile_index,
+                        rule_index,
+                        expression_index,
+                    })?;
+                let bytes = redaction_regex_resident_bytes(&expression).ok_or(
+                    SnapshotError::ExpressionBuild {
+                        profile_index,
+                        rule_index,
+                        expression_index,
+                    },
+                )?;
+                let (profile_bytes, snapshot_bytes) = checked_redaction_matcher_resident_bytes(
+                    limits.compiled_matcher_resident_bytes,
+                    *snapshot_matcher_resident_bytes,
+                    bytes,
+                )
+                .ok_or(SnapshotError::ExpressionBuild {
+                    profile_index,
+                    rule_index,
+                    expression_index,
+                })?;
+                limits.compiled_matcher_resident_bytes = profile_bytes;
+                *snapshot_matcher_resident_bytes = snapshot_bytes;
+                text_expressions.push(expression);
+            }
+        }
+        Ok(Self {
+            replacement: plan.replacement,
+            limits,
+            text_literals,
+            binary_literals,
+            text_expressions,
+        })
+    }
+
+    fn redact_complete(
+        &self,
+        payload: Vec<u8>,
+        class: PayloadClass,
+        limit: usize,
+        payload_limit: PayloadLimit,
+    ) -> Result<RedactedPayload, SnapshotError> {
+        check_size(payload.len(), limit, payload_limit)?;
+        if matches!(class, PayloadClass::Text) {
+            std::str::from_utf8(&payload).map_err(|_| SnapshotError::InvalidText)?;
+        }
+
+        let literal_matcher = match class {
+            PayloadClass::Text => &self.text_literals,
+            PayloadClass::Binary => &self.binary_literals,
+        };
+        let (mut output, mut replacements) =
+            literal_matcher.replace_bounded(payload, &self.replacement, limit, payload_limit)?;
+        if matches!(class, PayloadClass::Text) {
+            for expression in &self.text_expressions {
+                let (next, count) = replace_regex_bounded(
+                    output,
+                    expression,
+                    &self.replacement,
+                    limit,
+                    payload_limit,
+                )?;
+                output = next;
+                replacements =
+                    replacements
+                        .checked_add(count)
+                        .ok_or(SnapshotError::PayloadTooLarge {
+                            payload: payload_limit,
+                            limit,
+                        })?;
+            }
+        }
+        Ok(RedactedPayload {
+            bytes: output,
+            replacements,
+        })
+    }
+}
+
+fn remaining_matcher_resident_budget(
+    profile_bytes: usize,
+    snapshot_bytes: usize,
+    profile_index: usize,
+) -> Result<usize, SnapshotError> {
+    remaining_redaction_matcher_resident_bytes(profile_bytes, snapshot_bytes)
+        .ok_or(SnapshotError::CompiledMatcherTooLarge { profile_index })
+}
+
+struct LiteralMatcher {
+    combined: Option<AhoCorasick>,
+    environment: Option<ZeroizingAhoCorasick>,
+}
+
+impl LiteralMatcher {
+    fn build(
+        rules: &[ResolvedRule],
+        class: PayloadClass,
+        profile_index: usize,
+        build_budget: usize,
+    ) -> Result<(Self, usize), SnapshotError> {
+        let pattern_capacity = rules
+            .iter()
+            .filter(|rule| rule.applies_to(class))
+            .map(ResolvedRule::literal_count)
+            .try_fold(0usize, usize::checked_add)
+            .unwrap_or(usize::MAX);
+        let mut combined_patterns = Vec::new();
+        combined_patterns
+            .try_reserve_exact(pattern_capacity)
+            .map_err(|_| SnapshotError::AllocationFailed)?;
+        let mut combined_unique = HashSet::new();
+        let mut environment_patterns = Vec::new();
+        for rule in rules.iter().filter(|rule| rule.applies_to(class)) {
+            for literal in rule.literals.iter().map(Vec::as_slice) {
+                if combined_unique.insert(literal) {
+                    combined_patterns.push(literal);
+                }
+            }
+            for literal in rule.environment_literals.iter().map(SecretBytes::as_bytes) {
+                environment_patterns.push(literal);
+            }
+        }
+        let combined = build_automaton(combined_patterns, profile_index, build_budget)?;
+        let combined_bytes = combined.as_ref().map_or(0, AhoCorasick::memory_usage);
+        let environment_budget = build_budget
+            .checked_sub(combined_bytes)
+            .ok_or(SnapshotError::CompiledMatcherTooLarge { profile_index })?;
+        let environment =
+            ZeroizingAhoCorasick::build(environment_patterns, profile_index, environment_budget)?;
+        let environment_bytes = environment
+            .as_ref()
+            .map(ZeroizingAhoCorasick::resident_bytes)
+            .transpose()
+            .map_err(|()| SnapshotError::MatcherBuild { profile_index })?
+            .unwrap_or(0);
+        let resident_bytes = combined_bytes
+            .checked_add(environment_bytes)
+            .filter(|bytes| *bytes <= build_budget)
+            .ok_or(SnapshotError::CompiledMatcherTooLarge { profile_index })?;
+        Ok((
+            Self {
+                combined,
+                environment,
+            },
+            resident_bytes,
+        ))
+    }
+
+    fn replace_bounded(
+        &self,
+        input: Vec<u8>,
+        replacement: &[u8],
+        limit: usize,
+        payload_limit: PayloadLimit,
+    ) -> Result<(Vec<u8>, usize), SnapshotError> {
+        if self.combined.is_none() && self.environment.is_none() {
+            return Ok((input, 0));
+        }
+        let protected = self.environment_intervals(&input)?;
+        let (output_len, count) = literal_replacement_shape(
+            &input,
+            self.combined.as_ref(),
+            &protected,
+            replacement.len(),
+            limit,
+            payload_limit,
+        )?;
+        if count == 0 {
+            return Ok((input, 0));
+        }
+
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(output_len)
+            .map_err(|_| SnapshotError::AllocationFailed)?;
+        let mut cursor = 0usize;
+        for interval in protected.iter() {
+            append_literal_replacements(
+                &mut output,
+                &input[cursor..interval.start],
+                self.combined.as_ref(),
+                replacement,
+            );
+            output.extend_from_slice(replacement);
+            cursor = interval.end;
+        }
+        append_literal_replacements(
+            &mut output,
+            &input[cursor..],
+            self.combined.as_ref(),
+            replacement,
+        );
+        debug_assert_eq!(output.len(), output_len);
+        Ok((output, count))
+    }
+
+    fn environment_intervals(&self, input: &[u8]) -> Result<ZeroizingVec<Interval>, SnapshotError> {
+        let Some(environment) = &self.environment else {
+            return Ok(ZeroizingVec(Vec::new()));
+        };
+        let max_intervals = MAX_MATCHER_SCRATCH_BYTES / std::mem::size_of::<Interval>();
+        let mut interval_count = 0usize;
+        environment.for_each_match(input, |_, _| {
+            interval_count = interval_count.saturating_add(1);
+            interval_count <= max_intervals
+        });
+        if interval_count > max_intervals {
+            return Err(SnapshotError::MatcherScratchExceeded {
+                limit: MAX_MATCHER_SCRATCH_BYTES,
+            });
+        }
+
+        let mut intervals = ZeroizingVec(Vec::new());
+        intervals
+            .0
+            .try_reserve_exact(interval_count)
+            .map_err(|_| SnapshotError::AllocationFailed)?;
+        if intervals
+            .0
+            .capacity()
+            .checked_mul(std::mem::size_of::<Interval>())
+            .is_none_or(|bytes| bytes > MAX_MATCHER_SCRATCH_BYTES)
+        {
+            return Err(SnapshotError::MatcherScratchExceeded {
+                limit: MAX_MATCHER_SCRATCH_BYTES,
+            });
+        }
+        environment.for_each_match(input, |start, end| {
+            if intervals.len() == max_intervals {
+                return false;
+            }
+            intervals.0.push(Interval { start, end });
+            true
+        });
+        debug_assert_eq!(intervals.len(), interval_count);
+        intervals.sort_unstable_by_key(|interval| (interval.start, interval.end));
+        let mut merged = 0usize;
+        for index in 0..intervals.len() {
+            let interval = intervals[index];
+            if merged != 0 && interval.start < intervals[merged - 1].end {
+                intervals[merged - 1].end = intervals[merged - 1].end.max(interval.end);
+            } else {
+                intervals[merged] = interval;
+                merged += 1;
+            }
+        }
+        intervals.0.truncate(merged);
+        Ok(intervals)
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Interval {
+    start: usize,
+    end: usize,
+}
+
+fn build_automaton(
+    patterns: Vec<&[u8]>,
+    profile_index: usize,
+    build_budget: usize,
+) -> Result<Option<AhoCorasick>, SnapshotError> {
+    let matcher = build_redaction_literal_automaton(patterns, build_budget)
+        .map_err(|_| SnapshotError::MatcherBuild { profile_index })?;
+    if matcher
+        .as_ref()
+        .is_some_and(|matcher| matcher.memory_usage() > build_budget)
+    {
+        return Err(SnapshotError::CompiledMatcherTooLarge { profile_index });
+    }
+    Ok(matcher)
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct SecretEdge {
+    source: usize,
+    byte: u8,
+    target: usize,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct SecretNode {
+    edge_start: usize,
+    edge_len: usize,
+    failure: usize,
+    output_len: usize,
+}
+
+struct ZeroizingAhoCorasick {
+    nodes: ZeroizingVec<SecretNode>,
+    edges: ZeroizingVec<SecretEdge>,
+}
+
+impl ZeroizingAhoCorasick {
+    fn build(
+        mut patterns: Vec<&[u8]>,
+        profile_index: usize,
+        build_budget: usize,
+    ) -> Result<Option<Self>, SnapshotError> {
+        if patterns.is_empty() {
+            return Ok(None);
+        }
+        patterns.sort_unstable();
+        patterns.dedup();
+
+        let mut state_count = 1usize;
+        let mut previous = &[][..];
+        for pattern in &patterns {
+            let shared = common_prefix_len(previous, pattern);
+            state_count = state_count
+                .checked_add(pattern.len() - shared)
+                .ok_or(SnapshotError::MatcherBuild { profile_index })?;
+            previous = pattern;
+        }
+
+        let max_pattern_len = patterns
+            .iter()
+            .map(|pattern| pattern.len())
+            .max()
+            .unwrap_or(0);
+        let edge_count = state_count - 1;
+        let (projected_resident_bytes, projected_build_bytes) =
+            zeroizing_aho_memory_projection(state_count, edge_count, max_pattern_len)
+                .ok_or(SnapshotError::MatcherBuild { profile_index })?;
+        if projected_build_bytes > build_budget {
+            return Err(SnapshotError::CompiledMatcherTooLarge { profile_index });
+        }
+
+        let mut nodes = ZeroizingVec::filled(state_count, SecretNode::default())?;
+        let mut edges = ZeroizingVec(Vec::new());
+        edges
+            .0
+            .try_reserve_exact(edge_count)
+            .map_err(|_| SnapshotError::AllocationFailed)?;
+        let mut terminal_lengths = ZeroizingVec::filled(state_count, 0usize)?;
+        let mut path = ZeroizingVec(Vec::new());
+        path.0
+            .try_reserve_exact(max_pattern_len.saturating_add(1))
+            .map_err(|_| SnapshotError::AllocationFailed)?;
+        path.0.push(0usize);
+        let actual_resident_bytes = nodes
+            .0
+            .capacity()
+            .checked_mul(std::mem::size_of::<SecretNode>())
+            .and_then(|node_bytes| {
+                edges
+                    .0
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<SecretEdge>())
+                    .and_then(|edge_bytes| node_bytes.checked_add(edge_bytes))
+            })
+            .ok_or(SnapshotError::MatcherBuild { profile_index })?;
+        if actual_resident_bytes > projected_resident_bytes || actual_resident_bytes > build_budget
+        {
+            return Err(SnapshotError::CompiledMatcherTooLarge { profile_index });
+        }
+
+        previous = &[];
+        let mut next_state = 1usize;
+        for pattern in patterns {
+            let shared = common_prefix_len(previous, pattern);
+            path.0.truncate(shared + 1);
+            let mut source = *path.last().expect("root path is retained");
+            for &byte in &pattern[shared..] {
+                let target = next_state;
+                next_state += 1;
+                edges.0.push(SecretEdge {
+                    source,
+                    byte,
+                    target,
+                });
+                path.0.push(target);
+                source = target;
+            }
+            terminal_lengths[source] = terminal_lengths[source].max(pattern.len());
+            previous = pattern;
+        }
+        debug_assert_eq!(next_state, state_count);
+        debug_assert_eq!(edges.len(), edge_count);
+        edges.sort_unstable_by_key(|edge| (edge.source, edge.byte));
+        populate_edge_ranges(&mut nodes, &edges);
+
+        let mut matcher = Self { nodes, edges };
+        matcher.populate_failure_links(
+            &terminal_lengths,
+            terminal_lengths.0.capacity(),
+            path.0.capacity(),
+            build_budget,
+            profile_index,
+        )?;
+        Ok(Some(matcher))
+    }
+
+    fn resident_bytes(&self) -> Result<usize, ()> {
+        self.nodes
+            .0
+            .capacity()
+            .checked_mul(std::mem::size_of::<SecretNode>())
+            .and_then(|node_bytes| {
+                self.edges
+                    .0
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<SecretEdge>())
+                    .and_then(|edge_bytes| node_bytes.checked_add(edge_bytes))
+            })
+            .ok_or(())
+    }
+
+    fn populate_failure_links(
+        &mut self,
+        terminal_lengths: &[usize],
+        terminal_capacity: usize,
+        path_capacity: usize,
+        build_budget: usize,
+        profile_index: usize,
+    ) -> Result<(), SnapshotError> {
+        let mut queue = ZeroizingVec(Vec::new());
+        queue
+            .0
+            .try_reserve_exact(self.nodes.len())
+            .map_err(|_| SnapshotError::AllocationFailed)?;
+        let actual_build_bytes = self
+            .resident_bytes()
+            .ok()
+            .and_then(|bytes| {
+                terminal_capacity
+                    .checked_mul(std::mem::size_of::<usize>())
+                    .and_then(|terminal_bytes| bytes.checked_add(terminal_bytes))
+            })
+            .and_then(|bytes| {
+                path_capacity
+                    .checked_mul(std::mem::size_of::<usize>())
+                    .and_then(|path_bytes| bytes.checked_add(path_bytes))
+            })
+            .and_then(|bytes| {
+                queue
+                    .0
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<usize>())
+                    .and_then(|queue_bytes| bytes.checked_add(queue_bytes))
+            })
+            .ok_or(SnapshotError::MatcherBuild { profile_index })?;
+        if actual_build_bytes > build_budget {
+            return Err(SnapshotError::CompiledMatcherTooLarge { profile_index });
+        }
+        self.nodes[0].output_len = terminal_lengths[0];
+        let root_edges = self.edge_range(0);
+        for edge_index in root_edges {
+            let target = self.edges[edge_index].target;
+            self.nodes[target].output_len = terminal_lengths[target];
+            queue.0.push(target);
+        }
+
+        let mut cursor = 0usize;
+        while cursor < queue.len() {
+            let source = queue[cursor];
+            cursor += 1;
+            let source_failure = self.nodes[source].failure;
+            let edges = self.edge_range(source);
+            for edge_index in edges {
+                let edge = self.edges[edge_index];
+                let mut failure = source_failure;
+                while failure != 0 && self.transition(failure, edge.byte).is_none() {
+                    failure = self.nodes[failure].failure;
+                }
+                let failure_target = self.transition(failure, edge.byte).unwrap_or(0);
+                self.nodes[edge.target].failure = failure_target;
+                self.nodes[edge.target].output_len =
+                    terminal_lengths[edge.target].max(self.nodes[failure_target].output_len);
+                queue.0.push(edge.target);
+            }
+        }
+        Ok(())
+    }
+
+    fn for_each_match(&self, input: &[u8], mut callback: impl FnMut(usize, usize) -> bool) {
+        let mut state = 0usize;
+        for (index, &byte) in input.iter().enumerate() {
+            while state != 0 && self.transition(state, byte).is_none() {
+                state = self.nodes[state].failure;
+            }
+            state = self.transition(state, byte).unwrap_or(0);
+            let length = self.nodes[state].output_len;
+            if length != 0 && !callback(index + 1 - length, index + 1) {
+                return;
+            }
+        }
+    }
+
+    fn transition(&self, state: usize, byte: u8) -> Option<usize> {
+        let edges = &self.edges[self.edge_range(state)];
+        edges
+            .binary_search_by_key(&byte, |edge| edge.byte)
+            .ok()
+            .map(|index| edges[index].target)
+    }
+
+    fn edge_range(&self, state: usize) -> std::ops::Range<usize> {
+        let node = self.nodes[state];
+        node.edge_start..node.edge_start + node.edge_len
+    }
+
+    #[cfg(test)]
+    fn zeroize(&mut self) {
+        self.nodes.zeroize();
+        self.edges.zeroize();
+    }
+}
+
+fn zeroizing_aho_memory_projection(
+    state_count: usize,
+    edge_count: usize,
+    max_pattern_len: usize,
+) -> Option<(usize, usize)> {
+    let resident_bytes = state_count
+        .checked_mul(std::mem::size_of::<SecretNode>())?
+        .checked_add(edge_count.checked_mul(std::mem::size_of::<SecretEdge>())?)?;
+    // Terminal lengths, the construction path, and the BFS queue coexist
+    // briefly with the approved resident node and edge arrays.
+    let temporary_bytes = state_count
+        .checked_mul(std::mem::size_of::<usize>())?
+        .checked_add(
+            max_pattern_len
+                .checked_add(1)?
+                .checked_mul(std::mem::size_of::<usize>())?,
+        )?
+        .checked_add(state_count.checked_mul(std::mem::size_of::<usize>())?)?;
+    Some((resident_bytes, resident_bytes.checked_add(temporary_bytes)?))
+}
+
+fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn populate_edge_ranges(nodes: &mut [SecretNode], edges: &[SecretEdge]) {
+    let mut cursor = 0usize;
+    while cursor < edges.len() {
+        let source = edges[cursor].source;
+        let start = cursor;
+        while cursor < edges.len() && edges[cursor].source == source {
+            cursor += 1;
+        }
+        nodes[source].edge_start = start;
+        nodes[source].edge_len = cursor - start;
+    }
+}
+
+mod zero_valid {
+    use super::{Interval, SecretEdge, SecretNode};
+
+    pub(super) trait Sealed {}
+
+    /// Types whose initialized values remain valid after a bytewise zero fill.
+    ///
+    /// # Safety
+    /// Every byte being zero must be a valid representation of `Self`. `Copy`
+    /// excludes destructors that a bytewise overwrite could bypass.
+    pub(super) unsafe trait ZeroValid: Sealed + Copy + Default {}
+
+    impl Sealed for u8 {}
+    // SAFETY: every `u8` bit pattern, including zero, is valid.
+    unsafe impl ZeroValid for u8 {}
+
+    impl Sealed for usize {}
+    // SAFETY: the all-zero representation is the integer value zero.
+    unsafe impl ZeroValid for usize {}
+
+    impl Sealed for Interval {}
+    // SAFETY: `Interval` contains only `usize` fields, for which all-zero is valid.
+    unsafe impl ZeroValid for Interval {}
+
+    impl Sealed for SecretEdge {}
+    // SAFETY: `SecretEdge` contains only `usize` and `u8` fields; zero is valid
+    // for every field and padding bytes carry no validity invariant.
+    unsafe impl ZeroValid for SecretEdge {}
+
+    impl Sealed for SecretNode {}
+    // SAFETY: `SecretNode` contains only `usize` fields, for which all-zero is valid.
+    unsafe impl ZeroValid for SecretNode {}
+}
+
+use zero_valid::ZeroValid;
+
+struct ZeroizingVec<T: ZeroValid>(Vec<T>);
+
+impl<T: ZeroValid> ZeroizingVec<T> {
+    fn filled(len: usize, value: T) -> Result<Self, SnapshotError> {
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(len)
+            .map_err(|_| SnapshotError::AllocationFailed)?;
+        values.resize(len, value);
+        Ok(Self(values))
+    }
+
+    fn zeroize(&mut self) {
+        wipe_vec_capacity(&mut self.0);
+    }
+}
+
+impl<T: ZeroValid> std::ops::Deref for ZeroizingVec<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T: ZeroValid> std::ops::DerefMut for ZeroizingVec<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<T: ZeroValid> Drop for ZeroizingVec<T> {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+fn literal_replacement_shape(
+    input: &[u8],
+    combined: Option<&AhoCorasick>,
+    protected: &[Interval],
+    replacement_len: usize,
+    limit: usize,
+    payload: PayloadLimit,
+) -> Result<(usize, usize), SnapshotError> {
+    let mut removed = 0usize;
+    let mut count = 0usize;
+    let mut cursor = 0usize;
+    for interval in protected {
+        if let Some(combined) = combined {
+            accumulate_matches(
+                combined.find_iter(&input[cursor..interval.start]),
+                &mut removed,
+                &mut count,
+                payload,
+                limit,
+            )?;
+        }
+        removed = removed
+            .checked_add(interval.end - interval.start)
+            .ok_or(SnapshotError::PayloadTooLarge { payload, limit })?;
+        count = count
+            .checked_add(1)
+            .ok_or(SnapshotError::PayloadTooLarge { payload, limit })?;
+        cursor = interval.end;
+    }
+    if let Some(combined) = combined {
+        accumulate_matches(
+            combined.find_iter(&input[cursor..]),
+            &mut removed,
+            &mut count,
+            payload,
+            limit,
+        )?;
+    }
+    checked_output_len(input.len(), removed, count, replacement_len, limit, payload)
+        .map(|output_len| (output_len, count))
+}
+
+fn accumulate_matches(
+    matches: impl Iterator<Item = aho_corasick::Match>,
+    removed: &mut usize,
+    count: &mut usize,
+    payload: PayloadLimit,
+    limit: usize,
+) -> Result<(), SnapshotError> {
+    for matched in matches {
+        *removed = removed
+            .checked_add(matched.len())
+            .ok_or(SnapshotError::PayloadTooLarge { payload, limit })?;
+        *count = count
+            .checked_add(1)
+            .ok_or(SnapshotError::PayloadTooLarge { payload, limit })?;
+    }
+    Ok(())
+}
+
+fn append_literal_replacements(
+    output: &mut Vec<u8>,
+    input: &[u8],
+    combined: Option<&AhoCorasick>,
+    replacement: &[u8],
+) {
+    let Some(combined) = combined else {
+        output.extend_from_slice(input);
+        return;
+    };
+    let mut cursor = 0usize;
+    for matched in combined.find_iter(input) {
+        output.extend_from_slice(&input[cursor..matched.start()]);
+        output.extend_from_slice(replacement);
+        cursor = matched.end();
+    }
+    output.extend_from_slice(&input[cursor..]);
+}
+
+struct ResolvedRule {
+    literals: Vec<Vec<u8>>,
+    environment_literals: Vec<SecretBytes>,
+    expressions: Vec<String>,
+    payloads: CompiledRedactionPayloads,
+}
+
+impl ResolvedRule {
+    fn activate(
+        plan: RedactionRulePlan,
+        profile_index: usize,
+        rule_index: usize,
+        individual_limit: usize,
+        aggregate_limit: usize,
+        aggregate_bytes: &mut usize,
+    ) -> Result<Self, SnapshotError> {
+        let mut environment_literals = Vec::with_capacity(plan.literal_environment_variables.len());
+        for (source_index, variable) in plan.literal_environment_variables.into_iter().enumerate() {
+            let value = read_environment_literal(
+                &variable,
+                individual_limit,
+                profile_index,
+                rule_index,
+                source_index,
+            )?;
+            if value.is_empty() {
+                return Err(SnapshotError::SourceEmpty {
+                    profile_index,
+                    rule_index,
+                    source_index,
+                });
+            }
+            std::str::from_utf8(value.as_bytes()).map_err(|_| {
+                SnapshotError::SourceInvalidUtf8 {
+                    profile_index,
+                    rule_index,
+                    source_index,
+                }
+            })?;
+            *aggregate_bytes = aggregate_bytes
+                .checked_add(value.len())
+                .filter(|total| *total <= aggregate_limit)
+                .ok_or(SnapshotError::AggregateTooLarge { profile_index })?;
+            environment_literals.push(value);
+        }
+        Ok(Self {
+            literals: plan.literals,
+            environment_literals,
+            expressions: plan.expressions,
+            payloads: plan.payloads,
+        })
+    }
+
+    fn applies_to(&self, class: PayloadClass) -> bool {
+        matches!(
+            (self.payloads, class),
+            (CompiledRedactionPayloads::Text, PayloadClass::Text)
+                | (CompiledRedactionPayloads::Binary, PayloadClass::Binary)
+                | (CompiledRedactionPayloads::Both, _)
+        )
+    }
+
+    fn literal_count(&self) -> usize {
+        self.literals
+            .len()
+            .saturating_add(self.environment_literals.len())
+    }
+}
+
+fn replace_regex_bounded(
+    input: Vec<u8>,
+    expression: &DfaRegex,
+    replacement: &[u8],
+    limit: usize,
+    payload_limit: PayloadLimit,
+) -> Result<(Vec<u8>, usize), SnapshotError> {
+    let (output_len, count) = replacement_shape(
+        input.len(),
+        expression.find_iter(&input).map(|matched| matched.len()),
+        replacement.len(),
+        limit,
+        payload_limit,
+    )?;
+    if count == 0 {
+        return Ok((input, 0));
+    }
+
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(output_len)
+        .map_err(|_| SnapshotError::AllocationFailed)?;
+    let mut cursor = 0;
+    for matched in expression.find_iter(&input) {
+        output.extend_from_slice(&input[cursor..matched.start()]);
+        output.extend_from_slice(replacement);
+        cursor = matched.end();
+    }
+    output.extend_from_slice(&input[cursor..]);
+    debug_assert_eq!(output.len(), output_len);
+    Ok((output, count))
+}
+
+fn replacement_shape(
+    input_len: usize,
+    match_lengths: impl Iterator<Item = usize>,
+    replacement_len: usize,
+    limit: usize,
+    payload: PayloadLimit,
+) -> Result<(usize, usize), SnapshotError> {
+    let mut removed = 0usize;
+    let mut count = 0usize;
+    for matched_len in match_lengths {
+        removed = removed
+            .checked_add(matched_len)
+            .ok_or(SnapshotError::PayloadTooLarge { payload, limit })?;
+        count = count
+            .checked_add(1)
+            .ok_or(SnapshotError::PayloadTooLarge { payload, limit })?;
+    }
+    let output_len =
+        checked_output_len(input_len, removed, count, replacement_len, limit, payload)?;
+    Ok((output_len, count))
+}
+
+fn checked_output_len(
+    input_len: usize,
+    removed: usize,
+    count: usize,
+    replacement_len: usize,
+    limit: usize,
+    payload: PayloadLimit,
+) -> Result<usize, SnapshotError> {
+    input_len
+        .checked_sub(removed)
+        .and_then(|retained| {
+            replacement_len
+                .checked_mul(count)
+                .and_then(|added| retained.checked_add(added))
+        })
+        .filter(|output_len| *output_len <= limit)
+        .ok_or(SnapshotError::PayloadTooLarge { payload, limit })
+}
+
+fn check_size(bytes: usize, limit: usize, payload: PayloadLimit) -> Result<(), SnapshotError> {
+    if bytes > limit {
+        return Err(SnapshotError::PayloadTooLarge { payload, limit });
+    }
+    Ok(())
+}
+
+struct SecretBytes(Vec<u8>);
+
+impl SecretBytes {
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl Drop for SecretBytes {
+    fn drop(&mut self) {
+        wipe_vec_capacity(&mut self.0);
+    }
+}
+
+fn wipe_vec_capacity<T: ZeroValid>(values: &mut Vec<T>) {
+    let byte_len = values
+        .capacity()
+        .checked_mul(std::mem::size_of::<T>())
+        .expect("vector allocation byte length is representable");
+    let pointer = values.as_mut_ptr().cast::<u8>();
+    for index in 0..byte_len {
+        // The allocation remains live for this entire wipe, including capacity slack.
+        unsafe { std::ptr::write_volatile(pointer.add(index), 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+enum EnvironmentReadError {
+    Unavailable,
+    TooLarge,
+}
+
+fn read_environment_literal(
+    variable: &str,
+    individual_limit: usize,
+    profile_index: usize,
+    rule_index: usize,
+    source_index: usize,
+) -> Result<SecretBytes, SnapshotError> {
+    read_environment_bytes(variable, individual_limit).map_err(|error| match error {
+        EnvironmentReadError::Unavailable => SnapshotError::SourceUnavailable {
+            profile_index,
+            rule_index,
+            source_index,
+        },
+        EnvironmentReadError::TooLarge => SnapshotError::SourceTooLarge {
+            profile_index,
+            rule_index,
+            source_index,
+        },
+    })
+}
+
+fn read_environment_bytes(
+    variable: &str,
+    individual_limit: usize,
+) -> Result<SecretBytes, EnvironmentReadError> {
+    let value = env::var_os(variable).ok_or(EnvironmentReadError::Unavailable)?;
+    let bytes = SecretBytes(value.into_encoded_bytes());
+    if bytes.len() > individual_limit {
+        return Err(EnvironmentReadError::TooLarge);
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::config::v3_compile::{
+        MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE,
+        MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT,
+    };
+
+    static NEXT_ENV: AtomicUsize = AtomicUsize::new(0);
+
+    struct EnvGuard(String);
+
+    impl EnvGuard {
+        fn set(value: &str) -> Self {
+            let name = format!(
+                "ACL_PROXY_REDACTION_SNAPSHOT_TEST_{}_{}",
+                std::process::id(),
+                NEXT_ENV.fetch_add(1, Ordering::Relaxed)
+            );
+            env::set_var(&name, value);
+            Self(name)
+        }
+
+        fn missing() -> Self {
+            let name = format!(
+                "ACL_PROXY_REDACTION_SNAPSHOT_TEST_{}_{}",
+                std::process::id(),
+                NEXT_ENV.fetch_add(1, Ordering::Relaxed)
+            );
+            env::remove_var(&name);
+            Self(name)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            env::remove_var(&self.0);
+        }
+    }
+
+    fn profile(variable: Option<String>) -> RedactionProfilePlan {
+        RedactionProfilePlan {
+            replacement: b"[MASKED]".to_vec(),
+            max_body_bytes: 32,
+            max_decoded_body_bytes: 128,
+            max_frame_bytes: 16,
+            max_message_bytes: 128,
+            allow_permessage_deflate: true,
+            max_environment_literal_sources: 2,
+            max_environment_literal_bytes: 64,
+            max_environment_literal_total_bytes: 96,
+            rules: vec![RedactionRulePlan {
+                literals: vec![b"literal".to_vec()],
+                literal_environment_variables: variable.into_iter().collect(),
+                expressions: vec![r"token-[0-9]+".to_string()],
+                payloads: CompiledRedactionPayloads::Text,
+            }],
+        }
+    }
+
+    fn plan(profile: RedactionProfilePlan) -> RedactionPlan {
+        RedactionPlan {
+            profiles: BTreeMap::from([("main".to_string(), profile)]),
+        }
+    }
+
+    #[test]
+    fn fixed_replacement_obeys_payload_selection() {
+        let source = EnvGuard::set("environment-secret");
+        let mut profile_plan = profile(Some(source.0.clone()));
+        profile_plan.rules.push(RedactionRulePlan {
+            literals: vec![b"binary-secret".to_vec()],
+            literal_environment_variables: vec![],
+            expressions: vec![],
+            payloads: CompiledRedactionPayloads::Binary,
+        });
+        let snapshot = RedactionSnapshot::activate(plan(profile_plan)).unwrap();
+        let rendered = format!("{snapshot:?} {:?}", snapshot.profile("main").unwrap());
+        assert!(!rendered.contains("environment-secret"));
+        assert!(!rendered.contains(&source.0));
+        let profile = snapshot.profile("main").unwrap();
+
+        let text = profile
+            .redact_decoded_http_body(b"literal environment-secret token-12 binary-secret".to_vec())
+            .unwrap();
+        assert_eq!(text.replacements, 3);
+        assert_eq!(text.bytes, b"[MASKED] [MASKED] [MASKED] binary-secret");
+        let binary = profile
+            .redact_websocket_message(b"literal binary-secret".to_vec(), PayloadClass::Binary)
+            .unwrap();
+        assert_eq!(binary.replacements, 1);
+        assert_eq!(binary.bytes, b"literal [MASKED]");
+    }
+
+    #[test]
+    fn longer_environment_literal_wins_across_rule_boundaries() {
+        let source = EnvGuard::set("secret-token");
+        let mut profile_plan = profile(None);
+        profile_plan.rules[0].literals = vec![b"secret".to_vec(), b"token".to_vec()];
+        profile_plan.rules.push(RedactionRulePlan {
+            literals: vec![],
+            literal_environment_variables: vec![source.0.clone()],
+            expressions: vec![],
+            payloads: CompiledRedactionPayloads::Text,
+        });
+        let prefix_handle = RedactionSnapshot::activate(plan(profile_plan))
+            .unwrap()
+            .profile("main")
+            .unwrap();
+        let output = prefix_handle
+            .redact_decoded_http_body(b"secret-token".to_vec())
+            .unwrap();
+        assert_eq!(output.replacements, 1);
+        assert_eq!(output.bytes, b"[MASKED]");
+
+        let later_source = EnvGuard::set("bcdef");
+        let mut later_plan = profile(None);
+        later_plan.rules[0].literals = vec![b"abc".to_vec()];
+        later_plan.rules.push(RedactionRulePlan {
+            literals: vec![],
+            literal_environment_variables: vec![later_source.0.clone()],
+            expressions: vec![],
+            payloads: CompiledRedactionPayloads::Text,
+        });
+        let later = RedactionSnapshot::activate(plan(later_plan))
+            .unwrap()
+            .profile("main")
+            .unwrap()
+            .redact_decoded_http_body(b"abcdef".to_vec())
+            .unwrap();
+        assert_eq!(later.bytes, b"a[MASKED]");
+
+        let overlap_source = EnvGuard::set("aaa");
+        let overlap = RedactionSnapshot::activate(plan(profile(Some(overlap_source.0.clone()))))
+            .unwrap()
+            .profile("main")
+            .unwrap()
+            .redact_decoded_http_body(b"aaaa".to_vec())
+            .unwrap();
+        assert_eq!(overlap.replacements, 1);
+        assert_eq!(overlap.bytes, b"[MASKED]");
+    }
+
+    #[test]
+    fn transport_fragments_are_only_validated_and_complete_payload_is_redacted() {
+        let source = EnvGuard::set("boundary-secret");
+        let profile = RedactionSnapshot::activate(plan(profile(Some(source.0.clone()))))
+            .unwrap()
+            .profile("main")
+            .unwrap();
+        let first = b"prefix boundary-";
+        let second = b"secret suffix";
+        profile
+            .validate_encoded_http_body_size(first.len())
+            .unwrap();
+        profile.validate_websocket_frame_size(second.len()).unwrap();
+        assert_eq!(first, b"prefix boundary-");
+        assert_eq!(second, b"secret suffix");
+
+        let output = profile
+            .redact_websocket_message(
+                [first.as_slice(), second.as_slice()].concat(),
+                PayloadClass::Text,
+            )
+            .unwrap();
+        assert_eq!(output.bytes, b"prefix [MASKED] suffix");
+    }
+
+    #[test]
+    fn narrow_handle_survives_snapshot_drop() {
+        let source = EnvGuard::set("retained-secret");
+        let snapshot = RedactionSnapshot::activate(plan(profile(Some(source.0.clone())))).unwrap();
+        let profile = snapshot.profile("main").unwrap();
+        drop(snapshot);
+
+        let output = profile
+            .redact_websocket_message(b"retained-secret".to_vec(), PayloadClass::Text)
+            .unwrap();
+        assert_eq!(output.bytes, b"[MASKED]");
+        assert!(!format!("{profile:?}").contains("retained-secret"));
+    }
+
+    #[test]
+    fn snapshot_rotation_is_atomic() {
+        let source = EnvGuard::set("old-secret");
+        let old = RedactionSnapshot::activate(plan(profile(Some(source.0.clone()))))
+            .unwrap()
+            .profile("main")
+            .unwrap();
+        env::set_var(&source.0, "new-secret");
+        let new = RedactionSnapshot::activate(plan(profile(Some(source.0.clone()))))
+            .unwrap()
+            .profile("main")
+            .unwrap();
+
+        assert_eq!(
+            old.redact_decoded_http_body(b"old-secret new-secret".to_vec())
+                .unwrap()
+                .bytes,
+            b"[MASKED] new-secret"
+        );
+        assert_eq!(
+            new.redact_decoded_http_body(b"old-secret new-secret".to_vec())
+                .unwrap()
+                .bytes,
+            b"old-secret [MASKED]"
+        );
+    }
+
+    #[test]
+    fn missing_empty_and_individual_oversize_errors_are_sanitized() {
+        let missing = EnvGuard::missing();
+        let error =
+            RedactionSnapshot::activate(plan(profile(Some(missing.0.clone())))).unwrap_err();
+        assert!(matches!(error, SnapshotError::SourceUnavailable { .. }));
+        assert!(!format!("{error:?} {error}").contains(&missing.0));
+
+        let empty = EnvGuard::set("");
+        let error = RedactionSnapshot::activate(plan(profile(Some(empty.0.clone())))).unwrap_err();
+        assert!(matches!(error, SnapshotError::SourceEmpty { .. }));
+
+        let value = "sensitive-value-that-is-deliberately-longer-than-the-individual-source-limit";
+        let large = EnvGuard::set(value);
+        let error = RedactionSnapshot::activate(plan(profile(Some(large.0.clone())))).unwrap_err();
+        assert!(matches!(error, SnapshotError::SourceTooLarge { .. }));
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains(&large.0));
+        assert!(!rendered.contains(value));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_source_is_rejected_without_disclosure() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let source = EnvGuard::missing();
+        env::set_var(&source.0, OsString::from_vec(vec![b's', 0xff, b'x']));
+        let error = RedactionSnapshot::activate(plan(profile(Some(source.0.clone())))).unwrap_err();
+        assert!(matches!(error, SnapshotError::SourceInvalidUtf8 { .. }));
+        assert!(!format!("{error:?} {error}").contains(&source.0));
+    }
+
+    #[test]
+    fn source_count_and_aggregate_limits_are_enforced() {
+        let one = EnvGuard::set("12345678");
+        let two = EnvGuard::set("abcdefgh");
+        let mut count_profile = profile(None);
+        count_profile.max_environment_literal_sources = 1;
+        count_profile.rules[0].literal_environment_variables = vec![one.0.clone(), two.0.clone()];
+        assert!(matches!(
+            RedactionSnapshot::activate(plan(count_profile)).unwrap_err(),
+            SnapshotError::SourceCount { .. }
+        ));
+
+        let mut aggregate_profile = profile(None);
+        aggregate_profile.max_environment_literal_total_bytes = 15;
+        aggregate_profile.rules[0].literal_environment_variables =
+            vec![one.0.clone(), two.0.clone()];
+        assert!(matches!(
+            RedactionSnapshot::activate(plan(aggregate_profile)).unwrap_err(),
+            SnapshotError::AggregateTooLarge { .. }
+        ));
+    }
+
+    #[test]
+    fn validation_limits_and_scratch_metadata_are_exact() {
+        let snapshot = RedactionSnapshot::activate(plan(profile(None))).unwrap();
+        let profile = snapshot.profile("main").unwrap();
+        assert_eq!(profile.limits().matcher_scratch_bytes, 0);
+        assert!(profile.limits().matcher_scratch_bytes <= MAX_MATCHER_SCRATCH_BYTES);
+        assert!(profile.limits().compiled_matcher_resident_bytes > 0);
+        assert!(
+            profile.limits().compiled_matcher_resident_bytes
+                <= MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE
+        );
+        assert_eq!(
+            snapshot.compiled_matcher_resident_bytes(),
+            profile.limits().compiled_matcher_resident_bytes
+        );
+        assert!(
+            snapshot.compiled_matcher_resident_bytes()
+                <= MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT
+        );
+        assert!(profile.validate_encoded_http_body_size(32).is_ok());
+        assert!(matches!(
+            profile.validate_encoded_http_body_size(33),
+            Err(SnapshotError::PayloadTooLarge {
+                payload: PayloadLimit::EncodedHttpBody,
+                limit: 32
+            })
+        ));
+        assert!(profile.validate_websocket_frame_size(16).is_ok());
+        assert!(profile.validate_encoded_websocket_message_size(128).is_ok());
+    }
+
+    #[test]
+    fn invalid_text_and_replacement_expansion_fail_before_output_allocation() {
+        let mut profile_plan = profile(None);
+        profile_plan.max_decoded_body_bytes = 32;
+        let profile = RedactionSnapshot::activate(plan(profile_plan))
+            .unwrap()
+            .profile("main")
+            .unwrap();
+        assert!(matches!(
+            profile.redact_websocket_message(vec![0xff], PayloadClass::Text),
+            Err(SnapshotError::InvalidText)
+        ));
+        assert!(matches!(
+            profile.redact_decoded_http_body(b"literal literal literal literal".to_vec()),
+            Err(SnapshotError::PayloadTooLarge {
+                payload: PayloadLimit::DecodedHttpBody,
+                limit: 32
+            })
+        ));
+    }
+
+    #[test]
+    fn adversarial_dense_matches_remain_bounded() {
+        let mut profile_plan = profile(None);
+        profile_plan.replacement = b"0123456789".to_vec();
+        profile_plan.max_message_bytes = 1024;
+        profile_plan.rules[0].literals = vec![b"a".to_vec(), b"aa".to_vec(), b"aaa".to_vec()];
+        profile_plan.rules[0].expressions.clear();
+        let profile = RedactionSnapshot::activate(plan(profile_plan))
+            .unwrap()
+            .profile("main")
+            .unwrap();
+
+        let output = profile
+            .redact_websocket_message(vec![b'a'; 300], PayloadClass::Text)
+            .unwrap();
+        assert_eq!(output.replacements, 100);
+        assert_eq!(output.bytes.len(), 1000);
+        assert!(output.bytes.capacity() <= 1024);
+    }
+
+    #[test]
+    fn environment_overlap_scratch_exhaustion_fails_closed() {
+        let source = EnvGuard::set("a");
+        let mut profile_plan = profile(Some(source.0.clone()));
+        profile_plan.max_message_bytes = 100_000;
+        profile_plan.rules[0].literals.clear();
+        profile_plan.rules[0].expressions.clear();
+        let profile = RedactionSnapshot::activate(plan(profile_plan))
+            .unwrap()
+            .profile("main")
+            .unwrap();
+        assert_eq!(
+            profile.limits().matcher_scratch_bytes,
+            MAX_MATCHER_SCRATCH_BYTES
+        );
+        let interval_limit = MAX_MATCHER_SCRATCH_BYTES / std::mem::size_of::<Interval>();
+        assert!(matches!(
+            profile.redact_websocket_message(vec![b'a'; interval_limit + 1], PayloadClass::Text),
+            Err(SnapshotError::MatcherScratchExceeded {
+                limit: MAX_MATCHER_SCRATCH_BYTES
+            })
+        ));
+    }
+
+    #[test]
+    fn environment_automaton_state_is_exact_and_zeroizable() {
+        let she = SecretBytes(b"she".to_vec());
+        let he = SecretBytes(b"he".to_vec());
+        let hers = SecretBytes(b"hers".to_vec());
+        let mut matcher = ZeroizingAhoCorasick::build(
+            vec![she.as_bytes(), he.as_bytes(), hers.as_bytes()],
+            0,
+            MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE,
+        )
+        .unwrap()
+        .unwrap();
+        let mut matches = Vec::new();
+        matcher.for_each_match(b"ushers", |start, end| {
+            matches.push(start..end);
+            true
+        });
+        assert_eq!(matches, vec![1..4, 2..6]);
+        assert!(matcher.edges.iter().any(|edge| edge.byte != 0));
+
+        matcher.zeroize();
+        assert!(matcher
+            .nodes
+            .iter()
+            .all(|node| *node == SecretNode::default()));
+        assert!(matcher
+            .edges
+            .iter()
+            .all(|edge| *edge == SecretEdge::default()));
+        assert_allocation_zeroed(&matcher.nodes.0);
+        assert_allocation_zeroed(&matcher.edges.0);
+    }
+
+    #[test]
+    fn environment_automaton_rejects_oversized_resident_and_temporary_state() {
+        let secret = SecretBytes(vec![b'x'; 300 * 1024]);
+        let error = ZeroizingAhoCorasick::build(
+            vec![secret.as_bytes()],
+            3,
+            MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE,
+        )
+        .err()
+        .expect("the projected build peak exceeds the profile ceiling");
+        assert_eq!(
+            error,
+            SnapshotError::CompiledMatcherTooLarge { profile_index: 3 }
+        );
+
+        let (resident, build_peak) = zeroizing_aho_memory_projection(1024, 1023, 1023).unwrap();
+        assert!(build_peak > resident);
+    }
+
+    #[test]
+    fn activation_defensively_rejects_cache_requiring_regex_syntax() {
+        const EXPRESSION_MARKER: &str = "activation-regex-secret-marker";
+        let mut profile_plan = profile(None);
+        profile_plan.rules[0].expressions = vec![format!(r"\b{EXPRESSION_MARKER}\b")];
+        let error = RedactionSnapshot::activate(plan(profile_plan)).unwrap_err();
+        assert!(matches!(
+            error,
+            SnapshotError::ExpressionBuild {
+                profile_index: 0,
+                rule_index: 0,
+                expression_index: 0
+            }
+        ));
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains(EXPRESSION_MARKER));
+    }
+
+    fn assert_allocation_zeroed<T>(values: &Vec<T>) {
+        let byte_len = values.capacity() * std::mem::size_of::<T>();
+        // The test reads only the still-live allocation after the explicit wipe.
+        let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), byte_len) };
+        assert!(bytes.iter().all(|byte| *byte == 0));
+    }
+}

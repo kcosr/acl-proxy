@@ -13,7 +13,7 @@ const DEFAULT_CONFIG_PATH: &str = "config/acl-proxy.toml";
 const MAX_CONFIG_BYTES: usize = 10 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ConfigPathSource {
+pub(crate) enum ConfigPathSource {
     Explicit,
     Environment,
     Default,
@@ -173,16 +173,26 @@ fn load_selected_config_v3(
         path: path.clone(),
         valid_up_to: source.valid_up_to(),
     })?;
-    let authored = toml::from_str(text).map_err(|source| V3LoadError::ParseToml {
-        path: path.clone(),
-        diagnostic: sanitize_toml_error(text, &source),
-    })?;
+    let authored = parse_config_text(text, &path)?;
 
     Ok(LoadedConfigV3 {
         authored,
         path,
         config_root,
         path_source: selected.source,
+    })
+}
+
+pub(super) fn parse_config_text(text: &str, path: &Path) -> Result<ConfigV3, V3LoadError> {
+    if text.len() > MAX_CONFIG_BYTES {
+        return Err(V3LoadError::TooLarge {
+            path: path.to_path_buf(),
+            max_bytes: MAX_CONFIG_BYTES,
+        });
+    }
+    toml::from_str(text).map_err(|source| V3LoadError::ParseToml {
+        path: path.to_path_buf(),
+        diagnostic: sanitize_toml_error(text, &source),
     })
 }
 

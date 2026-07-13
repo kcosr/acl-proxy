@@ -6,6 +6,7 @@ version = 4
 name = "acl-proxy"
 version = "0.2.0"
 dependencies = [
+ "aho-corasick",
  "arc-swap",
  "assert_cmd",
  "base64 0.22.1",
@@ -31,6 +32,7 @@ dependencies = [
  "rand",
  "rcgen",
  "regex",
+ "regex-automata",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",

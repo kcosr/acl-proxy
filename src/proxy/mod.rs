@@ -1,3 +1,4 @@
+pub(crate) mod authority;
 pub mod explicit_https;
 pub mod http;
 pub mod https_connect;

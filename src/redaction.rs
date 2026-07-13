@@ -1,6 +1,14 @@
 use crate::config::{RedactionMatch, RedactionProfileConfig};
 use regex::{NoExpand, Regex};
 
+mod snapshot;
+
+#[allow(unused_imports)]
+pub(crate) use snapshot::{
+    PayloadClass, PayloadLimit, ProfileHandle, RedactedPayload, RedactionLimits, RedactionSnapshot,
+    SnapshotError,
+};
+
 #[derive(Debug, Clone)]
 pub struct RedactionProfile {
     pub name: String,

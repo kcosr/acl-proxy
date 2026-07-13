@@ -1,0 +1,360 @@
+use std::fmt;
+use std::path::{Path, PathBuf};
+
+use super::v3_compile::{
+    compile_v3, CompiledProductConfig, ReloadableProductPlan, StaticFingerprint,
+    StaticProductConfig,
+};
+use super::v3_loader;
+
+pub(crate) use super::v3_loader::ConfigPathSource;
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ConfigFileMetadata {
+    pub(crate) path: PathBuf,
+    pub(crate) config_root: PathBuf,
+    pub(crate) path_source: ConfigPathSource,
+}
+
+impl fmt::Debug for ConfigFileMetadata {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConfigFileMetadata")
+            .field("path_source", &self.path_source)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Pure compiler output. Activation consumes `reloadable_plan`; validation and
+/// policy-dump commands may inspect these artifacts without resolving material
+/// or starting runtime resources.
+pub(crate) struct CompiledConfig {
+    pub(crate) static_config: StaticProductConfig,
+    pub(crate) static_fingerprint: StaticFingerprint,
+    pub(crate) reloadable_plan: ReloadableProductPlan,
+}
+
+impl fmt::Debug for CompiledConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompiledConfig")
+            .field("static_fingerprint", &self.static_fingerprint)
+            .field("reloadable_plan", &self.reloadable_plan)
+            .finish_non_exhaustive()
+    }
+}
+
+pub(crate) struct LoadedCompiledConfig {
+    pub(crate) metadata: ConfigFileMetadata,
+    pub(crate) compiled: CompiledConfig,
+}
+
+impl fmt::Debug for LoadedCompiledConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LoadedCompiledConfig")
+            .field("compiled", &self.compiled)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ConfigTextInput<'a> {
+    pub(crate) text: &'a str,
+    pub(crate) source_path: &'a Path,
+    pub(crate) config_root: &'a Path,
+}
+
+pub(crate) enum ConfigFacadeError {
+    Load {
+        message: String,
+    },
+    Compile {
+        source_path: PathBuf,
+        message: String,
+    },
+}
+
+impl fmt::Display for ConfigFacadeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Load { message } => formatter.write_str(message),
+            Self::Compile {
+                source_path,
+                message,
+            } => write!(
+                formatter,
+                "configuration file {} failed validation: {message}",
+                source_path.display()
+            ),
+        }
+    }
+}
+
+impl fmt::Debug for ConfigFacadeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("ConfigFacadeError")
+            .field(&format_args!("{self}"))
+            .finish()
+    }
+}
+
+impl std::error::Error for ConfigFacadeError {}
+
+pub(crate) fn load_and_compile_config(
+    explicit_path: Option<&Path>,
+) -> Result<LoadedCompiledConfig, ConfigFacadeError> {
+    let loaded = v3_loader::load_config_v3(explicit_path).map_err(load_error)?;
+    let metadata = ConfigFileMetadata {
+        path: loaded.path,
+        config_root: loaded.config_root,
+        path_source: loaded.path_source,
+    };
+    let compiled = compile_authored(loaded.authored, &metadata.config_root, &metadata.path)?;
+    Ok(LoadedCompiledConfig { metadata, compiled })
+}
+
+pub(crate) fn compile_config_text(
+    input: ConfigTextInput<'_>,
+) -> Result<CompiledConfig, ConfigFacadeError> {
+    let authored =
+        v3_loader::parse_config_text(input.text, input.source_path).map_err(load_error)?;
+    compile_authored(authored, input.config_root, input.source_path)
+}
+
+fn compile_authored(
+    authored: super::authoring::ConfigV3,
+    config_root: &Path,
+    source_path: &Path,
+) -> Result<CompiledConfig, ConfigFacadeError> {
+    let compiled =
+        compile_v3(authored, config_root).map_err(|source| ConfigFacadeError::Compile {
+            source_path: source_path.to_path_buf(),
+            message: source.to_string(),
+        })?;
+    Ok(split_compiled(compiled))
+}
+
+fn load_error(source: super::v3_loader::V3LoadError) -> ConfigFacadeError {
+    ConfigFacadeError::Load {
+        message: source.to_string(),
+    }
+}
+
+fn split_compiled(compiled: CompiledProductConfig) -> CompiledConfig {
+    CompiledConfig {
+        static_config: compiled.static_config,
+        static_fingerprint: compiled.static_fingerprint,
+        reloadable_plan: compiled.reloadable_plan,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::config::v3_compile::AuthorizationProviderPlan;
+
+    const MINIMAL: &str = r#"
+schema_version = 3
+
+[listeners.explicit_http]
+bind = "127.0.0.1:8881"
+http_versions = ["http1"]
+
+[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+"#;
+
+    #[test]
+    fn load_and_compile_returns_selected_file_metadata_and_compiled_artifacts() {
+        let directory = tempdir().unwrap();
+        let config_root = directory.path().join("config");
+        fs::create_dir(&config_root).unwrap();
+        let path = config_root.join("acl-proxy.toml");
+        fs::write(&path, MINIMAL).unwrap();
+
+        let loaded = load_and_compile_config(Some(&path)).unwrap();
+        assert_eq!(loaded.metadata.path, path);
+        assert_eq!(loaded.metadata.config_root, config_root);
+        assert_eq!(loaded.metadata.path_source, ConfigPathSource::Explicit);
+        assert_eq!(loaded.compiled.static_config.schema_version, 3);
+        assert_eq!(
+            loaded.compiled.static_config.config_root,
+            loaded.metadata.config_root
+        );
+        assert!(format!("{loaded:?}").contains("StaticFingerprint("));
+    }
+
+    #[test]
+    fn text_compilation_is_pure_and_yields_validate_and_dump_inputs() {
+        let input = MINIMAL.replace(
+            "[policy]",
+            r#"[control]
+bind = "127.0.0.1:8898"
+
+[control.tls]
+certificate_chain = "missing-control-cert.pem"
+private_key = "missing-control-key.pem"
+
+[authorization.providers.local]
+kind = "process"
+command = "missing-provider-that-must-not-run"
+
+[credentials.sources.environment]
+source = "environment"
+variable = "MISSING_FACADE_TEST_SECRET"
+
+[credentials.sources.file]
+source = "file"
+path = "missing-secret-file"
+
+[redaction.profiles.secrets]
+rules = [{ literal_environment_variables = ["MISSING_REDACTION_SECRET"] }]
+
+[policy]"#,
+        );
+        let source_path = Path::new("/etc/acl-proxy/acl-proxy.toml");
+        let compiled = compile_config_text(ConfigTextInput {
+            text: &input,
+            source_path,
+            config_root: source_path.parent().unwrap(),
+        })
+        .expect("pure compilation must not open material, resolve secrets, or spawn providers");
+
+        let AuthorizationProviderPlan::Process(provider) = compiled
+            .reloadable_plan
+            .authorization
+            .providers
+            .get("local")
+            .unwrap()
+        else {
+            panic!("local must be a process provider");
+        };
+        assert_eq!(
+            provider.command,
+            Path::new("/etc/acl-proxy/missing-provider-that-must-not-run")
+        );
+        assert_eq!(compiled.reloadable_plan.credentials.sources.len(), 2);
+        assert_eq!(compiled.reloadable_plan.redaction.profiles.len(), 1);
+    }
+
+    #[test]
+    fn compiled_policy_plan_is_ready_for_secret_free_dump_projection() {
+        let input = MINIMAL.replace(
+            "[policy]\ndefault = \"deny\"",
+            r#"[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "health"
+description = "Health endpoint"
+decision = "allow"
+methods = ["GET"]"#,
+        );
+        let compiled = compile_config_text(ConfigTextInput {
+            text: &input,
+            source_path: Path::new("/tmp/config.toml"),
+            config_root: Path::new("/tmp"),
+        })
+        .unwrap();
+        let rule = &compiled.reloadable_plan.policy.rules[0];
+        assert_eq!(rule.id, "health");
+        assert_eq!(rule.description.as_deref(), Some("Health endpoint"));
+        assert_eq!(rule.methods, [http::Method::GET]);
+    }
+
+    #[test]
+    fn facade_rejects_non_v3_without_fallback() {
+        let error = compile_config_text(ConfigTextInput {
+            text: &MINIMAL.replace("schema_version = 3", "schema_version = 2"),
+            source_path: Path::new("/tmp/legacy.toml"),
+            config_root: Path::new("/tmp"),
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("strict schema v3"));
+        assert!(error.to_string().contains("invalid value"));
+    }
+
+    #[test]
+    fn text_compilation_enforces_the_loader_byte_ceiling() {
+        let oversized = " ".repeat(10 * 1024 * 1024 + 1);
+        let error = compile_config_text(ConfigTextInput {
+            text: &oversized,
+            source_path: Path::new("/tmp/oversized.toml"),
+            config_root: Path::new("/tmp"),
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("10485760-byte limit"));
+    }
+
+    #[test]
+    fn combined_parse_and_compile_errors_are_sanitized() {
+        const PARSE_SECRET: &str = "parse-secret-marker-37d9";
+        let parse_input = format!(
+            r#"{MINIMAL}
+[credentials.sources.token]
+source = "environment"
+variable = "{PARSE_SECRET}
+"#
+        );
+        let parse_error = compile_config_text(ConfigTextInput {
+            text: &parse_input,
+            source_path: Path::new("/tmp/parse.toml"),
+            config_root: Path::new("/tmp"),
+        })
+        .unwrap_err();
+        assert_secret_absent(&parse_error, PARSE_SECRET);
+        assert!(parse_error.to_string().contains("syntax error"));
+
+        const REGEX_SECRET: &str = "regex-secret-marker-28ac";
+        let compile_input = format!(
+            r#"{MINIMAL}
+[redaction.profiles.secrets]
+rules = [{{ expressions = ["{REGEX_SECRET}("] }}]
+"#
+        );
+        let compile_error = compile_config_text(ConfigTextInput {
+            text: &compile_input,
+            source_path: Path::new("/tmp/compile.toml"),
+            config_root: Path::new("/tmp"),
+        })
+        .unwrap_err();
+        assert_secret_absent(&compile_error, REGEX_SECRET);
+        assert!(compile_error
+            .to_string()
+            .contains("invalid regular expression"));
+    }
+
+    #[test]
+    fn validate_rejects_unbounded_regex_without_resolving_environment_sources() {
+        const SECRET: &str = "bounded-regex-secret-marker-5a71";
+        let input = format!(
+            r#"{MINIMAL}
+[redaction.profiles.secrets]
+rules = [{{ expressions = ['\b{SECRET}\b'], literal_environment_variables = ["MISSING_VALIDATE_REDACTION_SOURCE"] }}]
+"#
+        );
+        let error = compile_config_text(ConfigTextInput {
+            text: &input,
+            source_path: Path::new("/tmp/bounded-regex.toml"),
+            config_root: Path::new("/tmp"),
+        })
+        .expect_err("validation must reject cache-requiring regex syntax");
+        assert_secret_absent(&error, SECRET);
+        assert!(error.to_string().contains("expressions[0]"));
+        assert!(error.to_string().contains("bounded matcher"));
+    }
+
+    fn assert_secret_absent(error: &ConfigFacadeError, secret: &str) {
+        assert!(!error.to_string().contains(secret), "{error}");
+        assert!(!format!("{error:?}").contains(secret), "{error:?}");
+    }
+}
