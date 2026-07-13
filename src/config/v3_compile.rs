@@ -82,6 +82,7 @@ const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_REDACTION_MATCHER_SCRATCH_BYTES: usize = MIB;
 const DECODER_SCRATCH_BYTES: usize = 64 * 1024;
 const PROVIDER_STREAM_SCRATCH_BYTES: usize = 64 * 1024;
+const MIN_PROVIDER_RESPONSE_PREFIX_BYTES: usize = br#"{"id":"x","#.len();
 
 /// Static, product-owned values. File paths identify material but no material is
 /// opened or parsed by this compiler.
@@ -3282,16 +3283,13 @@ fn compile_http_rule_schedule(
     config: &super::authoring::ConfigV3,
     rule: &PolicyRuleConfig,
 ) -> Result<HttpRuleAllocationSchedule, V3CompileError> {
-    let process_body = rule.authorization_provider.as_ref().and_then(|name| {
+    let process_provider = rule.authorization_provider.as_ref().and_then(|name| {
         match config.authorization.providers.get(name) {
-            Some(AuthorizationProviderConfig::Process(provider))
-                if provider.include_request_body =>
-            {
-                Some(provider)
-            }
+            Some(AuthorizationProviderConfig::Process(provider)) => Some(provider),
             _ => None,
         }
     });
+    let process_body = process_provider.filter(|provider| provider.include_request_body);
     let profile = rule.redaction_profile.as_ref().map(|name| {
         config
             .redaction
@@ -3325,7 +3323,24 @@ fn compile_http_rule_schedule(
     });
 
     let mut initial_peak = 0usize;
-    let mut incoming_stages = Vec::with_capacity(3);
+    let mut incoming_stages = Vec::with_capacity(4);
+    let response_continuation_bytes = process_provider
+        .map(|provider| provider_response_continuation_bytes(provider.max_stdout_line_bytes));
+    let response_continuation_allocation = response_continuation_bytes
+        .map(|bytes| {
+            project_guarded_body_allocation(
+                bytes,
+                "policy.rules",
+                "HTTP provider-response continuation arithmetic overflow",
+            )
+        })
+        .transpose()?;
+    if let Some(response_continuation_allocation) = response_continuation_allocation {
+        initial_peak = initial_peak.max(response_continuation_allocation);
+        incoming_stages.push(IncomingBodyStage {
+            additional_bytes: response_continuation_allocation,
+        });
+    }
     if let Some(provider) = process_body {
         let (encoded_limit, original_limit) = effective_process_body_limits
             .expect("process-body limits were derived with the process provider");
@@ -3343,25 +3358,19 @@ fn compile_http_rule_schedule(
         incoming_stages.push(IncomingBodyStage {
             additional_bytes: provider_stream_scratch,
         });
+        let response_continuation_bytes = response_continuation_bytes
+            .expect("process-body provider has a response continuation limit");
+        initial_peak = initial_peak.max(guarded_body_stage_peak(
+            [original_limit, response_continuation_bytes],
+            "policy.rules",
+            "HTTP provider-response continuation arithmetic overflow",
+        )?);
         if provider.allow_request_body_replacement {
             // The original remains live until a structurally accepted
             // replacement irrevocably wins. Only then may replacement decode
             // and redaction proceed without the original allocation.
-            let response_framing = project_guarded_body_allocation(
-                provider.max_stdout_line_bytes,
-                "policy.rules",
-                "HTTP provider-response framing arithmetic overflow",
-            )?;
-            initial_peak = initial_peak.max(guarded_body_stage_peak(
-                [original_limit, provider.max_stdout_line_bytes],
-                "policy.rules",
-                "HTTP provider-response framing arithmetic overflow",
-            )?);
-            incoming_stages.push(IncomingBodyStage {
-                additional_bytes: response_framing,
-            });
             initial_peak = initial_peak.max(replacement_decode_peak(
-                provider.max_stdout_line_bytes,
+                response_continuation_bytes,
                 original_limit,
             )?);
         }
@@ -3452,13 +3461,17 @@ fn compile_http_rule_schedule(
     })
 }
 
+fn provider_response_continuation_bytes(max_stdout_line_bytes: usize) -> usize {
+    max_stdout_line_bytes.saturating_sub(MIN_PROVIDER_RESPONSE_PREFIX_BYTES)
+}
+
 fn replacement_decode_peak(
-    max_stdout_line_bytes: usize,
+    response_continuation_bytes: usize,
     max_decoded_replacement_bytes: usize,
 ) -> Result<usize, V3CompileError> {
     guarded_body_stage_peak(
         [
-            max_stdout_line_bytes,
+            response_continuation_bytes,
             max_decoded_replacement_bytes,
             DECODER_SCRATCH_BYTES,
         ],
@@ -4775,6 +4788,7 @@ command = "/bin/body-provider"
 include_request_body = true
 max_request_body_bytes = 1
 max_decoded_request_body_bytes = 1
+max_stdout_line_bytes = 11
 retire_timeout = "1s"
 "#,
             r#"
@@ -4816,14 +4830,138 @@ authorization_provider = "body"
 
     #[test]
     fn replacement_projection_charges_each_chunk_and_node_at_boundary() {
-        let line_bytes = 64 * 1024 + 1;
-        let peak = replacement_decode_peak(line_bytes, 1).unwrap();
+        let continuation_bytes = 64 * 1024 + 1;
+        let peak = replacement_decode_peak(continuation_bytes, 1).unwrap();
 
         assert_eq!(
             peak,
-            guarded(line_bytes) + guarded(1) + guarded(DECODER_SCRATCH_BYTES)
+            guarded(continuation_bytes) + guarded(1) + guarded(DECODER_SCRATCH_BYTES)
         );
-        assert_eq!(guarded(line_bytes), 2 * guarded(1));
+        assert_eq!(guarded(continuation_bytes), 2 * guarded(1));
+    }
+
+    #[test]
+    fn decision_only_response_continuation_uses_exact_chunk_boundaries() {
+        for continuation_bytes in [64 * 1024, 64 * 1024 + 1] {
+            let max_stdout_line_bytes = continuation_bytes + MIN_PROVIDER_RESPONSE_PREFIX_BYTES;
+            let input = resource_config(
+                "",
+                &format!(
+                    r#"
+[authorization.providers.decision]
+kind = "process"
+command = "/bin/decision-provider"
+max_stdout_line_bytes = {max_stdout_line_bytes}
+retire_timeout = "1s"
+"#
+                ),
+                r#"
+[[policy.rules]]
+id = "decision"
+decision = "delegate"
+methods = ["GET"]
+authorization_provider = "decision"
+"#,
+            );
+            let resources = compile(&input).unwrap().reloadable_plan.resource_plan;
+
+            assert_eq!(
+                resources.http_wire_body_peak_bytes_by_cursor,
+                [guarded(continuation_bytes), 0]
+            );
+            assert_eq!(
+                resources.max_reachable_http_wire_body_peak_bytes,
+                guarded(continuation_bytes)
+            );
+        }
+        assert_eq!(guarded(64 * 1024), guarded(1));
+        assert_eq!(guarded(64 * 1024 + 1), 2 * guarded(1));
+    }
+
+    #[test]
+    fn retained_body_overlaps_a_pass_reachable_response_continuation() {
+        let later_continuation_bytes = 2 * 64 * 1024 + 1;
+        let later_line_bytes = later_continuation_bytes + MIN_PROVIDER_RESPONSE_PREFIX_BYTES;
+        let input = resource_config(
+            "",
+            &format!(
+                r#"
+[authorization.providers.body]
+kind = "process"
+command = "/bin/body-provider"
+include_request_body = true
+max_request_body_bytes = 1
+max_decoded_request_body_bytes = 1
+max_stdout_line_bytes = 11
+retire_timeout = "1s"
+
+[authorization.providers.later]
+kind = "process"
+command = "/bin/later-provider"
+max_stdout_line_bytes = {later_line_bytes}
+retire_timeout = "1s"
+"#
+            ),
+            r#"
+[[policy.rules]]
+id = "body"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "body"
+
+[[policy.rules]]
+id = "later"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "later"
+"#,
+        );
+        let resources = compile(&input).unwrap().reloadable_plan.resource_plan;
+        let retained_original = guarded(1);
+        let later_continuation = guarded(later_continuation_bytes);
+
+        assert_eq!(later_continuation, 3 * guarded(1));
+        assert_eq!(
+            resources.http_wire_body_peak_bytes_by_cursor,
+            [
+                retained_original + later_continuation,
+                later_continuation,
+                0,
+            ]
+        );
+    }
+
+    #[test]
+    fn default_decision_only_response_preserves_compiled_capacity() {
+        let input = resource_config(
+            "",
+            r#"
+[authorization.providers.decision]
+kind = "process"
+command = "/bin/decision-provider"
+retire_timeout = "1s"
+"#,
+            r#"
+[[policy.rules]]
+id = "decision"
+decision = "delegate"
+methods = ["GET"]
+authorization_provider = "decision"
+"#,
+        );
+        let resources = compile(&input).unwrap().reloadable_plan.resource_plan;
+        let peak = guarded(provider_response_continuation_bytes(MIB));
+
+        assert_eq!(resources.http_wire_body_peak_bytes_by_cursor, [peak, 0]);
+        assert_eq!(resources.max_reachable_http_wire_body_peak_bytes, peak);
+        assert_eq!(
+            resources.wire_body_full_peak_capacity,
+            Capacity::Finite(8 * GIB / peak)
+        );
+        assert_eq!(
+            resources.wire_body_quota_key_full_peak_capacity,
+            Capacity::Finite(GIB / peak)
+        );
     }
 
     #[test]
@@ -4837,6 +4975,7 @@ command = "/bin/body-provider"
 include_request_body = true
 max_request_body_bytes = 1
 max_decoded_request_body_bytes = 1
+max_stdout_line_bytes = 11
 retire_timeout = "1s"
 
 [redaction.profiles.terminal]

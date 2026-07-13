@@ -67,6 +67,8 @@ pub(crate) struct ParentTls {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum EgressActivationError {
+    #[error("egress activation was cancelled")]
+    ActivationCancelled,
     #[error("egress plan route and parent metadata are inconsistent")]
     Route,
     #[error("egress parent URL is invalid")]
@@ -103,6 +105,7 @@ impl EgressSnapshot {
     pub(crate) fn activate(
         plan: EgressPlan,
         credential_sources: &CredentialSourceRegistry,
+        mut is_cancelled: impl FnMut() -> bool,
     ) -> Result<Self, EgressActivationError> {
         let EgressPlan {
             route,
@@ -113,11 +116,11 @@ impl EgressSnapshot {
         } = plan;
         let origin_trust = origin_tls.trust;
         let origin_http_versions = origin_tls.http_versions.clone().into_boxed_slice();
-        let origin_client = build_origin_client(origin_tls)?;
+        let origin_client = build_origin_client(origin_tls, &mut is_cancelled)?;
         let route = match (route, parent_proxy) {
             (CompiledEgressRoute::Direct, None) => EgressRoute::Direct,
             (CompiledEgressRoute::ParentProxy, Some(parent)) => {
-                EgressRoute::Parent(ParentEndpoint::activate(parent)?)
+                EgressRoute::Parent(ParentEndpoint::activate(parent, &mut is_cancelled)?)
             }
             _ => return Err(EgressActivationError::Route),
         };
@@ -168,7 +171,10 @@ impl EgressSnapshot {
 impl crate::runtime::EgressSnapshot for EgressSnapshot {}
 
 impl ParentEndpoint {
-    fn activate(plan: ParentProxyPlan) -> Result<Self, EgressActivationError> {
+    fn activate(
+        plan: ParentProxyPlan,
+        is_cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<Self, EgressActivationError> {
         let ParentProxyPlan {
             kind,
             url,
@@ -182,7 +188,7 @@ impl ParentEndpoint {
         let scheme = uri.scheme_str().ok_or(EgressActivationError::ParentUrl)?;
         let transport = match (scheme, tls) {
             ("http", None) => ParentTransport::Http,
-            ("https", Some(tls)) => ParentTransport::Https(ParentTls::activate(tls)?),
+            ("https", Some(tls)) => ParentTransport::Https(ParentTls::activate(tls, is_cancelled)?),
             _ => return Err(EgressActivationError::Route),
         };
         Ok(Self {
@@ -221,8 +227,13 @@ impl ParentEndpoint {
 }
 
 impl ParentTls {
-    fn activate(plan: ParentProxyTlsPlan) -> Result<Self, EgressActivationError> {
-        Self::activate_with_loader(plan, load_tls_trust)
+    fn activate(
+        plan: ParentProxyTlsPlan,
+        is_cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<Self, EgressActivationError> {
+        Self::activate_with_loader(plan, |trust, ca_certificate| {
+            load_tls_trust(trust, ca_certificate, is_cancelled)
+        })
     }
 
     fn activate_with_loader<F>(
@@ -290,7 +301,10 @@ impl ParentTls {
     }
 }
 
-fn build_origin_client(plan: TransportTlsPlan) -> Result<OriginClient, EgressActivationError> {
+fn build_origin_client(
+    plan: TransportTlsPlan,
+    is_cancelled: &mut dyn FnMut() -> bool,
+) -> Result<OriginClient, EgressActivationError> {
     let http1 = plan.http_versions.contains(&CompiledHttpVersion::Http1);
     let http2 = plan.http_versions.contains(&CompiledHttpVersion::Http2);
     if !http1 && !http2 {
@@ -298,7 +312,7 @@ fn build_origin_client(plan: TransportTlsPlan) -> Result<OriginClient, EgressAct
     }
     // hyper-rustls owns origin ALPN construction from the enabled protocol
     // set and requires the supplied rustls config to start with no ALPN list.
-    let loaded_trust = load_tls_trust(plan.trust, plan.ca_certificate.as_deref())?;
+    let loaded_trust = load_tls_trust(plan.trust, plan.ca_certificate.as_deref(), is_cancelled)?;
     warn_if_insecure("origin", plan.trust);
     let tls = build_tls_config(&loaded_trust, Vec::new(), true);
     let protocols = HttpsConnectorBuilder::new()
@@ -316,17 +330,22 @@ fn build_origin_client(plan: TransportTlsPlan) -> Result<OriginClient, EgressAct
 fn load_tls_trust(
     trust: CompiledTlsTrust,
     ca_certificate: Option<&Path>,
+    is_cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<LoadedTlsTrust, EgressActivationError> {
     match trust {
-        CompiledTlsTrust::System => Ok(LoadedTlsTrust::Roots(root_store_with_native_roots()?)),
+        CompiledTlsTrust::System => Ok(LoadedTlsTrust::Roots(root_store_with_native_roots(
+            is_cancelled,
+        )?)),
         CompiledTlsTrust::Custom => Ok(LoadedTlsTrust::Roots(root_store_from_custom_ca(
             ca_certificate.ok_or(EgressActivationError::CaUnavailable)?,
+            is_cancelled,
         )?)),
         CompiledTlsTrust::SystemPlusCustom => {
-            let mut roots = root_store_with_native_roots()?;
+            let mut roots = root_store_with_native_roots(is_cancelled)?;
             add_custom_ca(
                 &mut roots,
                 ca_certificate.ok_or(EgressActivationError::CaUnavailable)?,
+                is_cancelled,
             )?;
             Ok(LoadedTlsTrust::Roots(roots))
         }
@@ -370,10 +389,14 @@ fn warn_if_insecure(scope: &'static str, trust: CompiledTlsTrust) {
     }
 }
 
-fn root_store_with_native_roots() -> Result<RootCertStore, EgressActivationError> {
+fn root_store_with_native_roots(
+    is_cancelled: &mut dyn FnMut() -> bool,
+) -> Result<RootCertStore, EgressActivationError> {
     let mut roots = RootCertStore::empty();
-    let certificates =
-        rustls_native_certs::load_native_certs().map_err(|_| EgressActivationError::NativeRoots)?;
+    check_activation_cancellation(is_cancelled)?;
+    let certificates = rustls_native_certs::load_native_certs();
+    check_activation_cancellation(is_cancelled)?;
+    let certificates = certificates.map_err(|_| EgressActivationError::NativeRoots)?;
     for certificate in certificates {
         roots
             .add(&Certificate(certificate.0))
@@ -392,16 +415,28 @@ fn validate_native_root_store(
     }
 }
 
-fn root_store_from_custom_ca(path: &Path) -> Result<RootCertStore, EgressActivationError> {
+fn root_store_from_custom_ca(
+    path: &Path,
+    is_cancelled: &mut dyn FnMut() -> bool,
+) -> Result<RootCertStore, EgressActivationError> {
     let mut roots = RootCertStore::empty();
-    add_custom_ca(&mut roots, path)?;
+    add_custom_ca(&mut roots, path, is_cancelled)?;
     Ok(roots)
 }
 
-fn add_custom_ca(roots: &mut RootCertStore, path: &Path) -> Result<(), EgressActivationError> {
-    let file = File::open(path).map_err(|_| EgressActivationError::CaUnavailable)?;
-    let certificates = rustls_pemfile::certs(&mut BufReader::new(file))
-        .map_err(|_| EgressActivationError::CaInvalid)?;
+fn add_custom_ca(
+    roots: &mut RootCertStore,
+    path: &Path,
+    is_cancelled: &mut dyn FnMut() -> bool,
+) -> Result<(), EgressActivationError> {
+    check_activation_cancellation(is_cancelled)?;
+    let file = File::open(path);
+    check_activation_cancellation(is_cancelled)?;
+    let file = file.map_err(|_| EgressActivationError::CaUnavailable)?;
+    check_activation_cancellation(is_cancelled)?;
+    let certificates = rustls_pemfile::certs(&mut BufReader::new(file));
+    check_activation_cancellation(is_cancelled)?;
+    let certificates = certificates.map_err(|_| EgressActivationError::CaInvalid)?;
     if certificates.is_empty() {
         return Err(EgressActivationError::CaEmpty);
     }
@@ -411,6 +446,16 @@ fn add_custom_ca(roots: &mut RootCertStore, path: &Path) -> Result<(), EgressAct
             .map_err(|_| EgressActivationError::CaUnusable)?;
     }
     Ok(())
+}
+
+fn check_activation_cancellation(
+    is_cancelled: &mut dyn FnMut() -> bool,
+) -> Result<(), EgressActivationError> {
+    if is_cancelled() {
+        Err(EgressActivationError::ActivationCancelled)
+    } else {
+        Ok(())
+    }
 }
 
 struct NoVerifyServerCert;
@@ -531,11 +576,22 @@ mod tests {
     }
 
     fn activate(plan: EgressPlan) -> EgressSnapshot {
-        EgressSnapshot::activate(plan, &CredentialSourceRegistry::from_names([])).unwrap()
+        EgressSnapshot::activate(plan, &CredentialSourceRegistry::from_names([]), || false).unwrap()
     }
 
     fn activation_error(plan: EgressPlan) -> EgressActivationError {
-        match EgressSnapshot::activate(plan, &CredentialSourceRegistry::from_names([])) {
+        activation_error_with_cancellation(plan, || false)
+    }
+
+    fn activation_error_with_cancellation(
+        plan: EgressPlan,
+        is_cancelled: impl FnMut() -> bool,
+    ) -> EgressActivationError {
+        match EgressSnapshot::activate(
+            plan,
+            &CredentialSourceRegistry::from_names([]),
+            is_cancelled,
+        ) {
             Ok(_) => panic!("egress activation unexpectedly succeeded"),
             Err(error) => error,
         }
@@ -691,7 +747,7 @@ default = "deny"
             },
             |trust, ca_certificate| {
                 load_count.set(load_count.get() + 1);
-                load_tls_trust(trust, ca_certificate)
+                load_tls_trust(trust, ca_certificate, &mut || false)
             },
         )
         .unwrap();
@@ -706,11 +762,14 @@ default = "deny"
 
     #[test]
     fn parent_alpn_validation_enforces_exact_h2_without_downgrading_h1() {
-        let tls = ParentTls::activate(ParentProxyTlsPlan {
-            trust: CompiledTlsTrust::Insecure,
-            ca_certificate: None,
-            server_name: "parent.example".to_string(),
-        })
+        let tls = ParentTls::activate(
+            ParentProxyTlsPlan {
+                trust: CompiledTlsTrust::Insecure,
+                ca_certificate: None,
+                server_name: "parent.example".to_string(),
+            },
+            &mut || false,
+        )
         .unwrap();
 
         assert_eq!(tls.validate_negotiated_alpn(false, None), Ok(()));
@@ -751,11 +810,14 @@ default = "deny"
         assert!(origin_logs.contains("tls_scope=\"origin\""));
 
         let parent_logs = capture_logs(|| {
-            ParentTls::activate(ParentProxyTlsPlan {
-                trust: CompiledTlsTrust::Insecure,
-                ca_certificate: None,
-                server_name: "sensitive-parent-name.example".to_string(),
-            })
+            ParentTls::activate(
+                ParentProxyTlsPlan {
+                    trust: CompiledTlsTrust::Insecure,
+                    ca_certificate: None,
+                    server_name: "sensitive-parent-name.example".to_string(),
+                },
+                &mut || false,
+            )
             .unwrap();
         });
         assert_eq!(
@@ -818,6 +880,63 @@ default = "deny"
         assert!(!error
             .to_string()
             .contains(directory.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn custom_ca_material_reads_are_bracketed_by_cancellation_checks() {
+        let directory = TempDir::new().unwrap();
+        let ca = write_ca(&directory);
+        let plan = direct_plan(
+            CompiledTlsTrust::Custom,
+            Some(ca.clone()),
+            vec![CompiledHttpVersion::Http1],
+        );
+        let checks = Cell::new(0usize);
+        let error =
+            match EgressSnapshot::activate(plan, &CredentialSourceRegistry::from_names([]), || {
+                let next = checks.get() + 1;
+                checks.set(next);
+                next == 4
+            }) {
+                Ok(_) => panic!("post-read cancellation unexpectedly activated egress"),
+                Err(error) => error,
+            };
+
+        assert_eq!(error, EgressActivationError::ActivationCancelled);
+        assert_eq!(checks.get(), 4);
+        assert!(!error.to_string().contains(ca.to_str().unwrap()));
+
+        let missing = directory.path().join("unopened-sensitive-ca.pem");
+        let error = activation_error_with_cancellation(
+            direct_plan(
+                CompiledTlsTrust::Custom,
+                Some(missing.clone()),
+                vec![CompiledHttpVersion::Http1],
+            ),
+            || true,
+        );
+        assert_eq!(error, EgressActivationError::ActivationCancelled);
+        assert!(!error.to_string().contains(missing.to_str().unwrap()));
+    }
+
+    #[test]
+    fn native_root_reads_are_bracketed_by_cancellation_checks() {
+        let checks = Cell::new(0usize);
+        let error = activation_error_with_cancellation(
+            direct_plan(
+                CompiledTlsTrust::System,
+                None,
+                vec![CompiledHttpVersion::Http1],
+            ),
+            || {
+                let next = checks.get() + 1;
+                checks.set(next);
+                next == 2
+            },
+        );
+
+        assert_eq!(error, EgressActivationError::ActivationCancelled);
+        assert_eq!(checks.get(), 2);
     }
 
     #[test]
@@ -894,7 +1013,7 @@ credential = "api"
             CredentialSourceRegistry::from_names(["token".to_string(), "api".to_string()]);
         let token = sources.get("token").unwrap();
         let api = sources.get("api").unwrap();
-        let snapshot = EgressSnapshot::activate(plan.clone(), &sources).unwrap();
+        let snapshot = EgressSnapshot::activate(plan.clone(), &sources, || false).unwrap();
         assert_eq!(
             snapshot.credential_actions(),
             [
@@ -907,7 +1026,7 @@ credential = "api"
         );
 
         let missing_api = CredentialSourceRegistry::from_names(["token".to_string()]);
-        let error = match EgressSnapshot::activate(plan, &missing_api) {
+        let error = match EgressSnapshot::activate(plan, &missing_api, || false) {
             Ok(_) => panic!("unknown credential name unexpectedly activated"),
             Err(error) => error,
         };
@@ -941,8 +1060,8 @@ credential = "token"
 "#,
         );
         let sources = CredentialSourceRegistry::from_names(["token".to_string()]);
-        let first = EgressSnapshot::activate(plan.clone(), &sources).unwrap();
-        let second = EgressSnapshot::activate(plan, &sources).unwrap();
+        let first = EgressSnapshot::activate(plan.clone(), &sources, || false).unwrap();
+        let second = EgressSnapshot::activate(plan, &sources, || false).unwrap();
 
         assert_ne!(
             first.request_headers.as_ptr(),

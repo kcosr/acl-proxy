@@ -52,6 +52,9 @@ pub(crate) struct RedactedPayload {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum SnapshotError {
+    #[error("redaction activation was cancelled")]
+    ActivationCancelled,
+
     #[error("redaction profile {profile_index} has too many environment literal sources")]
     SourceCount { profile_index: usize },
 
@@ -148,7 +151,10 @@ impl fmt::Debug for RedactionSnapshot {
 }
 
 impl RedactionSnapshot {
-    pub(crate) fn activate(plan: RedactionPlan) -> Result<RedactionActivation, SnapshotError> {
+    pub(crate) fn activate(
+        plan: RedactionPlan,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<RedactionActivation, SnapshotError> {
         let profile_registry = RedactionProfileRegistry::from_names(plan.profiles.keys().cloned());
         let mut profiles = Vec::with_capacity(plan.profiles.len());
         let mut compiled_matcher_resident_bytes = 0usize;
@@ -157,6 +163,7 @@ impl RedactionSnapshot {
                 profile,
                 profile_index,
                 &mut compiled_matcher_resident_bytes,
+                &mut is_cancelled,
             )?);
         }
         Ok(RedactionActivation {
@@ -230,11 +237,13 @@ impl ProfileHandle {
         plan: RedactionProfilePlan,
         profile_index: usize,
         snapshot_matcher_resident_bytes: &mut usize,
+        is_cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<Self, SnapshotError> {
         Ok(Self(Arc::new(ProfileSnapshot::activate(
             plan,
             profile_index,
             snapshot_matcher_resident_bytes,
+            is_cancelled,
         )?)))
     }
 
@@ -316,6 +325,7 @@ impl ProfileSnapshot {
         plan: RedactionProfilePlan,
         profile_index: usize,
         snapshot_matcher_resident_bytes: &mut usize,
+        is_cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<Self, SnapshotError> {
         let source_count = plan
             .rules
@@ -348,6 +358,7 @@ impl ProfileSnapshot {
                 plan.max_environment_literal_bytes,
                 plan.max_environment_literal_total_bytes,
                 &mut aggregate_bytes,
+                is_cancelled,
             )?);
         }
 
@@ -1289,6 +1300,7 @@ impl ResolvedRule {
         individual_limit: usize,
         aggregate_limit: usize,
         aggregate_bytes: &mut usize,
+        is_cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<Self, SnapshotError> {
         let mut environment_literals = Vec::with_capacity(plan.literal_environment_variables.len());
         for (source_index, variable) in plan.literal_environment_variables.into_iter().enumerate() {
@@ -1298,6 +1310,7 @@ impl ResolvedRule {
                 profile_index,
                 rule_index,
                 source_index,
+                is_cancelled,
             )?;
             if value.is_empty() {
                 return Err(SnapshotError::SourceEmpty {
@@ -1470,8 +1483,16 @@ fn read_environment_literal(
     profile_index: usize,
     rule_index: usize,
     source_index: usize,
+    is_cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<SecretBytes, SnapshotError> {
-    read_environment_bytes(variable, individual_limit).map_err(|error| match error {
+    if is_cancelled() {
+        return Err(SnapshotError::ActivationCancelled);
+    }
+    let result = read_environment_bytes(variable, individual_limit);
+    if is_cancelled() {
+        return Err(SnapshotError::ActivationCancelled);
+    }
+    result.map_err(|error| match error {
         EnvironmentReadError::Unavailable => SnapshotError::SourceUnavailable {
             profile_index,
             rule_index,
@@ -1507,6 +1528,10 @@ mod tests {
         MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE,
         MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT,
     };
+
+    fn activate(plan: RedactionPlan) -> Result<RedactionActivation, SnapshotError> {
+        RedactionSnapshot::activate(plan, || false)
+    }
 
     fn redaction_profile_index(index: usize) -> RedactionProfileIndex {
         let name = format!("index-{index:08}");
@@ -1596,7 +1621,7 @@ mod tests {
             expressions: vec![],
             payloads: CompiledRedactionPayloads::Binary,
         });
-        let snapshot = RedactionSnapshot::activate(plan(profile_plan)).unwrap();
+        let snapshot = activate(plan(profile_plan)).unwrap();
         let rendered = format!("{snapshot:?} {:?}", snapshot.profile("main").unwrap());
         assert!(!rendered.contains("environment-secret"));
         assert!(!rendered.contains(&source.0));
@@ -1617,7 +1642,7 @@ mod tests {
     #[test]
     fn activation_returns_deterministic_indices_then_drops_profile_names() {
         let source = EnvGuard::set("indexed-environment-secret");
-        let activation = RedactionSnapshot::activate(RedactionPlan {
+        let activation = activate(RedactionPlan {
             profiles: BTreeMap::from([
                 ("z-profile-marker".to_string(), profile(None)),
                 (
@@ -1654,7 +1679,7 @@ mod tests {
         let mut authored_plan = profile(None);
         authored_plan.rules[0].literals = vec![b"abc".to_vec(), b"bcdef".to_vec()];
         authored_plan.rules[0].expressions.clear();
-        let authored = RedactionSnapshot::activate(plan(authored_plan))
+        let authored = activate(plan(authored_plan))
             .unwrap()
             .profile("main")
             .unwrap()
@@ -1672,7 +1697,7 @@ mod tests {
             expressions: vec![],
             payloads: CompiledRedactionPayloads::Text,
         });
-        let prefix_handle = RedactionSnapshot::activate(plan(profile_plan))
+        let prefix_handle = activate(plan(profile_plan))
             .unwrap()
             .profile("main")
             .unwrap();
@@ -1691,7 +1716,7 @@ mod tests {
             expressions: vec![],
             payloads: CompiledRedactionPayloads::Text,
         });
-        let later = RedactionSnapshot::activate(plan(later_plan))
+        let later = activate(plan(later_plan))
             .unwrap()
             .profile("main")
             .unwrap()
@@ -1701,7 +1726,7 @@ mod tests {
         assert_eq!(later.bytes, b"[MASKED]");
 
         let overlap_source = EnvGuard::set("aaa");
-        let overlap = RedactionSnapshot::activate(plan(profile(Some(overlap_source.0.clone()))))
+        let overlap = activate(plan(profile(Some(overlap_source.0.clone()))))
             .unwrap()
             .profile("main")
             .unwrap()
@@ -1714,7 +1739,7 @@ mod tests {
     #[test]
     fn transport_fragments_are_only_validated_and_complete_payload_is_redacted() {
         let source = EnvGuard::set("boundary-secret");
-        let profile = RedactionSnapshot::activate(plan(profile(Some(source.0.clone()))))
+        let profile = activate(plan(profile(Some(source.0.clone()))))
             .unwrap()
             .profile("main")
             .unwrap();
@@ -1739,7 +1764,7 @@ mod tests {
     #[test]
     fn narrow_handle_survives_snapshot_drop() {
         let source = EnvGuard::set("retained-secret");
-        let snapshot = RedactionSnapshot::activate(plan(profile(Some(source.0.clone())))).unwrap();
+        let snapshot = activate(plan(profile(Some(source.0.clone())))).unwrap();
         let profile = snapshot.profile("main").unwrap();
         drop(snapshot);
 
@@ -1753,12 +1778,12 @@ mod tests {
     #[test]
     fn snapshot_rotation_is_atomic() {
         let source = EnvGuard::set("old-secret");
-        let old = RedactionSnapshot::activate(plan(profile(Some(source.0.clone()))))
+        let old = activate(plan(profile(Some(source.0.clone()))))
             .unwrap()
             .profile("main")
             .unwrap();
         env::set_var(&source.0, "new-secret");
-        let new = RedactionSnapshot::activate(plan(profile(Some(source.0.clone()))))
+        let new = activate(plan(profile(Some(source.0.clone()))))
             .unwrap()
             .profile("main")
             .unwrap();
@@ -1778,20 +1803,36 @@ mod tests {
     }
 
     #[test]
+    fn environment_reads_are_bracketed_by_cancellation_checks() {
+        let source = EnvGuard::set("sensitive-cancelled-literal");
+        let mut checks = 0usize;
+        let error = RedactionSnapshot::activate(plan(profile(Some(source.0.clone()))), || {
+            checks += 1;
+            checks == 2
+        })
+        .unwrap_err();
+
+        assert_eq!(error, SnapshotError::ActivationCancelled);
+        assert_eq!(checks, 2);
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains(&source.0));
+        assert!(!rendered.contains("sensitive-cancelled-literal"));
+    }
+
+    #[test]
     fn missing_empty_and_individual_oversize_errors_are_sanitized() {
         let missing = EnvGuard::missing();
-        let error =
-            RedactionSnapshot::activate(plan(profile(Some(missing.0.clone())))).unwrap_err();
+        let error = activate(plan(profile(Some(missing.0.clone())))).unwrap_err();
         assert!(matches!(error, SnapshotError::SourceUnavailable { .. }));
         assert!(!format!("{error:?} {error}").contains(&missing.0));
 
         let empty = EnvGuard::set("");
-        let error = RedactionSnapshot::activate(plan(profile(Some(empty.0.clone())))).unwrap_err();
+        let error = activate(plan(profile(Some(empty.0.clone())))).unwrap_err();
         assert!(matches!(error, SnapshotError::SourceEmpty { .. }));
 
         let value = "sensitive-value-that-is-deliberately-longer-than-the-individual-source-limit";
         let large = EnvGuard::set(value);
-        let error = RedactionSnapshot::activate(plan(profile(Some(large.0.clone())))).unwrap_err();
+        let error = activate(plan(profile(Some(large.0.clone())))).unwrap_err();
         assert!(matches!(error, SnapshotError::SourceTooLarge { .. }));
         let rendered = format!("{error:?} {error}");
         assert!(!rendered.contains(&large.0));
@@ -1806,7 +1847,7 @@ mod tests {
 
         let source = EnvGuard::missing();
         env::set_var(&source.0, OsString::from_vec(vec![b's', 0xff, b'x']));
-        let error = RedactionSnapshot::activate(plan(profile(Some(source.0.clone())))).unwrap_err();
+        let error = activate(plan(profile(Some(source.0.clone())))).unwrap_err();
         assert!(matches!(error, SnapshotError::SourceInvalidUtf8 { .. }));
         assert!(!format!("{error:?} {error}").contains(&source.0));
     }
@@ -1819,7 +1860,7 @@ mod tests {
         count_profile.max_environment_literal_sources = 1;
         count_profile.rules[0].literal_environment_variables = vec![one.0.clone(), two.0.clone()];
         assert!(matches!(
-            RedactionSnapshot::activate(plan(count_profile)).unwrap_err(),
+            activate(plan(count_profile)).unwrap_err(),
             SnapshotError::SourceCount { .. }
         ));
 
@@ -1828,14 +1869,14 @@ mod tests {
         aggregate_profile.rules[0].literal_environment_variables =
             vec![one.0.clone(), two.0.clone()];
         assert!(matches!(
-            RedactionSnapshot::activate(plan(aggregate_profile)).unwrap_err(),
+            activate(plan(aggregate_profile)).unwrap_err(),
             SnapshotError::AggregateTooLarge { .. }
         ));
     }
 
     #[test]
     fn validation_limits_and_scratch_metadata_are_exact() {
-        let snapshot = RedactionSnapshot::activate(plan(profile(None))).unwrap();
+        let snapshot = activate(plan(profile(None))).unwrap();
         let handle = snapshot.profile("main").unwrap();
         assert_eq!(
             handle.limits().matcher_scratch_bytes,
@@ -1868,7 +1909,7 @@ mod tests {
 
         let mut expression_only = profile(None);
         expression_only.rules[0].literals.clear();
-        let expression_only = RedactionSnapshot::activate(plan(expression_only))
+        let expression_only = activate(plan(expression_only))
             .unwrap()
             .profile("main")
             .unwrap();
@@ -1879,7 +1920,7 @@ mod tests {
     fn activation_resident_accounting_matches_the_pure_sparse_projection() {
         let mut profile_plan = profile(None);
         profile_plan.rules[0].expressions.clear();
-        let snapshot = RedactionSnapshot::activate(plan(profile_plan)).unwrap();
+        let snapshot = activate(plan(profile_plan)).unwrap();
         let mut patterns = boxed_pattern_refs(&[b"literal".as_slice()]);
         let reference_bytes = patterns.allocation_bytes();
         let reference_construction_bytes = patterns.construction_peak_bytes();
@@ -1900,7 +1941,7 @@ mod tests {
     fn invalid_text_and_replacement_expansion_fail_before_output_allocation() {
         let mut profile_plan = profile(None);
         profile_plan.max_decoded_body_bytes = 32;
-        let profile = RedactionSnapshot::activate(plan(profile_plan))
+        let profile = activate(plan(profile_plan))
             .unwrap()
             .profile("main")
             .unwrap();
@@ -1924,7 +1965,7 @@ mod tests {
         profile_plan.max_message_bytes = 1024;
         profile_plan.rules[0].literals = vec![b"a".to_vec(), b"aa".to_vec(), b"aaa".to_vec()];
         profile_plan.rules[0].expressions.clear();
-        let profile = RedactionSnapshot::activate(plan(profile_plan))
+        let profile = activate(plan(profile_plan))
             .unwrap()
             .profile("main")
             .unwrap();
@@ -1993,7 +2034,7 @@ mod tests {
         profile_plan.max_message_bytes = PAYLOAD_BYTES;
         profile_plan.rules[0].literals = vec![b"a".to_vec(), vec![b'b'; HORIZON]];
         profile_plan.rules[0].expressions.clear();
-        let profile = RedactionSnapshot::activate(plan(profile_plan))
+        let profile = activate(plan(profile_plan))
             .unwrap()
             .profile("main")
             .unwrap();
@@ -2017,7 +2058,7 @@ mod tests {
             .map(|length| vec![b'a'; length])
             .collect();
         profile_plan.rules[0].expressions.clear();
-        let profile = RedactionSnapshot::activate(plan(profile_plan))
+        let profile = activate(plan(profile_plan))
             .unwrap()
             .profile("main")
             .unwrap();
@@ -2042,7 +2083,7 @@ mod tests {
         profile_plan.max_message_bytes = PAYLOAD_BYTES;
         profile_plan.rules[0].literals = vec![b"a".to_vec()];
         profile_plan.rules[0].expressions.clear();
-        let profile = RedactionSnapshot::activate(plan(profile_plan))
+        let profile = activate(plan(profile_plan))
             .unwrap()
             .profile("main")
             .unwrap();
@@ -2065,7 +2106,7 @@ mod tests {
         profile_plan.max_message_bytes = 100_000;
         profile_plan.rules[0].literals.clear();
         profile_plan.rules[0].expressions.clear();
-        let profile = RedactionSnapshot::activate(plan(profile_plan))
+        let profile = activate(plan(profile_plan))
             .unwrap()
             .profile("main")
             .unwrap();
@@ -2089,7 +2130,7 @@ mod tests {
         profile_plan.rules[0].expressions.clear();
 
         assert!(matches!(
-            RedactionSnapshot::activate(plan(profile_plan)).unwrap_err(),
+            activate(plan(profile_plan)).unwrap_err(),
             SnapshotError::MatcherScratchExceeded {
                 limit: MAX_REDACTION_MATCHER_SCRATCH_BYTES
             }
@@ -2232,7 +2273,7 @@ mod tests {
         const EXPRESSION_MARKER: &str = "activation-regex-secret-marker";
         let mut profile_plan = profile(None);
         profile_plan.rules[0].expressions = vec![format!(r"\b{EXPRESSION_MARKER}\b")];
-        let error = RedactionSnapshot::activate(plan(profile_plan)).unwrap_err();
+        let error = activate(plan(profile_plan)).unwrap_err();
         assert!(matches!(
             error,
             SnapshotError::ExpressionBuild {

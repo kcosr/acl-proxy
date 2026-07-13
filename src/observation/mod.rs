@@ -388,7 +388,7 @@ mod tests {
         for (name, max_body_bytes) in entries {
             profiles.insert(name.to_owned(), profile_plan(max_body_bytes));
         }
-        RedactionSnapshot::activate(RedactionPlan { profiles }).expect("profiles")
+        RedactionSnapshot::activate(RedactionPlan { profiles }, || false).expect("profiles")
     }
 
     fn activate(
