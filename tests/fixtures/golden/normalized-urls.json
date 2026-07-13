@@ -1,0 +1,50 @@
+[
+  {
+    "input": "https://EXAMPLE.COM.:443/a/../admin?q=1",
+    "url": "https://example.com/admin?q=1",
+    "authority": "example.com",
+    "host_for_capture": "example.com",
+    "port": 443,
+    "error": null
+  },
+  {
+    "input": "http://[::1]:8080/relative/path",
+    "url": "http://[::1]:8080/relative/path",
+    "authority": "[::1]:8080",
+    "host_for_capture": "[::1]",
+    "port": 8080,
+    "error": null
+  },
+  {
+    "input": "https://example.com/%61dmin/%7Eme/%3A?q=%61",
+    "url": "https://example.com/admin/~me/%3A?q=%61",
+    "authority": "example.com",
+    "host_for_capture": "example.com",
+    "port": 443,
+    "error": null
+  },
+  {
+    "input": "https://example.com/a%2Fb#ignored-fragment",
+    "url": "https://example.com/a%2Fb",
+    "authority": "example.com",
+    "host_for_capture": "example.com",
+    "port": 443,
+    "error": null
+  },
+  {
+    "input": "http://user:secret@example.com/",
+    "url": null,
+    "authority": null,
+    "host_for_capture": null,
+    "port": null,
+    "error": "URL userinfo is not allowed"
+  },
+  {
+    "input": "ftp://example.com/",
+    "url": null,
+    "authority": null,
+    "host_for_capture": null,
+    "port": null,
+    "error": "unsupported URL scheme 'ftp'"
+  }
+]

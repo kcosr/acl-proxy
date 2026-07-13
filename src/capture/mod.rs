@@ -1,16 +1,27 @@
-use std::collections::BTreeMap;
-use std::fs;
-use std::io::ErrorKind as IoErrorKind;
+use std::collections::{BTreeMap, HashMap};
+use std::fs::{self, File, OpenOptions};
+use std::io::{ErrorKind as IoErrorKind, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::SystemTime;
 
 use base64::{engine::general_purpose, Engine as _};
+use fs2::FileExt;
+use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
 use crate::config::{CaptureConfig, Config};
-use crate::filesystem::write_private_file;
+use crate::filesystem::create_private_dir_all;
 use crate::sensitive::redact_url_for_sink;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
+static CAPTURE_DIRECTORY_LOCKS: Lazy<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static CAPTURE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Maximum number of body bytes to buffer per request/response for capture.
 ///
@@ -191,6 +202,13 @@ pub enum CaptureError {
 
     #[error("failed to write capture file {path}: {source}")]
     WriteFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to lock capture directory {path}: {source}")]
+    LockDirectory {
         path: PathBuf,
         #[source]
         source: std::io::Error,
@@ -410,20 +428,174 @@ pub fn write_capture_record(
     config: &Config,
     record: &CaptureRecord,
 ) -> Result<PathBuf, CaptureError> {
-    let path = resolve_capture_path(config, record);
-
     let json = serde_json::to_string_pretty(record)?;
-    write_private_file(&path, format!("{json}\n")).map_err(|source| CaptureError::WriteFile {
-        path: path.clone(),
+    let requested_path = resolve_capture_path(config, record);
+    let directory = requested_path.parent().unwrap_or_else(|| Path::new("."));
+    create_private_dir_all(directory).map_err(|source| CaptureError::CreateDir {
+        path: directory.to_path_buf(),
         source,
     })?;
-    prune_capture_directory(config, &path)?;
+    let canonical_directory =
+        fs::canonicalize(directory).map_err(|source| CaptureError::CreateDir {
+            path: directory.to_path_buf(),
+            source,
+        })?;
+    let requested_path = canonical_directory.join(
+        requested_path
+            .file_name()
+            .expect("validated capture path has a file name"),
+    );
+    let directory_lock = capture_directory_lock(&canonical_directory);
+    let _guard = directory_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let lock_directory = canonical_directory.join(".capture-state");
+    create_private_dir_all(&lock_directory).map_err(|source| CaptureError::LockDirectory {
+        path: canonical_directory.clone(),
+        source,
+    })?;
+    let lock_path = lock_directory.join("lock");
+    let lock_file =
+        open_capture_lock(&lock_path).map_err(|source| CaptureError::LockDirectory {
+            path: canonical_directory.clone(),
+            source,
+        })?;
+    lock_file
+        .lock_exclusive()
+        .map_err(|source| CaptureError::LockDirectory {
+            path: canonical_directory.clone(),
+            source,
+        })?;
+
+    let (temp_path, mut temp_file) =
+        create_private_capture_temp(&requested_path).map_err(|source| CaptureError::WriteFile {
+            path: requested_path.clone(),
+            source,
+        })?;
+    if let Err(source) = temp_file
+        .write_all(format!("{json}\n").as_bytes())
+        .and_then(|()| sync_capture_file(&temp_file))
+    {
+        drop(temp_file);
+        let _ = fs::remove_file(&temp_path);
+        return Err(CaptureError::WriteFile {
+            path: requested_path.clone(),
+            source,
+        });
+    }
+    drop(temp_file);
+    let path = publish_capture_no_replace(&temp_path, &requested_path).map_err(|source| {
+        let _ = fs::remove_file(&temp_path);
+        CaptureError::WriteFile {
+            path: requested_path.clone(),
+            source,
+        }
+    })?;
+    if let Err(error) = sync_capture_directory(&canonical_directory) {
+        tracing::warn!(capture_path = %path.display(), %error, "capture published but directory sync failed");
+    }
+    if let Err(error) = prune_capture_directory(&config.capture, &canonical_directory, &path) {
+        tracing::warn!(capture_path = %path.display(), %error, "capture published but retention maintenance failed");
+    }
+    if let Err(error) = sync_capture_directory(&canonical_directory) {
+        tracing::warn!(capture_path = %path.display(), %error, "capture retention completed but directory sync failed");
+    }
 
     Ok(path)
 }
 
-fn prune_capture_directory(config: &Config, written_path: &Path) -> Result<(), CaptureError> {
-    let directory = PathBuf::from(effective_capture_directory(&config.capture));
+fn open_capture_lock(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
+}
+
+fn capture_directory_lock(directory: &Path) -> Arc<Mutex<()>> {
+    let key = if directory.is_absolute() {
+        directory.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|current| current.join(directory))
+            .unwrap_or_else(|_| directory.to_path_buf())
+    };
+    let mut locks = CAPTURE_DIRECTORY_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = locks.get(&key).and_then(Weak::upgrade) {
+        return existing;
+    }
+
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
+}
+
+fn collision_capture_path(requested_path: &Path, collision: u64) -> PathBuf {
+    if collision == 0 {
+        return requested_path.to_path_buf();
+    }
+    let stem = requested_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let extension = requested_path
+        .extension()
+        .map(|value| value.to_string_lossy());
+    let filename = match &extension {
+        Some(extension) => format!("{stem}.{collision}.{extension}"),
+        None => format!("{stem}.{collision}"),
+    };
+    requested_path.with_file_name(filename)
+}
+
+fn publish_capture_no_replace(temp_path: &Path, requested_path: &Path) -> std::io::Result<PathBuf> {
+    for collision in 0u64.. {
+        let candidate = collision_capture_path(requested_path, collision);
+        match fs::hard_link(temp_path, &candidate) {
+            Ok(()) => {
+                if let Err(error) = fs::remove_file(temp_path) {
+                    tracing::warn!(capture_path = %candidate.display(), temp_path = %temp_path.display(), %error, "capture published but temp cleanup failed");
+                }
+                return Ok(candidate);
+            }
+            Err(source) if source.kind() == IoErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(source),
+        }
+    }
+
+    unreachable!("u64 capture filename suffixes exhausted")
+}
+
+fn create_private_capture_temp(final_path: &Path) -> std::io::Result<(PathBuf, File)> {
+    if let Some(parent) = final_path.parent() {
+        create_private_dir_all(parent)?;
+    }
+
+    loop {
+        let sequence = CAPTURE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temp_path =
+            final_path.with_file_name(format!(".capture.{}.{}.tmp", std::process::id(), sequence));
+        let mut options = OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&temp_path) {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(source) if source.kind() == IoErrorKind::AlreadyExists => continue,
+            Err(source) => return Err(source),
+        }
+    }
+}
+
+fn prune_capture_directory(
+    capture: &CaptureConfig,
+    directory: &Path,
+    written_path: &Path,
+) -> Result<(), CaptureError> {
+    let directory = directory.to_path_buf();
     let read_dir = fs::read_dir(&directory).map_err(|source| CaptureError::ReadDir {
         path: directory.clone(),
         source,
@@ -436,6 +608,14 @@ fn prune_capture_directory(config: &Config, written_path: &Path) -> Result<(), C
             source,
         })?;
         let path = entry.path();
+        if is_capture_internal_file(&path) {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(source) if source.kind() == IoErrorKind::NotFound => {}
+                Err(source) => return Err(CaptureError::RemoveFile { path, source }),
+            }
+            continue;
+        }
         let metadata = match entry.metadata() {
             Ok(metadata) => metadata,
             Err(source) if source.kind() == IoErrorKind::NotFound => continue,
@@ -465,9 +645,9 @@ fn prune_capture_directory(config: &Config, written_path: &Path) -> Result<(), C
 
     for entry in entries {
         let is_first = kept_files == 0;
-        let within_count = kept_files < config.capture.max_files;
+        let within_count = kept_files < capture.max_files;
         let next_bytes = kept_bytes.saturating_add(entry.len);
-        let within_bytes = next_bytes <= config.capture.max_total_bytes;
+        let within_bytes = next_bytes <= capture.max_total_bytes;
         if is_first || (within_count && within_bytes) {
             kept_files += 1;
             kept_bytes = next_bytes;
@@ -483,6 +663,37 @@ fn prune_capture_directory(config: &Config, written_path: &Path) -> Result<(), C
                     source,
                 });
             }
+        }
+    }
+
+    Ok(())
+}
+
+fn is_capture_internal_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(".capture.") && name.ends_with(".tmp"))
+}
+
+#[cfg(unix)]
+fn sync_capture_directory(directory: &Path) -> std::io::Result<()> {
+    File::open(directory)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_capture_directory(_directory: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn sync_capture_file(file: &File) -> std::io::Result<()> {
+    file.sync_all()?;
+
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
+            return Err(std::io::Error::last_os_error());
         }
     }
 

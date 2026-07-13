@@ -1,0 +1,82 @@
+[
+  {
+    "name": "deny administration",
+    "url": "https://example.com/admin/settings",
+    "method": "GET",
+    "start_index": 0,
+    "allowed": false,
+    "matched_index": 0,
+    "matched_action": "deny",
+    "matched_rule_id": "deny-admin"
+  },
+  {
+    "name": "canonical URL still denies administration",
+    "url": "https://EXAMPLE.COM.:443/a/../admin/settings",
+    "method": "GET",
+    "start_index": 0,
+    "allowed": false,
+    "matched_index": 0,
+    "matched_action": "deny",
+    "matched_rule_id": "deny-admin"
+  },
+  {
+    "name": "encoded unreserved path still denies administration",
+    "url": "https://example.com/%61dmin/settings",
+    "method": "GET",
+    "start_index": 0,
+    "allowed": false,
+    "matched_index": 0,
+    "matched_action": "deny",
+    "matched_rule_id": "deny-admin"
+  },
+  {
+    "name": "delegate is fail closed before approval",
+    "url": "https://example.com/app/report",
+    "method": "POST",
+    "start_index": 0,
+    "allowed": false,
+    "matched_index": 1,
+    "matched_action": "delegate",
+    "matched_rule_id": "delegate-app"
+  },
+  {
+    "name": "delegate pass resumes at following allow",
+    "url": "https://example.com/app/report",
+    "method": "POST",
+    "start_index": 2,
+    "allowed": true,
+    "matched_index": 2,
+    "matched_action": "allow",
+    "matched_rule_id": "allow-app-after-pass"
+  },
+  {
+    "name": "public path is allowed",
+    "url": "https://example.com/public/readme",
+    "method": "GET",
+    "start_index": 0,
+    "allowed": true,
+    "matched_index": 3,
+    "matched_action": "allow",
+    "matched_rule_id": "allow-public"
+  },
+  {
+    "name": "unmatched path uses deny default",
+    "url": "https://example.com/private/data",
+    "method": "GET",
+    "start_index": 0,
+    "allowed": false,
+    "matched_index": null,
+    "matched_action": null,
+    "matched_rule_id": null
+  },
+  {
+    "name": "userinfo is rejected before policy",
+    "url": "https://user:secret@example.com/public/readme",
+    "method": "GET",
+    "start_index": 0,
+    "allowed": false,
+    "matched_index": null,
+    "matched_action": null,
+    "matched_rule_id": null
+  }
+]

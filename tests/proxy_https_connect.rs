@@ -579,13 +579,16 @@ async fn allowed_https_via_connect_is_proxied_and_captured() {
     let capture_dir = temp_dir.path().join("captures");
     // Wait for async capture tasks to flush to disk and ensure at least one file.
     for _ in 0..10 {
-        if capture_dir.is_dir() {
-            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
+        if capture_dir.is_dir()
+            && std::fs::read_dir(&capture_dir)
                 .expect("read capture dir")
-                .collect();
-            if !entries.is_empty() {
-                break;
-            }
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry.file_type().is_ok_and(|kind| kind.is_file())
+                        && entry.path().extension().is_some_and(|ext| ext == "json")
+                })
+        {
+            break;
         }
         sleep(Duration::from_millis(50)).await;
     }

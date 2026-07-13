@@ -1,0 +1,29 @@
+{
+  "timestamp": "2024-01-01T00:00:00Z",
+  "requestId": "golden-request",
+  "kind": "request",
+  "decision": "allow",
+  "mode": "https_connect",
+  "url": "https://example.com/resource",
+  "method": "POST",
+  "statusCode": 200,
+  "statusMessage": "OK",
+  "client": {
+    "address": "127.0.0.1",
+    "port": 43210
+  },
+  "target": {
+    "address": "203.0.113.10",
+    "port": 443
+  },
+  "httpVersion": "1.1",
+  "headers": {
+    "content-type": "text/plain"
+  },
+  "body": {
+    "encoding": "base64",
+    "length": 5,
+    "data": "aGVsbG8=",
+    "contentType": "text/plain"
+  }
+}

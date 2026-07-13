@@ -1569,11 +1569,11 @@ request_timeout_ms = 30000
 internal_base_path = "/_acl-proxy"
 
 [proxy.listeners.explicit_http]
-bind = "0.0.0.0:8881"
+bind = "127.0.0.1:8881"
 enable_http2 = true
 
 [proxy.listeners.transparent_https]
-bind = "0.0.0.0:8889"
+bind = "127.0.0.1:8889"
 handshake_timeout_ms = 10000
 request_header_timeout_ms = 10000
 max_connections = 1024

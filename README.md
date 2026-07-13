@@ -117,7 +117,9 @@ mkdir -p config
 cp acl-proxy.sample.toml config/acl-proxy.toml
 ```
 
-The generated minimal config defaults to deny-all and disables capture.
+The generated minimal config defaults to deny-all, disables capture, and binds
+its listeners to IPv4 loopback. Change the listener binds explicitly when the
+proxy must accept connections from another host or network namespace.
 
 ### 2. Validate & Run
 
@@ -148,7 +150,7 @@ curl http://example.com/path \
 
 # HTTPS proxy (CONNECT MITM)
 curl -x http://127.0.0.1:8881 https://example.com/ \
-  --proxy-cacert certs/ca-cert.pem
+  --cacert certs/ca-cert.pem
 
 # Explicit HTTPS proxy (static proxy certificate)
 # Requires proxy.listeners.explicit_https to be configured.
@@ -738,7 +740,26 @@ Capture happens for:
 
 `capture.filename` must be a filename template, not a path. Use `capture.directory` to choose the output directory; templates containing path separators, absolute paths, or `..` path segments are rejected.
 
-After each capture write, acl-proxy prunes older regular files in `capture.directory` until both `capture.max_files` and `capture.max_total_bytes` are satisfied. Both limits must be at least `1`. The newest just-written capture file is retained even if a single file exceeds the byte cap.
+Capture files are written privately, synced, and published with atomic
+no-replace semantics, so readers do not observe partial JSON and overlapping
+acl-proxy processes do not overwrite completed records. If a filename template
+collides, acl-proxy preserves both records by adding a numeric suffix before the
+extension (`capture.1.json`, `capture.2.json`, and so on).
+
+After each capture write, acl-proxy uses a private `.capture-state/lock` file to
+serialize publication and retention across threads and processes sharing that
+directory. It removes abandoned `.capture.*.tmp` files and prunes older capture
+records until both `capture.max_files` and `capture.max_total_bytes` are
+satisfied; the internal state directory and temp files never count toward either limit. Both
+limits must be at least `1`. The newest just-written capture file is retained
+even if a single file exceeds the byte cap.
+
+`write_capture_record` returns an error only before a record is published.
+Cleanup, directory-sync, or retention failures after publication are logged
+against the committed path and retried as applicable on a later write, so a
+caller retry cannot duplicate a record whose result was reported as failed.
+Linux uses `fsync`; macOS additionally requests `F_FULLFSYNC` for capture data
+before publication.
 
 On Unix, capture directories are created or tightened to owner-only (`0700`) and capture JSON files are created or tightened to owner-only (`0600`). Capture URLs have userinfo removed and query strings replaced with `REDACTED`; `Authorization`, `Proxy-Authorization`, `Cookie`, and `Set-Cookie` header values are replaced with `[REDACTED]`. Capture bodies and other headers can still contain sensitive decrypted data; treat capture files as sensitive.
 
@@ -1197,7 +1218,7 @@ On-disk files are not reloaded on startup — the proxy regenerates from the CA 
 ### Client Trust
 
 Clients must trust the proxy CA:
-- **CONNECT MITM**: `--proxy-cacert certs/ca-cert.pem` or import the CA system-wide.
+- **CONNECT MITM**: `--cacert certs/ca-cert.pem` or import the CA system-wide.
 - **Transparent HTTPS**: `--cacert certs/ca-cert.pem` or import the CA system-wide.
 - Plain HTTP proxy traffic does not require CA trust.
 
@@ -1280,7 +1301,7 @@ Decodes the base64 body payload from a capture JSON file. Reports errors for inv
 
 - Clients must trust the proxy CA for CONNECT and transparent HTTPS modes.
 - Clients using `proxy.listeners.explicit_https` must trust the static proxy server certificate chain configured for that listener.
-- Use `--proxy-cacert certs/ca-cert.pem` (CONNECT) or `--cacert certs/ca-cert.pem` (transparent HTTPS).
+- Use `--cacert certs/ca-cert.pem` for CONNECT MITM or transparent HTTPS.
 - If direct-origin upstream TLS verification fails, check `tls.verify_upstream` and confirm upstream certificates are valid. If HTTPS parent egress fails, check `proxy.egress.default.tls.trust`, `server_name`, and `ca_cert_path`.
 
 ### Missing Configuration File

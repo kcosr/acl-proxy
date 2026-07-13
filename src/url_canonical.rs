@@ -120,6 +120,51 @@ fn host_for_url_authority(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct GoldenCase {
+        input: String,
+        url: Option<String>,
+        authority: Option<String>,
+        host_for_capture: Option<String>,
+        port: Option<u16>,
+        error: Option<String>,
+    }
+
+    #[test]
+    fn canonicalization_matches_golden_corpus() {
+        let cases: Vec<GoldenCase> = serde_json::from_str(include_str!(
+            "../tests/fixtures/golden/normalized-urls.json"
+        ))
+        .expect("parse URL golden corpus");
+
+        for case in cases {
+            match canonicalize_http_url(&case.input) {
+                Ok(actual) => {
+                    assert_eq!(Some(actual.url), case.url, "{}: URL", case.input);
+                    assert_eq!(
+                        Some(actual.authority),
+                        case.authority,
+                        "{}: authority",
+                        case.input
+                    );
+                    assert_eq!(
+                        Some(actual.host_for_capture),
+                        case.host_for_capture,
+                        "{}: capture host",
+                        case.input
+                    );
+                    assert_eq!(Some(actual.port), case.port, "{}: port", case.input);
+                    assert_eq!(case.error, None, "{}: unexpected success", case.input);
+                }
+                Err(error) => {
+                    assert_eq!(Some(error.to_string()), case.error, "{}: error", case.input);
+                    assert_eq!(case.url, None, "{}: expected URL", case.input);
+                }
+            }
+        }
+    }
 
     #[test]
     fn canonicalizes_host_path_and_default_port() {

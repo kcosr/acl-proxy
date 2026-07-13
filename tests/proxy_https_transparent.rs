@@ -10,6 +10,9 @@ use acl_proxy::capture::{
     CaptureDecision, CaptureKind, CaptureMode, CaptureRecord, DEFAULT_MAX_BODY_BYTES,
 };
 use acl_proxy::config::Config;
+use acl_proxy::proxy::explicit_https::{
+    build_static_tls_acceptor, run_explicit_https_proxy_on_listener,
+};
 use acl_proxy::proxy::https_transparent::run_https_transparent_proxy_on_listener;
 use base64::engine::general_purpose;
 use base64::Engine;
@@ -60,6 +63,17 @@ struct TestWebSocketFrame {
 
 async fn transparent_h2_test_guard() -> AsyncMutexGuard<'static, ()> {
     TRANSPARENT_H2_TEST_LOCK.lock().await
+}
+
+fn capture_record_file_count(capture_dir: &Path) -> usize {
+    std::fs::read_dir(capture_dir)
+        .expect("read capture dir")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry.file_type().is_ok_and(|kind| kind.is_file())
+                && entry.path().extension().is_some_and(|ext| ext == "json")
+        })
+        .count()
 }
 
 async fn wait_for_single_allow_capture_version_pair(
@@ -612,6 +626,114 @@ async fn start_upstream_https_http1_only_echo_server() -> SocketAddr {
     });
 
     addr
+}
+
+fn write_proxy_identity(temp_dir: &TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
+    let mut params = CertificateParams::new(vec!["127.0.0.1".to_string()]).expect("params");
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, "127.0.0.1");
+    params.distinguished_name = dn;
+
+    let key = KeyPair::generate().expect("generate proxy key");
+    let cert = params.self_signed(&key).expect("self-signed proxy cert");
+
+    let cert_path = temp_dir.path().join("proxy-cert.pem");
+    let key_path = temp_dir.path().join("proxy-key.pem");
+    std::fs::write(&cert_path, cert.pem()).expect("write proxy cert");
+    std::fs::write(&key_path, key.serialize_pem()).expect("write proxy key");
+
+    (cert_path, key_path)
+}
+
+fn explicit_https_parent_config(cert_path: &Path, key_path: &Path, allow_pattern: &str) -> Config {
+    let toml = format!(
+        r#"
+schema_version = "2"
+
+[proxy]
+listeners.explicit_https.bind = "127.0.0.1:1"
+listeners.explicit_https.cert_chain_path = {cert_path:?}
+listeners.explicit_https.key_path = {key_path:?}
+
+[logging]
+level = "info"
+
+[capture]
+allowed_request = false
+allowed_response = false
+denied_request = false
+denied_response = false
+directory = "logs-capture"
+
+[tls]
+verify_upstream = false
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = {allow_pattern:?}
+"#,
+        cert_path = cert_path.display().to_string(),
+        key_path = key_path.display().to_string(),
+    );
+
+    toml::from_str(&toml).expect("parse explicit HTTPS parent config")
+}
+
+async fn start_explicit_https_parent(
+    mut config: Config,
+    listener: StdTcpListener,
+) -> (SocketAddr, TempDir) {
+    let addr = listener.local_addr().expect("parent proxy addr");
+    let temp_dir = TempDir::new().expect("parent proxy temp dir");
+    config.logging.directory = None;
+    config.capture.directory = temp_dir
+        .path()
+        .join("captures")
+        .to_string_lossy()
+        .to_string();
+    config.certificates.certs_dir = temp_dir.path().join("certs").to_string_lossy().to_string();
+
+    let listener_cfg = config
+        .proxy
+        .listeners
+        .explicit_https
+        .as_ref()
+        .expect("explicit HTTPS parent listener")
+        .clone();
+    let tls_acceptor = build_static_tls_acceptor(&listener_cfg).expect("parent TLS acceptor");
+    let state = AppState::shared_from_config(config).expect("parent proxy app state");
+
+    tokio::spawn(async move {
+        let _ = run_explicit_https_proxy_on_listener(
+            state,
+            listener,
+            tls_acceptor,
+            listener_cfg,
+            std::future::pending(),
+        )
+        .await
+        .map_err(|err| eprintln!("explicit HTTPS parent on {addr} exited: {err}"));
+    });
+
+    (addr, temp_dir)
+}
+
+fn configure_https_parent(config: &mut Config, parent_addr: SocketAddr, ca_cert_path: &Path) {
+    config.proxy.egress.default = Some(acl_proxy::config::EgressTargetConfig {
+        target_type: acl_proxy::config::EgressTargetType::ExplicitProxy,
+        transport: acl_proxy::config::EgressTransport::Https,
+        host: "127.0.0.1".to_string(),
+        port: parent_addr.port(),
+        tls: Some(acl_proxy::config::EgressTlsConfig {
+            trust: Some(acl_proxy::config::EgressTlsTrust::CustomCa),
+            server_name: Some("127.0.0.1".to_string()),
+            ca_cert_path: Some(ca_cert_path.to_path_buf()),
+        }),
+    });
+    config.loop_protection.add_header = false;
 }
 
 fn minimal_https_transparent_config() -> Config {
@@ -1311,13 +1433,8 @@ async fn allowed_https_transparent_is_proxied_and_captured() {
     let capture_dir = temp_dir.path().join("captures");
     // Wait briefly for async capture tasks to flush to disk.
     for _ in 0..10 {
-        if capture_dir.is_dir() {
-            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
-                .expect("read capture dir")
-                .collect();
-            if !entries.is_empty() {
-                break;
-            }
+        if capture_dir.is_dir() && capture_record_file_count(&capture_dir) > 0 {
+            break;
         }
         sleep(Duration::from_millis(50)).await;
     }
@@ -1415,6 +1532,93 @@ async fn configured_egress_forwarding_applies_to_https_transparent_requests() {
             .get("host")
             .and_then(|value| value.to_str().ok()),
         Some("transparent-target.test:9443")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn transparent_https_can_forward_through_explicit_https_parent() {
+    let (upstream_addr, seen_requests) = start_upstream_https_body_echo_server().await;
+    let identity_dir = TempDir::new().expect("parent identity dir");
+    let (parent_cert_path, parent_key_path) = write_proxy_identity(&identity_dir);
+    let allow_pattern = format!("https://{}:{}/**", upstream_addr.ip(), upstream_addr.port());
+
+    let mut parent_config =
+        explicit_https_parent_config(&parent_cert_path, &parent_key_path, &allow_pattern);
+    parent_config.proxy.egress.request_header_actions =
+        vec![acl_proxy::config::EgressRequestHeaderActionConfig {
+            action: acl_proxy::config::HeaderActionKind::Set,
+            name: "x-parent-proxy".to_string(),
+            when: acl_proxy::config::HeaderWhen::Always,
+            value: Some("explicit-https".to_string()),
+            values: None,
+            value_from_env: false,
+            values_from_env: Vec::new(),
+            search: None,
+            replace: None,
+        }];
+    let parent_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind parent proxy");
+    parent_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking parent proxy");
+    let (parent_addr, _parent_temp_dir) =
+        start_explicit_https_parent(parent_config, parent_listener).await;
+
+    let mut config = minimal_https_transparent_config();
+    config.capture.allowed_request = false;
+    config.capture.allowed_response = false;
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyRuleAction::Allow,
+            pattern: Some(allow_pattern),
+            patterns: None,
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: None,
+            headers_not_match: None,
+            request_timeout_ms: None,
+            allow_upgrades: true,
+            redaction_profile: None,
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+    configure_https_parent(&mut config, parent_addr, &parent_cert_path);
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir, ca_cert_path) =
+        start_proxy_with_config(config, proxy_listener).await;
+    let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    let (status, body) = send_https_request_with_body_via_transparent(
+        proxy_addr,
+        &ca_cert_path,
+        "transparent.test",
+        &host_header,
+        "/via-https-parent",
+        b"parent-hop",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK.as_u16());
+    assert_eq!(body, "body-forwarded");
+    let seen = seen_requests.lock().unwrap();
+    let request = seen.first().expect("upstream request through parent");
+    assert_eq!(request.body, b"parent-hop");
+    assert_eq!(
+        request
+            .headers
+            .get("x-parent-proxy")
+            .and_then(|value| value.to_str().ok()),
+        Some("explicit-https")
     );
 }
 
@@ -1742,6 +1946,126 @@ async fn redaction_profile_redacts_transparent_https_messages() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn websocket_client_messages_are_redacted_through_explicit_https_parent() {
+    use rustls_pemfile;
+
+    let (upstream_addr, seen_payloads) = start_upstream_https_redaction_server().await;
+    let identity_dir = TempDir::new().expect("parent identity dir");
+    let (parent_cert_path, parent_key_path) = write_proxy_identity(&identity_dir);
+    let allow_pattern = format!("https://{}:{}/ws", upstream_addr.ip(), upstream_addr.port());
+
+    let parent_config =
+        explicit_https_parent_config(&parent_cert_path, &parent_key_path, &allow_pattern);
+    let parent_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind parent proxy");
+    parent_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking parent proxy");
+    let (parent_addr, _parent_temp_dir) =
+        start_explicit_https_parent(parent_config, parent_listener).await;
+
+    let mut config = minimal_https_transparent_config();
+    config.policy.default = acl_proxy::config::PolicyDefaultAction::Deny;
+    config.redaction.profiles.insert(
+        "secrets".to_string(),
+        acl_proxy::config::RedactionProfileConfig {
+            replacement: "[REDACTED]".to_string(),
+            rules: vec![acl_proxy::config::RedactionRuleConfig {
+                literals: vec!["password".to_string()],
+                expressions: Vec::new(),
+                match_mode: acl_proxy::config::RedactionMatch::Both,
+            }],
+            ..Default::default()
+        },
+    );
+    config.policy.rules = vec![acl_proxy::config::PolicyRuleConfig::Direct(
+        acl_proxy::config::PolicyRuleDirectConfig {
+            action: acl_proxy::config::PolicyRuleAction::Allow,
+            pattern: Some(allow_pattern),
+            patterns: None,
+            description: None,
+            methods: None,
+            subnets: Vec::new(),
+            headers_absent: None,
+            headers_match: None,
+            headers_not_match: None,
+            request_timeout_ms: None,
+            allow_upgrades: true,
+            redaction_profile: Some("secrets".to_string()),
+            with: None,
+            add_url_enc_variants: None,
+            header_actions: Vec::new(),
+            external_auth_profile: None,
+            rule_id: None,
+        },
+    )];
+    configure_https_parent(&mut config, parent_addr, &parent_cert_path);
+
+    let proxy_listener = StdTcpListener::bind("127.0.0.1:0").expect("bind proxy");
+    proxy_listener
+        .set_nonblocking(true)
+        .expect("set nonblocking proxy");
+    let (proxy_addr, _temp_dir, ca_cert_path) =
+        start_proxy_with_config(config, proxy_listener).await;
+    let host_header = format!("{}:{}", upstream_addr.ip(), upstream_addr.port());
+
+    let stream = tokio::net::TcpStream::connect(proxy_addr)
+        .await
+        .expect("connect proxy");
+    let ca_pem = std::fs::read(&ca_cert_path).expect("read ca cert");
+    let mut reader = std::io::Cursor::new(ca_pem);
+    let mut roots = RootCertStore::empty();
+    for cert in rustls_pemfile::certs(&mut reader).expect("parse ca cert") {
+        let cert = RustlsCertificate(cert.to_vec());
+        roots.add(&cert).expect("add root cert to store");
+    }
+    let tls_config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(tls_config));
+    let server_name = ServerName::try_from("transparent.test").expect("server name");
+    let mut tls_stream = connector
+        .connect(server_name, stream)
+        .await
+        .expect("TLS connect");
+
+    let request = format!(
+        concat!(
+            "GET /ws HTTP/1.1\r\n",
+            "Host: {host}\r\n",
+            "Connection: Upgrade\r\n",
+            "Upgrade: websocket\r\n",
+            "Sec-WebSocket-Version: 13\r\n",
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n",
+            "\r\n"
+        ),
+        host = host_header
+    );
+    tls_stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("write websocket upgrade request");
+    let (_head, status) = read_http_response_head(&mut tls_stream)
+        .await
+        .expect("read websocket response");
+    assert_eq!(status, StatusCode::SWITCHING_PROTOCOLS.as_u16());
+
+    write_websocket_frame(&mut tls_stream, 0x1, b"client password", true)
+        .await
+        .expect("write websocket frame");
+    let response = read_websocket_frame(&mut tls_stream)
+        .await
+        .expect("read websocket response frame");
+    assert_eq!(response.opcode, 0x1);
+    assert_eq!(response.payload, b"upstream password");
+
+    let seen = seen_payloads.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].opcode, 0x1);
+    assert_eq!(seen[0].payload, b"client [REDACTED]");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn allow_upgrades_false_blocks_transparent_https_upgrade() {
     let upstream_addr = start_upstream_https_echo_server().await;
 
@@ -1856,13 +2180,8 @@ async fn allowed_https_transparent_h2_is_proxied_and_captured() {
 
     let capture_dir = temp_dir.path().join("captures");
     for _ in 0..10 {
-        if capture_dir.is_dir() {
-            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
-                .expect("read capture dir")
-                .collect();
-            if !entries.is_empty() {
-                break;
-            }
+        if capture_dir.is_dir() && capture_record_file_count(&capture_dir) > 0 {
+            break;
         }
         sleep(Duration::from_millis(50)).await;
     }
@@ -1980,13 +2299,8 @@ async fn upstream_failure_https_transparent_is_captured() {
 
     let capture_dir = temp_dir.path().join("captures");
     for _ in 0..10 {
-        if capture_dir.is_dir() {
-            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
-                .expect("read capture dir")
-                .collect();
-            if !entries.is_empty() {
-                break;
-            }
+        if capture_dir.is_dir() && capture_record_file_count(&capture_dir) > 0 {
+            break;
         }
         sleep(Duration::from_millis(50)).await;
     }
@@ -2169,13 +2483,8 @@ async fn concurrent_h2_streams_share_connection_and_are_captured() {
 
     let capture_dir = temp_dir.path().join("captures");
     for _ in 0..10 {
-        if capture_dir.is_dir() {
-            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
-                .expect("read capture dir")
-                .collect();
-            if entries.len() >= 2 {
-                break;
-            }
+        if capture_dir.is_dir() && capture_record_file_count(&capture_dir) >= 2 {
+            break;
         }
         sleep(Duration::from_millis(50)).await;
     }
@@ -2459,13 +2768,8 @@ async fn large_h2_request_body_is_truncated_in_capture() {
 
     let capture_dir = temp_dir.path().join("captures");
     for _ in 0..10 {
-        if capture_dir.is_dir() {
-            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
-                .expect("read capture dir")
-                .collect();
-            if !entries.is_empty() {
-                break;
-            }
+        if capture_dir.is_dir() && capture_record_file_count(&capture_dir) > 0 {
+            break;
         }
         sleep(Duration::from_millis(50)).await;
     }
@@ -2869,13 +3173,8 @@ async fn denied_https_transparent_returns_403() {
 
     let capture_dir = temp_dir.path().join("captures");
     for _ in 0..10 {
-        if capture_dir.is_dir() {
-            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
-                .expect("read capture dir")
-                .collect();
-            if !entries.is_empty() {
-                break;
-            }
+        if capture_dir.is_dir() && capture_record_file_count(&capture_dir) > 0 {
+            break;
         }
         sleep(Duration::from_millis(50)).await;
     }
@@ -3185,13 +3484,8 @@ async fn denied_https_transparent_h2_returns_403() {
 
     let capture_dir = temp_dir.path().join("captures");
     for _ in 0..10 {
-        if capture_dir.is_dir() {
-            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
-                .expect("read capture dir")
-                .collect();
-            if !entries.is_empty() {
-                break;
-            }
+        if capture_dir.is_dir() && capture_record_file_count(&capture_dir) > 0 {
+            break;
         }
         sleep(Duration::from_millis(50)).await;
     }

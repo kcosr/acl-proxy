@@ -376,13 +376,16 @@ async fn two_proxy_chain_preserves_http2_on_inner_to_outer_hop() {
 
     let capture_dir = outer_temp_dir.path().join("captures");
     for _ in 0..20 {
-        if capture_dir.is_dir() {
-            let entries: Vec<_> = std::fs::read_dir(&capture_dir)
+        if capture_dir.is_dir()
+            && std::fs::read_dir(&capture_dir)
                 .expect("read capture dir")
-                .collect();
-            if !entries.is_empty() {
-                break;
-            }
+                .filter_map(Result::ok)
+                .any(|entry| {
+                    entry.file_type().is_ok_and(|kind| kind.is_file())
+                        && entry.path().extension().is_some_and(|ext| ext == "json")
+                })
+        {
+            break;
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }

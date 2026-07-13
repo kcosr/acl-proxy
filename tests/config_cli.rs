@@ -279,6 +279,15 @@ fn config_init_creates_file_at_path() {
         contents.contains("[proxy]"),
         "generated config should contain [proxy] section"
     );
+    assert_eq!(
+        contents.matches("127.0.0.1:").count(),
+        2,
+        "every generated listener should bind to loopback"
+    );
+    assert!(
+        !contents.contains("0.0.0.0:"),
+        "generated deny-all config must not expose listeners on all interfaces"
+    );
 }
 
 #[test]
