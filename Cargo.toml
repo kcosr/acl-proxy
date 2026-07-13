@@ -19,7 +19,6 @@ toml = "0.8"
 thiserror = "1.0"
 once_cell = "1.19"
 arc-swap = "1.7"
-aho-corasick = "1.1"
 ipnet = { version = "2.9", features = ["serde"] }
 idna = "1.1"
 regex = "1.11"

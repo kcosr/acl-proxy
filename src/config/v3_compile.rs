@@ -1,10 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder, AhoCorasickKind, MatchKind as AhoMatchKind};
 use http::header::{HeaderName, HeaderValue};
 use http::Method;
 use regex_automata::{
@@ -70,8 +69,6 @@ const MAX_REDACTION_ENV_BYTES_PER_SNAPSHOT: usize = 64 * MIB;
 pub(crate) const MAX_REDACTION_REGEX_DFA_BYTES: usize = MIB;
 pub(crate) const MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE: usize = 16 * MIB;
 pub(crate) const MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT: usize = 64 * MIB;
-const REDACTION_AHO_BUILD_BASE_BYTES: usize = 64 * 1024;
-const REDACTION_AHO_BUILD_BYTES_PER_INPUT_UNIT: usize = 1024;
 const MAX_TOML_REDACTION_LITERALS_PER_PROFILE: usize = 4_096;
 const MAX_TOML_REDACTION_LITERAL_BYTES_PER_PROFILE: usize = 16 * MIB;
 const MAX_LOG_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
@@ -81,7 +78,7 @@ const MAX_CAPTURE_INFLIGHT_BYTES: usize = 4 * GIB;
 const MAX_CAPTURE_FILES: usize = 10_000_000;
 const MAX_CAPTURE_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024 * 1024;
 const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
-const MATCHER_SCRATCH_BYTES: usize = MIB;
+pub(crate) const MAX_REDACTION_MATCHER_SCRATCH_BYTES: usize = MIB;
 const DECODER_SCRATCH_BYTES: usize = 64 * 1024;
 const PROVIDER_STREAM_SCRATCH_BYTES: usize = 64 * 1024;
 
@@ -594,33 +591,134 @@ pub(crate) fn redaction_regex_resident_bytes(expression: &DfaRegex) -> Option<us
         .checked_add(expression.reverse().memory_usage())
 }
 
-pub(crate) fn build_redaction_literal_automaton(
-    patterns: Vec<&[u8]>,
-    build_budget: usize,
-) -> Result<Option<AhoCorasick>, ()> {
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RedactionLiteralEdge {
+    pub(crate) source: usize,
+    pub(crate) byte: u8,
+    pub(crate) target: usize,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RedactionLiteralNode {
+    pub(crate) edge_start: usize,
+    pub(crate) edge_len: usize,
+    pub(crate) failure: usize,
+    pub(crate) output_len: usize,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct RedactionLiteralInterval {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+}
+
+pub(crate) struct RedactionLiteralProjection {
+    pub(crate) state_count: usize,
+    pub(crate) edge_count: usize,
+    pub(crate) max_pattern_len: usize,
+    pub(crate) resident_bytes: usize,
+    pub(crate) reference_build_bytes: usize,
+    pub(crate) trie_build_bytes: usize,
+    pub(crate) failure_build_bytes: usize,
+    pub(crate) build_bytes: usize,
+}
+
+pub(crate) fn redaction_literal_reference_bytes(
+    staging_capacity: usize,
+    final_len: usize,
+) -> Option<(usize, usize)> {
+    let element_bytes = std::mem::size_of::<&[u8]>();
+    let staging_bytes = staging_capacity.checked_mul(element_bytes)?;
+    let final_bytes = final_len.checked_mul(element_bytes)?;
+    let construction_bytes = staging_bytes.checked_add(final_bytes)?;
+    Some((final_bytes, construction_bytes))
+}
+
+pub(crate) fn redaction_literal_projection(
+    patterns: &mut [&[u8]],
+    pattern_reference_bytes: usize,
+    pattern_reference_construction_bytes: usize,
+) -> Option<RedactionLiteralProjection> {
     if patterns.is_empty() {
-        return Ok(None);
+        if pattern_reference_bytes != 0 || pattern_reference_construction_bytes != 0 {
+            return None;
+        }
+        return Some(RedactionLiteralProjection {
+            state_count: 0,
+            edge_count: 0,
+            max_pattern_len: 0,
+            resident_bytes: 0,
+            reference_build_bytes: 0,
+            trie_build_bytes: 0,
+            failure_build_bytes: 0,
+            build_bytes: 0,
+        });
     }
-    let input_units = patterns.iter().try_fold(1usize, |units, pattern| {
-        units.checked_add(pattern.len())?.checked_add(1)
-    });
-    // The fixed sparse representation plus this deliberately conservative
-    // input multiplier bounds the dependency's candidate build allocations.
-    let projected_build_bytes = input_units
-        .and_then(|units| units.checked_mul(REDACTION_AHO_BUILD_BYTES_PER_INPUT_UNIT))
-        .and_then(|bytes| bytes.checked_add(REDACTION_AHO_BUILD_BASE_BYTES))
-        .ok_or(())?;
-    if projected_build_bytes > build_budget {
-        return Err(());
+    let minimum_reference_bytes = patterns.len().checked_mul(std::mem::size_of::<&[u8]>())?;
+    if pattern_reference_bytes != minimum_reference_bytes
+        || pattern_reference_construction_bytes < pattern_reference_bytes
+    {
+        return None;
     }
-    AhoCorasickBuilder::new()
-        .kind(Some(AhoCorasickKind::NoncontiguousNFA))
-        .match_kind(AhoMatchKind::Standard)
-        .dense_depth(0)
-        .prefilter(false)
-        .build(patterns)
-        .map(Some)
-        .map_err(|_| ())
+    patterns.sort_unstable();
+
+    let mut state_count = 1usize;
+    let mut max_pattern_len = 0usize;
+    for index in 0..patterns.len() {
+        let pattern = patterns[index];
+        let previous = index
+            .checked_sub(1)
+            .map(|previous| patterns[previous])
+            .unwrap_or(&[]);
+        if index != 0 && pattern == previous {
+            continue;
+        }
+        let shared = pattern_common_prefix_len(previous, pattern);
+        state_count = state_count.checked_add(pattern.len() - shared)?;
+        max_pattern_len = max_pattern_len.max(pattern.len());
+    }
+    let edge_count = state_count.checked_sub(1)?;
+    let resident_bytes = state_count
+        .checked_mul(std::mem::size_of::<RedactionLiteralNode>())?
+        .checked_add(edge_count.checked_mul(std::mem::size_of::<RedactionLiteralEdge>())?)?;
+    let terminal_and_path_bytes = state_count
+        .checked_mul(std::mem::size_of::<usize>())?
+        .checked_add(
+            max_pattern_len
+                .checked_add(1)?
+                .checked_mul(std::mem::size_of::<usize>())?,
+        )?;
+    let shared_build_bytes = resident_bytes.checked_add(terminal_and_path_bytes)?;
+    // Reference-array conversion, trie construction, and failure-link BFS are
+    // distinct peaks. The reference box is wiped before the BFS queue exists.
+    let trie_build_bytes = shared_build_bytes.checked_add(pattern_reference_bytes)?;
+    let failure_build_bytes =
+        shared_build_bytes.checked_add(state_count.checked_mul(std::mem::size_of::<usize>())?)?;
+    Some(RedactionLiteralProjection {
+        state_count,
+        edge_count,
+        max_pattern_len,
+        resident_bytes,
+        reference_build_bytes: pattern_reference_construction_bytes,
+        trie_build_bytes,
+        failure_build_bytes,
+        build_bytes: pattern_reference_construction_bytes
+            .max(trie_build_bytes)
+            .max(failure_build_bytes),
+    })
+}
+
+pub(crate) fn redaction_literal_scratch_bytes(max_pattern_len: usize) -> Option<usize> {
+    max_pattern_len
+        .checked_mul(std::mem::size_of::<RedactionLiteralInterval>())
+        .filter(|bytes| *bytes <= MAX_REDACTION_MATCHER_SCRATCH_BYTES)
+}
+
+fn pattern_common_prefix_len(left: &[u8], right: &[u8]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left == right)
+        .count()
 }
 
 pub(crate) fn checked_redaction_matcher_resident_bytes(
@@ -2740,6 +2838,7 @@ fn validate_redaction_limits(config: &super::authoring::ConfigV3) -> Result<(), 
             profile.max_environment_literal_total_bytes,
             MAX_REDACTION_ENV_TOTAL_BYTES_PER_PROFILE,
         )?;
+        configured_profile_literal_scratch_bytes(profile, &prefix)?;
         if profile.max_decoded_body_bytes < profile.max_body_bytes {
             return Err(V3CompileError::at(
                 &prefix,
@@ -2967,6 +3066,33 @@ fn validate_logging_capture_limits(
     Ok(())
 }
 
+fn configured_profile_literal_scratch_bytes(
+    profile: &super::authoring::RedactionProfileConfig,
+    path: &str,
+) -> Result<usize, V3CompileError> {
+    let mut max_pattern_len = 0usize;
+    let mut has_environment_source = false;
+    for rule in &profile.rules {
+        max_pattern_len = max_pattern_len.max(
+            rule.literals
+                .iter()
+                .map(|literal| literal.len())
+                .max()
+                .unwrap_or(0),
+        );
+        has_environment_source |= !rule.literal_environment_variables.is_empty();
+    }
+    if has_environment_source {
+        max_pattern_len = max_pattern_len.max(profile.max_environment_literal_bytes);
+    }
+    redaction_literal_scratch_bytes(max_pattern_len).ok_or_else(|| {
+        V3CompileError::at(
+            path,
+            "configured literal horizon exceeds the matcher scratch ceiling",
+        )
+    })
+}
+
 fn compile_resource_plan(
     config: &super::authoring::ConfigV3,
 ) -> Result<CompiledResourcePlan, V3CompileError> {
@@ -3083,7 +3209,15 @@ fn compile_resource_plan(
                         .profiles
                         .get(name)
                         .expect("profile references validated before resource compilation");
-                    upgrade_wire_peak(profile.max_message_bytes, profile.allow_permessage_deflate)
+                    let scratch_bytes = configured_profile_literal_scratch_bytes(
+                        profile,
+                        &format!("redaction.profiles.{name}"),
+                    )?;
+                    upgrade_wire_peak(
+                        profile.max_message_bytes,
+                        profile.allow_permessage_deflate,
+                        scratch_bytes,
+                    )
                 })
                 .transpose()?
                 .unwrap_or(0);
@@ -3163,6 +3297,14 @@ fn compile_http_rule_schedule(
             .get(name)
             .expect("profile references validated before resource compilation")
     });
+    let profile_scratch_bytes = rule
+        .redaction_profile
+        .as_ref()
+        .zip(profile)
+        .map(|(name, profile)| {
+            configured_profile_literal_scratch_bytes(profile, &format!("redaction.profiles.{name}"))
+        })
+        .transpose()?;
 
     let mut initial_peak = 0usize;
     let mut incoming_stages = Vec::with_capacity(3);
@@ -3214,17 +3356,36 @@ fn compile_http_rule_schedule(
             initial_peak = initial_peak.max(decode_peak(encoded_limit, original_limit)?);
         }
         let redaction_additional = checked_add(
-            MATCHER_SCRATCH_BYTES,
+            profile_scratch_bytes.expect("redaction profile scratch was derived"),
             profile.max_decoded_body_bytes,
             "policy.rules",
             "HTTP redaction plan arithmetic overflow",
         )?;
-        initial_peak = initial_peak.max(checked_add(
+        let has_text_expressions = profile.rules.iter().any(|rule| {
+            !rule.expressions.is_empty() && !matches!(rule.payloads, RedactionPayloads::Binary)
+        });
+        let regex_peak = if has_text_expressions {
+            checked_add(
+                profile.max_decoded_body_bytes,
+                profile.max_decoded_body_bytes,
+                "policy.rules",
+                "HTTP regex redaction plan arithmetic overflow",
+            )?
+        } else {
+            0
+        };
+        let original_redaction_peak = checked_add(
             original_limit,
             redaction_additional,
             "policy.rules",
             "HTTP redaction plan arithmetic overflow",
-        )?);
+        )?
+        .max(regex_peak);
+        initial_peak = initial_peak.max(original_redaction_peak);
+        // A prior delegate's retained body becomes the regex input. The
+        // incoming stage therefore adds only matcher scratch and the output
+        // buffer; the standalone peak above covers both regex buffers when
+        // no prior body is retained.
         incoming_stages.push(IncomingBodyStage {
             additional_bytes: redaction_additional,
         });
@@ -3234,12 +3395,14 @@ fn compile_http_rule_schedule(
             let replacement_limit = provider
                 .max_decoded_request_body_bytes
                 .min(profile.max_decoded_body_bytes);
-            initial_peak = initial_peak.max(checked_add(
+            let replacement_redaction_peak = checked_add(
                 replacement_limit,
                 redaction_additional,
                 "policy.rules",
                 "HTTP replacement-redaction plan arithmetic overflow",
-            )?);
+            )?
+            .max(regex_peak);
+            initial_peak = initial_peak.max(replacement_redaction_peak);
         }
     }
 
@@ -3286,6 +3449,7 @@ fn checked_add(
 fn upgrade_wire_peak(
     max_message_bytes: usize,
     allow_permessage_deflate: bool,
+    matcher_scratch_bytes: usize,
 ) -> Result<usize, V3CompileError> {
     let mut peak = max_message_bytes;
     if allow_permessage_deflate {
@@ -3302,7 +3466,7 @@ fn upgrade_wire_peak(
             "upgrade wire-body plan arithmetic overflow",
         )?;
     }
-    for allocation in [max_message_bytes, MATCHER_SCRATCH_BYTES, max_message_bytes] {
+    for allocation in [max_message_bytes, matcher_scratch_bytes, max_message_bytes] {
         peak = checked_add(
             peak,
             allocation,
@@ -3809,13 +3973,34 @@ fn compile_credentials_plan(value: &CredentialsConfig) -> Result<CredentialsPlan
     })
 }
 
+enum AuthoredLiteralProjectionError {
+    Scratch,
+    Matcher,
+}
+
 fn authored_literal_resident_bytes(
     value: &super::authoring::RedactionProfileConfig,
     class: CompiledRedactionPayloads,
     build_budget: usize,
-) -> Result<usize, ()> {
-    let mut unique = HashSet::new();
+) -> Result<usize, AuthoredLiteralProjectionError> {
+    let pattern_count = value
+        .rules
+        .iter()
+        .filter(|rule| {
+            matches!(
+                (rule.payloads, class),
+                (RedactionPayloads::Text, CompiledRedactionPayloads::Text)
+                    | (RedactionPayloads::Binary, CompiledRedactionPayloads::Binary)
+                    | (RedactionPayloads::Both, _)
+            )
+        })
+        .map(|rule| rule.literals.len())
+        .try_fold(0usize, usize::checked_add)
+        .ok_or(AuthoredLiteralProjectionError::Matcher)?;
     let mut patterns = Vec::new();
+    patterns
+        .try_reserve_exact(pattern_count)
+        .map_err(|_| AuthoredLiteralProjectionError::Matcher)?;
     for rule in &value.rules {
         let applies = matches!(
             (rule.payloads, class),
@@ -3827,16 +4012,28 @@ fn authored_literal_resident_bytes(
             continue;
         }
         for literal in &rule.literals {
-            if unique.insert(literal.as_bytes()) {
-                patterns.push(literal.as_bytes());
-            }
+            patterns.push(literal.as_bytes());
         }
     }
-    let resident_bytes = build_redaction_literal_automaton(patterns, build_budget)?
-        .map_or(0, |matcher| matcher.memory_usage());
-    (resident_bytes <= build_budget)
-        .then_some(resident_bytes)
-        .ok_or(())
+    debug_assert_eq!(patterns.len(), pattern_count);
+    let (pattern_reference_bytes, pattern_reference_construction_bytes) =
+        redaction_literal_reference_bytes(patterns.capacity(), patterns.len())
+            .ok_or(AuthoredLiteralProjectionError::Matcher)?;
+    let mut patterns = patterns.into_boxed_slice();
+    if std::mem::size_of_val(patterns.as_ref()) != pattern_reference_bytes {
+        return Err(AuthoredLiteralProjectionError::Matcher);
+    }
+    let projection = redaction_literal_projection(
+        &mut patterns,
+        pattern_reference_bytes,
+        pattern_reference_construction_bytes,
+    );
+    let projection = projection.ok_or(AuthoredLiteralProjectionError::Matcher)?;
+    redaction_literal_scratch_bytes(projection.max_pattern_len)
+        .ok_or(AuthoredLiteralProjectionError::Scratch)?;
+    (projection.build_bytes <= build_budget && projection.resident_bytes <= build_budget)
+        .then_some(projection.resident_bytes)
+        .ok_or(AuthoredLiteralProjectionError::Matcher)
 }
 
 fn compile_redaction_plan(value: &RedactionConfig) -> Result<RedactionPlan, V3CompileError> {
@@ -3856,11 +4053,16 @@ fn compile_redaction_plan(value: &RedactionConfig) -> Result<RedactionPlan, V3Co
                 CompiledRedactionPayloads::Text,
                 MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE.min(snapshot_remaining),
             )
-            .map_err(|_| {
-                V3CompileError::at(
-                    &prefix,
-                    "bounded text literal matcher build ceiling exceeded",
-                )
+            .map_err(|error| {
+                let message = match error {
+                    AuthoredLiteralProjectionError::Scratch => {
+                        "text literal exceeds the matcher scratch horizon"
+                    }
+                    AuthoredLiteralProjectionError::Matcher => {
+                        "bounded text literal matcher build ceiling exceeded"
+                    }
+                };
+                V3CompileError::at(&prefix, message)
             })?;
             let binary_literal_budget = MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE
                 .checked_sub(text_literal_bytes)
@@ -3875,11 +4077,16 @@ fn compile_redaction_plan(value: &RedactionConfig) -> Result<RedactionPlan, V3Co
                 CompiledRedactionPayloads::Binary,
                 binary_literal_budget,
             )
-            .map_err(|_| {
-                V3CompileError::at(
-                    &prefix,
-                    "bounded binary literal matcher build ceiling exceeded",
-                )
+            .map_err(|error| {
+                let message = match error {
+                    AuthoredLiteralProjectionError::Scratch => {
+                        "binary literal exceeds the matcher scratch horizon"
+                    }
+                    AuthoredLiteralProjectionError::Matcher => {
+                        "bounded binary literal matcher build ceiling exceeded"
+                    }
+                };
+                V3CompileError::at(&prefix, message)
             })?;
             let literal_bytes = text_literal_bytes
                 .checked_add(binary_literal_bytes)
@@ -4374,8 +4581,11 @@ rules = [{{ expressions = ['\bsecret-marker\b'] }}]
     }
 
     #[test]
-    fn authored_literal_candidate_is_rejected_before_an_oversized_aho_build() {
-        let literal = "x".repeat(17 * 1024);
+    fn authored_literal_horizon_is_rejected_during_pure_compilation() {
+        let literal = "x".repeat(
+            MAX_REDACTION_MATCHER_SCRATCH_BYTES / std::mem::size_of::<RedactionLiteralInterval>()
+                + 1,
+        );
         let input = format!(
             r#"{MINIMAL}
 
@@ -4383,11 +4593,83 @@ rules = [{{ expressions = ['\bsecret-marker\b'] }}]
 rules = [{{ literals = ["{literal}"] }}]
 "#
         );
-        let error = compile(&input).expect_err("the conservative build projection exceeds 16 MiB");
+        let error = compile(&input).expect_err("the literal horizon exceeds one MiB of scratch");
         let rendered = format!("{error:?} {error}");
         assert!(rendered.contains("redaction.profiles.secrets"));
-        assert!(rendered.contains("bounded text literal matcher build ceiling exceeded"));
+        assert!(rendered.contains("configured literal horizon exceeds"));
         assert!(!rendered.contains(&literal));
+    }
+
+    #[test]
+    fn sparse_literal_projection_is_exact_after_sorting_and_deduplication() {
+        let abc = b"abc".as_slice();
+        let abd = b"abd".as_slice();
+        let mut patterns = Vec::new();
+        patterns.try_reserve_exact(3).unwrap();
+        patterns.extend([abd, abc, abc]);
+        let (pattern_reference_bytes, pattern_reference_construction_bytes) =
+            redaction_literal_reference_bytes(patterns.capacity(), patterns.len()).unwrap();
+        assert_eq!(
+            pattern_reference_construction_bytes,
+            (patterns.capacity() + patterns.len()) * std::mem::size_of::<&[u8]>()
+        );
+        let mut patterns = patterns.into_boxed_slice();
+        let projection = redaction_literal_projection(
+            &mut patterns,
+            pattern_reference_bytes,
+            pattern_reference_construction_bytes,
+        )
+        .unwrap();
+
+        assert_eq!(patterns[0], abc);
+        assert_eq!(patterns[1], abc);
+        assert_eq!(patterns[2], abd);
+        assert_eq!(projection.state_count, 5);
+        assert_eq!(projection.edge_count, 4);
+        assert_eq!(projection.max_pattern_len, 3);
+        assert_eq!(
+            projection.resident_bytes,
+            5 * std::mem::size_of::<RedactionLiteralNode>()
+                + 4 * std::mem::size_of::<RedactionLiteralEdge>()
+        );
+        let shared_build_bytes = projection.resident_bytes
+            + 5 * std::mem::size_of::<usize>()
+            + 4 * std::mem::size_of::<usize>();
+        assert_eq!(
+            projection.reference_build_bytes,
+            pattern_reference_construction_bytes
+        );
+        assert_eq!(
+            projection.trie_build_bytes,
+            shared_build_bytes + pattern_reference_bytes
+        );
+        assert_eq!(
+            projection.failure_build_bytes,
+            shared_build_bytes + 5 * std::mem::size_of::<usize>()
+        );
+        assert_eq!(
+            projection.build_bytes,
+            projection
+                .reference_build_bytes
+                .max(projection.trie_build_bytes)
+                .max(projection.failure_build_bytes)
+        );
+    }
+
+    #[test]
+    fn configured_environment_horizon_is_rejected_during_pure_compilation() {
+        let input = format!(
+            r#"{MINIMAL}
+
+[redaction.profiles.secrets]
+max_environment_literal_bytes = 65537
+rules = [{{ literal_environment_variables = ["TEST_REDACTION_SECRET"] }}]
+"#
+        );
+        let error = compile(&input).expect_err("the configured source horizon exceeds scratch");
+        assert!(error
+            .to_string()
+            .contains("configured literal horizon exceeds"));
     }
 
     fn resource_config(service: &str, definitions: &str, rules: &str) -> String {
@@ -5276,8 +5558,9 @@ redaction_profile = "large"
         );
         let compiled = compile(&input).unwrap();
         let plan = &compiled.reloadable_plan.resource_plan;
-        assert_eq!(plan.http_wire_body_peak_bytes_by_cursor[0], 17 * MIB);
-        assert_eq!(plan.http_wire_body_peak_bytes_by_cursor[1], 17 * MIB);
+        let decode_peak = 16 * MIB + DECODER_SCRATCH_BYTES;
+        assert_eq!(plan.http_wire_body_peak_bytes_by_cursor[0], decode_peak);
+        assert_eq!(plan.http_wire_body_peak_bytes_by_cursor[1], decode_peak);
     }
 
     #[test]
@@ -5313,12 +5596,13 @@ redaction_profile = "terminal"
 "#,
         );
         let compiled = compile(&input).unwrap();
+        let scratch = redaction_literal_scratch_bytes("terminal-test-literal".len()).unwrap();
         assert_eq!(
             compiled
                 .reloadable_plan
                 .resource_plan
                 .http_wire_body_peak_bytes_by_cursor,
-            vec![25 * MIB, 17 * MIB, 0]
+            vec![24 * MIB + scratch, 16 * MIB + scratch, 0]
         );
     }
 
@@ -5369,12 +5653,18 @@ redaction_profile = "terminal"
 "#,
         );
         let compiled = compile(&input).unwrap();
+        let scratch = redaction_literal_scratch_bytes("terminal-test-literal".len()).unwrap();
         assert_eq!(
             compiled
                 .reloadable_plan
                 .resource_plan
                 .http_wire_body_peak_bytes_by_cursor,
-            vec![25 * MIB, 17 * MIB, 17 * MIB, 0]
+            vec![
+                24 * MIB + scratch,
+                16 * MIB + scratch,
+                16 * MIB + scratch,
+                0,
+            ]
         );
     }
 
@@ -5408,6 +5698,53 @@ authorization_provider = "replacing"
                 .resource_plan
                 .max_reachable_http_wire_body_peak_bytes,
             32 * MIB + DECODER_SCRATCH_BYTES
+        );
+    }
+
+    #[test]
+    fn expanding_regex_passes_cover_two_profile_limit_buffers() {
+        let input = resource_config(
+            "",
+            r#"
+[authorization.providers.expanding]
+kind = "process"
+command = "/bin/expanding-provider"
+include_request_body = true
+allow_request_body_replacement = true
+max_request_body_bytes = 1048576
+max_decoded_request_body_bytes = 1048576
+max_stdout_line_bytes = 1048576
+retire_timeout = "1h"
+
+[redaction.profiles.expanding]
+replacement = "expanded-value"
+max_body_bytes = 1048576
+max_decoded_body_bytes = 8388608
+rules = [{ expressions = ["a", "e"] }]
+"#,
+            r#"
+[[policy.rules]]
+id = "retain-provider-input"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "expanding"
+
+[[policy.rules]]
+id = "replace-and-redact"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "expanding"
+redaction_profile = "expanding"
+"#,
+        );
+        let compiled = compile(&input).unwrap();
+
+        assert_eq!(
+            compiled
+                .reloadable_plan
+                .resource_plan
+                .http_wire_body_peak_bytes_by_cursor,
+            vec![16 * MIB, 16 * MIB, 0]
         );
     }
 
@@ -5451,17 +5788,20 @@ redaction_profile = "deflate"
         let compiled = compile(&input).unwrap();
         let plan = &compiled.reloadable_plan.resource_plan;
         let transport = 2 * 64 * 1024;
+        let plain_scratch = redaction_literal_scratch_bytes("plain-test-literal".len()).unwrap();
+        let deflate_scratch =
+            redaction_literal_scratch_bytes("deflate-test-literal".len()).unwrap();
         assert_eq!(
             plan.upgrade_allocation_bytes_by_rule,
             vec![
                 Some(transport),
-                Some(transport + 4 * MIB),
-                Some(transport + 5 * MIB + DECODER_SCRATCH_BYTES),
+                Some(transport + 3 * MIB + plain_scratch),
+                Some(transport + 4 * MIB + deflate_scratch + DECODER_SCRATCH_BYTES),
             ]
         );
         assert_eq!(
             plan.max_upgrade_allocation_per_stream,
-            transport + 5 * MIB + DECODER_SCRATCH_BYTES
+            transport + 4 * MIB + deflate_scratch + DECODER_SCRATCH_BYTES
         );
     }
 

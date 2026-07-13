@@ -1,19 +1,21 @@
-use std::collections::{BTreeMap, HashSet};
+use std::alloc::{alloc, dealloc, Layout};
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
+use std::mem::MaybeUninit;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
-use aho_corasick::AhoCorasick;
 use regex_automata::dfa::regex::Regex as DfaRegex;
 
 use crate::config::v3_compile::{
-    build_redaction_literal_automaton, build_redaction_regex,
-    checked_redaction_matcher_resident_bytes, redaction_regex_resident_bytes,
-    remaining_redaction_matcher_resident_bytes, CompiledRedactionPayloads, RedactionPlan,
-    RedactionProfilePlan, RedactionRulePlan,
+    build_redaction_regex, checked_redaction_matcher_resident_bytes, redaction_literal_projection,
+    redaction_literal_reference_bytes, redaction_literal_scratch_bytes,
+    redaction_regex_resident_bytes, remaining_redaction_matcher_resident_bytes,
+    CompiledRedactionPayloads, RedactionLiteralEdge as SecretEdge,
+    RedactionLiteralInterval as Interval, RedactionLiteralNode as SecretNode, RedactionPlan,
+    RedactionProfilePlan, RedactionRulePlan, MAX_REDACTION_MATCHER_SCRATCH_BYTES,
 };
-
-const MAX_MATCHER_SCRATCH_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PayloadClass {
@@ -282,24 +284,16 @@ impl ProfileSnapshot {
             return Err(SnapshotError::SourceCount { profile_index });
         }
 
-        let has_literal_matcher = plan.rules.iter().any(|rule| {
-            !rule.literals.is_empty() || !rule.literal_environment_variables.is_empty()
-        });
-        let matcher_scratch_bytes = if has_literal_matcher {
-            MAX_MATCHER_SCRATCH_BYTES
-        } else {
-            0
-        };
         let mut limits = RedactionLimits {
             max_body_bytes: plan.max_body_bytes,
             max_decoded_body_bytes: plan.max_decoded_body_bytes,
             max_frame_bytes: plan.max_frame_bytes,
             max_message_bytes: plan.max_message_bytes,
             allow_permessage_deflate: plan.allow_permessage_deflate,
-            matcher_scratch_bytes,
+            matcher_scratch_bytes: 0,
             compiled_matcher_resident_bytes: 0,
         };
-        debug_assert!(limits.matcher_scratch_bytes <= MAX_MATCHER_SCRATCH_BYTES);
+        debug_assert!(limits.matcher_scratch_bytes <= MAX_REDACTION_MATCHER_SCRATCH_BYTES);
 
         let mut aggregate_bytes = 0usize;
         let mut rules = Vec::with_capacity(plan.rules.len());
@@ -345,6 +339,9 @@ impl ProfileSnapshot {
         .ok_or(SnapshotError::CompiledMatcherTooLarge { profile_index })?;
         limits.compiled_matcher_resident_bytes = profile_bytes;
         *snapshot_matcher_resident_bytes = snapshot_bytes;
+        limits.matcher_scratch_bytes = text_literals
+            .scratch_bytes()
+            .max(binary_literals.scratch_bytes());
 
         let mut text_expressions = Vec::new();
         for (rule_index, rule) in rules.iter_mut().enumerate() {
@@ -451,8 +448,8 @@ fn remaining_matcher_resident_budget(
 }
 
 struct LiteralMatcher {
-    combined: Option<AhoCorasick>,
-    environment: Option<ZeroizingAhoCorasick>,
+    matcher: Option<ZeroizingAhoCorasick>,
+    max_pattern_len: usize,
 }
 
 impl LiteralMatcher {
@@ -468,43 +465,39 @@ impl LiteralMatcher {
             .map(ResolvedRule::literal_count)
             .try_fold(0usize, usize::checked_add)
             .unwrap_or(usize::MAX);
-        let mut combined_patterns = Vec::new();
-        combined_patterns
-            .try_reserve_exact(pattern_capacity)
-            .map_err(|_| SnapshotError::AllocationFailed)?;
-        let mut combined_unique = HashSet::new();
-        let mut environment_patterns = Vec::new();
+        let mut patterns =
+            ZeroizingPatternRefs::new(pattern_capacity, build_budget, profile_index)?;
+        let mut max_pattern_len = 0usize;
         for rule in rules.iter().filter(|rule| rule.applies_to(class)) {
             for literal in rule.literals.iter().map(Vec::as_slice) {
-                if combined_unique.insert(literal) {
-                    combined_patterns.push(literal);
-                }
+                max_pattern_len = max_pattern_len.max(literal.len());
+                patterns
+                    .push(literal)
+                    .ok_or(SnapshotError::MatcherBuild { profile_index })?;
             }
             for literal in rule.environment_literals.iter().map(SecretBytes::as_bytes) {
-                environment_patterns.push(literal);
+                max_pattern_len = max_pattern_len.max(literal.len());
+                patterns
+                    .push(literal)
+                    .ok_or(SnapshotError::MatcherBuild { profile_index })?;
             }
         }
-        let combined = build_automaton(combined_patterns, profile_index, build_budget)?;
-        let combined_bytes = combined.as_ref().map_or(0, AhoCorasick::memory_usage);
-        let environment_budget = build_budget
-            .checked_sub(combined_bytes)
-            .ok_or(SnapshotError::CompiledMatcherTooLarge { profile_index })?;
-        let environment =
-            ZeroizingAhoCorasick::build(environment_patterns, profile_index, environment_budget)?;
-        let environment_bytes = environment
+        debug_assert_eq!(patterns.len(), pattern_capacity);
+        checked_matcher_scratch_bytes(max_pattern_len)?;
+        let matcher = ZeroizingAhoCorasick::build(patterns, profile_index, build_budget)?;
+        let resident_bytes = matcher
             .as_ref()
             .map(ZeroizingAhoCorasick::resident_bytes)
             .transpose()
             .map_err(|()| SnapshotError::MatcherBuild { profile_index })?
             .unwrap_or(0);
-        let resident_bytes = combined_bytes
-            .checked_add(environment_bytes)
-            .filter(|bytes| *bytes <= build_budget)
-            .ok_or(SnapshotError::CompiledMatcherTooLarge { profile_index })?;
+        if resident_bytes > build_budget {
+            return Err(SnapshotError::CompiledMatcherTooLarge { profile_index });
+        }
         Ok((
             Self {
-                combined,
-                environment,
+                matcher,
+                max_pattern_len,
             },
             resident_bytes,
         ))
@@ -517,13 +510,28 @@ impl LiteralMatcher {
         limit: usize,
         payload_limit: PayloadLimit,
     ) -> Result<(Vec<u8>, usize), SnapshotError> {
-        if self.combined.is_none() && self.environment.is_none() {
+        if self.matcher.is_none() {
             return Ok((input, 0));
         }
-        let matches = self.match_intervals(&input)?;
-        let (output_len, count) = literal_replacement_shape(
+        let mut removed = 0usize;
+        let mut count = 0usize;
+        self.for_each_merged_interval(&input, |interval| {
+            removed = removed.checked_add(interval.end - interval.start).ok_or(
+                SnapshotError::PayloadTooLarge {
+                    payload: payload_limit,
+                    limit,
+                },
+            )?;
+            count = count.checked_add(1).ok_or(SnapshotError::PayloadTooLarge {
+                payload: payload_limit,
+                limit,
+            })?;
+            Ok(())
+        })?;
+        let output_len = checked_output_len(
             input.len(),
-            &matches,
+            removed,
+            count,
             replacement.len(),
             limit,
             payload_limit,
@@ -537,125 +545,244 @@ impl LiteralMatcher {
             .try_reserve_exact(output_len)
             .map_err(|_| SnapshotError::AllocationFailed)?;
         let mut cursor = 0usize;
-        for interval in matches.iter() {
+        self.for_each_merged_interval(&input, |interval| {
             output.extend_from_slice(&input[cursor..interval.start]);
             output.extend_from_slice(replacement);
             cursor = interval.end;
-        }
+            Ok(())
+        })?;
         output.extend_from_slice(&input[cursor..]);
         debug_assert_eq!(output.len(), output_len);
         Ok((output, count))
     }
 
-    fn match_intervals(&self, input: &[u8]) -> Result<ZeroizingVec<Interval>, SnapshotError> {
-        let max_intervals = MAX_MATCHER_SCRATCH_BYTES / std::mem::size_of::<Interval>();
-        let mut interval_count = 0usize;
-        if let Some(combined) = &self.combined {
-            for _ in combined.find_overlapping_iter(input) {
-                interval_count = interval_count.saturating_add(1);
-                if interval_count > max_intervals {
-                    break;
-                }
-            }
-        }
-        if interval_count <= max_intervals {
-            if let Some(environment) = &self.environment {
-                environment.for_each_match(input, |_, _| {
-                    interval_count = interval_count.saturating_add(1);
-                    interval_count <= max_intervals
-                });
-            }
-        }
-        if interval_count > max_intervals {
-            return Err(SnapshotError::MatcherScratchExceeded {
-                limit: MAX_MATCHER_SCRATCH_BYTES,
-            });
-        }
+    fn scratch_bytes(&self) -> usize {
+        checked_matcher_scratch_bytes(self.max_pattern_len)
+            .expect("literal matcher scratch was checked during activation")
+    }
 
-        let mut intervals = ZeroizingVec(Vec::new());
-        intervals
-            .0
-            .try_reserve_exact(interval_count)
-            .map_err(|_| SnapshotError::AllocationFailed)?;
-        if intervals
-            .0
-            .capacity()
-            .checked_mul(std::mem::size_of::<Interval>())
-            .is_none_or(|bytes| bytes > MAX_MATCHER_SCRATCH_BYTES)
+    fn for_each_merged_interval(
+        &self,
+        input: &[u8],
+        mut callback: impl FnMut(Interval) -> Result<(), SnapshotError>,
+    ) -> Result<(), SnapshotError> {
+        let mut pending = PendingIntervals::new(self.max_pattern_len)?;
+        for interval in self
+            .matcher
+            .iter()
+            .flat_map(|matcher| matcher.matches(input))
         {
+            let finalized_end = interval.end.saturating_sub(self.max_pattern_len);
+            pending.flush_through(finalized_end, &mut callback)?;
+            pending.merge(interval)?;
+        }
+        pending.flush_all(&mut callback)
+    }
+}
+
+struct PendingIntervals {
+    storage: ZeroizingBox<Interval>,
+    head: usize,
+    len: usize,
+}
+
+impl PendingIntervals {
+    fn new(interval_capacity: usize) -> Result<Self, SnapshotError> {
+        checked_matcher_scratch_bytes(interval_capacity)?;
+        let storage = ZeroizingBox::filled(interval_capacity, Interval::default())?;
+        Ok(Self {
+            storage,
+            head: 0,
+            len: 0,
+        })
+    }
+
+    fn merge(&mut self, mut interval: Interval) -> Result<(), SnapshotError> {
+        while let Some(existing) = self.back() {
+            if existing.end <= interval.start {
+                break;
+            }
+            interval.start = interval.start.min(existing.start);
+            self.pop_back();
+        }
+        if self.len == self.storage.len() {
             return Err(SnapshotError::MatcherScratchExceeded {
-                limit: MAX_MATCHER_SCRATCH_BYTES,
+                limit: MAX_REDACTION_MATCHER_SCRATCH_BYTES,
             });
         }
-        if let Some(combined) = &self.combined {
-            for matched in combined.find_overlapping_iter(input) {
-                intervals.0.push(Interval {
-                    start: matched.start(),
-                    end: matched.end(),
-                });
-            }
+        let index = self.index(self.len);
+        self.storage[index] = interval;
+        self.len += 1;
+        Ok(())
+    }
+
+    fn flush_through(
+        &mut self,
+        finalized_end: usize,
+        callback: &mut impl FnMut(Interval) -> Result<(), SnapshotError>,
+    ) -> Result<(), SnapshotError> {
+        while self
+            .front()
+            .is_some_and(|interval| interval.end <= finalized_end)
+        {
+            callback(self.pop_front().expect("checked pending front"))?;
         }
-        if let Some(environment) = &self.environment {
-            environment.for_each_match(input, |start, end| {
-                if intervals.len() == max_intervals {
-                    return false;
-                }
-                intervals.0.push(Interval { start, end });
-                true
-            });
+        Ok(())
+    }
+
+    fn flush_all(
+        &mut self,
+        callback: &mut impl FnMut(Interval) -> Result<(), SnapshotError>,
+    ) -> Result<(), SnapshotError> {
+        while let Some(interval) = self.pop_front() {
+            callback(interval)?;
         }
-        debug_assert_eq!(intervals.len(), interval_count);
-        intervals.sort_unstable_by_key(|interval| (interval.start, interval.end));
-        let mut merged = 0usize;
-        for index in 0..intervals.len() {
-            let interval = intervals[index];
-            if merged != 0 && interval.start < intervals[merged - 1].end {
-                intervals[merged - 1].end = intervals[merged - 1].end.max(interval.end);
-            } else {
-                intervals[merged] = interval;
-                merged += 1;
-            }
+        Ok(())
+    }
+
+    fn front(&self) -> Option<Interval> {
+        (self.len != 0).then(|| self.storage[self.head])
+    }
+
+    fn back(&self) -> Option<Interval> {
+        (self.len != 0).then(|| self.storage[self.index(self.len - 1)])
+    }
+
+    fn pop_front(&mut self) -> Option<Interval> {
+        let interval = self.front()?;
+        self.storage[self.head] = Interval::default();
+        self.head = (self.head + 1) % self.storage.len();
+        self.len -= 1;
+        if self.len == 0 {
+            self.head = 0;
         }
-        intervals.0.truncate(merged);
-        Ok(intervals)
+        Some(interval)
+    }
+
+    fn pop_back(&mut self) {
+        debug_assert!(self.len != 0);
+        let index = self.index(self.len - 1);
+        self.storage[index] = Interval::default();
+        self.len -= 1;
+        if self.len == 0 {
+            self.head = 0;
+        }
+    }
+
+    fn index(&self, offset: usize) -> usize {
+        debug_assert!(offset < self.storage.len());
+        (self.head + offset) % self.storage.len()
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct Interval {
-    start: usize,
-    end: usize,
+struct ZeroizingPatternRefs<'a> {
+    storage: Box<[MaybeUninit<&'a [u8]>]>,
+    initialized: usize,
+    construction_peak_bytes: usize,
 }
 
-fn build_automaton(
-    patterns: Vec<&[u8]>,
-    profile_index: usize,
-    build_budget: usize,
-) -> Result<Option<AhoCorasick>, SnapshotError> {
-    let matcher = build_redaction_literal_automaton(patterns, build_budget)
-        .map_err(|_| SnapshotError::MatcherBuild { profile_index })?;
-    if matcher
-        .as_ref()
-        .is_some_and(|matcher| matcher.memory_usage() > build_budget)
-    {
-        return Err(SnapshotError::CompiledMatcherTooLarge { profile_index });
+impl<'a> ZeroizingPatternRefs<'a> {
+    fn new(len: usize, build_budget: usize, profile_index: usize) -> Result<Self, SnapshotError> {
+        let mut storage = Vec::new();
+        storage
+            .try_reserve_exact(len)
+            .map_err(|_| SnapshotError::AllocationFailed)?;
+        storage.resize_with(len, MaybeUninit::uninit);
+        let (final_bytes, construction_peak_bytes) =
+            redaction_literal_reference_bytes(storage.capacity(), len)
+                .ok_or(SnapshotError::MatcherBuild { profile_index })?;
+        if construction_peak_bytes > build_budget {
+            return Err(SnapshotError::CompiledMatcherTooLarge { profile_index });
+        }
+        let storage = storage.into_boxed_slice();
+        if std::mem::size_of_val(storage.as_ref()) != final_bytes {
+            return Err(SnapshotError::MatcherBuild { profile_index });
+        }
+        Ok(Self {
+            storage,
+            initialized: 0,
+            construction_peak_bytes,
+        })
     }
-    Ok(matcher)
+
+    fn push(&mut self, pattern: &'a [u8]) -> Option<()> {
+        let slot = self.storage.get_mut(self.initialized)?;
+        slot.write(pattern);
+        self.initialized += 1;
+        Some(())
+    }
+
+    fn len(&self) -> usize {
+        self.initialized
+    }
+
+    fn is_empty(&self) -> bool {
+        self.initialized == 0
+    }
+
+    fn allocation_bytes(&self) -> usize {
+        std::mem::size_of_val(self.storage.as_ref())
+    }
+
+    fn construction_peak_bytes(&self) -> usize {
+        self.construction_peak_bytes
+    }
+
+    fn initialized_slice(&self) -> Option<&[&'a [u8]]> {
+        (self.initialized == self.storage.len()).then(|| {
+            // Every slot is initialized, and the returned borrow cannot outlive
+            // either the source slices or this construction-only container.
+            unsafe {
+                std::slice::from_raw_parts(
+                    self.storage.as_ptr().cast::<&'a [u8]>(),
+                    self.storage.len(),
+                )
+            }
+        })
+    }
+
+    fn initialized_mut_slice(&mut self) -> Option<&mut [&'a [u8]]> {
+        (self.initialized == self.storage.len()).then(|| {
+            // Every slot is initialized. Sorting changes only the order of
+            // valid references and remains bounded by this exclusive borrow.
+            unsafe {
+                std::slice::from_raw_parts_mut(
+                    self.storage.as_mut_ptr().cast::<&'a [u8]>(),
+                    self.storage.len(),
+                )
+            }
+        })
+    }
+
+    fn zeroize(&mut self) {
+        let pointer = self.storage.as_mut_ptr().cast::<u8>();
+        for index in 0..self.allocation_bytes() {
+            // `MaybeUninit` permits the zero representation written here.
+            unsafe { std::ptr::write_volatile(pointer.add(index), 0) };
+        }
+        self.initialized = 0;
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn allocation_is_zeroed(&self) -> bool {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(self.storage.as_ptr().cast::<u8>(), self.allocation_bytes())
+        };
+        bytes.iter().all(|byte| *byte == 0)
+    }
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-struct SecretEdge {
-    source: usize,
-    byte: u8,
-    target: usize,
+impl Drop for ZeroizingPatternRefs<'_> {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
 }
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-struct SecretNode {
-    edge_start: usize,
-    edge_len: usize,
-    failure: usize,
-    output_len: usize,
+fn checked_matcher_scratch_bytes(max_pattern_len: usize) -> Result<usize, SnapshotError> {
+    redaction_literal_scratch_bytes(max_pattern_len).ok_or(SnapshotError::MatcherScratchExceeded {
+        limit: MAX_REDACTION_MATCHER_SCRATCH_BYTES,
+    })
 }
 
 struct ZeroizingAhoCorasick {
@@ -665,49 +792,37 @@ struct ZeroizingAhoCorasick {
 
 impl ZeroizingAhoCorasick {
     fn build(
-        mut patterns: Vec<&[u8]>,
+        mut patterns: ZeroizingPatternRefs<'_>,
         profile_index: usize,
         build_budget: usize,
     ) -> Result<Option<Self>, SnapshotError> {
         if patterns.is_empty() {
             return Ok(None);
         }
-        patterns.sort_unstable();
-        patterns.dedup();
-
-        let mut state_count = 1usize;
-        let mut previous = &[][..];
-        for pattern in &patterns {
-            let shared = common_prefix_len(previous, pattern);
-            state_count = state_count
-                .checked_add(pattern.len() - shared)
-                .ok_or(SnapshotError::MatcherBuild { profile_index })?;
-            previous = pattern;
-        }
-
-        let max_pattern_len = patterns
-            .iter()
-            .map(|pattern| pattern.len())
-            .max()
-            .unwrap_or(0);
-        let edge_count = state_count - 1;
-        let (projected_resident_bytes, projected_build_bytes) =
-            zeroizing_aho_memory_projection(state_count, edge_count, max_pattern_len)
-                .ok_or(SnapshotError::MatcherBuild { profile_index })?;
-        if projected_build_bytes > build_budget {
+        let pattern_reference_bytes = patterns.allocation_bytes();
+        let pattern_reference_construction_bytes = patterns.construction_peak_bytes();
+        let projection = redaction_literal_projection(
+            patterns
+                .initialized_mut_slice()
+                .ok_or(SnapshotError::MatcherBuild { profile_index })?,
+            pattern_reference_bytes,
+            pattern_reference_construction_bytes,
+        )
+        .ok_or(SnapshotError::MatcherBuild { profile_index })?;
+        if projection.build_bytes > build_budget {
             return Err(SnapshotError::CompiledMatcherTooLarge { profile_index });
         }
 
-        let mut nodes = ZeroizingVec::filled(state_count, SecretNode::default())?;
+        let mut nodes = ZeroizingVec::filled(projection.state_count, SecretNode::default())?;
         let mut edges = ZeroizingVec(Vec::new());
         edges
             .0
-            .try_reserve_exact(edge_count)
+            .try_reserve_exact(projection.edge_count)
             .map_err(|_| SnapshotError::AllocationFailed)?;
-        let mut terminal_lengths = ZeroizingVec::filled(state_count, 0usize)?;
+        let mut terminal_lengths = ZeroizingVec::filled(projection.state_count, 0usize)?;
         let mut path = ZeroizingVec(Vec::new());
         path.0
-            .try_reserve_exact(max_pattern_len.saturating_add(1))
+            .try_reserve_exact(projection.max_pattern_len.saturating_add(1))
             .map_err(|_| SnapshotError::AllocationFailed)?;
         path.0.push(0usize);
         let actual_resident_bytes = nodes
@@ -722,14 +837,47 @@ impl ZeroizingAhoCorasick {
                     .and_then(|edge_bytes| node_bytes.checked_add(edge_bytes))
             })
             .ok_or(SnapshotError::MatcherBuild { profile_index })?;
-        if actual_resident_bytes > projected_resident_bytes || actual_resident_bytes > build_budget
+        if actual_resident_bytes != projection.resident_bytes
+            || actual_resident_bytes > build_budget
         {
             return Err(SnapshotError::CompiledMatcherTooLarge { profile_index });
         }
 
-        previous = &[];
+        let actual_trie_build_bytes = actual_resident_bytes
+            .checked_add(
+                terminal_lengths
+                    .0
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<usize>())
+                    .ok_or(SnapshotError::MatcherBuild { profile_index })?,
+            )
+            .and_then(|bytes| {
+                path.0
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<usize>())
+                    .and_then(|path_bytes| bytes.checked_add(path_bytes))
+            })
+            .and_then(|bytes| bytes.checked_add(pattern_reference_bytes))
+            .ok_or(SnapshotError::MatcherBuild { profile_index })?;
+        if actual_trie_build_bytes != projection.trie_build_bytes
+            || actual_trie_build_bytes > build_budget
+        {
+            return Err(SnapshotError::CompiledMatcherTooLarge { profile_index });
+        }
+
         let mut next_state = 1usize;
-        for pattern in patterns {
+        let pattern_slice = patterns
+            .initialized_slice()
+            .ok_or(SnapshotError::MatcherBuild { profile_index })?;
+        for index in 0..pattern_slice.len() {
+            let pattern = pattern_slice[index];
+            let previous = index
+                .checked_sub(1)
+                .map(|previous| pattern_slice[previous])
+                .unwrap_or(&[]);
+            if index != 0 && pattern == previous {
+                continue;
+            }
             let shared = common_prefix_len(previous, pattern);
             path.0.truncate(shared + 1);
             let mut source = *path.last().expect("root path is retained");
@@ -745,18 +893,22 @@ impl ZeroizingAhoCorasick {
                 source = target;
             }
             terminal_lengths[source] = terminal_lengths[source].max(pattern.len());
-            previous = pattern;
         }
-        debug_assert_eq!(next_state, state_count);
-        debug_assert_eq!(edges.len(), edge_count);
+        debug_assert_eq!(next_state, projection.state_count);
+        debug_assert_eq!(edges.len(), projection.edge_count);
         edges.sort_unstable_by_key(|edge| (edge.source, edge.byte));
         populate_edge_ranges(&mut nodes, &edges);
+
+        // The BFS phase does not need source pointers. Drop the exact-size box
+        // now so its volatile wipe completes before the queue is allocated.
+        drop(patterns);
 
         let mut matcher = Self { nodes, edges };
         matcher.populate_failure_links(
             &terminal_lengths,
             terminal_lengths.0.capacity(),
             path.0.capacity(),
+            projection.failure_build_bytes,
             build_budget,
             profile_index,
         )?;
@@ -783,6 +935,7 @@ impl ZeroizingAhoCorasick {
         terminal_lengths: &[usize],
         terminal_capacity: usize,
         path_capacity: usize,
+        projected_build_bytes: usize,
         build_budget: usize,
         profile_index: usize,
     ) -> Result<(), SnapshotError> {
@@ -812,7 +965,7 @@ impl ZeroizingAhoCorasick {
                     .and_then(|queue_bytes| bytes.checked_add(queue_bytes))
             })
             .ok_or(SnapshotError::MatcherBuild { profile_index })?;
-        if actual_build_bytes > build_budget {
+        if actual_build_bytes != projected_build_bytes || actual_build_bytes > build_budget {
             return Err(SnapshotError::CompiledMatcherTooLarge { profile_index });
         }
         self.nodes[0].output_len = terminal_lengths[0];
@@ -846,16 +999,22 @@ impl ZeroizingAhoCorasick {
     }
 
     fn for_each_match(&self, input: &[u8], mut callback: impl FnMut(usize, usize) -> bool) {
-        let mut state = 0usize;
-        for (index, &byte) in input.iter().enumerate() {
-            while state != 0 && self.transition(state, byte).is_none() {
-                state = self.nodes[state].failure;
-            }
-            state = self.transition(state, byte).unwrap_or(0);
-            let length = self.nodes[state].output_len;
-            if length != 0 && !callback(index + 1 - length, index + 1) {
+        for interval in self.matches(input) {
+            if !callback(interval.start, interval.end) {
                 return;
             }
+        }
+    }
+
+    fn matches<'matcher, 'input>(
+        &'matcher self,
+        input: &'input [u8],
+    ) -> ZeroizingMatchIter<'matcher, 'input> {
+        ZeroizingMatchIter {
+            matcher: self,
+            input,
+            state: 0,
+            index: 0,
         }
     }
 
@@ -879,25 +1038,34 @@ impl ZeroizingAhoCorasick {
     }
 }
 
-fn zeroizing_aho_memory_projection(
-    state_count: usize,
-    edge_count: usize,
-    max_pattern_len: usize,
-) -> Option<(usize, usize)> {
-    let resident_bytes = state_count
-        .checked_mul(std::mem::size_of::<SecretNode>())?
-        .checked_add(edge_count.checked_mul(std::mem::size_of::<SecretEdge>())?)?;
-    // Terminal lengths, the construction path, and the BFS queue coexist
-    // briefly with the approved resident node and edge arrays.
-    let temporary_bytes = state_count
-        .checked_mul(std::mem::size_of::<usize>())?
-        .checked_add(
-            max_pattern_len
-                .checked_add(1)?
-                .checked_mul(std::mem::size_of::<usize>())?,
-        )?
-        .checked_add(state_count.checked_mul(std::mem::size_of::<usize>())?)?;
-    Some((resident_bytes, resident_bytes.checked_add(temporary_bytes)?))
+struct ZeroizingMatchIter<'matcher, 'input> {
+    matcher: &'matcher ZeroizingAhoCorasick,
+    input: &'input [u8],
+    state: usize,
+    index: usize,
+}
+
+impl Iterator for ZeroizingMatchIter<'_, '_> {
+    type Item = Interval;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.index < self.input.len() {
+            let byte = self.input[self.index];
+            while self.state != 0 && self.matcher.transition(self.state, byte).is_none() {
+                self.state = self.matcher.nodes[self.state].failure;
+            }
+            self.state = self.matcher.transition(self.state, byte).unwrap_or(0);
+            self.index += 1;
+            let length = self.matcher.nodes[self.state].output_len;
+            if length != 0 {
+                return Some(Interval {
+                    start: self.index - length,
+                    end: self.index,
+                });
+            }
+        }
+        None
+    }
 }
 
 fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
@@ -993,22 +1161,74 @@ impl<T: ZeroValid> Drop for ZeroizingVec<T> {
     }
 }
 
-fn literal_replacement_shape(
-    input_len: usize,
-    matches: &[Interval],
-    replacement_len: usize,
-    limit: usize,
-    payload: PayloadLimit,
-) -> Result<(usize, usize), SnapshotError> {
-    let mut removed = 0usize;
-    for interval in matches {
-        removed = removed
-            .checked_add(interval.end - interval.start)
-            .ok_or(SnapshotError::PayloadTooLarge { payload, limit })?;
+struct ZeroizingBox<T: ZeroValid> {
+    pointer: NonNull<T>,
+    len: usize,
+    layout: Layout,
+}
+
+impl<T: ZeroValid> ZeroizingBox<T> {
+    fn filled(len: usize, value: T) -> Result<Self, SnapshotError> {
+        let layout = Layout::array::<T>(len).map_err(|_| SnapshotError::AllocationFailed)?;
+        let pointer = if layout.size() == 0 {
+            NonNull::dangling()
+        } else {
+            NonNull::new(unsafe { alloc(layout).cast::<T>() })
+                .ok_or(SnapshotError::AllocationFailed)?
+        };
+        for index in 0..len {
+            unsafe { pointer.as_ptr().add(index).write(value) };
+        }
+        Ok(Self {
+            pointer,
+            len,
+            layout,
+        })
     }
-    let count = matches.len();
-    checked_output_len(input_len, removed, count, replacement_len, limit, payload)
-        .map(|output_len| (output_len, count))
+
+    fn layout_bytes(&self) -> usize {
+        self.layout.size()
+    }
+
+    fn zeroize(&mut self) {
+        let pointer = self.pointer.as_ptr().cast::<u8>();
+        for index in 0..self.layout.size() {
+            // The allocation remains live throughout the volatile full-layout wipe.
+            unsafe { std::ptr::write_volatile(pointer.add(index), 0) };
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn allocation_is_zeroed(&self) -> bool {
+        let bytes = unsafe {
+            std::slice::from_raw_parts(self.pointer.as_ptr().cast::<u8>(), self.layout.size())
+        };
+        bytes.iter().all(|byte| *byte == 0)
+    }
+}
+
+impl<T: ZeroValid> std::ops::Deref for ZeroizingBox<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { std::slice::from_raw_parts(self.pointer.as_ptr(), self.len) }
+    }
+}
+
+impl<T: ZeroValid> std::ops::DerefMut for ZeroizingBox<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe { std::slice::from_raw_parts_mut(self.pointer.as_ptr(), self.len) }
+    }
+}
+
+impl<T: ZeroValid> Drop for ZeroizingBox<T> {
+    fn drop(&mut self) {
+        self.zeroize();
+        if self.layout.size() != 0 {
+            unsafe { dealloc(self.pointer.as_ptr().cast::<u8>(), self.layout) };
+        }
+    }
 }
 
 struct ResolvedRule {
@@ -1277,6 +1497,19 @@ mod tests {
         }
     }
 
+    fn boxed_pattern_refs<'a>(patterns: &[&'a [u8]]) -> ZeroizingPatternRefs<'a> {
+        let mut refs = ZeroizingPatternRefs::new(
+            patterns.len(),
+            MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE,
+            0,
+        )
+        .unwrap();
+        for pattern in patterns.iter().copied() {
+            refs.push(pattern).unwrap();
+        }
+        refs
+    }
+
     fn profile(variable: Option<String>) -> RedactionProfilePlan {
         RedactionProfilePlan {
             replacement: b"[MASKED]".to_vec(),
@@ -1521,9 +1754,9 @@ mod tests {
         let handle = snapshot.profile("main").unwrap();
         assert_eq!(
             handle.limits().matcher_scratch_bytes,
-            MAX_MATCHER_SCRATCH_BYTES
+            b"literal".len() * std::mem::size_of::<Interval>()
         );
-        assert!(handle.limits().matcher_scratch_bytes <= MAX_MATCHER_SCRATCH_BYTES);
+        assert!(handle.limits().matcher_scratch_bytes <= MAX_REDACTION_MATCHER_SCRATCH_BYTES);
         assert!(handle.limits().compiled_matcher_resident_bytes > 0);
         assert!(
             handle.limits().compiled_matcher_resident_bytes
@@ -1555,6 +1788,27 @@ mod tests {
             .profile("main")
             .unwrap();
         assert_eq!(expression_only.limits().matcher_scratch_bytes, 0);
+    }
+
+    #[test]
+    fn activation_resident_accounting_matches_the_pure_sparse_projection() {
+        let mut profile_plan = profile(None);
+        profile_plan.rules[0].expressions.clear();
+        let snapshot = RedactionSnapshot::activate(plan(profile_plan)).unwrap();
+        let mut patterns = boxed_pattern_refs(&[b"literal".as_slice()]);
+        let reference_bytes = patterns.allocation_bytes();
+        let reference_construction_bytes = patterns.construction_peak_bytes();
+        let projection = redaction_literal_projection(
+            patterns.initialized_mut_slice().unwrap(),
+            reference_bytes,
+            reference_construction_bytes,
+        )
+        .unwrap();
+
+        assert_eq!(
+            snapshot.compiled_matcher_resident_bytes(),
+            projection.resident_bytes
+        );
     }
 
     #[test]
@@ -1599,9 +1853,130 @@ mod tests {
     }
 
     #[test]
-    fn environment_overlap_scratch_exhaustion_fails_closed() {
+    fn pending_interval_ring_wraps_and_merges_overlapping_suffixes() {
+        let mut pending = PendingIntervals::new(4).unwrap();
+        assert_eq!(
+            pending.storage.layout_bytes(),
+            4 * std::mem::size_of::<Interval>()
+        );
+        for (start, end) in [(0, 1), (2, 3), (4, 5)] {
+            pending.merge(Interval { start, end }).unwrap();
+        }
+        let mut emitted = Vec::new();
+        pending
+            .flush_through(3, &mut |interval| {
+                emitted.push((interval.start, interval.end));
+                Ok(())
+            })
+            .unwrap();
+        pending.merge(Interval { start: 6, end: 7 }).unwrap();
+        pending.merge(Interval { start: 8, end: 9 }).unwrap();
+        pending.merge(Interval { start: 6, end: 10 }).unwrap();
+        pending
+            .flush_all(&mut |interval| {
+                emitted.push((interval.start, interval.end));
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(emitted, vec![(0, 1), (2, 3), (4, 5), (6, 10)]);
+    }
+
+    #[test]
+    fn pending_interval_storage_has_an_exact_wipeable_layout() {
+        let mut pending = PendingIntervals::new(7).unwrap();
+        assert_eq!(pending.storage.len(), 7);
+        assert_eq!(
+            pending.storage.layout_bytes(),
+            7 * std::mem::size_of::<Interval>()
+        );
+        pending.storage.fill(Interval { start: 1, end: 2 });
+        pending.storage.zeroize();
+        assert!(pending.storage.allocation_is_zeroed());
+
+        let empty = PendingIntervals::new(0).unwrap();
+        assert!(empty.storage.is_empty());
+        assert_eq!(empty.storage.layout_bytes(), 0);
+    }
+
+    #[test]
+    fn dense_adjacent_matches_with_long_nonmatching_horizon_remain_linear() {
+        const HORIZON: usize = 32 * 1024;
+        const PAYLOAD_BYTES: usize = 256 * 1024;
+        let mut profile_plan = profile(None);
+        profile_plan.replacement = b"X".to_vec();
+        profile_plan.max_message_bytes = PAYLOAD_BYTES;
+        profile_plan.rules[0].literals = vec![b"a".to_vec(), vec![b'b'; HORIZON]];
+        profile_plan.rules[0].expressions.clear();
+        let profile = RedactionSnapshot::activate(plan(profile_plan))
+            .unwrap()
+            .profile("main")
+            .unwrap();
+
+        let output = profile
+            .redact_websocket_message(vec![b'a'; PAYLOAD_BYTES], PayloadClass::Text)
+            .unwrap();
+
+        assert_eq!(output.replacements, PAYLOAD_BYTES);
+        assert_eq!(output.bytes, vec![b'X'; PAYLOAD_BYTES]);
+    }
+
+    #[test]
+    fn nested_authored_pattern_density_does_not_enumerate_raw_matches() {
+        const PAYLOAD_BYTES: usize = 512 * 1024;
+        const PATTERN_COUNT: usize = 512;
+        let mut profile_plan = profile(None);
+        profile_plan.replacement = b"X".to_vec();
+        profile_plan.max_message_bytes = PAYLOAD_BYTES;
+        profile_plan.rules[0].literals = (1..=PATTERN_COUNT)
+            .map(|length| vec![b'a'; length])
+            .collect();
+        profile_plan.rules[0].expressions.clear();
+        let profile = RedactionSnapshot::activate(plan(profile_plan))
+            .unwrap()
+            .profile("main")
+            .unwrap();
+        assert_eq!(
+            profile.limits().matcher_scratch_bytes,
+            PATTERN_COUNT * std::mem::size_of::<Interval>()
+        );
+
+        let output = profile
+            .redact_websocket_message(vec![b'a'; PAYLOAD_BYTES], PayloadClass::Text)
+            .unwrap();
+
+        assert_eq!(output.replacements, 1);
+        assert_eq!(output.bytes, b"X");
+    }
+
+    #[test]
+    fn multi_megabyte_dense_authored_matches_stream_with_bounded_scratch() {
+        const PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+        let mut profile_plan = profile(None);
+        profile_plan.replacement = b"X".to_vec();
+        profile_plan.max_message_bytes = PAYLOAD_BYTES;
+        profile_plan.rules[0].literals = vec![b"a".to_vec()];
+        profile_plan.rules[0].expressions.clear();
+        let profile = RedactionSnapshot::activate(plan(profile_plan))
+            .unwrap()
+            .profile("main")
+            .unwrap();
+        let payload = b"a_".repeat(PAYLOAD_BYTES / 2);
+
+        let output = profile
+            .redact_websocket_message(payload, PayloadClass::Text)
+            .unwrap();
+
+        assert_eq!(output.replacements, PAYLOAD_BYTES / 2);
+        assert_eq!(output.bytes.len(), PAYLOAD_BYTES);
+        assert!(output.bytes.chunks_exact(2).all(|chunk| chunk == b"X_"));
+    }
+
+    #[test]
+    fn dense_environment_matches_stream_with_exact_scratch() {
         let source = EnvGuard::set("a");
         let mut profile_plan = profile(Some(source.0.clone()));
+        profile_plan.replacement = b"X".to_vec();
         profile_plan.max_message_bytes = 100_000;
         profile_plan.rules[0].literals.clear();
         profile_plan.rules[0].expressions.clear();
@@ -1611,14 +1986,28 @@ mod tests {
             .unwrap();
         assert_eq!(
             profile.limits().matcher_scratch_bytes,
-            MAX_MATCHER_SCRATCH_BYTES
+            std::mem::size_of::<Interval>()
         );
-        let interval_limit = MAX_MATCHER_SCRATCH_BYTES / std::mem::size_of::<Interval>();
+        let output = profile
+            .redact_websocket_message(b"a_".repeat(50_000), PayloadClass::Text)
+            .unwrap();
+        assert_eq!(output.replacements, 50_000);
+        assert_eq!(output.bytes.len(), 100_000);
+        assert!(output.bytes.chunks_exact(2).all(|chunk| chunk == b"X_"));
+    }
+
+    #[test]
+    fn literal_horizon_exceeding_scratch_ceiling_is_rejected_at_activation() {
+        let interval_limit = MAX_REDACTION_MATCHER_SCRATCH_BYTES / std::mem::size_of::<Interval>();
+        let mut profile_plan = profile(None);
+        profile_plan.rules[0].literals = vec![vec![b'a'; interval_limit + 1]];
+        profile_plan.rules[0].expressions.clear();
+
         assert!(matches!(
-            profile.redact_websocket_message(vec![b'a'; interval_limit + 1], PayloadClass::Text),
-            Err(SnapshotError::MatcherScratchExceeded {
-                limit: MAX_MATCHER_SCRATCH_BYTES
-            })
+            RedactionSnapshot::activate(plan(profile_plan)).unwrap_err(),
+            SnapshotError::MatcherScratchExceeded {
+                limit: MAX_REDACTION_MATCHER_SCRATCH_BYTES
+            }
         ));
     }
 
@@ -1628,7 +2017,7 @@ mod tests {
         let he = SecretBytes(b"he".to_vec());
         let hers = SecretBytes(b"hers".to_vec());
         let mut matcher = ZeroizingAhoCorasick::build(
-            vec![she.as_bytes(), he.as_bytes(), hers.as_bytes()],
+            boxed_pattern_refs(&[she.as_bytes(), he.as_bytes(), hers.as_bytes()]),
             0,
             MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE,
         )
@@ -1659,7 +2048,7 @@ mod tests {
     fn environment_automaton_rejects_oversized_resident_and_temporary_state() {
         let secret = SecretBytes(vec![b'x'; 300 * 1024]);
         let error = ZeroizingAhoCorasick::build(
-            vec![secret.as_bytes()],
+            boxed_pattern_refs(&[secret.as_bytes()]),
             3,
             MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE,
         )
@@ -1670,8 +2059,87 @@ mod tests {
             SnapshotError::CompiledMatcherTooLarge { profile_index: 3 }
         );
 
-        let (resident, build_peak) = zeroizing_aho_memory_projection(1024, 1023, 1023).unwrap();
-        assert!(build_peak > resident);
+        let literal = vec![b'x'; 1023];
+        let mut patterns = boxed_pattern_refs(&[literal.as_slice()]);
+        let reference_bytes = patterns.allocation_bytes();
+        let reference_construction_bytes = patterns.construction_peak_bytes();
+        let projection = redaction_literal_projection(
+            patterns.initialized_mut_slice().unwrap(),
+            reference_bytes,
+            reference_construction_bytes,
+        )
+        .unwrap();
+        assert!(projection.build_bytes > projection.resident_bytes);
+    }
+
+    #[test]
+    fn duplicate_pattern_references_are_counted_exactly_and_zeroizable() {
+        let literal = SecretBytes(b"duplicate-secret".to_vec());
+        let source_patterns = vec![literal.as_bytes(); 4096];
+        let mut patterns = boxed_pattern_refs(&source_patterns);
+        let reference_bytes = patterns.allocation_bytes();
+        let reference_construction_bytes = patterns.construction_peak_bytes();
+        let projection = redaction_literal_projection(
+            patterns.initialized_mut_slice().unwrap(),
+            reference_bytes,
+            reference_construction_bytes,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reference_bytes,
+            source_patterns.len() * std::mem::size_of::<&[u8]>()
+        );
+        assert_eq!(
+            projection.reference_build_bytes,
+            reference_construction_bytes
+        );
+        assert_eq!(
+            projection.trie_build_bytes,
+            projection.resident_bytes
+                + projection.state_count * std::mem::size_of::<usize>()
+                + (projection.max_pattern_len + 1) * std::mem::size_of::<usize>()
+                + reference_bytes
+        );
+        assert_eq!(
+            projection.build_bytes,
+            projection
+                .reference_build_bytes
+                .max(projection.trie_build_bytes)
+                .max(projection.failure_build_bytes)
+        );
+
+        patterns.zeroize();
+        assert_eq!(patterns.len(), 0);
+        assert!(patterns.allocation_is_zeroed());
+
+        let preconversion_error =
+            ZeroizingPatternRefs::new(source_patterns.len(), reference_bytes * 2 - 1, 7)
+                .err()
+                .expect("the staging and final reference allocations can coexist");
+        assert_eq!(
+            preconversion_error,
+            SnapshotError::CompiledMatcherTooLarge { profile_index: 7 }
+        );
+
+        let error = ZeroizingAhoCorasick::build(
+            boxed_pattern_refs(&source_patterns),
+            7,
+            projection.build_bytes - 1,
+        )
+        .err()
+        .expect("the pre-dedup reference box is part of the build ceiling");
+        assert_eq!(
+            error,
+            SnapshotError::CompiledMatcherTooLarge { profile_index: 7 }
+        );
+        assert!(ZeroizingAhoCorasick::build(
+            boxed_pattern_refs(&source_patterns),
+            7,
+            projection.build_bytes,
+        )
+        .unwrap()
+        .is_some());
     }
 
     #[test]
