@@ -1,11 +1,15 @@
 use std::collections::VecDeque;
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::marker::PhantomData;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 
 use crate::config::{compile_config_text, CompiledConfig, ConfigTextInput};
 
@@ -182,6 +186,65 @@ impl StaticResources for FakeStaticResources {
     }
 }
 
+struct BlockingStaticResources {
+    shutdowns: AtomicUsize,
+    completions: AtomicUsize,
+    entered: Notify,
+    completed: Notify,
+    release: Semaphore,
+}
+
+impl Default for BlockingStaticResources {
+    fn default() -> Self {
+        Self {
+            shutdowns: AtomicUsize::new(0),
+            completions: AtomicUsize::new(0),
+            entered: Notify::new(),
+            completed: Notify::new(),
+            release: Semaphore::new(0),
+        }
+    }
+}
+
+impl StaticResources for BlockingStaticResources {
+    fn shutdown(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            self.shutdowns.fetch_add(1, Ordering::AcqRel);
+            self.entered.notify_waiters();
+            let permit = self
+                .release
+                .acquire()
+                .await
+                .expect("semaphore remains open");
+            permit.forget();
+            self.completions.fetch_add(1, Ordering::AcqRel);
+            self.completed.notify_waiters();
+        })
+    }
+}
+
+impl BlockingStaticResources {
+    async fn wait_until_entered(&self) {
+        loop {
+            let entered = self.entered.notified();
+            if self.shutdowns.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            entered.await;
+        }
+    }
+
+    async fn wait_until_completed(&self) {
+        loop {
+            let completed = self.completed.notified();
+            if self.completions.load(Ordering::Acquire) != 0 {
+                return;
+            }
+            completed.await;
+        }
+    }
+}
+
 #[derive(Default)]
 struct FakeSource {
     configs: Mutex<VecDeque<String>>,
@@ -213,8 +276,8 @@ impl CandidateSource for FakeSource {
     }
 }
 
-#[derive(Default)]
 struct FakeActivator {
+    static_fingerprint: crate::config::StaticFingerprint,
     calls: AtomicUsize,
     entered: AtomicUsize,
     entered_changed: Notify,
@@ -229,6 +292,23 @@ struct FakeActivator {
 }
 
 impl FakeActivator {
+    fn new(static_fingerprint: crate::config::StaticFingerprint) -> Self {
+        Self {
+            static_fingerprint,
+            calls: AtomicUsize::new(0),
+            entered: AtomicUsize::new(0),
+            entered_changed: Notify::new(),
+            release: Notify::new(),
+            block_next: AtomicBool::new(false),
+            fail_next: AtomicBool::new(false),
+            reject_publication_next: AtomicBool::new(false),
+            panic_cleanup_next: AtomicBool::new(false),
+            block_commit_next: AtomicBool::new(false),
+            owners: Mutex::new(Vec::new()),
+            cleanup_events: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
     async fn wait_until_entered(&self, expected: usize) {
         loop {
             let changed = self.entered_changed.notified();
@@ -245,6 +325,10 @@ impl FakeActivator {
 }
 
 impl CandidateActivator for FakeActivator {
+    fn static_fingerprint(&self) -> &crate::config::StaticFingerprint {
+        &self.static_fingerprint
+    }
+
     fn activate(
         &self,
         _id: GenerationId,
@@ -343,32 +427,215 @@ fn compile(text: &str) -> Result<CompiledConfig, String> {
     .map_err(|error| error.to_string())
 }
 
-fn runtime_fixture(
+async fn runtime_fixture(
     initial: &str,
 ) -> (
     Arc<Runtime>,
-    crate::config::ReloadableProductPlan,
+    CompiledConfig,
     Arc<FakeSource>,
     Arc<FakeActivator>,
     Arc<FakeStaticResources>,
 ) {
     let compiled = compile(initial).expect("compile initial config");
     let source = Arc::new(FakeSource::default());
-    let activator = Arc::new(FakeActivator::default());
+    let activator = Arc::new(FakeActivator::new(compiled.static_fingerprint.clone()));
     let static_resources = Arc::new(FakeStaticResources::default());
     let static_ownership = StaticOwnership::new(
-        compiled.static_config,
-        compiled.static_fingerprint,
+        compiled.static_config.clone(),
+        compiled.static_fingerprint.clone(),
         static_resources.clone(),
     );
-    let runtime = Runtime::new(static_ownership, source.clone(), activator.clone());
-    (
-        runtime,
-        compiled.reloadable_plan,
+    let runtime = Runtime::new(static_ownership, source.clone(), activator.clone())
+        .await
+        .expect("matching runtime construction");
+    (runtime, compiled, source, activator, static_resources)
+}
+
+#[tokio::test]
+async fn cross_wired_activator_is_rejected_at_runtime_construction() {
+    let owned = compile(&config("30s", "127.0.0.1:8881", 2)).unwrap();
+    let crossed = compile(&config("30s", "127.0.0.1:9999", 2)).unwrap();
+    let static_resources = Arc::new(FakeStaticResources::default());
+    let static_ownership = StaticOwnership::new(
+        owned.static_config,
+        owned.static_fingerprint,
+        static_resources.clone(),
+    );
+    let source = Arc::new(FakeSource::default());
+    let activator: Arc<dyn CandidateActivator> =
+        Arc::new(FakeActivator::new(crossed.static_fingerprint));
+
+    let result = Runtime::new(static_ownership, source.clone(), activator.clone()).await;
+
+    assert!(matches!(
+        result,
+        Err(RuntimeError::ActivatorStaticFingerprintMismatch)
+    ));
+    assert_eq!(static_resources.shutdowns.load(Ordering::Acquire), 1);
+    assert_eq!(Arc::strong_count(&static_resources), 1);
+    assert_eq!(Arc::strong_count(&source), 1);
+    assert_eq!(Arc::strong_count(&activator), 1);
+}
+
+#[tokio::test]
+async fn claimed_static_fingerprint_mismatch_shuts_down_without_retention() {
+    let owned = compile(&config("30s", "127.0.0.1:8881", 2)).unwrap();
+    let crossed = compile(&config("30s", "127.0.0.1:9999", 2)).unwrap();
+    let static_resources = Arc::new(FakeStaticResources::default());
+    let activator: Arc<dyn CandidateActivator> =
+        Arc::new(FakeActivator::new(owned.static_fingerprint.clone()));
+    let static_ownership = StaticOwnership::new(
+        owned.static_config,
+        crossed.static_fingerprint,
+        static_resources.clone(),
+    );
+    let source = Arc::new(FakeSource::default());
+
+    let result = Runtime::new(static_ownership, source.clone(), activator.clone()).await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("false compiled fingerprint claim must be rejected"),
+    };
+
+    assert_eq!(error, RuntimeError::StaticOwnershipFingerprintMismatch);
+    assert_eq!(
+        error.to_string(),
+        "claimed static configuration fingerprint does not match canonical configuration"
+    );
+    assert_eq!(static_resources.shutdowns.load(Ordering::Acquire), 1);
+    assert_eq!(Arc::strong_count(&static_resources), 1);
+    assert_eq!(Arc::strong_count(&source), 1);
+    assert_eq!(Arc::strong_count(&activator), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn non_utf8_static_path_derivation_failure_shuts_down_without_retention() {
+    let mut owned = compile(&config("30s", "127.0.0.1:8881", 2)).unwrap();
+    owned.static_config.config_root = OsString::from_vec(vec![b'/', 0xff]).into();
+    let static_resources = Arc::new(FakeStaticResources::default());
+    let activator: Arc<dyn CandidateActivator> =
+        Arc::new(FakeActivator::new(owned.static_fingerprint.clone()));
+    let static_ownership = StaticOwnership::new(
+        owned.static_config,
+        owned.static_fingerprint,
+        static_resources.clone(),
+    );
+    let source = Arc::new(FakeSource::default());
+
+    let result = Runtime::new(static_ownership, source.clone(), activator.clone()).await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("non-UTF-8 static path must reject construction"),
+    };
+
+    assert_eq!(error, RuntimeError::StaticFingerprintDerivationFailed);
+    assert_eq!(
+        error.to_string(),
+        "static configuration fingerprint could not be derived"
+    );
+    assert_eq!(static_resources.shutdowns.load(Ordering::Acquire), 1);
+    assert_eq!(Arc::strong_count(&static_resources), 1);
+    assert_eq!(Arc::strong_count(&source), 1);
+    assert_eq!(Arc::strong_count(&activator), 1);
+}
+
+#[tokio::test]
+async fn unpolled_cross_wired_construction_still_completes_static_shutdown() {
+    let BlockedConstruction {
+        construction,
+        static_resources,
         source,
         activator,
+    } = blocked_cross_wired_construction();
+
+    static_resources.wait_until_entered().await;
+    drop(construction);
+    release_blocked_static_shutdown(&static_resources).await;
+
+    assert_eq!(static_resources.shutdowns.load(Ordering::Acquire), 1);
+    assert_eq!(static_resources.completions.load(Ordering::Acquire), 1);
+    assert_eq!(Arc::strong_count(&static_resources), 1);
+    assert_eq!(Arc::strong_count(&source), 1);
+    assert_eq!(Arc::strong_count(&activator), 1);
+}
+
+#[tokio::test]
+async fn abort_before_first_construction_poll_still_completes_static_shutdown() {
+    let BlockedConstruction {
+        construction,
         static_resources,
+        source,
+        activator,
+    } = blocked_cross_wired_construction();
+    let poll_gate = Arc::new(Notify::new());
+    let construction_task = tokio::spawn({
+        let poll_gate = poll_gate.clone();
+        async move {
+            poll_gate.notified().await;
+            construction.await
+        }
+    });
+
+    static_resources.wait_until_entered().await;
+    construction_task.abort();
+    match construction_task.await {
+        Err(error) => assert!(error.is_cancelled()),
+        Ok(_) => panic!("construction task must be cancelled"),
+    }
+    release_blocked_static_shutdown(&static_resources).await;
+
+    assert_eq!(static_resources.shutdowns.load(Ordering::Acquire), 1);
+    assert_eq!(static_resources.completions.load(Ordering::Acquire), 1);
+    assert_eq!(Arc::strong_count(&static_resources), 1);
+    assert_eq!(Arc::strong_count(&source), 1);
+    assert_eq!(Arc::strong_count(&activator), 1);
+    assert_eq!(Arc::strong_count(&poll_gate), 1);
+}
+
+struct BlockedConstruction {
+    construction: BoxFuture<'static, Result<Arc<Runtime>, RuntimeError>>,
+    static_resources: Arc<BlockingStaticResources>,
+    source: Arc<FakeSource>,
+    activator: Arc<dyn CandidateActivator>,
+}
+
+fn blocked_cross_wired_construction() -> BlockedConstruction {
+    let owned = compile(&config("30s", "127.0.0.1:8881", 2)).unwrap();
+    let crossed = compile(&config("30s", "127.0.0.1:9999", 2)).unwrap();
+    let static_resources = Arc::new(BlockingStaticResources::default());
+    let static_ownership = StaticOwnership::new(
+        owned.static_config,
+        owned.static_fingerprint,
+        static_resources.clone(),
+    );
+    let source = Arc::new(FakeSource::default());
+    let activator: Arc<dyn CandidateActivator> =
+        Arc::new(FakeActivator::new(crossed.static_fingerprint));
+    let construction = Runtime::new(static_ownership, source.clone(), activator.clone());
+    BlockedConstruction {
+        construction,
+        static_resources,
+        source,
+        activator,
+    }
+}
+
+async fn release_blocked_static_shutdown(static_resources: &Arc<BlockingStaticResources>) {
+    static_resources.release.add_permits(1);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        static_resources.wait_until_completed(),
     )
+    .await
+    .expect("detached construction cleanup completes");
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while Arc::strong_count(static_resources) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("construction cleanup releases static resources");
 }
 
 async fn wait_for_retiring(runtime: &Runtime, expected: usize) {
@@ -392,7 +659,7 @@ async fn wait_for_retiring(runtime: &Runtime, expected: usize) {
 #[tokio::test]
 async fn initial_publish_installs_one_ready_generation() {
     let (runtime, initial, _source, activator, _static_resources) =
-        runtime_fixture(&config("30s", "127.0.0.1:8881", 2));
+        runtime_fixture(&config("30s", "127.0.0.1:8881", 2)).await;
 
     let id = runtime.start(initial).await.expect("initial publish");
 
@@ -404,9 +671,25 @@ async fn initial_publish_installs_one_ready_generation() {
 }
 
 #[tokio::test]
+async fn initial_static_fingerprint_mismatch_rejects_before_activation() {
+    let (runtime, _initial, _source, activator, _static_resources) =
+        runtime_fixture(&config("30s", "127.0.0.1:8881", 2)).await;
+    let crossed = compile(&config("30s", "127.0.0.1:9999", 2)).unwrap();
+
+    assert_eq!(
+        runtime.start(crossed).await,
+        Err(RuntimeError::StaticFingerprintChanged)
+    );
+    assert_eq!(activator.calls.load(Ordering::Acquire), 0);
+    assert_eq!(runtime.lifecycle(), LifecycleState::Starting);
+    assert_eq!(runtime.active_generation_id(), None);
+}
+
+#[tokio::test]
 async fn reload_is_atomic_and_static_fingerprint_rejection_preserves_active() {
     let initial_text = config("30s", "127.0.0.1:8881", 2);
-    let (runtime, initial, source, activator, _static_resources) = runtime_fixture(&initial_text);
+    let (runtime, initial, source, activator, _static_resources) =
+        runtime_fixture(&initial_text).await;
     let first = runtime.start(initial).await.unwrap();
     let old_lease = runtime.lease().await.unwrap();
 
@@ -434,7 +717,7 @@ async fn reload_is_atomic_and_static_fingerprint_rejection_preserves_active() {
 #[tokio::test]
 async fn failed_activation_preserves_the_published_generation() {
     let text = config("30s", "127.0.0.1:8881", 2);
-    let (runtime, initial, source, activator, _static_resources) = runtime_fixture(&text);
+    let (runtime, initial, source, activator, _static_resources) = runtime_fixture(&text).await;
     let first = runtime.start(initial).await.unwrap();
     activator.fail_next.store(true, Ordering::Release);
     source.push(config("31s", "127.0.0.1:8881", 2));
@@ -457,7 +740,7 @@ async fn failed_activation_preserves_the_published_generation() {
 #[tokio::test]
 async fn concurrent_reload_triggers_coalesce_and_reread_latest() {
     let text = config("30s", "127.0.0.1:8881", 2);
-    let (runtime, initial, source, activator, _static_resources) = runtime_fixture(&text);
+    let (runtime, initial, source, activator, _static_resources) = runtime_fixture(&text).await;
     runtime.start(initial).await.unwrap();
     source.push(config("31s", "127.0.0.1:8881", 2));
     source.push(config("32s", "127.0.0.1:8881", 2));
@@ -488,7 +771,7 @@ async fn concurrent_reload_triggers_coalesce_and_reread_latest() {
 #[tokio::test]
 async fn retiring_ceiling_rejects_before_loading_or_activating() {
     let text = config("30s", "127.0.0.1:8881", 1);
-    let (runtime, initial, source, activator, _static_resources) = runtime_fixture(&text);
+    let (runtime, initial, source, activator, _static_resources) = runtime_fixture(&text).await;
     runtime.start(initial).await.unwrap();
     let first_lease = runtime.lease().await.unwrap();
     source.push(config("31s", "127.0.0.1:8881", 1));
@@ -512,7 +795,7 @@ async fn retiring_ceiling_rejects_before_loading_or_activating() {
 #[tokio::test]
 async fn old_lease_delays_retirement_cleanup_and_releases_it_once() {
     let text = config("30s", "127.0.0.1:8881", 2);
-    let (runtime, initial, source, activator, _static_resources) = runtime_fixture(&text);
+    let (runtime, initial, source, activator, _static_resources) = runtime_fixture(&text).await;
     runtime.start(initial).await.unwrap();
     let old_lease = runtime.lease().await.unwrap();
     let old_owner = activator.owner(0);
@@ -544,7 +827,7 @@ async fn old_lease_delays_retirement_cleanup_and_releases_it_once() {
 #[tokio::test]
 async fn cleanup_panic_cannot_pin_retiring_count_or_shutdown() {
     let text = config("30s", "127.0.0.1:8881", 2);
-    let (runtime, initial, _source, activator, static_resources) = runtime_fixture(&text);
+    let (runtime, initial, _source, activator, static_resources) = runtime_fixture(&text).await;
     activator.panic_cleanup_next.store(true, Ordering::Release);
     runtime.start(initial).await.unwrap();
 
@@ -560,7 +843,7 @@ async fn cleanup_panic_cannot_pin_retiring_count_or_shutdown() {
 #[tokio::test]
 async fn retirement_start_panic_cannot_interrupt_publication_or_shutdown() {
     let text = config("30s", "127.0.0.1:8881", 2);
-    let (runtime, initial, source, activator, static_resources) = runtime_fixture(&text);
+    let (runtime, initial, source, activator, static_resources) = runtime_fixture(&text).await;
     let first = runtime.start(initial).await.unwrap();
     let old_owner = activator.owner(0);
     old_owner
@@ -593,7 +876,7 @@ async fn retirement_start_panic_cannot_interrupt_publication_or_shutdown() {
 #[tokio::test]
 async fn rejected_publication_cleans_candidate_and_preserves_active() {
     let text = config("30s", "127.0.0.1:8881", 2);
-    let (runtime, initial, source, activator, _static_resources) = runtime_fixture(&text);
+    let (runtime, initial, source, activator, _static_resources) = runtime_fixture(&text).await;
     let first = runtime.start(initial).await.unwrap();
     activator
         .reject_publication_next
@@ -622,7 +905,7 @@ async fn rejected_publication_cleans_candidate_and_preserves_active() {
 #[tokio::test]
 async fn completed_retirement_supervisors_are_reaped_incrementally() {
     let text = config("30s", "127.0.0.1:8881", 2);
-    let (runtime, initial, source, _activator, _static_resources) = runtime_fixture(&text);
+    let (runtime, initial, source, _activator, _static_resources) = runtime_fixture(&text).await;
     runtime.start(initial).await.unwrap();
 
     for second in 31..51 {
@@ -637,7 +920,7 @@ async fn completed_retirement_supervisors_are_reaped_incrementally() {
 #[tokio::test]
 async fn reload_trigger_at_worker_exit_is_handed_off_without_loss() {
     let text = config("30s", "127.0.0.1:8881", 2);
-    let (runtime, initial, source, _activator, _static_resources) = runtime_fixture(&text);
+    let (runtime, initial, source, _activator, _static_resources) = runtime_fixture(&text).await;
     runtime.start(initial).await.unwrap();
     source.push(config("31s", "127.0.0.1:8881", 2));
     source.push(config("32s", "127.0.0.1:8881", 2));
@@ -668,7 +951,7 @@ async fn reload_trigger_at_worker_exit_is_handed_off_without_loss() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn lease_waits_until_swapped_generation_publication_commits() {
     let text = config("30s", "127.0.0.1:8881", 2);
-    let (runtime, initial, source, activator, _static_resources) = runtime_fixture(&text);
+    let (runtime, initial, source, activator, _static_resources) = runtime_fixture(&text).await;
     runtime.start(initial).await.unwrap();
     source.push(config("31s", "127.0.0.1:8881", 2));
     activator.block_commit_next.store(true, Ordering::Release);
@@ -707,7 +990,7 @@ async fn lease_waits_until_swapped_generation_publication_commits() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lease_loaded_before_publication_retries_the_committed_generation() {
     let text = config("30s", "127.0.0.1:8881", 2);
-    let (runtime, initial, source, _activator, _static_resources) = runtime_fixture(&text);
+    let (runtime, initial, source, _activator, _static_resources) = runtime_fixture(&text).await;
     let first = runtime.start(initial).await.unwrap();
     runtime.block_lease_before_acquire();
     runtime.block_publication_exit();
@@ -751,7 +1034,7 @@ async fn lease_loaded_before_publication_retries_the_committed_generation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lease_acquired_before_validation_retries_the_committed_generation() {
     let text = config("30s", "127.0.0.1:8881", 2);
-    let (runtime, initial, source, _activator, _static_resources) = runtime_fixture(&text);
+    let (runtime, initial, source, _activator, _static_resources) = runtime_fixture(&text).await;
     let first = runtime.start(initial).await.unwrap();
     runtime.block_lease_before_validation();
 
@@ -785,7 +1068,7 @@ async fn lease_acquired_before_validation_retries_the_committed_generation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lease_waiter_wakes_on_shutdown_before_drain_finishes() {
     let text = config("30s", "127.0.0.1:8881", 2);
-    let (runtime, initial, _source, activator, _static_resources) = runtime_fixture(&text);
+    let (runtime, initial, _source, activator, _static_resources) = runtime_fixture(&text).await;
     runtime.start(initial).await.unwrap();
     let old_lease = runtime.lease().await.unwrap();
     let owner = activator.owner(0);
@@ -835,7 +1118,7 @@ async fn lease_waiter_wakes_on_shutdown_before_drain_finishes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_wins_blocked_reload_and_cleans_candidate_before_active() {
     let text = config("30s", "127.0.0.1:8881", 2);
-    let (runtime, initial, source, activator, _static_resources) = runtime_fixture(&text);
+    let (runtime, initial, source, activator, _static_resources) = runtime_fixture(&text).await;
     runtime.start(initial).await.unwrap();
     source.push(config("31s", "127.0.0.1:8881", 2));
     activator.block_next.store(true, Ordering::Release);
@@ -877,7 +1160,7 @@ async fn shutdown_wins_blocked_reload_and_cleans_candidate_before_active() {
 #[tokio::test]
 async fn shutdown_wins_during_initial_activation_and_prevents_publication() {
     let text = config("30s", "127.0.0.1:8881", 2);
-    let (runtime, initial, _source, activator, static_resources) = runtime_fixture(&text);
+    let (runtime, initial, _source, activator, static_resources) = runtime_fixture(&text).await;
     activator.block_next.store(true, Ordering::Release);
 
     let start_runtime = runtime.clone();
@@ -902,7 +1185,7 @@ async fn shutdown_wins_during_initial_activation_and_prevents_publication() {
 #[tokio::test]
 async fn publication_winner_is_the_generation_shutdown_drains() {
     let text = config("30s", "127.0.0.1:8881", 2);
-    let (runtime, initial, source, activator, static_resources) = runtime_fixture(&text);
+    let (runtime, initial, source, activator, static_resources) = runtime_fixture(&text).await;
     runtime.start(initial).await.unwrap();
     source.push(config("31s", "127.0.0.1:8881", 2));
     let ReloadTriggerResult::Completed { generation, .. } = runtime.trigger_reload().await.unwrap()

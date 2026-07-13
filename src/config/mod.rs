@@ -11,7 +11,9 @@ pub(crate) use facade::{
     ConfigFileMetadata, ConfigPathSource, ConfigTextInput, LoadedCompiledConfig,
 };
 #[allow(unused_imports)]
-pub(crate) use v3_compile::{ReloadableProductPlan, StaticFingerprint, StaticProductConfig};
+pub(crate) use v3_compile::{
+    ReloadableProductPlan, StaticFingerprint, StaticFingerprintError, StaticProductConfig,
+};
 
 use std::env;
 use std::fs;

@@ -14,6 +14,35 @@ use crate::runtime::{GenerationOwner, ObservationSnapshot, RedactionProfileIndex
 use capture::CaptureLimitUpdate;
 pub(crate) use capture::{CapturePermit, CapturePool};
 
+/// Process-owned observation state shared by all candidate, active, and
+/// retiring generations. Static sink construction will live behind this same
+/// boundary; generations receive only their reloadable policy and narrow
+/// shared admission handles.
+pub(crate) struct ProductObservationRuntime {
+    capture_pool: Arc<CapturePool>,
+}
+
+impl ProductObservationRuntime {
+    pub(crate) fn new() -> Self {
+        Self {
+            capture_pool: CapturePool::new(0),
+        }
+    }
+
+    pub(crate) fn activate(
+        &self,
+        plan: ObservationPlan,
+        redaction: &RedactionActivation,
+    ) -> Result<ObservationActivation, ObservationActivationError> {
+        ProductObservationSnapshot::activate(plan, redaction, self.capture_pool.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn committed_capture_limit(&self) -> usize {
+        self.capture_pool.committed_limit()
+    }
+}
+
 pub(crate) struct ProductObservationSnapshot {
     logging: ObservationLoggingPolicy,
     capture: Option<CapturePolicy>,

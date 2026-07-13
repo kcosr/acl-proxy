@@ -58,6 +58,8 @@ pub(crate) enum AuthorizationActivationError {
     Cancelled,
     #[error("authorization callbacks are not supported by this runtime")]
     UnsupportedCallback,
+    #[error("authorization provider registry does not match the activation plan")]
+    ProviderRegistryMismatch,
     #[error("authorization provider '{provider}' has a kind not supported by this runtime")]
     UnsupportedProviderKind { provider: String },
     #[error("process authorization provider '{provider}' requires unsupported capabilities")]
@@ -69,6 +71,7 @@ pub(crate) enum AuthorizationActivationError {
 impl ProductAuthorizationSnapshot {
     pub(crate) async fn activate(
         plan: AuthorizationPlan,
+        provider_registry: ProviderRegistry,
         cancellation: ActivationCancellation,
     ) -> Result<AuthorizationActivation, AuthorizationActivationError> {
         if cancellation.is_cancelled() {
@@ -87,7 +90,13 @@ impl ProductAuthorizationSnapshot {
             });
         }
 
-        let provider_registry = ProviderRegistry::from_names(plan.providers.keys().cloned());
+        let registry_matches = provider_registry.len() == plan.providers.len()
+            && plan.providers.keys().enumerate().all(|(index, name)| {
+                provider_registry.get(name).map(ProviderIndex::get) == Some(index)
+            });
+        if !registry_matches {
+            return Err(AuthorizationActivationError::ProviderRegistryMismatch);
+        }
         let mut providers = Vec::with_capacity(provider_registry.len());
         let mut rollback = ActivationRollback::new(provider_registry.len());
 
@@ -339,6 +348,14 @@ mod tests {
         ActivationCancellation::new_for_test()
     }
 
+    async fn activate(
+        plan: AuthorizationPlan,
+        cancellation: ActivationCancellation,
+    ) -> Result<AuthorizationActivation, AuthorizationActivationError> {
+        let provider_registry = ProviderRegistry::from_names(plan.providers.keys().cloned());
+        ProductAuthorizationSnapshot::activate(plan, provider_registry, cancellation).await
+    }
+
     fn request(id: &str) -> ProviderRequest<'_> {
         ProviderRequest {
             request_id: id,
@@ -376,7 +393,7 @@ mod tests {
         let mut zeta = process_plan(&directory, &script);
         zeta.include_headers = vec![HeaderName::from_static("x-zeta")];
         zeta.on_failure = CompiledProviderFailureMode::Error;
-        let activation = ProductAuthorizationSnapshot::activate(
+        let activation = activate(
             authorization_plan(BTreeMap::from([
                 ("zeta".to_string(), AuthorizationProviderPlan::Process(zeta)),
                 (
@@ -418,7 +435,7 @@ for line in sys.stdin:
     print(json.dumps({"id":request["id"],"type":"response","decision":"allow"}, separators=(",", ":")), flush=True)
 "#,
         );
-        let activation = ProductAuthorizationSnapshot::activate(
+        let activation = activate(
             authorization_plan(BTreeMap::from([(
                 "decision".to_string(),
                 AuthorizationProviderPlan::Process(process_plan(&directory, &script)),
@@ -477,7 +494,7 @@ for line in sys.stdin:
     print(json.dumps({"id":request["id"],"type":"response","decision":"pass"}, separators=(",", ":")), flush=True)
 "#,
         );
-        let activation = ProductAuthorizationSnapshot::activate(
+        let activation = activate(
             authorization_plan(BTreeMap::from([(
                 "decision".to_string(),
                 AuthorizationProviderPlan::Process(process_plan(&directory, &script)),
@@ -527,14 +544,31 @@ for line in sys.stdin:
     async fn pre_cancelled_activation_starts_no_provider() {
         let cancellation = cancellation();
         cancellation.cancel_for_test();
-        let result = ProductAuthorizationSnapshot::activate(
-            authorization_plan(BTreeMap::new()),
-            cancellation,
-        )
-        .await;
+        let result = activate(authorization_plan(BTreeMap::new()), cancellation).await;
         assert!(matches!(
             result,
             Err(AuthorizationActivationError::Cancelled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn mismatched_provider_registry_is_rejected_before_spawn() {
+        let directory = TempDir::new().unwrap();
+        let script = write_python(&directory, "unused.py", "raise SystemExit(99)\n");
+        let plan = authorization_plan(BTreeMap::from([(
+            "configured".to_string(),
+            AuthorizationProviderPlan::Process(process_plan(&directory, &script)),
+        )]));
+        let result = ProductAuthorizationSnapshot::activate(
+            plan,
+            ProviderRegistry::from_names(["different".to_string()]),
+            cancellation(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(AuthorizationActivationError::ProviderRegistryMismatch)
         ));
     }
 
@@ -550,7 +584,7 @@ for line in sys.stdin:
         let mut failing = process_plan(&directory, &script);
         failing.command = directory.path().join("missing-provider-command");
 
-        let result = ProductAuthorizationSnapshot::activate(
+        let result = activate(
             authorization_plan(BTreeMap::from([
                 (
                     "alpha-starts".to_string(),
@@ -583,7 +617,7 @@ for line in sys.stdin:
         let mut provider = process_plan(&directory, &script);
         provider.pass_environment = vec![missing.clone()];
 
-        let result = ProductAuthorizationSnapshot::activate(
+        let result = activate(
             authorization_plan(BTreeMap::from([(
                 "safe-provider-name".to_string(),
                 AuthorizationProviderPlan::Process(provider),

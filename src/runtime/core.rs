@@ -6,9 +6,7 @@ use arc_swap::ArcSwapOption;
 use tokio::sync::{Mutex, Notify};
 use tokio::task::JoinHandle;
 
-use crate::config::{
-    CompiledConfig, ReloadableProductPlan, StaticFingerprint, StaticProductConfig,
-};
+use crate::config::{CompiledConfig, StaticFingerprint, StaticProductConfig};
 
 use super::activation::{
     ActivationCancellation, BoxFuture, CandidateActivator, CandidateSource, RuntimeError,
@@ -48,19 +46,19 @@ pub(crate) trait StaticResources: Send + Sync {
 /// implementation because the compiled static configuration contains paths.
 pub(crate) struct StaticOwnership {
     pub(crate) config: StaticProductConfig,
-    pub(crate) fingerprint: StaticFingerprint,
+    pub(crate) claimed_fingerprint: StaticFingerprint,
     pub(crate) resources: Arc<dyn StaticResources>,
 }
 
 impl StaticOwnership {
     pub(crate) fn new(
         config: StaticProductConfig,
-        fingerprint: StaticFingerprint,
+        claimed_fingerprint: StaticFingerprint,
         resources: Arc<dyn StaticResources>,
     ) -> Self {
         Self {
             config,
-            fingerprint,
+            claimed_fingerprint,
             resources,
         }
     }
@@ -77,6 +75,7 @@ pub(crate) enum ReloadTriggerResult {
 
 pub(crate) struct Runtime {
     static_ownership: StaticOwnership,
+    static_fingerprint: StaticFingerprint,
     source: Arc<dyn CandidateSource>,
     activator: Arc<dyn CandidateActivator>,
     active: ArcSwapOption<Generation>,
@@ -133,6 +132,17 @@ struct MarkedRetirement {
     reason: CleanupReason,
 }
 
+fn reject_runtime_construction(
+    static_ownership: StaticOwnership,
+    error: RuntimeError,
+) -> BoxFuture<'static, Result<Arc<Runtime>, RuntimeError>> {
+    let cleanup = tokio::spawn(async move { static_ownership.resources.shutdown().await });
+    Box::pin(async move {
+        let _ = cleanup.await;
+        Err(error)
+    })
+}
+
 impl Drop for ReloadWorkerOwnership {
     fn drop(&mut self) {
         if self.owns {
@@ -149,9 +159,31 @@ impl Runtime {
         static_ownership: StaticOwnership,
         source: Arc<dyn CandidateSource>,
         activator: Arc<dyn CandidateActivator>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
+    ) -> BoxFuture<'static, Result<Arc<Self>, RuntimeError>> {
+        let static_fingerprint = match StaticFingerprint::from_config(&static_ownership.config) {
+            Ok(fingerprint) => fingerprint,
+            Err(_) => {
+                return reject_runtime_construction(
+                    static_ownership,
+                    RuntimeError::StaticFingerprintDerivationFailed,
+                )
+            }
+        };
+        if static_fingerprint != static_ownership.claimed_fingerprint {
+            return reject_runtime_construction(
+                static_ownership,
+                RuntimeError::StaticOwnershipFingerprintMismatch,
+            );
+        }
+        if activator.static_fingerprint() != &static_fingerprint {
+            return reject_runtime_construction(
+                static_ownership,
+                RuntimeError::ActivatorStaticFingerprintMismatch,
+            );
+        }
+        let runtime = Arc::new(Self {
             static_ownership,
+            static_fingerprint,
             source,
             activator,
             active: ArcSwapOption::empty(),
@@ -196,7 +228,8 @@ impl Runtime {
             publication_exit_changed: Notify::new(),
             #[cfg(test)]
             publication_exit_release: Notify::new(),
-        })
+        });
+        Box::pin(async move { Ok(runtime) })
     }
 
     pub(crate) fn static_config(&self) -> &StaticProductConfig {
@@ -278,17 +311,17 @@ impl Runtime {
 
     pub(crate) async fn start(
         self: &Arc<Self>,
-        initial_plan: ReloadableProductPlan,
+        initial: CompiledConfig,
     ) -> Result<GenerationId, RuntimeError> {
         let runtime = self.clone();
-        tokio::spawn(async move { runtime.start_owned(initial_plan).await })
+        tokio::spawn(async move { runtime.start_owned(initial).await })
             .await
             .map_err(|_| RuntimeError::CoordinatorTask)?
     }
 
     async fn start_owned(
         self: &Arc<Self>,
-        initial_plan: ReloadableProductPlan,
+        initial: CompiledConfig,
     ) -> Result<GenerationId, RuntimeError> {
         let _activation = self.activation.lock().await;
         match self.lifecycle() {
@@ -299,11 +332,15 @@ impl Runtime {
             _ => return Err(RuntimeError::AlreadyStarted),
         }
 
+        if initial.static_fingerprint != self.static_fingerprint {
+            return Err(RuntimeError::StaticFingerprintChanged);
+        }
+
         let cancellation = self.register_cancellation();
         let id = self.allocate_generation_id();
         let activated = self
             .activator
-            .activate(id, initial_plan, cancellation.clone())
+            .activate(id, initial.reloadable_plan, cancellation.clone())
             .await;
         self.clear_cancellation(&cancellation);
         let activated = activated?;
@@ -399,7 +436,7 @@ impl Runtime {
         cancellation: &ActivationCancellation,
     ) -> Result<GenerationId, RuntimeError> {
         cancellation.check()?;
-        if compiled.static_fingerprint != self.static_ownership.fingerprint {
+        if compiled.static_fingerprint != self.static_fingerprint {
             return Err(RuntimeError::StaticFingerprintChanged);
         }
         let id = self.allocate_generation_id();

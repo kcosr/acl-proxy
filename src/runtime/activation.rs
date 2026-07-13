@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tokio::sync::Notify;
 
-use crate::config::{CompiledConfig, ReloadableProductPlan};
+use crate::config::{CompiledConfig, ReloadableProductPlan, StaticFingerprint};
 
 use super::generation::{ActivatedGeneration, GenerationId};
 
@@ -84,6 +84,10 @@ pub(crate) trait CandidateSource: Send + Sync {
 }
 
 pub(crate) trait CandidateActivator: Send + Sync {
+    /// Identifies the process-lifetime configuration used to construct this
+    /// activator and its static admission/runtime state.
+    fn static_fingerprint(&self) -> &StaticFingerprint;
+
     /// Consumes the unresolved plan. The returned value must contain only
     /// resolved handles and adapter-local indices. Logical reference names and
     /// redaction environment locators may not survive this boundary; credential
@@ -109,6 +113,12 @@ pub(crate) enum RuntimeError {
     ActivationCancelled,
     #[error("reload changes restart-required static configuration")]
     StaticFingerprintChanged,
+    #[error("static configuration fingerprint could not be derived")]
+    StaticFingerprintDerivationFailed,
+    #[error("claimed static configuration fingerprint does not match canonical configuration")]
+    StaticOwnershipFingerprintMismatch,
+    #[error("candidate activator is bound to different static configuration")]
+    ActivatorStaticFingerprintMismatch,
     #[error("publishing would exceed the retiring-generation ceiling ({limit})")]
     RetiringGenerationLimit { limit: usize },
     #[error("runtime is not accepting reloads")]

@@ -837,6 +837,19 @@ pub(crate) enum Capacity {
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct StaticFingerprint([u8; 32]);
 
+#[derive(Debug, thiserror::Error)]
+#[error("failed to fingerprint static product configuration: {0}")]
+pub(crate) struct StaticFingerprintError(#[from] serde_json::Error);
+
+impl StaticFingerprint {
+    pub(crate) fn from_config(
+        config: &StaticProductConfig,
+    ) -> Result<Self, StaticFingerprintError> {
+        let bytes = serde_json::to_vec(config)?;
+        Ok(Self(Sha256::digest(bytes).into()))
+    }
+}
+
 impl fmt::Debug for StaticFingerprint {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("StaticFingerprint(")?;
@@ -900,15 +913,11 @@ pub(super) fn compile_v3(
         validation.compiled_urls_by_rule,
         resource_plan,
     )?;
-    let fingerprint_bytes = serde_json::to_vec(&static_config).map_err(|error| {
-        V3CompileError::at(
-            "schema_version",
-            format!("failed to fingerprint static config: {error}"),
-        )
-    })?;
+    let static_fingerprint = StaticFingerprint::from_config(&static_config)
+        .map_err(|error| V3CompileError::at("schema_version", error.to_string()))?;
 
     Ok(CompiledProductConfig {
-        static_fingerprint: StaticFingerprint(Sha256::digest(&fingerprint_bytes).into()),
+        static_fingerprint,
         static_config,
         reloadable_plan,
     })
