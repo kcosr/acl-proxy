@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt;
 use std::net::IpAddr;
 use std::time::Duration;
 
@@ -6,9 +7,18 @@ use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http::Method;
 use memchr::memmem::Finder;
 
+#[cfg(test)]
+use crate::config::v3_compile::CredentialActionPlan;
 use crate::config::v3_compile::{
-    CompiledDefaultDecision, CompiledHeaderEffectWhen, CompiledRuleDecision, CredentialActionPlan,
-    HeaderEffectPlan, HeaderPredicatesPlan, PolicyPlan, PolicyRulePlan,
+    CompiledDefaultDecision, CompiledHeaderEffectWhen, CompiledRuleDecision, HeaderEffectPlan,
+    HeaderPredicatesPlan, PolicyPlan, PolicyRulePlan,
+};
+use crate::credentials::{
+    resolve_credential_action, CredentialBindingError, ResolvedCredentialAction,
+};
+use crate::runtime::{
+    CredentialSourceRegistry, ProviderIndex, ProviderRegistry, RedactionProfileIndex,
+    RedactionProfileRegistry,
 };
 use crate::url::CanonicalUrl;
 
@@ -18,7 +28,48 @@ const MAX_HEADER_VALUE_BYTES: usize = 1024 * 1024;
 /// Immutable, generation-owned policy compiled from the product configuration.
 pub(crate) struct CompiledPolicySnapshot {
     default: CompiledDefaultDecision,
-    rules: Box<[PolicyRulePlan]>,
+    rules: Box<[ActivatedPolicyRule]>,
+}
+
+impl fmt::Debug for CompiledPolicySnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompiledPolicySnapshot")
+            .field("rule_count", &self.rules.len())
+            .finish()
+    }
+}
+
+struct ActivatedPolicyRule {
+    id: String,
+    description: Option<String>,
+    decision: CompiledRuleDecision,
+    urls: Vec<crate::url::CompiledUrlPattern>,
+    methods: Vec<Method>,
+    client_cidrs: Vec<ipnet::IpNet>,
+    headers: HeaderPredicatesPlan,
+    request_timeout: Option<Duration>,
+    allow_upgrades: bool,
+    authorization_provider: Option<ProviderIndex>,
+    redaction_profile: Option<RedactionProfileIndex>,
+    request_headers: Vec<HeaderEffectPlan>,
+    response_headers: Vec<HeaderEffectPlan>,
+    credential_actions: Box<[ResolvedCredentialAction]>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum PolicyActivationError {
+    #[error("policy rule {rule_index} references an unknown authorization provider")]
+    AuthorizationProvider { rule_index: usize },
+    #[error("policy rule {rule_index} references an unknown redaction profile")]
+    RedactionProfile { rule_index: usize },
+    #[error(
+        "credential action {action_index} in policy rule {rule_index} references an unknown source"
+    )]
+    CredentialSource {
+        rule_index: usize,
+        action_index: usize,
+    },
 }
 
 pub(crate) struct PolicyCursor<'snapshot> {
@@ -41,15 +92,69 @@ pub(crate) struct PolicyEvaluation<'snapshot> {
 pub(crate) struct PolicyRuleMatch<'snapshot> {
     snapshot: &'snapshot CompiledPolicySnapshot,
     index: usize,
-    rule: &'snapshot PolicyRulePlan,
+    rule: &'snapshot ActivatedPolicyRule,
 }
 
 impl CompiledPolicySnapshot {
-    pub(crate) fn from_plan(plan: PolicyPlan) -> Self {
-        Self {
+    pub(crate) fn activate(
+        plan: PolicyPlan,
+        provider_registry: &ProviderRegistry,
+        redaction_profile_registry: &RedactionProfileRegistry,
+        credential_source_registry: &CredentialSourceRegistry,
+    ) -> Result<Self, PolicyActivationError> {
+        let rules = plan
+            .rules
+            .into_iter()
+            .enumerate()
+            .map(|(rule_index, rule)| {
+                activate_rule(
+                    rule_index,
+                    rule,
+                    provider_registry,
+                    redaction_profile_registry,
+                    credential_source_registry,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_boxed_slice();
+        Ok(Self {
             default: plan.default,
-            rules: plan.rules.into_boxed_slice(),
-        }
+            rules,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_plan(plan: PolicyPlan) -> Self {
+        let provider_names = plan
+            .rules
+            .iter()
+            .filter_map(|rule| rule.authorization_provider.as_deref());
+        let profile_names = plan
+            .rules
+            .iter()
+            .filter_map(|rule| rule.redaction_profile.as_deref());
+        let credential_names = plan.rules.iter().flat_map(|rule| {
+            rule.credential_actions.iter().map(|action| match action {
+                CredentialActionPlan::Bearer { credential }
+                | CredentialActionPlan::CustomHeader { credential, .. } => credential.as_str(),
+                CredentialActionPlan::Basic {
+                    password_credential,
+                    ..
+                } => password_credential.as_str(),
+            })
+        });
+        let provider_registry = ProviderRegistry::from_names(provider_names.map(str::to_owned));
+        let redaction_profile_registry =
+            RedactionProfileRegistry::from_names(profile_names.map(str::to_owned));
+        let credential_source_registry =
+            CredentialSourceRegistry::from_names(credential_names.map(str::to_owned));
+        Self::activate(
+            plan,
+            &provider_registry,
+            &redaction_profile_registry,
+            &credential_source_registry,
+        )
+        .expect("test policy bindings are complete")
     }
 
     pub(crate) fn evaluate<'snapshot, ExtraPresence>(
@@ -130,12 +235,12 @@ impl<'snapshot> PolicyRuleMatch<'snapshot> {
         self.rule.allow_upgrades
     }
 
-    pub(crate) fn authorization_provider(&self) -> Option<&'snapshot str> {
-        self.rule.authorization_provider.as_deref()
+    pub(crate) fn authorization_provider(&self) -> Option<ProviderIndex> {
+        self.rule.authorization_provider
     }
 
-    pub(crate) fn redaction_profile(&self) -> Option<&'snapshot str> {
-        self.rule.redaction_profile.as_deref()
+    pub(crate) fn redaction_profile(&self) -> Option<RedactionProfileIndex> {
+        self.rule.redaction_profile
     }
 
     pub(crate) fn request_header_effects(&self) -> &'snapshot [HeaderEffectPlan] {
@@ -146,9 +251,66 @@ impl<'snapshot> PolicyRuleMatch<'snapshot> {
         &self.rule.response_headers
     }
 
-    pub(crate) fn credential_actions(&self) -> &'snapshot [CredentialActionPlan] {
+    pub(crate) fn credential_actions(&self) -> &'snapshot [ResolvedCredentialAction] {
         &self.rule.credential_actions
     }
+}
+
+impl crate::runtime::PolicySnapshot for CompiledPolicySnapshot {}
+
+fn activate_rule(
+    rule_index: usize,
+    rule: PolicyRulePlan,
+    provider_registry: &ProviderRegistry,
+    redaction_profile_registry: &RedactionProfileRegistry,
+    credential_source_registry: &CredentialSourceRegistry,
+) -> Result<ActivatedPolicyRule, PolicyActivationError> {
+    let authorization_provider = rule
+        .authorization_provider
+        .map(|name| {
+            provider_registry
+                .get(&name)
+                .ok_or(PolicyActivationError::AuthorizationProvider { rule_index })
+        })
+        .transpose()?;
+    let redaction_profile = rule
+        .redaction_profile
+        .map(|name| {
+            redaction_profile_registry
+                .get(&name)
+                .ok_or(PolicyActivationError::RedactionProfile { rule_index })
+        })
+        .transpose()?;
+    let credential_actions = rule
+        .credential_actions
+        .into_iter()
+        .enumerate()
+        .map(|(action_index, action)| {
+            resolve_credential_action(action, credential_source_registry).map_err(
+                |CredentialBindingError::UnknownSource| PolicyActivationError::CredentialSource {
+                    rule_index,
+                    action_index,
+                },
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_boxed_slice();
+    Ok(ActivatedPolicyRule {
+        id: rule.id,
+        description: rule.description,
+        decision: rule.decision,
+        urls: rule.urls,
+        methods: rule.methods,
+        client_cidrs: rule.client_cidrs,
+        headers: rule.headers,
+        request_timeout: rule.request_timeout,
+        allow_upgrades: rule.allow_upgrades,
+        authorization_provider,
+        redaction_profile,
+        request_headers: rule.request_headers,
+        response_headers: rule.response_headers,
+        credential_actions,
+    })
 }
 
 impl<'snapshot> PolicyCursor<'snapshot> {
@@ -185,7 +347,7 @@ fn canonical_peer_ip(peer_ip: IpAddr) -> IpAddr {
 }
 
 fn rule_matches<ExtraPresence>(
-    rule: &PolicyRulePlan,
+    rule: &ActivatedPolicyRule,
     url: &CanonicalUrl,
     peer_ip: IpAddr,
     method: &Method,
@@ -505,6 +667,13 @@ mod tests {
     use super::*;
     use crate::config::v3_compile::{HeaderValuePredicatePlan, PolicyRulePlan};
     use crate::url::{canonicalize_http_url, CompiledUrlPattern};
+
+    fn provider_index(index: usize) -> ProviderIndex {
+        let name = format!("index-{index:08}");
+        ProviderRegistry::from_names((0..=index).map(|value| format!("index-{value:08}")))
+            .get(&name)
+            .unwrap()
+    }
 
     fn empty_predicates() -> HeaderPredicatesPlan {
         HeaderPredicatesPlan {
@@ -1266,7 +1435,159 @@ mod tests {
                 matched.id(),
                 matched.authorization_provider()
             ),
-            (1, "delegate-rule", Some("approval"))
+            (1, "delegate-rule", Some(provider_index(0)))
+        );
+    }
+
+    #[test]
+    fn activation_resolves_canonical_registries_and_preserves_action_order() {
+        let mut bound = rule(
+            "bound",
+            CompiledRuleDecision::Allow,
+            "https://example.com/**",
+        );
+        bound.authorization_provider = Some("provider-marker".to_string());
+        bound.redaction_profile = Some("profile-marker".to_string());
+        bound.credential_actions = vec![
+            CredentialActionPlan::Bearer {
+                credential: "bearer-marker".to_string(),
+            },
+            CredentialActionPlan::Basic {
+                username: "buildbot".to_string(),
+                password_credential: "password-marker".to_string(),
+            },
+            CredentialActionPlan::CustomHeader {
+                header: HeaderName::from_static("x-api-key"),
+                credential: "custom-marker".to_string(),
+            },
+        ];
+        let provider_registry = ProviderRegistry::from_names(["provider-marker".to_string()]);
+        let profile_registry = RedactionProfileRegistry::from_names(["profile-marker".to_string()]);
+        let credential_registry = CredentialSourceRegistry::from_names([
+            "custom-marker".to_string(),
+            "password-marker".to_string(),
+            "bearer-marker".to_string(),
+        ]);
+        let snapshot = CompiledPolicySnapshot::activate(
+            PolicyPlan {
+                default: CompiledDefaultDecision::Deny,
+                rules: vec![bound],
+            },
+            &provider_registry,
+            &profile_registry,
+            &credential_registry,
+        )
+        .unwrap();
+        let matched = evaluate(&snapshot, "https://example.com/", &HeaderMap::new())
+            .matched
+            .unwrap();
+
+        assert_eq!(
+            matched.authorization_provider(),
+            provider_registry.get("provider-marker")
+        );
+        assert_eq!(
+            matched.redaction_profile(),
+            profile_registry.get("profile-marker")
+        );
+        assert_eq!(
+            matched.credential_actions(),
+            &[
+                ResolvedCredentialAction::Bearer {
+                    source: credential_registry.get("bearer-marker").unwrap(),
+                },
+                ResolvedCredentialAction::Basic {
+                    username: "buildbot".to_string(),
+                    source: credential_registry.get("password-marker").unwrap(),
+                },
+                ResolvedCredentialAction::CustomHeader {
+                    header: HeaderName::from_static("x-api-key"),
+                    source: credential_registry.get("custom-marker").unwrap(),
+                },
+            ]
+        );
+        let rendered = format!("{snapshot:?}");
+        for marker in [
+            "provider-marker",
+            "profile-marker",
+            "bearer-marker",
+            "password-marker",
+            "custom-marker",
+        ] {
+            assert!(!rendered.contains(marker));
+        }
+    }
+
+    #[test]
+    fn activation_rejects_each_unknown_reference_with_indices_only() {
+        let providers = ProviderRegistry::from_names([]);
+        let profiles = RedactionProfileRegistry::from_names([]);
+        let credentials = CredentialSourceRegistry::from_names([]);
+        let mut provider = rule(
+            "provider",
+            CompiledRuleDecision::Delegate,
+            "https://example.com/**",
+        );
+        provider.authorization_provider = Some("missing-provider-marker".to_string());
+        let error = CompiledPolicySnapshot::activate(
+            PolicyPlan {
+                default: CompiledDefaultDecision::Deny,
+                rules: vec![provider],
+            },
+            &providers,
+            &profiles,
+            &credentials,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            PolicyActivationError::AuthorizationProvider { rule_index: 0 }
+        );
+        assert!(!format!("{error:?} {error}").contains("missing-provider-marker"));
+
+        let mut profile = rule(
+            "profile",
+            CompiledRuleDecision::Allow,
+            "https://example.com/**",
+        );
+        profile.redaction_profile = Some("missing-profile-marker".to_string());
+        assert_eq!(
+            CompiledPolicySnapshot::activate(
+                PolicyPlan {
+                    default: CompiledDefaultDecision::Deny,
+                    rules: vec![profile],
+                },
+                &providers,
+                &profiles,
+                &credentials,
+            )
+            .unwrap_err(),
+            PolicyActivationError::RedactionProfile { rule_index: 0 }
+        );
+
+        let mut credential = rule(
+            "credential",
+            CompiledRuleDecision::Allow,
+            "https://example.com/**",
+        );
+        credential.credential_actions = vec![CredentialActionPlan::Bearer {
+            credential: "missing-credential-marker".to_string(),
+        }];
+        assert_eq!(
+            CompiledPolicySnapshot::activate(
+                PolicyPlan {
+                    default: CompiledDefaultDecision::Deny,
+                    rules: vec![credential],
+                },
+                &providers,
+                &profiles,
+                &credentials,
+            )
+            .unwrap_err(),
+            PolicyActivationError::CredentialSource {
+                rule_index: 0,
+                action_index: 0,
+            }
         );
     }
 }

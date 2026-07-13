@@ -12,9 +12,10 @@ pub(crate) use core::{
 };
 #[allow(unused_imports)]
 pub(crate) use generation::{
-    ActivatedGeneration, AuthorizationSnapshot, CleanupReason, CredentialIndex, CredentialResolver,
-    EgressSnapshot, Generation, GenerationId, GenerationLease, GenerationOwner,
-    ObservationSnapshot, PolicySnapshot, ProviderIndex, PublicationGuard, RedactionProfileIndex,
+    ActivatedGeneration, AuthorizationSnapshot, CleanupReason, CredentialResolver,
+    CredentialSourceIndex, CredentialSourceRegistry, EgressSnapshot, Generation, GenerationId,
+    GenerationLease, GenerationOwner, ObservationSnapshot, PolicySnapshot, ProviderIndex,
+    ProviderRegistry, PublicationGuard, RedactionProfileIndex, RedactionProfileRegistry,
     RedactionSnapshot, ResolvedBindings, ResolvedRuleBindings, SafetySnapshot,
 };
 

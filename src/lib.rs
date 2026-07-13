@@ -5,6 +5,7 @@ pub mod certs;
 pub mod cli;
 pub mod config;
 mod credentials;
+mod egress;
 pub mod external_auth;
 mod filesystem;
 pub mod logging;

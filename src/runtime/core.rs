@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::{panic::catch_unwind, panic::AssertUnwindSafe};
 
 use arc_swap::ArcSwapOption;
 use tokio::sync::{Mutex, Notify};
@@ -418,19 +419,31 @@ impl Runtime {
         cancellation: &ActivationCancellation,
     ) -> Result<GenerationId, RuntimeError> {
         let generation = Arc::new(Generation::from_activated(id, activated));
-        let mut publication_guard = match generation.owner.publication_guard() {
-            Ok(guard) => guard,
+        let retirement = match self.publish_sync(&generation, expected, cancellation) {
+            Ok(retirement) => retirement,
             Err(error) => {
                 self.cleanup_candidate(generation.owner.clone()).await;
                 return Err(error);
             }
         };
 
-        if let Err(error) = cancellation.check() {
-            drop(publication_guard);
-            self.cleanup_candidate(generation.owner.clone()).await;
-            return Err(error);
+        self.wait_at_publication_exit_for_test().await;
+
+        if let Some(retirement) = retirement {
+            self.schedule_retirement(retirement).await;
         }
+        Ok(id)
+    }
+
+    fn publish_sync(
+        &self,
+        generation: &Arc<Generation>,
+        expected: LifecycleState,
+        cancellation: &ActivationCancellation,
+    ) -> Result<Option<MarkedRetirement>, RuntimeError> {
+        let mut publication_guard = generation.owner.publication_guard()?;
+
+        cancellation.check()?;
 
         if self
             .lifecycle
@@ -442,8 +455,6 @@ impl Runtime {
             )
             .is_err()
         {
-            drop(publication_guard);
-            self.cleanup_candidate(generation.owner.clone()).await;
             return Err(RuntimeError::ShuttingDown);
         }
 
@@ -457,12 +468,7 @@ impl Runtime {
             .store(LifecycleState::Running as u8, Ordering::Release);
         self.ready.store(true, Ordering::Release);
         self.lifecycle_changed.notify_waiters();
-        self.wait_at_publication_exit_for_test().await;
-
-        if let Some(retirement) = retirement {
-            self.schedule_retirement(retirement).await;
-        }
-        Ok(id)
+        Ok(retirement)
     }
 
     fn check_retiring_ceiling(&self) -> Result<(), RuntimeError> {
@@ -490,6 +496,14 @@ impl Runtime {
         reason: CleanupReason,
     ) -> MarkedRetirement {
         generation.begin_retirement();
+        let owner = generation.owner.clone();
+        if catch_unwind(AssertUnwindSafe(|| owner.retirement_started(reason))).is_err() {
+            tracing::error!(
+                generation = generation.id().get(),
+                ?reason,
+                "generation owner panicked while starting retirement"
+            );
+        }
         self.retiring_count.fetch_add(1, Ordering::AcqRel);
         MarkedRetirement { generation, reason }
     }

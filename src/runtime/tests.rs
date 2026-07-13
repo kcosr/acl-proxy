@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
+use std::marker::PhantomData;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
@@ -19,6 +21,12 @@ impl RedactionSnapshot for EmptySnapshot {}
 impl ObservationSnapshot for EmptySnapshot {}
 impl SafetySnapshot for EmptySnapshot {}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnerEvent {
+    RetirementStarted(CleanupReason),
+    Cleanup(CleanupReason),
+}
+
 #[derive(Default)]
 struct FakeOwner {
     commits: AtomicUsize,
@@ -27,16 +35,19 @@ struct FakeOwner {
     shutdowns: AtomicUsize,
     reject_publication: AtomicBool,
     panic_cleanup: AtomicBool,
+    panic_retirement_started: AtomicBool,
     block_commit: AtomicBool,
     commit_released: Mutex<bool>,
     commit_release: Condvar,
     commit_started: AtomicBool,
     commit_entered: Notify,
     cleanup_events: Option<Arc<Mutex<Vec<CleanupReason>>>>,
+    events: Mutex<Vec<OwnerEvent>>,
 }
 
 struct FakePublicationGuard<'a> {
     owner: &'a FakeOwner,
+    _not_send: PhantomData<Rc<()>>,
 }
 
 impl PublicationGuard for FakePublicationGuard<'_> {
@@ -58,7 +69,20 @@ impl GenerationOwner for FakeOwner {
         if self.reject_publication.swap(false, Ordering::AcqRel) {
             return Err(RuntimeError::CandidateNotLive("fake owner exited".into()));
         }
-        Ok(Box::new(FakePublicationGuard { owner: self }))
+        Ok(Box::new(FakePublicationGuard {
+            owner: self,
+            _not_send: PhantomData,
+        }))
+    }
+
+    fn retirement_started(&self, reason: CleanupReason) {
+        if self.panic_retirement_started.swap(false, Ordering::AcqRel) {
+            panic!("fake retirement-start panic");
+        }
+        self.events
+            .lock()
+            .unwrap()
+            .push(OwnerEvent::RetirementStarted(reason));
     }
 
     fn cleanup(&self, reason: CleanupReason) -> BoxFuture<'_, ()> {
@@ -69,6 +93,10 @@ impl GenerationOwner for FakeOwner {
             if let Some(events) = &self.cleanup_events {
                 events.lock().unwrap().push(reason);
             }
+            self.events
+                .lock()
+                .unwrap()
+                .push(OwnerEvent::Cleanup(reason));
             match reason {
                 CleanupReason::CandidateRejected => {
                     self.candidate_cleanups.fetch_add(1, Ordering::AcqRel);
@@ -85,6 +113,10 @@ impl GenerationOwner for FakeOwner {
 }
 
 impl FakeOwner {
+    fn events(&self) -> Vec<OwnerEvent> {
+        self.events.lock().unwrap().clone()
+    }
+
     async fn wait_for_commit(&self) {
         loop {
             let entered = self.commit_entered.notified();
@@ -448,12 +480,24 @@ async fn old_lease_delays_retirement_cleanup_and_releases_it_once() {
     runtime.trigger_reload().await.unwrap();
     wait_for_retiring(&runtime, 1).await;
     assert_eq!(old_owner.retirements.load(Ordering::Acquire), 0);
+    assert_eq!(
+        old_owner.events(),
+        vec![OwnerEvent::RetirementStarted(CleanupReason::Retired)]
+    );
 
     drop(old_lease);
     wait_for_retiring(&runtime, 0).await;
     assert_eq!(old_owner.retirements.load(Ordering::Acquire), 1);
+    assert_eq!(
+        old_owner.events(),
+        vec![
+            OwnerEvent::RetirementStarted(CleanupReason::Retired),
+            OwnerEvent::Cleanup(CleanupReason::Retired),
+        ]
+    );
     tokio::task::yield_now().await;
     assert_eq!(old_owner.retirements.load(Ordering::Acquire), 1);
+    assert_eq!(old_owner.events().len(), 2);
 }
 
 #[tokio::test]
@@ -468,6 +512,39 @@ async fn cleanup_panic_cannot_pin_retiring_count_or_shutdown() {
         .expect("cleanup panic must not deadlock shutdown");
 
     assert_eq!(runtime.retiring_generations(), 0);
+    assert_eq!(runtime.lifecycle(), LifecycleState::Stopped);
+    assert_eq!(static_resources.shutdowns.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn retirement_start_panic_cannot_interrupt_publication_or_shutdown() {
+    let text = config("30s", "127.0.0.1:8881", 2);
+    let (runtime, initial, source, activator, static_resources) = runtime_fixture(&text);
+    let first = runtime.start(initial).await.unwrap();
+    let old_owner = activator.owner(0);
+    old_owner
+        .panic_retirement_started
+        .store(true, Ordering::Release);
+    source.push(config("31s", "127.0.0.1:8881", 2));
+
+    let ReloadTriggerResult::Completed {
+        generation: second, ..
+    } = runtime.trigger_reload().await.unwrap()
+    else {
+        panic!("reload unexpectedly coalesced");
+    };
+    assert_ne!(second, first);
+    assert_eq!(runtime.lifecycle(), LifecycleState::Running);
+    assert_eq!(runtime.active_generation_id(), Some(second));
+    wait_for_retiring(&runtime, 0).await;
+    assert_eq!(
+        old_owner.events(),
+        vec![OwnerEvent::Cleanup(CleanupReason::Retired)]
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), runtime.shutdown())
+        .await
+        .expect("retirement-start panic must not deadlock later shutdown");
     assert_eq!(runtime.lifecycle(), LifecycleState::Stopped);
     assert_eq!(static_resources.shutdowns.load(Ordering::Acquire), 1);
 }
@@ -495,6 +572,10 @@ async fn rejected_publication_cleans_candidate_and_preserves_active() {
         1
     );
     assert_eq!(activator.owner(0).commits.load(Ordering::Acquire), 1);
+    assert_eq!(
+        activator.owner(1).events(),
+        vec![OwnerEvent::Cleanup(CleanupReason::CandidateRejected)]
+    );
 }
 
 #[tokio::test]
@@ -663,9 +744,10 @@ async fn lease_acquired_before_validation_retries_the_committed_generation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lease_waiter_wakes_on_shutdown_before_drain_finishes() {
     let text = config("30s", "127.0.0.1:8881", 2);
-    let (runtime, initial, _source, _activator, _static_resources) = runtime_fixture(&text);
+    let (runtime, initial, _source, activator, _static_resources) = runtime_fixture(&text);
     runtime.start(initial).await.unwrap();
     let old_lease = runtime.lease().await.unwrap();
+    let owner = activator.owner(0);
     runtime.block_lease_before_acquire();
 
     let lease_runtime = runtime.clone();
@@ -685,6 +767,10 @@ async fn lease_waiter_wakes_on_shutdown_before_drain_finishes() {
         !shutdown.is_finished(),
         "old lease must keep shutdown draining"
     );
+    assert_eq!(
+        owner.events(),
+        vec![OwnerEvent::RetirementStarted(CleanupReason::Shutdown)]
+    );
 
     runtime.release_lease_before_acquire();
     assert_eq!(waiter.await.unwrap(), None);
@@ -696,6 +782,13 @@ async fn lease_waiter_wakes_on_shutdown_before_drain_finishes() {
     drop(old_lease);
     shutdown.await.unwrap();
     assert_eq!(runtime.lifecycle(), LifecycleState::Stopped);
+    assert_eq!(
+        owner.events(),
+        vec![
+            OwnerEvent::RetirementStarted(CleanupReason::Shutdown),
+            OwnerEvent::Cleanup(CleanupReason::Shutdown),
+        ]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

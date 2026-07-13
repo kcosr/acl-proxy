@@ -75,10 +75,12 @@ pub(crate) trait CandidateSource: Send + Sync {
 
 pub(crate) trait CandidateActivator: Send + Sync {
     /// Consumes the unresolved plan. The returned value must contain only
-    /// resolved handles and adapter-local indices; source names may not survive
-    /// this boundary. Before returning `Err`, implementations must synchronously
-    /// terminate and join every resource created during the attempt. The core
-    /// has no owner handle with which to clean a failed partial activation.
+    /// resolved handles and adapter-local indices. Logical reference names and
+    /// redaction environment locators may not survive this boundary; credential
+    /// locators remain encapsulated only in the opaque late resolver. Before
+    /// returning `Err`, implementations must synchronously terminate and join
+    /// every resource created during the attempt. The core has no owner handle
+    /// with which to clean a failed partial activation.
     fn activate(
         &self,
         id: GenerationId,

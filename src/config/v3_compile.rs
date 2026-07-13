@@ -207,9 +207,10 @@ pub(crate) struct StaticLoggingConfig {
 
 /// Purely compiled, unresolved generation input. Runtime activation must turn
 /// this into a snapshot by resolving redaction sources and eagerly starting
-/// process providers. Activation consumes this plan, resolves and drops source
-/// locators (including environment variable names), and request paths never
-/// consume it directly.
+/// process providers. Activation consumes logical names and redaction source
+/// locators. Credential environment/file locators survive only inside the
+/// opaque late resolver that owns uncached final-injection reads; request paths
+/// never consume this plan directly.
 pub(crate) struct ReloadableProductPlan {
     pub(crate) request_timeout: Duration,
     pub(crate) max_content_decoding_expansion_ratio: usize,

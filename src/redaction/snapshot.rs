@@ -1,4 +1,5 @@
 use std::alloc::{alloc, dealloc, Layout};
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
@@ -16,6 +17,7 @@ use crate::config::v3_compile::{
     RedactionLiteralInterval as Interval, RedactionLiteralNode as SecretNode, RedactionPlan,
     RedactionProfilePlan, RedactionRulePlan, MAX_REDACTION_MATCHER_SCRATCH_BYTES,
 };
+use crate::runtime::{RedactionProfileIndex, RedactionProfileRegistry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PayloadClass {
@@ -121,8 +123,19 @@ pub(crate) enum SnapshotError {
 }
 
 pub(crate) struct RedactionSnapshot {
-    profiles: BTreeMap<String, ProfileHandle>,
+    profiles: Box<[ProfileHandle]>,
     compiled_matcher_resident_bytes: usize,
+}
+
+pub(crate) struct RedactionActivation {
+    profile_registry: RedactionProfileRegistry,
+    snapshot: RedactionSnapshot,
+}
+
+impl fmt::Debug for RedactionActivation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.snapshot.fmt(formatter)
+    }
 }
 
 impl fmt::Debug for RedactionSnapshot {
@@ -135,27 +148,28 @@ impl fmt::Debug for RedactionSnapshot {
 }
 
 impl RedactionSnapshot {
-    pub(crate) fn activate(plan: RedactionPlan) -> Result<Self, SnapshotError> {
-        let mut profiles = BTreeMap::new();
+    pub(crate) fn activate(plan: RedactionPlan) -> Result<RedactionActivation, SnapshotError> {
+        let profile_registry = RedactionProfileRegistry::from_names(plan.profiles.keys().cloned());
+        let mut profiles = Vec::with_capacity(plan.profiles.len());
         let mut compiled_matcher_resident_bytes = 0usize;
-        for (profile_index, (name, profile)) in plan.profiles.into_iter().enumerate() {
-            profiles.insert(
-                name,
-                ProfileHandle::activate(
-                    profile,
-                    profile_index,
-                    &mut compiled_matcher_resident_bytes,
-                )?,
-            );
+        for (profile_index, (_, profile)) in plan.profiles.into_iter().enumerate() {
+            profiles.push(ProfileHandle::activate(
+                profile,
+                profile_index,
+                &mut compiled_matcher_resident_bytes,
+            )?);
         }
-        Ok(Self {
-            profiles,
-            compiled_matcher_resident_bytes,
+        Ok(RedactionActivation {
+            profile_registry,
+            snapshot: Self {
+                profiles: profiles.into_boxed_slice(),
+                compiled_matcher_resident_bytes,
+            },
         })
     }
 
-    pub(crate) fn profile(&self, name: &str) -> Option<ProfileHandle> {
-        self.profiles.get(name).cloned()
+    pub(crate) fn profile(&self, index: RedactionProfileIndex) -> Option<ProfileHandle> {
+        self.profiles.get(index.get()).cloned()
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -168,6 +182,35 @@ impl RedactionSnapshot {
 
     pub(crate) fn compiled_matcher_resident_bytes(&self) -> usize {
         self.compiled_matcher_resident_bytes
+    }
+}
+
+impl crate::runtime::RedactionSnapshot for RedactionSnapshot {}
+
+impl RedactionActivation {
+    pub(crate) fn profile_index(&self, name: &str) -> Option<RedactionProfileIndex> {
+        self.profile_registry.get(name)
+    }
+
+    pub(crate) fn profile(&self, name: &str) -> Option<ProfileHandle> {
+        self.profile_index(name)
+            .and_then(|index| self.snapshot.profile(index))
+    }
+
+    pub(crate) fn profile_registry(&self) -> &RedactionProfileRegistry {
+        &self.profile_registry
+    }
+
+    pub(crate) fn into_parts(self) -> (RedactionSnapshot, RedactionProfileRegistry) {
+        (self.snapshot, self.profile_registry)
+    }
+}
+
+impl std::ops::Deref for RedactionActivation {
+    type Target = RedactionSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
     }
 }
 
@@ -1465,6 +1508,13 @@ mod tests {
         MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT,
     };
 
+    fn redaction_profile_index(index: usize) -> RedactionProfileIndex {
+        let name = format!("index-{index:08}");
+        RedactionProfileRegistry::from_names((0..=index).map(|value| format!("index-{value:08}")))
+            .get(&name)
+            .unwrap()
+    }
+
     static NEXT_ENV: AtomicUsize = AtomicUsize::new(0);
 
     struct EnvGuard(String);
@@ -1562,6 +1612,41 @@ mod tests {
             .unwrap();
         assert_eq!(binary.replacements, 1);
         assert_eq!(binary.bytes, b"literal [MASKED]");
+    }
+
+    #[test]
+    fn activation_returns_deterministic_indices_then_drops_profile_names() {
+        let source = EnvGuard::set("indexed-environment-secret");
+        let activation = RedactionSnapshot::activate(RedactionPlan {
+            profiles: BTreeMap::from([
+                ("z-profile-marker".to_string(), profile(None)),
+                (
+                    "a-profile-marker".to_string(),
+                    profile(Some(source.0.clone())),
+                ),
+            ]),
+        })
+        .unwrap();
+
+        assert_eq!(
+            activation.profile_index("a-profile-marker"),
+            Some(redaction_profile_index(0))
+        );
+        assert_eq!(
+            activation.profile_index("z-profile-marker"),
+            Some(redaction_profile_index(1))
+        );
+        let (snapshot, indices) = activation.into_parts();
+        assert_eq!(indices.len(), 2);
+        drop(indices);
+
+        let rendered = format!("{snapshot:?}");
+        assert!(!rendered.contains("a-profile-marker"));
+        assert!(!rendered.contains("z-profile-marker"));
+        assert!(!rendered.contains(&source.0));
+        assert!(snapshot.profile(redaction_profile_index(0)).is_some());
+        assert!(snapshot.profile(redaction_profile_index(1)).is_some());
+        assert!(snapshot.profile(redaction_profile_index(2)).is_none());
     }
 
     #[test]

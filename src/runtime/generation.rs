@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -27,19 +28,109 @@ impl GenerationId {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct ProviderIndex(pub(crate) usize);
+pub(crate) struct ProviderIndex(usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct RedactionProfileIndex(pub(crate) usize);
+pub(crate) struct RedactionProfileIndex(usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct CredentialIndex(pub(crate) usize);
+pub(crate) struct CredentialSourceIndex(usize);
+
+macro_rules! index_registry {
+    ($registry:ident, $index:ident, $label:literal) => {
+        pub(crate) struct $registry {
+            indices: BTreeMap<String, $index>,
+        }
+
+        impl $registry {
+            pub(crate) fn from_names(names: impl IntoIterator<Item = String>) -> Self {
+                let names: BTreeSet<_> = names.into_iter().collect();
+                let indices = names
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, name)| (name, $index(index)))
+                    .collect();
+                Self { indices }
+            }
+
+            pub(crate) fn get(&self, name: &str) -> Option<$index> {
+                self.indices.get(name).copied()
+            }
+
+            pub(crate) fn len(&self) -> usize {
+                self.indices.len()
+            }
+        }
+
+        impl fmt::Debug for $registry {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter
+                    .debug_struct($label)
+                    .field("count", &self.indices.len())
+                    .finish()
+            }
+        }
+
+        impl $index {
+            pub(crate) fn get(self) -> usize {
+                self.0
+            }
+        }
+    };
+}
+
+index_registry!(ProviderRegistry, ProviderIndex, "ProviderRegistry");
+index_registry!(
+    RedactionProfileRegistry,
+    RedactionProfileIndex,
+    "RedactionProfileRegistry"
+);
+index_registry!(
+    CredentialSourceRegistry,
+    CredentialSourceIndex,
+    "CredentialSourceRegistry"
+);
+
+#[cfg(test)]
+mod index_registry_tests {
+    use super::*;
+
+    #[test]
+    fn registries_assign_dense_indices_independent_of_input_order() {
+        let forward = ProviderRegistry::from_names([
+            "alpha-provider".to_string(),
+            "omega-provider".to_string(),
+        ]);
+        let reverse = ProviderRegistry::from_names([
+            "omega-provider".to_string(),
+            "alpha-provider".to_string(),
+            "alpha-provider".to_string(),
+        ]);
+
+        assert_eq!(forward.len(), 2);
+        assert_eq!(reverse.len(), 2);
+        assert_eq!(forward.get("alpha-provider"), reverse.get("alpha-provider"));
+        assert_eq!(forward.get("omega-provider"), reverse.get("omega-provider"));
+        assert_eq!(forward.get("alpha-provider").unwrap().get(), 0);
+        assert_eq!(forward.get("omega-provider").unwrap().get(), 1);
+        assert!(!format!("{forward:?}").contains("alpha-provider"));
+    }
+
+    #[test]
+    fn registry_domains_assign_their_own_non_forgeable_indices() {
+        let credentials = CredentialSourceRegistry::from_names(["shared".to_string()]);
+        let profiles = RedactionProfileRegistry::from_names(["shared".to_string()]);
+
+        assert_eq!(credentials.get("shared").unwrap().get(), 0);
+        assert_eq!(profiles.get("shared").unwrap().get(), 0);
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ResolvedRuleBindings {
     pub(crate) authorization_provider: Option<ProviderIndex>,
     pub(crate) redaction_profile: Option<RedactionProfileIndex>,
-    pub(crate) credentials: Box<[CredentialIndex]>,
+    pub(crate) credentials: Box<[CredentialSourceIndex]>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -71,7 +162,7 @@ pub(crate) enum CleanupReason {
     Shutdown,
 }
 
-pub(crate) trait PublicationGuard: Send {
+pub(crate) trait PublicationGuard {
     /// Transfers candidate-owned resources into the published generation.
     /// This must be infallible because the active snapshot has already swapped.
     fn commit(&mut self);
@@ -81,6 +172,13 @@ pub(crate) trait GenerationOwner: Send + Sync {
     /// Holds the adapter's final liveness lock until publication commits or the
     /// returned guard is dropped.
     fn publication_guard(&self) -> Result<Box<dyn PublicationGuard + '_>, RuntimeError>;
+
+    /// Notifies owned resources that their generation has begun retirement.
+    /// This is called exactly once, synchronously after new lease admission is
+    /// closed, so adapters can establish deadlines before lease draining.
+    /// Rejected unpublished candidates do not receive this notification.
+    /// Implementations must not block or panic.
+    fn retirement_started(&self, reason: CleanupReason);
 
     /// Idempotently stops and joins resources owned by this candidate or
     /// generation. Implementations must remain cancellation-safe themselves.

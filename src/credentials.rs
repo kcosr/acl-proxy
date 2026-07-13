@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::File;
@@ -23,6 +24,9 @@ use zeroize::Zeroize;
 use crate::config::v3_compile::{
     CredentialActionPlan, CredentialSourcePlan, CredentialsPlan, InboundCredentialPlan,
 };
+use crate::runtime::{
+    CredentialSourceIndex, CredentialSourceRegistry, ProviderIndex, ProviderRegistry,
+};
 
 const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
 const MAX_FILE_READ_BYTES: u64 = MAX_CREDENTIAL_BYTES as u64 + 3;
@@ -43,23 +47,115 @@ pub(crate) enum CredentialError {
     DuplicateInboundHeader,
 }
 
-/// Resolves stable credential locators only at the final header-injection point.
-///
-/// This type borrows compiled metadata and intentionally exposes no locator or
-/// secret-bearing debug representation.
-pub(crate) struct CredentialBoundary<'plan> {
-    plan: &'plan CredentialsPlan,
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum CredentialBindingError {
+    #[error("credential action references an unknown source")]
+    UnknownSource,
 }
 
-impl<'plan> CredentialBoundary<'plan> {
-    pub(crate) fn new(plan: &'plan CredentialsPlan) -> Self {
-        Self { plan }
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum CredentialActivationError {
+    #[error("inbound credential references an unknown process provider")]
+    UnknownProcessProvider,
+}
+
+/// A typed destination paired with an opaque stable-source index.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ResolvedCredentialAction {
+    Bearer {
+        source: CredentialSourceIndex,
+    },
+    Basic {
+        username: String,
+        source: CredentialSourceIndex,
+    },
+    CustomHeader {
+        header: HeaderName,
+        source: CredentialSourceIndex,
+    },
+}
+
+pub(crate) fn resolve_credential_action(
+    action: CredentialActionPlan,
+    source_registry: &CredentialSourceRegistry,
+) -> Result<ResolvedCredentialAction, CredentialBindingError> {
+    match action {
+        CredentialActionPlan::Bearer { credential } => Ok(ResolvedCredentialAction::Bearer {
+            source: source_index(source_registry, &credential)?,
+        }),
+        CredentialActionPlan::Basic {
+            username,
+            password_credential,
+        } => Ok(ResolvedCredentialAction::Basic {
+            username,
+            source: source_index(source_registry, &password_credential)?,
+        }),
+        CredentialActionPlan::CustomHeader { header, credential } => {
+            Ok(ResolvedCredentialAction::CustomHeader {
+                header,
+                source: source_index(source_registry, &credential)?,
+            })
+        }
+    }
+}
+
+fn source_index(
+    source_registry: &CredentialSourceRegistry,
+    name: &str,
+) -> Result<CredentialSourceIndex, CredentialBindingError> {
+    source_registry
+        .get(name)
+        .ok_or(CredentialBindingError::UnknownSource)
+}
+
+struct InboundCredential {
+    header: HeaderName,
+    process_providers: Box<[ProviderIndex]>,
+}
+
+/// Generation-owned credential metadata. Deliberately has no `Debug`
+/// implementation because its source adapters retain secret locators.
+pub(crate) struct CredentialResolverSnapshot {
+    sources: Box<[CredentialSourcePlan]>,
+    inbound: Box<[InboundCredential]>,
+}
+
+pub(crate) struct CredentialActivation {
+    source_registry: CredentialSourceRegistry,
+    snapshot: CredentialResolverSnapshot,
+}
+
+impl CredentialResolverSnapshot {
+    pub(crate) fn activate(
+        plan: CredentialsPlan,
+        provider_registry: &ProviderRegistry,
+    ) -> Result<CredentialActivation, CredentialActivationError> {
+        let CredentialsPlan {
+            allowed_custom_headers: _,
+            inbound,
+            sources,
+        } = plan;
+        let source_registry = CredentialSourceRegistry::from_names(sources.keys().cloned());
+        let sources = sources.into_values().collect::<Vec<_>>().into_boxed_slice();
+        let inbound = inbound
+            .into_values()
+            .map(|inbound| activate_inbound(inbound, provider_registry))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_boxed_slice();
+        Ok(CredentialActivation {
+            source_registry,
+            snapshot: Self { sources, inbound },
+        })
+    }
+
+    pub(crate) fn source_count(&self) -> usize {
+        self.sources.len()
     }
 
     /// Resolves and validates every action before replacing any destination.
     pub(crate) fn inject(
         &self,
-        actions: &[CredentialActionPlan],
+        actions: &[ResolvedCredentialAction],
         headers: &mut HeaderMap,
     ) -> Result<(), CredentialError> {
         let staged = actions
@@ -75,21 +171,18 @@ impl<'plan> CredentialBoundary<'plan> {
 
     fn resolve_action(
         &self,
-        action: &CredentialActionPlan,
+        action: &ResolvedCredentialAction,
     ) -> Result<ResolvedHeader, CredentialError> {
         match action {
-            CredentialActionPlan::Bearer { credential } => {
-                let secret = self.resolve(credential)?;
+            ResolvedCredentialAction::Bearer { source } => {
+                let secret = self.resolve(*source)?;
                 let mut material = Vec::with_capacity("Bearer ".len() + secret.len());
                 material.extend_from_slice(b"Bearer ");
                 material.extend_from_slice(secret.as_bytes());
                 ResolvedHeader::new(AUTHORIZATION, SecretBytes::from_owned(material))
             }
-            CredentialActionPlan::Basic {
-                username,
-                password_credential,
-            } => {
-                let password = self.resolve(password_credential)?;
+            ResolvedCredentialAction::Basic { username, source } => {
+                let password = self.resolve(*source)?;
                 let mut plain = Vec::with_capacity(username.len() + 1 + password.len());
                 plain.extend_from_slice(username.as_bytes());
                 plain.push(b':');
@@ -103,17 +196,16 @@ impl<'plan> CredentialBoundary<'plan> {
                 material.extend_from_slice(encoded.as_bytes());
                 ResolvedHeader::new(AUTHORIZATION, SecretBytes::from_owned(material))
             }
-            CredentialActionPlan::CustomHeader { header, credential } => {
-                ResolvedHeader::new(header.clone(), self.resolve(credential)?)
+            ResolvedCredentialAction::CustomHeader { header, source } => {
+                ResolvedHeader::new(header.clone(), self.resolve(*source)?)
             }
         }
     }
 
-    fn resolve(&self, id: &str) -> Result<SecretBytes, CredentialError> {
+    fn resolve(&self, index: CredentialSourceIndex) -> Result<SecretBytes, CredentialError> {
         let source = self
-            .plan
             .sources
-            .get(id)
+            .get(index.get())
             .ok_or(CredentialError::UnknownSource)?;
         match source {
             CredentialSourcePlan::Environment { variable } => {
@@ -128,6 +220,53 @@ impl<'plan> CredentialBoundary<'plan> {
             }
         }
     }
+
+    pub(crate) fn extract_inbound<'resolver>(
+        &'resolver self,
+        headers: &mut HeaderMap,
+    ) -> Result<InboundCredentials<'resolver>, CredentialError> {
+        InboundCredentials::extract(self, headers)
+    }
+}
+
+impl crate::runtime::CredentialResolver for CredentialResolverSnapshot {}
+
+impl CredentialActivation {
+    pub(crate) fn source_registry(&self) -> &CredentialSourceRegistry {
+        &self.source_registry
+    }
+
+    pub(crate) fn into_parts(self) -> (CredentialResolverSnapshot, CredentialSourceRegistry) {
+        (self.snapshot, self.source_registry)
+    }
+}
+
+impl std::ops::Deref for CredentialActivation {
+    type Target = CredentialResolverSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+fn activate_inbound(
+    inbound: InboundCredentialPlan,
+    provider_registry: &ProviderRegistry,
+) -> Result<InboundCredential, CredentialActivationError> {
+    let process_providers = inbound
+        .process_providers
+        .into_iter()
+        .map(|name| {
+            provider_registry
+                .get(&name)
+                .ok_or(CredentialActivationError::UnknownProcessProvider)
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_boxed_slice();
+    Ok(InboundCredential {
+        header: inbound.header,
+        process_providers,
+    })
 }
 
 #[cfg(unix)]
@@ -231,8 +370,9 @@ struct ResolvedHeader {
 
 impl ResolvedHeader {
     fn new(name: HeaderName, secret: SecretBytes) -> Result<Self, CredentialError> {
-        HeaderValue::from_bytes(secret.as_bytes())
-            .map_err(|_| CredentialError::InvalidHeaderValue)?;
+        if !valid_header_value_bytes(secret.as_bytes()) {
+            return Err(CredentialError::InvalidHeaderValue);
+        }
         Ok(Self {
             name,
             material: secret,
@@ -241,30 +381,36 @@ impl ResolvedHeader {
 
     fn inject(self, headers: &mut HeaderMap) {
         let mut value = HeaderValue::from_bytes(self.material.as_bytes())
-            .expect("staged credential header value remains valid");
+            .expect("staged credential bytes satisfy HeaderValue validation");
         value.set_sensitive(true);
         headers.insert(self.name, value);
     }
 }
 
+fn valid_header_value_bytes(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .all(|byte| *byte == b'\t' || (*byte >= 32 && *byte != 127))
+}
+
 /// Request-scoped inbound values removed from the ordinary request headers.
 ///
 /// Only the process-provider copy method can materialize captured values again.
-pub(crate) struct InboundCredentials<'plan> {
-    plan: &'plan CredentialsPlan,
-    captured: BTreeMap<String, SecretBytes>,
+pub(crate) struct InboundCredentials<'resolver> {
+    resolver: &'resolver CredentialResolverSnapshot,
+    captured: Box<[Option<SecretBytes>]>,
 }
 
-impl<'plan> InboundCredentials<'plan> {
-    pub(crate) fn extract(
-        plan: &'plan CredentialsPlan,
+impl<'resolver> InboundCredentials<'resolver> {
+    fn extract(
+        resolver: &'resolver CredentialResolverSnapshot,
         headers: &mut HeaderMap,
     ) -> Result<Self, CredentialError> {
-        let mut captured = BTreeMap::new();
+        let mut captured = Vec::with_capacity(resolver.inbound.len());
         let mut duplicated = false;
         let mut invalid = None;
 
-        for (id, inbound) in &plan.inbound {
+        for inbound in &resolver.inbound {
             let mut values: Vec<_> = headers
                 .get_all(&inbound.header)
                 .iter()
@@ -272,18 +418,21 @@ impl<'plan> InboundCredentials<'plan> {
                 .collect();
             headers.remove(&inbound.header);
 
-            match values.len() {
-                0 => {}
+            let captured_value = match values.len() {
+                0 => None,
                 1 => match values.pop().expect("one captured value") {
-                    Ok(value) => {
-                        captured.insert(id.clone(), value);
-                    }
+                    Ok(value) => Some(value),
                     Err(error) => {
                         invalid.get_or_insert(error);
+                        None
                     }
                 },
-                _ => duplicated = true,
-            }
+                _ => {
+                    duplicated = true;
+                    None
+                }
+            };
+            captured.push(captured_value);
         }
 
         if duplicated {
@@ -292,31 +441,36 @@ impl<'plan> InboundCredentials<'plan> {
         if let Some(error) = invalid {
             return Err(error);
         }
-        Ok(Self { plan, captured })
+        Ok(Self {
+            resolver,
+            captured: captured.into_boxed_slice(),
+        })
     }
 
-    pub(crate) fn is_present(&self, id: &str) -> bool {
-        self.captured.contains_key(id)
+    pub(crate) fn is_present(&self, header: &HeaderName) -> bool {
+        self.resolver
+            .inbound
+            .iter()
+            .zip(self.captured.iter())
+            .any(|(inbound, value)| inbound.header == *header && value.is_some())
     }
 
     /// Replaces authorized inbound headers in a process-only dispatch map.
     pub(crate) fn copy_for_process_provider(
         &self,
-        provider_id: &str,
+        provider: ProviderIndex,
         destination: &mut HeaderMap,
     ) -> Result<usize, CredentialError> {
-        for inbound in self.plan.inbound.values() {
+        for inbound in &self.resolver.inbound {
             destination.remove(&inbound.header);
         }
 
         let mut staged = Vec::new();
-        for (id, secret) in &self.captured {
-            let inbound = self
-                .plan
-                .inbound
-                .get(id)
-                .ok_or(CredentialError::SourceUnavailable)?;
-            if provider_is_authorized(inbound, provider_id) {
+        for (inbound, secret) in self.resolver.inbound.iter().zip(self.captured.iter()) {
+            if provider_is_authorized(inbound, provider) {
+                let Some(secret) = secret else {
+                    continue;
+                };
                 staged.push(ResolvedHeader::new(
                     inbound.header.clone(),
                     SecretBytes::from_owned(secret.as_bytes().to_vec()),
@@ -331,11 +485,8 @@ impl<'plan> InboundCredentials<'plan> {
     }
 }
 
-fn provider_is_authorized(inbound: &InboundCredentialPlan, provider_id: &str) -> bool {
-    inbound
-        .process_providers
-        .iter()
-        .any(|authorized| authorized == provider_id)
+fn provider_is_authorized(inbound: &InboundCredential, provider: ProviderIndex) -> bool {
+    inbound.process_providers.contains(&provider)
 }
 
 struct SecretBytes(Vec<u8>);
@@ -426,6 +577,20 @@ mod tests {
 
     use super::*;
 
+    fn credential_index(index: usize) -> CredentialSourceIndex {
+        let name = format!("index-{index:08}");
+        CredentialSourceRegistry::from_names((0..=index).map(|value| format!("index-{value:08}")))
+            .get(&name)
+            .unwrap()
+    }
+
+    fn provider_index(index: usize) -> ProviderIndex {
+        let name = format!("index-{index:08}");
+        ProviderRegistry::from_names((0..=index).map(|value| format!("index-{value:08}")))
+            .get(&name)
+            .unwrap()
+    }
+
     fn plan_with_sources(sources: BTreeMap<String, CredentialSourcePlan>) -> CredentialsPlan {
         CredentialsPlan {
             allowed_custom_headers: vec![HeaderName::from_static("x-api-key")],
@@ -450,10 +615,22 @@ mod tests {
         )]))
     }
 
-    fn custom_action() -> CredentialActionPlan {
-        CredentialActionPlan::CustomHeader {
+    fn activate(plan: CredentialsPlan) -> CredentialResolverSnapshot {
+        let provider_registry = ProviderRegistry::from_names(
+            plan.inbound
+                .values()
+                .flat_map(|inbound| inbound.process_providers.iter().cloned()),
+        );
+        CredentialResolverSnapshot::activate(plan, &provider_registry)
+            .unwrap()
+            .into_parts()
+            .0
+    }
+
+    fn custom_action() -> ResolvedCredentialAction {
+        ResolvedCredentialAction::CustomHeader {
             header: HeaderName::from_static("x-api-key"),
-            credential: "token".to_string(),
+            source: credential_index(0),
         }
     }
 
@@ -470,9 +647,9 @@ mod tests {
     fn environment_rotation_is_visible_and_destination_is_replaced() {
         const VARIABLE: &str = "ACL_PROXY_TEST_LATE_CREDENTIAL_ROTATION_7F19";
         let plan = environment_plan(VARIABLE);
-        let boundary = CredentialBoundary::new(&plan);
-        let actions = [CredentialActionPlan::Bearer {
-            credential: "token".to_string(),
+        let boundary = activate(plan);
+        let actions = [ResolvedCredentialAction::Bearer {
+            source: credential_index(0),
         }];
         let mut headers = HeaderMap::new();
         headers.append(AUTHORIZATION, HeaderValue::from_static("old-one"));
@@ -495,7 +672,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("credential");
         let plan = file_plan(path.clone());
-        let boundary = CredentialBoundary::new(&plan);
+        let boundary = activate(plan);
         let mut headers = HeaderMap::new();
 
         write_secure_file(&path, b"first\r\n");
@@ -520,25 +697,25 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("credential");
         let plan = file_plan(path.clone());
-        let boundary = CredentialBoundary::new(&plan);
+        let boundary = activate(plan);
 
         write_secure_file(&path, &vec![b'a'; MAX_CREDENTIAL_BYTES]);
-        boundary.resolve("token").unwrap();
+        boundary.resolve(credential_index(0)).unwrap();
 
         let mut maximum_with_crlf = vec![b'a'; MAX_CREDENTIAL_BYTES];
         maximum_with_crlf.extend_from_slice(b"\r\n");
         write_secure_file(&path, &maximum_with_crlf);
-        boundary.resolve("token").unwrap();
+        boundary.resolve(credential_index(0)).unwrap();
 
         write_secure_file(&path, &vec![b'a'; MAX_CREDENTIAL_BYTES + 1]);
         assert_eq!(
-            boundary.resolve("token").err(),
+            boundary.resolve(credential_index(0)).err(),
             Some(CredentialError::ValueTooLarge)
         );
 
         write_secure_file(&path, b"\n");
         assert_eq!(
-            boundary.resolve("token").err(),
+            boundary.resolve(credential_index(0)).err(),
             Some(CredentialError::EmptyValue)
         );
     }
@@ -594,9 +771,7 @@ mod tests {
         symlink(&target, &link).unwrap();
 
         assert_eq!(
-            CredentialBoundary::new(&file_plan(link))
-                .resolve("token")
-                .err(),
+            activate(file_plan(link)).resolve(credential_index(0)).err(),
             Some(CredentialError::SourceUnavailable)
         );
     }
@@ -612,8 +787,8 @@ mod tests {
         symlink(&real_parent, &linked_parent).unwrap();
 
         assert_eq!(
-            CredentialBoundary::new(&file_plan(linked_parent.join("credential")))
-                .resolve("token")
+            activate(file_plan(linked_parent.join("credential")))
+                .resolve(credential_index(0))
                 .err(),
             Some(CredentialError::SourceUnavailable)
         );
@@ -623,8 +798,8 @@ mod tests {
     #[test]
     fn relative_credential_source_is_rejected() {
         assert_eq!(
-            CredentialBoundary::new(&file_plan(PathBuf::from("credential")))
-                .resolve("token")
+            activate(file_plan(PathBuf::from("credential")))
+                .resolve(credential_index(0))
                 .err(),
             Some(CredentialError::SourceUnavailable)
         );
@@ -643,9 +818,7 @@ mod tests {
         assert_eq!(unsafe { libc::mkfifo(path_bytes.as_ptr(), 0o600) }, 0);
 
         assert_eq!(
-            CredentialBoundary::new(&file_plan(path))
-                .resolve("token")
-                .err(),
+            activate(file_plan(path)).resolve(credential_index(0)).err(),
             Some(CredentialError::SourceUnavailable)
         );
     }
@@ -659,9 +832,7 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
 
         assert_eq!(
-            CredentialBoundary::new(&file_plan(path))
-                .resolve("token")
-                .err(),
+            activate(file_plan(path)).resolve(credential_index(0)).err(),
             Some(CredentialError::SourceUnavailable)
         );
     }
@@ -688,7 +859,7 @@ mod tests {
         let replacement = directory.path().join("credential.new");
         write_secure_file(&path, b"first");
         let plan = file_plan(path.clone());
-        let boundary = CredentialBoundary::new(&plan);
+        let boundary = activate(plan);
         let mut headers = HeaderMap::new();
 
         boundary.inject(&[custom_action()], &mut headers).unwrap();
@@ -721,24 +892,43 @@ mod tests {
             ),
         ]));
         let actions = [
-            CredentialActionPlan::CustomHeader {
+            ResolvedCredentialAction::CustomHeader {
                 header: HeaderName::from_static("x-first-secret"),
-                credential: "good".to_string(),
+                source: credential_index(1),
             },
-            CredentialActionPlan::CustomHeader {
+            ResolvedCredentialAction::CustomHeader {
                 header: HeaderName::from_static("x-second-secret"),
-                credential: "bad".to_string(),
+                source: credential_index(0),
             },
         ];
         let mut headers = HeaderMap::new();
+        headers.insert("x-first-secret", HeaderValue::from_static("existing"));
+        headers.insert("x-unrelated", HeaderValue::from_static("retained"));
+        let original = headers.clone();
 
         assert_eq!(
-            CredentialBoundary::new(&plan).inject(&actions, &mut headers),
+            activate(plan).inject(&actions, &mut headers),
             Err(CredentialError::InvalidHeaderValue)
         );
-        assert!(headers.is_empty());
+        assert_eq!(headers, original);
         env::remove_var(GOOD);
         env::remove_var(BAD);
+    }
+
+    #[test]
+    fn allocation_free_header_validation_matches_http_for_every_byte() {
+        assert_eq!(
+            valid_header_value_bytes(b""),
+            HeaderValue::from_bytes(b"").is_ok()
+        );
+        for byte in 0u8..=u8::MAX {
+            let value = [byte];
+            assert_eq!(
+                valid_header_value_bytes(&value),
+                HeaderValue::from_bytes(&value).is_ok(),
+                "byte {byte}"
+            );
+        }
     }
 
     #[test]
@@ -746,14 +936,14 @@ mod tests {
         const VARIABLE: &str = "ACL_PROXY_TEST_LATE_CREDENTIAL_TYPED_A53E";
         env::set_var(VARIABLE, "password");
         let plan = environment_plan(VARIABLE);
-        let boundary = CredentialBoundary::new(&plan);
+        let boundary = activate(plan);
         let mut headers = HeaderMap::new();
 
         boundary
             .inject(
-                &[CredentialActionPlan::Basic {
+                &[ResolvedCredentialAction::Basic {
                     username: "buildbot".to_string(),
-                    password_credential: "token".to_string(),
+                    source: credential_index(0),
                 }],
                 &mut headers,
             )
@@ -777,21 +967,139 @@ mod tests {
         env::set_var(VARIABLE, SECRET);
         let plan = environment_plan(VARIABLE);
         let mut headers = HeaderMap::new();
-        CredentialBoundary::new(&plan)
-            .inject(&[custom_action()], &mut headers)
-            .unwrap();
+        let boundary = activate(plan);
+        boundary.inject(&[custom_action()], &mut headers).unwrap();
 
         let header_debug = format!("{headers:?}");
         assert!(!header_debug.contains(SECRET));
         assert!(header_debug.contains("Sensitive"));
 
         env::remove_var(VARIABLE);
-        let error = CredentialBoundary::new(&plan)
+        let error = boundary
             .inject(&[custom_action()], &mut headers)
             .unwrap_err();
         let error_text = format!("{error:?} {error}");
         assert!(!error_text.contains(VARIABLE));
         assert!(!error_text.contains(SECRET));
+    }
+
+    #[test]
+    fn action_binding_consumes_source_name_and_keeps_only_its_index() {
+        let marker = "logical-source-marker";
+        let registry = CredentialSourceRegistry::from_names([marker.to_string()]);
+        let action = resolve_credential_action(
+            CredentialActionPlan::CustomHeader {
+                header: HeaderName::from_static("x-api-key"),
+                credential: marker.to_string(),
+            },
+            &registry,
+        )
+        .unwrap();
+
+        assert_eq!(
+            action,
+            ResolvedCredentialAction::CustomHeader {
+                header: HeaderName::from_static("x-api-key"),
+                source: registry.get(marker).unwrap(),
+            }
+        );
+        assert!(!format!("{action:?}").contains(marker));
+        let error = resolve_credential_action(
+            CredentialActionPlan::Bearer {
+                credential: marker.to_string(),
+            },
+            &CredentialSourceRegistry::from_names([]),
+        )
+        .unwrap_err();
+        assert_eq!(error, CredentialBindingError::UnknownSource);
+        assert!(!format!("{error:?} {error}").contains(marker));
+    }
+
+    #[test]
+    fn activation_derives_canonical_source_order_without_reading_material() {
+        const FIRST: &str = "ACL_PROXY_TEST_ACTIVATION_FIRST_6CB7";
+        const SECOND: &str = "ACL_PROXY_TEST_ACTIVATION_SECOND_6CB7";
+        env::remove_var(FIRST);
+        env::remove_var(SECOND);
+        let plan = plan_with_sources(BTreeMap::from([
+            (
+                "alpha".to_string(),
+                CredentialSourcePlan::Environment {
+                    variable: FIRST.to_string(),
+                },
+            ),
+            (
+                "omega".to_string(),
+                CredentialSourcePlan::Environment {
+                    variable: SECOND.to_string(),
+                },
+            ),
+        ]));
+        let reversed =
+            CredentialSourceRegistry::from_names(["omega".to_string(), "alpha".to_string()]);
+        let activation =
+            CredentialResolverSnapshot::activate(plan, &ProviderRegistry::from_names([]))
+                .expect("activation must not read credential material");
+        assert_eq!(
+            activation.source_registry().get("alpha"),
+            reversed.get("alpha")
+        );
+        assert_eq!(
+            activation.source_registry().get("omega"),
+            reversed.get("omega")
+        );
+        let (resolver, source_registry) = activation.into_parts();
+        assert_eq!(resolver.source_count(), 2);
+        assert_eq!(
+            resolver
+                .inject(
+                    &[ResolvedCredentialAction::Bearer {
+                        source: source_registry.get("alpha").unwrap(),
+                    }],
+                    &mut HeaderMap::new(),
+                )
+                .unwrap_err(),
+            CredentialError::SourceUnavailable
+        );
+
+        env::set_var(FIRST, "first-value");
+        env::set_var(SECOND, "second-value");
+        let mut headers = HeaderMap::new();
+        resolver
+            .inject(
+                &[
+                    ResolvedCredentialAction::CustomHeader {
+                        header: HeaderName::from_static("x-first"),
+                        source: source_registry.get("alpha").unwrap(),
+                    },
+                    ResolvedCredentialAction::CustomHeader {
+                        header: HeaderName::from_static("x-second"),
+                        source: source_registry.get("omega").unwrap(),
+                    },
+                ],
+                &mut headers,
+            )
+            .unwrap();
+        assert_eq!(headers.get("x-first").unwrap(), "first-value");
+        assert_eq!(headers.get("x-second").unwrap(), "second-value");
+        env::remove_var(FIRST);
+        env::remove_var(SECOND);
+    }
+
+    #[test]
+    fn resolver_rejects_an_index_from_a_different_registry_domain_size() {
+        let resolver = activate(environment_plan("UNUSED_SOURCE"));
+        assert_eq!(
+            resolver
+                .inject(
+                    &[ResolvedCredentialAction::Bearer {
+                        source: credential_index(1),
+                    }],
+                    &mut HeaderMap::new(),
+                )
+                .unwrap_err(),
+            CredentialError::UnknownSource
+        );
     }
 
     fn inbound_plan() -> CredentialsPlan {
@@ -811,21 +1119,22 @@ mod tests {
     #[test]
     fn inbound_credentials_are_removed_and_only_copied_to_authorized_processes() {
         let plan = inbound_plan();
+        let resolver = activate(plan);
         let mut request_headers = HeaderMap::new();
         request_headers.insert(
             "x-identity-token",
             HeaderValue::from_static("identity-secret"),
         );
 
-        let inbound = InboundCredentials::extract(&plan, &mut request_headers).unwrap();
+        let inbound = resolver.extract_inbound(&mut request_headers).unwrap();
         assert!(!request_headers.contains_key("x-identity-token"));
-        assert!(inbound.is_present("identity"));
+        assert!(inbound.is_present(&HeaderName::from_static("x-identity-token")));
 
         let mut provider_headers = HeaderMap::new();
         provider_headers.insert("x-identity-token", HeaderValue::from_static("spoofed"));
         assert_eq!(
             inbound
-                .copy_for_process_provider("webhook-or-other-process", &mut provider_headers)
+                .copy_for_process_provider(provider_index(1), &mut provider_headers)
                 .unwrap(),
             0
         );
@@ -833,7 +1142,7 @@ mod tests {
 
         assert_eq!(
             inbound
-                .copy_for_process_provider("gitlab", &mut provider_headers)
+                .copy_for_process_provider(provider_index(0), &mut provider_headers)
                 .unwrap(),
             1
         );
@@ -857,13 +1166,14 @@ mod tests {
                 process_providers: vec!["gitlab".to_string()],
             },
         );
+        let resolver = activate(plan);
         let mut headers = HeaderMap::new();
         headers.append("x-identity-token", HeaderValue::from_static("one"));
         headers.append("x-identity-token", HeaderValue::from_static("two"));
         headers.insert("x-secondary-token", HeaderValue::from_static("also-secret"));
 
         assert_eq!(
-            InboundCredentials::extract(&plan, &mut headers).err(),
+            resolver.extract_inbound(&mut headers).err(),
             Some(CredentialError::DuplicateInboundHeader)
         );
         assert!(!headers.contains_key("x-identity-token"));
@@ -880,15 +1190,51 @@ mod tests {
                 process_providers: vec!["gitlab".to_string()],
             },
         );
+        let resolver = activate(plan);
         let mut headers = HeaderMap::new();
         headers.insert("x-identity-token", HeaderValue::from_static(""));
         headers.insert("x-secondary-token", HeaderValue::from_static("also-secret"));
 
         assert_eq!(
-            InboundCredentials::extract(&plan, &mut headers).err(),
+            resolver.extract_inbound(&mut headers).err(),
             Some(CredentialError::EmptyValue)
         );
         assert!(!headers.contains_key("x-identity-token"));
         assert!(!headers.contains_key("x-secondary-token"));
+    }
+
+    #[test]
+    fn multiple_inbound_credentials_keep_index_alignment() {
+        let mut plan = inbound_plan();
+        plan.inbound.insert(
+            "secondary".to_string(),
+            InboundCredentialPlan {
+                header: HeaderName::from_static("x-secondary-token"),
+                process_providers: vec!["gitlab".to_string()],
+            },
+        );
+        let resolver = activate(plan);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-secondary-token",
+            HeaderValue::from_static("secondary-secret"),
+        );
+
+        let inbound = resolver.extract_inbound(&mut headers).unwrap();
+
+        assert!(!inbound.is_present(&HeaderName::from_static("x-identity-token")));
+        assert!(inbound.is_present(&HeaderName::from_static("x-secondary-token")));
+        let mut provider_headers = HeaderMap::new();
+        assert_eq!(
+            inbound
+                .copy_for_process_provider(provider_index(0), &mut provider_headers)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            provider_headers.get("x-secondary-token").unwrap(),
+            "secondary-secret"
+        );
+        assert!(!provider_headers.contains_key("x-identity-token"));
     }
 }
