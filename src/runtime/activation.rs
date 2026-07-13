@@ -62,6 +62,16 @@ impl ActivationCancellation {
             Ok(())
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        Self::new()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel_for_test(&self) {
+        self.cancel();
+    }
 }
 
 pub(crate) trait CandidateSource: Send + Sync {

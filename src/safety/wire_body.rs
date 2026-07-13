@@ -278,6 +278,15 @@ impl HttpWireBodyGuard {
         }
     }
 
+    pub(crate) fn stream_scratch(&self) -> Result<GuardedScratch, WireBodyBufferError> {
+        let (chunk, charged_bytes) = allocate_secret_chunk(&self.inner)?;
+        Ok(GuardedScratch {
+            guard: self.inner.clone(),
+            chunk,
+            charged_bytes,
+        })
+    }
+
     pub(crate) fn live_bytes(&self) -> usize {
         self.inner.live_bytes.load(Ordering::Acquire)
     }
@@ -408,35 +417,10 @@ impl GuardedBodyBuilder {
     }
 
     fn try_allocate_chunk(&mut self) -> Result<(), WireBodyBufferError> {
-        let allocation_bytes = MAX_BUFFER_GROWTH_BYTES
-            .checked_add(std::mem::size_of::<SecretChunk>())
-            .ok_or(WireBodyBufferError::CursorPeakExceeded)?;
-        self.guard.try_charge(allocation_bytes)?;
-        let mut charge = PendingCharge {
-            guard: self.guard.clone(),
-            bytes: allocation_bytes,
-        };
-        #[cfg(test)]
-        if self.guard.pool.take_allocation_failure() {
-            return Err(WireBodyBufferError::AllocationFailed);
-        }
-        let mut bytes = FallibleBox::<[u8]>::try_new_uninit_slice(MAX_BUFFER_GROWTH_BYTES)
-            .map_err(|_| WireBodyBufferError::AllocationFailed)?;
-        for byte in bytes.iter_mut() {
-            byte.write(0);
-        }
-        // Every element was initialized to zero above.
-        let bytes = unsafe { bytes.assume_init() };
-        let chunk = FallibleBox::try_new(SecretChunk {
-            bytes,
-            initialized: 0,
-            next: None,
-        })
-        .map_err(|_| WireBodyBufferError::AllocationFailed)?;
-        let mut chunk = chunk;
+        let (mut chunk, charged_bytes) = allocate_secret_chunk(&self.guard)?;
         chunk.next = self.reverse.take();
         self.reverse = Some(chunk);
-        self.charged_bytes += charge.commit();
+        self.charged_bytes += charged_bytes;
         Ok(())
     }
 
@@ -455,6 +439,63 @@ impl GuardedBodyBuilder {
             len: self.len,
             charged_bytes: std::mem::take(&mut self.charged_bytes),
         }
+    }
+}
+
+pub(crate) struct GuardedScratch {
+    guard: Arc<GuardInner>,
+    chunk: FallibleBox<SecretChunk>,
+    charged_bytes: usize,
+}
+
+impl GuardedScratch {
+    pub(crate) fn capacity(&self) -> usize {
+        self.chunk.bytes.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.chunk.initialized == 0
+    }
+
+    pub(crate) fn remaining(&self) -> usize {
+        self.capacity() - self.chunk.initialized
+    }
+
+    pub(crate) fn extend_from_slice(&mut self, input: &[u8]) -> usize {
+        self.chunk.extend_from_slice(input)
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        self.chunk.initialized()
+    }
+
+    pub(crate) fn reset(&mut self) {
+        let initialized = self.chunk.initialized;
+        self.chunk.bytes[..initialized].zeroize();
+        self.chunk.initialized = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_zeroed_for_test(&self) -> bool {
+        self.chunk.bytes.iter().all(|byte| *byte == 0)
+    }
+}
+
+impl fmt::Debug for GuardedScratch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuardedScratch")
+            .field("capacity", &self.capacity())
+            .field("initialized", &self.chunk.initialized)
+            .field("charged_bytes", &self.charged_bytes)
+            .finish()
+    }
+}
+
+impl Drop for GuardedScratch {
+    fn drop(&mut self) {
+        self.reset();
+        self.guard.release(std::mem::take(&mut self.charged_bytes));
     }
 }
 
@@ -528,6 +569,37 @@ impl<'a> Iterator for GuardedBodySegments<'a> {
 struct PendingCharge {
     guard: Arc<GuardInner>,
     bytes: usize,
+}
+
+fn allocate_secret_chunk(
+    guard: &Arc<GuardInner>,
+) -> Result<(FallibleBox<SecretChunk>, usize), WireBodyBufferError> {
+    let allocation_bytes = MAX_BUFFER_GROWTH_BYTES
+        .checked_add(std::mem::size_of::<SecretChunk>())
+        .ok_or(WireBodyBufferError::CursorPeakExceeded)?;
+    guard.try_charge(allocation_bytes)?;
+    let mut charge = PendingCharge {
+        guard: guard.clone(),
+        bytes: allocation_bytes,
+    };
+    #[cfg(test)]
+    if guard.pool.take_allocation_failure() {
+        return Err(WireBodyBufferError::AllocationFailed);
+    }
+    let mut bytes = FallibleBox::<[u8]>::try_new_uninit_slice(MAX_BUFFER_GROWTH_BYTES)
+        .map_err(|_| WireBodyBufferError::AllocationFailed)?;
+    for byte in bytes.iter_mut() {
+        byte.write(0);
+    }
+    // Every element was initialized to zero above.
+    let bytes = unsafe { bytes.assume_init() };
+    let chunk = FallibleBox::try_new(SecretChunk {
+        bytes,
+        initialized: 0,
+        next: None,
+    })
+    .map_err(|_| WireBodyBufferError::AllocationFailed)?;
+    Ok((chunk, charge.commit()))
 }
 
 impl PendingCharge {
@@ -604,6 +676,47 @@ mod linked_tests {
 
     fn body_bytes(body: &GuardedBody) -> Vec<u8> {
         body.segments().flatten().copied().collect()
+    }
+
+    #[test]
+    fn stream_scratch_has_one_exact_reusable_charge() {
+        let one = allocation(1);
+        let pool = WireBodyPool::new(one, one);
+        let guard = pool.begin(one, key());
+        let mut scratch = guard.stream_scratch().unwrap();
+
+        assert_eq!(scratch.capacity(), MAX_BUFFER_GROWTH_BYTES);
+        assert_eq!(guard.live_bytes(), one);
+        assert_eq!(pool.global_charge(), one);
+        assert_eq!(
+            scratch.extend_from_slice(&vec![0xa5; MAX_BUFFER_GROWTH_BYTES]),
+            MAX_BUFFER_GROWTH_BYTES
+        );
+        assert_eq!(scratch.remaining(), 0);
+        scratch.reset();
+        assert!(scratch.is_empty());
+        assert!(scratch.chunk.bytes.iter().all(|byte| *byte == 0));
+        assert_eq!(guard.live_bytes(), one);
+
+        assert_eq!(scratch.extend_from_slice(b"reused"), 6);
+        drop(scratch);
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+    }
+
+    #[test]
+    fn stream_scratch_allocation_failure_restores_every_charge() {
+        let one = allocation(1);
+        let pool = WireBodyPool::new(one, one);
+        let guard = pool.begin(one, key());
+        pool.fail_next_allocation();
+
+        assert!(matches!(
+            guard.stream_scratch(),
+            Err(WireBodyBufferError::AllocationFailed)
+        ));
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
     }
 
     #[test]

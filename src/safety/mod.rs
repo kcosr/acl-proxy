@@ -300,9 +300,11 @@ authorization_provider = "approval"
         .expect("test config compiles");
         let plan = compiled.reloadable_plan;
         assert_eq!(
-            plan.resource_plan.http_wire_body_peak_bytes_by_cursor,
-            [0, 0]
+            plan.resource_plan.http_wire_body_peak_bytes_by_cursor.len(),
+            2
         );
+        assert!(plan.resource_plan.http_wire_body_peak_bytes_by_cursor[0] > 0);
+        assert_eq!(plan.resource_plan.http_wire_body_peak_bytes_by_cursor[1], 0);
 
         let providers = ProviderRegistry::from_names(plan.authorization.providers.into_keys());
         let policy_activation = CompiledPolicySnapshot::activate(

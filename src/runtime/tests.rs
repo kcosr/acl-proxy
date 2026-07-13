@@ -15,7 +15,23 @@ struct EmptySnapshot;
 
 impl PolicySnapshot for EmptySnapshot {}
 impl EgressSnapshot for EmptySnapshot {}
-impl AuthorizationSnapshot for EmptySnapshot {}
+impl AuthorizationSnapshot for EmptySnapshot {
+    fn dispatch<'a>(
+        &'a self,
+        _provider: ProviderIndex,
+        _request: crate::authorization::protocol::ProviderRequest<'a>,
+        _guard: crate::safety::HttpWireBodyGuard,
+        _request_deadline: tokio::time::Instant,
+    ) -> BoxFuture<
+        'a,
+        Result<
+            crate::authorization::AuthorizationDecision,
+            crate::authorization::AuthorizationDispatchError,
+        >,
+    > {
+        Box::pin(async { Err(crate::authorization::AuthorizationDispatchError::UnknownProvider) })
+    }
+}
 impl CredentialResolver for EmptySnapshot {}
 impl RedactionSnapshot for EmptySnapshot {}
 impl ObservationSnapshot for EmptySnapshot {}

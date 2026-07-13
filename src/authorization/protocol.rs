@@ -2,12 +2,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 #[cfg(test)]
 use std::io::Read;
-use std::io::Write;
+use std::io::{self, Write};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 #[cfg(test)]
 use base64::read::DecoderReader;
+use base64::Engine as _;
 use http::{HeaderName, HeaderValue};
 #[cfg(test)]
 use serde::de::{IgnoredAny, MapAccess, Visitor};
@@ -15,10 +18,12 @@ use serde::ser::{SerializeMap, SerializeSeq};
 #[cfg(test)]
 use serde::{Deserialize, Deserializer};
 use serde::{Serialize, Serializer};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
-use zeroize::Zeroize;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::process::ChildStdout;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::config::v3_compile::ProviderOutputPlan;
+use crate::safety::wire_body::GuardedScratch;
 use crate::safety::{GuardedBody, HttpWireBodyGuard};
 
 #[cfg(test)]
@@ -237,14 +242,33 @@ pub(crate) struct ProviderRequestHeaders<'a> {
     fields: &'a [IncludedHeader<'a>],
 }
 
+const MAX_INCLUDED_HEADER_VALUE_BYTES: usize = 64 * 1024;
+const MAX_INCLUDED_HEADERS_BYTES: usize = 1024 * 1024;
+const MAX_PROVIDER_REQUEST_ID_BYTES: usize = 4096;
+
 impl<'a> ProviderRequestHeaders<'a> {
     pub(crate) fn new(fields: &'a [IncludedHeader<'a>]) -> Result<Self, RequestShapeError> {
         let mut names = BTreeSet::new();
+        let mut aggregate_bytes = 0usize;
         for field in fields {
             if field.values.is_empty()
                 || !names.insert(field.name.as_str())
                 || field.values.iter().any(|value| value.to_str().is_err())
             {
+                return Err(RequestShapeError::InvalidHeaders);
+            }
+            aggregate_bytes = aggregate_bytes
+                .checked_add(field.name.as_str().len())
+                .ok_or(RequestShapeError::InvalidHeaders)?;
+            for value in field.values {
+                if value.as_bytes().len() > MAX_INCLUDED_HEADER_VALUE_BYTES {
+                    return Err(RequestShapeError::InvalidHeaders);
+                }
+                aggregate_bytes = aggregate_bytes
+                    .checked_add(value.as_bytes().len())
+                    .ok_or(RequestShapeError::InvalidHeaders)?;
+            }
+            if aggregate_bytes > MAX_INCLUDED_HEADERS_BYTES {
                 return Err(RequestShapeError::InvalidHeaders);
             }
         }
@@ -292,7 +316,7 @@ pub(crate) struct GuardedProviderBody<'a> {
 }
 
 pub(crate) struct ProviderRequest<'a> {
-    pub(crate) id: &'a str,
+    pub(crate) request_id: &'a str,
     pub(crate) url: &'a str,
     pub(crate) method: &'a str,
     pub(crate) client_ip: &'a str,
@@ -301,11 +325,17 @@ pub(crate) struct ProviderRequest<'a> {
 }
 
 impl ProviderRequest<'_> {
-    pub(crate) fn write_compact(&self, mut writer: impl Write) -> Result<(), RequestShapeError> {
-        self.prevalidate()?;
+    pub(crate) fn write_compact(
+        &self,
+        correlation_id: &str,
+        mut writer: impl Write,
+    ) -> Result<(), RequestShapeError> {
+        self.prevalidate(correlation_id)?;
 
         writer.write_all(b"{\"id\":")?;
-        write_json_string(&mut writer, self.id)?;
+        write_json_string(&mut writer, correlation_id)?;
+        writer.write_all(b",\"requestId\":")?;
+        write_json_string(&mut writer, self.request_id)?;
         writer.write_all(b",\"type\":\"request\",\"url\":")?;
         write_json_string(&mut writer, self.url)?;
         writer.write_all(b",\"method\":")?;
@@ -335,7 +365,82 @@ impl ProviderRequest<'_> {
         Ok(())
     }
 
-    fn prevalidate(&self) -> Result<(), RequestShapeError> {
+    pub(crate) async fn stream_before_commit<W>(
+        &self,
+        correlation_id: &str,
+        writer: &mut W,
+        scratch: &mut GuardedScratch,
+    ) -> Result<ProviderRequestCommit, RequestStreamError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        self.prevalidate(correlation_id)
+            .map_err(RequestStreamError::Shape)?;
+        let mut writer = ScratchAsyncWriter { writer, scratch };
+
+        writer.write_all(b"{\"id\":").await?;
+        write_json_string_async(&mut writer, correlation_id).await?;
+        writer.write_all(b",\"requestId\":").await?;
+        write_json_string_async(&mut writer, self.request_id).await?;
+        writer.write_all(b",\"type\":\"request\",\"url\":").await?;
+        write_json_string_async(&mut writer, self.url).await?;
+        writer.write_all(b",\"method\":").await?;
+        write_json_string_async(&mut writer, self.method).await?;
+        writer.write_all(b",\"clientIp\":").await?;
+        write_json_string_async(&mut writer, self.client_ip).await?;
+        if let Some(headers) = self.headers.filter(|headers| !headers.is_empty()) {
+            writer.write_all(b",\"headers\":{").await?;
+            for (field_index, field) in headers.fields.iter().enumerate() {
+                if field_index != 0 {
+                    writer.write_all(b",").await?;
+                }
+                write_json_string_async(&mut writer, field.name.as_str()).await?;
+                writer.write_all(b":[").await?;
+                for (value_index, value) in field.values.iter().enumerate() {
+                    if value_index != 0 {
+                        writer.write_all(b",").await?;
+                    }
+                    let value = value.to_str().map_err(|_| {
+                        RequestStreamError::Shape(RequestShapeError::InvalidHeaders)
+                    })?;
+                    write_json_string_async(&mut writer, value).await?;
+                }
+                writer.write_all(b"]").await?;
+            }
+            writer.write_all(b"}").await?;
+        }
+        if let Some(body) = &self.body {
+            writer
+                .write_all(b",\"body\":{\"encoding\":\"base64\"")
+                .await?;
+            if let Some(content_type) = body.content_type {
+                writer.write_all(b",\"contentType\":").await?;
+                write_json_string_async(&mut writer, content_type).await?;
+            }
+            if let Some(content_encoding) = body.content_encoding {
+                writer.write_all(b",\"contentEncoding\":").await?;
+                write_json_string_async(&mut writer, content_encoding).await?;
+            }
+            writer.write_all(b",\"data\":\"").await?;
+            write_base64_async(&mut writer, body.decoded).await?;
+            writer.write_all(b"\"}").await?;
+        }
+        writer.write_all(b"}").await?;
+        writer.flush().await?;
+        Ok(ProviderRequestCommit { _private: () })
+    }
+
+    fn prevalidate(&self, correlation_id: &str) -> Result<(), RequestShapeError> {
+        if self.request_id.is_empty() || self.request_id.len() > MAX_PROVIDER_REQUEST_ID_BYTES {
+            return Err(RequestShapeError::InvalidRequestId);
+        }
+        if correlation_id.len() != PROCESS_PROVIDER_CORRELATION_ID_BYTES
+            || correlation_id
+                .bytes()
+                .any(|byte| matches!(byte, b'\\' | b'"' | 0..=31 | 127..=u8::MAX))
+        {
+            return Err(RequestShapeError::InvalidRequestId);
+        }
         if let Some(headers) = self.headers {
             ProviderRequestHeaders::new(headers.fields)?;
         }
@@ -345,6 +450,159 @@ impl ProviderRequest<'_> {
         }
         Ok(())
     }
+}
+
+pub(crate) struct ProviderRequestCommit {
+    _private: (),
+}
+
+impl ProviderRequestCommit {
+    pub(crate) async fn commit<W>(self, writer: &mut W) -> io::Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        writer.write_all(b"\n").await?;
+        writer.flush().await
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RequestStreamError {
+    #[error("process-provider request shape is invalid")]
+    Shape(RequestShapeError),
+    #[error("process-provider stdin write failed")]
+    Io(#[source] io::Error),
+}
+
+impl From<io::Error> for RequestStreamError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+struct ScratchAsyncWriter<'writer, W> {
+    writer: &'writer mut W,
+    scratch: &'writer mut GuardedScratch,
+}
+
+impl<W> Drop for ScratchAsyncWriter<'_, W> {
+    fn drop(&mut self) {
+        self.scratch.reset();
+    }
+}
+
+impl<W> ScratchAsyncWriter<'_, W>
+where
+    W: AsyncWrite + Unpin,
+{
+    async fn write_all(&mut self, mut bytes: &[u8]) -> io::Result<()> {
+        while !bytes.is_empty() {
+            if self.scratch.remaining() == 0 {
+                self.flush().await?;
+            }
+            let copied = self.scratch.extend_from_slice(bytes);
+            bytes = &bytes[copied..];
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self) -> io::Result<()> {
+        if !self.scratch.is_empty() {
+            let result = self.writer.write_all(self.scratch.as_slice()).await;
+            self.scratch.reset();
+            result?;
+        }
+        Ok(())
+    }
+}
+
+async fn write_json_string_async<W>(
+    writer: &mut ScratchAsyncWriter<'_, W>,
+    value: &str,
+) -> Result<(), RequestStreamError>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer.write_all(b"\"").await?;
+    let mut run_start = 0;
+    for (index, byte) in value.bytes().enumerate() {
+        let escape = match byte {
+            b'"' => Some(b"\\\"".as_slice()),
+            b'\\' => Some(b"\\\\".as_slice()),
+            b'\x08' => Some(b"\\b".as_slice()),
+            b'\x0c' => Some(b"\\f".as_slice()),
+            b'\n' => Some(b"\\n".as_slice()),
+            b'\r' => Some(b"\\r".as_slice()),
+            b'\t' => Some(b"\\t".as_slice()),
+            0..=31 => None,
+            _ => continue,
+        };
+        writer
+            .write_all(&value.as_bytes()[run_start..index])
+            .await?;
+        if let Some(escape) = escape {
+            writer.write_all(escape).await?;
+        } else {
+            let escaped = Zeroizing::new([
+                b'\\',
+                b'u',
+                b'0',
+                b'0',
+                hex_digit(byte >> 4),
+                hex_digit(byte & 0x0f),
+            ]);
+            writer.write_all(&escaped[..]).await?;
+        }
+        run_start = index + 1;
+    }
+    writer.write_all(&value.as_bytes()[run_start..]).await?;
+    writer.write_all(b"\"").await?;
+    Ok(())
+}
+
+fn hex_digit(nibble: u8) -> u8 {
+    match nibble {
+        0..=9 => b'0' + nibble,
+        _ => b'a' + nibble - 10,
+    }
+}
+
+async fn write_base64_async<W>(
+    writer: &mut ScratchAsyncWriter<'_, W>,
+    decoded: &GuardedBody,
+) -> Result<(), RequestStreamError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut triple = Zeroizing::new([0u8; 3]);
+    let mut triple_len = 0;
+    let result = async {
+        for segment in decoded.segments() {
+            for byte in segment {
+                triple[triple_len] = *byte;
+                triple_len += 1;
+                if triple_len == triple.len() {
+                    let mut encoded = Zeroizing::new([0u8; 4]);
+                    BASE64_STANDARD
+                        .encode_slice(&triple[..], &mut encoded[..])
+                        .expect("four output bytes fit one base64 quantum");
+                    writer.write_all(&encoded[..]).await?;
+                    triple_len = 0;
+                }
+            }
+        }
+        if triple_len != 0 {
+            let mut encoded = Zeroizing::new([0u8; 4]);
+            let encoded_len = BASE64_STANDARD
+                .encode_slice(&triple[..triple_len], &mut encoded[..])
+                .expect("four output bytes fit one base64 quantum");
+            let result = writer.write_all(&encoded[..encoded_len]).await;
+            result?;
+        }
+        Ok(())
+    }
+    .await;
+    result
 }
 
 fn write_json_string(writer: impl Write, value: &str) -> Result<(), RequestShapeError> {
@@ -365,6 +623,7 @@ fn write_base64_stream(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RequestShapeError {
+    InvalidRequestId,
     InvalidHeaders,
     InvalidBodyMetadata,
     Serialization,
@@ -376,7 +635,39 @@ impl From<std::io::Error> for RequestShapeError {
     }
 }
 
+pub(crate) const PROCESS_PROVIDER_CORRELATION_ID_BYTES: usize = 34;
+pub(crate) const PROCESS_PROVIDER_RESPONSE_PREFIX_BYTES: usize =
+    br#"{"id":""#.len() + PROCESS_PROVIDER_CORRELATION_ID_BYTES + 1;
+pub(crate) const PROCESS_PROVIDER_RESPONSE_TERMINATOR_BYTES: usize = 1;
+pub(crate) const PROCESS_PROVIDER_MIN_DECISION_RESPONSE_BYTES: usize =
+    PROCESS_PROVIDER_RESPONSE_PREFIX_BYTES
+        + br#","type":"response","decision":"pass"}"#.len()
+        + PROCESS_PROVIDER_RESPONSE_TERMINATOR_BYTES;
 const MAX_RESPONSE_ID_PREFIX_BYTES: usize = 4096;
+
+const _: () = assert!(PROCESS_PROVIDER_RESPONSE_PREFIX_BYTES <= MAX_RESPONSE_ID_PREFIX_BYTES);
+
+/// Unbuffered child stdout. Keeping construction at the authorization owner
+/// prevents a prefetching reader from crossing the request-assignment boundary.
+pub(super) struct DirectProviderStdout {
+    inner: ChildStdout,
+}
+
+impl DirectProviderStdout {
+    pub(super) fn new(inner: ChildStdout) -> Self {
+        Self { inner }
+    }
+}
+
+impl AsyncRead for DirectProviderStdout {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(context, buffer)
+    }
+}
 
 pub(crate) struct ProviderResponseContinuation {
     id: String,
@@ -408,15 +699,34 @@ pub(crate) enum ResponsePrefixError {
     Io(#[source] std::io::Error),
 }
 
-/// Reads only the first `id` member and the following comma. The supervisor
-/// must match that ID to a pending request and supply its body guard before any
-/// continuation bytes are consumed.
-pub(crate) async fn read_provider_response_prefix<R>(
+/// Reads only the first `id` member through its closing quote. The supervisor
+/// must match that ID to a pending request and supply its body guard before the
+/// delimiter or any continuation bytes are consumed. The direct stdout reader
+/// must not be wrapped in a prefetching buffer.
+pub(super) async fn read_provider_response_prefix(
+    reader: &mut DirectProviderStdout,
+    max_line_bytes: usize,
+) -> Result<Option<ProviderResponseContinuation>, ResponsePrefixError> {
+    read_provider_response_prefix_from(reader, max_line_bytes).await
+}
+
+#[cfg(test)]
+pub(super) async fn read_provider_response_prefix_for_test<R>(
     reader: &mut R,
     max_line_bytes: usize,
 ) -> Result<Option<ProviderResponseContinuation>, ResponsePrefixError>
 where
-    R: AsyncBufRead + Unpin,
+    R: AsyncRead + Unpin,
+{
+    read_provider_response_prefix_from(reader, max_line_bytes).await
+}
+
+async fn read_provider_response_prefix_from<R>(
+    reader: &mut R,
+    max_line_bytes: usize,
+) -> Result<Option<ProviderResponseContinuation>, ResponsePrefixError>
+where
+    R: AsyncRead + Unpin,
 {
     let prefix_limit = max_line_bytes.min(MAX_RESPONSE_ID_PREFIX_BYTES);
     let mut consumed = 0usize;
@@ -453,7 +763,6 @@ where
             }
         }
     }
-    expect_prefix_byte(reader, &mut consumed, prefix_limit, b',').await?;
     let parsed_id = std::str::from_utf8(&id[..id_len])
         .map_err(|_| ResponsePrefixError::Invalid)?
         .to_owned();
@@ -472,7 +781,7 @@ async fn expect_prefix_bytes<R>(
     expected: &[u8],
 ) -> Result<(), ResponsePrefixError>
 where
-    R: AsyncBufRead + Unpin,
+    R: AsyncRead + Unpin,
 {
     for expected in expected {
         expect_prefix_byte(reader, consumed, limit, *expected).await?;
@@ -487,7 +796,7 @@ async fn expect_prefix_byte<R>(
     expected: u8,
 ) -> Result<(), ResponsePrefixError>
 where
-    R: AsyncBufRead + Unpin,
+    R: AsyncRead + Unpin,
 {
     if read_prefix_byte(reader, consumed, limit).await? != Some(expected) {
         return Err(ResponsePrefixError::Invalid);
@@ -501,19 +810,24 @@ async fn read_prefix_byte<R>(
     limit: usize,
 ) -> Result<Option<u8>, ResponsePrefixError>
 where
-    R: AsyncBufRead + Unpin,
+    R: AsyncRead + Unpin,
 {
     if *consumed == limit {
         return Err(ResponsePrefixError::TooLong);
     }
-    let available = reader.fill_buf().await.map_err(ResponsePrefixError::Io)?;
-    let Some(byte) = available.first().copied() else {
+    let mut byte = [0u8; 1];
+    if reader
+        .read(&mut byte)
+        .await
+        .map_err(ResponsePrefixError::Io)?
+        == 0
+    {
         return Ok(None);
-    };
+    }
+    let byte = byte[0];
     if byte == b'\n' || byte == b'\r' {
         return Err(ResponsePrefixError::Invalid);
     }
-    reader.consume(1);
     *consumed += 1;
     Ok(Some(byte))
 }
@@ -1220,12 +1534,36 @@ impl Drop for SecretBytes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
     use http::header::CONTENT_TYPE;
     use std::net::{IpAddr, Ipv4Addr};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use crate::safety::{WireBodyPool, WireBodyQuotaKey};
+
+    const TEST_CORRELATION_ID: &str = "p0000000000000001-0000000000000001";
+
+    struct PendingAsyncWriter {
+        attempted: bool,
+    }
+
+    impl AsyncWrite for PendingAsyncWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            _: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.attempted = true;
+            Poll::Pending
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
 
     fn outputs(required: bool) -> ProviderOutputRegistry {
         ProviderOutputRegistry::activate(BTreeMap::from([(
@@ -1282,7 +1620,7 @@ mod tests {
         decoded.try_extend_from_slice(b"{}").unwrap();
         let decoded = decoded.finish();
         let request = ProviderRequest {
-            id: "request-1",
+            request_id: "request-1",
             url: "https://example.test/path",
             method: "GET",
             client_ip: "127.0.0.1",
@@ -1294,10 +1632,14 @@ mod tests {
             }),
         };
         let mut serialized = Vec::new();
-        request.write_compact(&mut serialized).unwrap();
+        request
+            .write_compact(TEST_CORRELATION_ID, &mut serialized)
+            .unwrap();
         assert_eq!(
             String::from_utf8(serialized).unwrap(),
-            "{\"id\":\"request-1\",\"type\":\"request\",\"url\":\"https://example.test/path\",\"method\":\"GET\",\"clientIp\":\"127.0.0.1\",\"headers\":{\"content-type\":[\"first\",\"second\"]},\"body\":{\"encoding\":\"base64\",\"contentType\":\"application/json\",\"contentEncoding\":\"identity\",\"data\":\"e30=\"}}\n"
+            format!(
+                "{{\"id\":\"{TEST_CORRELATION_ID}\",\"requestId\":\"request-1\",\"type\":\"request\",\"url\":\"https://example.test/path\",\"method\":\"GET\",\"clientIp\":\"127.0.0.1\",\"headers\":{{\"content-type\":[\"first\",\"second\"]}},\"body\":{{\"encoding\":\"base64\",\"contentType\":\"application/json\",\"contentEncoding\":\"identity\",\"data\":\"e30=\"}}}}\n"
+            )
         );
     }
 
@@ -1320,7 +1662,7 @@ mod tests {
         assert_eq!(decoded.segments().count(), 2);
 
         let request = ProviderRequest {
-            id: "request-1",
+            request_id: "request-1",
             url: "https://example.test/path",
             method: "POST",
             client_ip: "127.0.0.1",
@@ -1332,12 +1674,160 @@ mod tests {
             }),
         };
         let mut serialized = Vec::new();
-        request.write_compact(&mut serialized).unwrap();
+        request
+            .write_compact(TEST_CORRELATION_ID, &mut serialized)
+            .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&serialized).unwrap();
         assert_eq!(
             json["body"]["data"],
             BASE64_STANDARD.encode(body_bytes.as_slice())
         );
+    }
+
+    #[tokio::test]
+    async fn async_request_stream_reuses_one_guarded_chunk_and_commits_lf_separately() {
+        let url = format!("https://example.test/{}", "x".repeat(2 * 64 * 1024 + 7));
+        let request = ProviderRequest {
+            request_id: "request-1",
+            url: &url,
+            method: "GET",
+            client_ip: "127.0.0.1",
+            headers: None,
+            body: None,
+        };
+        let mut expected = Vec::new();
+        request
+            .write_compact(TEST_CORRELATION_ID, &mut expected)
+            .unwrap();
+
+        let allocation =
+            crate::safety::wire_body::guarded_body_allocation_bytes(64 * 1024).unwrap();
+        let pool = WireBodyPool::new(allocation, allocation);
+        let guard = pool.begin_for_test(
+            allocation,
+            WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::LOCALHOST), |_| false),
+        );
+        let mut scratch = guard.stream_scratch().unwrap();
+        let mut streamed = Vec::new();
+        let commit = request
+            .stream_before_commit(TEST_CORRELATION_ID, &mut streamed, &mut scratch)
+            .await
+            .unwrap();
+
+        assert_eq!(guard.live_bytes(), allocation);
+        assert_eq!(pool.global_charge(), allocation);
+        assert_eq!(streamed, expected[..expected.len() - 1]);
+        drop(scratch);
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+
+        commit.commit(&mut streamed).await.unwrap();
+        assert_eq!(streamed, expected);
+    }
+
+    #[tokio::test]
+    async fn cancelling_pending_base64_stream_wipes_scratch_and_drop_owned_staging() {
+        let one = crate::safety::wire_body::guarded_body_allocation_bytes(64 * 1024).unwrap();
+        let peak = 2 * one;
+        let pool = WireBodyPool::new(peak, peak);
+        let guard = pool.begin_for_test(
+            peak,
+            WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::LOCALHOST), |_| false),
+        );
+        let mut body = guard.buffer();
+        body.try_extend_from_slice(&vec![0xa5; 64 * 1024]).unwrap();
+        let body = body.finish();
+        let request = ProviderRequest {
+            request_id: "request-1",
+            url: "https://example.test/",
+            method: "POST",
+            client_ip: "127.0.0.1",
+            headers: None,
+            body: Some(GuardedProviderBody {
+                content_type: None,
+                content_encoding: None,
+                decoded: &body,
+            }),
+        };
+        let mut scratch = guard.stream_scratch().unwrap();
+        let mut output = PendingAsyncWriter { attempted: false };
+
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            request.stream_before_commit(TEST_CORRELATION_ID, &mut output, &mut scratch),
+        )
+        .await
+        .is_err());
+        assert!(output.attempted);
+        assert!(scratch.is_empty());
+        assert!(scratch.is_zeroed_for_test());
+        assert_eq!(guard.live_bytes(), peak);
+
+        drop(scratch);
+        assert_eq!(guard.live_bytes(), one);
+        drop(body);
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+    }
+
+    #[tokio::test]
+    async fn async_serializer_exactly_matches_sync_for_escapes_utf8_and_base64_tails() {
+        for body_len in [64 * 1024 + 3, 1, 2] {
+            let body_allocation =
+                crate::safety::wire_body::guarded_body_allocation_bytes(body_len).unwrap();
+            let scratch_allocation =
+                crate::safety::wire_body::guarded_body_allocation_bytes(64 * 1024).unwrap();
+            let peak = body_allocation + scratch_allocation;
+            let pool = WireBodyPool::new(peak, peak);
+            let guard = pool.begin_for_test(
+                peak,
+                WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::LOCALHOST), |_| false),
+            );
+            let body_bytes = (0..body_len)
+                .map(|index| (index % 251) as u8)
+                .collect::<Vec<_>>();
+            let mut body = guard.buffer();
+            body.try_extend_from_slice(&body_bytes).unwrap();
+            let body = body.finish();
+            if body_len > 64 * 1024 {
+                assert_eq!(body.segments().count(), 2);
+                assert_eq!(body_len % 3, 1);
+            }
+            let header_value = HeaderValue::from_static("quote-\"-slash-\\-utf8-safe");
+            let header_values = [header_value];
+            let header_fields = [IncludedHeader::new(&CONTENT_TYPE, &header_values)];
+            let headers = ProviderRequestHeaders::new(&header_fields).unwrap();
+            let request = ProviderRequest {
+                request_id: "id-\"-\\-\u{8}-\u{c}-\n-\r-\t-\u{1}-é-雪",
+                url: "https://example.test/\"/\\/\u{8}/\u{c}/\n/\r/\t/\u{1}/é/雪",
+                method: "MÉTHOD",
+                client_ip: "雪",
+                headers: Some(&headers),
+                body: Some(GuardedProviderBody {
+                    content_type: Some("application/octet-stream"),
+                    content_encoding: Some("identity"),
+                    decoded: &body,
+                }),
+            };
+
+            let mut synchronous = Vec::new();
+            request
+                .write_compact(TEST_CORRELATION_ID, &mut synchronous)
+                .unwrap();
+            let mut asynchronous = Vec::new();
+            let mut scratch = guard.stream_scratch().unwrap();
+            let commit = request
+                .stream_before_commit(TEST_CORRELATION_ID, &mut asynchronous, &mut scratch)
+                .await
+                .unwrap();
+            drop(scratch);
+            commit.commit(&mut asynchronous).await.unwrap();
+
+            assert_eq!(asynchronous, synchronous, "body length {body_len}");
+            drop(body);
+            assert_eq!(guard.live_bytes(), 0);
+            assert_eq!(pool.global_charge(), 0);
+        }
     }
 
     #[test]
@@ -1358,7 +1848,7 @@ mod tests {
             (None, Some("gzip\n")),
         ] {
             let request = ProviderRequest {
-                id: "request-1",
+                request_id: "request-1",
                 url: "https://example.test/",
                 method: "POST",
                 client_ip: "127.0.0.1",
@@ -1371,11 +1861,47 @@ mod tests {
             };
             let mut output = Vec::new();
             assert_eq!(
-                request.write_compact(&mut output),
+                request.write_compact(TEST_CORRELATION_ID, &mut output),
                 Err(RequestShapeError::InvalidBodyMetadata)
             );
             assert!(output.is_empty());
         }
+    }
+
+    #[test]
+    fn logical_and_correlation_ids_are_bounded_before_any_writer_byte() {
+        let oversized = "x".repeat(MAX_PROVIDER_REQUEST_ID_BYTES + 1);
+        for request_id in ["", oversized.as_str()] {
+            let request = ProviderRequest {
+                request_id,
+                url: "https://example.test/",
+                method: "GET",
+                client_ip: "127.0.0.1",
+                headers: None,
+                body: None,
+            };
+            let mut output = Vec::new();
+            assert_eq!(
+                request.write_compact(TEST_CORRELATION_ID, &mut output),
+                Err(RequestShapeError::InvalidRequestId)
+            );
+            assert!(output.is_empty());
+        }
+
+        let request = ProviderRequest {
+            request_id: "request-1",
+            url: "https://example.test/",
+            method: "GET",
+            client_ip: "127.0.0.1",
+            headers: None,
+            body: None,
+        };
+        let mut output = Vec::new();
+        assert_eq!(
+            request.write_compact("unsafe", &mut output),
+            Err(RequestShapeError::InvalidRequestId)
+        );
+        assert!(output.is_empty());
     }
 
     #[test]
@@ -1389,7 +1915,7 @@ mod tests {
         ));
         let headers = ProviderRequestHeaders { fields: &fields };
         let request = ProviderRequest {
-            id: "request-1",
+            request_id: "request-1",
             url: "https://example.test/",
             method: "GET",
             client_ip: "127.0.0.1",
@@ -1398,9 +1924,92 @@ mod tests {
         };
         let mut output = Vec::new();
         assert_eq!(
-            request.write_compact(&mut output),
+            request.write_compact(TEST_CORRELATION_ID, &mut output),
             Err(RequestShapeError::InvalidHeaders)
         );
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn included_header_value_limit_accepts_exact_and_rejects_plus_one() {
+        let exact = HeaderValue::from_bytes(&vec![b'x'; MAX_INCLUDED_HEADER_VALUE_BYTES]).unwrap();
+        let exact_values = [exact];
+        let exact_fields = [IncludedHeader::new(&CONTENT_TYPE, &exact_values)];
+        assert!(ProviderRequestHeaders::new(&exact_fields).is_ok());
+
+        let over =
+            HeaderValue::from_bytes(&vec![b'x'; MAX_INCLUDED_HEADER_VALUE_BYTES + 1]).unwrap();
+        let over_values = [over];
+        let over_fields = [IncludedHeader::new(&CONTENT_TYPE, &over_values)];
+        assert!(matches!(
+            ProviderRequestHeaders::new(&over_fields),
+            Err(RequestShapeError::InvalidHeaders)
+        ));
+    }
+
+    #[tokio::test]
+    async fn included_header_aggregate_limit_is_exact_and_precedes_async_writer_bytes() {
+        let names = (0..16)
+            .map(|index| HeaderName::from_bytes(format!("x-limit-{index}").as_bytes()).unwrap())
+            .collect::<Vec<_>>();
+        let name_bytes = names.iter().map(|name| name.as_str().len()).sum::<usize>();
+        let total_value_bytes = MAX_INCLUDED_HEADERS_BYTES - name_bytes;
+        let base_value_bytes = total_value_bytes / names.len();
+        let remainder = total_value_bytes % names.len();
+        let exact_values = (0..names.len())
+            .map(|index| {
+                let len = base_value_bytes + usize::from(index < remainder);
+                assert!(len <= MAX_INCLUDED_HEADER_VALUE_BYTES);
+                HeaderValue::from_bytes(&vec![b'x'; len]).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let exact_fields = names
+            .iter()
+            .zip(&exact_values)
+            .map(|(name, value)| IncludedHeader::new(name, std::slice::from_ref(value)))
+            .collect::<Vec<_>>();
+        assert!(ProviderRequestHeaders::new(&exact_fields).is_ok());
+
+        let mut over_values = exact_values.clone();
+        let last_len = over_values.last().unwrap().as_bytes().len();
+        *over_values.last_mut().unwrap() =
+            HeaderValue::from_bytes(&vec![b'x'; last_len + 1]).unwrap();
+        let over_fields = names
+            .iter()
+            .zip(&over_values)
+            .map(|(name, value)| IncludedHeader::new(name, std::slice::from_ref(value)))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            ProviderRequestHeaders::new(&over_fields),
+            Err(RequestShapeError::InvalidHeaders)
+        ));
+
+        let headers = ProviderRequestHeaders {
+            fields: &over_fields,
+        };
+        let request = ProviderRequest {
+            request_id: "request-1",
+            url: "https://example.test/",
+            method: "GET",
+            client_ip: "127.0.0.1",
+            headers: Some(&headers),
+            body: None,
+        };
+        let allocation =
+            crate::safety::wire_body::guarded_body_allocation_bytes(64 * 1024).unwrap();
+        let pool = WireBodyPool::new(allocation, allocation);
+        let guard = pool.begin_for_test(
+            allocation,
+            WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::LOCALHOST), |_| false),
+        );
+        let mut scratch = guard.stream_scratch().unwrap();
+        let mut output = Vec::new();
+        assert!(matches!(
+            request
+                .stream_before_commit(TEST_CORRELATION_ID, &mut output, &mut scratch)
+                .await,
+            Err(RequestStreamError::Shape(RequestShapeError::InvalidHeaders))
+        ));
         assert!(output.is_empty());
     }
 
@@ -1412,36 +2021,41 @@ mod tests {
             .await
             .unwrap();
         drop(writer);
-        let mut reader = BufReader::new(reader);
-        let Some(prefix) = read_provider_response_prefix(&mut reader, 256)
+        let mut reader = reader;
+        let Some(prefix) = read_provider_response_prefix_for_test(&mut reader, 256)
             .await
             .unwrap()
         else {
             panic!("expected prefix");
         };
         assert_eq!(prefix.id(), "request-1");
-        assert!(prefix.remaining_line_bytes() < 256);
+        assert_eq!(prefix.consumed_bytes(), b"{\"id\":\"request-1\"".len());
+        assert_eq!(prefix.remaining_line_bytes(), 256 - prefix.consumed_bytes());
         let mut remaining = Vec::new();
-        reader.read_to_end(&mut remaining).await.unwrap();
-        assert_eq!(remaining, b"\"type\":\"response\",\"decision\":\"deny\"}\n");
+        AsyncReadExt::read_to_end(&mut reader, &mut remaining)
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining,
+            b",\"type\":\"response\",\"decision\":\"deny\"}\n"
+        );
     }
 
     #[tokio::test]
     async fn prefix_reader_rejects_missing_first_id_unterminated_and_overlimit() {
         for bytes in [
             b"{\"type\":\"response\",\"id\":\"request-1\",\"decision\":\"deny\"}\n".as_slice(),
-            b"{\"id\":\"request-1\"".as_slice(),
+            b"{\"id\":\"request-1".as_slice(),
         ] {
-            let mut reader = BufReader::new(bytes);
+            let mut reader = bytes;
             assert!(matches!(
-                read_provider_response_prefix(&mut reader, 256).await,
+                read_provider_response_prefix_for_test(&mut reader, 256).await,
                 Err(ResponsePrefixError::Invalid)
             ));
         }
-        let mut reader =
-            BufReader::new(b"{\"id\":\"request-1\",\"type\":\"response\"}\n".as_slice());
+        let mut reader = b"{\"id\":\"request-1\",\"type\":\"response\"}\n".as_slice();
         assert!(matches!(
-            read_provider_response_prefix(&mut reader, 8).await,
+            read_provider_response_prefix_for_test(&mut reader, 8).await,
             Err(ResponsePrefixError::TooLong)
         ));
     }
@@ -1450,14 +2064,16 @@ mod tests {
     async fn prefix_reader_rejects_empty_id_before_consuming_the_next_member() {
         let bytes =
             b"{\"id\":\"\",\"id\":\"request-1\",\"type\":\"response\",\"decision\":\"deny\"}\n";
-        let mut reader = BufReader::new(bytes.as_slice());
+        let mut reader = bytes.as_slice();
         assert!(matches!(
-            read_provider_response_prefix(&mut reader, 256).await,
+            read_provider_response_prefix_for_test(&mut reader, 256).await,
             Err(ResponsePrefixError::Invalid)
         ));
 
         let mut remaining = Vec::new();
-        reader.read_to_end(&mut remaining).await.unwrap();
+        AsyncReadExt::read_to_end(&mut reader, &mut remaining)
+            .await
+            .unwrap();
         assert_eq!(
             remaining,
             b",\"id\":\"request-1\",\"type\":\"response\",\"decision\":\"deny\"}\n"
@@ -1472,9 +2088,9 @@ mod tests {
             b"{\"id\":\"line\nbreak\",\"type\":\"response\"}\n".as_slice(),
             b"{\"id\":\"line\rbreak\",\"type\":\"response\"}\n".as_slice(),
         ] {
-            let mut reader = BufReader::new(bytes);
+            let mut reader = bytes;
             assert!(matches!(
-                read_provider_response_prefix(&mut reader, 256).await,
+                read_provider_response_prefix_for_test(&mut reader, 256).await,
                 Err(ResponsePrefixError::Invalid)
             ));
         }

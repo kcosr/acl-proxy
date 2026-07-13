@@ -151,10 +151,24 @@ macro_rules! snapshot_handle {
 
 snapshot_handle!(PolicySnapshot);
 snapshot_handle!(EgressSnapshot);
-snapshot_handle!(AuthorizationSnapshot);
 snapshot_handle!(CredentialResolver);
 snapshot_handle!(RedactionSnapshot);
 snapshot_handle!(ObservationSnapshot);
+pub(crate) trait AuthorizationSnapshot: Send + Sync {
+    fn dispatch<'a>(
+        &'a self,
+        provider: ProviderIndex,
+        request: crate::authorization::protocol::ProviderRequest<'a>,
+        guard: crate::safety::HttpWireBodyGuard,
+        request_deadline: tokio::time::Instant,
+    ) -> BoxFuture<
+        'a,
+        Result<
+            crate::authorization::AuthorizationDecision,
+            crate::authorization::AuthorizationDispatchError,
+        >,
+    >;
+}
 pub(crate) trait SafetySnapshot: Send + Sync {
     fn contains_loop_marker(&self, headers: &HeaderMap) -> bool;
 
