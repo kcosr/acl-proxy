@@ -1,6 +1,6 @@
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, TryLockError};
+use std::sync::{Arc, RwLock, TryLockError};
 
 use crate::runtime::{BoxFuture, CleanupReason, GenerationOwner, PublicationGuard, RuntimeError};
 
@@ -8,7 +8,7 @@ use crate::runtime::{BoxFuture, CleanupReason, GenerationOwner, PublicationGuard
 /// observation epoch. Admission uses atomic accounting and never waits or delays
 /// the wire path.
 pub(crate) struct CapturePool {
-    publication_gate: Mutex<()>,
+    publication_gate: RwLock<()>,
     committed_limit: AtomicUsize,
     used: AtomicUsize,
 }
@@ -28,7 +28,7 @@ impl CapturePool {
     /// observation generation it activates.
     pub(crate) fn new(initial_limit: usize) -> Arc<Self> {
         Arc::new(Self {
-            publication_gate: Mutex::new(()),
+            publication_gate: RwLock::new(()),
             committed_limit: AtomicUsize::new(initial_limit),
             used: AtomicUsize::new(0),
         })
@@ -37,11 +37,20 @@ impl CapturePool {
     /// Attempts an exact capture-owned byte reservation. Failure is immediate
     /// and observation-only; callers omit the payload rather than wait.
     pub(crate) fn try_acquire(self: &Arc<Self>, bytes: usize) -> Option<CapturePermit> {
-        let _publication = match self.publication_gate.try_lock() {
+        self.try_acquire_with_hook(bytes, || {})
+    }
+
+    fn try_acquire_with_hook(
+        self: &Arc<Self>,
+        bytes: usize,
+        hook: impl FnOnce(),
+    ) -> Option<CapturePermit> {
+        let _publication = match self.publication_gate.try_read() {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => return None,
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         };
+        hook();
         let mut used = self.used.load(Ordering::Acquire);
         loop {
             let next = used.checked_add(bytes)?;
@@ -73,7 +82,7 @@ impl CapturePool {
     fn commit_limit(&self, limit: usize) {
         let _publication = self
             .publication_gate
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.committed_limit.store(limit, Ordering::Release);
     }
@@ -82,7 +91,7 @@ impl CapturePool {
     fn commit_limit_with_hook(&self, limit: usize, hook: impl FnOnce()) {
         let _publication = self
             .publication_gate
-            .lock()
+            .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         hook();
         self.committed_limit.store(limit, Ordering::Release);
@@ -240,6 +249,35 @@ mod tests {
         let permit = pool.try_acquire(usize::MAX).expect("maximum permit");
         assert!(pool.try_acquire(1).is_none());
         drop(permit);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn concurrent_admissions_share_the_limit_gate() {
+        let pool = CapturePool::new(16);
+        let first_entered = Arc::new(Barrier::new(2));
+        let finish_first = Arc::new(Barrier::new(2));
+        let first_pool = pool.clone();
+        let first = thread::spawn({
+            let first_entered = first_entered.clone();
+            let finish_first = finish_first.clone();
+            move || {
+                first_pool.try_acquire_with_hook(4, || {
+                    first_entered.wait();
+                    finish_first.wait();
+                })
+            }
+        });
+
+        first_entered.wait();
+        let second = pool
+            .try_acquire(4)
+            .expect("another admission may enter while the first holds a read gate");
+        finish_first.wait();
+        let first = first.join().expect("first admission thread").unwrap();
+
+        assert_eq!(pool.used(), 8);
+        drop((first, second));
         assert_eq!(pool.used(), 0);
     }
 

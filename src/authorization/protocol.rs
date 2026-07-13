@@ -331,7 +331,7 @@ impl ProviderRequest<'_> {
             write_base64_stream(&mut writer, body.decoded)?;
             writer.write_all(b"\"}")?;
         }
-        writer.write_all(b"}")?;
+        writer.write_all(b"}\n")?;
         Ok(())
     }
 
@@ -437,7 +437,12 @@ where
             .await?
             .ok_or(ResponsePrefixError::Invalid)?;
         match byte {
-            b'\"' if id_len != 0 => break,
+            b'\"' => {
+                if id_len == 0 {
+                    return Err(ResponsePrefixError::Invalid);
+                }
+                break;
+            }
             b'\\' | 0..=31 | 127..=u8::MAX => return Err(ResponsePrefixError::Invalid),
             byte => {
                 if id_len == id.len() {
@@ -1292,7 +1297,7 @@ mod tests {
         request.write_compact(&mut serialized).unwrap();
         assert_eq!(
             String::from_utf8(serialized).unwrap(),
-            r#"{"id":"request-1","type":"request","url":"https://example.test/path","method":"GET","clientIp":"127.0.0.1","headers":{"content-type":["first","second"]},"body":{"encoding":"base64","contentType":"application/json","contentEncoding":"identity","data":"e30="}}"#
+            "{\"id\":\"request-1\",\"type\":\"request\",\"url\":\"https://example.test/path\",\"method\":\"GET\",\"clientIp\":\"127.0.0.1\",\"headers\":{\"content-type\":[\"first\",\"second\"]},\"body\":{\"encoding\":\"base64\",\"contentType\":\"application/json\",\"contentEncoding\":\"identity\",\"data\":\"e30=\"}}\n"
         );
     }
 
@@ -1439,6 +1444,40 @@ mod tests {
             read_provider_response_prefix(&mut reader, 8).await,
             Err(ResponsePrefixError::TooLong)
         ));
+    }
+
+    #[tokio::test]
+    async fn prefix_reader_rejects_empty_id_before_consuming_the_next_member() {
+        let bytes =
+            b"{\"id\":\"\",\"id\":\"request-1\",\"type\":\"response\",\"decision\":\"deny\"}\n";
+        let mut reader = BufReader::new(bytes.as_slice());
+        assert!(matches!(
+            read_provider_response_prefix(&mut reader, 256).await,
+            Err(ResponsePrefixError::Invalid)
+        ));
+
+        let mut remaining = Vec::new();
+        reader.read_to_end(&mut remaining).await.unwrap();
+        assert_eq!(
+            remaining,
+            b",\"id\":\"request-1\",\"type\":\"response\",\"decision\":\"deny\"}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefix_reader_rejects_adversarial_id_encodings() {
+        for bytes in [
+            b"{\"id\":\"escaped\\\"id\",\"type\":\"response\"}\n".as_slice(),
+            b"{\"id\":\"non-ASCII-\xc3\xa9\",\"type\":\"response\"}\n".as_slice(),
+            b"{\"id\":\"line\nbreak\",\"type\":\"response\"}\n".as_slice(),
+            b"{\"id\":\"line\rbreak\",\"type\":\"response\"}\n".as_slice(),
+        ] {
+            let mut reader = BufReader::new(bytes);
+            assert!(matches!(
+                read_provider_response_prefix(&mut reader, 256).await,
+                Err(ResponsePrefixError::Invalid)
+            ));
+        }
     }
 
     #[test]

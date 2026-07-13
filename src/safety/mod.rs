@@ -38,8 +38,18 @@ impl ProductSafetySnapshot {
         resources: &CompiledResourcePlan,
         http_wire_body_plan_brand: HttpWireBodyPlanBrand,
         wire_body_pool: Arc<WireBodyPool>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, SafetyActivationError> {
+        let expected_cursor_count = resources
+            .upgrade_allocation_bytes_by_rule
+            .len()
+            .checked_add(1)
+            .ok_or(SafetyActivationError::InvalidHttpWireBodyPlans)?;
+        if resources.http_wire_body_peak_bytes_by_cursor.len() != expected_cursor_count
+            || http_wire_body_plan_brand.cursor_count() != expected_cursor_count
+        {
+            return Err(SafetyActivationError::InvalidHttpWireBodyPlans);
+        }
+        Ok(Self {
             loop_detection: LoopDetection {
                 inject: plan.loop_detection.inject,
                 header: plan.loop_detection.header,
@@ -50,8 +60,14 @@ impl ProductSafetySnapshot {
                 .clone()
                 .into_boxed_slice(),
             http_wire_body_plan_brand,
-        }
+        })
     }
+}
+
+#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum SafetyActivationError {
+    #[error("compiled HTTP wire-body cursor plans are inconsistent")]
+    InvalidHttpWireBodyPlans,
 }
 
 impl SafetySnapshot for ProductSafetySnapshot {
@@ -95,16 +111,22 @@ pub(crate) struct UnknownHttpWireBodyPlan;
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
+    use std::path::Path;
 
     use http::header::{HeaderName, HeaderValue};
+    use http::Method;
 
     use super::*;
     use crate::config::v3_compile::{
         Capacity, CompiledResourcePlan, LoopDetectionPlan, SafetyPlan,
     };
+    use crate::config::{compile_config_text, ConfigTextInput};
+    use crate::policy::CompiledPolicySnapshot;
+    use crate::runtime::{CredentialSourceRegistry, ProviderRegistry, RedactionProfileRegistry};
+    use crate::url::canonicalize_http_url;
 
     fn snapshot(inject: bool) -> ProductSafetySnapshot {
-        let (brand, _) = HttpWireBodyPlanIndex::test_pair(0);
+        let (brand, _) = HttpWireBodyPlanIndex::test_pair(2, 0);
         let peak = wire_body::guarded_body_allocation_bytes(128).unwrap();
         ProductSafetySnapshot::activate(
             SafetyPlan {
@@ -114,7 +136,7 @@ mod tests {
                 },
             },
             &CompiledResourcePlan {
-                http_wire_body_peak_bytes_by_cursor: vec![peak],
+                http_wire_body_peak_bytes_by_cursor: vec![peak, 0],
                 max_reachable_http_wire_body_peak_bytes: peak,
                 wire_body_full_peak_capacity: Capacity::Finite(8),
                 wire_body_quota_key_full_peak_capacity: Capacity::Finite(4),
@@ -125,6 +147,7 @@ mod tests {
             brand,
             WireBodyPool::new(peak * 8, peak * 4),
         )
+        .expect("test safety plan is consistent")
     }
 
     fn key() -> WireBodyQuotaKey {
@@ -196,7 +219,7 @@ mod tests {
         let snapshot = snapshot(true);
         assert!(matches!(
             snapshot.begin_http_body(
-                HttpWireBodyPlanIndex::test_for_brand(snapshot.http_wire_body_plan_brand, 1),
+                HttpWireBodyPlanIndex::test_for_brand(snapshot.http_wire_body_plan_brand, 2),
                 key(),
             ),
             Err(UnknownHttpWireBodyPlan)
@@ -207,11 +230,116 @@ mod tests {
     #[test]
     fn snapshot_rejects_foreign_plan_brand_without_granting_a_guard() {
         let snapshot = snapshot(true);
-        let (_, foreign) = HttpWireBodyPlanIndex::test_pair(0);
+        let (_, foreign) = HttpWireBodyPlanIndex::test_pair(2, 0);
         assert!(matches!(
             snapshot.begin_http_body(foreign, key()),
             Err(UnknownHttpWireBodyPlan)
         ));
         assert_eq!(snapshot.wire_body_pool.global_charge(), 0);
+    }
+
+    #[test]
+    fn activation_rejects_missing_terminal_cursor_plan() {
+        let (brand, _) = HttpWireBodyPlanIndex::test_pair(2, 0);
+        let peak = wire_body::guarded_body_allocation_bytes(128).unwrap();
+        let result = ProductSafetySnapshot::activate(
+            SafetyPlan {
+                loop_detection: LoopDetectionPlan {
+                    inject: true,
+                    header: HeaderName::from_static("x-loop-marker"),
+                },
+            },
+            &CompiledResourcePlan {
+                http_wire_body_peak_bytes_by_cursor: vec![peak],
+                max_reachable_http_wire_body_peak_bytes: peak,
+                wire_body_full_peak_capacity: Capacity::Finite(8),
+                wire_body_quota_key_full_peak_capacity: Capacity::Finite(4),
+                upgrade_allocation_bytes_by_rule: vec![None],
+                max_upgrade_allocation_per_stream: 0,
+                max_upgrade_allocation_all_streams: 0,
+            },
+            brand,
+            WireBodyPool::new(peak * 8, peak * 4),
+        );
+
+        assert!(matches!(
+            result,
+            Err(SafetyActivationError::InvalidHttpWireBodyPlans)
+        ));
+    }
+
+    #[test]
+    fn compiler_terminal_cursor_survives_final_delegate_resume() {
+        let compiled = compile_config_text(ConfigTextInput {
+            text: r#"
+schema_version = 3
+
+[listeners.explicit_http]
+bind = "127.0.0.1:8881"
+http_versions = ["http1"]
+
+[listeners.explicit_http.connect]
+http1 = "deny"
+
+[authorization.providers.approval]
+kind = "process"
+command = "/bin/approval"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "final-delegate"
+decision = "delegate"
+urls = ["https://example.test/**"]
+authorization_provider = "approval"
+"#,
+            source_path: Path::new("/tmp/terminal-cursor.toml"),
+            config_root: Path::new("/tmp"),
+        })
+        .expect("test config compiles");
+        let plan = compiled.reloadable_plan;
+        assert_eq!(
+            plan.resource_plan.http_wire_body_peak_bytes_by_cursor,
+            [0, 0]
+        );
+
+        let providers = ProviderRegistry::from_names(plan.authorization.providers.into_keys());
+        let policy_activation = CompiledPolicySnapshot::activate(
+            plan.policy,
+            &providers,
+            &RedactionProfileRegistry::from_names([]),
+            &CredentialSourceRegistry::from_names([]),
+        )
+        .expect("compiled policy activates");
+        let safety = ProductSafetySnapshot::activate(
+            plan.safety,
+            &plan.resource_plan,
+            policy_activation.wire_body_plan_brand(),
+            WireBodyPool::new(1, 1),
+        )
+        .expect("compiler and policy cursor domains agree");
+        let (policy, _) = policy_activation.into_parts();
+        let url = canonicalize_http_url("https://example.test/path").unwrap();
+        let first = policy.evaluate(
+            &url,
+            Ipv4Addr::new(192, 0, 2, 1).into(),
+            &Method::GET,
+            &HeaderMap::new(),
+            |_| false,
+        );
+        assert_eq!(first.matched.as_ref().unwrap().id(), "final-delegate");
+        let terminal = first.matched.unwrap().resume_cursor().resume(
+            &url,
+            Ipv4Addr::new(192, 0, 2, 1).into(),
+            &Method::GET,
+            &HeaderMap::new(),
+            |_| false,
+        );
+        assert!(terminal.matched.is_none());
+        let guard = safety
+            .begin_http_body(terminal.wire_body_plan(), key())
+            .expect("terminal cursor has a compiler-produced safety plan");
+        assert_eq!(guard.cursor_peak_bytes(), 0);
     }
 }

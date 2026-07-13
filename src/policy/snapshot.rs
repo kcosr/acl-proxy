@@ -34,7 +34,10 @@ pub(crate) struct HttpWireBodyPlanIndex {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct HttpWireBodyPlanBrand(u64);
+pub(crate) struct HttpWireBodyPlanBrand {
+    id: u64,
+    cursor_count: usize,
+}
 
 impl HttpWireBodyPlanIndex {
     fn new(brand: HttpWireBodyPlanBrand, ordinal: usize) -> Self {
@@ -52,8 +55,8 @@ impl HttpWireBodyPlanIndex {
     }
 
     #[cfg(test)]
-    pub(crate) fn test_pair(ordinal: usize) -> (HttpWireBodyPlanBrand, Self) {
-        let brand = next_wire_body_plan_brand();
+    pub(crate) fn test_pair(cursor_count: usize, ordinal: usize) -> (HttpWireBodyPlanBrand, Self) {
+        let brand = next_wire_body_plan_brand(cursor_count);
         (brand, Self::new(brand, ordinal))
     }
 
@@ -63,10 +66,16 @@ impl HttpWireBodyPlanIndex {
     }
 }
 
-fn next_wire_body_plan_brand() -> HttpWireBodyPlanBrand {
-    let brand = NEXT_WIRE_BODY_PLAN_BRAND.fetch_add(1, Ordering::Relaxed);
-    assert!(brand != 0, "HTTP wire-body plan brand overflow");
-    HttpWireBodyPlanBrand(brand)
+impl HttpWireBodyPlanBrand {
+    pub(crate) fn cursor_count(self) -> usize {
+        self.cursor_count
+    }
+}
+
+fn next_wire_body_plan_brand(cursor_count: usize) -> HttpWireBodyPlanBrand {
+    let id = NEXT_WIRE_BODY_PLAN_BRAND.fetch_add(1, Ordering::Relaxed);
+    assert!(id != 0, "HTTP wire-body plan brand overflow");
+    HttpWireBodyPlanBrand { id, cursor_count }
 }
 
 /// Immutable, generation-owned policy compiled from the product configuration.
@@ -180,6 +189,10 @@ impl CompiledPolicySnapshot {
             })
             .collect::<Result<Vec<_>, _>>()?
             .into_boxed_slice();
+        let cursor_count = rules
+            .len()
+            .checked_add(1)
+            .expect("policy cursor count overflow");
         let bindings = resolved_bindings(
             &rules,
             provider_registry.len(),
@@ -190,7 +203,7 @@ impl CompiledPolicySnapshot {
             snapshot: Self {
                 default,
                 rules,
-                wire_body_plan_brand: next_wire_body_plan_brand(),
+                wire_body_plan_brand: next_wire_body_plan_brand(cursor_count),
             },
             bindings,
         })
@@ -1213,7 +1226,7 @@ mod tests {
         assert_eq!(
             evaluation
                 .wire_body_plan()
-                .resolve(snapshot.wire_body_plan_brand, &[101, 202]),
+                .resolve(snapshot.wire_body_plan_brand, &[101, 202, 303]),
             Some(101)
         );
     }
@@ -1250,7 +1263,7 @@ mod tests {
         assert_eq!(
             first
                 .wire_body_plan()
-                .resolve(active.wire_body_plan_brand, &[11, 22, 33]),
+                .resolve(active.wire_body_plan_brand, &[11, 22, 33, 44]),
             Some(11)
         );
         let resumed = first.matched.unwrap().resume_cursor().resume(
@@ -1264,7 +1277,7 @@ mod tests {
         assert_eq!(
             resumed
                 .wire_body_plan()
-                .resolve(active.wire_body_plan_brand, &[11, 22, 33]),
+                .resolve(active.wire_body_plan_brand, &[11, 22, 33, 44]),
             Some(22)
         );
 
@@ -1279,7 +1292,7 @@ mod tests {
         assert_eq!(
             resumed
                 .wire_body_plan()
-                .resolve(foreign.wire_body_plan_brand, &[22]),
+                .resolve(foreign.wire_body_plan_brand, &[22, 0]),
             None
         );
     }
