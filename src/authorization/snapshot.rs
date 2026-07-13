@@ -74,6 +74,35 @@ impl ProductAuthorizationSnapshot {
         provider_registry: ProviderRegistry,
         cancellation: ActivationCancellation,
     ) -> Result<AuthorizationActivation, AuthorizationActivationError> {
+        #[cfg(test)]
+        return Self::activate_inner(plan, provider_registry, cancellation, |_| {}).await;
+
+        #[cfg(not(test))]
+        Self::activate_inner(plan, provider_registry, cancellation).await
+    }
+
+    #[cfg(test)]
+    async fn activate_with_hook(
+        plan: AuthorizationPlan,
+        provider_registry: ProviderRegistry,
+        cancellation: ActivationCancellation,
+        after_provider_activation: impl FnMut(&Arc<ProcessProvider>),
+    ) -> Result<AuthorizationActivation, AuthorizationActivationError> {
+        Self::activate_inner(
+            plan,
+            provider_registry,
+            cancellation,
+            after_provider_activation,
+        )
+        .await
+    }
+
+    async fn activate_inner(
+        plan: AuthorizationPlan,
+        provider_registry: ProviderRegistry,
+        cancellation: ActivationCancellation,
+        #[cfg(test)] mut after_provider_activation: impl FnMut(&Arc<ProcessProvider>),
+    ) -> Result<AuthorizationActivation, AuthorizationActivationError> {
         if cancellation.is_cancelled() {
             return Err(AuthorizationActivationError::Cancelled);
         }
@@ -119,6 +148,8 @@ impl ProductAuthorizationSnapshot {
                     }
                 };
             rollback.push(process.clone());
+            #[cfg(test)]
+            after_provider_activation(&process);
             providers.push(ActiveProvider::Process(process));
         }
 
@@ -554,10 +585,17 @@ for line in sys.stdin:
     #[tokio::test]
     async fn mismatched_provider_registry_is_rejected_before_spawn() {
         let directory = TempDir::new().unwrap();
-        let script = write_python(&directory, "unused.py", "raise SystemExit(99)\n");
+        let marker = directory.path().join("spawned.marker");
+        let script = write_python(
+            &directory,
+            "mark-spawn.py",
+            "from pathlib import Path\nimport sys\nPath(sys.argv[1]).write_text('spawned')\n",
+        );
+        let mut provider = process_plan(&directory, &script);
+        provider.args.push(marker.to_string_lossy().into_owned());
         let plan = authorization_plan(BTreeMap::from([(
             "configured".to_string(),
-            AuthorizationProviderPlan::Process(process_plan(&directory, &script)),
+            AuthorizationProviderPlan::Process(provider),
         )]));
         let result = ProductAuthorizationSnapshot::activate(
             plan,
@@ -570,6 +608,60 @@ for line in sys.stdin:
             result,
             Err(AuthorizationActivationError::ProviderRegistryMismatch)
         ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!marker.exists(), "registry rejection spawned the provider");
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_process_activation_cleans_and_reaps_exactly_once() {
+        let directory = TempDir::new().unwrap();
+        let script = write_python(
+            &directory,
+            "idle-until-cancelled.py",
+            "import time\nwhile True:\n    time.sleep(1)\n",
+        );
+        let plan = authorization_plan(BTreeMap::from([(
+            "provider".to_string(),
+            AuthorizationProviderPlan::Process(process_plan(&directory, &script)),
+        )]));
+        let provider_registry = ProviderRegistry::from_names(plan.providers.keys().cloned());
+        let cancellation = cancellation();
+        let observed = Arc::new(Mutex::new(None));
+        let hook_observed = observed.clone();
+        let hook_cancellation = cancellation.clone();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            ProductAuthorizationSnapshot::activate_with_hook(
+                plan,
+                provider_registry,
+                cancellation,
+                move |provider| {
+                    let pid = provider.child_id().expect("activated provider has a child");
+                    *hook_observed.lock().unwrap() = Some((provider.clone(), pid));
+                    hook_cancellation.cancel_for_test();
+                },
+            ),
+        )
+        .await
+        .expect("cancelled activation completes cleanup");
+
+        assert!(matches!(
+            result,
+            Err(AuthorizationActivationError::Cancelled)
+        ));
+        let (provider, pid) = observed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("hook observed the activated provider");
+        assert_eq!(provider.cleanup_starts(), 1);
+        // SAFETY: signal zero only checks whether the child PID still exists.
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 
     #[tokio::test]

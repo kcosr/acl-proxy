@@ -247,13 +247,28 @@ impl BlockingStaticResources {
 
 #[derive(Default)]
 struct FakeSource {
-    configs: Mutex<VecDeque<String>>,
+    candidates: Mutex<VecDeque<FakeCandidate>>,
     calls: AtomicUsize,
+}
+
+enum FakeCandidate {
+    Text(String),
+    Compiled(Box<CompiledConfig>),
 }
 
 impl FakeSource {
     fn push(&self, config: String) {
-        self.configs.lock().unwrap().push_back(config);
+        self.candidates
+            .lock()
+            .unwrap()
+            .push_back(FakeCandidate::Text(config));
+    }
+
+    fn push_compiled(&self, compiled: CompiledConfig) {
+        self.candidates
+            .lock()
+            .unwrap()
+            .push_back(FakeCandidate::Compiled(Box::new(compiled)));
     }
 }
 
@@ -265,13 +280,16 @@ impl CandidateSource for FakeSource {
         Box::pin(async move {
             cancellation.check()?;
             self.calls.fetch_add(1, Ordering::AcqRel);
-            let text = self
-                .configs
+            let candidate = self
+                .candidates
                 .lock()
                 .unwrap()
                 .pop_front()
                 .ok_or_else(|| RuntimeError::CandidateSource("no fake config queued".into()))?;
-            compile(&text).map_err(RuntimeError::CandidateSource)
+            match candidate {
+                FakeCandidate::Text(text) => compile(&text).map_err(RuntimeError::CandidateSource),
+                FakeCandidate::Compiled(compiled) => Ok(*compiled),
+            }
         })
     }
 }
@@ -593,6 +611,39 @@ async fn abort_before_first_construction_poll_still_completes_static_shutdown() 
     assert_eq!(Arc::strong_count(&poll_gate), 1);
 }
 
+#[test]
+fn rejected_construction_outside_tokio_cleans_inline_when_polled() {
+    let owned = compile(&config("30s", "127.0.0.1:8881", 2)).unwrap();
+    let crossed = compile(&config("30s", "127.0.0.1:9999", 2)).unwrap();
+    let static_resources = Arc::new(FakeStaticResources::default());
+    let static_ownership = StaticOwnership::new(
+        owned.static_config,
+        owned.static_fingerprint,
+        static_resources.clone(),
+    );
+    let source = Arc::new(FakeSource::default());
+    let activator: Arc<dyn CandidateActivator> =
+        Arc::new(FakeActivator::new(crossed.static_fingerprint));
+
+    let construction = Runtime::new(static_ownership, source.clone(), activator.clone());
+    assert_eq!(static_resources.shutdowns.load(Ordering::Acquire), 0);
+
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = executor.block_on(construction);
+
+    assert!(matches!(
+        result,
+        Err(RuntimeError::ActivatorStaticFingerprintMismatch)
+    ));
+    assert_eq!(static_resources.shutdowns.load(Ordering::Acquire), 1);
+    assert_eq!(Arc::strong_count(&static_resources), 1);
+    assert_eq!(Arc::strong_count(&source), 1);
+    assert_eq!(Arc::strong_count(&activator), 1);
+}
+
 struct BlockedConstruction {
     construction: BoxFuture<'static, Result<Arc<Runtime>, RuntimeError>>,
     static_resources: Arc<BlockingStaticResources>,
@@ -683,6 +734,41 @@ async fn initial_static_fingerprint_mismatch_rejects_before_activation() {
     assert_eq!(activator.calls.load(Ordering::Acquire), 0);
     assert_eq!(runtime.lifecycle(), LifecycleState::Starting);
     assert_eq!(runtime.active_generation_id(), None);
+}
+
+#[tokio::test]
+async fn forged_initial_fingerprint_cannot_hide_cross_wired_static_config() {
+    let (runtime, mut initial, _source, activator, _static_resources) =
+        runtime_fixture(&config("30s", "127.0.0.1:8881", 2)).await;
+    let crossed = compile(&config("30s", "127.0.0.1:9999", 2)).unwrap();
+    initial.static_config = crossed.static_config;
+
+    assert_eq!(
+        runtime.start(initial).await,
+        Err(RuntimeError::StaticFingerprintChanged)
+    );
+    assert_eq!(activator.calls.load(Ordering::Acquire), 0);
+    assert_eq!(runtime.lifecycle(), LifecycleState::Starting);
+    assert_eq!(runtime.active_generation_id(), None);
+}
+
+#[tokio::test]
+async fn forged_reload_fingerprint_cannot_hide_cross_wired_static_config() {
+    let initial_text = config("30s", "127.0.0.1:8881", 2);
+    let (runtime, initial, source, activator, _static_resources) =
+        runtime_fixture(&initial_text).await;
+    let claimed = initial.static_fingerprint.clone();
+    let first = runtime.start(initial).await.unwrap();
+    let mut crossed = compile(&config("31s", "127.0.0.1:9999", 2)).unwrap();
+    crossed.static_fingerprint = claimed;
+    source.push_compiled(crossed);
+
+    assert_eq!(
+        runtime.trigger_reload().await.unwrap_err(),
+        RuntimeError::StaticFingerprintChanged
+    );
+    assert_eq!(runtime.active_generation_id(), Some(first));
+    assert_eq!(activator.calls.load(Ordering::Acquire), 1);
 }
 
 #[tokio::test]

@@ -52,6 +52,8 @@ struct Inner {
     reader: Mutex<Option<EpochReader>>,
     supervisor: Mutex<Option<JoinHandle<()>>>,
     cleanup: CleanupState,
+    #[cfg(test)]
+    cleanup_starts: AtomicUsize,
 }
 
 struct SpawnConfig {
@@ -280,6 +282,8 @@ impl ProcessProvider {
                 complete: AtomicBool::new(false),
                 changed: Notify::new(),
             },
+            #[cfg(test)]
+            cleanup_starts: AtomicUsize::new(0),
         });
         install_io_tasks(&inner, 1, spawned.stdin, spawned.stdout);
         let supervisor_inner = inner.clone();
@@ -493,8 +497,13 @@ impl ProcessProvider {
     }
 
     #[cfg(test)]
-    fn child_id(&self) -> Option<u32> {
+    pub(super) fn child_id(&self) -> Option<u32> {
         lock(&self.inner.state).child.as_ref().and_then(Child::id)
+    }
+
+    #[cfg(test)]
+    pub(super) fn cleanup_starts(&self) -> usize {
+        self.inner.cleanup_starts.load(Ordering::Acquire)
     }
 }
 
@@ -557,6 +566,8 @@ impl GenerationOwner for ProcessProvider {
                 .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
+                #[cfg(test)]
+                self.inner.cleanup_starts.fetch_add(1, Ordering::AcqRel);
                 let inner = self.inner.clone();
                 std::mem::drop(tokio::spawn(async move {
                     let _ = inner.events.send(SupervisorEvent::Stop);

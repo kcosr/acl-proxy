@@ -136,11 +136,19 @@ fn reject_runtime_construction(
     static_ownership: StaticOwnership,
     error: RuntimeError,
 ) -> BoxFuture<'static, Result<Arc<Runtime>, RuntimeError>> {
-    let cleanup = tokio::spawn(async move { static_ownership.resources.shutdown().await });
-    Box::pin(async move {
-        let _ = cleanup.await;
-        Err(error)
-    })
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            let cleanup = handle.spawn(async move { static_ownership.resources.shutdown().await });
+            Box::pin(async move {
+                let _ = cleanup.await;
+                Err(error)
+            })
+        }
+        Err(_) => Box::pin(async move {
+            static_ownership.resources.shutdown().await;
+            Err(error)
+        }),
+    }
 }
 
 impl Drop for ReloadWorkerOwnership {
@@ -332,9 +340,7 @@ impl Runtime {
             _ => return Err(RuntimeError::AlreadyStarted),
         }
 
-        if initial.static_fingerprint != self.static_fingerprint {
-            return Err(RuntimeError::StaticFingerprintChanged);
-        }
+        self.validate_compiled_static(&initial)?;
 
         let cancellation = self.register_cancellation();
         let id = self.allocate_generation_id();
@@ -436,9 +442,7 @@ impl Runtime {
         cancellation: &ActivationCancellation,
     ) -> Result<GenerationId, RuntimeError> {
         cancellation.check()?;
-        if compiled.static_fingerprint != self.static_fingerprint {
-            return Err(RuntimeError::StaticFingerprintChanged);
-        }
+        self.validate_compiled_static(&compiled)?;
         let id = self.allocate_generation_id();
         let activated = self
             .activator
@@ -446,6 +450,15 @@ impl Runtime {
             .await?;
         self.publish(id, activated, LifecycleState::Running, cancellation)
             .await
+    }
+
+    fn validate_compiled_static(&self, compiled: &CompiledConfig) -> Result<(), RuntimeError> {
+        let canonical = StaticFingerprint::from_config(&compiled.static_config)
+            .map_err(|_| RuntimeError::StaticFingerprintDerivationFailed)?;
+        if canonical != compiled.static_fingerprint || canonical != self.static_fingerprint {
+            return Err(RuntimeError::StaticFingerprintChanged);
+        }
+        Ok(())
     }
 
     async fn publish(
