@@ -8,7 +8,7 @@ use crate::config::{
     PolicyRuleConfig, PolicyRuleDirectConfig, PolicyRuleIncludeConfig, PolicyRuleTemplateConfig,
     RulesetMap, UrlEncVariants,
 };
-use crate::url_canonical::canonicalize_http_url;
+use crate::url::canonicalize_http_url;
 use http::header::{HeaderName, HeaderValue};
 use http::HeaderMap;
 use ipnet::IpNet;

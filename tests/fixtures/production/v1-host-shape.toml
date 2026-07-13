@@ -1,0 +1,13 @@
+schema_version = "1"
+
+[proxy]
+http_port = 8881
+https_port = 8889
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "deny"
+pattern = "**"
+headers_absent = ["x-aw-identity-token"]

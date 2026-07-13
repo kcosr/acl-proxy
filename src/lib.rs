@@ -13,4 +13,4 @@ pub mod proxy;
 pub mod redaction;
 mod sensitive;
 mod tls_identity;
-mod url_canonical;
+mod url;

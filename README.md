@@ -318,15 +318,17 @@ protocol + "//" + host[:port] + path + optional "?query"
 
 - The scheme is preserved (`http:` or `https:`).
 - Only `http` and `https` URLs are accepted. URLs with userinfo are rejected.
-- Hostnames are lowercased and a trailing DNS dot is removed.
+- DNS hostnames use nontransitional IDNA processing with STD3 ASCII and DNS-length validation, are lowercased, and have one trailing DNS dot removed. Invalid labels, including labels containing underscores, are rejected. IP literals are canonicalized separately.
 - Default ports (`:80` for HTTP, `:443` for HTTPS) are omitted in both requests and rule patterns; non-default ports are preserved.
 - Dot segments in the path are resolved before matching or forwarding.
-- Percent-encoded unreserved path characters are decoded before matching or forwarding (for example `%61` becomes `a`); reserved encodings such as `%2F` are preserved so existing URL-encoded path parameters continue to work.
+- Percent-encoded unreserved path characters are decoded before matching or forwarding (for example `%61` becomes `a`). Encoded structural delimiters such as `%2F`, `%3F`, and `%23` remain opaque within their component and are forwarded in canonical uppercase spelling.
+- Double-encoding-shaped `%25HH` input, where `HH` is hexadecimal, is rejected as ambiguous.
 - The path defaults to `/` when empty.
-- Query strings are preserved; fragments are ignored.
+- Query strings are preserved; fragments are rejected.
 - IPv6 hostnames use standard bracket notation (e.g., `https://[::1]:8443/path`).
+- The full canonical URL used for policy evaluation is the exact target forwarded upstream, including its scheme, authority, path, and query.
 
-> **Security note on encoded path separators.** acl-proxy deliberately preserves `%2F` (and other reserved encodings) rather than decoding them, so that URL-encoded path parameters keep working. The proxy matches policy on, and forwards upstream, the same byte-for-byte path — so the proxy itself is internally consistent. However, an upstream that *decodes* `%2F` and then resolves `..` segments can still interpret a path differently from the proxy. For example, with an `allow` rule for `https://host/api/v1/**`, a request to `https://host/api/v1/..%2f..%2finternal` matches the allow rule (the encoded slashes are not path separators to the proxy) but may resolve to `/internal` on a decoding upstream. If your upstreams decode `%2F`, reject or normalize encoded slashes before routing at the upstream, and avoid relying on allow-prefix rules to constrain those paths. This is the residual portion of finding XACL-2; the dot-segment half (literal `..`) is resolved by the canonicalizer.
+> **Security note on encoded path separators.** An upstream that decodes an opaque `%2F` and then resolves dot segments can still route differently from the canonical URL. Reject encoded slashes at that upstream or avoid relying on allow-prefix rules where routing occurs after such decoding.
 
 ### Pattern Syntax
 

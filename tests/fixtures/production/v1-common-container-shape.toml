@@ -1,0 +1,16 @@
+schema_version = "1"
+
+[proxy]
+bind_address = "0.0.0.0"
+http_port = 8881
+
+[proxy.egress.default]
+host = "192.0.2.10"
+port = 8881
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "**"

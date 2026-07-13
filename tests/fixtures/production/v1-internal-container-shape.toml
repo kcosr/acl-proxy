@@ -1,0 +1,17 @@
+schema_version = "1"
+
+[proxy]
+bind_address = "0.0.0.0"
+http_port = 8881
+
+[[proxy.egress.request_header_actions]]
+action = "set"
+name = "x-aw-policy-context"
+value = "synthetic-v1-context"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+action = "allow"
+pattern = "https://*.corp.example.test/**"

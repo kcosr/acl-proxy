@@ -1,0 +1,129 @@
+schema_version = 3
+
+[service]
+request_timeout = "2h"
+shutdown_drain_timeout = "30s"
+max_inflight_wire_body_bytes = 8589934592
+max_inflight_wire_body_bytes_per_quota_key = 1073741824
+min_wire_body_concurrency = 64
+max_content_decoding_expansion_ratio = 128
+
+[control]
+bind = "127.0.0.1:8898"
+base_path = "/_acl-proxy"
+
+[listeners.explicit_http]
+bind = "0.0.0.0:8881"
+http_versions = ["http1"]
+
+[listeners.explicit_http.connect]
+http1 = "mitm"
+
+[listeners.transparent_https]
+bind = "0.0.0.0:8889"
+http_versions = ["http1", "http2"]
+
+[mitm]
+mode = "files"
+ca_certificate = "tls/fixture-ca-cert.pem"
+ca_private_key = "tls/fixture-ca-key.pem"
+directory = "runtime/certs"
+
+[egress]
+route = "parent_proxy"
+
+[egress.origin_tls]
+trust = "system"
+http_versions = ["http1"]
+
+[egress.parent_proxy]
+kind = "acl_proxy"
+url = "http://host-proxy.example.test:8881"
+
+[[egress.request_headers]]
+operation = "set"
+when = "always"
+name = "x-aw-policy-context"
+value = "fixture-internal"
+
+[[egress.credential_actions]]
+kind = "custom_header"
+header = "x-aw-identity-token"
+credential = "aw_identity"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "prod-internal-r00-internal-api"
+description = "Sanitized source rule 00: internal API"
+decision = "allow"
+urls = ["https://api.private-a.example.test/**"]
+
+[[policy.rules]]
+id = "prod-internal-r01-downloads"
+description = "Sanitized source rule 01: GET-only source and release downloads"
+decision = "allow"
+urls = [
+  "https://downloads.private-b.example.test/**",
+  "https://raw.githubusercontent.com/**",
+  "https://api.github.com/**",
+  "https://github.com/**",
+  "https://release-assets.githubusercontent.com/**",
+]
+methods = ["GET"]
+
+[[policy.rules]]
+id = "prod-internal-r02-packages"
+description = "Sanitized source rule 02: package registry"
+decision = "allow"
+urls = ["https://registry.npmjs.org/**"]
+
+[[policy.rules]]
+id = "prod-internal-r03-tool-service"
+description = "Sanitized source rule 03: internal tool service"
+decision = "allow"
+urls = ["https://tools.private-c.example.test/**"]
+
+[[policy.rules]]
+id = "prod-internal-r04-gitlab"
+description = "Sanitized source rule 04: internal Git service"
+decision = "allow"
+urls = ["https://gitlab.example.test/**"]
+
+[[policy.rules]]
+id = "prod-internal-r05-development-host"
+description = "Sanitized source rule 05: development host"
+decision = "allow"
+urls = ["https://dev.private-d.example.test/**"]
+
+[[policy.rules]]
+id = "prod-internal-r06-corporate-https"
+description = "Sanitized source rule 06: one-label HTTPS corporate wildcard"
+decision = "allow"
+urls = ["https://*.corp.example.test/**"]
+
+[[policy.rules]]
+id = "prod-internal-r07-corporate-http"
+description = "Sanitized source rule 07: one-label HTTP corporate wildcard"
+decision = "allow"
+urls = ["http://*.corp.example.test/**"]
+
+[authorization]
+internal_context_headers = ["x-aw-policy-context"]
+
+[credentials]
+allowed_custom_headers = ["x-aw-identity-token"]
+
+[credentials.sources.aw_identity]
+source = "environment"
+variable = "AW_IDENTITY_TOKEN"
+
+[observation.logging]
+level = "error"
+directory = "runtime/logs"
+console = false
+
+[safety.loop_detection]
+inject = false
+header = "x-acl-proxy-request-id"

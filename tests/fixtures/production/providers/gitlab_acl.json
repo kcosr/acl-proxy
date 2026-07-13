@@ -1,0 +1,19 @@
+{
+  "schema": "synthetic-fixture-v1",
+  "identities": {
+    "fixture-common-identity": {
+      "contexts": {
+        "": [
+          "group/public"
+        ]
+      }
+    },
+    "fixture-internal-identity": {
+      "contexts": {
+        "fixture-internal": [
+          "group/internal"
+        ]
+      }
+    }
+  }
+}

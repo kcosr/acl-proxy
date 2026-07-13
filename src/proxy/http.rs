@@ -48,7 +48,7 @@ use crate::proxy::https_connect;
 use crate::proxy::websocket;
 use crate::redaction::RedactionProfile;
 use crate::sensitive::{is_sensitive_header_name, redact_url_for_sink, REDACTED};
-use crate::url_canonical::{canonicalize_http_url, CanonicalUrl};
+use crate::url::{canonicalize_http_url, CanonicalUrl};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HttpProxyError {
@@ -3974,6 +3974,23 @@ mod tests {
         let target = target.expect("target");
         assert_eq!(target.address.as_deref(), Some("example.com"));
         assert_eq!(target.port, Some(80));
+    }
+
+    #[test]
+    fn forwarding_uses_the_exact_canonical_url_contract() {
+        let req = Request::builder()
+            .uri("https://EXAMPLE.com.:443/a/%2e%2e/b%2fc?Key=One&key=two")
+            .body(Body::empty())
+            .expect("request");
+
+        let (url, target) = build_full_url(&req, HttpListenerMode::Explicit).expect("full url");
+        assert_eq!(
+            url, "https://example.com/b%2Fc?Key=One&key=two",
+            "the string used after canonicalization must be the forwarding string"
+        );
+        let target = target.expect("target");
+        assert_eq!(target.address.as_deref(), Some("example.com"));
+        assert_eq!(target.port, Some(443));
     }
 
     #[test]

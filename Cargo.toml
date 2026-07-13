@@ -14,11 +14,13 @@ path = "src/bin/extract-capture-body.rs"
 clap = { version = "4.5.4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 toml = "0.8"
 thiserror = "1.0"
 once_cell = "1.19"
 arc-swap = "1.7"
 ipnet = { version = "2.9", features = ["serde"] }
+idna = "1.1"
 regex = "1.11"
 url = "2.5"
 urlencoding = "2.1"
@@ -45,6 +47,7 @@ rustls-pemfile = "1"
 dashmap = "5"
 lru = "0.12"
 fs2 = "0.4"
+humantime = "2.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"

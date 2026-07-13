@@ -1,0 +1,1542 @@
+use std::collections::BTreeMap;
+use std::net::SocketAddr;
+use std::path::PathBuf;
+
+use ipnet::IpNet;
+use serde::de;
+use serde::{Deserialize, Deserializer};
+
+use super::duration::{seconds, DrainTimeout, PositiveDuration};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SchemaVersion;
+
+impl SchemaVersion {
+    pub(super) const NUMBER: u32 = 3;
+
+    pub(super) fn number(self) -> u32 {
+        Self::NUMBER
+    }
+}
+
+impl<'de> Deserialize<'de> for SchemaVersion {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let version = u32::deserialize(deserializer)?;
+        if version != Self::NUMBER {
+            return Err(de::Error::custom(format!(
+                "unsupported schema_version {version}, expected {}",
+                Self::NUMBER
+            )));
+        }
+        Ok(Self)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ConfigV3 {
+    pub schema_version: SchemaVersion,
+
+    #[serde(default)]
+    pub service: ServiceConfig,
+
+    #[serde(default)]
+    pub control: Option<ControlConfig>,
+
+    pub listeners: ListenersConfig,
+
+    #[serde(default)]
+    pub mitm: Option<MitmConfig>,
+
+    #[serde(default)]
+    pub egress: EgressConfig,
+
+    pub policy: PolicyConfig,
+
+    #[serde(default)]
+    pub authorization: AuthorizationConfig,
+
+    #[serde(default)]
+    pub credentials: CredentialsConfig,
+
+    #[serde(default)]
+    pub redaction: RedactionConfig,
+
+    #[serde(default)]
+    pub observation: ObservationConfig,
+
+    #[serde(default)]
+    pub safety: SafetyConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ServiceConfig {
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout: PositiveDuration,
+
+    #[serde(default = "default_shutdown_drain_timeout")]
+    pub shutdown_drain_timeout: DrainTimeout,
+
+    #[serde(default = "default_max_retiring_generations")]
+    pub max_retiring_generations: usize,
+
+    #[serde(default = "default_max_active_upgrades")]
+    pub max_active_upgrades: usize,
+
+    #[serde(default = "default_upgrade_relay_buffer_bytes")]
+    pub upgrade_relay_buffer_bytes: usize,
+
+    #[serde(default = "default_max_upgrade_buffer_bytes")]
+    pub max_upgrade_buffer_bytes: usize,
+
+    #[serde(default = "default_max_upgrade_lifetime")]
+    pub max_upgrade_lifetime: PositiveDuration,
+
+    #[serde(default = "default_max_inflight_wire_body_bytes")]
+    pub max_inflight_wire_body_bytes: usize,
+
+    #[serde(default = "default_max_inflight_wire_body_bytes_per_quota_key")]
+    pub max_inflight_wire_body_bytes_per_quota_key: usize,
+
+    #[serde(default = "default_min_wire_body_concurrency")]
+    pub min_wire_body_concurrency: usize,
+
+    #[serde(default = "default_max_content_decoding_expansion_ratio")]
+    pub max_content_decoding_expansion_ratio: usize,
+}
+
+impl Default for ServiceConfig {
+    fn default() -> Self {
+        Self {
+            request_timeout: default_request_timeout(),
+            shutdown_drain_timeout: default_shutdown_drain_timeout(),
+            max_retiring_generations: default_max_retiring_generations(),
+            max_active_upgrades: default_max_active_upgrades(),
+            upgrade_relay_buffer_bytes: default_upgrade_relay_buffer_bytes(),
+            max_upgrade_buffer_bytes: default_max_upgrade_buffer_bytes(),
+            max_upgrade_lifetime: default_max_upgrade_lifetime(),
+            max_inflight_wire_body_bytes: default_max_inflight_wire_body_bytes(),
+            max_inflight_wire_body_bytes_per_quota_key:
+                default_max_inflight_wire_body_bytes_per_quota_key(),
+            min_wire_body_concurrency: default_min_wire_body_concurrency(),
+            max_content_decoding_expansion_ratio: default_max_content_decoding_expansion_ratio(),
+        }
+    }
+}
+
+fn default_request_timeout() -> PositiveDuration {
+    seconds(30)
+}
+
+fn default_shutdown_drain_timeout() -> DrainTimeout {
+    DrainTimeout::Bounded(seconds(30))
+}
+
+fn default_max_retiring_generations() -> usize {
+    2
+}
+
+fn default_max_active_upgrades() -> usize {
+    256
+}
+
+fn default_upgrade_relay_buffer_bytes() -> usize {
+    64 * 1024
+}
+
+fn default_max_upgrade_buffer_bytes() -> usize {
+    2 * 1024 * 1024 * 1024
+}
+
+fn default_max_upgrade_lifetime() -> PositiveDuration {
+    seconds(8 * 60 * 60)
+}
+
+fn default_max_inflight_wire_body_bytes() -> usize {
+    8 * 1024 * 1024 * 1024
+}
+
+fn default_max_inflight_wire_body_bytes_per_quota_key() -> usize {
+    1024 * 1024 * 1024
+}
+
+fn default_min_wire_body_concurrency() -> usize {
+    64
+}
+
+fn default_max_content_decoding_expansion_ratio() -> usize {
+    128
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ControlConfig {
+    pub bind: SocketAddr,
+
+    #[serde(default = "default_control_base_path")]
+    pub base_path: String,
+
+    #[serde(default = "default_listener_timeout")]
+    pub request_header_timeout: PositiveDuration,
+
+    #[serde(default = "default_control_max_connections")]
+    pub max_connections: usize,
+
+    #[serde(default = "default_control_max_request_body_bytes")]
+    pub max_request_body_bytes: usize,
+
+    #[serde(default)]
+    pub tls: Option<StaticTlsIdentityConfig>,
+}
+
+fn default_control_base_path() -> String {
+    "/_acl-proxy".to_string()
+}
+
+fn default_control_max_connections() -> usize {
+    128
+}
+
+fn default_control_max_request_body_bytes() -> usize {
+    64 * 1024
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct StaticTlsIdentityConfig {
+    pub certificate_chain: PathBuf,
+    pub private_key: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ListenersConfig {
+    #[serde(default)]
+    pub explicit_http: Option<ExplicitHttpListenerConfig>,
+
+    #[serde(default)]
+    pub transparent_http: Option<TransparentHttpListenerConfig>,
+
+    #[serde(default)]
+    pub explicit_https: Option<ExplicitHttpsListenerConfig>,
+
+    #[serde(default)]
+    pub transparent_https: Option<TransparentHttpsListenerConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum HttpVersion {
+    Http1,
+    Http2,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ExplicitHttpListenerConfig {
+    pub bind: SocketAddr,
+    pub http_versions: Vec<HttpVersion>,
+    pub connect: ConnectConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TransparentHttpListenerConfig {
+    pub bind: SocketAddr,
+    pub http_versions: Vec<HttpVersion>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ExplicitHttpsListenerConfig {
+    pub bind: SocketAddr,
+    pub http_versions: Vec<HttpVersion>,
+
+    #[serde(default = "default_listener_timeout")]
+    pub handshake_timeout: PositiveDuration,
+
+    #[serde(default = "default_listener_timeout")]
+    pub request_header_timeout: PositiveDuration,
+
+    #[serde(default = "default_listener_max_connections")]
+    pub max_connections: usize,
+
+    #[serde(default = "default_listener_max_concurrent_streams")]
+    pub max_concurrent_streams: u32,
+
+    pub connect: ConnectConfig,
+    pub tls: StaticTlsIdentityConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TransparentHttpsListenerConfig {
+    pub bind: SocketAddr,
+    pub http_versions: Vec<HttpVersion>,
+
+    #[serde(default = "default_listener_timeout")]
+    pub handshake_timeout: PositiveDuration,
+
+    #[serde(default = "default_listener_timeout")]
+    pub request_header_timeout: PositiveDuration,
+
+    #[serde(default = "default_listener_max_connections")]
+    pub max_connections: usize,
+
+    #[serde(default = "default_listener_max_concurrent_streams")]
+    pub max_concurrent_streams: u32,
+}
+
+fn default_listener_timeout() -> PositiveDuration {
+    seconds(10)
+}
+
+fn default_listener_max_connections() -> usize {
+    1024
+}
+
+fn default_listener_max_concurrent_streams() -> u32 {
+    128
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ConnectConfig {
+    #[serde(default)]
+    pub http1: Option<Http1ConnectPolicy>,
+
+    #[serde(default)]
+    pub http2: Option<Http2ConnectPolicy>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum Http1ConnectPolicy {
+    Deny,
+    Mitm,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum Http2ConnectPolicy {
+    Deny,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub(super) enum MitmConfig {
+    Generated(GeneratedMitmConfig),
+    Files(FileMitmConfig),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GeneratedMitmConfig {
+    pub directory: PathBuf,
+
+    #[serde(default = "default_max_cached_certificates")]
+    pub max_cached_certificates: usize,
+
+    #[serde(default)]
+    pub persist_leaf_certificates: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FileMitmConfig {
+    pub ca_certificate: PathBuf,
+    pub ca_private_key: PathBuf,
+
+    pub directory: PathBuf,
+
+    #[serde(default = "default_max_cached_certificates")]
+    pub max_cached_certificates: usize,
+
+    #[serde(default)]
+    pub persist_leaf_certificates: bool,
+}
+
+fn default_max_cached_certificates() -> usize {
+    1024
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct EgressConfig {
+    #[serde(default)]
+    pub route: EgressRoute,
+
+    #[serde(default)]
+    pub origin_tls: TransportTlsConfig,
+
+    #[serde(default)]
+    pub parent_proxy: Option<ParentProxyConfig>,
+
+    #[serde(default)]
+    pub request_headers: Vec<HeaderEffectConfig>,
+
+    #[serde(default)]
+    pub credential_actions: Vec<CredentialActionConfig>,
+}
+
+impl Default for EgressConfig {
+    fn default() -> Self {
+        Self {
+            route: EgressRoute::Direct,
+            origin_tls: TransportTlsConfig::default(),
+            parent_proxy: None,
+            request_headers: Vec::new(),
+            credential_actions: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum EgressRoute {
+    #[default]
+    Direct,
+    ParentProxy,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TransportTlsConfig {
+    #[serde(default)]
+    pub trust: TlsTrust,
+
+    #[serde(default)]
+    pub ca_certificate: Option<PathBuf>,
+
+    #[serde(default = "default_http_versions")]
+    pub http_versions: Vec<HttpVersion>,
+}
+
+impl Default for TransportTlsConfig {
+    fn default() -> Self {
+        Self {
+            trust: TlsTrust::System,
+            ca_certificate: None,
+            http_versions: default_http_versions(),
+        }
+    }
+}
+
+fn default_http_versions() -> Vec<HttpVersion> {
+    vec![HttpVersion::Http1, HttpVersion::Http2]
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum TlsTrust {
+    #[default]
+    System,
+    Custom,
+    SystemPlusCustom,
+    Insecure,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ParentProxyConfig {
+    pub kind: ParentProxyKind,
+    pub url: String,
+
+    #[serde(default)]
+    pub tls: Option<ParentProxyTlsConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ParentProxyKind {
+    AclProxy,
+    Generic,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ParentProxyTlsConfig {
+    #[serde(default)]
+    pub trust: TlsTrust,
+
+    #[serde(default)]
+    pub ca_certificate: Option<PathBuf>,
+
+    #[serde(default)]
+    pub server_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PolicyConfig {
+    pub default: PolicyDefaultDecision,
+
+    #[serde(default)]
+    pub rules: Vec<PolicyRuleConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum PolicyDefaultDecision {
+    Allow,
+    Deny,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PolicyRuleConfig {
+    pub id: String,
+
+    #[serde(default)]
+    pub description: Option<String>,
+
+    pub decision: RuleDecision,
+
+    #[serde(default)]
+    pub urls: Vec<String>,
+
+    #[serde(default)]
+    pub methods: Vec<String>,
+
+    #[serde(default)]
+    pub client_cidrs: Vec<IpNet>,
+
+    #[serde(default)]
+    pub headers: HeaderPredicatesConfig,
+
+    #[serde(default)]
+    pub request_timeout: Option<PositiveDuration>,
+
+    #[serde(default)]
+    pub allow_upgrades: bool,
+
+    #[serde(default)]
+    pub authorization_provider: Option<String>,
+
+    #[serde(default)]
+    pub redaction_profile: Option<String>,
+
+    #[serde(default)]
+    pub request_headers: Vec<HeaderEffectConfig>,
+
+    #[serde(default)]
+    pub response_headers: Vec<HeaderEffectConfig>,
+
+    #[serde(default)]
+    pub credential_actions: Vec<CredentialActionConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum RuleDecision {
+    Allow,
+    Deny,
+    Delegate,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(super) struct HeaderPredicatesConfig {
+    #[serde(default)]
+    pub absent_any: Vec<String>,
+
+    #[serde(default)]
+    pub present_all: Vec<String>,
+
+    #[serde(default)]
+    pub all: BTreeMap<String, Vec<String>>,
+
+    #[serde(default)]
+    pub none: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "operation", rename_all = "lowercase")]
+pub(super) enum HeaderEffectConfig {
+    Set(SetOrAppendHeaderEffectConfig),
+    Append(SetOrAppendHeaderEffectConfig),
+    Remove(RemoveHeaderEffectConfig),
+    Replace(ReplaceHeaderEffectConfig),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SetOrAppendHeaderEffectConfig {
+    pub when: HeaderEffectWhen,
+    pub name: String,
+
+    #[serde(default)]
+    pub value: Option<String>,
+
+    #[serde(default)]
+    pub values: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RemoveHeaderEffectConfig {
+    pub when: HeaderEffectWhen,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ReplaceHeaderEffectConfig {
+    pub when: HeaderEffectWhen,
+    pub name: String,
+    pub search: String,
+    pub replace: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum HeaderEffectWhen {
+    Always,
+    IfPresent,
+    IfAbsent,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AuthorizationConfig {
+    #[serde(default)]
+    pub internal_context_headers: Vec<String>,
+
+    #[serde(default)]
+    pub callback: Option<AuthorizationCallbackConfig>,
+
+    #[serde(default)]
+    pub providers: BTreeMap<String, AuthorizationProviderConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AuthorizationCallbackConfig {
+    pub public_url: String,
+
+    #[serde(default = "default_resume_token_ttl")]
+    pub resume_token_ttl: PositiveDuration,
+
+    #[serde(default = "default_max_pending_operations")]
+    pub max_pending_operations: usize,
+}
+
+fn default_resume_token_ttl() -> PositiveDuration {
+    seconds(5 * 60)
+}
+
+fn default_max_pending_operations() -> usize {
+    4096
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub(super) enum AuthorizationProviderConfig {
+    Webhook(WebhookProviderConfig),
+    Process(ProcessProviderConfig),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WebhookProviderConfig {
+    pub url: String,
+
+    #[serde(default = "default_provider_timeout")]
+    pub timeout: PositiveDuration,
+
+    #[serde(default)]
+    pub on_failure: ProviderFailureMode,
+
+    #[serde(default)]
+    pub include_headers: Vec<String>,
+
+    #[serde(default = "default_max_response_bytes")]
+    pub max_response_bytes: usize,
+
+    #[serde(default)]
+    pub outputs: BTreeMap<String, ProviderOutputConfig>,
+
+    #[serde(default)]
+    pub tls: Option<WebhookTlsConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct WebhookTlsConfig {
+    #[serde(default)]
+    pub trust: TlsTrust,
+
+    #[serde(default)]
+    pub ca_certificate: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ProcessProviderConfig {
+    pub command: PathBuf,
+
+    #[serde(default)]
+    pub args: Vec<String>,
+
+    #[serde(default = "default_provider_timeout")]
+    pub timeout: PositiveDuration,
+
+    #[serde(default)]
+    pub on_failure: ProviderFailureMode,
+
+    #[serde(default)]
+    pub inherit_environment: bool,
+
+    #[serde(default)]
+    pub pass_environment: Vec<String>,
+
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+
+    #[serde(default)]
+    pub include_headers: Vec<String>,
+
+    #[serde(default)]
+    pub include_request_body: bool,
+
+    #[serde(default)]
+    pub allow_request_body_replacement: bool,
+
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_request_body_bytes: usize,
+
+    #[serde(default = "default_max_decoded_request_body_bytes")]
+    pub max_decoded_request_body_bytes: usize,
+
+    #[serde(default = "default_max_stdout_line_bytes")]
+    pub max_stdout_line_bytes: usize,
+
+    #[serde(default = "default_max_pending_requests")]
+    pub max_pending_requests: usize,
+
+    #[serde(default = "default_restart_backoff")]
+    pub restart_backoff: PositiveDuration,
+
+    #[serde(default = "default_retire_timeout")]
+    pub retire_timeout: PositiveDuration,
+
+    #[serde(default)]
+    pub outputs: BTreeMap<String, ProviderOutputConfig>,
+}
+
+fn default_provider_timeout() -> PositiveDuration {
+    seconds(30)
+}
+
+fn default_max_response_bytes() -> usize {
+    64 * 1024
+}
+
+fn default_max_request_body_bytes() -> usize {
+    10 * 1024 * 1024
+}
+
+fn default_max_decoded_request_body_bytes() -> usize {
+    50 * 1024 * 1024
+}
+
+fn default_max_stdout_line_bytes() -> usize {
+    1024 * 1024
+}
+
+fn default_max_pending_requests() -> usize {
+    256
+}
+
+fn default_restart_backoff() -> PositiveDuration {
+    seconds(1)
+}
+
+fn default_retire_timeout() -> PositiveDuration {
+    seconds(30)
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum ProviderFailureMode {
+    #[default]
+    Deny,
+    Error,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(super) enum ProviderOutputConfig {
+    Bearer(BearerProviderOutputConfig),
+    Basic(BasicProviderOutputConfig),
+    CustomHeader(CustomHeaderProviderOutputConfig),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BearerProviderOutputConfig {
+    #[serde(default)]
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BasicProviderOutputConfig {
+    pub username: String,
+
+    #[serde(default)]
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CustomHeaderProviderOutputConfig {
+    pub header: String,
+
+    #[serde(default)]
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CredentialsConfig {
+    #[serde(default)]
+    pub allowed_custom_headers: Vec<String>,
+
+    #[serde(default)]
+    pub inbound: BTreeMap<String, InboundCredentialConfig>,
+
+    #[serde(default)]
+    pub sources: BTreeMap<String, CredentialSourceConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct InboundCredentialConfig {
+    pub header: String,
+    pub process_providers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "source", rename_all = "lowercase")]
+pub(super) enum CredentialSourceConfig {
+    Environment(EnvironmentCredentialSourceConfig),
+    File(FileCredentialSourceConfig),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct EnvironmentCredentialSourceConfig {
+    pub variable: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct FileCredentialSourceConfig {
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(super) enum CredentialActionConfig {
+    Bearer(BearerCredentialActionConfig),
+    Basic(BasicCredentialActionConfig),
+    CustomHeader(CustomHeaderCredentialActionConfig),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BearerCredentialActionConfig {
+    pub credential: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BasicCredentialActionConfig {
+    pub username: String,
+    pub password_credential: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CustomHeaderCredentialActionConfig {
+    pub header: String,
+    pub credential: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RedactionConfig {
+    #[serde(default)]
+    pub profiles: BTreeMap<String, RedactionProfileConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RedactionProfileConfig {
+    #[serde(default = "default_redaction_replacement")]
+    pub replacement: String,
+
+    #[serde(default = "default_max_request_body_bytes")]
+    pub max_body_bytes: usize,
+
+    #[serde(default = "default_max_decoded_request_body_bytes")]
+    pub max_decoded_body_bytes: usize,
+
+    #[serde(default = "default_max_frame_bytes")]
+    pub max_frame_bytes: usize,
+
+    #[serde(default = "default_max_message_bytes")]
+    pub max_message_bytes: usize,
+
+    #[serde(default)]
+    pub allow_permessage_deflate: bool,
+
+    #[serde(default = "default_max_environment_literal_sources")]
+    pub max_environment_literal_sources: usize,
+
+    #[serde(default = "default_max_environment_literal_bytes")]
+    pub max_environment_literal_bytes: usize,
+
+    #[serde(default = "default_max_environment_literal_total_bytes")]
+    pub max_environment_literal_total_bytes: usize,
+
+    pub rules: Vec<RedactionRuleConfig>,
+}
+
+fn default_redaction_replacement() -> String {
+    "[REDACTED]".to_string()
+}
+
+fn default_max_frame_bytes() -> usize {
+    256 * 1024
+}
+
+fn default_max_message_bytes() -> usize {
+    1024 * 1024
+}
+
+fn default_max_environment_literal_sources() -> usize {
+    64
+}
+
+fn default_max_environment_literal_bytes() -> usize {
+    64 * 1024
+}
+
+fn default_max_environment_literal_total_bytes() -> usize {
+    1024 * 1024
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RedactionRuleConfig {
+    #[serde(default)]
+    pub literals: Vec<String>,
+
+    #[serde(default)]
+    pub literal_environment_variables: Vec<String>,
+
+    #[serde(default)]
+    pub expressions: Vec<String>,
+
+    #[serde(default)]
+    pub payloads: RedactionPayloads,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(super) enum RedactionPayloads {
+    #[default]
+    Text,
+    Binary,
+    Both,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ObservationConfig {
+    #[serde(default)]
+    pub logging: LoggingConfigV3,
+
+    #[serde(default)]
+    pub capture: Option<CaptureConfigV3>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct LoggingConfigV3 {
+    #[serde(default = "default_logging_level")]
+    pub level: String,
+
+    #[serde(default)]
+    pub directory: Option<PathBuf>,
+
+    #[serde(default = "default_logging_max_bytes")]
+    pub max_bytes: u64,
+
+    #[serde(default = "default_logging_max_files")]
+    pub max_files: usize,
+
+    #[serde(default = "default_logging_console")]
+    pub console: bool,
+
+    #[serde(default)]
+    pub policy_decisions: PolicyDecisionLoggingConfig,
+}
+
+impl Default for LoggingConfigV3 {
+    fn default() -> Self {
+        Self {
+            level: default_logging_level(),
+            directory: None,
+            max_bytes: default_logging_max_bytes(),
+            max_files: default_logging_max_files(),
+            console: default_logging_console(),
+            policy_decisions: PolicyDecisionLoggingConfig::default(),
+        }
+    }
+}
+
+fn default_logging_level() -> String {
+    "info".to_string()
+}
+
+fn default_logging_max_bytes() -> u64 {
+    100 * 1024 * 1024
+}
+
+fn default_logging_max_files() -> usize {
+    5
+}
+
+fn default_logging_console() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PolicyDecisionLoggingConfig {
+    #[serde(default)]
+    pub allows: bool,
+
+    #[serde(default = "default_log_denies")]
+    pub denies: bool,
+
+    #[serde(default = "default_allow_log_level")]
+    pub allow_level: String,
+
+    #[serde(default = "default_deny_log_level")]
+    pub deny_level: String,
+}
+
+impl Default for PolicyDecisionLoggingConfig {
+    fn default() -> Self {
+        Self {
+            allows: false,
+            denies: default_log_denies(),
+            allow_level: default_allow_log_level(),
+            deny_level: default_deny_log_level(),
+        }
+    }
+}
+
+fn default_log_denies() -> bool {
+    true
+}
+
+fn default_allow_log_level() -> String {
+    "info".to_string()
+}
+
+fn default_deny_log_level() -> String {
+    "warn".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CaptureConfigV3 {
+    pub events: Vec<CaptureEvent>,
+    pub redaction_profile: String,
+    pub directory: PathBuf,
+
+    #[serde(default = "default_capture_filename")]
+    pub filename: String,
+
+    #[serde(default = "default_capture_max_body_bytes")]
+    pub max_body_bytes: usize,
+
+    #[serde(default = "default_capture_max_inflight_body_bytes")]
+    pub max_inflight_body_bytes: usize,
+
+    #[serde(default = "default_capture_max_files")]
+    pub max_files: usize,
+
+    #[serde(default = "default_capture_max_total_bytes")]
+    pub max_total_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+pub(super) enum CaptureEvent {
+    #[serde(rename = "request.allowed")]
+    RequestAllowed,
+    #[serde(rename = "response.allowed")]
+    ResponseAllowed,
+    #[serde(rename = "request.denied")]
+    RequestDenied,
+    #[serde(rename = "response.denied")]
+    ResponseDenied,
+}
+
+fn default_capture_filename() -> String {
+    "{requestId}-{suffix}.json".to_string()
+}
+
+fn default_capture_max_body_bytes() -> usize {
+    1024 * 1024
+}
+
+fn default_capture_max_inflight_body_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+fn default_capture_max_files() -> usize {
+    10_000
+}
+
+fn default_capture_max_total_bytes() -> u64 {
+    1024 * 1024 * 1024
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SafetyConfig {
+    #[serde(default)]
+    pub loop_detection: LoopDetectionConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct LoopDetectionConfig {
+    #[serde(default = "default_true")]
+    pub inject: bool,
+
+    #[serde(default = "default_loop_header")]
+    pub header: String,
+}
+
+impl Default for LoopDetectionConfig {
+    fn default() -> Self {
+        Self {
+            inject: true,
+            header: default_loop_header(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_loop_header() -> String {
+    "x-acl-proxy-request-id".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    const MINIMAL: &str = r#"
+schema_version = 3
+
+[service]
+request_timeout = "30s"
+shutdown_drain_timeout = "30s"
+
+[listeners.explicit_http]
+bind = "127.0.0.1:8881"
+http_versions = ["http1"]
+
+[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+
+[observation.logging]
+level = "info"
+console = true
+
+[safety.loop_detection]
+inject = true
+header = "x-acl-proxy-request-id"
+"#;
+
+    #[test]
+    fn minimal_v3_config_parses_with_secure_defaults() {
+        let config: ConfigV3 = toml::from_str(MINIMAL).unwrap();
+        assert_eq!(
+            config.service.request_timeout.get(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            config.service.shutdown_drain_timeout.bounded(),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(config.service.max_retiring_generations, 2);
+        assert_eq!(config.service.max_active_upgrades, 256);
+        assert_eq!(config.service.upgrade_relay_buffer_bytes, 64 * 1024);
+        assert_eq!(
+            config.service.max_upgrade_buffer_bytes,
+            2 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            config.service.max_upgrade_lifetime.get(),
+            Duration::from_secs(8 * 60 * 60)
+        );
+        assert_eq!(
+            config.service.max_inflight_wire_body_bytes,
+            8 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            config.service.max_inflight_wire_body_bytes_per_quota_key,
+            1024 * 1024 * 1024
+        );
+        assert_eq!(config.service.min_wire_body_concurrency, 64);
+        assert_eq!(config.service.max_content_decoding_expansion_ratio, 128);
+        assert_eq!(config.policy.default, PolicyDefaultDecision::Deny);
+        assert!(config.policy.rules.is_empty());
+        assert!(config.safety.loop_detection.inject);
+        assert_eq!(config.observation.logging.level, "info");
+        assert!(config.observation.logging.console);
+        assert!(config.mitm.is_none());
+        assert!(config.credentials.inbound.is_empty());
+        assert!(config.credentials.sources.is_empty());
+
+        let listener = config.listeners.explicit_http.unwrap();
+        assert_eq!(listener.bind, "127.0.0.1:8881".parse().unwrap());
+        assert_eq!(listener.http_versions, vec![HttpVersion::Http1]);
+        assert_eq!(listener.connect.http1, Some(Http1ConnectPolicy::Deny));
+        assert_eq!(listener.connect.http2, None);
+    }
+
+    #[test]
+    fn final_service_capacity_fields_are_authored_with_exact_names() {
+        let authored = MINIMAL.replace(
+            "shutdown_drain_timeout = \"30s\"",
+            r#"shutdown_drain_timeout = "unbounded"
+max_retiring_generations = 4
+max_active_upgrades = 512
+upgrade_relay_buffer_bytes = 131072
+max_upgrade_buffer_bytes = 3221225472
+max_upgrade_lifetime = "12h"
+max_inflight_wire_body_bytes = 17179869184
+max_inflight_wire_body_bytes_per_quota_key = 2147483648
+min_wire_body_concurrency = 128
+max_content_decoding_expansion_ratio = 96"#,
+        );
+
+        let parsed: ConfigV3 = toml::from_str(&authored).unwrap();
+        assert_eq!(
+            parsed.service.shutdown_drain_timeout,
+            DrainTimeout::Unbounded
+        );
+        assert_eq!(parsed.service.max_retiring_generations, 4);
+        assert_eq!(parsed.service.max_active_upgrades, 512);
+        assert_eq!(parsed.service.upgrade_relay_buffer_bytes, 128 * 1024);
+        assert_eq!(
+            parsed.service.max_upgrade_buffer_bytes,
+            3 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            parsed.service.max_upgrade_lifetime.get(),
+            Duration::from_secs(12 * 60 * 60)
+        );
+        assert_eq!(
+            parsed.service.max_inflight_wire_body_bytes,
+            16 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            parsed.service.max_inflight_wire_body_bytes_per_quota_key,
+            2 * 1024 * 1024 * 1024
+        );
+        assert_eq!(parsed.service.min_wire_body_concurrency, 128);
+        assert_eq!(parsed.service.max_content_decoding_expansion_ratio, 96);
+    }
+
+    #[test]
+    fn schema_version_is_integer_three_only() {
+        for invalid in [
+            MINIMAL.replacen("schema_version = 3", "schema_version = 2", 1),
+            MINIMAL.replacen("schema_version = 3", "schema_version = 4", 1),
+            MINIMAL.replacen("schema_version = 3", "schema_version = \"3\"", 1),
+        ] {
+            assert!(toml::from_str::<ConfigV3>(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn unknown_fields_are_rejected_at_nested_and_top_levels() {
+        let top = format!("{MINIMAL}\nlegacy = true\n");
+        assert!(toml::from_str::<ConfigV3>(&top).is_err());
+
+        let nested = MINIMAL.replace(
+            "http_versions = [\"http1\"]",
+            "http_versions = [\"http1\"]\nenable_http2 = true",
+        );
+        assert!(toml::from_str::<ConfigV3>(&nested).is_err());
+    }
+
+    #[test]
+    fn strict_tagged_variants_reject_fields_from_other_variants() {
+        let generated_with_file = format!(
+            "{MINIMAL}\n[mitm]\nmode = \"generated\"\ndirectory = \"certs\"\nca_certificate = \"ca.pem\"\n"
+        );
+        assert!(toml::from_str::<ConfigV3>(&generated_with_file).is_err());
+
+        let webhook_with_process_field = format!(
+            "{MINIMAL}\n[authorization.providers.approval]\nkind = \"webhook\"\nurl = \"https://example.test/auth\"\ncommand = \"/bin/false\"\n"
+        );
+        assert!(toml::from_str::<ConfigV3>(&webhook_with_process_field).is_err());
+
+        let bearer_with_basic_field = format!(
+            "{MINIMAL}\n[[egress.credential_actions]]\nkind = \"bearer\"\ncredential = \"token\"\nusername = \"wrong\"\n"
+        );
+        assert!(toml::from_str::<ConfigV3>(&bearer_with_basic_field).is_err());
+
+        let remove_with_value = format!(
+            "{MINIMAL}\n[[egress.request_headers]]\noperation = \"remove\"\nwhen = \"always\"\nname = \"x-test\"\nvalue = \"wrong\"\n"
+        );
+        assert!(toml::from_str::<ConfigV3>(&remove_with_value).is_err());
+    }
+
+    #[test]
+    fn complete_provider_and_observation_shapes_parse() {
+        let config = format!(
+            r#"{MINIMAL}
+
+[control]
+bind = "127.0.0.1:8898"
+max_request_body_bytes = 65536
+
+[authorization]
+internal_context_headers = ["x-aw-policy-context"]
+
+[authorization.callback]
+public_url = "http://127.0.0.1:8898/_acl-proxy/external-auth/callback"
+max_pending_operations = 4096
+
+[authorization.providers.approval]
+kind = "webhook"
+url = "https://approval.example.test/authorize"
+max_response_bytes = 65536
+
+[authorization.providers.approval.outputs.session]
+kind = "bearer"
+required = true
+
+[authorization.providers.local]
+kind = "process"
+command = "/usr/local/bin/approve"
+args = ["--stdio"]
+inherit_environment = false
+pass_environment = ["PATH"]
+environment = {{ APPROVAL_MODE = "interactive" }}
+include_headers = ["content-type", "x-aw-identity-token"]
+include_request_body = true
+allow_request_body_replacement = true
+max_pending_requests = 256
+retire_timeout = "30s"
+
+[authorization.providers.local.outputs.api_key]
+kind = "custom_header"
+header = "x-api-key"
+
+[credentials]
+allowed_custom_headers = ["x-api-key"]
+
+[credentials.inbound.aw_identity]
+header = "x-aw-identity-token"
+process_providers = ["local"]
+
+[credentials.sources.token]
+source = "environment"
+variable = "TOKEN"
+
+[redaction.profiles.secrets]
+max_environment_literal_sources = 64
+max_environment_literal_bytes = 65536
+max_environment_literal_total_bytes = 1048576
+
+[[redaction.profiles.secrets.rules]]
+literals = ["secret"]
+literal_environment_variables = ["REDACT_TOKEN"]
+payloads = "both"
+
+[observation.capture]
+events = ["request.denied", "response.denied"]
+redaction_profile = "secrets"
+directory = "captures"
+max_inflight_body_bytes = 67108864
+"#
+        );
+
+        let parsed: ConfigV3 = toml::from_str(&config).unwrap();
+        let control = parsed.control.as_ref().unwrap();
+        assert_eq!(control.max_request_body_bytes, 64 * 1024);
+        assert_eq!(
+            parsed
+                .authorization
+                .callback
+                .as_ref()
+                .unwrap()
+                .resume_token_ttl
+                .get(),
+            Duration::from_secs(5 * 60)
+        );
+        assert_eq!(parsed.authorization.providers.len(), 2);
+        assert_eq!(parsed.authorization.internal_context_headers.len(), 1);
+        assert_eq!(parsed.credentials.inbound.len(), 1);
+        let webhook = match &parsed.authorization.providers["approval"] {
+            AuthorizationProviderConfig::Webhook(webhook) => webhook,
+            AuthorizationProviderConfig::Process(_) => panic!("expected webhook provider"),
+        };
+        assert_eq!(webhook.timeout.get(), Duration::from_secs(30));
+        assert_eq!(webhook.on_failure, ProviderFailureMode::Deny);
+        assert_eq!(webhook.max_response_bytes, 64 * 1024);
+
+        let process = match &parsed.authorization.providers["local"] {
+            AuthorizationProviderConfig::Process(process) => process,
+            AuthorizationProviderConfig::Webhook(_) => panic!("expected process provider"),
+        };
+        assert!(process.include_request_body);
+        assert!(process.allow_request_body_replacement);
+        assert_eq!(process.max_request_body_bytes, 10 * 1024 * 1024);
+        assert_eq!(process.max_decoded_request_body_bytes, 50 * 1024 * 1024);
+        assert_eq!(process.max_stdout_line_bytes, 1024 * 1024);
+        assert_eq!(process.max_pending_requests, 256);
+        assert_eq!(process.restart_backoff.get(), Duration::from_secs(1));
+        assert_eq!(process.retire_timeout.get(), Duration::from_secs(30));
+
+        let redaction = &parsed.redaction.profiles["secrets"];
+        assert_eq!(redaction.max_environment_literal_sources, 64);
+        assert_eq!(redaction.max_environment_literal_bytes, 64 * 1024);
+        assert_eq!(redaction.max_environment_literal_total_bytes, 1024 * 1024);
+        let capture = parsed.observation.capture.unwrap();
+        assert_eq!(capture.events.len(), 2);
+        assert_eq!(capture.redaction_profile, "secrets");
+        assert_eq!(capture.max_inflight_body_bytes, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn workload_identity_and_inbound_credentials_use_typed_shapes() {
+        let config = format!(
+            r#"{MINIMAL}
+
+[[policy.rules]]
+id = "identity"
+decision = "allow"
+urls = ["https://example.test/**"]
+
+[policy.rules.headers]
+present_all = ["x-aw-identity-token"]
+
+[[policy.rules.credential_actions]]
+kind = "custom_header"
+header = "x-aw-identity-token"
+credential = "identity"
+
+[credentials]
+allowed_custom_headers = ["x-aw-identity-token"]
+
+[credentials.inbound.aw_identity]
+header = "x-aw-identity-token"
+process_providers = ["gitlab"]
+
+[credentials.sources.identity]
+source = "environment"
+variable = "AW_IDENTITY_TOKEN"
+"#
+        );
+
+        let parsed: ConfigV3 = toml::from_str(&config).unwrap();
+        let rule = &parsed.policy.rules[0];
+        assert_eq!(rule.headers.present_all, ["x-aw-identity-token"]);
+        assert!(matches!(
+            &rule.credential_actions[0],
+            CredentialActionConfig::CustomHeader(action)
+                if action.header == "x-aw-identity-token" && action.credential == "identity"
+        ));
+        let inbound = &parsed.credentials.inbound["aw_identity"];
+        assert_eq!(inbound.header, "x-aw-identity-token");
+        assert_eq!(inbound.process_providers, ["gitlab"]);
+        assert!(matches!(
+            &parsed.credentials.sources["identity"],
+            CredentialSourceConfig::Environment(source)
+                if source.variable == "AW_IDENTITY_TOKEN"
+        ));
+    }
+
+    #[test]
+    fn parent_kind_and_required_mitm_directory_parse() {
+        let config = MINIMAL.replace(
+            "[policy]",
+            r#"[egress]
+route = "parent_proxy"
+
+[egress.parent_proxy]
+kind = "acl_proxy"
+url = "https://parent.example.test:8443"
+
+[egress.parent_proxy.tls]
+trust = "system"
+
+[policy]"#,
+        ) + r#"
+
+[mitm]
+mode = "files"
+ca_certificate = "ca-cert.pem"
+ca_private_key = "ca-key.pem"
+directory = "certs"
+"#;
+
+        let parsed: ConfigV3 = toml::from_str(&config).unwrap();
+        let parent = parsed.egress.parent_proxy.unwrap();
+        assert_eq!(parent.kind, ParentProxyKind::AclProxy);
+
+        let missing_parent_kind = config.replace("kind = \"acl_proxy\"\n", "");
+        assert!(toml::from_str::<ConfigV3>(&missing_parent_kind).is_err());
+
+        let missing_mitm_directory = config.replace("directory = \"certs\"\n", "");
+        assert!(toml::from_str::<ConfigV3>(&missing_mitm_directory).is_err());
+    }
+
+    #[test]
+    fn removed_v2_authoring_shapes_are_not_accepted() {
+        let legacy_rule =
+            format!("{MINIMAL}\n[[policy.rules]]\naction = \"allow\"\npattern = \"**\"\n");
+        assert!(toml::from_str::<ConfigV3>(&legacy_rule).is_err());
+
+        let legacy_top = MINIMAL.replace(
+            "[listeners.explicit_http]",
+            "[proxy.listeners.explicit_http]",
+        );
+        assert!(toml::from_str::<ConfigV3>(&legacy_top).is_err());
+
+        for obsolete in [
+            MINIMAL.replace("inject = true", "enabled = true\ninject = true"),
+            format!(
+                "{MINIMAL}\n[redaction.profiles.legacy]\nunsupported_extensions = \"deny\"\nrules = []\n"
+            ),
+        ] {
+            assert!(toml::from_str::<ConfigV3>(&obsolete).is_err());
+        }
+    }
+}

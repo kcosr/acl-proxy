@@ -1,0 +1,547 @@
+schema_version = 3
+
+[service]
+request_timeout = "2h"
+shutdown_drain_timeout = "30s"
+max_inflight_wire_body_bytes = 8589934592
+max_inflight_wire_body_bytes_per_quota_key = 1073741824
+min_wire_body_concurrency = 64
+max_content_decoding_expansion_ratio = 128
+
+[control]
+bind = "127.0.0.1:8898"
+base_path = "/_acl-proxy"
+
+[listeners.explicit_http]
+bind = "0.0.0.0:8881"
+http_versions = ["http1"]
+
+[listeners.explicit_http.connect]
+http1 = "mitm"
+
+[listeners.transparent_https]
+bind = "0.0.0.0:8889"
+http_versions = ["http1", "http2"]
+
+[mitm]
+mode = "generated"
+directory = "runtime/certs"
+
+[egress]
+route = "direct"
+
+[egress.origin_tls]
+trust = "system"
+http_versions = ["http1"]
+
+[[egress.request_headers]]
+operation = "remove"
+when = "always"
+name = "x-aw-policy-context"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "prod-host-r00-require-identity"
+description = "Sanitized source rule 00: deny when workload identity is absent"
+decision = "deny"
+urls = ["**"]
+
+[policy.rules.headers]
+absent_any = ["x-aw-identity-token"]
+
+[[policy.rules]]
+id = "prod-host-r01-ai-redaction-a"
+description = "Sanitized source rule 01: AI service group with wire redaction"
+decision = "allow"
+urls = [
+  "https://api.anthropic.com/**",
+  "https://console.anthropic.com/**",
+  "https://downloads.ai-a.example.test/**",
+  "https://telemetry.ai-a.example.test/**",
+]
+redaction_profile = "sensitive_strings"
+
+[[policy.rules]]
+id = "prod-host-r02-editor-redaction"
+description = "Sanitized source rule 02: editor service group with one-label wildcard"
+decision = "allow"
+urls = [
+  "https://api.editor.example.test/**",
+  "https://*.cursor.sh/**",
+]
+redaction_profile = "sensitive_strings"
+
+[[policy.rules]]
+id = "prod-host-r03-ai-redaction-b"
+description = "Sanitized source rule 03: AI and source service group with recursive wildcard"
+decision = "allow"
+urls = [
+  "https://chatgpt.com/**",
+  "https://api.openai.com/**",
+  "https://auth.openai.com/**",
+  "https://developers.openai.com/**",
+  "https://github.com/**",
+  "https://api.github.com/**",
+  "https://**.chatgpt.com/**",
+]
+redaction_profile = "sensitive_strings"
+
+[[policy.rules]]
+id = "prod-host-r04-context-a-allow"
+description = "Sanitized source rule 04: context-A destination group represented by its reviewed source network"
+decision = "allow"
+urls = [
+  "http://git.private-a.example.test/**",
+  "https://git.private-a.example.test/**",
+  "http://artifacts.private-b.example.test/**",
+  "https://artifacts.private-b.example.test/**",
+  "http://models.private-c.example.test/**",
+  "https://models.private-c.example.test/**",
+  "http://downloads.private-d.example.test/**",
+  "https://downloads.private-d.example.test/**",
+  "http://*.source.private-e.example.test/**",
+  "https://*.source.private-e.example.test/**",
+  "http://*.tools.private-f.example.test/**",
+  "https://*.tools.private-f.example.test/**",
+]
+client_cidrs = ["198.18.1.0/24"]
+
+[[policy.rules]]
+id = "prod-host-r05-context-b-models"
+description = "Sanitized source rule 05: context-B model endpoints represented by its reviewed source network"
+decision = "allow"
+urls = [
+  "https://model-a.private.example.test/**",
+  "https://model-b.private.example.test/**",
+  "https://model-c.private.example.test/**",
+  "https://model-d.private.example.test/**",
+]
+client_cidrs = ["198.18.2.0/24"]
+
+[[policy.rules]]
+id = "prod-host-r06-context-a-corporate-deny"
+description = "Sanitized source rule 06: context-A corporate deny represented by its reviewed source network"
+decision = "deny"
+urls = [
+  "http://private-a.example.test/**",
+  "https://private-a.example.test/**",
+  "http://*.private-a.example.test/**",
+  "https://*.private-a.example.test/**",
+  "http://private-b.example.test/**",
+  "https://private-b.example.test/**",
+  "http://*.private-b.example.test/**",
+  "https://*.private-b.example.test/**",
+  "http://private-c.example.test/**",
+  "https://private-c.example.test/**",
+  "http://*.private-c.example.test/**",
+  "https://*.private-c.example.test/**",
+  "http://*.private-d.example.test/**",
+  "https://*.private-d.example.test/**",
+]
+client_cidrs = ["198.18.1.0/24"]
+
+[[policy.rules]]
+id = "prod-host-r07-github-sensitive-deny"
+description = "Sanitized source rule 07: deny sensitive source-host operations"
+decision = "deny"
+urls = [
+  "https://github.com/*/*/settings/**",
+  "https://github.com/*/*/delete/**",
+]
+
+[[policy.rules]]
+id = "prod-host-r08-npm-mutation-deny"
+description = "Sanitized source rule 08: deny package registry mutation methods"
+decision = "deny"
+urls = ["https://registry.npmjs.org/**"]
+methods = ["PUT", "PATCH", "DELETE"]
+
+[[policy.rules]]
+id = "prod-host-r09-context-a-catchall"
+description = "Sanitized source rule 09: context-A catchall represented by its reviewed source network"
+decision = "allow"
+urls = ["**"]
+client_cidrs = ["198.18.1.0/24"]
+
+[[policy.rules]]
+id = "prod-host-r10-development-host"
+description = "Sanitized source rule 10: development host"
+decision = "allow"
+urls = ["https://dev.private-g.example.test/**"]
+
+[[policy.rules]]
+id = "prod-host-r11-agent-service"
+description = "Sanitized source rule 11: internal agent service"
+decision = "allow"
+urls = ["https://agent-service.private-h.example.test/**"]
+
+[[policy.rules]]
+id = "prod-host-r12-agent-chat"
+description = "Sanitized source rule 12: internal agent chat API"
+decision = "allow"
+urls = ["https://agent-chat.private-i.example.test/api/**"]
+
+[[policy.rules]]
+id = "prod-host-r13-telemetry"
+description = "Sanitized source rule 13: production telemetry with recursive host wildcards"
+decision = "allow"
+urls = [
+  "https://statsig.anthropic.com/**",
+  "https://**.sentry.io/**",
+  "https://**.datadoghq.com/**",
+]
+
+[[policy.rules]]
+id = "prod-host-r14-raw-source-get"
+description = "Sanitized source rule 14: GET-only raw source content"
+decision = "allow"
+urls = ["https://raw.githubusercontent.com/**"]
+methods = ["GET"]
+
+[[policy.rules]]
+id = "prod-host-r15-storage-get"
+description = "Sanitized source rule 15: GET-only storage downloads"
+decision = "allow"
+urls = [
+  "https://storage.googleapis.com/**",
+  "https://downloads.private-j.example.test/**",
+]
+methods = ["GET"]
+
+[[policy.rules]]
+id = "prod-host-r16-context-c-model-a-deny"
+description = "Sanitized source rule 16: context-C model gate represented by non-internal source networks"
+decision = "deny"
+urls = ["https://model-a.private.example.test/**"]
+client_cidrs = ["203.0.113.0/24"]
+
+[[policy.rules]]
+id = "prod-host-r17-context-c-model-a-get"
+description = "Sanitized source rule 17: internal GET for model A"
+decision = "allow"
+urls = ["https://model-a.private.example.test/**"]
+methods = ["GET"]
+client_cidrs = ["198.18.0.0/24"]
+
+[[policy.rules]]
+id = "prod-host-r18-context-c-model-b-deny"
+description = "Sanitized source rule 18: context-C model gate represented by non-internal source networks"
+decision = "deny"
+urls = ["https://model-b.private.example.test/**"]
+client_cidrs = ["203.0.113.0/24"]
+
+[[policy.rules]]
+id = "prod-host-r19-context-c-model-b-get"
+description = "Sanitized source rule 19: internal GET for model B"
+decision = "allow"
+urls = ["https://model-b.private.example.test/**"]
+methods = ["GET"]
+client_cidrs = ["198.18.0.0/24"]
+
+[[policy.rules]]
+id = "prod-host-r20-editor-download-get"
+description = "Sanitized source rule 20: GET-only editor download"
+decision = "allow"
+urls = ["https://downloads.editor.example.test/**"]
+methods = ["GET"]
+
+[[policy.rules]]
+id = "prod-host-r21-ai-source-downloads"
+description = "Sanitized source rule 21: GET-only AI and source downloads"
+decision = "allow"
+urls = [
+  "https://files.openai.com/**?**",
+  "https://raw.githubusercontent.com/**",
+]
+methods = ["GET"]
+
+[[policy.rules]]
+id = "prod-host-r22-private-api-group"
+description = "Sanitized source rule 22: ordered private API group"
+decision = "allow"
+urls = [
+  "https://api.private-k.example.test/v1/read/**",
+  "https://api.private-k.example.test/v1/list/**",
+  "https://api.private-k.example.test/v1/status/**",
+  "https://api.private-k.example.test/v2/read/**",
+  "https://api.private-k.example.test/v2/list/**",
+  "https://api.private-l.example.test/v1/**",
+  "https://api.private-m.example.test/v1/**",
+  "https://api.private-k.example.test/health/**",
+]
+
+[[policy.rules]]
+id = "prod-host-r23-private-api-put"
+description = "Sanitized source rule 23: one private API PUT"
+decision = "allow"
+urls = ["https://api.private-k.example.test/v1/upload/**"]
+methods = ["PUT"]
+
+[[policy.rules]]
+id = "prod-host-r24-private-api-get-a"
+description = "Sanitized source rule 24: one private API GET"
+decision = "allow"
+urls = ["https://api.private-m.example.test/v1/item/**"]
+methods = ["GET"]
+
+[[policy.rules]]
+id = "prod-host-r25-private-api-get-b"
+description = "Sanitized source rule 25: second private API GET"
+decision = "allow"
+urls = ["https://api.private-m.example.test/v1/result/**"]
+methods = ["GET"]
+
+[[policy.rules]]
+id = "prod-host-r26-private-api-get-c"
+description = "Sanitized source rule 26: third private API GET"
+decision = "allow"
+urls = ["https://api.private-k.example.test/v1/report/**"]
+methods = ["GET"]
+
+[[policy.rules]]
+id = "prod-host-r27-private-api-post-a"
+description = "Sanitized source rule 27: one private API POST"
+decision = "allow"
+urls = ["https://api.private-m.example.test/v1/upload/**"]
+methods = ["POST"]
+
+[[policy.rules]]
+id = "prod-host-r28-private-api-post-b"
+description = "Sanitized source rule 28: second private API POST"
+decision = "allow"
+urls = ["https://api.private-m.example.test/v1/query/**"]
+methods = ["POST"]
+
+[[policy.rules]]
+id = "prod-host-r29-private-api-post-c"
+description = "Sanitized source rule 29: third private API POST"
+decision = "allow"
+urls = ["https://api.private-k.example.test/v1/action/**"]
+methods = ["POST"]
+
+[[policy.rules]]
+id = "prod-host-r30-agent-api-group"
+description = "Sanitized source rule 30: ordered agent API group"
+decision = "allow"
+urls = [
+  "https://api.private-m.example.test/agent/start/**",
+  "https://api.private-m.example.test/agent/stop/**",
+  "https://api.private-m.example.test/agent/status/**",
+  "https://api.private-m.example.test/agent/events/**",
+  "https://api.private-k.example.test/agent/start/**",
+  "https://api.private-k.example.test/agent/stop/**",
+  "https://api.private-k.example.test/agent/status/**",
+  "https://api.private-k.example.test/agent/events/**",
+]
+
+[[policy.rules]]
+id = "prod-host-r31-private-api-secondary"
+description = "Sanitized source rule 31: secondary private API group"
+decision = "allow"
+urls = [
+  "https://api.private-m.example.test/v2/a/**",
+  "https://api.private-m.example.test/v2/b/**",
+  "https://api.private-m.example.test/v2/c/**",
+  "https://api.private-m.example.test/v2/d/**",
+  "https://api.private-m.example.test/v2/e/**",
+  "https://api.private-m.example.test/v2/f/**",
+]
+
+[[policy.rules]]
+id = "prod-host-r32-toolchain-downloads"
+description = "Sanitized source rule 32: GET and HEAD toolchain/package downloads"
+decision = "allow"
+urls = [
+  "https://github.com/**",
+  "https://api.github.com/**",
+  "https://raw.githubusercontent.com/**",
+  "https://objects.githubusercontent.com/**",
+  "https://release-assets.githubusercontent.com/**",
+  "https://registry.npmjs.org/**",
+  "https://packages.private-n.example.test/**",
+  "https://packages.private-o.example.test/**",
+  "https://packages.private-p.example.test/**",
+  "https://packages.private-q.example.test/**",
+  "https://packages.private-r.example.test/**",
+  "https://packages.private-s.example.test/**",
+  "https://packages.private-t.example.test/**",
+  "https://packages.private-u.example.test/**",
+  "https://packages.private-v.example.test/**",
+  "https://storage.googleapis.com/**",
+  "https://downloads.private-w.example.test/**",
+  "https://downloads.private-x.example.test/**",
+  "https://downloads.private-y.example.test/**",
+  "https://downloads.private-z.example.test/**",
+]
+methods = ["GET", "HEAD"]
+
+[[policy.rules]]
+id = "prod-host-r33-package-sources"
+description = "Sanitized source rule 33: GET-only package sources"
+decision = "allow"
+urls = [
+  "https://packages.private-aa.example.test/**",
+  "https://packages.private-ab.example.test/**",
+  "https://packages.private-ac.example.test/**",
+]
+methods = ["GET"]
+
+[[policy.rules]]
+id = "prod-host-r34-ai-npm-packages"
+description = "Sanitized source rule 34: GET-only AI package metadata"
+decision = "allow"
+urls = [
+  "https://registry.npmjs.org/ai-package/**",
+  "https://registry.npmjs.org/ai-helper/**",
+]
+methods = ["GET"]
+
+[[policy.rules]]
+id = "prod-host-r35-npm-get"
+description = "Sanitized source rule 35: GET package metadata"
+decision = "allow"
+urls = ["https://registry.npmjs.org/**"]
+methods = ["GET"]
+
+[[policy.rules]]
+id = "prod-host-r36-npm-post"
+description = "Sanitized source rule 36: POST package operation"
+decision = "allow"
+urls = ["https://registry.npmjs.org/-/fixture/**"]
+methods = ["POST"]
+
+[[policy.rules]]
+id = "prod-host-r37-rocky-downloads"
+description = "Sanitized source rule 37: GET-only operating-system mirrors"
+decision = "allow"
+urls = [
+  "https://mirrors.rockylinux.org/**",
+  "https://dl.rockylinux.org/**",
+  "https://rocky-linux-*.production.gcp.mirrors.ctrliq.cloud/pub/rocky/**",
+]
+methods = ["GET"]
+
+[[policy.rules]]
+id = "prod-host-r38-public-gitlab-get"
+description = "Sanitized source rule 38: GET-only public Git service"
+decision = "allow"
+urls = ["https://gitlab.com/**"]
+methods = ["GET"]
+
+[[policy.rules]]
+id = "prod-host-r39-internal-git-read"
+description = "Sanitized source rule 39: internal Git token and repository reads"
+decision = "allow"
+urls = [
+  "https://gitlab.example.test/group/public.git/info/refs",
+  "https://gitlab.example.test/api/v4/projects/group%2Fpublic/**",
+]
+
+[[policy.rules]]
+id = "prod-host-r40-internal-git-query"
+description = "Sanitized source rule 40: query-bearing internal Git reads"
+decision = "allow"
+urls = [
+  "https://gitlab.example.test/group/public.git/**?service=*",
+  "https://gitlab.example.test/api/v4/projects/group%2Fpublic/**?**",
+]
+
+[[policy.rules]]
+id = "prod-host-r41-internal-git-context-c-deny"
+description = "Sanitized source rule 41: internal-workload deny before delegation"
+decision = "deny"
+urls = [
+  "https://gitlab.example.test/group/restricted.git/**",
+  "https://gitlab.example.test/api/v4/projects/group%2Frestricted/**",
+]
+client_cidrs = ["198.18.0.0/24"]
+
+[[policy.rules]]
+id = "prod-host-r42-gitlab-delegate"
+description = "Sanitized source rule 42: Git provider validates identity/context pair"
+decision = "delegate"
+urls = ["https://gitlab.example.test/**"]
+client_cidrs = ["198.18.0.0/15"]
+authorization_provider = "gitlab_acl"
+
+[[policy.rules]]
+id = "prod-host-r43-private-tail-allow"
+description = "Sanitized source rule 43: final private destination pair"
+decision = "allow"
+urls = [
+  "https://downloads.private-d.example.test/**",
+  "https://*.source.private-e.example.test/**",
+]
+
+[authorization]
+internal_context_headers = ["x-aw-policy-context"]
+
+[authorization.providers.gitlab_acl]
+kind = "process"
+command = "providers/gitlab_acl.py"
+args = ["--config", "providers/gitlab_acl.json"]
+timeout = "1s"
+on_failure = "deny"
+inherit_environment = false
+environment = { PATH = "/usr/bin:/bin" }
+include_headers = ["x-aw-identity-token", "x-aw-policy-context"]
+include_request_body = false
+allow_request_body_replacement = false
+max_pending_requests = 256
+restart_backoff = "1s"
+retire_timeout = "2h"
+
+[authorization.providers.agent_runner_acl]
+kind = "process"
+command = "providers/agent_runner_acl.py"
+args = ["--config", "providers/agent_runner_acl.json"]
+timeout = "1s"
+on_failure = "deny"
+inherit_environment = false
+environment = { PATH = "/usr/bin:/bin" }
+include_headers = ["x-aw-identity-token"]
+include_request_body = false
+allow_request_body_replacement = false
+max_pending_requests = 256
+restart_backoff = "1s"
+retire_timeout = "2h"
+
+[credentials.inbound.aw_identity]
+header = "x-aw-identity-token"
+process_providers = ["gitlab_acl", "agent_runner_acl"]
+
+[redaction.profiles.sensitive_strings]
+replacement = "[REDACTED]"
+max_body_bytes = 10485760
+max_decoded_body_bytes = 52428800
+max_frame_bytes = 262144
+max_message_bytes = 1048576
+allow_permessage_deflate = false
+max_environment_literal_sources = 64
+max_environment_literal_bytes = 65536
+max_environment_literal_total_bytes = 1048576
+
+[[redaction.profiles.sensitive_strings.rules]]
+literals = ["synthetic-safe-literal"]
+literal_environment_variables = [
+  "FIXTURE_REDACT_A",
+  "FIXTURE_REDACT_B",
+  "FIXTURE_REDACT_C",
+  "FIXTURE_REDACT_D",
+  "FIXTURE_REDACT_E",
+]
+expressions = ["fixture-secret-[A-Za-z0-9_.-]{20,}"]
+payloads = "text"
+
+[observation.logging]
+level = "info"
+directory = "runtime/logs"
+max_bytes = 104857600
+max_files = 5
+console = false
+
+[safety.loop_detection]
+inject = true
+header = "x-acl-proxy-request-id"

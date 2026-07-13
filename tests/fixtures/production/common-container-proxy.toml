@@ -1,0 +1,79 @@
+schema_version = 3
+
+[service]
+request_timeout = "2h"
+shutdown_drain_timeout = "30s"
+max_inflight_wire_body_bytes = 8589934592
+max_inflight_wire_body_bytes_per_quota_key = 1073741824
+min_wire_body_concurrency = 64
+max_content_decoding_expansion_ratio = 128
+
+[control]
+bind = "127.0.0.1:8898"
+base_path = "/_acl-proxy"
+
+[listeners.explicit_http]
+bind = "0.0.0.0:8881"
+http_versions = ["http1"]
+
+[listeners.explicit_http.connect]
+http1 = "mitm"
+
+[listeners.transparent_https]
+bind = "0.0.0.0:8889"
+http_versions = ["http1", "http2"]
+
+[mitm]
+mode = "files"
+ca_certificate = "tls/fixture-ca-cert.pem"
+ca_private_key = "tls/fixture-ca-key.pem"
+directory = "runtime/certs"
+
+[egress]
+route = "parent_proxy"
+
+[egress.origin_tls]
+trust = "system"
+http_versions = ["http1"]
+
+[egress.parent_proxy]
+kind = "acl_proxy"
+url = "http://host-proxy.example.test:8881"
+
+[[egress.request_headers]]
+operation = "remove"
+when = "always"
+name = "x-aw-policy-context"
+
+[[egress.credential_actions]]
+kind = "custom_header"
+header = "x-aw-identity-token"
+credential = "aw_identity"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "prod-common-r00-parent-all"
+description = "Sanitized source rule 00: parent all valid HTTP and HTTPS URLs"
+decision = "allow"
+urls = ["**"]
+
+[authorization]
+internal_context_headers = ["x-aw-policy-context"]
+
+[credentials]
+allowed_custom_headers = ["x-aw-identity-token"]
+
+[credentials.sources.aw_identity]
+source = "environment"
+variable = "AW_IDENTITY_TOKEN"
+
+[observation.logging]
+level = "error"
+directory = "runtime/logs"
+console = false
+
+[safety.loop_detection]
+inject = false
+header = "x-acl-proxy-request-id"

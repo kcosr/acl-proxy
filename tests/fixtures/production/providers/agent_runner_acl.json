@@ -1,0 +1,8 @@
+{
+  "schema": "synthetic-fixture-v1",
+  "identities": {
+    "fixture-runner-identity": [
+      "https://runner.example.test/jobs/*"
+    ]
+  }
+}

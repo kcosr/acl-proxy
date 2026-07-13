@@ -1,3 +1,9 @@
+mod authoring;
+mod duration;
+mod v3_compile;
+mod v3_loader;
+mod v3_template;
+
 use std::env;
 use std::fs;
 use std::io::BufReader;
