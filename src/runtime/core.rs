@@ -105,6 +105,14 @@ pub(crate) struct Runtime {
     #[cfg(test)]
     lease_acquire_release: Notify,
     #[cfg(test)]
+    lease_validation_blocked: AtomicBool,
+    #[cfg(test)]
+    lease_validation_entered: AtomicBool,
+    #[cfg(test)]
+    lease_validation_changed: Notify,
+    #[cfg(test)]
+    lease_validation_release: Notify,
+    #[cfg(test)]
     publication_exit_blocked: AtomicBool,
     #[cfg(test)]
     publication_exit_entered: AtomicBool,
@@ -172,6 +180,14 @@ impl Runtime {
             #[cfg(test)]
             lease_acquire_release: Notify::new(),
             #[cfg(test)]
+            lease_validation_blocked: AtomicBool::new(false),
+            #[cfg(test)]
+            lease_validation_entered: AtomicBool::new(false),
+            #[cfg(test)]
+            lease_validation_changed: Notify::new(),
+            #[cfg(test)]
+            lease_validation_release: Notify::new(),
+            #[cfg(test)]
             publication_exit_blocked: AtomicBool::new(false),
             #[cfg(test)]
             publication_exit_entered: AtomicBool::new(false),
@@ -232,9 +248,19 @@ impl Runtime {
                         }
                         continue;
                     };
+                    self.wait_before_lease_validation_for_test().await;
 
                     match self.lifecycle() {
-                        LifecycleState::Running => return Some(lease),
+                        LifecycleState::Running => {
+                            let still_active = self
+                                .active
+                                .load_full()
+                                .is_some_and(|active| Arc::ptr_eq(&active, &generation));
+                            if still_active {
+                                return Some(lease);
+                            }
+                            drop(lease);
+                        }
                         LifecycleState::Starting | LifecycleState::Publishing => {
                             drop(lease);
                             changed.await;
@@ -621,6 +647,31 @@ impl Runtime {
     }
 
     #[cfg(test)]
+    pub(super) fn block_lease_before_validation(&self) {
+        self.lease_validation_entered
+            .store(false, Ordering::Release);
+        self.lease_validation_blocked.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) async fn wait_for_lease_before_validation(&self) {
+        loop {
+            let changed = self.lease_validation_changed.notified();
+            if self.lease_validation_entered.load(Ordering::Acquire) {
+                return;
+            }
+            changed.await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn release_lease_before_validation(&self) {
+        self.lease_validation_blocked
+            .store(false, Ordering::Release);
+        self.lease_validation_release.notify_one();
+    }
+
+    #[cfg(test)]
     pub(super) fn block_publication_exit(&self) {
         self.publication_exit_entered
             .store(false, Ordering::Release);
@@ -679,6 +730,19 @@ impl Runtime {
 
     #[cfg(not(test))]
     async fn wait_before_lease_acquire_for_test(&self) {}
+
+    #[cfg(test)]
+    async fn wait_before_lease_validation_for_test(&self) {
+        if self.lease_validation_blocked.load(Ordering::Acquire) {
+            let released = self.lease_validation_release.notified();
+            self.lease_validation_entered.store(true, Ordering::Release);
+            self.lease_validation_changed.notify_one();
+            released.await;
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn wait_before_lease_validation_for_test(&self) {}
 
     #[cfg(test)]
     async fn wait_at_publication_exit_for_test(&self) {

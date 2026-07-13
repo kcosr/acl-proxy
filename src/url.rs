@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use idna::domain_to_ascii_strict;
 use regex::Regex;
@@ -258,7 +258,7 @@ impl CompiledUrlPattern {
             Some((path, query)) => (path, Some(query)),
             None => (target, None),
         };
-        let path = normalize_path(if raw_path.is_empty() { "/" } else { raw_path })?;
+        let path = normalize_pattern_path(if raw_path.is_empty() { "/" } else { raw_path })?;
         let path = compile_component_glob(&path, ComponentKind::Path)?;
         let query = raw_query
             .map(|query| {
@@ -386,9 +386,10 @@ fn canonical_host(raw: &str) -> Result<String, UrlError> {
         .strip_prefix('[')
         .and_then(|host| host.strip_suffix(']'))
     {
-        let address = literal
-            .parse::<std::net::Ipv6Addr>()
-            .map_err(|_| UrlError::Host)?;
+        let address = literal.parse::<Ipv6Addr>().map_err(|_| UrlError::Host)?;
+        if is_deprecated_ipv4_compatible(address) {
+            return Err(UrlError::Host);
+        }
         return Ok(address
             .to_ipv4_mapped()
             .map(|mapped| mapped.to_string())
@@ -410,6 +411,13 @@ fn canonical_host(raw: &str) -> Result<String, UrlError> {
     let domain = domain.to_ascii_lowercase();
     validate_dns_name(&domain)?;
     Ok(domain)
+}
+
+fn is_deprecated_ipv4_compatible(address: Ipv6Addr) -> bool {
+    let octets = address.octets();
+    octets[..12].iter().all(|octet| *octet == 0)
+        && address != Ipv6Addr::UNSPECIFIED
+        && address != Ipv6Addr::LOCALHOST
 }
 
 fn is_strict_ipv4_shape(host: &str) -> bool {
@@ -535,6 +543,11 @@ fn compile_host_pattern(raw: &str) -> Result<HostPattern, UrlError> {
     if host.is_empty() || host.len() > 253 {
         return Err(UrlError::Host);
     }
+    if is_ipv4_shaped_glob(host) {
+        return Err(UrlError::Glob(
+            "IP literals cannot be expressed with host wildcards".into(),
+        ));
+    }
     let mut labels = Vec::new();
     let mut canonical_length = 0usize;
     for raw_label in host.split('.') {
@@ -577,6 +590,19 @@ fn compile_host_pattern(raw: &str) -> Result<HostPattern, UrlError> {
     })
 }
 
+fn is_ipv4_shaped_glob(host: &str) -> bool {
+    let labels: Vec<_> = host.split('.').collect();
+    (1..=4).contains(&labels.len())
+        && host.contains('*')
+        && host.bytes().any(|byte| byte.is_ascii_digit())
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || byte == b'*')
+        })
+}
+
 fn canonical_literal_label(raw: &str) -> Result<String, UrlError> {
     let label = domain_to_ascii_strict(raw).map_err(|_| UrlError::Host)?;
     if label.contains('.') {
@@ -611,7 +637,7 @@ enum ComponentKind {
 fn compile_component_glob(raw: &str, kind: ComponentKind) -> Result<Regex, UrlError> {
     let (single, recursive) = match kind {
         ComponentKind::Path => ("[^/]*", ".*"),
-        ComponentKind::Query => (".*", ".*"),
+        ComponentKind::Query => ("[^&]*", ".*"),
     };
     let expression = if matches!(kind, ComponentKind::Path) && raw.ends_with("/**") {
         let base = &raw[..raw.len() - 3];
@@ -620,6 +646,25 @@ fn compile_component_glob(raw: &str, kind: ComponentKind) -> Result<Regex, UrlEr
         glob_regex(raw, single, recursive)
     };
     Regex::new(&format!("^{expression}$")).map_err(|error| UrlError::Glob(error.to_string()))
+}
+
+fn normalize_pattern_path(path: &str) -> Result<String, UrlError> {
+    let normalized = normalize_component(
+        if path.is_empty() { "/" } else { path },
+        ComponentKind::Path,
+    )?;
+    if !normalized.starts_with('/') {
+        return Err(UrlError::Parse);
+    }
+    if normalized
+        .split('/')
+        .any(|segment| matches!(segment, "." | ".."))
+    {
+        return Err(UrlError::Glob(
+            "path patterns cannot contain dot or dot-dot segments".into(),
+        ));
+    }
+    Ok(normalized)
 }
 
 fn glob_regex(raw: &str, single: &str, recursive: &str) -> String {
@@ -1053,6 +1098,64 @@ mod tests {
     }
 
     #[test]
+    fn deprecated_ipv4_compatible_ipv6_literals_are_rejected() {
+        for raw in [
+            "http://[::192.0.2.1]/",
+            "http://[::c000:201]/",
+            "https://[::0.0.0.2]:8443/",
+        ] {
+            assert!(matches!(canonicalize_http_url(raw), Err(UrlError::Host)));
+        }
+
+        assert_eq!(canonicalize_http_url("http://[::]/").unwrap().host, "::");
+        assert_eq!(canonicalize_http_url("http://[::1]/").unwrap().host, "::1");
+        assert_eq!(
+            canonicalize_http_url("http://[::ffff:192.0.2.1]/")
+                .unwrap()
+                .host,
+            "192.0.2.1"
+        );
+    }
+
+    #[test]
+    fn ipv4_shaped_host_globs_are_rejected_instead_of_becoming_dns_patterns() {
+        for pattern in [
+            "http://169.254.*.*/**",
+            "http://127.*/**",
+            "http://10.**/**",
+            "http://192.168.*/**",
+            "http://1*/**",
+            "https://*.0.2.1/**",
+            "https://192.0.2.*/**",
+            "https://1*.2.3.4/**",
+            "https://**.2.3.4/**",
+        ] {
+            assert!(matches!(
+                CompiledUrlPattern::compile(pattern),
+                Err(UrlError::Glob(_))
+            ));
+        }
+
+        CompiledUrlPattern::compile("https://build-*.2.3.4/**")
+            .expect("a visibly nonnumeric DNS label remains a hostname glob");
+        CompiledUrlPattern::compile("https://**/**")
+            .expect("a pure wildcard remains a DNS hostname glob");
+    }
+
+    #[test]
+    fn dns_host_globs_never_match_canonical_ip_targets() {
+        let pattern = CompiledUrlPattern::compile("http://**/**").unwrap();
+        for target in [
+            "http://192.0.2.1/path",
+            "http://[::ffff:192.0.2.1]/path",
+            "http://[2001:db8::1]/path",
+        ] {
+            let target = canonicalize_http_url(target).unwrap();
+            assert!(!pattern.is_match(&target), "{target:?}");
+        }
+    }
+
+    #[test]
     fn host_globs_preserve_recursive_one_label_and_label_local_intent() {
         assert!(!matches(
             "https://**.chatgpt.com/**",
@@ -1084,6 +1187,69 @@ mod tests {
         assert!(!matches(
             "https://rocky-linux-*.production.gcp.mirrors.ctrliq.cloud/**",
             "https://rocky-linux.evil.production.gcp.mirrors.ctrliq.cloud/pkg"
+        ));
+
+        assert!(matches(
+            "https://api.**.example.com/**",
+            "https://api.us.example.com/"
+        ));
+        assert!(matches(
+            "https://api.**.example.com/**",
+            "https://api.us.central.example.com/"
+        ));
+        assert!(!matches(
+            "https://api.**.example.com/**",
+            "https://api.example.com/"
+        ));
+        assert!(matches(
+            "https://api-*.example.com/**",
+            "https://api-v1.example.com/"
+        ));
+        assert!(!matches(
+            "https://api-*.example.com/**",
+            "https://api.v1.example.com/"
+        ));
+        assert!(matches!(
+            CompiledUrlPattern::compile("https://api**prod.example.com/**"),
+            Err(UrlError::Glob(_))
+        ));
+    }
+
+    #[test]
+    fn production_hostname_glob_corpus_preserves_label_boundaries() {
+        for suffix in ["chatgpt.com", "sentry.io", "datadoghq.com"] {
+            let pattern = format!("https://**.{suffix}/**");
+            assert!(!matches(&pattern, &format!("https://{suffix}/")));
+            assert!(matches(&pattern, &format!("https://api.{suffix}/")));
+            assert!(matches(
+                &pattern,
+                &format!("https://us.api.{suffix}/v1/items")
+            ));
+            assert!(!matches(
+                &pattern,
+                &format!("https://api.{suffix}.attacker.test/")
+            ));
+        }
+
+        for suffix in ["cursor.sh", "vailsys.com", "vailsys.net"] {
+            let pattern = format!("https://*.{suffix}/**");
+            assert!(!matches(&pattern, &format!("https://{suffix}/")));
+            assert!(matches(&pattern, &format!("https://api.{suffix}/")));
+            assert!(!matches(&pattern, &format!("https://us.api.{suffix}/")));
+        }
+
+        let rocky = "https://rocky-linux-*.production.gcp.mirrors.ctrliq.cloud/**";
+        assert!(matches(
+            rocky,
+            "https://rocky-linux-9.production.gcp.mirrors.ctrliq.cloud/packages"
+        ));
+        assert!(matches(
+            rocky,
+            "https://rocky-linux-9-stream.production.gcp.mirrors.ctrliq.cloud/packages"
+        ));
+        assert!(!matches(
+            rocky,
+            "https://rocky-linux-9.evil.production.gcp.mirrors.ctrliq.cloud/packages"
         ));
     }
 
@@ -1129,6 +1295,48 @@ mod tests {
             "https://example.com/empty?",
             "https://example.com/empty"
         ));
+        assert!(matches(
+            "https://example.com/search?key=*",
+            "https://example.com/search?key=one"
+        ));
+        assert!(!matches(
+            "https://example.com/search?key=*",
+            "https://example.com/search?key=one&admin=true"
+        ));
+        assert!(matches(
+            "https://example.com/search?key=**",
+            "https://example.com/search?key=one&admin=true"
+        ));
+        assert!(matches(
+            "https://example.com/search?key=*&mode=safe",
+            "https://example.com/search?key=one&mode=safe"
+        ));
+        assert!(!matches(
+            "https://example.com/search?key=*&mode=safe",
+            "https://example.com/search?key=one&admin=true&mode=safe"
+        ));
+    }
+
+    #[test]
+    fn authored_pattern_paths_reject_dot_segments_before_canonicalization() {
+        for pattern in [
+            "https://example.com/a/../admin",
+            "https://example.com/a/./admin",
+            "https://example.com/a/%2e%2e/admin",
+            "https://example.com/a/.%2e/admin",
+        ] {
+            assert!(matches!(
+                CompiledUrlPattern::compile(pattern),
+                Err(UrlError::Glob(_))
+            ));
+        }
+
+        assert_eq!(
+            canonicalize_http_url("https://example.com/a/../admin")
+                .unwrap()
+                .path,
+            "/admin"
+        );
     }
 
     #[test]

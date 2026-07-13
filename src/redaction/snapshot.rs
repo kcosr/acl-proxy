@@ -282,10 +282,13 @@ impl ProfileSnapshot {
             return Err(SnapshotError::SourceCount { profile_index });
         }
 
-        let matcher_scratch_bytes = if source_count == 0 {
-            0
-        } else {
+        let has_literal_matcher = plan.rules.iter().any(|rule| {
+            !rule.literals.is_empty() || !rule.literal_environment_variables.is_empty()
+        });
+        let matcher_scratch_bytes = if has_literal_matcher {
             MAX_MATCHER_SCRATCH_BYTES
+        } else {
+            0
         };
         let mut limits = RedactionLimits {
             max_body_bytes: plan.max_body_bytes,
@@ -517,11 +520,10 @@ impl LiteralMatcher {
         if self.combined.is_none() && self.environment.is_none() {
             return Ok((input, 0));
         }
-        let protected = self.environment_intervals(&input)?;
+        let matches = self.match_intervals(&input)?;
         let (output_len, count) = literal_replacement_shape(
-            &input,
-            self.combined.as_ref(),
-            &protected,
+            input.len(),
+            &matches,
             replacement.len(),
             limit,
             payload_limit,
@@ -535,36 +537,35 @@ impl LiteralMatcher {
             .try_reserve_exact(output_len)
             .map_err(|_| SnapshotError::AllocationFailed)?;
         let mut cursor = 0usize;
-        for interval in protected.iter() {
-            append_literal_replacements(
-                &mut output,
-                &input[cursor..interval.start],
-                self.combined.as_ref(),
-                replacement,
-            );
+        for interval in matches.iter() {
+            output.extend_from_slice(&input[cursor..interval.start]);
             output.extend_from_slice(replacement);
             cursor = interval.end;
         }
-        append_literal_replacements(
-            &mut output,
-            &input[cursor..],
-            self.combined.as_ref(),
-            replacement,
-        );
+        output.extend_from_slice(&input[cursor..]);
         debug_assert_eq!(output.len(), output_len);
         Ok((output, count))
     }
 
-    fn environment_intervals(&self, input: &[u8]) -> Result<ZeroizingVec<Interval>, SnapshotError> {
-        let Some(environment) = &self.environment else {
-            return Ok(ZeroizingVec(Vec::new()));
-        };
+    fn match_intervals(&self, input: &[u8]) -> Result<ZeroizingVec<Interval>, SnapshotError> {
         let max_intervals = MAX_MATCHER_SCRATCH_BYTES / std::mem::size_of::<Interval>();
         let mut interval_count = 0usize;
-        environment.for_each_match(input, |_, _| {
-            interval_count = interval_count.saturating_add(1);
-            interval_count <= max_intervals
-        });
+        if let Some(combined) = &self.combined {
+            for _ in combined.find_overlapping_iter(input) {
+                interval_count = interval_count.saturating_add(1);
+                if interval_count > max_intervals {
+                    break;
+                }
+            }
+        }
+        if interval_count <= max_intervals {
+            if let Some(environment) = &self.environment {
+                environment.for_each_match(input, |_, _| {
+                    interval_count = interval_count.saturating_add(1);
+                    interval_count <= max_intervals
+                });
+            }
+        }
         if interval_count > max_intervals {
             return Err(SnapshotError::MatcherScratchExceeded {
                 limit: MAX_MATCHER_SCRATCH_BYTES,
@@ -586,13 +587,23 @@ impl LiteralMatcher {
                 limit: MAX_MATCHER_SCRATCH_BYTES,
             });
         }
-        environment.for_each_match(input, |start, end| {
-            if intervals.len() == max_intervals {
-                return false;
+        if let Some(combined) = &self.combined {
+            for matched in combined.find_overlapping_iter(input) {
+                intervals.0.push(Interval {
+                    start: matched.start(),
+                    end: matched.end(),
+                });
             }
-            intervals.0.push(Interval { start, end });
-            true
-        });
+        }
+        if let Some(environment) = &self.environment {
+            environment.for_each_match(input, |start, end| {
+                if intervals.len() == max_intervals {
+                    return false;
+                }
+                intervals.0.push(Interval { start, end });
+                true
+            });
+        }
         debug_assert_eq!(intervals.len(), interval_count);
         intervals.sort_unstable_by_key(|interval| (interval.start, interval.end));
         let mut merged = 0usize;
@@ -983,82 +994,21 @@ impl<T: ZeroValid> Drop for ZeroizingVec<T> {
 }
 
 fn literal_replacement_shape(
-    input: &[u8],
-    combined: Option<&AhoCorasick>,
-    protected: &[Interval],
+    input_len: usize,
+    matches: &[Interval],
     replacement_len: usize,
     limit: usize,
     payload: PayloadLimit,
 ) -> Result<(usize, usize), SnapshotError> {
     let mut removed = 0usize;
-    let mut count = 0usize;
-    let mut cursor = 0usize;
-    for interval in protected {
-        if let Some(combined) = combined {
-            accumulate_matches(
-                combined.find_iter(&input[cursor..interval.start]),
-                &mut removed,
-                &mut count,
-                payload,
-                limit,
-            )?;
-        }
+    for interval in matches {
         removed = removed
             .checked_add(interval.end - interval.start)
             .ok_or(SnapshotError::PayloadTooLarge { payload, limit })?;
-        count = count
-            .checked_add(1)
-            .ok_or(SnapshotError::PayloadTooLarge { payload, limit })?;
-        cursor = interval.end;
     }
-    if let Some(combined) = combined {
-        accumulate_matches(
-            combined.find_iter(&input[cursor..]),
-            &mut removed,
-            &mut count,
-            payload,
-            limit,
-        )?;
-    }
-    checked_output_len(input.len(), removed, count, replacement_len, limit, payload)
+    let count = matches.len();
+    checked_output_len(input_len, removed, count, replacement_len, limit, payload)
         .map(|output_len| (output_len, count))
-}
-
-fn accumulate_matches(
-    matches: impl Iterator<Item = aho_corasick::Match>,
-    removed: &mut usize,
-    count: &mut usize,
-    payload: PayloadLimit,
-    limit: usize,
-) -> Result<(), SnapshotError> {
-    for matched in matches {
-        *removed = removed
-            .checked_add(matched.len())
-            .ok_or(SnapshotError::PayloadTooLarge { payload, limit })?;
-        *count = count
-            .checked_add(1)
-            .ok_or(SnapshotError::PayloadTooLarge { payload, limit })?;
-    }
-    Ok(())
-}
-
-fn append_literal_replacements(
-    output: &mut Vec<u8>,
-    input: &[u8],
-    combined: Option<&AhoCorasick>,
-    replacement: &[u8],
-) {
-    let Some(combined) = combined else {
-        output.extend_from_slice(input);
-        return;
-    };
-    let mut cursor = 0usize;
-    for matched in combined.find_iter(input) {
-        output.extend_from_slice(&input[cursor..matched.start()]);
-        output.extend_from_slice(replacement);
-        cursor = matched.end();
-    }
-    output.extend_from_slice(&input[cursor..]);
 }
 
 struct ResolvedRule {
@@ -1382,7 +1332,19 @@ mod tests {
     }
 
     #[test]
-    fn longer_environment_literal_wins_across_rule_boundaries() {
+    fn literal_overlaps_merge_across_authored_and_environment_sources() {
+        let mut authored_plan = profile(None);
+        authored_plan.rules[0].literals = vec![b"abc".to_vec(), b"bcdef".to_vec()];
+        authored_plan.rules[0].expressions.clear();
+        let authored = RedactionSnapshot::activate(plan(authored_plan))
+            .unwrap()
+            .profile("main")
+            .unwrap()
+            .redact_decoded_http_body(b"abcdef".to_vec())
+            .unwrap();
+        assert_eq!(authored.replacements, 1);
+        assert_eq!(authored.bytes, b"[MASKED]");
+
         let source = EnvGuard::set("secret-token");
         let mut profile_plan = profile(None);
         profile_plan.rules[0].literals = vec![b"secret".to_vec(), b"token".to_vec()];
@@ -1402,9 +1364,9 @@ mod tests {
         assert_eq!(output.replacements, 1);
         assert_eq!(output.bytes, b"[MASKED]");
 
-        let later_source = EnvGuard::set("bcdef");
+        let later_source = EnvGuard::set("cd");
         let mut later_plan = profile(None);
-        later_plan.rules[0].literals = vec![b"abc".to_vec()];
+        later_plan.rules[0].literals = vec![b"abcd".to_vec()];
         later_plan.rules.push(RedactionRulePlan {
             literals: vec![],
             literal_environment_variables: vec![later_source.0.clone()],
@@ -1415,9 +1377,10 @@ mod tests {
             .unwrap()
             .profile("main")
             .unwrap()
-            .redact_decoded_http_body(b"abcdef".to_vec())
+            .redact_decoded_http_body(b"abcd".to_vec())
             .unwrap();
-        assert_eq!(later.bytes, b"a[MASKED]");
+        assert_eq!(later.replacements, 1);
+        assert_eq!(later.bytes, b"[MASKED]");
 
         let overlap_source = EnvGuard::set("aaa");
         let overlap = RedactionSnapshot::activate(plan(profile(Some(overlap_source.0.clone()))))
@@ -1555,32 +1518,43 @@ mod tests {
     #[test]
     fn validation_limits_and_scratch_metadata_are_exact() {
         let snapshot = RedactionSnapshot::activate(plan(profile(None))).unwrap();
-        let profile = snapshot.profile("main").unwrap();
-        assert_eq!(profile.limits().matcher_scratch_bytes, 0);
-        assert!(profile.limits().matcher_scratch_bytes <= MAX_MATCHER_SCRATCH_BYTES);
-        assert!(profile.limits().compiled_matcher_resident_bytes > 0);
+        let handle = snapshot.profile("main").unwrap();
+        assert_eq!(
+            handle.limits().matcher_scratch_bytes,
+            MAX_MATCHER_SCRATCH_BYTES
+        );
+        assert!(handle.limits().matcher_scratch_bytes <= MAX_MATCHER_SCRATCH_BYTES);
+        assert!(handle.limits().compiled_matcher_resident_bytes > 0);
         assert!(
-            profile.limits().compiled_matcher_resident_bytes
+            handle.limits().compiled_matcher_resident_bytes
                 <= MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE
         );
         assert_eq!(
             snapshot.compiled_matcher_resident_bytes(),
-            profile.limits().compiled_matcher_resident_bytes
+            handle.limits().compiled_matcher_resident_bytes
         );
         assert!(
             snapshot.compiled_matcher_resident_bytes()
                 <= MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT
         );
-        assert!(profile.validate_encoded_http_body_size(32).is_ok());
+        assert!(handle.validate_encoded_http_body_size(32).is_ok());
         assert!(matches!(
-            profile.validate_encoded_http_body_size(33),
+            handle.validate_encoded_http_body_size(33),
             Err(SnapshotError::PayloadTooLarge {
                 payload: PayloadLimit::EncodedHttpBody,
                 limit: 32
             })
         ));
-        assert!(profile.validate_websocket_frame_size(16).is_ok());
-        assert!(profile.validate_encoded_websocket_message_size(128).is_ok());
+        assert!(handle.validate_websocket_frame_size(16).is_ok());
+        assert!(handle.validate_encoded_websocket_message_size(128).is_ok());
+
+        let mut expression_only = profile(None);
+        expression_only.rules[0].literals.clear();
+        let expression_only = RedactionSnapshot::activate(plan(expression_only))
+            .unwrap()
+            .profile("main")
+            .unwrap();
+        assert_eq!(expression_only.limits().matcher_scratch_bytes, 0);
     }
 
     #[test]
@@ -1619,8 +1593,8 @@ mod tests {
         let output = profile
             .redact_websocket_message(vec![b'a'; 300], PayloadClass::Text)
             .unwrap();
-        assert_eq!(output.replacements, 100);
-        assert_eq!(output.bytes.len(), 1000);
+        assert_eq!(output.replacements, 1);
+        assert_eq!(output.bytes, b"0123456789");
         assert!(output.bytes.capacity() <= 1024);
     }
 

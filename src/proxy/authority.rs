@@ -34,6 +34,8 @@ pub(crate) enum AuthorityError {
     MissingSni,
     #[error("TLS SNI is invalid")]
     InvalidSni,
+    #[error("transparent TLS destination port must be nonzero")]
+    InvalidDestinationPort,
 }
 
 #[derive(Clone)]
@@ -195,13 +197,17 @@ pub(crate) fn reconcile_connect_inner_request<B>(
 
 pub(crate) fn reconcile_transparent_https_request<B>(
     request: &mut Request<B>,
+    destination_port: u16,
     sni: Option<&str>,
 ) -> Result<CanonicalRequestTarget, AuthorityError> {
     reject_connect_method(request)?;
+    if destination_port == 0 {
+        return Err(AuthorityError::InvalidDestinationPort);
+    }
     let sni = sni.ok_or(AuthorityError::MissingSni)?;
     let sni_host = canonicalize_tls_server_name(sni).map_err(|_| AuthorityError::InvalidSni)?;
-    let primary =
-        canonicalize_http_authority("https", &sni_host).map_err(|_| AuthorityError::InvalidSni)?;
+    let primary = canonicalize_http_authority("https", &format!("{sni_host}:{destination_port}"))
+        .map_err(|_| AuthorityError::InvalidDestinationPort)?;
 
     let canonical = if request.version() == Version::HTTP_2 {
         let canonical = canonical_absolute_request_target(request.uri())?;
@@ -449,7 +455,7 @@ mod tests {
                 "/path",
                 Some("example.com"),
             ),
-            |request| reconcile_transparent_https_request(request, Some("example.com")),
+            |request| reconcile_transparent_https_request(request, 443, Some("example.com")),
         );
         assert_connect_rejected_without_mutation(
             request(
@@ -458,7 +464,7 @@ mod tests {
                 "https://example.com/path",
                 Some("example.com"),
             ),
-            |request| reconcile_transparent_https_request(request, Some("example.com")),
+            |request| reconcile_transparent_https_request(request, 443, Some("example.com")),
         );
     }
 
@@ -719,6 +725,39 @@ mod tests {
     }
 
     #[test]
+    fn connect_sni_ipv4_reconciles_mapped_targets_and_rejects_native_mismatches() {
+        let mut mapped = request(
+            Method::CONNECT,
+            Version::HTTP_11,
+            "[::ffff:192.0.2.10]:8443",
+            Some("192.0.2.10:8443"),
+        );
+        let mapped = reconcile_connect_outer_request(&mut mapped).unwrap();
+        assert_eq!(mapped.authority.host, "192.0.2.10");
+        reconcile_connect_sni(&mapped, Some("192.0.2.10")).unwrap();
+        assert_eq!(
+            reconcile_connect_sni(&mapped, Some("192.0.2.11")),
+            Err(AuthorityError::ConflictingAuthority)
+        );
+
+        let mut native = request(
+            Method::CONNECT,
+            Version::HTTP_11,
+            "[2001:db8::1]:8443",
+            Some("[2001:db8::1]:8443"),
+        );
+        let native = reconcile_connect_outer_request(&mut native).unwrap();
+        assert_eq!(
+            reconcile_connect_sni(&native, Some("192.0.2.10")),
+            Err(AuthorityError::ConflictingAuthority)
+        );
+        assert_eq!(
+            reconcile_connect_sni(&native, Some("2001:db8::1")),
+            Err(AuthorityError::InvalidSni)
+        );
+    }
+
+    #[test]
     fn connect_inner_h1_reconciles_every_authority_source() {
         let mut outer = request(
             Method::CONNECT,
@@ -820,19 +859,41 @@ mod tests {
             Some("xn--bcher-kva.example:443"),
         );
         let target =
-            reconcile_transparent_https_request(&mut valid, Some("B\u{dc}CHER.example.")).unwrap();
+            reconcile_transparent_https_request(&mut valid, 443, Some("B\u{dc}CHER.example."))
+                .unwrap();
         assert_eq!(target.url.url, "https://xn--bcher-kva.example/path");
         assert_eq!(host(&valid), "xn--bcher-kva.example");
 
+        let mut intercepted_nondefault = request(
+            Method::GET,
+            Version::HTTP_11,
+            "/path",
+            Some("example.com:8443"),
+        );
+        let target = reconcile_transparent_https_request(
+            &mut intercepted_nondefault,
+            8443,
+            Some("example.com"),
+        )
+        .unwrap();
+        assert_eq!(target.url.url, "https://example.com:8443/path");
+        assert_eq!(host(&intercepted_nondefault), "example.com:8443");
+
         let mut missing_sni = request(Method::GET, Version::HTTP_11, "/", Some("example.com"));
         assert_eq!(
-            reconcile_transparent_https_request(&mut missing_sni, None),
+            reconcile_transparent_https_request(&mut missing_sni, 443, None),
             Err(AuthorityError::MissingSni)
+        );
+
+        let mut invalid_port = request(Method::GET, Version::HTTP_11, "/", Some("example.com"));
+        assert_eq!(
+            reconcile_transparent_https_request(&mut invalid_port, 0, Some("example.com")),
+            Err(AuthorityError::InvalidDestinationPort)
         );
 
         let mut nondefault = request(Method::GET, Version::HTTP_11, "/", Some("example.com:8443"));
         assert_eq!(
-            reconcile_transparent_https_request(&mut nondefault, Some("example.com")),
+            reconcile_transparent_https_request(&mut nondefault, 443, Some("example.com")),
             Err(AuthorityError::ConflictingAuthority)
         );
 
@@ -843,7 +904,7 @@ mod tests {
             Some("example.com"),
         );
         assert_eq!(
-            reconcile_transparent_https_request(&mut absolute, Some("example.com")),
+            reconcile_transparent_https_request(&mut absolute, 443, Some("example.com")),
             Err(AuthorityError::RequestTargetForm)
         );
     }
@@ -856,9 +917,32 @@ mod tests {
             "https://EXAMPLE.com.:443/path",
             None,
         );
-        let target = reconcile_transparent_https_request(&mut valid, Some("example.com")).unwrap();
+        let target =
+            reconcile_transparent_https_request(&mut valid, 443, Some("example.com")).unwrap();
         assert_eq!(target.url.url, "https://example.com/path");
         assert_eq!(host(&valid), "example.com");
+
+        let mut nondefault = request(
+            Method::GET,
+            Version::HTTP_2,
+            "https://EXAMPLE.com.:8443/path",
+            None,
+        );
+        let target =
+            reconcile_transparent_https_request(&mut nondefault, 8443, Some("example.com"))
+                .unwrap();
+        assert_eq!(target.url.url, "https://example.com:8443/path");
+        assert_eq!(host(&nondefault), "example.com:8443");
+
+        let mut mapped = request(
+            Method::GET,
+            Version::HTTP_2,
+            "https://[::ffff:192.0.2.10]:8443/path",
+            Some("192.0.2.10:8443"),
+        );
+        let target =
+            reconcile_transparent_https_request(&mut mapped, 8443, Some("192.0.2.10")).unwrap();
+        assert_eq!(target.url.url, "https://192.0.2.10:8443/path");
 
         let mut host_conflict = request(
             Method::GET,
@@ -867,7 +951,7 @@ mod tests {
             Some("other.example"),
         );
         assert_eq!(
-            reconcile_transparent_https_request(&mut host_conflict, Some("example.com")),
+            reconcile_transparent_https_request(&mut host_conflict, 443, Some("example.com")),
             Err(AuthorityError::ConflictingAuthority)
         );
 
@@ -879,7 +963,7 @@ mod tests {
         );
         append_host(&mut duplicate_host, "example.com");
         assert_eq!(
-            reconcile_transparent_https_request(&mut duplicate_host, Some("example.com")),
+            reconcile_transparent_https_request(&mut duplicate_host, 443, Some("example.com")),
             Err(AuthorityError::DuplicateHost)
         );
 
@@ -890,7 +974,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            reconcile_transparent_https_request(&mut authority_conflict, Some("example.com")),
+            reconcile_transparent_https_request(&mut authority_conflict, 443, Some("example.com")),
             Err(AuthorityError::ConflictingAuthority)
         );
 
@@ -901,7 +985,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            reconcile_transparent_https_request(&mut scheme_conflict, Some("example.com")),
+            reconcile_transparent_https_request(&mut scheme_conflict, 443, Some("example.com")),
             Err(AuthorityError::SchemeMismatch)
         );
     }

@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http::Method;
+use memchr::memmem::Finder;
 
 use crate::config::v3_compile::{
     CompiledDefaultDecision, CompiledHeaderEffectWhen, CompiledRuleDecision, CredentialActionPlan,
@@ -266,7 +267,6 @@ pub(crate) fn apply_header_effects(
     effects: &[HeaderEffectPlan],
     headers: &mut HeaderMap,
 ) -> Result<(), HeaderEffectError> {
-    validate_header_limits(headers)?;
     let original_presence: HashSet<HeaderName> = headers.keys().cloned().collect();
     let mut staged = headers.clone();
 
@@ -279,7 +279,6 @@ pub(crate) fn apply_header_effects(
             CompiledHeaderEffectWhen::IfAbsent => !originally_present,
         };
         if !applies {
-            validate_header_limits(&staged)?;
             continue;
         }
 
@@ -345,10 +344,11 @@ fn replace_header_bytes(
     if search.is_empty() {
         return Err(HeaderEffectError::InvalidValue);
     }
+    let finder = Finder::new(search);
     let output_lengths: Vec<usize> = headers
         .get_all(name)
         .iter()
-        .map(|value| replaced_len(value.as_bytes(), search, replacement))
+        .map(|value| replaced_len(value.as_bytes(), &finder, search.len(), replacement))
         .collect::<Result<_, _>>()?;
     if output_lengths.is_empty() {
         return Ok(());
@@ -368,7 +368,13 @@ fn replace_header_bytes(
         .iter()
         .zip(output_lengths)
         .map(|(value, output_len)| {
-            let replaced = replace_all(value.as_bytes(), search, replacement, output_len);
+            let replaced = replace_all(
+                value.as_bytes(),
+                &finder,
+                search.len(),
+                replacement,
+                output_len,
+            );
             HeaderValue::from_bytes(&replaced).map_err(|_| HeaderEffectError::InvalidValue)
         })
         .collect::<Result<_, _>>()?;
@@ -381,12 +387,13 @@ fn replace_header_bytes(
 
 fn replaced_len(
     input: &[u8],
-    search: &[u8],
+    finder: &Finder<'_>,
+    search_len: usize,
     replacement: &[u8],
 ) -> Result<usize, HeaderEffectError> {
-    let matches = nonoverlapping_match_count(input, search);
+    let matches = finder.find_iter(input).count();
     let removed = matches
-        .checked_mul(search.len())
+        .checked_mul(search_len)
         .ok_or(HeaderEffectError::SizeOverflow)?;
     let inserted = matches
         .checked_mul(replacement.len())
@@ -402,32 +409,23 @@ fn replaced_len(
     Ok(output_len)
 }
 
-fn nonoverlapping_match_count(mut input: &[u8], search: &[u8]) -> usize {
-    let mut count = 0;
-    while let Some(index) = find_subslice(input, search) {
-        count += 1;
-        input = &input[index + search.len()..];
-    }
-    count
-}
-
-fn replace_all(input: &[u8], search: &[u8], replacement: &[u8], output_len: usize) -> Vec<u8> {
+fn replace_all(
+    input: &[u8],
+    finder: &Finder<'_>,
+    search_len: usize,
+    replacement: &[u8],
+    output_len: usize,
+) -> Vec<u8> {
     let mut output = Vec::with_capacity(output_len);
-    let mut remainder = input;
-    while let Some(index) = find_subslice(remainder, search) {
-        output.extend_from_slice(&remainder[..index]);
+    let mut cursor = 0usize;
+    for index in finder.find_iter(input) {
+        output.extend_from_slice(&input[cursor..index]);
         output.extend_from_slice(replacement);
-        remainder = &remainder[index + search.len()..];
+        cursor = index + search_len;
     }
-    output.extend_from_slice(remainder);
+    output.extend_from_slice(&input[cursor..]);
     debug_assert_eq!(output.len(), output_len);
     output
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|candidate| candidate == needle)
 }
 
 fn validate_header_limits(headers: &HeaderMap) -> Result<(), HeaderEffectError> {
@@ -535,6 +533,23 @@ mod tests {
         )
     }
 
+    fn evaluate_single_rule(
+        rule: PolicyRulePlan,
+        peer: &str,
+        method: &Method,
+        headers: &HeaderMap,
+    ) -> PolicyOutcome {
+        snapshot(CompiledDefaultDecision::Deny, vec![rule])
+            .evaluate(
+                &canonicalize_http_url("https://example.com/").unwrap(),
+                peer.parse().unwrap(),
+                method,
+                headers,
+                |_| false,
+            )
+            .outcome
+    }
+
     #[test]
     fn canonical_url_matching_keeps_schemes_exact() {
         let snapshot = snapshot(
@@ -617,6 +632,28 @@ mod tests {
     }
 
     #[test]
+    fn native_ipv6_cidr_matches_only_native_ipv6_peers_in_range() {
+        let mut allow = rule(
+            "native-v6",
+            CompiledRuleDecision::Allow,
+            "https://example.com/**",
+        );
+        allow.client_cidrs = vec![IpNet::from_str("2001:db8::/32").unwrap()];
+
+        for (peer, expected) in [
+            ("2001:db8::1", PolicyOutcome::Allow),
+            ("2001:dba::1", PolicyOutcome::Deny),
+            ("::ffff:192.0.2.44", PolicyOutcome::Deny),
+        ] {
+            assert_eq!(
+                evaluate_single_rule(allow.clone(), peer, &Method::GET, &HeaderMap::new()),
+                expected,
+                "peer {peer}"
+            );
+        }
+    }
+
+    #[test]
     fn raw_duplicate_values_are_compared_individually() {
         let name = HeaderName::from_static("x-scope");
         let mut allow = rule(
@@ -661,6 +698,126 @@ mod tests {
             |name| name == inbound,
         );
         assert_eq!(result.outcome, PolicyOutcome::Allow);
+    }
+
+    #[test]
+    fn header_predicate_and_method_parity_corpus() {
+        let first = HeaderName::from_static("x-first");
+        let second = HeaderName::from_static("x-second");
+        let mut both_headers = HeaderMap::new();
+        both_headers.insert(first.clone(), HeaderValue::from_static("allow"));
+        both_headers.insert(second.clone(), HeaderValue::from_static("present"));
+
+        let mut absent_any = rule(
+            "absent-any",
+            CompiledRuleDecision::Allow,
+            "https://example.com/**",
+        );
+        absent_any.headers.absent_any = vec![first.clone(), second.clone()];
+        assert_eq!(
+            evaluate_single_rule(
+                absent_any.clone(),
+                "192.0.2.10",
+                &Method::GET,
+                &both_headers
+            ),
+            PolicyOutcome::Deny
+        );
+        let mut one_absent = both_headers.clone();
+        one_absent.remove(&second);
+        assert_eq!(
+            evaluate_single_rule(absent_any, "192.0.2.10", &Method::GET, &one_absent),
+            PolicyOutcome::Allow
+        );
+
+        let mut present_all = rule(
+            "present-all",
+            CompiledRuleDecision::Allow,
+            "https://example.com/**",
+        );
+        present_all.headers.present_all = vec![first.clone(), second.clone()];
+        assert_eq!(
+            evaluate_single_rule(present_all.clone(), "192.0.2.10", &Method::GET, &one_absent,),
+            PolicyOutcome::Deny
+        );
+        assert_eq!(
+            evaluate_single_rule(present_all, "192.0.2.10", &Method::GET, &both_headers),
+            PolicyOutcome::Allow
+        );
+
+        let value_predicate = HeaderValuePredicatePlan {
+            name: first.clone(),
+            values: vec![HeaderValue::from_static("allow")],
+        };
+        let mut all = rule("all", CompiledRuleDecision::Allow, "https://example.com/**");
+        all.headers.all.push(value_predicate.clone());
+        assert_eq!(
+            evaluate_single_rule(all.clone(), "192.0.2.10", &Method::GET, &HeaderMap::new()),
+            PolicyOutcome::Deny
+        );
+        assert_eq!(
+            evaluate_single_rule(all, "192.0.2.10", &Method::GET, &both_headers),
+            PolicyOutcome::Allow
+        );
+
+        let mut none = rule(
+            "none",
+            CompiledRuleDecision::Allow,
+            "https://example.com/**",
+        );
+        none.headers.none.push(value_predicate);
+        assert_eq!(
+            evaluate_single_rule(none.clone(), "192.0.2.10", &Method::GET, &both_headers),
+            PolicyOutcome::Deny
+        );
+        assert_eq!(
+            evaluate_single_rule(none, "192.0.2.10", &Method::GET, &HeaderMap::new()),
+            PolicyOutcome::Allow
+        );
+
+        let mut method_and_header = rule(
+            "method-and-header",
+            CompiledRuleDecision::Allow,
+            "https://example.com/**",
+        );
+        method_and_header.methods.push(Method::GET);
+        method_and_header.headers.present_all.push(first);
+        assert_eq!(
+            evaluate_single_rule(
+                method_and_header.clone(),
+                "192.0.2.10",
+                &Method::GET,
+                &both_headers,
+            ),
+            PolicyOutcome::Allow
+        );
+        assert_eq!(
+            evaluate_single_rule(
+                method_and_header.clone(),
+                "192.0.2.10",
+                &Method::from_bytes(b"get").unwrap(),
+                &both_headers,
+            ),
+            PolicyOutcome::Allow
+        );
+        assert_eq!(
+            evaluate_single_rule(
+                method_and_header.clone(),
+                "192.0.2.10",
+                &Method::POST,
+                &both_headers,
+            ),
+            PolicyOutcome::Deny
+        );
+        assert_eq!(
+            evaluate_single_rule(
+                method_and_header,
+                "192.0.2.10",
+                &Method::GET,
+                &HeaderMap::new(),
+            ),
+            PolicyOutcome::Deny
+        );
     }
 
     #[test]
@@ -851,6 +1008,27 @@ mod tests {
     }
 
     #[test]
+    fn effects_may_remove_or_ignore_oversized_inbound_fields() {
+        let name = HeaderName::from_static("x-oversized");
+        let oversized = HeaderValue::from_bytes(&vec![b'x'; MAX_HEADER_FIELD_BYTES + 1]).unwrap();
+
+        let mut unchanged = HeaderMap::new();
+        unchanged.insert(name.clone(), oversized.clone());
+        let original = unchanged.clone();
+        apply_header_effects(&[], &mut unchanged).unwrap();
+        assert_eq!(unchanged, original);
+
+        let effects = [HeaderEffectPlan::Remove {
+            when: CompiledHeaderEffectWhen::Always,
+            name: name.clone(),
+        }];
+        let mut removed = HeaderMap::new();
+        removed.insert(name.clone(), oversized);
+        apply_header_effects(&effects, &mut removed).unwrap();
+        assert!(!removed.contains_key(name));
+    }
+
+    #[test]
     fn append_aggregate_limit_is_rejected_without_mutation() {
         let existing = HeaderName::from_static("x-existing");
         let appended = HeaderName::from_static("x-appended");
@@ -864,6 +1042,46 @@ mod tests {
             when: CompiledHeaderEffectWhen::Always,
             name: appended,
             values: vec![HeaderValue::from_static("x")],
+        }];
+        assert_eq!(
+            apply_header_effects(&effects, &mut headers),
+            Err(HeaderEffectError::AggregateLimit)
+        );
+        assert_eq!(headers, original);
+    }
+
+    #[test]
+    fn set_replaces_a_name_that_occupies_the_aggregate_boundary() {
+        let name = HeaderName::from_static("x-full");
+        let full_field = HeaderValue::from_bytes(&vec![b'x'; MAX_HEADER_FIELD_BYTES]).unwrap();
+        let mut headers = HeaderMap::new();
+        for _ in 0..(MAX_HEADER_VALUE_BYTES / MAX_HEADER_FIELD_BYTES) {
+            headers.append(name.clone(), full_field.clone());
+        }
+        let effects = [HeaderEffectPlan::Set {
+            when: CompiledHeaderEffectWhen::Always,
+            name: name.clone(),
+            values: vec![HeaderValue::from_static("x")],
+        }];
+        apply_header_effects(&effects, &mut headers).unwrap();
+        assert_eq!(headers.get_all(name).iter().count(), 1);
+        assert_eq!(headers.values().next().unwrap(), "x");
+    }
+
+    #[test]
+    fn replacement_aggregate_expansion_is_rejected_without_mutation() {
+        let name = HeaderName::from_static("x-expand-many");
+        let input = HeaderValue::from_bytes(&vec![b'a'; 30_000]).unwrap();
+        let mut headers = HeaderMap::new();
+        for _ in 0..20 {
+            headers.append(name.clone(), input.clone());
+        }
+        let original = headers.clone();
+        let effects = [HeaderEffectPlan::Replace {
+            when: CompiledHeaderEffectWhen::Always,
+            name,
+            search: "a".to_string(),
+            replace: "aa".to_string(),
         }];
         assert_eq!(
             apply_header_effects(&effects, &mut headers),

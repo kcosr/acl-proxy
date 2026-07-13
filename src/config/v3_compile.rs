@@ -615,7 +615,7 @@ pub(crate) fn build_redaction_literal_automaton(
     }
     AhoCorasickBuilder::new()
         .kind(Some(AhoCorasickKind::NoncontiguousNFA))
-        .match_kind(AhoMatchKind::LeftmostLongest)
+        .match_kind(AhoMatchKind::Standard)
         .dense_depth(0)
         .prefilter(false)
         .build(patterns)
@@ -1695,9 +1695,9 @@ fn validate_references_and_security_boundaries(
     config: &super::authoring::ConfigV3,
 ) -> Result<ValidationFacts, V3CompileError> {
     validate_named_maps(config)?;
-    validate_credentials(config)?;
+    let credential_destinations = validate_credentials(config)?;
     validate_internal_context(config)?;
-    validate_provider_security(config)?;
+    validate_provider_security(config, &credential_destinations)?;
     let compiled_urls_by_rule = validate_policy(config)?;
     validate_capture(config)?;
 
@@ -1746,7 +1746,9 @@ fn validate_identifier(value: &str, path: &str) -> Result<(), V3CompileError> {
     Ok(())
 }
 
-fn validate_credentials(config: &super::authoring::ConfigV3) -> Result<(), V3CompileError> {
+fn validate_credentials(
+    config: &super::authoring::ConfigV3,
+) -> Result<BTreeSet<String>, V3CompileError> {
     let loop_header = normalize_header_name(
         &config.safety.loop_detection.header,
         "safety.loop_detection.header",
@@ -1852,7 +1854,7 @@ fn validate_credentials(config: &super::authoring::ConfigV3) -> Result<(), V3Com
         &inbound_headers,
         &internal_context_headers,
     )?;
-    Ok(())
+    Ok(all_credential_destinations)
 }
 
 fn collect_all_credential_destinations(
@@ -2069,7 +2071,10 @@ fn validate_internal_context(config: &super::authoring::ConfigV3) -> Result<(), 
     Ok(())
 }
 
-fn validate_provider_security(config: &super::authoring::ConfigV3) -> Result<(), V3CompileError> {
+fn validate_provider_security(
+    config: &super::authoring::ConfigV3,
+    credential_destinations: &BTreeSet<String>,
+) -> Result<(), V3CompileError> {
     let loop_header = normalize_header_name(
         &config.safety.loop_detection.header,
         "safety.loop_detection.header",
@@ -2114,6 +2119,12 @@ fn validate_provider_security(config: &super::authoring::ConfigV3) -> Result<(),
                 return Err(V3CompileError::at(
                     path,
                     "provider may not receive a protected header",
+                ));
+            }
+            if credential_destinations.contains(&header) {
+                return Err(V3CompileError::at(
+                    path,
+                    "provider may not receive an outbound credential destination",
                 ));
             }
             if let Some(providers) = inbound.get(&header) {
@@ -5667,6 +5678,58 @@ credential = "password"
             assert!(
                 error.to_string().contains("credential destination"),
                 "{name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn providers_cannot_include_custom_credential_destinations() {
+        for (kind, provider) in [
+            (
+                "webhook",
+                r#"kind = "webhook"
+url = "https://approval.example.test/authorize""#,
+            ),
+            (
+                "process",
+                r#"kind = "process"
+command = "/bin/authorize""#,
+            ),
+        ] {
+            let definitions = format!(
+                r#"
+[credentials]
+allowed_custom_headers = ["x-api-key"]
+
+[credentials.sources.token]
+source = "environment"
+variable = "TEST_TOKEN"
+
+[authorization.providers.auth]
+{provider}
+include_headers = ["X-Api-Key"]
+"#
+            );
+            let rules = r#"
+[[policy.rules]]
+id = "credential-destination"
+decision = "allow"
+methods = ["GET"]
+
+[[policy.rules.credential_actions]]
+kind = "custom_header"
+header = "x-api-key"
+credential = "token"
+"#;
+            let error = match compile(&resource_config("", &definitions, rules)) {
+                Ok(_) => panic!("{kind} provider must not receive a credential"),
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("outbound credential destination"),
+                "{kind}: {error}"
             );
         }
     }

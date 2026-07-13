@@ -16,6 +16,30 @@
     "error": null
   },
   {
+    "input": "http://[::192.0.2.1]/",
+    "url": null,
+    "authority": null,
+    "host_for_capture": null,
+    "port": null,
+    "error": "URL is missing a valid host"
+  },
+  {
+    "input": "http://[::c000:201]/",
+    "url": null,
+    "authority": null,
+    "host_for_capture": null,
+    "port": null,
+    "error": "URL is missing a valid host"
+  },
+  {
+    "input": "http://[::ffff:192.0.2.1]/",
+    "url": "http://192.0.2.1/",
+    "authority": "192.0.2.1",
+    "host_for_capture": "192.0.2.1",
+    "port": 80,
+    "error": null
+  },
+  {
     "input": "https://example.com/%61dmin/%7Eme/%3A?q=%61",
     "url": "https://example.com/admin/~me/%3A?q=a",
     "authority": "example.com",

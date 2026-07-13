@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::File;
-use std::io::{Read, Take};
+use std::io::{ErrorKind, Read};
 use std::path::Path;
 
 #[cfg(unix)]
@@ -18,6 +18,7 @@ use std::path::Component;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use http::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
+use zeroize::Zeroize;
 
 use crate::config::v3_compile::{
     CredentialActionPlan, CredentialSourcePlan, CredentialsPlan, InboundCredentialPlan,
@@ -123,14 +124,7 @@ impl<'plan> CredentialBoundary<'plan> {
             }
             CredentialSourcePlan::File { path } => {
                 let file = open_credential_file(path)?;
-                let mut bytes = Vec::new();
-                let mut bounded: Take<File> = file.take(MAX_FILE_READ_BYTES);
-                if bounded.read_to_end(&mut bytes).is_err() {
-                    bytes.fill(0);
-                    return Err(CredentialError::SourceUnavailable);
-                }
-                strip_one_terminal_line_ending(&mut bytes);
-                SecretBytes::new(bytes)
+                SecretBytes::read_file(file)
             }
         }
     }
@@ -347,15 +341,27 @@ fn provider_is_authorized(inbound: &InboundCredentialPlan, provider_id: &str) ->
 struct SecretBytes(Vec<u8>);
 
 impl SecretBytes {
-    fn new(mut bytes: Vec<u8>) -> Result<Self, CredentialError> {
-        if bytes.is_empty() {
+    fn new(bytes: Vec<u8>) -> Result<Self, CredentialError> {
+        Self(bytes).validate()
+    }
+
+    fn read_file(mut file: File) -> Result<Self, CredentialError> {
+        let mut secret = Self(vec![0; MAX_FILE_READ_BYTES as usize]);
+        let initialized = read_into_fixed_buffer(&mut file, &mut secret.0)?;
+        secret.0[initialized..].zeroize();
+        secret.0.truncate(initialized);
+        strip_one_terminal_line_ending(&mut secret.0);
+        secret.validate()
+    }
+
+    fn validate(self) -> Result<Self, CredentialError> {
+        if self.0.is_empty() {
             return Err(CredentialError::EmptyValue);
         }
-        if bytes.len() > MAX_CREDENTIAL_BYTES {
-            bytes.fill(0);
+        if self.0.len() > MAX_CREDENTIAL_BYTES {
             return Err(CredentialError::ValueTooLarge);
         }
-        Ok(Self(bytes))
+        Ok(self)
     }
 
     fn from_owned(bytes: Vec<u8>) -> Self {
@@ -369,20 +375,41 @@ impl SecretBytes {
     fn len(&self) -> usize {
         self.0.len()
     }
+
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
 }
 
 impl Drop for SecretBytes {
     fn drop(&mut self) {
-        self.0.fill(0);
+        self.zeroize();
     }
 }
 
-fn strip_one_terminal_line_ending(bytes: &mut Vec<u8>) {
-    if bytes.ends_with(b"\r\n") {
-        bytes.truncate(bytes.len() - 2);
-    } else if bytes.ends_with(b"\n") {
-        bytes.truncate(bytes.len() - 1);
+fn read_into_fixed_buffer(file: &mut File, buffer: &mut [u8]) -> Result<usize, CredentialError> {
+    let mut initialized = 0usize;
+    while initialized < buffer.len() {
+        match file.read(&mut buffer[initialized..]) {
+            Ok(0) => break,
+            Ok(read) => initialized += read,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(_) => return Err(CredentialError::SourceUnavailable),
+        }
     }
+    Ok(initialized)
+}
+
+fn strip_one_terminal_line_ending(bytes: &mut Vec<u8>) {
+    let retained = if bytes.ends_with(b"\r\n") {
+        bytes.len() - 2
+    } else if bytes.ends_with(b"\n") {
+        bytes.len() - 1
+    } else {
+        return;
+    };
+    bytes[retained..].zeroize();
+    bytes.truncate(retained);
 }
 
 #[cfg(test)]
@@ -514,6 +541,47 @@ mod tests {
             boundary.resolve("token").err(),
             Some(CredentialError::EmptyValue)
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn file_read_uses_one_fixed_bounded_allocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credential");
+        write_secure_file(&path, b"bounded");
+        let mut file = File::open(path).unwrap();
+        let mut buffer = vec![0; MAX_FILE_READ_BYTES as usize];
+        let pointer = buffer.as_ptr();
+        let capacity = buffer.capacity();
+
+        let initialized = read_into_fixed_buffer(&mut file, &mut buffer).unwrap();
+
+        assert_eq!(initialized, 7);
+        assert_eq!(buffer.as_ptr(), pointer);
+        assert_eq!(buffer.capacity(), capacity);
+        buffer.zeroize();
+    }
+
+    #[test]
+    fn line_ending_and_secret_drop_wipe_the_whole_allocation() {
+        let mut allocation = Vec::with_capacity(128);
+        allocation.extend_from_slice(b"value\r\n");
+        allocation.resize(128, 0x5a);
+        allocation.truncate(7);
+
+        strip_one_terminal_line_ending(&mut allocation);
+        assert_eq!(allocation.len(), 5);
+        let capacity = allocation.capacity();
+        // SAFETY: the removed two-byte tail was initialized before truncation and explicitly wiped.
+        let after_strip = unsafe { std::slice::from_raw_parts(allocation.as_ptr(), capacity) };
+        assert_eq!(&after_strip[5..7], &[0, 0]);
+        let mut secret = SecretBytes::from_owned(allocation);
+        secret.zeroize();
+
+        assert_eq!(secret.0.len(), 0);
+        // SAFETY: zeroize initialized the complete live allocation, including spare capacity.
+        let allocation = unsafe { std::slice::from_raw_parts(secret.0.as_ptr(), capacity) };
+        assert!(allocation.iter().all(|byte| *byte == 0));
     }
 
     #[cfg(unix)]

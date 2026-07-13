@@ -627,6 +627,40 @@ async fn lease_loaded_before_publication_retries_the_committed_generation() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lease_acquired_before_validation_retries_the_committed_generation() {
+    let text = config("30s", "127.0.0.1:8881", 2);
+    let (runtime, initial, source, _activator, _static_resources) = runtime_fixture(&text);
+    let first = runtime.start(initial).await.unwrap();
+    runtime.block_lease_before_validation();
+
+    let lease_runtime = runtime.clone();
+    let waiter = tokio::spawn(async move {
+        lease_runtime
+            .lease()
+            .await
+            .map(|generation| generation.id())
+    });
+    runtime.wait_for_lease_before_validation().await;
+
+    source.push(config("31s", "127.0.0.1:8881", 2));
+    let ReloadTriggerResult::Completed {
+        generation: second, ..
+    } = runtime.trigger_reload().await.unwrap()
+    else {
+        panic!("reload unexpectedly coalesced");
+    };
+    assert_ne!(second, first);
+    assert_eq!(runtime.lifecycle(), LifecycleState::Running);
+    assert_eq!(runtime.active_generation_id(), Some(second));
+    assert_eq!(runtime.retiring_generations(), 1);
+    assert!(!waiter.is_finished(), "stale lease escaped validation");
+
+    runtime.release_lease_before_validation();
+    assert_eq!(waiter.await.unwrap(), Some(second));
+    wait_for_retiring(&runtime, 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lease_waiter_wakes_on_shutdown_before_drain_finishes() {
     let text = config("30s", "127.0.0.1:8881", 2);
     let (runtime, initial, _source, _activator, _static_resources) = runtime_fixture(&text);
