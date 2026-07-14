@@ -33,7 +33,7 @@ use super::router::{ControlRouter, ControlRouterError};
 
 const HTTP1_ALPN: &[u8] = b"http/1.1";
 const TRANSIENT_ACCEPT_RETRY: Duration = Duration::from_millis(10);
-const RESOURCE_ACCEPT_RETRY: Duration = Duration::from_secs(1);
+const RECOVERABLE_ACCEPT_RETRY: Duration = Duration::from_secs(1);
 const MAX_CONSECUTIVE_BACKOFF_ACCEPT_FAILURES: usize = 30;
 const MAX_IMMEDIATE_ACCEPT_FAILURES_BEFORE_BACKOFF: usize = 1_024;
 
@@ -398,7 +398,7 @@ async fn run_control_supervisor(
                                 continue;
                             }
                             AcceptErrorDisposition::RetryAfter(retry_after)
-                            | AcceptErrorDisposition::RetryResourcePressure(retry_after) => {
+                            | AcceptErrorDisposition::RetryIndefinitely(retry_after) => {
                                 retry_after
                             }
                             AcceptErrorDisposition::Fatal => {
@@ -524,7 +524,7 @@ async fn run_control_supervisor(
 enum AcceptErrorDisposition {
     RetryNow,
     RetryAfter(Duration),
-    RetryResourcePressure(Duration),
+    RetryIndefinitely(Duration),
     Fatal,
 }
 
@@ -556,8 +556,8 @@ impl AcceptFailureTracker {
                     AcceptErrorDisposition::RetryAfter(retry_after)
                 }
             }
-            AcceptErrorDisposition::RetryResourcePressure(retry_after) => {
-                AcceptErrorDisposition::RetryResourcePressure(retry_after)
+            AcceptErrorDisposition::RetryIndefinitely(retry_after) => {
+                AcceptErrorDisposition::RetryIndefinitely(retry_after)
             }
             AcceptErrorDisposition::Fatal => AcceptErrorDisposition::Fatal,
         }
@@ -577,8 +577,8 @@ fn classify_accept_error(error: &io::Error) -> AcceptErrorDisposition {
     if is_fatal_accept_error(error) {
         return AcceptErrorDisposition::Fatal;
     }
-    if is_resource_pressure_accept_error(error) {
-        return AcceptErrorDisposition::RetryResourcePressure(RESOURCE_ACCEPT_RETRY);
+    if is_indefinitely_retryable_accept_error(error) {
+        return AcceptErrorDisposition::RetryIndefinitely(RECOVERABLE_ACCEPT_RETRY);
     }
     match error.kind() {
         io::ErrorKind::Interrupted
@@ -587,8 +587,12 @@ fn classify_accept_error(error: &io::Error) -> AcceptErrorDisposition {
         | io::ErrorKind::ConnectionReset
         | io::ErrorKind::ConnectionRefused => AcceptErrorDisposition::RetryNow,
         io::ErrorKind::TimedOut => AcceptErrorDisposition::RetryAfter(TRANSIENT_ACCEPT_RETRY),
-        _ => AcceptErrorDisposition::RetryAfter(RESOURCE_ACCEPT_RETRY),
+        _ => AcceptErrorDisposition::RetryAfter(RECOVERABLE_ACCEPT_RETRY),
     }
+}
+
+fn is_indefinitely_retryable_accept_error(error: &io::Error) -> bool {
+    is_resource_pressure_accept_error(error) || is_pending_network_accept_error(error)
 }
 
 fn is_resource_pressure_accept_error(error: &io::Error) -> bool {
@@ -596,6 +600,40 @@ fn is_resource_pressure_accept_error(error: &io::Error) -> bool {
         return true;
     }
     is_platform_resource_pressure_accept_error(error)
+}
+
+fn is_pending_network_accept_error(error: &io::Error) -> bool {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::NetworkDown
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::HostUnreachable
+    ) {
+        return true;
+    }
+    is_platform_pending_network_accept_error(error)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn is_platform_pending_network_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(
+            libc::ENETDOWN
+                | libc::EPROTO
+                | libc::ENOPROTOOPT
+                | libc::EHOSTDOWN
+                | libc::ENONET
+                | libc::EHOSTUNREACH
+                | libc::EOPNOTSUPP
+                | libc::ENETUNREACH
+        )
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn is_platform_pending_network_accept_error(_error: &io::Error) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -1071,14 +1109,14 @@ mod tests {
         );
         assert_eq!(
             classify_accept_error(&io::Error::other("platform-specific accept failure")),
-            AcceptErrorDisposition::RetryAfter(RESOURCE_ACCEPT_RETRY)
+            AcceptErrorDisposition::RetryAfter(RECOVERABLE_ACCEPT_RETRY)
         );
 
         #[cfg(unix)]
         {
             assert_eq!(
                 classify_accept_error(&io::Error::from_raw_os_error(libc::EMFILE)),
-                AcceptErrorDisposition::RetryResourcePressure(RESOURCE_ACCEPT_RETRY)
+                AcceptErrorDisposition::RetryIndefinitely(RECOVERABLE_ACCEPT_RETRY)
             );
             assert_eq!(
                 classify_accept_error(&io::Error::from_raw_os_error(libc::EBADF)),
@@ -1094,7 +1132,7 @@ mod tests {
         for _ in 1..MAX_CONSECUTIVE_BACKOFF_ACCEPT_FAILURES {
             assert_eq!(
                 tracker.on_error(&error),
-                AcceptErrorDisposition::RetryAfter(RESOURCE_ACCEPT_RETRY)
+                AcceptErrorDisposition::RetryAfter(RECOVERABLE_ACCEPT_RETRY)
             );
         }
         assert_eq!(tracker.on_error(&error), AcceptErrorDisposition::Fatal);
@@ -1102,7 +1140,7 @@ mod tests {
         tracker.on_success();
         assert_eq!(
             tracker.on_error(&error),
-            AcceptErrorDisposition::RetryAfter(RESOURCE_ACCEPT_RETRY)
+            AcceptErrorDisposition::RetryAfter(RECOVERABLE_ACCEPT_RETRY)
         );
     }
 
@@ -1135,10 +1173,35 @@ mod tests {
         for _ in 0..(MAX_CONSECUTIVE_BACKOFF_ACCEPT_FAILURES * 2) {
             assert_eq!(
                 tracker.on_error(&error),
-                AcceptErrorDisposition::RetryResourcePressure(RESOURCE_ACCEPT_RETRY)
+                AcceptErrorDisposition::RetryIndefinitely(RECOVERABLE_ACCEPT_RETRY)
             );
         }
         assert_eq!(tracker.immediate_failures_since_backoff(), 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn pending_network_accept_errors_never_exhaust_the_retry_budget() {
+        for errno in [
+            libc::ENETDOWN,
+            libc::EPROTO,
+            libc::ENOPROTOOPT,
+            libc::EHOSTDOWN,
+            libc::ENONET,
+            libc::EHOSTUNREACH,
+            libc::EOPNOTSUPP,
+            libc::ENETUNREACH,
+        ] {
+            let error = io::Error::from_raw_os_error(errno);
+            let mut tracker = AcceptFailureTracker::default();
+            for _ in 0..(MAX_CONSECUTIVE_BACKOFF_ACCEPT_FAILURES * 2) {
+                assert_eq!(
+                    tracker.on_error(&error),
+                    AcceptErrorDisposition::RetryIndefinitely(RECOVERABLE_ACCEPT_RETRY),
+                    "errno {errno} must remain recoverable"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
