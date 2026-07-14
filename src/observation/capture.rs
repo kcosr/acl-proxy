@@ -365,7 +365,7 @@ mod tests {
                     redaction_profile: "accounting".to_owned(),
                     directory: PathBuf::from("/accounting-captures"),
                     filename: "capture-{requestId}-{suffix}.json".to_owned(),
-                    max_body_bytes: 8,
+                    max_body_bytes: 1,
                     max_inflight_body_bytes: limit,
                     max_files: 10,
                     max_total_bytes: 100,
