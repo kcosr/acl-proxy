@@ -35,6 +35,7 @@ const HTTP1_ALPN: &[u8] = b"http/1.1";
 const TRANSIENT_ACCEPT_RETRY: Duration = Duration::from_millis(10);
 const RESOURCE_ACCEPT_RETRY: Duration = Duration::from_secs(1);
 const MAX_CONSECUTIVE_BACKOFF_ACCEPT_FAILURES: usize = 30;
+const MAX_CONSECUTIVE_IMMEDIATE_ACCEPT_FAILURES: usize = 1_024;
 
 pub(crate) struct ControlServer {
     stop: watch::Sender<ControlStop>,
@@ -384,10 +385,21 @@ async fn run_control_supervisor(
                     Err(error) => {
                         let retry_after = match accept_failures.on_error(&error) {
                             AcceptErrorDisposition::RetryNow => {
+                                let consecutive = accept_failures.consecutive_immediate_failures();
+                                if consecutive == 1 || consecutive.is_power_of_two() {
+                                    tracing::warn!(
+                                        error = %error,
+                                        consecutive,
+                                        "control listener accept failed without backoff"
+                                    );
+                                }
                                 tokio::task::yield_now().await;
                                 continue;
                             }
-                            AcceptErrorDisposition::RetryAfter(retry_after) => retry_after,
+                            AcceptErrorDisposition::RetryAfter(retry_after)
+                            | AcceptErrorDisposition::RetryResourcePressure(retry_after) => {
+                                retry_after
+                            }
                             AcceptErrorDisposition::Fatal => {
                                 break SupervisorExit::Error(Arc::new(ControlServerRunError::Accept(error)));
                             }
@@ -511,20 +523,27 @@ async fn run_control_supervisor(
 enum AcceptErrorDisposition {
     RetryNow,
     RetryAfter(Duration),
+    RetryResourcePressure(Duration),
     Fatal,
 }
 
 #[derive(Default)]
 struct AcceptFailureTracker {
     consecutive_backoff_failures: usize,
+    consecutive_immediate_failures: usize,
 }
 
 impl AcceptFailureTracker {
     fn on_error(&mut self, error: &io::Error) -> AcceptErrorDisposition {
         match classify_accept_error(error) {
             AcceptErrorDisposition::RetryNow => {
-                self.on_success();
-                AcceptErrorDisposition::RetryNow
+                self.consecutive_immediate_failures += 1;
+                if self.consecutive_immediate_failures >= MAX_CONSECUTIVE_IMMEDIATE_ACCEPT_FAILURES
+                {
+                    AcceptErrorDisposition::Fatal
+                } else {
+                    AcceptErrorDisposition::RetryNow
+                }
             }
             AcceptErrorDisposition::RetryAfter(retry_after) => {
                 self.consecutive_backoff_failures += 1;
@@ -534,18 +553,29 @@ impl AcceptFailureTracker {
                     AcceptErrorDisposition::RetryAfter(retry_after)
                 }
             }
+            AcceptErrorDisposition::RetryResourcePressure(retry_after) => {
+                AcceptErrorDisposition::RetryResourcePressure(retry_after)
+            }
             AcceptErrorDisposition::Fatal => AcceptErrorDisposition::Fatal,
         }
     }
 
     fn on_success(&mut self) {
         self.consecutive_backoff_failures = 0;
+        self.consecutive_immediate_failures = 0;
+    }
+
+    fn consecutive_immediate_failures(&self) -> usize {
+        self.consecutive_immediate_failures
     }
 }
 
 fn classify_accept_error(error: &io::Error) -> AcceptErrorDisposition {
     if is_fatal_accept_error(error) {
         return AcceptErrorDisposition::Fatal;
+    }
+    if is_resource_pressure_accept_error(error) {
+        return AcceptErrorDisposition::RetryResourcePressure(RESOURCE_ACCEPT_RETRY);
     }
     match error.kind() {
         io::ErrorKind::Interrupted
@@ -556,6 +586,32 @@ fn classify_accept_error(error: &io::Error) -> AcceptErrorDisposition {
         io::ErrorKind::TimedOut => AcceptErrorDisposition::RetryAfter(TRANSIENT_ACCEPT_RETRY),
         _ => AcceptErrorDisposition::RetryAfter(RESOURCE_ACCEPT_RETRY),
     }
+}
+
+fn is_resource_pressure_accept_error(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::OutOfMemory {
+        return true;
+    }
+    is_platform_resource_pressure_accept_error(error)
+}
+
+#[cfg(unix)]
+fn is_platform_resource_pressure_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    )
+}
+
+#[cfg(windows)]
+fn is_platform_resource_pressure_accept_error(error: &io::Error) -> bool {
+    // WSAENOBUFS.
+    error.raw_os_error() == Some(10055)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_platform_resource_pressure_accept_error(_error: &io::Error) -> bool {
+    false
 }
 
 fn is_fatal_accept_error(error: &io::Error) -> bool {
@@ -983,7 +1039,7 @@ mod tests {
         {
             assert_eq!(
                 classify_accept_error(&io::Error::from_raw_os_error(libc::EMFILE)),
-                AcceptErrorDisposition::RetryAfter(RESOURCE_ACCEPT_RETRY)
+                AcceptErrorDisposition::RetryResourcePressure(RESOURCE_ACCEPT_RETRY)
             );
             assert_eq!(
                 classify_accept_error(&io::Error::from_raw_os_error(libc::EBADF)),
@@ -1009,6 +1065,35 @@ mod tests {
             tracker.on_error(&error),
             AcceptErrorDisposition::RetryAfter(RESOURCE_ACCEPT_RETRY)
         );
+    }
+
+    #[test]
+    fn persistent_immediate_accept_failures_exhaust_their_own_retry_budget() {
+        let error = io::Error::new(io::ErrorKind::ConnectionAborted, "persistent transient");
+        let mut tracker = AcceptFailureTracker::default();
+        for expected in 1..MAX_CONSECUTIVE_IMMEDIATE_ACCEPT_FAILURES {
+            assert_eq!(tracker.on_error(&error), AcceptErrorDisposition::RetryNow);
+            assert_eq!(tracker.consecutive_immediate_failures(), expected);
+        }
+        assert_eq!(tracker.on_error(&error), AcceptErrorDisposition::Fatal);
+
+        tracker.on_success();
+        assert_eq!(tracker.on_error(&error), AcceptErrorDisposition::RetryNow);
+        assert_eq!(tracker.consecutive_immediate_failures(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_pressure_never_exhausts_the_accept_retry_budget() {
+        let error = io::Error::from_raw_os_error(libc::EMFILE);
+        let mut tracker = AcceptFailureTracker::default();
+        for _ in 0..(MAX_CONSECUTIVE_BACKOFF_ACCEPT_FAILURES * 2) {
+            assert_eq!(
+                tracker.on_error(&error),
+                AcceptErrorDisposition::RetryResourcePressure(RESOURCE_ACCEPT_RETRY)
+            );
+        }
+        assert_eq!(tracker.consecutive_immediate_failures(), 0);
     }
 
     #[cfg(unix)]

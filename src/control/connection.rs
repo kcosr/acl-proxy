@@ -143,16 +143,13 @@ where
             return Ok(None);
         }
         let idle = store.initialized_len() == 0;
-        if idle && connection_should_close(shutdown) {
-            return Ok(None);
-        }
         let reading = tokio::time::timeout_at(deadline, stream.read(store.writable()));
         tokio::pin!(reading);
         let read = match if idle {
             tokio::select! {
                 biased;
-                _ = wait_for_connection_close(shutdown) => return Ok(None),
                 result = &mut reading => result,
+                _ = wait_for_connection_close(shutdown) => return Ok(None),
             }
         } else {
             reading.await
@@ -340,6 +337,34 @@ mod tests {
             .await
             .expect("an idle keep-alive must close promptly")
             .unwrap();
+        assert!(trailing.is_empty());
+        assert!(task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn graceful_close_serves_one_request_that_is_already_readable() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        client
+            .write_all(b"GET /_acl-proxy/ready HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let (shutdown, shutdown_rx) = watch::channel(ControlConnectionSignal::Running);
+        shutdown
+            .send(ControlConnectionSignal::CloseAfterRequest)
+            .unwrap();
+        let task = tokio::spawn(run_server(
+            server,
+            config(Duration::from_secs(1), Duration::from_secs(1)),
+            shutdown_rx,
+        ));
+
+        let response = read_response(&mut client).await;
+        assert!(response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(response
+            .windows(b"Connection: close".len())
+            .any(|window| window == b"Connection: close"));
+        let mut trailing = Vec::new();
+        client.read_to_end(&mut trailing).await.unwrap();
         assert!(trailing.is_empty());
         assert!(task.await.unwrap().is_ok());
     }
