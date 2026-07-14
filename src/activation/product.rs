@@ -1,5 +1,8 @@
 use std::sync::Arc;
 
+use crate::authorization::webhook::runtime::{
+    WebhookAuthorizationRuntime, WebhookAuthorizationRuntimeError,
+};
 use crate::authorization::{
     AuthorizationActivation, AuthorizationActivationError, ProductAuthorizationSnapshot,
 };
@@ -26,10 +29,11 @@ pub(crate) struct ProductActivator {
     static_fingerprint: StaticFingerprint,
     wire_body_pool: Arc<WireBodyPool>,
     observation_runtime: Arc<ProductObservationRuntime>,
+    authorization_runtime: Arc<WebhookAuthorizationRuntime>,
 }
 
 impl ProductActivator {
-    pub(crate) fn new(static_config: &StaticProductConfig) -> Result<Self, StaticFingerprintError> {
+    pub(crate) fn new(static_config: &StaticProductConfig) -> Result<Self, ProductActivatorError> {
         let static_fingerprint = StaticFingerprint::from_config(static_config)?;
         Ok(Self {
             static_fingerprint,
@@ -40,11 +44,16 @@ impl ProductActivator {
                     .max_inflight_wire_body_bytes_per_quota_key,
             ),
             observation_runtime: Arc::new(ProductObservationRuntime::new()),
+            authorization_runtime: WebhookAuthorizationRuntime::try_new(static_config)?,
         })
     }
 
     pub(crate) fn observation_runtime_handle(&self) -> Arc<ProductObservationRuntime> {
         self.observation_runtime.clone()
+    }
+
+    pub(crate) fn authorization_runtime_handle(&self) -> Arc<WebhookAuthorizationRuntime> {
+        self.authorization_runtime.clone()
     }
 
     async fn activate_generation(
@@ -177,6 +186,14 @@ impl ProductActivator {
             owner,
         })
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ProductActivatorError {
+    #[error("static fingerprint derivation failed")]
+    StaticFingerprint(#[from] StaticFingerprintError),
+    #[error("static authorization runtime construction failed")]
+    Authorization(#[from] WebhookAuthorizationRuntimeError),
 }
 
 impl CandidateActivator for ProductActivator {
@@ -522,10 +539,25 @@ default = "deny""#
         let second = ProductActivator::new(&second_config.static_config).unwrap();
         let first_observation = first.observation_runtime_handle();
         let second_observation = second.observation_runtime_handle();
+        let first_authorization = first.authorization_runtime_handle();
+        let first_authorization_again = first.authorization_runtime_handle();
+        let second_authorization = second.authorization_runtime_handle();
 
         assert_eq!(first.static_fingerprint(), &first_config.static_fingerprint);
         assert_eq!(first.static_fingerprint(), second.static_fingerprint());
         assert!(!Arc::ptr_eq(&first_observation, &second_observation));
+        assert!(Arc::ptr_eq(
+            &first_authorization,
+            &first_authorization_again
+        ));
+        assert!(!Arc::ptr_eq(&first_authorization, &second_authorization));
+        assert_eq!(
+            first_authorization.transport_counts().maximum_deliveries,
+            first_config
+                .static_config
+                .service
+                .max_active_webhook_deliveries
+        );
 
         let activated = first
             .activate_generation(
