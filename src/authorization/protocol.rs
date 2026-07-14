@@ -53,6 +53,10 @@ impl ProviderOutputIndex {
     pub(crate) fn get(self) -> usize {
         self.ordinal
     }
+
+    pub(crate) fn registry_id(self) -> u64 {
+        self.registry_id
+    }
 }
 
 pub(crate) enum ProviderOutputDefinition {
@@ -62,7 +66,7 @@ pub(crate) enum ProviderOutputDefinition {
 }
 
 impl ProviderOutputDefinition {
-    fn required(&self) -> bool {
+    pub(crate) fn required(&self) -> bool {
         match self {
             Self::Bearer { required }
             | Self::Basic { required, .. }
@@ -114,6 +118,18 @@ impl ProviderOutputRegistry {
         self.definitions.len()
     }
 
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(crate) fn wire_names(&self) -> impl Iterator<Item = &str> {
+        self.by_wire_name.keys().map(String::as_str)
+    }
+
+    pub(crate) fn index(&self, wire_name: &str) -> Option<ProviderOutputIndex> {
+        self.by_wire_name.get(wire_name).copied()
+    }
+
     pub(crate) fn definition(
         &self,
         index: ProviderOutputIndex,
@@ -121,6 +137,10 @@ impl ProviderOutputRegistry {
         (index.registry_id == self.id)
             .then(|| self.definitions.get(index.get()))
             .flatten()
+    }
+
+    pub(crate) fn definitions(&self) -> &[ProviderOutputDefinition] {
+        &self.definitions
     }
 }
 
