@@ -12,7 +12,7 @@ use memchr::memmem::Finder;
 use crate::config::compiler::CredentialActionPlan;
 use crate::config::compiler::{
     CompiledDefaultDecision, CompiledHeaderEffectWhen, CompiledRuleDecision, HeaderEffectPlan,
-    HeaderPredicatesPlan, PolicyPlan, PolicyRulePlan,
+    HeaderPredicatesPlan, HttpBodyReadPlan, PolicyPlan, PolicyRulePlan,
 };
 use crate::credentials::{
     resolve_credential_action, CredentialBindingError, ResolvedCredentialAction,
@@ -82,6 +82,7 @@ fn next_wire_body_plan_brand(cursor_count: usize) -> HttpWireBodyPlanBrand {
 pub(crate) struct CompiledPolicySnapshot {
     default: CompiledDefaultDecision,
     rules: Box<[ActivatedPolicyRule]>,
+    http_body_read_plans_by_cursor: Box<[HttpBodyReadPlan]>,
     wire_body_plan_brand: HttpWireBodyPlanBrand,
 }
 
@@ -124,6 +125,8 @@ struct ActivatedPolicyRule {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum PolicyActivationError {
+    #[error("policy body-read plan count mismatch: expected {expected}, got {actual}")]
+    BodyReadPlanCount { expected: usize, actual: usize },
     #[error("policy rule {rule_index} references an unknown authorization provider")]
     AuthorizationProvider { rule_index: usize },
     #[error("policy rule {rule_index} references an unknown redaction profile")]
@@ -152,10 +155,15 @@ pub(crate) enum PolicyOutcome {
 pub(crate) struct PolicyEvaluation<'snapshot> {
     pub(crate) outcome: PolicyOutcome,
     pub(crate) matched: Option<PolicyRuleMatch<'snapshot>>,
+    body_read_plan: HttpBodyReadPlan,
     wire_body_plan: HttpWireBodyPlanIndex,
 }
 
 impl PolicyEvaluation<'_> {
+    pub(crate) fn body_read_plan(&self) -> HttpBodyReadPlan {
+        self.body_read_plan
+    }
+
     pub(crate) fn wire_body_plan(&self) -> HttpWireBodyPlanIndex {
         self.wire_body_plan
     }
@@ -174,7 +182,21 @@ impl CompiledPolicySnapshot {
         redaction_profile_registry: &RedactionProfileRegistry,
         credential_source_registry: &CredentialSourceRegistry,
     ) -> Result<PolicyActivation, PolicyActivationError> {
-        let PolicyPlan { default, rules } = plan;
+        let PolicyPlan {
+            default,
+            rules,
+            http_body_read_plans_by_cursor,
+        } = plan;
+        let cursor_count = rules
+            .len()
+            .checked_add(1)
+            .expect("policy cursor count overflow");
+        if http_body_read_plans_by_cursor.len() != cursor_count {
+            return Err(PolicyActivationError::BodyReadPlanCount {
+                expected: cursor_count,
+                actual: http_body_read_plans_by_cursor.len(),
+            });
+        }
         let rules = rules
             .into_iter()
             .enumerate()
@@ -189,10 +211,6 @@ impl CompiledPolicySnapshot {
             })
             .collect::<Result<Vec<_>, _>>()?
             .into_boxed_slice();
-        let cursor_count = rules
-            .len()
-            .checked_add(1)
-            .expect("policy cursor count overflow");
         let bindings = resolved_bindings(
             &rules,
             provider_registry.len(),
@@ -203,6 +221,7 @@ impl CompiledPolicySnapshot {
             snapshot: Self {
                 default,
                 rules,
+                http_body_read_plans_by_cursor: http_body_read_plans_by_cursor.into_boxed_slice(),
                 wire_body_plan_brand: next_wire_body_plan_brand(cursor_count),
             },
             bindings,
@@ -281,6 +300,7 @@ impl CompiledPolicySnapshot {
                         index,
                         rule,
                     }),
+                    body_read_plan: self.http_body_read_plans_by_cursor[start_index],
                     wire_body_plan: HttpWireBodyPlanIndex::new(
                         self.wire_body_plan_brand,
                         start_index,
@@ -295,6 +315,7 @@ impl CompiledPolicySnapshot {
                 CompiledDefaultDecision::Deny => PolicyOutcome::Deny,
             },
             matched: None,
+            body_read_plan: self.http_body_read_plans_by_cursor[start_index],
             wire_body_plan: HttpWireBodyPlanIndex::new(self.wire_body_plan_brand, start_index),
         }
     }
@@ -865,7 +886,35 @@ mod tests {
         default: CompiledDefaultDecision,
         rules: Vec<PolicyRulePlan>,
     ) -> CompiledPolicySnapshot {
-        CompiledPolicySnapshot::from_plan(PolicyPlan { default, rules })
+        let http_body_read_plans_by_cursor =
+            vec![HttpBodyReadPlan::Disabled; rules.len().checked_add(1).unwrap()];
+        CompiledPolicySnapshot::from_plan(PolicyPlan {
+            default,
+            rules,
+            http_body_read_plans_by_cursor,
+        })
+    }
+
+    fn snapshot_with_body_read_plans(
+        default: CompiledDefaultDecision,
+        rules: Vec<PolicyRulePlan>,
+        http_body_read_plans_by_cursor: Vec<HttpBodyReadPlan>,
+    ) -> CompiledPolicySnapshot {
+        CompiledPolicySnapshot::from_plan(PolicyPlan {
+            default,
+            rules,
+            http_body_read_plans_by_cursor,
+        })
+    }
+
+    fn mandatory_body_plan(max_encoded_bytes: usize, max_decoded_bytes: usize) -> HttpBodyReadPlan {
+        HttpBodyReadPlan::Mandatory(
+            crate::config::compiler::HttpBodyReadLimits::try_new(
+                max_encoded_bytes,
+                max_decoded_bytes,
+            )
+            .unwrap(),
+        )
     }
 
     fn evaluate<'a>(
@@ -1309,6 +1358,96 @@ mod tests {
     }
 
     #[test]
+    fn body_read_plan_tracks_starting_and_delegate_cursors_without_foreign_lookup() {
+        let skipped = rule(
+            "skipped",
+            CompiledRuleDecision::Deny,
+            "https://other.example/**",
+        );
+        let delegate = rule(
+            "delegate",
+            CompiledRuleDecision::Delegate,
+            "https://example.com/**",
+        );
+        let allow = rule(
+            "allow",
+            CompiledRuleDecision::Allow,
+            "https://example.com/**",
+        );
+        let active = snapshot_with_body_read_plans(
+            CompiledDefaultDecision::Deny,
+            vec![skipped, delegate, allow],
+            vec![
+                mandatory_body_plan(16, 32),
+                mandatory_body_plan(8, 32),
+                mandatory_body_plan(4, 16),
+                HttpBodyReadPlan::Disabled,
+            ],
+        );
+        let url = canonicalize_http_url("https://example.com/path").unwrap();
+        let first = active.evaluate(
+            &url,
+            "192.0.2.10".parse().unwrap(),
+            &Method::GET,
+            &HeaderMap::new(),
+            |_| false,
+        );
+
+        assert_eq!(first.matched.as_ref().unwrap().index(), 1);
+        assert_eq!(
+            first
+                .body_read_plan()
+                .limits()
+                .map(|limits| (limits.max_encoded_bytes(), limits.max_decoded_bytes(),)),
+            Some((16, 32))
+        );
+        assert_eq!(
+            first
+                .wire_body_plan()
+                .resolve(active.wire_body_plan_brand, &[101, 202, 303, 0]),
+            Some(101)
+        );
+
+        let resumed = first.matched.unwrap().resume_cursor().resume(
+            &url,
+            "192.0.2.10".parse().unwrap(),
+            &Method::GET,
+            &HeaderMap::new(),
+            |_| false,
+        );
+        assert_eq!(resumed.matched.as_ref().unwrap().index(), 2);
+        assert_eq!(
+            resumed
+                .body_read_plan()
+                .limits()
+                .map(|limits| (limits.max_encoded_bytes(), limits.max_decoded_bytes(),)),
+            Some((4, 16))
+        );
+
+        let foreign = snapshot(
+            CompiledDefaultDecision::Deny,
+            vec![rule(
+                "foreign",
+                CompiledRuleDecision::Allow,
+                "https://example.com/**",
+            )],
+        );
+        assert_eq!(
+            resumed
+                .wire_body_plan()
+                .resolve(foreign.wire_body_plan_brand, &[999, 0]),
+            None
+        );
+        assert_eq!(
+            resumed
+                .body_read_plan()
+                .limits()
+                .map(|limits| (limits.max_encoded_bytes(), limits.max_decoded_bytes(),)),
+            Some((4, 16))
+        );
+    }
+
+    #[test]
     fn continuation_is_bound_to_its_originating_snapshot() {
         let first = rule(
             "delegate-old",
@@ -1720,6 +1859,10 @@ mod tests {
             PolicyPlan {
                 default: CompiledDefaultDecision::Deny,
                 rules: vec![bound],
+                http_body_read_plans_by_cursor: vec![
+                    HttpBodyReadPlan::Disabled,
+                    HttpBodyReadPlan::Disabled,
+                ],
             },
             &provider_registry,
             &profile_registry,
@@ -1799,6 +1942,10 @@ mod tests {
             PolicyPlan {
                 default: CompiledDefaultDecision::Deny,
                 rules: vec![provider],
+                http_body_read_plans_by_cursor: vec![
+                    HttpBodyReadPlan::Disabled,
+                    HttpBodyReadPlan::Disabled,
+                ],
             },
             &providers,
             &profiles,
@@ -1822,6 +1969,10 @@ mod tests {
                 PolicyPlan {
                     default: CompiledDefaultDecision::Deny,
                     rules: vec![profile],
+                    http_body_read_plans_by_cursor: vec![
+                        HttpBodyReadPlan::Disabled,
+                        HttpBodyReadPlan::Disabled,
+                    ],
                 },
                 &providers,
                 &profiles,
@@ -1844,6 +1995,10 @@ mod tests {
                 PolicyPlan {
                     default: CompiledDefaultDecision::Deny,
                     rules: vec![credential],
+                    http_body_read_plans_by_cursor: vec![
+                        HttpBodyReadPlan::Disabled,
+                        HttpBodyReadPlan::Disabled,
+                    ],
                 },
                 &providers,
                 &profiles,
@@ -1853,6 +2008,33 @@ mod tests {
             PolicyActivationError::CredentialSource {
                 rule_index: 0,
                 action_index: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn activation_rejects_a_body_read_plan_table_with_the_wrong_cursor_count() {
+        let error = CompiledPolicySnapshot::activate(
+            PolicyPlan {
+                default: CompiledDefaultDecision::Deny,
+                rules: vec![rule(
+                    "allow",
+                    CompiledRuleDecision::Allow,
+                    "https://example.com/**",
+                )],
+                http_body_read_plans_by_cursor: vec![HttpBodyReadPlan::Disabled],
+            },
+            &ProviderRegistry::from_names([]),
+            &RedactionProfileRegistry::from_names([]),
+            &CredentialSourceRegistry::from_names([]),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            PolicyActivationError::BodyReadPlanCount {
+                expected: 2,
+                actual: 1,
             }
         );
     }

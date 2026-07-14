@@ -6,6 +6,9 @@ pub(crate) use snapshot::{
     HttpWireBodyPlanIndex, PolicyCursor, PolicyEvaluation, PolicyOutcome, PolicyRuleMatch,
 };
 
+#[allow(unused_imports)]
+pub(crate) use crate::config::compiler::{HttpBodyReadLimits, HttpBodyReadPlan};
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 

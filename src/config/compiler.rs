@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -322,6 +323,64 @@ pub(crate) struct ParentProxyTlsPlan {
 pub(crate) struct PolicyPlan {
     pub(crate) default: CompiledDefaultDecision,
     pub(crate) rules: Vec<PolicyRulePlan>,
+    pub(crate) http_body_read_plans_by_cursor: Vec<HttpBodyReadPlan>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HttpBodyReadPlan {
+    Disabled,
+    Mandatory(HttpBodyReadLimits),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HttpBodyReadLimits {
+    max_encoded_bytes: NonZeroUsize,
+    max_decoded_bytes: NonZeroUsize,
+}
+
+impl HttpBodyReadPlan {
+    pub(crate) fn requires_mandatory_read(self) -> bool {
+        matches!(self, Self::Mandatory(_))
+    }
+
+    pub(crate) fn limits(self) -> Option<HttpBodyReadLimits> {
+        match self {
+            Self::Disabled => None,
+            Self::Mandatory(limits) => Some(limits),
+        }
+    }
+
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Disabled, plan) | (plan, Self::Disabled) => plan,
+            (Self::Mandatory(left), Self::Mandatory(right)) => Self::Mandatory(
+                HttpBodyReadLimits::try_new(
+                    left.max_encoded_bytes().max(right.max_encoded_bytes()),
+                    left.max_decoded_bytes().max(right.max_decoded_bytes()),
+                )
+                .expect("maxima of validated HTTP body read limits remain valid"),
+            ),
+        }
+    }
+}
+
+impl HttpBodyReadLimits {
+    pub(crate) fn try_new(max_encoded_bytes: usize, max_decoded_bytes: usize) -> Option<Self> {
+        let max_encoded_bytes = NonZeroUsize::new(max_encoded_bytes)?;
+        let max_decoded_bytes = NonZeroUsize::new(max_decoded_bytes)?;
+        (max_decoded_bytes >= max_encoded_bytes).then_some(Self {
+            max_encoded_bytes,
+            max_decoded_bytes,
+        })
+    }
+
+    pub(crate) fn max_encoded_bytes(self) -> usize {
+        self.max_encoded_bytes.get()
+    }
+
+    pub(crate) fn max_decoded_bytes(self) -> usize {
+        self.max_decoded_bytes.get()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3559,20 +3618,7 @@ fn compile_http_rule_schedule(
             configured_profile_literal_scratch_bytes(profile, &format!("redaction.profiles.{name}"))
         })
         .transpose()?;
-    let effective_body_limits = match (process_body, profile) {
-        (Some(provider), Some(profile)) => Some((
-            provider.max_request_body_bytes.min(profile.max_body_bytes),
-            provider
-                .max_decoded_request_body_bytes
-                .min(profile.max_decoded_body_bytes),
-        )),
-        (Some(provider), None) => Some((
-            provider.max_request_body_bytes,
-            provider.max_decoded_request_body_bytes,
-        )),
-        (None, Some(profile)) => Some((profile.max_body_bytes, profile.max_decoded_body_bytes)),
-        (None, None) => None,
-    };
+    let effective_body_limits = effective_http_body_limits(process_body, profile);
 
     let mut initial_peak = 0usize;
     let mut incoming_stages = Vec::with_capacity(6);
@@ -3797,6 +3843,72 @@ fn compile_http_rule_schedule(
     })
 }
 
+fn effective_http_body_limits(
+    process_body: Option<&super::authoring::ProcessProviderConfig>,
+    profile: Option<&super::authoring::RedactionProfileConfig>,
+) -> Option<(usize, usize)> {
+    match (process_body, profile) {
+        (Some(provider), Some(profile)) => Some((
+            provider.max_request_body_bytes.min(profile.max_body_bytes),
+            provider
+                .max_decoded_request_body_bytes
+                .min(profile.max_decoded_body_bytes),
+        )),
+        (Some(provider), None) => Some((
+            provider.max_request_body_bytes,
+            provider.max_decoded_request_body_bytes,
+        )),
+        (None, Some(profile)) => Some((profile.max_body_bytes, profile.max_decoded_body_bytes)),
+        (None, None) => None,
+    }
+}
+
+fn compile_http_body_read_plans(
+    config: &super::authoring::AuthoringConfig,
+) -> Result<Vec<HttpBodyReadPlan>, ConfigCompileError> {
+    let cursor_count = config.policy.rules.len().checked_add(1).ok_or_else(|| {
+        ConfigCompileError::at("policy.rules", "HTTP body read cursor count overflow")
+    })?;
+    let mut plans = vec![HttpBodyReadPlan::Disabled; cursor_count];
+
+    for index in (0..config.policy.rules.len()).rev() {
+        let rule = &config.policy.rules[index];
+        let process_body = rule.authorization_provider.as_ref().and_then(|name| {
+            match config.authorization.providers.get(name) {
+                Some(AuthorizationProviderConfig::Process(provider))
+                    if provider.include_request_body =>
+                {
+                    Some(provider)
+                }
+                _ => None,
+            }
+        });
+        let profile = rule.redaction_profile.as_ref().map(|name| {
+            config
+                .redaction
+                .profiles
+                .get(name)
+                .expect("profile references validated before body-read compilation")
+        });
+        let exact = effective_http_body_limits(process_body, profile)
+            .map(|(max_encoded_bytes, max_decoded_bytes)| {
+                HttpBodyReadLimits::try_new(max_encoded_bytes, max_decoded_bytes)
+                    .map(HttpBodyReadPlan::Mandatory)
+                    .ok_or_else(|| {
+                        ConfigCompileError::at(
+                            format!("policy.rules[{index}]"),
+                            "mandatory HTTP body read limits must be nonzero and decoded must be at least encoded",
+                        )
+                    })
+            })
+            .transpose()?
+            .unwrap_or(HttpBodyReadPlan::Disabled);
+        plans[index] = exact.merge(plans[index + 1]);
+    }
+
+    Ok(plans)
+}
+
 fn provider_response_guarded_suffix_bytes(
     max_stdout_line_bytes: usize,
     path: &str,
@@ -3907,11 +4019,16 @@ fn compile_reloadable_plan(
     compiled_urls_by_rule: Vec<Vec<CompiledUrlPattern>>,
     resource_plan: CompiledResourcePlan,
 ) -> Result<ReloadableProductPlan, ConfigCompileError> {
+    let http_body_read_plans_by_cursor = compile_http_body_read_plans(config)?;
     Ok(ReloadableProductPlan {
         request_timeout: config.service.request_timeout.get(),
         max_content_decoding_expansion_ratio: config.service.max_content_decoding_expansion_ratio,
         egress: compile_egress_plan(&config.egress)?,
-        policy: compile_policy_plan(&config.policy, compiled_urls_by_rule)?,
+        policy: compile_policy_plan(
+            &config.policy,
+            compiled_urls_by_rule,
+            http_body_read_plans_by_cursor,
+        )?,
         authorization: compile_authorization_plan(&config.authorization, working_directory)?,
         credentials: compile_credentials_plan(&config.credentials)?,
         redaction: compile_redaction_plan(&config.redaction)?,
@@ -3986,6 +4103,7 @@ fn compile_parent_proxy_plan(
 fn compile_policy_plan(
     value: &PolicyConfig,
     compiled_urls_by_rule: Vec<Vec<CompiledUrlPattern>>,
+    http_body_read_plans_by_cursor: Vec<HttpBodyReadPlan>,
 ) -> Result<PolicyPlan, ConfigCompileError> {
     if compiled_urls_by_rule.len() != value.rules.len() {
         return Err(ConfigCompileError::at(
@@ -4006,6 +4124,7 @@ fn compile_policy_plan(
             super::authoring::PolicyDefaultDecision::Deny => CompiledDefaultDecision::Deny,
         },
         rules,
+        http_body_read_plans_by_cursor,
     })
 }
 
@@ -5145,6 +5264,167 @@ default = "deny"
     fn guarded(payload_bytes: usize) -> usize {
         guarded_body_allocation_bytes(payload_bytes)
             .expect("test payload must have a guarded allocation projection")
+    }
+
+    fn body_read_limits(plan: HttpBodyReadPlan) -> Option<(usize, usize)> {
+        plan.limits()
+            .map(|limits| (limits.max_encoded_bytes(), limits.max_decoded_bytes()))
+    }
+
+    #[test]
+    fn body_read_plans_are_explicitly_disabled_without_mandatory_inspection() {
+        let compiled = compile(&resource_config(
+            "",
+            "",
+            r#"
+[[policy.rules]]
+id = "metadata-only"
+decision = "allow"
+methods = ["GET"]
+"#,
+        ))
+        .unwrap();
+        let plans = &compiled
+            .reloadable_plan
+            .policy
+            .http_body_read_plans_by_cursor;
+
+        assert_eq!(plans, &[HttpBodyReadPlan::Disabled; 2]);
+        assert!(!plans[0].requires_mandatory_read());
+        assert_eq!(plans[0].limits(), None);
+    }
+
+    #[test]
+    fn exact_rule_body_read_plan_uses_provider_profile_minima() {
+        let compiled = compile(&resource_config(
+            "",
+            r#"
+[authorization.providers.body]
+kind = "process"
+command = "/bin/body-provider"
+include_request_body = true
+max_request_body_bytes = 16
+max_decoded_request_body_bytes = 32
+retire_timeout = "1s"
+
+[redaction.profiles.strict]
+max_body_bytes = 8
+max_decoded_body_bytes = 24
+rules = [{ literals = ["secret"] }]
+"#,
+            r#"
+[[policy.rules]]
+id = "combined"
+decision = "delegate"
+authorization_provider = "body"
+redaction_profile = "strict"
+methods = ["POST"]
+"#,
+        ))
+        .unwrap();
+        let plans = &compiled
+            .reloadable_plan
+            .policy
+            .http_body_read_plans_by_cursor;
+
+        assert!(plans[0].requires_mandatory_read());
+        assert_eq!(body_read_limits(plans[0]), Some((8, 24)));
+        assert_eq!(plans[1], HttpBodyReadPlan::Disabled);
+    }
+
+    #[test]
+    fn delegate_suffix_body_read_plan_uses_independent_component_maxima() {
+        let compiled = compile(&resource_config(
+            "",
+            r#"
+[authorization.providers.wide-encoded]
+kind = "process"
+command = "/bin/wide-encoded"
+include_request_body = true
+max_request_body_bytes = 16
+max_decoded_request_body_bytes = 16
+retire_timeout = "1s"
+
+[authorization.providers.wide-decoded]
+kind = "process"
+command = "/bin/wide-decoded"
+include_request_body = true
+max_request_body_bytes = 8
+max_decoded_request_body_bytes = 32
+retire_timeout = "1s"
+"#,
+            r#"
+[[policy.rules]]
+id = "first"
+decision = "delegate"
+authorization_provider = "wide-encoded"
+methods = ["POST"]
+
+[[policy.rules]]
+id = "continuation"
+decision = "delegate"
+authorization_provider = "wide-decoded"
+methods = ["POST"]
+"#,
+        ))
+        .unwrap();
+        let plans = &compiled
+            .reloadable_plan
+            .policy
+            .http_body_read_plans_by_cursor;
+
+        assert_eq!(body_read_limits(plans[0]), Some((16, 32)));
+        assert_eq!(body_read_limits(plans[1]), Some((8, 32)));
+        assert_eq!(plans[2], HttpBodyReadPlan::Disabled);
+    }
+
+    #[test]
+    fn skipped_predicate_keeps_later_mandatory_body_read_reachable() {
+        let compiled = compile(&resource_config(
+            "",
+            r#"
+[authorization.providers.body]
+kind = "process"
+command = "/bin/body-provider"
+include_request_body = true
+max_request_body_bytes = 12
+max_decoded_request_body_bytes = 36
+retire_timeout = "1s"
+"#,
+            r#"
+[[policy.rules]]
+id = "get-only"
+decision = "deny"
+methods = ["GET"]
+
+[[policy.rules]]
+id = "post-provider"
+decision = "delegate"
+authorization_provider = "body"
+methods = ["POST"]
+"#,
+        ))
+        .unwrap();
+        let plans = &compiled
+            .reloadable_plan
+            .policy
+            .http_body_read_plans_by_cursor;
+
+        assert_eq!(body_read_limits(plans[0]), Some((12, 36)));
+        assert_eq!(body_read_limits(plans[1]), Some((12, 36)));
+        assert_eq!(plans[2], HttpBodyReadPlan::Disabled);
+    }
+
+    #[test]
+    fn body_read_limits_reject_zero_and_inverted_bounds() {
+        assert!(HttpBodyReadLimits::try_new(0, 1).is_none());
+        assert!(HttpBodyReadLimits::try_new(1, 0).is_none());
+        assert!(HttpBodyReadLimits::try_new(2, 1).is_none());
+        assert_eq!(
+            HttpBodyReadLimits::try_new(1, 1)
+                .map(|limits| (limits.max_encoded_bytes(), limits.max_decoded_bytes(),)),
+            Some((1, 1))
+        );
     }
 
     fn webhook_config(max_request_bytes: usize, max_response_bytes: usize) -> String {
