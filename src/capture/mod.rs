@@ -325,6 +325,10 @@ impl CaptureArtifactJob {
         {
             return Err(CaptureArtifactJobError::MetadataAlreadyHasBodyOutcome);
         }
+        if encoded.is_empty() {
+            self.payload = CaptureArtifactPayload::Unavailable;
+            return Ok(());
+        }
         self.payload = CaptureArtifactPayload::Http {
             encoded,
             encoding,
@@ -349,6 +353,10 @@ impl CaptureArtifactJob {
             || self.metadata.record.provider_replacement_size.is_some()
         {
             return Err(CaptureArtifactJobError::MetadataAlreadyHasBodyOutcome);
+        }
+        if encoded.is_empty() {
+            self.payload = CaptureArtifactPayload::Unavailable;
+            return Ok(());
         }
         self.payload = CaptureArtifactPayload::WebSocket {
             encoded,
@@ -1643,6 +1651,31 @@ default = "deny"
     }
 
     #[tokio::test]
+    async fn artifact_worker_emits_metadata_only_for_complete_empty_http_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let (epoch, _owner) = capture_engine_epoch(directory.path(), 1024, false);
+        let mut job = CaptureArtifactJob::try_begin(
+            epoch,
+            crate::observation::CaptureEvent::RequestAllowed,
+            sample_record_with_body(None),
+            16,
+        )
+        .unwrap()
+        .expect("capture admission");
+        let encoded = operation_body(&job, b"");
+        job.complete_http_body(encoded, CaptureContentEncoding::Gzip, None, true)
+            .unwrap();
+
+        let worker = CaptureArtifactWorker::start(1).unwrap();
+        worker.try_submit(job).unwrap();
+        worker.shutdown().await;
+
+        let record = read_only_capture_record(directory.path());
+        assert!(record.body.is_none());
+        assert!(record.body_truncated.is_none());
+    }
+
+    #[tokio::test]
     async fn artifact_worker_redacts_complete_websocket_text_messages() {
         let directory = tempfile::tempdir().unwrap();
         let (epoch, _owner) = capture_engine_epoch(directory.path(), 1024, false);
@@ -1670,6 +1703,33 @@ default = "deny"
             b"before REDACTED after"
         );
         assert_eq!(record.body_truncated, None);
+    }
+
+    #[tokio::test]
+    async fn artifact_worker_emits_metadata_only_for_complete_empty_websocket_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let (epoch, _owner) = capture_engine_epoch(directory.path(), 1024, false);
+        let mut metadata = sample_record_with_body(None);
+        metadata.request_id = "empty-websocket".to_owned();
+        let mut job = CaptureArtifactJob::try_begin(
+            epoch,
+            crate::observation::CaptureEvent::ResponseAllowed,
+            metadata,
+            16,
+        )
+        .unwrap()
+        .expect("capture admission");
+        let encoded = operation_body(&job, b"");
+        job.complete_websocket_message(encoded, true, PayloadClass::Binary)
+            .unwrap();
+
+        let worker = CaptureArtifactWorker::start(1).unwrap();
+        worker.try_submit(job).unwrap();
+        worker.shutdown().await;
+
+        let record = read_only_capture_record(directory.path());
+        assert!(record.body.is_none());
+        assert!(record.body_truncated.is_none());
     }
 
     #[tokio::test]

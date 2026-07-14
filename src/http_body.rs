@@ -564,12 +564,9 @@ fn poll_capture_decode<F: Future>(future: F) -> F::Output {
 }
 
 struct CaptureWebSocketInflateSession {
-    state: *mut InflateState,
     output_offset: usize,
     workspace: CaptureWorkspace,
 }
-
-unsafe impl Send for CaptureWebSocketInflateSession {}
 
 impl CaptureWebSocketInflateSession {
     async fn new(
@@ -586,27 +583,37 @@ impl CaptureWebSocketInflateSession {
         if !(workspace.as_mut_ptr() as usize).is_multiple_of(std::mem::align_of::<InflateState>()) {
             return Err(CaptureHttpDecodeError::ResourceExhausted);
         }
-        let state = workspace.as_mut_ptr().cast::<InflateState>();
+        let (state_bytes, _) = workspace.as_mut_bytes().split_at_mut(output_offset);
+        let state = state_bytes.as_mut_ptr().cast::<InflateState>();
+        // The aligned state region is large enough for InflateState and remains
+        // exclusively owned by this session until Drop destroys it.
         unsafe { state.write(InflateState::new(DataFormat::Raw)) };
         Ok(Self {
-            state,
             output_offset,
             workspace,
         })
     }
 
     fn inflate(&mut self, input: &[u8]) -> (miniz_oxide::StreamResult, &[u8], usize) {
-        let output = &mut self.workspace.as_mut_bytes()[self.output_offset..];
+        let (state_bytes, output) = self
+            .workspace
+            .as_mut_bytes()
+            .split_at_mut(self.output_offset);
+        let state = state_bytes.as_mut_ptr().cast::<InflateState>();
         let capacity = output.len();
-        let result = inflate(unsafe { &mut *self.state }, input, output, MZFlush::Sync);
+        // split_at_mut proves that the live state and output ranges are disjoint.
+        let result = inflate(unsafe { &mut *state }, input, output, MZFlush::Sync);
         (result, &output[..result.bytes_written], capacity)
     }
 }
 
 impl Drop for CaptureWebSocketInflateSession {
     fn drop(&mut self) {
-        unsafe { ptr::drop_in_place(self.state) };
-        self.state = ptr::null_mut();
+        let (state_bytes, _) = self
+            .workspace
+            .as_mut_bytes()
+            .split_at_mut(self.output_offset);
+        unsafe { ptr::drop_in_place(state_bytes.as_mut_ptr().cast::<InflateState>()) };
         self.workspace.reset();
     }
 }

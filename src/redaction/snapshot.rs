@@ -552,12 +552,12 @@ impl ProfileHandle {
         payload: C::Body,
     ) -> Result<(C::Body, usize), SnapshotError> {
         context.validate_body(&payload)?;
-        let class = if stable_utf8_valid(&payload) {
-            PayloadClass::Text
-        } else {
-            PayloadClass::Binary
-        };
-        self.redact_stable_complete(
+        let class = classify_stable_http_body(
+            &payload,
+            self.0.limits.max_decoded_body_bytes,
+            PayloadLimit::DecodedHttpBody,
+        )?;
+        self.redact_stable_validated(
             context,
             payload,
             class,
@@ -579,6 +579,17 @@ impl ProfileHandle {
         if matches!(class, PayloadClass::Text) && !stable_utf8_valid(&payload) {
             return Err(SnapshotError::InvalidText);
         }
+        self.redact_stable_validated(context, payload, class, limit, payload_limit)
+    }
+
+    fn redact_stable_validated<C: StableRedactionContext>(
+        &self,
+        context: &C,
+        payload: C::Body,
+        class: PayloadClass,
+        limit: usize,
+        payload_limit: PayloadLimit,
+    ) -> Result<(C::Body, usize), SnapshotError> {
         let literal_matcher = match class {
             PayloadClass::Text => &self.0.text_literals,
             PayloadClass::Binary => &self.0.binary_literals,
@@ -1892,16 +1903,48 @@ fn copy_stable_range<B: StableRedactionBody, R: StableRedactionBuilder>(
     end: usize,
     output: &mut R,
 ) -> Result<(), SnapshotError> {
+    if start >= end {
+        return Ok(());
+    }
+
+    enum Traversal {
+        Complete,
+        Failed(SnapshotError),
+    }
+
     let mut offset = 0usize;
-    input.try_for_each_segment(|segment| {
+    let result = input.try_for_each_segment(|segment| {
         let segment_end = offset + segment.len();
         if segment_end > start && offset < end {
             let local_start = start.saturating_sub(offset);
             let local_end = (end - offset).min(segment.len());
-            output.try_extend_redacted(&segment[local_start..local_end])?;
+            output
+                .try_extend_redacted(&segment[local_start..local_end])
+                .map_err(Traversal::Failed)?;
         }
         offset = segment_end;
-        Ok(())
+        if offset >= end {
+            Err(Traversal::Complete)
+        } else {
+            Ok(())
+        }
+    });
+    match result {
+        Ok(()) | Err(Traversal::Complete) => Ok(()),
+        Err(Traversal::Failed(error)) => Err(error),
+    }
+}
+
+fn classify_stable_http_body<B: StableRedactionBody>(
+    payload: &B,
+    limit: usize,
+    payload_limit: PayloadLimit,
+) -> Result<PayloadClass, SnapshotError> {
+    check_size(payload.len(), limit, payload_limit)?;
+    Ok(if stable_utf8_valid(payload) {
+        PayloadClass::Text
+    } else {
+        PayloadClass::Binary
     })
 }
 
@@ -2134,6 +2177,7 @@ fn read_environment_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
     use std::env;
     use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2147,6 +2191,39 @@ mod tests {
     use crate::observation::{CapturePool, ProductObservationSnapshot};
     use crate::safety::allocation::{body_allocation_bytes, MAX_BUFFER_GROWTH_BYTES};
     use crate::safety::{WireBodyPool, WireBodyQuotaKey};
+
+    struct CountingStableBody<'a> {
+        segments: &'a [&'a [u8]],
+        len: usize,
+        visited: Cell<usize>,
+    }
+
+    impl StableRedactionBody for CountingStableBody<'_> {
+        fn len(&self) -> usize {
+            self.len
+        }
+
+        fn try_for_each_segment<E>(
+            &self,
+            mut callback: impl FnMut(&[u8]) -> Result<(), E>,
+        ) -> Result<(), E> {
+            for segment in self.segments {
+                self.visited.set(self.visited.get() + 1);
+                callback(segment)?;
+            }
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CollectingStableBuilder(Vec<u8>);
+
+    impl StableRedactionBuilder for CollectingStableBuilder {
+        fn try_extend_redacted(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+            self.0.extend_from_slice(bytes);
+            Ok(())
+        }
+    }
 
     fn activate(plan: RedactionPlan) -> Result<RedactionActivation, SnapshotError> {
         RedactionSnapshot::activate(plan, || false)
@@ -2287,6 +2364,46 @@ mod tests {
         let mut body = operation.body_buffer();
         body.try_extend_from_slice(bytes).unwrap();
         body.finish()
+    }
+
+    #[test]
+    fn oversized_stable_http_body_is_rejected_before_segment_traversal() {
+        let segments = [b"not visited".as_slice()];
+        let body = CountingStableBody {
+            segments: &segments,
+            len: 129,
+            visited: Cell::new(0),
+        };
+
+        assert!(matches!(
+            classify_stable_http_body(&body, 128, PayloadLimit::DecodedHttpBody),
+            Err(SnapshotError::PayloadTooLarge {
+                payload: PayloadLimit::DecodedHttpBody,
+                limit: 128
+            })
+        ));
+        assert_eq!(body.visited.get(), 0);
+    }
+
+    #[test]
+    fn copy_stable_range_stops_at_the_segment_containing_end() {
+        let segments = [
+            b"abc".as_slice(),
+            b"def".as_slice(),
+            b"ghi".as_slice(),
+            b"jkl".as_slice(),
+        ];
+        let body = CountingStableBody {
+            segments: &segments,
+            len: 12,
+            visited: Cell::new(0),
+        };
+        let mut output = CollectingStableBuilder::default();
+
+        copy_stable_range(&body, 2, 5, &mut output).unwrap();
+
+        assert_eq!(output.0, b"cde");
+        assert_eq!(body.visited.get(), 2);
     }
 
     #[test]
