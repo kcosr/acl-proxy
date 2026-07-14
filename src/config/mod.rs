@@ -11,8 +11,8 @@ pub(crate) use compiler::{
 };
 #[allow(unused_imports)]
 pub(crate) use facade::{
-    compile_config_text, load_and_compile_config, CompiledConfig, ConfigFacadeError,
-    ConfigFileMetadata, ConfigPathSource, ConfigTextInput, LoadedCompiledConfig,
+    compile_config_text, load_and_compile_config, load_and_compile_exact_config, CompiledConfig,
+    ConfigFacadeError, ConfigFileMetadata, ConfigPathSource, ConfigTextInput, LoadedCompiledConfig,
 };
 
 use std::env;

@@ -131,9 +131,27 @@ pub(super) fn load_config(explicit_path: Option<&Path>) -> Result<LoadedConfig, 
         None
     };
     let selected = select_config_path(explicit_path, environment_path.as_deref());
+    if selected.path.is_absolute() {
+        return load_selected_config(selected, Path::new(""));
+    }
     let current_dir =
         env::current_dir().map_err(|source| ConfigLoadError::CurrentDirectory { source })?;
     load_selected_config(selected, &current_dir)
+}
+
+pub(super) fn load_exact_config(path: &Path) -> Result<LoadedConfig, ConfigLoadError> {
+    if !path.is_absolute() {
+        return Err(ConfigLoadError::InvalidPath {
+            path: path.to_path_buf(),
+        });
+    }
+    load_selected_config(
+        SelectedConfigPath {
+            path: path.to_path_buf(),
+            source: ConfigPathSource::Explicit,
+        },
+        Path::new(""),
+    )
 }
 
 pub(super) fn select_config_path(

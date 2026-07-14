@@ -115,6 +115,19 @@ pub(crate) fn load_and_compile_config(
     Ok(LoadedCompiledConfig { metadata, compiled })
 }
 
+pub(crate) fn load_and_compile_exact_config(
+    path: &Path,
+) -> Result<LoadedCompiledConfig, ConfigFacadeError> {
+    let loaded = loader::load_exact_config(path).map_err(load_error)?;
+    let metadata = ConfigFileMetadata {
+        path: loaded.path,
+        config_root: loaded.config_root,
+        path_source: loaded.path_source,
+    };
+    let compiled = compile_authored(loaded.authored, &metadata.config_root, &metadata.path)?;
+    Ok(LoadedCompiledConfig { metadata, compiled })
+}
+
 pub(crate) fn compile_config_text(
     input: ConfigTextInput<'_>,
 ) -> Result<CompiledConfig, ConfigFacadeError> {
