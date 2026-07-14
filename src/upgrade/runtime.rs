@@ -1181,8 +1181,18 @@ impl EntryShared {
         timing.application_stop = timing.application_stop.min(now);
         timing.cleanup_cutoff = timing.cleanup_cutoff.min(cause_cutoff);
         drop(timing);
-        self.terminal_state.store(ENTRY_CLOSING, Ordering::Release);
-        self.changed.notify_waiters();
+        if self
+            .terminal_state
+            .compare_exchange(
+                ENTRY_CLOSE_REQUESTED,
+                ENTRY_CLOSING,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.changed.notify_waiters();
+        }
     }
 }
 
@@ -3403,6 +3413,66 @@ mod tests {
             Some(UpgradeTerminalCause::Cancelled)
         );
         runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blocked_terminal_submission_cannot_reopen_closed_entry() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let (entry_tx, entry_rx) = oneshot::channel();
+        let (setup_entered_tx, setup_entered_rx) = std_mpsc::channel();
+        let (setup_release_tx, setup_release_rx) = std_mpsc::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), move |handshake| async move {
+                let entry = handshake
+                    .commit(
+                        None,
+                        UpgradeEntryPlan::new(inert_control(), move |_| async move {
+                            setup_entered_tx.send(()).unwrap();
+                            setup_release_rx.recv().unwrap();
+                            Err(UpgradeTerminalCause::SetupFailed)
+                        }),
+                    )
+                    .unwrap();
+                entry_tx.send(entry).unwrap();
+            })
+            .unwrap();
+        let entry = entry_rx.await.unwrap();
+        setup_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("setup did not enter its gated poll");
+
+        let submitter = entry.clone();
+        let (submit_started_tx, submit_started_rx) = std_mpsc::channel();
+        let submit = tokio::task::spawn_blocking(move || {
+            submit_started_tx.send(()).unwrap();
+            submitter.submit_terminal(UpgradeTerminalCause::Cancelled);
+        });
+        submit_started_rx.recv().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while entry.shared.terminal_state.load(Ordering::Acquire) != ENTRY_CLOSE_REQUESTED {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal submission did not block on the setup transition");
+
+        runtime.inner.close_entry(entry.id());
+        tokio::time::timeout(Duration::from_secs(1), entry.wait_closed())
+            .await
+            .expect("forced coordinator completion did not close the entry");
+        assert_eq!(
+            entry.shared.terminal_state.load(Ordering::Acquire),
+            ENTRY_CLOSED
+        );
+
+        setup_release_tx.send(()).unwrap();
+        submit.await.unwrap();
+        assert_eq!(
+            entry.shared.terminal_state.load(Ordering::Acquire),
+            ENTRY_CLOSED
+        );
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+        assert_eq!(runtime.counts().tracked_tasks, 0);
     }
 
     #[tokio::test]
