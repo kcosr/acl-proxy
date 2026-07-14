@@ -17,6 +17,8 @@ use crate::config::{CaptureConfig, Config};
 use crate::filesystem::create_private_dir_all;
 use crate::sensitive::redact_url_for_sink;
 
+mod worker;
+
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
@@ -709,7 +711,6 @@ pub fn write_capture_record(
     sink: &CaptureSinkSpec,
     record: &CaptureRecord,
 ) -> Result<PathBuf, CaptureError> {
-    let json = serde_json::to_string_pretty(record)?;
     let requested_path = resolve_capture_path(sink, record);
     let directory = requested_path.parent().unwrap_or_else(|| Path::new("."));
     create_private_dir_all(directory).map_err(|source| CaptureError::CreateDir {
@@ -753,15 +754,15 @@ pub fn write_capture_record(
             path: requested_path.clone(),
             source,
         })?;
-    if let Err(source) = temp_file
-        .write_all(format!("{json}\n").as_bytes())
-        .and_then(|()| sync_capture_file(&temp_file))
-    {
+    if let Err(error) = write_capture_artifact(&mut temp_file, record) {
         drop(temp_file);
         let _ = fs::remove_file(&temp_path);
-        return Err(CaptureError::WriteFile {
-            path: requested_path.clone(),
-            source,
+        return Err(match error {
+            CaptureArtifactWriteError::Serialize(source) => CaptureError::Serialize(source),
+            CaptureArtifactWriteError::Io(source) => CaptureError::WriteFile {
+                path: requested_path.clone(),
+                source,
+            },
         });
     }
     drop(temp_file);
@@ -783,6 +784,21 @@ pub fn write_capture_record(
     }
 
     Ok(path)
+}
+
+enum CaptureArtifactWriteError {
+    Serialize(serde_json::Error),
+    Io(std::io::Error),
+}
+
+fn write_capture_artifact(
+    file: &mut File,
+    record: &CaptureRecord,
+) -> Result<(), CaptureArtifactWriteError> {
+    serde_json::to_writer(&mut *file, record).map_err(CaptureArtifactWriteError::Serialize)?;
+    file.write_all(b"\n")
+        .map_err(CaptureArtifactWriteError::Io)?;
+    sync_capture_file(file).map_err(CaptureArtifactWriteError::Io)
 }
 
 fn open_capture_lock(path: &Path) -> std::io::Result<File> {
