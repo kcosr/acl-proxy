@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use http::header::{HeaderValue, HOST};
 use http::{Method, Request, Response, StatusCode, Version};
@@ -27,6 +28,8 @@ use super::headers::{
     prepare_origin_request, strip_response_hop_by_hop, HeaderPreparationError, RequestTargetForm,
     SanitizedRequest,
 };
+
+const TERMINAL_DRIVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ForwardError {
@@ -68,6 +71,8 @@ pub(crate) enum ForwardBodyError {
     Connection(#[source] std::sync::Arc<hyper::Error>),
     #[error("upstream connection task failed")]
     Task(#[source] std::sync::Arc<tokio::task::JoinError>),
+    #[error("upstream connection did not finish before the terminal drain deadline")]
+    Timeout,
 }
 
 pub(crate) struct ForwardBody {
@@ -75,6 +80,8 @@ pub(crate) struct ForwardBody {
     data_done: bool,
     trailers: Option<Option<http::HeaderMap>>,
     terminal_error: Option<ForwardBodyError>,
+    terminal_drain_timeout: Duration,
+    terminal_drain_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     driver: DriverTask,
 }
 
@@ -141,6 +148,45 @@ impl Drop for DriverTask {
 }
 
 impl ForwardBody {
+    fn new(body: Body, driver: DriverTask) -> Self {
+        Self {
+            body: Some(body),
+            data_done: false,
+            trailers: None,
+            terminal_error: None,
+            terminal_drain_timeout: TERMINAL_DRIVER_DRAIN_TIMEOUT,
+            terminal_drain_deadline: None,
+            driver,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_terminal_drain_timeout(mut self, timeout: Duration) -> Self {
+        self.terminal_drain_timeout = timeout;
+        self
+    }
+
+    fn begin_terminal_drain(&mut self) {
+        if self.terminal_drain_deadline.is_none() {
+            self.terminal_drain_deadline =
+                Some(Box::pin(tokio::time::sleep(self.terminal_drain_timeout)));
+        }
+    }
+
+    fn poll_terminal_drain_timeout(&mut self, context: &mut Context<'_>) -> Poll<ForwardBodyError> {
+        let Some(deadline) = self.terminal_drain_deadline.as_mut() else {
+            return Poll::Pending;
+        };
+        if deadline.as_mut().poll(context).is_pending() {
+            return Poll::Pending;
+        }
+
+        self.body.take();
+        self.trailers.take();
+        self.terminal_error.get_or_insert(ForwardBodyError::Timeout);
+        self.poll_terminal_error_join(context)
+    }
+
     fn poll_response_trailers(
         &mut self,
         context: &mut Context<'_>,
@@ -150,7 +196,7 @@ impl ForwardBody {
         }
         let trailers = match self.body.as_mut() {
             Some(body) => match Pin::new(body).poll_trailers(context) {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => return self.poll_terminal_drain_timeout(context).map(Err),
                 Poll::Ready(Ok(trailers)) => trailers,
                 Poll::Ready(Err(error)) => {
                     self.body.take();
@@ -193,7 +239,7 @@ impl ForwardBody {
             return self.poll_terminal_error_join(context).map(Err);
         }
         match self.driver.poll(context) {
-            Poll::Pending => Poll::Pending,
+            Poll::Pending => self.poll_terminal_drain_timeout(context).map(Err),
             Poll::Ready(Ok(Ok(()))) => Poll::Ready(Ok(())),
             Poll::Ready(Ok(Err(error))) => {
                 let error = ForwardBodyError::Connection(std::sync::Arc::new(error));
@@ -240,10 +286,12 @@ impl HttpBody for ForwardBody {
                     }
                     Poll::Ready(None) => {
                         self.data_done = true;
+                        self.begin_terminal_drain();
                     }
                 }
             } else {
                 self.data_done = true;
+                self.begin_terminal_drain();
             }
         }
         match self.poll_response_trailers(context) {
@@ -611,16 +659,7 @@ where
     };
     let (mut parts, body) = response.into_parts();
     strip_response_hop_by_hop(&mut parts.headers);
-    Ok(Response::from_parts(
-        parts,
-        ForwardBody {
-            body: Some(body),
-            data_done: false,
-            trailers: None,
-            terminal_error: None,
-            driver,
-        },
-    ))
+    Ok(Response::from_parts(parts, ForwardBody::new(body, driver)))
 }
 
 #[cfg(test)]
@@ -908,13 +947,7 @@ mod tests {
             completed_for_driver.store(1, Ordering::SeqCst);
             Ok(())
         });
-        let body = ForwardBody {
-            body: Some(Body::from("complete")),
-            data_done: false,
-            trailers: None,
-            terminal_error: None,
-            driver: DriverTask::from_handle(driver),
-        };
+        let body = ForwardBody::new(Body::from("complete"), DriverTask::from_handle(driver));
 
         let mut body = body;
         assert_eq!(body.data().await.unwrap().unwrap(), "complete");
@@ -931,13 +964,7 @@ mod tests {
             let _signal = signal;
             std::future::pending::<Result<(), hyper::Error>>().await
         });
-        let body = ForwardBody {
-            body: Some(Body::empty()),
-            data_done: false,
-            trailers: None,
-            terminal_error: None,
-            driver: DriverTask::from_handle(driver),
-        };
+        let body = ForwardBody::new(Body::empty(), DriverTask::from_handle(driver));
 
         drop(body);
         tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
@@ -982,13 +1009,7 @@ mod tests {
             io::ErrorKind::ConnectionReset,
             "injected body failure",
         )));
-        let body = ForwardBody {
-            body: Some(Body::wrap_stream(stream)),
-            data_done: false,
-            trailers: None,
-            terminal_error: None,
-            driver: DriverTask::from_handle(driver),
-        };
+        let body = ForwardBody::new(Body::wrap_stream(stream), DriverTask::from_handle(driver));
 
         assert!(hyper::body::to_bytes(body).await.is_err());
         tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
@@ -1005,13 +1026,7 @@ mod tests {
         )));
         let driver =
             tokio::spawn(async { std::future::pending::<Result<(), hyper::Error>>().await });
-        let mut body = ForwardBody {
-            body: Some(Body::wrap_stream(stream)),
-            data_done: false,
-            trailers: None,
-            terminal_error: None,
-            driver: DriverTask::from_handle(driver),
-        };
+        let mut body = ForwardBody::new(Body::wrap_stream(stream), DriverTask::from_handle(driver));
 
         for _ in 0..2 {
             let error = body.data().await.unwrap().unwrap_err();
@@ -1039,13 +1054,7 @@ mod tests {
             sender.send_trailers(trailers).await.unwrap();
         });
         let driver = tokio::spawn(async { Ok(()) });
-        let mut body = ForwardBody {
-            body: Some(body),
-            data_done: false,
-            trailers: None,
-            terminal_error: None,
-            driver: DriverTask::from_handle(driver),
-        };
+        let mut body = ForwardBody::new(body, DriverTask::from_handle(driver));
 
         assert_eq!(body.data().await.unwrap().unwrap(), "with-trailer");
         assert!(body.data().await.is_none());
@@ -1064,13 +1073,7 @@ mod tests {
             let _signal = signal;
             std::future::pending::<Result<(), hyper::Error>>().await
         });
-        let mut body = ForwardBody {
-            body: Some(Body::empty()),
-            data_done: false,
-            trailers: None,
-            terminal_error: None,
-            driver: DriverTask::from_handle(driver),
-        };
+        let mut body = ForwardBody::new(Body::empty(), DriverTask::from_handle(driver));
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(10), body.data())
                 .await
@@ -1085,6 +1088,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_driver_drain_timeout_is_sticky_and_aborts_driver() {
+        let (started_tx, started_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let signal = DropSignal(Some(dropped_tx));
+        let driver = tokio::spawn(async move {
+            let _signal = signal;
+            started_tx.send(()).ok();
+            std::future::pending::<Result<(), hyper::Error>>().await
+        });
+        started_rx.await.unwrap();
+        let mut body = ForwardBody::new(Body::empty(), DriverTask::from_handle(driver))
+            .with_terminal_drain_timeout(Duration::ZERO);
+
+        let error = body.data().await.unwrap().unwrap_err();
+        assert!(matches!(error, ForwardBodyError::Timeout));
+        let error = body.data().await.unwrap().unwrap_err();
+        assert!(matches!(error, ForwardBodyError::Timeout));
+        let error = body.trailers().await.unwrap_err();
+        assert!(matches!(error, ForwardBodyError::Timeout));
+        assert!(!body.is_end_stream());
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn h1_driver_error_is_sticky_and_does_not_require_trailer_polling() {
         let (client, server) = tokio::io::duplex(1024);
         let (_sender, connection) = conn::Builder::new()
@@ -1092,13 +1122,7 @@ mod tests {
             .await
             .unwrap();
         drop(server);
-        let mut body = ForwardBody {
-            body: Some(Body::empty()),
-            data_done: false,
-            trailers: None,
-            terminal_error: None,
-            driver: DriverTask::spawn(connection),
-        };
+        let mut body = ForwardBody::new(Body::empty(), DriverTask::spawn(connection));
         let error = tokio::time::timeout(std::time::Duration::from_secs(1), body.data())
             .await
             .unwrap()
