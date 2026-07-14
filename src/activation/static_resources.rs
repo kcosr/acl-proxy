@@ -6,6 +6,7 @@ use crate::authorization::webhook::runtime::{
     WebhookAuthorizationRuntime, WebhookAuthorizationRuntimeError,
 };
 use crate::config::{StaticFingerprint, StaticFingerprintError, StaticProductConfig};
+use crate::control::server::{ControlServer, ControlServerError};
 use crate::observation::ProductObservationRuntime;
 use crate::runtime::{BoxFuture, ServiceReadiness, StaticResourceBrand, StaticResources};
 use crate::safety::WireBodyPool;
@@ -24,9 +25,15 @@ pub(crate) struct ProductStaticResources {
     shutdown_drain_timeout: Option<std::time::Duration>,
     shutdown_started: AtomicBool,
     shutdown_deadline: Mutex<Option<tokio::time::Instant>>,
+    control: Mutex<ControlOwnership>,
     wire_body_pool: Arc<WireBodyPool>,
     observation_runtime: Arc<ProductObservationRuntime>,
     authorization_runtime: Arc<WebhookAuthorizationRuntime>,
+}
+
+struct ControlOwnership {
+    config: Option<crate::config::compiler::StaticControlConfig>,
+    server: Option<Arc<ControlServer>>,
 }
 
 impl ProductStaticResources {
@@ -40,6 +47,10 @@ impl ProductStaticResources {
             shutdown_drain_timeout: static_config.service.shutdown_drain_timeout,
             shutdown_started: AtomicBool::new(false),
             shutdown_deadline: Mutex::new(None),
+            control: Mutex::new(ControlOwnership {
+                config: static_config.control.clone(),
+                server: None,
+            }),
             wire_body_pool: WireBodyPool::new(
                 static_config.service.max_inflight_wire_body_bytes,
                 static_config
@@ -74,6 +85,66 @@ impl ProductStaticResources {
     pub(crate) fn activator(self: &Arc<Self>) -> Arc<ProductActivator> {
         Arc::new(ProductActivator::new(self.clone()))
     }
+
+    pub(crate) fn start_control(
+        self: &Arc<Self>,
+    ) -> Result<Option<std::net::SocketAddr>, ProductStaticResourcesError> {
+        self.start_control_with(|config| {
+            ControlServer::bind(
+                config,
+                self.authorization_runtime.clone(),
+                self.readiness.clone(),
+            )
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_control_with_listener(
+        self: &Arc<Self>,
+        listener: std::net::TcpListener,
+    ) -> Result<Option<std::net::SocketAddr>, ProductStaticResourcesError> {
+        self.start_control_with(|config| {
+            ControlServer::from_prebound(
+                config,
+                listener,
+                self.authorization_runtime.clone(),
+                self.readiness.clone(),
+            )
+        })
+    }
+
+    fn start_control_with(
+        &self,
+        start: impl FnOnce(
+            &crate::config::compiler::StaticControlConfig,
+        ) -> Result<Arc<ControlServer>, ControlServerError>,
+    ) -> Result<Option<std::net::SocketAddr>, ProductStaticResourcesError> {
+        let mut control = self
+            .control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return Err(ProductStaticResourcesError::ShuttingDown);
+        }
+        if control.server.is_some() {
+            return Err(ProductStaticResourcesError::ControlAlreadyStarted);
+        }
+        let Some(config) = control.config.as_ref() else {
+            return Ok(None);
+        };
+        let server = start(config)?;
+        let local_addr = server.local_addr();
+        control.server = Some(server);
+        Ok(Some(local_addr))
+    }
+
+    pub(crate) fn control_server(&self) -> Option<Arc<ControlServer>> {
+        self.control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .server
+            .clone()
+    }
 }
 
 impl StaticResources for ProductStaticResources {
@@ -86,6 +157,10 @@ impl StaticResources for ProductStaticResources {
     }
 
     fn begin_shutdown(&self) {
+        let _control = self
+            .control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.readiness.begin_shutdown();
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
             return;
@@ -103,18 +178,34 @@ impl StaticResources for ProductStaticResources {
     fn shutdown(&self) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             self.begin_shutdown();
+            let control = self.control_server();
             let deadline = *self
                 .shutdown_deadline
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(deadline) = deadline {
+            let deadline_won = if let Some(deadline) = deadline {
                 tokio::select! {
                     biased;
-                    _ = self.authorization_runtime.wait_until_drained() => return,
-                    _ = tokio::time::sleep_until(deadline) => {}
+                    _ = tokio::time::sleep_until(deadline) => true,
+                    _ = self.authorization_runtime.wait_until_drained() => false,
                 }
+            } else {
+                self.authorization_runtime.wait_until_drained().await;
+                false
+            };
+            if deadline_won {
                 self.authorization_runtime
                     .final_cancel_all(PendingTerminalCause::Shutdown);
+            }
+            if let Some(control) = control {
+                let result = if deadline_won {
+                    control.abort_and_join().await
+                } else {
+                    control.close_and_join().await
+                };
+                if let Err(error) = result {
+                    panic!("control-server shutdown failed: {error}");
+                }
             }
             self.authorization_runtime.wait_until_drained().await;
         })
@@ -127,4 +218,10 @@ pub(crate) enum ProductStaticResourcesError {
     StaticFingerprint(#[from] StaticFingerprintError),
     #[error("static authorization runtime construction failed")]
     Authorization(#[from] WebhookAuthorizationRuntimeError),
+    #[error("control server construction failed")]
+    Control(#[from] ControlServerError),
+    #[error("control server has already started")]
+    ControlAlreadyStarted,
+    #[error("static resources are shutting down")]
+    ShuttingDown,
 }

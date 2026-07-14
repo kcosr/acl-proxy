@@ -248,8 +248,9 @@ mod tests {
     use std::path::Path;
     #[cfg(unix)]
     use std::sync::Mutex;
-    #[cfg(unix)]
     use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
     use crate::config::{compile_config_text, ConfigTextInput};
@@ -331,6 +332,44 @@ header = "x-acl-proxy-request-id"
                 .accepting
         );
         crate::runtime::StaticResources::shutdown(resources.as_ref()).await;
+    }
+
+    #[tokio::test]
+    async fn product_static_owner_keeps_control_open_until_joined_shutdown() {
+        let text = format!(
+            "{MINIMAL}\n[control]\nbind = \"127.0.0.1:8898\"\nbase_path = \"/_acl-proxy\"\nrequest_header_timeout = \"1s\"\nrequest_body_timeout = \"1s\"\nmax_connections = 2\nmax_request_body_bytes = 65536\n"
+        );
+        let compiled = compile(&text);
+        let resources = ProductStaticResources::try_new(&compiled.static_config).unwrap();
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = resources
+            .start_control_with_listener(listener)
+            .unwrap()
+            .unwrap();
+
+        async fn readiness(address: std::net::SocketAddr) -> Vec<u8> {
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream
+                .write_all(b"GET /_acl-proxy/ready HTTP/1.1\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            let mut response = Vec::new();
+            tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut response))
+                .await
+                .unwrap()
+                .unwrap();
+            response
+        }
+
+        assert!(readiness(address).await.starts_with(b"HTTP/1.1 503"));
+        crate::runtime::StaticResources::begin_shutdown(resources.as_ref());
+        assert!(readiness(address).await.starts_with(b"HTTP/1.1 503"));
+
+        crate::runtime::StaticResources::shutdown(resources.as_ref()).await;
+        assert!(tokio::net::TcpStream::connect(address).await.is_err());
+        let control = resources.control_server().unwrap();
+        assert_eq!(control.arena_counts().live, 0);
+        assert_eq!(control.arena_counts().available, 2);
     }
 
     #[tokio::test]
