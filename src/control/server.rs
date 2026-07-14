@@ -69,7 +69,6 @@ impl ControlServer {
         Self::start(prepared, listener)
     }
 
-    #[cfg(test)]
     pub(crate) fn from_prebound(
         config: &StaticControlConfig,
         listener: StdTcpListener,

@@ -1,3 +1,4 @@
+use std::net::{SocketAddr, TcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
@@ -16,6 +17,7 @@ use crate::observation::ProductObservationRuntime;
 use crate::runtime::{BoxFuture, ServiceReadiness, StaticResourceBrand, StaticResources};
 use crate::safety::WireBodyPool;
 
+use super::listeners::{PreparedProxyListeners, ProxyListenerBindError};
 use super::product::ProductActivator;
 
 /// One process-lifetime owner for all static product state.
@@ -32,10 +34,22 @@ pub(crate) struct ProductStaticResources {
     shutdown_deadline: Mutex<Option<tokio::time::Instant>>,
     control_failure: watch::Sender<Option<Arc<ControlServerRunError>>>,
     control_shutdown_error: Mutex<Option<Arc<ControlServerShutdownError>>>,
+    ingress: Mutex<IngressOwnership>,
     control: Mutex<ControlOwnership>,
     wire_body_pool: Arc<WireBodyPool>,
     observation_runtime: Arc<ProductObservationRuntime>,
     authorization_runtime: Arc<WebhookAuthorizationRuntime>,
+}
+
+struct IngressOwnership {
+    config: crate::config::compiler::StaticListenersConfig,
+    state: IngressState,
+}
+
+enum IngressState {
+    Unprepared,
+    Prepared(PreparedProxyListeners),
+    Adopted,
 }
 
 struct ControlOwnership {
@@ -72,6 +86,10 @@ impl ProductStaticResources {
             shutdown_deadline: Mutex::new(None),
             control_failure,
             control_shutdown_error: Mutex::new(None),
+            ingress: Mutex::new(IngressOwnership {
+                config: static_config.listeners.clone(),
+                state: IngressState::Unprepared,
+            }),
             control: Mutex::new(ControlOwnership {
                 config: static_config.control.clone(),
                 server: None,
@@ -111,6 +129,85 @@ impl ProductStaticResources {
         Arc::new(ProductActivator::new(self.clone()))
     }
 
+    pub(crate) fn prepare_ingress(self: &Arc<Self>) -> Result<(), ProductStaticResourcesError> {
+        self.prepare_ingress_with(TcpListener::bind, |config, listener, failure_observer| {
+            ControlServer::from_prebound(
+                config,
+                listener,
+                self.authorization_runtime.clone(),
+                self.readiness.clone(),
+                failure_observer,
+            )
+        })
+    }
+
+    fn prepare_ingress_with(
+        self: &Arc<Self>,
+        bind: impl FnMut(SocketAddr) -> std::io::Result<TcpListener>,
+        start_control: impl FnOnce(
+            &crate::config::compiler::StaticControlConfig,
+            TcpListener,
+            Arc<dyn ControlServerFailureObserver>,
+        ) -> Result<Arc<ControlServer>, ControlServerError>,
+    ) -> Result<(), ProductStaticResourcesError> {
+        let mut ingress = self
+            .ingress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return Err(ProductStaticResourcesError::ShuttingDown);
+        }
+        if !matches!(ingress.state, IngressState::Unprepared) {
+            return Err(ProductStaticResourcesError::IngressAlreadyPrepared);
+        }
+
+        let listeners = PreparedProxyListeners::bind(&ingress.config, bind)?;
+        let mut control = self
+            .control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if control.server.is_some() {
+            return Err(ProductStaticResourcesError::ControlAlreadyStarted);
+        }
+        if let Some(config) = control.config.as_ref() {
+            let listener =
+                TcpListener::bind(config.bind).map_err(|source| ControlServerError::Bind {
+                    address: config.bind,
+                    source,
+                })?;
+            let failure_observer = Arc::new(ProductControlFailureObserver {
+                owner: Arc::downgrade(self),
+            });
+            control.server = Some(start_control(config, listener, failure_observer)?);
+        }
+
+        ingress.state = IngressState::Prepared(listeners);
+        Ok(())
+    }
+
+    pub(crate) fn take_prepared_proxy_listeners(
+        &self,
+    ) -> Result<PreparedProxyListeners, ProductStaticResourcesError> {
+        let mut ingress = self
+            .ingress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let IngressState::Prepared(_) = &ingress.state else {
+            return Err(match ingress.state {
+                IngressState::Unprepared => ProductStaticResourcesError::IngressNotPrepared,
+                IngressState::Adopted => ProductStaticResourcesError::IngressAlreadyAdopted,
+                IngressState::Prepared(_) => unreachable!(),
+            });
+        };
+        let IngressState::Prepared(listeners) =
+            std::mem::replace(&mut ingress.state, IngressState::Adopted)
+        else {
+            unreachable!();
+        };
+        Ok(listeners)
+    }
+
+    #[cfg(test)]
     pub(crate) fn start_control(
         self: &Arc<Self>,
     ) -> Result<Option<std::net::SocketAddr>, ProductStaticResourcesError> {
@@ -158,6 +255,7 @@ impl ProductStaticResources {
         })
     }
 
+    #[cfg(test)]
     fn start_control_with(
         self: &Arc<Self>,
         start: impl FnOnce(
@@ -259,6 +357,10 @@ impl StaticResources for ProductStaticResources {
     }
 
     fn begin_shutdown(&self) {
+        let mut ingress = self
+            .ingress
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let _control = self
             .control
             .lock()
@@ -266,6 +368,9 @@ impl StaticResources for ProductStaticResources {
         self.readiness.begin_shutdown();
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
             return;
+        }
+        if matches!(ingress.state, IngressState::Prepared(_)) {
+            ingress.state = IngressState::Adopted;
         }
         let deadline = self
             .shutdown_drain_timeout
@@ -337,8 +442,217 @@ pub(crate) enum ProductStaticResourcesError {
     Authorization(#[from] WebhookAuthorizationRuntimeError),
     #[error("control server construction failed")]
     Control(#[from] ControlServerError),
+    #[error(transparent)]
+    ProxyListenerBind(#[from] ProxyListenerBindError),
+    #[error("static ingress has already been prepared")]
+    IngressAlreadyPrepared,
+    #[error("static ingress has not been prepared")]
+    IngressNotPrepared,
+    #[error("prepared proxy listeners have already been adopted or released")]
+    IngressAlreadyAdopted,
     #[error("control server has already started")]
     ControlAlreadyStarted,
     #[error("static resources are shutting down")]
     ShuttingDown,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use super::*;
+    use crate::config::compiler::{
+        CompiledTlsIdentity, StaticCleartextListener, StaticExplicitHttpsListener,
+        StaticTransparentHttpsListener,
+    };
+    use crate::config::{compile_config_text, ConfigTextInput};
+
+    fn available_addresses<const N: usize>() -> [SocketAddr; N] {
+        let listeners: Vec<_> = (0..N)
+            .map(|_| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
+            .collect();
+        let addresses = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap())
+            .collect::<Vec<_>>()
+            .try_into()
+            .ok()
+            .unwrap();
+        drop(listeners);
+        addresses
+    }
+
+    fn static_config(addresses: [SocketAddr; 5]) -> StaticProductConfig {
+        let [explicit_http, transparent_http, explicit_https, transparent_https, control] =
+            addresses;
+        let text = format!(
+            r#"schema_version = 3
+
+[service]
+request_timeout = "30s"
+shutdown_drain_timeout = "1s"
+max_retiring_generations = 2
+max_active_upgrades = 256
+upgrade_relay_buffer_bytes = 65536
+max_upgrade_buffer_bytes = 2147483648
+max_upgrade_lifetime = "8h"
+max_inflight_wire_body_bytes = 8589934592
+max_inflight_wire_body_bytes_per_quota_key = 1073741824
+min_wire_body_concurrency = 64
+max_content_decoding_expansion_ratio = 128
+
+[control]
+bind = "{control}"
+base_path = "/_acl-proxy"
+request_header_timeout = "1s"
+request_body_timeout = "1s"
+max_connections = 2
+max_request_body_bytes = 65536
+
+[listeners.explicit_http]
+bind = "{explicit_http}"
+http_versions = ["http1"]
+
+[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+
+[observation.logging]
+level = "info"
+console = true
+
+[safety.loop_detection]
+inject = true
+header = "x-acl-proxy-request-id"
+"#
+        );
+        let mut config = compile_config_text(ConfigTextInput {
+            text: &text,
+            source_path: Path::new("/tmp/static-ingress/acl-proxy.toml"),
+            config_root: Path::new("/tmp/static-ingress"),
+        })
+        .unwrap()
+        .static_config;
+        let explicit = config.listeners.explicit_http.as_ref().unwrap();
+        let versions = explicit.http_versions.clone();
+        let connect = explicit.connect.clone().unwrap();
+        config.listeners.transparent_http = Some(StaticCleartextListener {
+            bind: transparent_http,
+            http_versions: versions.clone(),
+            connect: None,
+        });
+        config.listeners.explicit_https = Some(StaticExplicitHttpsListener {
+            bind: explicit_https,
+            http_versions: versions.clone(),
+            handshake_timeout: Duration::from_secs(1),
+            request_header_timeout: Duration::from_secs(1),
+            max_connections: 2,
+            max_concurrent_streams: 8,
+            connect,
+            tls: CompiledTlsIdentity {
+                certificate_chain: PathBuf::from("/tmp/static-ingress/server.pem"),
+                private_key: PathBuf::from("/tmp/static-ingress/server-key.pem"),
+            },
+        });
+        config.listeners.transparent_https = Some(StaticTransparentHttpsListener {
+            bind: transparent_https,
+            http_versions: versions,
+            handshake_timeout: Duration::from_secs(1),
+            request_header_timeout: Duration::from_secs(1),
+            max_connections: 2,
+            max_concurrent_streams: 8,
+        });
+        config
+    }
+
+    fn assert_bindable(addresses: impl IntoIterator<Item = SocketAddr>) {
+        for address in addresses {
+            TcpListener::bind(address)
+                .unwrap_or_else(|error| panic!("expected {address} to be released: {error}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_reserves_every_configured_listener_and_is_one_shot() {
+        let addresses = available_addresses::<5>();
+        let resources = ProductStaticResources::try_new(&static_config(addresses)).unwrap();
+
+        resources.prepare_ingress().unwrap();
+        for address in addresses {
+            assert!(
+                TcpListener::bind(address).is_err(),
+                "prepared listener {address} was not reserved"
+            );
+        }
+        assert!(matches!(
+            resources.prepare_ingress(),
+            Err(ProductStaticResourcesError::IngressAlreadyPrepared)
+        ));
+
+        StaticResources::shutdown(resources.as_ref()).await;
+        assert_bindable(addresses);
+    }
+
+    #[tokio::test]
+    async fn later_proxy_bind_failure_releases_earlier_sockets() {
+        let addresses = available_addresses::<5>();
+        let blocker = TcpListener::bind(addresses[2]).unwrap();
+        let resources = ProductStaticResources::try_new(&static_config(addresses)).unwrap();
+
+        assert!(matches!(
+            resources.prepare_ingress(),
+            Err(ProductStaticResourcesError::ProxyListenerBind(error))
+                if error.name == "explicit_https" && error.address == addresses[2]
+        ));
+        assert_bindable([addresses[0], addresses[1], addresses[3], addresses[4]]);
+
+        drop(blocker);
+        StaticResources::shutdown(resources.as_ref()).await;
+    }
+
+    #[tokio::test]
+    async fn control_adoption_failure_releases_all_prebound_sockets() {
+        let addresses = available_addresses::<5>();
+        let resources = ProductStaticResources::try_new(&static_config(addresses)).unwrap();
+
+        assert!(matches!(
+            resources.prepare_ingress_with(TcpListener::bind, |_config, _listener, _observer| {
+                Err(ControlServerError::RuntimeUnavailable)
+            }),
+            Err(ProductStaticResourcesError::Control(
+                ControlServerError::RuntimeUnavailable
+            ))
+        ));
+        assert_bindable(addresses);
+
+        StaticResources::shutdown(resources.as_ref()).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_releases_prepared_but_unstarted_proxy_sockets() {
+        let addresses = available_addresses::<5>();
+        let resources = ProductStaticResources::try_new(&static_config(addresses)).unwrap();
+        resources.prepare_ingress().unwrap();
+
+        StaticResources::shutdown(resources.as_ref()).await;
+
+        assert_bindable(addresses);
+        assert!(matches!(
+            resources.take_prepared_proxy_listeners(),
+            Err(ProductStaticResourcesError::IngressAlreadyAdopted)
+        ));
+    }
+
+    #[test]
+    fn construction_does_not_bind_configured_sockets() {
+        let addresses = available_addresses::<5>();
+        let resources = ProductStaticResources::try_new(&static_config(addresses)).unwrap();
+
+        assert_bindable(addresses);
+        drop(resources);
+    }
 }
