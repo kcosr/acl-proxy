@@ -345,6 +345,33 @@ mod tests {
         path
     }
 
+    async fn wait_for_pid_file(path: &Path) -> libc::pid_t {
+        const TIMEOUT: Duration = Duration::from_secs(5);
+        const RETRY_DELAY: Duration = Duration::from_millis(5);
+
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        loop {
+            let last_observation = match fs::read_to_string(path) {
+                Ok(contents) => match contents.trim().parse::<libc::pid_t>() {
+                    Ok(pid) if pid > 0 => return pid,
+                    Ok(pid) => format!("contents {contents:?} contained non-positive PID {pid}"),
+                    Err(error) => {
+                        format!("contents {contents:?} could not be parsed as a PID: {error}")
+                    }
+                },
+                Err(error) => format!("read failed: {error}"),
+            };
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                panic!(
+                    "PID file {} was not ready within {TIMEOUT:?}; last observation: {last_observation}",
+                    path.display()
+                );
+            }
+            tokio::time::sleep_until((now + RETRY_DELAY).min(deadline)).await;
+        }
+    }
+
     fn process_plan(directory: &TempDir, script: &Path) -> ProcessProviderPlan {
         ProcessProviderPlan {
             command: PathBuf::from("/usr/bin/python3"),
@@ -797,15 +824,8 @@ while True:
         }
         let mut pids = Vec::new();
         for pid_file in &pid_files {
-            for _ in 0..200 {
-                if let Ok(contents) = fs::read_to_string(pid_file) {
-                    pids.push(contents.parse::<libc::pid_t>().unwrap());
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
+            pids.push(wait_for_pid_file(pid_file).await);
         }
-        assert_eq!(pids.len(), 2);
 
         let waiter = tokio::spawn(async move {
             rollback.rollback().await;

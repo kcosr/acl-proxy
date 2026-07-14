@@ -1507,6 +1507,27 @@ mod tests {
         panic!("helper did not create its synchronization file");
     }
 
+    async fn wait_for_pid_file(path: &Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let last_observation = match fs::read_to_string(path) {
+                Ok(contents) => match contents.trim().parse::<u32>() {
+                    Ok(pid) if pid != 0 => return pid,
+                    Ok(_) => "file contains invalid zero PID".to_string(),
+                    Err(error) => format!("file contents {contents:?} are not a PID: {error}"),
+                },
+                Err(error) => format!("file could not be read: {error}"),
+            };
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for PID file {}: {last_observation}",
+                    path.display(),
+                );
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     #[tokio::test]
     async fn publication_rejects_a_child_that_exited_after_eager_spawn() {
         let directory = TempDir::new().unwrap();
@@ -2242,8 +2263,7 @@ for line in sys.stdin:
             .await
             .unwrap();
         commit(&provider);
-        wait_for_file(&pid_path).await;
-        let pid: u32 = fs::read_to_string(&pid_path).unwrap().parse().unwrap();
+        let pid = wait_for_pid_file(&pid_path).await;
 
         provider.retirement_started(CleanupReason::Retired);
         assert_eq!(
@@ -2435,11 +2455,7 @@ while True:
             .await
             .unwrap();
         commit(&provider);
-        wait_for_file(&descendant_pid).await;
-        let descendant_pid = fs::read_to_string(descendant_pid)
-            .unwrap()
-            .parse::<u32>()
-            .unwrap();
+        let descendant_pid = wait_for_pid_file(&descendant_pid).await;
         assert!(process_alive(descendant_pid));
 
         cleanup(&provider).await;
