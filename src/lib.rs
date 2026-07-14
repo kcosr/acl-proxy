@@ -27,4 +27,5 @@ mod safety;
 mod sensitive;
 mod tls;
 mod tls_identity;
+mod upgrade;
 mod url;
