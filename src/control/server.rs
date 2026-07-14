@@ -35,7 +35,7 @@ const HTTP1_ALPN: &[u8] = b"http/1.1";
 const TRANSIENT_ACCEPT_RETRY: Duration = Duration::from_millis(10);
 const RESOURCE_ACCEPT_RETRY: Duration = Duration::from_secs(1);
 const MAX_CONSECUTIVE_BACKOFF_ACCEPT_FAILURES: usize = 30;
-const MAX_CONSECUTIVE_IMMEDIATE_ACCEPT_FAILURES: usize = 1_024;
+const MAX_IMMEDIATE_ACCEPT_FAILURES_BEFORE_BACKOFF: usize = 1_024;
 
 pub(crate) struct ControlServer {
     stop: watch::Sender<ControlStop>,
@@ -385,7 +385,8 @@ async fn run_control_supervisor(
                     Err(error) => {
                         let retry_after = match accept_failures.on_error(&error) {
                             AcceptErrorDisposition::RetryNow => {
-                                let consecutive = accept_failures.consecutive_immediate_failures();
+                                let consecutive =
+                                    accept_failures.immediate_failures_since_backoff();
                                 if consecutive == 1 || consecutive.is_power_of_two() {
                                     tracing::warn!(
                                         error = %error,
@@ -530,17 +531,19 @@ enum AcceptErrorDisposition {
 #[derive(Default)]
 struct AcceptFailureTracker {
     consecutive_backoff_failures: usize,
-    consecutive_immediate_failures: usize,
+    immediate_failures_since_backoff: usize,
 }
 
 impl AcceptFailureTracker {
     fn on_error(&mut self, error: &io::Error) -> AcceptErrorDisposition {
         match classify_accept_error(error) {
             AcceptErrorDisposition::RetryNow => {
-                self.consecutive_immediate_failures += 1;
-                if self.consecutive_immediate_failures >= MAX_CONSECUTIVE_IMMEDIATE_ACCEPT_FAILURES
+                self.immediate_failures_since_backoff += 1;
+                if self.immediate_failures_since_backoff
+                    >= MAX_IMMEDIATE_ACCEPT_FAILURES_BEFORE_BACKOFF
                 {
-                    AcceptErrorDisposition::Fatal
+                    self.immediate_failures_since_backoff = 0;
+                    AcceptErrorDisposition::RetryAfter(TRANSIENT_ACCEPT_RETRY)
                 } else {
                     AcceptErrorDisposition::RetryNow
                 }
@@ -562,11 +565,11 @@ impl AcceptFailureTracker {
 
     fn on_success(&mut self) {
         self.consecutive_backoff_failures = 0;
-        self.consecutive_immediate_failures = 0;
+        self.immediate_failures_since_backoff = 0;
     }
 
-    fn consecutive_immediate_failures(&self) -> usize {
-        self.consecutive_immediate_failures
+    fn immediate_failures_since_backoff(&self) -> usize {
+        self.immediate_failures_since_backoff
     }
 }
 
@@ -951,6 +954,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sustained_aborted_accepts_are_throttled_then_recover() {
+        let config = config(1);
+        let errors = std::iter::repeat_with(|| {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "injected client-induced abort",
+            )
+        })
+        .take(MAX_IMMEDIATE_ACCEPT_FAILURES_BEFORE_BACKOFF * 2);
+        let server = ControlServer::from_prebound_with_accept_errors(
+            &config,
+            prebound(),
+            WebhookAuthorizationRuntime::for_test(None),
+            Arc::new(ServiceReadiness::new()),
+            errors,
+            Arc::new(IgnoreControlServerFailure),
+        )
+        .unwrap();
+
+        let mut client = tokio::net::TcpStream::connect(server.local_addr())
+            .await
+            .unwrap();
+        client
+            .write_all(b"GET /_acl-proxy/ready HTTP/1.1\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+            .await
+            .expect("client-induced accept aborts must not terminate the listener")
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+        server.close_and_join().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn one_connection_task_panic_does_not_fail_the_control_supervisor() {
         let config = config(1);
         let server = ControlServer::from_prebound_with_connection_panic(
@@ -1068,18 +1107,24 @@ mod tests {
     }
 
     #[test]
-    fn persistent_immediate_accept_failures_exhaust_their_own_retry_budget() {
+    fn persistent_immediate_accept_failures_are_throttled_without_becoming_fatal() {
         let error = io::Error::new(io::ErrorKind::ConnectionAborted, "persistent transient");
         let mut tracker = AcceptFailureTracker::default();
-        for expected in 1..MAX_CONSECUTIVE_IMMEDIATE_ACCEPT_FAILURES {
-            assert_eq!(tracker.on_error(&error), AcceptErrorDisposition::RetryNow);
-            assert_eq!(tracker.consecutive_immediate_failures(), expected);
+        for _ in 0..2 {
+            for expected in 1..MAX_IMMEDIATE_ACCEPT_FAILURES_BEFORE_BACKOFF {
+                assert_eq!(tracker.on_error(&error), AcceptErrorDisposition::RetryNow);
+                assert_eq!(tracker.immediate_failures_since_backoff(), expected);
+            }
+            assert_eq!(
+                tracker.on_error(&error),
+                AcceptErrorDisposition::RetryAfter(TRANSIENT_ACCEPT_RETRY)
+            );
+            assert_eq!(tracker.immediate_failures_since_backoff(), 0);
         }
-        assert_eq!(tracker.on_error(&error), AcceptErrorDisposition::Fatal);
 
         tracker.on_success();
         assert_eq!(tracker.on_error(&error), AcceptErrorDisposition::RetryNow);
-        assert_eq!(tracker.consecutive_immediate_failures(), 1);
+        assert_eq!(tracker.immediate_failures_since_backoff(), 1);
     }
 
     #[cfg(unix)]
@@ -1093,7 +1138,7 @@ mod tests {
                 AcceptErrorDisposition::RetryResourcePressure(RESOURCE_ACCEPT_RETRY)
             );
         }
-        assert_eq!(tracker.consecutive_immediate_failures(), 0);
+        assert_eq!(tracker.immediate_failures_since_backoff(), 0);
     }
 
     #[cfg(unix)]
