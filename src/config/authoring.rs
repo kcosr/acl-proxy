@@ -1130,6 +1130,9 @@ pub(super) struct AuthoringCaptureConfig {
     #[serde(default = "default_capture_max_inflight_body_bytes")]
     pub max_inflight_body_bytes: usize,
 
+    #[serde(default = "default_capture_max_pending_records")]
+    pub max_pending_records: usize,
+
     #[serde(default = "default_capture_max_files")]
     pub max_files: usize,
 
@@ -1159,6 +1162,10 @@ fn default_capture_max_body_bytes() -> usize {
 
 fn default_capture_max_inflight_body_bytes() -> usize {
     64 * 1024 * 1024
+}
+
+pub(super) fn default_capture_max_pending_records() -> usize {
+    1024
 }
 
 fn default_capture_max_files() -> usize {

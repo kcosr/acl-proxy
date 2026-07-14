@@ -92,6 +92,7 @@ const MAX_LOG_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const MAX_LOG_FILES: usize = 1_000_000;
 const MAX_CAPTURE_BODY_BYTES: usize = GIB;
 const MAX_CAPTURE_INFLIGHT_BYTES: usize = 4 * GIB;
+const MAX_CAPTURE_PENDING_RECORDS: usize = 65_536;
 const MAX_CAPTURE_FILES: usize = 10_000_000;
 const MAX_CAPTURE_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024 * 1024;
 pub(crate) const MAX_PROVIDER_CREDENTIAL_BYTES: usize = 64 * 1024;
@@ -114,6 +115,7 @@ pub(crate) struct StaticProductConfig {
     pub(crate) mitm: Option<StaticMitmConfig>,
     pub(crate) callback_public_url: Option<String>,
     pub(crate) logging: StaticLoggingConfig,
+    pub(crate) capture: StaticCaptureConfig,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
@@ -230,6 +232,11 @@ pub(crate) struct StaticLoggingConfig {
     pub(crate) max_bytes: u64,
     pub(crate) max_files: usize,
     pub(crate) console: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct StaticCaptureConfig {
+    pub(crate) max_pending_records: usize,
 }
 
 /// Purely compiled, unresolved generation input. Runtime activation must turn
@@ -3362,6 +3369,11 @@ fn validate_logging_capture_limits(
             MAX_CAPTURE_INFLIGHT_BYTES,
         )?;
         check_range(
+            "observation.capture.max_pending_records",
+            capture.max_pending_records,
+            MAX_CAPTURE_PENDING_RECORDS,
+        )?;
+        check_range(
             "observation.capture.max_files",
             capture.max_files,
             MAX_CAPTURE_FILES,
@@ -5084,6 +5096,12 @@ fn compile_static_config(
             max_bytes: config.observation.logging.max_bytes,
             max_files: config.observation.logging.max_files,
             console: config.observation.logging.console,
+        },
+        capture: StaticCaptureConfig {
+            max_pending_records: config.observation.capture.as_ref().map_or_else(
+                super::authoring::default_capture_max_pending_records,
+                |capture| capture.max_pending_records,
+            ),
         },
     })
 }
@@ -6891,6 +6909,98 @@ redaction_profile = "terminal"
         let serialized = serde_json::to_vec(&compiled.static_config).unwrap();
         let expected: [u8; 32] = Sha256::digest(serialized).into();
         assert_eq!(compiled.static_fingerprint.0, expected);
+    }
+
+    fn capture_config(max_pending_records: Option<usize>) -> String {
+        let pending = max_pending_records
+            .map(|value| format!("max_pending_records = {value}\n"))
+            .unwrap_or_default();
+        format!(
+            r#"{MINIMAL}
+
+[redaction.profiles.audit]
+rules = [{{ literals = ["marker"] }}]
+
+[redaction.profiles.next]
+rules = [{{ literals = ["next"] }}]
+
+[observation.capture]
+events = ["request.denied"]
+redaction_profile = "audit"
+directory = "captures-a"
+filename = "{{requestId}}-{{suffix}}.json"
+max_body_bytes = 1024
+max_inflight_body_bytes = 4096
+{pending}max_files = 10
+max_total_bytes = 16384
+"#
+        )
+    }
+
+    #[test]
+    fn capture_pending_records_is_defaulted_into_the_always_present_static_model() {
+        let absent = compile(MINIMAL).unwrap();
+        let enabled = compile(&capture_config(None)).unwrap();
+
+        assert_eq!(absent.static_config.capture.max_pending_records, 1024);
+        assert_eq!(enabled.static_config.capture.max_pending_records, 1024);
+        assert_eq!(absent.static_fingerprint, enabled.static_fingerprint);
+    }
+
+    #[test]
+    fn capture_pending_records_is_validated_and_changes_the_static_fingerprint() {
+        let baseline = compile(&capture_config(None)).unwrap();
+        let configured = compile(&capture_config(Some(2048))).unwrap();
+
+        assert_eq!(configured.static_config.capture.max_pending_records, 2048);
+        assert_ne!(baseline.static_fingerprint, configured.static_fingerprint);
+
+        for value in [0, MAX_CAPTURE_PENDING_RECORDS + 1] {
+            let error = compile(&capture_config(Some(value))).unwrap_err();
+            assert_eq!(error.path, "observation.capture.max_pending_records");
+            assert_eq!(
+                error.message,
+                format!("must be between 1 and {MAX_CAPTURE_PENDING_RECORDS}")
+            );
+        }
+    }
+
+    #[test]
+    fn capture_sink_and_body_policy_fields_remain_reloadable() {
+        let baseline = compile(&capture_config(None)).unwrap();
+        let changed_input = capture_config(None)
+            .replace("request.denied", "response.denied")
+            .replace(
+                "redaction_profile = \"audit\"",
+                "redaction_profile = \"next\"",
+            )
+            .replace("directory = \"captures-a\"", "directory = \"captures-b\"")
+            .replace(
+                "filename = \"{requestId}-{suffix}.json\"",
+                "filename = \"{requestId}.next-{suffix}.json\"",
+            )
+            .replace("max_body_bytes = 1024", "max_body_bytes = 2048")
+            .replace(
+                "max_inflight_body_bytes = 4096",
+                "max_inflight_body_bytes = 8192",
+            )
+            .replace("max_files = 10", "max_files = 11")
+            .replace("max_total_bytes = 16384", "max_total_bytes = 32768");
+        let changed = compile(&changed_input).unwrap();
+
+        assert_eq!(baseline.static_fingerprint, changed.static_fingerprint);
+        let capture = changed.reloadable_plan.observation.capture.unwrap();
+        assert!(matches!(
+            capture.events.as_slice(),
+            [CompiledCaptureEvent::ResponseDenied]
+        ));
+        assert_eq!(capture.redaction_profile, "next");
+        assert!(capture.directory.ends_with("captures-b"));
+        assert_eq!(capture.filename, "{requestId}.next-{suffix}.json");
+        assert_eq!(capture.max_body_bytes, 2048);
+        assert_eq!(capture.max_inflight_body_bytes, 8192);
+        assert_eq!(capture.max_files, 11);
+        assert_eq!(capture.max_total_bytes, 32768);
     }
 
     #[test]
