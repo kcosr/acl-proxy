@@ -75,17 +75,18 @@ impl CapturePool {
         })
     }
 
-    /// Attempts an exact capture-owned byte reservation. Failure is immediate
-    /// and observation-only; callers omit the payload rather than wait.
-    pub(crate) fn try_acquire(self: &Arc<Self>, bytes: usize) -> Option<CapturePermit> {
-        self.try_acquire_with_hook(bytes, || {})
+    /// Starts one bounded capture operation under the currently published
+    /// enabled state and ceiling. Failure is immediate and observation-only;
+    /// callers omit the payload rather than wait.
+    pub(crate) fn try_admit(self: &Arc<Self>, bytes: usize) -> Option<CaptureOperation> {
+        self.try_admit_with_hook(bytes, || {})
     }
 
-    fn try_acquire_with_hook(
+    fn try_admit_with_hook(
         self: &Arc<Self>,
         bytes: usize,
         hook: impl FnOnce(),
-    ) -> Option<CapturePermit> {
+    ) -> Option<CaptureOperation> {
         let _publication = match self.publication_gate.try_read() {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => return None,
@@ -110,9 +111,10 @@ impl CapturePool {
                 Err(current) => used = current,
             }
         }
-        Some(CapturePermit {
+        Some(CaptureOperation {
             pool: self.clone(),
-            bytes,
+            ceiling: published.limit,
+            charged: bytes,
         })
     }
 
@@ -189,34 +191,94 @@ impl CapturePool {
     }
 
     fn release(&self, bytes: usize) {
-        let previous = self.used.fetch_sub(bytes, Ordering::AcqRel);
-        assert!(previous >= bytes, "capture permit accounting underflow");
+        assert!(
+            self.used
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                    used.checked_sub(bytes)
+                })
+                .is_ok(),
+            "capture operation accounting underflow"
+        );
     }
 }
 
-pub(crate) struct CapturePermit {
+/// Incremental byte budget for one observation-only capture attempt.
+///
+/// The ceiling is captured at admission. Reload cannot invalidate an admitted
+/// operation. New operations through leased policies use the currently
+/// published enabled state and ceiling.
+pub(crate) struct CaptureOperation {
     pool: Arc<CapturePool>,
-    bytes: usize,
+    ceiling: usize,
+    charged: usize,
 }
 
-impl CapturePermit {
-    pub(crate) fn bytes(&self) -> usize {
-        self.bytes
+impl CaptureOperation {
+    pub(crate) fn charged_bytes(&self) -> usize {
+        self.charged
+    }
+
+    pub(crate) fn ceiling(&self) -> usize {
+        self.ceiling
+    }
+
+    /// Charges additional capture-owned memory before allocation. Exhaustion
+    /// or arithmetic overflow leaves both the operation and pool unchanged.
+    pub(crate) fn try_grow(&mut self, additional: usize) -> bool {
+        if additional == 0 {
+            return true;
+        }
+        let Some(next_charge) = self.charged.checked_add(additional) else {
+            return false;
+        };
+        if next_charge > self.ceiling {
+            return false;
+        }
+
+        let mut used = self.pool.used.load(Ordering::Acquire);
+        loop {
+            let Some(next_used) = used.checked_add(additional) else {
+                return false;
+            };
+            if next_used > self.ceiling {
+                return false;
+            }
+            match self.pool.used.compare_exchange_weak(
+                used,
+                next_used,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.charged = next_charge;
+                    return true;
+                }
+                Err(current) => used = current,
+            }
+        }
+    }
+
+    /// Releases bytes as capture-owned buffers are discarded.
+    pub(crate) fn shrink(&mut self, bytes: usize) {
+        assert!(bytes <= self.charged, "capture operation shrink underflow");
+        self.pool.release(bytes);
+        self.charged -= bytes;
     }
 }
 
-impl fmt::Debug for CapturePermit {
+impl fmt::Debug for CaptureOperation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("CapturePermit")
-            .field("bytes", &self.bytes)
+            .debug_struct("CaptureOperation")
+            .field("ceiling", &self.ceiling)
+            .field("charged", &self.charged)
             .finish()
     }
 }
 
-impl Drop for CapturePermit {
+impl Drop for CaptureOperation {
     fn drop(&mut self) {
-        self.pool.release(self.bytes);
+        self.pool.release(self.charged);
     }
 }
 
@@ -319,7 +381,7 @@ mod tests {
         ObservationPlan, PolicyDecisionLoggingPlan, RedactionPlan, RedactionProfilePlan,
         RedactionRulePlan, ReloadableLoggingPlan,
     };
-    use crate::observation::{ObservationActivation, ProductObservationSnapshot};
+    use crate::observation::{CaptureEvent, ObservationActivation, ProductObservationSnapshot};
     use crate::redaction::RedactionSnapshot;
 
     fn accounting_capture_activation(
@@ -389,6 +451,10 @@ mod tests {
         pool
     }
 
+    fn try_admit_current(pool: &Arc<CapturePool>, bytes: usize) -> Option<CaptureOperation> {
+        pool.try_admit(bytes)
+    }
+
     #[test]
     fn rejected_update_does_not_change_the_committed_limit() {
         let pool = enabled_pool(16);
@@ -416,9 +482,10 @@ mod tests {
     }
 
     #[test]
-    fn old_permits_survive_disablement_and_new_admission_is_rejected() {
+    fn admitted_operation_survives_disablement_and_new_admission_is_rejected() {
         let pool = enabled_pool(16);
-        let old = pool.try_acquire(12).expect("old permit");
+        let mut old = try_admit_current(&pool, 12).expect("old operation");
+        let old_epoch = pool.current_epoch();
         let update = CaptureEpochUpdate::new(pool.clone(), Arc::new(CaptureEpoch::disabled()), 4);
         update
             .publication_guard()
@@ -426,30 +493,75 @@ mod tests {
             .commit();
 
         assert_eq!(pool.used(), 12);
-        assert!(pool.try_acquire(1).is_none());
+        assert!(old.try_grow(4));
+        assert_eq!(pool.used(), 16);
+        assert!(old_epoch
+            .capture()
+            .expect("old policy")
+            .try_admit(CaptureEvent::RequestAllowed, 0)
+            .is_none());
         drop(old);
         assert_eq!(pool.used(), 0);
-        assert!(pool.try_acquire(0).is_none());
-        assert!(pool.try_acquire(4).is_none());
+        assert!(try_admit_current(&pool, 0).is_none());
+        assert!(try_admit_current(&pool, 4).is_none());
     }
 
     #[test]
-    fn exact_permits_saturate_without_waiting() {
+    fn exact_operations_saturate_without_waiting() {
         let pool = enabled_pool(10);
-        let first = pool.try_acquire(6).expect("first");
-        let second = pool.try_acquire(4).expect("second");
-        assert!(pool.try_acquire(1).is_none());
+        let first = try_admit_current(&pool, 6).expect("first");
+        let second = try_admit_current(&pool, 4).expect("second");
+        assert!(try_admit_current(&pool, 1).is_none());
         assert_eq!(pool.used(), 10);
         drop((first, second));
         assert_eq!(pool.used(), 0);
     }
 
     #[test]
+    fn operation_grows_and_shrinks_with_exact_drop_restoration() {
+        let pool = enabled_pool(20);
+        let mut operation = try_admit_current(&pool, 3).expect("operation");
+
+        assert_eq!(operation.ceiling(), 20);
+        assert_eq!(operation.charged_bytes(), 3);
+        assert!(operation.try_grow(9));
+        assert_eq!(operation.charged_bytes(), 12);
+        assert_eq!(pool.used(), 12);
+
+        operation.shrink(5);
+        assert_eq!(operation.charged_bytes(), 7);
+        assert_eq!(pool.used(), 7);
+
+        drop(operation);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn failed_growth_leaves_operation_and_pool_unchanged() {
+        let pool = enabled_pool(10);
+        let mut operation = try_admit_current(&pool, 6).expect("operation");
+        let contention = try_admit_current(&pool, 4).expect("contention");
+
+        assert!(!operation.try_grow(1));
+        assert_eq!(operation.charged_bytes(), 6);
+        assert_eq!(pool.used(), 10);
+
+        drop(contention);
+        assert!(!operation.try_grow(5));
+        assert!(!operation.try_grow(usize::MAX));
+        assert_eq!(operation.charged_bytes(), 6);
+        assert_eq!(pool.used(), 6);
+
+        drop(operation);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
     fn arithmetic_overflow_is_an_observation_only_omission() {
         let pool = enabled_pool(usize::MAX);
-        let permit = pool.try_acquire(usize::MAX).expect("maximum permit");
-        assert!(pool.try_acquire(1).is_none());
-        drop(permit);
+        let operation = try_admit_current(&pool, usize::MAX).expect("maximum operation");
+        assert!(try_admit_current(&pool, 1).is_none());
+        drop(operation);
         assert_eq!(pool.used(), 0);
     }
 
@@ -463,7 +575,7 @@ mod tests {
             let first_entered = first_entered.clone();
             let finish_first = finish_first.clone();
             move || {
-                first_pool.try_acquire_with_hook(4, || {
+                first_pool.try_admit_with_hook(4, || {
                     first_entered.wait();
                     finish_first.wait();
                 })
@@ -471,8 +583,7 @@ mod tests {
         });
 
         first_entered.wait();
-        let second = pool
-            .try_acquire(4)
+        let second = try_admit_current(&pool, 4)
             .expect("another admission may enter while the first holds a read gate");
         finish_first.wait();
         let first = first.join().expect("first admission thread").unwrap();
@@ -483,10 +594,11 @@ mod tests {
     }
 
     #[test]
-    fn enabled_lower_limit_publication_preserves_permits_and_enforces_the_new_ceiling() {
+    fn enabled_lower_limit_preserves_admitted_ceiling_and_rebinds_old_epoch_admission() {
         let pool = enabled_pool(16);
-        let existing = pool.try_acquire(8).expect("existing permit");
-        let candidate = accounting_capture_activation(pool.clone(), 4);
+        let old_epoch = pool.current_epoch();
+        let mut existing = try_admit_current(&pool, 6).expect("existing operation");
+        let candidate = accounting_capture_activation(pool.clone(), 8);
         let (snapshot, _owner) = candidate.into_parts();
         let new_epoch = snapshot.capture_epoch().clone();
         let publication_entered = Arc::new(Barrier::new(2));
@@ -497,7 +609,7 @@ mod tests {
             let finish_publication = finish_publication.clone();
             move || {
                 assert_eq!(
-                    publication_pool.publish_with_hook(new_epoch, 4, || {
+                    publication_pool.publish_with_hook(new_epoch, 8, || {
                         publication_entered.wait();
                         finish_publication.wait();
                     }),
@@ -507,17 +619,33 @@ mod tests {
         });
 
         publication_entered.wait();
-        assert!(pool.try_acquire(1).is_none());
+        assert!(try_admit_current(&pool, 1).is_none());
         finish_publication.wait();
         publisher.join().expect("publisher");
 
         assert!(pool.current_epoch().is_enabled());
-        assert_eq!(pool.committed_limit(), 4);
-        assert_eq!(pool.used(), 8);
-        assert!(pool.try_acquire(1).is_none());
+        assert_eq!(pool.committed_limit(), 8);
+        assert_eq!(pool.used(), 6);
+        let reloaded_old = old_epoch
+            .capture()
+            .expect("old policy")
+            .try_admit(CaptureEvent::RequestAllowed, 0)
+            .expect("old leased policy uses newly published enabled ceiling");
+        assert_eq!(reloaded_old.ceiling(), 8);
+        let mut current = try_admit_current(&pool, 0).expect("new epoch operation");
+        assert_eq!(current.ceiling(), 8);
+        assert!(existing.try_grow(10));
+        assert_eq!(existing.charged_bytes(), 16);
+        assert_eq!(pool.used(), 16);
+        assert!(!existing.try_grow(1));
+        assert!(!current.try_grow(1));
+        assert_eq!(current.charged_bytes(), 0);
+        drop((current, reloaded_old));
         drop(existing);
         assert_eq!(pool.used(), 0);
-        assert_eq!(pool.try_acquire(4).expect("new ceiling").bytes(), 4);
+        let current = try_admit_current(&pool, 8).expect("new ceiling");
+        assert_eq!(current.charged_bytes(), 8);
+        assert_eq!(current.ceiling(), 8);
     }
 
     #[test]
@@ -573,7 +701,7 @@ mod tests {
         let candidate = accounting_capture_activation(pool.clone(), 32);
         let (_snapshot, owner) = candidate.into_parts();
         let mut stale_guard = owner.publication_guard().expect("pre-shutdown guard");
-        let pre_shutdown_zero = pool.try_acquire(0).expect("open zero-byte admission");
+        let pre_shutdown_zero = try_admit_current(&pool, 0).expect("open zero-byte admission");
         drop(pre_shutdown_zero);
 
         pool.close();
@@ -585,8 +713,8 @@ mod tests {
         assert_eq!(pool.committed_limit(), 0);
         assert!(!closed_epoch.is_enabled());
         assert!(Arc::ptr_eq(&pool.current_epoch(), &closed_epoch));
-        assert!(pool.try_acquire(0).is_none());
-        assert!(pool.try_acquire(1).is_none());
+        assert!(try_admit_current(&pool, 0).is_none());
+        assert!(try_admit_current(&pool, 1).is_none());
         assert!(matches!(
             owner.publication_guard(),
             Err(RuntimeError::ShuttingDown)
@@ -636,7 +764,7 @@ mod tests {
         assert_eq!(limit, 0);
         assert!(!enabled);
         assert!(!epoch.is_enabled());
-        assert!(pool.try_acquire(0).is_none());
+        assert!(try_admit_current(&pool, 0).is_none());
     }
 
     #[test]
@@ -655,6 +783,6 @@ mod tests {
         assert_eq!(limit, 0);
         assert!(!enabled);
         assert!(Arc::ptr_eq(&epoch, &closed_epoch));
-        assert!(pool.try_acquire(0).is_none());
+        assert!(try_admit_current(&pool, 0).is_none());
     }
 }

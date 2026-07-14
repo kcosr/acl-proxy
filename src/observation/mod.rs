@@ -12,7 +12,7 @@ use crate::redaction::{ProfileHandle, RedactionActivation, RedactionSnapshot};
 use crate::runtime::{GenerationOwner, ObservationSnapshot, RedactionProfileIndex};
 
 use capture::CaptureEpochUpdate;
-pub(crate) use capture::{CapturePermit, CapturePool};
+pub(crate) use capture::{CaptureOperation, CapturePool};
 
 /// Process-owned observation state shared by all candidate, active, and
 /// retiring generations. Static sink construction will live behind this same
@@ -335,11 +335,11 @@ impl CapturePolicy {
         self.events.contains(event)
     }
 
-    pub(crate) fn try_admit(&self, event: CaptureEvent, bytes: usize) -> Option<CapturePermit> {
+    pub(crate) fn try_admit(&self, event: CaptureEvent, bytes: usize) -> Option<CaptureOperation> {
         if !self.captures(event) {
             return None;
         }
-        self.pool.upgrade()?.try_acquire(bytes)
+        self.pool.upgrade()?.try_admit(bytes)
     }
 
     pub(crate) fn profile_index(&self) -> RedactionProfileIndex {
@@ -611,7 +611,7 @@ mod tests {
 
         assert_eq!(pool.committed_limit(), 8);
         assert!(Arc::ptr_eq(&pool.current_epoch(), &original_epoch));
-        assert!(pool.try_acquire(9).is_none());
+        assert!(pool.try_admit(9).is_none());
     }
 
     #[test]
@@ -629,7 +629,7 @@ mod tests {
 
         assert_eq!(pool.committed_limit(), 32);
         assert!(Arc::ptr_eq(&pool.current_epoch(), snapshot.capture_epoch()));
-        assert!(pool.try_acquire(32).is_some());
+        assert!(pool.try_admit(32).is_some());
     }
 
     #[test]
