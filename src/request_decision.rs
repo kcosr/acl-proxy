@@ -835,7 +835,7 @@ rules = [{ literals = ["secret"], payloads = "text" }]"#,
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn provider_pass_reuses_the_cursor_guard_for_terminal_allow_and_deny() {
+    async fn delegate_outcome_and_default_fallthrough_corpus() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().unwrap();
@@ -912,6 +912,11 @@ authorization_provider = "first"
 id = "terminal"
 decision = "delegate"
 methods = ["GET"]
+urls = [
+  "https://example.test/allow",
+  "https://example.test/deny",
+  "https://example.test/exact-body",
+]
 authorization_provider = "terminal""#;
         let initial = compile(&config(policy, &providers));
         let (runtime, _source, _, pool) = runtime(initial).await;
@@ -964,6 +969,19 @@ authorization_provider = "terminal""#;
             .collect::<Vec<_>>();
         assert_eq!(forwarded, b"exact-body");
         drop(allowed);
+        assert_eq!(pool.global_charge(), 0);
+
+        let url = canonicalize_http_url("https://example.test/default-deny").unwrap();
+        let RequestDecision::Deny(default) =
+            decide_request(&lease, input("default-deny", &url, HeaderMap::new()))
+                .await
+                .unwrap()
+        else {
+            panic!("provider pass must resume through the deny default");
+        };
+        assert!(default.rule.is_none());
+        assert_eq!(default.reason, DenyReason::Policy);
+        drop(default);
         assert_eq!(pool.global_charge(), 0);
 
         drop(lease);
