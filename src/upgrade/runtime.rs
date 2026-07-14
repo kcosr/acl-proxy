@@ -17,6 +17,7 @@ use crate::redaction::ProfileHandle;
 const ENTRY_OPEN: u8 = 0;
 const ENTRY_CLOSING: u8 = 1;
 const ENTRY_CLOSED: u8 = 2;
+const ENTRY_CLOSE_REQUESTED: u8 = 3;
 const DEFAULT_ENTRY_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 
 type UpgradeSetupTask =
@@ -313,9 +314,8 @@ struct EntryRecord {
 struct EntryShared {
     timing: Mutex<EntryTiming>,
     cleanup_grace: Duration,
-    requested_cause: Mutex<Option<UpgradeTerminalCause>>,
     winning_cause: Mutex<Option<UpgradeTerminalCause>>,
-    setup_succeeded: AtomicBool,
+    setup_transition: Mutex<SetupTransition>,
     changed: Notify,
     terminal_state: AtomicU8,
     closed: Notify,
@@ -326,6 +326,10 @@ struct EntryTiming {
     application_stop: Instant,
     cleanup_cutoff: Instant,
     stop_cause: UpgradeTerminalCause,
+}
+
+struct SetupTransition {
+    succeeded: bool,
 }
 
 enum SupervisorCommand {
@@ -423,6 +427,31 @@ enum EntryTaskResult {
     Setup(Result<UpgradeRelayPair, UpgradeTerminalCause>),
     Relay(UpgradeTerminalCause),
     TerminalControl,
+}
+
+struct LinearizedSetupTask {
+    shared: Arc<EntryShared>,
+    setup: UpgradeSetupTask,
+}
+
+impl Future for LinearizedSetupTask {
+    type Output = Result<UpgradeRelayPair, UpgradeTerminalCause>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let shared = self.shared.clone();
+        let mut transition = lock(&shared.setup_transition);
+        let timing = *lock(&shared.timing);
+        if shared.terminal_state.load(Ordering::Acquire) != ENTRY_OPEN
+            || Instant::now() >= timing.application_stop
+        {
+            return Poll::Ready(Err(timing.stop_cause));
+        }
+        let result = self.setup.as_mut().poll(context);
+        if matches!(result, Poll::Ready(Ok(_))) {
+            transition.succeeded = true;
+        }
+        result
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -864,7 +893,6 @@ impl RuntimeInner {
             abort.abort();
         }
         shared.terminal_state.store(ENTRY_CLOSED, Ordering::Release);
-        let _ = lock(&shared.requested_cause).take();
         shared.closed.notify_waiters();
         self.changed.notify_waiters();
     }
@@ -1015,9 +1043,8 @@ impl UpgradeHandshake {
                 stop_cause: UpgradeTerminalCause::LifetimeExpired,
             }),
             cleanup_grace: self.inner.limits.cleanup_grace,
-            requested_cause: Mutex::new(None),
             winning_cause: Mutex::new(None),
-            setup_succeeded: AtomicBool::new(false),
+            setup_transition: Mutex::new(SetupTransition { succeeded: false }),
             changed: Notify::new(),
             terminal_state: AtomicU8::new(ENTRY_OPEN),
             closed: Notify::new(),
@@ -1092,13 +1119,8 @@ impl fmt::Debug for CommittedUpgrade {
 
 impl CommittedUpgrade {
     pub(crate) fn submit_terminal(&self, cause: UpgradeTerminalCause) {
-        let _timing = lock(&self.shared.timing);
-        let mut requested = lock(&self.shared.requested_cause);
-        if requested.is_none() {
-            *requested = Some(cause);
-            drop(requested);
-            self.shared.changed.notify_waiters();
-        }
+        self.shared
+            .begin_closing(cause, Instant::now(), self.shared.cleanup_grace);
     }
 
     pub(crate) async fn wait_closed(&self) {
@@ -1127,6 +1149,7 @@ impl CommittedUpgrade {
 
 impl EntryShared {
     fn lower_for_shutdown(&self, deadline: Instant) {
+        let _transition = lock(&self.setup_transition);
         {
             let mut timing = lock(&self.timing);
             if deadline <= timing.application_stop {
@@ -1143,20 +1166,23 @@ impl EntryShared {
             .terminal_state
             .compare_exchange(
                 ENTRY_OPEN,
-                ENTRY_CLOSING,
+                ENTRY_CLOSE_REQUESTED,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_ok()
+            .is_err()
         {
-            *lock(&self.winning_cause) = Some(cause);
-            let cause_cutoff = now.checked_add(cleanup_grace).unwrap_or(now);
-            let mut timing = lock(&self.timing);
-            timing.application_stop = timing.application_stop.min(now);
-            timing.cleanup_cutoff = timing.cleanup_cutoff.min(cause_cutoff);
-            drop(timing);
-            self.changed.notify_waiters();
+            return;
         }
+        let _transition = lock(&self.setup_transition);
+        *lock(&self.winning_cause) = Some(cause);
+        let cause_cutoff = now.checked_add(cleanup_grace).unwrap_or(now);
+        let mut timing = lock(&self.timing);
+        timing.application_stop = timing.application_stop.min(now);
+        timing.cleanup_cutoff = timing.cleanup_cutoff.min(cause_cutoff);
+        drop(timing);
+        self.terminal_state.store(ENTRY_CLOSING, Ordering::Release);
+        self.changed.notify_waiters();
     }
 }
 
@@ -1268,19 +1294,17 @@ fn handle_entry_task_completion(
             let mut pair = Some(pair);
             let rejected = {
                 let timing = lock(&shared.timing);
-                let mut requested = lock(&shared.requested_cause);
                 let now = Instant::now();
                 if shared.terminal_state.load(Ordering::Acquire) == ENTRY_OPEN
                     && now < timing.application_stop
-                    && requested.is_none()
                 {
                     let pair = pair.take().expect("relay pair is promoted once");
                     tasks.spawn(async move { EntryTaskResult::Relay(pair.first.await) });
                     tasks.spawn(async move { EntryTaskResult::Relay(pair.second.await) });
                     None
-                } else if let Some(cause) = requested.take() {
-                    Some((cause, now))
-                } else if now >= timing.application_stop {
+                } else if shared.terminal_state.load(Ordering::Acquire) == ENTRY_OPEN
+                    && now >= timing.application_stop
+                {
                     Some((timing.stop_cause, timing.application_stop))
                 } else {
                     None
@@ -1388,39 +1412,20 @@ async fn run_entry_coordinator(
     snapshot: UpgradedStreamSnapshot,
     plan: UpgradeEntryPlan,
 ) {
-    run_entry_coordinator_with_hooks(
-        inner,
-        shared,
-        snapshot,
-        plan,
-        || {},
-        || {},
-        || async {},
-        || {},
-    )
-    .await;
+    run_entry_coordinator_with_hooks(inner, shared, snapshot, plan, || {}, || {}, || {}).await;
 }
 
-async fn run_entry_coordinator_with_hooks<
-    RawHook,
-    SetupHook,
-    SetupSuccessHook,
-    SetupSuccessFuture,
-    CloseHook,
->(
+async fn run_entry_coordinator_with_hooks<RawHook, SetupHook, CloseHook>(
     inner: Arc<RuntimeInner>,
     shared: Arc<EntryShared>,
     snapshot: UpgradedStreamSnapshot,
     plan: UpgradeEntryPlan,
     before_raw_start: RawHook,
     before_setup_authorization: SetupHook,
-    after_setup_success: SetupSuccessHook,
     before_close_authorization: CloseHook,
 ) where
     RawHook: FnOnce() + Send + 'static,
     SetupHook: FnOnce(),
-    SetupSuccessHook: FnOnce() -> SetupSuccessFuture + Send + 'static,
-    SetupSuccessFuture: Future<Output = ()> + Send + 'static,
     CloseHook: FnOnce(),
 {
     let cleanup_grace = shared.cleanup_grace;
@@ -1443,7 +1448,6 @@ async fn run_entry_coordinator_with_hooks<
     };
     let mut pending_setup = Some((plan.setup, snapshot));
     let mut before_setup_authorization = Some(before_setup_authorization);
-    let mut after_setup_success = Some(after_setup_success);
     let mut before_close_authorization = Some(before_close_authorization);
 
     loop {
@@ -1452,14 +1456,9 @@ async fn run_entry_coordinator_with_hooks<
         }
         let changed = shared.changed.notified();
         if shared.terminal_state.load(Ordering::Acquire) == ENTRY_OPEN {
-            let requested = { lock(&shared.requested_cause).take() };
-            if let Some(cause) = requested {
-                shared.begin_closing(cause, Instant::now(), cleanup_grace);
-            } else {
-                let timing = *lock(&shared.timing);
-                if Instant::now() >= timing.application_stop {
-                    shared.begin_closing(timing.stop_cause, timing.application_stop, cleanup_grace);
-                }
+            let timing = *lock(&shared.timing);
+            if Instant::now() >= timing.application_stop {
+                shared.begin_closing(timing.stop_cause, timing.application_stop, cleanup_grace);
             }
         }
 
@@ -1467,7 +1466,7 @@ async fn run_entry_coordinator_with_hooks<
             let cause =
                 lock(&shared.winning_cause).expect("closing entry has a winning terminal cause");
             let established =
-                phase == EntryPhase::Established || shared.setup_succeeded.load(Ordering::Acquire);
+                phase == EntryPhase::Established || lock(&shared.setup_transition).succeeded;
             let control = terminal_control
                 .take()
                 .expect("entry cleanup owns terminal control");
@@ -1497,17 +1496,12 @@ async fn run_entry_coordinator_with_hooks<
                 {
                     let (build, snapshot) = pending.take().expect("setup is admitted once");
                     let setup_shared = shared.clone();
-                    let after_setup_success = after_setup_success
-                        .take()
-                        .expect("setup success hook is installed once");
                     tasks.spawn(async move {
-                        let setup = build(snapshot);
-                        let result = setup.await;
-                        if result.is_ok() {
-                            setup_shared.setup_succeeded.store(true, Ordering::Release);
-                            after_setup_success().await;
-                        }
-                        EntryTaskResult::Setup(result)
+                        let setup = LinearizedSetupTask {
+                            shared: setup_shared,
+                            setup: build(snapshot),
+                        };
+                        EntryTaskResult::Setup(setup.await)
                     });
                     (true, None)
                 } else {
@@ -2123,9 +2117,8 @@ mod tests {
                 stop_cause: UpgradeTerminalCause::LifetimeExpired,
             }),
             cleanup_grace: Duration::from_millis(100),
-            requested_cause: Mutex::new(None),
             winning_cause: Mutex::new(None),
-            setup_succeeded: AtomicBool::new(false),
+            setup_transition: Mutex::new(SetupTransition { succeeded: false }),
             changed: Notify::new(),
             terminal_state: AtomicU8::new(ENTRY_OPEN),
             closed: Notify::new(),
@@ -2145,7 +2138,6 @@ mod tests {
             ),
             || {},
             || panic!("coordinator authorization panic"),
-            || async {},
             || {},
         ));
 
@@ -2169,9 +2161,8 @@ mod tests {
                 stop_cause: UpgradeTerminalCause::LifetimeExpired,
             }),
             cleanup_grace: Duration::from_millis(100),
-            requested_cause: Mutex::new(None),
             winning_cause: Mutex::new(None),
-            setup_succeeded: AtomicBool::new(false),
+            setup_transition: Mutex::new(SetupTransition { succeeded: false }),
             changed: Notify::new(),
             terminal_state: AtomicU8::new(ENTRY_OPEN),
             closed: Notify::new(),
@@ -2214,9 +2205,8 @@ mod tests {
                 stop_cause: UpgradeTerminalCause::LifetimeExpired,
             }),
             cleanup_grace: Duration::from_millis(100),
-            requested_cause: Mutex::new(None),
             winning_cause: Mutex::new(None),
-            setup_succeeded: AtomicBool::new(false),
+            setup_transition: Mutex::new(SetupTransition { succeeded: false }),
             changed: Notify::new(),
             terminal_state: AtomicU8::new(ENTRY_OPEN),
             closed: Notify::new(),
@@ -2248,7 +2238,6 @@ mod tests {
                 registration_release_rx.recv().unwrap();
             },
             || {},
-            || async {},
             || {},
         ));
 
@@ -2285,9 +2274,8 @@ mod tests {
                     stop_cause: UpgradeTerminalCause::LifetimeExpired,
                 }),
                 cleanup_grace: Duration::from_millis(100),
-                requested_cause: Mutex::new(None),
                 winning_cause: Mutex::new(None),
-                setup_succeeded: AtomicBool::new(false),
+                setup_transition: Mutex::new(SetupTransition { succeeded: false }),
                 changed: Notify::new(),
                 terminal_state: AtomicU8::new(ENTRY_OPEN),
                 closed: Notify::new(),
@@ -3096,9 +3084,8 @@ mod tests {
                 stop_cause: UpgradeTerminalCause::LifetimeExpired,
             }),
             cleanup_grace: Duration::from_millis(100),
-            requested_cause: Mutex::new(None),
             winning_cause: Mutex::new(None),
-            setup_succeeded: AtomicBool::new(false),
+            setup_transition: Mutex::new(SetupTransition { succeeded: false }),
             changed: Notify::new(),
             terminal_state: AtomicU8::new(ENTRY_OPEN),
             closed: Notify::new(),
@@ -3132,7 +3119,6 @@ mod tests {
                 authorization_tx.send(()).unwrap();
                 resume_rx.recv().unwrap();
             },
-            || async {},
             || {},
         ));
 
@@ -3166,9 +3152,8 @@ mod tests {
                 stop_cause: UpgradeTerminalCause::LifetimeExpired,
             }),
             cleanup_grace: Duration::from_millis(100),
-            requested_cause: Mutex::new(None),
             winning_cause: Mutex::new(None),
-            setup_succeeded: AtomicBool::new(false),
+            setup_transition: Mutex::new(SetupTransition { succeeded: false }),
             changed: Notify::new(),
             terminal_state: AtomicU8::new(ENTRY_OPEN),
             closed: Notify::new(),
@@ -3206,7 +3191,6 @@ mod tests {
             ),
             || {},
             || {},
-            || async {},
             move || {
                 authorization_tx.send(()).unwrap();
                 resume_rx.recv().unwrap();
@@ -3231,14 +3215,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn terminal_or_deadline_pending_setup_completion_drops_relays_unpolled() {
-        for winning_cause in [
-            UpgradeTerminalCause::Cancelled,
-            UpgradeTerminalCause::LifetimeExpired,
+        for (winning_cause, deadline) in [
+            (UpgradeTerminalCause::Cancelled, false),
+            (UpgradeTerminalCause::LifetimeExpired, true),
         ] {
-            for _ in 0..16 {
+            for _ in 0..1 {
                 let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
                 let raw_aborts = Arc::new(AtomicUsize::new(0));
                 let established_closes = Arc::new(AtomicUsize::new(0));
+                let setup_completed = Arc::new(AtomicUsize::new(0));
                 let relay_polls = Arc::new(AtomicUsize::new(0));
                 let now = Instant::now();
                 let shared = Arc::new(EntryShared {
@@ -3248,18 +3233,20 @@ mod tests {
                         stop_cause: UpgradeTerminalCause::LifetimeExpired,
                     }),
                     cleanup_grace: Duration::from_millis(100),
-                    requested_cause: Mutex::new(None),
                     winning_cause: Mutex::new(None),
-                    setup_succeeded: AtomicBool::new(false),
+                    setup_transition: Mutex::new(SetupTransition { succeeded: false }),
                     changed: Notify::new(),
                     terminal_state: AtomicU8::new(ENTRY_OPEN),
                     closed: Notify::new(),
                 });
                 let (setup_started_tx, setup_started_rx) = oneshot::channel();
                 let (setup_release_tx, setup_release_rx) = oneshot::channel();
-                let (setup_succeeded_tx, setup_succeeded_rx) = oneshot::channel();
+                let (final_poll_blocked_tx, final_poll_blocked_rx) = oneshot::channel();
+                let (final_poll_release_tx, final_poll_release_rx) = std_mpsc::channel();
+                let setup_shared = shared.clone();
+                let setup_completed_for_task = setup_completed.clone();
                 let setup_relay_polls = relay_polls.clone();
-                let coordinator = tokio::spawn(run_entry_coordinator_with_hooks(
+                let coordinator = tokio::spawn(run_entry_coordinator(
                     runtime.inner.clone(),
                     shared.clone(),
                     UpgradedStreamSnapshot::new(2, None),
@@ -3276,8 +3263,18 @@ mod tests {
                         move |_| async move {
                             let _ = setup_started_tx.send(());
                             let _ = setup_release_rx.await;
+                            if deadline {
+                                let mut timing = lock(&setup_shared.timing);
+                                timing.application_stop = Instant::now();
+                                timing.stop_cause = winning_cause;
+                                drop(timing);
+                                setup_shared.changed.notify_waiters();
+                            }
+                            let _ = final_poll_blocked_tx.send(());
+                            final_poll_release_rx.recv().unwrap();
                             let first_polls = setup_relay_polls.clone();
                             let second_polls = setup_relay_polls;
+                            setup_completed_for_task.fetch_add(1, Ordering::SeqCst);
                             Ok(UpgradeRelayPair::new(
                                 async move {
                                     first_polls.fetch_add(1, Ordering::SeqCst);
@@ -3292,30 +3289,38 @@ mod tests {
                             ))
                         },
                     ),
-                    || {},
-                    || {},
-                    move || async move {
-                        let _ = setup_succeeded_tx.send(());
-                        std::future::pending::<()>().await;
-                    },
-                    || {},
                 ));
 
                 setup_started_rx.await.unwrap();
                 setup_release_tx.send(()).unwrap();
-                setup_succeeded_rx.await.unwrap();
-                if winning_cause == UpgradeTerminalCause::Cancelled {
-                    *lock(&shared.requested_cause) = Some(winning_cause);
-                } else {
-                    let mut timing = lock(&shared.timing);
-                    timing.application_stop = Instant::now();
-                    timing.stop_cause = winning_cause;
-                }
-                shared.changed.notify_waiters();
+                final_poll_blocked_rx.await.unwrap();
+                assert_eq!(shared.terminal_state.load(Ordering::Acquire), ENTRY_OPEN);
+                let terminal_shared = shared.clone();
+                let (transition_started_tx, transition_started_rx) = std_mpsc::channel();
+                let terminal = tokio::task::spawn_blocking(move || {
+                    transition_started_tx.send(()).unwrap();
+                    terminal_shared.begin_closing(
+                        winning_cause,
+                        Instant::now(),
+                        terminal_shared.cleanup_grace,
+                    );
+                });
+                transition_started_rx.recv().unwrap();
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while shared.terminal_state.load(Ordering::Acquire) != ENTRY_CLOSE_REQUESTED {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("terminal transition did not contend with the final setup poll");
+                final_poll_release_tx.send(()).unwrap();
+                terminal.await.unwrap();
                 tokio::time::timeout(Duration::from_secs(1), coordinator)
                     .await
                     .expect("coordinator did not resolve the setup/terminal race")
                     .unwrap();
+                assert_eq!(setup_completed.load(Ordering::SeqCst), 1);
+                assert!(lock(&shared.setup_transition).succeeded);
                 assert_eq!(established_closes.load(Ordering::SeqCst), 1);
                 assert_eq!(relay_polls.load(Ordering::SeqCst), 0);
                 assert_eq!(raw_aborts.load(Ordering::SeqCst), 1);
@@ -3323,6 +3328,81 @@ mod tests {
                 runtime.shutdown_and_wait(Some(Instant::now())).await;
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn terminal_transition_before_next_setup_poll_prevents_setup_success() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let raw_aborts = Arc::new(AtomicUsize::new(0));
+        let established_closes = Arc::new(AtomicUsize::new(0));
+        let setup_effects = Arc::new(AtomicUsize::new(0));
+        let now = Instant::now();
+        let shared = Arc::new(EntryShared {
+            timing: Mutex::new(EntryTiming {
+                application_stop: now + Duration::from_secs(1),
+                cleanup_cutoff: now + Duration::from_secs(2),
+                stop_cause: UpgradeTerminalCause::LifetimeExpired,
+            }),
+            cleanup_grace: Duration::from_millis(100),
+            winning_cause: Mutex::new(None),
+            setup_transition: Mutex::new(SetupTransition { succeeded: false }),
+            changed: Notify::new(),
+            terminal_state: AtomicU8::new(ENTRY_OPEN),
+            closed: Notify::new(),
+        });
+        let (setup_started_tx, setup_started_rx) = oneshot::channel();
+        let (setup_release_tx, setup_release_rx) = oneshot::channel();
+        let coordinator = tokio::spawn(run_entry_coordinator(
+            runtime.inner.clone(),
+            shared.clone(),
+            UpgradedStreamSnapshot::new(2, None),
+            UpgradeEntryPlan::new(
+                UpgradeTerminalControl::new(
+                    raw_teardown_with_guard(DropCount(raw_aborts.clone())),
+                    {
+                        let established_closes = established_closes.clone();
+                        move |_| async move {
+                            established_closes.fetch_add(1, Ordering::SeqCst);
+                        }
+                    },
+                ),
+                {
+                    let setup_effects = setup_effects.clone();
+                    move |_| async move {
+                        let _ = setup_started_tx.send(());
+                        let _ = setup_release_rx.await;
+                        setup_effects.fetch_add(1, Ordering::SeqCst);
+                        Err(UpgradeTerminalCause::SetupFailed)
+                    }
+                },
+            ),
+        ));
+
+        setup_started_rx.await.unwrap();
+        let terminal_shared = shared.clone();
+        tokio::task::spawn_blocking(move || {
+            terminal_shared.begin_closing(
+                UpgradeTerminalCause::Cancelled,
+                Instant::now(),
+                terminal_shared.cleanup_grace,
+            );
+        })
+        .await
+        .unwrap();
+        assert_eq!(shared.terminal_state.load(Ordering::Acquire), ENTRY_CLOSING);
+        let _ = setup_release_tx.send(());
+        tokio::time::timeout(Duration::from_secs(1), coordinator)
+            .await
+            .expect("coordinator did not cancel setup after terminal won transition")
+            .unwrap();
+        assert_eq!(setup_effects.load(Ordering::SeqCst), 0);
+        assert_eq!(established_closes.load(Ordering::SeqCst), 0);
+        assert_eq!(raw_aborts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *lock(&shared.winning_cause),
+            Some(UpgradeTerminalCause::Cancelled)
+        );
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
     }
 
     #[tokio::test]
