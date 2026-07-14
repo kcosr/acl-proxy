@@ -594,6 +594,14 @@ pub(crate) enum ProviderBodyReplacementDecodeError {
 }
 
 impl ProviderBodyReplacement {
+    pub(crate) fn decoded_size(&self) -> usize {
+        match &self.storage {
+            #[cfg(test)]
+            ProviderBodyReplacementStorage::Decoded(bytes) => bytes.len(),
+            ProviderBodyReplacementStorage::Encoded { decoded_bytes, .. } => *decoded_bytes,
+        }
+    }
+
     pub(crate) fn content_type(&self) -> Option<&str> {
         self.content_type.as_deref()
     }
@@ -645,11 +653,7 @@ impl ProviderBodyReplacement {
         redaction_max_decoded_bytes: usize,
     ) -> Result<(Option<String>, Option<String>, GuardedBody), ProviderBodyReplacementDecodeError>
     {
-        let decoded_bytes = match &self.storage {
-            #[cfg(test)]
-            ProviderBodyReplacementStorage::Decoded(bytes) => bytes.len(),
-            ProviderBodyReplacementStorage::Encoded { decoded_bytes, .. } => *decoded_bytes,
-        };
+        let decoded_bytes = self.decoded_size();
         if decoded_bytes > provider_max_decoded_bytes {
             return Err(ProviderBodyReplacementDecodeError::ProviderBodyLimit);
         }
