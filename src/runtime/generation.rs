@@ -177,22 +177,22 @@ pub(crate) struct AuthorizationDispatchContext<'a> {
 }
 
 impl<'a> AuthorizationDispatchContext<'a> {
-    pub(crate) fn rule_id(&self) -> &'a str {
-        self.rule_id
-    }
-
-    pub(crate) fn request(&self) -> &crate::authorization::protocol::ProviderRequest<'a> {
-        &self.request
-    }
-
     pub(crate) fn into_request(self) -> crate::authorization::protocol::ProviderRequest<'a> {
         self.request
     }
 
-    pub(crate) fn retain_generation(
-        &self,
-    ) -> Result<GenerationRetention, GenerationRetentionError> {
-        self.generation.retain_for_operation()
+    pub(crate) fn into_webhook_parts(
+        self,
+    ) -> Result<
+        (
+            &'a str,
+            crate::authorization::protocol::ProviderRequest<'a>,
+            GenerationRetention,
+        ),
+        GenerationRetentionError,
+    > {
+        let retention = self.generation.retain_for_operation()?;
+        Ok((self.rule_id, self.request, retention))
     }
 }
 pub(crate) trait SafetySnapshot: Send + Sync {

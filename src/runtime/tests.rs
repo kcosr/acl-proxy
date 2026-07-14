@@ -1,25 +1,57 @@
 use std::collections::VecDeque;
 #[cfg(unix)]
 use std::ffi::OsString;
+use std::io;
 use std::marker::PhantomData;
+use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
-use tokio::sync::{Notify, Semaphore};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{oneshot, Notify, Semaphore};
 
 use crate::authorization::callback::{
-    CallbackClaimResult, PendingCapabilityStore, PendingDeadline,
+    CallbackClaimResult, PendingCapabilityStore, PendingDeadline, ResumeTokenDigest,
 };
-use crate::config::compiler::PendingOperationLimit;
+use crate::authorization::protocol::{ProviderDecision, ProviderRequest};
+use crate::authorization::webhook::runtime::WebhookAuthorizationRuntime;
+use crate::authorization::ProductAuthorizationSnapshot;
+use crate::config::compiler::{
+    AuthorizationCallbackPlan, AuthorizationPlan, AuthorizationProviderPlan,
+    CompiledProviderFailureMode, PendingOperationLimit, WebhookProviderPlan,
+};
 use crate::config::{compile_config_text, CompiledConfig, ConfigTextInput};
+use crate::destination::{
+    DestinationFacts, DestinationGuard, DestinationResolver, LocalAddressSnapshot,
+    LocalAddressSource, ResolveFuture,
+};
+use crate::safety::{WireBodyPool, WireBodyQuotaKey};
 
 use super::*;
 
 struct EmptySnapshot;
+
+struct FixedDestinationResolver(SocketAddr);
+
+impl DestinationResolver for FixedDestinationResolver {
+    fn resolve(&self, _host: &str, _port: u16, _max_addresses: usize) -> ResolveFuture<'_> {
+        let endpoint = self.0;
+        Box::pin(async move { Ok(vec![endpoint]) })
+    }
+}
+
+struct EmptyLocalAddressSource;
+
+impl LocalAddressSource for EmptyLocalAddressSource {
+    fn snapshot(&self) -> io::Result<LocalAddressSnapshot> {
+        Ok(LocalAddressSnapshot::default())
+    }
+}
 
 impl PolicySnapshot for EmptySnapshot {}
 impl EgressSnapshot for EmptySnapshot {}
@@ -592,6 +624,172 @@ async fn runtime_fixture(
         .await
         .expect("matching runtime construction");
     (runtime, compiled, source, activator, static_resources)
+}
+
+#[tokio::test]
+async fn webhook_delivery_resources_end_before_callback_wait() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = listener.local_addr().unwrap();
+    let (body_sender, body_receiver) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut wire = Vec::new();
+        let mut scratch = [0u8; 4096];
+        let (head_end, content_length) = loop {
+            let read = stream.read(&mut scratch).await.unwrap();
+            assert_ne!(read, 0, "webhook request ended before its complete head");
+            wire.extend_from_slice(&scratch[..read]);
+            if let Some(head_end) = wire.windows(4).position(|window| window == b"\r\n\r\n") {
+                let head_end = head_end + 4;
+                let head = std::str::from_utf8(&wire[..head_end]).unwrap();
+                let content_length = head
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("Content-Length: ")
+                            .map(|value| value.parse::<usize>().unwrap())
+                    })
+                    .unwrap();
+                break (head_end, content_length);
+            }
+        };
+        while wire.len() - head_end < content_length {
+            let read = stream.read(&mut scratch).await.unwrap();
+            assert_ne!(read, 0, "webhook request body ended early");
+            wire.extend_from_slice(&scratch[..read]);
+        }
+        body_sender
+            .send(wire[head_end..head_end + content_length].to_vec())
+            .unwrap();
+        stream
+            .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+    });
+
+    let destination = DestinationGuard::with_sources(
+        DestinationFacts::for_test([], None, None, 16).unwrap(),
+        Arc::new(FixedDestinationResolver(endpoint)),
+        Arc::new(EmptyLocalAddressSource),
+    );
+    let webhook_runtime = WebhookAuthorizationRuntime::for_test_with_destination(
+        Some("http://control.test/_acl/external-auth/callback"),
+        destination,
+    );
+    let authorization_plan = AuthorizationPlan {
+        internal_context_headers: vec![],
+        callback: Some(AuthorizationCallbackPlan {
+            resume_token_ttl: Duration::from_secs(5),
+            max_pending_operations: PendingOperationLimit::try_new(1).unwrap(),
+        }),
+        providers: std::collections::BTreeMap::from([(
+            "webhook".to_string(),
+            AuthorizationProviderPlan::Webhook(WebhookProviderPlan {
+                url: format!("http://provider.test:{}/authorize", endpoint.port()),
+                timeout: Duration::from_secs(5),
+                on_failure: CompiledProviderFailureMode::Deny,
+                include_headers: vec![],
+                max_request_bytes: 8192,
+                max_response_bytes: 4096,
+                outputs: std::collections::BTreeMap::new(),
+                tls: None,
+            }),
+        )]),
+    };
+    let provider_registry = ProviderRegistry::from_names(["webhook".to_string()]);
+    let provider = provider_registry.get("webhook").unwrap();
+    let authorization = ProductAuthorizationSnapshot::activate(
+        authorization_plan,
+        provider_registry,
+        webhook_runtime.clone(),
+        ActivationCancellation::new_for_test(),
+    )
+    .await
+    .unwrap();
+    let (authorization, _, owners) = authorization.into_parts();
+    assert!(owners.is_empty());
+
+    let compiled = compile(&config("30s", "127.0.0.1:8881", 2)).unwrap();
+    let empty = Arc::new(EmptySnapshot);
+    let generation = Arc::new(Generation::from_activated(
+        GenerationId::new(1),
+        ActivatedGeneration {
+            request_timeout: Duration::from_secs(30),
+            max_content_decoding_expansion_ratio: 128,
+            resource_plan: compiled.reloadable_plan.resource_plan.clone(),
+            bindings: ResolvedBindings::default(),
+            policy: empty.clone(),
+            egress: empty.clone(),
+            authorization: Arc::new(authorization),
+            credentials: empty.clone(),
+            redaction: empty.clone(),
+            observation: empty.clone(),
+            safety: empty,
+            owner: Arc::new(FakeOwner::default()),
+        },
+    ));
+    let lease = generation.try_lease().unwrap();
+    let body_guard = WireBodyPool::new(2 * 1024 * 1024, 2 * 1024 * 1024).begin_for_test(
+        512 * 1024,
+        WireBodyQuotaKey::from_peer("192.0.2.10".parse().unwrap(), |_| false),
+    );
+    let request = ProviderRequest {
+        request_id: "request-1",
+        url: "https://example.test/resource",
+        method: "GET",
+        client_ip: "192.0.2.10",
+        headers: None,
+        body: None,
+    };
+    let dispatch = lease.dispatch_authorization(
+        provider,
+        "rule-1",
+        request,
+        &body_guard,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+    );
+    tokio::pin!(dispatch);
+    let body = tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            _ = &mut dispatch => panic!("dispatch completed before callback"),
+            body = body_receiver => body.unwrap(),
+        }
+    })
+    .await
+    .expect("webhook request reaches provider");
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("webhook provider closes after acknowledgement")
+        .unwrap();
+
+    let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let encoded = value["resumeToken"].as_str().unwrap().as_bytes();
+    let encoded: [u8; 43] = encoded.try_into().unwrap();
+    let digest = ResumeTokenDigest::from_encoded(&encoded);
+    let claim = match webhook_runtime.pending_store().try_claim(digest).unwrap() {
+        CallbackClaimResult::Claimed(claim) => claim,
+        CallbackClaimResult::Expired(_) => panic!("fresh callback token expired"),
+    };
+    tokio::time::timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            _ = &mut dispatch => panic!("dispatch completed before claimed callback"),
+            _ = claim.payload().wait_for_delivery_teardown() => {}
+        }
+    })
+    .await
+    .expect("delivery teardown precedes callback parsing");
+    assert_eq!(webhook_runtime.transport_counts().live_deliveries, 0);
+    let payload = claim.complete().unwrap();
+    assert!(payload.complete(Ok(ProviderDecision::Deny)).is_ok());
+
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(5), dispatch)
+            .await
+            .expect("callback completion releases dispatch")
+            .unwrap(),
+        crate::authorization::AuthorizationDecision::Deny
+    ));
+    assert_eq!(webhook_runtime.pending_store().counts().occupancy, 0);
 }
 
 #[tokio::test]

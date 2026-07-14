@@ -148,6 +148,7 @@ impl ProductActivator {
         let authorization = ProductAuthorizationSnapshot::activate(
             authorization,
             provider_registry,
+            self.authorization_runtime.clone(),
             cancellation.clone(),
         )
         .await

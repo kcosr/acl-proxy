@@ -8,8 +8,12 @@ use super::process::{
 };
 #[cfg(test)]
 use super::protocol::ProviderRequest;
+use super::protocol::{ProviderBodyReplacement, ProviderCredentialSet, ProviderDecision};
+use super::webhook::provider::{WebhookActivationError, WebhookProvider};
+use super::webhook::runtime::{WebhookAuthorizationRuntime, WebhookDispatchError};
 use crate::config::compiler::{
-    AuthorizationPlan, AuthorizationProviderPlan, CompiledProviderFailureMode,
+    AuthorizationCallbackPlan, AuthorizationPlan, AuthorizationProviderPlan,
+    CompiledProviderFailureMode,
 };
 use crate::runtime::{
     ActivationCancellation, AuthorizationDispatchContext, AuthorizationSnapshot, BoxFuture,
@@ -20,10 +24,13 @@ use crate::safety::HttpWireBodyGuard;
 pub(crate) struct ProductAuthorizationSnapshot {
     internal_context_headers: Box<[HeaderName]>,
     providers: Box<[ActiveProvider]>,
+    callback: Option<AuthorizationCallbackPlan>,
+    webhook_runtime: Arc<WebhookAuthorizationRuntime>,
 }
 
 enum ActiveProvider {
     Process(Arc<ProcessProvider>),
+    Webhook(Arc<WebhookProvider>),
 }
 
 pub(crate) struct AuthorizationActivation {
@@ -38,31 +45,35 @@ pub(crate) struct AuthorizationProviderMetadata<'snapshot> {
     pub(crate) failure_mode: CompiledProviderFailureMode,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AuthorizationDecision {
-    Allow,
+    Allow {
+        credentials: Option<ProviderCredentialSet>,
+        replacement: Option<ProviderBodyReplacement>,
+    },
     Deny,
     Pass,
 }
 
-#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum AuthorizationDispatchError {
     #[error("authorization provider index is not active")]
     UnknownProvider,
     #[error("process authorization provider dispatch failed")]
     Process(#[source] ProcessRequestError),
+    #[error("webhook authorization provider dispatch failed")]
+    Webhook(#[source] WebhookDispatchError),
 }
 
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum AuthorizationActivationError {
     #[error("authorization activation was cancelled")]
     Cancelled,
-    #[error("authorization callbacks are not supported by this runtime")]
-    UnsupportedCallback,
     #[error("authorization provider registry does not match the activation plan")]
     ProviderRegistryMismatch,
-    #[error("authorization provider '{provider}' has a kind not supported by this runtime")]
-    UnsupportedProviderKind { provider: String },
+    #[error("webhook authorization callback configuration is inconsistent")]
+    InvalidWebhookConfiguration,
+    #[error("webhook authorization provider '{provider}' could not be activated")]
+    WebhookActivation { provider: String },
     #[error("process authorization provider '{provider}' requires unsupported capabilities")]
     UnsupportedProcessCapabilities { provider: String },
     #[error("process authorization provider '{provider}' could not be activated")]
@@ -73,21 +84,31 @@ impl ProductAuthorizationSnapshot {
     pub(crate) async fn activate(
         plan: AuthorizationPlan,
         provider_registry: ProviderRegistry,
+        webhook_runtime: Arc<WebhookAuthorizationRuntime>,
         cancellation: ActivationCancellation,
     ) -> Result<AuthorizationActivation, AuthorizationActivationError> {
-        Self::activate_inner(plan, provider_registry, cancellation, |_| {}).await
+        Self::activate_inner(
+            plan,
+            provider_registry,
+            webhook_runtime,
+            cancellation,
+            |_| {},
+        )
+        .await
     }
 
     #[cfg(test)]
     async fn activate_with_hook(
         plan: AuthorizationPlan,
         provider_registry: ProviderRegistry,
+        webhook_runtime: Arc<WebhookAuthorizationRuntime>,
         cancellation: ActivationCancellation,
         after_provider_activation: impl FnMut(&Arc<ProcessProvider>),
     ) -> Result<AuthorizationActivation, AuthorizationActivationError> {
         Self::activate_inner(
             plan,
             provider_registry,
+            webhook_runtime,
             cancellation,
             after_provider_activation,
         )
@@ -97,23 +118,21 @@ impl ProductAuthorizationSnapshot {
     async fn activate_inner(
         plan: AuthorizationPlan,
         provider_registry: ProviderRegistry,
+        webhook_runtime: Arc<WebhookAuthorizationRuntime>,
         cancellation: ActivationCancellation,
         mut after_provider_activation: impl FnMut(&Arc<ProcessProvider>),
     ) -> Result<AuthorizationActivation, AuthorizationActivationError> {
         if cancellation.is_cancelled() {
             return Err(AuthorizationActivationError::Cancelled);
         }
-        if plan.callback.is_some() {
-            return Err(AuthorizationActivationError::UnsupportedCallback);
-        }
-        if let Some((provider, _)) = plan
+        let has_webhook = plan
             .providers
-            .iter()
-            .find(|(_, plan)| matches!(plan, AuthorizationProviderPlan::Webhook(_)))
+            .values()
+            .any(|provider| matches!(provider, AuthorizationProviderPlan::Webhook(_)));
+        if has_webhook != plan.callback.is_some()
+            || (has_webhook && webhook_runtime.callback_url().is_none())
         {
-            return Err(AuthorizationActivationError::UnsupportedProviderKind {
-                provider: provider.clone(),
-            });
+            return Err(AuthorizationActivationError::InvalidWebhookConfiguration);
         }
 
         let registry_matches = provider_registry.len() == plan.providers.len()
@@ -131,22 +150,38 @@ impl ProductAuthorizationSnapshot {
                 provider_registry.get(&name).map(ProviderIndex::get),
                 Some(providers.len())
             );
-            let AuthorizationProviderPlan::Process(process_plan) = provider else {
-                unreachable!("unsupported provider kinds were rejected before activation");
-            };
-            let process =
-                match ProcessProvider::activate(process_plan, || cancellation.is_cancelled()).await
-                {
-                    Ok(process) => process,
-                    Err(error) => {
-                        let error = map_activation_error(error, &cancellation, &name);
-                        rollback.rollback().await;
-                        return Err(error);
-                    }
-                };
-            rollback.push(process.clone());
-            after_provider_activation(&process);
-            providers.push(ActiveProvider::Process(process));
+            match provider {
+                AuthorizationProviderPlan::Process(process_plan) => {
+                    let process = match ProcessProvider::activate(process_plan, || {
+                        cancellation.is_cancelled()
+                    })
+                    .await
+                    {
+                        Ok(process) => process,
+                        Err(error) => {
+                            let error = map_activation_error(error, &cancellation, &name);
+                            rollback.rollback().await;
+                            return Err(error);
+                        }
+                    };
+                    rollback.push(process.clone());
+                    after_provider_activation(&process);
+                    providers.push(ActiveProvider::Process(process));
+                }
+                AuthorizationProviderPlan::Webhook(webhook_plan) => {
+                    let webhook = match WebhookProvider::activate(webhook_plan, || {
+                        cancellation.is_cancelled()
+                    }) {
+                        Ok(webhook) => webhook,
+                        Err(error) => {
+                            let error = map_webhook_activation_error(error, &cancellation, &name);
+                            rollback.rollback().await;
+                            return Err(error);
+                        }
+                    };
+                    providers.push(ActiveProvider::Webhook(webhook));
+                }
+            }
         }
 
         if cancellation.is_cancelled() {
@@ -159,6 +194,8 @@ impl ProductAuthorizationSnapshot {
             snapshot: Self {
                 internal_context_headers: plan.internal_context_headers.into_boxed_slice(),
                 providers: providers.into_boxed_slice(),
+                callback: plan.callback,
+                webhook_runtime,
             },
             owners: rollback.disarm(),
         })
@@ -176,6 +213,10 @@ impl ProductAuthorizationSnapshot {
             ActiveProvider::Process(process) => Some(AuthorizationProviderMetadata {
                 include_headers: process.include_headers(),
                 failure_mode: process.failure_mode(),
+            }),
+            ActiveProvider::Webhook(webhook) => Some(AuthorizationProviderMetadata {
+                include_headers: webhook.include_headers(),
+                failure_mode: webhook.failure_mode(),
             }),
         }
     }
@@ -199,6 +240,9 @@ impl ProductAuthorizationSnapshot {
                     .await
                     .map(AuthorizationDecision::from)
                     .map_err(AuthorizationDispatchError::Process),
+                ActiveProvider::Webhook(_) => {
+                    unreachable!("process-only test dispatch selected a webhook provider")
+                }
             }
         })
     }
@@ -212,7 +256,6 @@ impl AuthorizationSnapshot for ProductAuthorizationSnapshot {
         guard: &'a HttpWireBodyGuard,
         request_deadline: Instant,
     ) -> BoxFuture<'a, Result<AuthorizationDecision, AuthorizationDispatchError>> {
-        let request = context.into_request();
         Box::pin(async move {
             let provider = self
                 .providers
@@ -220,10 +263,24 @@ impl AuthorizationSnapshot for ProductAuthorizationSnapshot {
                 .ok_or(AuthorizationDispatchError::UnknownProvider)?;
             match provider {
                 ActiveProvider::Process(process) => process
-                    .decide(request, guard, request_deadline)
+                    .decide(context.into_request(), guard, request_deadline)
                     .await
                     .map(AuthorizationDecision::from)
                     .map_err(AuthorizationDispatchError::Process),
+                ActiveProvider::Webhook(webhook) => self
+                    .webhook_runtime
+                    .dispatch(
+                        webhook.clone(),
+                        self.callback
+                            .as_ref()
+                            .expect("an activated webhook snapshot owns callback policy"),
+                        context,
+                        guard,
+                        request_deadline,
+                    )
+                    .await
+                    .map(AuthorizationDecision::from)
+                    .map_err(AuthorizationDispatchError::Webhook),
             }
         })
     }
@@ -232,9 +289,28 @@ impl AuthorizationSnapshot for ProductAuthorizationSnapshot {
 impl From<ProcessDecision> for AuthorizationDecision {
     fn from(decision: ProcessDecision) -> Self {
         match decision {
-            ProcessDecision::Allow => Self::Allow,
+            ProcessDecision::Allow => Self::Allow {
+                credentials: None,
+                replacement: None,
+            },
             ProcessDecision::Deny => Self::Deny,
             ProcessDecision::Pass => Self::Pass,
+        }
+    }
+}
+
+impl From<ProviderDecision> for AuthorizationDecision {
+    fn from(decision: ProviderDecision) -> Self {
+        match decision {
+            ProviderDecision::Allow {
+                credentials,
+                replacement,
+            } => Self::Allow {
+                credentials: Some(credentials),
+                replacement,
+            },
+            ProviderDecision::Deny => Self::Deny,
+            ProviderDecision::Pass => Self::Pass,
         }
     }
 }
@@ -258,6 +334,7 @@ impl AuthorizationActivation {
     pub(crate) fn process_provider_for_test(&self, index: usize) -> Option<Arc<ProcessProvider>> {
         match self.snapshot.providers.get(index)? {
             ActiveProvider::Process(provider) => Some(provider.clone()),
+            ActiveProvider::Webhook(_) => None,
         }
     }
 }
@@ -290,6 +367,20 @@ fn map_activation_error(
                 }
             }
             ProcessActivationError::Cancelled => AuthorizationActivationError::Cancelled,
+        }
+    }
+}
+
+fn map_webhook_activation_error(
+    error: WebhookActivationError,
+    cancellation: &ActivationCancellation,
+    provider: &str,
+) -> AuthorizationActivationError {
+    if cancellation.is_cancelled() || matches!(error, WebhookActivationError::Cancelled) {
+        AuthorizationActivationError::Cancelled
+    } else {
+        AuthorizationActivationError::WebhookActivation {
+            provider: provider.to_owned(),
         }
     }
 }
@@ -360,7 +451,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::config::compiler::{CompiledProviderFailureMode, ProcessProviderPlan};
+    use crate::config::compiler::{
+        AuthorizationCallbackPlan, CompiledProviderFailureMode, PendingOperationLimit,
+        ProcessProviderPlan, WebhookProviderPlan,
+    };
     use crate::runtime::{PublicationGuard, RuntimeError};
     use crate::safety::{WireBodyPool, WireBodyQuotaKey};
 
@@ -439,7 +533,13 @@ mod tests {
         cancellation: ActivationCancellation,
     ) -> Result<AuthorizationActivation, AuthorizationActivationError> {
         let provider_registry = ProviderRegistry::from_names(plan.providers.keys().cloned());
-        ProductAuthorizationSnapshot::activate(plan, provider_registry, cancellation).await
+        ProductAuthorizationSnapshot::activate(
+            plan,
+            provider_registry,
+            WebhookAuthorizationRuntime::for_test(None),
+            cancellation,
+        )
+        .await
     }
 
     fn request(id: &str) -> ProviderRequest<'_> {
@@ -510,6 +610,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn webhook_provider_activates_with_generation_callback_policy() {
+        let plan = AuthorizationPlan {
+            internal_context_headers: vec![],
+            callback: Some(AuthorizationCallbackPlan {
+                resume_token_ttl: Duration::from_secs(30),
+                max_pending_operations: PendingOperationLimit::try_new(4).unwrap(),
+            }),
+            providers: BTreeMap::from([(
+                "webhook".to_string(),
+                AuthorizationProviderPlan::Webhook(WebhookProviderPlan {
+                    url: "http://127.0.0.1:9/authorize".to_string(),
+                    timeout: Duration::from_secs(2),
+                    on_failure: CompiledProviderFailureMode::Deny,
+                    include_headers: vec![HeaderName::from_static("x-context")],
+                    max_request_bytes: 8192,
+                    max_response_bytes: 4096,
+                    outputs: BTreeMap::new(),
+                    tls: None,
+                }),
+            )]),
+        };
+        let registry = ProviderRegistry::from_names(plan.providers.keys().cloned());
+        let activation = ProductAuthorizationSnapshot::activate(
+            plan,
+            registry,
+            WebhookAuthorizationRuntime::for_test(Some(
+                "http://127.0.0.1:8888/_acl/external-auth/callback",
+            )),
+            cancellation(),
+        )
+        .await
+        .unwrap();
+        let provider = activation.provider_registry().get("webhook").unwrap();
+
+        assert_eq!(
+            activation
+                .provider_metadata(provider)
+                .unwrap()
+                .include_headers,
+            ["x-context"]
+        );
+        let (_, _, owners) = activation.into_parts();
+        assert!(owners.is_empty());
+    }
+
+    #[tokio::test]
     async fn object_safe_dispatch_routes_by_provider_index() {
         let directory = TempDir::new().unwrap();
         let script = write_python(
@@ -538,7 +684,7 @@ for line in sys.stdin:
         }
 
         let _: &dyn AuthorizationSnapshot = &snapshot;
-        assert_eq!(
+        assert!(matches!(
             snapshot
                 .dispatch_process_for_test(
                     provider,
@@ -548,8 +694,8 @@ for line in sys.stdin:
                 )
                 .await
                 .unwrap(),
-            AuthorizationDecision::Allow
-        );
+            AuthorizationDecision::Allow { .. }
+        ));
         let foreign =
             ProviderRegistry::from_names(["unused-a".to_string(), "unused-z".to_string()])
                 .get("unused-z")
@@ -605,7 +751,7 @@ for line in sys.stdin:
         assert_eq!(guard.live_bytes(), body_charge);
 
         let _: &dyn AuthorizationSnapshot = &snapshot;
-        assert_eq!(
+        assert!(matches!(
             snapshot
                 .dispatch_process_for_test(
                     provider,
@@ -616,7 +762,7 @@ for line in sys.stdin:
                 .await
                 .unwrap(),
             AuthorizationDecision::Pass
-        );
+        ));
         assert_eq!(guard.live_bytes(), body_charge);
 
         let body = guard.transfer_body(body).unwrap();
@@ -653,6 +799,7 @@ for line in sys.stdin:
         let result = ProductAuthorizationSnapshot::activate_with_hook(
             plan,
             ProviderRegistry::from_names(["different".to_string()]),
+            WebhookAuthorizationRuntime::for_test(None),
             cancellation(),
             |_| {
                 activations.fetch_add(1, Ordering::AcqRel);
@@ -690,6 +837,7 @@ for line in sys.stdin:
             ProductAuthorizationSnapshot::activate_with_hook(
                 plan,
                 provider_registry,
+                WebhookAuthorizationRuntime::for_test(None),
                 cancellation,
                 move |provider| {
                     let pid = provider.child_id().expect("activated provider has a child");

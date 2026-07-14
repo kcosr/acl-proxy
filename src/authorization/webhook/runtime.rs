@@ -8,12 +8,18 @@ use super::pool::{
     WebhookTransportArenaError, WebhookTransportLease,
 };
 use super::provider::WebhookProvider;
-use crate::authorization::callback::PendingCapabilityStore;
+use super::request::{WebhookRequest, WebhookRequestError};
+use super::transport::{connect_and_deliver, WebhookDeliveryError};
+use crate::authorization::callback::{
+    PendingCapabilityStore, PendingDeadline, PendingTerminalCause, PendingTerminalResult,
+};
 use crate::authorization::protocol::ProviderDecision;
+use crate::config::compiler::AuthorizationCallbackPlan;
 use crate::config::StaticProductConfig;
 use crate::destination::{DestinationFacts, DestinationGuard, DestinationGuardError};
-use crate::runtime::GenerationRetention;
+use crate::runtime::{AuthorizationDispatchContext, GenerationRetention, GenerationRetentionError};
 use crate::safety::wire_body::ProviderResponseCharge;
+use crate::safety::HttpWireBodyGuard;
 use crate::url::{canonicalize_http_url, CanonicalUrl, UrlError};
 
 pub(crate) struct WebhookAuthorizationRuntime {
@@ -63,6 +69,30 @@ pub(crate) enum WebhookAuthorizationRuntimeError {
     CallbackUrl(#[from] UrlError),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum WebhookDispatchError {
+    #[error("webhook callback configuration is unavailable")]
+    CallbackUnavailable,
+    #[error("webhook generation retention failed")]
+    Retention(#[from] GenerationRetentionError),
+    #[error("webhook transport admission failed")]
+    Transport(#[from] WebhookTransportAdmissionError),
+    #[error("webhook request preparation failed")]
+    Request(#[from] WebhookRequestError),
+    #[error("webhook pending operation admission failed")]
+    PendingAdmission,
+    #[error("webhook delivery failed")]
+    Delivery(#[from] WebhookDeliveryError),
+    #[error("webhook acknowledgement status was not successful: {0}")]
+    AcknowledgementStatus(u16),
+    #[error("webhook operation ended: {0:?}")]
+    Terminal(PendingTerminalCause),
+    #[error("webhook callback failed")]
+    Callback(#[from] WebhookCompletionError),
+    #[error("webhook callback completion channel closed")]
+    CompletionClosed,
+}
+
 impl WebhookAuthorizationRuntime {
     pub(crate) fn try_new(
         static_config: &StaticProductConfig,
@@ -82,6 +112,27 @@ impl WebhookAuthorizationRuntime {
             pending: PendingCapabilityStore::new(),
             callback_url,
         }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(callback_url: Option<&str>) -> Arc<Self> {
+        Self::for_test_with_destination(
+            callback_url,
+            DestinationGuard::system(DestinationFacts::for_test([], None, None, 16).unwrap()),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_with_destination(
+        callback_url: Option<&str>,
+        destination: DestinationGuard,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            transport: WebhookTransportArena::try_new(1, 64 * 1024, 128 * 1024).unwrap(),
+            destination,
+            pending: PendingCapabilityStore::new(),
+            callback_url: callback_url.map(|url| canonicalize_http_url(url).unwrap()),
+        })
     }
 
     pub(crate) fn try_acquire_transport(
@@ -112,6 +163,154 @@ impl WebhookAuthorizationRuntime {
 
     pub(crate) fn callback_url(&self) -> Option<&CanonicalUrl> {
         self.callback_url.as_ref()
+    }
+
+    pub(crate) async fn dispatch(
+        &self,
+        provider: Arc<WebhookProvider>,
+        callback: &AuthorizationCallbackPlan,
+        context: AuthorizationDispatchContext<'_>,
+        guard: &HttpWireBodyGuard,
+        request_deadline: tokio::time::Instant,
+    ) -> Result<ProviderDecision, WebhookDispatchError> {
+        let transport = self.try_acquire_transport()?;
+        let callback_url = self
+            .callback_url()
+            .ok_or(WebhookDispatchError::CallbackUnavailable)?;
+        let (rule_id, request, retention) = context.into_webhook_parts()?;
+        let request = WebhookRequest {
+            request_id: request.request_id,
+            rule_id,
+            url: request.url,
+            method: request.method,
+            client_ip: request.client_ip,
+            headers: request.headers,
+        };
+        let prepared = request.prepare(&callback_url.url, provider.max_request_bytes(), guard)?;
+
+        let dispatch_start = tokio::time::Instant::now();
+        let deadline = PendingDeadline::earliest(
+            dispatch_start,
+            request_deadline,
+            provider.timeout(),
+            callback.resume_token_ttl,
+        );
+        let teardown = DeliveryTeardown::new();
+        let teardown_guard = teardown.completion_guard();
+        let (completion, receiver) = oneshot::channel();
+        let payload = PendingWebhookOperation::new(
+            retention,
+            provider.clone(),
+            guard.provider_response_charge(),
+            teardown,
+            completion,
+        );
+        let admission = self
+            .pending
+            .try_admit(callback.max_pending_operations, deadline, payload)
+            .map_err(|_| WebhookDispatchError::PendingAdmission)?;
+        let (token, operation) = admission.into_parts();
+        let request_body = prepared.finish(&token)?;
+        drop(token);
+
+        let signal = operation.signal_handle();
+        let cancellation_signal = signal.clone();
+        let cancellation = async {
+            tokio::select! {
+                biased;
+                _ = cancellation_signal.wait_until_not_pending() => {}
+                _ = tokio::time::sleep_until(deadline.at()) => {}
+            }
+        };
+        let delivery = connect_and_deliver(
+            &self.destination,
+            &provider,
+            transport,
+            request_body,
+            cancellation,
+        )
+        .await;
+        drop(teardown_guard);
+
+        match delivery {
+            Ok(acknowledgement) if (200..300).contains(&acknowledgement.status) => {}
+            Ok(acknowledgement) => {
+                return terminal_delivery_result(
+                    operation,
+                    receiver,
+                    PendingTerminalCause::DeliveryFailed,
+                    WebhookDispatchError::AcknowledgementStatus(acknowledgement.status),
+                )
+                .await;
+            }
+            Err(WebhookDeliveryError::Cancelled) if !signal.is_pending() => {}
+            Err(WebhookDeliveryError::Cancelled) => {
+                return terminal_delivery_result(
+                    operation,
+                    receiver,
+                    deadline.cause(),
+                    WebhookDispatchError::Terminal(deadline.cause()),
+                )
+                .await;
+            }
+            Err(error) => {
+                return terminal_delivery_result(
+                    operation,
+                    receiver,
+                    PendingTerminalCause::DeliveryFailed,
+                    WebhookDispatchError::Delivery(error),
+                )
+                .await;
+            }
+        }
+
+        await_callback(operation, receiver).await
+    }
+}
+
+async fn terminal_delivery_result(
+    operation: crate::authorization::callback::PendingOperationGuard<PendingWebhookOperation>,
+    receiver: oneshot::Receiver<Result<ProviderDecision, WebhookCompletionError>>,
+    cause: PendingTerminalCause,
+    error: WebhookDispatchError,
+) -> Result<ProviderDecision, WebhookDispatchError> {
+    match operation.finish_pending(cause) {
+        PendingTerminalResult::Won(terminal) => {
+            drop(terminal);
+            Err(error)
+        }
+        PendingTerminalResult::ClaimOwns { .. } => await_callback(operation, receiver).await,
+        PendingTerminalResult::AlreadyTerminal | PendingTerminalResult::Poisoned => {
+            await_callback(operation, receiver).await
+        }
+    }
+}
+
+async fn await_callback(
+    operation: crate::authorization::callback::PendingOperationGuard<PendingWebhookOperation>,
+    mut receiver: oneshot::Receiver<Result<ProviderDecision, WebhookCompletionError>>,
+) -> Result<ProviderDecision, WebhookDispatchError> {
+    tokio::select! {
+        biased;
+        result = &mut receiver => {
+            drop(operation);
+            result.map_err(|_| WebhookDispatchError::CompletionClosed)?.map_err(Into::into)
+        }
+        terminal = operation.expire_at_deadline() => {
+            match terminal {
+                PendingTerminalResult::Won(terminal) => {
+                    let cause = terminal.cause();
+                    drop(terminal);
+                    Err(WebhookDispatchError::Terminal(cause))
+                }
+                PendingTerminalResult::ClaimOwns { .. }
+                | PendingTerminalResult::AlreadyTerminal
+                | PendingTerminalResult::Poisoned => receiver
+                    .await
+                    .map_err(|_| WebhookDispatchError::CompletionClosed)?
+                    .map_err(Into::into),
+            }
+        }
     }
 }
 

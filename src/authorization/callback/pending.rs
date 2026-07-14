@@ -599,18 +599,20 @@ impl<P> fmt::Debug for PendingOperationSignal<P> {
 }
 
 impl<P> PendingOperationSignal<P> {
+    pub(crate) fn is_pending(&self) -> bool {
+        self.store
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pending
+            .contains_key(&self.operation)
+    }
+
     pub(crate) async fn wait_until_not_pending(&self) {
         loop {
             let changed = self.store.inner.changed.notified();
-            let pending = self
-                .store
-                .inner
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .pending
-                .contains_key(&self.operation);
-            if !pending {
+            if !self.is_pending() {
                 return;
             }
             changed.await;
