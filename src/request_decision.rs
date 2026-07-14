@@ -4,19 +4,20 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use tokio::time::Instant;
 
 use crate::authorization::protocol::{
-    IncludedHeader, ProviderBodyReplacement, ProviderCredentialSet, ProviderRequest,
-    ProviderRequestHeaders,
+    GuardedProviderBody, IncludedHeader, ProviderBodyReplacement, ProviderCredentialSet,
+    ProviderRequest, ProviderRequestHeaders,
 };
 use crate::authorization::{AuthorizationDecision, AuthorizationDispatchError};
 use crate::config::compiler::{CompiledProviderFailureMode, HeaderEffectPlan};
 use crate::credentials::{CredentialError, InboundCredentials, ResolvedCredentialAction};
 use crate::policy::{PolicyEvaluation, PolicyOutcome, PolicyRuleMatch};
 use crate::runtime::{GenerationLease, ProviderIndex};
-use crate::safety::{HttpWireBodyGuard, UnknownHttpWireBodyPlan, WireBodyQuotaKey};
+use crate::safety::wire_body::WireBodyBufferError;
+use crate::safety::{GuardedBody, HttpWireBodyGuard, UnknownHttpWireBodyPlan, WireBodyQuotaKey};
 use crate::url::CanonicalUrl;
 
-/// Body-free strict request input. Body-bearing ingress will extend this type
-/// only after decoding can allocate from the guard selected by this decision.
+/// Strict request head. Body-bearing ingress prepares this first, then decodes
+/// only through the selected guard before completing the decision.
 pub(crate) struct RequestInput<'request> {
     pub(crate) request_id: &'request str,
     pub(crate) url: &'request CanonicalUrl,
@@ -28,7 +29,7 @@ pub(crate) struct RequestInput<'request> {
 }
 
 pub(crate) enum RequestDecision<'generation> {
-    Allow(AllowedRequest<'generation>),
+    Allow(Box<AllowedRequest<'generation>>),
     Deny(DeniedRequest<'generation>),
 }
 
@@ -37,6 +38,7 @@ pub(crate) struct AllowedRequest<'generation> {
     pub(crate) rule: Option<PolicyRuleMatch<'generation>>,
     pub(crate) provider_credentials: Option<ProviderCredentialSet>,
     pub(crate) body_replacement: Option<ProviderBodyReplacement>,
+    pub(crate) body: Option<GuardedRequestBody>,
 }
 
 pub(crate) struct DeniedRequest<'generation> {
@@ -56,6 +58,7 @@ pub(crate) enum DenyReason {
     Policy,
     Provider,
     ProviderFailure,
+    ProviderBodyLimit,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -64,6 +67,8 @@ pub(crate) enum RequestDecisionError {
     Credential(#[from] CredentialError),
     #[error("the policy wire-body plan does not belong to this generation")]
     BodyPlan(#[from] UnknownHttpWireBodyPlan),
+    #[error("request body was not allocated by the selected policy guard")]
+    BodyGuard(#[from] WireBodyBufferError),
     #[error("authorization provider metadata is missing")]
     MissingProvider,
     #[error("authorization request headers are invalid")]
@@ -97,8 +102,76 @@ impl<'generation> AllowedRequest<'generation> {
 
 pub(crate) async fn decide_request<'generation>(
     lease: &'generation GenerationLease,
-    mut input: RequestInput<'_>,
+    input: RequestInput<'_>,
 ) -> Result<RequestDecision<'generation>, RequestDecisionError> {
+    prepare_request(lease, input)?.decide(None).await
+}
+
+pub(crate) struct GuardedRequestBody {
+    pub(crate) content_type: Option<String>,
+    pub(crate) content_encoding: Option<String>,
+    pub(crate) decoded: GuardedBody,
+}
+
+pub(crate) struct PreparedRequest<'generation, 'request> {
+    lease: &'generation GenerationLease,
+    identity: RequestIdentity<'request>,
+    headers: HeaderMap,
+    inbound: InboundCredentials<'generation>,
+    internal_context: HeaderMap,
+    evaluation: PolicyEvaluation<'generation>,
+    guard: HttpWireBodyGuard,
+    early_deny: Option<DenyReason>,
+}
+
+impl<'generation, 'request> PreparedRequest<'generation, 'request> {
+    pub(crate) fn body_guard(&self) -> &HttpWireBodyGuard {
+        &self.guard
+    }
+
+    pub(crate) async fn decide(
+        self,
+        body: Option<GuardedRequestBody>,
+    ) -> Result<RequestDecision<'generation>, RequestDecisionError> {
+        let body = body
+            .map(|body| -> Result<_, WireBodyBufferError> {
+                Ok(GuardedRequestBody {
+                    content_type: body.content_type,
+                    content_encoding: body.content_encoding,
+                    decoded: self.guard.transfer_body(body.decoded)?,
+                })
+            })
+            .transpose()?;
+        if let Some(reason) = self.early_deny {
+            return Ok(RequestDecision::Deny(DeniedRequest {
+                common: DecidedRequest {
+                    headers: self.headers,
+                    body_guard: self.guard,
+                },
+                rule: None,
+                reason,
+            }));
+        }
+        evaluate_to_terminal(
+            self.lease,
+            DecisionState {
+                identity: self.identity,
+                headers: self.headers,
+                inbound: self.inbound,
+                internal_context: self.internal_context,
+                evaluation: self.evaluation,
+                guard: self.guard,
+                body,
+            },
+        )
+        .await
+    }
+}
+
+pub(crate) fn prepare_request<'generation, 'request>(
+    lease: &'generation GenerationLease,
+    mut input: RequestInput<'request>,
+) -> Result<PreparedRequest<'generation, 'request>, RequestDecisionError> {
     let inbound = lease.credentials().extract_inbound(&mut input.headers)?;
     let internal_context = strip_internal_context(
         &mut input.headers,
@@ -117,32 +190,42 @@ pub(crate) async fn decide_request<'generation>(
         .begin_http_body(evaluation.wire_body_plan(), input.quota_key)?;
 
     if lease.safety().contains_loop_marker(&input.headers) {
-        return Ok(RequestDecision::Deny(DeniedRequest {
-            common: DecidedRequest {
-                headers: input.headers,
-                body_guard: guard,
+        // Loop denial is completed through the same prepared request path so
+        // the selected guard remains the sole body authority.
+        return Ok(PreparedRequest {
+            lease,
+            identity: RequestIdentity {
+                request_id: input.request_id,
+                url: input.url,
+                method: input.method,
+                peer_ip: input.peer_ip,
+                deadline: input.deadline,
             },
-            rule: None,
-            reason: DenyReason::LoopDetected,
-        }));
+            headers: input.headers,
+            inbound,
+            internal_context,
+            evaluation,
+            guard,
+            early_deny: Some(DenyReason::LoopDetected),
+        });
     }
 
-    evaluate_to_terminal(
+    Ok(PreparedRequest {
         lease,
-        RequestIdentity {
+        identity: RequestIdentity {
             request_id: input.request_id,
             url: input.url,
             method: input.method,
             peer_ip: input.peer_ip,
             deadline: input.deadline,
         },
-        input.headers,
+        headers: input.headers,
         inbound,
         internal_context,
         evaluation,
         guard,
-    )
-    .await
+        early_deny: None,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -154,19 +237,33 @@ struct RequestIdentity<'request> {
     deadline: Instant,
 }
 
-async fn evaluate_to_terminal<'generation>(
-    lease: &'generation GenerationLease,
-    input: RequestIdentity<'_>,
+struct DecisionState<'generation, 'request> {
+    identity: RequestIdentity<'request>,
     headers: HeaderMap,
     inbound: InboundCredentials<'generation>,
     internal_context: HeaderMap,
-    mut evaluation: PolicyEvaluation<'generation>,
+    evaluation: PolicyEvaluation<'generation>,
     guard: HttpWireBodyGuard,
+    body: Option<GuardedRequestBody>,
+}
+
+async fn evaluate_to_terminal<'generation>(
+    lease: &'generation GenerationLease,
+    state: DecisionState<'generation, '_>,
 ) -> Result<RequestDecision<'generation>, RequestDecisionError> {
+    let DecisionState {
+        identity: input,
+        headers,
+        inbound,
+        internal_context,
+        mut evaluation,
+        guard,
+        mut body,
+    } = state;
     loop {
         match evaluation.outcome {
             PolicyOutcome::Allow => {
-                return Ok(RequestDecision::Allow(AllowedRequest {
+                return Ok(RequestDecision::Allow(Box::new(AllowedRequest {
                     common: DecidedRequest {
                         headers,
                         body_guard: guard,
@@ -174,7 +271,8 @@ async fn evaluate_to_terminal<'generation>(
                     rule: evaluation.matched,
                     provider_credentials: None,
                     body_replacement: None,
-                }));
+                    body,
+                })));
             }
             PolicyOutcome::Deny => {
                 return Ok(RequestDecision::Deny(DeniedRequest {
@@ -201,6 +299,27 @@ async fn evaluate_to_terminal<'generation>(
             .provider_metadata(provider)
             .ok_or(RequestDecisionError::MissingProvider)?;
         let failure_mode = metadata.failure_mode;
+        if metadata.include_request_body && body.is_none() {
+            body = Some(GuardedRequestBody {
+                content_type: None,
+                content_encoding: None,
+                decoded: guard.buffer().finish(),
+            });
+        }
+        if metadata.include_request_body
+            && body
+                .as_ref()
+                .is_some_and(|body| body.decoded.len() > metadata.max_decoded_request_body_bytes)
+        {
+            return Ok(RequestDecision::Deny(DeniedRequest {
+                common: DecidedRequest {
+                    headers,
+                    body_guard: guard,
+                },
+                rule: Some(matched),
+                reason: DenyReason::ProviderBodyLimit,
+            }));
+        }
         let provider_header_values = provider_header_values(
             metadata.include_headers,
             &headers,
@@ -215,13 +334,23 @@ async fn evaluate_to_terminal<'generation>(
         let provider_headers = ProviderRequestHeaders::new(&included_headers)
             .map_err(|_| RequestDecisionError::ProviderRequestHeaders)?;
         let peer_ip = input.peer_ip.to_string();
+        let provider_body = metadata.include_request_body.then(|| {
+            let body = body
+                .as_ref()
+                .expect("body-including providers receive at least an empty guarded body");
+            GuardedProviderBody {
+                content_type: body.content_type.as_deref(),
+                content_encoding: body.content_encoding.as_deref(),
+                decoded: &body.decoded,
+            }
+        });
         let provider_request = ProviderRequest {
             request_id: input.request_id,
             url: &input.url.url,
             method: input.method.as_str(),
             client_ip: &peer_ip,
             headers: (!included_headers.is_empty()).then_some(&provider_headers),
-            body: None,
+            body: provider_body,
         };
 
         let decision = match lease
@@ -253,7 +382,7 @@ async fn evaluate_to_terminal<'generation>(
                 credentials,
                 replacement,
             } => {
-                return Ok(RequestDecision::Allow(AllowedRequest {
+                return Ok(RequestDecision::Allow(Box::new(AllowedRequest {
                     common: DecidedRequest {
                         headers,
                         body_guard: guard,
@@ -261,7 +390,8 @@ async fn evaluate_to_terminal<'generation>(
                     rule: Some(matched),
                     provider_credentials: credentials,
                     body_replacement: replacement,
-                }));
+                    body,
+                })));
             }
             AuthorizationDecision::Deny => {
                 return Ok(RequestDecision::Deny(DeniedRequest {
@@ -411,9 +541,15 @@ header = "x-test-loop"
 
     async fn runtime(
         initial: CompiledConfig,
-    ) -> (Arc<Runtime>, Arc<QueueSource>, crate::runtime::GenerationId) {
+    ) -> (
+        Arc<Runtime>,
+        Arc<QueueSource>,
+        crate::runtime::GenerationId,
+        Arc<crate::safety::WireBodyPool>,
+    ) {
         let source = Arc::new(QueueSource(Mutex::new(VecDeque::new())));
         let resources = ProductStaticResources::try_new(&initial.static_config).unwrap();
+        let pool = resources.wire_body_pool();
         let activator = resources.activator();
         let ownership = StaticOwnership::new(
             initial.static_config.clone(),
@@ -424,7 +560,7 @@ header = "x-test-loop"
             .await
             .unwrap();
         let generation = runtime.start(initial).await.unwrap();
-        (runtime, source, generation)
+        (runtime, source, generation, pool)
     }
 
     fn input<'a>(
@@ -496,7 +632,7 @@ include_headers = ["x-test-identity"]
 header = "x-test-identity"
 process_providers = ["identity_sink"]"#,
         ));
-        let (runtime, source, first_id) = runtime(initial).await;
+        let (runtime, source, first_id, _pool) = runtime(initial).await;
         let old = runtime.lease().await.unwrap();
         let url = canonicalize_http_url("https://example.test/resource").unwrap();
         let mut headers = HeaderMap::new();
@@ -563,7 +699,12 @@ process_providers = ["identity_sink"]"#,
             r#"#!/bin/sh
 while IFS= read -r line; do
   id=$(printf "%s" "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-  [ -n "$id" ] && printf '{"id":"%s","type":"response","decision":"pass"}\n' "$id"
+  decision=pass
+  case "$line" in
+    *exact-body*ZXhhY3QtYm9keQ==*) ;;
+    *exact-body*) decision=deny ;;
+  esac
+  [ -n "$id" ] && printf '{"id":"%s","type":"response","decision":"%s"}\n' "$id" "$decision"
 done
 "#,
         )
@@ -575,6 +716,8 @@ while IFS= read -r line; do
   id=$(printf "%s" "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
   case "$line" in
     *deny*) decision=deny ;;
+    *exact-body*ZXhhY3QtYm9keQ==*) decision=allow ;;
+    *exact-body*) decision=deny ;;
     *) decision=allow ;;
   esac
   [ -n "$id" ] && printf '{"id":"%s","type":"response","decision":"%s"}\n' "$id" "$decision"
@@ -594,12 +737,18 @@ kind = "process"
 command = "{}"
 timeout = "2s"
 retire_timeout = "6s"
+include_request_body = true
+max_request_body_bytes = 1024
+max_decoded_request_body_bytes = 1024
 
 [authorization.providers.terminal]
 kind = "process"
 command = "{}"
 timeout = "2s"
-retire_timeout = "6s""#,
+retire_timeout = "6s"
+include_request_body = true
+max_request_body_bytes = 1024
+max_decoded_request_body_bytes = 1024"#,
             pass.display(),
             terminal.display()
         );
@@ -618,7 +767,7 @@ decision = "delegate"
 methods = ["GET"]
 authorization_provider = "terminal""#;
         let initial = compile(&config(policy, &providers));
-        let (runtime, _source, _) = runtime(initial).await;
+        let (runtime, _source, _, pool) = runtime(initial).await;
         let lease = runtime.lease().await.unwrap();
 
         for (path, expected_allow) in [("allow", true), ("deny", false)] {
@@ -639,6 +788,36 @@ authorization_provider = "terminal""#;
                 _ => panic!("unexpected terminal provider decision"),
             }
         }
+
+        let url = canonicalize_http_url("https://example.test/exact-body").unwrap();
+        let prepared =
+            prepare_request(&lease, input("exact-body", &url, HeaderMap::new())).unwrap();
+        let mut decoded = prepared.body_guard().buffer();
+        decoded.try_extend_from_slice(b"exact-body").unwrap();
+        let RequestDecision::Allow(allowed) = prepared
+            .decide(Some(GuardedRequestBody {
+                content_type: Some("text/plain".into()),
+                content_encoding: None,
+                decoded: decoded.finish(),
+            }))
+            .await
+            .unwrap()
+        else {
+            panic!("both providers must observe the exact preserved body");
+        };
+        assert_eq!(allowed.rule.as_ref().unwrap().id(), "terminal");
+        let forwarded = allowed
+            .body
+            .as_ref()
+            .unwrap()
+            .decoded
+            .segments()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        assert_eq!(forwarded, b"exact-body");
+        drop(allowed);
+        assert_eq!(pool.global_charge(), 0);
 
         drop(lease);
         runtime.shutdown().await;

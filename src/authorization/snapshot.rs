@@ -42,6 +42,8 @@ pub(crate) struct AuthorizationActivation {
 #[derive(Clone, Copy)]
 pub(crate) struct AuthorizationProviderMetadata<'snapshot> {
     pub(crate) include_headers: &'snapshot [HeaderName],
+    pub(crate) include_request_body: bool,
+    pub(crate) max_decoded_request_body_bytes: usize,
     pub(crate) failure_mode: CompiledProviderFailureMode,
 }
 
@@ -212,10 +214,14 @@ impl ProductAuthorizationSnapshot {
         match self.providers.get(provider.get())? {
             ActiveProvider::Process(process) => Some(AuthorizationProviderMetadata {
                 include_headers: process.include_headers(),
+                include_request_body: process.include_request_body(),
+                max_decoded_request_body_bytes: process.max_decoded_request_body_bytes(),
                 failure_mode: process.failure_mode(),
             }),
             ActiveProvider::Webhook(webhook) => Some(AuthorizationProviderMetadata {
                 include_headers: webhook.include_headers(),
+                include_request_body: false,
+                max_decoded_request_body_bytes: 0,
                 failure_mode: webhook.failure_mode(),
             }),
         }

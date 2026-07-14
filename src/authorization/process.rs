@@ -38,6 +38,8 @@ struct Inner {
     response_schema: DecisionOnlyResponseSchema,
     failure_mode: CompiledProviderFailureMode,
     include_headers: Box<[HeaderName]>,
+    include_request_body: bool,
+    max_decoded_request_body_bytes: usize,
     timeout: Duration,
     max_stdout_line_bytes: usize,
     max_pending_requests: usize,
@@ -207,7 +209,6 @@ impl ProcessProvider {
         mut is_cancelled: impl FnMut() -> bool,
     ) -> Result<Arc<Self>, ProcessActivationError> {
         let response_schema = DecisionOnlyResponseSchema::activate(&plan)
-            .filter(|_| !plan.include_request_body)
             .ok_or(ProcessActivationError::UnsupportedCapabilities)?;
         let ProcessProviderPlan {
             command,
@@ -222,7 +223,7 @@ impl ProcessProvider {
             include_request_body,
             allow_request_body_replacement,
             max_request_body_bytes: _,
-            max_decoded_request_body_bytes: _,
+            max_decoded_request_body_bytes,
             max_stdout_line_bytes,
             max_pending_requests,
             restart_backoff,
@@ -230,11 +231,7 @@ impl ProcessProvider {
             outputs,
         } = plan;
 
-        let _ = (
-            include_request_body,
-            allow_request_body_replacement,
-            outputs,
-        );
+        let _ = (allow_request_body_replacement, outputs);
 
         check_cancellation(&mut is_cancelled)?;
         let environment = capture_environment(
@@ -265,6 +262,8 @@ impl ProcessProvider {
             response_schema,
             failure_mode: on_failure,
             include_headers: include_headers.into_boxed_slice(),
+            include_request_body,
+            max_decoded_request_body_bytes,
             timeout,
             max_stdout_line_bytes,
             max_pending_requests,
@@ -322,13 +321,21 @@ impl ProcessProvider {
         self.inner.failure_mode
     }
 
+    pub(crate) fn include_request_body(&self) -> bool {
+        self.inner.include_request_body
+    }
+
+    pub(crate) fn max_decoded_request_body_bytes(&self) -> usize {
+        self.inner.max_decoded_request_body_bytes
+    }
+
     pub(crate) async fn decide(
         &self,
         request: ProviderRequest<'_>,
         guard: &HttpWireBodyGuard,
         request_deadline: Instant,
     ) -> Result<ProcessDecision, ProcessRequestError> {
-        if request.body.is_some() {
+        if request.body.is_some() != self.inner.include_request_body {
             return Err(ProcessRequestError::InvalidRequest);
         }
         let operation_deadline =
@@ -2041,7 +2048,7 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn activation_rejects_every_non_decision_only_capability() {
+    async fn activation_rejects_outputs_and_replacement_but_accepts_request_bodies() {
         let directory = TempDir::new().unwrap();
         let script = write_python(&directory, "raise SystemExit(0)\n");
 
@@ -2055,7 +2062,7 @@ for line in sys.stdin:
         let mut with_body = plan(&directory, &script);
         with_body.include_request_body = true;
 
-        for candidate in [with_output, with_replacement, with_body] {
+        for candidate in [with_output, with_replacement] {
             assert_eq!(
                 ProcessProvider::activate(candidate, || false)
                     .await
@@ -2063,6 +2070,10 @@ for line in sys.stdin:
                 ProcessActivationError::UnsupportedCapabilities
             );
         }
+        let provider = ProcessProvider::activate(with_body, || false)
+            .await
+            .expect("body inclusion uses the guarded request protocol");
+        cleanup(&provider).await;
     }
 
     #[tokio::test]
