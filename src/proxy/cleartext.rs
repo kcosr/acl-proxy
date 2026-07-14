@@ -11,7 +11,7 @@ use std::time::Duration;
 use bytes::Buf;
 use chrono::Utc;
 use http::header::{CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRAILER};
-use http::{HeaderMap, HeaderValue, Request, Response, StatusCode, Version};
+use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Version};
 use hyper::body::{Bytes, HttpBody, SizeHint};
 use hyper::server::conn::Http;
 use hyper::service::service_fn;
@@ -693,8 +693,8 @@ struct HttpCaptureContext {
     epoch: Arc<CaptureEpoch>,
     request_id: String,
     url: String,
-    method: String,
-    client: CaptureEndpoint,
+    method: Method,
+    client: SocketAddr,
     target: Option<CaptureEndpoint>,
     request_version: Version,
     max_expansion_ratio: usize,
@@ -706,7 +706,7 @@ impl HttpCaptureContext {
         epoch: Arc<CaptureEpoch>,
         request_id: String,
         peer: SocketAddr,
-        method: String,
+        method: Method,
         request_version: Version,
         max_expansion_ratio: usize,
     ) -> Self {
@@ -716,10 +716,7 @@ impl HttpCaptureContext {
             request_id,
             url: String::new(),
             method,
-            client: CaptureEndpoint {
-                address: Some(peer.ip().to_string()),
-                port: Some(peer.port()),
-            },
+            client: peer,
             target: None,
             request_version,
             max_expansion_ratio,
@@ -727,6 +724,9 @@ impl HttpCaptureContext {
     }
 
     fn bind_target(&mut self, target: &crate::url::CanonicalUrl) {
+        if !self.epoch.is_enabled() {
+            return;
+        }
         self.url.clone_from(&target.url);
         self.target = Some(CaptureEndpoint {
             address: Some(target.host_for_capture.clone()),
@@ -734,10 +734,16 @@ impl HttpCaptureContext {
         });
     }
 
+    fn captures(&self, event: CaptureEvent) -> bool {
+        self.epoch
+            .capture()
+            .is_some_and(|policy| policy.captures(event))
+    }
+
     fn begin(
         &self,
         event: CaptureEvent,
-        record: CaptureRecord,
+        record: impl FnOnce() -> CaptureRecord,
         body_headers: &HeaderMap,
     ) -> Option<CaptureSubmission> {
         HttpCaptureTap::try_begin(
@@ -805,7 +811,7 @@ impl HttpCaptureContext {
             decision,
             mode: CaptureMode::HttpProxy,
             url: self.url.clone(),
-            method: self.method.clone(),
+            method: self.method.to_string(),
             status_code: status.map(|status| status.as_u16()),
             status_message: if include_status_message {
                 status
@@ -814,7 +820,10 @@ impl HttpCaptureContext {
             } else {
                 None
             },
-            client: self.client.clone(),
+            client: CaptureEndpoint {
+                address: Some(self.client.ip().to_string()),
+                port: Some(self.client.port()),
+            },
             target: self.target.clone(),
             http_version: Some(http_version(version).to_owned()),
             headers: headers.map(headers_to_capture_map),
@@ -831,17 +840,25 @@ impl HttpCaptureContext {
         body_headers: &HeaderMap,
         provenance: TerminalRequestBodyProvenance,
     ) -> Option<CaptureSubmission> {
-        let mut record = self.request_record(CaptureDecision::Allow, Some(headers));
         if let TerminalRequestBodyProvenance::ProviderReplacement { size } = provenance {
-            record.mark_provider_replacement_omitted(size);
-            if let Some(mut submission) =
-                self.begin(CaptureEvent::RequestAllowed, record, body_headers)
-            {
+            if let Some(mut submission) = self.begin(
+                CaptureEvent::RequestAllowed,
+                || {
+                    let mut record = self.request_record(CaptureDecision::Allow, Some(headers));
+                    record.mark_provider_replacement_omitted(size);
+                    record
+                },
+                body_headers,
+            ) {
                 submission.abandon();
             }
             return None;
         }
-        self.begin(CaptureEvent::RequestAllowed, record, body_headers)
+        self.begin(
+            CaptureEvent::RequestAllowed,
+            || self.request_record(CaptureDecision::Allow, Some(headers)),
+            body_headers,
+        )
     }
 
     fn submit_denied_request(
@@ -850,13 +867,18 @@ impl HttpCaptureContext {
         body: Option<DecisionBody>,
         provenance: TerminalRequestBodyProvenance,
     ) {
-        let mut record = self.request_record(CaptureDecision::Deny, headers);
         let body_headers = body.as_ref().map(terminal_body_headers).unwrap_or_default();
-        if let TerminalRequestBodyProvenance::ProviderReplacement { size } = provenance {
-            record.mark_provider_replacement_omitted(size);
-        }
-        let Some(mut submission) = self.begin(CaptureEvent::RequestDenied, record, &body_headers)
-        else {
+        let Some(mut submission) = self.begin(
+            CaptureEvent::RequestDenied,
+            || {
+                let mut record = self.request_record(CaptureDecision::Deny, headers);
+                if let TerminalRequestBodyProvenance::ProviderReplacement { size } = provenance {
+                    record.mark_provider_replacement_omitted(size);
+                }
+                record
+            },
+            &body_headers,
+        ) else {
             return;
         };
         match (provenance, body) {
@@ -891,13 +913,15 @@ impl HttpCaptureContext {
             HeaderValue::from_str(&message.len().to_string())
                 .expect("fixed response length is a valid header"),
         );
-        let record =
-            self.response_record(decision, self.request_version, Some(&headers), status, true);
         let event = match decision {
             CaptureDecision::Allow => CaptureEvent::ResponseAllowed,
             CaptureDecision::Deny => CaptureEvent::ResponseDenied,
         };
-        if let Some(mut submission) = self.begin(event, record, &headers) {
+        if let Some(mut submission) = self.begin(
+            event,
+            || self.response_record(decision, self.request_version, Some(&headers), status, true),
+            &headers,
+        ) {
             submission.push(message.as_bytes());
             submission.finish();
         }
@@ -1042,7 +1066,7 @@ async fn execute_request(
 ) -> HandledResponse {
     let started_at = Instant::now();
     let request_id = request_id();
-    let request_method = request.method().to_string();
+    let request_method = request.method().clone();
     let request_version = request.version();
     let Some(lease) = runtime.lease().await else {
         return HandledResponse::fixed(
@@ -1194,12 +1218,14 @@ async fn execute_request(
             )
         }
     };
-    let decision_error_headers = sanitized_capture_headers(prepared.headers_for_observation());
+    let decision_error_headers = capture
+        .captures(CaptureEvent::RequestDenied)
+        .then(|| sanitized_capture_headers(prepared.headers_for_observation()));
     let decision = match prepared.decide(decision_body).await {
         Ok(decision) => decision,
         Err(error) => {
             capture.submit_denied_request(
-                Some(&decision_error_headers),
+                decision_error_headers.as_ref(),
                 None,
                 error
                     .body_provenance()
@@ -1340,13 +1366,15 @@ async fn execute_request(
     }
     let response_capture = capture.begin(
         CaptureEvent::ResponseAllowed,
-        capture.response_record(
-            CaptureDecision::Allow,
-            response.version(),
-            Some(response.headers()),
-            response.status(),
-            false,
-        ),
+        || {
+            capture.response_record(
+                CaptureDecision::Allow,
+                response.version(),
+                Some(response.headers()),
+                response.status(),
+                false,
+            )
+        },
         response.headers(),
     );
     HandledResponse {
@@ -1947,11 +1975,22 @@ max_total_bytes = 16777216
                                 .unwrap()
                                 .send(parts.headers)
                                 .ok();
+                            let (mut response_sender, response_body) = Body::channel();
+                            tokio::spawn(async move {
+                                response_sender
+                                    .send_data(Bytes::from_static(b"response-"))
+                                    .await
+                                    .unwrap();
+                                response_sender
+                                    .send_data(Bytes::from_static(b"body"))
+                                    .await
+                                    .unwrap();
+                            });
                             Ok::<_, Infallible>(
                                 Response::builder()
                                     .header(http::header::SET_COOKIE, "origin-cookie-secret")
                                     .header("x-origin-response", "visible")
-                                    .body(Body::from("response-body"))
+                                    .body(response_body)
                                     .unwrap(),
                             )
                         }

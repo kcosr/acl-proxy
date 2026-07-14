@@ -310,6 +310,24 @@ impl CaptureArtifactJob {
         }))
     }
 
+    fn begin_admitted(
+        epoch: Arc<CaptureEpoch>,
+        operation: CaptureOperation,
+        metadata: CaptureRecord,
+        max_expansion_ratio: usize,
+    ) -> Result<Self, CaptureArtifactJobError> {
+        if metadata.body.is_some() || metadata.body_truncated.is_some() {
+            return Err(CaptureArtifactJobError::MetadataAlreadyHasBodyOutcome);
+        }
+        Ok(Self {
+            operation,
+            epoch,
+            metadata: SanitizedCaptureMetadata::from_record(metadata),
+            payload: CaptureArtifactPayload::Unavailable,
+            max_expansion_ratio,
+        })
+    }
+
     pub(crate) fn operation(&self) -> &CaptureOperation {
         &self.operation
     }

@@ -22,10 +22,11 @@ impl HttpCaptureTap {
     pub(crate) fn try_begin(
         epoch: Arc<CaptureEpoch>,
         event: CaptureEvent,
-        metadata: CaptureRecord,
+        metadata: impl FnOnce() -> CaptureRecord,
         headers: &HeaderMap,
         max_expansion_ratio: usize,
     ) -> Option<Self> {
+        let operation = epoch.capture()?.try_admit(event)?;
         // Parse and copy the narrow, noncredential header state before the tap
         // can outlive the caller's complete header map.
         let encoding = parse_capture_content_encoding(headers).ok();
@@ -35,9 +36,13 @@ impl HttpCaptureTap {
             .map(str::to_owned);
         let content_encoding_present = headers.contains_key(CONTENT_ENCODING);
 
-        let job = match CaptureArtifactJob::try_begin(epoch, event, metadata, max_expansion_ratio) {
-            Ok(Some(job)) => job,
-            Ok(None) => return None,
+        let job = match CaptureArtifactJob::begin_admitted(
+            epoch,
+            operation,
+            metadata(),
+            max_expansion_ratio,
+        ) {
+            Ok(job) => job,
             Err(error) => {
                 tracing::debug!(error = %error, "capture tap omitted invalid metadata");
                 return None;
@@ -222,7 +227,7 @@ mod tests {
         let mut tap = HttpCaptureTap::try_begin(
             epoch,
             CaptureEvent::RequestAllowed,
-            metadata(),
+            metadata,
             &HeaderMap::new(),
             16,
         )
@@ -246,7 +251,7 @@ mod tests {
         let mut tap = HttpCaptureTap::try_begin(
             epoch,
             CaptureEvent::RequestAllowed,
-            metadata(),
+            metadata,
             &HeaderMap::new(),
             16,
         )
@@ -269,7 +274,7 @@ mod tests {
         let mut tap = HttpCaptureTap::try_begin(
             epoch,
             CaptureEvent::RequestAllowed,
-            metadata(),
+            metadata,
             &HeaderMap::new(),
             16,
         )
@@ -290,14 +295,9 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let mut tap = HttpCaptureTap::try_begin(
-            epoch,
-            CaptureEvent::RequestAllowed,
-            metadata(),
-            &headers,
-            23,
-        )
-        .expect("capture tap");
+        let mut tap =
+            HttpCaptureTap::try_begin(epoch, CaptureEvent::RequestAllowed, metadata, &headers, 23)
+                .expect("capture tap");
         tap.push(b"encoded");
 
         match tap.finish().payload {
@@ -321,14 +321,9 @@ mod tests {
         let (epoch, _pool, _owner) = epoch_with_limit(directory.path(), 128 * 1024);
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_ENCODING, HeaderValue::from_static("gzip, br"));
-        let mut tap = HttpCaptureTap::try_begin(
-            epoch,
-            CaptureEvent::RequestAllowed,
-            metadata(),
-            &headers,
-            16,
-        )
-        .expect("capture tap");
+        let mut tap =
+            HttpCaptureTap::try_begin(epoch, CaptureEvent::RequestAllowed, metadata, &headers, 16)
+                .expect("capture tap");
         tap.push(b"ignored");
 
         assert!(matches!(
@@ -339,15 +334,22 @@ mod tests {
 
     #[test]
     fn disabled_event_does_not_create_a_tap() {
+        use std::cell::Cell;
+
         let directory = tempfile::tempdir().unwrap();
         let (epoch, _pool, _owner) = epoch_with_limit(directory.path(), 128 * 1024);
+        let materialized = Cell::new(false);
         assert!(HttpCaptureTap::try_begin(
             epoch,
             CaptureEvent::ResponseAllowed,
-            metadata(),
+            || {
+                materialized.set(true);
+                metadata()
+            },
             &HeaderMap::new(),
             16,
         )
         .is_none());
+        assert!(!materialized.get());
     }
 }
