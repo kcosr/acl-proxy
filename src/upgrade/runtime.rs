@@ -139,37 +139,55 @@ impl fmt::Debug for UpgradedStreamSnapshot {
 /// in-progress capture cancellation. Every established relay pair must provide
 /// one, and only the entry coordinator invokes it.
 pub(crate) struct UpgradeTerminalControl {
-    raw_abort: AbortHandle,
-    established_close: Option<UpgradeTerminalBuilder>,
+    raw_teardown: RawTeardownOwner,
+    established_close: UpgradeTerminalBuilder,
+}
+
+struct RawTeardownOwner {
+    task: Option<JoinHandle<()>>,
+    abort: AbortHandle,
+}
+
+impl RawTeardownOwner {
+    fn new(task: JoinHandle<()>) -> Self {
+        let abort = task.abort_handle();
+        Self {
+            task: Some(task),
+            abort,
+        }
+    }
+
+    async fn abort_and_join(mut self) {
+        self.abort.abort();
+        let task = self.task.take().expect("raw teardown task is joined once");
+        if let Err(error) = task.await {
+            if !error.is_cancelled() {
+                tracing::error!(%error, "upgrade raw teardown task failed");
+            }
+        }
+    }
+}
+
+impl Drop for RawTeardownOwner {
+    fn drop(&mut self) {
+        self.abort.abort();
+    }
 }
 
 impl UpgradeTerminalControl {
-    pub(crate) fn new<Build, Task>(raw_abort: AbortHandle, established_close: Build) -> Self
+    pub(crate) fn new<Build, Task>(raw_teardown: JoinHandle<()>, established_close: Build) -> Self
     where
         Build: FnOnce(UpgradeTerminalCause) -> Task + Send + 'static,
         Task: Future<Output = ()> + Send + 'static,
     {
         Self {
-            raw_abort,
-            established_close: Some(Box::new(move |cause| Box::pin(established_close(cause)))),
+            raw_teardown: RawTeardownOwner::new(raw_teardown),
+            established_close: Box::new(move |cause| Box::pin(established_close(cause))),
         }
     }
 
-    fn into_task(mut self, cause: UpgradeTerminalCause) -> UpgradeTerminalTask {
-        let established_close = self
-            .established_close
-            .take()
-            .expect("terminal control is consumed exactly once");
-        Box::pin(async move {
-            established_close(cause).await;
-            drop(self);
-        })
-    }
-}
-
-impl Drop for UpgradeTerminalControl {
-    fn drop(&mut self) {
-        self.raw_abort.abort();
+    fn into_parts(self) -> (RawTeardownOwner, UpgradeTerminalBuilder) {
+        (self.raw_teardown, self.established_close)
     }
 }
 
@@ -1136,61 +1154,66 @@ fn handle_entry_task_completion(
 async fn finish_entry_cleanup_with_hook<Hook>(
     shared: &EntryShared,
     tasks: &mut JoinSet<EntryTaskResult>,
-    retain_relay_tasks: bool,
-    terminal_control: Option<UpgradeTerminalControl>,
+    established: bool,
+    terminal_control: UpgradeTerminalControl,
     cause: UpgradeTerminalCause,
     before_close_authorization: Hook,
 ) where
     Hook: FnOnce(),
 {
-    if !retain_relay_tasks {
-        tasks.shutdown().await;
-    }
-    if Instant::now() >= lock(&shared.timing).cleanup_cutoff {
-        tasks.shutdown().await;
-        return;
-    }
-    if let Some(control) = terminal_control {
+    let (raw_teardown, established_close) = terminal_control.into_parts();
+    'cleanup: {
+        if !established {
+            tasks.shutdown().await;
+            break 'cleanup;
+        }
+        if Instant::now() >= lock(&shared.timing).cleanup_cutoff {
+            tasks.shutdown().await;
+            break 'cleanup;
+        }
         before_close_authorization();
-        let mut control = Some(control);
+        let mut established_close = Some(established_close);
         let admitted = {
             let timing = lock(&shared.timing);
             if Instant::now() >= timing.cleanup_cutoff {
                 false
             } else {
-                let control = control.take().expect("close control is admitted once");
+                let established_close = established_close
+                    .take()
+                    .expect("established close is admitted once");
                 tasks.spawn(async move {
-                    control.into_task(cause).await;
+                    established_close(cause).await;
                     EntryTaskResult::TerminalControl
                 });
                 true
             }
         };
         if !admitted {
-            drop(control);
+            drop(established_close);
             tasks.shutdown().await;
-            return;
+            break 'cleanup;
         }
-    }
-    while !tasks.is_empty() {
-        let changed = shared.changed.notified();
-        let cutoff = lock(&shared.timing).cleanup_cutoff;
-        if Instant::now() >= cutoff {
-            tasks.shutdown().await;
-            return;
-        }
-        tokio::select! {
-            biased;
-            _ = tokio::time::sleep_until(cutoff) => {
+        while !tasks.is_empty() {
+            let changed = shared.changed.notified();
+            let cutoff = lock(&shared.timing).cleanup_cutoff;
+            if Instant::now() >= cutoff {
                 tasks.shutdown().await;
-                return;
+                break 'cleanup;
             }
-            joined = tasks.join_next() => {
-                let _ = joined;
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(cutoff) => {
+                    tasks.shutdown().await;
+                    break 'cleanup;
+                }
+                joined = tasks.join_next() => {
+                    let _ = joined;
+                }
+                _ = changed => {}
             }
-            _ = changed => {}
         }
     }
+    raw_teardown.abort_and_join().await;
 }
 
 async fn run_entry_coordinator(
@@ -1240,12 +1263,14 @@ async fn run_entry_coordinator_with_hooks<SetupHook, CloseHook>(
             let cause =
                 lock(&shared.winning_cause).expect("closing entry has a winning terminal cause");
             let established = phase == EntryPhase::Established;
-            let control = terminal_control.take();
+            let control = terminal_control
+                .take()
+                .expect("entry cleanup owns terminal control");
             finish_entry_cleanup_with_hook(
                 &shared,
                 &mut tasks,
                 established,
-                established.then_some(control).flatten(),
+                control,
                 cause,
                 before_close_authorization
                     .take()
@@ -1412,15 +1437,12 @@ mod tests {
         UpgradeAllocation::from_compiled_rule(rule, Some(wire_bytes)).unwrap()
     }
 
-    fn inert_abort_handle() -> AbortHandle {
-        let task = tokio::spawn(std::future::pending::<()>());
-        let abort = task.abort_handle();
-        drop(task);
-        abort
+    fn inert_raw_teardown() -> JoinHandle<()> {
+        tokio::spawn(std::future::pending::<()>())
     }
 
     fn inert_control() -> UpgradeTerminalControl {
-        UpgradeTerminalControl::new(inert_abort_handle(), |_| async {})
+        UpgradeTerminalControl::new(inert_raw_teardown(), |_| async {})
     }
 
     fn plan<Build, Setup>(build: Build) -> UpgradeEntryPlan
@@ -1453,16 +1475,6 @@ mod tests {
         })
         .await
         .expect("upgrade runtime counts did not converge")
-    }
-
-    async fn wait_for_atomic(counter: &AtomicUsize, expected: usize) {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while counter.load(Ordering::SeqCst) != expected {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("atomic counter did not converge");
     }
 
     #[test]
@@ -1597,14 +1609,27 @@ mod tests {
         }
     }
 
-    fn abort_handle_with_guard(guard: impl Send + 'static) -> AbortHandle {
-        let task = tokio::spawn(async move {
+    struct BlockingDrop {
+        started: Option<std_mpsc::Sender<()>>,
+        release: std_mpsc::Receiver<()>,
+        completed: Arc<AtomicUsize>,
+    }
+
+    impl Drop for BlockingDrop {
+        fn drop(&mut self) {
+            if let Some(started) = self.started.take() {
+                let _ = started.send(());
+            }
+            let _ = self.release.recv();
+            self.completed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn raw_teardown_with_guard(guard: impl Send + 'static) -> JoinHandle<()> {
+        tokio::spawn(async move {
             let _guard = guard;
             std::future::pending::<()>().await;
-        });
-        let abort = task.abort_handle();
-        drop(task);
-        abort
+        })
     }
 
     #[tokio::test]
@@ -1785,7 +1810,7 @@ mod tests {
                         None,
                         UpgradeEntryPlan::new(
                             UpgradeTerminalControl::new(
-                                abort_handle_with_guard((
+                                raw_teardown_with_guard((
                                     DropCount(raw_aborts.clone()),
                                     DropSignal(Some(raw_abort_tx)),
                                 )),
@@ -1921,7 +1946,7 @@ mod tests {
                         None,
                         UpgradeEntryPlan::new(
                             UpgradeTerminalControl::new(
-                                inert_abort_handle(),
+                                inert_raw_teardown(),
                                 move |cause| async move {
                                     let _ = cause_tx.send(cause);
                                     let _ = release_tx.send(());
@@ -1964,7 +1989,7 @@ mod tests {
                         None,
                         UpgradeEntryPlan::new(
                             UpgradeTerminalControl::new(
-                                inert_abort_handle(),
+                                inert_raw_teardown(),
                                 move |_| async move {
                                     let _ = cleanup_started_tx.send(());
                                     let _ = cleanup_release_rx.await;
@@ -2015,7 +2040,7 @@ mod tests {
                         None,
                         UpgradeEntryPlan::new(
                             UpgradeTerminalControl::new(
-                                abort_handle_with_guard(cleanup_drop),
+                                raw_teardown_with_guard(cleanup_drop),
                                 |_| async move {
                                     std::future::pending::<()>().await;
                                 },
@@ -2040,7 +2065,6 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), entry.wait_closed())
             .await
             .unwrap();
-        wait_for_atomic(&drops, 2).await;
         assert_eq!(drops.load(Ordering::SeqCst), 2);
         runtime.shutdown_and_wait(Some(Instant::now())).await;
     }
@@ -2140,7 +2164,7 @@ mod tests {
                             None,
                             UpgradeEntryPlan::new(
                                 UpgradeTerminalControl::new(
-                                    inert_abort_handle(),
+                                    inert_raw_teardown(),
                                     move |_| async move {
                                         control_calls.fetch_add(1, Ordering::SeqCst);
                                     },
@@ -2197,7 +2221,7 @@ mod tests {
                                 None,
                                 UpgradeEntryPlan::new(
                                     UpgradeTerminalControl::new(
-                                        abort_handle_with_guard(DropCount(raw_aborts.clone())),
+                                        raw_teardown_with_guard(DropCount(raw_aborts.clone())),
                                         move |_| async move {
                                             established_closes.fetch_add(1, Ordering::SeqCst);
                                         },
@@ -2225,23 +2249,24 @@ mod tests {
                     UpgradeTerminalCause::DownstreamWriteFailed
                 })
             );
-            wait_for_atomic(&raw_aborts, 1).await;
             assert_eq!(raw_aborts.load(Ordering::SeqCst), 1);
             assert_eq!(established_closes.load(Ordering::SeqCst), 0);
             runtime.shutdown_and_wait(Some(Instant::now())).await;
         }
     }
 
-    #[tokio::test]
-    async fn pre101_cleanup_uses_nonblocking_abort_handle() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn raw_teardown_is_joined_before_entry_closes() {
         let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
-        let raw_aborts = Arc::new(AtomicUsize::new(0));
+        let raw_teardowns = Arc::new(AtomicUsize::new(0));
         let established_closes = Arc::new(AtomicUsize::new(0));
         let setup_drops = Arc::new(AtomicUsize::new(0));
+        let (raw_started_tx, raw_started_rx) = std_mpsc::channel();
+        let (raw_release_tx, raw_release_rx) = std_mpsc::channel();
         let (entry_tx, entry_rx) = oneshot::channel();
         runtime
             .try_spawn_handshake(allocation(0, 0), {
-                let raw_aborts = raw_aborts.clone();
+                let raw_teardowns = raw_teardowns.clone();
                 let established_closes = established_closes.clone();
                 let setup_drops = setup_drops.clone();
                 move |handshake| async move {
@@ -2250,7 +2275,11 @@ mod tests {
                             None,
                             UpgradeEntryPlan::new(
                                 UpgradeTerminalControl::new(
-                                    abort_handle_with_guard(DropCount(raw_aborts.clone())),
+                                    raw_teardown_with_guard(BlockingDrop {
+                                        started: Some(raw_started_tx),
+                                        release: raw_release_rx,
+                                        completed: raw_teardowns,
+                                    }),
                                     move |_| async move {
                                         established_closes.fetch_add(1, Ordering::SeqCst);
                                     },
@@ -2267,13 +2296,22 @@ mod tests {
             })
             .unwrap();
         let entry = entry_rx.await.unwrap();
-        entry.wait_closed().await;
+        raw_started_rx.recv().unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), entry.wait_closed())
+                .await
+                .is_err(),
+            "entry closed before its raw teardown task joined"
+        );
+        raw_release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entry.wait_closed())
+            .await
+            .expect("entry did not close after raw teardown joined");
         assert_eq!(
             entry.terminal_cause(),
             Some(UpgradeTerminalCause::DownstreamWriteFailed)
         );
-        wait_for_atomic(&raw_aborts, 1).await;
-        assert_eq!(raw_aborts.load(Ordering::SeqCst), 1);
+        assert_eq!(raw_teardowns.load(Ordering::SeqCst), 1);
         assert_eq!(established_closes.load(Ordering::SeqCst), 0);
         assert_eq!(setup_drops.load(Ordering::SeqCst), 1);
         runtime.shutdown_and_wait(Some(Instant::now())).await;
@@ -2301,7 +2339,7 @@ mod tests {
                             None,
                             UpgradeEntryPlan::new(
                                 UpgradeTerminalControl::new(
-                                    abort_handle_with_guard(DropCount(raw_aborts.clone())),
+                                    raw_teardown_with_guard(DropCount(raw_aborts.clone())),
                                     move |_| async move {
                                         let _drop = DropCount(cleanup_drops);
                                         let _ = cleanup_started_tx.send(());
@@ -2339,7 +2377,6 @@ mod tests {
             entry.terminal_cause(),
             Some(UpgradeTerminalCause::PeerClosed)
         );
-        wait_for_atomic(&raw_aborts, 1).await;
         assert_eq!(raw_aborts.load(Ordering::SeqCst), 1);
         assert_eq!(cleanup_drops.load(Ordering::SeqCst), 1);
         assert_eq!(relay_drops.load(Ordering::SeqCst), 1);
@@ -2372,7 +2409,7 @@ mod tests {
             UpgradedStreamSnapshot::new(2, None),
             UpgradeEntryPlan::new(
                 UpgradeTerminalControl::new(
-                    abort_handle_with_guard(DropCount(raw_cancellations.clone())),
+                    raw_teardown_with_guard(DropCount(raw_cancellations.clone())),
                     {
                         let established_closes = established_closes.clone();
                         move |_| async move {
@@ -2402,7 +2439,6 @@ mod tests {
             .await
             .expect("coordinator did not reject setup after shutdown")
             .unwrap();
-        wait_for_atomic(&raw_cancellations, 1).await;
         assert_eq!(setup_effects.load(Ordering::SeqCst), 0);
         assert_eq!(established_closes.load(Ordering::SeqCst), 0);
         assert_eq!(
@@ -2437,7 +2473,7 @@ mod tests {
             UpgradedStreamSnapshot::new(2, None),
             UpgradeEntryPlan::new(
                 UpgradeTerminalControl::new(
-                    abort_handle_with_guard(DropCount(raw_cancellations.clone())),
+                    raw_teardown_with_guard(DropCount(raw_cancellations.clone())),
                     {
                         let close_effects = close_effects.clone();
                         move |_| async move {
@@ -2474,7 +2510,6 @@ mod tests {
             .await
             .expect("coordinator did not reject close after cutoff lowering")
             .unwrap();
-        wait_for_atomic(&raw_cancellations, 1).await;
         assert_eq!(close_effects.load(Ordering::SeqCst), 0);
         assert_eq!(relay_drops.load(Ordering::SeqCst), 1);
         assert_eq!(
@@ -2510,7 +2545,7 @@ mod tests {
                 UpgradedStreamSnapshot::new(2, None),
                 UpgradeEntryPlan::new(
                     UpgradeTerminalControl::new(
-                        abort_handle_with_guard(DropCount(raw_aborts.clone())),
+                        raw_teardown_with_guard(DropCount(raw_aborts.clone())),
                         {
                             let established_closes = established_closes.clone();
                             move |_| async move {
@@ -2544,7 +2579,6 @@ mod tests {
                 .await
                 .expect("coordinator did not resolve the setup/terminal race")
                 .unwrap();
-            wait_for_atomic(&raw_aborts, 1).await;
             assert_eq!(established_closes.load(Ordering::SeqCst), 1);
             assert_eq!(raw_aborts.load(Ordering::SeqCst), 1);
         }
@@ -2569,7 +2603,7 @@ mod tests {
                             None,
                             UpgradeEntryPlan::new(
                                 UpgradeTerminalControl::new(
-                                    abort_handle_with_guard(DropCount(raw_aborts.clone())),
+                                    raw_teardown_with_guard(DropCount(raw_aborts.clone())),
                                     move |_| async move {
                                         established_closes.fetch_add(1, Ordering::SeqCst);
                                     },
@@ -2598,7 +2632,6 @@ mod tests {
             entry.terminal_cause(),
             Some(UpgradeTerminalCause::PeerClosed)
         );
-        wait_for_atomic(&raw_aborts, 1).await;
         assert_eq!(established_closes.load(Ordering::SeqCst), 1);
         assert_eq!(raw_aborts.load(Ordering::SeqCst), 1);
         runtime.shutdown_and_wait(Some(Instant::now())).await;
@@ -2624,7 +2657,7 @@ mod tests {
                             None,
                             UpgradeEntryPlan::new(
                                 UpgradeTerminalControl::new(
-                                    abort_handle_with_guard(terminal),
+                                    raw_teardown_with_guard(terminal),
                                     move |_| async move {
                                         terminal_calls.fetch_add(1, Ordering::SeqCst);
                                         std::future::pending::<()>().await;
@@ -2665,7 +2698,6 @@ mod tests {
             async move { third.submit_terminal(UpgradeTerminalCause::Cancelled) },
         );
         entry.wait_closed().await;
-        wait_for_atomic(&drops, 3).await;
         assert_eq!(terminal_calls.load(Ordering::SeqCst), 1);
         assert_eq!(drops.load(Ordering::SeqCst), 3);
         assert_eq!(runtime.counts().reserved_slots, 0);
