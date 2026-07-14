@@ -247,6 +247,14 @@ impl<'a> IncludedHeader<'a> {
     pub(crate) fn new(name: &'a HeaderName, values: &'a [HeaderValue]) -> Self {
         Self { name, values }
     }
+
+    pub(crate) fn name(&self) -> &HeaderName {
+        self.name
+    }
+
+    pub(crate) fn values(&self) -> &[HeaderValue] {
+        self.values
+    }
 }
 
 pub(crate) struct ProviderRequestHeaders<'a> {
@@ -288,6 +296,10 @@ impl<'a> ProviderRequestHeaders<'a> {
 
     fn is_empty(&self) -> bool {
         self.fields.is_empty()
+    }
+
+    pub(crate) fn fields(&self) -> &[IncludedHeader<'a>] {
+        self.fields
     }
 }
 

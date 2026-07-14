@@ -536,6 +536,10 @@ impl<S> ConnectedDestination<S> {
         &mut self.stream
     }
 
+    pub(crate) fn into_stream(self) -> S {
+        self.stream
+    }
+
     pub(crate) fn map_stream<T>(self, map: impl FnOnce(S) -> T) -> ConnectedDestination<T> {
         ConnectedDestination {
             target: self.target,

@@ -30,6 +30,14 @@ impl ResumeToken {
     }
 
     #[cfg(test)]
+    pub(crate) fn from_encoded_for_test(encoded: [u8; RESUME_TOKEN_ENCODED_BYTES]) -> Self {
+        Self {
+            encoded: Zeroizing::new(encoded),
+            drop_observer: None,
+        }
+    }
+
+    #[cfg(test)]
     fn with_drop_observer(
         encoded: [u8; RESUME_TOKEN_ENCODED_BYTES],
         observer: std::sync::Arc<std::sync::atomic::AtomicBool>,
