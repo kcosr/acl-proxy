@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use allocator_api2::boxed::Box as FallibleBox;
 use zeroize::Zeroize;
 
-use crate::http1::store::{ParserStore, ParserStoreAllocationError};
+use crate::http1::store::{ParserStore, ParserStoreAllocationError, PARSER_STORE_BYTES};
 
 #[derive(Clone)]
 pub(crate) struct WebhookTransportArena {
@@ -35,8 +35,11 @@ impl WebhookTransportArena {
         if maximum_deliveries == 0 {
             return Err(WebhookTransportArenaError::ZeroDeliveries);
         }
-        if buffer_bytes == 0 {
-            return Err(WebhookTransportArenaError::ZeroBufferBytes);
+        if buffer_bytes < PARSER_STORE_BYTES {
+            return Err(WebhookTransportArenaError::BufferTooSmall {
+                minimum: PARSER_STORE_BYTES,
+                actual: buffer_bytes,
+            });
         }
         if maximum_transport_bytes == 0 {
             return Err(WebhookTransportArenaError::ZeroTransportBytes);
@@ -184,10 +187,9 @@ impl WebhookTransportLease {
 
 impl Drop for WebhookTransportLease {
     fn drop(&mut self) {
-        let Some(mut buffers) = self.buffers.take() else {
+        let Some(buffers) = self.buffers.take() else {
             return;
         };
-        buffers.wipe();
         drop(buffers);
         release_reservation(&self.arena);
     }
@@ -226,11 +228,10 @@ impl AsMut<[u8]> for WebhookOutboundBuffer {
 
 impl Drop for WebhookOutboundBuffer {
     fn drop(&mut self) {
-        let mut buffer = self
+        let buffer = self
             .buffer
             .take()
             .expect("webhook outbound wrapper always owns its buffer");
-        buffer.wipe();
         drop(buffer);
         self.reservation.release_buffer();
     }
@@ -257,11 +258,10 @@ impl WebhookInboundBuffer {
 
 impl Drop for WebhookInboundBuffer {
     fn drop(&mut self) {
-        let mut parser_store = self
+        let parser_store = self
             .parser_store
             .take()
             .expect("webhook inbound wrapper always owns its parser store");
-        parser_store.wipe();
         drop(parser_store);
         self.reservation.release_buffer();
     }
@@ -325,11 +325,6 @@ impl TransportBuffers {
             .map_err(|_| WebhookTransportAdmissionError::Allocation)?;
         Ok(Self { outbound, inbound })
     }
-
-    fn wipe(&mut self) {
-        self.outbound.wipe();
-        self.inbound.wipe();
-    }
 }
 
 struct OutboundBuffer {
@@ -387,7 +382,7 @@ struct OutboundAllocationError;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WebhookTransportArenaError {
     ZeroDeliveries,
-    ZeroBufferBytes,
+    BufferTooSmall { minimum: usize, actual: usize },
     ZeroTransportBytes,
     CapacityOverflow,
     InsufficientTransportBytes { required: usize, available: usize },
@@ -399,9 +394,10 @@ impl fmt::Display for WebhookTransportArenaError {
             Self::ZeroDeliveries => {
                 formatter.write_str("webhook transport arena requires a positive delivery limit")
             }
-            Self::ZeroBufferBytes => {
-                formatter.write_str("webhook transport buffers require a positive size")
-            }
+            Self::BufferTooSmall { minimum, actual } => write!(
+                formatter,
+                "webhook transport buffers require at least {minimum} bytes but received {actual}"
+            ),
             Self::ZeroTransportBytes => {
                 formatter.write_str("webhook transport arena requires a positive byte limit")
             }
@@ -504,14 +500,28 @@ mod tests {
         );
         assert_eq!(
             WebhookTransportArena::try_new(1, 0, 1).err().unwrap(),
-            WebhookTransportArenaError::ZeroBufferBytes
+            WebhookTransportArenaError::BufferTooSmall {
+                minimum: PARSER_STORE_BYTES,
+                actual: 0,
+            }
         );
         assert_eq!(
-            WebhookTransportArena::try_new(1, 1, 0).err().unwrap(),
+            WebhookTransportArena::try_new(1, PARSER_STORE_BYTES - 1, 2 * PARSER_STORE_BYTES,)
+                .err()
+                .unwrap(),
+            WebhookTransportArenaError::BufferTooSmall {
+                minimum: PARSER_STORE_BYTES,
+                actual: PARSER_STORE_BYTES - 1,
+            }
+        );
+        assert_eq!(
+            WebhookTransportArena::try_new(1, PARSER_STORE_BYTES, 0)
+                .err()
+                .unwrap(),
             WebhookTransportArenaError::ZeroTransportBytes
         );
         assert_eq!(
-            WebhookTransportArena::try_new(usize::MAX, 2, usize::MAX)
+            WebhookTransportArena::try_new(usize::MAX, PARSER_STORE_BYTES, usize::MAX)
                 .err()
                 .unwrap(),
             WebhookTransportArenaError::CapacityOverflow
