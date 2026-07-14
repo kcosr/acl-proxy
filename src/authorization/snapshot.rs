@@ -249,6 +249,17 @@ impl ProductAuthorizationSnapshot {
 }
 
 impl AuthorizationSnapshot for ProductAuthorizationSnapshot {
+    fn internal_context_headers(&self) -> &[HeaderName] {
+        ProductAuthorizationSnapshot::internal_context_headers(self)
+    }
+
+    fn provider_metadata(
+        &self,
+        provider: ProviderIndex,
+    ) -> Option<AuthorizationProviderMetadata<'_>> {
+        ProductAuthorizationSnapshot::provider_metadata(self, provider)
+    }
+
     fn dispatch<'a>(
         &'a self,
         provider: ProviderIndex,
@@ -594,15 +605,17 @@ mod tests {
 
         let alpha = activation.provider_registry().get("alpha").unwrap();
         let zeta = activation.provider_registry().get("zeta").unwrap();
+        let snapshot: &dyn AuthorizationSnapshot = &*activation;
         assert_eq!((alpha.get(), zeta.get()), (0, 1));
         assert_eq!(
-            activation.provider_metadata(alpha).unwrap().include_headers[0],
+            snapshot.provider_metadata(alpha).unwrap().include_headers[0],
             "x-alpha"
         );
         assert!(matches!(
-            activation.provider_metadata(zeta).unwrap().failure_mode,
+            snapshot.provider_metadata(zeta).unwrap().failure_mode,
             CompiledProviderFailureMode::Error
         ));
+        assert!(snapshot.internal_context_headers().is_empty());
 
         let (_, _, owners) = activation.into_parts();
         assert_eq!(owners.len(), 2);

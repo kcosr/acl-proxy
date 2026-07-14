@@ -110,7 +110,15 @@ impl ProductObservationSnapshot {
     }
 }
 
-impl ObservationSnapshot for ProductObservationSnapshot {}
+impl ObservationSnapshot for ProductObservationSnapshot {
+    fn logging(&self) -> &ObservationLoggingPolicy {
+        ProductObservationSnapshot::logging(self)
+    }
+
+    fn capture(&self) -> Option<&CapturePolicy> {
+        ProductObservationSnapshot::capture(self)
+    }
+}
 
 pub(crate) struct ObservationActivation {
     snapshot: ProductObservationSnapshot,

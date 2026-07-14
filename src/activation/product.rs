@@ -568,6 +568,62 @@ header = "x-acl-proxy-request-id"
 
         assert_eq!(activated.bindings.provider_count, 0);
         assert_eq!(activated.bindings.redaction_profile_count, 1);
+        let url = crate::url::canonicalize_http_url("https://example.test/resource").unwrap();
+        let policy = activated.policy.evaluate(
+            &url,
+            "192.0.2.10".parse().unwrap(),
+            &http::Method::GET,
+            &http::HeaderMap::new(),
+            &|_| false,
+        );
+        assert_eq!(policy.outcome, crate::policy::PolicyOutcome::Deny);
+        assert!(policy.matched.is_none());
+
+        assert!(matches!(
+            activated.egress.route(),
+            crate::egress::EgressRoute::Direct
+        ));
+        assert_eq!(activated.egress.origin_http_versions().len(), 2);
+        assert!(activated.egress.credential_actions().is_empty());
+        let mut request_headers = http::HeaderMap::new();
+        activated
+            .egress
+            .apply_request_headers(&mut request_headers)
+            .unwrap();
+        let _origin_client = activated.egress.origin_client();
+        let _origin_trust = activated.egress.origin_trust();
+
+        assert_eq!(activated.credentials.source_count(), 0);
+        activated
+            .credentials
+            .inject(&[], &mut request_headers)
+            .unwrap();
+        let inbound = activated
+            .credentials
+            .extract_inbound(&mut request_headers)
+            .unwrap();
+        assert!(!inbound.is_present(&http::header::AUTHORIZATION));
+
+        assert!(activated
+            .authorization
+            .internal_context_headers()
+            .is_empty());
+
+        assert_eq!(activated.redaction.len(), 1);
+        assert!(!activated.redaction.is_empty());
+        assert!(activated.redaction.compiled_matcher_resident_bytes() > 0);
+        let capture = activated
+            .observation
+            .capture()
+            .expect("capture policy is generation-owned");
+        assert!(activated
+            .redaction
+            .profile(capture.profile_index())
+            .is_some());
+        assert!(matches!(
+            activated.observation.logging().level(),
+            crate::config::compiler::CompiledLogLevel::Info
+        ));
         assert_eq!(observation_runtime.committed_capture_limit(), 0);
         let mut publication = activated.owner.publication_guard().unwrap();
         publication.commit();

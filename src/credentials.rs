@@ -229,7 +229,26 @@ impl CredentialResolverSnapshot {
     }
 }
 
-impl crate::runtime::CredentialResolver for CredentialResolverSnapshot {}
+impl crate::runtime::CredentialResolver for CredentialResolverSnapshot {
+    fn source_count(&self) -> usize {
+        CredentialResolverSnapshot::source_count(self)
+    }
+
+    fn inject(
+        &self,
+        actions: &[ResolvedCredentialAction],
+        headers: &mut HeaderMap,
+    ) -> Result<(), CredentialError> {
+        CredentialResolverSnapshot::inject(self, actions, headers)
+    }
+
+    fn extract_inbound<'resolver>(
+        &'resolver self,
+        headers: &mut HeaderMap,
+    ) -> Result<InboundCredentials<'resolver>, CredentialError> {
+        CredentialResolverSnapshot::extract_inbound(self, headers)
+    }
+}
 
 impl CredentialActivation {
     pub(crate) fn source_registry(&self) -> &CredentialSourceRegistry {

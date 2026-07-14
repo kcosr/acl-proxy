@@ -367,7 +367,18 @@ impl<'snapshot> PolicyRuleMatch<'snapshot> {
     }
 }
 
-impl crate::runtime::PolicySnapshot for CompiledPolicySnapshot {}
+impl crate::runtime::PolicySnapshot for CompiledPolicySnapshot {
+    fn evaluate<'snapshot>(
+        &'snapshot self,
+        url: &CanonicalUrl,
+        peer_ip: IpAddr,
+        method: &Method,
+        headers: &HeaderMap,
+        extra_presence: &dyn Fn(&HeaderName) -> bool,
+    ) -> PolicyEvaluation<'snapshot> {
+        CompiledPolicySnapshot::evaluate(self, url, peer_ip, method, headers, extra_presence)
+    }
+}
 
 fn resolved_bindings(
     rules: &[ActivatedPolicyRule],

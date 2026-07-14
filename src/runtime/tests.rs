@@ -53,9 +53,58 @@ impl LocalAddressSource for EmptyLocalAddressSource {
     }
 }
 
-impl PolicySnapshot for EmptySnapshot {}
-impl EgressSnapshot for EmptySnapshot {}
+impl PolicySnapshot for EmptySnapshot {
+    fn evaluate<'snapshot>(
+        &'snapshot self,
+        _url: &crate::url::CanonicalUrl,
+        _peer_ip: std::net::IpAddr,
+        _method: &http::Method,
+        _headers: &http::HeaderMap,
+        _extra_presence: &dyn Fn(&http::HeaderName) -> bool,
+    ) -> crate::policy::PolicyEvaluation<'snapshot> {
+        panic!("empty test policy cannot evaluate requests")
+    }
+}
+impl EgressSnapshot for EmptySnapshot {
+    fn route(&self) -> &crate::egress::EgressRoute {
+        panic!("empty test egress has no route")
+    }
+
+    fn origin_client(&self) -> crate::egress::OriginClient {
+        panic!("empty test egress has no client")
+    }
+
+    fn origin_trust(&self) -> crate::config::compiler::CompiledTlsTrust {
+        panic!("empty test egress has no trust policy")
+    }
+
+    fn origin_http_versions(&self) -> &[crate::config::compiler::CompiledHttpVersion] {
+        &[]
+    }
+
+    fn apply_request_headers(
+        &self,
+        _headers: &mut http::HeaderMap,
+    ) -> Result<(), crate::policy::HeaderEffectError> {
+        Ok(())
+    }
+
+    fn credential_actions(&self) -> &[crate::credentials::ResolvedCredentialAction] {
+        &[]
+    }
+}
 impl AuthorizationSnapshot for EmptySnapshot {
+    fn internal_context_headers(&self) -> &[http::HeaderName] {
+        &[]
+    }
+
+    fn provider_metadata(
+        &self,
+        _provider: ProviderIndex,
+    ) -> Option<crate::authorization::AuthorizationProviderMetadata<'_>> {
+        None
+    }
+
     fn dispatch<'a>(
         &'a self,
         _provider: ProviderIndex,
@@ -72,9 +121,56 @@ impl AuthorizationSnapshot for EmptySnapshot {
         Box::pin(async { Err(crate::authorization::AuthorizationDispatchError::UnknownProvider) })
     }
 }
-impl CredentialResolver for EmptySnapshot {}
-impl RedactionSnapshot for EmptySnapshot {}
-impl ObservationSnapshot for EmptySnapshot {}
+impl CredentialResolver for EmptySnapshot {
+    fn source_count(&self) -> usize {
+        0
+    }
+
+    fn inject(
+        &self,
+        actions: &[crate::credentials::ResolvedCredentialAction],
+        _headers: &mut http::HeaderMap,
+    ) -> Result<(), crate::credentials::CredentialError> {
+        assert!(actions.is_empty());
+        Ok(())
+    }
+
+    fn extract_inbound<'resolver>(
+        &'resolver self,
+        _headers: &mut http::HeaderMap,
+    ) -> Result<
+        crate::credentials::InboundCredentials<'resolver>,
+        crate::credentials::CredentialError,
+    > {
+        panic!("empty test credentials cannot extract inbound values")
+    }
+}
+impl RedactionSnapshot for EmptySnapshot {
+    fn profile(&self, _index: RedactionProfileIndex) -> Option<crate::redaction::ProfileHandle> {
+        None
+    }
+
+    fn len(&self) -> usize {
+        0
+    }
+
+    fn is_empty(&self) -> bool {
+        true
+    }
+
+    fn compiled_matcher_resident_bytes(&self) -> usize {
+        0
+    }
+}
+impl ObservationSnapshot for EmptySnapshot {
+    fn logging(&self) -> &crate::observation::ObservationLoggingPolicy {
+        panic!("empty test observation has no logging policy")
+    }
+
+    fn capture(&self) -> Option<&crate::observation::CapturePolicy> {
+        None
+    }
+}
 impl SafetySnapshot for EmptySnapshot {
     fn contains_loop_marker(&self, _headers: &http::HeaderMap) -> bool {
         false

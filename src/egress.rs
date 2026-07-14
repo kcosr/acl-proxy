@@ -162,7 +162,31 @@ impl EgressSnapshot {
     }
 }
 
-impl crate::runtime::EgressSnapshot for EgressSnapshot {}
+impl crate::runtime::EgressSnapshot for EgressSnapshot {
+    fn route(&self) -> &EgressRoute {
+        EgressSnapshot::route(self)
+    }
+
+    fn origin_client(&self) -> OriginClient {
+        EgressSnapshot::origin_client(self)
+    }
+
+    fn origin_trust(&self) -> CompiledTlsTrust {
+        EgressSnapshot::origin_trust(self)
+    }
+
+    fn origin_http_versions(&self) -> &[CompiledHttpVersion] {
+        EgressSnapshot::origin_http_versions(self)
+    }
+
+    fn apply_request_headers(&self, headers: &mut HeaderMap) -> Result<(), HeaderEffectError> {
+        EgressSnapshot::apply_request_headers(self, headers)
+    }
+
+    fn credential_actions(&self) -> &[ResolvedCredentialAction] {
+        EgressSnapshot::credential_actions(self)
+    }
+}
 
 impl ParentEndpoint {
     fn activate(

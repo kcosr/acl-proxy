@@ -143,18 +143,75 @@ pub(crate) struct ResolvedBindings {
     pub(crate) rules: Box<[ResolvedRuleBindings]>,
 }
 
-macro_rules! snapshot_handle {
-    ($name:ident) => {
-        pub(crate) trait $name: Send + Sync {}
-    };
+pub(crate) trait PolicySnapshot: Send + Sync {
+    fn evaluate<'snapshot>(
+        &'snapshot self,
+        url: &crate::url::CanonicalUrl,
+        peer_ip: std::net::IpAddr,
+        method: &http::Method,
+        headers: &HeaderMap,
+        extra_presence: &dyn Fn(&http::HeaderName) -> bool,
+    ) -> crate::policy::PolicyEvaluation<'snapshot>;
 }
 
-snapshot_handle!(PolicySnapshot);
-snapshot_handle!(EgressSnapshot);
-snapshot_handle!(CredentialResolver);
-snapshot_handle!(RedactionSnapshot);
-snapshot_handle!(ObservationSnapshot);
+pub(crate) trait EgressSnapshot: Send + Sync {
+    fn route(&self) -> &crate::egress::EgressRoute;
+
+    fn origin_client(&self) -> crate::egress::OriginClient;
+
+    fn origin_trust(&self) -> crate::config::compiler::CompiledTlsTrust;
+
+    fn origin_http_versions(&self) -> &[crate::config::compiler::CompiledHttpVersion];
+
+    fn apply_request_headers(
+        &self,
+        headers: &mut HeaderMap,
+    ) -> Result<(), crate::policy::HeaderEffectError>;
+
+    fn credential_actions(&self) -> &[crate::credentials::ResolvedCredentialAction];
+}
+
+pub(crate) trait CredentialResolver: Send + Sync {
+    fn source_count(&self) -> usize;
+
+    fn inject(
+        &self,
+        actions: &[crate::credentials::ResolvedCredentialAction],
+        headers: &mut HeaderMap,
+    ) -> Result<(), crate::credentials::CredentialError>;
+
+    fn extract_inbound<'resolver>(
+        &'resolver self,
+        headers: &mut HeaderMap,
+    ) -> Result<
+        crate::credentials::InboundCredentials<'resolver>,
+        crate::credentials::CredentialError,
+    >;
+}
+
+pub(crate) trait RedactionSnapshot: Send + Sync {
+    fn profile(&self, index: RedactionProfileIndex) -> Option<crate::redaction::ProfileHandle>;
+
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool;
+
+    fn compiled_matcher_resident_bytes(&self) -> usize;
+}
+
+pub(crate) trait ObservationSnapshot: Send + Sync {
+    fn logging(&self) -> &crate::observation::ObservationLoggingPolicy;
+
+    fn capture(&self) -> Option<&crate::observation::CapturePolicy>;
+}
 pub(crate) trait AuthorizationSnapshot: Send + Sync {
+    fn internal_context_headers(&self) -> &[http::HeaderName];
+
+    fn provider_metadata(
+        &self,
+        provider: ProviderIndex,
+    ) -> Option<crate::authorization::AuthorizationProviderMetadata<'_>>;
+
     fn dispatch<'a>(
         &'a self,
         provider: ProviderIndex,

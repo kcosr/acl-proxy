@@ -192,7 +192,23 @@ impl RedactionSnapshot {
     }
 }
 
-impl crate::runtime::RedactionSnapshot for RedactionSnapshot {}
+impl crate::runtime::RedactionSnapshot for RedactionSnapshot {
+    fn profile(&self, index: RedactionProfileIndex) -> Option<ProfileHandle> {
+        RedactionSnapshot::profile(self, index)
+    }
+
+    fn len(&self) -> usize {
+        RedactionSnapshot::len(self)
+    }
+
+    fn is_empty(&self) -> bool {
+        RedactionSnapshot::is_empty(self)
+    }
+
+    fn compiled_matcher_resident_bytes(&self) -> usize {
+        RedactionSnapshot::compiled_matcher_resident_bytes(self)
+    }
+}
 
 impl RedactionActivation {
     pub(crate) fn profile_index(&self, name: &str) -> Option<RedactionProfileIndex> {
