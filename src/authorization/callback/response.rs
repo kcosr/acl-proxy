@@ -33,9 +33,8 @@ pub(crate) struct CallbackResponsePrefix {
 
 impl CallbackResponsePrefix {
     pub(crate) fn parse(
-        prefix: [u8; CALLBACK_RESPONSE_PREFIX_BYTES],
+        prefix: &[u8; CALLBACK_RESPONSE_PREFIX_BYTES],
     ) -> Result<Self, CallbackPrefixError> {
-        let prefix = Zeroizing::new(prefix);
         let token_start = CALLBACK_PREFIX_START.len();
         let token_end = token_start + RESUME_TOKEN_ENCODED_BYTES;
         if &prefix[..token_start] != CALLBACK_PREFIX_START
@@ -46,10 +45,11 @@ impl CallbackResponsePrefix {
         {
             return Err(CallbackPrefixError::Invalid);
         }
-        let mut encoded = Zeroizing::new([0u8; RESUME_TOKEN_ENCODED_BYTES]);
-        encoded.copy_from_slice(&prefix[token_start..token_end]);
+        let encoded: &[u8; RESUME_TOKEN_ENCODED_BYTES] = prefix[token_start..token_end]
+            .try_into()
+            .expect("the canonical token range has one fixed length");
         Ok(Self {
-            digest: ResumeTokenDigest::from_encoded(&encoded),
+            digest: ResumeTokenDigest::from_encoded(encoded),
         })
     }
 
@@ -792,7 +792,7 @@ mod tests {
             .unwrap_or(&[])
             .try_into()
             .map_err(|_| CallbackResponseError::Malformed)?;
-        CallbackResponsePrefix::parse(prefix).map_err(|_| CallbackResponseError::Malformed)?;
+        CallbackResponsePrefix::parse(&prefix).map_err(|_| CallbackResponseError::Malformed)?;
         let mut parser =
             AssignedCallbackResponseParser::new(outputs, charge, provider_limit, control_limit)?;
         for chunk in body[CALLBACK_RESPONSE_PREFIX_BYTES..].chunks(3) {
@@ -822,8 +822,8 @@ mod tests {
 
     #[test]
     fn callback_prefix_is_exact_redacted_and_replay_stable() {
-        let parsed = CallbackResponsePrefix::parse(*PREFIX).unwrap();
-        let replay = CallbackResponsePrefix::parse(*PREFIX).unwrap();
+        let parsed = CallbackResponsePrefix::parse(PREFIX).unwrap();
+        let replay = CallbackResponsePrefix::parse(PREFIX).unwrap();
         assert_eq!(parsed.digest(), replay.digest());
         assert!(!format!("{parsed:?}").contains("AAAA"));
 
@@ -842,7 +842,7 @@ mod tests {
             noncanonical_delimiter,
         ] {
             assert_eq!(
-                CallbackResponsePrefix::parse(invalid),
+                CallbackResponsePrefix::parse(&invalid),
                 Err(CallbackPrefixError::Invalid)
             );
         }

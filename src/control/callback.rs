@@ -2,7 +2,7 @@ use std::future::Future;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::time::Instant;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::authorization::callback::{
     AssignedCallbackResponseParser, CallbackClaim, CallbackClaimError, CallbackClaimResult,
@@ -87,6 +87,35 @@ where
     R: AsyncRead + Unpin,
     P: CallbackPayload,
 {
+    let outcome = handle_callback_entity_inner(
+        reader,
+        store,
+        framing,
+        pending,
+        control_max_request_body_bytes,
+        body_deadline,
+    )
+    .await;
+    let connection_reusable = outcome.connection_reusable && store.initialized_len() == 0;
+    store.wipe();
+    CallbackApplicationOutcome {
+        connection_reusable,
+        ..outcome
+    }
+}
+
+async fn handle_callback_entity_inner<R, P>(
+    reader: &mut R,
+    store: &mut ParserStore,
+    framing: BodyFraming,
+    pending: &PendingCapabilityStore<P>,
+    control_max_request_body_bytes: usize,
+    body_deadline: Instant,
+) -> CallbackApplicationOutcome
+where
+    R: AsyncRead + Unpin,
+    P: CallbackPayload,
+{
     if let (BodyFraming::ContentLength(length), Ok(control_limit)) =
         (framing, u64::try_from(control_max_request_body_bytes))
     {
@@ -133,12 +162,14 @@ where
         }
     }
 
-    let prefix = match CallbackResponsePrefix::parse(*prefix) {
+    let parsed_prefix = CallbackResponsePrefix::parse(&prefix);
+    prefix.zeroize();
+    let prefix = match parsed_prefix {
         Ok(prefix) => prefix,
         Err(_) => return CallbackApplicationOutcome::respond(EmptyResponseStatus::NotFound, false),
     };
     let claim = match pending.try_claim(prefix.digest()) {
-        Ok(CallbackClaimResult::Claimed(claim)) => claim,
+        Ok(CallbackClaimResult::Claimed(claim)) => ClaimCompletionGuard::new(claim),
         Ok(CallbackClaimResult::Expired(terminal)) => {
             let cause = terminal.cause();
             terminal.into_payload().complete_terminal(cause);
@@ -155,24 +186,32 @@ where
         }
     };
 
-    let teardown_result = {
-        let teardown = claim.payload().wait_for_delivery_teardown();
+    let pre_parse_result = {
+        let teardown = claim.claim().payload().wait_for_delivery_teardown();
         tokio::pin!(teardown);
-        tokio::select! {
+        let mut result = tokio::select! {
             biased;
-            _ = claim.wait_for_terminal_signal() => TeardownResult::Terminal,
-            _ = tokio::time::sleep_until(body_deadline) => TeardownResult::BodyTimeout,
-            _ = &mut teardown => TeardownResult::Complete,
+            _ = claim.claim().wait_for_terminal_signal() => PreParseResult::Terminal,
+            _ = tokio::time::sleep_until(body_deadline) => PreParseResult::BodyTimeout,
+            _ = &mut teardown => PreParseResult::Ready,
+        };
+        if !matches!(result, PreParseResult::Ready) {
+            teardown.await;
+        } else if claim.claim().terminal_signal().is_some() {
+            result = PreParseResult::Terminal;
+        } else if Instant::now() >= body_deadline {
+            result = PreParseResult::BodyTimeout;
         }
+        result
     };
-    match teardown_result {
-        TeardownResult::Complete => {}
-        TeardownResult::Terminal => {
-            complete_claim(claim, PayloadCompletion::Terminal);
+    match pre_parse_result {
+        PreParseResult::Ready => {}
+        PreParseResult::Terminal => {
+            claim.complete(PayloadCompletion::Terminal);
             return CallbackApplicationOutcome::respond(EmptyResponseStatus::NotFound, false);
         }
-        TeardownResult::BodyTimeout => {
-            complete_claim(claim, PayloadCompletion::Invalid);
+        PreParseResult::BodyTimeout => {
+            claim.complete(PayloadCompletion::Invalid);
             return CallbackApplicationOutcome::close_without_response();
         }
     }
@@ -182,7 +221,7 @@ where
         store,
         &mut framer,
         end_of_stream,
-        &claim,
+        claim.claim(),
         control_max_request_body_bytes,
         body_deadline,
     )
@@ -190,7 +229,7 @@ where
 
     match parse_result {
         ClaimedEntityResult::Decision(decision) => {
-            let terminal = complete_claim(claim, PayloadCompletion::Decision(decision));
+            let terminal = claim.complete(PayloadCompletion::Decision(decision));
             if terminal {
                 CallbackApplicationOutcome::respond(EmptyResponseStatus::NotFound, false)
             } else {
@@ -198,7 +237,7 @@ where
             }
         }
         ClaimedEntityResult::Rejected(status) => {
-            let terminal = complete_claim(claim, PayloadCompletion::Invalid);
+            let terminal = claim.complete(PayloadCompletion::Invalid);
             if terminal {
                 CallbackApplicationOutcome::respond(EmptyResponseStatus::NotFound, false)
             } else {
@@ -206,11 +245,11 @@ where
             }
         }
         ClaimedEntityResult::Terminal => {
-            complete_claim(claim, PayloadCompletion::Terminal);
+            claim.complete(PayloadCompletion::Terminal);
             CallbackApplicationOutcome::respond(EmptyResponseStatus::NotFound, false)
         }
         ClaimedEntityResult::Failed => {
-            complete_claim(claim, PayloadCompletion::Invalid);
+            claim.complete(PayloadCompletion::Invalid);
             CallbackApplicationOutcome::close_without_response()
         }
     }
@@ -350,6 +389,39 @@ where
     }
 }
 
+struct ClaimCompletionGuard<P: CallbackPayload> {
+    claim: Option<CallbackClaim<P>>,
+}
+
+impl<P: CallbackPayload> ClaimCompletionGuard<P> {
+    fn new(claim: CallbackClaim<P>) -> Self {
+        Self { claim: Some(claim) }
+    }
+
+    fn claim(&self) -> &CallbackClaim<P> {
+        self.claim
+            .as_ref()
+            .expect("an active callback completion guard owns its claim")
+    }
+
+    fn complete(mut self, completion: PayloadCompletion) -> bool {
+        complete_claim(
+            self.claim
+                .take()
+                .expect("an active callback completion guard owns its claim"),
+            completion,
+        )
+    }
+}
+
+impl<P: CallbackPayload> Drop for ClaimCompletionGuard<P> {
+    fn drop(&mut self) {
+        if let Some(claim) = self.claim.take() {
+            complete_claim(claim, PayloadCompletion::Terminal);
+        }
+    }
+}
+
 async fn fill_store<R>(reader: &mut R, store: &mut ParserStore, deadline: Instant) -> ReadResult
 where
     R: AsyncRead + Unpin,
@@ -383,8 +455,8 @@ enum PayloadCompletion {
     Terminal,
 }
 
-enum TeardownResult {
-    Complete,
+enum PreParseResult {
+    Ready,
     Terminal,
     BodyTimeout,
 }
@@ -576,6 +648,11 @@ mod tests {
         Instant::now() + Duration::from_secs(5)
     }
 
+    fn assert_store_wiped(store: &ParserStore) {
+        assert_eq!(store.initialized_len(), 0);
+        assert!(store.complete_storage().iter().all(|byte| *byte == 0));
+    }
+
     #[tokio::test]
     async fn callback_claim_waits_for_delivery_teardown_then_completes_once() {
         let admitted = admit(4096, 128 * 1024);
@@ -583,24 +660,26 @@ mod tests {
         let mut store = ParserStore::try_new().unwrap();
         store.append(&body).unwrap();
         let mut reader = tokio::io::empty();
-        let future = handle_callback_entity_with_store(
-            &mut reader,
-            &mut store,
-            BodyFraming::ContentLength(body.len() as u64),
-            &admitted.store,
-            4096,
-            deadline(),
-        );
-        tokio::pin!(future);
+        let outcome = {
+            let future = handle_callback_entity_with_store(
+                &mut reader,
+                &mut store,
+                BodyFraming::ContentLength(body.len() as u64),
+                &admitted.store,
+                4096,
+                deadline(),
+            );
+            tokio::pin!(future);
 
-        assert!(tokio::time::timeout(Duration::from_millis(20), &mut future)
-            .await
-            .is_err());
-        assert_eq!(admitted.store.counts().claimed, 1);
-        assert_eq!(admitted.guard.live_bytes(), 0);
+            assert!(tokio::time::timeout(Duration::from_millis(20), &mut future)
+                .await
+                .is_err());
+            assert_eq!(admitted.store.counts().claimed, 1);
+            assert_eq!(admitted.guard.live_bytes(), 0);
 
-        admitted.teardown.complete();
-        let outcome = future.await;
+            admitted.teardown.complete();
+            future.await
+        };
         assert_eq!(outcome.response().unwrap().status(), 204);
         assert!(outcome.connection_reusable());
         assert_eq!(
@@ -609,6 +688,7 @@ mod tests {
         );
         assert_eq!(admitted.store.counts().occupancy, 0);
         assert_eq!(admitted.guard.live_bytes(), 0);
+        assert_store_wiped(&store);
 
         let mut replay_store = ParserStore::try_new().unwrap();
         replay_store.append(&body).unwrap();
@@ -623,6 +703,7 @@ mod tests {
         )
         .await;
         assert_eq!(replay.response().unwrap().status(), 404);
+        assert_store_wiped(&replay_store);
         drop(admitted.operation);
     }
 
@@ -647,6 +728,7 @@ mod tests {
         assert_eq!(outcome.response().unwrap().status(), 404);
         assert_eq!(admitted.store.counts().pending, 1);
         assert_eq!(admitted.store.counts().claimed, 0);
+        assert_store_wiped(&store);
         drop(admitted.operation);
         assert!(admitted.completion.await.is_err());
     }
@@ -679,6 +761,7 @@ mod tests {
         );
         assert_eq!(malformed.store.counts().occupancy, 0);
         assert_eq!(malformed.guard.live_bytes(), 0);
+        assert_store_wiped(&store);
         drop(malformed.operation);
 
         let bad_framing = admit(4096, 128 * 1024);
@@ -706,6 +789,7 @@ mod tests {
             RecordedCompletion::Invalid
         );
         assert_eq!(bad_framing.store.counts().occupancy, 0);
+        assert_store_wiped(&store);
         drop(bad_framing.operation);
     }
 
@@ -725,6 +809,7 @@ mod tests {
         .await;
         assert_eq!(outcome.response().unwrap().status(), 413);
         assert_eq!(oversized.store.counts().pending, 1);
+        assert_store_wiped(&store);
         drop(oversized.operation);
 
         let charge_failure = admit(4096, 1);
@@ -747,33 +832,72 @@ mod tests {
         );
         assert_eq!(charge_failure.store.counts().occupancy, 0);
         assert_eq!(charge_failure.guard.live_bytes(), 0);
+        assert_store_wiped(&store);
         drop(charge_failure.operation);
+
+        let streamed_limit = admit(
+            crate::authorization::protocol::MIN_CALLBACK_RESPONSE_BYTES,
+            128 * 1024,
+        );
+        streamed_limit.teardown.complete();
+        let mut body = deny_body(&streamed_limit.token);
+        assert_eq!(
+            body.len(),
+            crate::authorization::protocol::MIN_CALLBACK_RESPONSE_BYTES
+        );
+        body.push(b' ');
+        store.append(&body).unwrap();
+        let outcome = handle_callback_entity_with_store(
+            &mut reader,
+            &mut store,
+            BodyFraming::ContentLength(body.len() as u64),
+            &streamed_limit.store,
+            4096,
+            deadline(),
+        )
+        .await;
+        assert_eq!(outcome.response().unwrap().status(), 400);
+        assert_eq!(
+            streamed_limit.completion.await.unwrap(),
+            RecordedCompletion::Invalid
+        );
+        assert_store_wiped(&store);
+        drop(streamed_limit.operation);
     }
 
     #[tokio::test]
-    async fn callback_body_timeout_consumes_a_claim_without_an_application_response() {
+    async fn callback_body_timeout_waits_for_delivery_teardown_before_completion() {
         let admitted = admit(4096, 128 * 1024);
-        admitted.teardown.complete();
         let prefix = format!("{{\"resumeToken\":\"{}\",", admitted.token);
         let mut store = ParserStore::try_new().unwrap();
         store.append(prefix.as_bytes()).unwrap();
         let (_writer, mut reader) = tokio::io::duplex(64);
 
-        let outcome = handle_callback_entity_with_store(
-            &mut reader,
-            &mut store,
-            BodyFraming::ContentLength(97),
-            &admitted.store,
-            4096,
-            Instant::now() + Duration::from_millis(20),
-        )
-        .await;
+        let outcome = {
+            let future = handle_callback_entity_with_store(
+                &mut reader,
+                &mut store,
+                BodyFraming::ContentLength(97),
+                &admitted.store,
+                4096,
+                Instant::now() + Duration::from_millis(20),
+            );
+            tokio::pin!(future);
+
+            assert!(tokio::time::timeout(Duration::from_millis(40), &mut future)
+                .await
+                .is_err());
+            assert_eq!(admitted.store.counts().claimed, 1);
+            admitted.teardown.complete();
+            future.await
+        };
         assert_eq!(outcome.response(), None);
         assert_eq!(
             admitted.completion.await.unwrap(),
             RecordedCompletion::Invalid
         );
         assert_eq!(admitted.store.counts().occupancy, 0);
+        assert_store_wiped(&store);
         drop(admitted.operation);
     }
 
@@ -784,33 +908,79 @@ mod tests {
         let mut store = ParserStore::try_new().unwrap();
         store.append(&body).unwrap();
         let mut reader = tokio::io::empty();
-        let future = handle_callback_entity_with_store(
-            &mut reader,
-            &mut store,
-            BodyFraming::ContentLength(body.len() as u64),
-            &admitted.store,
-            4096,
-            deadline(),
-        );
-        tokio::pin!(future);
+        let outcome = {
+            let future = handle_callback_entity_with_store(
+                &mut reader,
+                &mut store,
+                BodyFraming::ContentLength(body.len() as u64),
+                &admitted.store,
+                4096,
+                deadline(),
+            );
+            tokio::pin!(future);
 
-        assert!(tokio::time::timeout(Duration::from_millis(20), &mut future)
-            .await
-            .is_err());
-        assert!(matches!(
-            admitted
-                .operation
-                .finish_pending(PendingTerminalCause::RequestDeadline),
-            crate::authorization::callback::PendingTerminalResult::ClaimOwns {
-                signal_recorded: true
-            }
-        ));
+            assert!(tokio::time::timeout(Duration::from_millis(20), &mut future)
+                .await
+                .is_err());
+            assert!(matches!(
+                admitted
+                    .operation
+                    .finish_pending(PendingTerminalCause::RequestDeadline),
+                crate::authorization::callback::PendingTerminalResult::ClaimOwns {
+                    signal_recorded: true
+                }
+            ));
 
-        let outcome = future.await;
+            assert!(tokio::time::timeout(Duration::from_millis(20), &mut future)
+                .await
+                .is_err());
+            assert_eq!(admitted.store.counts().claimed, 1);
+            admitted.teardown.complete();
+            future.await
+        };
         assert_eq!(outcome.response().unwrap().status(), 404);
         assert_eq!(
             admitted.completion.await.unwrap(),
             RecordedCompletion::Terminal(PendingTerminalCause::RequestDeadline)
+        );
+        assert_eq!(admitted.store.counts().occupancy, 0);
+        assert_store_wiped(&store);
+        drop(admitted.operation);
+    }
+
+    #[tokio::test]
+    async fn dropped_claimed_handler_preserves_recorded_terminal_completion() {
+        let admitted = admit(4096, 128 * 1024);
+        let body = deny_body(&admitted.token);
+        let mut store = ParserStore::try_new().unwrap();
+        store.append(&body).unwrap();
+        let mut reader = tokio::io::empty();
+
+        {
+            let future = handle_callback_entity_with_store(
+                &mut reader,
+                &mut store,
+                BodyFraming::ContentLength(body.len() as u64),
+                &admitted.store,
+                4096,
+                deadline(),
+            );
+            tokio::pin!(future);
+            assert!(tokio::time::timeout(Duration::from_millis(20), &mut future)
+                .await
+                .is_err());
+            assert_eq!(
+                admitted
+                    .store
+                    .final_cancel_all(PendingTerminalCause::Shutdown)
+                    .count(),
+                0
+            );
+        }
+
+        assert_eq!(
+            admitted.completion.await.unwrap(),
+            RecordedCompletion::Terminal(PendingTerminalCause::Shutdown)
         );
         assert_eq!(admitted.store.counts().occupancy, 0);
         drop(admitted.operation);
