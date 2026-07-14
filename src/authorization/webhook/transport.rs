@@ -370,15 +370,22 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
 
+    use rcgen::{CertificateParams, KeyPair};
+    use rustls::{Certificate, PrivateKey, ServerConfig};
+    use tempfile::TempDir;
     use tokio::sync::oneshot;
+    use tokio_rustls::TlsAcceptor;
 
     use super::*;
     use crate::authorization::webhook::pool::WebhookTransportArena;
     use crate::authorization::webhook::provider::WebhookProvider;
-    use crate::config::compiler::{CompiledProviderFailureMode, WebhookProviderPlan};
+    use crate::config::compiler::{
+        CompiledProviderFailureMode, CompiledTlsTrust, WebhookProviderPlan, WebhookTlsPlan,
+    };
     use crate::destination::{
         DestinationFacts, DestinationResolver, LocalAddressSnapshot, LocalAddressSource,
         ResolveFuture,
@@ -426,6 +433,241 @@ mod tests {
         fn snapshot(&self) -> io::Result<LocalAddressSnapshot> {
             Ok(LocalAddressSnapshot::default())
         }
+    }
+
+    struct TlsFixture {
+        _directory: TempDir,
+        ca_certificate: PathBuf,
+        acceptor: TlsAcceptor,
+    }
+
+    fn tls_fixture(hostname: &str) -> TlsFixture {
+        let directory = TempDir::new().unwrap();
+        let key = KeyPair::generate().unwrap();
+        let certificate = CertificateParams::new(vec![hostname.to_owned()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let ca_certificate = directory.path().join("ca.pem");
+        std::fs::write(&ca_certificate, certificate.pem()).unwrap();
+
+        let mut config = ServerConfig::builder()
+            .with_safe_defaults()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![Certificate(certificate.der().to_vec())],
+                PrivateKey(key.serialize_der()),
+            )
+            .unwrap();
+        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        TlsFixture {
+            _directory: directory,
+            ca_certificate,
+            acceptor: TlsAcceptor::from(Arc::new(config)),
+        }
+    }
+
+    fn tls_provider(
+        host: &str,
+        port: u16,
+        trust: CompiledTlsTrust,
+        ca_certificate: Option<PathBuf>,
+    ) -> Arc<WebhookProvider> {
+        WebhookProvider::activate(
+            WebhookProviderPlan {
+                url: format!("https://{host}:{port}/authorize"),
+                timeout: Duration::from_secs(2),
+                on_failure: CompiledProviderFailureMode::Deny,
+                include_headers: vec![],
+                max_request_bytes: 4096,
+                max_response_bytes: 64,
+                outputs: BTreeMap::new(),
+                tls: Some(WebhookTlsPlan {
+                    trust,
+                    ca_certificate,
+                }),
+            },
+            || false,
+        )
+        .unwrap()
+    }
+
+    fn loopback_destination(endpoint: SocketAddr) -> DestinationGuard {
+        DestinationGuard::with_sources(
+            DestinationFacts::for_test([], None, None, 1).unwrap(),
+            Arc::new(FixedResolver(endpoint)),
+            Arc::new(EmptyLocalAddresses),
+        )
+    }
+
+    async fn deliver_over_loopback(
+        endpoint: SocketAddr,
+        provider: &WebhookProvider,
+    ) -> Result<WebhookAcknowledgement, WebhookDeliveryError> {
+        let destination = loopback_destination(endpoint);
+        let arena = arena();
+        let lease = arena.try_acquire().unwrap();
+        let guard = guard();
+        let result = connect_and_deliver(
+            &destination,
+            provider,
+            lease,
+            body(&guard, b"{\"requestId\":\"tls-matrix\"}"),
+            std::future::pending(),
+        )
+        .await;
+        assert_eq!(arena.counts().live_deliveries, 0);
+        assert_eq!(guard.live_bytes(), 0);
+        result
+    }
+
+    fn spawn_tls_acknowledgement(
+        listener: tokio::net::TcpListener,
+        acceptor: TlsAcceptor,
+    ) -> tokio::task::JoinHandle<(Option<Vec<u8>>, Vec<u8>)> {
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(stream).await.unwrap();
+            let negotiated = stream.get_ref().1.alpn_protocol().map(ToOwned::to_owned);
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = stream.shutdown().await;
+            (negotiated, request)
+        })
+    }
+
+    fn spawn_rejected_tls_handshake(
+        listener: tokio::net::TcpListener,
+        acceptor: TlsAcceptor,
+    ) -> tokio::task::JoinHandle<io::Result<()>> {
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            acceptor.accept(stream).await.map(|_| ())
+        })
+    }
+
+    #[tokio::test]
+    async fn webhook_tls_activation_and_transport_matrix() {
+        let trusted = tls_fixture("localhost");
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = spawn_tls_acknowledgement(listener, trusted.acceptor.clone());
+        let provider = tls_provider(
+            "localhost",
+            endpoint.port(),
+            CompiledTlsTrust::Custom,
+            Some(trusted.ca_certificate.clone()),
+        );
+        assert_eq!(
+            provider.tls().unwrap().alpn_protocols,
+            [b"http/1.1".to_vec()]
+        );
+        assert_eq!(
+            deliver_over_loopback(endpoint, &provider)
+                .await
+                .unwrap()
+                .status,
+            204
+        );
+        let (negotiated, request) = server.await.unwrap();
+        assert_eq!(negotiated.as_deref(), Some(b"http/1.1".as_slice()));
+        assert!(request.starts_with(b"POST /authorize HTTP/1.1\r\n"));
+
+        let untrusted = tls_fixture("not-localhost.invalid");
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = spawn_tls_acknowledgement(listener, untrusted.acceptor.clone());
+        let provider = tls_provider(
+            "localhost",
+            endpoint.port(),
+            CompiledTlsTrust::Insecure,
+            None,
+        );
+        assert_eq!(
+            deliver_over_loopback(endpoint, &provider)
+                .await
+                .unwrap()
+                .status,
+            204
+        );
+        let (negotiated, _) = server.await.unwrap();
+        assert_eq!(negotiated.as_deref(), Some(b"http/1.1".as_slice()));
+
+        let wrong_trust = tls_fixture("wrong-trust.invalid");
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = spawn_rejected_tls_handshake(listener, trusted.acceptor.clone());
+        let provider = tls_provider(
+            "localhost",
+            endpoint.port(),
+            CompiledTlsTrust::Custom,
+            Some(wrong_trust.ca_certificate.clone()),
+        );
+        assert!(matches!(
+            deliver_over_loopback(endpoint, &provider).await,
+            Err(WebhookDeliveryError::TlsHandshake(_))
+        ));
+        assert!(server.await.unwrap().is_err());
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = spawn_rejected_tls_handshake(listener, trusted.acceptor.clone());
+        let provider = tls_provider(
+            "wrong-name.invalid",
+            endpoint.port(),
+            CompiledTlsTrust::Custom,
+            Some(trusted.ca_certificate.clone()),
+        );
+        assert!(matches!(
+            deliver_over_loopback(endpoint, &provider).await,
+            Err(WebhookDeliveryError::TlsHandshake(_))
+        ));
+        assert!(server.await.unwrap().is_err());
+
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let plaintext_server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut received = vec![0u8; 4096];
+            let count = stream.read(&mut received).await.unwrap();
+            received.truncate(count);
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            let _ = stream.shutdown().await;
+            received
+        });
+        let provider = tls_provider(
+            "localhost",
+            endpoint.port(),
+            CompiledTlsTrust::Insecure,
+            None,
+        );
+        assert!(matches!(
+            deliver_over_loopback(endpoint, &provider).await,
+            Err(WebhookDeliveryError::TlsHandshake(_))
+        ));
+        let received = plaintext_server.await.unwrap();
+        assert_eq!(received.first().copied(), Some(0x16));
+        assert!(!received.windows(5).any(|bytes| bytes == b"POST "));
+        assert!(!received
+            .windows(b"tls-matrix".len())
+            .any(|bytes| bytes == b"tls-matrix"));
     }
 
     #[tokio::test]
