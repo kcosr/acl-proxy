@@ -663,7 +663,9 @@ impl Drop for UpgradeRuntime {
     fn drop(&mut self) {
         // Emergency abandonment only. Managed shutdown uses shutdown_and_wait
         // so every coordinator explicitly shuts down and joins its children.
-        // The detached root supervisor still drains every task it owns.
+        // Close the admission gate before Stop so every commit that won the
+        // same state lock has already enqueued its coordinator for draining.
+        self.begin_shutdown(Some(Instant::now()));
         let _ = self.inner.supervisor_tasks.send(SupervisorCommand::Stop);
     }
 }
@@ -1965,6 +1967,115 @@ mod tests {
             .await
             .expect("runtime drop abandoned a supervised raw teardown")
             .unwrap();
+        assert_eq!(raw_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_drop_wins_against_inflight_commit_before_coordinator_registration() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let setup_polls = Arc::new(AtomicUsize::new(0));
+        let raw_polls = Arc::new(AtomicUsize::new(0));
+        let raw_drops = Arc::new(AtomicUsize::new(0));
+        let (commit_entered_tx, commit_entered_rx) = std_mpsc::channel();
+        let (commit_release_tx, commit_release_rx) = std_mpsc::channel();
+        let (result_tx, result_rx) = std_mpsc::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), {
+                let setup_polls = setup_polls.clone();
+                let raw_polls = raw_polls.clone();
+                let raw_drops = raw_drops.clone();
+                move |handshake| async move {
+                    commit_entered_tx.send(()).unwrap();
+                    commit_release_rx.recv().unwrap();
+                    let result = handshake.commit(
+                        None,
+                        UpgradeEntryPlan::new(
+                            UpgradeTerminalControl::new(
+                                counted_raw_teardown_with_guard(DropCount(raw_drops), raw_polls),
+                                |_| async {},
+                            ),
+                            move |_| async move {
+                                setup_polls.fetch_add(1, Ordering::SeqCst);
+                                Err(UpgradeTerminalCause::SetupFailed)
+                            },
+                        ),
+                    );
+                    result_tx.send(result.map(|_| ())).unwrap();
+                }
+            })
+            .unwrap();
+        commit_entered_rx.recv().unwrap();
+
+        drop(runtime);
+        commit_release_tx.send(()).unwrap();
+
+        assert_eq!(
+            result_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Err(UpgradeCommitError::AdmissionClosed)
+        );
+        assert_eq!(setup_polls.load(Ordering::SeqCst), 0);
+        assert_eq!(raw_polls.load(Ordering::SeqCst), 0);
+        assert_eq!(raw_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inflight_commit_registration_precedes_runtime_drop_stop_and_drains() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let setup_polls = Arc::new(AtomicUsize::new(0));
+        let raw_polls = Arc::new(AtomicUsize::new(0));
+        let raw_drops = Arc::new(AtomicUsize::new(0));
+        let (raw_dropped_tx, raw_dropped_rx) = oneshot::channel();
+        let (registered_tx, registered_rx) = std_mpsc::channel();
+        let (commit_release_tx, commit_release_rx) = std_mpsc::channel();
+        let (result_tx, result_rx) = std_mpsc::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), {
+                let setup_polls = setup_polls.clone();
+                let raw_polls = raw_polls.clone();
+                let raw_drops = raw_drops.clone();
+                move |mut handshake| async move {
+                    let result = handshake.commit_with_start_hook(
+                        None,
+                        UpgradeEntryPlan::new(
+                            UpgradeTerminalControl::new(
+                                counted_raw_teardown_with_guard(
+                                    (DropSignal(Some(raw_dropped_tx)), DropCount(raw_drops)),
+                                    raw_polls,
+                                ),
+                                |_| async {},
+                            ),
+                            move |_| async move {
+                                setup_polls.fetch_add(1, Ordering::SeqCst);
+                                Err(UpgradeTerminalCause::SetupFailed)
+                            },
+                        ),
+                        || {
+                            registered_tx.send(()).unwrap();
+                            commit_release_rx.recv().unwrap();
+                        },
+                    );
+                    result_tx.send(result).unwrap();
+                }
+            })
+            .unwrap();
+        registered_rx.recv().unwrap();
+
+        drop(runtime);
+        commit_release_tx.send(()).unwrap();
+
+        let entry = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .expect("commit that registered before Drop remains committed");
+        tokio::time::timeout(Duration::from_secs(1), entry.wait_closed())
+            .await
+            .expect("runtime Drop detached the registered coordinator");
+        tokio::time::timeout(Duration::from_secs(1), raw_dropped_rx)
+            .await
+            .expect("runtime Drop detached the registered terminal plan")
+            .unwrap();
+        assert_eq!(setup_polls.load(Ordering::SeqCst), 0);
+        assert_eq!(raw_polls.load(Ordering::SeqCst), 0);
         assert_eq!(raw_drops.load(Ordering::SeqCst), 1);
     }
 
