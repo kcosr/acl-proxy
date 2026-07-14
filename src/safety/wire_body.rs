@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use zeroize::Zeroize;
 
+use crate::network::canonical_ip;
+
 const QUOTA_SHARD_COUNT: usize = 16;
 pub(crate) const MAX_BUFFER_GROWTH_BYTES: usize = 64 * 1024;
 
@@ -45,16 +47,6 @@ impl fmt::Debug for WireBodyQuotaKey {
             Self::LocalHost => formatter.write_str("WireBodyQuotaKey::LocalHost"),
             Self::Peer(_) => formatter.write_str("WireBodyQuotaKey::Peer"),
         }
-    }
-}
-
-fn canonical_ip(peer: IpAddr) -> IpAddr {
-    match peer {
-        IpAddr::V6(peer) => peer
-            .to_ipv4_mapped()
-            .map(IpAddr::V4)
-            .unwrap_or(IpAddr::V6(peer)),
-        peer => peer,
     }
 }
 

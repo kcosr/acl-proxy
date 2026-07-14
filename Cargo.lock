@@ -19,11 +19,13 @@ dependencies = [
  "fs2",
  "h2",
  "http",
+ "httparse",
  "humantime",
  "hyper",
  "hyper-rustls",
  "hyper-tls",
  "idna",
+ "if-addrs",
  "ipnet",
  "libc",
  "lru",
@@ -909,6 +911,16 @@ checksum = "3acae9609540aa318d1bc588455225fb2085b9ed0c4f6bd0d9d5bcd86f1a0344"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

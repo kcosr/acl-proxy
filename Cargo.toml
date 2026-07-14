@@ -20,6 +20,7 @@ thiserror = "1.0"
 once_cell = "1.19"
 arc-swap = "1.7"
 ipnet = { version = "2.9", features = ["serde"] }
+if-addrs = { version = "0.15.0", features = ["link-local"] }
 idna = "1.1"
 regex = "1.11"
 regex-automata = { version = "0.4.13", default-features = false, features = ["std", "syntax", "dfa-build", "dfa-search", "unicode"] }
@@ -37,6 +38,7 @@ zstd = "0.13"
 rand = "0.8"
 tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal", "process"] }
 hyper = { version = "0.14", features = ["full"] }
+httparse = "1.10.1"
 hyper-tls = "0.5"
 tokio-stream = "0.1"
 chrono = { version = "0.4", features = ["serde", "clock"] }

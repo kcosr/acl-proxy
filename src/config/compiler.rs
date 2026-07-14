@@ -20,6 +20,8 @@ use crate::authorization::protocol::{
     MIN_WEBHOOK_REQUEST_WITHOUT_CALLBACK_URL_BYTES, PROCESS_PROVIDER_MIN_DECISION_RESPONSE_BYTES,
     PROCESS_PROVIDER_RESPONSE_PREFIX_BYTES, PROCESS_PROVIDER_RESPONSE_TERMINATOR_BYTES,
 };
+use crate::http1::store::PARSER_STORE_BYTES;
+use crate::network::{canonical_socket_addr, socket_binds_overlap};
 use crate::safety::wire_body::guarded_body_allocation_bytes;
 use crate::url::{canonicalize_http_url, CompiledUrlPattern};
 
@@ -37,7 +39,6 @@ const GIB: usize = 1024 * MIB;
 const MAX_CONFIG_BYTES: usize = 10 * MIB;
 const MAX_CONTROL_CONNECTIONS: usize = 65_536;
 const MAX_CONTROL_BODY_BYTES: usize = MIB;
-const CONTROL_PARSER_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_ENDPOINT_BYTES: usize = 8 * 1024;
 const CALLBACK_ROUTE_SUFFIX: &str = "/external-auth/callback";
 const MAX_PENDING_CALLBACKS: usize = 65_536;
@@ -1303,7 +1304,7 @@ fn control_parser_arena_bytes(
 ) -> Result<usize, ConfigCompileError> {
     control
         .max_connections
-        .checked_mul(CONTROL_PARSER_BUFFER_BYTES)
+        .checked_mul(PARSER_STORE_BYTES)
         .ok_or_else(|| ConfigCompileError::at("control", "parser-arena arithmetic overflow"))
 }
 
@@ -1478,24 +1479,6 @@ fn insert_unique_bind(
     }
     binds.insert(canonical_socket_addr(bind));
     Ok(())
-}
-
-fn socket_binds_overlap(left: SocketAddr, right: SocketAddr) -> bool {
-    let left = canonical_socket_addr(left);
-    let right = canonical_socket_addr(right);
-    left.port() == right.port()
-        && (left.ip() == right.ip() || left.ip().is_unspecified() || right.ip().is_unspecified())
-}
-
-fn canonical_socket_addr(address: SocketAddr) -> SocketAddr {
-    match address {
-        SocketAddr::V6(address) => address
-            .ip()
-            .to_ipv4_mapped()
-            .map(|mapped| SocketAddr::new(IpAddr::V4(mapped), address.port()))
-            .unwrap_or(SocketAddr::V6(address)),
-        address => address,
-    }
 }
 
 fn validate_http_versions(versions: &[HttpVersion], path: &str) -> Result<(), ConfigCompileError> {
@@ -6792,7 +6775,7 @@ x-aw-identity-token = ["secret"]"#,
             assert_eq!(control.request_body_timeout, Duration::from_secs(10));
             assert_eq!(
                 control.parser_arena_bytes,
-                control.max_connections * CONTROL_PARSER_BUFFER_BYTES
+                control.max_connections * PARSER_STORE_BYTES
             );
             assert!(
                 compiled
