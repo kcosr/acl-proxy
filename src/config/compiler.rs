@@ -7957,6 +7957,93 @@ redaction_profile = "small"
     }
 
     #[test]
+    fn runtime_enforced_local_minimum_excludes_merged_body_from_large_provider_rehome() {
+        let output_headers = (0..128)
+            .map(|index| format!("\"x-output-{index}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let outputs = (0..128)
+            .map(|index| {
+                format!(
+                    r#"
+[authorization.providers.current.outputs.value_{index}]
+kind = "custom_header"
+header = "x-output-{index}"
+"#
+                )
+            })
+            .collect::<String>();
+        let definitions = format!(
+            r#"
+[credentials]
+allowed_custom_headers = [{output_headers}]
+
+[authorization.providers.current]
+kind = "process"
+command = "/bin/current-provider"
+include_request_body = true
+max_request_body_bytes = {MIB}
+max_decoded_request_body_bytes = {}
+max_stdout_line_bytes = {MAX_PROCESS_STDOUT_LINE_BYTES}
+retire_timeout = "1s"
+{outputs}
+
+[authorization.providers.larger]
+kind = "process"
+command = "/bin/larger-provider"
+include_request_body = true
+max_request_body_bytes = {MIB}
+max_decoded_request_body_bytes = {}
+max_stdout_line_bytes = 80
+retire_timeout = "1s"
+
+[redaction.profiles.strict]
+max_body_bytes = 1
+max_decoded_body_bytes = 1
+rules = [{{ literals = ["x"] }}]
+"#,
+            64 * MIB,
+            64 * MIB,
+        );
+        let input = resource_config(
+            "",
+            &definitions,
+            r#"
+[[policy.rules]]
+id = "current"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "current"
+redaction_profile = "strict"
+
+[[policy.rules]]
+id = "larger"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "larger"
+"#,
+        );
+        let authored: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
+        let current = compile_http_rule_schedule(&authored, &authored.policy.rules[0]).unwrap();
+        let merged_decode = decode_peak(MIB, 64 * MIB).unwrap();
+        let merged_original = guarded(64 * MIB);
+        assert_eq!(current.local_body_allocation, Some(guarded(1)));
+        assert!(
+            merged_original + current.max_incoming_additional_bytes() > merged_decode,
+            "without pre-stage local enforcement the merged body would exceed the compiled peak"
+        );
+
+        let compiled = compile(&input).unwrap();
+        assert_eq!(
+            compiled
+                .reloadable_plan
+                .resource_plan
+                .http_wire_body_peak_bytes_by_cursor,
+            [merged_decode, merged_decode, 0]
+        );
+    }
+
+    #[test]
     fn expanding_regex_passes_cover_two_profile_limit_buffers() {
         let input = resource_config(
             "",

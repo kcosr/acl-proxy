@@ -750,10 +750,12 @@ async fn execute_request(
                 Ok(body) => body,
                 Err(error) => return body_failure(error),
             };
+            let encoded_len = body.encoded_len();
             (
                 Some(DecisionBody {
                     content_type,
                     content_encoding: Some("identity".to_owned()),
+                    encoded_len,
                     decoded: body.into_guarded_body(),
                 }),
                 None,

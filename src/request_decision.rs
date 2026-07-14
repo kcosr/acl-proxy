@@ -119,6 +119,7 @@ pub(crate) async fn decide_request<'generation>(
 pub(crate) struct GuardedRequestBody {
     pub(crate) content_type: Option<String>,
     pub(crate) content_encoding: Option<String>,
+    pub(crate) encoded_len: usize,
     pub(crate) decoded: GuardedBody,
 }
 
@@ -159,6 +160,7 @@ impl<'generation, 'request> PreparedRequest<'generation, 'request> {
                 Ok(GuardedRequestBody {
                     content_type: body.content_type,
                     content_encoding: body.content_encoding,
+                    encoded_len: body.encoded_len,
                     decoded: self.guard.transfer_body(body.decoded)?,
                 })
             })
@@ -294,6 +296,22 @@ async fn evaluate_to_terminal<'generation>(
         match evaluation.outcome {
             PolicyOutcome::Allow => {
                 let matched = evaluation.matched;
+                let local_failure = match matched.as_ref() {
+                    Some(matched) => {
+                        validate_local_body_limits(lease, matched, None, body.as_ref())?
+                    }
+                    None => None,
+                };
+                if let Some(reason) = local_failure {
+                    return Ok(RequestDecision::Deny(DeniedRequest {
+                        common: DecidedRequest {
+                            headers,
+                            body_guard: guard,
+                        },
+                        rule: matched,
+                        reason,
+                    }));
+                }
                 let body = match select_terminal_body(
                     &guard,
                     body,
@@ -360,13 +378,12 @@ async fn evaluate_to_terminal<'generation>(
             body = Some(GuardedRequestBody {
                 content_type: None,
                 content_encoding: None,
+                encoded_len: 0,
                 decoded: guard.buffer().finish(),
             });
         }
-        if metadata.include_request_body
-            && body
-                .as_ref()
-                .is_some_and(|body| body.decoded.len() > metadata.max_decoded_request_body_bytes)
+        if let Some(reason) =
+            validate_local_body_limits(lease, &matched, Some(metadata), body.as_ref())?
         {
             return Ok(RequestDecision::Deny(DeniedRequest {
                 common: DecidedRequest {
@@ -374,7 +391,7 @@ async fn evaluate_to_terminal<'generation>(
                     body_guard: guard,
                 },
                 rule: Some(matched),
-                reason: DenyReason::ProviderBodyLimit,
+                reason,
             }));
         }
         let provider_header_values = provider_header_values(
@@ -573,6 +590,7 @@ fn select_terminal_body(
         body = Some(GuardedRequestBody {
             content_type,
             content_encoding,
+            encoded_len: decoded.len(),
             decoded,
         });
     }
@@ -621,9 +639,39 @@ fn redact_terminal_body(
     body = Some(GuardedRequestBody {
         content_type: current.content_type,
         content_encoding: current.content_encoding,
+        encoded_len: current.encoded_len,
         decoded: redacted.body,
     });
     Ok(TerminalBody::Ready(body))
+}
+
+fn validate_local_body_limits(
+    lease: &GenerationLease,
+    rule: &PolicyRuleMatch<'_>,
+    provider: Option<crate::authorization::AuthorizationProviderMetadata<'_>>,
+    body: Option<&GuardedRequestBody>,
+) -> Result<Option<DenyReason>, RequestDecisionError> {
+    let Some(body) = body else {
+        return Ok(None);
+    };
+    if provider.is_some_and(|provider| {
+        provider.include_request_body
+            && (body.encoded_len > provider.max_request_body_bytes
+                || body.decoded.len() > provider.max_decoded_request_body_bytes)
+    }) {
+        return Ok(Some(DenyReason::ProviderBodyLimit));
+    }
+    let Some(profile_index) = rule.redaction_profile() else {
+        return Ok(None);
+    };
+    let profile = lease
+        .redaction()
+        .profile(profile_index)
+        .ok_or(RequestDecisionError::MissingRedactionProfile)?;
+    let limits = profile.limits();
+    Ok((body.encoded_len > limits.max_body_bytes
+        || body.decoded.len() > limits.max_decoded_body_bytes)
+        .then_some(DenyReason::RedactionFailure))
 }
 
 fn provider_header_values(
@@ -942,6 +990,316 @@ rules = [{ literals = ["secret"], payloads = "text" }]"#,
         runtime.shutdown().await;
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn merged_suffix_profile_limit_denies_before_provider_dispatch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("provider-dispatched");
+        let provider = directory.path().join("provider.sh");
+        std::fs::write(
+            &provider,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  printf x >> "{}"
+  id=$(printf "%s" "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  [ -n "$id" ] && printf '{{"id":"%s","type":"response","decision":"allow"}}\n' "$id"
+done
+"#,
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&provider).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&provider, permissions).unwrap();
+
+        let initial = compile(&config(
+            r#"[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "strict-profile"
+decision = "delegate"
+methods = ["GET"]
+authorization_provider = "generous"
+redaction_profile = "strict"
+
+[[policy.rules]]
+id = "larger-suffix"
+decision = "delegate"
+methods = ["GET"]
+authorization_provider = "larger""#,
+            &format!(
+                r#"[authorization.providers.generous]
+kind = "process"
+command = "{}"
+retire_timeout = "6s"
+include_request_body = true
+max_request_body_bytes = 16
+max_decoded_request_body_bytes = 16
+
+[authorization.providers.larger]
+kind = "process"
+command = "/bin/cat"
+retire_timeout = "6s"
+include_request_body = true
+max_request_body_bytes = 16
+max_decoded_request_body_bytes = 16
+
+[redaction.profiles.strict]
+max_body_bytes = 1
+max_decoded_body_bytes = 1
+rules = [{{ literals = ["x"] }}]"#,
+                provider.display()
+            ),
+        ));
+        let (runtime, _source, _, pool) = runtime(initial).await;
+        let lease = runtime.lease().await.unwrap();
+        let url = canonicalize_http_url("https://example.test/profile-limit").unwrap();
+        let prepared = prepare_request(&lease, input("profile-limit", &url, HeaderMap::new()))
+            .expect("the suffix cursor prepares");
+        assert_eq!(
+            prepared
+                .body_read_plan()
+                .limits()
+                .map(|limits| (limits.max_encoded_bytes(), limits.max_decoded_bytes())),
+            Some((16, 16))
+        );
+        let mut decoded = prepared.body_guard().buffer();
+        decoded.try_extend_from_slice(b"xx").unwrap();
+
+        let RequestDecision::Deny(denied) = prepared
+            .decide(Some(GuardedRequestBody {
+                content_type: Some("text/plain".into()),
+                content_encoding: Some("identity".into()),
+                encoded_len: 2,
+                decoded: decoded.finish(),
+            }))
+            .await
+            .unwrap()
+        else {
+            panic!("the current profile limit must deny");
+        };
+        assert_eq!(denied.reason, DenyReason::RedactionFailure);
+        assert_eq!(denied.rule.as_ref().unwrap().id(), "strict-profile");
+        assert!(!marker.exists(), "provider dispatch must not begin");
+        drop(denied);
+        assert_eq!(pool.global_charge(), 0);
+
+        drop(lease);
+        runtime.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resumed_cursor_enforces_provider_encoded_limit_before_dispatch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let pass_marker = directory.path().join("pass-dispatched");
+        let denied_marker = directory.path().join("denied-dispatched");
+        let pass_provider = directory.path().join("pass.sh");
+        let denied_provider = directory.path().join("denied.sh");
+        for (path, marker, decision) in [
+            (&pass_provider, &pass_marker, "pass"),
+            (&denied_provider, &denied_marker, "allow"),
+        ] {
+            std::fs::write(
+                path,
+                format!(
+                    r#"#!/bin/sh
+while IFS= read -r line; do
+  printf x >> "{}"
+  id=$(printf "%s" "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  [ -n "$id" ] && printf '{{"id":"%s","type":"response","decision":"{}"}}\n' "$id"
+done
+"#,
+                    marker.display(),
+                    decision
+                ),
+            )
+            .unwrap();
+            let mut permissions = std::fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(path, permissions).unwrap();
+        }
+
+        let initial = compile(&config(
+            r#"[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "pass-first"
+decision = "delegate"
+methods = ["GET"]
+authorization_provider = "pass"
+
+[[policy.rules]]
+id = "strict-encoded"
+decision = "delegate"
+methods = ["GET"]
+authorization_provider = "strict"
+
+[[policy.rules]]
+id = "larger-suffix"
+decision = "delegate"
+methods = ["GET"]
+authorization_provider = "larger""#,
+            &format!(
+                r#"[authorization.providers.pass]
+kind = "process"
+command = "{}"
+retire_timeout = "6s"
+
+[authorization.providers.strict]
+kind = "process"
+command = "{}"
+retire_timeout = "6s"
+include_request_body = true
+max_request_body_bytes = 1
+max_decoded_request_body_bytes = 16
+
+[authorization.providers.larger]
+kind = "process"
+command = "/bin/cat"
+retire_timeout = "6s"
+include_request_body = true
+max_request_body_bytes = 16
+max_decoded_request_body_bytes = 16"#,
+                pass_provider.display(),
+                denied_provider.display()
+            ),
+        ));
+        let (runtime, _source, _, pool) = runtime(initial).await;
+        let lease = runtime.lease().await.unwrap();
+        let url = canonicalize_http_url("https://example.test/resumed-limit").unwrap();
+        let prepared = prepare_request(&lease, input("resumed-limit", &url, HeaderMap::new()))
+            .expect("the suffix cursor prepares");
+        assert_eq!(
+            prepared
+                .body_read_plan()
+                .limits()
+                .map(|limits| (limits.max_encoded_bytes(), limits.max_decoded_bytes())),
+            Some((16, 16))
+        );
+        let mut decoded = prepared.body_guard().buffer();
+        decoded.try_extend_from_slice(b"x").unwrap();
+
+        let RequestDecision::Deny(denied) = prepared
+            .decide(Some(GuardedRequestBody {
+                content_type: Some("text/plain".into()),
+                content_encoding: Some("identity".into()),
+                encoded_len: 2,
+                decoded: decoded.finish(),
+            }))
+            .await
+            .unwrap()
+        else {
+            panic!("the resumed provider encoded limit must deny");
+        };
+        assert_eq!(denied.reason, DenyReason::ProviderBodyLimit);
+        assert_eq!(denied.rule.as_ref().unwrap().id(), "strict-encoded");
+        assert_eq!(std::fs::read(&pass_marker).unwrap(), b"x");
+        assert!(
+            !denied_marker.exists(),
+            "rejected provider must not dispatch"
+        );
+        drop(denied);
+        assert_eq!(pool.global_charge(), 0);
+
+        drop(lease);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn terminal_allow_enforces_profile_encoded_limit_before_redaction() {
+        let initial = compile(&config(
+            r#"[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "strict-terminal"
+decision = "allow"
+methods = ["GET"]
+redaction_profile = "strict"
+
+[[policy.rules]]
+id = "larger-suffix"
+decision = "allow"
+methods = ["POST"]
+redaction_profile = "larger""#,
+            r#"[redaction.profiles.strict]
+max_body_bytes = 1
+max_decoded_body_bytes = 16
+rules = [{ literals = ["x"] }]
+
+[redaction.profiles.larger]
+max_body_bytes = 16
+max_decoded_body_bytes = 16
+rules = [{ literals = ["x"] }]"#,
+        ));
+        let (runtime, _source, _, pool) = runtime(initial).await;
+        let lease = runtime.lease().await.unwrap();
+        let url = canonicalize_http_url("https://example.test/terminal-limit").unwrap();
+        let prepared = prepare_request(&lease, input("terminal-limit", &url, HeaderMap::new()))
+            .expect("the suffix cursor prepares");
+        assert_eq!(
+            prepared
+                .body_read_plan()
+                .limits()
+                .map(|limits| (limits.max_encoded_bytes(), limits.max_decoded_bytes())),
+            Some((16, 16))
+        );
+        let mut decoded = prepared.body_guard().buffer();
+        decoded.try_extend_from_slice(b"x").unwrap();
+
+        let RequestDecision::Deny(denied) = prepared
+            .decide(Some(GuardedRequestBody {
+                content_type: Some("text/plain".into()),
+                content_encoding: Some("identity".into()),
+                encoded_len: 2,
+                decoded: decoded.finish(),
+            }))
+            .await
+            .unwrap()
+        else {
+            panic!("the terminal profile encoded limit must deny");
+        };
+        assert_eq!(denied.reason, DenyReason::RedactionFailure);
+        assert_eq!(denied.rule.as_ref().unwrap().id(), "strict-terminal");
+        drop(denied);
+        assert_eq!(pool.global_charge(), 0);
+
+        let prepared = prepare_request(
+            &lease,
+            input("terminal-within-limit", &url, HeaderMap::new()),
+        )
+        .unwrap();
+        let mut decoded = prepared.body_guard().buffer();
+        decoded.try_extend_from_slice(b"x").unwrap();
+        let RequestDecision::Allow(allowed) = prepared
+            .decide(Some(GuardedRequestBody {
+                content_type: Some("text/plain".into()),
+                content_encoding: Some("identity".into()),
+                encoded_len: 1,
+                decoded: decoded.finish(),
+            }))
+            .await
+            .unwrap()
+        else {
+            panic!("the exact encoded boundary must redact and allow");
+        };
+        assert_eq!(allowed.body.as_ref().unwrap().encoded_len, 1);
+        drop(allowed);
+        assert_eq!(pool.global_charge(), 0);
+
+        drop(lease);
+        runtime.shutdown().await;
+    }
+
     #[tokio::test]
     async fn initial_policy_match_owns_the_immutable_request_deadline() {
         let initial = compile(&config(
@@ -1109,6 +1467,7 @@ authorization_provider = "terminal""#;
             .decide(Some(GuardedRequestBody {
                 content_type: Some("text/plain".into()),
                 content_encoding: None,
+                encoded_len: b"exact-body".len(),
                 decoded: decoded.finish(),
             }))
             .await
@@ -1228,6 +1587,7 @@ authorization_provider = "replacing"
                 .decide(Some(GuardedRequestBody {
                     content_type: Some("text/plain".into()),
                     content_encoding: None,
+                    encoded_len: b"original body".len(),
                     decoded: original.finish(),
                 }))
                 .await

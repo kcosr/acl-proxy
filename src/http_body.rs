@@ -26,9 +26,11 @@ const BROTLI_FIXED_WORKSPACE_BYTES: usize = 4 * MIB;
 const BROTLI_MAX_TREE_COUNT: usize = 256;
 const BROTLI_HUFFMAN_CODE_BYTES: usize = 4;
 const BROTLI_HUFFMAN_POINTER_BYTES: usize = size_of::<usize>();
-const BROTLI_LITERAL_HUFFMAN_TABLE_ENTRIES: usize = 630;
-const BROTLI_COMMAND_HUFFMAN_TABLE_ENTRIES: usize = 1080;
-const BROTLI_DISTANCE_HUFFMAN_TABLE_ENTRIES: usize = 920;
+const BROTLI_HUFFMAN_SECOND_LEVEL_TABLE_ENTRIES: usize = 376;
+const BROTLI_LITERAL_HUFFMAN_TABLE_ENTRIES: usize = 256 + BROTLI_HUFFMAN_SECOND_LEVEL_TABLE_ENTRIES;
+const BROTLI_COMMAND_HUFFMAN_TABLE_ENTRIES: usize = 704 + BROTLI_HUFFMAN_SECOND_LEVEL_TABLE_ENTRIES;
+const BROTLI_DISTANCE_HUFFMAN_TABLE_ENTRIES: usize =
+    520 + BROTLI_HUFFMAN_SECOND_LEVEL_TABLE_ENTRIES;
 const BROTLI_DECODER_STATE_BUDGET_BYTES: usize = 8 * KIB;
 const BROTLI_SHARED_DICTIONARY_BUDGET_BYTES: usize = 2 * KIB;
 const BROTLI_BLOCK_TREE_BUDGET_BYTES: usize = 16 * KIB;
@@ -114,6 +116,7 @@ pub(crate) enum CanonicalContentEncoding {
 }
 
 pub(crate) struct GuardedRequestBody {
+    encoded_len: usize,
     body: GuardedBody,
 }
 
@@ -126,6 +129,10 @@ impl GuardedRequestBody {
         self.body.len()
     }
 
+    pub(crate) fn encoded_len(&self) -> usize {
+        self.encoded_len
+    }
+
     pub(crate) fn into_guarded_body(self) -> GuardedBody {
         self.body
     }
@@ -135,6 +142,7 @@ impl std::fmt::Debug for GuardedRequestBody {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("GuardedRequestBody")
+            .field("encoded_len", &self.encoded_len)
             .field("len", &self.body.len())
             .field("content_encoding", &CanonicalContentEncoding::Identity)
             .finish()
@@ -264,7 +272,10 @@ where
         if encoded.len() > limits.max_decoded_bytes() {
             return Err(HttpBodyReadError::DecodedLimitExceeded);
         }
-        return Ok(GuardedRequestBody { body: encoded });
+        return Ok(GuardedRequestBody {
+            encoded_len: encoded.len(),
+            body: encoded,
+        });
     }
 
     let workspace_sizes =
@@ -316,8 +327,12 @@ where
             .await?
         }
     };
+    let encoded_len = encoded.len();
     drop(encoded);
-    Ok(GuardedRequestBody { body: decoded })
+    Ok(GuardedRequestBody {
+        encoded_len,
+        body: decoded,
+    })
 }
 
 fn parse_content_encoding(headers: &HeaderMap) -> Result<ContentEncoding, HttpBodyReadError> {
@@ -1429,6 +1444,7 @@ mod tests {
                 invoke(encoded, encoding, max_encoded, plain.len(), 128).await;
             let body = result.unwrap_or_else(|error| panic!("encoding {encoding:?}: {error:?}"));
             assert_eq!(body.content_encoding(), CanonicalContentEncoding::Identity);
+            assert_eq!(body.encoded_len(), max_encoded, "encoding {encoding:?}");
             assert_eq!(body.len(), plain.len());
             assert_eq!(body_bytes(&body), plain, "encoding {encoding:?}");
             drop(body);
