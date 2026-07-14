@@ -68,6 +68,14 @@ impl WebhookAuthorizationRuntime {
         self.transport.counts()
     }
 
+    pub(crate) fn begin_transport_shutdown(&self) {
+        self.transport.begin_shutdown();
+    }
+
+    pub(crate) async fn wait_for_transport_shutdown(&self) {
+        self.transport.wait_until_empty().await;
+    }
+
     pub(crate) fn destination_guard(&self) -> &DestinationGuard {
         &self.destination
     }

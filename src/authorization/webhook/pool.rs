@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use allocator_api2::boxed::Box as FallibleBox;
+use tokio::sync::Notify;
 use zeroize::Zeroize;
 
 use crate::http1::store::{ParserStore, ParserStoreAllocationError, PARSER_STORE_BYTES};
@@ -18,10 +19,11 @@ struct ArenaInner {
     bytes_per_delivery: usize,
     maximum_transport_bytes: usize,
     state: Mutex<ArenaState>,
+    changed: Notify,
 }
 
-#[derive(Default)]
 struct ArenaState {
+    accepting: bool,
     live_deliveries: usize,
     reserved_transport_bytes: usize,
 }
@@ -63,7 +65,12 @@ impl WebhookTransportArena {
                 buffer_bytes,
                 bytes_per_delivery,
                 maximum_transport_bytes,
-                state: Mutex::new(ArenaState::default()),
+                state: Mutex::new(ArenaState {
+                    accepting: true,
+                    live_deliveries: 0,
+                    reserved_transport_bytes: 0,
+                }),
+                changed: Notify::new(),
             }),
         })
     }
@@ -84,6 +91,9 @@ impl WebhookTransportArena {
                 .state
                 .lock()
                 .map_err(|_| WebhookTransportAdmissionError::Poisoned)?;
+            if !state.accepting {
+                return Err(WebhookTransportAdmissionError::Closed);
+            }
             if state.live_deliveries >= self.inner.maximum_deliveries {
                 return Err(WebhookTransportAdmissionError::AtCapacity);
             }
@@ -113,6 +123,27 @@ impl WebhookTransportArena {
         }
     }
 
+    pub(crate) fn begin_shutdown(&self) {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.accepting = false;
+        drop(state);
+        self.inner.changed.notify_waiters();
+    }
+
+    pub(crate) async fn wait_until_empty(&self) {
+        loop {
+            let changed = self.inner.changed.notified();
+            if self.counts().live_deliveries == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     pub(crate) fn counts(&self) -> WebhookTransportArenaCounts {
         let state = self
             .inner
@@ -120,6 +151,7 @@ impl WebhookTransportArena {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         WebhookTransportArenaCounts {
+            accepting: state.accepting,
             maximum_deliveries: self.inner.maximum_deliveries,
             live_deliveries: state.live_deliveries,
             buffer_bytes: self.inner.buffer_bytes,
@@ -298,6 +330,11 @@ fn release_reservation(arena: &ArenaInner) {
         .reserved_transport_bytes
         .checked_sub(arena.bytes_per_delivery)
         .expect("reserved webhook transport bytes cannot underflow");
+    let empty = state.live_deliveries == 0;
+    drop(state);
+    if empty {
+        arena.changed.notify_waiters();
+    }
 }
 
 struct TransportBuffers {
@@ -421,6 +458,7 @@ impl std::error::Error for WebhookTransportArenaError {}
 pub(crate) enum WebhookTransportAdmissionError {
     Allocation,
     AtCapacity,
+    Closed,
     Poisoned,
 }
 
@@ -429,6 +467,7 @@ impl fmt::Display for WebhookTransportAdmissionError {
         match self {
             Self::Allocation => formatter.write_str("could not allocate webhook transport buffers"),
             Self::AtCapacity => formatter.write_str("webhook delivery capacity exhausted"),
+            Self::Closed => formatter.write_str("webhook delivery admission is closed"),
             Self::Poisoned => formatter.write_str("webhook delivery admission gate failed"),
         }
     }
@@ -438,6 +477,7 @@ impl std::error::Error for WebhookTransportAdmissionError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WebhookTransportArenaCounts {
+    pub(crate) accepting: bool,
     pub(crate) maximum_deliveries: usize,
     pub(crate) live_deliveries: usize,
     pub(crate) buffer_bytes: usize,
@@ -461,6 +501,7 @@ mod tests {
         assert_eq!(
             arena.counts(),
             WebhookTransportArenaCounts {
+                accepting: true,
                 maximum_deliveries: 2,
                 live_deliveries: 2,
                 buffer_bytes: BUFFER_BYTES,
@@ -488,6 +529,34 @@ mod tests {
         drop(replacement);
         assert_eq!(arena.counts().live_deliveries, 0);
         assert_eq!(arena.counts().reserved_transport_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_admission_and_drains_complete_split_reservations() {
+        let arena = WebhookTransportArena::try_new(1, BUFFER_BYTES, 2 * BUFFER_BYTES).unwrap();
+        let (outbound, inbound) = arena.try_acquire().unwrap().split();
+
+        arena.begin_shutdown();
+        arena.begin_shutdown();
+        assert!(!arena.counts().accepting);
+        assert!(matches!(
+            arena.try_acquire(),
+            Err(WebhookTransportAdmissionError::Closed)
+        ));
+
+        drop(outbound);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            arena.wait_until_empty()
+        )
+        .await
+        .is_err());
+
+        drop(inbound);
+        tokio::time::timeout(std::time::Duration::from_secs(1), arena.wait_until_empty())
+            .await
+            .expect("arena drains after both split buffers return");
+        assert_eq!(arena.counts().live_deliveries, 0);
     }
 
     #[test]
