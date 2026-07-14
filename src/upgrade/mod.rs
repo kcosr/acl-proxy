@@ -2,8 +2,9 @@ mod runtime;
 
 #[allow(unused_imports)]
 pub(crate) use runtime::{
-    CommittedUpgrade, UpgradeAdmissionError, UpgradeAdmissionGuard, UpgradeAllocation,
-    UpgradeAllocationError, UpgradeCommitError, UpgradeEntryStartError, UpgradeHandshakeSpawnError,
+    CommittedUpgrade, UpgradeAdmissionError, UpgradeAllocation, UpgradeAllocationError,
+    UpgradeCommitError, UpgradeEntryStartError, UpgradeHandshake, UpgradeHandshakeSpawnError,
     UpgradeRelayPair, UpgradeRuntime, UpgradeRuntimeCounts, UpgradeRuntimeError,
-    UpgradeRuntimeLimits, UpgradeTerminalCause, UpgradedStreamSnapshot,
+    UpgradeRuntimeLimits, UpgradeSnapshotContext, UpgradeTerminalCause, UpgradeTerminalControl,
+    UpgradedStreamSnapshot,
 };

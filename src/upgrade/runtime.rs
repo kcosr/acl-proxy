@@ -4,8 +4,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
+use tokio::runtime::Handle;
 use tokio::sync::{mpsc, Notify};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio::time::Instant;
@@ -15,14 +17,16 @@ use crate::redaction::ProfileHandle;
 const ENTRY_OPEN: u8 = 0;
 const ENTRY_CLOSING: u8 = 1;
 const ENTRY_CLOSED: u8 = 2;
-const ENTRY_CLEANUP_GRACE: Duration = Duration::from_secs(1);
+const DEFAULT_ENTRY_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 
-type UpgradeTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type UpgradeSetupTask =
     Pin<Box<dyn Future<Output = Result<UpgradeRelayPair, UpgradeTerminalCause>> + Send + 'static>>;
 type UpgradeSetupBuilder =
     Box<dyn FnOnce(UpgradedStreamSnapshot) -> UpgradeSetupTask + Send + 'static>;
 type UpgradeRelayTask = Pin<Box<dyn Future<Output = UpgradeTerminalCause> + Send + 'static>>;
+type UpgradeTerminalTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+type UpgradeTerminalBuilder =
+    Box<dyn FnOnce(UpgradeTerminalCause) -> UpgradeTerminalTask + Send + 'static>;
 
 /// Static limits for the one process-owned upgrade runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,6 +35,7 @@ pub(crate) struct UpgradeRuntimeLimits {
     max_upgrade_buffer_bytes: usize,
     relay_buffer_bytes: usize,
     max_upgrade_lifetime: Duration,
+    cleanup_grace: Duration,
 }
 
 impl UpgradeRuntimeLimits {
@@ -45,39 +50,48 @@ impl UpgradeRuntimeLimits {
             max_upgrade_buffer_bytes,
             relay_buffer_bytes,
             max_upgrade_lifetime,
+            cleanup_grace: DEFAULT_ENTRY_CLEANUP_GRACE,
         }
     }
 
     pub(crate) fn relay_buffer_bytes(self) -> usize {
         self.relay_buffer_bytes
     }
+
+    #[cfg(test)]
+    fn with_cleanup_grace(mut self, cleanup_grace: Duration) -> Self {
+        self.cleanup_grace = cleanup_grace;
+        self
+    }
 }
 
-/// The compiler-produced exact reservation for one matched rule.
+/// The compiler-produced mandatory wire working set for one matched rule.
+/// Transport buffers are process-static and are added exactly at admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UpgradeAllocation {
     rule_index: usize,
-    bytes: usize,
+    wire_bytes: usize,
 }
 
 impl UpgradeAllocation {
     pub(crate) fn from_compiled_rule(
         rule_index: usize,
-        compiled_bytes: Option<usize>,
+        compiled_wire_bytes: Option<usize>,
     ) -> Result<Self, UpgradeAllocationError> {
-        let bytes = compiled_bytes.ok_or(UpgradeAllocationError::RuleDisallowsUpgrades)?;
-        if bytes == 0 {
-            return Err(UpgradeAllocationError::ZeroBytes);
-        }
-        Ok(Self { rule_index, bytes })
+        let wire_bytes =
+            compiled_wire_bytes.ok_or(UpgradeAllocationError::RuleDisallowsUpgrades)?;
+        Ok(Self {
+            rule_index,
+            wire_bytes,
+        })
     }
 
     pub(crate) fn rule_index(self) -> usize {
         self.rule_index
     }
 
-    pub(crate) fn bytes(self) -> usize {
-        self.bytes
+    pub(crate) fn wire_bytes(self) -> usize {
+        self.wire_bytes
     }
 }
 
@@ -85,8 +99,6 @@ impl UpgradeAllocation {
 pub(crate) enum UpgradeAllocationError {
     #[error("the matched rule does not allow upgrades")]
     RuleDisallowsUpgrades,
-    #[error("the compiled upgrade allocation must be positive")]
-    ZeroBytes,
 }
 
 /// Immutable state retained by an established stream. This type deliberately
@@ -97,7 +109,7 @@ pub(crate) struct UpgradedStreamSnapshot {
 }
 
 impl UpgradedStreamSnapshot {
-    pub(crate) fn new(relay_buffer_bytes: usize, wire_redaction: Option<ProfileHandle>) -> Self {
+    fn new(relay_buffer_bytes: usize, wire_redaction: Option<ProfileHandle>) -> Self {
         Self {
             relay_buffer_bytes,
             wire_redaction,
@@ -113,6 +125,21 @@ impl UpgradedStreamSnapshot {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UpgradeSnapshotContext {
+    relay_buffer_bytes: usize,
+}
+
+impl UpgradeSnapshotContext {
+    pub(crate) fn build(self, wire_redaction: Option<ProfileHandle>) -> UpgradedStreamSnapshot {
+        UpgradedStreamSnapshot::new(self.relay_buffer_bytes, wire_redaction)
+    }
+
+    pub(crate) fn relay_buffer_bytes(self) -> usize {
+        self.relay_buffer_bytes
+    }
+}
+
 impl fmt::Debug for UpgradedStreamSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -123,13 +150,43 @@ impl fmt::Debug for UpgradedStreamSnapshot {
     }
 }
 
+/// Cause-aware ownership adapter for downstream close, socket teardown, and
+/// in-progress capture cancellation. Every established relay pair must provide
+/// one, and only the entry coordinator invokes it.
+pub(crate) struct UpgradeTerminalControl {
+    build: Option<UpgradeTerminalBuilder>,
+}
+
+impl UpgradeTerminalControl {
+    pub(crate) fn new<Build, Task>(build: Build) -> Self
+    where
+        Build: FnOnce(UpgradeTerminalCause) -> Task + Send + 'static,
+        Task: Future<Output = ()> + Send + 'static,
+    {
+        Self {
+            build: Some(Box::new(move |cause| Box::pin(build(cause)))),
+        }
+    }
+
+    fn into_task(mut self, cause: UpgradeTerminalCause) -> UpgradeTerminalTask {
+        self.build
+            .take()
+            .expect("terminal control is consumed exactly once")(cause)
+    }
+}
+
 pub(crate) struct UpgradeRelayPair {
     first: UpgradeRelayTask,
     second: UpgradeRelayTask,
+    terminal: UpgradeTerminalControl,
 }
 
 impl UpgradeRelayPair {
-    pub(crate) fn new<First, Second>(first: First, second: Second) -> Self
+    pub(crate) fn new<First, Second>(
+        first: First,
+        second: Second,
+        terminal: UpgradeTerminalControl,
+    ) -> Self
     where
         First: Future<Output = UpgradeTerminalCause> + Send + 'static,
         Second: Future<Output = UpgradeTerminalCause> + Send + 'static,
@@ -137,6 +194,7 @@ impl UpgradeRelayPair {
         Self {
             first: Box::pin(first),
             second: Box::pin(second),
+            terminal,
         }
     }
 }
@@ -159,9 +217,10 @@ pub(crate) struct UpgradeRuntime {
 
 struct RuntimeInner {
     limits: UpgradeRuntimeLimits,
+    handle: Handle,
     state: Mutex<RuntimeState>,
     changed: Notify,
-    tasks: mpsc::UnboundedSender<TaskCommand>,
+    supervisor_tasks: mpsc::UnboundedSender<SupervisorCommand>,
 }
 
 struct RuntimeState {
@@ -169,27 +228,32 @@ struct RuntimeState {
     next_id: u64,
     reserved_slots: usize,
     reserved_bytes: usize,
-    supervisor_tasks: usize,
+    tracked_tasks: usize,
     uncommitted: HashMap<u64, UncommittedRecord>,
     entries: HashMap<u64, EntryRecord>,
 }
 
-struct UncommittedRecord {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Reservation {
     allocation: UpgradeAllocation,
-    abort: Option<AbortHandle>,
+    bytes: usize,
+}
+
+struct UncommittedRecord {
+    reservation: Reservation,
+    abort: AbortHandle,
 }
 
 struct EntryRecord {
-    allocation: UpgradeAllocation,
+    reservation: Reservation,
     shared: Arc<EntryShared>,
-    handshake_abort: Option<AbortHandle>,
-    coordinator_abort: Option<AbortHandle>,
 }
 
 struct EntryShared {
     timing: Mutex<EntryTiming>,
     setup: Mutex<Option<UpgradeSetupBuilder>>,
-    terminal_cause: Mutex<Option<UpgradeTerminalCause>>,
+    requested_cause: Mutex<Option<UpgradeTerminalCause>>,
+    winning_cause: Mutex<Option<UpgradeTerminalCause>>,
     changed: Notify,
     terminal_state: AtomicU8,
     started: AtomicBool,
@@ -200,48 +264,113 @@ struct EntryShared {
 struct EntryTiming {
     application_stop: Instant,
     cleanup_cutoff: Instant,
+    stop_cause: UpgradeTerminalCause,
 }
 
-enum TaskCommand {
-    StartHandshake { id: u64, task: UpgradeTask },
-    StartEntry { id: u64, task: UpgradeTask },
+enum SupervisorCommand {
+    Track(OwnedTask),
     Stop,
 }
 
-#[derive(Clone, Copy)]
-enum TaskKind {
-    Handshake,
-    Entry,
+struct OwnedTask {
+    task: Option<JoinHandle<()>>,
+}
+
+struct TrackedTaskCompletion {
+    inner: Arc<RuntimeInner>,
+    counted: Arc<AtomicBool>,
+}
+
+struct HandshakeTaskCompletion {
+    inner: Arc<RuntimeInner>,
+    id: u64,
+    _tracked: TrackedTaskCompletion,
+}
+
+impl OwnedTask {
+    fn new(task: JoinHandle<()>) -> Self {
+        Self { task: Some(task) }
+    }
+}
+
+impl Future for OwnedTask {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let task = self.task.as_mut().expect("owned task is polled until join");
+        match Pin::new(task).poll(context) {
+            Poll::Ready(_) => {
+                self.task.take();
+                Poll::Ready(())
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for OwnedTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for TrackedTaskCompletion {
+    fn drop(&mut self) {
+        if self.counted.swap(false, Ordering::AcqRel) {
+            let mut state = lock(&self.inner.state);
+            state.tracked_tasks = state
+                .tracked_tasks
+                .checked_sub(1)
+                .expect("tracked task count cannot underflow");
+            drop(state);
+            self.inner.changed.notify_waiters();
+        }
+    }
+}
+
+impl Drop for HandshakeTaskCompletion {
+    fn drop(&mut self) {
+        self.inner.release_uncommitted(self.id);
+    }
 }
 
 enum EntryTaskResult {
     Setup(Result<UpgradeRelayPair, UpgradeTerminalCause>),
     Relay(UpgradeTerminalCause),
+    TerminalControl,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EntryPhase {
+    WaitingForSetup,
+    SettingUp,
+    Relaying,
 }
 
 impl UpgradeRuntime {
     pub(crate) fn try_new(limits: UpgradeRuntimeLimits) -> Result<Arc<Self>, UpgradeRuntimeError> {
         validate_limits(limits)?;
-        let handle = tokio::runtime::Handle::try_current()
-            .map_err(|_| UpgradeRuntimeError::RuntimeUnavailable)?;
-        let (tasks, receiver) = mpsc::unbounded_channel();
+        let handle = Handle::try_current().map_err(|_| UpgradeRuntimeError::RuntimeUnavailable)?;
+        let (supervisor_tasks, receiver) = mpsc::unbounded_channel();
         let inner = Arc::new(RuntimeInner {
             limits,
+            handle: handle.clone(),
             state: Mutex::new(RuntimeState {
                 accepting: true,
                 next_id: 0,
                 reserved_slots: 0,
                 reserved_bytes: 0,
-                supervisor_tasks: 0,
+                tracked_tasks: 0,
                 uncommitted: HashMap::new(),
                 entries: HashMap::new(),
             }),
             changed: Notify::new(),
-            tasks,
+            supervisor_tasks,
         });
-        let supervisor_inner = inner.clone();
         let supervisor = handle.spawn(async move {
-            run_task_supervisor(supervisor_inner, receiver).await;
+            run_task_supervisor(receiver).await;
         });
         Ok(Arc::new(Self {
             inner,
@@ -253,45 +382,97 @@ impl UpgradeRuntime {
         self.inner.limits
     }
 
-    pub(crate) fn try_admit(
+    /// Atomically reserves admission and installs the runtime-owned handshake
+    /// task. No unregistered guard is ever returned to the caller.
+    pub(crate) fn try_spawn_handshake<Build, Task>(
         self: &Arc<Self>,
         allocation: UpgradeAllocation,
-    ) -> Result<UpgradeAdmissionGuard, UpgradeAdmissionError> {
+        build: Build,
+    ) -> Result<(), UpgradeHandshakeSpawnError>
+    where
+        Build: FnOnce(UpgradeHandshake) -> Task + Send + 'static,
+        Task: Future<Output = ()> + Send + 'static,
+    {
+        self.try_spawn_handshake_with_hook(allocation, build, || {})
+    }
+
+    fn try_spawn_handshake_with_hook<Build, Task, Hook>(
+        self: &Arc<Self>,
+        allocation: UpgradeAllocation,
+        build: Build,
+        after_spawn_before_registration: Hook,
+    ) -> Result<(), UpgradeHandshakeSpawnError>
+    where
+        Build: FnOnce(UpgradeHandshake) -> Task + Send + 'static,
+        Task: Future<Output = ()> + Send + 'static,
+        Hook: FnOnce(),
+    {
         let mut state = lock(&self.inner.state);
-        if !state.accepting {
-            return Err(UpgradeAdmissionError::Closed);
-        }
-        if state.reserved_slots >= self.inner.limits.max_active_upgrades {
-            return Err(UpgradeAdmissionError::SlotCapacity);
-        }
-        let next_bytes = state
-            .reserved_bytes
-            .checked_add(allocation.bytes)
-            .ok_or(UpgradeAdmissionError::BufferCapacity)?;
-        if next_bytes > self.inner.limits.max_upgrade_buffer_bytes {
-            return Err(UpgradeAdmissionError::BufferCapacity);
-        }
-        let id = state.next_id;
-        state.next_id = state
-            .next_id
-            .checked_add(1)
-            .ok_or(UpgradeAdmissionError::IdentifierExhausted)?;
-        state.reserved_slots += 1;
-        state.reserved_bytes = next_bytes;
-        state.uncommitted.insert(
-            id,
-            UncommittedRecord {
-                allocation,
-                abort: None,
-            },
-        );
-        drop(state);
-        Ok(UpgradeAdmissionGuard {
+        let reservation = validate_admission(&self.inner.limits, &state, allocation)?;
+        let (id, following_id) = validate_next_id(&state)?;
+        let (start, started) = tokio::sync::oneshot::channel();
+        let handshake = UpgradeHandshake {
             inner: self.inner.clone(),
             id,
-            allocation,
-            committed: false,
-        })
+            reservation,
+        };
+        let counted = Arc::new(AtomicBool::new(true));
+        let tracked = TrackedTaskCompletion {
+            inner: self.inner.clone(),
+            counted: counted.clone(),
+        };
+        let completion = HandshakeTaskCompletion {
+            inner: self.inner.clone(),
+            id,
+            _tracked: tracked,
+        };
+        let task = self.inner.handle.spawn(async move {
+            async move {
+                let _completion = completion;
+                if started.await.is_err() {
+                    return;
+                }
+                build(handshake).await;
+            }
+            .await;
+        });
+        let abort = task.abort_handle();
+        after_spawn_before_registration();
+        apply_reservation(&mut state, reservation);
+        state.next_id = following_id;
+        state
+            .uncommitted
+            .insert(id, UncommittedRecord { reservation, abort });
+        state.tracked_tasks = state
+            .tracked_tasks
+            .checked_add(1)
+            .expect("tracked task count cannot overflow bounded upgrade metadata");
+        if let Err(error) = self
+            .inner
+            .supervisor_tasks
+            .send(SupervisorCommand::Track(OwnedTask::new(task)))
+        {
+            let SupervisorCommand::Track(task) = error.0 else {
+                unreachable!("only a tracked task was sent")
+            };
+            let record = state
+                .uncommitted
+                .remove(&id)
+                .expect("new uncommitted admission is present");
+            release_reservation(&mut state, record.reservation);
+            if counted.swap(false, Ordering::AcqRel) {
+                state.tracked_tasks -= 1;
+            }
+            state.next_id = id;
+            drop(state);
+            drop(task);
+            drop(start);
+            return Err(UpgradeHandshakeSpawnError::SupervisorStopped);
+        }
+        let _ = start.send(());
+        drop(state);
+        self.inner.changed.notify_waiters();
+        Ok(())
     }
 
     /// Closes admission. A finite drain lowers both entry deadlines to the
@@ -303,7 +484,7 @@ impl UpgradeRuntime {
             let uncommitted = state
                 .uncommitted
                 .values()
-                .filter_map(|record| record.abort.clone())
+                .map(|record| record.abort.clone())
                 .collect::<Vec<_>>();
             let entries = state
                 .entries
@@ -332,10 +513,24 @@ impl UpgradeRuntime {
                 !state.accepting
                     && state.uncommitted.is_empty()
                     && state.entries.is_empty()
-                    && state.supervisor_tasks == 0
+                    && state.tracked_tasks == 0
             };
             if drained {
-                break;
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn wait_until_registry_drained(&self) {
+        loop {
+            let notified = self.inner.changed.notified();
+            let drained = {
+                let state = lock(&self.inner.state);
+                !state.accepting && state.uncommitted.is_empty() && state.entries.is_empty()
+            };
+            if drained {
+                return;
             }
             notified.await;
         }
@@ -343,16 +538,17 @@ impl UpgradeRuntime {
 
     pub(crate) async fn shutdown_and_wait(&self, drain_deadline: Option<Instant>) {
         self.begin_shutdown(drain_deadline);
-        self.wait_until_drained().await;
+        self.wait_until_registry_drained().await;
         let supervisor = {
             let mut owned = lock(&self.supervisor);
             let Some(supervisor) = owned.take() else {
                 return;
             };
-            let _ = self.inner.tasks.send(TaskCommand::Stop);
+            let _ = self.inner.supervisor_tasks.send(SupervisorCommand::Stop);
             supervisor
         };
         let _ = supervisor.await;
+        self.wait_until_drained().await;
     }
 
     pub(crate) fn counts(&self) -> UpgradeRuntimeCounts {
@@ -364,7 +560,7 @@ impl UpgradeRuntime {
             reserved_bytes: state.reserved_bytes,
             uncommitted: state.uncommitted.len(),
             committed: state.entries.len(),
-            supervisor_tasks: state.supervisor_tasks,
+            tracked_tasks: state.tracked_tasks,
             accepting: state.accepting,
         }
     }
@@ -392,11 +588,66 @@ fn validate_limits(limits: UpgradeRuntimeLimits) -> Result<(), UpgradeRuntimeErr
     if limits.max_upgrade_lifetime.is_zero() {
         return Err(UpgradeRuntimeError::ZeroLifetime);
     }
+    let relay_bytes = limits
+        .relay_buffer_bytes
+        .checked_mul(2)
+        .ok_or(UpgradeRuntimeError::RelayCapacityOverflow)?;
+    let baseline = relay_bytes
+        .checked_mul(limits.max_active_upgrades)
+        .ok_or(UpgradeRuntimeError::BaselineCapacityOverflow)?;
+    if baseline > limits.max_upgrade_buffer_bytes {
+        return Err(UpgradeRuntimeError::InsufficientBaselineCapacity);
+    }
     let now = Instant::now();
     now.checked_add(limits.max_upgrade_lifetime)
-        .and_then(|deadline| deadline.checked_add(ENTRY_CLEANUP_GRACE))
+        .and_then(|deadline| deadline.checked_add(limits.cleanup_grace))
         .ok_or(UpgradeRuntimeError::LifetimeOverflow)?;
     Ok(())
+}
+
+fn validate_admission(
+    limits: &UpgradeRuntimeLimits,
+    state: &RuntimeState,
+    allocation: UpgradeAllocation,
+) -> Result<Reservation, UpgradeAdmissionError> {
+    if !state.accepting {
+        return Err(UpgradeAdmissionError::Closed);
+    }
+    if state.reserved_slots >= limits.max_active_upgrades {
+        return Err(UpgradeAdmissionError::SlotCapacity);
+    }
+    let relay_bytes = limits
+        .relay_buffer_bytes
+        .checked_mul(2)
+        .ok_or(UpgradeAdmissionError::BufferCapacity)?;
+    let bytes = relay_bytes
+        .checked_add(allocation.wire_bytes)
+        .ok_or(UpgradeAdmissionError::BufferCapacity)?;
+    let next_bytes = state
+        .reserved_bytes
+        .checked_add(bytes)
+        .ok_or(UpgradeAdmissionError::BufferCapacity)?;
+    if next_bytes > limits.max_upgrade_buffer_bytes {
+        return Err(UpgradeAdmissionError::BufferCapacity);
+    }
+    Ok(Reservation { allocation, bytes })
+}
+
+fn validate_next_id(state: &RuntimeState) -> Result<(u64, u64), UpgradeAdmissionError> {
+    let id = state.next_id;
+    let following = state
+        .next_id
+        .checked_add(1)
+        .ok_or(UpgradeAdmissionError::IdentifierExhausted)?;
+    Ok((id, following))
+}
+
+fn apply_reservation(state: &mut RuntimeState, reservation: Reservation) {
+    state.reserved_slots += 1;
+    state.reserved_bytes = state
+        .reserved_bytes
+        .checked_add(reservation.bytes)
+        .expect("validated upgrade reservation remains addressable");
 }
 
 impl RuntimeInner {
@@ -406,7 +657,7 @@ impl RuntimeInner {
             let Some(record) = state.uncommitted.remove(&id) else {
                 return;
             };
-            release_reservation(&mut state, record.allocation);
+            release_reservation(&mut state, record.reservation);
             true
         };
         if removed {
@@ -415,175 +666,189 @@ impl RuntimeInner {
     }
 
     fn close_entry(&self, id: u64) {
-        let (shared, handshake_abort) = {
+        let shared = {
             let mut state = lock(&self.state);
             let Some(record) = state.entries.remove(&id) else {
                 return;
             };
-            release_reservation(&mut state, record.allocation);
-            (record.shared, record.handshake_abort)
+            release_reservation(&mut state, record.reservation);
+            record.shared
         };
         shared.terminal_state.store(ENTRY_CLOSED, Ordering::Release);
-        if let Some(abort) = handshake_abort {
-            abort.abort();
-        }
         drop(lock(&shared.setup).take());
-        let _ = lock(&shared.terminal_cause).take();
+        let _ = lock(&shared.requested_cause).take();
         shared.closed.notify_waiters();
         self.changed.notify_waiters();
     }
 
-    fn task_finished(&self) {
-        let mut state = lock(&self.state);
-        state.supervisor_tasks = state
+    fn spawn_entry_coordinator(
+        self: &Arc<Self>,
+        state: &mut RuntimeState,
+        id: u64,
+        shared: Arc<EntryShared>,
+        snapshot: UpgradedStreamSnapshot,
+    ) -> Result<(), OwnedTask> {
+        let completion = EntryCompletionGuard {
+            inner: self.clone(),
+            id,
+        };
+        let counted = Arc::new(AtomicBool::new(true));
+        let task_completion = TrackedTaskCompletion {
+            inner: self.clone(),
+            counted: counted.clone(),
+        };
+        let task = self.handle.spawn(async move {
+            async move {
+                let _task_completion = task_completion;
+                let _completion = completion;
+                run_entry_coordinator(shared, snapshot).await;
+            }
+            .await;
+        });
+        state.tracked_tasks = state
+            .tracked_tasks
+            .checked_add(1)
+            .expect("tracked task count cannot overflow bounded upgrade metadata");
+        if let Err(error) = self
             .supervisor_tasks
-            .checked_sub(1)
-            .expect("upgrade supervisor task count cannot underflow");
-        drop(state);
-        self.changed.notify_waiters();
+            .send(SupervisorCommand::Track(OwnedTask::new(task)))
+        {
+            let SupervisorCommand::Track(task) = error.0 else {
+                unreachable!("only a tracked task was sent")
+            };
+            if counted.swap(false, Ordering::AcqRel) {
+                state.tracked_tasks -= 1;
+            }
+            return Err(task);
+        }
+        Ok(())
     }
 }
 
-fn release_reservation(state: &mut RuntimeState, allocation: UpgradeAllocation) {
+fn release_reservation(state: &mut RuntimeState, reservation: Reservation) {
     state.reserved_slots = state
         .reserved_slots
         .checked_sub(1)
         .expect("upgrade slot accounting cannot underflow");
     state.reserved_bytes = state
         .reserved_bytes
-        .checked_sub(allocation.bytes)
+        .checked_sub(reservation.bytes)
         .expect("upgrade byte accounting cannot underflow");
 }
 
-pub(crate) struct UpgradeAdmissionGuard {
+pub(crate) struct UpgradeHandshake {
     inner: Arc<RuntimeInner>,
     id: u64,
-    allocation: UpgradeAllocation,
-    committed: bool,
+    reservation: Reservation,
 }
 
-impl fmt::Debug for UpgradeAdmissionGuard {
+impl fmt::Debug for UpgradeHandshake {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("UpgradeAdmissionGuard")
+            .debug_struct("UpgradeHandshake")
             .field("id", &self.id)
-            .field("allocation", &self.allocation)
-            .field("committed", &self.committed)
+            .field("reservation", &self.reservation)
             .finish()
     }
 }
 
-impl UpgradeAdmissionGuard {
+impl UpgradeHandshake {
     pub(crate) fn allocation(&self) -> UpgradeAllocation {
-        self.allocation
+        self.reservation.allocation
     }
 
-    /// Transfers the guard into the runtime-owned uncommitted task set. The
-    /// task must call `commit` only after body completion and 101 validation.
-    pub(crate) fn spawn_handshake<Build, Task>(
-        self,
-        build: Build,
-    ) -> Result<(), UpgradeHandshakeSpawnError>
-    where
-        Build: FnOnce(UpgradeAdmissionGuard) -> Task,
-        Task: Future<Output = ()> + Send + 'static,
-    {
-        let id = self.id;
-        let sender = self.inner.tasks.clone();
-        let task = Box::pin(build(self));
-        sender
-            .send(TaskCommand::StartHandshake { id, task })
-            .map_err(|_| UpgradeHandshakeSpawnError::SupervisorStopped)
+    pub(crate) fn reserved_bytes(&self) -> usize {
+        self.reservation.bytes
     }
 
-    pub(crate) fn commit(
+    /// Commits only while admission remains open. Snapshot construction and
+    /// deadline derivation both happen inside the same winning gate.
+    pub(crate) fn commit<Build>(
         mut self,
-        snapshot: UpgradedStreamSnapshot,
-    ) -> Result<CommittedUpgrade, UpgradeCommitError> {
-        self.commit_with_hook(snapshot, || {})
+        snapshot_builder: Build,
+    ) -> Result<CommittedUpgrade, UpgradeCommitError>
+    where
+        Build: FnOnce(UpgradeSnapshotContext) -> UpgradedStreamSnapshot,
+    {
+        self.commit_with_hook(snapshot_builder, || {})
     }
 
-    fn commit_with_hook(
+    fn commit_with_hook<Build, Hook>(
         &mut self,
-        snapshot: UpgradedStreamSnapshot,
-        hook: impl FnOnce(),
-    ) -> Result<CommittedUpgrade, UpgradeCommitError> {
+        snapshot_builder: Build,
+        hook: Hook,
+    ) -> Result<CommittedUpgrade, UpgradeCommitError>
+    where
+        Build: FnOnce(UpgradeSnapshotContext) -> UpgradedStreamSnapshot,
+        Hook: FnOnce(),
+    {
+        let mut state = lock(&self.inner.state);
+        hook();
+        if !state.accepting {
+            return Err(UpgradeCommitError::AdmissionClosed);
+        }
+        let record = state
+            .uncommitted
+            .get(&self.id)
+            .ok_or(UpgradeCommitError::HandshakeReleased)?;
+        debug_assert_eq!(record.reservation, self.reservation);
+
+        let snapshot = snapshot_builder(UpgradeSnapshotContext {
+            relay_buffer_bytes: self.inner.limits.relay_buffer_bytes,
+        });
         let now = Instant::now();
         let application_stop = now
             .checked_add(self.inner.limits.max_upgrade_lifetime)
             .ok_or(UpgradeCommitError::LifetimeOverflow)?;
         let cleanup_cutoff = application_stop
-            .checked_add(ENTRY_CLEANUP_GRACE)
+            .checked_add(self.inner.limits.cleanup_grace)
             .ok_or(UpgradeCommitError::LifetimeOverflow)?;
         let shared = Arc::new(EntryShared {
             timing: Mutex::new(EntryTiming {
                 application_stop,
                 cleanup_cutoff,
+                stop_cause: UpgradeTerminalCause::LifetimeExpired,
             }),
             setup: Mutex::new(None),
-            terminal_cause: Mutex::new(None),
+            requested_cause: Mutex::new(None),
+            winning_cause: Mutex::new(None),
             changed: Notify::new(),
             terminal_state: AtomicU8::new(ENTRY_OPEN),
             started: AtomicBool::new(false),
             closed: Notify::new(),
         });
 
+        let record = state
+            .uncommitted
+            .remove(&self.id)
+            .expect("checked uncommitted handshake remains present");
+        state.entries.insert(
+            self.id,
+            EntryRecord {
+                reservation: record.reservation,
+                shared: shared.clone(),
+            },
+        );
+        if let Err(task) =
+            self.inner
+                .spawn_entry_coordinator(&mut state, self.id, shared.clone(), snapshot)
         {
-            let mut state = lock(&self.inner.state);
-            hook();
-            if !state.accepting {
-                return Err(UpgradeCommitError::AdmissionClosed);
-            }
             let record = state
-                .uncommitted
+                .entries
                 .remove(&self.id)
-                .ok_or(UpgradeCommitError::GuardReleased)?;
-            debug_assert_eq!(record.allocation, self.allocation);
-            state.entries.insert(
-                self.id,
-                EntryRecord {
-                    allocation: record.allocation,
-                    shared: shared.clone(),
-                    handshake_abort: record.abort,
-                    coordinator_abort: None,
-                },
-            );
-            self.committed = true;
-        }
-
-        let completion = EntryCompletionGuard {
-            inner: self.inner.clone(),
-            id: self.id,
-        };
-        let coordinator_inner = self.inner.clone();
-        let coordinator_shared = shared.clone();
-        let id = self.id;
-        let task = Box::pin(async move {
-            let _completion = completion;
-            run_entry_coordinator(coordinator_inner, id, coordinator_shared, snapshot).await;
-        });
-        if self
-            .inner
-            .tasks
-            .send(TaskCommand::StartEntry { id, task })
-            .is_err()
-        {
-            self.inner.close_entry(id);
+                .expect("new committed entry remains present");
+            release_reservation(&mut state, record.reservation);
+            drop(state);
+            drop(task);
             return Err(UpgradeCommitError::SupervisorStopped);
         }
+        drop(state);
+        self.inner.changed.notify_waiters();
         Ok(CommittedUpgrade {
             _inner: self.inner.clone(),
-            id,
+            id: self.id,
             shared,
         })
-    }
-}
-
-impl Drop for UpgradeAdmissionGuard {
-    fn drop(&mut self) {
-        if !self.committed {
-            self.inner.release_uncommitted(self.id);
-        }
     }
 }
 
@@ -603,15 +868,15 @@ impl fmt::Debug for CommittedUpgrade {
                 "terminal_state",
                 &self.shared.terminal_state.load(Ordering::Acquire),
             )
+            .field("terminal_cause", &self.terminal_cause())
             .finish()
     }
 }
 
 impl CommittedUpgrade {
-    /// Installs the post-commit setup. Setup owns downstream 101 emission and
-    /// returns both relay futures, whose handles remain coordinator-owned. The
-    /// narrow stream snapshot is transferred into setup and is never retained
-    /// by clonable registry handles.
+    /// Installs post-commit setup. Setup owns downstream 101 emission and
+    /// returns both relay futures plus mandatory terminal control. The narrow
+    /// snapshot is transferred into setup, never retained by clonable handles.
     pub(crate) fn start<Build, Setup>(&self, build: Build) -> Result<(), UpgradeEntryStartError>
     where
         Build: FnOnce(UpgradedStreamSnapshot) -> Setup + Send + 'static,
@@ -634,10 +899,10 @@ impl CommittedUpgrade {
     }
 
     pub(crate) fn submit_terminal(&self, cause: UpgradeTerminalCause) {
-        let mut terminal = lock(&self.shared.terminal_cause);
-        if terminal.is_none() {
-            *terminal = Some(cause);
-            drop(terminal);
+        let mut requested = lock(&self.shared.requested_cause);
+        if requested.is_none() {
+            *requested = Some(cause);
+            drop(requested);
             self.shared.changed.notify_waiters();
         }
     }
@@ -650,6 +915,10 @@ impl CommittedUpgrade {
             }
             notified.await;
         }
+    }
+
+    pub(crate) fn terminal_cause(&self) -> Option<UpgradeTerminalCause> {
+        *lock(&self.shared.winning_cause)
     }
 
     pub(crate) fn id(&self) -> u64 {
@@ -666,13 +935,16 @@ impl EntryShared {
     fn lower_for_shutdown(&self, deadline: Instant) {
         {
             let mut timing = lock(&self.timing);
-            timing.application_stop = timing.application_stop.min(deadline);
+            if deadline <= timing.application_stop {
+                timing.application_stop = deadline;
+                timing.stop_cause = UpgradeTerminalCause::Shutdown;
+            }
             timing.cleanup_cutoff = timing.cleanup_cutoff.min(deadline);
         }
         self.changed.notify_waiters();
     }
 
-    fn begin_closing(&self, _cause: UpgradeTerminalCause) {
+    fn begin_closing(&self, cause: UpgradeTerminalCause, now: Instant, cleanup_grace: Duration) {
         if self
             .terminal_state
             .compare_exchange(
@@ -683,8 +955,8 @@ impl EntryShared {
             )
             .is_ok()
         {
-            let now = Instant::now();
-            let cause_cutoff = now.checked_add(ENTRY_CLEANUP_GRACE).unwrap_or(now);
+            *lock(&self.winning_cause) = Some(cause);
+            let cause_cutoff = now.checked_add(cleanup_grace).unwrap_or(now);
             let mut timing = lock(&self.timing);
             timing.application_stop = timing.application_stop.min(now);
             timing.cleanup_cutoff = timing.cleanup_cutoff.min(cause_cutoff);
@@ -705,10 +977,7 @@ impl Drop for EntryCompletionGuard {
     }
 }
 
-async fn run_task_supervisor(
-    inner: Arc<RuntimeInner>,
-    mut receiver: mpsc::UnboundedReceiver<TaskCommand>,
-) {
+async fn run_task_supervisor(mut receiver: mpsc::UnboundedReceiver<SupervisorCommand>) {
     let mut tasks = JoinSet::new();
     let mut stopping = false;
     loop {
@@ -719,132 +988,156 @@ async fn run_task_supervisor(
             biased;
             joined = tasks.join_next(), if !tasks.is_empty() => {
                 let _ = joined;
-                inner.task_finished();
             }
             command = receiver.recv(), if !stopping => {
                 match command {
-                    Some(TaskCommand::StartHandshake { id, task }) => {
-                        spawn_owned_task(&inner, &mut tasks, TaskKind::Handshake, id, task);
+                    Some(SupervisorCommand::Track(task)) => {
+                        tasks.spawn(async move { task.await });
                     }
-                    Some(TaskCommand::StartEntry { id, task }) => {
-                        spawn_owned_task(&inner, &mut tasks, TaskKind::Entry, id, task);
-                    }
-                    Some(TaskCommand::Stop) | None => stopping = true,
+                    Some(SupervisorCommand::Stop) | None => stopping = true,
                 }
             }
         }
     }
 }
 
-fn spawn_owned_task(
-    inner: &Arc<RuntimeInner>,
-    tasks: &mut JoinSet<()>,
-    kind: TaskKind,
-    id: u64,
-    task: UpgradeTask,
-) {
-    let mut state = lock(&inner.state);
-    let record_exists = match kind {
-        TaskKind::Handshake => state.accepting && state.uncommitted.contains_key(&id),
-        TaskKind::Entry => state.entries.contains_key(&id),
+async fn run_entry_coordinator(shared: Arc<EntryShared>, snapshot: UpgradedStreamSnapshot) {
+    let cleanup_grace = {
+        let timing = lock(&shared.timing);
+        timing
+            .cleanup_cutoff
+            .saturating_duration_since(timing.application_stop)
     };
-    if !record_exists {
-        return;
-    }
-    let abort = tasks.spawn(task);
-    state.supervisor_tasks += 1;
-    match kind {
-        TaskKind::Handshake => {
-            state
-                .uncommitted
-                .get_mut(&id)
-                .expect("checked uncommitted record exists")
-                .abort = Some(abort);
-        }
-        TaskKind::Entry => {
-            state
-                .entries
-                .get_mut(&id)
-                .expect("checked committed entry exists")
-                .coordinator_abort = Some(abort);
-        }
-    }
-}
-
-async fn run_entry_coordinator(
-    _inner: Arc<RuntimeInner>,
-    _id: u64,
-    shared: Arc<EntryShared>,
-    snapshot: UpgradedStreamSnapshot,
-) {
     let mut tasks = JoinSet::new();
     let mut snapshot = Some(snapshot);
+    let mut phase = EntryPhase::WaitingForSetup;
+    let mut terminal_control: Option<UpgradeTerminalControl> = None;
+
     loop {
         let changed = shared.changed.notified();
-        if let Some(cause) = lock(&shared.terminal_cause).take() {
-            shared.begin_closing(cause);
-        }
-        let state = shared.terminal_state.load(Ordering::Acquire);
-        if state == ENTRY_CLOSING {
-            tasks.abort_all();
-            drain_entry_tasks(&shared, &mut tasks).await;
-            return;
-        }
-        if state == ENTRY_CLOSED {
-            return;
+        if shared.terminal_state.load(Ordering::Acquire) == ENTRY_OPEN {
+            let requested = { lock(&shared.requested_cause).take() };
+            if let Some(cause) = requested {
+                shared.begin_closing(cause, Instant::now(), cleanup_grace);
+            } else {
+                let timing = *lock(&shared.timing);
+                if Instant::now() >= timing.application_stop {
+                    shared.begin_closing(timing.stop_cause, timing.application_stop, cleanup_grace);
+                }
+            }
         }
 
-        if let Some(build) = lock(&shared.setup).take() {
-            let snapshot = snapshot
-                .take()
-                .expect("entry setup is installed at most once");
-            let setup = build(snapshot);
-            tasks.spawn(async move { EntryTaskResult::Setup(setup.await) });
-            continue;
+        if shared.terminal_state.load(Ordering::Acquire) == ENTRY_CLOSING {
+            match phase {
+                EntryPhase::WaitingForSetup | EntryPhase::SettingUp => {
+                    tasks.abort_all();
+                    tasks.shutdown().await;
+                    return;
+                }
+                EntryPhase::Relaying => {
+                    let timing = *lock(&shared.timing);
+                    if Instant::now() >= timing.cleanup_cutoff {
+                        tasks.abort_all();
+                        tasks.shutdown().await;
+                        return;
+                    }
+                    if let Some(control) = terminal_control.take() {
+                        let cause = lock(&shared.winning_cause)
+                            .expect("closing entry has a winning terminal cause");
+                        tasks.spawn(async move {
+                            control.into_task(cause).await;
+                            EntryTaskResult::TerminalControl
+                        });
+                    }
+                    if tasks.is_empty() {
+                        return;
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep_until(timing.cleanup_cutoff) => {
+                            tasks.abort_all();
+                            tasks.shutdown().await;
+                            return;
+                        }
+                        _ = changed => {}
+                        joined = tasks.join_next() => {
+                            let _ = joined;
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
+
+        if phase == EntryPhase::WaitingForSetup {
+            let build = { lock(&shared.setup).take() };
+            if let Some(build) = build {
+                let snapshot = snapshot
+                    .take()
+                    .expect("entry setup is installed at most once");
+                tasks.spawn(async move {
+                    let setup = build(snapshot);
+                    EntryTaskResult::Setup(setup.await)
+                });
+                phase = EntryPhase::SettingUp;
+                continue;
+            }
         }
 
         let timing = *lock(&shared.timing);
         tokio::select! {
             biased;
             _ = tokio::time::sleep_until(timing.cleanup_cutoff) => {
-                shared.begin_closing(UpgradeTerminalCause::LifetimeExpired);
+                shared.begin_closing(
+                    timing.stop_cause,
+                    timing.application_stop,
+                    cleanup_grace,
+                );
             }
             _ = tokio::time::sleep_until(timing.application_stop) => {
-                shared.begin_closing(UpgradeTerminalCause::LifetimeExpired);
+                shared.begin_closing(
+                    timing.stop_cause,
+                    timing.application_stop,
+                    cleanup_grace,
+                );
             }
             _ = changed => {}
             joined = tasks.join_next(), if !tasks.is_empty() => {
-                match joined {
-                    Some(Ok(EntryTaskResult::Setup(Ok(pair)))) => {
+                match (phase, joined) {
+                    (EntryPhase::SettingUp, Some(Ok(EntryTaskResult::Setup(Ok(pair))))) => {
+                        terminal_control = Some(pair.terminal);
                         tasks.spawn(async move { EntryTaskResult::Relay(pair.first.await) });
                         tasks.spawn(async move { EntryTaskResult::Relay(pair.second.await) });
+                        phase = EntryPhase::Relaying;
                     }
-                    Some(Ok(EntryTaskResult::Setup(Err(cause))))
-                    | Some(Ok(EntryTaskResult::Relay(cause))) => shared.begin_closing(cause),
-                    Some(Err(_)) => shared.begin_closing(UpgradeTerminalCause::Cancelled),
-                    None => {}
+                    (EntryPhase::SettingUp, Some(Ok(EntryTaskResult::Setup(Err(cause))))) => {
+                        shared.begin_closing(cause, Instant::now(), cleanup_grace);
+                    }
+                    (EntryPhase::SettingUp, Some(Err(_))) => {
+                        shared.begin_closing(
+                            UpgradeTerminalCause::SetupFailed,
+                            Instant::now(),
+                            cleanup_grace,
+                        );
+                    }
+                    (EntryPhase::Relaying, Some(Ok(EntryTaskResult::Relay(cause)))) => {
+                        shared.begin_closing(cause, Instant::now(), cleanup_grace);
+                    }
+                    (EntryPhase::Relaying, Some(Err(_))) => {
+                        shared.begin_closing(
+                            UpgradeTerminalCause::RelayError,
+                            Instant::now(),
+                            cleanup_grace,
+                        );
+                    }
+                    (_, Some(Ok(EntryTaskResult::TerminalControl)))
+                    | (_, Some(Ok(EntryTaskResult::Setup(_))))
+                    | (_, Some(Ok(EntryTaskResult::Relay(_))))
+                    | (_, None) => {}
+                    (EntryPhase::WaitingForSetup, Some(Err(_))) => {
+                        unreachable!("waiting phase owns no coordinator task")
+                    }
                 }
-            }
-        }
-    }
-}
-
-async fn drain_entry_tasks(shared: &EntryShared, tasks: &mut JoinSet<EntryTaskResult>) {
-    tasks.abort_all();
-    while !tasks.is_empty() {
-        let changed = shared.changed.notified();
-        let cutoff = lock(&shared.timing).cleanup_cutoff;
-        tokio::select! {
-            biased;
-            _ = tokio::time::sleep_until(cutoff) => {
-                tasks.shutdown().await;
-                return;
-            }
-            _ = changed => {
-                tasks.abort_all();
-            }
-            joined = tasks.join_next() => {
-                let _ = joined;
             }
         }
     }
@@ -864,7 +1157,7 @@ pub(crate) struct UpgradeRuntimeCounts {
     pub(crate) reserved_bytes: usize,
     pub(crate) uncommitted: usize,
     pub(crate) committed: usize,
-    pub(crate) supervisor_tasks: usize,
+    pub(crate) tracked_tasks: usize,
     pub(crate) accepting: bool,
 }
 
@@ -878,6 +1171,12 @@ pub(crate) enum UpgradeRuntimeError {
     ZeroRelayBufferBytes,
     #[error("upgrade runtime requires a positive maximum lifetime")]
     ZeroLifetime,
+    #[error("two relay buffers overflow addressable capacity")]
+    RelayCapacityOverflow,
+    #[error("baseline relay capacity multiplication overflowed")]
+    BaselineCapacityOverflow,
+    #[error("aggregate buffer capacity cannot hold every admitted stream's relay buffers")]
+    InsufficientBaselineCapacity,
     #[error("upgrade lifetime arithmetic overflowed")]
     LifetimeOverflow,
     #[error("upgrade runtime construction requires an active Tokio runtime")]
@@ -898,6 +1197,8 @@ pub(crate) enum UpgradeAdmissionError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum UpgradeHandshakeSpawnError {
+    #[error(transparent)]
+    Admission(#[from] UpgradeAdmissionError),
     #[error("the upgrade task supervisor stopped")]
     SupervisorStopped,
 }
@@ -906,8 +1207,8 @@ pub(crate) enum UpgradeHandshakeSpawnError {
 pub(crate) enum UpgradeCommitError {
     #[error("upgrade admission closed before commit")]
     AdmissionClosed,
-    #[error("the upgrade admission guard was already released")]
-    GuardReleased,
+    #[error("the runtime-owned upgrade handshake was already released")]
+    HandshakeReleased,
     #[error("upgrade lifetime arithmetic overflowed")]
     LifetimeOverflow,
     #[error("the upgrade task supervisor stopped")]
@@ -928,116 +1229,159 @@ mod tests {
     use std::sync::{mpsc as std_mpsc, Barrier};
     use std::thread;
 
+    use tokio::sync::oneshot;
+
     use super::*;
 
     fn limits(slots: usize, bytes: usize) -> UpgradeRuntimeLimits {
         UpgradeRuntimeLimits::new(slots, bytes, 2, Duration::from_secs(60))
     }
 
-    fn allocation(rule: usize, bytes: usize) -> UpgradeAllocation {
-        UpgradeAllocation::from_compiled_rule(rule, Some(bytes)).unwrap()
+    fn short_limits(lifetime: Duration, cleanup: Duration) -> UpgradeRuntimeLimits {
+        UpgradeRuntimeLimits::new(2, 64, 2, lifetime).with_cleanup_grace(cleanup)
     }
 
-    fn snapshot(runtime: &UpgradeRuntime) -> UpgradedStreamSnapshot {
-        UpgradedStreamSnapshot::new(runtime.limits().relay_buffer_bytes(), None)
+    fn allocation(rule: usize, wire_bytes: usize) -> UpgradeAllocation {
+        UpgradeAllocation::from_compiled_rule(rule, Some(wire_bytes)).unwrap()
     }
 
-    async fn wait_for_counts(runtime: &UpgradeRuntime, expected: UpgradeRuntimeCounts) {
+    fn snapshot(context: UpgradeSnapshotContext) -> UpgradedStreamSnapshot {
+        context.build(None)
+    }
+
+    fn inert_control() -> UpgradeTerminalControl {
+        UpgradeTerminalControl::new(|_| async {})
+    }
+
+    async fn wait_for_counts(
+        runtime: &UpgradeRuntime,
+        predicate: impl Fn(UpgradeRuntimeCounts) -> bool,
+    ) -> UpgradeRuntimeCounts {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if runtime.counts() == expected {
-                    return;
+                let notified = runtime.inner.changed.notified();
+                let counts = runtime.counts();
+                if predicate(counts) {
+                    return counts;
                 }
-                runtime.inner.changed.notified().await;
+                notified.await;
             }
         })
         .await
-        .expect("upgrade runtime counts did not converge");
+        .expect("upgrade runtime counts did not converge")
+    }
+
+    #[test]
+    fn constructor_binds_baseline_relay_capacity() {
+        assert_eq!(
+            validate_limits(UpgradeRuntimeLimits::new(
+                1,
+                usize::MAX,
+                usize::MAX,
+                Duration::from_secs(1),
+            )),
+            Err(UpgradeRuntimeError::RelayCapacityOverflow)
+        );
+        assert_eq!(
+            validate_limits(UpgradeRuntimeLimits::new(
+                usize::MAX,
+                usize::MAX,
+                1,
+                Duration::from_secs(1),
+            )),
+            Err(UpgradeRuntimeError::BaselineCapacityOverflow)
+        );
+        assert_eq!(
+            validate_limits(UpgradeRuntimeLimits::new(2, 11, 3, Duration::from_secs(1),)),
+            Err(UpgradeRuntimeError::InsufficientBaselineCapacity)
+        );
     }
 
     #[tokio::test]
     async fn upgrade_admission_and_relay_bounds() {
-        let runtime = UpgradeRuntime::try_new(limits(3, 10)).unwrap();
         assert_eq!(
             UpgradeAllocation::from_compiled_rule(0, None),
             Err(UpgradeAllocationError::RuleDisallowsUpgrades)
         );
-        let first = runtime.try_admit(allocation(0, 6)).unwrap();
-        let second = runtime.try_admit(allocation(1, 4)).unwrap();
-        assert_eq!(
-            runtime.try_admit(allocation(2, 1)).unwrap_err(),
-            UpgradeAdmissionError::BufferCapacity
-        );
-        assert_eq!(first.allocation().bytes(), 6);
-        assert_eq!(second.allocation().rule_index(), 1);
-        assert_eq!(runtime.counts().reserved_bytes, 10);
-        drop(first);
-        let third = runtime.try_admit(allocation(2, 6)).unwrap();
-        assert_eq!(runtime.counts().reserved_slots, 2);
-        drop((second, third));
-        runtime.shutdown_and_wait(Some(Instant::now())).await;
-        assert_eq!(runtime.counts().reserved_bytes, 0);
-    }
+        assert_eq!(allocation(0, 0).wire_bytes(), 0);
 
-    #[tokio::test]
-    async fn upgrade_admission_guard_releases_on_pre101_failure() {
-        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
-        let guard = runtime.try_admit(allocation(0, 8)).unwrap();
-        guard
-            .spawn_handshake(|guard| async move {
-                assert_eq!(guard.allocation().bytes(), 8);
-                drop(guard);
+        let slot_runtime = UpgradeRuntime::try_new(limits(1, 64)).unwrap();
+        let (release_tx, release_rx) = oneshot::channel();
+        slot_runtime
+            .try_spawn_handshake(allocation(0, 0), move |handshake| async move {
+                assert_eq!(handshake.reserved_bytes(), 4);
+                let _ = release_rx.await;
             })
             .unwrap();
-        let mut expected = runtime.counts();
-        expected.reserved_slots = 0;
-        expected.reserved_bytes = 0;
-        expected.uncommitted = 0;
-        expected.supervisor_tasks = 0;
-        wait_for_counts(&runtime, expected).await;
-        let replacement = runtime.try_admit(allocation(0, 8)).unwrap();
-        drop(replacement);
-        runtime.shutdown_and_wait(Some(Instant::now())).await;
+        assert_eq!(slot_runtime.counts().reserved_bytes, 4);
+        assert_eq!(
+            slot_runtime
+                .try_spawn_handshake(allocation(1, 0), |_| async {})
+                .unwrap_err(),
+            UpgradeHandshakeSpawnError::Admission(UpgradeAdmissionError::SlotCapacity)
+        );
+        let _ = release_tx.send(());
+        wait_for_counts(&slot_runtime, |counts| counts.reserved_slots == 0).await;
+        slot_runtime.shutdown_and_wait(Some(Instant::now())).await;
+
+        let byte_runtime = UpgradeRuntime::try_new(limits(2, 8)).unwrap();
+        let (release_tx, release_rx) = oneshot::channel();
+        byte_runtime
+            .try_spawn_handshake(allocation(0, 1), move |_| async move {
+                let _ = release_rx.await;
+            })
+            .unwrap();
+        assert_eq!(byte_runtime.counts().reserved_bytes, 5);
+        assert_eq!(
+            byte_runtime
+                .try_spawn_handshake(allocation(1, 0), |_| async {})
+                .unwrap_err(),
+            UpgradeHandshakeSpawnError::Admission(UpgradeAdmissionError::BufferCapacity)
+        );
+        let _ = release_tx.send(());
+        wait_for_counts(&byte_runtime, |counts| counts.reserved_slots == 0).await;
+        byte_runtime.shutdown_and_wait(Some(Instant::now())).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn upgrade_admission_shutdown_race_linearizes_registry_snapshot() {
+    async fn handshake_cannot_poll_before_atomic_registration() {
         let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
-        let guard = runtime.try_admit(allocation(0, 8)).unwrap();
-        let entered = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
-        let (result_tx, result_rx) = std_mpsc::channel();
-        let commit_thread = thread::spawn({
-            let entered = entered.clone();
-            let release = release.clone();
-            move || {
-                let mut guard = guard;
-                let result = guard.commit_with_hook(UpgradedStreamSnapshot::new(2, None), || {
-                    entered.wait();
-                    release.wait();
-                });
-                result_tx.send(result).unwrap();
-            }
-        });
-        entered.wait();
-        let shutdown_runtime = runtime.clone();
-        let shutdown = thread::spawn(move || {
-            shutdown_runtime.begin_shutdown(Some(Instant::now()));
-        });
-        release.wait();
-        commit_thread.join().unwrap();
-        shutdown.join().unwrap();
-        let entry = result_rx.recv().unwrap().expect("commit won the gate");
-        entry.wait_closed().await;
-        runtime.wait_until_drained().await;
+        let polled = Arc::new(AtomicUsize::new(0));
+        runtime
+            .try_spawn_handshake_with_hook(
+                allocation(0, 0),
+                {
+                    let polled = polled.clone();
+                    move |_| async move {
+                        polled.fetch_add(1, Ordering::SeqCst);
+                    }
+                },
+                || {
+                    thread::sleep(Duration::from_millis(20));
+                    assert_eq!(polled.load(Ordering::SeqCst), 0);
+                },
+            )
+            .unwrap();
+        wait_for_counts(&runtime, |counts| {
+            counts.reserved_slots == 0 && counts.tracked_tasks == 0
+        })
+        .await;
+        assert_eq!(polled.load(Ordering::SeqCst), 1);
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
 
+    #[tokio::test]
+    async fn identifier_exhaustion_is_mutation_free() {
         let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
-        let guard = runtime.try_admit(allocation(0, 8)).unwrap();
-        runtime.begin_shutdown(Some(Instant::now()));
+        lock(&runtime.inner.state).next_id = u64::MAX;
+        let before = runtime.counts();
         assert_eq!(
-            guard.commit(snapshot(&runtime)).unwrap_err(),
-            UpgradeCommitError::AdmissionClosed
+            runtime
+                .try_spawn_handshake(allocation(0, 0), |_| async {})
+                .unwrap_err(),
+            UpgradeHandshakeSpawnError::Admission(UpgradeAdmissionError::IdentifierExhausted)
         );
+        assert_eq!(runtime.counts(), before);
         runtime.shutdown_and_wait(Some(Instant::now())).await;
     }
 
@@ -1049,48 +1393,535 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn upgrade_terminal_races_release_resources_once() {
+    struct DropSignal(Option<oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(signal) = self.0.take() {
+                let _ = signal.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_task_releases_admission_on_pre101_failure() {
         let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
-        let entry = runtime
-            .try_admit(allocation(0, 8))
-            .unwrap()
-            .commit(snapshot(&runtime))
-            .unwrap();
-        let dropped = Arc::new(AtomicUsize::new(0));
-        let first_drop = DropCount(dropped.clone());
-        let second_drop = DropCount(dropped.clone());
-        let never_first = async move {
-            let _drop = first_drop;
-            std::future::pending::<()>().await;
-            UpgradeTerminalCause::PeerClosed
-        };
-        let never_second = async move {
-            let _drop = second_drop;
-            std::future::pending::<()>().await;
-            UpgradeTerminalCause::RelayError
-        };
-        entry
-            .start(move |_snapshot| async move {
-                Ok(UpgradeRelayPair::new(never_first, never_second))
+        runtime
+            .try_spawn_handshake(allocation(0, 0), |handshake| async move {
+                assert_eq!(handshake.allocation().rule_index(), 0);
             })
             .unwrap();
+        wait_for_counts(&runtime, |counts| {
+            counts.reserved_slots == 0 && counts.tracked_tasks == 0
+        })
+        .await;
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            runtime.shutdown_and_wait(Some(Instant::now())),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("shutdown did not drain: {:?}", runtime.counts()));
+    }
 
-        let one = entry.clone();
-        let two = entry.clone();
-        let three = entry.clone();
-        let terminal = tokio::spawn(async move {
-            tokio::join!(
-                async move { one.submit_terminal(UpgradeTerminalCause::PeerClosed) },
-                async move { two.submit_terminal(UpgradeTerminalCause::RelayError) },
-                async move { three.submit_terminal(UpgradeTerminalCause::Cancelled) },
-            );
+    #[tokio::test]
+    async fn shutdown_aborts_and_joins_parked_uncommitted_handshake() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let drop_count = DropCount(dropped.clone());
+        let (started_tx, started_rx) = oneshot::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), move |_| async move {
+                let _drop = drop_count;
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
+        started_rx.await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            runtime.shutdown_and_wait(Some(Instant::now())),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("shutdown did not drain: {:?}", runtime.counts()));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.counts().reserved_bytes, 0);
+        assert_eq!(runtime.counts().tracked_tasks, 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_drop_aborts_every_owned_task() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), move |_| async move {
+                let _drop = DropSignal(Some(dropped_tx));
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
+        started_rx.await.unwrap();
+        drop(runtime);
+        tokio::time::timeout(Duration::from_secs(2), dropped_rx)
+            .await
+            .expect("runtime drop detached a tracked task")
+            .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn upgrade_admission_shutdown_race_linearizes_registry_snapshot() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let setup_effects = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let (result_tx, result_rx) = std_mpsc::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), {
+                let snapshots = snapshots.clone();
+                let entered = entered.clone();
+                let release = release.clone();
+                move |mut handshake| async move {
+                    let result = handshake.commit_with_hook(
+                        |context| {
+                            snapshots.fetch_add(1, Ordering::SeqCst);
+                            snapshot(context)
+                        },
+                        || {
+                            entered.wait();
+                            release.wait();
+                        },
+                    );
+                    result_tx.send(result).unwrap();
+                }
+            })
+            .unwrap();
+        entered.wait();
+        let shutdown_runtime = runtime.clone();
+        let shutdown = thread::spawn(move || {
+            shutdown_runtime.begin_shutdown(Some(Instant::now()));
         });
-        terminal.await.unwrap();
+        release.wait();
+        shutdown.join().unwrap();
+        let entry = result_rx.recv().unwrap().expect("commit won the gate");
+        let _ = entry.start({
+            let setup_effects = setup_effects.clone();
+            move |_| async move {
+                setup_effects.fetch_add(1, Ordering::SeqCst);
+                Err(UpgradeTerminalCause::DownstreamWriteFailed)
+            }
+        });
         entry.wait_closed().await;
+        assert_eq!(snapshots.load(Ordering::SeqCst), 1);
+        assert_eq!(setup_effects.load(Ordering::SeqCst), 0);
+        runtime.wait_until_drained().await;
+
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let snapshots = Arc::new(AtomicUsize::new(0));
+        let setup_effects = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered_rx) = std_mpsc::channel();
+        let (release_tx, release_rx) = std_mpsc::channel();
+        let (result_tx, result_rx) = std_mpsc::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), {
+                let snapshots = snapshots.clone();
+                let setup_effects = setup_effects.clone();
+                move |handshake| async move {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    let result = handshake.commit(|context| {
+                        snapshots.fetch_add(1, Ordering::SeqCst);
+                        snapshot(context)
+                    });
+                    if let Ok(entry) = &result {
+                        entry
+                            .start(move |_| async move {
+                                setup_effects.fetch_add(1, Ordering::SeqCst);
+                                Err(UpgradeTerminalCause::DownstreamWriteFailed)
+                            })
+                            .unwrap();
+                    }
+                    result_tx.send(result.map(|_| ())).unwrap();
+                }
+            })
+            .unwrap();
+        entered_rx.recv().unwrap();
+        runtime.begin_shutdown(Some(Instant::now()));
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            result_rx.recv().unwrap(),
+            Err(UpgradeCommitError::AdmissionClosed)
+        );
+        runtime.wait_until_drained().await;
+        assert_eq!(snapshots.load(Ordering::SeqCst), 0);
+        assert_eq!(setup_effects.load(Ordering::SeqCst), 0);
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
+
+    #[tokio::test]
+    async fn committed_handshake_can_await_close_and_run_post_close_work() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let post_close = Arc::new(AtomicUsize::new(0));
+        let (entry_tx, entry_rx) = oneshot::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), {
+                let post_close = post_close.clone();
+                move |handshake| async move {
+                    let entry = handshake.commit(snapshot).unwrap();
+                    entry
+                        .start(|_| async {
+                            Ok(UpgradeRelayPair::new(
+                                async { UpgradeTerminalCause::PeerClosed },
+                                async { UpgradeTerminalCause::PeerClosed },
+                                inert_control(),
+                            ))
+                        })
+                        .unwrap();
+                    entry_tx.send(entry.clone()).unwrap();
+                    entry.wait_closed().await;
+                    post_close.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+            .unwrap();
+        let entry = entry_rx.await.unwrap();
+        entry.wait_closed().await;
+        wait_for_counts(&runtime, |counts| counts.tracked_tasks == 0).await;
+        assert_eq!(post_close.load(Ordering::SeqCst), 1);
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
+
+    #[tokio::test]
+    async fn exact_relay_cause_reaches_terminal_control() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let (cause_tx, cause_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), move |handshake| async move {
+                let entry = handshake.commit(snapshot).unwrap();
+                entry
+                    .start(|_| async move {
+                        Ok(UpgradeRelayPair::new(
+                            async { UpgradeTerminalCause::RelayError },
+                            async move {
+                                let _ = release_rx.await;
+                                UpgradeTerminalCause::PeerClosed
+                            },
+                            UpgradeTerminalControl::new(move |cause| async move {
+                                let _ = cause_tx.send(cause);
+                                let _ = release_tx.send(());
+                            }),
+                        ))
+                    })
+                    .unwrap();
+                entry.wait_closed().await;
+            })
+            .unwrap();
+        assert_eq!(cause_rx.await.unwrap(), UpgradeTerminalCause::RelayError);
         runtime.begin_shutdown(Some(Instant::now()));
         runtime.wait_until_drained().await;
-        assert_eq!(dropped.load(Ordering::SeqCst), 2);
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_cleanup_uses_grace_then_cutoff_aborts_and_joins() {
+        let runtime =
+            UpgradeRuntime::try_new(limits(1, 8).with_cleanup_grace(Duration::from_millis(100)))
+                .unwrap();
+        let (entry_tx, entry_rx) = oneshot::channel();
+        let (cleanup_started_tx, cleanup_started_rx) = oneshot::channel();
+        let (cleanup_release_tx, cleanup_release_rx) = oneshot::channel();
+        let (relay_release_tx, relay_release_rx) = oneshot::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), move |handshake| async move {
+                let entry = handshake.commit(snapshot).unwrap();
+                entry
+                    .start(|_| async move {
+                        Ok(UpgradeRelayPair::new(
+                            async { UpgradeTerminalCause::PeerClosed },
+                            async move {
+                                let _ = relay_release_rx.await;
+                                UpgradeTerminalCause::PeerClosed
+                            },
+                            UpgradeTerminalControl::new(move |_| async move {
+                                let _ = cleanup_started_tx.send(());
+                                let _ = cleanup_release_rx.await;
+                            }),
+                        ))
+                    })
+                    .unwrap();
+                entry_tx.send(entry).unwrap();
+            })
+            .unwrap();
+        let entry = entry_rx.await.unwrap();
+        cleanup_started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), entry.wait_closed())
+                .await
+                .is_err()
+        );
+        let _ = cleanup_release_tx.send(());
+        let _ = relay_release_tx.send(());
+        entry.wait_closed().await;
+        assert_eq!(
+            entry.terminal_cause(),
+            Some(UpgradeTerminalCause::PeerClosed)
+        );
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+
+        let runtime =
+            UpgradeRuntime::try_new(limits(1, 8).with_cleanup_grace(Duration::from_millis(30)))
+                .unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let relay_drop = DropCount(drops.clone());
+        let cleanup_drop = DropCount(drops.clone());
+        let (entry_tx, entry_rx) = oneshot::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), move |handshake| async move {
+                let entry = handshake.commit(snapshot).unwrap();
+                entry
+                    .start(|_| async move {
+                        Ok(UpgradeRelayPair::new(
+                            async { UpgradeTerminalCause::PeerClosed },
+                            async move {
+                                let _drop = relay_drop;
+                                std::future::pending::<()>().await;
+                                UpgradeTerminalCause::PeerClosed
+                            },
+                            UpgradeTerminalControl::new(move |_| async move {
+                                let _drop = cleanup_drop;
+                                std::future::pending::<()>().await;
+                            }),
+                        ))
+                    })
+                    .unwrap();
+                entry_tx.send(entry).unwrap();
+            })
+            .unwrap();
+        let entry = entry_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entry.wait_closed())
+            .await
+            .unwrap();
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
+
+    #[tokio::test]
+    async fn lifetime_natural_close_and_shutdown_choose_one_cause() {
+        async fn run_case(
+            lifetime: Duration,
+            shutdown: Option<Duration>,
+            relay: UpgradeTerminalCause,
+        ) -> UpgradeTerminalCause {
+            let runtime =
+                UpgradeRuntime::try_new(short_limits(lifetime, Duration::from_millis(30))).unwrap();
+            let (entry_tx, entry_rx) = oneshot::channel();
+            runtime
+                .try_spawn_handshake(allocation(0, 0), move |handshake| async move {
+                    let entry = handshake.commit(snapshot).unwrap();
+                    entry
+                        .start(move |_| async move {
+                            Ok(UpgradeRelayPair::new(
+                                async move {
+                                    if relay == UpgradeTerminalCause::PeerClosed {
+                                        return relay;
+                                    }
+                                    std::future::pending::<()>().await;
+                                    relay
+                                },
+                                async {
+                                    std::future::pending::<()>().await;
+                                    UpgradeTerminalCause::PeerClosed
+                                },
+                                inert_control(),
+                            ))
+                        })
+                        .unwrap();
+                    entry_tx.send(entry).unwrap();
+                })
+                .unwrap();
+            let entry = entry_rx.await.unwrap();
+            if let Some(delay) = shutdown {
+                runtime.begin_shutdown(Some(Instant::now() + delay));
+            }
+            tokio::time::timeout(Duration::from_secs(1), entry.wait_closed())
+                .await
+                .unwrap();
+            let cause = entry.terminal_cause().unwrap();
+            runtime.begin_shutdown(Some(Instant::now()));
+            runtime.wait_until_drained().await;
+            runtime.shutdown_and_wait(Some(Instant::now())).await;
+            cause
+        }
+
+        assert_eq!(
+            run_case(
+                Duration::from_secs(1),
+                None,
+                UpgradeTerminalCause::PeerClosed,
+            )
+            .await,
+            UpgradeTerminalCause::PeerClosed
+        );
+        assert_eq!(
+            run_case(
+                Duration::from_millis(20),
+                None,
+                UpgradeTerminalCause::Cancelled,
+            )
+            .await,
+            UpgradeTerminalCause::LifetimeExpired
+        );
+        assert_eq!(
+            run_case(
+                Duration::from_secs(1),
+                Some(Duration::from_millis(20)),
+                UpgradeTerminalCause::Cancelled,
+            )
+            .await,
+            UpgradeTerminalCause::Shutdown
+        );
+    }
+
+    #[tokio::test]
+    async fn finite_equal_stop_and_cutoff_aborts_without_downstream_cleanup_grace() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let control_calls = Arc::new(AtomicUsize::new(0));
+        let relay_drops = Arc::new(AtomicUsize::new(0));
+        let (entry_tx, entry_rx) = oneshot::channel();
+        let (relays_started_tx, relays_started_rx) = oneshot::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), {
+                let control_calls = control_calls.clone();
+                let relay_drops = relay_drops.clone();
+                move |handshake| async move {
+                    let entry = handshake.commit(snapshot).unwrap();
+                    entry
+                        .start(move |_| async move {
+                            let first_drop = DropCount(relay_drops.clone());
+                            let second_drop = DropCount(relay_drops.clone());
+                            let _ = relays_started_tx.send(());
+                            Ok(UpgradeRelayPair::new(
+                                async move {
+                                    let _drop = first_drop;
+                                    std::future::pending::<()>().await;
+                                    UpgradeTerminalCause::PeerClosed
+                                },
+                                async move {
+                                    let _drop = second_drop;
+                                    std::future::pending::<()>().await;
+                                    UpgradeTerminalCause::PeerClosed
+                                },
+                                UpgradeTerminalControl::new(move |_| async move {
+                                    control_calls.fetch_add(1, Ordering::SeqCst);
+                                }),
+                            ))
+                        })
+                        .unwrap();
+                    entry_tx.send(entry).unwrap();
+                }
+            })
+            .unwrap();
+        let entry = entry_rx.await.unwrap();
+        relays_started_rx.await.unwrap();
+        runtime.begin_shutdown(Some(Instant::now()));
+        entry.wait_closed().await;
+        assert_eq!(entry.terminal_cause(), Some(UpgradeTerminalCause::Shutdown));
+        assert_eq!(control_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(relay_drops.load(Ordering::SeqCst), 2);
+        runtime.wait_until_drained().await;
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
+
+    #[tokio::test]
+    async fn setup_failure_and_panic_are_pre_relay_terminal_paths() {
+        for panic_setup in [false, true] {
+            let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+            let (entry_tx, entry_rx) = oneshot::channel();
+            runtime
+                .try_spawn_handshake(allocation(0, 0), move |handshake| async move {
+                    let entry = handshake.commit(snapshot).unwrap();
+                    entry
+                        .start(move |_| async move {
+                            if panic_setup {
+                                panic!("setup panic");
+                            }
+                            Err(UpgradeTerminalCause::DownstreamWriteFailed)
+                        })
+                        .unwrap();
+                    entry_tx.send(entry).unwrap();
+                })
+                .unwrap();
+            let entry = entry_rx.await.unwrap();
+            entry.wait_closed().await;
+            assert_eq!(
+                entry.terminal_cause(),
+                Some(if panic_setup {
+                    UpgradeTerminalCause::SetupFailed
+                } else {
+                    UpgradeTerminalCause::DownstreamWriteFailed
+                })
+            );
+            runtime.shutdown_and_wait(Some(Instant::now())).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn upgrade_terminal_races_release_resources_once() {
+        let runtime =
+            UpgradeRuntime::try_new(limits(1, 8).with_cleanup_grace(Duration::from_millis(30)))
+                .unwrap();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let terminal_calls = Arc::new(AtomicUsize::new(0));
+        let (entry_tx, entry_rx) = oneshot::channel();
+        let (started_tx, started_rx) = oneshot::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), {
+                let drops = drops.clone();
+                let terminal_calls = terminal_calls.clone();
+                move |handshake| async move {
+                    let entry = handshake.commit(snapshot).unwrap();
+                    entry
+                        .start(move |_| async move {
+                            let first = DropCount(drops.clone());
+                            let second = DropCount(drops.clone());
+                            let terminal = DropCount(drops.clone());
+                            Ok(UpgradeRelayPair::new(
+                                async move {
+                                    let _drop = first;
+                                    let _ = started_tx.send(());
+                                    std::future::pending::<()>().await;
+                                    UpgradeTerminalCause::PeerClosed
+                                },
+                                async move {
+                                    let _drop = second;
+                                    std::future::pending::<()>().await;
+                                    UpgradeTerminalCause::RelayError
+                                },
+                                UpgradeTerminalControl::new(move |_| async move {
+                                    let _drop = terminal;
+                                    terminal_calls.fetch_add(1, Ordering::SeqCst);
+                                    std::future::pending::<()>().await;
+                                }),
+                            ))
+                        })
+                        .unwrap();
+                    entry_tx.send(entry).unwrap();
+                }
+            })
+            .unwrap();
+        let entry = entry_rx.await.unwrap();
+        started_rx.await.unwrap();
+        let first = entry.clone();
+        let second = entry.clone();
+        let third = entry.clone();
+        tokio::join!(
+            async move { first.submit_terminal(UpgradeTerminalCause::PeerClosed) },
+            async move { second.submit_terminal(UpgradeTerminalCause::RelayError) },
+            async move { third.submit_terminal(UpgradeTerminalCause::Cancelled) },
+        );
+        entry.wait_closed().await;
+        assert_eq!(terminal_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 3);
         assert_eq!(runtime.counts().reserved_slots, 0);
         assert_eq!(runtime.counts().reserved_bytes, 0);
         runtime.shutdown_and_wait(Some(Instant::now())).await;
@@ -1099,11 +1930,14 @@ mod tests {
     #[tokio::test]
     async fn finite_shutdown_only_lowers_committed_deadlines() {
         let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
-        let entry = runtime
-            .try_admit(allocation(0, 8))
-            .unwrap()
-            .commit(snapshot(&runtime))
+        let (entry_tx, entry_rx) = oneshot::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), move |handshake| async move {
+                let entry = handshake.commit(snapshot).unwrap();
+                entry_tx.send(entry).unwrap();
+            })
             .unwrap();
+        let entry = entry_rx.await.unwrap();
         let before = entry.timing();
         let drain = Instant::now() + Duration::from_secs(10);
         runtime.begin_shutdown(Some(drain));
@@ -1111,6 +1945,7 @@ mod tests {
         assert!(after.application_stop <= before.application_stop);
         assert_eq!(after.application_stop, drain);
         assert_eq!(after.cleanup_cutoff, drain);
+        assert_eq!(after.stop_cause, UpgradeTerminalCause::Shutdown);
 
         runtime.begin_shutdown(Some(drain + Duration::from_secs(10)));
         assert_eq!(entry.timing().application_stop, drain);
