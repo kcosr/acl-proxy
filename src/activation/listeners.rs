@@ -4,11 +4,11 @@ use std::net::{SocketAddr, TcpListener};
 use crate::config::compiler::StaticListenersConfig;
 
 #[derive(Default)]
-pub(crate) struct PreparedProxyListeners {
-    pub(crate) explicit_http: Option<TcpListener>,
-    pub(crate) transparent_http: Option<TcpListener>,
-    pub(crate) explicit_https: Option<TcpListener>,
-    pub(crate) transparent_https: Option<TcpListener>,
+pub(super) struct PreparedProxyListeners {
+    pub(super) explicit_http: Option<TcpListener>,
+    pub(super) transparent_http: Option<TcpListener>,
+    pub(super) explicit_https: Option<TcpListener>,
+    pub(super) transparent_https: Option<TcpListener>,
 }
 
 impl PreparedProxyListeners {

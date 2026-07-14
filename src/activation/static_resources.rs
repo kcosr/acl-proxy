@@ -185,7 +185,11 @@ impl ProductStaticResources {
         Ok(())
     }
 
-    pub(crate) fn take_prepared_proxy_listeners(
+    /// Transfers the complete listener bundle into synchronous supervisor startup.
+    ///
+    /// The caller must return the successfully started supervisors to this owner
+    /// before yielding so shutdown continues to own and join every ingress task.
+    pub(super) fn take_prepared_proxy_listeners_for_supervisor_start(
         &self,
     ) -> Result<PreparedProxyListeners, ProductStaticResourcesError> {
         let mut ingress = self
@@ -469,6 +473,8 @@ mod tests {
     };
     use crate::config::{compile_config_text, ConfigTextInput};
 
+    static LISTENER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn available_addresses<const N: usize>() -> [SocketAddr; N] {
         let listeners: Vec<_> = (0..N)
             .map(|_| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
@@ -578,6 +584,7 @@ header = "x-acl-proxy-request-id"
 
     #[tokio::test]
     async fn preparation_reserves_every_configured_listener_and_is_one_shot() {
+        let _test = LISTENER_TEST_LOCK.lock().await;
         let addresses = available_addresses::<5>();
         let resources = ProductStaticResources::try_new(&static_config(addresses)).unwrap();
 
@@ -599,6 +606,7 @@ header = "x-acl-proxy-request-id"
 
     #[tokio::test]
     async fn later_proxy_bind_failure_releases_earlier_sockets() {
+        let _test = LISTENER_TEST_LOCK.lock().await;
         let addresses = available_addresses::<5>();
         let blocker = TcpListener::bind(addresses[2]).unwrap();
         let resources = ProductStaticResources::try_new(&static_config(addresses)).unwrap();
@@ -616,6 +624,7 @@ header = "x-acl-proxy-request-id"
 
     #[tokio::test]
     async fn control_adoption_failure_releases_all_prebound_sockets() {
+        let _test = LISTENER_TEST_LOCK.lock().await;
         let addresses = available_addresses::<5>();
         let resources = ProductStaticResources::try_new(&static_config(addresses)).unwrap();
 
@@ -634,6 +643,7 @@ header = "x-acl-proxy-request-id"
 
     #[tokio::test]
     async fn shutdown_releases_prepared_but_unstarted_proxy_sockets() {
+        let _test = LISTENER_TEST_LOCK.lock().await;
         let addresses = available_addresses::<5>();
         let resources = ProductStaticResources::try_new(&static_config(addresses)).unwrap();
         resources.prepare_ingress().unwrap();
@@ -642,13 +652,14 @@ header = "x-acl-proxy-request-id"
 
         assert_bindable(addresses);
         assert!(matches!(
-            resources.take_prepared_proxy_listeners(),
+            resources.take_prepared_proxy_listeners_for_supervisor_start(),
             Err(ProductStaticResourcesError::IngressAlreadyAdopted)
         ));
     }
 
-    #[test]
-    fn construction_does_not_bind_configured_sockets() {
+    #[tokio::test]
+    async fn construction_does_not_bind_configured_sockets() {
+        let _test = LISTENER_TEST_LOCK.lock().await;
         let addresses = available_addresses::<5>();
         let resources = ProductStaticResources::try_new(&static_config(addresses)).unwrap();
 
