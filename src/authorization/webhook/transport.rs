@@ -3,7 +3,7 @@ use std::io;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::watch;
-use tokio::task::JoinError;
+use tokio::task::{JoinError, JoinHandle};
 use tokio_rustls::TlsConnector;
 
 use super::ack::{
@@ -27,15 +27,23 @@ pub(crate) async fn connect_and_deliver<C>(
 where
     C: Future<Output = ()> + Send,
 {
-    tokio::pin!(cancellation);
+    let deadline = tokio::time::Instant::now() + provider.timeout();
+    let effective_cancellation = async move {
+        tokio::select! {
+            biased;
+            _ = cancellation => {}
+            _ = tokio::time::sleep_until(deadline) => {}
+        }
+    };
+    tokio::pin!(effective_cancellation);
     let resolved = tokio::select! {
         biased;
-        _ = cancellation.as_mut() => return Err(WebhookDeliveryError::Cancelled),
+        _ = effective_cancellation.as_mut() => return Err(WebhookDeliveryError::Cancelled),
         result = destination_guard.resolve(DestinationTarget::webhook(provider.url())) => result?,
     };
     let connected = tokio::select! {
         biased;
-        _ = cancellation.as_mut() => return Err(WebhookDeliveryError::Cancelled),
+        _ = effective_cancellation.as_mut() => return Err(WebhookDeliveryError::Cancelled),
         result = destination_guard.connect_system(resolved) => result?,
     };
     let stream: Box<dyn WebhookIo> = if let Some(config) = provider.tls() {
@@ -44,7 +52,7 @@ where
         let stream = connected.into_stream();
         let tls = tokio::select! {
             biased;
-            _ = cancellation.as_mut() => return Err(WebhookDeliveryError::Cancelled),
+            _ = effective_cancellation.as_mut() => return Err(WebhookDeliveryError::Cancelled),
             result = TlsConnector::from(config).connect(server_name, stream) => {
                 result.map_err(WebhookDeliveryError::TlsHandshake)?
             },
@@ -59,7 +67,7 @@ where
         provider.url(),
         request_body,
         provider.max_response_bytes(),
-        cancellation.as_mut(),
+        effective_cancellation.as_mut(),
     )
     .await
 }
@@ -85,14 +93,20 @@ where
     let (outbound, inbound) = lease.split();
     let (reader, writer) = tokio::io::split(stream);
     let (stop, stop_rx) = watch::channel(false);
-    let mut writer_task = tokio::spawn(run_writer(
+    let writer_task = tokio::spawn(run_writer(
         writer,
         outbound,
         request_body,
         request_head_bytes,
         stop_rx.clone(),
     ));
-    let mut reader_task = tokio::spawn(run_reader(reader, inbound, max_response_bytes, stop_rx));
+    let reader_task = tokio::spawn(run_reader(reader, inbound, max_response_bytes, stop_rx));
+    let mut tasks = DeliveryTasks {
+        stop,
+        writer: writer_task,
+        reader: reader_task,
+        armed: true,
+    };
     tokio::pin!(cancellation);
 
     let mut writer_completion = None;
@@ -104,7 +118,7 @@ where
         tokio::select! {
             biased;
             _ = &mut cancellation => break Err(WebhookDeliveryError::Cancelled),
-            joined = &mut writer_task, if !writer_done => {
+            joined = &mut tasks.writer, if !writer_done => {
                 writer_done = true;
                 match joined {
                     Ok(completion) => {
@@ -120,7 +134,7 @@ where
                     break Ok(acknowledgement.expect("successful reader completed"));
                 }
             }
-            joined = &mut reader_task, if !reader_done => {
+            joined = &mut tasks.reader, if !reader_done => {
                 reader_done = true;
                 match joined {
                     Ok(completion) => {
@@ -139,9 +153,9 @@ where
         }
     };
 
-    let _ = stop.send(true);
+    tasks.stop();
     if !writer_done {
-        match writer_task.await {
+        match (&mut tasks.writer).await {
             Ok(completion) => {
                 let WriterCompletion {
                     outbound,
@@ -155,7 +169,7 @@ where
         }
     }
     if !reader_done {
-        match reader_task.await {
+        match (&mut tasks.reader).await {
             Ok(completion) => reader_completion = Some(completion.inbound),
             Err(error) if terminal.is_ok() => return Err(WebhookDeliveryError::Task(error)),
             Err(_) => {}
@@ -164,9 +178,37 @@ where
 
     // These values own all sensitive delivery allocations. Their explicit
     // teardown occurs only after both task joins above have completed.
+    tasks.disarm();
     drop(writer_completion);
     drop(reader_completion);
     terminal
+}
+
+struct DeliveryTasks {
+    stop: watch::Sender<bool>,
+    writer: JoinHandle<WriterCompletion>,
+    reader: JoinHandle<ReaderTaskCompletion>,
+    armed: bool,
+}
+
+impl DeliveryTasks {
+    fn stop(&self) {
+        let _ = self.stop.send(true);
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DeliveryTasks {
+    fn drop(&mut self) {
+        if self.armed {
+            self.stop();
+            self.writer.abort();
+            self.reader.abort();
+        }
+    }
 }
 
 struct WriterCompletion {
@@ -337,13 +379,22 @@ pub(crate) enum WebhookDeliveryError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::io;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use tokio::sync::oneshot;
 
     use super::*;
     use crate::authorization::webhook::pool::WebhookTransportArena;
+    use crate::authorization::webhook::provider::WebhookProvider;
+    use crate::config::compiler::{CompiledProviderFailureMode, WebhookProviderPlan};
+    use crate::destination::{
+        DestinationFacts, DestinationResolver, LocalAddressSnapshot, LocalAddressSource,
+        ResolveFuture,
+    };
     use crate::safety::{HttpWireBodyGuard, WireBodyPool, WireBodyQuotaKey};
     use crate::url::canonicalize_http_url;
 
@@ -362,6 +413,22 @@ mod tests {
 
     fn arena() -> WebhookTransportArena {
         WebhookTransportArena::try_new(1, 64 * 1024, 128 * 1024).unwrap()
+    }
+
+    struct HangingResolver;
+
+    impl DestinationResolver for HangingResolver {
+        fn resolve(&self, _host: &str, _port: u16, _max_addresses: usize) -> ResolveFuture<'_> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    struct EmptyLocalAddresses;
+
+    impl LocalAddressSource for EmptyLocalAddresses {
+        fn snapshot(&self) -> io::Result<LocalAddressSnapshot> {
+            Ok(LocalAddressSnapshot::default())
+        }
     }
 
     #[tokio::test]
@@ -443,6 +510,84 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(eof, 0);
+        assert_eq!(arena.counts().live_deliveries, 0);
+        assert_eq!(guard.live_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropped_delivery_aborts_owned_tasks_without_detaching_resources() {
+        let arena = arena();
+        let lease = arena.try_acquire().unwrap();
+        let guard = guard();
+        let request_body = body(&guard, b"{}");
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(10),
+            deliver_one(
+                client,
+                lease,
+                &canonicalize_http_url("http://localhost/authorize").unwrap(),
+                request_body,
+                64,
+                std::future::pending(),
+            ),
+        )
+        .await;
+        assert!(timed_out.is_err());
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while arena.counts().live_deliveries != 0 || guard.live_bytes() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            let mut byte = [0u8; 1];
+            while server.read(&mut byte).await.unwrap() != 0 {}
+        })
+        .await
+        .unwrap();
+        assert!(arena.try_acquire().is_ok());
+    }
+
+    #[tokio::test]
+    async fn provider_deadline_covers_resolution_and_releases_admission() {
+        let provider = WebhookProvider::activate(
+            WebhookProviderPlan {
+                url: "http://localhost/authorize".to_owned(),
+                timeout: Duration::from_millis(10),
+                on_failure: CompiledProviderFailureMode::Deny,
+                include_headers: vec![],
+                max_request_bytes: 4096,
+                max_response_bytes: 64,
+                outputs: BTreeMap::new(),
+                tls: None,
+            },
+            || false,
+        )
+        .unwrap();
+        let destination = DestinationGuard::with_sources(
+            DestinationFacts::for_test([], None, None, 1).unwrap(),
+            Arc::new(HangingResolver),
+            Arc::new(EmptyLocalAddresses),
+        );
+        let arena = arena();
+        let lease = arena.try_acquire().unwrap();
+        let guard = guard();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            connect_and_deliver(
+                &destination,
+                &provider,
+                lease,
+                body(&guard, b"{}"),
+                std::future::pending(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(WebhookDeliveryError::Cancelled)));
         assert_eq!(arena.counts().live_deliveries, 0);
         assert_eq!(guard.live_bytes(), 0);
     }

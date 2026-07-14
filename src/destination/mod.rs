@@ -263,7 +263,7 @@ impl DestinationFacts {
     }
 
     #[cfg(test)]
-    fn for_test(
+    pub(crate) fn for_test(
         listener_binds: impl IntoIterator<Item = SocketAddr>,
         control_bind: Option<SocketAddr>,
         reserved_control: Option<ReservedControlSubtree>,
