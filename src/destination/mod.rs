@@ -951,6 +951,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn webhook_provider_cannot_target_self_or_control_plane() {
+        for (facts, resolved, reason, port) in [
+            (
+                facts([endpoint("127.0.0.1:8443")], None),
+                endpoint("127.0.0.1:8443"),
+                ProtectedReason::Listener,
+                8443,
+            ),
+            (
+                facts([], Some(endpoint("127.0.0.1:8898"))),
+                endpoint("127.0.0.1:8898"),
+                ProtectedReason::Control,
+                8898,
+            ),
+        ] {
+            let resolver = Arc::new(FixedResolver::new([resolved]));
+            let guard = guard(facts, Arc::clone(&resolver), [LocalStep::Addresses(vec![])]);
+
+            assert!(matches!(
+                guard.resolve(target(DestinationRoute::Webhook, port)).await,
+                Err(DestinationGuardError::ProtectedDestination {
+                    reason: actual,
+                    ..
+                }) if actual == reason
+            ));
+            assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        }
+
+        let callback_url = crate::url::canonicalize_http_url(
+            "https://control.example/_acl/external-auth/callback",
+        )
+        .expect("canonical callback URL");
+        let resolver = Arc::new(FixedResolver::new([endpoint("192.0.2.60:443")]));
+        let guard = guard(
+            DestinationFacts::for_test(
+                [],
+                None,
+                Some(ReservedControlSubtree::new(&callback_url, "/_acl")),
+                8,
+            )
+            .expect("destination facts"),
+            Arc::clone(&resolver),
+            [LocalStep::Addresses(vec![])],
+        );
+
+        assert!(matches!(
+            guard.resolve(DestinationTarget::webhook(&callback_url)).await,
+            Err(DestinationGuardError::ReservedControlSubtree)
+        ));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn resolved_destination_is_pinned_without_second_lookup() {
         let first = endpoint("192.0.2.30:443");
         let second = endpoint("192.0.2.31:443");
