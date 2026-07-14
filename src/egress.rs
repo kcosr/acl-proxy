@@ -67,6 +67,13 @@ impl OriginProtocol {
     pub(crate) fn is_http2(self) -> bool {
         self == Self::Http2
     }
+
+    fn from_compiled(version: CompiledHttpVersion) -> Self {
+        match version {
+            CompiledHttpVersion::Http1 => Self::Http1,
+            CompiledHttpVersion::Http2 => Self::Http2,
+        }
+    }
 }
 
 pub(crate) struct ParentTls {
@@ -379,6 +386,24 @@ impl OriginTls {
         &self.http_versions
     }
 
+    pub(crate) fn select_protocol(&self, ingress: OriginProtocol) -> OriginProtocol {
+        let ingress_enabled = if ingress.is_http2() {
+            self.http2_config.is_some()
+        } else {
+            self.http1_config.is_some()
+        };
+        if ingress_enabled {
+            return ingress;
+        }
+
+        OriginProtocol::from_compiled(
+            *self
+                .http_versions
+                .first()
+                .expect("activated origin TLS has an enabled HTTP protocol"),
+        )
+    }
+
     pub(crate) fn client_config(
         &self,
         protocol: OriginProtocol,
@@ -689,6 +714,13 @@ default = "deny"
                     .err(),
                 Some(OriginProtocolError::Disabled)
             );
+            let ingress = if expected.is_http2() {
+                OriginProtocol::Http1
+            } else {
+                OriginProtocol::Http2
+            };
+            assert_eq!(snapshot.origin_tls().select_protocol(ingress), expected);
+            assert_eq!(snapshot.origin_tls().select_protocol(expected), expected);
             let incompatible: &[u8] = if version == CompiledHttpVersion::Http2 {
                 b"http/1.1"
             } else {
@@ -705,6 +737,24 @@ default = "deny"
                     .origin_tls()
                     .validate_negotiated_alpn(expected, Some(expected_alpn)),
                 Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn origin_protocol_selection_preserves_enabled_ingress_regardless_of_configured_order() {
+        for versions in [
+            vec![CompiledHttpVersion::Http1, CompiledHttpVersion::Http2],
+            vec![CompiledHttpVersion::Http2, CompiledHttpVersion::Http1],
+        ] {
+            let snapshot = activate(direct_plan(CompiledTlsTrust::Insecure, None, versions));
+            assert_eq!(
+                snapshot.origin_tls().select_protocol(OriginProtocol::Http1),
+                OriginProtocol::Http1
+            );
+            assert_eq!(
+                snapshot.origin_tls().select_protocol(OriginProtocol::Http2),
+                OriginProtocol::Http2
             );
         }
     }

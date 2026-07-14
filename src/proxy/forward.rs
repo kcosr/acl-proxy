@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use http::header::{HeaderValue, HOST};
+use http::header::{HeaderValue, HOST, TE};
 use http::{Method, Request, Response, StatusCode, Version};
 use hyper::body::{Bytes, HttpBody, SizeHint};
 use hyper::client::conn;
@@ -57,8 +57,6 @@ pub(crate) enum ForwardError {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ResolveForwardingError {
-    #[error(transparent)]
-    Protocol(#[from] OriginProtocolError),
     #[error(transparent)]
     Destination(#[from] DestinationGuardError),
 }
@@ -402,7 +400,8 @@ pub(crate) type ForwardedResponse = Response<ForwardBody>;
 
 pub(crate) struct ResolvedForwardingTarget<'egress> {
     canonical_url: String,
-    protocol: OriginProtocol,
+    ingress_protocol: OriginProtocol,
+    origin_protocol: OriginProtocol,
     egress_identity: usize,
     route: ResolvedForwardingRoute,
     _egress: std::marker::PhantomData<&'egress dyn EgressSnapshot>,
@@ -424,7 +423,8 @@ pub(crate) async fn resolve_forwarding_target<'egress>(
     egress: &'egress dyn EgressSnapshot,
     destinations: &DestinationGuard,
 ) -> Result<ResolvedForwardingTarget<'egress>, ResolveForwardingError> {
-    egress.origin_tls().client_config(request.protocol())?;
+    let ingress_protocol = request.protocol();
+    let origin_protocol = egress.origin_tls().select_protocol(ingress_protocol);
     let egress_identity = egress.route() as *const EgressRoute as usize;
     let route = match egress.route() {
         EgressRoute::Direct => ResolvedForwardingRoute::Direct(
@@ -441,7 +441,8 @@ pub(crate) async fn resolve_forwarding_target<'egress>(
     };
     Ok(ResolvedForwardingTarget {
         canonical_url: canonical.url.clone(),
-        protocol: request.protocol(),
+        ingress_protocol,
+        origin_protocol,
         egress_identity,
         route,
         _egress: std::marker::PhantomData,
@@ -481,8 +482,10 @@ where
     C: DestinationConnector,
     C::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let selected_origin_protocol = egress.origin_tls().select_protocol(request.protocol());
     if target.canonical_url != canonical.url
-        || target.protocol != request.protocol()
+        || target.ingress_protocol != request.protocol()
+        || target.origin_protocol != selected_origin_protocol
         || target.egress_identity != egress.route() as *const EgressRoute as usize
     {
         return Err(ForwardError::ResolvedTargetMismatch);
@@ -494,7 +497,7 @@ where
                 .connect(resolved, connector)
                 .await?
                 .into_stream();
-            forward_direct(request, canonical, egress, stream).await
+            forward_direct(request, canonical, egress, selected_origin_protocol, stream).await
         }
         (
             EgressRoute::Parent(parent),
@@ -507,7 +510,15 @@ where
                 .connect(resolved, connector)
                 .await?
                 .into_stream();
-            forward_via_parent(request, canonical, egress, parent, stream).await
+            forward_via_parent(
+                request,
+                canonical,
+                egress,
+                parent,
+                selected_origin_protocol,
+                stream,
+            )
+            .await
         }
         _ => Err(ForwardError::ResolvedTargetMismatch),
     }
@@ -517,18 +528,20 @@ async fn forward_direct<S>(
     request: SanitizedRequest,
     canonical: &CanonicalUrl,
     egress: &dyn EgressSnapshot,
+    protocol: OriginProtocol,
     stream: S,
 ) -> Result<ForwardedResponse, ForwardError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let protocol = request.protocol();
     if canonical.scheme == "https" {
         let stream = connect_origin_tls(stream, canonical, egress, protocol).await?;
-        let request = prepare_origin_request(request, canonical, RequestTargetForm::Origin)?;
+        let request =
+            prepare_forward_request(request, canonical, RequestTargetForm::Origin, protocol)?;
         send_request(stream, request, protocol).await
     } else {
-        let request = prepare_origin_request(request, canonical, RequestTargetForm::Origin)?;
+        let request =
+            prepare_forward_request(request, canonical, RequestTargetForm::Origin, protocol)?;
         send_request(stream, request, protocol).await
     }
 }
@@ -538,12 +551,12 @@ async fn forward_via_parent<S>(
     canonical: &CanonicalUrl,
     egress: &dyn EgressSnapshot,
     parent: &ParentEndpoint,
+    protocol: OriginProtocol,
     stream: S,
 ) -> Result<ForwardedResponse, ForwardError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let protocol = request.protocol();
     if canonical.scheme == "https" {
         // CONNECT is deliberately HTTP/1.1 and contains no logical-origin
         // headers. The selected origin protocol applies inside the tunnel.
@@ -551,21 +564,30 @@ where
             ParentTransport::Http => {
                 let tunnel = connect_parent_tunnel(stream, canonical).await?;
                 let origin = connect_origin_tls(tunnel, canonical, egress, protocol).await?;
-                let request =
-                    prepare_origin_request(request, canonical, RequestTargetForm::Origin)?;
+                let request = prepare_forward_request(
+                    request,
+                    canonical,
+                    RequestTargetForm::Origin,
+                    protocol,
+                )?;
                 send_request(origin, request, protocol).await
             }
             ParentTransport::Https(tls) => {
                 let parent_stream = connect_parent_tls(stream, tls, false).await?;
                 let tunnel = connect_parent_tunnel(parent_stream, canonical).await?;
                 let origin = connect_origin_tls(tunnel, canonical, egress, protocol).await?;
-                let request =
-                    prepare_origin_request(request, canonical, RequestTargetForm::Origin)?;
+                let request = prepare_forward_request(
+                    request,
+                    canonical,
+                    RequestTargetForm::Origin,
+                    protocol,
+                )?;
                 send_request(origin, request, protocol).await
             }
         }
     } else {
-        let request = prepare_origin_request(request, canonical, RequestTargetForm::Absolute)?;
+        let request =
+            prepare_forward_request(request, canonical, RequestTargetForm::Absolute, protocol)?;
         match parent.transport() {
             ParentTransport::Http => send_request(stream, request, protocol).await,
             ParentTransport::Https(tls) => {
@@ -574,6 +596,40 @@ where
             }
         }
     }
+}
+
+fn prepare_forward_request(
+    request: SanitizedRequest,
+    canonical: &CanonicalUrl,
+    target_form: RequestTargetForm,
+    protocol: OriginProtocol,
+) -> Result<Request<Body>, HeaderPreparationError> {
+    let mut request = prepare_origin_request(request, canonical, target_form)?;
+    request.headers_mut().remove(HOST);
+    if protocol.is_http2() {
+        *request.version_mut() = Version::HTTP_2;
+        *request.uri_mut() = canonical
+            .url
+            .parse()
+            .map_err(|_| HeaderPreparationError::Target)?;
+    } else {
+        request.headers_mut().remove(TE);
+        *request.version_mut() = Version::HTTP_11;
+        let target = match target_form {
+            RequestTargetForm::Origin => match &canonical.query {
+                Some(query) => format!("{}?{query}", canonical.path),
+                None => canonical.path.clone(),
+            },
+            RequestTargetForm::Absolute => canonical.url.clone(),
+        };
+        *request.uri_mut() = target.parse().map_err(|_| HeaderPreparationError::Target)?;
+        request.headers_mut().insert(
+            HOST,
+            HeaderValue::from_str(&canonical.authority)
+                .map_err(|_| HeaderPreparationError::Authority)?,
+        );
+    }
+    Ok(request)
 }
 
 async fn connect_origin_tls<S>(
@@ -949,6 +1005,226 @@ mod tests {
             .await;
     }
 
+    async fn serve_selected_protocol(
+        stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        protocol: CompiledHttpVersion,
+        captured: oneshot::Sender<(Version, String, http::HeaderMap, Vec<u8>)>,
+    ) {
+        let captured = Arc::new(Mutex::new(Some(captured)));
+        let mut http = Http::new();
+        match protocol {
+            CompiledHttpVersion::Http1 => {
+                http.http1_only(true);
+            }
+            CompiledHttpVersion::Http2 => {
+                http.http2_only(true);
+            }
+        }
+        let _ = http
+            .serve_connection(
+                stream,
+                service_fn(move |request: Request<Body>| {
+                    let version = request.version();
+                    let uri = request.uri().to_string();
+                    let headers = request.headers().clone();
+                    let captured = Arc::clone(&captured);
+                    async move {
+                        let body = hyper::body::to_bytes(request.into_body()).await.unwrap();
+                        captured
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .unwrap()
+                            .send((version, uri, headers, body.to_vec()))
+                            .ok();
+                        let mut response = Response::new(Body::from("upstream-response"));
+                        response
+                            .headers_mut()
+                            .insert("x-end-to-end", HeaderValue::from_static("visible"));
+                        Ok::<_, std::convert::Infallible>(response)
+                    }
+                }),
+            )
+            .await;
+    }
+
+    fn protocol_alpn(protocol: CompiledHttpVersion) -> &'static [u8] {
+        match protocol {
+            CompiledHttpVersion::Http1 => b"http/1.1",
+            CompiledHttpVersion::Http2 => b"h2",
+        }
+    }
+
+    async fn accept_connect<S>(mut stream: S) -> S
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        let mut head = Vec::new();
+        loop {
+            let mut byte = [0_u8; 1];
+            stream.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+            assert!(head.len() < 8 * 1024);
+        }
+        let head = String::from_utf8(head).unwrap().to_ascii_lowercase();
+        assert!(head.starts_with("connect origin.example:443 http/1.1\r\n"));
+        assert!(head.contains("\r\nhost: origin.example:443\r\n"));
+        for forbidden in [
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "x-workload-identity",
+            "x-loop-marker",
+            "request-body",
+            "/translate",
+        ] {
+            assert!(!head.contains(forbidden), "CONNECT leaked {forbidden}");
+        }
+        stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .unwrap();
+        stream
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum TranslationRoute {
+        DirectClear,
+        DirectTls,
+        HttpParentClearOrigin,
+        HttpsParentClearOrigin,
+        HttpParentTlsOrigin,
+        HttpsParentTlsOrigin,
+    }
+
+    async fn assert_protocol_translation(
+        route: TranslationRoute,
+        ingress_version: Version,
+        egress_version: CompiledHttpVersion,
+    ) {
+        let tls_origin = matches!(
+            route,
+            TranslationRoute::DirectTls
+                | TranslationRoute::HttpParentTlsOrigin
+                | TranslationRoute::HttpsParentTlsOrigin
+        );
+        let canonical = canonicalize_http_url(if tls_origin {
+            "https://origin.example/translate?q=1"
+        } else {
+            "http://origin.example:8080/translate?q=1"
+        })
+        .unwrap();
+        let parent = match route {
+            TranslationRoute::DirectClear | TranslationRoute::DirectTls => None,
+            TranslationRoute::HttpParentClearOrigin | TranslationRoute::HttpParentTlsOrigin => {
+                Some(("http://parent.example:8443/", false))
+            }
+            TranslationRoute::HttpsParentClearOrigin | TranslationRoute::HttpsParentTlsOrigin => {
+                Some(("https://parent.example:8443/", true))
+            }
+        };
+        let egress = activate_with_versions(parent, vec![egress_version]);
+        let mut request = request_with_version(ingress_version);
+        if ingress_version == Version::HTTP_2 {
+            request
+                .headers_mut()
+                .insert(TE, HeaderValue::from_static("trailers"));
+        }
+        let expected_ingress = if ingress_version == Version::HTTP_2 {
+            OriginProtocol::Http2
+        } else {
+            OriginProtocol::Http1
+        };
+        let expected_origin = if egress_version == CompiledHttpVersion::Http2 {
+            OriginProtocol::Http2
+        } else {
+            OriginProtocol::Http1
+        };
+        let (guard, _) = guard();
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        let (captured_tx, captured_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            match route {
+                TranslationRoute::DirectClear | TranslationRoute::HttpParentClearOrigin => {
+                    serve_selected_protocol(server, egress_version, captured_tx).await;
+                }
+                TranslationRoute::DirectTls => {
+                    let tls = tls_acceptor(protocol_alpn(egress_version))
+                        .accept(server)
+                        .await
+                        .unwrap();
+                    serve_selected_protocol(tls, egress_version, captured_tx).await;
+                }
+                TranslationRoute::HttpsParentClearOrigin => {
+                    let parent = tls_acceptor(protocol_alpn(egress_version))
+                        .accept(server)
+                        .await
+                        .unwrap();
+                    serve_selected_protocol(parent, egress_version, captured_tx).await;
+                }
+                TranslationRoute::HttpParentTlsOrigin => {
+                    let tunnel = accept_connect(server).await;
+                    let origin = tls_acceptor(protocol_alpn(egress_version))
+                        .accept(tunnel)
+                        .await
+                        .unwrap();
+                    serve_selected_protocol(origin, egress_version, captured_tx).await;
+                }
+                TranslationRoute::HttpsParentTlsOrigin => {
+                    let parent = tls_acceptor(b"http/1.1").accept(server).await.unwrap();
+                    let tunnel = accept_connect(parent).await;
+                    let origin = tls_acceptor(protocol_alpn(egress_version))
+                        .accept(tunnel)
+                        .await
+                        .unwrap();
+                    serve_selected_protocol(origin, egress_version, captured_tx).await;
+                }
+            }
+        });
+        let target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
+            .await
+            .unwrap();
+        assert_eq!(target.ingress_protocol, expected_ingress, "{route:?}");
+        assert_eq!(target.origin_protocol, expected_origin, "{route:?}");
+
+        let response =
+            forward_with_connector(request, &canonical, &egress, &guard, target, &connector)
+                .await
+                .unwrap();
+        finish_response(response).await;
+        let (version, uri, headers, body) = captured_rx.await.unwrap();
+        let expected_version = if egress_version == CompiledHttpVersion::Http2 {
+            Version::HTTP_2
+        } else {
+            Version::HTTP_11
+        };
+        assert_eq!(version, expected_version, "{route:?}");
+        let ordinary_parent = matches!(
+            route,
+            TranslationRoute::HttpParentClearOrigin | TranslationRoute::HttpsParentClearOrigin
+        );
+        let expected_uri = if expected_origin.is_http2() || ordinary_parent {
+            canonical.url.as_str()
+        } else {
+            "/translate?q=1"
+        };
+        assert_eq!(uri, expected_uri, "{route:?}");
+        if expected_origin.is_http2() {
+            assert!(!headers.contains_key(HOST), "{route:?}");
+        } else {
+            assert_eq!(headers[HOST], canonical.authority, "{route:?}");
+            assert!(!headers.contains_key(TE), "{route:?}");
+        }
+        assert_eq!(headers["authorization"], "Bearer origin-secret");
+        assert!(!headers.contains_key("proxy-authorization"));
+        assert_eq!(body, b"request-body");
+        server.await.unwrap();
+    }
+
     async fn finish_response(response: ForwardedResponse) {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["x-end-to-end"], "visible");
@@ -1211,23 +1487,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_authorized_protocol_fails_before_dns_or_connect() {
-        for (enabled, requested) in [
-            (CompiledHttpVersion::Http1, Version::HTTP_2),
-            (CompiledHttpVersion::Http2, Version::HTTP_11),
+    async fn h2_ingress_translates_to_h1_across_direct_and_parent_routes() {
+        for route in [
+            TranslationRoute::DirectClear,
+            TranslationRoute::DirectTls,
+            TranslationRoute::HttpParentClearOrigin,
+            TranslationRoute::HttpsParentClearOrigin,
+            TranslationRoute::HttpParentTlsOrigin,
+            TranslationRoute::HttpsParentTlsOrigin,
         ] {
-            let canonical = canonicalize_http_url("http://origin.example/resource").unwrap();
-            let egress = activate_with_versions(None, vec![enabled]);
-            let request = request_with_version(requested);
-            let (guard, resolver) = guard();
+            assert_protocol_translation(route, Version::HTTP_2, CompiledHttpVersion::Http1).await;
+        }
+    }
 
-            assert!(matches!(
-                resolve_forwarding_target(&canonical, &request, &egress, &guard).await,
-                Err(ResolveForwardingError::Protocol(
-                    OriginProtocolError::Disabled
-                ))
-            ));
-            assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    #[tokio::test]
+    async fn h1_ingress_translates_to_h2_across_direct_and_parent_routes() {
+        for route in [
+            TranslationRoute::DirectClear,
+            TranslationRoute::DirectTls,
+            TranslationRoute::HttpParentClearOrigin,
+            TranslationRoute::HttpsParentClearOrigin,
+            TranslationRoute::HttpParentTlsOrigin,
+            TranslationRoute::HttpsParentTlsOrigin,
+        ] {
+            assert_protocol_translation(route, Version::HTTP_11, CompiledHttpVersion::Http2).await;
         }
     }
 
@@ -1300,6 +1583,46 @@ mod tests {
 
         assert!(matches!(
             forward_with_connector(request, &canonical, &foreign, &guard, target, &connector).await,
+            Err(ForwardError::ResolvedTargetMismatch)
+        ));
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn resolved_target_binds_ingress_and_selected_origin_protocols() {
+        let canonical = canonicalize_http_url("http://origin.example/resource").unwrap();
+        let egress = activate_with_versions(None, vec![CompiledHttpVersion::Http1]);
+        let (guard, _) = guard();
+
+        let resolved_for_h2 = request_with_version(Version::HTTP_2);
+        let target = resolve_forwarding_target(&canonical, &resolved_for_h2, &egress, &guard)
+            .await
+            .unwrap();
+        let (client, _server) = tokio::io::duplex(1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        assert!(matches!(
+            forward_with_connector(
+                request_with_version(Version::HTTP_11),
+                &canonical,
+                &egress,
+                &guard,
+                target,
+                &connector,
+            )
+            .await,
+            Err(ForwardError::ResolvedTargetMismatch)
+        ));
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
+
+        let request = request_with_version(Version::HTTP_2);
+        let mut target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
+            .await
+            .unwrap();
+        target.origin_protocol = OriginProtocol::Http2;
+        let (client, _server) = tokio::io::duplex(1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        assert!(matches!(
+            forward_with_connector(request, &canonical, &egress, &guard, target, &connector).await,
             Err(ForwardError::ResolvedTargetMismatch)
         ));
         assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
