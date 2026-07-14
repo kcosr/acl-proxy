@@ -8,7 +8,7 @@ use crate::authorization::protocol::{
     ProviderRequest, ProviderRequestHeaders, StagedProviderCredentialMutation,
 };
 use crate::authorization::{AuthorizationDecision, AuthorizationDispatchError};
-use crate::config::compiler::{CompiledProviderFailureMode, HeaderEffectPlan};
+use crate::config::compiler::{CompiledProviderFailureMode, HeaderEffectPlan, HttpBodyReadPlan};
 use crate::credentials::{CredentialError, InboundCredentials, ResolvedCredentialAction};
 use crate::policy::{PolicyEvaluation, PolicyOutcome, PolicyRuleMatch};
 use crate::runtime::{GenerationLease, ProviderIndex};
@@ -133,6 +133,14 @@ pub(crate) struct PreparedRequest<'generation, 'request> {
 impl<'generation, 'request> PreparedRequest<'generation, 'request> {
     pub(crate) fn body_guard(&self) -> &HttpWireBodyGuard {
         &self.guard
+    }
+
+    pub(crate) fn body_read_plan(&self) -> HttpBodyReadPlan {
+        if self.early_deny.is_some() {
+            HttpBodyReadPlan::Disabled
+        } else {
+            self.evaluation.body_read_plan()
+        }
     }
 
     pub(crate) async fn decide(
@@ -778,6 +786,50 @@ process_providers = ["identity_sink"]"#,
         drop(current_decision);
         drop(current);
         drop(old);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn prepared_request_exposes_cursor_body_plan_but_early_deny_stays_body_free() {
+        let initial = compile(&config(
+            r#"[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "body-aware"
+decision = "allow"
+methods = ["GET"]
+redaction_profile = "wire""#,
+            r#"[redaction.profiles.wire]
+max_body_bytes = 16
+max_decoded_body_bytes = 32
+rules = [{ literals = ["secret"], payloads = "text" }]"#,
+        ));
+        let (runtime, _source, _, _pool) = runtime(initial).await;
+        let lease = runtime.lease().await.unwrap();
+        let url = canonicalize_http_url("https://example.test/body").unwrap();
+
+        let prepared = prepare_request(&lease, input("ordinary", &url, HeaderMap::new())).unwrap();
+        assert_eq!(
+            prepared
+                .body_read_plan()
+                .limits()
+                .map(|limits| (limits.max_encoded_bytes(), limits.max_decoded_bytes())),
+            Some((16, 32))
+        );
+        drop(prepared);
+
+        let mut looped_headers = HeaderMap::new();
+        looped_headers.insert("x-test-loop", HeaderValue::from_static("already-seen"));
+        let looped = prepare_request(&lease, input("looped", &url, looped_headers)).unwrap();
+        assert_eq!(looped.body_read_plan(), HttpBodyReadPlan::Disabled);
+        let RequestDecision::Deny(denied) = looped.decide(None).await.unwrap() else {
+            panic!("a loop-marked request must deny without reading its body");
+        };
+        assert_eq!(denied.reason, DenyReason::LoopDetected);
+
+        drop(denied);
+        drop(lease);
         runtime.shutdown().await;
     }
 
