@@ -75,18 +75,6 @@ impl CapturePool {
         })
     }
 
-    #[cfg(test)]
-    pub(super) fn enabled_for_accounting_test(initial_limit: usize) -> Arc<Self> {
-        let pool = Self::new();
-        pool.published.store(Arc::new(PublishedCaptureState {
-            epoch: Arc::new(CaptureEpoch::disabled()),
-            limit: initial_limit,
-            enabled: true,
-            closed: false,
-        }));
-        pool
-    }
-
     /// Attempts an exact capture-owned byte reservation. Failure is immediate
     /// and observation-only; callers omit the payload rather than wait.
     pub(crate) fn try_acquire(self: &Arc<Self>, bytes: usize) -> Option<CapturePermit> {
@@ -320,19 +308,95 @@ impl PublicationGuard for CaptureEpochPublicationGuard<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
     use std::sync::Barrier;
     use std::thread;
 
     use super::*;
+    use crate::config::compiler::{
+        CapturePlan, CompiledCaptureEvent, CompiledLogLevel, CompiledRedactionPayloads,
+        ObservationPlan, PolicyDecisionLoggingPlan, RedactionPlan, RedactionProfilePlan,
+        RedactionRulePlan, ReloadableLoggingPlan,
+    };
+    use crate::observation::{ObservationActivation, ProductObservationSnapshot};
+    use crate::redaction::RedactionSnapshot;
+
+    fn accounting_capture_activation(
+        pool: Arc<CapturePool>,
+        limit: usize,
+    ) -> ObservationActivation {
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "accounting".to_owned(),
+            RedactionProfilePlan {
+                replacement: b"[REMOVED]".to_vec(),
+                max_body_bytes: 8,
+                max_decoded_body_bytes: 128,
+                max_frame_bytes: 64,
+                max_message_bytes: 128,
+                allow_permessage_deflate: false,
+                max_environment_literal_sources: 1,
+                max_environment_literal_bytes: 64,
+                max_environment_literal_total_bytes: 64,
+                rules: vec![RedactionRulePlan {
+                    literals: vec![b"secret".to_vec()],
+                    literal_environment_variables: Vec::new(),
+                    expressions: Vec::new(),
+                    payloads: CompiledRedactionPayloads::Both,
+                }],
+            },
+        );
+        let redaction =
+            RedactionSnapshot::activate(RedactionPlan { profiles }, || false).expect("redaction");
+        ProductObservationSnapshot::activate(
+            ObservationPlan {
+                logging: ReloadableLoggingPlan {
+                    level: CompiledLogLevel::Info,
+                    policy_decisions: PolicyDecisionLoggingPlan {
+                        allows: false,
+                        denies: true,
+                        allow_level: CompiledLogLevel::Info,
+                        deny_level: CompiledLogLevel::Warn,
+                    },
+                },
+                capture: Some(CapturePlan {
+                    events: vec![CompiledCaptureEvent::RequestAllowed],
+                    redaction_profile: "accounting".to_owned(),
+                    directory: PathBuf::from("/accounting-captures"),
+                    filename: "capture-{requestId}-{suffix}.json".to_owned(),
+                    max_body_bytes: 8,
+                    max_inflight_body_bytes: limit,
+                    max_files: 10,
+                    max_total_bytes: 100,
+                }),
+            },
+            &redaction,
+            pool,
+        )
+        .expect("capture activation")
+    }
+
+    fn enabled_pool(limit: usize) -> Arc<CapturePool> {
+        let pool = CapturePool::new();
+        let activation = accounting_capture_activation(pool.clone(), limit);
+        let (_, owner) = activation.into_parts();
+        owner
+            .publication_guard()
+            .expect("initial publication guard")
+            .commit();
+        assert!(pool.current_epoch().is_enabled());
+        pool
+    }
 
     #[test]
     fn rejected_update_does_not_change_the_committed_limit() {
-        let pool = CapturePool::enabled_for_accounting_test(16);
+        let pool = enabled_pool(16);
         let original = pool.current_epoch();
-        let proposed = Arc::new(CaptureEpoch::disabled());
-        let update = CaptureEpochUpdate::new(pool.clone(), proposed, 32);
+        let candidate = accounting_capture_activation(pool.clone(), 32);
+        let (_snapshot, owner) = candidate.into_parts();
         {
-            let _rejected_guard = update.publication_guard().expect("publication guard");
+            let _rejected_guard = owner.publication_guard().expect("publication guard");
         }
         assert_eq!(pool.committed_limit(), 16);
         assert!(Arc::ptr_eq(&pool.current_epoch(), &original));
@@ -340,10 +404,11 @@ mod tests {
 
     #[test]
     fn publication_commit_changes_the_limit_once() {
-        let pool = CapturePool::enabled_for_accounting_test(16);
-        let proposed = Arc::new(CaptureEpoch::disabled());
-        let update = CaptureEpochUpdate::new(pool.clone(), proposed.clone(), 32);
-        let mut guard = update.publication_guard().expect("publication guard");
+        let pool = enabled_pool(16);
+        let candidate = accounting_capture_activation(pool.clone(), 32);
+        let (snapshot, owner) = candidate.into_parts();
+        let proposed = snapshot.capture_epoch().clone();
+        let mut guard = owner.publication_guard().expect("publication guard");
         guard.commit();
         guard.commit();
         assert_eq!(pool.committed_limit(), 32);
@@ -352,7 +417,7 @@ mod tests {
 
     #[test]
     fn old_permits_survive_disablement_and_new_admission_is_rejected() {
-        let pool = CapturePool::enabled_for_accounting_test(16);
+        let pool = enabled_pool(16);
         let old = pool.try_acquire(12).expect("old permit");
         let update = CaptureEpochUpdate::new(pool.clone(), Arc::new(CaptureEpoch::disabled()), 4);
         update
@@ -370,7 +435,7 @@ mod tests {
 
     #[test]
     fn exact_permits_saturate_without_waiting() {
-        let pool = CapturePool::enabled_for_accounting_test(10);
+        let pool = enabled_pool(10);
         let first = pool.try_acquire(6).expect("first");
         let second = pool.try_acquire(4).expect("second");
         assert!(pool.try_acquire(1).is_none());
@@ -381,7 +446,7 @@ mod tests {
 
     #[test]
     fn arithmetic_overflow_is_an_observation_only_omission() {
-        let pool = CapturePool::enabled_for_accounting_test(usize::MAX);
+        let pool = enabled_pool(usize::MAX);
         let permit = pool.try_acquire(usize::MAX).expect("maximum permit");
         assert!(pool.try_acquire(1).is_none());
         drop(permit);
@@ -390,7 +455,7 @@ mod tests {
 
     #[test]
     fn concurrent_admissions_share_the_limit_gate() {
-        let pool = CapturePool::enabled_for_accounting_test(16);
+        let pool = enabled_pool(16);
         let first_entered = Arc::new(Barrier::new(2));
         let finish_first = Arc::new(Barrier::new(2));
         let first_pool = pool.clone();
@@ -418,9 +483,12 @@ mod tests {
     }
 
     #[test]
-    fn lower_limit_publication_excludes_stale_limit_admission() {
-        let pool = CapturePool::enabled_for_accounting_test(16);
+    fn enabled_lower_limit_publication_preserves_permits_and_enforces_the_new_ceiling() {
+        let pool = enabled_pool(16);
         let existing = pool.try_acquire(8).expect("existing permit");
+        let candidate = accounting_capture_activation(pool.clone(), 4);
+        let (snapshot, _owner) = candidate.into_parts();
+        let new_epoch = snapshot.capture_epoch().clone();
         let publication_entered = Arc::new(Barrier::new(2));
         let finish_publication = Arc::new(Barrier::new(2));
         let publication_pool = pool.clone();
@@ -429,14 +497,10 @@ mod tests {
             let finish_publication = finish_publication.clone();
             move || {
                 assert_eq!(
-                    publication_pool.publish_with_hook(
-                        Arc::new(CaptureEpoch::disabled()),
-                        8,
-                        || {
-                            publication_entered.wait();
-                            finish_publication.wait();
-                        },
-                    ),
+                    publication_pool.publish_with_hook(new_epoch, 4, || {
+                        publication_entered.wait();
+                        finish_publication.wait();
+                    }),
                     CapturePublicationResult::Published
                 );
             }
@@ -447,16 +511,22 @@ mod tests {
         finish_publication.wait();
         publisher.join().expect("publisher");
 
-        assert_eq!(pool.committed_limit(), 8);
+        assert!(pool.current_epoch().is_enabled());
+        assert_eq!(pool.committed_limit(), 4);
+        assert_eq!(pool.used(), 8);
         assert!(pool.try_acquire(1).is_none());
         drop(existing);
+        assert_eq!(pool.used(), 0);
+        assert_eq!(pool.try_acquire(4).expect("new ceiling").bytes(), 4);
     }
 
     #[test]
     fn capture_epoch_publication_is_atomic_with_limit() {
-        let pool = CapturePool::enabled_for_accounting_test(16);
+        let pool = enabled_pool(16);
         let old_epoch = pool.current_epoch();
-        let new_epoch = Arc::new(CaptureEpoch::disabled());
+        let candidate = accounting_capture_activation(pool.clone(), 32);
+        let (snapshot, _owner) = candidate.into_parts();
+        let new_epoch = snapshot.capture_epoch().clone();
         let publication_entered = Arc::new(Barrier::new(2));
         let finish_publication = Arc::new(Barrier::new(2));
         let publication_pool = pool.clone();
@@ -493,16 +563,16 @@ mod tests {
             pool.published_for_test();
         assert!(Arc::ptr_eq(&published_epoch, &new_epoch));
         assert_eq!(published_limit, 32);
-        assert!(!published_enabled);
+        assert!(published_enabled);
         assert!(!published_closed);
     }
 
     #[test]
     fn permanent_closure_rejects_all_admission_and_publication() {
-        let pool = CapturePool::enabled_for_accounting_test(16);
-        let proposed = Arc::new(CaptureEpoch::disabled());
-        let update = CaptureEpochUpdate::new(pool.clone(), proposed, 32);
-        let mut stale_guard = update.publication_guard().expect("pre-shutdown guard");
+        let pool = enabled_pool(16);
+        let candidate = accounting_capture_activation(pool.clone(), 32);
+        let (_snapshot, owner) = candidate.into_parts();
+        let mut stale_guard = owner.publication_guard().expect("pre-shutdown guard");
         let pre_shutdown_zero = pool.try_acquire(0).expect("open zero-byte admission");
         drop(pre_shutdown_zero);
 
@@ -518,15 +588,17 @@ mod tests {
         assert!(pool.try_acquire(0).is_none());
         assert!(pool.try_acquire(1).is_none());
         assert!(matches!(
-            update.publication_guard(),
+            owner.publication_guard(),
             Err(RuntimeError::ShuttingDown)
         ));
     }
 
     #[test]
     fn publication_before_close_leaves_the_pool_permanently_closed() {
-        let pool = CapturePool::enabled_for_accounting_test(16);
-        let proposed = Arc::new(CaptureEpoch::disabled());
+        let pool = enabled_pool(16);
+        let candidate = accounting_capture_activation(pool.clone(), 32);
+        let (snapshot, _owner) = candidate.into_parts();
+        let proposed = snapshot.capture_epoch().clone();
         let publication_entered = Arc::new(Barrier::new(2));
         let finish_publication = Arc::new(Barrier::new(2));
         let close_started = Arc::new(Barrier::new(2));
@@ -569,11 +641,13 @@ mod tests {
 
     #[test]
     fn close_before_publication_rejects_the_publication_and_preserves_closed_state() {
-        let pool = CapturePool::enabled_for_accounting_test(16);
+        let pool = enabled_pool(16);
         pool.close();
         let closed_epoch = pool.current_epoch();
+        let candidate = accounting_capture_activation(pool.clone(), 32);
+        let (snapshot, _owner) = candidate.into_parts();
 
-        let result = pool.publish_with_hook(Arc::new(CaptureEpoch::disabled()), 32, || {});
+        let result = pool.publish_with_hook(snapshot.capture_epoch().clone(), 32, || {});
 
         assert_eq!(result, CapturePublicationResult::Closed);
         let (epoch, limit, enabled, closed) = pool.published_for_test();

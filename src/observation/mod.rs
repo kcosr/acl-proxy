@@ -518,6 +518,21 @@ mod tests {
             .commit();
     }
 
+    fn enabled_pool(limit: usize) -> Arc<CapturePool> {
+        let pool = CapturePool::new();
+        let activation = activate(
+            pool.clone(),
+            "initial-profile",
+            vec![CompiledCaptureEvent::RequestAllowed],
+            limit,
+            8,
+        );
+        let (_, owner) = activation.into_parts();
+        commit(&owner);
+        assert!(pool.current_epoch().is_enabled());
+        pool
+    }
+
     #[test]
     fn activation_resolves_the_named_typed_profile_from_one_activation() {
         let pool = CapturePool::new();
@@ -579,7 +594,7 @@ mod tests {
 
     #[test]
     fn rejected_candidate_does_not_change_capture_admission() {
-        let pool = CapturePool::enabled_for_accounting_test(8);
+        let pool = enabled_pool(8);
         let original_epoch = pool.current_epoch();
         let activation = activate(
             pool.clone(),
@@ -601,7 +616,7 @@ mod tests {
 
     #[test]
     fn committed_candidate_updates_the_shared_limit() {
-        let pool = CapturePool::enabled_for_accounting_test(8);
+        let pool = enabled_pool(8);
         let activation = activate(
             pool.clone(),
             "profile",
@@ -845,7 +860,7 @@ mod tests {
 
     #[tokio::test]
     async fn generation_owner_contract_is_noop_after_publication() {
-        let pool = CapturePool::enabled_for_accounting_test(8);
+        let pool = enabled_pool(8);
         let activation = activate(
             pool.clone(),
             "profile",
