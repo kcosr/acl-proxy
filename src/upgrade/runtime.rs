@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,7 +28,7 @@ type UpgradeRelayTask = Pin<Box<dyn Future<Output = UpgradeTerminalCause> + Send
 type UpgradeTerminalTask = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type UpgradeTerminalBuilder =
     Box<dyn FnOnce(UpgradeTerminalCause) -> UpgradeTerminalTask + Send + 'static>;
-type UpgradeRawAbort = Box<dyn FnOnce() + Send + 'static>;
+type UpgradeRawAbortAction = Box<dyn FnOnce() + Send + 'static>;
 
 /// Static limits for the one process-owned upgrade runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,21 +127,6 @@ impl UpgradedStreamSnapshot {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct UpgradeSnapshotContext {
-    relay_buffer_bytes: usize,
-}
-
-impl UpgradeSnapshotContext {
-    pub(crate) fn build(self, wire_redaction: Option<ProfileHandle>) -> UpgradedStreamSnapshot {
-        UpgradedStreamSnapshot::new(self.relay_buffer_bytes, wire_redaction)
-    }
-
-    pub(crate) fn relay_buffer_bytes(self) -> usize {
-        self.relay_buffer_bytes
-    }
-}
-
 impl fmt::Debug for UpgradedStreamSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -155,8 +141,28 @@ impl fmt::Debug for UpgradedStreamSnapshot {
 /// in-progress capture cancellation. Every established relay pair must provide
 /// one, and only the entry coordinator invokes it.
 pub(crate) struct UpgradeTerminalControl {
-    raw_abort: Option<UpgradeRawAbort>,
+    raw_abort: UpgradeRawAbort,
     established_close: Option<UpgradeTerminalBuilder>,
+}
+
+struct UpgradeRawAbort {
+    action: Option<UpgradeRawAbortAction>,
+}
+
+impl UpgradeRawAbort {
+    fn new(action: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            action: Some(Box::new(action)),
+        }
+    }
+
+    fn run(&mut self) {
+        if let Some(action) = self.action.take() {
+            if catch_unwind(AssertUnwindSafe(action)).is_err() {
+                tracing::error!("upgrade raw abort panicked");
+            }
+        }
+    }
 }
 
 impl UpgradeTerminalControl {
@@ -167,7 +173,7 @@ impl UpgradeTerminalControl {
         Task: Future<Output = ()> + Send + 'static,
     {
         Self {
-            raw_abort: Some(Box::new(raw_abort)),
+            raw_abort: UpgradeRawAbort::new(raw_abort),
             established_close: Some(Box::new(move |cause| Box::pin(established_close(cause)))),
         }
     }
@@ -186,9 +192,7 @@ impl UpgradeTerminalControl {
 
 impl Drop for UpgradeTerminalControl {
     fn drop(&mut self) {
-        if let Some(raw_abort) = self.raw_abort.take() {
-            raw_abort();
-        }
+        self.raw_abort.run();
     }
 }
 
@@ -624,6 +628,8 @@ impl UpgradeRuntime {
 
 impl Drop for UpgradeRuntime {
     fn drop(&mut self) {
+        // Emergency abandonment only. Managed shutdown uses shutdown_and_wait
+        // so every coordinator explicitly shuts down and joins its children.
         self.supervisor_abort.abort();
     }
 }
@@ -704,6 +710,17 @@ fn apply_reservation(state: &mut RuntimeState, reservation: Reservation) {
 }
 
 impl RuntimeInner {
+    fn track_owned_task(&self, task: OwnedTask) -> Result<(), OwnedTask> {
+        self.supervisor_tasks
+            .send(SupervisorCommand::Track(task))
+            .map_err(|error| {
+                let SupervisorCommand::Track(task) = error.0 else {
+                    unreachable!("only a tracked task was sent")
+                };
+                task
+            })
+    }
+
     fn complete_handshake(&self, id: u64) {
         let released = {
             let mut state = lock(&self.state);
@@ -760,14 +777,18 @@ impl RuntimeInner {
         self.changed.notify_waiters();
     }
 
-    fn spawn_entry_coordinator(
+    fn spawn_entry_coordinator<Register>(
         self: &Arc<Self>,
         state: &mut RuntimeState,
         id: u64,
         shared: Arc<EntryShared>,
         snapshot: UpgradedStreamSnapshot,
         plan: UpgradeEntryPlan,
-    ) -> Result<(), OwnedTask> {
+        register: Register,
+    ) -> Result<tokio::sync::oneshot::Sender<()>, OwnedTask>
+    where
+        Register: FnOnce(&RuntimeInner, OwnedTask) -> Result<(), OwnedTask>,
+    {
         let completion = EntryCompletionGuard {
             inner: self.clone(),
             id,
@@ -777,10 +798,14 @@ impl RuntimeInner {
             inner: self.clone(),
             counted: counted.clone(),
         };
+        let (start, started) = tokio::sync::oneshot::channel();
         let task = self.handle.spawn(async move {
             async move {
                 let _task_completion = task_completion;
                 let _completion = completion;
+                if started.await.is_err() {
+                    return;
+                }
                 run_entry_coordinator(shared, snapshot, plan).await;
             }
             .await;
@@ -789,19 +814,13 @@ impl RuntimeInner {
             .tracked_tasks
             .checked_add(1)
             .expect("tracked task count cannot overflow bounded upgrade metadata");
-        if let Err(error) = self
-            .supervisor_tasks
-            .send(SupervisorCommand::Track(OwnedTask::new(task)))
-        {
-            let SupervisorCommand::Track(task) = error.0 else {
-                unreachable!("only a tracked task was sent")
-            };
+        if let Err(task) = register(self, OwnedTask::new(task)) {
             if counted.swap(false, Ordering::AcqRel) {
                 state.tracked_tasks -= 1;
             }
             return Err(task);
         }
-        Ok(())
+        Ok(start)
     }
 }
 
@@ -843,29 +862,43 @@ impl UpgradeHandshake {
 
     /// Commits only while admission remains open. Snapshot construction and
     /// deadline derivation both happen inside the same winning gate.
-    pub(crate) fn commit<Build>(
+    pub(crate) fn commit(
         mut self,
-        snapshot_builder: Build,
+        wire_redaction: Option<ProfileHandle>,
         plan: UpgradeEntryPlan,
-    ) -> Result<CommittedUpgrade, UpgradeCommitError>
-    where
-        Build: FnOnce(UpgradeSnapshotContext) -> UpgradedStreamSnapshot,
-    {
-        self.commit_with_hook(snapshot_builder, plan, || {})
+    ) -> Result<CommittedUpgrade, UpgradeCommitError> {
+        self.commit_inner(wire_redaction, plan, || {}, RuntimeInner::track_owned_task)
     }
 
-    fn commit_with_hook<Build, Hook>(
+    fn commit_with_start_hook<Hook>(
         &mut self,
-        snapshot_builder: Build,
+        wire_redaction: Option<ProfileHandle>,
         plan: UpgradeEntryPlan,
-        hook: Hook,
+        after_registration_before_start: Hook,
     ) -> Result<CommittedUpgrade, UpgradeCommitError>
     where
-        Build: FnOnce(UpgradeSnapshotContext) -> UpgradedStreamSnapshot,
         Hook: FnOnce(),
     {
+        self.commit_inner(
+            wire_redaction,
+            plan,
+            after_registration_before_start,
+            RuntimeInner::track_owned_task,
+        )
+    }
+
+    fn commit_inner<Hook, Register>(
+        &mut self,
+        wire_redaction: Option<ProfileHandle>,
+        plan: UpgradeEntryPlan,
+        after_registration_before_start: Hook,
+        register: Register,
+    ) -> Result<CommittedUpgrade, UpgradeCommitError>
+    where
+        Hook: FnOnce(),
+        Register: FnOnce(&RuntimeInner, OwnedTask) -> Result<(), OwnedTask>,
+    {
         let mut state = lock(&self.inner.state);
-        hook();
         if !state.accepting {
             return Err(UpgradeCommitError::AdmissionClosed);
         }
@@ -875,9 +908,8 @@ impl UpgradeHandshake {
             .ok_or(UpgradeCommitError::HandshakeReleased)?;
         debug_assert_eq!(record.reservation, self.reservation);
 
-        let snapshot = snapshot_builder(UpgradeSnapshotContext {
-            relay_buffer_bytes: self.inner.limits.relay_buffer_bytes,
-        });
+        let snapshot =
+            UpgradedStreamSnapshot::new(self.inner.limits.relay_buffer_bytes, wire_redaction);
         let now = Instant::now();
         let application_stop = now
             .checked_add(self.inner.limits.max_upgrade_lifetime)
@@ -913,21 +945,30 @@ impl UpgradeHandshake {
                 coordinator_done: false,
             },
         );
-        if let Err(task) =
-            self.inner
-                .spawn_entry_coordinator(&mut state, self.id, shared.clone(), snapshot, plan)
-        {
-            let record = state
-                .entries
-                .remove(&self.id)
-                .expect("new committed entry remains present");
-            release_reservation(&mut state, record.reservation);
-            drop(state);
-            drop(task);
-            return Err(UpgradeCommitError::SupervisorStopped);
-        }
+        let start = match self.inner.spawn_entry_coordinator(
+            &mut state,
+            self.id,
+            shared.clone(),
+            snapshot,
+            plan,
+            register,
+        ) {
+            Ok(start) => start,
+            Err(task) => {
+                let record = state
+                    .entries
+                    .remove(&self.id)
+                    .expect("new committed entry remains present");
+                release_reservation(&mut state, record.reservation);
+                drop(state);
+                drop(task);
+                return Err(UpgradeCommitError::SupervisorStopped);
+            }
+        };
         drop(state);
         self.inner.changed.notify_waiters();
+        after_registration_before_start();
+        let _ = start.send(());
         Ok(CommittedUpgrade {
             _inner: self.inner.clone(),
             id: self.id,
@@ -1116,16 +1157,16 @@ fn handle_entry_task_completion(
 }
 
 async fn finish_entry_cleanup(
+    shared: &EntryShared,
     tasks: &mut JoinSet<EntryTaskResult>,
     retain_relay_tasks: bool,
     terminal_control: Option<UpgradeTerminalControl>,
     cause: UpgradeTerminalCause,
-    cutoff: Instant,
 ) {
     if !retain_relay_tasks {
         tasks.shutdown().await;
     }
-    if Instant::now() >= cutoff {
+    if Instant::now() >= lock(&shared.timing).cleanup_cutoff {
         tasks.shutdown().await;
         return;
     }
@@ -1136,6 +1177,12 @@ async fn finish_entry_cleanup(
         });
     }
     while !tasks.is_empty() {
+        let changed = shared.changed.notified();
+        let cutoff = lock(&shared.timing).cleanup_cutoff;
+        if Instant::now() >= cutoff {
+            tasks.shutdown().await;
+            return;
+        }
         tokio::select! {
             biased;
             _ = tokio::time::sleep_until(cutoff) => {
@@ -1145,6 +1192,7 @@ async fn finish_entry_cleanup(
             joined = tasks.join_next() => {
                 let _ = joined;
             }
+            _ = changed => {}
         }
     }
 }
@@ -1158,10 +1206,7 @@ async fn run_entry_coordinator(
     let mut tasks = JoinSet::new();
     let mut phase = EntryPhase::Establishing;
     let mut terminal_control = Some(plan.terminal_control);
-    tasks.spawn(async move {
-        let setup = (plan.setup)(snapshot);
-        EntryTaskResult::Setup(setup.await)
-    });
+    let mut pending_setup = Some((plan.setup, snapshot));
 
     loop {
         while let Some(joined) = tasks.try_join_next() {
@@ -1181,20 +1226,26 @@ async fn run_entry_coordinator(
         }
 
         if shared.terminal_state.load(Ordering::Acquire) == ENTRY_CLOSING {
-            let timing = *lock(&shared.timing);
             let cause =
                 lock(&shared.winning_cause).expect("closing entry has a winning terminal cause");
             let established = phase == EntryPhase::Established;
             let control = terminal_control.take();
             finish_entry_cleanup(
+                &shared,
                 &mut tasks,
                 established,
                 established.then_some(control).flatten(),
                 cause,
-                timing.cleanup_cutoff,
             )
             .await;
             return;
+        }
+
+        if let Some((build, snapshot)) = pending_setup.take() {
+            tasks.spawn(async move {
+                let setup = build(snapshot);
+                EntryTaskResult::Setup(setup.await)
+            });
         }
 
         let timing = *lock(&shared.timing);
@@ -1305,7 +1356,7 @@ pub(crate) enum UpgradeCommitError {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{mpsc as std_mpsc, Barrier};
+    use std::sync::mpsc as std_mpsc;
     use std::thread;
 
     use tokio::sync::oneshot;
@@ -1322,10 +1373,6 @@ mod tests {
 
     fn allocation(rule: usize, wire_bytes: usize) -> UpgradeAllocation {
         UpgradeAllocation::from_compiled_rule(rule, Some(wire_bytes)).unwrap()
-    }
-
-    fn snapshot(context: UpgradeSnapshotContext) -> UpgradedStreamSnapshot {
-        context.build(None)
     }
 
     fn inert_control() -> UpgradeTerminalControl {
@@ -1591,19 +1638,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn upgrade_admission_shutdown_race_linearizes_registry_snapshot() {
+    async fn upgrade_commit_shutdown_race_linearizes_registration() {
         let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
-        let snapshots = Arc::new(AtomicUsize::new(0));
         let setup_effects = Arc::new(AtomicUsize::new(0));
-        let entered = Arc::new(Barrier::new(2));
-        let release = Arc::new(Barrier::new(2));
+        let (registered_tx, registered_rx) = std_mpsc::channel();
+        let (start_tx, start_rx) = std_mpsc::channel();
         let (result_tx, result_rx) = std_mpsc::channel();
         runtime
             .try_spawn_handshake(allocation(0, 0), {
-                let snapshots = snapshots.clone();
                 let setup_effects = setup_effects.clone();
-                let entered = entered.clone();
-                let release = release.clone();
                 move |mut handshake| async move {
                     let entry_plan = plan({
                         let setup_effects = setup_effects.clone();
@@ -1612,52 +1655,35 @@ mod tests {
                             Err(UpgradeTerminalCause::DownstreamWriteFailed)
                         }
                     });
-                    let result = handshake.commit_with_hook(
-                        |context| {
-                            snapshots.fetch_add(1, Ordering::SeqCst);
-                            snapshot(context)
-                        },
-                        entry_plan,
-                        || {
-                            entered.wait();
-                            release.wait();
-                        },
-                    );
+                    let result = handshake.commit_with_start_hook(None, entry_plan, || {
+                        registered_tx.send(()).unwrap();
+                        start_rx.recv().unwrap();
+                    });
                     result_tx.send(result).unwrap();
                 }
             })
             .unwrap();
-        entered.wait();
-        let shutdown_runtime = runtime.clone();
-        let shutdown = thread::spawn(move || {
-            shutdown_runtime.begin_shutdown(Some(Instant::now()));
-        });
-        release.wait();
-        shutdown.join().unwrap();
+        registered_rx.recv().unwrap();
+        runtime.begin_shutdown(Some(Instant::now()));
+        start_tx.send(()).unwrap();
         let entry = result_rx.recv().unwrap().expect("commit won the gate");
         entry.wait_closed().await;
-        assert_eq!(snapshots.load(Ordering::SeqCst), 1);
         assert_eq!(setup_effects.load(Ordering::SeqCst), 0);
         runtime.wait_until_drained().await;
 
         let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
-        let snapshots = Arc::new(AtomicUsize::new(0));
         let setup_effects = Arc::new(AtomicUsize::new(0));
         let (entered_tx, entered_rx) = std_mpsc::channel();
         let (release_tx, release_rx) = std_mpsc::channel();
         let (result_tx, result_rx) = std_mpsc::channel();
         runtime
             .try_spawn_handshake(allocation(0, 0), {
-                let snapshots = snapshots.clone();
                 let setup_effects = setup_effects.clone();
                 move |handshake| async move {
                     entered_tx.send(()).unwrap();
                     release_rx.recv().unwrap();
                     let result = handshake.commit(
-                        |context| {
-                            snapshots.fetch_add(1, Ordering::SeqCst);
-                            snapshot(context)
-                        },
+                        None,
                         plan(move |_| async move {
                             setup_effects.fetch_add(1, Ordering::SeqCst);
                             Err(UpgradeTerminalCause::DownstreamWriteFailed)
@@ -1675,8 +1701,62 @@ mod tests {
             Err(UpgradeCommitError::AdmissionClosed)
         );
         runtime.wait_until_drained().await;
-        assert_eq!(snapshots.load(Ordering::SeqCst), 0);
         assert_eq!(setup_effects.load(Ordering::SeqCst), 0);
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
+
+    #[tokio::test]
+    async fn coordinator_registration_failure_does_not_poll_setup() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let setup_effects = Arc::new(AtomicUsize::new(0));
+        let raw_aborts = Arc::new(AtomicUsize::new(0));
+        let (raw_abort_tx, raw_abort_rx) = oneshot::channel();
+        let (result_tx, result_rx) = oneshot::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), {
+                let setup_effects = setup_effects.clone();
+                let raw_aborts = raw_aborts.clone();
+                move |mut handshake| async move {
+                    let result = handshake.commit_inner(
+                        None,
+                        UpgradeEntryPlan::new(
+                            UpgradeTerminalControl::new(
+                                move || {
+                                    raw_aborts.fetch_add(1, Ordering::SeqCst);
+                                    let _ = raw_abort_tx.send(());
+                                },
+                                |_| async {},
+                            ),
+                            move |_| async move {
+                                setup_effects.fetch_add(1, Ordering::SeqCst);
+                                Err(UpgradeTerminalCause::SetupFailed)
+                            },
+                        ),
+                        || {},
+                        |_, task| Err(task),
+                    );
+                    let _ = result_tx.send(result.map(|_| ()));
+                }
+            })
+            .unwrap();
+
+        assert_eq!(
+            result_rx.await.unwrap(),
+            Err(UpgradeCommitError::SupervisorStopped)
+        );
+        tokio::time::timeout(Duration::from_secs(1), raw_abort_rx)
+            .await
+            .expect("failed coordinator task did not release terminal ownership")
+            .unwrap();
+        wait_for_counts(&runtime, |counts| {
+            counts.reserved_slots == 0
+                && counts.reserved_bytes == 0
+                && counts.committed == 0
+                && counts.tracked_tasks == 0
+        })
+        .await;
+        assert_eq!(setup_effects.load(Ordering::SeqCst), 0);
+        assert_eq!(raw_aborts.load(Ordering::SeqCst), 1);
         runtime.shutdown_and_wait(Some(Instant::now())).await;
     }
 
@@ -1691,7 +1771,7 @@ mod tests {
             .try_spawn_handshake(allocation(0, 0), move |handshake| async move {
                 let entry = handshake
                     .commit(
-                        snapshot,
+                        None,
                         plan(|_| async move {
                             let _ = setup_release_rx.await;
                             Ok(UpgradeRelayPair::new(
@@ -1738,7 +1818,7 @@ mod tests {
                 .try_spawn_handshake(allocation(0, 0), move |handshake| async move {
                     let entry = handshake
                         .commit(
-                            snapshot,
+                            None,
                             plan(|_| async {
                                 Ok(UpgradeRelayPair::new(
                                     async { UpgradeTerminalCause::PeerClosed },
@@ -1774,7 +1854,7 @@ mod tests {
             .try_spawn_handshake(allocation(0, 0), move |handshake| async move {
                 let entry = handshake
                     .commit(
-                        snapshot,
+                        None,
                         UpgradeEntryPlan::new(
                             UpgradeTerminalControl::new(
                                 || {},
@@ -1817,7 +1897,7 @@ mod tests {
             .try_spawn_handshake(allocation(0, 0), move |handshake| async move {
                 let entry = handshake
                     .commit(
-                        snapshot,
+                        None,
                         UpgradeEntryPlan::new(
                             UpgradeTerminalControl::new(
                                 || {},
@@ -1868,7 +1948,7 @@ mod tests {
             .try_spawn_handshake(allocation(0, 0), move |handshake| async move {
                 let entry = handshake
                     .commit(
-                        snapshot,
+                        None,
                         UpgradeEntryPlan::new(
                             UpgradeTerminalControl::new(
                                 move || drop(cleanup_drop),
@@ -1914,7 +1994,7 @@ mod tests {
                 .try_spawn_handshake(allocation(0, 0), move |handshake| async move {
                     let entry = handshake
                         .commit(
-                            snapshot,
+                            None,
                             plan(move |_| async move {
                                 Ok(UpgradeRelayPair::new(
                                     async move {
@@ -1992,7 +2072,7 @@ mod tests {
                 move |handshake| async move {
                     let entry = handshake
                         .commit(
-                            snapshot,
+                            None,
                             UpgradeEntryPlan::new(
                                 UpgradeTerminalControl::new(
                                     || {},
@@ -2049,7 +2129,7 @@ mod tests {
                     move |handshake| async move {
                         let entry = handshake
                             .commit(
-                                snapshot,
+                                None,
                                 UpgradeEntryPlan::new(
                                     UpgradeTerminalControl::new(
                                         move || {
@@ -2086,6 +2166,124 @@ mod tests {
             assert_eq!(established_closes.load(Ordering::SeqCst), 0);
             runtime.shutdown_and_wait(Some(Instant::now())).await;
         }
+    }
+
+    #[tokio::test]
+    async fn raw_abort_panic_is_contained_on_pre101_cleanup() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let raw_aborts = Arc::new(AtomicUsize::new(0));
+        let established_closes = Arc::new(AtomicUsize::new(0));
+        let setup_drops = Arc::new(AtomicUsize::new(0));
+        let (entry_tx, entry_rx) = oneshot::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), {
+                let raw_aborts = raw_aborts.clone();
+                let established_closes = established_closes.clone();
+                let setup_drops = setup_drops.clone();
+                move |handshake| async move {
+                    let entry = handshake
+                        .commit(
+                            None,
+                            UpgradeEntryPlan::new(
+                                UpgradeTerminalControl::new(
+                                    move || {
+                                        raw_aborts.fetch_add(1, Ordering::SeqCst);
+                                        panic!("raw abort panic");
+                                    },
+                                    move |_| async move {
+                                        established_closes.fetch_add(1, Ordering::SeqCst);
+                                    },
+                                ),
+                                move |_| async move {
+                                    let _drop = DropCount(setup_drops);
+                                    Err(UpgradeTerminalCause::DownstreamWriteFailed)
+                                },
+                            ),
+                        )
+                        .unwrap();
+                    entry_tx.send(entry).unwrap();
+                }
+            })
+            .unwrap();
+        let entry = entry_rx.await.unwrap();
+        entry.wait_closed().await;
+        assert_eq!(
+            entry.terminal_cause(),
+            Some(UpgradeTerminalCause::DownstreamWriteFailed)
+        );
+        assert_eq!(raw_aborts.load(Ordering::SeqCst), 1);
+        assert_eq!(established_closes.load(Ordering::SeqCst), 0);
+        assert_eq!(setup_drops.load(Ordering::SeqCst), 1);
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+        assert_eq!(runtime.counts().tracked_tasks, 0);
+    }
+
+    #[tokio::test]
+    async fn lowered_cleanup_cutoff_interrupts_established_cleanup() {
+        let runtime =
+            UpgradeRuntime::try_new(limits(1, 8).with_cleanup_grace(Duration::from_secs(5)))
+                .unwrap();
+        let raw_aborts = Arc::new(AtomicUsize::new(0));
+        let cleanup_drops = Arc::new(AtomicUsize::new(0));
+        let relay_drops = Arc::new(AtomicUsize::new(0));
+        let (entry_tx, entry_rx) = oneshot::channel();
+        let (cleanup_started_tx, cleanup_started_rx) = oneshot::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), {
+                let raw_aborts = raw_aborts.clone();
+                let cleanup_drops = cleanup_drops.clone();
+                let relay_drops = relay_drops.clone();
+                move |handshake| async move {
+                    let entry = handshake
+                        .commit(
+                            None,
+                            UpgradeEntryPlan::new(
+                                UpgradeTerminalControl::new(
+                                    move || {
+                                        raw_aborts.fetch_add(1, Ordering::SeqCst);
+                                        panic!("raw abort panic at cleanup cutoff");
+                                    },
+                                    move |_| async move {
+                                        let _drop = DropCount(cleanup_drops);
+                                        let _ = cleanup_started_tx.send(());
+                                        std::future::pending::<()>().await;
+                                    },
+                                ),
+                                move |_| async move {
+                                    let relay_drop = DropCount(relay_drops);
+                                    Ok(UpgradeRelayPair::new(
+                                        async { UpgradeTerminalCause::PeerClosed },
+                                        async move {
+                                            let _drop = relay_drop;
+                                            std::future::pending::<()>().await;
+                                            UpgradeTerminalCause::PeerClosed
+                                        },
+                                    ))
+                                },
+                            ),
+                        )
+                        .unwrap();
+                    entry_tx.send(entry).unwrap();
+                }
+            })
+            .unwrap();
+        let entry = entry_rx.await.unwrap();
+        cleanup_started_rx.await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            runtime.shutdown_and_wait(Some(Instant::now())),
+        )
+        .await
+        .expect("lowered cleanup cutoff was not observed by active cleanup");
+        entry.wait_closed().await;
+        assert_eq!(
+            entry.terminal_cause(),
+            Some(UpgradeTerminalCause::PeerClosed)
+        );
+        assert_eq!(raw_aborts.load(Ordering::SeqCst), 1);
+        assert_eq!(cleanup_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(relay_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.counts().tracked_tasks, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -2175,7 +2373,7 @@ mod tests {
                 move |handshake| async move {
                     let entry = handshake
                         .commit(
-                            snapshot,
+                            None,
                             UpgradeEntryPlan::new(
                                 UpgradeTerminalControl::new(
                                     move || {
@@ -2231,7 +2429,7 @@ mod tests {
                     let terminal = DropCount(drops.clone());
                     let entry = handshake
                         .commit(
-                            snapshot,
+                            None,
                             UpgradeEntryPlan::new(
                                 UpgradeTerminalControl::new(
                                     move || drop(terminal),
@@ -2288,7 +2486,7 @@ mod tests {
         let (entry_tx, entry_rx) = oneshot::channel();
         runtime
             .try_spawn_handshake(allocation(0, 0), move |handshake| async move {
-                let entry = handshake.commit(snapshot, parked_plan()).unwrap();
+                let entry = handshake.commit(None, parked_plan()).unwrap();
                 entry_tx.send(entry).unwrap();
             })
             .unwrap();

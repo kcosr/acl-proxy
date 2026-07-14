@@ -5,6 +5,5 @@ pub(crate) use runtime::{
     CommittedUpgrade, UpgradeAdmissionError, UpgradeAllocation, UpgradeAllocationError,
     UpgradeCommitError, UpgradeEntryPlan, UpgradeHandshake, UpgradeHandshakeSpawnError,
     UpgradeRelayPair, UpgradeRuntime, UpgradeRuntimeCounts, UpgradeRuntimeError,
-    UpgradeRuntimeLimits, UpgradeSnapshotContext, UpgradeTerminalCause, UpgradeTerminalControl,
-    UpgradedStreamSnapshot,
+    UpgradeRuntimeLimits, UpgradeTerminalCause, UpgradeTerminalControl, UpgradedStreamSnapshot,
 };
