@@ -686,6 +686,34 @@ mod tests {
     }
 
     #[test]
+    fn typed_identity_action_replaces_spoofed_inbound_values() {
+        const VARIABLE: &str = "ACL_PROXY_TEST_TYPED_IDENTITY_28D4";
+        let resolver = activate(environment_plan(VARIABLE));
+        let actions = [ResolvedCredentialAction::CustomHeader {
+            header: HeaderName::from_static("x-aw-identity-token"),
+            source: credential_index(0),
+        }];
+        let mut headers = HeaderMap::new();
+        headers.append(
+            "x-aw-identity-token",
+            HeaderValue::from_static("spoofed-first"),
+        );
+        headers.append(
+            "x-aw-identity-token",
+            HeaderValue::from_static("spoofed-second"),
+        );
+
+        env::set_var(VARIABLE, "typed-identity");
+        resolver.inject(&actions, &mut headers).unwrap();
+        env::remove_var(VARIABLE);
+
+        assert_eq!(headers.get_all("x-aw-identity-token").iter().count(), 1);
+        let identity = headers.get("x-aw-identity-token").unwrap();
+        assert_eq!(identity, "typed-identity");
+        assert!(identity.is_sensitive());
+    }
+
+    #[test]
     #[cfg(unix)]
     fn file_rotation_and_one_terminal_line_ending_are_applied_per_injection() {
         let directory = tempfile::tempdir().unwrap();
@@ -1136,7 +1164,7 @@ mod tests {
     }
 
     #[test]
-    fn inbound_credentials_are_removed_and_only_copied_to_authorized_processes() {
+    fn typed_identity_is_visible_to_policy_and_provider_but_not_origin() {
         let plan = inbound_plan();
         let resolver = activate(plan);
         let mut request_headers = HeaderMap::new();
@@ -1146,6 +1174,8 @@ mod tests {
         );
 
         let inbound = resolver.extract_inbound(&mut request_headers).unwrap();
+        // Policy evaluates presence through this typed handle after extraction;
+        // the origin-facing request map no longer contains the secret.
         assert!(!request_headers.contains_key("x-identity-token"));
         assert!(inbound.is_present(&HeaderName::from_static("x-identity-token")));
 

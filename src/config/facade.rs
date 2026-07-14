@@ -357,15 +357,18 @@ methods = ["GET"]"#,
     }
 
     #[test]
-    fn facade_rejects_non_v3_without_fallback() {
-        let error = compile_config_text(ConfigTextInput {
-            text: &MINIMAL.replace("schema_version = 3", "schema_version = 2"),
-            source_path: Path::new("/tmp/legacy.toml"),
-            config_root: Path::new("/tmp"),
-        })
-        .unwrap_err();
-        assert!(error.to_string().contains("strict schema v3"));
-        assert!(error.to_string().contains("invalid value"));
+    fn production_v1_shapes_are_rejected_by_v3_runtime() {
+        let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/production");
+        for name in [
+            "v1-host-shape.toml",
+            "v1-common-container-shape.toml",
+            "v1-internal-container-shape.toml",
+        ] {
+            let error = load_and_compile_exact_config(&fixture_root.join(name)).unwrap_err();
+            let rendered = error.to_string();
+            assert!(rendered.contains("strict schema v3"), "{name}: {rendered}");
+            assert!(rendered.contains("invalid value"), "{name}: {rendered}");
+        }
     }
 
     #[test]

@@ -228,6 +228,41 @@ fn sanitized_v1_fixtures_are_structurally_incompatible_with_v3() {
     }
 }
 
+#[test]
+fn legacy_single_star_host_rules_receive_explicit_v3_intent() {
+    let host = parse_fixture("host-proxy.toml");
+    let internal = parse_fixture("internal-container-proxy.toml");
+    let patterns: BTreeSet<_> = rules(&host)
+        .iter()
+        .chain(rules(&internal))
+        .flat_map(|rule| strings(rule, "urls"))
+        .collect();
+
+    for recursive in [
+        "https://**.chatgpt.com/**",
+        "https://**.sentry.io/**",
+        "https://**.datadoghq.com/**",
+    ] {
+        assert!(patterns.contains(recursive));
+    }
+    for one_label in [
+        "https://*.cursor.sh/**",
+        "https://*.private-a.example.test/**",
+        "https://*.source.private-e.example.test/**",
+        "https://*.corp.example.test/**",
+        "http://*.corp.example.test/**",
+    ] {
+        assert!(patterns.contains(one_label));
+        assert!(
+            !patterns.contains(&one_label.replacen("*.", "**.", 1).as_str()),
+            "legacy one-label intent must not be silently widened: {one_label}"
+        );
+    }
+    assert!(
+        patterns.contains("https://rocky-linux-*.production.gcp.mirrors.ctrliq.cloud/pub/rocky/**")
+    );
+}
+
 struct ProviderFixture {
     script: &'static str,
     config: &'static str,

@@ -243,10 +243,10 @@ fn map_authorization_error(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     #[cfg(unix)]
     use std::fs;
     use std::path::Path;
-    #[cfg(unix)]
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -305,6 +305,144 @@ header = "x-acl-proxy-request-id"
     ) -> Arc<ProductActivator> {
         let resources = ProductStaticResources::try_new(static_config).unwrap();
         resources.activator()
+    }
+
+    #[derive(Default)]
+    struct ProductCandidateSource(Mutex<VecDeque<crate::config::CompiledConfig>>);
+
+    impl ProductCandidateSource {
+        fn push(&self, candidate: crate::config::CompiledConfig) {
+            self.0.lock().unwrap().push_back(candidate);
+        }
+    }
+
+    impl crate::runtime::CandidateSource for ProductCandidateSource {
+        fn load_latest(
+            &self,
+            cancellation: ActivationCancellation,
+        ) -> BoxFuture<'_, Result<crate::config::CompiledConfig, RuntimeError>> {
+            Box::pin(async move {
+                cancellation.check()?;
+                self.0.lock().unwrap().pop_front().ok_or_else(|| {
+                    RuntimeError::CandidateSource("no product candidate queued".to_string())
+                })
+            })
+        }
+    }
+
+    fn environment_redaction_config(variable: &str) -> String {
+        format!(
+            r#"{MINIMAL}
+[redaction.profiles.environment]
+rules = [{{ literal_environment_variables = ["{variable}"] }}]
+
+[[policy.rules]]
+id = "environment-redaction"
+decision = "allow"
+urls = ["https://example.test/**"]
+redaction_profile = "environment"
+"#
+        )
+    }
+
+    async fn product_runtime(
+        initial: &crate::config::CompiledConfig,
+    ) -> (Arc<crate::runtime::Runtime>, Arc<ProductCandidateSource>) {
+        let resources = ProductStaticResources::try_new(&initial.static_config).unwrap();
+        let activator = resources.activator();
+        let source = Arc::new(ProductCandidateSource::default());
+        let ownership = crate::runtime::StaticOwnership::new(
+            initial.static_config.clone(),
+            initial.static_fingerprint.clone(),
+            resources,
+        );
+        let runtime = crate::runtime::Runtime::new(ownership, source.clone(), activator)
+            .await
+            .unwrap();
+        (runtime, source)
+    }
+
+    fn redact_environment_secret(lease: &crate::runtime::GenerationLease, input: &[u8]) -> Vec<u8> {
+        let profile = lease.bindings().rules[0]
+            .redaction_profile
+            .expect("policy rule binds the environment redaction profile");
+        let redacted = lease
+            .redaction()
+            .profile(profile)
+            .unwrap()
+            .redact_decoded_http_body(input.to_vec())
+            .unwrap();
+        redacted.bytes.clone()
+    }
+
+    #[tokio::test]
+    async fn redaction_environment_rotation_publishes_one_generation() {
+        const VARIABLE: &str = "ACL_PROXY_PRODUCT_REDACTION_ROTATION_6A51";
+        std::env::set_var(VARIABLE, "old-generation-secret");
+        let text = environment_redaction_config(VARIABLE);
+        let initial = compile(&text);
+        let successor = compile(&text);
+        let (runtime, source) = product_runtime(&initial).await;
+        let first = runtime.start(initial).await.unwrap();
+        let old_lease = runtime.lease().await.unwrap();
+
+        std::env::set_var(VARIABLE, "new-generation-secret");
+        source.push(successor);
+        let crate::runtime::ReloadTriggerResult::Completed {
+            attempts,
+            generation: second,
+        } = runtime.trigger_reload().await.unwrap()
+        else {
+            panic!("the sole reload attempt must publish its candidate");
+        };
+        let new_lease = runtime.lease().await.unwrap();
+        std::env::remove_var(VARIABLE);
+
+        assert_eq!(attempts, 1);
+        assert_ne!(first, second);
+        assert_eq!(runtime.active_generation_id(), Some(second));
+        assert_eq!(old_lease.id(), first);
+        assert_eq!(new_lease.id(), second);
+        assert_eq!(
+            redact_environment_secret(&old_lease, b"old-generation-secret new-generation-secret"),
+            b"[REDACTED] new-generation-secret"
+        );
+        assert_eq!(
+            redact_environment_secret(&new_lease, b"old-generation-secret new-generation-secret"),
+            b"old-generation-secret [REDACTED]"
+        );
+
+        drop(old_lease);
+        drop(new_lease);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn redaction_source_failure_preserves_previous_generation() {
+        const VARIABLE: &str = "ACL_PROXY_PRODUCT_REDACTION_FAILURE_8C37";
+        std::env::set_var(VARIABLE, "published-generation-secret");
+        let text = environment_redaction_config(VARIABLE);
+        let initial = compile(&text);
+        let failed_successor = compile(&text);
+        let (runtime, source) = product_runtime(&initial).await;
+        let first = runtime.start(initial).await.unwrap();
+
+        std::env::remove_var(VARIABLE);
+        source.push(failed_successor);
+        let error = runtime.trigger_reload().await.unwrap_err();
+        assert!(matches!(error, RuntimeError::CandidateActivation(_)));
+        assert_eq!(runtime.active_generation_id(), Some(first));
+        let retained = runtime.lease().await.unwrap();
+        assert_eq!(retained.id(), first);
+        assert_eq!(
+            redact_environment_secret(&retained, b"published-generation-secret"),
+            b"[REDACTED]"
+        );
+        assert!(!error.to_string().contains(VARIABLE));
+        assert!(!error.to_string().contains("published-generation-secret"));
+
+        drop(retained);
+        runtime.shutdown().await;
     }
 
     #[tokio::test]

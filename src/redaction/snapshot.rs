@@ -2300,7 +2300,22 @@ mod tests {
     }
 
     #[test]
-    fn missing_empty_and_individual_oversize_errors_are_sanitized() {
+    fn redaction_environment_literal_sources_are_required_and_secret() {
+        let secret = EnvGuard::set("required-redaction-secret");
+        let snapshot = activate(plan(profile(Some(secret.0.clone())))).unwrap();
+        let rendered = format!("{snapshot:?} {:?}", snapshot.profile("main").unwrap());
+        assert!(!rendered.contains(&secret.0));
+        assert!(!rendered.contains("required-redaction-secret"));
+        assert_eq!(
+            snapshot
+                .profile("main")
+                .unwrap()
+                .redact_decoded_http_body(b"required-redaction-secret".to_vec())
+                .unwrap()
+                .bytes,
+            b"[MASKED]"
+        );
+
         let missing = EnvGuard::missing();
         let error = activate(plan(profile(Some(missing.0.clone())))).unwrap_err();
         assert!(matches!(error, SnapshotError::SourceUnavailable { .. }));

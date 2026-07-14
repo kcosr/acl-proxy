@@ -1223,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn production_hostname_glob_corpus_preserves_label_boundaries() {
+    fn hostname_recursive_and_label_local_glob_corpus() {
         for suffix in ["chatgpt.com", "sentry.io", "datadoghq.com"] {
             let pattern = format!("https://**.{suffix}/**");
             assert!(!matches(&pattern, &format!("https://{suffix}/")));
