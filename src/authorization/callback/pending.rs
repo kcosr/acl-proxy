@@ -359,6 +359,7 @@ impl<P> PendingCapabilityStore<P> {
             )
             .is_none());
         debug_assert_counts(&state);
+        self.inner.changed.notify_waiters();
         Ok(CallbackClaimResult::Claimed(CallbackClaim {
             store: self.clone(),
             operation,
@@ -598,6 +599,24 @@ impl<P> fmt::Debug for PendingOperationSignal<P> {
 }
 
 impl<P> PendingOperationSignal<P> {
+    pub(crate) async fn wait_until_not_pending(&self) {
+        loop {
+            let changed = self.store.inner.changed.notified();
+            let pending = self
+                .store
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pending
+                .contains_key(&self.operation);
+            if !pending {
+                return;
+            }
+            changed.await;
+        }
+    }
+
     pub(crate) fn finish_pending(&self, cause: PendingTerminalCause) -> PendingTerminalResult<P> {
         self.finish_pending_inner(cause, None, false)
     }
@@ -639,9 +658,7 @@ impl<P> PendingOperationSignal<P> {
                 .checked_sub(1)
                 .expect("a pending operation contributes one occupancy unit");
             debug_assert_counts(&state);
-            if state.occupancy == 0 {
-                self.store.inner.changed.notify_waiters();
-            }
+            self.store.inner.changed.notify_waiters();
             return PendingTerminalResult::Won(TerminalOperation {
                 cause: terminal_cause_at(entry.deadline, shutdown_deadline, occurred_at, cause),
                 payload: entry.payload,
@@ -1526,6 +1543,27 @@ mod tests {
         let completion = claim.complete_at(Instant::now()).unwrap_err();
         assert!(causes.contains(&completion.cause()));
         assert_eq!(completion.into_payload(), 23);
+    }
+
+    #[tokio::test]
+    async fn operation_signal_observes_claim_before_callback_processing() {
+        let store = PendingCapabilityStore::new();
+        let admission = admit_fixed(&store, 1, 31usize, 1);
+        let digest = admission.token().digest();
+        let handle = admission.into_parts().1;
+        let signal = handle.signal_handle();
+        let waiter = tokio::spawn(async move { signal.wait_until_not_pending().await });
+
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        let claim = claim_live(&store, digest);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("claim wakes delivery cancellation")
+            .unwrap();
+
+        assert_eq!(claim.complete().unwrap(), 31);
+        drop(handle);
     }
 
     #[test]

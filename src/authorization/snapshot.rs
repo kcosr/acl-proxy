@@ -6,13 +6,14 @@ use tokio::time::Instant;
 use super::process::{
     ProcessActivationError, ProcessDecision, ProcessProvider, ProcessRequestError,
 };
+#[cfg(test)]
 use super::protocol::ProviderRequest;
 use crate::config::compiler::{
     AuthorizationPlan, AuthorizationProviderPlan, CompiledProviderFailureMode,
 };
 use crate::runtime::{
-    ActivationCancellation, AuthorizationSnapshot, BoxFuture, CleanupReason, GenerationOwner,
-    ProviderIndex, ProviderRegistry,
+    ActivationCancellation, AuthorizationDispatchContext, AuthorizationSnapshot, BoxFuture,
+    CleanupReason, GenerationOwner, ProviderIndex, ProviderRegistry,
 };
 use crate::safety::HttpWireBodyGuard;
 
@@ -178,16 +179,40 @@ impl ProductAuthorizationSnapshot {
             }),
         }
     }
-}
 
-impl AuthorizationSnapshot for ProductAuthorizationSnapshot {
-    fn dispatch<'a>(
+    #[cfg(test)]
+    fn dispatch_process_for_test<'a>(
         &'a self,
         provider: ProviderIndex,
         request: ProviderRequest<'a>,
         guard: &'a HttpWireBodyGuard,
         request_deadline: Instant,
     ) -> BoxFuture<'a, Result<AuthorizationDecision, AuthorizationDispatchError>> {
+        Box::pin(async move {
+            let provider = self
+                .providers
+                .get(provider.get())
+                .ok_or(AuthorizationDispatchError::UnknownProvider)?;
+            match provider {
+                ActiveProvider::Process(process) => process
+                    .decide(request, guard, request_deadline)
+                    .await
+                    .map(AuthorizationDecision::from)
+                    .map_err(AuthorizationDispatchError::Process),
+            }
+        })
+    }
+}
+
+impl AuthorizationSnapshot for ProductAuthorizationSnapshot {
+    fn dispatch<'a>(
+        &'a self,
+        provider: ProviderIndex,
+        context: AuthorizationDispatchContext<'a>,
+        guard: &'a HttpWireBodyGuard,
+        request_deadline: Instant,
+    ) -> BoxFuture<'a, Result<AuthorizationDecision, AuthorizationDispatchError>> {
+        let request = context.into_request();
         Box::pin(async move {
             let provider = self
                 .providers
@@ -512,10 +537,10 @@ for line in sys.stdin:
             guard.commit();
         }
 
-        let object: &dyn AuthorizationSnapshot = &snapshot;
+        let _: &dyn AuthorizationSnapshot = &snapshot;
         assert_eq!(
-            object
-                .dispatch(
+            snapshot
+                .dispatch_process_for_test(
                     provider,
                     request("request-1"),
                     &body_guard(),
@@ -530,8 +555,8 @@ for line in sys.stdin:
                 .get("unused-z")
                 .unwrap();
         assert!(matches!(
-            object
-                .dispatch(
+            snapshot
+                .dispatch_process_for_test(
                     foreign,
                     request("request-2"),
                     &body_guard(),
@@ -579,10 +604,10 @@ for line in sys.stdin:
         let body_charge = body.charged_bytes();
         assert_eq!(guard.live_bytes(), body_charge);
 
-        let object: &dyn AuthorizationSnapshot = &snapshot;
+        let _: &dyn AuthorizationSnapshot = &snapshot;
         assert_eq!(
-            object
-                .dispatch(
+            snapshot
+                .dispatch_process_for_test(
                     provider,
                     request("request-pass"),
                     &guard,

@@ -158,7 +158,7 @@ pub(crate) trait AuthorizationSnapshot: Send + Sync {
     fn dispatch<'a>(
         &'a self,
         provider: ProviderIndex,
-        request: crate::authorization::protocol::ProviderRequest<'a>,
+        context: AuthorizationDispatchContext<'a>,
         guard: &'a crate::safety::HttpWireBodyGuard,
         request_deadline: tokio::time::Instant,
     ) -> BoxFuture<
@@ -168,6 +168,32 @@ pub(crate) trait AuthorizationSnapshot: Send + Sync {
             crate::authorization::AuthorizationDispatchError,
         >,
     >;
+}
+
+pub(crate) struct AuthorizationDispatchContext<'a> {
+    rule_id: &'a str,
+    request: crate::authorization::protocol::ProviderRequest<'a>,
+    generation: &'a GenerationLease,
+}
+
+impl<'a> AuthorizationDispatchContext<'a> {
+    pub(crate) fn rule_id(&self) -> &'a str {
+        self.rule_id
+    }
+
+    pub(crate) fn request(&self) -> &crate::authorization::protocol::ProviderRequest<'a> {
+        &self.request
+    }
+
+    pub(crate) fn into_request(self) -> crate::authorization::protocol::ProviderRequest<'a> {
+        self.request
+    }
+
+    pub(crate) fn retain_generation(
+        &self,
+    ) -> Result<GenerationRetention, GenerationRetentionError> {
+        self.generation.retain_for_operation()
+    }
 }
 pub(crate) trait SafetySnapshot: Send + Sync {
     fn contains_loop_marker(&self, headers: &HeaderMap) -> bool;
@@ -414,6 +440,32 @@ impl GenerationLease {
         &self,
     ) -> Result<GenerationRetention, GenerationRetentionError> {
         self.generation.retain_existing()
+    }
+
+    pub(crate) fn dispatch_authorization<'a>(
+        &'a self,
+        provider: ProviderIndex,
+        rule_id: &'a str,
+        request: crate::authorization::protocol::ProviderRequest<'a>,
+        guard: &'a crate::safety::HttpWireBodyGuard,
+        request_deadline: tokio::time::Instant,
+    ) -> BoxFuture<
+        'a,
+        Result<
+            crate::authorization::AuthorizationDecision,
+            crate::authorization::AuthorizationDispatchError,
+        >,
+    > {
+        self.generation.authorization.dispatch(
+            provider,
+            AuthorizationDispatchContext {
+                rule_id,
+                request,
+                generation: self,
+            },
+            guard,
+            request_deadline,
+        )
     }
 }
 

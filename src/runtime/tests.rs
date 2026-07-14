@@ -27,7 +27,7 @@ impl AuthorizationSnapshot for EmptySnapshot {
     fn dispatch<'a>(
         &'a self,
         _provider: ProviderIndex,
-        _request: crate::authorization::protocol::ProviderRequest<'a>,
+        _context: AuthorizationDispatchContext<'a>,
         _guard: &'a crate::safety::HttpWireBodyGuard,
         _request_deadline: tokio::time::Instant,
     ) -> BoxFuture<

@@ -13,12 +13,12 @@ pub(crate) use core::{
 };
 #[allow(unused_imports)]
 pub(crate) use generation::{
-    ActivatedGeneration, AuthorizationSnapshot, CleanupReason, CredentialResolver,
-    CredentialSourceIndex, CredentialSourceRegistry, EgressSnapshot, Generation, GenerationId,
-    GenerationLease, GenerationOwner, GenerationRetention, GenerationRetentionError,
-    ObservationSnapshot, PolicySnapshot, ProviderIndex, ProviderRegistry, PublicationGuard,
-    RedactionProfileIndex, RedactionProfileRegistry, RedactionSnapshot, ResolvedBindings,
-    ResolvedRuleBindings, SafetySnapshot,
+    ActivatedGeneration, AuthorizationDispatchContext, AuthorizationSnapshot, CleanupReason,
+    CredentialResolver, CredentialSourceIndex, CredentialSourceRegistry, EgressSnapshot,
+    Generation, GenerationId, GenerationLease, GenerationOwner, GenerationRetention,
+    GenerationRetentionError, ObservationSnapshot, PolicySnapshot, ProviderIndex, ProviderRegistry,
+    PublicationGuard, RedactionProfileIndex, RedactionProfileRegistry, RedactionSnapshot,
+    ResolvedBindings, ResolvedRuleBindings, SafetySnapshot,
 };
 #[allow(unused_imports)]
 pub(crate) use readiness::ServiceReadiness;
