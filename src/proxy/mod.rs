@@ -6,4 +6,5 @@ pub mod http;
 pub mod https_connect;
 pub mod https_transparent;
 pub(crate) mod listener;
+pub(crate) mod original_destination;
 pub mod websocket;

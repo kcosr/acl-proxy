@@ -97,9 +97,8 @@ impl ProductRuntime {
                 executor: tokio::runtime::Handle::current(),
             });
         let mut supervisors = Vec::new();
-        for (kind, listener) in prepared.into_entries() {
+        for listener in prepared.into_entries() {
             match starter.start(
-                kind,
                 listener,
                 self.static_resources.ingress_assets(),
                 observer.clone(),
@@ -204,6 +203,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::activation::listeners::{PreparedProxyListener, ProxyListenerConfig};
+    use crate::config::compiler::{CompiledHttp1ConnectPolicy, CompiledHttpVersion};
     use crate::config::load_and_compile_exact_config;
 
     struct FakeSupervisor {
@@ -255,22 +256,24 @@ mod tests {
     struct FakeStarter {
         fail_at: Option<usize>,
         supervisors: Vec<Arc<FakeSupervisor>>,
+        configs: Vec<ProxyListenerConfig>,
     }
 
     impl ProxySupervisorStarter for FakeStarter {
         fn start(
             &mut self,
-            kind: super::super::listeners::ProxyListenerKind,
-            _listener: TcpListener,
+            listener: PreparedProxyListener,
             _assets: &Arc<super::super::assets::ProductIngressAssets>,
             observer: Arc<dyn ProxySupervisorFailureObserver>,
         ) -> Result<Arc<dyn ProxySupervisor>, ProxySupervisorStartError> {
+            let kind = listener.kind();
             if self.fail_at == Some(self.supervisors.len()) {
                 return Err(ProxySupervisorStartError {
                     listener: kind,
                     message: "injected startup failure".to_string(),
                 });
             }
+            self.configs.push(listener.config);
             let supervisor = Arc::new(FakeSupervisor {
                 observer,
                 kind,
@@ -360,6 +363,14 @@ default = "deny"
         let mut starter = FakeStarter::default();
         product.start_proxy_supervisors(&mut starter).await.unwrap();
         assert!(product.runtime().is_ready());
+        let [ProxyListenerConfig::ExplicitHttp(config)] = starter.configs.as_slice() else {
+            panic!("expected the exact explicit HTTP listener config");
+        };
+        assert_eq!(config.bind, addresses[0]);
+        assert_eq!(config.http_versions, [CompiledHttpVersion::Http1]);
+        let connect = config.connect.as_ref().expect("compiled CONNECT policy");
+        assert_eq!(connect.http1, Some(CompiledHttp1ConnectPolicy::Deny));
+        assert!(!connect.http2_denied);
 
         product.shutdown().await;
         assert_bindable(addresses);
@@ -480,6 +491,7 @@ http_versions = ["http1"]
         let mut starter = FakeStarter {
             fail_at: Some(1),
             supervisors: Vec::new(),
+            configs: Vec::new(),
         };
 
         let result = product.start_proxy_supervisors(&mut starter).await;
