@@ -356,6 +356,33 @@ impl Generation {
         }
     }
 
+    fn retain_existing(self: &Arc<Self>) -> Result<GenerationRetention, GenerationRetentionError> {
+        let mut state = self.leases.load(Ordering::Acquire);
+        loop {
+            let count = state & LEASE_COUNT_MASK;
+            debug_assert!(
+                count > 0,
+                "an operation retention is derived from a live generation lease"
+            );
+            if count == LEASE_COUNT_MASK {
+                return Err(GenerationRetentionError::CountExhausted);
+            }
+            match self.leases.compare_exchange_weak(
+                state,
+                state + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Ok(GenerationRetention {
+                        generation: self.clone(),
+                    })
+                }
+                Err(current) => state = current,
+            }
+        }
+    }
+
     pub(super) fn begin_retirement(&self) {
         let previous = self.leases.fetch_or(RETIRING_BIT, Ordering::AcqRel);
         if previous & RETIRING_BIT == 0 && previous & LEASE_COUNT_MASK == 0 {
@@ -379,6 +406,17 @@ pub(crate) struct GenerationLease {
     generation: Arc<Generation>,
 }
 
+impl GenerationLease {
+    /// Retains this exact generation for an operation admitted by the current
+    /// request. Retirement may already have started; the live request lease is
+    /// the authority to extend only its captured generation.
+    pub(crate) fn retain_for_operation(
+        &self,
+    ) -> Result<GenerationRetention, GenerationRetentionError> {
+        self.generation.retain_existing()
+    }
+}
+
 impl Deref for GenerationLease {
     type Target = Generation;
 
@@ -389,10 +427,47 @@ impl Deref for GenerationLease {
 
 impl Drop for GenerationLease {
     fn drop(&mut self) {
-        let previous = self.generation.leases.fetch_sub(1, Ordering::AcqRel);
-        debug_assert_ne!(previous & LEASE_COUNT_MASK, 0);
-        if previous & RETIRING_BIT != 0 && previous & LEASE_COUNT_MASK == 1 {
-            self.generation.leases_drained.notify_waiters();
-        }
+        release_retention(&self.generation);
     }
+}
+
+/// Opaque operation-owned liveness for one captured generation. It exposes no
+/// snapshot cloning or admission path and can only be derived from a live lease.
+pub(crate) struct GenerationRetention {
+    generation: Arc<Generation>,
+}
+
+impl GenerationRetention {
+    pub(crate) fn id(&self) -> GenerationId {
+        self.generation.id()
+    }
+}
+
+impl fmt::Debug for GenerationRetention {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GenerationRetention")
+            .field("generation", &self.id())
+            .finish()
+    }
+}
+
+impl Drop for GenerationRetention {
+    fn drop(&mut self) {
+        release_retention(&self.generation);
+    }
+}
+
+fn release_retention(generation: &Generation) {
+    let previous = generation.leases.fetch_sub(1, Ordering::AcqRel);
+    debug_assert_ne!(previous & LEASE_COUNT_MASK, 0);
+    if previous & RETIRING_BIT != 0 && previous & LEASE_COUNT_MASK == 1 {
+        generation.leases_drained.notify_waiters();
+    }
+}
+
+#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum GenerationRetentionError {
+    #[error("generation operation-retention count is exhausted")]
+    CountExhausted,
 }

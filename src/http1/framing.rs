@@ -15,6 +15,7 @@ pub(crate) enum BodyFraming {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BodyProgress {
     NeedInput,
+    Paused,
     Complete,
 }
 
@@ -69,6 +70,34 @@ impl BodyFramer {
         &mut self,
         store: &mut ParserStore,
         end_of_stream: bool,
+        consume_entity: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<BodyProgress, FramingProcessError<E>> {
+        self.process_inner(store, end_of_stream, None, consume_entity)
+    }
+
+    pub(crate) fn process_up_to<E>(
+        &mut self,
+        store: &mut ParserStore,
+        end_of_stream: bool,
+        entity_octet_limit: u64,
+        consume_entity: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<BodyProgress, FramingProcessError<E>> {
+        if entity_octet_limit < self.entity_bytes {
+            return Err(FramingError::EntityLimitBehindProgress.into());
+        }
+        self.process_inner(
+            store,
+            end_of_stream,
+            Some(entity_octet_limit),
+            consume_entity,
+        )
+    }
+
+    fn process_inner<E>(
+        &mut self,
+        store: &mut ParserStore,
+        end_of_stream: bool,
+        entity_octet_limit: Option<u64>,
         mut consume_entity: impl FnMut(&[u8]) -> Result<(), E>,
     ) -> Result<BodyProgress, FramingProcessError<E>> {
         loop {
@@ -80,6 +109,9 @@ impl BodyFramer {
                     self.state = FramingState::Complete;
                 }
                 FramingState::ContentLength(remaining) => {
+                    if self.at_entity_limit(entity_octet_limit) {
+                        return Ok(BodyProgress::Paused);
+                    }
                     if store.initialized_len() == 0 {
                         return if end_of_stream {
                             Err(FramingError::UnexpectedEndOfStream.into())
@@ -89,15 +121,26 @@ impl BodyFramer {
                     }
                     let available = u64::try_from(store.initialized_len())
                         .map_err(|_| FramingError::ArithmeticOverflow)?;
-                    let consumed = remaining.min(available);
+                    let consumed =
+                        self.limit_consumption(remaining.min(available), entity_octet_limit)?;
                     self.consume(store, consumed, &mut consume_entity)?;
                     self.state = FramingState::ContentLength(remaining - consumed);
+                    if self.at_entity_limit(entity_octet_limit) {
+                        return Ok(BodyProgress::Paused);
+                    }
                 }
                 FramingState::CloseDelimited => {
+                    if self.at_entity_limit(entity_octet_limit) {
+                        return Ok(BodyProgress::Paused);
+                    }
                     if store.initialized_len() != 0 {
-                        let consumed = u64::try_from(store.initialized_len())
+                        let available = u64::try_from(store.initialized_len())
                             .map_err(|_| FramingError::ArithmeticOverflow)?;
+                        let consumed = self.limit_consumption(available, entity_octet_limit)?;
                         self.consume(store, consumed, &mut consume_entity)?;
+                        if self.at_entity_limit(entity_octet_limit) {
+                            return Ok(BodyProgress::Paused);
+                        }
                     }
                     if end_of_stream {
                         self.state = FramingState::Complete;
@@ -106,6 +149,9 @@ impl BodyFramer {
                     }
                 }
                 FramingState::ChunkSize => {
+                    if self.at_entity_limit(entity_octet_limit) {
+                        return Ok(BodyProgress::Paused);
+                    }
                     let Some(line_end) = self.chunk_line_end(store.initialized())? else {
                         return if end_of_stream {
                             Err(FramingError::UnexpectedEndOfStream.into())
@@ -125,9 +171,15 @@ impl BodyFramer {
                     };
                 }
                 FramingState::ChunkData(0) => {
+                    if self.at_entity_limit(entity_octet_limit) {
+                        return Ok(BodyProgress::Paused);
+                    }
                     self.state = FramingState::ChunkDataTerminator;
                 }
                 FramingState::ChunkData(remaining) => {
+                    if self.at_entity_limit(entity_octet_limit) {
+                        return Ok(BodyProgress::Paused);
+                    }
                     if store.initialized_len() == 0 {
                         return if end_of_stream {
                             Err(FramingError::UnexpectedEndOfStream.into())
@@ -137,11 +189,18 @@ impl BodyFramer {
                     }
                     let available = u64::try_from(store.initialized_len())
                         .map_err(|_| FramingError::ArithmeticOverflow)?;
-                    let consumed = remaining.min(available);
+                    let consumed =
+                        self.limit_consumption(remaining.min(available), entity_octet_limit)?;
                     self.consume(store, consumed, &mut consume_entity)?;
                     self.state = FramingState::ChunkData(remaining - consumed);
+                    if self.at_entity_limit(entity_octet_limit) {
+                        return Ok(BodyProgress::Paused);
+                    }
                 }
                 FramingState::ChunkDataTerminator => {
+                    if self.at_entity_limit(entity_octet_limit) {
+                        return Ok(BodyProgress::Paused);
+                    }
                     if store.initialized_len() < 2 {
                         return if end_of_stream {
                             Err(FramingError::UnexpectedEndOfStream.into())
@@ -156,6 +215,9 @@ impl BodyFramer {
                     self.state = FramingState::ChunkSize;
                 }
                 FramingState::ChunkTrailerTerminator => {
+                    if self.at_entity_limit(entity_octet_limit) {
+                        return Ok(BodyProgress::Paused);
+                    }
                     if store.initialized_len() < 2 {
                         if store
                             .initialized()
@@ -178,6 +240,26 @@ impl BodyFramer {
                 }
                 FramingState::Complete => return Ok(BodyProgress::Complete),
             }
+        }
+    }
+
+    fn at_entity_limit(&self, entity_octet_limit: Option<u64>) -> bool {
+        entity_octet_limit.is_some_and(|limit| self.entity_bytes == limit)
+    }
+
+    fn limit_consumption(
+        &self,
+        available: u64,
+        entity_octet_limit: Option<u64>,
+    ) -> Result<u64, FramingError> {
+        match entity_octet_limit {
+            Some(limit) => {
+                let remaining = limit
+                    .checked_sub(self.entity_bytes)
+                    .ok_or(FramingError::EntityLimitBehindProgress)?;
+                Ok(available.min(remaining))
+            }
+            None => Ok(available),
         }
     }
 
@@ -339,6 +421,7 @@ pub(crate) enum FramingError {
     MalformedChunkTerminator,
     TrailersForbidden,
     UnexpectedEndOfStream,
+    EntityLimitBehindProgress,
     Store(ParserStoreError),
 }
 
@@ -353,6 +436,9 @@ impl fmt::Display for FramingError {
             }
             Self::TrailersForbidden => formatter.write_str("HTTP/1 trailers are forbidden"),
             Self::UnexpectedEndOfStream => formatter.write_str("incomplete HTTP/1 entity framing"),
+            Self::EntityLimitBehindProgress => {
+                formatter.write_str("HTTP/1 entity limit is behind consumed progress")
+            }
             Self::Store(error) => error.fmt(formatter),
         }
     }
@@ -606,5 +692,215 @@ mod tests {
                 "{wire:?}"
             );
         }
+    }
+
+    #[test]
+    fn content_length_prefix_boundary_is_cumulative_across_fragmented_input() {
+        const PREFIX_BYTES: u64 = 61;
+        let body = [vec![b'p'; PREFIX_BYTES as usize], b"suffix".to_vec()].concat();
+        let mut store = ParserStore::try_new().unwrap();
+        let mut framer = BodyFramer::new(BodyFraming::ContentLength(body.len() as u64));
+        let mut exposed = Vec::new();
+
+        for byte in &body[..PREFIX_BYTES as usize - 1] {
+            store.append(&[*byte]).unwrap();
+            assert_eq!(
+                framer.process_up_to(&mut store, false, PREFIX_BYTES, |bytes| {
+                    exposed.extend_from_slice(bytes);
+                    Ok::<_, ()>(())
+                }),
+                Ok(BodyProgress::NeedInput)
+            );
+        }
+        store.append(&body[PREFIX_BYTES as usize - 1..]).unwrap();
+        assert_eq!(
+            framer.process_up_to(&mut store, true, PREFIX_BYTES, |bytes| {
+                exposed.extend_from_slice(bytes);
+                Ok::<_, ()>(())
+            }),
+            Ok(BodyProgress::Paused)
+        );
+        assert_eq!(exposed, vec![b'p'; PREFIX_BYTES as usize]);
+        assert_eq!(framer.entity_bytes(), PREFIX_BYTES);
+        assert_eq!(store.initialized(), b"suffix");
+        assert_eq!(store.zeroized_bytes_for_test(), PREFIX_BYTES as usize);
+
+        let retained = store.initialized().to_vec();
+        assert_eq!(
+            framer.process_up_to(&mut store, true, PREFIX_BYTES, |_| Ok::<_, ()>(())),
+            Ok(BodyProgress::Paused)
+        );
+        assert_eq!(store.initialized(), retained);
+
+        assert_eq!(
+            framer.process(&mut store, true, |bytes| {
+                exposed.extend_from_slice(bytes);
+                Ok::<_, ()>(())
+            }),
+            Ok(BodyProgress::Complete)
+        );
+        assert_eq!(exposed, body);
+        assert_eq!(framer.entity_bytes(), body.len() as u64);
+    }
+
+    #[test]
+    fn exact_content_length_prefix_pauses_before_terminal_completion() {
+        const PREFIX_BYTES: u64 = 61;
+        let body = vec![b'p'; PREFIX_BYTES as usize];
+        let mut store = ParserStore::try_new().unwrap();
+        store.append(&body).unwrap();
+        let mut framer = BodyFramer::new(BodyFraming::ContentLength(PREFIX_BYTES));
+        let mut exposed = Vec::new();
+
+        assert_eq!(
+            framer.process_up_to(&mut store, true, PREFIX_BYTES, |bytes| {
+                exposed.extend_from_slice(bytes);
+                Ok::<_, ()>(())
+            }),
+            Ok(BodyProgress::Paused)
+        );
+        assert_eq!(exposed, body);
+        assert!(store.initialized().is_empty());
+
+        assert_eq!(
+            framer.process(&mut store, true, |_| Ok::<_, ()>(())),
+            Ok(BodyProgress::Complete)
+        );
+        assert_eq!(framer.entity_bytes(), PREFIX_BYTES);
+    }
+
+    #[test]
+    fn chunked_prefix_boundary_inside_data_leaves_buffered_suffix_unexposed() {
+        const PREFIX_BYTES: u64 = 61;
+        let first_chunk = vec![b'a'; 64];
+        let mut wire = b"40\r\n".to_vec();
+        wire.extend_from_slice(&first_chunk);
+        wire.extend_from_slice(b"\r\n1\r\nb\r\n0\r\n\r\n");
+        let mut store = ParserStore::try_new().unwrap();
+        store.append(&wire).unwrap();
+        let mut framer = BodyFramer::new(BodyFraming::Chunked);
+        let mut exposed = Vec::new();
+
+        assert_eq!(
+            framer.process_up_to(&mut store, false, PREFIX_BYTES, |bytes| {
+                exposed.extend_from_slice(bytes);
+                Ok::<_, ()>(())
+            }),
+            Ok(BodyProgress::Paused)
+        );
+        assert_eq!(exposed, vec![b'a'; PREFIX_BYTES as usize]);
+        assert_eq!(framer.entity_bytes(), PREFIX_BYTES);
+        assert!(store.initialized().starts_with(b"aaa\r\n1\r\nb"));
+
+        assert_eq!(
+            framer.process(&mut store, false, |bytes| {
+                exposed.extend_from_slice(bytes);
+                Ok::<_, ()>(())
+            }),
+            Ok(BodyProgress::Complete)
+        );
+        assert_eq!(exposed, [first_chunk, b"b".to_vec()].concat());
+    }
+
+    #[test]
+    fn chunked_prefix_boundary_at_chunk_end_defers_terminal_metadata() {
+        const PREFIX_BYTES: u64 = 61;
+        let mut wire = b"3d\r\n".to_vec();
+        wire.extend(std::iter::repeat_n(b'p', PREFIX_BYTES as usize));
+        wire.extend_from_slice(b"\r\n1\r\ns\r\n0\r\n\r\n");
+        let mut store = ParserStore::try_new().unwrap();
+        store.append(&wire).unwrap();
+        let mut framer = BodyFramer::new(BodyFraming::Chunked);
+        let mut exposed = Vec::new();
+
+        assert_eq!(
+            framer.process_up_to(&mut store, false, PREFIX_BYTES, |bytes| {
+                exposed.extend_from_slice(bytes);
+                Ok::<_, ()>(())
+            }),
+            Ok(BodyProgress::Paused)
+        );
+        assert_eq!(store.initialized(), b"\r\n1\r\ns\r\n0\r\n\r\n");
+
+        assert_eq!(
+            framer.process(&mut store, false, |bytes| {
+                exposed.extend_from_slice(bytes);
+                Ok::<_, ()>(())
+            }),
+            Ok(BodyProgress::Complete)
+        );
+        assert_eq!(
+            exposed,
+            [vec![b'p'; PREFIX_BYTES as usize], b"s".to_vec()].concat()
+        );
+
+        let mut malformed = ParserStore::try_new().unwrap();
+        let mut malformed_wire = b"3d\r\n".to_vec();
+        malformed_wire.extend(std::iter::repeat_n(b'p', PREFIX_BYTES as usize));
+        malformed_wire.extend_from_slice(b"XY");
+        malformed.append(&malformed_wire).unwrap();
+        let mut framer = BodyFramer::new(BodyFraming::Chunked);
+        assert_eq!(
+            framer.process_up_to(&mut malformed, false, PREFIX_BYTES, |_| Ok::<_, ()>(())),
+            Ok(BodyProgress::Paused)
+        );
+        assert_eq!(malformed.initialized(), b"XY");
+        assert_eq!(
+            framer.process(&mut malformed, false, |_| Ok::<_, ()>(())),
+            Err(FramingProcessError::Framing(
+                FramingError::MalformedChunkTerminator
+            ))
+        );
+    }
+
+    #[test]
+    fn close_delimited_prefix_boundary_resumes_to_eof() {
+        const PREFIX_BYTES: u64 = 61;
+        let body = [vec![b'p'; PREFIX_BYTES as usize], b"tail".to_vec()].concat();
+        let mut store = ParserStore::try_new().unwrap();
+        store.append(&body).unwrap();
+        let mut framer = BodyFramer::new(BodyFraming::CloseDelimited);
+        let mut exposed = Vec::new();
+
+        assert_eq!(
+            framer.process_up_to(&mut store, true, PREFIX_BYTES, |bytes| {
+                exposed.extend_from_slice(bytes);
+                Ok::<_, ()>(())
+            }),
+            Ok(BodyProgress::Paused)
+        );
+        assert_eq!(store.initialized(), b"tail");
+        assert_eq!(
+            framer.process(&mut store, true, |bytes| {
+                exposed.extend_from_slice(bytes);
+                Ok::<_, ()>(())
+            }),
+            Ok(BodyProgress::Complete)
+        );
+        assert_eq!(exposed, body);
+    }
+
+    #[test]
+    fn bounded_resume_still_validates_truncation_and_rejects_retrograde_limit() {
+        const PREFIX_BYTES: u64 = 61;
+        let mut store = ParserStore::try_new().unwrap();
+        store.append(&vec![b'p'; PREFIX_BYTES as usize]).unwrap();
+        let mut framer = BodyFramer::new(BodyFraming::ContentLength(PREFIX_BYTES + 1));
+        assert_eq!(
+            framer.process_up_to(&mut store, true, PREFIX_BYTES, |_| Ok::<_, ()>(())),
+            Ok(BodyProgress::Paused)
+        );
+        assert_eq!(
+            framer.process_up_to(&mut store, true, PREFIX_BYTES - 1, |_| Ok::<_, ()>(())),
+            Err(FramingProcessError::Framing(
+                FramingError::EntityLimitBehindProgress
+            ))
+        );
+        assert_eq!(
+            framer.process(&mut store, true, |_| Ok::<_, ()>(())),
+            Err(FramingProcessError::Framing(
+                FramingError::UnexpectedEndOfStream
+            ))
+        );
     }
 }

@@ -1,3 +1,4 @@
+pub(crate) mod callback;
 pub(crate) mod process;
 pub(crate) mod process_response;
 pub(crate) mod protocol;

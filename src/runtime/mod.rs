@@ -1,6 +1,7 @@
 mod activation;
 mod core;
 mod generation;
+mod readiness;
 
 #[allow(unused_imports)]
 pub(crate) use activation::{
@@ -14,10 +15,13 @@ pub(crate) use core::{
 pub(crate) use generation::{
     ActivatedGeneration, AuthorizationSnapshot, CleanupReason, CredentialResolver,
     CredentialSourceIndex, CredentialSourceRegistry, EgressSnapshot, Generation, GenerationId,
-    GenerationLease, GenerationOwner, ObservationSnapshot, PolicySnapshot, ProviderIndex,
-    ProviderRegistry, PublicationGuard, RedactionProfileIndex, RedactionProfileRegistry,
-    RedactionSnapshot, ResolvedBindings, ResolvedRuleBindings, SafetySnapshot,
+    GenerationLease, GenerationOwner, GenerationRetention, GenerationRetentionError,
+    ObservationSnapshot, PolicySnapshot, ProviderIndex, ProviderRegistry, PublicationGuard,
+    RedactionProfileIndex, RedactionProfileRegistry, RedactionSnapshot, ResolvedBindings,
+    ResolvedRuleBindings, SafetySnapshot,
 };
+#[allow(unused_imports)]
+pub(crate) use readiness::ServiceReadiness;
 
 #[cfg(test)]
 mod tests;

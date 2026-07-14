@@ -14,6 +14,7 @@ use super::activation::{
 use super::generation::{
     ActivatedGeneration, CleanupReason, Generation, GenerationId, GenerationLease,
 };
+use super::readiness::ServiceReadiness;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -39,6 +40,16 @@ impl LifecycleState {
 }
 
 pub(crate) trait StaticResources: Send + Sync {
+    /// Returns the readiness state owned by these exact listener resources.
+    fn readiness(&self) -> &Arc<ServiceReadiness>;
+
+    /// Synchronously and idempotently closes new product ingress and admissions
+    /// for new work or dispatches before generation retirement begins. Control
+    /// callback ingress needed to drain pending operations remains available.
+    fn begin_shutdown(&self);
+
+    /// Performs the final control-ingress close and task joins after every
+    /// generation has retired and pending operations have drained.
     fn shutdown(&self) -> BoxFuture<'_, ()>;
 }
 
@@ -47,6 +58,7 @@ pub(crate) trait StaticResources: Send + Sync {
 pub(crate) struct StaticOwnership {
     pub(crate) config: StaticProductConfig,
     pub(crate) claimed_fingerprint: StaticFingerprint,
+    pub(crate) readiness: Arc<ServiceReadiness>,
     pub(crate) resources: Arc<dyn StaticResources>,
 }
 
@@ -56,9 +68,11 @@ impl StaticOwnership {
         claimed_fingerprint: StaticFingerprint,
         resources: Arc<dyn StaticResources>,
     ) -> Self {
+        let readiness = resources.readiness().clone();
         Self {
             config,
             claimed_fingerprint,
+            readiness,
             resources,
         }
     }
@@ -81,7 +95,7 @@ pub(crate) struct Runtime {
     active: ArcSwapOption<Generation>,
     lifecycle: AtomicU8,
     lifecycle_changed: Notify,
-    ready: AtomicBool,
+    shutdown_transition: StdMutex<()>,
     next_generation: AtomicU64,
     activation: Mutex<()>,
     pending_reload: AtomicBool,
@@ -136,6 +150,8 @@ fn reject_runtime_construction(
     static_ownership: StaticOwnership,
     error: RuntimeError,
 ) -> BoxFuture<'static, Result<Arc<Runtime>, RuntimeError>> {
+    static_ownership.readiness.begin_shutdown();
+    static_ownership.resources.begin_shutdown();
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
             let cleanup = handle.spawn(async move { static_ownership.resources.shutdown().await });
@@ -197,7 +213,7 @@ impl Runtime {
             active: ArcSwapOption::empty(),
             lifecycle: AtomicU8::new(LifecycleState::Starting as u8),
             lifecycle_changed: Notify::new(),
-            ready: AtomicBool::new(false),
+            shutdown_transition: StdMutex::new(()),
             next_generation: AtomicU64::new(1),
             activation: Mutex::new(()),
             pending_reload: AtomicBool::new(false),
@@ -249,7 +265,7 @@ impl Runtime {
     }
 
     pub(crate) fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
+        self.static_ownership.readiness.is_ready()
     }
 
     pub(crate) fn active_generation_id(&self) -> Option<GenerationId> {
@@ -491,6 +507,7 @@ impl Runtime {
         expected: LifecycleState,
         cancellation: &ActivationCancellation,
     ) -> Result<Option<MarkedRetirement>, RuntimeError> {
+        let _shutdown_transition = self.shutdown_transition.lock().unwrap();
         let mut publication_guard = generation.owner.publication_guard()?;
 
         cancellation.check()?;
@@ -516,7 +533,7 @@ impl Runtime {
         drop(publication_guard);
         self.lifecycle
             .store(LifecycleState::Running as u8, Ordering::Release);
-        self.ready.store(true, Ordering::Release);
+        self.static_ownership.readiness.mark_ready();
         self.lifecycle_changed.notify_waiters();
         Ok(retirement)
     }
@@ -584,15 +601,22 @@ impl Runtime {
 
     pub(crate) async fn shutdown(self: &Arc<Self>) {
         let runtime = self.clone();
-        let _ = tokio::spawn(async move { runtime.shutdown_owned().await }).await;
+        match tokio::spawn(async move { runtime.shutdown_owned().await }).await {
+            Ok(()) => {}
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => panic!("runtime shutdown task failed: {error}"),
+        }
     }
 
     async fn shutdown_owned(self: &Arc<Self>) {
         loop {
             let changed = self.lifecycle_changed.notified();
+            let shutdown_transition = self.shutdown_transition.lock().unwrap();
             let state = self.lifecycle();
             match state {
                 LifecycleState::Starting | LifecycleState::Running => {
+                    self.static_ownership.readiness.begin_shutdown();
+                    self.static_ownership.resources.begin_shutdown();
                     if self
                         .lifecycle
                         .compare_exchange(
@@ -604,15 +628,22 @@ impl Runtime {
                         .is_ok()
                     {
                         self.lifecycle_changed.notify_waiters();
+                        drop(shutdown_transition);
                         break;
                     }
                 }
-                LifecycleState::Publishing | LifecycleState::ShuttingDown => changed.await,
+                LifecycleState::Publishing => {
+                    drop(shutdown_transition);
+                    changed.await;
+                }
+                LifecycleState::ShuttingDown => {
+                    drop(shutdown_transition);
+                    changed.await;
+                }
                 LifecycleState::Stopped => return,
             }
         }
 
-        self.ready.store(false, Ordering::Release);
         self.pending_reload.store(false, Ordering::Release);
         if let Some(cancellation) = self.current_cancellation.lock().unwrap().as_ref() {
             cancellation.cancel();
