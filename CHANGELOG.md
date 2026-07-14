@@ -4,9 +4,6 @@
 
 ### Breaking Changes
 
-- Require `egress.origin_tls.http_versions` to enable every HTTP version enabled
-  by any proxy listener; protocol mismatches now fail configuration compilation
-  instead of denying requests at forwarding time.
 - Advanced `schema_version` to `"2"` for the breaking listener and parent-egress configuration redesign. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
 - Replaced the flat proxy listener settings with `proxy.listeners.*` sections for explicit HTTP, transparent HTTP, explicit HTTPS, and transparent HTTPS listeners. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
 - Changed `proxy.egress.default` to require an explicit parent-proxy `type` and `transport`. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
