@@ -381,7 +381,7 @@ pub(crate) enum WebhookDeliveryError {
 mod tests {
     use std::collections::BTreeMap;
     use std::io;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -420,6 +420,15 @@ mod tests {
     impl DestinationResolver for HangingResolver {
         fn resolve(&self, _host: &str, _port: u16, _max_addresses: usize) -> ResolveFuture<'_> {
             Box::pin(std::future::pending())
+        }
+    }
+
+    struct FixedResolver(SocketAddr);
+
+    impl DestinationResolver for FixedResolver {
+        fn resolve(&self, _host: &str, _port: u16, _max_addresses: usize) -> ResolveFuture<'_> {
+            let endpoint = self.0;
+            Box::pin(async move { Ok(vec![endpoint]) })
         }
     }
 
@@ -588,6 +597,65 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(result, Err(WebhookDeliveryError::Cancelled)));
+        assert_eq!(arena.counts().live_deliveries, 0);
+        assert_eq!(guard.live_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn provider_deadline_bounds_close_delimited_acknowledgement_drain() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let (release_server, hold_server) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            while stream.read(&mut request).await.unwrap() != 0 {}
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\n\r\npartial")
+                .await
+                .unwrap();
+            let _ = hold_server.await;
+            drop(stream);
+        });
+        let provider = WebhookProvider::activate(
+            WebhookProviderPlan {
+                url: format!("http://localhost:{}/authorize", endpoint.port()),
+                timeout: Duration::from_millis(100),
+                on_failure: CompiledProviderFailureMode::Deny,
+                include_headers: vec![],
+                max_request_bytes: 4096,
+                max_response_bytes: 64,
+                outputs: BTreeMap::new(),
+                tls: None,
+            },
+            || false,
+        )
+        .unwrap();
+        let destination = DestinationGuard::with_sources(
+            DestinationFacts::for_test([], None, None, 1).unwrap(),
+            Arc::new(FixedResolver(endpoint)),
+            Arc::new(EmptyLocalAddresses),
+        );
+        let arena = arena();
+        let lease = arena.try_acquire().unwrap();
+        let guard = guard();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            connect_and_deliver(
+                &destination,
+                &provider,
+                lease,
+                body(&guard, b"{}"),
+                std::future::pending(),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(WebhookDeliveryError::Cancelled)));
+        release_server.send(()).unwrap();
+        server.await.unwrap();
         assert_eq!(arena.counts().live_deliveries, 0);
         assert_eq!(guard.live_bytes(), 0);
     }

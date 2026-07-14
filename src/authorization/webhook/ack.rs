@@ -70,10 +70,7 @@ impl AcknowledgementParser {
                         return Err(AcknowledgementError::ResponseBodyTooLarge);
                     }
                 }
-                BodyFraming::Chunked | BodyFraming::CloseDelimited => {}
-                BodyFraming::None => {
-                    unreachable!("responses without explicit framing are close-delimited")
-                }
+                BodyFraming::Chunked | BodyFraming::CloseDelimited | BodyFraming::None => {}
             }
             self.state = ParserState::Body {
                 status: head.status,
