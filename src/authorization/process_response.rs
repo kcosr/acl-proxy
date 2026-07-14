@@ -347,8 +347,8 @@ fn parse_decision_only(
     let mut message_type = None;
     let mut decision = None;
 
-    match cursor.next() {
-        Some(b'}') if cursor.peek().is_none() => {
+    match cursor.next_structural() {
+        Some(b'}') if cursor.peek_structural().is_none() => {
             return Ok(DecisionOnlyResponse::AssignedFailure(
                 AssignedResponseError::InvalidShape,
             ));
@@ -358,8 +358,9 @@ fn parse_decision_only(
     }
 
     loop {
+        cursor.skip_whitespace();
         let key = parse_json_string::<MAX_JSON_KEY_BYTES>(&mut cursor).map_err(fatal)?;
-        expect_byte(&mut cursor, b':').map_err(fatal)?;
+        expect_structural_byte(&mut cursor, b':').map_err(fatal)?;
         match key.as_bytes() {
             Some(b"id") => {
                 duplicate_id = true;
@@ -391,14 +392,14 @@ fn parse_decision_only(
             }
         }
 
-        match cursor.next() {
+        match cursor.next_structural() {
             Some(b',') => {}
             Some(b'}') => break,
             _ => return Err(FatalProcessResponseError::MalformedJson),
         }
     }
 
-    if cursor.peek().is_some() {
+    if cursor.peek_structural().is_some() {
         return Err(FatalProcessResponseError::MalformedJson);
     }
     if duplicate_id {
@@ -434,6 +435,7 @@ fn parse_decision_only(
 fn parse_scalar_string(
     cursor: &mut SegmentCursor<'_>,
 ) -> Result<Option<ParsedString<MAX_SCALAR_BYTES>>, FatalProcessResponseError> {
+    cursor.skip_whitespace();
     if cursor.peek() == Some(b'"') {
         Ok(Some(
             parse_json_string::<MAX_SCALAR_BYTES>(cursor).map_err(fatal)?,
@@ -463,7 +465,14 @@ fn expect_byte(cursor: &mut SegmentCursor<'_>, expected: u8) -> Result<(), JsonE
         .ok_or(JsonError::Malformed)
 }
 
+fn expect_structural_byte(cursor: &mut SegmentCursor<'_>, expected: u8) -> Result<(), JsonError> {
+    (cursor.next_structural() == Some(expected))
+        .then_some(())
+        .ok_or(JsonError::Malformed)
+}
+
 fn skip_json_value(cursor: &mut SegmentCursor<'_>, depth: usize) -> Result<(), JsonError> {
+    cursor.skip_whitespace();
     match cursor.peek() {
         Some(b'"') => {
             parse_json_string::<0>(cursor)?;
@@ -487,16 +496,17 @@ fn enter_json_container(depth: usize) -> Result<usize, JsonError> {
 }
 
 fn skip_json_object(cursor: &mut SegmentCursor<'_>, depth: usize) -> Result<(), JsonError> {
-    expect_byte(cursor, b'{')?;
-    if cursor.peek() == Some(b'}') {
-        cursor.next();
+    expect_structural_byte(cursor, b'{')?;
+    if cursor.peek_structural() == Some(b'}') {
+        cursor.next_structural();
         return Ok(());
     }
     loop {
+        cursor.skip_whitespace();
         parse_json_string::<0>(cursor)?;
-        expect_byte(cursor, b':')?;
+        expect_structural_byte(cursor, b':')?;
         skip_json_value(cursor, depth)?;
-        match cursor.next() {
+        match cursor.next_structural() {
             Some(b',') => {}
             Some(b'}') => return Ok(()),
             _ => return Err(JsonError::Malformed),
@@ -505,14 +515,14 @@ fn skip_json_object(cursor: &mut SegmentCursor<'_>, depth: usize) -> Result<(), 
 }
 
 fn skip_json_array(cursor: &mut SegmentCursor<'_>, depth: usize) -> Result<(), JsonError> {
-    expect_byte(cursor, b'[')?;
-    if cursor.peek() == Some(b']') {
-        cursor.next();
+    expect_structural_byte(cursor, b'[')?;
+    if cursor.peek_structural() == Some(b']') {
+        cursor.next_structural();
         return Ok(());
     }
     loop {
         skip_json_value(cursor, depth)?;
-        match cursor.next() {
+        match cursor.next_structural() {
             Some(b',') => {}
             Some(b']') => return Ok(()),
             _ => return Err(JsonError::Malformed),
@@ -716,6 +726,22 @@ impl<'a> SegmentCursor<'a> {
         Some(byte)
     }
 
+    fn skip_whitespace(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+            self.offset += 1;
+        }
+    }
+
+    fn peek_structural(&mut self) -> Option<u8> {
+        self.skip_whitespace();
+        self.peek()
+    }
+
+    fn next_structural(&mut self) -> Option<u8> {
+        self.skip_whitespace();
+        self.next()
+    }
+
     fn advance_segment(&mut self) {
         while self.offset == self.current.len() {
             let Some(next) = self.segments.next() else {
@@ -748,7 +774,9 @@ mod tests {
 
     use super::*;
     use crate::authorization::protocol::read_provider_response_prefix_for_test;
-    use crate::config::compiler::{CompiledProviderFailureMode, ProviderOutputPlan};
+    use crate::config::compiler::{
+        CompiledProviderFailureMode, ProviderOutputPlan, MAX_PROVIDER_OUTPUT_NAME_BYTES,
+    };
     use crate::safety::wire_body::guarded_body_allocation_bytes;
     use crate::safety::{WireBodyPool, WireBodyQuotaKey};
 
@@ -1044,14 +1072,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_utf8_trailing_bytes_and_noncompact_json_are_fatal() {
+    async fn malformed_utf8_trailing_bytes_and_invalid_json_are_fatal() {
         for line in [
             b"{\"id\":\"r\",\"type\":\"res\xffponse\",\"decision\":\"allow\"}\n".as_slice(),
             b"{\"id\":\"r\",\"type\":\"response\",\"decision\":\"allow\"}x\n".as_slice(),
-            b"{\"id\":\"r\",\"type\":\"response\",\"decision\":\"allow\"} \n".as_slice(),
             b"{\"id\":\"r\",\"unknown\":[}\n".as_slice(),
             b"{\"id\":\"r\",\"type\":\"response\",\"decision\":\"allow\"\n".as_slice(),
-            b"{\"id\":\"r\",\"type\":\"response\"\r,\"decision\":\"allow\"}\n".as_slice(),
         ] {
             let result = run(line, line.len()).await.0;
             assert!(matches!(
@@ -1060,6 +1086,77 @@ mod tests {
                     | Err(FatalProcessResponseError::InvalidUtf8)
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn decision_only_and_expanded_accept_equivalent_json_whitespace() {
+        let line =
+            b"{\"id\":\"r\" \t, \"type\" : \"response\" , \"decision\" : \"allow\" \t } \r\n";
+        assert_eq!(
+            run(line, line.len()).await.0.unwrap(),
+            DecisionOnlyResponse::Decision(DecisionOnlyProviderDecision::Allow)
+        );
+
+        let mut reader = RecordingReader::new(line);
+        let continuation = read_provider_response_prefix_for_test(&mut reader, line.len())
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, guard, _) = guard_for(line.len());
+        let charge = guard.provider_response_charge();
+        let outputs = ProviderOutputRegistry::activate(BTreeMap::from([(
+            "token".to_string(),
+            ProviderOutputPlan::Bearer { required: false },
+        )]));
+        let response = read_expanded_response(&mut reader, continuation, &charge, &outputs, None)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            response,
+            ProcessResponse::Expanded(ProviderDecision::Allow { .. })
+        ));
+        drop(response);
+        assert_eq!(guard.live_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn expanded_parser_accepts_the_bounded_provider_output_name() {
+        let output_name = "a".repeat(MAX_PROVIDER_OUTPUT_NAME_BYTES);
+        let line = format!(
+            "{{\"id\":\"r\",\"type\":\"response\",\"decision\":\"allow\",\"values\":{{\"{output_name}\":\"secret\"}}}}\n"
+        );
+        let mut reader = RecordingReader::new(line.as_bytes());
+        let continuation = read_provider_response_prefix_for_test(&mut reader, line.len())
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, guard, _) = guard_for(line.len());
+        let charge = guard.provider_response_charge();
+        let outputs = ProviderOutputRegistry::activate(BTreeMap::from([(
+            output_name.clone(),
+            ProviderOutputPlan::Bearer { required: true },
+        )]));
+        let response = read_expanded_response(&mut reader, continuation, &charge, &outputs, None)
+            .await
+            .unwrap();
+
+        let ProcessResponse::Expanded(ProviderDecision::Allow { credentials, .. }) = response
+        else {
+            panic!("the exact-bound output name must be assigned");
+        };
+        let (_, staging_guard, _) = guard_for(1);
+        let staged = outputs
+            .stage_credentials(&credentials, &staging_guard)
+            .unwrap();
+        let mut headers = http::HeaderMap::new();
+        staged.apply(&mut headers).unwrap();
+        assert_eq!(
+            headers.get(http::header::AUTHORIZATION).unwrap(),
+            "Bearer secret"
+        );
+        drop(credentials);
+        assert_eq!(guard.live_bytes(), 0);
     }
 
     #[tokio::test]

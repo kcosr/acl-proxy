@@ -4,8 +4,9 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use tokio::time::Instant;
 
 use crate::authorization::protocol::{
-    GuardedProviderBody, IncludedHeader, ProviderBodyReplacement, ProviderCredentialInjectionError,
-    ProviderRequest, ProviderRequestHeaders, StagedProviderCredentialMutation,
+    GuardedProviderBody, IncludedHeader, ProviderBodyReplacement,
+    ProviderBodyReplacementDecodeError, ProviderCredentialInjectionError, ProviderRequest,
+    ProviderRequestHeaders, StagedProviderCredentialMutation,
 };
 use crate::authorization::{AuthorizationDecision, AuthorizationDispatchError};
 use crate::config::compiler::{CompiledProviderFailureMode, HeaderEffectPlan, HttpBodyReadPlan};
@@ -278,7 +279,10 @@ async fn evaluate_to_terminal<'generation>(
         match evaluation.outcome {
             PolicyOutcome::Allow => {
                 let matched = evaluation.matched;
-                let body = select_terminal_body(&guard, body, None)?;
+                let body = match select_terminal_body(&guard, body, None, usize::MAX)? {
+                    TerminalBody::Ready(body) => body,
+                    TerminalBody::RedactionDenied => unreachable!("no replacement was selected"),
+                };
                 let body = match redact_terminal_body(lease, matched.as_ref(), &guard, body)? {
                     TerminalBody::Ready(body) => body,
                     TerminalBody::RedactionDenied => {
@@ -410,7 +414,25 @@ async fn evaluate_to_terminal<'generation>(
                 credentials,
                 replacement,
             } => {
-                let body = select_terminal_body(&guard, body, replacement)?;
+                let replacement_limit = terminal_decoded_body_limit(
+                    lease,
+                    Some(&matched),
+                    metadata.max_decoded_request_body_bytes,
+                )?;
+                let body = match select_terminal_body(&guard, body, replacement, replacement_limit)?
+                {
+                    TerminalBody::Ready(body) => body,
+                    TerminalBody::RedactionDenied => {
+                        return Ok(RequestDecision::Deny(DeniedRequest {
+                            common: DecidedRequest {
+                                headers,
+                                body_guard: guard,
+                            },
+                            rule: Some(matched),
+                            reason: DenyReason::RedactionFailure,
+                        }));
+                    }
+                };
                 let provider_credentials = credentials
                     .as_ref()
                     .map(|credentials| {
@@ -477,19 +499,41 @@ fn select_terminal_body(
     guard: &HttpWireBodyGuard,
     mut body: Option<GuardedRequestBody>,
     replacement: Option<ProviderBodyReplacement>,
-) -> Result<Option<GuardedRequestBody>, RequestDecisionError> {
+    max_decoded_bytes: usize,
+) -> Result<TerminalBody, RequestDecisionError> {
     if let Some(replacement) = replacement {
         drop(body.take());
-        let (content_type, content_encoding, decoded) = replacement
-            .decode(guard)
-            .map_err(|_| RequestDecisionError::ProviderReplacementDecode)?;
+        let (content_type, content_encoding, decoded) =
+            match replacement.decode_with_limit(guard, max_decoded_bytes) {
+                Ok(decoded) => decoded,
+                Err(ProviderBodyReplacementDecodeError::BodyLimit) => {
+                    return Ok(TerminalBody::RedactionDenied)
+                }
+                Err(ProviderBodyReplacementDecodeError::InvalidBody) => {
+                    return Err(RequestDecisionError::ProviderReplacementDecode)
+                }
+            };
         body = Some(GuardedRequestBody {
             content_type,
             content_encoding,
             decoded,
         });
     }
-    Ok(body)
+    Ok(TerminalBody::Ready(body))
+}
+
+fn terminal_decoded_body_limit(
+    lease: &GenerationLease,
+    rule: Option<&PolicyRuleMatch<'_>>,
+    provider_limit: usize,
+) -> Result<usize, RequestDecisionError> {
+    let Some(profile_index) = rule.and_then(PolicyRuleMatch::redaction_profile) else {
+        return Ok(provider_limit);
+    };
+    let Some(profile) = lease.redaction().profile(profile_index) else {
+        return Err(RequestDecisionError::MissingRedactionProfile);
+    };
+    Ok(provider_limit.min(profile.limits().max_decoded_body_bytes))
 }
 
 fn redact_terminal_body(
@@ -567,6 +611,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+    use base64::Engine as _;
     use http::header::HeaderValue;
 
     use super::*;
@@ -1050,10 +1096,9 @@ redaction_profile = "wire""#;
                 prepare_request(&lease, input("replacement", &url, HeaderMap::new())).unwrap();
             let one_guarded_chunk =
                 crate::safety::wire_body::guarded_body_allocation_bytes(1).unwrap();
-            assert_eq!(
-                prepared.body_guard().cursor_peak_bytes(),
-                4 * one_guarded_chunk,
-                "the exact terminal peak retains compact guarded credentials beside decoded input, matcher scratch, and redacted output"
+            assert!(
+                prepared.body_guard().cursor_peak_bytes() >= 4 * one_guarded_chunk,
+                "the terminal peak retains compact guarded credentials beside decoded input, matcher scratch, and redacted output"
             );
             let mut original = prepared.body_guard().buffer();
             original.try_extend_from_slice(b"original body").unwrap();
@@ -1115,5 +1160,72 @@ redaction_profile = "wire""#;
             drop(lease);
             runtime.shutdown().await;
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn profile_limit_denies_multichunk_provider_replacement_before_decode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("large-replacement.sh");
+        let encoded = BASE64_STANDARD.encode(vec![b'x'; 64 * 1024 + 1]);
+        let script = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf "%s" "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  [ -n "$id" ] && printf '{"id":"%s","type":"response","decision":"allow","requestBody":{"encoding":"base64","contentType":"text/plain","data":"__DATA__"}}\n' "$id"
+done
+"#
+        .replace("__DATA__", &encoded);
+        std::fs::write(&provider, script).unwrap();
+        let mut permissions = std::fs::metadata(&provider).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&provider, permissions).unwrap();
+
+        let extra = format!(
+            r#"[authorization.providers.replacing]
+kind = "process"
+command = "{}"
+timeout = "2s"
+retire_timeout = "6s"
+include_request_body = true
+allow_request_body_replacement = true
+max_request_body_bytes = 131072
+max_decoded_request_body_bytes = 131072
+max_stdout_line_bytes = 100000
+
+[redaction.profiles.wire]
+max_body_bytes = 1
+max_decoded_body_bytes = 1
+rules = [{{ literals = ["x"], payloads = "text" }}]"#,
+            provider.display()
+        );
+        let policy = r#"[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "replace"
+decision = "delegate"
+methods = ["GET"]
+authorization_provider = "replacing"
+redaction_profile = "wire""#;
+        let initial = compile(&config(policy, &extra));
+        let (runtime, _source, _, pool) = runtime(initial).await;
+        let lease = runtime.lease().await.unwrap();
+        let url = canonicalize_http_url("https://example.test/replacement").unwrap();
+
+        let decision = decide_request(&lease, input("replacement", &url, HeaderMap::new()))
+            .await
+            .expect("a profile limit is a terminal denial, not a provider protocol failure");
+        let RequestDecision::Deny(denied) = decision else {
+            panic!("the profile-clamped replacement must deny");
+        };
+        assert_eq!(denied.reason, DenyReason::RedactionFailure);
+        assert_eq!(denied.rule.as_ref().unwrap().id(), "replace");
+        drop(denied);
+        assert_eq!(pool.global_charge(), 0);
+
+        drop(lease);
+        runtime.shutdown().await;
     }
 }

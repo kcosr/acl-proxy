@@ -579,8 +579,16 @@ enum ProviderBodyReplacementStorage {
     Encoded {
         body: Arc<GuardedBody>,
         range: ProcessEffectRange,
-        max_decoded_bytes: usize,
+        decoded_bytes: usize,
     },
+}
+
+#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum ProviderBodyReplacementDecodeError {
+    #[error("authorization provider replacement exceeds the terminal body limit")]
+    BodyLimit,
+    #[error("authorization provider replacement decode failed")]
+    InvalidBody,
 }
 
 impl ProviderBodyReplacement {
@@ -606,7 +614,7 @@ impl ProviderBodyReplacement {
         content_encoding: Option<String>,
         body: Arc<GuardedBody>,
         range: ProcessEffectRange,
-        max_decoded_bytes: usize,
+        decoded_bytes: usize,
     ) -> Self {
         Self {
             content_type,
@@ -614,25 +622,45 @@ impl ProviderBodyReplacement {
             storage: ProviderBodyReplacementStorage::Encoded {
                 body,
                 range,
-                max_decoded_bytes,
+                decoded_bytes,
             },
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn decode(
         self,
         guard: &HttpWireBodyGuard,
-    ) -> Result<(Option<String>, Option<String>, GuardedBody), AssignedResponseError> {
+    ) -> Result<(Option<String>, Option<String>, GuardedBody), ProviderBodyReplacementDecodeError>
+    {
+        self.decode_with_limit(guard, usize::MAX)
+    }
+
+    pub(crate) fn decode_with_limit(
+        self,
+        guard: &HttpWireBodyGuard,
+        max_decoded_bytes: usize,
+    ) -> Result<(Option<String>, Option<String>, GuardedBody), ProviderBodyReplacementDecodeError>
+    {
+        let decoded_bytes = match &self.storage {
+            #[cfg(test)]
+            ProviderBodyReplacementStorage::Decoded(bytes) => bytes.len(),
+            ProviderBodyReplacementStorage::Encoded { decoded_bytes, .. } => *decoded_bytes,
+        };
+        if decoded_bytes > max_decoded_bytes {
+            return Err(ProviderBodyReplacementDecodeError::BodyLimit);
+        }
         let decoded = match self.storage {
             #[cfg(test)]
             ProviderBodyReplacementStorage::Decoded(bytes) => guard
                 .transfer_body(bytes)
-                .map_err(|_| AssignedResponseError::InvalidBody)?,
+                .map_err(|_| ProviderBodyReplacementDecodeError::InvalidBody)?,
             ProviderBodyReplacementStorage::Encoded {
                 body,
                 range,
-                max_decoded_bytes,
-            } => decode_guarded_base64_range(guard, &body, range, max_decoded_bytes)?,
+                decoded_bytes: _,
+            } => decode_guarded_base64_range(guard, &body, range, max_decoded_bytes)
+                .map_err(|_| ProviderBodyReplacementDecodeError::InvalidBody)?,
         };
         Ok((self.content_type, self.content_encoding, decoded))
     }
@@ -2750,7 +2778,7 @@ mod tests {
     }
 
     #[test]
-    fn contiguous_credentials_inject_atomically_with_typed_sensitive_headers() {
+    fn provider_credentials_materialize_only_at_final_apply() {
         let outputs = ProviderOutputRegistry::activate(BTreeMap::from([
             (
                 "password".to_string(),

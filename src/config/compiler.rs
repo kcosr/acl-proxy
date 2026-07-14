@@ -94,6 +94,7 @@ const MAX_CAPTURE_INFLIGHT_BYTES: usize = 4 * GIB;
 const MAX_CAPTURE_FILES: usize = 10_000_000;
 const MAX_CAPTURE_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024 * 1024;
 pub(crate) const MAX_PROVIDER_CREDENTIAL_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_PROVIDER_OUTPUT_NAME_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_REDACTION_MATCHER_SCRATCH_BYTES: usize = MIB;
 const DECODER_SCRATCH_BYTES: usize = 64 * 1024;
 const PROVIDER_REQUEST_STREAM_SCRATCH_BYTES: usize = 64 * 1024;
@@ -2325,6 +2326,14 @@ fn provider_output_destinations(
     let mut destinations = BTreeSet::new();
     for (name, output) in outputs {
         validate_identifier(name, &format!("{path}.{name}"))?;
+        if name.len() > MAX_PROVIDER_OUTPUT_NAME_BYTES {
+            return Err(ConfigCompileError::at(
+                format!("{path}.{name}"),
+                format!(
+                    "provider output name must be at most {MAX_PROVIDER_OUTPUT_NAME_BYTES} bytes"
+                ),
+            ));
+        }
         let destination = match output {
             super::authoring::ProviderOutputConfig::Bearer(_) => "authorization".to_string(),
             super::authoring::ProviderOutputConfig::Basic(value) => {
@@ -3729,29 +3738,38 @@ fn compile_http_rule_schedule(
         .transpose()?;
     if let Some(response_continuation_allocation) = response_continuation_allocation {
         initial_peak = initial_peak.max(response_continuation_allocation);
-        incoming_stages.push(IncomingBodyStage {
-            additional_bytes: response_continuation_allocation,
-        });
     }
     if let (Some(callback), Some(credentials)) =
         (webhook_callback_allocation, credential_allocation)
     {
-        initial_peak = initial_peak.max(checked_add(
+        let rehome_peak = checked_add(
             callback,
             credentials,
             "policy.rules",
             "webhook credential rehome arithmetic overflow",
-        )?);
+        )?;
+        initial_peak = initial_peak.max(rehome_peak);
+        incoming_stages.push(IncomingBodyStage {
+            additional_bytes: rehome_peak,
+        });
     }
     if let (Some(continuation), Some(credentials)) =
         (response_continuation_allocation, credential_allocation)
     {
-        initial_peak = initial_peak.max(checked_add(
+        let rehome_peak = checked_add(
             continuation,
             credentials,
             "policy.rules",
             "process credential rehome arithmetic overflow",
-        )?);
+        )?;
+        initial_peak = initial_peak.max(rehome_peak);
+        incoming_stages.push(IncomingBodyStage {
+            additional_bytes: rehome_peak,
+        });
+    } else if let Some(continuation) = response_continuation_allocation {
+        incoming_stages.push(IncomingBodyStage {
+            additional_bytes: continuation,
+        });
     }
     if let Some((encoded_limit, original_limit)) = effective_body_limits {
         initial_peak = initial_peak.max(decode_peak(encoded_limit, original_limit)?);
@@ -3896,7 +3914,12 @@ fn compile_http_rule_schedule(
         // buffer; the standalone peak above covers both regex buffers when
         // no prior body is retained.
         incoming_stages.push(IncomingBodyStage {
-            additional_bytes: redaction_additional,
+            additional_bytes: checked_add(
+                redaction_additional,
+                credential_allocation,
+                "policy.rules",
+                "HTTP incoming credential-redaction plan arithmetic overflow",
+            )?,
         });
         if process_body.is_some_and(|provider| provider.allow_request_body_replacement) {
             let replacement_limit = effective_body_limits
@@ -5905,6 +5928,136 @@ redaction_profile = "small"
     }
 
     #[test]
+    fn retained_delegate_body_overlaps_later_response_and_compact_credentials() {
+        let continuation_bytes = 4 * MIB + 1;
+        let max_stdout_line_bytes = continuation_bytes
+            + PROCESS_PROVIDER_RESPONSE_PREFIX_BYTES
+            + PROCESS_PROVIDER_RESPONSE_TERMINATOR_BYTES;
+        let input = resource_config(
+            "",
+            &format!(
+                r#"
+[credentials]
+allowed_custom_headers = ["x-trace-token"]
+
+[authorization.providers.first]
+kind = "process"
+command = "/bin/first-provider"
+include_request_body = true
+max_request_body_bytes = 1
+max_decoded_request_body_bytes = 1
+max_stdout_line_bytes = 80
+retire_timeout = "1s"
+
+[authorization.providers.later]
+kind = "process"
+command = "/bin/later-provider"
+max_stdout_line_bytes = {max_stdout_line_bytes}
+retire_timeout = "1s"
+
+[authorization.providers.later.outputs.token]
+kind = "bearer"
+
+[authorization.providers.later.outputs.trace]
+kind = "custom_header"
+header = "x-trace-token"
+"#
+            ),
+            r#"
+[[policy.rules]]
+id = "first"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "first"
+
+[[policy.rules]]
+id = "later"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "later"
+"#,
+        );
+        let plan = compile(&input).unwrap().reloadable_plan.resource_plan;
+        let retained = guarded(1);
+        let continuation = guarded(continuation_bytes);
+        let compact_credentials = guarded(2 * MAX_PROVIDER_CREDENTIAL_BYTES);
+        let rehome = continuation + compact_credentials;
+
+        assert_eq!(continuation, 65 * guarded(1));
+        assert_eq!(compact_credentials, 2 * guarded(1));
+        assert!(retained + rehome > decode_peak(1, 1).unwrap());
+        assert_eq!(
+            plan.http_wire_body_peak_bytes_by_cursor,
+            [retained + rehome, rehome, 0]
+        );
+    }
+
+    #[test]
+    fn retained_delegate_body_overlaps_later_credentials_and_redaction_scratch() {
+        let input = resource_config(
+            "",
+            r#"
+[authorization.providers.first]
+kind = "process"
+command = "/bin/first-provider"
+include_request_body = true
+max_request_body_bytes = 65537
+max_decoded_request_body_bytes = 65537
+max_stdout_line_bytes = 80
+retire_timeout = "1s"
+
+[authorization.providers.later]
+kind = "process"
+command = "/bin/later-provider"
+max_stdout_line_bytes = 80
+retire_timeout = "1s"
+
+[authorization.providers.later.outputs.token]
+kind = "bearer"
+
+[redaction.profiles.small]
+max_body_bytes = 1
+max_decoded_body_bytes = 1
+rules = [{ literals = ["x"] }]
+"#,
+            r#"
+[[policy.rules]]
+id = "first"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "first"
+
+[[policy.rules]]
+id = "later"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "later"
+redaction_profile = "small"
+"#,
+        );
+        let authored: super::super::authoring::AuthoringConfig =
+            toml::from_str(&input).expect("test input should deserialize");
+        let later_schedule =
+            compile_http_rule_schedule(&authored, &authored.policy.rules[1]).unwrap();
+        let plan = compile(&input).unwrap().reloadable_plan.resource_plan;
+        let retained = guarded(65_537);
+        let literal_scratch = guarded(redaction_literal_scratch_bytes(1).unwrap());
+        let redaction_output = guarded(1);
+        let compact_credentials =
+            guarded(provider_response_guarded_suffix_bytes(80, "test").unwrap());
+        let incoming_redaction = literal_scratch + redaction_output + compact_credentials;
+
+        assert_eq!(
+            later_schedule.max_incoming_additional_bytes(),
+            incoming_redaction
+        );
+        assert_eq!(retained, 2 * guarded(1));
+        assert_eq!(incoming_redaction, 3 * guarded(1));
+        assert!(plan.http_wire_body_peak_bytes_by_cursor[0] >= retained + incoming_redaction);
+        assert_eq!(plan.http_wire_body_peak_bytes_by_cursor[2], 0);
+    }
+
+    #[test]
     fn redacted_original_overlaps_decision_only_request_and_response_stages() {
         let response_bytes = 2 * 64 * 1024 + 1;
         let max_stdout_line_bytes = response_bytes
@@ -7673,6 +7826,33 @@ header = "x-not-allowed"
         );
         let error = compile(&input).expect_err("unused provider outputs remain configured input");
         assert!(error.to_string().contains("allowed_custom_headers"));
+    }
+
+    #[test]
+    fn provider_output_name_bound_matches_the_process_parser() {
+        fn provider_with_output(name: &str) -> String {
+            format!(
+                r#"{MINIMAL}
+
+[authorization.providers.auth]
+kind = "process"
+command = "/bin/authorize"
+
+[authorization.providers.auth.outputs.{name}]
+kind = "bearer"
+"#
+            )
+        }
+
+        let exact = "a".repeat(MAX_PROVIDER_OUTPUT_NAME_BYTES);
+        compile(&provider_with_output(&exact)).expect("the documented name bound must compile");
+
+        let over = "a".repeat(MAX_PROVIDER_OUTPUT_NAME_BYTES + 1);
+        let error = compile(&provider_with_output(&over))
+            .expect_err("the parser cannot admit output names beyond its fixed bound");
+        assert!(error
+            .to_string()
+            .contains(&format!("at most {MAX_PROVIDER_OUTPUT_NAME_BYTES} bytes")));
     }
 
     #[test]

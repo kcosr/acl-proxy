@@ -917,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn callback_typed_outputs_decode_directly_into_guarded_storage() {
+    fn webhook_response_limit_and_typed_output_matrix() {
         let outputs = outputs(true);
         let response = body(
             " \"type\" : \"response\" , \"decision\" : \"allow\" , \"values\" : {\"api_token\":\"sec\\u0072et-\\ud83d\\ude80\",\"trace_id\":\"trace\\tvalue\"} } \r\n",
@@ -947,10 +947,27 @@ mod tests {
         drop(credentials);
         assert_eq!(pool.global_charge(), 0);
         assert_eq!(guard.live_bytes(), 0);
+
+        for (provider_limit, control_limit) in [
+            (response.len() - 1, response.len()),
+            (response.len(), response.len() - 1),
+        ] {
+            assert!(matches!(
+                parse(
+                    &response,
+                    &outputs,
+                    &guard.provider_response_charge(),
+                    provider_limit,
+                    control_limit,
+                ),
+                Err(CallbackResponseError::LimitExceeded)
+            ));
+            assert_eq!(guard.live_bytes(), 0);
+        }
     }
 
     #[test]
-    fn segmented_callback_credentials_cross_provider_boundary_without_copy() {
+    fn callback_secret_material_is_not_observable() {
         let outputs = outputs(true);
         let response = body(
             "\"type\":\"response\",\"decision\":\"allow\",\"values\":{\"api_token\":\"secret-marker\"}}",

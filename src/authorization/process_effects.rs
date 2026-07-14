@@ -9,11 +9,11 @@ use super::protocol::{
     AssignedResponseError, ProcessEffectRange, ProcessEffectSegments, ProcessProviderCredentials,
     ProviderBodyReplacement, ProviderCredentialSet, ProviderDecision, ProviderOutputRegistry,
 };
-use crate::config::compiler::MAX_PROVIDER_CREDENTIAL_BYTES;
+use crate::config::compiler::{MAX_PROVIDER_CREDENTIAL_BYTES, MAX_PROVIDER_OUTPUT_NAME_BYTES};
 use crate::safety::wire_body::{GuardedBodyBuilder, WireBodyBufferError};
 use crate::safety::ProviderResponseCharge;
 
-const MAX_KEY_BYTES: usize = 64;
+const MAX_KEY_BYTES: usize = MAX_PROVIDER_OUTPUT_NAME_BYTES;
 const MAX_METADATA_BYTES: usize = 1024;
 
 pub(super) enum ProcessEffectsParseError {
@@ -428,23 +428,23 @@ impl<'a> AssignedProcessEffectsParser<'a> {
                 .expect("an active parser owns guarded effect storage")
                 .finish(),
         );
-        let replacement = if let Some(range) = self.replacement_range {
-            let max =
-                self.max_decoded_replacement_bytes
-                    .ok_or(ProcessEffectsParseError::Assigned(
-                        AssignedResponseError::BodyNotAllowed,
-                    ))?;
-            validate_base64(&storage, range, max).map_err(ProcessEffectsParseError::Assigned)?;
-            Some(ProviderBodyReplacement::from_encoded(
-                self.content_type,
-                self.content_encoding,
-                storage.clone(),
-                range,
-                max,
-            ))
-        } else {
-            None
-        };
+        let replacement =
+            if let Some(range) = self.replacement_range {
+                let max = self.max_decoded_replacement_bytes.ok_or(
+                    ProcessEffectsParseError::Assigned(AssignedResponseError::BodyNotAllowed),
+                )?;
+                let decoded_bytes = validate_base64(&storage, range, max)
+                    .map_err(ProcessEffectsParseError::Assigned)?;
+                Some(ProviderBodyReplacement::from_encoded(
+                    self.content_type,
+                    self.content_encoding,
+                    storage.clone(),
+                    range,
+                    decoded_bytes,
+                ))
+            } else {
+                None
+            };
         let credentials =
             ProviderCredentialSet::from_process_segmented(ProcessProviderCredentials::new(
                 self.outputs.id(),
@@ -799,7 +799,7 @@ fn validate_base64(
     storage: &crate::safety::GuardedBody,
     range: ProcessEffectRange,
     max_decoded_bytes: usize,
-) -> Result<(), AssignedResponseError> {
+) -> Result<usize, AssignedResponseError> {
     let mut quartet = [0u8; 4];
     let mut quartet_len = 0usize;
     let mut decoded_len = 0usize;
@@ -839,7 +839,7 @@ fn validate_base64(
     if quartet_len != 0 {
         return Err(AssignedResponseError::InvalidBody);
     }
-    Ok(())
+    Ok(decoded_len)
 }
 
 #[derive(Clone, Copy)]
@@ -885,10 +885,10 @@ pub(super) struct AssignedTailSyntax {
     depth: usize,
     mode: JsonMode,
     escape: EscapeState,
-    utf8: [u8; 4],
+    utf8: Zeroizing<[u8; 4]>,
     utf8_len: usize,
     utf8_need: usize,
-    key: [u8; MAX_KEY_BYTES],
+    key: Zeroizing<[u8; MAX_KEY_BYTES]>,
     key_len: usize,
     key_overflow: bool,
     duplicate_id: bool,
@@ -903,10 +903,10 @@ impl AssignedTailSyntax {
             depth: 1,
             mode: JsonMode::Structural,
             escape: EscapeState::Normal,
-            utf8: [0; 4],
+            utf8: Zeroizing::new([0; 4]),
             utf8_len: 0,
             utf8_need: 0,
-            key: [0; MAX_KEY_BYTES],
+            key: Zeroizing::new([0; MAX_KEY_BYTES]),
             key_len: 0,
             key_overflow: false,
             duplicate_id: false,
@@ -1091,7 +1091,7 @@ impl AssignedTailSyntax {
             self.utf8_len += 1;
             if self.utf8_len == self.utf8_need {
                 std::str::from_utf8(&self.utf8[..self.utf8_len]).map_err(|_| ())?;
-                let utf8 = self.utf8;
+                let utf8 = *self.utf8;
                 let len = self.utf8_len;
                 self.capture_key(&utf8[..len], key);
                 self.utf8_len = 0;
@@ -1263,6 +1263,8 @@ fn number_step(state: NumberState, byte: u8) -> Result<Option<NumberState>, ()> 
 
 #[cfg(test)]
 mod tests {
+    use zeroize::Zeroize;
+
     use super::AssignedTailSyntax;
 
     fn validate(tail: &[u8]) -> Result<AssignedTailSyntax, ()> {
@@ -1303,5 +1305,21 @@ mod tests {
 
         assert!(validate(&nested(126)).is_ok());
         assert!(validate(&nested(127)).is_err());
+    }
+
+    #[test]
+    fn assigned_tail_secret_scratch_is_zeroizing() {
+        let mut syntax = AssignedTailSyntax::new();
+        for byte in [b',', b'"', 0xc3, 0xa9, b'"', b':', b'0', b'}'] {
+            syntax.push(byte).unwrap();
+        }
+        syntax.finish().unwrap();
+
+        assert!(syntax.utf8.iter().any(|byte| *byte != 0));
+        assert!(syntax.key.iter().any(|byte| *byte != 0));
+        syntax.utf8.zeroize();
+        syntax.key.zeroize();
+        assert!(syntax.utf8.iter().all(|byte| *byte == 0));
+        assert!(syntax.key.iter().all(|byte| *byte == 0));
     }
 }
