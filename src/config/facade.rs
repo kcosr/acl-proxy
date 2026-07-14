@@ -73,6 +73,10 @@ pub(crate) enum ConfigFacadeError {
         source_path: PathBuf,
         message: String,
     },
+    WriteTemplate {
+        path: PathBuf,
+        source: std::io::Error,
+    },
 }
 
 impl fmt::Display for ConfigFacadeError {
@@ -87,6 +91,13 @@ impl fmt::Display for ConfigFacadeError {
                 "configuration file {} failed validation: {message}",
                 source_path.display()
             ),
+            Self::WriteTemplate { path, source } => {
+                write!(
+                    formatter,
+                    "failed to write configuration template {}: {source}",
+                    path.display()
+                )
+            }
         }
     }
 }
@@ -133,6 +144,13 @@ pub(crate) fn compile_config_text(
 ) -> Result<CompiledConfig, ConfigFacadeError> {
     let authored = loader::parse_config_text(input.text, input.source_path).map_err(load_error)?;
     compile_authored(authored, input.config_root, input.source_path)
+}
+
+pub(crate) fn write_default_config_template(path: &Path) -> Result<(), ConfigFacadeError> {
+    super::template::write_default_config(path).map_err(|source| ConfigFacadeError::WriteTemplate {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 fn compile_authored(
@@ -418,6 +436,19 @@ rules = [{{ expressions = ['\b{SECRET}\b'], literal_environment_variables = ["MI
         assert_secret_absent(&error, SECRET);
         assert!(error.to_string().contains("expressions[0]"));
         assert!(error.to_string().contains("bounded matcher"));
+    }
+
+    #[test]
+    fn strict_init_template_round_trips_through_pure_facade_compilation() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("config/acl-proxy.toml");
+
+        write_default_config_template(&path).unwrap();
+        let loaded = load_and_compile_exact_config(&path).unwrap();
+
+        assert_eq!(loaded.compiled.static_config.schema_version, 3);
+        assert_eq!(loaded.metadata.path, path);
+        assert_eq!(loaded.compiled.reloadable_plan.policy.rules.len(), 0);
     }
 
     fn assert_secret_absent(error: &ConfigFacadeError, secret: &str) {

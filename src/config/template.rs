@@ -1,3 +1,7 @@
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
+use std::path::Path;
+
 pub(super) const DEFAULT_CONFIG: &str = r#"schema_version = 3
 
 [service]
@@ -35,9 +39,21 @@ inject = true
 header = "x-acl-proxy-request-id"
 "#;
 
+pub(super) fn write_default_config(path: &Path) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(DEFAULT_CONFIG.as_bytes())?;
+    file.sync_all()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
+
+    use tempfile::tempdir;
 
     use super::*;
 
@@ -73,5 +89,18 @@ mod tests {
             compiled.static_config.service.max_webhook_transport_bytes,
             64 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn writer_creates_parent_and_never_overwrites() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("nested/acl-proxy.toml");
+
+        write_default_config(&path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), DEFAULT_CONFIG);
+
+        let error = write_default_config(&path).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&path).unwrap(), DEFAULT_CONFIG);
     }
 }

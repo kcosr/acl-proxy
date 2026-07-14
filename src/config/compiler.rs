@@ -798,7 +798,7 @@ pub(crate) struct ReloadableLoggingPlan {
     pub(crate) policy_decisions: PolicyDecisionLoggingPlan,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CompiledLogLevel {
     Trace,
     Debug,

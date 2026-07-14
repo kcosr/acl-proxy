@@ -3,6 +3,7 @@ pub(crate) mod compiler;
 mod duration;
 mod facade;
 mod loader;
+mod policy_dump;
 mod template;
 
 #[allow(unused_imports)]
@@ -11,9 +12,12 @@ pub(crate) use compiler::{
 };
 #[allow(unused_imports)]
 pub(crate) use facade::{
-    compile_config_text, load_and_compile_config, load_and_compile_exact_config, CompiledConfig,
-    ConfigFacadeError, ConfigFileMetadata, ConfigPathSource, ConfigTextInput, LoadedCompiledConfig,
+    compile_config_text, load_and_compile_config, load_and_compile_exact_config,
+    write_default_config_template, CompiledConfig, ConfigFacadeError, ConfigFileMetadata,
+    ConfigPathSource, ConfigTextInput, LoadedCompiledConfig,
 };
+#[allow(unused_imports)]
+pub(crate) use policy_dump::{PolicyDump, PolicyDumpTableRow};
 
 use std::env;
 use std::fs;

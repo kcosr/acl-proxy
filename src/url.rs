@@ -189,6 +189,7 @@ pub(crate) fn canonicalize_http_url_from_parts(
 
 #[derive(Debug, Clone)]
 pub(crate) struct CompiledUrlPattern {
+    authored: String,
     match_all: bool,
     scheme: String,
     port: u16,
@@ -218,6 +219,7 @@ impl CompiledUrlPattern {
     pub(crate) fn compile(raw: &str) -> Result<Self, UrlError> {
         if raw == "**" {
             return Ok(Self {
+                authored: raw.to_string(),
                 match_all: true,
                 scheme: String::new(),
                 port: 0,
@@ -268,6 +270,7 @@ impl CompiledUrlPattern {
             .transpose()?;
 
         Ok(Self {
+            authored: raw.to_string(),
             match_all: false,
             scheme,
             port,
@@ -292,6 +295,10 @@ impl CompiledUrlPattern {
             (Some(pattern), Some(query)) => pattern.is_match(query),
             (Some(_), None) => false,
         }
+    }
+
+    pub(crate) fn authored(&self) -> &str {
+        &self.authored
     }
 }
 
