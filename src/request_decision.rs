@@ -4,8 +4,8 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method};
 use tokio::time::Instant;
 
 use crate::authorization::protocol::{
-    GuardedProviderBody, IncludedHeader, ProviderBodyReplacement, ProviderCredentialSet,
-    ProviderRequest, ProviderRequestHeaders,
+    GuardedProviderBody, IncludedHeader, ProviderBodyReplacement, ProviderCredentialInjectionError,
+    ProviderRequest, ProviderRequestHeaders, StagedProviderCredentialMutation,
 };
 use crate::authorization::{AuthorizationDecision, AuthorizationDispatchError};
 use crate::config::compiler::{CompiledProviderFailureMode, HeaderEffectPlan};
@@ -36,8 +36,7 @@ pub(crate) enum RequestDecision<'generation> {
 pub(crate) struct AllowedRequest<'generation> {
     pub(crate) common: DecidedRequest,
     pub(crate) rule: Option<PolicyRuleMatch<'generation>>,
-    pub(crate) provider_credentials: Option<ProviderCredentialSet>,
-    pub(crate) body_replacement: Option<ProviderBodyReplacement>,
+    pub(crate) provider_credentials: Option<StagedProviderCredentialMutation>,
     pub(crate) body: Option<GuardedRequestBody>,
 }
 
@@ -59,6 +58,7 @@ pub(crate) enum DenyReason {
     Provider,
     ProviderFailure,
     ProviderBodyLimit,
+    RedactionFailure,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -71,10 +71,16 @@ pub(crate) enum RequestDecisionError {
     BodyGuard(#[from] WireBodyBufferError),
     #[error("authorization provider metadata is missing")]
     MissingProvider,
+    #[error("the policy redaction profile is missing from this generation")]
+    MissingRedactionProfile,
     #[error("authorization request headers are invalid")]
     ProviderRequestHeaders,
     #[error("authorization provider dispatch failed")]
     Provider(#[source] AuthorizationDispatchError),
+    #[error("authorization provider credential injection failed")]
+    ProviderCredentialInjection(#[from] ProviderCredentialInjectionError),
+    #[error("authorization provider replacement decode failed")]
+    ProviderReplacementDecode,
 }
 
 impl<'generation> AllowedRequest<'generation> {
@@ -263,14 +269,28 @@ async fn evaluate_to_terminal<'generation>(
     loop {
         match evaluation.outcome {
             PolicyOutcome::Allow => {
+                let matched = evaluation.matched;
+                let body = select_terminal_body(&guard, body, None)?;
+                let body = match redact_terminal_body(lease, matched.as_ref(), &guard, body)? {
+                    TerminalBody::Ready(body) => body,
+                    TerminalBody::RedactionDenied => {
+                        return Ok(RequestDecision::Deny(DeniedRequest {
+                            common: DecidedRequest {
+                                headers,
+                                body_guard: guard,
+                            },
+                            rule: matched,
+                            reason: DenyReason::RedactionFailure,
+                        }));
+                    }
+                };
                 return Ok(RequestDecision::Allow(Box::new(AllowedRequest {
                     common: DecidedRequest {
                         headers,
                         body_guard: guard,
                     },
-                    rule: evaluation.matched,
+                    rule: matched,
                     provider_credentials: None,
-                    body_replacement: None,
                     body,
                 })));
             }
@@ -382,14 +402,38 @@ async fn evaluate_to_terminal<'generation>(
                 credentials,
                 replacement,
             } => {
+                let body = select_terminal_body(&guard, body, replacement)?;
+                let provider_credentials = credentials
+                    .as_ref()
+                    .map(|credentials| {
+                        lease.authorization().stage_provider_credentials(
+                            provider,
+                            credentials,
+                            &guard,
+                        )
+                    })
+                    .transpose()?;
+                drop(credentials);
+                let body = match redact_terminal_body(lease, Some(&matched), &guard, body)? {
+                    TerminalBody::Ready(body) => body,
+                    TerminalBody::RedactionDenied => {
+                        return Ok(RequestDecision::Deny(DeniedRequest {
+                            common: DecidedRequest {
+                                headers,
+                                body_guard: guard,
+                            },
+                            rule: Some(matched),
+                            reason: DenyReason::RedactionFailure,
+                        }));
+                    }
+                };
                 return Ok(RequestDecision::Allow(Box::new(AllowedRequest {
                     common: DecidedRequest {
                         headers,
                         body_guard: guard,
                     },
                     rule: Some(matched),
-                    provider_credentials: credentials,
-                    body_replacement: replacement,
+                    provider_credentials,
                     body,
                 })));
             }
@@ -414,6 +458,57 @@ async fn evaluate_to_terminal<'generation>(
             }
         }
     }
+}
+
+enum TerminalBody {
+    Ready(Option<GuardedRequestBody>),
+    RedactionDenied,
+}
+
+fn select_terminal_body(
+    guard: &HttpWireBodyGuard,
+    mut body: Option<GuardedRequestBody>,
+    replacement: Option<ProviderBodyReplacement>,
+) -> Result<Option<GuardedRequestBody>, RequestDecisionError> {
+    if let Some(replacement) = replacement {
+        drop(body.take());
+        let (content_type, content_encoding, decoded) = replacement
+            .decode(guard)
+            .map_err(|_| RequestDecisionError::ProviderReplacementDecode)?;
+        body = Some(GuardedRequestBody {
+            content_type,
+            content_encoding,
+            decoded,
+        });
+    }
+    Ok(body)
+}
+
+fn redact_terminal_body(
+    lease: &GenerationLease,
+    rule: Option<&PolicyRuleMatch<'_>>,
+    guard: &HttpWireBodyGuard,
+    mut body: Option<GuardedRequestBody>,
+) -> Result<TerminalBody, RequestDecisionError> {
+    let Some(profile_index) = rule.and_then(PolicyRuleMatch::redaction_profile) else {
+        return Ok(TerminalBody::Ready(body));
+    };
+    let Some(profile) = lease.redaction().profile(profile_index) else {
+        return Err(RequestDecisionError::MissingRedactionProfile);
+    };
+    let Some(current) = body.take() else {
+        return Ok(TerminalBody::Ready(body));
+    };
+    let redacted = match profile.redact_guarded_decoded_http_body(guard, current.decoded) {
+        Ok(redacted) => redacted,
+        Err(_) => return Ok(TerminalBody::RedactionDenied),
+    };
+    body = Some(GuardedRequestBody {
+        content_type: current.content_type,
+        content_encoding: current.content_encoding,
+        decoded: redacted.body,
+    });
+    Ok(TerminalBody::Ready(body))
 }
 
 fn provider_header_values(
@@ -821,5 +916,134 @@ authorization_provider = "terminal""#;
 
         drop(lease);
         runtime.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_provider_replacement_is_selected_then_redacted_or_denied() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (max_body_bytes, expect_allow) in [(128, true), (4, false)] {
+            let directory = tempfile::tempdir().unwrap();
+            let provider = directory.path().join("replacement.sh");
+            std::fs::write(
+                &provider,
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf "%s" "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  [ -n "$id" ] && printf '{"id":"%s","type":"response","decision":"allow","values":{"token":"secret-marker"},"requestBody":{"encoding":"base64","contentType":"text/plain","data":"cmVwbGFjZW1lbnQgc2VjcmV0"}}\n' "$id"
+done
+"#,
+            )
+            .unwrap();
+            let mut permissions = std::fs::metadata(&provider).unwrap().permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&provider, permissions).unwrap();
+
+            let extra = format!(
+                r#"[authorization.providers.replacing]
+kind = "process"
+command = "{}"
+timeout = "2s"
+retire_timeout = "6s"
+include_request_body = true
+allow_request_body_replacement = true
+max_request_body_bytes = 128
+max_decoded_request_body_bytes = 128
+max_stdout_line_bytes = 1024
+
+[authorization.providers.replacing.outputs.token]
+kind = "bearer"
+required = true
+
+[redaction.profiles.wire]
+replacement = "[MASKED]"
+max_body_bytes = {max_body_bytes}
+max_decoded_body_bytes = {max_body_bytes}
+rules = [{{ literals = ["secret"], payloads = "text" }}]"#,
+                provider.display()
+            );
+            let policy = r#"[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "replace"
+decision = "delegate"
+methods = ["GET"]
+authorization_provider = "replacing"
+redaction_profile = "wire""#;
+            let initial = compile(&config(policy, &extra));
+            let (runtime, _source, _, pool) = runtime(initial).await;
+            let lease = runtime.lease().await.unwrap();
+            let url = canonicalize_http_url("https://example.test/replacement").unwrap();
+            let prepared =
+                prepare_request(&lease, input("replacement", &url, HeaderMap::new())).unwrap();
+            let one_guarded_chunk =
+                crate::safety::wire_body::guarded_body_allocation_bytes(1).unwrap();
+            assert_eq!(
+                prepared.body_guard().cursor_peak_bytes(),
+                4 * one_guarded_chunk,
+                "the exact terminal peak retains compact guarded credentials beside decoded input, matcher scratch, and redacted output"
+            );
+            let mut original = prepared.body_guard().buffer();
+            original.try_extend_from_slice(b"original body").unwrap();
+            let decision = prepared
+                .decide(Some(GuardedRequestBody {
+                    content_type: Some("text/plain".into()),
+                    content_encoding: None,
+                    decoded: original.finish(),
+                }))
+                .await
+                .unwrap();
+
+            if expect_allow {
+                let RequestDecision::Allow(mut allowed) = decision else {
+                    panic!("bounded replacement must be allowed");
+                };
+                assert!(allowed
+                    .common
+                    .headers
+                    .get(http::header::AUTHORIZATION)
+                    .is_none());
+                let staged = allowed.provider_credentials.take().unwrap();
+                assert!(!format!("{staged:?}").contains("secret-marker"));
+                let mut origin_headers = HeaderMap::new();
+                staged.apply(&mut origin_headers).unwrap();
+                assert_eq!(
+                    origin_headers.get(http::header::AUTHORIZATION).unwrap(),
+                    "Bearer secret-marker"
+                );
+                assert!(origin_headers
+                    .get(http::header::AUTHORIZATION)
+                    .unwrap()
+                    .is_sensitive());
+                let body = allowed.body.as_ref().unwrap();
+                assert_eq!(body.content_type.as_deref(), Some("text/plain"));
+                assert_eq!(
+                    body.decoded
+                        .segments()
+                        .flatten()
+                        .copied()
+                        .collect::<Vec<_>>(),
+                    b"replacement [MASKED]"
+                );
+                drop(allowed);
+            } else {
+                let RequestDecision::Deny(denied) = decision else {
+                    panic!("replacement redaction limit failure must deny");
+                };
+                assert_eq!(denied.reason, DenyReason::RedactionFailure);
+                assert_eq!(denied.rule.as_ref().unwrap().id(), "replace");
+                assert!(denied
+                    .common
+                    .headers
+                    .get(http::header::AUTHORIZATION)
+                    .is_none());
+                drop(denied);
+            }
+            assert_eq!(pool.global_charge(), 0);
+            drop(lease);
+            runtime.shutdown().await;
+        }
     }
 }

@@ -208,6 +208,16 @@ pub(crate) trait AuthorizationSnapshot: Send + Sync {
         provider: ProviderIndex,
     ) -> Option<crate::authorization::AuthorizationProviderMetadata<'_>>;
 
+    fn stage_provider_credentials(
+        &self,
+        provider: ProviderIndex,
+        credentials: &crate::authorization::protocol::ProviderCredentialSet,
+        guard: &crate::safety::HttpWireBodyGuard,
+    ) -> Result<
+        crate::authorization::protocol::StagedProviderCredentialMutation,
+        crate::authorization::protocol::ProviderCredentialInjectionError,
+    >;
+
     fn dispatch<'a>(
         &'a self,
         provider: ProviderIndex,

@@ -97,6 +97,18 @@ impl AuthorizationSnapshot for EmptySnapshot {
         None
     }
 
+    fn stage_provider_credentials(
+        &self,
+        _provider: ProviderIndex,
+        _credentials: &crate::authorization::protocol::ProviderCredentialSet,
+        _guard: &crate::safety::HttpWireBodyGuard,
+    ) -> Result<
+        crate::authorization::protocol::StagedProviderCredentialMutation,
+        crate::authorization::protocol::ProviderCredentialInjectionError,
+    > {
+        Err(crate::authorization::protocol::ProviderCredentialInjectionError::UnknownProvider)
+    }
+
     fn dispatch<'a>(
         &'a self,
         _provider: ProviderIndex,

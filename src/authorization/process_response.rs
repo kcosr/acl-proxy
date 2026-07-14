@@ -2,7 +2,13 @@ use std::fmt;
 
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use super::protocol::{AssignedResponseError, DirectProviderStdout, ProviderResponseContinuation};
+use super::process_effects::{
+    AssignedProcessEffectsParser, AssignedTailSyntax, ProcessEffectsParseError,
+};
+use super::protocol::{
+    AssignedResponseError, DirectProviderStdout, ProviderDecision, ProviderOutputRegistry,
+    ProviderResponseContinuation,
+};
 use crate::config::compiler::ProcessProviderPlan;
 use crate::safety::wire_body::{GuardedBodySegments, WireBodyBufferError};
 #[cfg(test)]
@@ -18,6 +24,35 @@ const MAX_SCALAR_BYTES: usize = 16;
 /// can use the decision-only response parser.
 pub(super) struct DecisionOnlyResponseSchema {
     _private: (),
+}
+
+pub(super) enum ProcessResponseSchema {
+    DecisionOnly(DecisionOnlyResponseSchema),
+    Expanded {
+        outputs: ProviderOutputRegistry,
+        max_decoded_replacement_bytes: Option<usize>,
+    },
+}
+
+impl ProcessResponseSchema {
+    pub(super) fn activate(plan: &ProcessProviderPlan) -> Self {
+        match DecisionOnlyResponseSchema::activate(plan) {
+            Some(schema) => Self::DecisionOnly(schema),
+            None => Self::Expanded {
+                outputs: ProviderOutputRegistry::activate(plan.outputs.clone()),
+                max_decoded_replacement_bytes: plan
+                    .allow_request_body_replacement
+                    .then_some(plan.max_decoded_request_body_bytes),
+            },
+        }
+    }
+
+    pub(super) fn outputs(&self) -> Option<&ProviderOutputRegistry> {
+        match self {
+            Self::DecisionOnly(_) => None,
+            Self::Expanded { outputs, .. } => Some(outputs),
+        }
+    }
 }
 
 impl DecisionOnlyResponseSchema {
@@ -37,6 +72,12 @@ pub(super) enum DecisionOnlyProviderDecision {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DecisionOnlyResponse {
     Decision(DecisionOnlyProviderDecision),
+    AssignedFailure(AssignedResponseError),
+}
+
+pub(super) enum ProcessResponse {
+    DecisionOnly(DecisionOnlyProviderDecision),
+    Expanded(ProviderDecision),
     AssignedFailure(AssignedResponseError),
 }
 
@@ -67,6 +108,147 @@ pub(super) async fn read_decision_only_response(
     _schema: &DecisionOnlyResponseSchema,
 ) -> Result<DecisionOnlyResponse, FatalProcessResponseError> {
     read_decision_only_response_from(reader, continuation, guard).await
+}
+
+pub(super) async fn read_process_response(
+    reader: &mut DirectProviderStdout,
+    continuation: ProviderResponseContinuation,
+    guard: &ProviderResponseCharge,
+    schema: &ProcessResponseSchema,
+) -> Result<ProcessResponse, FatalProcessResponseError> {
+    match schema {
+        ProcessResponseSchema::DecisionOnly(schema) => {
+            match read_decision_only_response(reader, continuation, guard, schema).await? {
+                DecisionOnlyResponse::Decision(decision) => {
+                    Ok(ProcessResponse::DecisionOnly(decision))
+                }
+                DecisionOnlyResponse::AssignedFailure(error) => {
+                    Ok(ProcessResponse::AssignedFailure(error))
+                }
+            }
+        }
+        ProcessResponseSchema::Expanded {
+            outputs,
+            max_decoded_replacement_bytes,
+        } => {
+            read_expanded_response(
+                reader,
+                continuation,
+                guard,
+                outputs,
+                *max_decoded_replacement_bytes,
+            )
+            .await
+        }
+    }
+}
+
+async fn read_expanded_response<R>(
+    reader: &mut R,
+    continuation: ProviderResponseContinuation,
+    guard: &ProviderResponseCharge,
+    outputs: &ProviderOutputRegistry,
+    max_decoded_replacement_bytes: Option<usize>,
+) -> Result<ProcessResponse, FatalProcessResponseError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut remaining = continuation.remaining_line_bytes();
+    let mut parser = Some(AssignedProcessEffectsParser::new(
+        outputs,
+        max_decoded_replacement_bytes,
+        guard,
+    ));
+    let mut assigned_error = None;
+    let mut syntax = AssignedTailSyntax::new();
+    let mut pending_cr = false;
+    loop {
+        if remaining == 0 {
+            return Err(FatalProcessResponseError::TooLong);
+        }
+        let mut byte = [0u8; 1];
+        let read = reader
+            .read(&mut byte)
+            .await
+            .map_err(FatalProcessResponseError::Io)?;
+        if read == 0 {
+            return Err(FatalProcessResponseError::Unterminated);
+        }
+        remaining -= 1;
+        if byte[0] == b'\n' {
+            if syntax.duplicate_id() {
+                return Err(FatalProcessResponseError::DuplicateId);
+            }
+            syntax
+                .finish()
+                .map_err(|_| FatalProcessResponseError::MalformedJson)?;
+            if let Some(error) = assigned_error {
+                return Ok(ProcessResponse::AssignedFailure(error));
+            }
+            return match parser
+                .take()
+                .expect("a semantic parser exists without an assigned error")
+                .finish()
+            {
+                Ok(decision) => Ok(ProcessResponse::Expanded(decision)),
+                Err(ProcessEffectsParseError::Assigned(error)) => {
+                    Ok(ProcessResponse::AssignedFailure(error))
+                }
+                Err(ProcessEffectsParseError::Malformed) => Ok(ProcessResponse::AssignedFailure(
+                    AssignedResponseError::InvalidShape,
+                )),
+                Err(ProcessEffectsParseError::DuplicateId) => {
+                    Err(FatalProcessResponseError::DuplicateId)
+                }
+                Err(ProcessEffectsParseError::Admission(error)) => {
+                    Err(FatalProcessResponseError::Admission(error))
+                }
+            };
+        }
+        if remaining == 0 {
+            return Err(FatalProcessResponseError::TooLong);
+        }
+        if pending_cr {
+            push_expanded_byte(b'\r', &mut syntax, &mut parser, &mut assigned_error)?;
+            pending_cr = false;
+        }
+        if byte[0] == b'\r' {
+            pending_cr = true;
+        } else {
+            push_expanded_byte(byte[0], &mut syntax, &mut parser, &mut assigned_error)?;
+        }
+    }
+}
+
+fn push_expanded_byte(
+    byte: u8,
+    syntax: &mut AssignedTailSyntax,
+    parser: &mut Option<AssignedProcessEffectsParser<'_>>,
+    assigned_error: &mut Option<AssignedResponseError>,
+) -> Result<(), FatalProcessResponseError> {
+    syntax
+        .push(byte)
+        .map_err(|_| FatalProcessResponseError::MalformedJson)?;
+    let Some(active) = parser.as_mut() else {
+        return Ok(());
+    };
+    match active.push(byte) {
+        Ok(()) => Ok(()),
+        Err(ProcessEffectsParseError::Assigned(error)) => {
+            *assigned_error = Some(error);
+            parser.take();
+            Ok(())
+        }
+        Err(ProcessEffectsParseError::Malformed) => {
+            *assigned_error = Some(AssignedResponseError::InvalidShape);
+            parser.take();
+            Ok(())
+        }
+        Err(ProcessEffectsParseError::DuplicateId) => Err(FatalProcessResponseError::DuplicateId),
+        Err(ProcessEffectsParseError::Admission(error)) => {
+            Err(FatalProcessResponseError::Admission(error))
+        }
+    }
 }
 
 #[cfg(test)]

@@ -93,7 +93,7 @@ const MAX_CAPTURE_BODY_BYTES: usize = GIB;
 const MAX_CAPTURE_INFLIGHT_BYTES: usize = 4 * GIB;
 const MAX_CAPTURE_FILES: usize = 10_000_000;
 const MAX_CAPTURE_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024 * 1024;
-const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_PROVIDER_CREDENTIAL_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_REDACTION_MATCHER_SCRATCH_BYTES: usize = MIB;
 const DECODER_SCRATCH_BYTES: usize = 64 * 1024;
 const PROVIDER_REQUEST_STREAM_SCRATCH_BYTES: usize = 64 * 1024;
@@ -1384,8 +1384,6 @@ fn control_parser_arena_bytes(
 struct ListenerFacts {
     binds: BTreeSet<SocketAddr>,
     mitm_required: bool,
-    uses_http1: bool,
-    uses_http2: bool,
 }
 
 fn validate_listener_control_mitm_matrix(
@@ -1411,7 +1409,6 @@ fn validate_listener_control_mitm_matrix(
             &listener.http_versions,
             "listeners.explicit_http.http_versions",
         )?;
-        facts.record_http_versions(&listener.http_versions);
         facts.mitm_required |= validate_connect(
             &listener.http_versions,
             &listener.connect,
@@ -1425,7 +1422,6 @@ fn validate_listener_control_mitm_matrix(
             &listener.http_versions,
             "listeners.transparent_http.http_versions",
         )?;
-        facts.record_http_versions(&listener.http_versions);
     }
     if let Some(listener) = &listeners.explicit_https {
         let bind = validate_bind(listener.bind, "listeners.explicit_https.bind", false)?;
@@ -1434,7 +1430,6 @@ fn validate_listener_control_mitm_matrix(
             &listener.http_versions,
             "listeners.explicit_https.http_versions",
         )?;
-        facts.record_http_versions(&listener.http_versions);
         validate_listener_limits(
             listener.max_connections,
             listener.max_concurrent_streams,
@@ -1453,7 +1448,6 @@ fn validate_listener_control_mitm_matrix(
             &listener.http_versions,
             "listeners.transparent_https.http_versions",
         )?;
-        facts.record_http_versions(&listener.http_versions);
         validate_listener_limits(
             listener.max_connections,
             listener.max_concurrent_streams,
@@ -1521,17 +1515,6 @@ fn validate_listener_control_mitm_matrix(
         check_range("mitm.max_cached_certificates", cache, MAX_MITM_CERTIFICATES)?;
     }
     Ok(facts)
-}
-
-impl ListenerFacts {
-    fn record_http_versions(&mut self, versions: &[HttpVersion]) {
-        for version in versions {
-            match version {
-                HttpVersion::Http1 => self.uses_http1 = true,
-                HttpVersion::Http2 => self.uses_http2 = true,
-            }
-        }
-    }
 }
 
 fn validate_bind(
@@ -1684,15 +1667,6 @@ fn validate_tls_and_parent_matrix(
     listeners: &ListenerFacts,
 ) -> Result<(), ConfigCompileError> {
     validate_transport_tls(&config.egress.origin_tls, "egress.origin_tls")?;
-    let origin_versions = &config.egress.origin_tls.http_versions;
-    if (listeners.uses_http1 && !origin_versions.contains(&HttpVersion::Http1))
-        || (listeners.uses_http2 && !origin_versions.contains(&HttpVersion::Http2))
-    {
-        return Err(ConfigCompileError::at(
-            "egress.origin_tls.http_versions",
-            "must enable every HTTP version enabled by a proxy listener",
-        ));
-    }
     match config.egress.route {
         EgressRoute::Direct => {
             if config.egress.parent_proxy.is_some() {
@@ -3657,7 +3631,7 @@ fn compile_http_rule_schedule(
             )
         })
         .transpose()?;
-    let webhook_callback_allocation = webhook_provider
+    let webhook_callback_bytes = webhook_provider
         .map(|provider| {
             let control = config
                 .control
@@ -3674,11 +3648,22 @@ fn compile_http_rule_schedule(
                         "cannot hold the fixed callback capability prefix",
                     )
                 })?;
+            Ok(suffix_bytes)
+        })
+        .transpose()?;
+    let webhook_callback_allocation = webhook_callback_bytes
+        .map(|suffix_bytes| {
             project_guarded_body_allocation(
                 suffix_bytes,
                 "policy.rules",
                 "webhook callback allocation arithmetic overflow",
             )
+        })
+        .transpose()?;
+    let webhook_credential_bytes = webhook_provider
+        .zip(webhook_callback_bytes)
+        .map(|(provider, callback_bytes)| {
+            compact_provider_credential_bytes(provider.outputs.len(), callback_bytes)
         })
         .transpose()?;
     for allocation in [webhook_request_allocation, webhook_callback_allocation]
@@ -3726,11 +3711,47 @@ fn compile_http_rule_schedule(
             )
         })
         .transpose()?;
+    let process_credential_bytes = process_provider
+        .zip(response_continuation_bytes)
+        .map(|(provider, continuation_bytes)| {
+            compact_provider_credential_bytes(provider.outputs.len(), continuation_bytes)
+        })
+        .transpose()?;
+    let credential_bytes = process_credential_bytes.or(webhook_credential_bytes);
+    let credential_allocation = credential_bytes
+        .map(|bytes| {
+            project_guarded_body_allocation(
+                bytes,
+                "policy.rules",
+                "provider credential rehome arithmetic overflow",
+            )
+        })
+        .transpose()?;
     if let Some(response_continuation_allocation) = response_continuation_allocation {
         initial_peak = initial_peak.max(response_continuation_allocation);
         incoming_stages.push(IncomingBodyStage {
             additional_bytes: response_continuation_allocation,
         });
+    }
+    if let (Some(callback), Some(credentials)) =
+        (webhook_callback_allocation, credential_allocation)
+    {
+        initial_peak = initial_peak.max(checked_add(
+            callback,
+            credentials,
+            "policy.rules",
+            "webhook credential rehome arithmetic overflow",
+        )?);
+    }
+    if let (Some(continuation), Some(credentials)) =
+        (response_continuation_allocation, credential_allocation)
+    {
+        initial_peak = initial_peak.max(checked_add(
+            continuation,
+            credentials,
+            "policy.rules",
+            "process credential rehome arithmetic overflow",
+        )?);
     }
     if let Some((encoded_limit, original_limit)) = effective_body_limits {
         initial_peak = initial_peak.max(decode_peak(encoded_limit, original_limit)?);
@@ -3750,6 +3771,21 @@ fn compile_http_rule_schedule(
                 "webhook body-retention arithmetic overflow",
             )?);
         }
+        if let (Some(callback), Some(credentials)) =
+            (webhook_callback_allocation, credential_allocation)
+        {
+            initial_peak = initial_peak.max(
+                original_allocation
+                    .checked_add(callback)
+                    .and_then(|bytes| bytes.checked_add(credentials))
+                    .ok_or_else(|| {
+                        ConfigCompileError::at(
+                            "policy.rules",
+                            "webhook credential rehome arithmetic overflow",
+                        )
+                    })?,
+            );
+        }
         if process_provider.is_some() {
             initial_peak = initial_peak.max(guarded_body_stage_peak(
                 [original_limit, PROVIDER_REQUEST_STREAM_SCRATCH_BYTES],
@@ -3765,6 +3801,15 @@ fn compile_http_rule_schedule(
                 "policy.rules",
                 "HTTP provider-response continuation arithmetic overflow",
             )?);
+            if let (Some(continuation_bytes), Some(credentials)) =
+                (response_continuation_bytes, credential_bytes)
+            {
+                initial_peak = initial_peak.max(guarded_body_stage_peak(
+                    [original_limit, continuation_bytes, credentials],
+                    "policy.rules",
+                    "process credential rehome arithmetic overflow",
+                )?);
+            }
         }
     }
     if let Some(provider) = process_body {
@@ -3780,6 +3825,19 @@ fn compile_http_rule_schedule(
             initial_peak = initial_peak.max(replacement_decode_peak(
                 response_continuation_bytes,
                 original_limit,
+            )?);
+            if let Some(credentials) = credential_bytes {
+                initial_peak = initial_peak.max(guarded_body_stage_peak(
+                    [response_continuation_bytes, original_limit, credentials],
+                    "policy.rules",
+                    "process replacement credential rehome arithmetic overflow",
+                )?);
+            }
+        } else if let Some(credentials) = credential_bytes {
+            initial_peak = initial_peak.max(guarded_body_stage_peak(
+                [original_limit, response_continuation_bytes, credentials],
+                "policy.rules",
+                "process credential rehome arithmetic overflow",
             )?);
         }
     }
@@ -3810,17 +3868,28 @@ fn compile_http_rule_schedule(
         } else {
             0
         };
+        let credential_allocation = credential_allocation.unwrap_or(0);
         let original_redaction_peak = checked_add(
             project_guarded_body_allocation(
                 original_limit,
                 "policy.rules",
                 "HTTP redaction plan arithmetic overflow",
             )?,
-            redaction_additional,
+            checked_add(
+                redaction_additional,
+                credential_allocation,
+                "policy.rules",
+                "HTTP credential-redaction plan arithmetic overflow",
+            )?,
             "policy.rules",
             "HTTP redaction plan arithmetic overflow",
         )?
-        .max(regex_peak);
+        .max(checked_add(
+            regex_peak,
+            credential_allocation,
+            "policy.rules",
+            "HTTP credential-regex redaction plan arithmetic overflow",
+        )?);
         initial_peak = initial_peak.max(original_redaction_peak);
         // A prior delegate's retained body becomes the regex input. The
         // incoming stage therefore adds only matcher scratch and the output
@@ -3839,11 +3908,21 @@ fn compile_http_rule_schedule(
                     "policy.rules",
                     "HTTP replacement-redaction plan arithmetic overflow",
                 )?,
-                redaction_additional,
+                checked_add(
+                    redaction_additional,
+                    credential_allocation,
+                    "policy.rules",
+                    "HTTP replacement credential-redaction plan arithmetic overflow",
+                )?,
                 "policy.rules",
                 "HTTP replacement-redaction plan arithmetic overflow",
             )?
-            .max(regex_peak);
+            .max(checked_add(
+                regex_peak,
+                credential_allocation,
+                "policy.rules",
+                "HTTP replacement credential-regex plan arithmetic overflow",
+            )?);
             initial_peak = initial_peak.max(replacement_redaction_peak);
         }
     }
@@ -3947,6 +4026,21 @@ fn provider_response_guarded_suffix_bytes(
             ConfigCompileError::at(
                 path,
                 "cannot hold the fixed process-provider response prefix and terminator",
+            )
+        })
+}
+
+fn compact_provider_credential_bytes(
+    output_count: usize,
+    response_bytes: usize,
+) -> Result<usize, ConfigCompileError> {
+    output_count
+        .checked_mul(MAX_PROVIDER_CREDENTIAL_BYTES)
+        .map(|declared_bytes| declared_bytes.min(response_bytes))
+        .ok_or_else(|| {
+            ConfigCompileError::at(
+                "authorization.providers",
+                "provider credential storage arithmetic overflow",
             )
         })
 }
@@ -5729,6 +5823,88 @@ authorization_provider = "decision"
     }
 
     #[test]
+    fn process_credential_rehome_overlaps_the_raw_response_continuation() {
+        let continuation_bytes = 64 * 1024 + 1;
+        let max_stdout_line_bytes = continuation_bytes
+            + PROCESS_PROVIDER_RESPONSE_PREFIX_BYTES
+            + PROCESS_PROVIDER_RESPONSE_TERMINATOR_BYTES;
+        let input = resource_config(
+            "",
+            &format!(
+                r#"
+[authorization.providers.decision]
+kind = "process"
+command = "/bin/decision-provider"
+max_stdout_line_bytes = {max_stdout_line_bytes}
+retire_timeout = "1s"
+
+[authorization.providers.decision.outputs.token]
+kind = "bearer"
+"#
+            ),
+            r#"
+[[policy.rules]]
+id = "decision"
+decision = "delegate"
+methods = ["GET"]
+authorization_provider = "decision"
+"#,
+        );
+        let config: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
+        let schedule = compile_http_rule_schedule(&config, &config.policy.rules[0]).unwrap();
+        let continuation = guarded(continuation_bytes);
+        let compact_credentials = guarded(MAX_PROVIDER_CREDENTIAL_BYTES);
+
+        assert_eq!(continuation, 2 * guarded(1));
+        assert_eq!(compact_credentials, guarded(1));
+        assert_eq!(schedule.initial_peak, continuation + compact_credentials);
+    }
+
+    #[test]
+    fn compact_credentials_remain_live_through_terminal_redaction() {
+        let input = resource_config(
+            "",
+            r#"
+[authorization.providers.replacing]
+kind = "process"
+command = "/bin/replacing-provider"
+include_request_body = true
+allow_request_body_replacement = true
+max_request_body_bytes = 1
+max_decoded_request_body_bytes = 1
+max_stdout_line_bytes = 80
+retire_timeout = "1s"
+
+[authorization.providers.replacing.outputs.token]
+kind = "bearer"
+
+[redaction.profiles.small]
+max_body_bytes = 1
+max_decoded_body_bytes = 1
+rules = [{ literals = ["x"] }]
+"#,
+            r#"
+[[policy.rules]]
+id = "combined"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "replacing"
+redaction_profile = "small"
+"#,
+        );
+        let config: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
+        let schedule = compile_http_rule_schedule(&config, &config.policy.rules[0]).unwrap();
+        let literal_scratch = redaction_literal_scratch_bytes(1).unwrap();
+        let continuation_bytes = provider_response_guarded_suffix_bytes(80, "test").unwrap();
+        let compact_credential_bytes = continuation_bytes.min(MAX_PROVIDER_CREDENTIAL_BYTES);
+        let expected =
+            guarded(1) + guarded(literal_scratch) + guarded(1) + guarded(compact_credential_bytes);
+
+        assert_eq!(expected, 4 * guarded(1));
+        assert_eq!(schedule.initial_peak, expected);
+    }
+
+    #[test]
     fn redacted_original_overlaps_decision_only_request_and_response_stages() {
         let response_bytes = 2 * 64 * 1024 + 1;
         let max_stdout_line_bytes = response_bytes
@@ -6930,43 +7106,6 @@ trust = "system"
         ] {
             let error = compile(&input).unwrap_err();
             assert!(error.to_string().contains(expected), "{name}: {error}");
-        }
-    }
-
-    #[test]
-    fn every_listener_protocol_must_be_enabled_for_origin_egress() {
-        let h2_listener_h1_egress = MINIMAL
-            .replace(
-                "http_versions = [\"http1\"]\n\n[listeners.explicit_http.connect]",
-                "http_versions = [\"http1\", \"http2\"]\n\n[listeners.explicit_http.connect]",
-            )
-            .replace(
-                "http1 = \"deny\"\n\n[policy]",
-                "http1 = \"deny\"\nhttp2 = \"deny\"\n\n[egress.origin_tls]\nhttp_versions = [\"http1\"]\n\n[policy]",
-            );
-        let h1_listener_h2_egress = MINIMAL.replace(
-            "http1 = \"deny\"\n\n[policy]",
-            "http1 = \"deny\"\n\n[egress.origin_tls]\nhttp_versions = [\"http2\"]\n\n[policy]",
-        );
-
-        for (name, input) in [
-            (
-                "HTTP/2 listener with HTTP/1-only egress",
-                h2_listener_h1_egress,
-            ),
-            (
-                "HTTP/1 listener with HTTP/2-only egress",
-                h1_listener_h2_egress,
-            ),
-        ] {
-            let error = compile(&input).expect_err(name);
-            assert_eq!(error.path, "egress.origin_tls.http_versions");
-            assert!(
-                error
-                    .to_string()
-                    .contains("must enable every HTTP version enabled by a proxy listener"),
-                "{name}: {error}"
-            );
         }
     }
 

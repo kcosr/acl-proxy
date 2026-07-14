@@ -18,6 +18,8 @@ use crate::config::compiler::{
     RedactionProfilePlan, RedactionRulePlan, MAX_REDACTION_MATCHER_SCRATCH_BYTES,
 };
 use crate::runtime::{RedactionProfileIndex, RedactionProfileRegistry};
+use crate::safety::wire_body::{GuardedAllocationCharge, WireBodyBufferError};
+use crate::safety::{GuardedBody, HttpWireBodyGuard};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PayloadClass {
@@ -48,6 +50,27 @@ pub(crate) struct RedactionLimits {
 pub(crate) struct RedactedPayload {
     pub(crate) bytes: Vec<u8>,
     pub(crate) replacements: usize,
+}
+
+pub(crate) struct GuardedRedactedPayload {
+    pub(crate) body: GuardedBody,
+    pub(crate) replacements: usize,
+}
+
+impl fmt::Debug for GuardedRedactedPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuardedRedactedPayload")
+            .field("body", &self.body)
+            .field("replacements", &self.replacements)
+            .finish()
+    }
+}
+
+impl Drop for RedactedPayload {
+    fn drop(&mut self) {
+        wipe_vec_capacity(&mut self.bytes);
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -123,6 +146,9 @@ pub(crate) enum SnapshotError {
 
     #[error("redaction matcher scratch exceeds its {limit}-byte ceiling")]
     MatcherScratchExceeded { limit: usize },
+
+    #[error("redaction guarded-body operation failed")]
+    GuardedBody(#[source] WireBodyBufferError),
 }
 
 pub(crate) struct RedactionSnapshot {
@@ -314,6 +340,64 @@ impl ProfileHandle {
         )
     }
 
+    pub(crate) fn redact_guarded_decoded_http_body(
+        &self,
+        guard: &HttpWireBodyGuard,
+        payload: GuardedBody,
+    ) -> Result<GuardedRedactedPayload, SnapshotError> {
+        guard
+            .validate_body(&payload)
+            .map_err(SnapshotError::GuardedBody)?;
+        check_size(
+            payload.len(),
+            self.0.limits.max_decoded_body_bytes,
+            PayloadLimit::DecodedHttpBody,
+        )?;
+
+        let class = if guarded_utf8_valid(&payload) {
+            PayloadClass::Text
+        } else {
+            PayloadClass::Binary
+        };
+        let literal_matcher = match class {
+            PayloadClass::Text => &self.0.text_literals,
+            PayloadClass::Binary => &self.0.binary_literals,
+        };
+        let (mut output, mut replacements) = literal_matcher.replace_guarded(
+            guard,
+            payload,
+            &self.0.replacement,
+            self.0.limits.max_decoded_body_bytes,
+            PayloadLimit::DecodedHttpBody,
+        )?;
+        if matches!(class, PayloadClass::Text) && !self.0.text_expressions.is_empty() {
+            let mut current = GuardedExactBytes::from_body(guard, output)?;
+            for expression in &self.0.text_expressions {
+                let (next, count) = replace_regex_guarded(
+                    guard,
+                    &current,
+                    expression,
+                    &self.0.replacement,
+                    self.0.limits.max_decoded_body_bytes,
+                    PayloadLimit::DecodedHttpBody,
+                )?;
+                current = next;
+                replacements =
+                    replacements
+                        .checked_add(count)
+                        .ok_or(SnapshotError::PayloadTooLarge {
+                            payload: PayloadLimit::DecodedHttpBody,
+                            limit: self.0.limits.max_decoded_body_bytes,
+                        })?;
+            }
+            output = current.into_body(guard)?;
+        }
+        Ok(GuardedRedactedPayload {
+            body: output,
+            replacements,
+        })
+    }
+
     pub(crate) fn redact_websocket_message(
         &self,
         payload: Vec<u8>,
@@ -476,6 +560,7 @@ impl ProfileSnapshot {
             std::str::from_utf8(&payload).map_err(|_| SnapshotError::InvalidText)?;
         }
 
+        let payload = ZeroizingVec(payload);
         let literal_matcher = match class {
             PayloadClass::Text => &self.text_literals,
             PayloadClass::Binary => &self.binary_literals,
@@ -502,7 +587,7 @@ impl ProfileSnapshot {
             }
         }
         Ok(RedactedPayload {
-            bytes: output,
+            bytes: output.into_inner(),
             replacements,
         })
     }
@@ -575,11 +660,11 @@ impl LiteralMatcher {
 
     fn replace_bounded(
         &self,
-        input: Vec<u8>,
+        input: ZeroizingVec<u8>,
         replacement: &[u8],
         limit: usize,
         payload_limit: PayloadLimit,
-    ) -> Result<(Vec<u8>, usize), SnapshotError> {
+    ) -> Result<(ZeroizingVec<u8>, usize), SnapshotError> {
         if self.matcher.is_none() {
             return Ok((input, 0));
         }
@@ -610,19 +695,75 @@ impl LiteralMatcher {
             return Ok((input, 0));
         }
 
-        let mut output = Vec::new();
+        let mut output = ZeroizingVec(Vec::new());
         output
+            .0
             .try_reserve_exact(output_len)
             .map_err(|_| SnapshotError::AllocationFailed)?;
         let mut cursor = 0usize;
         self.for_each_merged_interval(&input, |interval| {
-            output.extend_from_slice(&input[cursor..interval.start]);
-            output.extend_from_slice(replacement);
+            output.0.extend_from_slice(&input[cursor..interval.start]);
+            output.0.extend_from_slice(replacement);
             cursor = interval.end;
             Ok(())
         })?;
-        output.extend_from_slice(&input[cursor..]);
+        output.0.extend_from_slice(&input[cursor..]);
         debug_assert_eq!(output.len(), output_len);
+        Ok((output, count))
+    }
+
+    fn replace_guarded(
+        &self,
+        guard: &HttpWireBodyGuard,
+        input: GuardedBody,
+        replacement: &[u8],
+        limit: usize,
+        payload_limit: PayloadLimit,
+    ) -> Result<(GuardedBody, usize), SnapshotError> {
+        if self.matcher.is_none() {
+            return Ok((input, 0));
+        }
+        let mut removed = 0usize;
+        let mut count = 0usize;
+        self.for_each_merged_interval_guarded(guard, &input, |interval| {
+            removed = removed.checked_add(interval.end - interval.start).ok_or(
+                SnapshotError::PayloadTooLarge {
+                    payload: payload_limit,
+                    limit,
+                },
+            )?;
+            count = count.checked_add(1).ok_or(SnapshotError::PayloadTooLarge {
+                payload: payload_limit,
+                limit,
+            })?;
+            Ok(())
+        })?;
+        let output_len = checked_output_len(
+            input.len(),
+            removed,
+            count,
+            replacement.len(),
+            limit,
+            payload_limit,
+        )?;
+        if count == 0 {
+            return Ok((input, 0));
+        }
+        let mut output = guard
+            .reserve_exact_buffer(output_len)
+            .map_err(SnapshotError::GuardedBody)?;
+        let mut cursor = 0usize;
+        self.for_each_merged_interval_guarded(guard, &input, |interval| {
+            copy_guarded_range(&input, cursor, interval.start, &mut output)?;
+            output
+                .try_extend_from_slice(replacement)
+                .map_err(SnapshotError::GuardedBody)?;
+            cursor = interval.end;
+            Ok(())
+        })?;
+        copy_guarded_range(&input, cursor, input.len(), &mut output)?;
+        let output = output.finish().map_err(SnapshotError::GuardedBody)?;
+        drop(input);
         Ok((output, count))
     }
 
@@ -648,10 +789,28 @@ impl LiteralMatcher {
         }
         pending.flush_all(&mut callback)
     }
+
+    fn for_each_merged_interval_guarded(
+        &self,
+        guard: &HttpWireBodyGuard,
+        input: &GuardedBody,
+        mut callback: impl FnMut(Interval) -> Result<(), SnapshotError>,
+    ) -> Result<(), SnapshotError> {
+        let mut pending = PendingIntervals::new_guarded(self.max_pattern_len, guard)?;
+        if let Some(matcher) = &self.matcher {
+            matcher.for_each_guarded_match(input, |interval| {
+                let finalized_end = interval.end.saturating_sub(self.max_pattern_len);
+                pending.flush_through(finalized_end, &mut callback)?;
+                pending.merge(interval)
+            })?;
+        }
+        pending.flush_all(&mut callback)
+    }
 }
 
 struct PendingIntervals {
     storage: ZeroizingBox<Interval>,
+    _charge: Option<GuardedAllocationCharge>,
     head: usize,
     len: usize,
 }
@@ -662,6 +821,25 @@ impl PendingIntervals {
         let storage = ZeroizingBox::filled(interval_capacity, Interval::default())?;
         Ok(Self {
             storage,
+            _charge: None,
+            head: 0,
+            len: 0,
+        })
+    }
+
+    fn new_guarded(
+        interval_capacity: usize,
+        guard: &HttpWireBodyGuard,
+    ) -> Result<Self, SnapshotError> {
+        let bytes = checked_matcher_scratch_bytes(interval_capacity)?;
+        let charge = guard
+            .charge_exact_allocation(bytes)
+            .map_err(SnapshotError::GuardedBody)?;
+        let storage = ZeroizingBox::filled(interval_capacity, Interval::default())?;
+        debug_assert_eq!(storage.layout.size(), charge.bytes());
+        Ok(Self {
+            storage,
+            _charge: Some(charge),
             head: 0,
             len: 0,
         })
@@ -1076,6 +1254,30 @@ impl ZeroizingAhoCorasick {
         }
     }
 
+    fn for_each_guarded_match(
+        &self,
+        input: &GuardedBody,
+        mut callback: impl FnMut(Interval) -> Result<(), SnapshotError>,
+    ) -> Result<(), SnapshotError> {
+        let mut state = 0usize;
+        let mut index = 0usize;
+        for byte in input.segments().flatten().copied() {
+            while state != 0 && self.transition(state, byte).is_none() {
+                state = self.nodes[state].failure;
+            }
+            state = self.transition(state, byte).unwrap_or(0);
+            index += 1;
+            let length = self.nodes[state].output_len;
+            if length != 0 {
+                callback(Interval {
+                    start: index - length,
+                    end: index,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     fn matches<'matcher, 'input>(
         &'matcher self,
         input: &'input [u8],
@@ -1208,6 +1410,11 @@ impl<T: ZeroValid> ZeroizingVec<T> {
 
     fn zeroize(&mut self) {
         wipe_vec_capacity(&mut self.0);
+    }
+
+    fn into_inner(self) -> Vec<T> {
+        let this = std::mem::ManuallyDrop::new(self);
+        unsafe { std::ptr::read(&this.0) }
     }
 }
 
@@ -1372,16 +1579,172 @@ impl ResolvedRule {
     }
 }
 
-fn replace_regex_bounded(
-    input: Vec<u8>,
+struct GuardedExactBytes {
+    storage: ZeroizingBox<u8>,
+    _charge: GuardedAllocationCharge,
+}
+
+impl GuardedExactBytes {
+    fn allocate(guard: &HttpWireBodyGuard, len: usize) -> Result<Self, SnapshotError> {
+        let charge = guard
+            .charge_exact_allocation(len)
+            .map_err(SnapshotError::GuardedBody)?;
+        let storage = ZeroizingBox::filled(len, 0u8)?;
+        debug_assert_eq!(storage.layout.size(), charge.bytes());
+        Ok(Self {
+            storage,
+            _charge: charge,
+        })
+    }
+
+    fn from_body(guard: &HttpWireBodyGuard, body: GuardedBody) -> Result<Self, SnapshotError> {
+        let mut contiguous = Self::allocate(guard, body.len())?;
+        let mut offset = 0usize;
+        for segment in body.segments() {
+            let end = offset + segment.len();
+            contiguous.storage[offset..end].copy_from_slice(segment);
+            offset = end;
+        }
+        drop(body);
+        Ok(contiguous)
+    }
+
+    fn into_body(self, guard: &HttpWireBodyGuard) -> Result<GuardedBody, SnapshotError> {
+        let mut output = guard
+            .reserve_exact_buffer(self.storage.len())
+            .map_err(SnapshotError::GuardedBody)?;
+        output
+            .try_extend_from_slice(&self.storage)
+            .map_err(SnapshotError::GuardedBody)?;
+        let output = output.finish().map_err(SnapshotError::GuardedBody)?;
+        drop(self);
+        Ok(output)
+    }
+}
+
+fn replace_regex_guarded(
+    guard: &HttpWireBodyGuard,
+    input: &GuardedExactBytes,
     expression: &DfaRegex,
     replacement: &[u8],
     limit: usize,
     payload_limit: PayloadLimit,
-) -> Result<(Vec<u8>, usize), SnapshotError> {
+) -> Result<(GuardedExactBytes, usize), SnapshotError> {
+    let bytes: &[u8] = &input.storage;
+    let (output_len, count) = replacement_shape(
+        bytes.len(),
+        expression.find_iter(bytes).map(|matched| matched.len()),
+        replacement.len(),
+        limit,
+        payload_limit,
+    )?;
+    if count == 0 {
+        let mut output = GuardedExactBytes::allocate(guard, bytes.len())?;
+        output.storage.copy_from_slice(bytes);
+        return Ok((output, 0));
+    }
+    let mut output = GuardedExactBytes::allocate(guard, output_len)?;
+    let mut source = 0usize;
+    let mut target = 0usize;
+    for matched in expression.find_iter(bytes) {
+        let retained = &bytes[source..matched.start()];
+        let retained_end = target + retained.len();
+        output.storage[target..retained_end].copy_from_slice(retained);
+        target = retained_end;
+        let replacement_end = target + replacement.len();
+        output.storage[target..replacement_end].copy_from_slice(replacement);
+        target = replacement_end;
+        source = matched.end();
+    }
+    output.storage[target..].copy_from_slice(&bytes[source..]);
+    Ok((output, count))
+}
+
+fn copy_guarded_range(
+    input: &GuardedBody,
+    start: usize,
+    end: usize,
+    output: &mut crate::safety::wire_body::ReservedGuardedBodyBuilder,
+) -> Result<(), SnapshotError> {
+    let mut offset = 0usize;
+    for segment in input.segments() {
+        let segment_end = offset + segment.len();
+        if segment_end > start && offset < end {
+            let local_start = start.saturating_sub(offset);
+            let local_end = (end - offset).min(segment.len());
+            output
+                .try_extend_from_slice(&segment[local_start..local_end])
+                .map_err(SnapshotError::GuardedBody)?;
+        }
+        if segment_end >= end {
+            break;
+        }
+        offset = segment_end;
+    }
+    Ok(())
+}
+
+fn guarded_utf8_valid(input: &GuardedBody) -> bool {
+    let mut carry = [0u8; 4];
+    let mut carry_len = 0usize;
+    for mut segment in input.segments() {
+        if carry_len != 0 {
+            let width = utf8_width(carry[0]);
+            if width == 0 {
+                return false;
+            }
+            let needed = width - carry_len;
+            let copied = needed.min(segment.len());
+            carry[carry_len..carry_len + copied].copy_from_slice(&segment[..copied]);
+            carry_len += copied;
+            segment = &segment[copied..];
+            if carry_len != width {
+                continue;
+            }
+            if std::str::from_utf8(&carry[..width]).is_err() {
+                return false;
+            }
+            carry_len = 0;
+        }
+        if segment.is_empty() {
+            continue;
+        }
+        if let Err(error) = std::str::from_utf8(segment) {
+            if error.error_len().is_some() {
+                return false;
+            }
+            let valid = error.valid_up_to();
+            let tail = &segment[valid..];
+            if tail.len() > 3 {
+                return false;
+            }
+            carry[..tail.len()].copy_from_slice(tail);
+            carry_len = tail.len();
+        }
+    }
+    carry_len == 0
+}
+
+fn utf8_width(first: u8) -> usize {
+    match first {
+        0x00..=0x7f => 1,
+        0xc2..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf4 => 4,
+        _ => 0,
+    }
+}
+
+fn replace_regex_bounded(
+    input: ZeroizingVec<u8>,
+    expression: &DfaRegex,
+    replacement: &[u8],
+    limit: usize,
+    payload_limit: PayloadLimit,
+) -> Result<(ZeroizingVec<u8>, usize), SnapshotError> {
     let (output_len, count) = replacement_shape(
         input.len(),
-        expression.find_iter(&input).map(|matched| matched.len()),
+        expression.find_iter(&*input).map(|matched| matched.len()),
         replacement.len(),
         limit,
         payload_limit,
@@ -1390,17 +1753,18 @@ fn replace_regex_bounded(
         return Ok((input, 0));
     }
 
-    let mut output = Vec::new();
+    let mut output = ZeroizingVec(Vec::new());
     output
+        .0
         .try_reserve_exact(output_len)
         .map_err(|_| SnapshotError::AllocationFailed)?;
     let mut cursor = 0;
-    for matched in expression.find_iter(&input) {
-        output.extend_from_slice(&input[cursor..matched.start()]);
-        output.extend_from_slice(replacement);
+    for matched in expression.find_iter(&*input) {
+        output.0.extend_from_slice(&input[cursor..matched.start()]);
+        output.0.extend_from_slice(replacement);
         cursor = matched.end();
     }
-    output.extend_from_slice(&input[cursor..]);
+    output.0.extend_from_slice(&input[cursor..]);
     debug_assert_eq!(output.len(), output_len);
     Ok((output, count))
 }
@@ -1538,12 +1902,14 @@ fn read_environment_bytes(
 mod tests {
     use super::*;
     use std::env;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::config::compiler::{
         MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE,
         MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT,
     };
+    use crate::safety::{WireBodyPool, WireBodyQuotaKey};
 
     fn activate(plan: RedactionPlan) -> Result<RedactionActivation, SnapshotError> {
         RedactionSnapshot::activate(plan, || false)
@@ -1625,6 +1991,104 @@ mod tests {
         RedactionPlan {
             profiles: BTreeMap::from([("main".to_string(), profile)]),
         }
+    }
+
+    fn request_guard() -> (Arc<WireBodyPool>, HttpWireBodyGuard) {
+        let pool = WireBodyPool::new(8 * 1024 * 1024, 8 * 1024 * 1024);
+        let guard = pool.clone().begin_for_test(
+            2 * 1024 * 1024,
+            WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::LOCALHOST), |_| false),
+        );
+        (pool, guard)
+    }
+
+    fn guarded_body(guard: &HttpWireBodyGuard, bytes: &[u8]) -> GuardedBody {
+        let mut body = guard.buffer();
+        body.try_extend_from_slice(bytes).unwrap();
+        body.finish()
+    }
+
+    #[test]
+    fn guarded_http_redaction_consumes_original_and_restores_all_charges() {
+        let snapshot = activate(plan(profile(None))).unwrap();
+        let profile = snapshot.profile("main").unwrap();
+        let (pool, guard) = request_guard();
+        let original = guarded_body(&guard, b"literal remains available");
+
+        let redacted = profile
+            .redact_guarded_decoded_http_body(&guard, original)
+            .unwrap();
+        assert_eq!(redacted.replacements, 1);
+        assert_eq!(
+            redacted
+                .body
+                .segments()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
+            b"[MASKED] remains available"
+        );
+
+        drop(redacted);
+        assert_eq!(pool.global_charge(), 0);
+    }
+
+    #[test]
+    fn guarded_http_redaction_rejects_a_foreign_request_guard() {
+        let snapshot = activate(plan(profile(None))).unwrap();
+        let profile = snapshot.profile("main").unwrap();
+        let (first_pool, first_guard) = request_guard();
+        let (second_pool, second_guard) = request_guard();
+        let original = guarded_body(&first_guard, b"literal");
+
+        assert!(matches!(
+            profile.redact_guarded_decoded_http_body(&second_guard, original),
+            Err(SnapshotError::GuardedBody(
+                WireBodyBufferError::ForeignGuard
+            ))
+        ));
+        assert_eq!(first_pool.global_charge(), 0);
+        assert_eq!(second_pool.global_charge(), 0);
+    }
+
+    #[test]
+    fn guarded_http_redaction_accounts_segmented_literal_and_regex_storage() {
+        let mut profile_plan = profile(None);
+        profile_plan.max_body_bytes = 96 * 1024;
+        profile_plan.max_decoded_body_bytes = 96 * 1024;
+        let snapshot = activate(plan(profile_plan)).unwrap();
+        let profile = snapshot.profile("main").unwrap();
+        let pool = WireBodyPool::new(8 * 1024 * 1024, 8 * 1024 * 1024);
+        let key = WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::LOCALHOST), |_| false);
+        let guard = pool.clone().begin_for_test(2 * 1024 * 1024, key.clone());
+        let mut bytes = vec![b'a'; 65_532];
+        bytes.extend_from_slice(b"literal token-123");
+        let original = guarded_body(&guard, &bytes);
+        let original_capacity = original.charged_bytes();
+        assert_eq!(guard.live_bytes(), original_capacity);
+        assert_eq!(pool.global_charge(), original_capacity);
+        assert_eq!(pool.quota_charge(&key), original_capacity);
+
+        let redacted = profile
+            .redact_guarded_decoded_http_body(&guard, original)
+            .unwrap();
+        assert_eq!(redacted.replacements, 2);
+        assert_eq!(guard.live_bytes(), redacted.body.charged_bytes());
+        assert_eq!(pool.global_charge(), redacted.body.charged_bytes());
+        assert_eq!(pool.quota_charge(&key), redacted.body.charged_bytes());
+        let suffix = redacted
+            .body
+            .segments()
+            .flatten()
+            .copied()
+            .skip(65_532)
+            .collect::<Vec<_>>();
+        assert_eq!(suffix, b"[MASKED] [MASKED]");
+
+        drop(redacted);
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+        assert_eq!(pool.quota_charge(&key), 0);
     }
 
     #[test]

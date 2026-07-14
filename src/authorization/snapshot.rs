@@ -8,7 +8,10 @@ use super::process::{
 };
 #[cfg(test)]
 use super::protocol::ProviderRequest;
-use super::protocol::{ProviderBodyReplacement, ProviderCredentialSet, ProviderDecision};
+use super::protocol::{
+    ProviderBodyReplacement, ProviderCredentialInjectionError, ProviderCredentialSet,
+    ProviderDecision, StagedProviderCredentialMutation,
+};
 use super::webhook::provider::{WebhookActivationError, WebhookProvider};
 use super::webhook::runtime::{WebhookAuthorizationRuntime, WebhookDispatchError};
 use crate::config::compiler::{
@@ -43,6 +46,7 @@ pub(crate) struct AuthorizationActivation {
 pub(crate) struct AuthorizationProviderMetadata<'snapshot> {
     pub(crate) include_headers: &'snapshot [HeaderName],
     pub(crate) include_request_body: bool,
+    pub(crate) max_request_body_bytes: usize,
     pub(crate) max_decoded_request_body_bytes: usize,
     pub(crate) failure_mode: CompiledProviderFailureMode,
 }
@@ -76,8 +80,6 @@ pub(crate) enum AuthorizationActivationError {
     InvalidWebhookConfiguration,
     #[error("webhook authorization provider '{provider}' could not be activated")]
     WebhookActivation { provider: String },
-    #[error("process authorization provider '{provider}' requires unsupported capabilities")]
-    UnsupportedProcessCapabilities { provider: String },
     #[error("process authorization provider '{provider}' could not be activated")]
     ProcessActivation { provider: String },
 }
@@ -215,16 +217,37 @@ impl ProductAuthorizationSnapshot {
             ActiveProvider::Process(process) => Some(AuthorizationProviderMetadata {
                 include_headers: process.include_headers(),
                 include_request_body: process.include_request_body(),
+                max_request_body_bytes: process.max_request_body_bytes(),
                 max_decoded_request_body_bytes: process.max_decoded_request_body_bytes(),
                 failure_mode: process.failure_mode(),
             }),
             ActiveProvider::Webhook(webhook) => Some(AuthorizationProviderMetadata {
                 include_headers: webhook.include_headers(),
                 include_request_body: false,
+                max_request_body_bytes: 0,
                 max_decoded_request_body_bytes: 0,
                 failure_mode: webhook.failure_mode(),
             }),
         }
+    }
+
+    pub(crate) fn stage_provider_credentials(
+        &self,
+        provider: ProviderIndex,
+        credentials: &ProviderCredentialSet,
+        guard: &HttpWireBodyGuard,
+    ) -> Result<StagedProviderCredentialMutation, ProviderCredentialInjectionError> {
+        let outputs = match self
+            .providers
+            .get(provider.get())
+            .ok_or(ProviderCredentialInjectionError::UnknownProvider)?
+        {
+            ActiveProvider::Process(process) => process
+                .outputs()
+                .ok_or(ProviderCredentialInjectionError::ForeignRegistry)?,
+            ActiveProvider::Webhook(webhook) => webhook.outputs(),
+        };
+        outputs.stage_credentials(credentials, guard)
     }
 
     #[cfg(test)]
@@ -264,6 +287,15 @@ impl AuthorizationSnapshot for ProductAuthorizationSnapshot {
         provider: ProviderIndex,
     ) -> Option<AuthorizationProviderMetadata<'_>> {
         ProductAuthorizationSnapshot::provider_metadata(self, provider)
+    }
+
+    fn stage_provider_credentials(
+        &self,
+        provider: ProviderIndex,
+        credentials: &ProviderCredentialSet,
+        guard: &HttpWireBodyGuard,
+    ) -> Result<StagedProviderCredentialMutation, ProviderCredentialInjectionError> {
+        ProductAuthorizationSnapshot::stage_provider_credentials(self, provider, credentials, guard)
     }
 
     fn dispatch<'a>(
@@ -309,6 +341,13 @@ impl From<ProcessDecision> for AuthorizationDecision {
             ProcessDecision::Allow => Self::Allow {
                 credentials: None,
                 replacement: None,
+            },
+            ProcessDecision::AllowWithOutputs {
+                credentials,
+                replacement,
+            } => Self::Allow {
+                credentials,
+                replacement,
             },
             ProcessDecision::Deny => Self::Deny,
             ProcessDecision::Pass => Self::Pass,
@@ -373,11 +412,6 @@ fn map_activation_error(
         AuthorizationActivationError::Cancelled
     } else {
         match error {
-            ProcessActivationError::UnsupportedCapabilities => {
-                AuthorizationActivationError::UnsupportedProcessCapabilities {
-                    provider: provider.to_owned(),
-                }
-            }
             ProcessActivationError::Spawn | ProcessActivationError::EnvironmentUnavailable => {
                 AuthorizationActivationError::ProcessActivation {
                     provider: provider.to_owned(),
@@ -593,6 +627,8 @@ mod tests {
         );
         let mut alpha = process_plan(&directory, &script);
         alpha.include_headers = vec![HeaderName::from_static("x-alpha")];
+        alpha.max_request_body_bytes = 257;
+        alpha.max_decoded_request_body_bytes = 511;
         let mut zeta = process_plan(&directory, &script);
         zeta.include_headers = vec![HeaderName::from_static("x-zeta")];
         zeta.on_failure = CompiledProviderFailureMode::Error;
@@ -616,6 +652,20 @@ mod tests {
         assert_eq!(
             snapshot.provider_metadata(alpha).unwrap().include_headers[0],
             "x-alpha"
+        );
+        assert_eq!(
+            snapshot
+                .provider_metadata(alpha)
+                .unwrap()
+                .max_request_body_bytes,
+            257
+        );
+        assert_eq!(
+            snapshot
+                .provider_metadata(alpha)
+                .unwrap()
+                .max_decoded_request_body_bytes,
+            511
         );
         assert!(matches!(
             snapshot.provider_metadata(zeta).unwrap().failure_mode,

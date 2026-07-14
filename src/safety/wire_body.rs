@@ -132,7 +132,8 @@ impl WireBodyPool {
             .sum()
     }
 
-    fn quota_charge(&self, key: &WireBodyQuotaKey) -> usize {
+    #[cfg(test)]
+    pub(crate) fn quota_charge(&self, key: &WireBodyQuotaKey) -> usize {
         let shard = self.shard(key);
         let entries = self.quota_shards[shard]
             .lock()
@@ -312,6 +313,17 @@ impl HttpWireBodyGuard {
         })
     }
 
+    pub(crate) fn charge_exact_allocation(
+        &self,
+        bytes: usize,
+    ) -> Result<GuardedAllocationCharge, WireBodyBufferError> {
+        self.inner.try_charge(bytes)?;
+        Ok(GuardedAllocationCharge {
+            guard: self.inner.clone(),
+            bytes,
+        })
+    }
+
     pub(crate) fn provider_response_charge(&self) -> ProviderResponseCharge {
         ProviderResponseCharge {
             inner: self.inner.clone(),
@@ -330,11 +342,33 @@ impl HttpWireBodyGuard {
         &self,
         body: GuardedBody,
     ) -> Result<GuardedBody, WireBodyBufferError> {
+        self.validate_body(&body)?;
+        Ok(body)
+    }
+
+    pub(crate) fn validate_body(&self, body: &GuardedBody) -> Result<(), WireBodyBufferError> {
         if Arc::ptr_eq(&self.inner, &body.guard) {
-            Ok(body)
+            Ok(())
         } else {
             Err(WireBodyBufferError::ForeignGuard)
         }
+    }
+}
+
+pub(crate) struct GuardedAllocationCharge {
+    guard: Arc<GuardInner>,
+    bytes: usize,
+}
+
+impl GuardedAllocationCharge {
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for GuardedAllocationCharge {
+    fn drop(&mut self) {
+        self.guard.release(std::mem::take(&mut self.bytes));
     }
 }
 
@@ -567,6 +601,16 @@ impl GuardedScratch {
 
     pub(crate) fn as_slice(&self) -> &[u8] {
         self.chunk.initialized()
+    }
+
+    pub(crate) fn writable(&mut self) -> &mut [u8] {
+        self.reset();
+        &mut self.chunk.bytes
+    }
+
+    pub(crate) fn set_initialized(&mut self, initialized: usize) {
+        assert!(initialized <= self.chunk.bytes.len());
+        self.chunk.initialized = initialized;
     }
 
     pub(crate) fn reset(&mut self) {

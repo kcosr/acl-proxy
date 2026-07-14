@@ -7,13 +7,13 @@ use crate::authorization::protocol::{
     ProviderOutputIndex, ProviderOutputRegistry, CALLBACK_RESPONSE_PREFIX_BYTES,
     MIN_CALLBACK_RESPONSE_BYTES,
 };
+use crate::config::compiler::MAX_PROVIDER_CREDENTIAL_BYTES;
 use crate::safety::wire_body::{GuardedBodyBuilder, GuardedBodySegments, WireBodyBufferError};
 use crate::safety::{GuardedBody, ProviderResponseCharge};
 
 const CALLBACK_PREFIX_START: &[u8] = b"{\"resumeToken\":\"";
 const MAX_PROVIDER_OUTPUTS: usize = 256;
 const OUTPUT_MATCH_WORDS: usize = MAX_PROVIDER_OUTPUTS / u64::BITS as usize;
-const MAX_PROVIDER_CREDENTIAL_BYTES: usize = 64 * 1024;
 
 const _: () = assert!(
     CALLBACK_PREFIX_START.len() + RESUME_TOKEN_ENCODED_BYTES + 2 == CALLBACK_RESPONSE_PREFIX_BYTES
@@ -100,6 +100,10 @@ pub(crate) struct CallbackCredentialSet {
 }
 
 impl CallbackCredentialSet {
+    pub(crate) fn registry_id(&self) -> u64 {
+        self.registry_id
+    }
+
     pub(crate) fn get(&self, index: ProviderOutputIndex) -> Option<CallbackCredentialSegments<'_>> {
         let range = self
             .values
@@ -743,7 +747,8 @@ mod tests {
     use std::collections::BTreeMap;
     use std::net::{IpAddr, Ipv4Addr};
 
-    use http::HeaderName;
+    use http::header::AUTHORIZATION;
+    use http::{HeaderMap, HeaderName};
 
     use super::*;
     use crate::authorization::protocol::ProviderCredentialSet;
@@ -950,7 +955,7 @@ mod tests {
         let response = body(
             "\"type\":\"response\",\"decision\":\"allow\",\"values\":{\"api_token\":\"secret-marker\"}}",
         );
-        let (_, guard) = guard(response.len());
+        let (_, guard) = guard(64 * 1024 + 1);
         let CallbackResponseDecision::Allow(credentials) = parse(
             &response,
             &outputs,
@@ -975,6 +980,15 @@ mod tests {
             b"secret-marker"
         );
         assert!(!format!("{provider_credentials:?}").contains("secret-marker"));
+
+        let mut headers = HeaderMap::new();
+        outputs
+            .stage_credentials(&provider_credentials, &guard)
+            .unwrap()
+            .apply(&mut headers)
+            .unwrap();
+        assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer secret-marker");
+        assert!(headers.get(AUTHORIZATION).unwrap().is_sensitive());
     }
 
     #[test]

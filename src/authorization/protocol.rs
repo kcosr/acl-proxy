@@ -1,17 +1,19 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
-use std::io;
 #[cfg(test)]
-use std::io::{Read, Write};
+use std::io::Write;
+use std::io::{self, Read};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use base64::encoded_len as base64_encoded_len;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
-#[cfg(test)]
 use base64::read::DecoderReader;
 use base64::Engine as _;
-use http::{HeaderName, HeaderValue};
+use http::header::AUTHORIZATION;
+use http::{HeaderMap, HeaderName, HeaderValue};
 #[cfg(test)]
 use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
@@ -20,15 +22,14 @@ use serde::{Deserialize, Deserializer};
 use serde::{Serialize, Serializer};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::ChildStdout;
-use zeroize::{Zeroize, Zeroizing};
+#[cfg(test)]
+use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
-use crate::config::compiler::ProviderOutputPlan;
+use crate::config::compiler::{ProviderOutputPlan, MAX_PROVIDER_CREDENTIAL_BYTES};
 use crate::safety::wire_body::GuardedScratch;
 use crate::safety::{GuardedBody, HttpWireBodyGuard};
 
-#[cfg(test)]
-const MAX_PROVIDER_CREDENTIAL_BYTES: usize = 64 * 1024;
-#[cfg(test)]
 const PROVIDER_STREAM_SCRATCH_BYTES: usize = 64 * 1024;
 static NEXT_OUTPUT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -142,6 +143,206 @@ impl ProviderOutputRegistry {
     pub(crate) fn definitions(&self) -> &[ProviderOutputDefinition] {
         &self.definitions
     }
+
+    pub(crate) fn stage_credentials(
+        &self,
+        credentials: &ProviderCredentialSet,
+        guard: &HttpWireBodyGuard,
+    ) -> Result<StagedProviderCredentialMutation, ProviderCredentialInjectionError> {
+        if credentials.registry_id() != self.id {
+            return Err(ProviderCredentialInjectionError::ForeignRegistry);
+        }
+
+        let mut destinations = HashSet::new();
+        destinations
+            .try_reserve(self.definitions.len())
+            .map_err(|_| ProviderCredentialInjectionError::AllocationFailed)?;
+        let mut staged = Vec::new();
+        staged
+            .try_reserve_exact(self.definitions.len())
+            .map_err(|_| ProviderCredentialInjectionError::AllocationFailed)?;
+        let mut storage = guard.buffer();
+        for (ordinal, definition) in self.definitions.iter().enumerate() {
+            let index = ProviderOutputIndex {
+                registry_id: self.id,
+                ordinal,
+            };
+            let Some(segments) = credentials.value_segments(index) else {
+                continue;
+            };
+            let (destination, rendering) = match definition {
+                ProviderOutputDefinition::Bearer { .. } => {
+                    (AUTHORIZATION, StagedProviderRendering::Bearer)
+                }
+                ProviderOutputDefinition::Basic { username, .. } => (
+                    AUTHORIZATION,
+                    StagedProviderRendering::Basic(username.clone()),
+                ),
+                ProviderOutputDefinition::CustomHeader { header, .. } => {
+                    (header.clone(), StagedProviderRendering::Custom)
+                }
+            };
+            if !destinations.insert(destination.clone()) {
+                return Err(ProviderCredentialInjectionError::DuplicateDestination);
+            }
+            let start = storage.len();
+            let mut length = 0usize;
+            for segment in segments {
+                length = length
+                    .checked_add(segment.len())
+                    .filter(|length| *length <= MAX_PROVIDER_CREDENTIAL_BYTES)
+                    .ok_or(ProviderCredentialInjectionError::InvalidCredential)?;
+                if !valid_header_value_bytes(segment) {
+                    return Err(ProviderCredentialInjectionError::InvalidCredential);
+                }
+                storage
+                    .try_extend_from_slice(segment)
+                    .map_err(|_| ProviderCredentialInjectionError::AllocationFailed)?;
+            }
+            if length == 0 {
+                return Err(ProviderCredentialInjectionError::InvalidCredential);
+            }
+            staged.push(StagedProviderHeader {
+                destination,
+                rendering,
+                range: ProcessEffectRange {
+                    start,
+                    end: storage.len(),
+                },
+            });
+        }
+
+        Ok(StagedProviderCredentialMutation {
+            headers: staged,
+            storage: storage.finish(),
+        })
+    }
+}
+
+pub(crate) struct StagedProviderCredentialMutation {
+    headers: Vec<StagedProviderHeader>,
+    storage: GuardedBody,
+}
+
+struct StagedProviderHeader {
+    destination: HeaderName,
+    rendering: StagedProviderRendering,
+    range: ProcessEffectRange,
+}
+
+enum StagedProviderRendering {
+    Bearer,
+    Basic(String),
+    Custom,
+}
+
+impl StagedProviderCredentialMutation {
+    pub(crate) fn apply(
+        self,
+        headers: &mut HeaderMap,
+    ) -> Result<(), ProviderCredentialInjectionError> {
+        let additional = self
+            .headers
+            .iter()
+            .filter(|header| !headers.contains_key(&header.destination))
+            .count();
+        headers
+            .try_reserve(additional)
+            .map_err(|_| ProviderCredentialInjectionError::AllocationFailed)?;
+        let mut mutations = Vec::new();
+        mutations
+            .try_reserve_exact(self.headers.len())
+            .map_err(|_| ProviderCredentialInjectionError::AllocationFailed)?;
+        for header in &self.headers {
+            let mut raw = Zeroizing::new(Vec::new());
+            raw.try_reserve_exact(header.range.end - header.range.start)
+                .map_err(|_| ProviderCredentialInjectionError::AllocationFailed)?;
+            for segment in ProcessEffectSegments::new(&self.storage, header.range) {
+                raw.extend_from_slice(segment);
+            }
+            let rendered = match &header.rendering {
+                StagedProviderRendering::Bearer => {
+                    let mut rendered = Zeroizing::new(Vec::new());
+                    let rendered_len = 7usize
+                        .checked_add(raw.len())
+                        .ok_or(ProviderCredentialInjectionError::AllocationFailed)?;
+                    rendered
+                        .try_reserve_exact(rendered_len)
+                        .map_err(|_| ProviderCredentialInjectionError::AllocationFailed)?;
+                    rendered.extend_from_slice(b"Bearer ");
+                    rendered.extend_from_slice(&raw);
+                    rendered
+                }
+                StagedProviderRendering::Basic(username) => {
+                    let mut plain = Zeroizing::new(Vec::new());
+                    let plain_len = username
+                        .len()
+                        .checked_add(1)
+                        .and_then(|len| len.checked_add(raw.len()))
+                        .ok_or(ProviderCredentialInjectionError::AllocationFailed)?;
+                    plain
+                        .try_reserve_exact(plain_len)
+                        .map_err(|_| ProviderCredentialInjectionError::AllocationFailed)?;
+                    plain.extend_from_slice(username.as_bytes());
+                    plain.push(b':');
+                    plain.extend_from_slice(&raw);
+                    let encoded_len = base64_encoded_len(plain.len(), true)
+                        .ok_or(ProviderCredentialInjectionError::AllocationFailed)?;
+                    let rendered_len = 6usize
+                        .checked_add(encoded_len)
+                        .ok_or(ProviderCredentialInjectionError::AllocationFailed)?;
+                    let mut rendered = Zeroizing::new(Vec::new());
+                    rendered
+                        .try_reserve_exact(rendered_len)
+                        .map_err(|_| ProviderCredentialInjectionError::AllocationFailed)?;
+                    rendered.resize(rendered_len, 0);
+                    rendered[..6].copy_from_slice(b"Basic ");
+                    BASE64_STANDARD
+                        .encode_slice(&plain, &mut rendered[6..])
+                        .map_err(|_| ProviderCredentialInjectionError::InvalidCredential)?;
+                    rendered
+                }
+                StagedProviderRendering::Custom => raw,
+            };
+            let mut value = HeaderValue::from_bytes(&rendered)
+                .map_err(|_| ProviderCredentialInjectionError::InvalidCredential)?;
+            value.set_sensitive(true);
+            mutations.push((header.destination.clone(), value));
+        }
+        for (destination, value) in mutations {
+            headers.insert(destination, value);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.headers.len()
+    }
+}
+
+impl fmt::Debug for StagedProviderCredentialMutation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StagedProviderCredentialMutation")
+            .field("header_count", &self.headers.len())
+            .field("charged_bytes", &self.storage.charged_bytes())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum ProviderCredentialInjectionError {
+    #[error("authorization provider is not active")]
+    UnknownProvider,
+    #[error("authorization credentials belong to another provider registry")]
+    ForeignRegistry,
+    #[error("authorization provider outputs target the same header")]
+    DuplicateDestination,
+    #[error("authorization provider returned invalid credential material")]
+    InvalidCredential,
+    #[error("authorization credential injection allocation failed")]
+    AllocationFailed,
 }
 
 impl fmt::Debug for ProviderOutputRegistry {
@@ -153,29 +354,83 @@ impl fmt::Debug for ProviderOutputRegistry {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct ContiguousProviderCredentials {
     registry_id: u64,
     values: Box<[Option<SecretBytes>]>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ProcessEffectRange {
+    pub(super) start: usize,
+    pub(super) end: usize,
+}
+
+pub(crate) struct ProcessProviderCredentials {
+    registry_id: u64,
+    values: Box<[Option<ProcessEffectRange>]>,
+    storage: Arc<GuardedBody>,
+}
+
+impl ProcessProviderCredentials {
+    pub(super) fn new(
+        registry_id: u64,
+        values: Box<[Option<ProcessEffectRange>]>,
+        storage: Arc<GuardedBody>,
+    ) -> Self {
+        Self {
+            registry_id,
+            values,
+            storage,
+        }
+    }
+
+    fn get(&self, index: ProviderOutputIndex) -> Option<ProcessEffectSegments<'_>> {
+        let range = self
+            .values
+            .get(index.get())
+            .filter(|_| self.registry_id == index.registry_id())
+            .and_then(|range| *range)?;
+        Some(ProcessEffectSegments::new(&self.storage, range))
+    }
+}
+
 pub(crate) enum ProviderCredentialSet {
+    #[cfg(test)]
     Contiguous(ContiguousProviderCredentials),
     Segmented(crate::authorization::callback::CallbackCredentialSet),
+    ProcessSegmented(ProcessProviderCredentials),
 }
 
 impl ProviderCredentialSet {
-    pub(crate) fn contiguous(&self, index: ProviderOutputIndex) -> Option<&[u8]> {
-        let Self::Contiguous(credentials) = self else {
-            return None;
-        };
-        if index.registry_id != credentials.registry_id {
-            return None;
+    pub(crate) fn registry_id(&self) -> u64 {
+        match self {
+            #[cfg(test)]
+            Self::Contiguous(credentials) => credentials.registry_id,
+            Self::Segmented(credentials) => credentials.registry_id(),
+            Self::ProcessSegmented(credentials) => credentials.registry_id,
         }
-        credentials
-            .values
-            .get(index.get())
-            .and_then(Option::as_ref)
-            .map(SecretBytes::as_bytes)
+    }
+
+    pub(crate) fn contiguous(&self, index: ProviderOutputIndex) -> Option<&[u8]> {
+        #[cfg(not(test))]
+        let _ = index;
+        #[cfg(test)]
+        {
+            let Self::Contiguous(credentials) = self else {
+                return None;
+            };
+            if index.registry_id != credentials.registry_id {
+                return None;
+            }
+            credentials
+                .values
+                .get(index.get())
+                .and_then(Option::as_ref)
+                .map(SecretBytes::as_bytes)
+        }
+        #[cfg(not(test))]
+        None
     }
 
     pub(crate) fn segmented(
@@ -183,7 +438,9 @@ impl ProviderCredentialSet {
         index: ProviderOutputIndex,
     ) -> Option<crate::authorization::callback::CallbackCredentialSegments<'_>> {
         match self {
+            #[cfg(test)]
             Self::Contiguous(_) => None,
+            Self::ProcessSegmented(_) => None,
             Self::Segmented(credentials) => credentials.get(index),
         }
     }
@@ -193,11 +450,51 @@ impl ProviderCredentialSet {
     ) -> Self {
         Self::Segmented(credentials)
     }
+
+    pub(super) fn from_process_segmented(credentials: ProcessProviderCredentials) -> Self {
+        Self::ProcessSegmented(credentials)
+    }
+
+    fn value_segments(&self, index: ProviderOutputIndex) -> Option<ProviderCredentialSegments<'_>> {
+        match self {
+            #[cfg(test)]
+            Self::Contiguous(_) => self
+                .contiguous(index)
+                .map(|value| ProviderCredentialSegments::Contiguous(Some(value))),
+            Self::Segmented(credentials) => credentials
+                .get(index)
+                .map(ProviderCredentialSegments::Callback),
+            Self::ProcessSegmented(credentials) => credentials
+                .get(index)
+                .map(ProviderCredentialSegments::Process),
+        }
+    }
+}
+
+enum ProviderCredentialSegments<'a> {
+    #[cfg(test)]
+    Contiguous(Option<&'a [u8]>),
+    Callback(crate::authorization::callback::CallbackCredentialSegments<'a>),
+    Process(ProcessEffectSegments<'a>),
+}
+
+impl<'a> Iterator for ProviderCredentialSegments<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            #[cfg(test)]
+            Self::Contiguous(value) => value.take(),
+            Self::Callback(segments) => segments.next(),
+            Self::Process(segments) => segments.next(),
+        }
+    }
 }
 
 impl fmt::Debug for ProviderCredentialSet {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(test)]
             Self::Contiguous(credentials) => formatter
                 .debug_struct("ProviderCredentialSet")
                 .field("representation", &"contiguous")
@@ -216,14 +513,74 @@ impl fmt::Debug for ProviderCredentialSet {
                 .field("representation", &"segmented")
                 .field("credentials", credentials)
                 .finish(),
+            Self::ProcessSegmented(credentials) => formatter
+                .debug_struct("ProviderCredentialSet")
+                .field("representation", &"process-segmented")
+                .field("count", &credentials.values.len())
+                .field(
+                    "present_count",
+                    &credentials
+                        .values
+                        .iter()
+                        .filter(|value| value.is_some())
+                        .count(),
+                )
+                .field("charged_bytes", &credentials.storage.charged_bytes())
+                .finish(),
         }
+    }
+}
+
+pub(super) struct ProcessEffectSegments<'a> {
+    segments: crate::safety::wire_body::GuardedBodySegments<'a>,
+    skip: usize,
+    remaining: usize,
+}
+
+impl<'a> ProcessEffectSegments<'a> {
+    pub(super) fn new(storage: &'a GuardedBody, range: ProcessEffectRange) -> Self {
+        Self {
+            segments: storage.segments(),
+            skip: range.start,
+            remaining: range.end - range.start,
+        }
+    }
+}
+
+impl<'a> Iterator for ProcessEffectSegments<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.remaining != 0 {
+            let segment = self.segments.next()?;
+            if self.skip >= segment.len() {
+                self.skip -= segment.len();
+                continue;
+            }
+            let available = &segment[self.skip..];
+            self.skip = 0;
+            let length = available.len().min(self.remaining);
+            self.remaining -= length;
+            return Some(&available[..length]);
+        }
+        None
     }
 }
 
 pub(crate) struct ProviderBodyReplacement {
     content_type: Option<String>,
     content_encoding: Option<String>,
-    bytes: GuardedBody,
+    storage: ProviderBodyReplacementStorage,
+}
+
+enum ProviderBodyReplacementStorage {
+    #[cfg(test)]
+    Decoded(GuardedBody),
+    Encoded {
+        body: Arc<GuardedBody>,
+        range: ProcessEffectRange,
+        max_decoded_bytes: usize,
+    },
 }
 
 impl ProviderBodyReplacement {
@@ -235,8 +592,49 @@ impl ProviderBodyReplacement {
         self.content_encoding.as_deref()
     }
 
-    pub(crate) fn segments(&self) -> impl Iterator<Item = &[u8]> {
-        self.bytes.segments()
+    #[cfg(test)]
+    pub(crate) fn decoded_segments(&self) -> Option<impl Iterator<Item = &[u8]>> {
+        match &self.storage {
+            #[cfg(test)]
+            ProviderBodyReplacementStorage::Decoded(bytes) => Some(bytes.segments()),
+            ProviderBodyReplacementStorage::Encoded { .. } => None,
+        }
+    }
+
+    pub(super) fn from_encoded(
+        content_type: Option<String>,
+        content_encoding: Option<String>,
+        body: Arc<GuardedBody>,
+        range: ProcessEffectRange,
+        max_decoded_bytes: usize,
+    ) -> Self {
+        Self {
+            content_type,
+            content_encoding,
+            storage: ProviderBodyReplacementStorage::Encoded {
+                body,
+                range,
+                max_decoded_bytes,
+            },
+        }
+    }
+
+    pub(crate) fn decode(
+        self,
+        guard: &HttpWireBodyGuard,
+    ) -> Result<(Option<String>, Option<String>, GuardedBody), AssignedResponseError> {
+        let decoded = match self.storage {
+            #[cfg(test)]
+            ProviderBodyReplacementStorage::Decoded(bytes) => guard
+                .transfer_body(bytes)
+                .map_err(|_| AssignedResponseError::InvalidBody)?,
+            ProviderBodyReplacementStorage::Encoded {
+                body,
+                range,
+                max_decoded_bytes,
+            } => decode_guarded_base64_range(guard, &body, range, max_decoded_bytes)?,
+        };
+        Ok((self.content_type, self.content_encoding, decoded))
     }
 }
 
@@ -244,8 +642,78 @@ impl fmt::Debug for ProviderBodyReplacement {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ProviderBodyReplacement")
-            .field("bytes", &self.bytes.len())
+            .field(
+                "encoded",
+                &matches!(self.storage, ProviderBodyReplacementStorage::Encoded { .. }),
+            )
             .finish_non_exhaustive()
+    }
+}
+
+fn decode_guarded_base64_range(
+    guard: &HttpWireBodyGuard,
+    storage: &GuardedBody,
+    range: ProcessEffectRange,
+    max_decoded_bytes: usize,
+) -> Result<GuardedBody, AssignedResponseError> {
+    let mut decoded = guard.buffer();
+    let encoded = ProcessEffectReader::new(storage, range);
+    let mut decoder = DecoderReader::new(encoded, &BASE64_STANDARD);
+    let mut scratch = guard
+        .stream_scratch()
+        .map_err(|_| AssignedResponseError::InvalidBody)?;
+    loop {
+        let read = decoder
+            .read(scratch.writable())
+            .map_err(|_| AssignedResponseError::InvalidBody)?;
+        if read == 0 {
+            break;
+        }
+        scratch.set_initialized(read);
+        if decoded
+            .len()
+            .checked_add(read)
+            .is_none_or(|len| len > max_decoded_bytes)
+        {
+            return Err(AssignedResponseError::InvalidBody);
+        }
+        decoded
+            .try_extend_from_slice(scratch.as_slice())
+            .map_err(|_| AssignedResponseError::InvalidBody)?;
+        scratch.reset();
+    }
+    Ok(decoded.finish())
+}
+
+struct ProcessEffectReader<'a> {
+    segments: ProcessEffectSegments<'a>,
+    current: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> ProcessEffectReader<'a> {
+    fn new(storage: &'a GuardedBody, range: ProcessEffectRange) -> Self {
+        Self {
+            segments: ProcessEffectSegments::new(storage, range),
+            current: &[],
+            offset: 0,
+        }
+    }
+}
+
+impl Read for ProcessEffectReader<'_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        while self.offset == self.current.len() {
+            let Some(segment) = self.segments.next() else {
+                return Ok(0);
+            };
+            self.current = segment;
+            self.offset = 0;
+        }
+        let copied = output.len().min(self.current.len() - self.offset);
+        output[..copied].copy_from_slice(&self.current[self.offset..self.offset + copied]);
+        self.offset += copied;
+        Ok(copied)
     }
 }
 
@@ -258,6 +726,7 @@ pub(crate) enum ProviderDecision {
     Pass,
 }
 
+#[cfg(test)]
 pub(crate) enum ResponseClassification {
     Assigned {
         id: String,
@@ -266,12 +735,32 @@ pub(crate) enum ResponseClassification {
     Unassignable(UnassignableResponseError),
 }
 
+#[cfg(test)]
 pub(crate) enum BodyReplacementAdmission<'a> {
     Denied,
     Allowed {
-        guard: &'a HttpWireBodyGuard,
+        guard: &'a dyn BodyReplacementGuard,
         max_decoded_bytes: usize,
     },
+}
+
+#[cfg(test)]
+pub(crate) trait BodyReplacementGuard {
+    fn replacement_buffer(&self) -> crate::safety::wire_body::GuardedBodyBuilder;
+}
+
+#[cfg(test)]
+impl BodyReplacementGuard for HttpWireBodyGuard {
+    fn replacement_buffer(&self) -> crate::safety::wire_body::GuardedBodyBuilder {
+        self.buffer()
+    }
+}
+
+#[cfg(test)]
+impl BodyReplacementGuard for crate::safety::ProviderResponseCharge {
+    fn replacement_buffer(&self) -> crate::safety::wire_body::GuardedBodyBuilder {
+        self.buffer()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -920,8 +1409,6 @@ where
     Ok(Some(byte))
 }
 
-// Schema reference only. Production response handling stops at the guarded
-// continuation state above and must not materialize a full stdout line.
 #[cfg(test)]
 fn parse_response(
     line: &str,
@@ -1053,7 +1540,6 @@ fn bind_output_values(
     ))
 }
 
-#[cfg(test)]
 fn valid_header_value_bytes(bytes: &[u8]) -> bool {
     bytes
         .iter()
@@ -1426,7 +1912,7 @@ impl CapturedBody {
         if encoded.len() > max_encoded_len {
             return Err(AssignedResponseError::InvalidBody);
         }
-        let mut decoded = guard.buffer();
+        let mut decoded = guard.replacement_buffer();
         let mut decoder = DecoderReader::new(encoded.as_bytes(), &BASE64_STANDARD);
         let mut scratch = [0u8; PROVIDER_STREAM_SCRATCH_BYTES];
         loop {
@@ -1455,7 +1941,7 @@ impl CapturedBody {
         Ok(ProviderBodyReplacement {
             content_type,
             content_encoding,
-            bytes: decoded.finish(),
+            storage: ProviderBodyReplacementStorage::Decoded(decoded.finish()),
         })
     }
 }
@@ -1476,7 +1962,7 @@ fn validate_content_metadata(
 }
 
 fn valid_canonical_content_encoding(value: &str) -> bool {
-    matches!(value, "identity" | "gzip" | "deflate" | "br" | "zstd")
+    value == "identity"
 }
 
 #[cfg(test)]
@@ -1595,8 +2081,10 @@ fn invalid_body() -> CapturedBody {
     }
 }
 
+#[cfg(test)]
 struct SecretBytes(Vec<u8>);
 
+#[cfg(test)]
 impl SecretBytes {
     fn as_bytes(&self) -> &[u8] {
         &self.0
@@ -1615,6 +2103,7 @@ impl SecretBytes {
     }
 }
 
+#[cfg(test)]
 impl Drop for SecretBytes {
     fn drop(&mut self) {
         self.0.zeroize();
@@ -1677,6 +2166,17 @@ mod tests {
             "token".to_string(),
             ProviderOutputPlan::Bearer { required },
         )]))
+    }
+
+    fn staging_guard() -> HttpWireBodyGuard {
+        let peak = crate::safety::wire_body::guarded_body_allocation_bytes(
+            2 * MAX_PROVIDER_CREDENTIAL_BYTES,
+        )
+        .unwrap();
+        WireBodyPool::new(peak, peak).begin_for_test(
+            peak,
+            WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::LOCALHOST), |_| false),
+        )
     }
 
     fn assigned_result(
@@ -2250,6 +2750,127 @@ mod tests {
     }
 
     #[test]
+    fn contiguous_credentials_inject_atomically_with_typed_sensitive_headers() {
+        let outputs = ProviderOutputRegistry::activate(BTreeMap::from([
+            (
+                "password".to_string(),
+                ProviderOutputPlan::Basic {
+                    username: "agent".to_string(),
+                    required: true,
+                },
+            ),
+            (
+                "trace".to_string(),
+                ProviderOutputPlan::CustomHeader {
+                    header: HeaderName::from_static("x-trace-token"),
+                    required: true,
+                },
+            ),
+        ]));
+        let ProviderDecision::Allow { credentials, .. } = assigned_result(
+            r#"{"id":"request-1","type":"response","decision":"allow","values":{"password":"secret-password","trace":"secret-trace"}}"#,
+            &outputs,
+            false,
+        )
+        .unwrap()
+        else {
+            panic!("expected allow");
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-preserved", HeaderValue::from_static("original"));
+        let credential_charge = crate::safety::wire_body::guarded_body_allocation_bytes(1).unwrap();
+        let peak = 2 * credential_charge;
+        let pool = WireBodyPool::new(peak, peak);
+        let quota_key = WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::LOCALHOST), |_| false);
+        let guard = pool.begin_for_test(peak, quota_key.clone());
+        let staged = outputs.stage_credentials(&credentials, &guard).unwrap();
+
+        assert_eq!(staged.len(), 2);
+        assert!(headers.get(AUTHORIZATION).is_none());
+        assert_eq!(pool.global_charge(), credential_charge);
+        assert_eq!(pool.quota_charge(&quota_key), credential_charge);
+        let debug = format!("{staged:?}");
+        assert!(!debug.contains("secret-password"));
+        assert!(!debug.contains("secret-trace"));
+
+        staged.apply(&mut headers).unwrap();
+
+        assert_eq!(
+            headers.get(AUTHORIZATION).unwrap(),
+            "Basic YWdlbnQ6c2VjcmV0LXBhc3N3b3Jk"
+        );
+        assert_eq!(headers.get("x-trace-token").unwrap(), "secret-trace");
+        assert_eq!(headers.get("x-preserved").unwrap(), "original");
+        assert!(headers.get(AUTHORIZATION).unwrap().is_sensitive());
+        assert!(headers.get("x-trace-token").unwrap().is_sensitive());
+        assert_eq!(pool.global_charge(), 0);
+        assert_eq!(pool.quota_charge(&quota_key), 0);
+    }
+
+    #[test]
+    fn foreign_or_conflicting_credentials_leave_headers_unchanged_and_errors_secret_safe() {
+        let first = outputs(true);
+        let second = outputs(true);
+        let ProviderDecision::Allow { credentials, .. } = assigned_result(
+            r#"{"id":"request-1","type":"response","decision":"allow","values":{"token":"secret-marker"}}"#,
+            &first,
+            false,
+        )
+        .unwrap()
+        else {
+            panic!("expected allow");
+        };
+        let headers = HeaderMap::from_iter([(
+            HeaderName::from_static("x-preserved"),
+            HeaderValue::from_static("original"),
+        )]);
+        let before = headers.clone();
+        let error = second
+            .stage_credentials(&credentials, &staging_guard())
+            .unwrap_err();
+        assert_eq!(error, ProviderCredentialInjectionError::ForeignRegistry);
+        assert_eq!(headers, before);
+        assert!(!format!("{error:?} {error}").contains("secret-marker"));
+
+        let conflicting = ProviderOutputRegistry::activate(BTreeMap::from([
+            (
+                "first".to_string(),
+                ProviderOutputPlan::CustomHeader {
+                    header: HeaderName::from_static("x-conflict"),
+                    required: true,
+                },
+            ),
+            (
+                "second".to_string(),
+                ProviderOutputPlan::CustomHeader {
+                    header: HeaderName::from_static("x-conflict"),
+                    required: true,
+                },
+            ),
+        ]));
+        let ProviderDecision::Allow { credentials, .. } = assigned_result(
+            r#"{"id":"request-1","type":"response","decision":"allow","values":{"first":"secret-one","second":"secret-two"}}"#,
+            &conflicting,
+            false,
+        )
+        .unwrap()
+        else {
+            panic!("expected allow");
+        };
+        let error = conflicting
+            .stage_credentials(&credentials, &staging_guard())
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ProviderCredentialInjectionError::DuplicateDestination
+        );
+        assert_eq!(headers, before);
+        let rendered = format!("{error:?} {error}");
+        assert!(!rendered.contains("secret-one"));
+        assert!(!rendered.contains("secret-two"));
+    }
+
+    #[test]
     fn assigned_shape_rejects_v2_fields_and_duplicate_non_id_fields() {
         let outputs = outputs(false);
         assert!(matches!(
@@ -2340,7 +2961,8 @@ mod tests {
         };
         assert_eq!(
             replacement
-                .segments()
+                .decoded_segments()
+                .unwrap()
                 .flatten()
                 .copied()
                 .collect::<Vec<_>>(),

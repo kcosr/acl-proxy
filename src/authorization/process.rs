@@ -15,12 +15,12 @@ use tokio::task::JoinHandle;
 use tokio::time::{self, Instant};
 
 use super::process_response::{
-    read_decision_only_response, DecisionOnlyProviderDecision, DecisionOnlyResponse,
-    DecisionOnlyResponseSchema,
+    read_process_response, DecisionOnlyProviderDecision, ProcessResponse, ProcessResponseSchema,
 };
 use super::protocol::{
-    read_provider_response_prefix, DirectProviderStdout, ProviderRequest, RequestStreamError,
-    PROCESS_PROVIDER_CORRELATION_ID_BYTES,
+    read_provider_response_prefix, DirectProviderStdout, ProviderBodyReplacement,
+    ProviderCredentialSet, ProviderDecision, ProviderOutputRegistry, ProviderRequest,
+    RequestStreamError, PROCESS_PROVIDER_CORRELATION_ID_BYTES,
 };
 use crate::config::compiler::{CompiledProviderFailureMode, ProcessProviderPlan};
 use crate::runtime::{BoxFuture, CleanupReason, GenerationOwner, PublicationGuard, RuntimeError};
@@ -35,10 +35,11 @@ pub(crate) struct ProcessProvider {
 
 struct Inner {
     spawn: SpawnConfig,
-    response_schema: DecisionOnlyResponseSchema,
+    response_schema: ProcessResponseSchema,
     failure_mode: CompiledProviderFailureMode,
     include_headers: Box<[HeaderName]>,
     include_request_body: bool,
+    max_request_body_bytes: usize,
     max_decoded_request_body_bytes: usize,
     timeout: Duration,
     max_stdout_line_bytes: usize,
@@ -91,7 +92,7 @@ enum Phase {
 }
 
 struct PendingRequest {
-    response: oneshot::Sender<Result<DecisionOnlyProviderDecision, ProcessRequestError>>,
+    response: oneshot::Sender<Result<ProcessDecision, ProcessRequestError>>,
     response_charge: ProviderResponseCharge,
     completed: Arc<AtomicBool>,
     request_deadline: Instant,
@@ -170,8 +171,6 @@ pub(crate) struct ProcessPublicationGuard<'provider> {
 
 #[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum ProcessActivationError {
-    #[error("process provider requires unsupported response capabilities")]
-    UnsupportedCapabilities,
     #[error("process-provider activation was cancelled")]
     Cancelled,
     #[error("process provider could not be started")]
@@ -196,9 +195,12 @@ pub(crate) enum ProcessRequestError {
     Timeout,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ProcessDecision {
     Allow,
+    AllowWithOutputs {
+        credentials: Option<ProviderCredentialSet>,
+        replacement: Option<ProviderBodyReplacement>,
+    },
     Deny,
     Pass,
 }
@@ -208,8 +210,7 @@ impl ProcessProvider {
         plan: ProcessProviderPlan,
         mut is_cancelled: impl FnMut() -> bool,
     ) -> Result<Arc<Self>, ProcessActivationError> {
-        let response_schema = DecisionOnlyResponseSchema::activate(&plan)
-            .ok_or(ProcessActivationError::UnsupportedCapabilities)?;
+        let response_schema = ProcessResponseSchema::activate(&plan);
         let ProcessProviderPlan {
             command,
             working_directory,
@@ -222,7 +223,7 @@ impl ProcessProvider {
             include_headers,
             include_request_body,
             allow_request_body_replacement,
-            max_request_body_bytes: _,
+            max_request_body_bytes,
             max_decoded_request_body_bytes,
             max_stdout_line_bytes,
             max_pending_requests,
@@ -263,6 +264,7 @@ impl ProcessProvider {
             failure_mode: on_failure,
             include_headers: include_headers.into_boxed_slice(),
             include_request_body,
+            max_request_body_bytes,
             max_decoded_request_body_bytes,
             timeout,
             max_stdout_line_bytes,
@@ -329,6 +331,14 @@ impl ProcessProvider {
         self.inner.max_decoded_request_body_bytes
     }
 
+    pub(crate) fn max_request_body_bytes(&self) -> usize {
+        self.inner.max_request_body_bytes
+    }
+
+    pub(crate) fn outputs(&self) -> Option<&ProviderOutputRegistry> {
+        self.inner.response_schema.outputs()
+    }
+
     pub(crate) async fn decide(
         &self,
         request: ProviderRequest<'_>,
@@ -350,7 +360,7 @@ impl ProcessProvider {
             Err(_) => return Err(ProcessRequestError::Timeout),
         };
         let result = match time::timeout_at(operation_deadline, receiver).await {
-            Ok(Ok(result)) => result.map(ProcessDecision::from),
+            Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(ProcessRequestError::Unavailable),
             Err(_) => Err(ProcessRequestError::Timeout),
         };
@@ -365,7 +375,7 @@ impl ProcessProvider {
         request_deadline: Instant,
     ) -> Result<
         (
-            oneshot::Receiver<Result<DecisionOnlyProviderDecision, ProcessRequestError>>,
+            oneshot::Receiver<Result<ProcessDecision, ProcessRequestError>>,
             RequestCancellationGuard,
         ),
         ProcessRequestError,
@@ -841,7 +851,7 @@ async fn run_reader(inner: Arc<Inner>, epoch: u64, stdout: ChildStdout) {
             inner.report_fatal(epoch);
             return;
         };
-        let parsed = read_decision_only_response(
+        let parsed = read_process_response(
             &mut stdout,
             continuation,
             &pending.response_charge,
@@ -860,10 +870,13 @@ async fn run_reader(inner: Arc<Inner>, epoch: u64, stdout: ChildStdout) {
                 }
                 pending.completed.store(true, Ordering::Release);
                 match response {
-                    DecisionOnlyResponse::Decision(decision) => {
-                        let _ = pending.response.send(Ok(decision));
+                    ProcessResponse::DecisionOnly(decision) => {
+                        let _ = pending.response.send(Ok(ProcessDecision::from(decision)));
                     }
-                    DecisionOnlyResponse::AssignedFailure(_) => {
+                    ProcessResponse::Expanded(decision) => {
+                        let _ = pending.response.send(Ok(ProcessDecision::from(decision)));
+                    }
+                    ProcessResponse::AssignedFailure(_) => {
                         let _ = pending
                             .response
                             .send(Err(ProcessRequestError::InvalidResponse));
@@ -896,6 +909,54 @@ impl From<DecisionOnlyProviderDecision> for ProcessDecision {
         }
     }
 }
+
+impl From<ProviderDecision> for ProcessDecision {
+    fn from(value: ProviderDecision) -> Self {
+        match value {
+            ProviderDecision::Allow {
+                credentials,
+                replacement,
+            } => Self::AllowWithOutputs {
+                credentials: Some(credentials),
+                replacement,
+            },
+            ProviderDecision::Deny => Self::Deny,
+            ProviderDecision::Pass => Self::Pass,
+        }
+    }
+}
+
+impl fmt::Debug for ProcessDecision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Allow => formatter.write_str("Allow"),
+            Self::AllowWithOutputs {
+                credentials,
+                replacement,
+            } => formatter
+                .debug_struct("Allow")
+                .field("credentials", credentials)
+                .field("replacement", replacement)
+                .finish(),
+            Self::Deny => formatter.write_str("Deny"),
+            Self::Pass => formatter.write_str("Pass"),
+        }
+    }
+}
+
+impl PartialEq for ProcessDecision {
+    fn eq(&self, other: &Self) -> bool {
+        matches!(
+            (self, other),
+            (Self::Allow, Self::Allow)
+                | (Self::AllowWithOutputs { .. }, Self::AllowWithOutputs { .. })
+                | (Self::Deny, Self::Deny)
+                | (Self::Pass, Self::Pass)
+        )
+    }
+}
+
+impl Eq for ProcessDecision {}
 
 impl Inner {
     fn assign_pending_response(&self, epoch: u64, id: &str) -> Option<PendingRequest> {
@@ -1495,6 +1556,15 @@ mod tests {
         )
     }
 
+    fn body_guard_with_pool() -> (Arc<WireBodyPool>, HttpWireBodyGuard) {
+        let pool = WireBodyPool::new(8 * 1024 * 1024, 8 * 1024 * 1024);
+        let guard = pool.clone().begin_for_test(
+            2 * 1024 * 1024,
+            WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::LOCALHOST), |_| false),
+        );
+        (pool, guard)
+    }
+
     fn commit(provider: &ProcessProvider) {
         let mut guard = provider.publication_guard().unwrap();
         guard.commit();
@@ -2048,31 +2118,247 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn activation_rejects_outputs_and_replacement_but_accepts_request_bodies() {
+    async fn activation_accepts_strict_process_provider_capabilities() {
         let directory = TempDir::new().unwrap();
         let script = write_python(&directory, "raise SystemExit(0)\n");
 
-        let mut with_output = plan(&directory, &script);
-        with_output.outputs.insert(
+        let mut candidate = plan(&directory, &script);
+        candidate.outputs.insert(
             "credential".to_string(),
             ProviderOutputPlan::Bearer { required: false },
         );
-        let mut with_replacement = plan(&directory, &script);
-        with_replacement.allow_request_body_replacement = true;
-        let mut with_body = plan(&directory, &script);
-        with_body.include_request_body = true;
+        candidate.allow_request_body_replacement = true;
+        candidate.include_request_body = true;
 
-        for candidate in [with_output, with_replacement] {
-            assert_eq!(
-                ProcessProvider::activate(candidate, || false)
-                    .await
-                    .unwrap_err(),
-                ProcessActivationError::UnsupportedCapabilities
-            );
-        }
-        let provider = ProcessProvider::activate(with_body, || false)
+        let provider = ProcessProvider::activate(candidate, || false)
             .await
-            .expect("body inclusion uses the guarded request protocol");
+            .expect("strict capabilities use the guarded request and response protocols");
+        cleanup(&provider).await;
+    }
+
+    #[tokio::test]
+    async fn expanded_response_binds_required_outputs_and_replacement() {
+        let directory = TempDir::new().unwrap();
+        let script = write_python(
+            &directory,
+            r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    response = {
+        "id": request["id"],
+        "type": "response",
+        "decision": "allow",
+        "values": {"token": "secret-marker"},
+        "requestBody": {
+            "encoding": "base64",
+            "contentType": "application/json",
+            "data": "e30="
+        }
+    }
+    print(json.dumps(response, separators=(",", ":")), flush=True)
+"#,
+        );
+        let mut provider_plan = plan(&directory, &script);
+        provider_plan.outputs.insert(
+            "token".to_string(),
+            ProviderOutputPlan::Bearer { required: true },
+        );
+        provider_plan.allow_request_body_replacement = true;
+        let provider = ProcessProvider::activate(provider_plan, || false)
+            .await
+            .unwrap();
+        commit(&provider);
+
+        let (pool, guard) = body_guard_with_pool();
+        let decision = provider
+            .decide(request("expanded"), &guard, request_deadline())
+            .await
+            .unwrap();
+        let ProcessDecision::AllowWithOutputs {
+            credentials: Some(credentials),
+            replacement: Some(replacement),
+        } = decision
+        else {
+            panic!("expected typed credentials and replacement");
+        };
+        drop(credentials);
+        assert_eq!(replacement.content_type(), Some("application/json"));
+        let (_, _, replacement) = replacement.decode(&guard).unwrap();
+        assert_eq!(
+            replacement
+                .segments()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
+            b"{}"
+        );
+        drop(replacement);
+        assert_eq!(pool.global_charge(), 0);
+        cleanup(&provider).await;
+    }
+
+    #[tokio::test]
+    async fn expanded_response_rejects_missing_output_and_invalid_replacement_without_fallback() {
+        for (name, response, max_decoded_bytes) in [
+            (
+                "missing-output",
+                r#"{"type":"response","decision":"allow"}"#,
+                1024,
+            ),
+            (
+                "malformed-replacement",
+                r#"{"type":"response","decision":"allow","values":{"token":"present"},"requestBody":{"encoding":"base64","data":"%%%"}}"#,
+                1024,
+            ),
+            (
+                "oversized-replacement",
+                r#"{"type":"response","decision":"allow","values":{"token":"present"},"requestBody":{"encoding":"base64","data":"e30="}}"#,
+                1,
+            ),
+            (
+                "noncanonical-base64-tail-bits",
+                r#"{"type":"response","decision":"allow","values":{"token":"present"},"requestBody":{"encoding":"base64","data":"Zh=="}}"#,
+                1024,
+            ),
+            (
+                "wrong-body-container",
+                r#"{"type":"response","decision":"allow","values":{"token":"present"},"requestBody":[]}"#,
+                1024,
+            ),
+            (
+                "compressed-replacement",
+                r#"{"type":"response","decision":"allow","values":{"token":"present"},"requestBody":{"encoding":"base64","contentEncoding":"zstd","data":"e30="}}"#,
+                1024,
+            ),
+        ] {
+            let directory = TempDir::new().unwrap();
+            let response_literal = serde_json::to_string(response).unwrap();
+            let source = format!(
+                "import json, sys\nfor line in sys.stdin:\n request=json.loads(line)\n response={{'id':request['id']}}\n response.update(json.loads({response_literal}))\n print(json.dumps(response, separators=(',', ':')), flush=True)\n"
+            );
+            let script = write_python(&directory, &source);
+            let mut provider_plan = plan(&directory, &script);
+            provider_plan.outputs.insert(
+                "token".to_string(),
+                ProviderOutputPlan::Bearer { required: true },
+            );
+            provider_plan.allow_request_body_replacement = true;
+            provider_plan.max_decoded_request_body_bytes = max_decoded_bytes;
+            let provider = ProcessProvider::activate(provider_plan, || false)
+                .await
+                .unwrap();
+            commit(&provider);
+
+            let (pool, guard) = body_guard_with_pool();
+            assert_eq!(
+                provider
+                    .decide(request(name), &guard, request_deadline())
+                    .await,
+                Err(ProcessRequestError::InvalidResponse),
+                "{name} must terminate as an invalid provider response"
+            );
+            assert_eq!(pool.global_charge(), 0, "{name} leaked guarded bytes");
+            cleanup(&provider).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn expanded_assigned_shape_failure_does_not_restart_the_child() {
+        let directory = TempDir::new().unwrap();
+        let script = write_python(
+            &directory,
+            r#"import json, sys
+count = 0
+for line in sys.stdin:
+    request = json.loads(line)
+    if count == 0:
+        print('{"id":"%s","type":"response","decision":"allow","unknown":{"nested":[1,{"ok":true}]}}' % request["id"], flush=True)
+    else:
+        print('{"id":"%s","type":"response","decision":"allow","values":{"token":"second-ok"}}' % request["id"], flush=True)
+    count += 1
+"#,
+        );
+        let mut provider_plan = plan(&directory, &script);
+        provider_plan.outputs.insert(
+            "token".to_string(),
+            ProviderOutputPlan::Bearer { required: true },
+        );
+        let provider = ProcessProvider::activate(provider_plan, || false)
+            .await
+            .unwrap();
+        commit(&provider);
+        let (pool, guard) = body_guard_with_pool();
+
+        assert_eq!(
+            provider
+                .decide(request("invalid-assigned"), &guard, request_deadline())
+                .await,
+            Err(ProcessRequestError::InvalidResponse)
+        );
+        let second = provider
+            .decide(request("same-child"), &guard, request_deadline())
+            .await
+            .unwrap();
+        assert!(matches!(second, ProcessDecision::AllowWithOutputs { .. }));
+        drop(second);
+        assert_eq!(pool.global_charge(), 0);
+        cleanup(&provider).await;
+    }
+
+    #[tokio::test]
+    async fn expanded_response_decodes_segmented_json_escapes_with_identity() {
+        let directory = TempDir::new().unwrap();
+        let script = write_python(
+            &directory,
+            r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    print('{"id":"%s" , "type" : "response" , "decision" : "allow" , "values" : { "token" : "sec\\u0072et" } , "requestBody" : { "encoding" : "base64" , "contentType" : "text/plain" , "contentEncoding" : "identity" , "data" : "e3\\u0030=" }}' % request["id"], flush=True)
+"#,
+        );
+        let mut provider_plan = plan(&directory, &script);
+        provider_plan.outputs.insert(
+            "token".to_string(),
+            ProviderOutputPlan::Bearer { required: true },
+        );
+        provider_plan.allow_request_body_replacement = true;
+        let provider = ProcessProvider::activate(provider_plan, || false)
+            .await
+            .unwrap();
+        commit(&provider);
+        let (pool, guard) = body_guard_with_pool();
+        let ProcessDecision::AllowWithOutputs {
+            credentials,
+            replacement: Some(replacement),
+        } = provider
+            .decide(request("escaped"), &guard, request_deadline())
+            .await
+            .unwrap()
+        else {
+            panic!("escaped guarded effects must be accepted");
+        };
+        let credentials = credentials.unwrap();
+        let mut headers = http::HeaderMap::new();
+        provider
+            .outputs()
+            .unwrap()
+            .stage_credentials(&credentials, &guard)
+            .unwrap()
+            .apply(&mut headers)
+            .unwrap();
+        assert_eq!(
+            headers.get(http::header::AUTHORIZATION).unwrap(),
+            "Bearer secret"
+        );
+        drop(credentials);
+        assert_eq!(replacement.content_encoding(), Some("identity"));
+        let (_, _, decoded) = replacement.decode(&guard).unwrap();
+        assert_eq!(
+            decoded.segments().flatten().copied().collect::<Vec<_>>(),
+            b"{}"
+        );
+        drop(decoded);
+        assert_eq!(pool.global_charge(), 0);
         cleanup(&provider).await;
     }
 
