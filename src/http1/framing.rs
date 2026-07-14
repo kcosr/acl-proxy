@@ -543,4 +543,68 @@ mod tests {
             Ok(BodyProgress::Complete)
         );
     }
+
+    #[test]
+    fn malformed_and_truncated_framing_errors_are_exact() {
+        let cases: &[(BodyFraming, &[u8], bool, FramingError)] = &[
+            (
+                BodyFraming::Chunked,
+                b"z\r\n",
+                false,
+                FramingError::MalformedChunkLine,
+            ),
+            (
+                BodyFraming::Chunked,
+                b"1;name=\"unterminated\r\n",
+                false,
+                FramingError::MalformedChunkLine,
+            ),
+            (
+                BodyFraming::Chunked,
+                b"1;=x\r\n",
+                false,
+                FramingError::MalformedChunkLine,
+            ),
+            (
+                BodyFraming::Chunked,
+                b"1\r\nxXY",
+                false,
+                FramingError::MalformedChunkTerminator,
+            ),
+            (
+                BodyFraming::Chunked,
+                b"2\r\nx",
+                true,
+                FramingError::UnexpectedEndOfStream,
+            ),
+            (
+                BodyFraming::Chunked,
+                b"1",
+                true,
+                FramingError::UnexpectedEndOfStream,
+            ),
+            (
+                BodyFraming::Chunked,
+                b"0\r\n\r",
+                true,
+                FramingError::UnexpectedEndOfStream,
+            ),
+            (
+                BodyFraming::ContentLength(2),
+                b"x",
+                true,
+                FramingError::UnexpectedEndOfStream,
+            ),
+        ];
+        for (framing, wire, end_of_stream, expected) in cases {
+            let mut store = ParserStore::try_new().unwrap();
+            store.append(wire).unwrap();
+            let mut framer = BodyFramer::new(*framing);
+            assert_eq!(
+                framer.process(&mut store, *end_of_stream, |_| Ok::<_, ()>(())),
+                Err(FramingProcessError::Framing(*expected)),
+                "{wire:?}"
+            );
+        }
+    }
 }

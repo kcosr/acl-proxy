@@ -689,8 +689,10 @@ impl std::error::Error for DestinationResolveError {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::task::{Context, Poll};
 
     use super::*;
 
@@ -761,6 +763,7 @@ mod tests {
     struct FakeStream {
         peer: SocketAddr,
         dropped: Arc<AtomicBool>,
+        bytes_written: Arc<AtomicUsize>,
     }
 
     impl Drop for FakeStream {
@@ -769,11 +772,30 @@ mod tests {
         }
     }
 
+    impl tokio::io::AsyncWrite for FakeStream {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            buffer: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.bytes_written.fetch_add(buffer.len(), Ordering::SeqCst);
+            Poll::Ready(Ok(buffer.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
     struct FakeConnector {
         actions: Mutex<VecDeque<ConnectAction>>,
         attempts: Mutex<Vec<SocketAddr>>,
         dropped: Arc<AtomicBool>,
-        bytes_written: AtomicUsize,
+        bytes_written: Arc<AtomicUsize>,
     }
 
     impl FakeConnector {
@@ -782,7 +804,7 @@ mod tests {
                 actions: Mutex::new(actions.into_iter().collect()),
                 attempts: Mutex::new(Vec::new()),
                 dropped: Arc::new(AtomicBool::new(false)),
-                bytes_written: AtomicUsize::new(0),
+                bytes_written: Arc::new(AtomicUsize::new(0)),
             }
         }
     }
@@ -799,9 +821,14 @@ mod tests {
                 .pop_front()
                 .expect("connect action");
             let dropped = Arc::clone(&self.dropped);
+            let bytes_written = Arc::clone(&self.bytes_written);
             Box::pin(async move {
                 match action {
-                    ConnectAction::Success(peer) => Ok(FakeStream { peer, dropped }),
+                    ConnectAction::Success(peer) => Ok(FakeStream {
+                        peer,
+                        dropped,
+                        bytes_written,
+                    }),
                     ConnectAction::Failure(kind) => {
                         Err(io::Error::new(kind, "injected connect failure"))
                     }
@@ -1075,6 +1102,62 @@ mod tests {
             guard.resolve(target(DestinationRoute::Direct, 443)).await,
             Err(DestinationGuardError::LocalAddressEnumeration(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn pre_dial_local_address_enumeration_failure_denies_without_dial() {
+        let candidate = endpoint("192.0.2.41:443");
+        let guard = guard(
+            facts([], None),
+            Arc::new(FixedResolver::new([candidate])),
+            [
+                LocalStep::Addresses(vec![]),
+                LocalStep::Failure(io::ErrorKind::PermissionDenied),
+            ],
+        );
+        let resolved = guard
+            .resolve(target(DestinationRoute::Direct, 443))
+            .await
+            .expect("initial local enumeration succeeds");
+        let connector = FakeConnector::new([ConnectAction::Success(candidate)]);
+
+        assert!(matches!(
+            guard.connect(resolved, &connector).await,
+            Err(DestinationGuardError::LocalAddressEnumeration(_))
+        ));
+        assert!(connector.attempts.lock().expect("attempt lock").is_empty());
+        assert!(!connector.dropped.load(Ordering::SeqCst));
+        assert_eq!(connector.bytes_written.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn post_connect_local_address_enumeration_failure_closes_before_bytes() {
+        let candidate = endpoint("192.0.2.42:443");
+        let guard = guard(
+            facts([], None),
+            Arc::new(FixedResolver::new([candidate])),
+            [
+                LocalStep::Addresses(vec![]),
+                LocalStep::Addresses(vec![]),
+                LocalStep::Failure(io::ErrorKind::PermissionDenied),
+            ],
+        );
+        let resolved = guard
+            .resolve(target(DestinationRoute::Direct, 443))
+            .await
+            .expect("initial local enumeration succeeds");
+        let connector = FakeConnector::new([ConnectAction::Success(candidate)]);
+
+        assert!(matches!(
+            guard.connect(resolved, &connector).await,
+            Err(DestinationGuardError::LocalAddressEnumeration(_))
+        ));
+        assert_eq!(
+            *connector.attempts.lock().expect("attempt lock"),
+            vec![candidate]
+        );
+        assert!(connector.dropped.load(Ordering::SeqCst));
+        assert_eq!(connector.bytes_written.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

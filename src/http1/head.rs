@@ -20,10 +20,20 @@ pub(crate) enum RequestMethod {
     Other,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct RequestTarget {
     bytes: [u8; MAX_REQUEST_TARGET_BYTES],
     len: usize,
+}
+
+impl fmt::Debug for RequestTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RequestTarget")
+            .field("bytes", &"<elided>")
+            .field("len", &self.len)
+            .finish()
+    }
 }
 
 impl RequestTarget {
@@ -501,6 +511,143 @@ mod tests {
             parse_request_head(&mut store),
             Err(HeadError::RequestTargetTooLong)
         );
+    }
+
+    #[test]
+    fn request_anti_smuggling_and_metadata_matrix_is_exact() {
+        let cases: &[(&[u8], HeadError)] = &[
+            (
+                b"POST / HTTP/1.1\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n",
+                HeadError::DuplicateContentLength,
+            ),
+            (
+                b"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
+                HeadError::DuplicateTransferEncoding,
+            ),
+            (
+                b"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n",
+                HeadError::UnsupportedTransferCoding,
+            ),
+            (
+                b"POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+                HeadError::ConflictingFraming,
+            ),
+            (
+                b"POST / HTTP/1.1\r\nUpgrade: websocket\r\n\r\n",
+                HeadError::UpgradeOrTrailersForbidden,
+            ),
+            (
+                b"POST / HTTP/1.1\r\nConnection: keep-alive, Upgrade\r\n\r\n",
+                HeadError::UpgradeOrTrailersForbidden,
+            ),
+            (b"POST / HTTP/1.0\r\n\r\n", HeadError::Http11Required),
+            (
+                b"POST / HTTP/1.1\r\nContent-Length: 18446744073709551616\r\n\r\n",
+                HeadError::ArithmeticOverflow,
+            ),
+        ];
+        for (wire, expected) in cases {
+            let mut store = ParserStore::try_new().unwrap();
+            store.append(wire).unwrap();
+            assert_eq!(parse_request_head(&mut store), Err(*expected), "{wire:?}");
+        }
+
+        let mut full_unterminated = ParserStore::try_new().unwrap();
+        full_unterminated
+            .append(&vec![b'a'; PARSER_STORE_BYTES])
+            .unwrap();
+        assert_eq!(
+            parse_request_head(&mut full_unterminated),
+            Err(HeadError::HeadTooLarge)
+        );
+
+        let mut store = ParserStore::try_new().unwrap();
+        store
+            .append(
+                b"POST / HTTP/1.1\r\nContent-Type: application/json; charset=utf-8\r\nContent-Encoding: gzip\r\nExpect: 100-continue\r\nContent-Length: 0\r\n\r\n",
+            )
+            .unwrap();
+        let HeadParse::Complete(other_media) = parse_request_head(&mut store).unwrap() else {
+            panic!("metadata request was incomplete");
+        };
+        assert_eq!(other_media.content_type, ContentType::Other);
+        assert!(other_media.content_encoding_present);
+        assert!(other_media.expect_present);
+
+        store.wipe();
+        store
+            .append(
+                b"POST / HTTP/1.1\r\nContent-Type: application/json\r\nContent-Type: application/json\r\nContent-Length: 0\r\n\r\n",
+            )
+            .unwrap();
+        let HeadParse::Complete(multiple_media) = parse_request_head(&mut store).unwrap() else {
+            panic!("multiple media-type request was incomplete");
+        };
+        assert_eq!(multiple_media.content_type, ContentType::Multiple);
+        assert!(!multiple_media.content_encoding_present);
+        assert!(!multiple_media.expect_present);
+    }
+
+    #[test]
+    fn acknowledgement_response_rejection_matrix_is_exact() {
+        let cases: &[(&[u8], HeadError)] = &[
+            (
+                b"HTTP/1.1 100 Continue\r\n\r\n",
+                HeadError::InterimResponseForbidden,
+            ),
+            (b"HTTP/1.0 200 OK\r\n\r\n", HeadError::Http11Required),
+            (
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                HeadError::InterimResponseForbidden,
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nUpgrade: websocket\r\n\r\n",
+                HeadError::UpgradeOrTrailersForbidden,
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nConnection: keep-alive, upgrade\r\n\r\n",
+                HeadError::UpgradeOrTrailersForbidden,
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\n",
+                HeadError::DuplicateContentLength,
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
+                HeadError::DuplicateTransferEncoding,
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n",
+                HeadError::UnsupportedTransferCoding,
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+                HeadError::ConflictingFraming,
+            ),
+        ];
+        for (wire, expected) in cases {
+            let mut store = ParserStore::try_new().unwrap();
+            store.append(wire).unwrap();
+            assert_eq!(parse_response_head(&mut store), Err(*expected), "{wire:?}");
+        }
+
+        let mut full_unterminated = ParserStore::try_new().unwrap();
+        full_unterminated
+            .append(&vec![b'a'; PARSER_STORE_BYTES])
+            .unwrap();
+        assert_eq!(
+            parse_response_head(&mut full_unterminated),
+            Err(HeadError::HeadTooLarge)
+        );
+    }
+
+    #[test]
+    fn request_target_debug_output_elides_wire_bytes() {
+        let target = RequestTarget::new(b"/secret-bearing-target").unwrap();
+        let rendered = format!("{target:?}");
+        assert!(rendered.contains("<elided>"));
+        assert!(rendered.contains("22"));
+        assert!(!rendered.contains("secret-bearing-target"));
     }
 
     #[test]
