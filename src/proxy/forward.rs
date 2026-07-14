@@ -1467,7 +1467,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn h2_ingress_translates_to_h1_across_direct_and_parent_routes() {
+    async fn origin_protocol_translation_matrix() {
         for route in [
             TranslationRoute::DirectClear,
             TranslationRoute::DirectTls,
@@ -1478,34 +1478,8 @@ mod tests {
         ] {
             assert_protocol_translation(route, Version::HTTP_2, vec![CompiledHttpVersion::Http1])
                 .await;
-        }
-    }
-
-    #[tokio::test]
-    async fn h1_ingress_translates_to_h2_across_direct_and_parent_routes() {
-        for route in [
-            TranslationRoute::DirectClear,
-            TranslationRoute::DirectTls,
-            TranslationRoute::HttpParentClearOrigin,
-            TranslationRoute::HttpsParentClearOrigin,
-            TranslationRoute::HttpParentTlsOrigin,
-            TranslationRoute::HttpsParentTlsOrigin,
-        ] {
             assert_protocol_translation(route, Version::HTTP_11, vec![CompiledHttpVersion::Http2])
                 .await;
-        }
-    }
-
-    #[tokio::test]
-    async fn enabled_ingress_protocol_is_preserved_across_direct_and_parent_routes() {
-        for route in [
-            TranslationRoute::DirectClear,
-            TranslationRoute::DirectTls,
-            TranslationRoute::HttpParentClearOrigin,
-            TranslationRoute::HttpsParentClearOrigin,
-            TranslationRoute::HttpParentTlsOrigin,
-            TranslationRoute::HttpsParentTlsOrigin,
-        ] {
             for ingress in [Version::HTTP_11, Version::HTTP_2] {
                 assert_protocol_translation(
                     route,
