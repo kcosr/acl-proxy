@@ -1514,7 +1514,36 @@ mod tests {
         let provider = ProcessProvider::activate(plan(&directory, &script), || false)
             .await
             .unwrap();
-        time::sleep(Duration::from_millis(50)).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let exit_observed = {
+                let mut state = lock(&provider.inner.state);
+                if !state.available {
+                    true
+                } else {
+                    let child = state
+                        .child
+                        .as_mut()
+                        .expect("available candidate must retain its child");
+                    observe_child_exit(child)
+                        .expect("candidate child exit observation must remain available")
+                }
+            };
+            if exit_observed {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let state = lock(&provider.inner.state);
+                panic!(
+                    "candidate child did not exit before publication test deadline; \
+                     phase={:?}, available={}, child_id={:?}",
+                    state.phase,
+                    state.available,
+                    state.child.as_ref().and_then(Child::id),
+                );
+            }
+            time::sleep(CHILD_EXIT_POLL_INTERVAL).await;
+        }
 
         let error = match provider.publication_guard() {
             Ok(_) => panic!("exited candidate passed publication"),
