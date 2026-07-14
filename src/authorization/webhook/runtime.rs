@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::{oneshot, Notify};
 
@@ -11,9 +11,10 @@ use super::provider::WebhookProvider;
 use super::request::{WebhookRequest, WebhookRequestError};
 use super::transport::{connect_and_deliver, WebhookDeliveryError};
 use crate::authorization::callback::{
-    PendingCapabilityStore, PendingDeadline, PendingTerminalCause, PendingTerminalResult,
+    CallbackResponseDecision, PendingCapabilityStore, PendingDeadline, PendingTerminalCause,
+    PendingTerminalResult,
 };
-use crate::authorization::protocol::ProviderDecision;
+use crate::authorization::protocol::{ProviderCredentialSet, ProviderDecision};
 use crate::config::compiler::AuthorizationCallbackPlan;
 use crate::config::StaticProductConfig;
 use crate::destination::{DestinationFacts, DestinationGuard, DestinationGuardError};
@@ -27,6 +28,7 @@ pub(crate) struct WebhookAuthorizationRuntime {
     destination: DestinationGuard,
     pending: PendingCapabilityStore<PendingWebhookOperation>,
     callback_url: Option<CanonicalUrl>,
+    accepting: Mutex<bool>,
 }
 
 pub(crate) struct PendingWebhookOperation {
@@ -55,8 +57,8 @@ struct DeliveryTeardownInner {
 pub(crate) enum WebhookCompletionError {
     #[error("webhook callback response was invalid")]
     InvalidResponse,
-    #[error("webhook operation ended before a callback response")]
-    Terminal,
+    #[error("webhook operation ended before a callback response: {0:?}")]
+    Terminal(PendingTerminalCause),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -91,6 +93,12 @@ pub(crate) enum WebhookDispatchError {
     Callback(#[from] WebhookCompletionError),
     #[error("webhook callback completion channel closed")]
     CompletionClosed,
+    #[error("webhook pending operation store failed")]
+    StorePoisoned,
+    #[error("webhook authorization admission is closed")]
+    AdmissionClosed,
+    #[error("webhook authorization admission gate failed")]
+    AdmissionPoisoned,
 }
 
 impl WebhookAuthorizationRuntime {
@@ -111,6 +119,7 @@ impl WebhookAuthorizationRuntime {
             destination: DestinationGuard::system(DestinationFacts::from_static(static_config)?),
             pending: PendingCapabilityStore::new(),
             callback_url,
+            accepting: Mutex::new(true),
         }))
     }
 
@@ -132,6 +141,7 @@ impl WebhookAuthorizationRuntime {
             destination,
             pending: PendingCapabilityStore::new(),
             callback_url: callback_url.map(|url| canonicalize_http_url(url).unwrap()),
+            accepting: Mutex::new(true),
         })
     }
 
@@ -145,12 +155,27 @@ impl WebhookAuthorizationRuntime {
         self.transport.counts()
     }
 
-    pub(crate) fn begin_transport_shutdown(&self) {
+    pub(crate) fn begin_shutdown(&self, drain_deadline: Option<tokio::time::Instant>) {
+        let mut accepting = self
+            .accepting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *accepting = false;
         self.transport.begin_shutdown();
+        self.pending.begin_shutdown(drain_deadline);
     }
 
-    pub(crate) async fn wait_for_transport_shutdown(&self) {
+    pub(crate) async fn wait_until_drained(&self) {
         self.transport.wait_until_empty().await;
+        self.pending.wait_until_empty().await;
+    }
+
+    pub(crate) fn final_cancel_all(&self, cause: PendingTerminalCause) {
+        for terminal in self.pending.final_cancel_all(cause) {
+            let cause = terminal.cause();
+            let payload = terminal.into_payload();
+            payload.complete(Err(WebhookCompletionError::Terminal(cause)));
+        }
     }
 
     pub(crate) fn destination_guard(&self) -> &DestinationGuard {
@@ -173,45 +198,62 @@ impl WebhookAuthorizationRuntime {
         guard: &HttpWireBodyGuard,
         request_deadline: tokio::time::Instant,
     ) -> Result<ProviderDecision, WebhookDispatchError> {
-        let transport = self.try_acquire_transport()?;
-        let callback_url = self
-            .callback_url()
-            .ok_or(WebhookDispatchError::CallbackUnavailable)?;
-        let (rule_id, request, retention) = context.into_webhook_parts()?;
-        let request = WebhookRequest {
-            request_id: request.request_id,
-            rule_id,
-            url: request.url,
-            method: request.method,
-            client_ip: request.client_ip,
-            headers: request.headers,
-        };
-        let prepared = request.prepare(&callback_url.url, provider.max_request_bytes(), guard)?;
-
         let dispatch_start = tokio::time::Instant::now();
-        let deadline = PendingDeadline::earliest(
-            dispatch_start,
-            request_deadline,
-            provider.timeout(),
-            callback.resume_token_ttl,
-        );
-        let teardown = DeliveryTeardown::new();
-        let teardown_guard = teardown.completion_guard();
-        let (completion, receiver) = oneshot::channel();
-        let payload = PendingWebhookOperation::new(
-            retention,
-            provider.clone(),
-            guard.provider_response_charge(),
-            teardown,
-            completion,
-        );
-        let admission = self
-            .pending
-            .try_admit(callback.max_pending_operations, deadline, payload)
-            .map_err(|_| WebhookDispatchError::PendingAdmission)?;
-        let (token, operation) = admission.into_parts();
-        let request_body = prepared.finish(&token)?;
-        drop(token);
+        let (transport, deadline, teardown_guard, receiver, operation, request_body) = {
+            let accepting = self
+                .accepting
+                .lock()
+                .map_err(|_| WebhookDispatchError::AdmissionPoisoned)?;
+            if !*accepting {
+                return Err(WebhookDispatchError::AdmissionClosed);
+            }
+            let transport = self.try_acquire_transport()?;
+            let callback_url = self
+                .callback_url()
+                .ok_or(WebhookDispatchError::CallbackUnavailable)?;
+            let (rule_id, request, retention) = context.into_webhook_parts()?;
+            let request = WebhookRequest {
+                request_id: request.request_id,
+                rule_id,
+                url: request.url,
+                method: request.method,
+                client_ip: request.client_ip,
+                headers: request.headers,
+            };
+            let prepared =
+                request.prepare(&callback_url.url, provider.max_request_bytes(), guard)?;
+            let deadline = PendingDeadline::earliest(
+                dispatch_start,
+                request_deadline,
+                provider.timeout(),
+                callback.resume_token_ttl,
+            );
+            let teardown = DeliveryTeardown::new();
+            let teardown_guard = teardown.completion_guard();
+            let (completion, receiver) = oneshot::channel();
+            let payload = PendingWebhookOperation::new(
+                retention,
+                provider.clone(),
+                guard.provider_response_charge(),
+                teardown,
+                completion,
+            );
+            let admission = self
+                .pending
+                .try_admit(callback.max_pending_operations, deadline, payload)
+                .map_err(|_| WebhookDispatchError::PendingAdmission)?;
+            let (token, operation) = admission.into_parts();
+            let request_body = prepared.finish(&token)?;
+            drop(token);
+            (
+                transport,
+                deadline,
+                teardown_guard,
+                receiver,
+                operation,
+                request_body,
+            )
+        };
 
         let signal = operation.signal_handle();
         let cancellation_signal = signal.clone();
@@ -280,9 +322,8 @@ async fn terminal_delivery_result(
             Err(error)
         }
         PendingTerminalResult::ClaimOwns { .. } => await_callback(operation, receiver).await,
-        PendingTerminalResult::AlreadyTerminal | PendingTerminalResult::Poisoned => {
-            await_callback(operation, receiver).await
-        }
+        PendingTerminalResult::AlreadyTerminal => await_callback(operation, receiver).await,
+        PendingTerminalResult::Poisoned => Err(WebhookDispatchError::StorePoisoned),
     }
 }
 
@@ -294,7 +335,9 @@ async fn await_callback(
         biased;
         result = &mut receiver => {
             drop(operation);
-            result.map_err(|_| WebhookDispatchError::CompletionClosed)?.map_err(Into::into)
+            result
+                .map_err(|_| WebhookDispatchError::CompletionClosed)?
+                .map_err(map_completion_error)
         }
         terminal = operation.expire_at_deadline() => {
             match terminal {
@@ -304,13 +347,20 @@ async fn await_callback(
                     Err(WebhookDispatchError::Terminal(cause))
                 }
                 PendingTerminalResult::ClaimOwns { .. }
-                | PendingTerminalResult::AlreadyTerminal
-                | PendingTerminalResult::Poisoned => receiver
+                | PendingTerminalResult::AlreadyTerminal => receiver
                     .await
                     .map_err(|_| WebhookDispatchError::CompletionClosed)?
-                    .map_err(Into::into),
+                    .map_err(map_completion_error),
+                PendingTerminalResult::Poisoned => Err(WebhookDispatchError::StorePoisoned),
             }
         }
+    }
+}
+
+fn map_completion_error(error: WebhookCompletionError) -> WebhookDispatchError {
+    match error {
+        WebhookCompletionError::Terminal(cause) => WebhookDispatchError::Terminal(cause),
+        other => WebhookDispatchError::Callback(other),
     }
 }
 
@@ -347,11 +397,20 @@ impl PendingWebhookOperation {
         self.delivery_teardown.wait().await;
     }
 
-    pub(crate) fn complete(
-        self,
-        result: Result<ProviderDecision, WebhookCompletionError>,
-    ) -> Result<(), Result<ProviderDecision, WebhookCompletionError>> {
-        self.completion.send(result)
+    pub(crate) fn complete(self, result: Result<ProviderDecision, WebhookCompletionError>) -> bool {
+        self.completion.send(result).is_ok()
+    }
+
+    pub(crate) fn complete_callback(self, decision: CallbackResponseDecision) -> bool {
+        let decision = match decision {
+            CallbackResponseDecision::Allow(credentials) => ProviderDecision::Allow {
+                credentials: ProviderCredentialSet::from_segmented(credentials),
+                replacement: None,
+            },
+            CallbackResponseDecision::Deny => ProviderDecision::Deny,
+            CallbackResponseDecision::Pass => ProviderDecision::Pass,
+        };
+        self.complete(Ok(decision))
     }
 }
 

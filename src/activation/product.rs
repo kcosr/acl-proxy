@@ -1,59 +1,46 @@
 use std::sync::Arc;
 
-use crate::authorization::webhook::runtime::{
-    WebhookAuthorizationRuntime, WebhookAuthorizationRuntimeError,
-};
 use crate::authorization::{
     AuthorizationActivation, AuthorizationActivationError, ProductAuthorizationSnapshot,
 };
 use crate::config::compiler::ReloadableProductPlan;
-use crate::config::{StaticFingerprint, StaticFingerprintError, StaticProductConfig};
+use crate::config::StaticFingerprint;
 use crate::credentials::CredentialResolverSnapshot;
 use crate::egress::{EgressActivationError, EgressSnapshot};
-use crate::observation::ProductObservationRuntime;
 use crate::policy::CompiledPolicySnapshot;
 use crate::redaction::{RedactionSnapshot, SnapshotError};
 use crate::runtime::{
     ActivatedGeneration, ActivationCancellation, BoxFuture, CandidateActivator, CleanupReason,
     GenerationId, GenerationOwner, ProviderRegistry, RuntimeError,
 };
-use crate::safety::{ProductSafetySnapshot, WireBodyPool};
+use crate::safety::ProductSafetySnapshot;
 
 use super::owner::ProductGenerationOwner;
+use super::static_resources::ProductStaticResources;
 
 /// Process-lifetime factory for complete generation candidates.
 ///
 /// Static admission pools are shared by every active, candidate, and retiring
 /// generation. Every other handle returned by activation is generation-owned.
 pub(crate) struct ProductActivator {
-    static_fingerprint: StaticFingerprint,
-    wire_body_pool: Arc<WireBodyPool>,
-    observation_runtime: Arc<ProductObservationRuntime>,
-    authorization_runtime: Arc<WebhookAuthorizationRuntime>,
+    static_resources: Arc<ProductStaticResources>,
 }
 
 impl ProductActivator {
-    pub(crate) fn new(static_config: &StaticProductConfig) -> Result<Self, ProductActivatorError> {
-        let static_fingerprint = StaticFingerprint::from_config(static_config)?;
-        Ok(Self {
-            static_fingerprint,
-            wire_body_pool: WireBodyPool::new(
-                static_config.service.max_inflight_wire_body_bytes,
-                static_config
-                    .service
-                    .max_inflight_wire_body_bytes_per_quota_key,
-            ),
-            observation_runtime: Arc::new(ProductObservationRuntime::new()),
-            authorization_runtime: WebhookAuthorizationRuntime::try_new(static_config)?,
-        })
+    pub(super) fn new(static_resources: Arc<ProductStaticResources>) -> Self {
+        Self { static_resources }
     }
 
-    pub(crate) fn observation_runtime_handle(&self) -> Arc<ProductObservationRuntime> {
-        self.observation_runtime.clone()
+    pub(crate) fn observation_runtime_handle(
+        &self,
+    ) -> Arc<crate::observation::ProductObservationRuntime> {
+        self.static_resources.observation_runtime()
     }
 
-    pub(crate) fn authorization_runtime_handle(&self) -> Arc<WebhookAuthorizationRuntime> {
-        self.authorization_runtime.clone()
+    pub(crate) fn authorization_runtime_handle(
+        &self,
+    ) -> Arc<crate::authorization::webhook::runtime::WebhookAuthorizationRuntime> {
+        self.static_resources.authorization_runtime()
     }
 
     async fn activate_generation(
@@ -125,13 +112,14 @@ impl ProductActivator {
             safety,
             &resource_plan,
             policy.wire_body_plan_brand(),
-            self.wire_body_pool.clone(),
+            self.static_resources.wire_body_pool(),
         )
         .map_err(|error| candidate_error(&cancellation, "safety", error.to_string()))?;
         cancellation.check()?;
 
         let observation = self
-            .observation_runtime
+            .static_resources
+            .observation_runtime()
             .activate(observation, &redaction)
             .map_err(|error| candidate_error(&cancellation, "observation", error.to_string()))?;
         cancellation.check()?;
@@ -148,7 +136,7 @@ impl ProductActivator {
         let authorization = ProductAuthorizationSnapshot::activate(
             authorization,
             provider_registry,
-            self.authorization_runtime.clone(),
+            self.static_resources.authorization_runtime(),
             cancellation.clone(),
         )
         .await
@@ -189,17 +177,13 @@ impl ProductActivator {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum ProductActivatorError {
-    #[error("static fingerprint derivation failed")]
-    StaticFingerprint(#[from] StaticFingerprintError),
-    #[error("static authorization runtime construction failed")]
-    Authorization(#[from] WebhookAuthorizationRuntimeError),
-}
-
 impl CandidateActivator for ProductActivator {
+    fn static_resource_brand(&self) -> &crate::runtime::StaticResourceBrand {
+        self.static_resources.static_resource_brand()
+    }
+
     fn static_fingerprint(&self) -> &StaticFingerprint {
-        &self.static_fingerprint
+        self.static_resources.static_fingerprint()
     }
 
     fn activate(
@@ -315,13 +299,47 @@ header = "x-acl-proxy-request-id"
         .expect("test configuration compiles")
     }
 
+    fn product_activator(
+        static_config: &crate::config::StaticProductConfig,
+    ) -> Arc<ProductActivator> {
+        let resources = ProductStaticResources::try_new(static_config).unwrap();
+        resources.activator()
+    }
+
+    #[tokio::test]
+    async fn product_static_owner_and_activator_share_one_authorization_runtime() {
+        let compiled = compile(MINIMAL);
+        let resources = ProductStaticResources::try_new(&compiled.static_config).unwrap();
+        let activator = resources.activator();
+        assert!(Arc::ptr_eq(
+            &resources.authorization_runtime(),
+            &activator.authorization_runtime_handle()
+        ));
+
+        crate::runtime::StaticResources::begin_shutdown(resources.as_ref());
+        assert!(
+            !resources
+                .authorization_runtime()
+                .transport_counts()
+                .accepting
+        );
+        assert!(
+            !resources
+                .authorization_runtime()
+                .pending_store()
+                .counts()
+                .accepting
+        );
+        crate::runtime::StaticResources::shutdown(resources.as_ref()).await;
+    }
+
     #[tokio::test]
     async fn complete_candidate_uses_static_pools_and_commits_capture_limit_at_publication() {
         let text = format!(
             "{MINIMAL}\n[redaction.profiles.audit]\nrules = [{{ literals = [\"marker\"] }}]\n\n[observation.capture]\nevents = [\"request.denied\"]\nredaction_profile = \"audit\"\ndirectory = \"captures\"\nmax_body_bytes = 1024\nmax_inflight_body_bytes = 8192\n"
         );
         let compiled = compile(&text);
-        let activator = ProductActivator::new(&compiled.static_config).unwrap();
+        let activator = product_activator(&compiled.static_config);
         let observation_runtime = activator.observation_runtime_handle();
 
         let activated = activator
@@ -364,7 +382,7 @@ header = "x-acl-proxy-request-id"
     #[tokio::test]
     async fn pre_cancelled_candidate_has_no_publication_effect() {
         let compiled = compile(MINIMAL);
-        let activator = ProductActivator::new(&compiled.static_config).unwrap();
+        let activator = product_activator(&compiled.static_config);
         let observation_runtime = activator.observation_runtime_handle();
         let cancellation = ActivationCancellation::new_for_test();
         cancellation.cancel_for_test();
@@ -404,7 +422,7 @@ default = "deny""#,
             config_root: directory.path(),
         })
         .unwrap();
-        let activator = ProductActivator::new(&compiled.static_config).unwrap();
+        let activator = product_activator(&compiled.static_config);
 
         let activated = activator
             .activate_generation(
@@ -448,7 +466,7 @@ default = "deny""#,
             config_root: directory.path(),
         })
         .unwrap();
-        let activator = ProductActivator::new(&compiled.static_config).unwrap();
+        let activator = product_activator(&compiled.static_config);
         let cancellation = ActivationCancellation::new_for_test();
         let hook_cancellation = cancellation.clone();
         let observed = Arc::new(Mutex::new(None));
@@ -510,7 +528,7 @@ default = "deny""#
             ),
         );
         let compiled = compile(&text);
-        let activator = ProductActivator::new(&compiled.static_config).unwrap();
+        let activator = product_activator(&compiled.static_config);
 
         let result = activator
             .activate_generation(
@@ -536,8 +554,8 @@ default = "deny""#
         );
         let first_config = compile(&text);
         let second_config = compile(&text);
-        let first = ProductActivator::new(&first_config.static_config).unwrap();
-        let second = ProductActivator::new(&second_config.static_config).unwrap();
+        let first = product_activator(&first_config.static_config);
+        let second = product_activator(&second_config.static_config);
         let first_observation = first.observation_runtime_handle();
         let second_observation = second.observation_runtime_handle();
         let first_authorization = first.authorization_runtime_handle();

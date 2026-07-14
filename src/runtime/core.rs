@@ -26,6 +26,19 @@ pub(crate) enum LifecycleState {
     Stopped = 4,
 }
 
+#[derive(Clone)]
+pub(crate) struct StaticResourceBrand(Arc<()>);
+
+impl StaticResourceBrand {
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(()))
+    }
+
+    pub(crate) fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 impl LifecycleState {
     fn from_raw(value: u8) -> Self {
         match value {
@@ -40,6 +53,8 @@ impl LifecycleState {
 }
 
 pub(crate) trait StaticResources: Send + Sync {
+    fn brand(&self) -> &StaticResourceBrand;
+
     /// Returns the readiness state owned by these exact listener resources.
     fn readiness(&self) -> &Arc<ServiceReadiness>;
 
@@ -48,8 +63,9 @@ pub(crate) trait StaticResources: Send + Sync {
     /// callback ingress needed to drain pending operations remains available.
     fn begin_shutdown(&self);
 
-    /// Performs the final control-ingress close and task joins after every
-    /// generation has retired and pending operations have drained.
+    /// Supervises static ingress and handler drain concurrently with generation
+    /// retirement. It must release every request-owned generation retention and
+    /// complete all task joins, but must not wait for generation-owner cleanup.
     fn shutdown(&self) -> BoxFuture<'_, ()>;
 }
 
@@ -203,6 +219,16 @@ impl Runtime {
             return reject_runtime_construction(
                 static_ownership,
                 RuntimeError::ActivatorStaticFingerprintMismatch,
+            );
+        }
+        if !static_ownership
+            .resources
+            .brand()
+            .same_instance(activator.static_resource_brand())
+        {
+            return reject_runtime_construction(
+                static_ownership,
+                RuntimeError::ActivatorStaticResourceMismatch,
             );
         }
         let runtime = Arc::new(Self {
@@ -648,6 +674,8 @@ impl Runtime {
         if let Some(cancellation) = self.current_cancellation.lock().unwrap().as_ref() {
             cancellation.cancel();
         }
+        let static_resources = self.static_ownership.resources.clone();
+        let static_shutdown = tokio::spawn(async move { static_resources.shutdown().await });
 
         let _activation = self.activation.lock().await;
         if let Some(active) = self.active.swap(None) {
@@ -655,7 +683,11 @@ impl Runtime {
             self.schedule_retirement(retirement).await;
         }
         self.wait_for_retirements().await;
-        self.static_ownership.resources.shutdown().await;
+        match static_shutdown.await {
+            Ok(()) => {}
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => panic!("static-resource shutdown task failed: {error}"),
+        }
         self.lifecycle
             .store(LifecycleState::Stopped as u8, Ordering::Release);
         self.lifecycle_changed.notify_waiters();

@@ -3,7 +3,6 @@ use std::io;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::watch;
-use tokio::task::{JoinError, JoinHandle};
 use tokio_rustls::TlsConnector;
 
 use super::ack::{
@@ -85,7 +84,7 @@ pub(crate) async fn deliver_one<S, C>(
     cancellation: C,
 ) -> Result<WebhookAcknowledgement, WebhookDeliveryError>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
     C: Future<Output = ()> + Send,
 {
     let request_head_bytes =
@@ -93,120 +92,111 @@ where
     let (outbound, inbound) = lease.split();
     let (reader, writer) = tokio::io::split(stream);
     let (stop, stop_rx) = watch::channel(false);
-    let writer_task = tokio::spawn(run_writer(
+    let writer = run_writer(
         writer,
         outbound,
         request_body,
         request_head_bytes,
         stop_rx.clone(),
-    ));
-    let reader_task = tokio::spawn(run_reader(reader, inbound, max_response_bytes, stop_rx));
-    let mut tasks = DeliveryTasks {
-        stop,
-        writer: writer_task,
-        reader: reader_task,
-        armed: true,
-    };
+    );
+    let reader = run_reader(reader, inbound, max_response_bytes, stop_rx);
+    tokio::pin!(writer);
+    tokio::pin!(reader);
     tokio::pin!(cancellation);
 
-    let mut writer_completion = None;
-    let mut reader_completion = None;
-    let mut acknowledgement = None;
-    let mut writer_done = false;
-    let mut reader_done = false;
-    let terminal = loop {
-        tokio::select! {
-            biased;
-            _ = &mut cancellation => break Err(WebhookDeliveryError::Cancelled),
-            joined = &mut tasks.writer, if !writer_done => {
-                writer_done = true;
-                match joined {
-                    Ok(completion) => {
-                        let WriterCompletion { outbound, request_body, result } = completion;
-                        writer_completion = Some((outbound, request_body));
-                        if let Err(error) = result {
-                            break Err(WebhookDeliveryError::Write(error));
-                        }
-                    }
-                    Err(error) => break Err(WebhookDeliveryError::Task(error)),
-                }
-                if reader_completion.is_some() {
-                    break Ok(acknowledgement.expect("successful reader completed"));
-                }
-            }
-            joined = &mut tasks.reader, if !reader_done => {
-                reader_done = true;
-                match joined {
-                    Ok(completion) => {
-                        reader_completion = Some(completion.inbound);
-                        match completion.result {
-                            Ok(value) => acknowledgement = Some(value),
-                            Err(error) => break Err(WebhookDeliveryError::Acknowledgement(error)),
-                        }
-                    }
-                    Err(error) => break Err(WebhookDeliveryError::Task(error)),
-                }
-                if writer_completion.is_some() {
-                    break Ok(acknowledgement.expect("successful reader completed"));
-                }
-            }
-        }
+    enum FirstCompletion {
+        Cancelled,
+        Writer(WriterCompletion),
+        Reader(ReaderTaskCompletion),
+    }
+
+    let first = tokio::select! {
+        biased;
+        _ = &mut cancellation => FirstCompletion::Cancelled,
+        completion = &mut writer => FirstCompletion::Writer(completion),
+        completion = &mut reader => FirstCompletion::Reader(completion),
     };
 
-    tasks.stop();
-    if !writer_done {
-        match (&mut tasks.writer).await {
-            Ok(completion) => {
-                let WriterCompletion {
-                    outbound,
-                    request_body,
-                    ..
-                } = completion;
-                writer_completion = Some((outbound, request_body));
+    match first {
+        FirstCompletion::Cancelled => {
+            let _ = stop.send(true);
+            let (writer_completion, reader_completion) = tokio::join!(writer, reader);
+            drop(writer_completion);
+            drop(reader_completion);
+            Err(WebhookDeliveryError::Cancelled)
+        }
+        FirstCompletion::Writer(writer_completion) => {
+            let WriterCompletion {
+                outbound,
+                request_body,
+                result: writer_result,
+            } = writer_completion;
+            if let Err(error) = writer_result {
+                let _ = stop.send(true);
+                let reader_completion = reader.await;
+                drop(outbound);
+                drop(request_body);
+                drop(reader_completion);
+                return Err(WebhookDeliveryError::Write(error));
             }
-            Err(error) if terminal.is_ok() => return Err(WebhookDeliveryError::Task(error)),
-            Err(_) => {}
+            let reader_completion = tokio::select! {
+                biased;
+                _ = &mut cancellation => {
+                    let _ = stop.send(true);
+                    let reader_completion = reader.await;
+                    drop(outbound);
+                    drop(request_body);
+                    drop(reader_completion);
+                    return Err(WebhookDeliveryError::Cancelled);
+                }
+                completion = &mut reader => completion,
+            };
+            let result = reader_completion
+                .result
+                .map_err(WebhookDeliveryError::Acknowledgement);
+            drop(outbound);
+            drop(request_body);
+            drop(reader_completion);
+            result
         }
-    }
-    if !reader_done {
-        match (&mut tasks.reader).await {
-            Ok(completion) => reader_completion = Some(completion.inbound),
-            Err(error) if terminal.is_ok() => return Err(WebhookDeliveryError::Task(error)),
-            Err(_) => {}
-        }
-    }
-
-    // These values own all sensitive delivery allocations. Their explicit
-    // teardown occurs only after both task joins above have completed.
-    tasks.disarm();
-    drop(writer_completion);
-    drop(reader_completion);
-    terminal
-}
-
-struct DeliveryTasks {
-    stop: watch::Sender<bool>,
-    writer: JoinHandle<WriterCompletion>,
-    reader: JoinHandle<ReaderTaskCompletion>,
-    armed: bool,
-}
-
-impl DeliveryTasks {
-    fn stop(&self) {
-        let _ = self.stop.send(true);
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for DeliveryTasks {
-    fn drop(&mut self) {
-        if self.armed {
-            self.stop();
-            self.writer.abort();
-            self.reader.abort();
+        FirstCompletion::Reader(reader_completion) => {
+            let ReaderTaskCompletion {
+                inbound,
+                result: reader_result,
+            } = reader_completion;
+            let acknowledgement = match reader_result {
+                Ok(acknowledgement) => acknowledgement,
+                Err(error) => {
+                    let _ = stop.send(true);
+                    let writer_completion = writer.await;
+                    drop(writer_completion);
+                    drop(inbound);
+                    return Err(WebhookDeliveryError::Acknowledgement(error));
+                }
+            };
+            let writer_completion = tokio::select! {
+                biased;
+                _ = &mut cancellation => {
+                    let _ = stop.send(true);
+                    let writer_completion = writer.await;
+                    drop(writer_completion);
+                    drop(inbound);
+                    return Err(WebhookDeliveryError::Cancelled);
+                }
+                completion = &mut writer => completion,
+            };
+            let WriterCompletion {
+                outbound,
+                request_body,
+                result: writer_result,
+            } = writer_completion;
+            let result = writer_result
+                .map(|()| acknowledgement)
+                .map_err(WebhookDeliveryError::Write);
+            drop(outbound);
+            drop(request_body);
+            drop(inbound);
+            result
         }
     }
 }
@@ -369,8 +359,6 @@ pub(crate) enum WebhookDeliveryError {
     Write(#[source] io::Error),
     #[error("webhook acknowledgement failed")]
     Acknowledgement(#[source] AcknowledgementError),
-    #[error("webhook delivery task failed")]
-    Task(#[source] JoinError),
     #[error("webhook TLS server name is invalid")]
     TlsServerName,
     #[error("webhook TLS handshake failed")]
@@ -524,7 +512,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropped_delivery_aborts_owned_tasks_without_detaching_resources() {
+    async fn dropped_delivery_synchronously_releases_every_owned_resource() {
         let arena = arena();
         let lease = arena.try_acquire().unwrap();
         let guard = guard();
@@ -543,14 +531,8 @@ mod tests {
         )
         .await;
         assert!(timed_out.is_err());
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while arena.counts().live_deliveries != 0 || guard.live_bytes() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        assert_eq!(arena.counts().live_deliveries, 0);
+        assert_eq!(guard.live_bytes(), 0);
         tokio::time::timeout(Duration::from_secs(1), async {
             let mut byte = [0u8; 1];
             while server.read(&mut byte).await.unwrap() != 0 {}

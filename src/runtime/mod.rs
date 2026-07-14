@@ -9,7 +9,8 @@ pub(crate) use activation::{
 };
 #[allow(unused_imports)]
 pub(crate) use core::{
-    LifecycleState, ReloadTriggerResult, Runtime, StaticOwnership, StaticResources,
+    LifecycleState, ReloadTriggerResult, Runtime, StaticOwnership, StaticResourceBrand,
+    StaticResources,
 };
 #[allow(unused_imports)]
 pub(crate) use generation::{

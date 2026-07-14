@@ -8,6 +8,7 @@ use tokio::sync::Notify;
 use crate::config::{CompiledConfig, ReloadableProductPlan, StaticFingerprint};
 
 use super::generation::{ActivatedGeneration, GenerationId};
+use super::StaticResourceBrand;
 
 pub(crate) type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -84,6 +85,10 @@ pub(crate) trait CandidateSource: Send + Sync {
 }
 
 pub(crate) trait CandidateActivator: Send + Sync {
+    /// Proves that activation uses the exact process-static resource owner
+    /// supplied to the runtime, not merely an equivalent configuration.
+    fn static_resource_brand(&self) -> &StaticResourceBrand;
+
     /// Identifies the process-lifetime configuration used to construct this
     /// activator and its static admission/runtime state.
     fn static_fingerprint(&self) -> &StaticFingerprint;
@@ -119,6 +124,8 @@ pub(crate) enum RuntimeError {
     StaticOwnershipFingerprintMismatch,
     #[error("candidate activator is bound to different static configuration")]
     ActivatorStaticFingerprintMismatch,
+    #[error("candidate activator is bound to a different static resource owner")]
+    ActivatorStaticResourceMismatch,
     #[error("publishing would exceed the retiring-generation ceiling ({limit})")]
     RetiringGenerationLimit { limit: usize },
     #[error("runtime is not accepting reloads")]

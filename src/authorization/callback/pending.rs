@@ -481,6 +481,19 @@ impl<P> PendingCapabilityStore<P> {
             .fail_next_reservation
             .store(true, Ordering::Release);
     }
+
+    #[cfg(test)]
+    fn poison_state(&self)
+    where
+        P: Send + 'static,
+    {
+        let inner = self.inner.clone();
+        let _ = std::thread::spawn(move || {
+            let _state = inner.state.lock().unwrap();
+            panic!("poison pending store for recovery test");
+        })
+        .join();
+    }
 }
 
 fn debug_assert_counts<P>(state: &StoreState<P>) {
@@ -560,8 +573,34 @@ impl<P> PendingOperationGuard<P> {
     }
 
     pub(crate) async fn expire_at_deadline(&self) -> PendingTerminalResult<P> {
-        tokio::time::sleep_until(self.deadline.at()).await;
-        self.finish_pending(self.deadline.cause())
+        loop {
+            let changed = self.store.inner.changed.notified();
+            let effective_deadline = {
+                let state = self
+                    .store
+                    .inner
+                    .state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state
+                    .shutdown_deadline
+                    .map_or(self.deadline.at(), |shutdown| {
+                        shutdown.min(self.deadline.at())
+                    })
+            };
+
+            if Instant::now() >= effective_deadline {
+                return self.finish_pending(self.deadline.cause());
+            }
+
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(effective_deadline) => {
+                    return self.finish_pending(self.deadline.cause());
+                }
+                _ = changed => {}
+            }
+        }
     }
 }
 
@@ -620,7 +659,7 @@ impl<P> PendingOperationSignal<P> {
     }
 
     pub(crate) fn finish_pending(&self, cause: PendingTerminalCause) -> PendingTerminalResult<P> {
-        self.finish_pending_inner(cause, None, false)
+        self.finish_pending_inner(cause, None, true)
     }
 
     #[cfg(test)]
@@ -1566,6 +1605,38 @@ mod tests {
 
         assert_eq!(claim.complete().unwrap(), 31);
         drop(handle);
+    }
+
+    #[tokio::test]
+    async fn shutdown_deadline_wakes_operation_coordinator_before_its_own_deadline() {
+        let store = PendingCapabilityStore::new();
+        let handle = admit_fixed(&store, 1, 41usize, 1).into_parts().1;
+        store.begin_shutdown(Some(Instant::now() + Duration::from_millis(20)));
+
+        let result = tokio::time::timeout(Duration::from_secs(1), handle.expire_at_deadline())
+            .await
+            .expect("shutdown deadline wakes the operation coordinator");
+        let PendingTerminalResult::Won(terminal) = result else {
+            panic!("operation coordinator must own shutdown expiry: {result:?}");
+        };
+        assert_eq!(terminal.cause(), PendingTerminalCause::Shutdown);
+        assert_eq!(terminal.into_payload(), 41);
+        assert_eq!(store.counts().occupancy, 0);
+    }
+
+    #[test]
+    fn production_terminal_signal_recovers_poison_and_releases_payload() {
+        let store = PendingCapabilityStore::new();
+        let handle = admit_fixed(&store, 1, 37usize, 1).into_parts().1;
+        store.poison_state();
+
+        let PendingTerminalResult::Won(terminal) =
+            handle.finish_pending(PendingTerminalCause::DeliveryFailed)
+        else {
+            panic!("poison recovery must retain terminal ownership");
+        };
+        assert_eq!(terminal.into_payload(), 37);
+        assert_eq!(store.counts().occupancy, 0);
     }
 
     #[test]

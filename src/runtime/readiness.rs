@@ -27,7 +27,7 @@ impl ServiceReadiness {
             .compare_exchange(STARTING, READY, Ordering::AcqRel, Ordering::Acquire);
     }
 
-    pub(super) fn begin_shutdown(&self) {
+    pub(crate) fn begin_shutdown(&self) {
         self.state.store(CLOSED, Ordering::Release);
     }
 }

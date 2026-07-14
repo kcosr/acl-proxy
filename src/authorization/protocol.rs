@@ -153,33 +153,70 @@ impl fmt::Debug for ProviderOutputRegistry {
     }
 }
 
-pub(crate) struct ProviderCredentialSet {
+pub(crate) struct ContiguousProviderCredentials {
     registry_id: u64,
     values: Box<[Option<SecretBytes>]>,
 }
 
+pub(crate) enum ProviderCredentialSet {
+    Contiguous(ContiguousProviderCredentials),
+    Segmented(crate::authorization::callback::CallbackCredentialSet),
+}
+
 impl ProviderCredentialSet {
-    pub(crate) fn get(&self, index: ProviderOutputIndex) -> Option<&[u8]> {
-        if index.registry_id != self.registry_id {
+    pub(crate) fn contiguous(&self, index: ProviderOutputIndex) -> Option<&[u8]> {
+        let Self::Contiguous(credentials) = self else {
+            return None;
+        };
+        if index.registry_id != credentials.registry_id {
             return None;
         }
-        self.values
+        credentials
+            .values
             .get(index.get())
             .and_then(Option::as_ref)
             .map(SecretBytes::as_bytes)
+    }
+
+    pub(crate) fn segmented(
+        &self,
+        index: ProviderOutputIndex,
+    ) -> Option<crate::authorization::callback::CallbackCredentialSegments<'_>> {
+        match self {
+            Self::Contiguous(_) => None,
+            Self::Segmented(credentials) => credentials.get(index),
+        }
+    }
+
+    pub(crate) fn from_segmented(
+        credentials: crate::authorization::callback::CallbackCredentialSet,
+    ) -> Self {
+        Self::Segmented(credentials)
     }
 }
 
 impl fmt::Debug for ProviderCredentialSet {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ProviderCredentialSet")
-            .field("count", &self.values.len())
-            .field(
-                "present_count",
-                &self.values.iter().filter(|value| value.is_some()).count(),
-            )
-            .finish()
+        match self {
+            Self::Contiguous(credentials) => formatter
+                .debug_struct("ProviderCredentialSet")
+                .field("representation", &"contiguous")
+                .field("count", &credentials.values.len())
+                .field(
+                    "present_count",
+                    &credentials
+                        .values
+                        .iter()
+                        .filter(|value| value.is_some())
+                        .count(),
+                )
+                .finish(),
+            Self::Segmented(credentials) => formatter
+                .debug_struct("ProviderCredentialSet")
+                .field("representation", &"segmented")
+                .field("credentials", credentials)
+                .finish(),
+        }
     }
 }
 
@@ -1008,10 +1045,12 @@ fn bind_output_values(
     {
         return Err(AssignedResponseError::MissingRequiredOutput);
     }
-    Ok(ProviderCredentialSet {
-        registry_id: outputs.id,
-        values: bound.into_boxed_slice(),
-    })
+    Ok(ProviderCredentialSet::Contiguous(
+        ContiguousProviderCredentials {
+            registry_id: outputs.id,
+            values: bound.into_boxed_slice(),
+        },
+    ))
 }
 
 #[cfg(test)]
@@ -2177,7 +2216,10 @@ mod tests {
             panic!("expected allow");
         };
         let index = outputs.by_wire_name["token"];
-        assert_eq!(credentials.get(index), Some(b"secret-marker".as_slice()));
+        assert_eq!(
+            credentials.contiguous(index),
+            Some(b"secret-marker".as_slice())
+        );
         assert!(!format!("{credentials:?}").contains("secret-marker"));
         assert!(!format!("{outputs:?}").contains("token"));
     }
@@ -2200,10 +2242,10 @@ mod tests {
         let second_index = second.by_wire_name["token"];
         assert_eq!(first_index.get(), second_index.get());
         assert_eq!(
-            credentials.get(first_index),
+            credentials.contiguous(first_index),
             Some(b"secret-marker".as_slice())
         );
-        assert_eq!(credentials.get(second_index), None);
+        assert_eq!(credentials.contiguous(second_index), None);
         assert!(first.definition(second_index).is_none());
     }
 

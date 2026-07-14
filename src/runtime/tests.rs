@@ -112,6 +112,13 @@ enum ShutdownEvent {
     StaticFinish,
 }
 
+fn shutdown_event_index(events: &[ShutdownEvent], event: ShutdownEvent) -> usize {
+    events
+        .iter()
+        .position(|candidate| *candidate == event)
+        .unwrap_or_else(|| panic!("missing shutdown event: {event:?}"))
+}
+
 #[derive(Default)]
 struct FakeOwner {
     commits: AtomicUsize,
@@ -239,6 +246,7 @@ impl FakeOwner {
 
 struct FakeStaticResources {
     readiness: Arc<ServiceReadiness>,
+    brand: StaticResourceBrand,
     begin_shutdowns: AtomicUsize,
     shutdown_begun: AtomicBool,
     block_begin_return: AtomicBool,
@@ -248,12 +256,14 @@ struct FakeStaticResources {
     begin_return_release: Condvar,
     shutdowns: AtomicUsize,
     shutdown_events: Arc<Mutex<Vec<ShutdownEvent>>>,
+    shutdown_retentions: Mutex<Vec<GenerationRetention>>,
 }
 
 impl Default for FakeStaticResources {
     fn default() -> Self {
         Self {
             readiness: Arc::new(ServiceReadiness::new()),
+            brand: StaticResourceBrand::new(),
             begin_shutdowns: AtomicUsize::new(0),
             shutdown_begun: AtomicBool::new(false),
             block_begin_return: AtomicBool::new(false),
@@ -263,11 +273,16 @@ impl Default for FakeStaticResources {
             begin_return_release: Condvar::new(),
             shutdowns: AtomicUsize::new(0),
             shutdown_events: Arc::new(Mutex::new(Vec::new())),
+            shutdown_retentions: Mutex::new(Vec::new()),
         }
     }
 }
 
 impl StaticResources for FakeStaticResources {
+    fn brand(&self) -> &StaticResourceBrand {
+        &self.brand
+    }
+
     fn readiness(&self) -> &Arc<ServiceReadiness> {
         &self.readiness
     }
@@ -294,6 +309,7 @@ impl StaticResources for FakeStaticResources {
     fn shutdown(&self) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             self.shutdowns.fetch_add(1, Ordering::AcqRel);
+            self.shutdown_retentions.lock().unwrap().clear();
             self.shutdown_events
                 .lock()
                 .unwrap()
@@ -303,6 +319,10 @@ impl StaticResources for FakeStaticResources {
 }
 
 impl FakeStaticResources {
+    fn release_retention_during_shutdown(&self, retention: GenerationRetention) {
+        self.shutdown_retentions.lock().unwrap().push(retention);
+    }
+
     async fn wait_for_begin_return_block(&self) {
         loop {
             let changed = self.begin_return_changed.notified();
@@ -321,6 +341,7 @@ impl FakeStaticResources {
 
 struct BlockingStaticResources {
     readiness: Arc<ServiceReadiness>,
+    brand: StaticResourceBrand,
     begin_shutdowns: AtomicUsize,
     shutdown_begun: AtomicBool,
     shutdowns: AtomicUsize,
@@ -334,6 +355,7 @@ impl Default for BlockingStaticResources {
     fn default() -> Self {
         Self {
             readiness: Arc::new(ServiceReadiness::new()),
+            brand: StaticResourceBrand::new(),
             begin_shutdowns: AtomicUsize::new(0),
             shutdown_begun: AtomicBool::new(false),
             shutdowns: AtomicUsize::new(0),
@@ -346,6 +368,10 @@ impl Default for BlockingStaticResources {
 }
 
 impl StaticResources for BlockingStaticResources {
+    fn brand(&self) -> &StaticResourceBrand {
+        &self.brand
+    }
+
     fn readiness(&self) -> &Arc<ServiceReadiness> {
         &self.readiness
     }
@@ -445,6 +471,7 @@ impl CandidateSource for FakeSource {
 
 struct FakeActivator {
     static_fingerprint: crate::config::StaticFingerprint,
+    static_resource_brand: StaticResourceBrand,
     calls: AtomicUsize,
     entered: AtomicUsize,
     entered_changed: Notify,
@@ -460,9 +487,13 @@ struct FakeActivator {
 }
 
 impl FakeActivator {
-    fn new(static_fingerprint: crate::config::StaticFingerprint) -> Self {
+    fn new(
+        static_fingerprint: crate::config::StaticFingerprint,
+        static_resource_brand: StaticResourceBrand,
+    ) -> Self {
         Self {
             static_fingerprint,
+            static_resource_brand,
             calls: AtomicUsize::new(0),
             entered: AtomicUsize::new(0),
             entered_changed: Notify::new(),
@@ -498,6 +529,10 @@ impl FakeActivator {
 }
 
 impl CandidateActivator for FakeActivator {
+    fn static_resource_brand(&self) -> &StaticResourceBrand {
+        &self.static_resource_brand
+    }
+
     fn static_fingerprint(&self) -> &crate::config::StaticFingerprint {
         &self.static_fingerprint
     }
@@ -612,8 +647,11 @@ async fn runtime_fixture(
 ) {
     let compiled = compile(initial).expect("compile initial config");
     let source = Arc::new(FakeSource::default());
-    let activator = Arc::new(FakeActivator::new(compiled.static_fingerprint.clone()));
     let static_resources = Arc::new(FakeStaticResources::default());
+    let activator = Arc::new(FakeActivator::new(
+        compiled.static_fingerprint.clone(),
+        static_resources.brand.clone(),
+    ));
     activator.observe_static_shutdown(static_resources.shutdown_events.clone());
     let static_ownership = StaticOwnership::new(
         compiled.static_config.clone(),
@@ -780,7 +818,7 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
     .expect("delivery teardown precedes callback parsing");
     assert_eq!(webhook_runtime.transport_counts().live_deliveries, 0);
     let payload = claim.complete().unwrap();
-    assert!(payload.complete(Ok(ProviderDecision::Deny)).is_ok());
+    assert!(payload.complete(Ok(ProviderDecision::Deny)));
 
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(5), dispatch)
@@ -790,6 +828,32 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
         crate::authorization::AuthorizationDecision::Deny
     ));
     assert_eq!(webhook_runtime.pending_store().counts().occupancy, 0);
+
+    webhook_runtime.begin_shutdown(None);
+    let rejected = lease
+        .dispatch_authorization(
+            provider,
+            "rule-after-shutdown",
+            ProviderRequest {
+                request_id: "request-after-shutdown",
+                url: "https://example.test/resource",
+                method: "GET",
+                client_ip: "192.0.2.10",
+                headers: None,
+                body: None,
+            },
+            &body_guard,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await;
+    assert!(matches!(
+        rejected,
+        Err(crate::authorization::AuthorizationDispatchError::Webhook(
+            crate::authorization::webhook::runtime::WebhookDispatchError::AdmissionClosed
+        ))
+    ));
+    assert_eq!(webhook_runtime.pending_store().counts().occupancy, 0);
+    webhook_runtime.wait_until_drained().await;
 }
 
 #[tokio::test]
@@ -804,8 +868,10 @@ async fn cross_wired_activator_is_rejected_at_runtime_construction() {
         static_resources.clone(),
     );
     let source = Arc::new(FakeSource::default());
-    let activator: Arc<dyn CandidateActivator> =
-        Arc::new(FakeActivator::new(crossed.static_fingerprint));
+    let activator: Arc<dyn CandidateActivator> = Arc::new(FakeActivator::new(
+        crossed.static_fingerprint,
+        static_resources.brand.clone(),
+    ));
 
     let construction = Runtime::new(static_ownership, source.clone(), activator.clone());
     assert!(!readiness.is_ready());
@@ -824,12 +890,39 @@ async fn cross_wired_activator_is_rejected_at_runtime_construction() {
 }
 
 #[tokio::test]
+async fn same_config_independent_static_resource_owner_is_rejected() {
+    let owned = compile(&config("30s", "127.0.0.1:8881", 2)).unwrap();
+    let static_resources = Arc::new(FakeStaticResources::default());
+    let static_ownership = StaticOwnership::new(
+        owned.static_config,
+        owned.static_fingerprint.clone(),
+        static_resources.clone(),
+    );
+    let source = Arc::new(FakeSource::default());
+    let activator: Arc<dyn CandidateActivator> = Arc::new(FakeActivator::new(
+        owned.static_fingerprint,
+        StaticResourceBrand::new(),
+    ));
+
+    let result = Runtime::new(static_ownership, source, activator).await;
+
+    assert!(matches!(
+        result,
+        Err(RuntimeError::ActivatorStaticResourceMismatch)
+    ));
+    assert_eq!(static_resources.begin_shutdowns.load(Ordering::Acquire), 1);
+    assert_eq!(static_resources.shutdowns.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
 async fn claimed_static_fingerprint_mismatch_shuts_down_without_retention() {
     let owned = compile(&config("30s", "127.0.0.1:8881", 2)).unwrap();
     let crossed = compile(&config("30s", "127.0.0.1:9999", 2)).unwrap();
     let static_resources = Arc::new(FakeStaticResources::default());
-    let activator: Arc<dyn CandidateActivator> =
-        Arc::new(FakeActivator::new(owned.static_fingerprint.clone()));
+    let activator: Arc<dyn CandidateActivator> = Arc::new(FakeActivator::new(
+        owned.static_fingerprint.clone(),
+        static_resources.brand.clone(),
+    ));
     let static_ownership = StaticOwnership::new(
         owned.static_config,
         crossed.static_fingerprint,
@@ -860,8 +953,10 @@ async fn non_utf8_static_path_derivation_failure_shuts_down_without_retention() 
     let mut owned = compile(&config("30s", "127.0.0.1:8881", 2)).unwrap();
     owned.static_config.config_root = OsString::from_vec(vec![b'/', 0xff]).into();
     let static_resources = Arc::new(FakeStaticResources::default());
-    let activator: Arc<dyn CandidateActivator> =
-        Arc::new(FakeActivator::new(owned.static_fingerprint.clone()));
+    let activator: Arc<dyn CandidateActivator> = Arc::new(FakeActivator::new(
+        owned.static_fingerprint.clone(),
+        static_resources.brand.clone(),
+    ));
     let static_ownership = StaticOwnership::new(
         owned.static_config,
         owned.static_fingerprint,
@@ -957,8 +1052,10 @@ fn rejected_construction_outside_tokio_cleans_inline_when_polled() {
         static_resources.clone(),
     );
     let source = Arc::new(FakeSource::default());
-    let activator: Arc<dyn CandidateActivator> =
-        Arc::new(FakeActivator::new(crossed.static_fingerprint));
+    let activator: Arc<dyn CandidateActivator> = Arc::new(FakeActivator::new(
+        crossed.static_fingerprint,
+        static_resources.brand.clone(),
+    ));
 
     let construction = Runtime::new(static_ownership, source.clone(), activator.clone());
     assert_eq!(static_resources.shutdowns.load(Ordering::Acquire), 0);
@@ -1000,8 +1097,10 @@ fn blocked_cross_wired_construction() -> BlockedConstruction {
         static_resources.clone(),
     );
     let source = Arc::new(FakeSource::default());
-    let activator: Arc<dyn CandidateActivator> =
-        Arc::new(FakeActivator::new(crossed.static_fingerprint));
+    let activator: Arc<dyn CandidateActivator> = Arc::new(FakeActivator::new(
+        crossed.static_fingerprint,
+        static_resources.brand.clone(),
+    ));
     let construction = Runtime::new(static_ownership, source.clone(), activator.clone());
     BlockedConstruction {
         construction,
@@ -1641,18 +1740,35 @@ async fn new_work_admission_closes_before_generation_drain_and_final_shutdown() 
     runtime.shutdown().await;
     runtime.shutdown().await;
 
-    assert_eq!(
-        *static_resources.shutdown_events.lock().unwrap(),
-        vec![
-            ShutdownEvent::StaticBegin,
-            ShutdownEvent::GenerationRetirementStarted,
-            ShutdownEvent::GenerationCleanup,
-            ShutdownEvent::StaticFinish,
-        ]
+    let events = static_resources.shutdown_events.lock().unwrap().clone();
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0], ShutdownEvent::StaticBegin);
+    assert!(
+        shutdown_event_index(&events, ShutdownEvent::GenerationRetirementStarted)
+            < shutdown_event_index(&events, ShutdownEvent::GenerationCleanup)
     );
+    assert!(events.contains(&ShutdownEvent::StaticFinish));
     assert_eq!(static_resources.begin_shutdowns.load(Ordering::Acquire), 1);
     assert_eq!(static_resources.shutdowns.load(Ordering::Acquire), 1);
     assert!(!runtime.is_ready());
+}
+
+#[tokio::test]
+async fn static_shutdown_releases_generation_retention_before_retirement_finishes() {
+    let (runtime, initial, _source, _activator, static_resources) =
+        runtime_fixture(&config("30s", "127.0.0.1:8881", 2)).await;
+    runtime.start(initial).await.unwrap();
+    let lease = runtime.lease().await.unwrap();
+    static_resources.release_retention_during_shutdown(lease.retain_for_operation().unwrap());
+    drop(lease);
+
+    tokio::time::timeout(Duration::from_secs(1), runtime.shutdown())
+        .await
+        .expect("static drain must run while generation retirement is waiting");
+
+    assert_eq!(runtime.lifecycle(), LifecycleState::Stopped);
+    assert_eq!(runtime.retiring_generations(), 0);
+    assert_eq!(static_resources.shutdowns.load(Ordering::Acquire), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1739,16 +1855,18 @@ async fn shutdown_wins_blocked_reload_and_cleans_candidate_before_active() {
     assert!(!runtime.is_ready());
     assert_eq!(runtime.active_generation_id(), None);
     assert_eq!(activator.owner(1).commits.load(Ordering::Acquire), 0);
-    assert_eq!(
-        *static_resources.shutdown_events.lock().unwrap(),
-        vec![
-            ShutdownEvent::StaticBegin,
-            ShutdownEvent::CandidateCleanup,
-            ShutdownEvent::GenerationRetirementStarted,
-            ShutdownEvent::GenerationCleanup,
-            ShutdownEvent::StaticFinish,
-        ]
+    let events = static_resources.shutdown_events.lock().unwrap().clone();
+    assert_eq!(events.len(), 5);
+    assert_eq!(events[0], ShutdownEvent::StaticBegin);
+    assert!(
+        shutdown_event_index(&events, ShutdownEvent::CandidateCleanup)
+            < shutdown_event_index(&events, ShutdownEvent::GenerationRetirementStarted)
     );
+    assert!(
+        shutdown_event_index(&events, ShutdownEvent::GenerationRetirementStarted)
+            < shutdown_event_index(&events, ShutdownEvent::GenerationCleanup)
+    );
+    assert!(events.contains(&ShutdownEvent::StaticFinish));
 
     source.push(config("32s", "127.0.0.1:8881", 2));
     assert_eq!(

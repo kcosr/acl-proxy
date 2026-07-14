@@ -341,12 +341,13 @@ impl<'a> AssignedCallbackResponseParser<'a> {
             self.fail();
             return Err(error);
         }
-        if self
-            .outputs
-            .definitions()
-            .iter()
-            .zip(&self.values)
-            .any(|(definition, value)| definition.required() && value.is_none())
+        if self.decision == Some(CallbackDecisionKind::Allow)
+            && self
+                .outputs
+                .definitions()
+                .iter()
+                .zip(&self.values)
+                .any(|(definition, value)| definition.required() && value.is_none())
         {
             self.fail();
             return Err(CallbackResponseError::MissingRequiredOutput);
@@ -745,6 +746,7 @@ mod tests {
     use http::HeaderName;
 
     use super::*;
+    use crate::authorization::protocol::ProviderCredentialSet;
     use crate::config::compiler::ProviderOutputPlan;
     use crate::safety::wire_body::guarded_body_allocation_bytes;
     use crate::safety::{HttpWireBodyGuard, WireBodyPool, WireBodyQuotaKey};
@@ -880,6 +882,36 @@ mod tests {
     }
 
     #[test]
+    fn deny_and_pass_do_not_require_allow_only_outputs() {
+        let outputs = outputs(true);
+        for (wire, expected) in [
+            (
+                body("\"type\":\"response\",\"decision\":\"deny\"}"),
+                CallbackDecisionKind::Deny,
+            ),
+            (
+                body("\"type\":\"response\",\"decision\":\"pass\"}"),
+                CallbackDecisionKind::Pass,
+            ),
+        ] {
+            let (_, guard) = guard(wire.len());
+            let parsed = parse(
+                &wire,
+                &outputs,
+                &guard.provider_response_charge(),
+                wire.len(),
+                wire.len(),
+            )
+            .unwrap();
+            assert!(matches!(
+                (expected, parsed),
+                (CallbackDecisionKind::Deny, CallbackResponseDecision::Deny)
+                    | (CallbackDecisionKind::Pass, CallbackResponseDecision::Pass)
+            ));
+        }
+    }
+
+    #[test]
     fn callback_typed_outputs_decode_directly_into_guarded_storage() {
         let outputs = outputs(true);
         let response = body(
@@ -910,6 +942,39 @@ mod tests {
         drop(credentials);
         assert_eq!(pool.global_charge(), 0);
         assert_eq!(guard.live_bytes(), 0);
+    }
+
+    #[test]
+    fn segmented_callback_credentials_cross_provider_boundary_without_copy() {
+        let outputs = outputs(true);
+        let response = body(
+            "\"type\":\"response\",\"decision\":\"allow\",\"values\":{\"api_token\":\"secret-marker\"}}",
+        );
+        let (_, guard) = guard(response.len());
+        let CallbackResponseDecision::Allow(credentials) = parse(
+            &response,
+            &outputs,
+            &guard.provider_response_charge(),
+            response.len(),
+            response.len(),
+        )
+        .unwrap() else {
+            panic!("allow response expected");
+        };
+        let index = outputs.index("api_token").unwrap();
+        let provider_credentials = ProviderCredentialSet::from_segmented(credentials);
+
+        assert!(provider_credentials.contiguous(index).is_none());
+        assert_eq!(
+            provider_credentials
+                .segmented(index)
+                .unwrap()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
+            b"secret-marker"
+        );
+        assert!(!format!("{provider_credentials:?}").contains("secret-marker"));
     }
 
     #[test]
