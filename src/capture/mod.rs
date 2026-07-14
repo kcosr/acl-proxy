@@ -325,10 +325,6 @@ impl CaptureArtifactJob {
         {
             return Err(CaptureArtifactJobError::MetadataAlreadyHasBodyOutcome);
         }
-        if encoded.is_empty() {
-            self.payload = CaptureArtifactPayload::Unavailable;
-            return Ok(());
-        }
         self.payload = CaptureArtifactPayload::Http {
             encoded,
             encoding,
@@ -353,10 +349,6 @@ impl CaptureArtifactJob {
             || self.metadata.record.provider_replacement_size.is_some()
         {
             return Err(CaptureArtifactJobError::MetadataAlreadyHasBodyOutcome);
-        }
-        if encoded.is_empty() {
-            self.payload = CaptureArtifactPayload::Unavailable;
-            return Ok(());
         }
         self.payload = CaptureArtifactPayload::WebSocket {
             encoded,
@@ -408,6 +400,9 @@ impl CaptureArtifactJob {
                 let redacted = policy
                     .profile()
                     .redact_capture_decoded_http_body(&self.operation, decoded)?;
+                if redacted.body.is_empty() {
+                    return Ok(None);
+                }
                 let body = CaptureArtifactBody::encode(
                     &self.operation,
                     redacted.body,
@@ -440,6 +435,9 @@ impl CaptureArtifactJob {
                     decoded,
                     class,
                 )?;
+                if redacted.body.is_empty() {
+                    return Ok(None);
+                }
                 let body = CaptureArtifactBody::encode(
                     &self.operation,
                     redacted.body,
@@ -1418,6 +1416,7 @@ fn sync_capture_file(file: &File) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::io::Write as _;
 
     use super::*;
     use crate::config::compiler::{
@@ -1429,6 +1428,8 @@ mod tests {
     use crate::observation::{CapturePool, ProductObservationSnapshot};
     use crate::redaction::RedactionSnapshot;
     use crate::runtime::GenerationOwner;
+    use flate2::write::GzEncoder;
+    use flate2::{Compress, Compression, FlushCompress, Status};
 
     fn minimal_config_with_capture() -> AppConfig {
         let toml = r#"
@@ -1577,6 +1578,26 @@ default = "deny"
         body.finish()
     }
 
+    fn gzip_bytes(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(bytes).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn permessage_deflate_bytes(bytes: &[u8]) -> Vec<u8> {
+        let mut encoder = Compress::new(Compression::default(), false);
+        let mut encoded = Vec::with_capacity(bytes.len() + 64);
+        assert_eq!(
+            encoder
+                .compress_vec(bytes, &mut encoded, FlushCompress::Sync)
+                .unwrap(),
+            Status::Ok
+        );
+        assert!(encoded.ends_with(&[0x00, 0x00, 0xff, 0xff]));
+        encoded.truncate(encoded.len() - 4);
+        encoded
+    }
+
     fn read_only_capture_record(directory: &Path) -> CaptureRecord {
         let mut records = fs::read_dir(directory)
             .expect("capture directory")
@@ -1662,7 +1683,7 @@ default = "deny"
         )
         .unwrap()
         .expect("capture admission");
-        let encoded = operation_body(&job, b"");
+        let encoded = operation_body(&job, &gzip_bytes(b""));
         job.complete_http_body(encoded, CaptureContentEncoding::Gzip, None, true)
             .unwrap();
 
@@ -1708,7 +1729,7 @@ default = "deny"
     #[tokio::test]
     async fn artifact_worker_emits_metadata_only_for_complete_empty_websocket_message() {
         let directory = tempfile::tempdir().unwrap();
-        let (epoch, _owner) = capture_engine_epoch(directory.path(), 1024, false);
+        let (epoch, _owner) = capture_engine_epoch(directory.path(), 1024, true);
         let mut metadata = sample_record_with_body(None);
         metadata.request_id = "empty-websocket".to_owned();
         let mut job = CaptureArtifactJob::try_begin(
@@ -1719,7 +1740,9 @@ default = "deny"
         )
         .unwrap()
         .expect("capture admission");
-        let encoded = operation_body(&job, b"");
+        let encoded_bytes = permessage_deflate_bytes(b"");
+        assert!(!encoded_bytes.is_empty());
+        let encoded = operation_body(&job, &encoded_bytes);
         job.complete_websocket_message(encoded, true, PayloadClass::Binary)
             .unwrap();
 
