@@ -3,7 +3,10 @@ use std::sync::{Arc, Mutex};
 use crate::config::{CompiledConfig, LoadedCompiledConfig};
 use crate::runtime::{GenerationId, Runtime, RuntimeError, StaticOwnership, StaticResources};
 
-use super::listeners::PreparedProxyListeners;
+use super::listeners::{
+    PreparedProxyListeners, ProxySupervisor, ProxySupervisorFailure,
+    ProxySupervisorFailureObserver, ProxySupervisorStartError, ProxySupervisorStarter,
+};
 use super::source::FileCandidateSource;
 use super::static_resources::{ProductStaticResources, ProductStaticResourcesError};
 
@@ -17,6 +20,26 @@ pub(crate) struct ProductRuntime {
     runtime: Arc<Runtime>,
     static_resources: Arc<ProductStaticResources>,
     initial: Mutex<Option<CompiledConfig>>,
+}
+
+struct ProductProxyFailureObserver {
+    runtime: std::sync::Weak<Runtime>,
+    static_resources: std::sync::Weak<ProductStaticResources>,
+    executor: tokio::runtime::Handle,
+}
+
+impl ProxySupervisorFailureObserver for ProductProxyFailureObserver {
+    fn failed(&self, error: Arc<ProxySupervisorFailure>) {
+        let Some(static_resources) = self.static_resources.upgrade() else {
+            return;
+        };
+        tracing::error!(error = %error, "proxy supervisor failed");
+        static_resources.record_proxy_failure(error);
+        StaticResources::begin_shutdown(static_resources.as_ref());
+        if let Some(runtime) = self.runtime.upgrade() {
+            self.executor.spawn(async move { runtime.shutdown().await });
+        }
+    }
 }
 
 impl ProductRuntime {
@@ -62,6 +85,44 @@ impl ProductRuntime {
             .map_err(Into::into)
     }
 
+    pub(crate) async fn start_proxy_supervisors(
+        self: &Arc<Self>,
+        starter: &mut dyn ProxySupervisorStarter,
+    ) -> Result<(), ProductRuntimeError> {
+        let prepared = self.take_prepared_proxy_listeners_for_supervisor_start()?;
+        let observer: Arc<dyn ProxySupervisorFailureObserver> =
+            Arc::new(ProductProxyFailureObserver {
+                runtime: Arc::downgrade(&self.runtime),
+                static_resources: Arc::downgrade(&self.static_resources),
+                executor: tokio::runtime::Handle::current(),
+            });
+        let mut supervisors = Vec::new();
+        for (kind, listener) in prepared.into_entries() {
+            match starter.start(kind, listener, observer.clone()) {
+                Ok(supervisor) => supervisors.push(supervisor),
+                Err(error) => {
+                    rollback_proxy_supervisors(supervisors).await;
+                    self.shutdown().await;
+                    return Err(error.into());
+                }
+            }
+        }
+        if let Err(error) = self
+            .static_resources
+            .adopt_proxy_supervisors(&mut supervisors)
+        {
+            rollback_proxy_supervisors(supervisors).await;
+            self.shutdown().await;
+            return Err(error.into());
+        }
+        StaticResources::readiness(self.static_resources.as_ref()).mark_ingress_started();
+        Ok(())
+    }
+
+    pub(crate) async fn wait_for_proxy_failure(&self) -> Option<Arc<ProxySupervisorFailure>> {
+        self.static_resources.wait_for_proxy_failure().await
+    }
+
     pub(crate) async fn activate_initial(&self) -> Result<GenerationId, ProductRuntimeError> {
         let initial = self
             .initial
@@ -94,10 +155,22 @@ impl ProductRuntime {
     pub(crate) async fn shutdown(&self) {
         self.runtime.shutdown().await;
     }
+}
 
-    #[cfg(test)]
-    fn confirm_ingress_started_for_test(&self) {
-        StaticResources::readiness(self.static_resources.as_ref()).mark_ingress_started();
+async fn rollback_proxy_supervisors(supervisors: Vec<Arc<dyn ProxySupervisor>>) {
+    for supervisor in &supervisors {
+        supervisor.begin_shutdown();
+    }
+    let mut joins = tokio::task::JoinSet::new();
+    for supervisor in supervisors {
+        joins.spawn(async move { supervisor.abort_and_join().await });
+    }
+    while let Some(result) = joins.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::error!(%error, "proxy startup rollback failed"),
+            Err(error) => tracing::error!(%error, "proxy startup rollback coordinator failed"),
+        }
     }
 }
 
@@ -107,6 +180,8 @@ pub(crate) enum ProductRuntimeError {
     StaticResources(#[from] ProductStaticResourcesError),
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
+    #[error(transparent)]
+    ProxySupervisorStart(#[from] ProxySupervisorStartError),
     #[error("initial activation has already been attempted")]
     InitialActivationAlreadyAttempted,
     #[error("initial activation coordinator did not complete")]
@@ -118,17 +193,93 @@ mod tests {
     use std::fs;
     use std::net::{Ipv4Addr, SocketAddr, TcpListener};
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use tempfile::tempdir;
 
     use super::*;
     use crate::config::load_and_compile_exact_config;
 
-    static LISTENER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    struct FakeSupervisor {
+        observer: Arc<dyn ProxySupervisorFailureObserver>,
+        kind: super::super::listeners::ProxyListenerKind,
+        shutdowns: AtomicUsize,
+        graceful_joins: AtomicUsize,
+        abort_joins: AtomicUsize,
+    }
+
+    impl FakeSupervisor {
+        fn fail(&self) {
+            self.observer.failed(Arc::new(ProxySupervisorFailure {
+                listener: self.kind,
+                message: "injected terminal failure".to_string(),
+            }));
+        }
+
+        fn joins(&self) -> usize {
+            self.graceful_joins.load(Ordering::Acquire) + self.abort_joins.load(Ordering::Acquire)
+        }
+    }
+
+    impl ProxySupervisor for FakeSupervisor {
+        fn begin_shutdown(&self) {
+            self.shutdowns.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn close_and_join(
+            &self,
+        ) -> crate::runtime::BoxFuture<'_, Result<(), ProxySupervisorFailure>> {
+            Box::pin(async move {
+                self.graceful_joins.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            })
+        }
+
+        fn abort_and_join(
+            &self,
+        ) -> crate::runtime::BoxFuture<'_, Result<(), ProxySupervisorFailure>> {
+            Box::pin(async move {
+                self.abort_joins.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeStarter {
+        fail_at: Option<usize>,
+        supervisors: Vec<Arc<FakeSupervisor>>,
+    }
+
+    impl ProxySupervisorStarter for FakeStarter {
+        fn start(
+            &mut self,
+            kind: super::super::listeners::ProxyListenerKind,
+            _listener: TcpListener,
+            observer: Arc<dyn ProxySupervisorFailureObserver>,
+        ) -> Result<Arc<dyn ProxySupervisor>, ProxySupervisorStartError> {
+            if self.fail_at == Some(self.supervisors.len()) {
+                return Err(ProxySupervisorStartError {
+                    listener: kind,
+                    message: "injected startup failure".to_string(),
+                });
+            }
+            let supervisor = Arc::new(FakeSupervisor {
+                observer,
+                kind,
+                shutdowns: AtomicUsize::new(0),
+                graceful_joins: AtomicUsize::new(0),
+                abort_joins: AtomicUsize::new(0),
+            });
+            self.supervisors.push(supervisor.clone());
+            Ok(supervisor)
+        }
+    }
 
     fn available_addresses<const N: usize>() -> [SocketAddr; N] {
         let listeners: Vec<_> = (0..N)
-            .map(|_| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
+            .map(|_| TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), 0)).unwrap())
             .collect();
         let addresses = listeners
             .iter()
@@ -188,7 +339,7 @@ default = "deny"
 
     #[tokio::test]
     async fn publication_before_ingress_confirmation_stays_not_ready() {
-        let _test = LISTENER_TEST_LOCK.lock().await;
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let addresses = available_addresses::<2>();
         let (_directory, loaded) = loaded(&config(addresses[0], addresses[1], ""));
         let product = ProductRuntime::prepare(loaded).await.unwrap();
@@ -200,7 +351,8 @@ default = "deny"
         product.activate_initial().await.unwrap();
         assert!(!product.runtime().is_ready());
 
-        product.confirm_ingress_started_for_test();
+        let mut starter = FakeStarter::default();
+        product.start_proxy_supervisors(&mut starter).await.unwrap();
         assert!(product.runtime().is_ready());
 
         product.shutdown().await;
@@ -209,12 +361,13 @@ default = "deny"
 
     #[tokio::test]
     async fn ingress_confirmation_before_publication_stays_not_ready() {
-        let _test = LISTENER_TEST_LOCK.lock().await;
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let addresses = available_addresses::<2>();
         let (_directory, loaded) = loaded(&config(addresses[0], addresses[1], ""));
         let product = ProductRuntime::prepare(loaded).await.unwrap();
 
-        product.confirm_ingress_started_for_test();
+        let mut starter = FakeStarter::default();
+        product.start_proxy_supervisors(&mut starter).await.unwrap();
         assert!(!product.runtime().is_ready());
 
         product.activate_initial().await.unwrap();
@@ -226,7 +379,7 @@ default = "deny"
 
     #[tokio::test]
     async fn failed_initial_activation_joins_shutdown_and_releases_every_socket() {
-        let _test = LISTENER_TEST_LOCK.lock().await;
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let addresses = available_addresses::<2>();
         let missing_variable = "ACL_PROXY_RUNNER_TEST_MISSING_REDACTION_LITERAL";
         std::env::remove_var(missing_variable);
@@ -256,7 +409,7 @@ rules = [{{ literal_environment_variables = ["{missing_variable}"] }}]
 
     #[tokio::test]
     async fn later_prebind_failure_releases_earlier_proxy_and_control_sockets() {
-        let _test = LISTENER_TEST_LOCK.lock().await;
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let addresses = available_addresses::<2>();
         let blocker = TcpListener::bind(addresses[1]).unwrap();
         let (_directory, loaded) = loaded(&config(addresses[0], addresses[1], ""));
@@ -272,6 +425,80 @@ rules = [{{ literal_environment_variables = ["{missing_variable}"] }}]
         assert_bindable([addresses[0]]);
         drop(blocker);
         assert_bindable([addresses[1]]);
+    }
+
+    #[tokio::test]
+    async fn partial_proxy_startup_rolls_back_and_joins_before_returning() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let addresses = available_addresses::<3>();
+        let extra = format!(
+            r#"[listeners.transparent_http]
+bind = "{}"
+http_versions = ["http1"]
+"#,
+            addresses[2]
+        );
+        let (_directory, loaded) = loaded(&config(addresses[0], addresses[1], &extra));
+        let product = ProductRuntime::prepare(loaded).await.unwrap();
+        let mut starter = FakeStarter {
+            fail_at: Some(1),
+            supervisors: Vec::new(),
+        };
+
+        let result = product.start_proxy_supervisors(&mut starter).await;
+
+        assert!(matches!(
+            result,
+            Err(ProductRuntimeError::ProxySupervisorStart(_))
+        ));
+        assert_eq!(starter.supervisors.len(), 1);
+        assert_eq!(starter.supervisors[0].shutdowns.load(Ordering::Acquire), 1);
+        assert_eq!(
+            starter.supervisors[0].abort_joins.load(Ordering::Acquire),
+            1
+        );
+        assert_eq!(
+            product.runtime().lifecycle(),
+            crate::runtime::LifecycleState::Stopped
+        );
+        assert_bindable(addresses);
+    }
+
+    #[tokio::test]
+    async fn terminal_proxy_failure_drives_shutdown_and_supervisors_join_once() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let addresses = available_addresses::<2>();
+        let (_directory, loaded) = loaded(&config(addresses[0], addresses[1], ""));
+        let product = ProductRuntime::prepare(loaded).await.unwrap();
+        product.activate_initial().await.unwrap();
+        let mut starter = FakeStarter::default();
+        product.start_proxy_supervisors(&mut starter).await.unwrap();
+        assert!(product.runtime().is_ready());
+
+        starter.supervisors[0].fail();
+        let failure =
+            tokio::time::timeout(Duration::from_secs(1), product.wait_for_proxy_failure())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            failure.listener,
+            super::super::listeners::ProxyListenerKind::ExplicitHttp
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while product.runtime().lifecycle() != crate::runtime::LifecycleState::Stopped {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!product.runtime().is_ready());
+        assert_eq!(starter.supervisors[0].joins(), 1);
+
+        product.shutdown().await;
+        product.shutdown().await;
+        assert_eq!(starter.supervisors[0].joins(), 1);
+        assert_bindable(addresses);
     }
 
     #[test]

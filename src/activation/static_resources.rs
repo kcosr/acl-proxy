@@ -17,7 +17,9 @@ use crate::observation::ProductObservationRuntime;
 use crate::runtime::{BoxFuture, ServiceReadiness, StaticResourceBrand, StaticResources};
 use crate::safety::WireBodyPool;
 
-use super::listeners::{PreparedProxyListeners, ProxyListenerBindError};
+use super::listeners::{
+    PreparedProxyListeners, ProxyListenerBindError, ProxySupervisor, ProxySupervisorFailure,
+};
 use super::product::ProductActivator;
 
 /// One process-lifetime owner for all static product state.
@@ -34,6 +36,10 @@ pub(crate) struct ProductStaticResources {
     shutdown_deadline: Mutex<Option<tokio::time::Instant>>,
     control_failure: watch::Sender<Option<Arc<ControlServerRunError>>>,
     control_shutdown_error: Mutex<Option<Arc<ControlServerShutdownError>>>,
+    proxy_failure: watch::Sender<Option<Arc<ProxySupervisorFailure>>>,
+    proxy_shutdown_error: Mutex<Option<Arc<ProxySupervisorFailure>>>,
+    proxy_supervisors: Mutex<Vec<Arc<dyn ProxySupervisor>>>,
+    proxy_shutdown: tokio::sync::OnceCell<()>,
     ingress: Mutex<IngressOwnership>,
     control: Mutex<ControlOwnership>,
     wire_body_pool: Arc<WireBodyPool>,
@@ -77,6 +83,7 @@ impl ProductStaticResources {
         static_config: &StaticProductConfig,
     ) -> Result<Arc<Self>, ProductStaticResourcesError> {
         let (control_failure, _) = watch::channel(None);
+        let (proxy_failure, _) = watch::channel(None);
         Ok(Arc::new(Self {
             readiness: Arc::new(ServiceReadiness::new()),
             brand: StaticResourceBrand::new(),
@@ -86,6 +93,10 @@ impl ProductStaticResources {
             shutdown_deadline: Mutex::new(None),
             control_failure,
             control_shutdown_error: Mutex::new(None),
+            proxy_failure,
+            proxy_shutdown_error: Mutex::new(None),
+            proxy_supervisors: Mutex::new(Vec::new()),
+            proxy_shutdown: tokio::sync::OnceCell::new(),
             ingress: Mutex::new(IngressOwnership {
                 config: static_config.listeners.clone(),
                 state: IngressState::Unprepared,
@@ -325,6 +336,97 @@ impl ProductStaticResources {
             .clone()
     }
 
+    pub(super) fn adopt_proxy_supervisors(
+        &self,
+        supervisors: &mut Vec<Arc<dyn ProxySupervisor>>,
+    ) -> Result<(), ProductStaticResourcesError> {
+        let mut owned = self
+            .proxy_supervisors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return Err(ProductStaticResourcesError::ShuttingDown);
+        }
+        if !owned.is_empty() {
+            return Err(ProductStaticResourcesError::ProxySupervisorsAlreadyAdopted);
+        }
+        owned.append(supervisors);
+        Ok(())
+    }
+
+    pub(super) fn record_proxy_failure(&self, error: Arc<ProxySupervisorFailure>) {
+        let _ = self.proxy_failure.send_if_modified(|recorded| {
+            if recorded.is_some() {
+                return false;
+            }
+            *recorded = Some(error);
+            true
+        });
+    }
+
+    pub(crate) async fn wait_for_proxy_failure(&self) -> Option<Arc<ProxySupervisorFailure>> {
+        let mut failure = self.proxy_failure.subscribe();
+        loop {
+            if let Some(error) = failure.borrow().clone() {
+                return Some(error);
+            }
+            if failure.changed().await.is_err() {
+                return failure.borrow().clone();
+            }
+        }
+    }
+
+    pub(crate) fn proxy_shutdown_error(&self) -> Option<Arc<ProxySupervisorFailure>> {
+        self.proxy_shutdown_error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    async fn shutdown_proxy_supervisors(&self) {
+        let supervisors = self
+            .proxy_supervisors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let deadline = *self
+            .shutdown_deadline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut joins = tokio::task::JoinSet::new();
+        for supervisor in supervisors {
+            joins.spawn(async move {
+                if let Some(deadline) = deadline {
+                    tokio::select! {
+                        biased;
+                        _ = tokio::time::sleep_until(deadline) => supervisor.abort_and_join().await,
+                        result = supervisor.close_and_join() => result,
+                    }
+                } else {
+                    supervisor.close_and_join().await
+                }
+            });
+        }
+        while let Some(result) = joins.join_next().await {
+            let error = match result {
+                Ok(Ok(())) => continue,
+                Ok(Err(error)) => Arc::new(error),
+                Err(error) => {
+                    tracing::error!(%error, "proxy supervisor shutdown coordinator failed");
+                    continue;
+                }
+            };
+            tracing::error!(error = %error, "proxy supervisor shutdown failed");
+            let mut recorded = self
+                .proxy_shutdown_error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if recorded.is_none() {
+                *recorded = Some(error);
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn shutdown_started_for_test(&self) -> bool {
         self.shutdown_started.load(Ordering::Acquire)
@@ -372,6 +474,14 @@ impl StaticResources for ProductStaticResources {
         self.readiness.begin_shutdown();
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
             return;
+        }
+        for supervisor in self
+            .proxy_supervisors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+        {
+            supervisor.begin_shutdown();
         }
         if matches!(ingress.state, IngressState::Prepared(_)) {
             ingress.state = IngressState::Adopted;
@@ -434,6 +544,9 @@ impl StaticResources for ProductStaticResources {
                 }
             }
             self.authorization_runtime.wait_until_drained().await;
+            self.proxy_shutdown
+                .get_or_init(|| self.shutdown_proxy_supervisors())
+                .await;
         })
     }
 }
@@ -456,6 +569,8 @@ pub(crate) enum ProductStaticResourcesError {
     IngressAlreadyAdopted,
     #[error("control server has already started")]
     ControlAlreadyStarted,
+    #[error("proxy supervisors have already been adopted")]
+    ProxySupervisorsAlreadyAdopted,
     #[error("static resources are shutting down")]
     ShuttingDown,
 }
@@ -473,11 +588,9 @@ mod tests {
     };
     use crate::config::{compile_config_text, ConfigTextInput};
 
-    static LISTENER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
     fn available_addresses<const N: usize>() -> [SocketAddr; N] {
         let listeners: Vec<_> = (0..N)
-            .map(|_| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
+            .map(|_| TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), 0)).unwrap())
             .collect();
         let addresses = listeners
             .iter()
@@ -584,7 +697,7 @@ header = "x-acl-proxy-request-id"
 
     #[tokio::test]
     async fn preparation_reserves_every_configured_listener_and_is_one_shot() {
-        let _test = LISTENER_TEST_LOCK.lock().await;
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let addresses = available_addresses::<5>();
         let resources = ProductStaticResources::try_new(&static_config(addresses)).unwrap();
 
@@ -606,7 +719,7 @@ header = "x-acl-proxy-request-id"
 
     #[tokio::test]
     async fn later_proxy_bind_failure_releases_earlier_sockets() {
-        let _test = LISTENER_TEST_LOCK.lock().await;
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let addresses = available_addresses::<5>();
         let blocker = TcpListener::bind(addresses[2]).unwrap();
         let resources = ProductStaticResources::try_new(&static_config(addresses)).unwrap();
@@ -624,7 +737,7 @@ header = "x-acl-proxy-request-id"
 
     #[tokio::test]
     async fn control_adoption_failure_releases_all_prebound_sockets() {
-        let _test = LISTENER_TEST_LOCK.lock().await;
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let addresses = available_addresses::<5>();
         let resources = ProductStaticResources::try_new(&static_config(addresses)).unwrap();
 
@@ -643,7 +756,7 @@ header = "x-acl-proxy-request-id"
 
     #[tokio::test]
     async fn shutdown_releases_prepared_but_unstarted_proxy_sockets() {
-        let _test = LISTENER_TEST_LOCK.lock().await;
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let addresses = available_addresses::<5>();
         let resources = ProductStaticResources::try_new(&static_config(addresses)).unwrap();
         resources.prepare_ingress().unwrap();
@@ -659,7 +772,7 @@ header = "x-acl-proxy-request-id"
 
     #[tokio::test]
     async fn construction_does_not_bind_configured_sockets() {
-        let _test = LISTENER_TEST_LOCK.lock().await;
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let addresses = available_addresses::<5>();
         let resources = ProductStaticResources::try_new(&static_config(addresses)).unwrap();
 
