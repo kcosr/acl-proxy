@@ -35,7 +35,8 @@ use crate::app::{AppState, ParentEgressTls, SharedAppState};
 use crate::auth_plugin::{AuthPluginHandle, PluginBodyInput, PluginBodyMutation, PluginDecision};
 use crate::capture::{
     build_capture_record, should_capture, BodyCaptureBuffer, BodyCaptureResult, CaptureDecision,
-    CaptureEndpoint, CaptureKind, CaptureMode, CaptureRecord, CaptureRecordOptions, HeaderMap,
+    CaptureEndpoint, CaptureKind, CaptureMode, CaptureRecord, CaptureRecordOptions,
+    CaptureSinkSpec, HeaderMap,
 };
 use crate::config::{
     parse_listener_bind, Config, EgressTargetConfig, EgressTransport, ExternalAuthProfileType,
@@ -2389,10 +2390,32 @@ pub(crate) async fn maybe_capture_static_response(
         }));
     }
 
-    write_capture_records_blocking(cfg.clone(), records).await;
+    write_capture_records_blocking(capture_sink_spec(cfg), records).await;
 }
 
-async fn write_capture_records_blocking(config: Config, records: Vec<CaptureRecord>) {
+fn capture_sink_spec(config: &Config) -> CaptureSinkSpec {
+    let directory = config.capture.directory.trim();
+    let directory = if directory.is_empty() {
+        "logs-capture"
+    } else {
+        directory
+    };
+    let filename = config.capture.filename.trim();
+    let filename = if filename.is_empty() {
+        "{requestId}-{suffix}.json"
+    } else {
+        filename
+    };
+    CaptureSinkSpec::new(
+        directory.into(),
+        filename.to_string(),
+        config.capture.max_files,
+        config.capture.max_total_bytes,
+    )
+    .expect("validated legacy capture sink configuration")
+}
+
+async fn write_capture_records_blocking(sink: CaptureSinkSpec, records: Vec<CaptureRecord>) {
     if records.is_empty() {
         return;
     }
@@ -2400,7 +2423,7 @@ async fn write_capture_records_blocking(config: Config, records: Vec<CaptureReco
     let result = tokio::task::spawn_blocking(move || {
         records
             .into_iter()
-            .filter_map(|record| crate::capture::write_capture_record(&config, &record).err())
+            .filter_map(|record| crate::capture::write_capture_record(&sink, &record).err())
             .map(|err| err.to_string())
             .collect::<Vec<_>>()
     })
@@ -2978,7 +3001,7 @@ pub(crate) async fn proxy_allowed_request(
             }
         }
 
-        write_capture_records_blocking(cfg, records).await;
+        write_capture_records_blocking(capture_sink_spec(&cfg), records).await;
     });
 
     if let (Some(downstream_upgrade), Some(upstream_upgrade)) =

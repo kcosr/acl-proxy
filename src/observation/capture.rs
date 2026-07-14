@@ -425,12 +425,15 @@ mod tests {
                 capture: Some(CapturePlan {
                     events: vec![CompiledCaptureEvent::RequestAllowed],
                     redaction_profile: "accounting".to_owned(),
-                    directory: PathBuf::from("/accounting-captures"),
-                    filename: "capture-{requestId}-{suffix}.json".to_owned(),
+                    sink: crate::capture::CaptureSinkSpec::new(
+                        PathBuf::from("/accounting-captures"),
+                        "capture-{requestId}-{suffix}.json".to_owned(),
+                        10,
+                        100,
+                    )
+                    .unwrap(),
                     max_body_bytes: 1,
                     max_inflight_body_bytes: limit,
-                    max_files: 10,
-                    max_total_bytes: 100,
                 }),
             },
             &redaction,

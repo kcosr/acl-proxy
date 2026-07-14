@@ -23,6 +23,9 @@ fn sample_record(body: Option<CaptureBody>) -> CaptureRecord {
         http_version: Some("1.1".to_string()),
         headers: None,
         body,
+        body_truncated: None,
+        provider_replacement_omitted: None,
+        provider_replacement_size: None,
     }
 }
 

@@ -1,9 +1,12 @@
 mod capture;
 
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
+use crate::capture::CaptureSinkSpec;
 use crate::config::compiler::{
     CapturePlan, CompiledCaptureEvent, CompiledLogLevel, ObservationPlan,
     PolicyDecisionLoggingPlan, ReloadableLoggingPlan,
@@ -281,11 +284,8 @@ pub(crate) struct CapturePolicy {
     events: CaptureEventSet,
     profile_index: RedactionProfileIndex,
     profile: ProfileHandle,
-    directory: PathBuf,
-    filename: String,
+    sink: CaptureSinkSpec,
     max_body_bytes: usize,
-    max_files: usize,
-    max_total_bytes: u64,
     pool: Weak<CapturePool>,
 }
 
@@ -295,8 +295,8 @@ impl fmt::Debug for CapturePolicy {
             .debug_struct("CapturePolicy")
             .field("event_count", &self.events.len())
             .field("max_body_bytes", &self.max_body_bytes)
-            .field("max_files", &self.max_files)
-            .field("max_total_bytes", &self.max_total_bytes)
+            .field("max_files", &self.sink.max_files())
+            .field("max_total_bytes", &self.sink.max_total_bytes())
             .finish_non_exhaustive()
     }
 }
@@ -311,22 +311,16 @@ impl CapturePolicy {
         let CapturePlan {
             events,
             redaction_profile: _,
-            directory,
-            filename,
+            sink,
             max_body_bytes,
             max_inflight_body_bytes: _,
-            max_files,
-            max_total_bytes,
         } = plan;
         Self {
             events: CaptureEventSet::from_compiled(events),
             profile_index,
             profile,
-            directory,
-            filename,
+            sink,
             max_body_bytes,
-            max_files,
-            max_total_bytes,
             pool,
         }
     }
@@ -351,11 +345,11 @@ impl CapturePolicy {
     }
 
     pub(crate) fn directory(&self) -> &Path {
-        &self.directory
+        self.sink.directory()
     }
 
     pub(crate) fn filename(&self) -> &str {
-        &self.filename
+        self.sink.filename_template()
     }
 
     pub(crate) fn max_body_bytes(&self) -> usize {
@@ -363,11 +357,11 @@ impl CapturePolicy {
     }
 
     pub(crate) fn max_files(&self) -> usize {
-        self.max_files
+        self.sink.max_files()
     }
 
     pub(crate) fn max_total_bytes(&self) -> u64 {
-        self.max_total_bytes
+        self.sink.max_total_bytes()
     }
 }
 
@@ -454,12 +448,15 @@ mod tests {
             capture: Some(CapturePlan {
                 events,
                 redaction_profile: profile_name.to_owned(),
-                directory: PathBuf::from("/private/capture-name"),
-                filename: "private-{requestId}-{suffix}.json".to_owned(),
+                sink: CaptureSinkSpec::new(
+                    PathBuf::from("/private/capture-name"),
+                    "private-{requestId}-{suffix}.json".to_owned(),
+                    10,
+                    100,
+                )
+                .unwrap(),
                 max_body_bytes: 8,
                 max_inflight_body_bytes: limit,
-                max_files: 10,
-                max_total_bytes: 100,
             }),
         }
     }

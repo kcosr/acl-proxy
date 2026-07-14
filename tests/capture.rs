@@ -7,7 +7,8 @@ use tempfile::TempDir;
 
 use acl_proxy::capture::{
     build_capture_record, should_capture, BodyCaptureBuffer, CaptureDecision, CaptureEndpoint,
-    CaptureKind, CaptureMode, CaptureRecordOptions, HeaderMap, DEFAULT_MAX_BODY_BYTES,
+    CaptureKind, CaptureMode, CaptureRecordOptions, CaptureSinkSpec, HeaderMap,
+    DEFAULT_MAX_BODY_BYTES,
 };
 use acl_proxy::config::Config;
 
@@ -35,6 +36,20 @@ fn capture_record(request_id: &str) -> acl_proxy::capture::CaptureRecord {
         status_message: None,
         body: None,
     })
+}
+
+fn capture_sink(config: &Config) -> CaptureSinkSpec {
+    CaptureSinkSpec::new(
+        config.capture.directory.clone().into(),
+        if config.capture.filename.trim().is_empty() {
+            "{requestId}-{suffix}.json".to_string()
+        } else {
+            config.capture.filename.clone()
+        },
+        config.capture.max_files,
+        config.capture.max_total_bytes,
+    )
+    .unwrap()
 }
 
 fn capture_file_names(capture_dir: &std::path::Path) -> Vec<String> {
@@ -93,7 +108,7 @@ fn capture_write_creates_expected_file_and_json() {
     };
 
     let record = build_capture_record(opts);
-    let path = acl_proxy::capture::write_capture_record(&config, &record).unwrap();
+    let path = acl_proxy::capture::write_capture_record(&capture_sink(&config), &record).unwrap();
 
     assert!(path.exists(), "capture file should exist");
     let contents = fs::read_to_string(&path).expect("read capture file");
@@ -122,7 +137,7 @@ fn capture_write_prunes_by_max_files() {
 
     for request_id in ["req-001", "req-002", "req-003"] {
         let record = capture_record(request_id);
-        acl_proxy::capture::write_capture_record(&config, &record).unwrap();
+        acl_proxy::capture::write_capture_record(&capture_sink(&config), &record).unwrap();
     }
 
     assert_eq!(
@@ -144,7 +159,7 @@ fn capture_write_prunes_by_max_total_bytes() {
 
     for request_id in ["req-001", "req-002", "req-003"] {
         let record = capture_record(request_id);
-        acl_proxy::capture::write_capture_record(&config, &record).unwrap();
+        acl_proxy::capture::write_capture_record(&capture_sink(&config), &record).unwrap();
     }
 
     assert_eq!(
@@ -162,17 +177,17 @@ fn concurrent_capture_writes_prune_as_one_transaction_per_directory() {
     config.capture.directory = capture_dir.to_string_lossy().to_string();
     config.capture.filename = "{requestId}.json".to_string();
     config.capture.max_files = 1;
-    let config = Arc::new(config);
+    let sink = Arc::new(capture_sink(&config));
     let barrier = Arc::new(Barrier::new(9));
 
     let writers: Vec<_> = (0..8)
         .map(|index| {
-            let config = Arc::clone(&config);
+            let sink = Arc::clone(&sink);
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 let record = capture_record(&format!("req-{index:03}"));
                 barrier.wait();
-                acl_proxy::capture::write_capture_record(&config, &record)
+                acl_proxy::capture::write_capture_record(&sink, &record)
             })
         })
         .collect();
@@ -203,18 +218,18 @@ fn concurrent_filename_collisions_keep_complete_records() {
     config.capture.directory = capture_dir.to_string_lossy().to_string();
     config.capture.filename = "capture.json".to_string();
     config.capture.max_files = 10;
-    let config = Arc::new(config);
+    let sink = Arc::new(capture_sink(&config));
     let barrier = Arc::new(Barrier::new(3));
 
     let writers: Vec<_> = ["first", "second"]
         .into_iter()
         .map(|request_id| {
-            let config = Arc::clone(&config);
+            let sink = Arc::clone(&sink);
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 let record = capture_record(request_id);
                 barrier.wait();
-                acl_proxy::capture::write_capture_record(&config, &record)
+                acl_proxy::capture::write_capture_record(&sink, &record)
             })
         })
         .collect();
@@ -284,7 +299,10 @@ fn aliased_capture_directories_share_collision_and_retention_transaction() {
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 barrier.wait();
-                acl_proxy::capture::write_capture_record(&config, &capture_record(request_id))
+                acl_proxy::capture::write_capture_record(
+                    &capture_sink(&config),
+                    &capture_record(request_id),
+                )
             })
         })
         .collect();
@@ -314,8 +332,11 @@ fn stale_internal_temp_files_do_not_consume_retention() {
     config.capture.max_files = 1;
     config.capture.max_total_bytes = 1024;
 
-    let path = acl_proxy::capture::write_capture_record(&config, &capture_record("current"))
-        .expect("write capture with stale temp");
+    let path = acl_proxy::capture::write_capture_record(
+        &capture_sink(&config),
+        &capture_record("current"),
+    )
+    .expect("write capture with stale temp");
 
     assert_eq!(path.file_name().unwrap(), "capture.json");
     assert!(!stale_temp.exists(), "stale temp must be cleaned");
@@ -424,7 +445,7 @@ fn capture_subprocess_writer() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(u64::MAX);
-    acl_proxy::capture::write_capture_record(&config, &capture_record(&request_id))
+    acl_proxy::capture::write_capture_record(&capture_sink(&config), &capture_record(&request_id))
         .expect("write subprocess capture");
 }
 

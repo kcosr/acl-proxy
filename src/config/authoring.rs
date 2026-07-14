@@ -1504,6 +1504,7 @@ max_inflight_body_bytes = 67108864
         assert_eq!(capture.events.len(), 2);
         assert_eq!(capture.redaction_profile, "secrets");
         assert_eq!(capture.max_inflight_body_bytes, 64 * 1024 * 1024);
+        assert_eq!(capture.max_pending_records, 1024);
     }
 
     #[test]

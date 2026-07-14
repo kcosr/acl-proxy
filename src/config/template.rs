@@ -89,6 +89,7 @@ mod tests {
             compiled.static_config.service.max_webhook_transport_bytes,
             64 * 1024 * 1024
         );
+        assert_eq!(compiled.static_config.capture.max_pending_records, 1024);
     }
 
     #[test]

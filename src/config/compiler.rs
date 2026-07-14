@@ -21,6 +21,7 @@ use crate::authorization::protocol::{
     MIN_WEBHOOK_REQUEST_WITHOUT_CALLBACK_URL_BYTES, PROCESS_PROVIDER_MIN_DECISION_RESPONSE_BYTES,
     PROCESS_PROVIDER_RESPONSE_PREFIX_BYTES, PROCESS_PROVIDER_RESPONSE_TERMINATOR_BYTES,
 };
+use crate::capture::CaptureSinkSpec;
 use crate::http1::store::PARSER_STORE_BYTES;
 use crate::http_body::{http_decoder_workspace_sizes, HTTP_DECODER_OUTPUT_STAGING_BYTES};
 use crate::network::{canonical_socket_addr, socket_binds_overlap};
@@ -891,12 +892,9 @@ pub(crate) struct PolicyDecisionLoggingPlan {
 pub(crate) struct CapturePlan {
     pub(crate) events: Vec<CompiledCaptureEvent>,
     pub(crate) redaction_profile: String,
-    pub(crate) directory: PathBuf,
-    pub(crate) filename: String,
+    pub(crate) sink: CaptureSinkSpec,
     pub(crate) max_body_bytes: usize,
     pub(crate) max_inflight_body_bytes: usize,
-    pub(crate) max_files: usize,
-    pub(crate) max_total_bytes: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5018,12 +5016,15 @@ fn compile_capture_plan(value: &super::authoring::AuthoringCaptureConfig) -> Cap
             })
             .collect(),
         redaction_profile: value.redaction_profile.clone(),
-        directory: value.directory.clone(),
-        filename: value.filename.clone(),
+        sink: CaptureSinkSpec::new(
+            value.directory.clone(),
+            value.filename.clone(),
+            value.max_files,
+            value.max_total_bytes,
+        )
+        .expect("validated observation capture sink"),
         max_body_bytes: value.max_body_bytes,
         max_inflight_body_bytes: value.max_inflight_body_bytes,
-        max_files: value.max_files,
-        max_total_bytes: value.max_total_bytes,
     }
 }
 
@@ -6995,12 +6996,15 @@ max_total_bytes = 16384
             [CompiledCaptureEvent::ResponseDenied]
         ));
         assert_eq!(capture.redaction_profile, "next");
-        assert!(capture.directory.ends_with("captures-b"));
-        assert_eq!(capture.filename, "{requestId}.next-{suffix}.json");
+        assert!(capture.sink.directory().ends_with("captures-b"));
+        assert_eq!(
+            capture.sink.filename_template(),
+            "{requestId}.next-{suffix}.json"
+        );
         assert_eq!(capture.max_body_bytes, 2048);
         assert_eq!(capture.max_inflight_body_bytes, 8192);
-        assert_eq!(capture.max_files, 11);
-        assert_eq!(capture.max_total_bytes, 32768);
+        assert_eq!(capture.sink.max_files(), 11);
+        assert_eq!(capture.sink.max_total_bytes(), 32768);
     }
 
     #[test]

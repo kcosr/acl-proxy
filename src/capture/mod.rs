@@ -9,7 +9,8 @@ use std::time::SystemTime;
 use base64::{engine::general_purpose, Engine as _};
 use fs2::FileExt;
 use once_cell::sync::Lazy;
-use serde::{Deserialize, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
 
 use crate::config::{CaptureConfig, Config};
@@ -63,6 +64,86 @@ pub struct CaptureEndpoint {
 
 pub type HeaderMap = BTreeMap<String, JsonValue>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureSinkSpec {
+    directory: PathBuf,
+    filename_template: String,
+    max_files: usize,
+    max_total_bytes: u64,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CaptureSinkSpecError {
+    #[error("capture directory must not be empty")]
+    EmptyDirectory,
+    #[error("capture filename template must be a nonempty basename")]
+    InvalidFilenameTemplate,
+    #[error("capture max_files must be at least 1")]
+    ZeroMaxFiles,
+    #[error("capture max_total_bytes must be at least 1")]
+    ZeroMaxTotalBytes,
+}
+
+impl CaptureSinkSpec {
+    pub fn new(
+        directory: PathBuf,
+        filename_template: String,
+        max_files: usize,
+        max_total_bytes: u64,
+    ) -> Result<Self, CaptureSinkSpecError> {
+        if directory.as_os_str().is_empty() {
+            return Err(CaptureSinkSpecError::EmptyDirectory);
+        }
+        if !is_valid_capture_filename_template(&filename_template) {
+            return Err(CaptureSinkSpecError::InvalidFilenameTemplate);
+        }
+        if max_files == 0 {
+            return Err(CaptureSinkSpecError::ZeroMaxFiles);
+        }
+        if max_total_bytes == 0 {
+            return Err(CaptureSinkSpecError::ZeroMaxTotalBytes);
+        }
+        Ok(Self {
+            directory,
+            filename_template,
+            max_files,
+            max_total_bytes,
+        })
+    }
+
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    pub fn filename_template(&self) -> &str {
+        &self.filename_template
+    }
+
+    pub fn max_files(&self) -> usize {
+        self.max_files
+    }
+
+    pub fn max_total_bytes(&self) -> u64 {
+        self.max_total_bytes
+    }
+}
+
+fn is_valid_capture_filename_template(template: &str) -> bool {
+    if template.is_empty()
+        || template.contains('/')
+        || template.contains('\\')
+        || template.contains("..")
+        || template.chars().any(char::is_control)
+    {
+        return false;
+    }
+    let mut components = Path::new(template).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(_)), None)
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CaptureBody {
     pub encoding: String,
@@ -76,11 +157,9 @@ pub struct CaptureBody {
     pub content_encoding: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct CaptureRecord {
     pub timestamp: String,
-
-    #[serde(rename = "requestId")]
     pub request_id: String,
 
     pub kind: CaptureKind,
@@ -89,25 +168,185 @@ pub struct CaptureRecord {
     pub url: String,
     pub method: String,
 
-    #[serde(rename = "statusCode", skip_serializing_if = "Option::is_none")]
     pub status_code: Option<u16>,
-
-    #[serde(rename = "statusMessage", skip_serializing_if = "Option::is_none")]
     pub status_message: Option<String>,
 
     pub client: CaptureEndpoint,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<CaptureEndpoint>,
-
-    #[serde(rename = "httpVersion", skip_serializing_if = "Option::is_none")]
     pub http_version: Option<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<HeaderMap>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<CaptureBody>,
+
+    pub body_truncated: Option<bool>,
+    pub provider_replacement_omitted: Option<bool>,
+    pub provider_replacement_size: Option<usize>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum CaptureRecordInvariantError {
+    #[error("bodyTruncated must be present only as true for a shorter base64 body prefix")]
+    InvalidBodyTruncated,
+    #[error("providerReplacementOmitted must be true and paired with providerReplacementSize")]
+    InvalidProviderReplacementMarker,
+    #[error("provider replacement records must omit body and bodyTruncated")]
+    ProviderReplacementContainsBody,
+}
+
+#[derive(Deserialize)]
+struct CaptureRecordWire {
+    timestamp: String,
+    #[serde(rename = "requestId")]
+    request_id: String,
+    kind: CaptureKind,
+    decision: CaptureDecision,
+    mode: CaptureMode,
+    url: String,
+    method: String,
+    #[serde(rename = "statusCode")]
+    status_code: Option<u16>,
+    #[serde(rename = "statusMessage")]
+    status_message: Option<String>,
+    client: CaptureEndpoint,
+    target: Option<CaptureEndpoint>,
+    #[serde(rename = "httpVersion")]
+    http_version: Option<String>,
+    headers: Option<HeaderMap>,
+    body: Option<CaptureBody>,
+    #[serde(rename = "bodyTruncated")]
+    body_truncated: Option<bool>,
+    #[serde(rename = "providerReplacementOmitted")]
+    provider_replacement_omitted: Option<bool>,
+    #[serde(rename = "providerReplacementSize")]
+    provider_replacement_size: Option<usize>,
+}
+
+impl CaptureRecord {
+    fn validate_invariants(&self) -> Result<(), CaptureRecordInvariantError> {
+        match (
+            self.provider_replacement_omitted,
+            self.provider_replacement_size,
+        ) {
+            (None, None) => {}
+            (Some(true), Some(_)) => {
+                if self.body.is_some() || self.body_truncated.is_some() {
+                    return Err(CaptureRecordInvariantError::ProviderReplacementContainsBody);
+                }
+                return Ok(());
+            }
+            _ => return Err(CaptureRecordInvariantError::InvalidProviderReplacementMarker),
+        }
+
+        if self.body_truncated == Some(false)
+            || self.body_truncated.is_some() && self.body.is_none()
+        {
+            return Err(CaptureRecordInvariantError::InvalidBodyTruncated);
+        }
+        if let Some(body) = &self.body {
+            if body.encoding == "base64" {
+                let Ok(stored) = general_purpose::STANDARD.decode(&body.data) else {
+                    return self
+                        .body_truncated
+                        .is_none()
+                        .then_some(())
+                        .ok_or(CaptureRecordInvariantError::InvalidBodyTruncated);
+                };
+                let truncated = stored.len() < body.length;
+                if stored.len() > body.length || self.body_truncated != truncated.then_some(true) {
+                    return Err(CaptureRecordInvariantError::InvalidBodyTruncated);
+                }
+            } else if self.body_truncated.is_some() {
+                return Err(CaptureRecordInvariantError::InvalidBodyTruncated);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn mark_provider_replacement_omitted(&mut self, size: usize) {
+        self.body = None;
+        self.body_truncated = None;
+        self.provider_replacement_omitted = Some(true);
+        self.provider_replacement_size = Some(size);
+    }
+}
+
+impl Serialize for CaptureRecord {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.validate_invariants()
+            .map_err(serde::ser::Error::custom)?;
+        let mut state = serializer.serialize_struct("CaptureRecord", 18)?;
+        state.serialize_field("timestamp", &self.timestamp)?;
+        state.serialize_field("requestId", &self.request_id)?;
+        state.serialize_field("kind", &self.kind)?;
+        state.serialize_field("decision", &self.decision)?;
+        state.serialize_field("mode", &self.mode)?;
+        state.serialize_field("url", &self.url)?;
+        state.serialize_field("method", &self.method)?;
+        if let Some(value) = &self.status_code {
+            state.serialize_field("statusCode", value)?;
+        }
+        if let Some(value) = &self.status_message {
+            state.serialize_field("statusMessage", value)?;
+        }
+        state.serialize_field("client", &self.client)?;
+        if let Some(value) = &self.target {
+            state.serialize_field("target", value)?;
+        }
+        if let Some(value) = &self.http_version {
+            state.serialize_field("httpVersion", value)?;
+        }
+        if let Some(value) = &self.headers {
+            state.serialize_field("headers", value)?;
+        }
+        if let Some(value) = &self.body {
+            state.serialize_field("body", value)?;
+        }
+        if let Some(value) = &self.body_truncated {
+            state.serialize_field("bodyTruncated", value)?;
+        }
+        if let Some(value) = &self.provider_replacement_omitted {
+            state.serialize_field("providerReplacementOmitted", value)?;
+        }
+        if let Some(value) = &self.provider_replacement_size {
+            state.serialize_field("providerReplacementSize", value)?;
+        }
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CaptureRecord {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = CaptureRecordWire::deserialize(deserializer)?;
+        let record = Self {
+            timestamp: wire.timestamp,
+            request_id: wire.request_id,
+            kind: wire.kind,
+            decision: wire.decision,
+            mode: wire.mode,
+            url: wire.url,
+            method: wire.method,
+            status_code: wire.status_code,
+            status_message: wire.status_message,
+            client: wire.client,
+            target: wire.target,
+            http_version: wire.http_version,
+            headers: wire.headers,
+            body: wire.body,
+            body_truncated: wire.body_truncated,
+            provider_replacement_omitted: wire.provider_replacement_omitted,
+            provider_replacement_size: wire.provider_replacement_size,
+        };
+        record
+            .validate_invariants()
+            .map_err(serde::de::Error::custom)?;
+        Ok(record)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -277,6 +516,10 @@ pub fn build_capture_record(opts: CaptureRecordOptions) -> CaptureRecord {
     } = opts;
 
     let body_info = body.and_then(|b| build_body(headers.as_ref(), &b));
+    let body_truncated = body_info
+        .as_ref()
+        .and_then(|(_, truncated)| truncated.then_some(true));
+    let body = body_info.map(|(body, _)| body);
 
     CaptureRecord {
         timestamp,
@@ -292,7 +535,10 @@ pub fn build_capture_record(opts: CaptureRecordOptions) -> CaptureRecord {
         target,
         http_version,
         headers,
-        body: body_info,
+        body,
+        body_truncated,
+        provider_replacement_omitted: None,
+        provider_replacement_size: None,
     }
 }
 
@@ -321,7 +567,10 @@ impl CaptureRecord {
     }
 }
 
-fn build_body(headers: Option<&HeaderMap>, body: &BodyCaptureResult) -> Option<CaptureBody> {
+fn build_body(
+    headers: Option<&HeaderMap>,
+    body: &BodyCaptureResult,
+) -> Option<(CaptureBody, bool)> {
     if body.total_len == 0 {
         return None;
     }
@@ -331,13 +580,16 @@ fn build_body(headers: Option<&HeaderMap>, body: &BodyCaptureResult) -> Option<C
 
     let data = general_purpose::STANDARD.encode(&body.captured);
 
-    Some(CaptureBody {
-        encoding: "base64".to_string(),
-        length: body.total_len,
-        data,
-        content_type,
-        content_encoding,
-    })
+    Some((
+        CaptureBody {
+            encoding: "base64".to_string(),
+            length: body.total_len,
+            data,
+            content_type,
+            content_encoding,
+        },
+        body.captured.len() < body.total_len,
+    ))
 }
 
 fn first_header_string(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -375,25 +627,14 @@ fn sanitize_path_component(input: &str) -> String {
 /// Filenames are produced from `capture.filename` using `{requestId}`,
 /// `{kind}`, and `{suffix}` placeholders. The `requestId` placeholder
 /// is sanitized to avoid introducing path separators. The directory is
-/// derived via `effective_capture_directory`.
-pub fn resolve_capture_path(config: &Config, record: &CaptureRecord) -> PathBuf {
-    let directory = effective_capture_directory(&config.capture);
+pub fn resolve_capture_path(sink: &CaptureSinkSpec, record: &CaptureRecord) -> PathBuf {
     let kind_suffix = match record.kind {
         CaptureKind::Request => "req",
         CaptureKind::Response => "res",
     };
 
     let safe_request_id = sanitize_path_component(&record.request_id);
-    let default_name = format!("{}-{}.json", safe_request_id, kind_suffix);
-
-    let raw_template = {
-        let tmpl = config.capture.filename.trim();
-        if tmpl.is_empty() {
-            default_name.as_str()
-        } else {
-            tmpl
-        }
-    };
+    let raw_template = sink.filename_template();
 
     let filename = raw_template
         .replace("{requestId}", &safe_request_id)
@@ -406,15 +647,7 @@ pub fn resolve_capture_path(config: &Config, record: &CaptureRecord) -> PathBuf 
         )
         .replace("{suffix}", kind_suffix);
 
-    Path::new(&directory).join(filename)
-}
-
-fn effective_capture_directory(capture: &CaptureConfig) -> String {
-    let capture_dir = capture.directory.trim();
-    if !capture_dir.is_empty() {
-        return capture_dir.to_string();
-    }
-    "logs-capture".to_string()
+    sink.directory().join(filename)
 }
 
 struct CaptureFileEntry {
@@ -425,11 +658,11 @@ struct CaptureFileEntry {
 }
 
 pub fn write_capture_record(
-    config: &Config,
+    sink: &CaptureSinkSpec,
     record: &CaptureRecord,
 ) -> Result<PathBuf, CaptureError> {
     let json = serde_json::to_string_pretty(record)?;
-    let requested_path = resolve_capture_path(config, record);
+    let requested_path = resolve_capture_path(sink, record);
     let directory = requested_path.parent().unwrap_or_else(|| Path::new("."));
     create_private_dir_all(directory).map_err(|source| CaptureError::CreateDir {
         path: directory.to_path_buf(),
@@ -494,7 +727,7 @@ pub fn write_capture_record(
     if let Err(error) = sync_capture_directory(&canonical_directory) {
         tracing::warn!(capture_path = %path.display(), %error, "capture published but directory sync failed");
     }
-    if let Err(error) = prune_capture_directory(&config.capture, &canonical_directory, &path) {
+    if let Err(error) = prune_capture_directory(sink, &canonical_directory, &path) {
         tracing::warn!(capture_path = %path.display(), %error, "capture published but retention maintenance failed");
     }
     if let Err(error) = sync_capture_directory(&canonical_directory) {
@@ -591,7 +824,7 @@ fn create_private_capture_temp(final_path: &Path) -> std::io::Result<(PathBuf, F
 }
 
 fn prune_capture_directory(
-    capture: &CaptureConfig,
+    sink: &CaptureSinkSpec,
     directory: &Path,
     written_path: &Path,
 ) -> Result<(), CaptureError> {
@@ -645,9 +878,9 @@ fn prune_capture_directory(
 
     for entry in entries {
         let is_first = kept_files == 0;
-        let within_count = kept_files < capture.max_files;
+        let within_count = kept_files < sink.max_files();
         let next_bytes = kept_bytes.saturating_add(entry.len);
-        let within_bytes = next_bytes <= capture.max_total_bytes;
+        let within_bytes = next_bytes <= sink.max_total_bytes();
         if is_first || (within_count && within_bytes) {
             kept_files += 1;
             kept_bytes = next_bytes;
@@ -731,6 +964,20 @@ default = "deny"
         toml::from_str(toml).expect("parse config")
     }
 
+    fn sink_from_config(config: &AppConfig) -> CaptureSinkSpec {
+        CaptureSinkSpec::new(
+            PathBuf::from(&config.capture.directory),
+            if config.capture.filename.trim().is_empty() {
+                "{requestId}-{suffix}.json".to_string()
+            } else {
+                config.capture.filename.clone()
+            },
+            config.capture.max_files,
+            config.capture.max_total_bytes,
+        )
+        .unwrap()
+    }
+
     fn sample_body_result(data: &[u8]) -> BodyCaptureResult {
         let mut buf = BodyCaptureBuffer::new(DEFAULT_MAX_BODY_BYTES);
         buf.push(data);
@@ -753,6 +1000,9 @@ default = "deny"
             http_version: Some("1.1".to_string()),
             headers: None,
             body,
+            body_truncated: None,
+            provider_replacement_omitted: None,
+            provider_replacement_size: None,
         }
     }
 
@@ -810,6 +1060,140 @@ default = "deny"
         let result = buf.finish();
         assert_eq!(result.total_len, usize::MAX);
         assert!(result.captured.is_empty());
+    }
+
+    #[test]
+    fn capture_sink_spec_validates_path_and_retention_inputs() {
+        let valid = CaptureSinkSpec::new(
+            PathBuf::from("captures"),
+            "{requestId}-{suffix}.json".to_string(),
+            10,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(valid.directory(), Path::new("captures"));
+        assert_eq!(valid.filename_template(), "{requestId}-{suffix}.json");
+        assert_eq!(valid.max_files(), 10);
+        assert_eq!(valid.max_total_bytes(), 1024);
+
+        assert_eq!(
+            CaptureSinkSpec::new(PathBuf::new(), "capture.json".to_string(), 1, 1),
+            Err(CaptureSinkSpecError::EmptyDirectory)
+        );
+        for filename in ["", ".", "..", "nested/capture.json", "nested\\capture.json"] {
+            assert_eq!(
+                CaptureSinkSpec::new(PathBuf::from("captures"), filename.to_string(), 1, 1),
+                Err(CaptureSinkSpecError::InvalidFilenameTemplate)
+            );
+        }
+        assert_eq!(
+            CaptureSinkSpec::new(PathBuf::from("captures"), "capture.json".to_string(), 0, 1,),
+            Err(CaptureSinkSpecError::ZeroMaxFiles)
+        );
+        assert_eq!(
+            CaptureSinkSpec::new(PathBuf::from("captures"), "capture.json".to_string(), 1, 0,),
+            Err(CaptureSinkSpecError::ZeroMaxTotalBytes)
+        );
+    }
+
+    #[test]
+    fn truncated_body_marker_is_exact_and_round_trips() {
+        let record = build_capture_record(CaptureRecordOptions {
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            request_id: "truncated".to_string(),
+            kind: CaptureKind::Response,
+            decision: CaptureDecision::Allow,
+            mode: CaptureMode::HttpProxy,
+            url: "http://example.com/".to_string(),
+            method: Some("GET".to_string()),
+            client: CaptureEndpoint::default(),
+            target: None,
+            http_version: None,
+            headers: None,
+            status_code: Some(200),
+            status_message: None,
+            body: Some(BodyCaptureResult {
+                captured: b"prefix".to_vec(),
+                total_len: 12,
+            }),
+        });
+
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["bodyTruncated"], true);
+        assert_eq!(value["body"]["length"], 12);
+        assert!(value.get("providerReplacementOmitted").is_none());
+        assert!(value.get("providerReplacementSize").is_none());
+        let decoded: CaptureRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.body_truncated, Some(true));
+
+        let complete = sample_record_with_body(Some(CaptureBody {
+            encoding: "base64".to_string(),
+            length: 6,
+            data: general_purpose::STANDARD.encode(b"prefix"),
+            content_type: None,
+            content_encoding: None,
+        }));
+        let value = serde_json::to_value(complete).unwrap();
+        assert!(value.get("bodyTruncated").is_none());
+    }
+
+    #[test]
+    fn invalid_body_truncated_shapes_are_rejected() {
+        let mut value = serde_json::to_value(sample_record_with_body(None)).unwrap();
+        value["bodyTruncated"] = JsonValue::Bool(false);
+        assert!(serde_json::from_value::<CaptureRecord>(value).is_err());
+
+        let mut value = serde_json::to_value(sample_record_with_body(None)).unwrap();
+        value["body"] = serde_json::json!({
+            "encoding": "base64",
+            "length": 8,
+            "data": general_purpose::STANDARD.encode(b"short")
+        });
+        assert!(serde_json::from_value::<CaptureRecord>(value).is_err());
+    }
+
+    #[test]
+    fn provider_replacement_marker_pair_is_exact_and_excludes_body() {
+        let mut record = sample_record_with_body(Some(CaptureBody {
+            encoding: "base64".to_string(),
+            length: 4,
+            data: general_purpose::STANDARD.encode(b"body"),
+            content_type: None,
+            content_encoding: None,
+        }));
+        record.mark_provider_replacement_omitted(4096);
+
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["providerReplacementOmitted"], true);
+        assert_eq!(value["providerReplacementSize"], 4096);
+        assert!(value.get("body").is_none());
+        assert!(value.get("bodyTruncated").is_none());
+        let decoded: CaptureRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.provider_replacement_omitted, Some(true));
+        assert_eq!(decoded.provider_replacement_size, Some(4096));
+    }
+
+    #[test]
+    fn invalid_provider_replacement_shapes_are_rejected() {
+        let base = serde_json::to_value(sample_record_with_body(None)).unwrap();
+        for fields in [
+            serde_json::json!({"providerReplacementOmitted": true}),
+            serde_json::json!({"providerReplacementSize": 1}),
+            serde_json::json!({
+                "providerReplacementOmitted": false,
+                "providerReplacementSize": 1
+            }),
+        ] {
+            let mut value = base.clone();
+            value.as_object_mut().unwrap().extend(
+                fields
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+            assert!(serde_json::from_value::<CaptureRecord>(value).is_err());
+        }
     }
 
     #[test]
@@ -897,9 +1281,12 @@ default = "deny"
             http_version: None,
             headers: None,
             body: None,
+            body_truncated: None,
+            provider_replacement_omitted: None,
+            provider_replacement_size: None,
         };
 
-        let path = resolve_capture_path(&cfg, &record);
+        let path = resolve_capture_path(&sink_from_config(&cfg), &record);
         assert_eq!(path, Path::new("logs-capture").join("req-123-req.json"));
     }
 
@@ -1007,13 +1394,16 @@ default = "deny"
             http_version: None,
             headers: None,
             body: None,
+            body_truncated: None,
+            provider_replacement_omitted: None,
+            provider_replacement_size: None,
         };
 
         let sanitized = sanitize_path_component(raw_request_id);
         assert!(!sanitized.contains('/'));
         assert!(!sanitized.contains('.'));
 
-        let path = resolve_capture_path(&cfg, &record);
+        let path = resolve_capture_path(&sink_from_config(&cfg), &record);
         let file_name = path
             .file_name()
             .expect("has file name")
