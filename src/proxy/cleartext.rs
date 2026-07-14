@@ -1243,9 +1243,9 @@ async fn execute_request(
     let mut observable =
         match prepare_observable_allowed_request(&lease, &mut allowed, origin_body, normalized) {
             Ok(prepared) => prepared,
-            Err(_) => {
+            Err((_error, headers)) => {
                 if let Some(mut submission) = capture.begin_allowed_request(
-                    &allowed.common.headers,
+                    &headers,
                     &allowed_body_headers,
                     allowed.body_provenance,
                 ) {
@@ -1405,22 +1405,27 @@ fn prepare_observable_allowed_request(
     allowed: &mut AllowedRequest<'_>,
     opaque_body: Option<Body>,
     normalized: bool,
-) -> Result<ObservableAllowedRequest, FinalRequestError> {
+) -> Result<ObservableAllowedRequest, (FinalRequestError, HeaderMap)> {
     let mut headers = std::mem::take(&mut allowed.common.headers);
-    apply_header_effects(allowed.request_header_effects(), &mut headers)?;
-    lease.egress().apply_request_headers(&mut headers)?;
+    if let Err(error) = apply_header_effects(allowed.request_header_effects(), &mut headers) {
+        return Err((error.into(), headers));
+    }
+    if let Err(error) = lease.egress().apply_request_headers(&mut headers) {
+        return Err((error.into(), headers));
+    }
 
     let body = if normalized {
-        let body = allowed
-            .body
-            .take()
-            .ok_or(FinalRequestError::MissingNormalizedBody)?;
+        let Some(body) = allowed.body.take() else {
+            return Err((FinalRequestError::MissingNormalizedBody, headers));
+        };
         headers.remove(CONTENT_ENCODING);
         headers.remove(CONTENT_LENGTH);
         match body.content_type.as_deref() {
             Some(value) => {
-                let value =
-                    HeaderValue::from_str(value).map_err(|_| FinalRequestError::ContentType)?;
+                let value = match HeaderValue::from_str(value) {
+                    Ok(value) => value,
+                    Err(_) => return Err((FinalRequestError::ContentType, headers)),
+                };
                 headers.insert(CONTENT_TYPE, value);
             }
             None => {
@@ -1433,7 +1438,7 @@ fn prepare_observable_allowed_request(
         }
     } else {
         if allowed.body.is_some() {
-            return Err(FinalRequestError::UnexpectedNormalizedBody);
+            return Err((FinalRequestError::UnexpectedNormalizedBody, headers));
         }
         OriginRequestBody::Opaque {
             body: opaque_body.expect("the opaque ingress body is retained"),
@@ -1576,10 +1581,8 @@ impl HttpBody for OriginRequestBody {
                         Poll::Ready(Some(Err(error)))
                     }
                     Poll::Ready(None) => {
-                        if body.is_end_stream() {
-                            if let Some(capture) = capture.as_mut() {
-                                capture.finish();
-                            }
+                        if let Some(capture) = capture.as_mut() {
+                            capture.finish_data_if_complete(true);
                         }
                         Poll::Ready(None)
                     }
@@ -1603,10 +1606,8 @@ impl HttpBody for OriginRequestBody {
                     }
                     Poll::Ready(Some(Err(never))) => match never {},
                     Poll::Ready(None) => {
-                        if body.is_end_stream() {
-                            if let Some(capture) = capture.as_mut() {
-                                capture.finish();
-                            }
+                        if let Some(capture) = capture.as_mut() {
+                            capture.finish_data_if_complete(true);
                         }
                         Poll::Ready(None)
                     }
@@ -1718,10 +1719,8 @@ impl HttpBody for ProxyResponseBody {
                         Poll::Ready(Some(Err(ProxyResponseBodyError::Forwarded(error))))
                     }
                     Poll::Ready(None) => {
-                        if body.is_end_stream() {
-                            if let Some(capture) = capture.as_mut() {
-                                capture.finish();
-                            }
+                        if let Some(capture) = capture.as_mut() {
+                            capture.finish_data_if_complete(true);
                         }
                         Poll::Ready(None)
                     }
@@ -1937,7 +1936,10 @@ max_total_bytes = 16777216
                         let headers_tx = headers_tx.clone();
                         async move {
                             let (parts, body) = request.into_parts();
-                            assert_eq!(to_bytes(body).await.unwrap(), "request-body");
+                            assert_eq!(
+                                to_bytes(body).await.unwrap(),
+                                "request-capture-redaction-sentinel-body"
+                            );
                             headers_tx
                                 .lock()
                                 .unwrap()
@@ -1982,6 +1984,14 @@ value = "yes"
         );
         let config = base_config(proxy, "explicit_http", &policy);
         let (directory, product) = product(config, listeners).await;
+        let (mut body_sender, body) = Body::channel();
+        body_sender
+            .send_data(Bytes::from_static(
+                b"request-capture-redaction-sentinel-body",
+            ))
+            .await
+            .unwrap();
+        drop(body_sender);
         let response = send_request(
             proxy,
             Request::builder()
@@ -1989,7 +1999,7 @@ value = "yes"
                 .uri(format!("http://{origin}/capture?secret=query"))
                 .header(http::header::AUTHORIZATION, "Bearer inbound-secret")
                 .header(http::header::COOKIE, "cookie-secret")
-                .body(Body::from("request-body"))
+                .body(body)
                 .unwrap(),
         )
         .await;
@@ -2020,7 +2030,10 @@ value = "yes"
             (response.kind, response.decision),
             (CaptureKind::Response, CaptureDecision::Allow)
         );
-        assert_eq!(request.decode_body_bytes().unwrap(), b"request-body");
+        assert_eq!(
+            request.decode_body_bytes().unwrap(),
+            b"request-[MASKED]-body"
+        );
         assert_eq!(response.decode_body_bytes().unwrap(), b"response-body");
         assert!(!request.url.contains("secret=query"));
         let request_headers = request.headers.as_ref().unwrap();
@@ -2034,6 +2047,8 @@ value = "yes"
         assert!(response.status_message.is_none());
 
         let ([proxy], listeners) = prebound_listeners::<1>();
+        let denied_origin = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let denied_origin_address = denied_origin.local_addr().unwrap();
         let policy = format!(
             r#"[listeners.explicit_http.connect]
 http1 = "deny"
@@ -2042,10 +2057,8 @@ http1 = "deny"
 default = "deny"
 
 {}"#,
-            capture_config()
+            capture_config(),
         );
-        let denied_origin = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let denied_origin_address = denied_origin.local_addr().unwrap();
         let (directory, runtime_product) =
             product(base_config(proxy, "explicit_http", &policy), listeners).await;
         let response = send_request(
@@ -2067,14 +2080,16 @@ default = "deny"
             .all(|record| record.decision == CaptureDecision::Deny));
         assert!(records
             .iter()
-            .find(|record| record.kind == CaptureKind::Request)
+            .find(|record| record.kind == CaptureKind::Request && record.url.ends_with("/denied"))
             .unwrap()
             .body
             .is_none());
         assert_eq!(
             records
                 .iter()
-                .find(|record| record.kind == CaptureKind::Response)
+                .find(|record| {
+                    record.kind == CaptureKind::Response && record.url.ends_with("/denied")
+                })
                 .unwrap()
                 .decode_body_bytes()
                 .unwrap(),
@@ -2097,6 +2112,18 @@ id = "post-allow-failure"
 decision = "allow"
 urls = ["http://{origin}/failure"]
 
+[[policy.rules]]
+id = "observable-header-failure"
+decision = "allow"
+urls = ["http://{origin}/header-failure"]
+
+[[policy.rules.request_headers]]
+operation = "replace"
+when = "always"
+name = "x-large"
+search = "x"
+replace = "xx"
+
 {}"#,
             capture_config()
         );
@@ -2111,20 +2138,212 @@ urls = ["http://{origin}/failure"]
         )
         .await;
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let response = send_request(
+            proxy,
+            Request::builder()
+                .uri(format!("http://{origin}/header-failure"))
+                .header(
+                    "x-large",
+                    HeaderValue::from_bytes(&vec![b'x'; 64 * 1024]).unwrap(),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         runtime_product.shutdown().await;
         let records = read_capture_records(directory.path());
-        assert_eq!(records.len(), 2);
+        assert_eq!(records.len(), 4);
         assert!(records
             .iter()
             .all(|record| record.decision == CaptureDecision::Allow));
         assert_eq!(
             records
                 .iter()
-                .find(|record| record.kind == CaptureKind::Response)
+                .find(|record| {
+                    record.kind == CaptureKind::Response && record.url.ends_with("/failure")
+                })
                 .unwrap()
                 .status_code,
             Some(502)
         );
+        let header_failure = records
+            .iter()
+            .find(|record| {
+                record.kind == CaptureKind::Request && record.url.ends_with("/header-failure")
+            })
+            .unwrap();
+        assert_eq!(
+            header_failure.headers.as_ref().unwrap()["x-large"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64 * 1024
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn active_executor_capture_omits_provider_replacement_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let provider_directory = tempdir().unwrap();
+        let provider_path = provider_directory.path().join("replacement.sh");
+        fs::write(
+            &provider_path,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf "%s" "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  if [ -n "$id" ]; then
+    case "$line" in
+      *complete-denied*) printf '{"id":"%s","type":"response","decision":"deny"}\n' "$id" ;;
+      *) printf '{"id":"%s","type":"response","decision":"allow","values":{"token":"secret-marker"},"requestBody":{"encoding":"base64","contentType":"text/plain","data":"cmVwbGFjZW1lbnQgc2VjcmV0"}}\n' "$id" ;;
+    esac
+  fi
+done
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&provider_path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&provider_path, permissions).unwrap();
+
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let (origin_tx, origin_rx) = oneshot::channel();
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin_listener.accept().await.unwrap();
+            let origin_tx = Arc::new(StdMutex::new(Some(origin_tx)));
+            Http::new()
+                .http1_only(true)
+                .serve_connection(
+                    stream,
+                    service_fn(move |request: Request<Body>| {
+                        let origin_tx = origin_tx.clone();
+                        async move {
+                            let authorization =
+                                request.headers().get(http::header::AUTHORIZATION).cloned();
+                            let body = to_bytes(request.into_body()).await.unwrap();
+                            origin_tx
+                                .lock()
+                                .unwrap()
+                                .take()
+                                .unwrap()
+                                .send((authorization, body))
+                                .ok();
+                            Ok::<_, Infallible>(Response::new(Body::from("accepted")))
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let policy = format!(
+            r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[authorization.providers.replacing]
+kind = "process"
+command = "{}"
+timeout = "2s"
+retire_timeout = "6s"
+include_request_body = true
+allow_request_body_replacement = true
+max_request_body_bytes = 128
+max_decoded_request_body_bytes = 128
+max_stdout_line_bytes = 1024
+
+[authorization.providers.replacing.outputs.token]
+kind = "bearer"
+required = true
+
+[redaction.profiles.wire]
+replacement = "[MASKED]"
+max_body_bytes = 128
+max_decoded_body_bytes = 128
+rules = [{{ literals = ["secret"], payloads = "text" }}]
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "replacement"
+decision = "delegate"
+urls = ["http://{origin}/replacement"]
+methods = ["POST"]
+authorization_provider = "replacing"
+redaction_profile = "wire"
+
+[[policy.rules]]
+id = "complete-denied"
+decision = "delegate"
+urls = ["http://{origin}/complete-denied"]
+methods = ["POST"]
+authorization_provider = "replacing"
+redaction_profile = "wire"
+
+{}"#,
+            provider_path.display(),
+            capture_config(),
+        );
+        let (directory, product) =
+            product(base_config(proxy, "explicit_http", &policy), listeners).await;
+        let response = send_request(
+            proxy,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri(format!("http://{origin}/replacement"))
+                .body(Body::from("original"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let (authorization, body) = origin_rx.await.unwrap();
+        assert_eq!(authorization.unwrap(), "Bearer secret-marker");
+        assert_eq!(body, "replacement [MASKED]");
+        let response = send_request(
+            proxy,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri(format!("http://{origin}/complete-denied"))
+                .body(Body::from("denied complete body"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        product.shutdown().await;
+        origin_task.await.unwrap();
+
+        let records = read_capture_records(directory.path());
+        let request = records
+            .iter()
+            .find(|record| {
+                record.kind == CaptureKind::Request && record.url.ends_with("/replacement")
+            })
+            .unwrap();
+        assert_eq!(request.provider_replacement_omitted, Some(true));
+        assert_eq!(
+            request.provider_replacement_size,
+            Some(b"replacement secret".len())
+        );
+        assert!(request.body.is_none());
+        assert!(!request
+            .headers
+            .as_ref()
+            .unwrap()
+            .contains_key("authorization"));
+        let denied = records
+            .iter()
+            .find(|record| {
+                record.kind == CaptureKind::Request && record.url.ends_with("/complete-denied")
+            })
+            .unwrap();
+        assert_eq!(denied.decision, CaptureDecision::Deny);
+        assert_eq!(denied.decode_body_bytes().unwrap(), b"denied complete body");
     }
 
     #[tokio::test]
@@ -2196,6 +2415,7 @@ default = "allow"
         headers: HeaderMap,
         body: Bytes,
         response_headers: HeaderMap,
+        capture_records: Vec<CaptureRecord>,
     }
 
     async fn normalized_round_trip(mode: CleartextMode) -> CapturedRoundTrip {
@@ -2226,6 +2446,7 @@ default = "allow"
                                     headers: parts.headers,
                                     body,
                                     response_headers: HeaderMap::new(),
+                                    capture_records: Vec::new(),
                                 })
                                 .ok();
                             Ok::<_, Infallible>(
@@ -2282,10 +2503,12 @@ operation = "set"
 when = "always"
 name = "x-shaped-response"
 value = "policy"
-"#
+{capture}
+"#,
+            capture = capture_config(),
         );
         let config = base_config(proxy, listener_table, &policy);
-        let (_directory, product) = product(config, listeners).await;
+        let (directory, product) = product(config, listeners).await;
 
         let plain = b"canonical decoded request bytes";
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -2316,6 +2539,7 @@ value = "policy"
         captured.response_headers = response_headers;
 
         product.shutdown().await;
+        captured.capture_records = read_capture_records(directory.path());
         origin_task.await.unwrap();
         captured
     }
@@ -2336,6 +2560,24 @@ value = "policy"
         );
         assert!(captured.headers.contains_key("x-test-loop"));
         assert_eq!(captured.response_headers["x-shaped-response"], "policy");
+        let request_capture = captured
+            .capture_records
+            .iter()
+            .find(|record| record.kind == CaptureKind::Request)
+            .unwrap();
+        assert_eq!(
+            request_capture.decode_body_bytes().unwrap(),
+            b"canonical decoded request bytes"
+        );
+        assert_eq!(
+            request_capture
+                .body
+                .as_ref()
+                .unwrap()
+                .content_encoding
+                .as_deref(),
+            Some("identity")
+        );
     }
 
     #[tokio::test]
