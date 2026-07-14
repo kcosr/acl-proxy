@@ -559,7 +559,7 @@ impl Runtime {
         drop(publication_guard);
         self.lifecycle
             .store(LifecycleState::Running as u8, Ordering::Release);
-        self.static_ownership.readiness.mark_ready();
+        self.static_ownership.readiness.mark_runtime_published();
         self.lifecycle_changed.notify_waiters();
         Ok(retirement)
     }

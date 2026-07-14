@@ -261,8 +261,10 @@ struct FakeStaticResources {
 
 impl Default for FakeStaticResources {
     fn default() -> Self {
+        let readiness = Arc::new(ServiceReadiness::new());
+        readiness.mark_ingress_started();
         Self {
-            readiness: Arc::new(ServiceReadiness::new()),
+            readiness,
             brand: StaticResourceBrand::new(),
             begin_shutdowns: AtomicUsize::new(0),
             shutdown_begun: AtomicBool::new(false),
@@ -353,8 +355,10 @@ struct BlockingStaticResources {
 
 impl Default for BlockingStaticResources {
     fn default() -> Self {
+        let readiness = Arc::new(ServiceReadiness::new());
+        readiness.mark_ingress_started();
         Self {
-            readiness: Arc::new(ServiceReadiness::new()),
+            readiness,
             brand: StaticResourceBrand::new(),
             begin_shutdowns: AtomicUsize::new(0),
             shutdown_begun: AtomicBool::new(false),
