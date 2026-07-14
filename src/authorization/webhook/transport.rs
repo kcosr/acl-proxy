@@ -35,10 +35,11 @@ where
         }
     };
     tokio::pin!(effective_cancellation);
+    let prepared = destination_guard.preflight(DestinationTarget::webhook(provider.url()))?;
     let resolved = tokio::select! {
         biased;
         _ = effective_cancellation.as_mut() => return Err(WebhookDeliveryError::Cancelled),
-        result = destination_guard.resolve(DestinationTarget::webhook(provider.url())) => result?,
+        result = destination_guard.complete_resolution(prepared) => result?,
     };
     let connected = tokio::select! {
         biased;

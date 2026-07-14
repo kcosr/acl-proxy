@@ -16,7 +16,7 @@ use tokio_rustls::TlsConnector;
 
 use crate::destination::{
     DestinationConnector, DestinationGuard, DestinationGuardError, DestinationTarget,
-    ResolvedDestination, TcpDestinationConnector,
+    PreparedDestination, ResolvedDestination, TcpDestinationConnector,
 };
 use crate::egress::{
     EgressRoute, OriginProtocol, OriginProtocolError, ParentAlpnError, ParentEndpoint,
@@ -456,6 +456,23 @@ impl HttpBody for ForwardBody {
 
 pub(crate) type ForwardedResponse = Response<ForwardBody>;
 
+pub(crate) struct PreparedForwardingTarget<'egress> {
+    canonical_url: String,
+    ingress_protocol: OriginProtocol,
+    origin_protocol: OriginProtocol,
+    egress_identity: usize,
+    route: PreparedForwardingRoute,
+    _egress: std::marker::PhantomData<&'egress dyn EgressSnapshot>,
+}
+
+enum PreparedForwardingRoute {
+    Direct(PreparedDestination),
+    Parent {
+        parent_url: String,
+        destination: PreparedDestination,
+    },
+}
+
 pub(crate) struct ResolvedForwardingTarget<'egress> {
     canonical_url: String,
     ingress_protocol: OriginProtocol,
@@ -473,31 +490,27 @@ enum ResolvedForwardingRoute {
     },
 }
 
-/// Resolves and validates the destination before policy or provider dispatch.
-/// The opaque result is consumed exactly once by `forward_request`.
-pub(crate) async fn resolve_forwarding_target<'egress>(
+/// Performs synchronous semantic destination checks before initial policy matching.
+pub(crate) fn preflight_forwarding_target<'egress>(
     canonical: &CanonicalUrl,
     request: &SanitizedRequest<impl Sized>,
     egress: &'egress dyn EgressSnapshot,
     destinations: &DestinationGuard,
-) -> Result<ResolvedForwardingTarget<'egress>, ResolveForwardingError> {
+) -> Result<PreparedForwardingTarget<'egress>, ResolveForwardingError> {
     let ingress_protocol = request.protocol();
     let origin_protocol = egress.origin_tls().select_protocol(ingress_protocol);
     let egress_identity = egress.route() as *const EgressRoute as usize;
     let route = match egress.route() {
-        EgressRoute::Direct => ResolvedForwardingRoute::Direct(
-            destinations
-                .resolve(DestinationTarget::direct(canonical))
-                .await?,
+        EgressRoute::Direct => PreparedForwardingRoute::Direct(
+            destinations.preflight(DestinationTarget::direct(canonical))?,
         ),
-        EgressRoute::Parent(parent) => ResolvedForwardingRoute::Parent {
+        EgressRoute::Parent(parent) => PreparedForwardingRoute::Parent {
             parent_url: parent.canonical_url().to_owned(),
             destination: destinations
-                .resolve(DestinationTarget::parent(parent.authority(), canonical))
-                .await?,
+                .preflight(DestinationTarget::parent(parent.authority(), canonical))?,
         },
     };
-    Ok(ResolvedForwardingTarget {
+    Ok(PreparedForwardingTarget {
         canonical_url: canonical.url.clone(),
         ingress_protocol,
         origin_protocol,
@@ -507,9 +520,44 @@ pub(crate) async fn resolve_forwarding_target<'egress>(
     })
 }
 
+/// Completes one pinned destination resolution under the request deadline.
+pub(crate) async fn resolve_forwarding_target<'egress>(
+    prepared: PreparedForwardingTarget<'egress>,
+    destinations: &DestinationGuard,
+) -> Result<ResolvedForwardingTarget<'egress>, ResolveForwardingError> {
+    let PreparedForwardingTarget {
+        canonical_url,
+        ingress_protocol,
+        origin_protocol,
+        egress_identity,
+        route,
+        _egress,
+    } = prepared;
+    let route = match route {
+        PreparedForwardingRoute::Direct(destination) => {
+            ResolvedForwardingRoute::Direct(destinations.complete_resolution(destination).await?)
+        }
+        PreparedForwardingRoute::Parent {
+            parent_url,
+            destination,
+        } => ResolvedForwardingRoute::Parent {
+            parent_url,
+            destination: destinations.complete_resolution(destination).await?,
+        },
+    };
+    Ok(ResolvedForwardingTarget {
+        canonical_url,
+        ingress_protocol,
+        origin_protocol,
+        egress_identity,
+        route,
+        _egress,
+    })
+}
+
 /// Sends one already-authorized logical origin request without connection reuse.
-/// The destination token carries the only DNS result; connect performs the
-/// synchronous pre- and post-connect validation before any outbound bytes.
+/// The resolved token carries the only DNS result; connect performs synchronous
+/// pre- and post-connect validation before any outbound bytes.
 pub(crate) async fn forward_request<'egress, B>(
     request: SanitizedRequest<B>,
     canonical: &CanonicalUrl,
@@ -898,6 +946,16 @@ mod tests {
         (guard, resolver)
     }
 
+    async fn prepare_and_resolve_target<'egress, B>(
+        canonical: &CanonicalUrl,
+        request: &SanitizedRequest<B>,
+        egress: &'egress dyn EgressSnapshot,
+        destinations: &DestinationGuard,
+    ) -> Result<ResolvedForwardingTarget<'egress>, ResolveForwardingError> {
+        let prepared = preflight_forwarding_target(canonical, request, egress, destinations)?;
+        resolve_forwarding_target(prepared, destinations).await
+    }
+
     fn activate(parent: Option<(&str, bool)>) -> ProductEgressSnapshot {
         activate_with_versions(
             parent,
@@ -1237,7 +1295,7 @@ mod tests {
                 }
             }
         });
-        let target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
             .await
             .unwrap();
         assert_eq!(target.ingress_protocol, expected_ingress, "{route:?}");
@@ -1604,7 +1662,7 @@ mod tests {
         let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
         let (captured_tx, captured_rx) = oneshot::channel();
         let server = tokio::spawn(serve_h2(server, captured_tx));
-        let target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
             .await
             .unwrap();
 
@@ -1635,7 +1693,7 @@ mod tests {
                 Err(error) => assert_eq!(error.kind(), io::ErrorKind::BrokenPipe),
             }
         });
-        let target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
             .await
             .unwrap();
 
@@ -1657,7 +1715,7 @@ mod tests {
         let (guard, _) = guard();
         let (client, _server) = tokio::io::duplex(1024);
         let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
-        let target = resolve_forwarding_target(&canonical, &request, &original, &guard)
+        let target = prepare_and_resolve_target(&canonical, &request, &original, &guard)
             .await
             .unwrap();
 
@@ -1675,7 +1733,7 @@ mod tests {
         let (guard, _) = guard();
 
         let resolved_for_h2 = request_with_version(Version::HTTP_2);
-        let target = resolve_forwarding_target(&canonical, &resolved_for_h2, &egress, &guard)
+        let target = prepare_and_resolve_target(&canonical, &resolved_for_h2, &egress, &guard)
             .await
             .unwrap();
         let (client, _server) = tokio::io::duplex(1024);
@@ -1695,7 +1753,7 @@ mod tests {
         assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
 
         let request = request_with_version(Version::HTTP_2);
-        let mut target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
+        let mut target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
             .await
             .unwrap();
         target.origin_protocol = OriginProtocol::Http2;
@@ -1743,7 +1801,7 @@ mod tests {
             server.read_to_end(&mut tail).await.unwrap();
             tail_tx.send(tail).ok();
         });
-        let target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
             .await
             .unwrap();
         let mut forwarding = Box::pin(forward_with_connector(
@@ -1768,7 +1826,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn direct_route_resolves_before_forward_and_never_resolves_again() {
+    async fn direct_route_preflight_is_synchronous_and_resolution_runs_exactly_once() {
         let canonical =
             canonicalize_http_url("http://origin.example:8080/canonical?q=%7e").unwrap();
         let egress = activate(None);
@@ -1779,9 +1837,12 @@ mod tests {
         let server = tokio::spawn(serve_h1(server, captured_tx));
 
         let request = request();
-        let target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
-            .await
-            .unwrap();
+        let prepared = preflight_forwarding_target(&canonical, &request, &egress, &guard)
+            .expect("semantic preflight");
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
+
+        let target = resolve_forwarding_target(prepared, &guard).await.unwrap();
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
         assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
 
@@ -1812,7 +1873,7 @@ mod tests {
         let (captured_tx, captured_rx) = oneshot::channel();
         let server = tokio::spawn(serve_h1(server, captured_tx));
         let request = request();
-        let target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
             .await
             .unwrap();
 
@@ -1842,7 +1903,7 @@ mod tests {
             serve_h1(tls, captured_tx).await;
         });
         let request = request();
-        let target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
             .await
             .unwrap();
 
@@ -1871,7 +1932,7 @@ mod tests {
                 Err(error) => assert_eq!(error.kind(), io::ErrorKind::BrokenPipe),
             }
         });
-        let target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
             .await
             .unwrap();
 
@@ -1911,7 +1972,7 @@ mod tests {
             serve_h1(tls, origin_tx).await;
         });
         let request = request();
-        let target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
             .await
             .unwrap();
 
@@ -1977,7 +2038,7 @@ mod tests {
             serve_h1(origin_tls, origin_tx).await;
         });
         let request = request();
-        let target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
             .await
             .unwrap();
 

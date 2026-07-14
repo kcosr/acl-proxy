@@ -192,6 +192,10 @@ impl<'generation, 'request> PreparedRequest<'generation, 'request> {
         }
     }
 
+    pub(crate) fn denies_without_resolution(&self) -> bool {
+        self.early_deny.is_some() || self.evaluation.outcome == PolicyOutcome::Deny
+    }
+
     pub(crate) async fn decide(
         self,
         body: Option<GuardedRequestBody>,
@@ -1207,6 +1211,7 @@ rules = [{ literals = ["secret"], payloads = "text" }]"#,
         let url = canonicalize_http_url("https://example.test/body").unwrap();
 
         let prepared = prepare_request(&lease, input("ordinary", &url, HeaderMap::new())).unwrap();
+        assert!(!prepared.denies_without_resolution());
         assert_eq!(
             prepared
                 .body_read_plan()
@@ -1219,6 +1224,7 @@ rules = [{ literals = ["secret"], payloads = "text" }]"#,
         let mut looped_headers = HeaderMap::new();
         looped_headers.insert("x-test-loop", HeaderValue::from_static("already-seen"));
         let looped = prepare_request(&lease, input("looped", &url, looped_headers)).unwrap();
+        assert!(looped.denies_without_resolution());
         assert_eq!(looped.body_read_plan(), HttpBodyReadPlan::Disabled);
         let RequestDecision::Deny(denied) = looped.decide(None).await.unwrap() else {
             panic!("a loop-marked request must deny without reading its body");
@@ -1607,6 +1613,7 @@ retire_timeout = "10s""#,
         let prepared = prepare_request(&lease, request).unwrap();
 
         assert_eq!(prepared.deadline(), started_at + Duration::from_secs(2));
+        assert!(!prepared.denies_without_resolution());
         drop(prepared);
 
         let default_started_at = Instant::now();
@@ -1618,6 +1625,7 @@ retire_timeout = "10s""#,
             prepared.deadline(),
             default_started_at + Duration::from_secs(5)
         );
+        assert!(prepared.denies_without_resolution());
         drop(prepared);
         drop(lease);
         runtime.shutdown().await;

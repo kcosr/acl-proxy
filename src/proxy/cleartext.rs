@@ -38,7 +38,8 @@ use crate::observation::{CaptureEpoch, CaptureEvent, ProductObservationRuntime};
 use crate::policy::apply_header_effects;
 use crate::proxy::authority::{reconcile_explicit_request, reconcile_transparent_http_request};
 use crate::proxy::forward::{
-    forward_request, resolve_forwarding_target, ForwardBody, ForwardBodyError,
+    forward_request, preflight_forwarding_target, resolve_forwarding_target, ForwardBody,
+    ForwardBodyError,
 };
 use crate::proxy::headers::{sanitize_untrusted_request, HeaderPreparationError, SanitizedRequest};
 use crate::request_decision::{
@@ -1084,13 +1085,6 @@ async fn execute_request(
         request_version,
         lease.max_content_decoding_expansion_ratio(),
     );
-    let Some(service_deadline) = started_at.checked_add(lease.request_timeout()) else {
-        return capture.deny_metadata_only(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "request failed\n",
-            true,
-        );
-    };
     let target = match mode {
         CleartextMode::Explicit => reconcile_explicit_request(&mut request),
         CleartextMode::Transparent => reconcile_transparent_http_request(&mut request),
@@ -1117,28 +1111,15 @@ async fn execute_request(
             return capture.deny_metadata_only(status, "invalid request\n", true);
         }
     };
-
-    let resolved = match tokio::time::timeout_at(
-        service_deadline,
-        resolve_forwarding_target(
-            &target.url,
-            &sanitized,
-            lease.egress(),
-            assets.destination_guard(),
-        ),
-    )
-    .await
-    {
-        Ok(Ok(resolved)) => resolved,
-        Ok(Err(_)) => {
-            return capture.deny_metadata_only(StatusCode::FORBIDDEN, "destination denied\n", true)
-        }
+    let prepared_target = match preflight_forwarding_target(
+        &target.url,
+        &sanitized,
+        lease.egress(),
+        assets.destination_guard(),
+    ) {
+        Ok(target) => target,
         Err(_) => {
-            return capture.deny_metadata_only(
-                StatusCode::GATEWAY_TIMEOUT,
-                "request timed out\n",
-                true,
-            )
+            return capture.deny_metadata_only(StatusCode::FORBIDDEN, "destination denied\n", true)
         }
     };
 
@@ -1176,6 +1157,51 @@ async fn execute_request(
         }
     };
     let deadline = prepared.deadline();
+    if prepared.denies_without_resolution() {
+        let decision = match prepared.decide(None).await {
+            Ok(decision) => decision,
+            Err(_) => {
+                return capture.deny_metadata_only(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "request failed\n",
+                    true,
+                )
+            }
+        };
+        let RequestDecision::Deny(mut denied) = decision else {
+            return capture.deny_metadata_only(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request failed\n",
+                true,
+            );
+        };
+        let body = denied.take_body_for_observation();
+        capture.submit_denied_request(Some(&denied.common.headers), body, denied.body_provenance);
+        return capture.fixed_response(
+            CaptureDecision::Deny,
+            StatusCode::FORBIDDEN,
+            "request denied\n",
+            !ingress_was_complete,
+        );
+    }
+    let resolved = match tokio::time::timeout_at(
+        deadline,
+        resolve_forwarding_target(prepared_target, assets.destination_guard()),
+    )
+    .await
+    {
+        Ok(Ok(resolved)) => resolved,
+        Ok(Err(_)) => {
+            return capture.deny_metadata_only(StatusCode::FORBIDDEN, "destination denied\n", true)
+        }
+        Err(_) => {
+            return capture.deny_metadata_only(
+                StatusCode::GATEWAY_TIMEOUT,
+                "request timed out\n",
+                true,
+            )
+        }
+    };
     let body_plan = prepared.body_read_plan();
     let (decision_body, origin_body, normalized) = match body_plan {
         HttpBodyReadPlan::Disabled => (None, Some(ingress_body), false),
@@ -1803,6 +1829,7 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
+    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
     use flate2::write::GzEncoder;
@@ -1816,6 +1843,10 @@ mod tests {
     use super::*;
     use crate::activation::runner::ProductRuntime;
     use crate::config::load_and_compile_exact_config;
+    use crate::destination::{
+        DestinationFacts, DestinationGuard, DestinationResolveError, DestinationResolver,
+        LocalAddressSnapshot, LocalAddressSource, ResolveFuture,
+    };
 
     struct ChannelFailureObserver(StdMutex<Option<oneshot::Sender<Arc<ProxySupervisorFailure>>>>);
 
@@ -1859,6 +1890,125 @@ mod tests {
         );
         product.start_proxy_supervisors(&mut starter).await.unwrap();
         (directory, product)
+    }
+
+    async fn product_with_destination_guard(
+        text: String,
+        listeners: Vec<StdTcpListener>,
+        destination_guard: Arc<DestinationGuard>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<ProductRuntime>,
+        Arc<ProductIngressAssets>,
+    ) {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("acl-proxy.toml");
+        fs::write(&path, text).unwrap();
+        let loaded = load_and_compile_exact_config(&path).unwrap();
+        let assets = ProductIngressAssets::with_destination_guard(
+            &loaded.compiled.static_config,
+            destination_guard,
+        )
+        .unwrap();
+        let product = ProductRuntime::prepare_from_prebound(loaded, listeners)
+            .await
+            .unwrap();
+        product.activate_initial().await.unwrap();
+        (directory, product, assets)
+    }
+
+    #[derive(Default)]
+    struct EmptyLocalAddresses;
+
+    impl LocalAddressSource for EmptyLocalAddresses {
+        fn snapshot(&self) -> io::Result<LocalAddressSnapshot> {
+            Ok(LocalAddressSnapshot::default())
+        }
+    }
+
+    struct ResolverDrop(Arc<AtomicBool>);
+
+    impl Drop for ResolverDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+
+    struct PendingResolver {
+        calls: AtomicUsize,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl PendingResolver {
+        fn new() -> (Arc<Self>, Arc<AtomicBool>) {
+            let dropped = Arc::new(AtomicBool::new(false));
+            (
+                Arc::new(Self {
+                    calls: AtomicUsize::new(0),
+                    dropped: dropped.clone(),
+                }),
+                dropped,
+            )
+        }
+    }
+
+    impl DestinationResolver for PendingResolver {
+        fn resolve(&self, _host: &str, _port: u16, _max_addresses: usize) -> ResolveFuture<'_> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            let dropped = self.dropped.clone();
+            Box::pin(async move {
+                let _drop = ResolverDrop(dropped);
+                std::future::pending::<Result<Vec<SocketAddr>, DestinationResolveError>>().await
+            })
+        }
+    }
+
+    struct DelayedResolver {
+        calls: AtomicUsize,
+        delay: Duration,
+        endpoint: SocketAddr,
+    }
+
+    impl DestinationResolver for DelayedResolver {
+        fn resolve(&self, _host: &str, _port: u16, _max_addresses: usize) -> ResolveFuture<'_> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            let delay = self.delay;
+            let endpoint = self.endpoint;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(vec![endpoint])
+            })
+        }
+    }
+
+    fn test_destination_guard(
+        proxy: SocketAddr,
+        resolver: Arc<dyn DestinationResolver>,
+    ) -> Arc<DestinationGuard> {
+        let facts = DestinationFacts::for_test([proxy], None, None, 8).unwrap();
+        Arc::new(DestinationGuard::with_sources(
+            facts,
+            resolver,
+            Arc::new(EmptyLocalAddresses),
+        ))
+    }
+
+    async fn execute_direct(
+        product: &Arc<ProductRuntime>,
+        assets: Arc<ProductIngressAssets>,
+        request: Request<Body>,
+    ) -> HandledResponse {
+        let peer = SocketAddr::from(([192, 0, 2, 44], 41_000));
+        execute_request(
+            CleartextMode::Explicit,
+            peer,
+            WireBodyQuotaKey::from_peer(peer.ip(), |_| false),
+            product.runtime().clone(),
+            product.observation_runtime().clone(),
+            assets,
+            request,
+        )
+        .await
     }
 
     fn base_config(listener: SocketAddr, listener_table: &str, policy: &str) -> String {
@@ -1923,6 +2073,160 @@ max_pending_records = 32
 max_files = 32
 max_total_bytes = 16777216
 "#
+    }
+
+    #[tokio::test]
+    async fn immediate_policy_denial_precedes_dns_resolution() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let (resolver, dropped) = PendingResolver::new();
+        let guard = test_destination_guard(proxy, resolver.clone());
+        let policy = r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+"#;
+        let (_directory, product, assets) = product_with_destination_guard(
+            base_config(proxy, "explicit_http", policy),
+            listeners,
+            guard,
+        )
+        .await;
+
+        let handled = tokio::time::timeout(
+            Duration::from_secs(1),
+            execute_direct(
+                &product,
+                assets,
+                Request::builder()
+                    .uri("http://deny.example/resource")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("policy denial must not poll the pending resolver");
+
+        assert_eq!(handled.response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(resolver.calls.load(Ordering::Acquire), 0);
+        assert!(!dropped.load(Ordering::Acquire));
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn matched_rule_deadline_cancels_pending_resolution() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let (resolver, dropped) = PendingResolver::new();
+        let guard = test_destination_guard(proxy, resolver.clone());
+        let policy = r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "short-resolution"
+decision = "allow"
+urls = ["http://slow.example/**"]
+request_timeout = "40ms"
+"#;
+        let (_directory, product, assets) = product_with_destination_guard(
+            base_config(proxy, "explicit_http", policy),
+            listeners,
+            guard,
+        )
+        .await;
+
+        let handled = tokio::time::timeout(
+            Duration::from_secs(1),
+            execute_direct(
+                &product,
+                assets,
+                Request::builder()
+                    .uri("http://slow.example/resource")
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("the matched rule deadline must bound resolution");
+
+        assert_eq!(handled.response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(resolver.calls.load(Ordering::Acquire), 1);
+        assert!(dropped.load(Ordering::Acquire));
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn matched_rule_deadline_can_exceed_service_default_during_resolution() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin_listener.accept().await.unwrap();
+            Http::new()
+                .http1_only(true)
+                .serve_connection(
+                    stream,
+                    service_fn(|_request| async {
+                        Ok::<_, Infallible>(Response::new(Body::from("resolved")))
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let resolver = Arc::new(DelayedResolver {
+            calls: AtomicUsize::new(0),
+            delay: Duration::from_millis(75),
+            endpoint: origin,
+        });
+        let guard = test_destination_guard(proxy, resolver.clone());
+        let policy = format!(
+            r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "long-resolution"
+decision = "allow"
+urls = ["http://slow.example:{}/resource"]
+request_timeout = "500ms"
+"#,
+            origin.port()
+        );
+        let config = base_config(proxy, "explicit_http", &policy).replacen(
+            "request_timeout = \"5s\"",
+            "request_timeout = \"20ms\"",
+            1,
+        );
+        let (_directory, product, assets) =
+            product_with_destination_guard(config, listeners, guard).await;
+
+        let handled = execute_direct(
+            &product,
+            assets,
+            Request::builder()
+                .uri(format!("http://slow.example:{}/resource", origin.port()))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(handled.response.status(), StatusCode::OK);
+        assert_eq!(resolver.calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            to_bytes(handled.response.into_body()).await.unwrap(),
+            "resolved"
+        );
+        product.shutdown().await;
+        origin_task.await.unwrap();
     }
 
     fn read_capture_records(directory: &std::path::Path) -> Vec<CaptureRecord> {

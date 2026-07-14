@@ -23,6 +23,13 @@ impl ProductIngressAssets {
         let destination_guard = Arc::new(DestinationGuard::system(DestinationFacts::from_static(
             config,
         )?));
+        Self::from_static_with_destination_guard(config, destination_guard)
+    }
+
+    fn from_static_with_destination_guard(
+        config: &StaticProductConfig,
+        destination_guard: Arc<DestinationGuard>,
+    ) -> Result<Arc<Self>, ProductIngressAssetsError> {
         let explicit_https_alpn = config
             .listeners
             .explicit_https
@@ -71,6 +78,14 @@ impl ProductIngressAssets {
             transparent_https_alpn: transparent_https_alpn.into_boxed_slice(),
             mitm,
         }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_destination_guard(
+        config: &StaticProductConfig,
+        destination_guard: Arc<DestinationGuard>,
+    ) -> Result<Arc<Self>, ProductIngressAssetsError> {
+        Self::from_static_with_destination_guard(config, destination_guard)
     }
 
     pub(crate) fn destination_guard(&self) -> &Arc<DestinationGuard> {

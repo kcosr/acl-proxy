@@ -290,6 +290,7 @@ impl DestinationFacts {
 }
 
 pub(crate) struct DestinationGuard {
+    brand: Arc<()>,
     facts: DestinationFacts,
     resolver: Arc<dyn DestinationResolver>,
     local_addresses: Arc<dyn LocalAddressSource>,
@@ -319,16 +320,18 @@ impl DestinationGuard {
         local_addresses: Arc<dyn LocalAddressSource>,
     ) -> Self {
         Self {
+            brand: Arc::new(()),
             facts,
             resolver,
             local_addresses,
         }
     }
 
-    pub(crate) async fn resolve(
+    /// Performs route-shape and literal-endpoint checks without consulting DNS.
+    pub(crate) fn preflight(
         &self,
         target: DestinationTarget,
-    ) -> Result<ResolvedDestination, DestinationGuardError> {
+    ) -> Result<PreparedDestination, DestinationGuardError> {
         if self
             .facts
             .reserved_control
@@ -337,15 +340,42 @@ impl DestinationGuard {
         {
             return Err(DestinationGuardError::ReservedControlSubtree);
         }
-        if target.route == DestinationRoute::Parent
-            && self
+
+        if target.route == DestinationRoute::Parent {
+            if self
                 .facts
                 .control_bind
                 .is_some_and(|control| target.literal_origin == Some(control))
-        {
-            return Err(DestinationGuardError::LiteralControlOrigin);
+            {
+                return Err(DestinationGuardError::LiteralControlOrigin);
+            }
+            if let Some(origin) = target.literal_origin {
+                let snapshot = self.local_snapshot()?;
+                self.validate(DestinationRoute::Direct, origin, &snapshot)?;
+            }
         }
 
+        if let Ok(ip) = target.resolution_host.parse() {
+            let endpoint = normalize_endpoint(SocketAddr::new(ip, target.resolution_port));
+            let snapshot = self.local_snapshot()?;
+            self.validate(target.route, endpoint, &snapshot)?;
+        }
+
+        Ok(PreparedDestination {
+            brand: self.brand.clone(),
+            target,
+        })
+    }
+
+    /// Completes exactly one resolution for a destination that passed semantic preflight.
+    pub(crate) async fn complete_resolution(
+        &self,
+        prepared: PreparedDestination,
+    ) -> Result<ResolvedDestination, DestinationGuardError> {
+        let PreparedDestination { brand, target } = prepared;
+        if !Arc::ptr_eq(&brand, &self.brand) {
+            return Err(DestinationGuardError::ForeignDestinationToken);
+        }
         let answers = self
             .resolver
             .resolve(
@@ -379,7 +409,11 @@ impl DestinationGuard {
             self.validate(target.route, address, &snapshot)?;
         }
 
-        Ok(ResolvedDestination { target, addresses })
+        Ok(ResolvedDestination {
+            brand,
+            target,
+            addresses,
+        })
     }
 
     pub(crate) async fn connect<C>(
@@ -390,7 +424,14 @@ impl DestinationGuard {
     where
         C: DestinationConnector,
     {
-        let ResolvedDestination { target, addresses } = resolved;
+        let ResolvedDestination {
+            brand,
+            target,
+            addresses,
+        } = resolved;
+        if !Arc::ptr_eq(&brand, &self.brand) {
+            return Err(DestinationGuardError::ForeignDestinationToken);
+        }
         let mut last_error = None;
         for candidate in addresses {
             let before = self.local_snapshot()?;
@@ -500,7 +541,14 @@ impl DestinationGuard {
 }
 
 #[derive(Debug)]
+pub(crate) struct PreparedDestination {
+    brand: Arc<()>,
+    target: DestinationTarget,
+}
+
+#[derive(Debug)]
 pub(crate) struct ResolvedDestination {
+    brand: Arc<()>,
     target: DestinationTarget,
     addresses: Vec<SocketAddr>,
 }
@@ -568,6 +616,7 @@ pub(crate) enum DestinationGuardError {
     },
     ReservedControlSubtree,
     LiteralControlOrigin,
+    ForeignDestinationToken,
     Allocation(TryReserveError),
     Resolution(DestinationResolveError),
     EmptyResolution,
@@ -611,6 +660,9 @@ impl fmt::Display for DestinationGuardError {
                     formatter,
                     "parent-route origin is the local control destination"
                 )
+            }
+            Self::ForeignDestinationToken => {
+                write!(formatter, "destination token belongs to another guard")
             }
             Self::Allocation(error) => write!(formatter, "destination allocation failed: {error}"),
             Self::Resolution(error) => write!(formatter, "destination resolution failed: {error}"),
@@ -704,6 +756,7 @@ mod tests {
     struct FixedResolver {
         answers: Vec<SocketAddr>,
         calls: AtomicUsize,
+        queries: Mutex<Vec<(String, u16)>>,
     }
 
     impl FixedResolver {
@@ -711,13 +764,18 @@ mod tests {
             Self {
                 answers: answers.into_iter().collect(),
                 calls: AtomicUsize::new(0),
+                queries: Mutex::new(Vec::new()),
             }
         }
     }
 
     impl DestinationResolver for FixedResolver {
-        fn resolve(&self, _host: &str, _port: u16, _max_addresses: usize) -> ResolveFuture<'_> {
+        fn resolve(&self, host: &str, port: u16, _max_addresses: usize) -> ResolveFuture<'_> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.queries
+                .lock()
+                .expect("resolver query lock")
+                .push((host.to_owned(), port));
             let answers = self.answers.clone();
             Box::pin(async move { Ok(answers) })
         }
@@ -892,6 +950,14 @@ mod tests {
         )
     }
 
+    async fn resolve(
+        guard: &DestinationGuard,
+        target: DestinationTarget,
+    ) -> Result<ResolvedDestination, DestinationGuardError> {
+        let prepared = guard.preflight(target)?;
+        guard.complete_resolution(prepared).await
+    }
+
     #[tokio::test]
     async fn live_local_address_guard_tracks_interface_changes() {
         let candidate = endpoint("192.0.2.10:8443");
@@ -907,7 +973,7 @@ mod tests {
             ],
         );
 
-        let first = guard.resolve(target(DestinationRoute::Direct, 8443)).await;
+        let first = resolve(&guard, target(DestinationRoute::Direct, 8443)).await;
         assert!(matches!(
             first,
             Err(DestinationGuardError::ProtectedDestination {
@@ -916,8 +982,7 @@ mod tests {
             })
         ));
 
-        let accepted = guard
-            .resolve(target(DestinationRoute::Direct, 8443))
+        let accepted = resolve(&guard, target(DestinationRoute::Direct, 8443))
             .await
             .expect("removed interface address is no longer protected");
         let connector = FakeConnector::new([ConnectAction::Success(candidate)]);
@@ -940,7 +1005,7 @@ mod tests {
             [LocalStep::Addresses(vec![])],
         );
 
-        let result = guard.resolve(target(DestinationRoute::Webhook, 443)).await;
+        let result = resolve(&guard, target(DestinationRoute::Webhook, 443)).await;
         assert!(matches!(
             result,
             Err(DestinationGuardError::ProtectedDestination {
@@ -970,7 +1035,7 @@ mod tests {
             let guard = guard(facts, Arc::clone(&resolver), [LocalStep::Addresses(vec![])]);
 
             assert!(matches!(
-                guard.resolve(target(DestinationRoute::Webhook, port)).await,
+                resolve(&guard, target(DestinationRoute::Webhook, port)).await,
                 Err(DestinationGuardError::ProtectedDestination {
                     reason: actual,
                     ..
@@ -997,9 +1062,7 @@ mod tests {
         );
 
         assert!(matches!(
-            guard
-                .resolve(DestinationTarget::webhook(&callback_url))
-                .await,
+            resolve(&guard, DestinationTarget::webhook(&callback_url)).await,
             Err(DestinationGuardError::ReservedControlSubtree)
         ));
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
@@ -1015,8 +1078,7 @@ mod tests {
             Arc::clone(&resolver),
             [LocalStep::Addresses(vec![])],
         );
-        let resolved = guard
-            .resolve(target(DestinationRoute::Direct, 443))
+        let resolved = resolve(&guard, target(DestinationRoute::Direct, 443))
             .await
             .expect("resolution");
         let connector = FakeConnector::new([
@@ -1044,9 +1106,7 @@ mod tests {
             [LocalStep::Addresses(vec![])],
         );
         assert!(matches!(
-            listener_guard
-                .resolve(target(DestinationRoute::Direct, 8080))
-                .await,
+            resolve(&listener_guard, target(DestinationRoute::Direct, 8080)).await,
             Err(DestinationGuardError::ProtectedDestination {
                 reason: ProtectedReason::Listener,
                 ..
@@ -1060,9 +1120,7 @@ mod tests {
             [LocalStep::Addresses(vec![])],
         );
         assert!(matches!(
-            control_guard
-                .resolve(target(DestinationRoute::Webhook, 8898))
-                .await,
+            resolve(&control_guard, target(DestinationRoute::Webhook, 8898)).await,
             Err(DestinationGuardError::ProtectedDestination {
                 reason: ProtectedReason::Control,
                 ..
@@ -1082,8 +1140,7 @@ mod tests {
                 LocalStep::Addresses(vec![local("198.51.100.9")]),
             ],
         );
-        let resolved = guard
-            .resolve(target(DestinationRoute::Direct, 8881))
+        let resolved = resolve(&guard, target(DestinationRoute::Direct, 8881))
             .await
             .expect("candidate was not local in the resolution snapshot");
         let connector = FakeConnector::new([ConnectAction::Success(candidate)]);
@@ -1108,7 +1165,7 @@ mod tests {
         );
 
         assert!(matches!(
-            guard.resolve(target(DestinationRoute::Direct, 8881)).await,
+            resolve(&guard, target(DestinationRoute::Direct, 8881)).await,
             Err(DestinationGuardError::ProtectedDestination {
                 reason: ProtectedReason::Listener,
                 ..
@@ -1124,9 +1181,7 @@ mod tests {
             [LocalStep::Addresses(vec![])],
         );
         assert!(matches!(
-            loopback_guard
-                .resolve(target(DestinationRoute::Parent, 3128))
-                .await,
+            resolve(&loopback_guard, target(DestinationRoute::Parent, 3128)).await,
             Err(DestinationGuardError::ProtectedDestination {
                 reason: ProtectedReason::LoopbackParent,
                 ..
@@ -1139,9 +1194,7 @@ mod tests {
             [LocalStep::Addresses(vec![local("10.0.0.8")])],
         );
         assert!(matches!(
-            local_guard
-                .resolve(target(DestinationRoute::Parent, 3128))
-                .await,
+            resolve(&local_guard, target(DestinationRoute::Parent, 3128)).await,
             Err(DestinationGuardError::ProtectedDestination {
                 reason: ProtectedReason::LocalParent,
                 ..
@@ -1158,7 +1211,7 @@ mod tests {
         );
 
         assert!(matches!(
-            guard.resolve(target(DestinationRoute::Direct, 443)).await,
+            resolve(&guard, target(DestinationRoute::Direct, 443)).await,
             Err(DestinationGuardError::LocalAddressEnumeration(_))
         ));
     }
@@ -1174,8 +1227,7 @@ mod tests {
                 LocalStep::Failure(io::ErrorKind::PermissionDenied),
             ],
         );
-        let resolved = guard
-            .resolve(target(DestinationRoute::Direct, 443))
+        let resolved = resolve(&guard, target(DestinationRoute::Direct, 443))
             .await
             .expect("initial local enumeration succeeds");
         let connector = FakeConnector::new([ConnectAction::Success(candidate)]);
@@ -1201,8 +1253,7 @@ mod tests {
                 LocalStep::Failure(io::ErrorKind::PermissionDenied),
             ],
         );
-        let resolved = guard
-            .resolve(target(DestinationRoute::Direct, 443))
+        let resolved = resolve(&guard, target(DestinationRoute::Direct, 443))
             .await
             .expect("initial local enumeration succeeds");
         let connector = FakeConnector::new([ConnectAction::Success(candidate)]);
@@ -1230,8 +1281,7 @@ mod tests {
                 LocalStep::Addresses(vec![local("203.0.113.41")]),
             ],
         );
-        let resolved = guard
-            .resolve(target(DestinationRoute::Direct, 8443))
+        let resolved = resolve(&guard, target(DestinationRoute::Direct, 8443))
             .await
             .expect("initial resolution");
         let connector = FakeConnector::new([ConnectAction::Success(candidate)]);
@@ -1255,8 +1305,7 @@ mod tests {
                 LocalStep::Addresses(vec![local("203.0.113.42")]),
             ],
         );
-        let resolved = guard
-            .resolve(target(DestinationRoute::Direct, 8443))
+        let resolved = resolve(&guard, target(DestinationRoute::Direct, 8443))
             .await
             .expect("initial resolution");
         let connector = FakeConnector::new([ConnectAction::Success(candidate)]);
@@ -1278,8 +1327,7 @@ mod tests {
             Arc::new(FixedResolver::new([candidate])),
             [LocalStep::Addresses(vec![])],
         );
-        let resolved = guard
-            .resolve(target(DestinationRoute::Direct, 443))
+        let resolved = resolve(&guard, target(DestinationRoute::Direct, 443))
             .await
             .expect("resolution");
         let connector = FakeConnector::new([ConnectAction::Success(different_peer)]);
@@ -1312,10 +1360,104 @@ mod tests {
         let reserved = DestinationTarget::webhook(&callback_url);
 
         assert!(matches!(
-            guard.resolve(reserved).await,
+            resolve(&guard, reserved).await,
             Err(DestinationGuardError::ReservedControlSubtree)
         ));
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn preflight_rejects_literal_listener_without_resolution() {
+        let resolver = Arc::new(FixedResolver::new([endpoint("127.0.0.1:8443")]));
+        let guard = guard(
+            facts([endpoint("127.0.0.1:8443")], None),
+            Arc::clone(&resolver),
+            [LocalStep::Addresses(vec![])],
+        );
+        let url = crate::url::canonicalize_http_url("http://127.0.0.1:8443/resource")
+            .expect("literal canonical URL");
+
+        assert!(matches!(
+            guard.preflight(DestinationTarget::direct(&url)),
+            Err(DestinationGuardError::ProtectedDestination {
+                reason: ProtectedReason::Listener,
+                ..
+            })
+        ));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn preflight_rejects_literal_unspecified_endpoint_without_resolution() {
+        let resolver = Arc::new(FixedResolver::new([endpoint("192.0.2.60:8080")]));
+        let guard = guard(
+            facts([], None),
+            Arc::clone(&resolver),
+            [LocalStep::Addresses(vec![])],
+        );
+        let url = crate::url::canonicalize_http_url("http://0.0.0.0:8080/resource")
+            .expect("literal canonical URL");
+
+        assert!(matches!(
+            guard.preflight(DestinationTarget::direct(&url)),
+            Err(DestinationGuardError::ProtectedDestination {
+                reason: ProtectedReason::Unspecified,
+                ..
+            })
+        ));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn parent_preflight_rejects_literal_self_hop_without_resolution() {
+        let resolver = Arc::new(FixedResolver::new([endpoint("192.0.2.61:3128")]));
+        let guard = guard(
+            facts([], None),
+            Arc::clone(&resolver),
+            [LocalStep::Addresses(vec![])],
+        );
+        let parent = crate::url::canonicalize_http_authority("http", "127.0.0.2:3128")
+            .expect("literal parent authority");
+        let origin = crate::url::canonicalize_http_url("https://origin.example/private")
+            .expect("canonical origin URL");
+
+        assert!(matches!(
+            guard.preflight(DestinationTarget::parent(&parent, &origin)),
+            Err(DestinationGuardError::ProtectedDestination {
+                reason: ProtectedReason::LoopbackParent,
+                ..
+            })
+        ));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn parent_preflight_defers_one_parent_hop_resolution() {
+        let resolver = Arc::new(FixedResolver::new([endpoint("192.0.2.61:3128")]));
+        let guard = guard(
+            facts([], None),
+            Arc::clone(&resolver),
+            [LocalStep::Addresses(vec![])],
+        );
+        let parent = crate::url::canonicalize_http_authority("http", "parent.example:3128")
+            .expect("canonical parent authority");
+        let origin = crate::url::canonicalize_http_url("https://origin.example:8443/private")
+            .expect("canonical origin URL");
+
+        let prepared = guard
+            .preflight(DestinationTarget::parent(&parent, &origin))
+            .expect("parent semantic preflight");
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+
+        guard
+            .complete_resolution(prepared)
+            .await
+            .expect("parent-hop resolution");
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *resolver.queries.lock().expect("resolver query lock"),
+            vec![("parent.example".to_owned(), 3128)]
+        );
     }
 
     #[tokio::test]
@@ -1333,10 +1475,47 @@ mod tests {
         let target = DestinationTarget::parent(&parent, &origin);
 
         assert!(matches!(
-            guard.resolve(target).await,
+            resolve(&guard, target).await,
             Err(DestinationGuardError::LiteralControlOrigin)
         ));
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn prepared_and_resolved_tokens_reject_a_foreign_guard() {
+        let endpoint = endpoint("192.0.2.62:8443");
+        let first_resolver = Arc::new(FixedResolver::new([endpoint]));
+        let second_resolver = Arc::new(FixedResolver::new([endpoint]));
+        let first = guard(
+            facts([], None),
+            first_resolver.clone(),
+            [LocalStep::Addresses(vec![])],
+        );
+        let second = guard(
+            facts([], None),
+            second_resolver.clone(),
+            [LocalStep::Addresses(vec![])],
+        );
+
+        let prepared = first
+            .preflight(target(DestinationRoute::Direct, 8443))
+            .unwrap();
+        assert!(matches!(
+            second.complete_resolution(prepared).await,
+            Err(DestinationGuardError::ForeignDestinationToken)
+        ));
+        assert_eq!(second_resolver.calls.load(Ordering::SeqCst), 0);
+
+        let prepared = first
+            .preflight(target(DestinationRoute::Direct, 8443))
+            .unwrap();
+        let resolved = first.complete_resolution(prepared).await.unwrap();
+        let connector = FakeConnector::new([ConnectAction::Success(endpoint)]);
+        assert!(matches!(
+            second.connect(resolved, &connector).await,
+            Err(DestinationGuardError::ForeignDestinationToken)
+        ));
+        assert!(connector.attempts.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1354,8 +1533,7 @@ mod tests {
             Arc::new(FixedResolver::new([scoped(8)])),
             [LocalStep::Addresses(vec![])],
         );
-        different_scope
-            .resolve(target(DestinationRoute::Direct, 8443))
+        resolve(&different_scope, target(DestinationRoute::Direct, 8443))
             .await
             .expect("a distinct IPv6 scope is a distinct listener tuple");
 
@@ -1365,9 +1543,7 @@ mod tests {
             [LocalStep::Addresses(vec![])],
         );
         assert!(matches!(
-            same_scope
-                .resolve(target(DestinationRoute::Direct, 8443))
-                .await,
+            resolve(&same_scope, target(DestinationRoute::Direct, 8443)).await,
             Err(DestinationGuardError::ProtectedDestination {
                 reason: ProtectedReason::Listener,
                 ..
@@ -1392,7 +1568,7 @@ mod tests {
                 [LocalStep::Addresses(vec![])],
             );
             assert!(matches!(
-                guard.resolve(target(DestinationRoute::Direct, 8443)).await,
+                resolve(&guard, target(DestinationRoute::Direct, 8443)).await,
                 Err(DestinationGuardError::ProtectedDestination {
                     reason: ProtectedReason::UnscopedIpv6LinkLocal,
                     ..
@@ -1417,8 +1593,7 @@ mod tests {
                 Arc::new(FixedResolver::new([scoped(8)])),
                 [LocalStep::Addresses(vec![])],
             );
-            let resolved = guard
-                .resolve(target(DestinationRoute::Direct, 8443))
+            let resolved = resolve(&guard, target(DestinationRoute::Direct, 8443))
                 .await
                 .expect("scoped candidate resolves");
             let connector = FakeConnector::new([ConnectAction::Success(scoped(0))]);
@@ -1447,8 +1622,7 @@ mod tests {
         let direct_url =
             crate::url::canonicalize_http_url("https://direct.example:8443/direct/path?mode=one")
                 .expect("direct URL");
-        let direct = guard
-            .resolve(DestinationTarget::direct(&direct_url))
+        let direct = resolve(&guard, DestinationTarget::direct(&direct_url))
             .await
             .expect("direct resolution");
         let direct = guard
@@ -1467,8 +1641,7 @@ mod tests {
         let webhook_url =
             crate::url::canonicalize_http_url("https://webhook.example:9443/provider/decision")
                 .expect("webhook URL");
-        let webhook = guard
-            .resolve(DestinationTarget::webhook(&webhook_url))
+        let webhook = resolve(&guard, DestinationTarget::webhook(&webhook_url))
             .await
             .expect("webhook resolution");
         let mut webhook = guard
@@ -1489,8 +1662,7 @@ mod tests {
         let origin =
             crate::url::canonicalize_http_url("https://origin.example:10443/parent/origin")
                 .expect("parent origin");
-        let parent = guard
-            .resolve(DestinationTarget::parent(&parent_hop, &origin))
+        let parent = resolve(&guard, DestinationTarget::parent(&parent_hop, &origin))
             .await
             .expect("parent resolution");
         let parent = guard
@@ -1580,7 +1752,7 @@ mod tests {
             [LocalStep::Addresses(vec![])],
         );
         assert!(matches!(
-            empty.resolve(target(DestinationRoute::Direct, 443)).await,
+            resolve(&empty, target(DestinationRoute::Direct, 443)).await,
             Err(DestinationGuardError::EmptyResolution)
         ));
 
@@ -1594,9 +1766,7 @@ mod tests {
             [LocalStep::Addresses(vec![])],
         );
         assert!(matches!(
-            oversized
-                .resolve(target(DestinationRoute::Direct, 443))
-                .await,
+            resolve(&oversized, target(DestinationRoute::Direct, 443)).await,
             Err(DestinationGuardError::ResolutionLimitExceeded { limit: 1 })
         ));
 
@@ -1606,9 +1776,7 @@ mod tests {
             [LocalStep::Addresses(vec![])],
         );
         assert!(matches!(
-            unspecified
-                .resolve(target(DestinationRoute::Direct, 443))
-                .await,
+            resolve(&unspecified, target(DestinationRoute::Direct, 443)).await,
             Err(DestinationGuardError::ProtectedDestination {
                 reason: ProtectedReason::Unspecified,
                 ..
