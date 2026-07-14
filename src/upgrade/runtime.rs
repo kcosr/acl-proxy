@@ -431,7 +431,9 @@ enum EntryTaskResult {
 
 struct LinearizedSetupTask {
     shared: Arc<EntryShared>,
-    setup: UpgradeSetupTask,
+    build: Option<UpgradeSetupBuilder>,
+    snapshot: Option<UpgradedStreamSnapshot>,
+    setup: Option<UpgradeSetupTask>,
 }
 
 struct SetupPollGuard {
@@ -484,7 +486,20 @@ impl Future for LinearizedSetupTask {
         {
             return Poll::Ready(Err(timing.stop_cause));
         }
-        let result = self.setup.as_mut().poll(context);
+        if self.setup.is_none() {
+            let build = self.build.take().expect("setup builder is invoked once");
+            let snapshot = self
+                .snapshot
+                .take()
+                .expect("setup snapshot is consumed once");
+            self.setup = Some(build(snapshot));
+        }
+        let result = self
+            .setup
+            .as_mut()
+            .expect("setup future is cached after builder invocation")
+            .as_mut()
+            .poll(context);
         if matches!(result, Poll::Ready(Ok(_))) {
             guard.succeeded = true;
         }
@@ -1572,7 +1587,9 @@ async fn run_entry_coordinator_with_hooks<RawHook, SetupHook, CloseHook>(
                     tasks.spawn(async move {
                         let setup = LinearizedSetupTask {
                             shared: setup_shared,
-                            setup: build(snapshot),
+                            build: Some(build),
+                            snapshot: Some(snapshot),
+                            setup: None,
                         };
                         EntryTaskResult::Setup(setup.await)
                     });
@@ -3565,6 +3582,128 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn synchronous_setup_builder_is_guarded_by_terminal_transition() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let established_closes = Arc::new(AtomicUsize::new(0));
+        let relay_polls = Arc::new(AtomicUsize::new(0));
+        let (builder_entered_tx, builder_entered_rx) = std_mpsc::channel();
+        let (builder_release_tx, builder_release_rx) = std_mpsc::channel();
+        let (entry_tx, entry_rx) = oneshot::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), {
+                let established_closes = established_closes.clone();
+                let relay_polls = relay_polls.clone();
+                move |handshake| async move {
+                    let entry = handshake
+                        .commit(
+                            None,
+                            UpgradeEntryPlan::new(
+                                UpgradeTerminalControl::new(
+                                    inert_raw_teardown(),
+                                    move |_| async move {
+                                        established_closes.fetch_add(1, Ordering::SeqCst);
+                                    },
+                                ),
+                                move |_| {
+                                    builder_entered_tx.send(()).unwrap();
+                                    builder_release_rx.recv().unwrap();
+                                    let first_polls = relay_polls.clone();
+                                    let second_polls = relay_polls;
+                                    async move {
+                                        Ok(UpgradeRelayPair::new(
+                                            async move {
+                                                first_polls.fetch_add(1, Ordering::SeqCst);
+                                                UpgradeTerminalCause::PeerClosed
+                                            },
+                                            async move {
+                                                second_polls.fetch_add(1, Ordering::SeqCst);
+                                                UpgradeTerminalCause::PeerClosed
+                                            },
+                                        ))
+                                    }
+                                },
+                            ),
+                        )
+                        .unwrap();
+                    entry_tx.send(entry).unwrap();
+                }
+            })
+            .unwrap();
+        let entry = entry_rx.await.unwrap();
+        builder_entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("setup builder did not execute inside its guarded poll");
+        assert_eq!(
+            entry.shared.setup_state.load(Ordering::Acquire),
+            SETUP_POLLING
+        );
+        entry.submit_terminal(UpgradeTerminalCause::Cancelled);
+        assert_eq!(
+            entry.shared.terminal_state.load(Ordering::Acquire),
+            ENTRY_CLOSE_WAITING_SETUP
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            entry.shared.terminal_state.load(Ordering::Acquire),
+            ENTRY_CLOSE_WAITING_SETUP
+        );
+        builder_release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entry.wait_closed())
+            .await
+            .expect("entry did not close after guarded setup builder returned");
+        assert_eq!(
+            entry.shared.setup_state.load(Ordering::Acquire),
+            SETUP_SUCCEEDED
+        );
+        assert_eq!(established_closes.load(Ordering::SeqCst), 1);
+        assert_eq!(relay_polls.load(Ordering::SeqCst), 0);
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
+
+    #[tokio::test]
+    async fn terminal_before_guarded_setup_poll_skips_builder() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let now = Instant::now();
+        let shared = Arc::new(EntryShared {
+            timing: Mutex::new(EntryTiming {
+                application_stop: now + Duration::from_secs(1),
+                cleanup_cutoff: now + Duration::from_secs(2),
+                stop_cause: UpgradeTerminalCause::LifetimeExpired,
+            }),
+            cleanup_grace: Duration::from_millis(100),
+            winning_cause: Mutex::new(None),
+            setup_state: AtomicU8::new(SETUP_IDLE),
+            changed: Notify::new(),
+            terminal_state: AtomicU8::new(ENTRY_OPEN),
+            closed: Notify::new(),
+        });
+        shared.begin_closing(
+            UpgradeTerminalCause::Cancelled,
+            Instant::now(),
+            shared.cleanup_grace,
+        );
+        let setup = LinearizedSetupTask {
+            shared: shared.clone(),
+            build: Some(Box::new({
+                let builds = builds.clone();
+                move |_| {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async { Err(UpgradeTerminalCause::SetupFailed) })
+                }
+            })),
+            snapshot: Some(UpgradedStreamSnapshot::new(2, None)),
+            setup: None,
+        };
+
+        let result = setup.await;
+        assert!(result.is_err());
+        assert_eq!(builds.load(Ordering::SeqCst), 0);
+        assert_eq!(shared.setup_state.load(Ordering::Acquire), SETUP_IDLE);
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn setup_poll_can_reentrantly_begin_shutdown_without_deadlock() {
         let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
         let relay_polls = Arc::new(AtomicUsize::new(0));
@@ -3639,12 +3778,12 @@ mod tests {
         };
         let setup = LinearizedSetupTask {
             shared: shared.clone(),
-            setup: Box::pin(async move {
+            build: Some(Box::new(move |_| {
                 entry.submit_terminal(UpgradeTerminalCause::Cancelled);
-                panic!("setup panic after reentrant terminal submission");
-                #[allow(unreachable_code)]
-                Err(UpgradeTerminalCause::SetupFailed)
-            }),
+                panic!("setup builder panic after reentrant terminal submission");
+            })),
+            snapshot: Some(UpgradedStreamSnapshot::new(2, None)),
+            setup: None,
         };
 
         let error = match tokio::spawn(setup).await {
