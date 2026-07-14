@@ -575,6 +575,10 @@ async fn serve_connection(
     http.http2_max_concurrent_streams(max_concurrent_streams);
     let http1 = versions.contains(&CompiledHttpVersion::Http1);
     let http2 = versions.contains(&CompiledHttpVersion::Http2);
+    if http2 {
+        http.http2_keep_alive_interval(request_header_timeout);
+        http.http2_keep_alive_timeout(request_header_timeout);
+    }
     match (http1, http2) {
         (true, false) => {
             http.http1_only(true);
@@ -1448,6 +1452,91 @@ value = "policy"
             b"canonical decoded request bytes".len().to_string()
         );
         assert_eq!(captured.headers[CONTENT_TYPE], "application/octet-stream");
+    }
+
+    #[tokio::test]
+    async fn cleartext_h2_idle_connection_releases_admission_for_waiting_client() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let policy = r#"[listeners.explicit_http.connect]
+http2 = "deny"
+
+[policy]
+default = "allow"
+"#;
+        let config = base_config(proxy, "explicit_http", policy).replacen(
+            "http_versions = [\"http1\"]",
+            "http_versions = [\"http2\"]\nrequest_header_timeout = \"250ms\"\nmax_connections = 1\nmax_concurrent_streams = 1",
+            1,
+        );
+        let (_directory, product) = product(config, listeners).await;
+
+        let mut idle = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        idle.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00")
+            .await
+            .unwrap();
+        let mut settings_header = [0_u8; 9];
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            idle.read_exact(&mut settings_header),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let settings_length = usize::from(settings_header[0]) << 16
+            | usize::from(settings_header[1]) << 8
+            | usize::from(settings_header[2]);
+        assert_eq!(settings_header[3], 0x04, "server must begin with SETTINGS");
+        assert_eq!(
+            settings_header[4], 0x00,
+            "server SETTINGS was already ACKed"
+        );
+        let mut settings_payload = vec![0_u8; settings_length];
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            idle.read_exact(&mut settings_payload),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        idle.write_all(b"\x00\x00\x00\x04\x01\x00\x00\x00\x00")
+            .await
+            .unwrap();
+
+        let waiting = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let mut builder = conn::Builder::new();
+        builder.http2_only(true);
+        let (mut sender, connection) = builder.handshake(waiting).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let response = sender.send_request(
+            Request::builder()
+                .uri(format!("http://{proxy}/self"))
+                .body(Body::empty())
+                .unwrap(),
+        );
+        tokio::pin!(response);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), response.as_mut())
+                .await
+                .is_err(),
+            "a second H2 connection bypassed the sole connection permit"
+        );
+
+        let response = tokio::time::timeout(Duration::from_secs(3), response.as_mut())
+            .await
+            .expect("the idle H2 connection must be reaped")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        to_bytes(response.into_body()).await.unwrap();
+
+        let mut idle_tail = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), idle.read_to_end(&mut idle_tail))
+            .await
+            .expect("the idle H2 transport must close")
+            .unwrap();
+        drop(sender);
+        product.shutdown().await;
+        driver.await.unwrap().unwrap();
     }
 
     #[tokio::test]
