@@ -1289,6 +1289,17 @@ succeed while `run` activation fails because runtime material is unavailable.
 Only `ACL_PROXY_CONFIG` participates in config-path selection when `--config`
 is absent; legacy field override environment variables are ignored.
 
+Mandatory schema-3 request-body normalization accepts exactly one content
+coding: `identity`, `gzip`, `deflate` (zlib-wrapped or raw), `br`, or `zstd`.
+It produces identity-coded guarded bytes and never recompresses them. Encoded
+and decoded limits, the cumulative expansion ratio above its one-time 1 MiB
+floor, and the request deadline are enforced while decoding. Codec state,
+history, allocator arenas, and output staging are precharged to the request's
+wire-body guard and wiped before release. Gzip headers have a fixed 16 KiB
+ceiling. Because the canonical body representation currently has no guarded
+trailer store, a `Trailer` declaration or nonempty delivered trailer map is
+rejected instead of being silently discarded.
+
 ### `acl-proxy-extract-capture-body`
 
 ```bash

@@ -16,6 +16,7 @@ use crate::network::canonical_ip;
 
 const QUOTA_SHARD_COUNT: usize = 16;
 pub(crate) const MAX_BUFFER_GROWTH_BYTES: usize = 64 * 1024;
+const WORKSPACE_ALIGNMENT: usize = std::mem::align_of::<u128>();
 
 pub(crate) fn guarded_body_allocation_bytes(payload_bytes: usize) -> Option<usize> {
     if payload_bytes == 0 {
@@ -23,6 +24,15 @@ pub(crate) fn guarded_body_allocation_bytes(payload_bytes: usize) -> Option<usiz
     }
     let chunks = payload_bytes.checked_add(MAX_BUFFER_GROWTH_BYTES - 1)? / MAX_BUFFER_GROWTH_BYTES;
     chunks.checked_mul(MAX_BUFFER_GROWTH_BYTES.checked_add(std::mem::size_of::<SecretChunk>())?)
+}
+
+pub(crate) fn guarded_workspace_allocation_bytes(payload_bytes: usize) -> Option<usize> {
+    if payload_bytes == 0 {
+        return Some(0);
+    }
+    payload_bytes
+        .checked_add(WORKSPACE_ALIGNMENT - 1)
+        .map(|bytes| bytes / WORKSPACE_ALIGNMENT * WORKSPACE_ALIGNMENT)
 }
 
 type QuotaShard = Mutex<HashMap<WireBodyQuotaKey, Arc<QuotaEntry>>>;
@@ -57,6 +67,8 @@ pub(crate) struct WireBodyPool {
     global_limit: usize,
     quota_limit: usize,
     global_charge: AtomicUsize,
+    #[cfg(test)]
+    peak_global_charge: AtomicUsize,
     quota_shards: Box<[QuotaShard]>,
     #[cfg(test)]
     fail_next_allocation: AtomicBool,
@@ -86,6 +98,8 @@ impl WireBodyPool {
             global_limit,
             quota_limit,
             global_charge: AtomicUsize::new(0),
+            #[cfg(test)]
+            peak_global_charge: AtomicUsize::new(0),
             quota_shards: (0..QUOTA_SHARD_COUNT)
                 .map(|_| Mutex::new(HashMap::new()))
                 .collect(),
@@ -121,6 +135,11 @@ impl WireBodyPool {
 
     pub(crate) fn global_charge(&self) -> usize {
         self.global_charge.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn peak_global_charge(&self) -> usize {
+        self.peak_global_charge.load(Ordering::Acquire)
     }
 
     fn quota_entry_count(&self) -> usize {
@@ -175,6 +194,9 @@ impl WireBodyPool {
             lease.entry.charge.fetch_sub(bytes, Ordering::AcqRel);
             return Err(WireBodyBufferError::GlobalExhausted);
         }
+        #[cfg(test)]
+        self.peak_global_charge
+            .fetch_max(self.global_charge.load(Ordering::Acquire), Ordering::AcqRel);
         Ok(())
     }
 
@@ -313,6 +335,36 @@ impl HttpWireBodyGuard {
             guard: self.inner.clone(),
             chunk,
             charged_bytes,
+        })
+    }
+
+    pub(crate) fn codec_workspace(
+        &self,
+        bytes: usize,
+    ) -> Result<GuardedWorkspace, WireBodyBufferError> {
+        let charged_bytes = guarded_workspace_allocation_bytes(bytes)
+            .ok_or(WireBodyBufferError::CursorPeakExceeded)?;
+        self.inner.try_charge(charged_bytes)?;
+        let mut charge = PendingCharge {
+            guard: self.inner.clone(),
+            bytes: charged_bytes,
+        };
+        #[cfg(test)]
+        if self.inner.pool.take_allocation_failure() {
+            return Err(WireBodyBufferError::AllocationFailed);
+        }
+        let words = charged_bytes / WORKSPACE_ALIGNMENT;
+        let mut storage = FallibleBox::<[u128]>::try_new_uninit_slice(words)
+            .map_err(|_| WireBodyBufferError::AllocationFailed)?;
+        for word in storage.iter_mut() {
+            word.write(0);
+        }
+        // Every word was initialized to zero above.
+        let storage = unsafe { storage.assume_init() };
+        Ok(GuardedWorkspace {
+            guard: self.inner.clone(),
+            storage,
+            charged_bytes: charge.commit(),
         })
     }
 
@@ -583,6 +635,57 @@ pub(crate) struct GuardedScratch {
     guard: Arc<GuardInner>,
     chunk: FallibleBox<SecretChunk>,
     charged_bytes: usize,
+}
+
+pub(crate) struct GuardedWorkspace {
+    guard: Arc<GuardInner>,
+    storage: FallibleBox<[u128]>,
+    charged_bytes: usize,
+}
+
+impl GuardedWorkspace {
+    pub(crate) fn len(&self) -> usize {
+        self.charged_bytes
+    }
+
+    pub(crate) fn as_mut_bytes(&mut self) -> &mut [u8] {
+        // The allocation is u128-aligned and covers exactly `charged_bytes` bytes.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.storage.as_mut_ptr().cast::<u8>(),
+                self.charged_bytes,
+            )
+        }
+    }
+
+    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.storage.as_mut_ptr().cast::<u8>()
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.storage.zeroize();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_zeroed_for_test(&self) -> bool {
+        self.storage.iter().all(|word| *word == 0)
+    }
+}
+
+impl fmt::Debug for GuardedWorkspace {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuardedWorkspace")
+            .field("charged_bytes", &self.charged_bytes)
+            .finish()
+    }
+}
+
+impl Drop for GuardedWorkspace {
+    fn drop(&mut self) {
+        self.reset();
+        self.guard.release(std::mem::take(&mut self.charged_bytes));
+    }
 }
 
 impl GuardedScratch {
@@ -1003,6 +1106,41 @@ mod linked_tests {
 
         assert!(matches!(
             guard.stream_scratch(),
+            Err(WireBodyBufferError::AllocationFailed)
+        ));
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+    }
+
+    #[test]
+    fn codec_workspace_is_precharged_aligned_and_zeroized() {
+        let requested = MAX_BUFFER_GROWTH_BYTES + 1;
+        let charged = guarded_workspace_allocation_bytes(requested).unwrap();
+        let pool = WireBodyPool::new(charged, charged);
+        let guard = pool.begin(charged, key());
+        let mut workspace = guard.codec_workspace(requested).unwrap();
+
+        assert_eq!(workspace.len(), charged);
+        assert_eq!(workspace.as_mut_ptr() as usize % WORKSPACE_ALIGNMENT, 0);
+        assert_eq!(guard.live_bytes(), charged);
+        workspace.as_mut_bytes().fill(0xa5);
+        workspace.reset();
+        assert!(workspace.is_zeroed_for_test());
+
+        drop(workspace);
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+    }
+
+    #[test]
+    fn codec_workspace_allocation_failure_restores_every_charge() {
+        let charged = guarded_workspace_allocation_bytes(1).unwrap();
+        let pool = WireBodyPool::new(charged, charged);
+        let guard = pool.begin(charged, key());
+        pool.fail_next_allocation();
+
+        assert!(matches!(
+            guard.codec_workspace(1),
             Err(WireBodyBufferError::AllocationFailed)
         ));
         assert_eq!(guard.live_bytes(), 0);

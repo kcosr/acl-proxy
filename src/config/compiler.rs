@@ -22,8 +22,9 @@ use crate::authorization::protocol::{
     PROCESS_PROVIDER_RESPONSE_PREFIX_BYTES, PROCESS_PROVIDER_RESPONSE_TERMINATOR_BYTES,
 };
 use crate::http1::store::PARSER_STORE_BYTES;
+use crate::http_body::{http_decoder_workspace_sizes, HTTP_DECODER_OUTPUT_STAGING_BYTES};
 use crate::network::{canonical_socket_addr, socket_binds_overlap};
-use crate::safety::wire_body::guarded_body_allocation_bytes;
+use crate::safety::wire_body::{guarded_body_allocation_bytes, guarded_workspace_allocation_bytes};
 use crate::url::{canonicalize_http_url, CompiledUrlPattern};
 
 use super::authoring::{
@@ -96,7 +97,8 @@ const MAX_CAPTURE_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024 * 1024;
 pub(crate) const MAX_PROVIDER_CREDENTIAL_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_PROVIDER_OUTPUT_NAME_BYTES: usize = 4 * 1024;
 pub(crate) const MAX_REDACTION_MATCHER_SCRATCH_BYTES: usize = MIB;
-const DECODER_SCRATCH_BYTES: usize = 64 * 1024;
+const PROVIDER_REPLACEMENT_STAGING_BYTES: usize = 64 * 1024;
+const WEBSOCKET_DEFLATE_SCRATCH_BYTES: usize = 64 * 1024;
 const PROVIDER_REQUEST_STREAM_SCRATCH_BYTES: usize = 64 * 1024;
 
 /// Static, product-owned values. File paths identify material but no material is
@@ -4076,7 +4078,7 @@ fn replacement_decode_peak(
         [
             response_continuation_bytes,
             max_decoded_replacement_bytes,
-            DECODER_SCRATCH_BYTES,
+            PROVIDER_REPLACEMENT_STAGING_BYTES,
         ],
         "service",
         "provider replacement decode arithmetic overflow",
@@ -4084,8 +4086,19 @@ fn replacement_decode_peak(
 }
 
 fn decode_peak(encoded: usize, decoded: usize) -> Result<usize, ConfigCompileError> {
-    guarded_body_stage_peak(
-        [encoded, decoded, DECODER_SCRATCH_BYTES],
+    let body_and_staging = guarded_body_stage_peak(
+        [encoded, decoded, HTTP_DECODER_OUTPUT_STAGING_BYTES],
+        "service",
+        "mandatory body-plan arithmetic overflow",
+    )?;
+    let workspace = http_decoder_workspace_sizes(decoded)
+        .and_then(|sizes| guarded_workspace_allocation_bytes(sizes.maximum()))
+        .ok_or_else(|| {
+            ConfigCompileError::at("service", "mandatory decoder workspace arithmetic overflow")
+        })?;
+    checked_add(
+        body_and_staging,
+        workspace,
         "service",
         "mandatory body-plan arithmetic overflow",
     )
@@ -4140,7 +4153,7 @@ fn upgrade_wire_peak(
         )?;
         peak = checked_add(
             peak,
-            DECODER_SCRATCH_BYTES,
+            WEBSOCKET_DEFLATE_SCRATCH_BYTES,
             "redaction.profiles",
             "upgrade wire-body plan arithmetic overflow",
         )?;
@@ -5794,7 +5807,7 @@ authorization_provider = "body"
         let config: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
         let schedule = compile_http_rule_schedule(&config, &config.policy.rules[0]).unwrap();
 
-        assert_eq!(schedule.initial_peak, 3 * guarded(1));
+        assert_eq!(schedule.initial_peak, decode_peak(1, 1).unwrap());
         assert_eq!(
             schedule.incoming_stages[0].additional_bytes,
             guarded(64 * 1024)
@@ -5920,10 +5933,11 @@ redaction_profile = "small"
         let literal_scratch = redaction_literal_scratch_bytes(1).unwrap();
         let continuation_bytes = provider_response_guarded_suffix_bytes(80, "test").unwrap();
         let compact_credential_bytes = continuation_bytes.min(MAX_PROVIDER_CREDENTIAL_BYTES);
-        let expected =
+        let terminal_redaction =
             guarded(1) + guarded(literal_scratch) + guarded(1) + guarded(compact_credential_bytes);
+        let expected = decode_peak(1, 1).unwrap().max(terminal_redaction);
 
-        assert_eq!(expected, 4 * guarded(1));
+        assert_eq!(terminal_redaction, 4 * guarded(1));
         assert_eq!(schedule.initial_peak, expected);
     }
 
@@ -6092,9 +6106,10 @@ redaction_profile = "small"
         let schedule = compile_http_rule_schedule(&config, &config.policy.rules[0]).unwrap();
         let retained = guarded(1);
         let response = guarded(response_bytes);
+        let decoder_peak = decode_peak(1, 1).unwrap();
 
         assert_eq!(response, 3 * guarded(1));
-        assert_eq!(schedule.initial_peak, retained + response);
+        assert_eq!(schedule.initial_peak, decoder_peak.max(retained + response));
         assert_eq!(schedule.retained_original_after_pass, Some(retained));
         assert_eq!(schedule.max_incoming_additional_bytes(), response);
     }
@@ -6148,13 +6163,14 @@ authorization_provider = "later"
         let resources = compile(&input).unwrap().reloadable_plan.resource_plan;
         let retained = guarded(1);
         let response = guarded(response_bytes);
+        let decoder_peak = decode_peak(1, 1).unwrap();
 
         assert_eq!(first.retained_original_after_pass, Some(retained));
         assert_eq!(second.initial_peak, response);
         assert_eq!(second.max_incoming_additional_bytes(), response);
         assert_eq!(
             resources.http_wire_body_peak_bytes_by_cursor,
-            [retained + response, response, 0]
+            [decoder_peak.max(retained + response), response, 0]
         );
     }
 
@@ -6250,7 +6266,7 @@ authorization_provider = "later"
 
         assert_eq!(
             peak,
-            guarded(continuation_bytes) + guarded(1) + guarded(DECODER_SCRATCH_BYTES)
+            guarded(continuation_bytes) + guarded(1) + guarded(PROVIDER_REPLACEMENT_STAGING_BYTES)
         );
         assert_eq!(guarded(continuation_bytes), 2 * guarded(1));
     }
@@ -6363,12 +6379,13 @@ authorization_provider = "later"
         let resources = compile(&input).unwrap().reloadable_plan.resource_plan;
         let retained_original = guarded(1);
         let later_continuation = guarded(later_continuation_bytes);
+        let decoder_peak = decode_peak(1, 1).unwrap();
 
         assert_eq!(later_continuation, 3 * guarded(1));
         assert_eq!(
             resources.http_wire_body_peak_bytes_by_cursor,
             [
-                retained_original + later_continuation,
+                decoder_peak.max(retained_original + later_continuation),
                 later_continuation,
                 0,
             ]
@@ -6449,6 +6466,7 @@ redaction_profile = "terminal"
         let second = compile_http_rule_schedule(&config, &config.policy.rules[1]).unwrap();
         let retained = first.retained_original_after_pass.unwrap();
         let later_additional = second.max_incoming_additional_bytes();
+        let decoder_peak = decode_peak(1, 1).unwrap();
         let compiled = compile(&input).unwrap();
 
         assert_eq!(retained, guarded(1));
@@ -6458,7 +6476,7 @@ redaction_profile = "terminal"
                 .reloadable_plan
                 .resource_plan
                 .http_wire_body_peak_bytes_by_cursor[0],
-            retained + later_additional
+            decoder_peak.max(retained + later_additional)
         );
     }
 
@@ -6510,15 +6528,40 @@ redaction_profile = "terminal"
         );
         let mut encoded = guard.buffer();
         let mut decoded = guard.buffer();
-        let mut decoder_scratch = guard.buffer();
+        let decoder_sizes = crate::http_body::http_decoder_workspace_sizes(1).unwrap();
+        let decoder_workspace = guard.codec_workspace(decoder_sizes.maximum()).unwrap();
+        let decoder_staging = guard.stream_scratch().unwrap();
         encoded.try_extend_from_slice(&[1]).unwrap();
         decoded.try_extend_from_slice(&[2]).unwrap();
-        decoder_scratch
-            .try_extend_from_slice(&[0; 64 * 1024])
-            .unwrap();
 
         assert_eq!(guard.live_bytes(), peak);
         assert_eq!(pool.global_charge(), peak);
+        assert_eq!(
+            decoder_workspace.len(),
+            guarded_workspace_allocation_bytes(decoder_sizes.maximum()).unwrap()
+        );
+        assert_eq!(
+            decoder_staging.capacity(),
+            HTTP_DECODER_OUTPUT_STAGING_BYTES
+        );
+    }
+
+    #[test]
+    fn mandatory_decoder_peak_selects_largest_codec_workspace() {
+        let encoded = 10 * MIB;
+        let decoded = 50 * MIB;
+        let sizes = crate::http_body::http_decoder_workspace_sizes(decoded).unwrap();
+        let expected = guarded(encoded)
+            + guarded(decoded)
+            + guarded(HTTP_DECODER_OUTPUT_STAGING_BYTES)
+            + guarded_workspace_allocation_bytes(sizes.maximum()).unwrap();
+
+        assert_eq!(decode_peak(encoded, decoded).unwrap(), expected);
+        assert!(
+            sizes.maximum() == sizes.deflate
+                || sizes.maximum() == sizes.brotli
+                || sizes.maximum() == sizes.zstd
+        );
     }
 
     fn reloadable_ownership_observations(plan: &ReloadableProductPlan) -> Vec<String> {
@@ -7474,7 +7517,7 @@ redaction_profile = "large"
         );
         let compiled = compile(&input).unwrap();
         let plan = &compiled.reloadable_plan.resource_plan;
-        let redaction_peak = 2 * guarded(8 * MIB) + guarded(DECODER_SCRATCH_BYTES);
+        let redaction_peak = decode_peak(8 * MIB, 8 * MIB).unwrap();
         assert_eq!(plan.http_wire_body_peak_bytes_by_cursor[0], redaction_peak);
         assert_eq!(plan.http_wire_body_peak_bytes_by_cursor[1], redaction_peak);
     }
@@ -7513,14 +7556,18 @@ redaction_profile = "terminal"
         );
         let compiled = compile(&input).unwrap();
         let scratch = redaction_literal_scratch_bytes("terminal-test-literal".len()).unwrap();
+        let first_decode = decode_peak(MIB, 16 * MIB).unwrap();
+        let terminal_decode = decode_peak(MIB, 8 * MIB).unwrap();
+        let first_retained_terminal = guarded(16 * MIB) + guarded(8 * MIB) + guarded(scratch);
+        let terminal_stage = 2 * guarded(8 * MIB) + guarded(scratch);
         assert_eq!(
             compiled
                 .reloadable_plan
                 .resource_plan
                 .http_wire_body_peak_bytes_by_cursor,
             vec![
-                guarded(16 * MIB) + guarded(8 * MIB) + guarded(scratch),
-                2 * guarded(8 * MIB) + guarded(scratch),
+                first_decode.max(first_retained_terminal),
+                terminal_decode.max(terminal_stage),
                 0,
             ]
         );
@@ -7574,15 +7621,19 @@ redaction_profile = "terminal"
         );
         let compiled = compile(&input).unwrap();
         let scratch = redaction_literal_scratch_bytes("terminal-test-literal".len()).unwrap();
+        let first_decode = decode_peak(MIB, 16 * MIB).unwrap();
+        let terminal_decode = decode_peak(MIB, 8 * MIB).unwrap();
+        let first_retained_terminal = guarded(16 * MIB) + guarded(8 * MIB) + guarded(scratch);
+        let terminal_stage = 2 * guarded(8 * MIB) + guarded(scratch);
         assert_eq!(
             compiled
                 .reloadable_plan
                 .resource_plan
                 .http_wire_body_peak_bytes_by_cursor,
             vec![
-                guarded(16 * MIB) + guarded(8 * MIB) + guarded(scratch),
-                2 * guarded(8 * MIB) + guarded(scratch),
-                2 * guarded(8 * MIB) + guarded(scratch),
+                first_decode.max(first_retained_terminal),
+                terminal_decode.max(terminal_stage),
+                terminal_decode.max(terminal_stage),
                 0,
             ]
         );
@@ -7612,18 +7663,20 @@ authorization_provider = "replacing"
 "#,
         );
         let compiled = compile(&input).unwrap();
+        let mandatory_decode = decode_peak(MIB, 16 * MIB).unwrap();
+        let replacement_decode = replacement_decode_peak(16 * MIB, 16 * MIB).unwrap();
         assert_eq!(
             compiled
                 .reloadable_plan
                 .resource_plan
                 .max_reachable_http_wire_body_peak_bytes,
-            2 * guarded(16 * MIB) + guarded(DECODER_SCRATCH_BYTES)
+            mandatory_decode.max(replacement_decode)
         );
     }
 
     #[test]
     fn stricter_profile_limits_every_combined_provider_body_stage() {
-        let peak = 3 * guarded(1);
+        let peak = decode_peak(1, 1).unwrap();
         let input = resource_config(
             &format!(
                 "max_inflight_wire_body_bytes = {}\nmax_inflight_wire_body_bytes_per_quota_key = {peak}\nmin_wire_body_concurrency = 5",
@@ -7762,12 +7815,12 @@ redaction_profile = "deflate"
             vec![
                 Some(transport),
                 Some(transport + 3 * MIB + plain_scratch),
-                Some(transport + 4 * MIB + deflate_scratch + DECODER_SCRATCH_BYTES),
+                Some(transport + 4 * MIB + deflate_scratch + WEBSOCKET_DEFLATE_SCRATCH_BYTES),
             ]
         );
         assert_eq!(
             plan.max_upgrade_allocation_per_stream,
-            transport + 4 * MIB + deflate_scratch + DECODER_SCRATCH_BYTES
+            transport + 4 * MIB + deflate_scratch + WEBSOCKET_DEFLATE_SCRATCH_BYTES
         );
     }
 

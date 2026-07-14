@@ -13,6 +13,7 @@ mod egress;
 pub mod external_auth;
 mod filesystem;
 mod http1;
+mod http_body;
 pub mod logging;
 pub mod loop_protection;
 mod network;
