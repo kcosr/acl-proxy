@@ -4,6 +4,7 @@ use http::header::{HeaderMap, HeaderName, HeaderValue, HOST, TE};
 use http::{Request, Uri, Version};
 use hyper::Body;
 
+use crate::egress::OriginProtocol;
 use crate::url::CanonicalUrl;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,15 +19,91 @@ pub(crate) enum HeaderPreparationError {
     Target,
     #[error("the canonical authority cannot be represented as an HTTP header")]
     Authority,
+    #[error("the ingress HTTP version cannot be forwarded")]
+    UnsupportedVersion,
+    #[error("HTTP upgrade requests require the dedicated upgrade executor")]
+    UpgradeUnsupported,
+    #[error("CONNECT requests require the dedicated CONNECT executor")]
+    ConnectUnsupported,
+    #[error("trusted request effects introduced a forbidden hop-by-hop header")]
+    Unsanitized,
+    #[error("the Connection header contains an invalid nominated field name")]
+    InvalidConnection,
+}
+
+pub(crate) struct SanitizedRequest {
+    request: Request<Body>,
+    protocol: OriginProtocol,
+}
+
+impl SanitizedRequest {
+    pub(crate) fn headers_mut(&mut self) -> &mut HeaderMap {
+        self.request.headers_mut()
+    }
+
+    pub(crate) fn protocol(&self) -> OriginProtocol {
+        self.protocol
+    }
+}
+
+/// Removes attacker-controlled hop-by-hop headers before any trusted request
+/// effect, credential, identity, or loop-marker mutation is applied.
+pub(crate) fn sanitize_untrusted_request(
+    mut request: Request<Body>,
+) -> Result<SanitizedRequest, HeaderPreparationError> {
+    if request.method() == http::Method::CONNECT {
+        return Err(HeaderPreparationError::ConnectUnsupported);
+    }
+    let protocol = match request.version() {
+        Version::HTTP_10 | Version::HTTP_11 => OriginProtocol::Http1,
+        Version::HTTP_2 => OriginProtocol::Http2,
+        _ => return Err(HeaderPreparationError::UnsupportedVersion),
+    };
+    let connection_tokens = strict_connection_header_tokens(request.headers())?;
+    if request.headers().contains_key(http::header::UPGRADE)
+        || connection_tokens.contains(&http::header::UPGRADE)
+    {
+        return Err(HeaderPreparationError::UpgradeUnsupported);
+    }
+    strip_request_hop_by_hop(request.headers_mut(), protocol.is_http2());
+    Ok(SanitizedRequest { request, protocol })
+}
+
+fn strict_connection_header_tokens(
+    headers: &HeaderMap,
+) -> Result<HashSet<HeaderName>, HeaderPreparationError> {
+    let mut tokens = HashSet::new();
+    for value in headers.get_all(http::header::CONNECTION).iter() {
+        let value = value
+            .to_str()
+            .map_err(|_| HeaderPreparationError::InvalidConnection)?;
+        for token in value.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                return Err(HeaderPreparationError::InvalidConnection);
+            }
+            tokens.insert(
+                HeaderName::from_bytes(token.as_bytes())
+                    .map_err(|_| HeaderPreparationError::InvalidConnection)?,
+            );
+        }
+    }
+    Ok(tokens)
 }
 
 pub(crate) fn prepare_origin_request(
-    mut request: Request<Body>,
+    mut sanitized: SanitizedRequest,
     canonical: &CanonicalUrl,
     target_form: RequestTargetForm,
-    use_http2: bool,
 ) -> Result<Request<Body>, HeaderPreparationError> {
-    strip_request_hop_by_hop(request.headers_mut(), use_http2);
+    let use_http2 = sanitized.protocol.is_http2();
+    if sanitized.request.headers().keys().any(|name| {
+        is_hop_by_hop(name)
+            && !(use_http2 && *name == TE && te_is_trailers_only(sanitized.request.headers()))
+    }) {
+        return Err(HeaderPreparationError::Unsanitized);
+    }
+    let request = &mut sanitized.request;
     request.headers_mut().remove(HOST);
 
     if use_http2 {
@@ -44,7 +121,7 @@ pub(crate) fn prepare_origin_request(
                 .map_err(|_| HeaderPreparationError::Authority)?,
         );
     }
-    Ok(request)
+    Ok(sanitized.request)
 }
 
 pub(crate) fn strip_response_hop_by_hop(headers: &mut HeaderMap) {
@@ -152,13 +229,9 @@ mod tests {
         let canonical =
             canonicalize_http_url("https://EXAMPLE.com:8443/a%2fb/../c?project=group%2fproject")
                 .unwrap();
-        let prepared = prepare_origin_request(
-            request("/untrusted"),
-            &canonical,
-            RequestTargetForm::Origin,
-            false,
-        )
-        .unwrap();
+        let sanitized = sanitize_untrusted_request(request("/untrusted")).unwrap();
+        let prepared =
+            prepare_origin_request(sanitized, &canonical, RequestTargetForm::Origin).unwrap();
 
         assert_eq!(prepared.uri().to_string(), "/c?project=group%2Fproject");
         assert_eq!(prepared.headers()[HOST], "example.com:8443");
@@ -173,13 +246,9 @@ mod tests {
     #[test]
     fn h1_parent_uses_exact_absolute_form() {
         let canonical = canonicalize_http_url("http://example.com/a%2fb?q=%7e").unwrap();
-        let prepared = prepare_origin_request(
-            request("/untrusted"),
-            &canonical,
-            RequestTargetForm::Absolute,
-            false,
-        )
-        .unwrap();
+        let sanitized = sanitize_untrusted_request(request("/untrusted")).unwrap();
+        let prepared =
+            prepare_origin_request(sanitized, &canonical, RequestTargetForm::Absolute).unwrap();
 
         assert_eq!(prepared.uri().to_string(), canonical.url);
         assert_eq!(prepared.headers()[HOST], canonical.authority);
@@ -188,13 +257,11 @@ mod tests {
     #[test]
     fn h2_rebuilds_pseudo_authority_without_a_host_header() {
         let canonical = canonicalize_http_url("https://example.com:8443/resource").unwrap();
-        let prepared = prepare_origin_request(
-            request("/untrusted"),
-            &canonical,
-            RequestTargetForm::Origin,
-            true,
-        )
-        .unwrap();
+        let mut request = request("/untrusted");
+        *request.version_mut() = Version::HTTP_2;
+        let sanitized = sanitize_untrusted_request(request).unwrap();
+        let prepared =
+            prepare_origin_request(sanitized, &canonical, RequestTargetForm::Origin).unwrap();
 
         assert_eq!(prepared.uri().to_string(), canonical.url);
         assert_eq!(prepared.version(), Version::HTTP_2);
@@ -228,8 +295,9 @@ mod tests {
             .headers_mut()
             .insert(TE, HeaderValue::from_static("trailers"));
 
+        let sanitized = sanitize_untrusted_request(request).unwrap();
         let prepared =
-            prepare_origin_request(request, &canonical, RequestTargetForm::Origin, false).unwrap();
+            prepare_origin_request(sanitized, &canonical, RequestTargetForm::Origin).unwrap();
 
         assert!(!prepared.headers().contains_key(TE));
     }
@@ -241,16 +309,106 @@ mod tests {
         trailers
             .headers_mut()
             .insert(TE, HeaderValue::from_static("Trailers"));
+        *trailers.version_mut() = Version::HTTP_2;
+        let trailers = sanitize_untrusted_request(trailers).unwrap();
         let trailers =
-            prepare_origin_request(trailers, &canonical, RequestTargetForm::Origin, true).unwrap();
+            prepare_origin_request(trailers, &canonical, RequestTargetForm::Origin).unwrap();
         assert_eq!(trailers.headers()[TE], "trailers");
 
         let mut invalid = request("/untrusted");
         invalid
             .headers_mut()
             .insert(TE, HeaderValue::from_static("trailers, deflate"));
+        *invalid.version_mut() = Version::HTTP_2;
+        let invalid = sanitize_untrusted_request(invalid).unwrap();
         let invalid =
-            prepare_origin_request(invalid, &canonical, RequestTargetForm::Origin, true).unwrap();
+            prepare_origin_request(invalid, &canonical, RequestTargetForm::Origin).unwrap();
         assert!(!invalid.headers().contains_key(TE));
+    }
+
+    #[test]
+    fn attacker_connection_tokens_are_consumed_before_trusted_injection() {
+        let canonical = canonicalize_http_url("http://example.com/resource").unwrap();
+        let mut request = request("/untrusted");
+        request
+            .headers_mut()
+            .insert(CONNECTION, HeaderValue::from_static("x-injected"));
+        request
+            .headers_mut()
+            .insert("x-injected", HeaderValue::from_static("attacker"));
+        let mut sanitized = sanitize_untrusted_request(request).unwrap();
+        assert!(!sanitized.headers_mut().contains_key("x-injected"));
+
+        sanitized
+            .headers_mut()
+            .insert("x-injected", HeaderValue::from_static("trusted"));
+        let prepared =
+            prepare_origin_request(sanitized, &canonical, RequestTargetForm::Origin).unwrap();
+        assert_eq!(prepared.headers()["x-injected"], "trusted");
+    }
+
+    #[test]
+    fn trusted_hop_header_mutation_fails_closed() {
+        let canonical = canonicalize_http_url("http://example.com/resource").unwrap();
+        let mut sanitized = sanitize_untrusted_request(request("/untrusted")).unwrap();
+        sanitized
+            .headers_mut()
+            .insert(CONNECTION, HeaderValue::from_static("close"));
+
+        assert!(matches!(
+            prepare_origin_request(sanitized, &canonical, RequestTargetForm::Origin),
+            Err(HeaderPreparationError::Unsanitized)
+        ));
+    }
+
+    #[test]
+    fn upgrade_intent_fails_before_hop_header_sanitization() {
+        for request in [
+            Request::builder()
+                .version(Version::HTTP_11)
+                .header(CONNECTION, "upgrade")
+                .header("upgrade", "websocket")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .version(Version::HTTP_11)
+                .header("upgrade", "custom")
+                .body(Body::empty())
+                .unwrap(),
+        ] {
+            assert!(matches!(
+                sanitize_untrusted_request(request),
+                Err(HeaderPreparationError::UpgradeUnsupported)
+            ));
+        }
+    }
+
+    #[test]
+    fn h1_and_h2_connect_require_the_dedicated_executor() {
+        for version in [Version::HTTP_11, Version::HTTP_2] {
+            let request = Request::builder()
+                .method(http::Method::CONNECT)
+                .version(version)
+                .uri("example.com:443")
+                .body(Body::empty())
+                .unwrap();
+            assert!(matches!(
+                sanitize_untrusted_request(request),
+                Err(HeaderPreparationError::ConnectUnsupported)
+            ));
+        }
+    }
+
+    #[test]
+    fn malformed_connection_token_list_fails_closed() {
+        let request = Request::builder()
+            .version(Version::HTTP_11)
+            .header(CONNECTION, "keep-alive,,x-private")
+            .body(Body::empty())
+            .unwrap();
+        assert!(matches!(
+            sanitize_untrusted_request(request),
+            Err(HeaderPreparationError::InvalidConnection)
+        ));
     }
 }

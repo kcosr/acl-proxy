@@ -53,7 +53,8 @@ pub(crate) enum ParentTransport {
 pub(crate) struct OriginTls {
     trust: CompiledTlsTrust,
     http_versions: Box<[CompiledHttpVersion]>,
-    client_config: Arc<ClientConfig>,
+    http1_config: Option<Arc<ClientConfig>>,
+    http2_config: Option<Arc<ClientConfig>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -107,6 +108,8 @@ pub(crate) enum ParentAlpnError {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum OriginProtocolError {
+    #[error("the authorized origin HTTP protocol is not enabled")]
+    Disabled,
     #[error("origin TLS did not negotiate an enabled HTTP protocol")]
     IncompatibleAlpn,
 }
@@ -358,16 +361,13 @@ impl OriginTls {
 
         let loaded_trust = load(trust, ca_certificate.as_deref())?;
         warn_if_insecure("origin", trust);
-        let alpn = match (http1, http2) {
-            (true, true) => ClientAlpn::Http2AndHttp1,
-            (true, false) => ClientAlpn::Http1,
-            (false, true) => ClientAlpn::Http2,
-            (false, false) => unreachable!("empty protocol list rejected above"),
-        };
         Ok(Self {
             trust,
             http_versions: http_versions.into_boxed_slice(),
-            client_config: Arc::new(build_client_config(&loaded_trust, alpn, true)),
+            http1_config: http1
+                .then(|| Arc::new(build_client_config(&loaded_trust, ClientAlpn::Http1, true))),
+            http2_config: http2
+                .then(|| Arc::new(build_client_config(&loaded_trust, ClientAlpn::Http2, true))),
         })
     }
 
@@ -379,33 +379,32 @@ impl OriginTls {
         &self.http_versions
     }
 
-    pub(crate) fn client_config(&self) -> Arc<ClientConfig> {
-        self.client_config.clone()
-    }
-
-    pub(crate) fn plaintext_protocol(&self) -> OriginProtocol {
-        if self.http_versions.contains(&CompiledHttpVersion::Http1) {
-            OriginProtocol::Http1
-        } else {
-            OriginProtocol::Http2
-        }
-    }
-
-    pub(crate) fn negotiated_protocol(
+    pub(crate) fn client_config(
         &self,
+        protocol: OriginProtocol,
+    ) -> Result<Arc<ClientConfig>, OriginProtocolError> {
+        let config = if protocol.is_http2() {
+            &self.http2_config
+        } else {
+            &self.http1_config
+        };
+        config.clone().ok_or(OriginProtocolError::Disabled)
+    }
+
+    pub(crate) fn validate_negotiated_alpn(
+        &self,
+        protocol: OriginProtocol,
         negotiated: Option<&[u8]>,
-    ) -> Result<OriginProtocol, OriginProtocolError> {
-        match negotiated {
-            Some(b"h2") if self.http_versions.contains(&CompiledHttpVersion::Http2) => {
-                Ok(OriginProtocol::Http2)
-            }
-            Some(b"http/1.1") | None
-                if self.http_versions.contains(&CompiledHttpVersion::Http1) =>
-            {
-                Ok(OriginProtocol::Http1)
-            }
-            _ => Err(OriginProtocolError::IncompatibleAlpn),
-        }
+    ) -> Result<(), OriginProtocolError> {
+        self.client_config(protocol)?;
+        let compatible = if protocol.is_http2() {
+            negotiated == Some(b"h2")
+        } else {
+            negotiated.is_none() || negotiated == Some(b"http/1.1")
+        };
+        compatible
+            .then_some(())
+            .ok_or(OriginProtocolError::IncompatibleAlpn)
     }
 }
 
@@ -638,8 +637,20 @@ default = "deny"
                 [CompiledHttpVersion::Http1, CompiledHttpVersion::Http2]
             );
             assert_eq!(
-                snapshot.origin_tls().client_config().alpn_protocols,
-                [b"h2".to_vec(), b"http/1.1".to_vec()]
+                snapshot
+                    .origin_tls()
+                    .client_config(OriginProtocol::Http1)
+                    .unwrap()
+                    .alpn_protocols,
+                [b"http/1.1".to_vec()]
+            );
+            assert_eq!(
+                snapshot
+                    .origin_tls()
+                    .client_config(OriginProtocol::Http2)
+                    .unwrap()
+                    .alpn_protocols,
+                [b"h2".to_vec()]
             );
         }
     }
@@ -649,22 +660,6 @@ default = "deny"
         for version in [CompiledHttpVersion::Http1, CompiledHttpVersion::Http2] {
             let snapshot = activate(direct_plan(CompiledTlsTrust::Insecure, None, vec![version]));
             assert_eq!(snapshot.origin_tls().http_versions(), [version]);
-            assert_eq!(
-                snapshot.origin_tls().client_config().alpn_protocols,
-                [if version == CompiledHttpVersion::Http2 {
-                    b"h2".to_vec()
-                } else {
-                    b"http/1.1".to_vec()
-                }]
-            );
-            assert_eq!(
-                snapshot.origin_tls().plaintext_protocol(),
-                if version == CompiledHttpVersion::Http2 {
-                    OriginProtocol::Http2
-                } else {
-                    OriginProtocol::Http1
-                }
-            );
             let expected = if version == CompiledHttpVersion::Http2 {
                 OriginProtocol::Http2
             } else {
@@ -678,16 +673,21 @@ default = "deny"
             assert_eq!(
                 snapshot
                     .origin_tls()
-                    .negotiated_protocol(Some(expected_alpn)),
-                Ok(expected)
+                    .client_config(expected)
+                    .unwrap()
+                    .alpn_protocols,
+                [expected_alpn.to_vec()]
             );
             assert_eq!(
-                snapshot.origin_tls().negotiated_protocol(None),
-                if version == CompiledHttpVersion::Http1 {
-                    Ok(OriginProtocol::Http1)
-                } else {
-                    Err(OriginProtocolError::IncompatibleAlpn)
-                }
+                snapshot
+                    .origin_tls()
+                    .client_config(if expected.is_http2() {
+                        OriginProtocol::Http1
+                    } else {
+                        OriginProtocol::Http2
+                    })
+                    .err(),
+                Some(OriginProtocolError::Disabled)
             );
             let incompatible: &[u8] = if version == CompiledHttpVersion::Http2 {
                 b"http/1.1"
@@ -697,8 +697,14 @@ default = "deny"
             assert_eq!(
                 snapshot
                     .origin_tls()
-                    .negotiated_protocol(Some(incompatible)),
+                    .validate_negotiated_alpn(expected, Some(incompatible)),
                 Err(OriginProtocolError::IncompatibleAlpn)
+            );
+            assert_eq!(
+                snapshot
+                    .origin_tls()
+                    .validate_negotiated_alpn(expected, Some(expected_alpn)),
+                Ok(())
             );
         }
     }
@@ -722,21 +728,31 @@ default = "deny"
 
         assert_eq!(load_count.get(), 1);
         assert_eq!(
-            tls.client_config().alpn_protocols,
-            [b"h2".to_vec(), b"http/1.1".to_vec()]
-        );
-        assert_eq!(tls.plaintext_protocol(), OriginProtocol::Http1);
-        assert_eq!(tls.negotiated_protocol(None), Ok(OriginProtocol::Http1));
-        assert_eq!(
-            tls.negotiated_protocol(Some(b"http/1.1")),
-            Ok(OriginProtocol::Http1)
+            tls.client_config(OriginProtocol::Http1)
+                .unwrap()
+                .alpn_protocols,
+            [b"http/1.1".to_vec()]
         );
         assert_eq!(
-            tls.negotiated_protocol(Some(b"h2")),
-            Ok(OriginProtocol::Http2)
+            tls.client_config(OriginProtocol::Http2)
+                .unwrap()
+                .alpn_protocols,
+            [b"h2".to_vec()]
         );
         assert_eq!(
-            tls.negotiated_protocol(Some(b"http/3")),
+            tls.validate_negotiated_alpn(OriginProtocol::Http1, None),
+            Ok(())
+        );
+        assert_eq!(
+            tls.validate_negotiated_alpn(OriginProtocol::Http1, Some(b"h2")),
+            Err(OriginProtocolError::IncompatibleAlpn)
+        );
+        assert_eq!(
+            tls.validate_negotiated_alpn(OriginProtocol::Http2, Some(b"h2")),
+            Ok(())
+        );
+        assert_eq!(
+            tls.validate_negotiated_alpn(OriginProtocol::Http2, None),
             Err(OriginProtocolError::IncompatibleAlpn)
         );
     }

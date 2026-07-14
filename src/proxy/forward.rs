@@ -25,6 +25,7 @@ use crate::url::CanonicalUrl;
 
 use super::headers::{
     prepare_origin_request, strip_response_hop_by_hop, HeaderPreparationError, RequestTargetForm,
+    SanitizedRequest,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -50,6 +51,14 @@ pub(crate) enum ForwardError {
 }
 
 #[derive(Debug, thiserror::Error)]
+pub(crate) enum ResolveForwardingError {
+    #[error(transparent)]
+    Protocol(#[from] OriginProtocolError),
+    #[error(transparent)]
+    Destination(#[from] DestinationGuardError),
+}
+
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum ForwardBodyError {
     #[error("upstream response body failed")]
     Body(#[source] hyper::Error),
@@ -63,13 +72,87 @@ pub(crate) struct ForwardBody {
     body: Option<Body>,
     data_done: bool,
     trailers: Option<Option<http::HeaderMap>>,
-    driver: Option<tokio::task::JoinHandle<Result<(), hyper::Error>>>,
+    terminal_error: Option<ForwardBodyError>,
+    driver: DriverTask,
+}
+
+struct DriverTask {
+    handle: Option<tokio::task::JoinHandle<Result<(), hyper::Error>>>,
+}
+
+impl DriverTask {
+    fn spawn<F>(driver: F) -> Self
+    where
+        F: Future<Output = Result<(), hyper::Error>> + Send + 'static,
+    {
+        Self {
+            handle: Some(tokio::spawn(driver)),
+        }
+    }
+
+    fn from_handle(handle: tokio::task::JoinHandle<Result<(), hyper::Error>>) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    fn poll(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<Result<(), hyper::Error>, tokio::task::JoinError>> {
+        let Some(handle) = self.handle.as_mut() else {
+            return Poll::Ready(Ok(Ok(())));
+        };
+        match Pin::new(handle).poll(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(result) => {
+                self.handle.take();
+                Poll::Ready(result)
+            }
+        }
+    }
+
+    fn abort(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            handle.abort();
+        }
+    }
+
+    async fn abort_and_join(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+
+    async fn join(mut self) -> Result<Result<(), hyper::Error>, tokio::task::JoinError> {
+        match self.handle.take() {
+            Some(handle) => handle.await,
+            None => Ok(Ok(())),
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.handle.is_none()
+    }
+}
+
+impl Drop for DriverTask {
+    fn drop(&mut self) {
+        self.abort();
+    }
 }
 
 impl ForwardBody {
-    fn abort_driver(&mut self) {
-        if let Some(driver) = self.driver.take() {
-            driver.abort();
+    fn poll_terminal_error_join(&mut self, context: &mut Context<'_>) -> Poll<ForwardBodyError> {
+        self.driver.abort();
+        match self.driver.poll(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(_) => Poll::Ready(
+                self.terminal_error
+                    .take()
+                    .expect("terminal response-body error is present while joining"),
+            ),
         }
     }
 }
@@ -82,6 +165,12 @@ impl HttpBody for ForwardBody {
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
+        if self.terminal_error.is_some() {
+            return match self.poll_terminal_error_join(context) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(error) => Poll::Ready(Some(Err(error))),
+            };
+        }
         if self.data_done {
             return Poll::Ready(None);
         }
@@ -91,8 +180,12 @@ impl HttpBody for ForwardBody {
                 Poll::Ready(Some(Ok(bytes))) => return Poll::Ready(Some(Ok(bytes))),
                 Poll::Ready(Some(Err(error))) => {
                     self.body.take();
-                    self.abort_driver();
-                    return Poll::Ready(Some(Err(ForwardBodyError::Body(error))));
+                    self.trailers.take();
+                    self.terminal_error = Some(ForwardBodyError::Body(error));
+                    return match self.poll_terminal_error_join(context) {
+                        Poll::Pending => Poll::Pending,
+                        Poll::Ready(error) => Poll::Ready(Some(Err(error))),
+                    };
                 }
                 Poll::Ready(None) => {
                     self.data_done = true;
@@ -108,6 +201,12 @@ impl HttpBody for ForwardBody {
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Result<Option<http::HeaderMap>, Self::Error>> {
+        if self.terminal_error.is_some() {
+            return match self.poll_terminal_error_join(context) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(error) => Poll::Ready(Err(error)),
+            };
+        }
         if self.trailers.is_none() {
             let trailers = match self.body.as_mut() {
                 Some(body) => match Pin::new(body).poll_trailers(context) {
@@ -115,8 +214,12 @@ impl HttpBody for ForwardBody {
                     Poll::Ready(Ok(trailers)) => trailers,
                     Poll::Ready(Err(error)) => {
                         self.body.take();
-                        self.abort_driver();
-                        return Poll::Ready(Err(ForwardBodyError::Body(error)));
+                        self.trailers.take();
+                        self.terminal_error = Some(ForwardBodyError::Body(error));
+                        return match self.poll_terminal_error_join(context) {
+                            Poll::Pending => Poll::Pending,
+                            Poll::Ready(error) => Poll::Ready(Err(error)),
+                        };
                     }
                 },
                 None => None,
@@ -128,24 +231,30 @@ impl HttpBody for ForwardBody {
             }));
         }
 
-        let Some(driver) = self.driver.as_mut() else {
+        if self.driver.is_finished() {
             return Poll::Ready(Ok(self.trailers.take().flatten()));
-        };
-        match Pin::new(driver).poll(context) {
+        }
+        match self.driver.poll(context) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(result) => {
-                self.driver.take();
-                match result {
-                    Ok(Ok(())) => Poll::Ready(Ok(self.trailers.take().flatten())),
-                    Ok(Err(error)) => Poll::Ready(Err(ForwardBodyError::Connection(error))),
-                    Err(error) => Poll::Ready(Err(ForwardBodyError::Task(error))),
+            Poll::Ready(result) => match result {
+                Ok(Ok(())) => Poll::Ready(Ok(self.trailers.take().flatten())),
+                Ok(Err(error)) => {
+                    self.trailers.take();
+                    Poll::Ready(Err(ForwardBodyError::Connection(error)))
                 }
-            }
+                Err(error) => {
+                    self.trailers.take();
+                    Poll::Ready(Err(ForwardBodyError::Task(error)))
+                }
+            },
         }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.data_done && self.body.is_none() && self.driver.is_none()
+        self.terminal_error.is_none()
+            && self.data_done
+            && self.body.is_none()
+            && self.driver.is_finished()
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -159,17 +268,14 @@ impl HttpBody for ForwardBody {
     }
 }
 
-impl Drop for ForwardBody {
-    fn drop(&mut self) {
-        self.abort_driver();
-    }
-}
-
 pub(crate) type ForwardedResponse = Response<ForwardBody>;
 
-pub(crate) struct ResolvedForwardingTarget {
+pub(crate) struct ResolvedForwardingTarget<'egress> {
     canonical_url: String,
+    protocol: OriginProtocol,
+    egress_identity: usize,
     route: ResolvedForwardingRoute,
+    _egress: std::marker::PhantomData<&'egress dyn EgressSnapshot>,
 }
 
 enum ResolvedForwardingRoute {
@@ -182,11 +288,14 @@ enum ResolvedForwardingRoute {
 
 /// Resolves and validates the destination before policy or provider dispatch.
 /// The opaque result is consumed exactly once by `forward_request`.
-pub(crate) async fn resolve_forwarding_target(
+pub(crate) async fn resolve_forwarding_target<'egress>(
     canonical: &CanonicalUrl,
-    egress: &dyn EgressSnapshot,
+    request: &SanitizedRequest,
+    egress: &'egress dyn EgressSnapshot,
     destinations: &DestinationGuard,
-) -> Result<ResolvedForwardingTarget, DestinationGuardError> {
+) -> Result<ResolvedForwardingTarget<'egress>, ResolveForwardingError> {
+    egress.origin_tls().client_config(request.protocol())?;
+    let egress_identity = egress.route() as *const EgressRoute as usize;
     let route = match egress.route() {
         EgressRoute::Direct => ResolvedForwardingRoute::Direct(
             destinations
@@ -202,19 +311,22 @@ pub(crate) async fn resolve_forwarding_target(
     };
     Ok(ResolvedForwardingTarget {
         canonical_url: canonical.url.clone(),
+        protocol: request.protocol(),
+        egress_identity,
         route,
+        _egress: std::marker::PhantomData,
     })
 }
 
 /// Sends one already-authorized logical origin request without connection reuse.
 /// The destination token carries the only DNS result; connect performs the
 /// synchronous pre- and post-connect validation before any outbound bytes.
-pub(crate) async fn forward_request(
-    request: Request<Body>,
+pub(crate) async fn forward_request<'egress>(
+    request: SanitizedRequest,
     canonical: &CanonicalUrl,
-    egress: &dyn EgressSnapshot,
+    egress: &'egress dyn EgressSnapshot,
     destinations: &DestinationGuard,
-    target: ResolvedForwardingTarget,
+    target: ResolvedForwardingTarget<'egress>,
 ) -> Result<ForwardedResponse, ForwardError> {
     forward_with_connector(
         request,
@@ -227,19 +339,22 @@ pub(crate) async fn forward_request(
     .await
 }
 
-async fn forward_with_connector<C>(
-    request: Request<Body>,
+async fn forward_with_connector<'egress, C>(
+    request: SanitizedRequest,
     canonical: &CanonicalUrl,
-    egress: &dyn EgressSnapshot,
+    egress: &'egress dyn EgressSnapshot,
     destinations: &DestinationGuard,
-    target: ResolvedForwardingTarget,
+    target: ResolvedForwardingTarget<'egress>,
     connector: &C,
 ) -> Result<ForwardedResponse, ForwardError>
 where
     C: DestinationConnector,
     C::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    if target.canonical_url != canonical.url {
+    if target.canonical_url != canonical.url
+        || target.protocol != request.protocol()
+        || target.egress_identity != egress.route() as *const EgressRoute as usize
+    {
         return Err(ForwardError::ResolvedTargetMismatch);
     }
 
@@ -269,7 +384,7 @@ where
 }
 
 async fn forward_direct<S>(
-    request: Request<Body>,
+    request: SanitizedRequest,
     canonical: &CanonicalUrl,
     egress: &dyn EgressSnapshot,
     stream: S,
@@ -277,29 +392,19 @@ async fn forward_direct<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let protocol = request.protocol();
     if canonical.scheme == "https" {
-        let (stream, protocol) = connect_origin_tls(stream, canonical, egress).await?;
-        let request = prepare_origin_request(
-            request,
-            canonical,
-            RequestTargetForm::Origin,
-            protocol.is_http2(),
-        )?;
+        let stream = connect_origin_tls(stream, canonical, egress, protocol).await?;
+        let request = prepare_origin_request(request, canonical, RequestTargetForm::Origin)?;
         send_request(stream, request, protocol).await
     } else {
-        let protocol = egress.origin_tls().plaintext_protocol();
-        let request = prepare_origin_request(
-            request,
-            canonical,
-            RequestTargetForm::Origin,
-            protocol.is_http2(),
-        )?;
+        let request = prepare_origin_request(request, canonical, RequestTargetForm::Origin)?;
         send_request(stream, request, protocol).await
     }
 }
 
 async fn forward_via_parent<S>(
-    request: Request<Body>,
+    request: SanitizedRequest,
     canonical: &CanonicalUrl,
     egress: &dyn EgressSnapshot,
     parent: &ParentEndpoint,
@@ -308,42 +413,29 @@ async fn forward_via_parent<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let protocol = request.protocol();
     if canonical.scheme == "https" {
         // CONNECT is deliberately HTTP/1.1 and contains no logical-origin
         // headers. The selected origin protocol applies inside the tunnel.
         match parent.transport() {
             ParentTransport::Http => {
                 let tunnel = connect_parent_tunnel(stream, canonical).await?;
-                let (origin, protocol) = connect_origin_tls(tunnel, canonical, egress).await?;
-                let request = prepare_origin_request(
-                    request,
-                    canonical,
-                    RequestTargetForm::Origin,
-                    protocol.is_http2(),
-                )?;
+                let origin = connect_origin_tls(tunnel, canonical, egress, protocol).await?;
+                let request =
+                    prepare_origin_request(request, canonical, RequestTargetForm::Origin)?;
                 send_request(origin, request, protocol).await
             }
             ParentTransport::Https(tls) => {
                 let parent_stream = connect_parent_tls(stream, tls, false).await?;
                 let tunnel = connect_parent_tunnel(parent_stream, canonical).await?;
-                let (origin, protocol) = connect_origin_tls(tunnel, canonical, egress).await?;
-                let request = prepare_origin_request(
-                    request,
-                    canonical,
-                    RequestTargetForm::Origin,
-                    protocol.is_http2(),
-                )?;
+                let origin = connect_origin_tls(tunnel, canonical, egress, protocol).await?;
+                let request =
+                    prepare_origin_request(request, canonical, RequestTargetForm::Origin)?;
                 send_request(origin, request, protocol).await
             }
         }
     } else {
-        let protocol = egress.origin_tls().plaintext_protocol();
-        let request = prepare_origin_request(
-            request,
-            canonical,
-            RequestTargetForm::Absolute,
-            protocol.is_http2(),
-        )?;
+        let request = prepare_origin_request(request, canonical, RequestTargetForm::Absolute)?;
         match parent.transport() {
             ParentTransport::Http => send_request(stream, request, protocol).await,
             ParentTransport::Https(tls) => {
@@ -358,21 +450,22 @@ async fn connect_origin_tls<S>(
     stream: S,
     canonical: &CanonicalUrl,
     egress: &dyn EgressSnapshot,
-) -> Result<(TlsStream<S>, OriginProtocol), ForwardError>
+    protocol: OriginProtocol,
+) -> Result<TlsStream<S>, ForwardError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let name =
         ServerName::try_from(canonical.host.as_str()).map_err(|_| ForwardError::TlsServerName)?;
-    let connector = TlsConnector::from(egress.origin_tls().client_config());
+    let connector = TlsConnector::from(egress.origin_tls().client_config(protocol)?);
     let stream = connector
         .connect(name, stream)
         .await
         .map_err(ForwardError::Tls)?;
-    let protocol = egress
+    egress
         .origin_tls()
-        .negotiated_protocol(stream.get_ref().1.alpn_protocol())?;
-    Ok((stream, protocol))
+        .validate_negotiated_alpn(protocol, stream.get_ref().1.alpn_protocol())?;
+    Ok(stream)
 }
 
 async fn connect_parent_tls<S>(
@@ -417,36 +510,31 @@ where
         .handshake(stream)
         .await
         .map_err(ForwardError::Http)?;
-    let driver = tokio::spawn(connection);
+    let driver = DriverTask::spawn(connection);
 
     let mut response = match sender.send_request(request).await {
         Ok(response) => response,
         Err(error) => {
-            abort_and_join(driver).await;
+            driver.abort_and_join().await;
             return Err(ForwardError::Http(error));
         }
     };
     if !response.status().is_success() {
-        abort_and_join(driver).await;
+        driver.abort_and_join().await;
         return Err(ForwardError::ParentConnect(response.status()));
     }
     let upgraded = match hyper::upgrade::on(&mut response).await {
         Ok(upgraded) => upgraded,
         Err(error) => {
-            abort_and_join(driver).await;
+            driver.abort_and_join().await;
             return Err(ForwardError::Http(error));
         }
     };
-    match driver.await {
+    match driver.join().await {
         Ok(Ok(())) => Ok(upgraded),
         Ok(Err(error)) => Err(ForwardError::Http(error)),
         Err(error) => Err(ForwardError::Tls(std::io::Error::other(error))),
     }
-}
-
-async fn abort_and_join(driver: tokio::task::JoinHandle<Result<(), hyper::Error>>) {
-    driver.abort();
-    let _ = driver.await;
 }
 
 async fn send_request<S>(
@@ -465,11 +553,11 @@ where
         .handshake(stream)
         .await
         .map_err(ForwardError::Http)?;
-    let driver = tokio::spawn(connection);
+    let driver = DriverTask::spawn(connection);
     let response = match sender.send_request(request).await {
         Ok(response) => response,
         Err(error) => {
-            abort_and_join(driver).await;
+            driver.abort_and_join().await;
             return Err(ForwardError::Http(error));
         }
     };
@@ -481,7 +569,8 @@ where
             body: Some(body),
             data_done: false,
             trailers: None,
-            driver: Some(driver),
+            terminal_error: None,
+            driver,
         },
     ))
 }
@@ -591,6 +680,16 @@ mod tests {
     }
 
     fn activate(parent: Option<(&str, bool)>) -> ProductEgressSnapshot {
+        activate_with_versions(
+            parent,
+            vec![CompiledHttpVersion::Http1, CompiledHttpVersion::Http2],
+        )
+    }
+
+    fn activate_with_versions(
+        parent: Option<(&str, bool)>,
+        http_versions: Vec<CompiledHttpVersion>,
+    ) -> ProductEgressSnapshot {
         let parent_proxy = parent.map(|(url, tls)| ParentProxyPlan {
             kind: CompiledParentProxyKind::Generic,
             url: url.to_owned(),
@@ -612,7 +711,7 @@ mod tests {
                 origin_tls: TransportTlsPlan {
                     trust: CompiledTlsTrust::Insecure,
                     ca_certificate: None,
-                    http_versions: vec![CompiledHttpVersion::Http1, CompiledHttpVersion::Http2],
+                    http_versions,
                 },
                 parent_proxy,
                 request_headers: vec![],
@@ -624,9 +723,14 @@ mod tests {
         .unwrap()
     }
 
-    fn request() -> Request<Body> {
-        Request::builder()
+    fn request() -> SanitizedRequest {
+        request_with_version(Version::HTTP_11)
+    }
+
+    fn request_with_version(version: Version) -> SanitizedRequest {
+        let request = Request::builder()
             .method(Method::POST)
+            .version(version)
             .uri("/untrusted-client-target")
             .header(HOST, "untrusted-client.example")
             .header("authorization", "Bearer origin-secret")
@@ -635,7 +739,8 @@ mod tests {
             .header("x-loop-marker", "request-42")
             .header("proxy-authorization", "Basic parent-secret")
             .body(Body::from("request-body"))
-            .unwrap()
+            .unwrap();
+        crate::proxy::headers::sanitize_untrusted_request(request).unwrap()
     }
 
     fn tls_acceptor(alpn: &[u8]) -> TlsAcceptor {
@@ -688,6 +793,39 @@ mod tests {
             .await;
     }
 
+    async fn serve_h2(
+        stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        captured: oneshot::Sender<(String, http::HeaderMap, Vec<u8>)>,
+    ) {
+        let captured = Arc::new(Mutex::new(Some(captured)));
+        let _ = Http::new()
+            .http2_only(true)
+            .serve_connection(
+                stream,
+                service_fn(move |request: Request<Body>| {
+                    let uri = request.uri().to_string();
+                    let headers = request.headers().clone();
+                    let captured = Arc::clone(&captured);
+                    async move {
+                        let body = hyper::body::to_bytes(request.into_body()).await.unwrap();
+                        captured
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .unwrap()
+                            .send((uri, headers, body.to_vec()))
+                            .ok();
+                        let mut response = Response::new(Body::from("upstream-response"));
+                        response
+                            .headers_mut()
+                            .insert("x-end-to-end", HeaderValue::from_static("visible"));
+                        Ok::<_, std::convert::Infallible>(response)
+                    }
+                }),
+            )
+            .await;
+    }
+
     async fn finish_response(response: ForwardedResponse) {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()["x-end-to-end"], "visible");
@@ -724,7 +862,8 @@ mod tests {
             body: Some(Body::from("complete")),
             data_done: false,
             trailers: None,
-            driver: Some(driver),
+            terminal_error: None,
+            driver: DriverTask::from_handle(driver),
         };
 
         let mut body = body;
@@ -746,7 +885,8 @@ mod tests {
             body: Some(Body::empty()),
             data_done: false,
             trailers: None,
-            driver: Some(driver),
+            terminal_error: None,
+            driver: DriverTask::from_handle(driver),
         };
 
         drop(body);
@@ -772,7 +912,8 @@ mod tests {
             body: Some(Body::wrap_stream(stream)),
             data_done: false,
             trailers: None,
-            driver: Some(driver),
+            terminal_error: None,
+            driver: DriverTask::from_handle(driver),
         };
 
         assert!(hyper::body::to_bytes(body).await.is_err());
@@ -803,7 +944,8 @@ mod tests {
             body: Some(body),
             data_done: false,
             trailers: None,
-            driver: Some(driver),
+            terminal_error: None,
+            driver: DriverTask::from_handle(driver),
         };
 
         assert_eq!(body.data().await.unwrap().unwrap(), "with-trailer");
@@ -826,7 +968,8 @@ mod tests {
             body: Some(Body::empty()),
             data_done: false,
             trailers: None,
-            driver: Some(driver),
+            terminal_error: None,
+            driver: DriverTask::from_handle(driver),
         };
         assert!(body.data().await.is_none());
 
@@ -849,7 +992,8 @@ mod tests {
             body: Some(Body::empty()),
             data_done: false,
             trailers: None,
-            driver: Some(tokio::spawn(connection)),
+            terminal_error: None,
+            driver: DriverTask::spawn(connection),
         };
         assert!(body.data().await.is_none());
 
@@ -858,6 +1002,134 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(matches!(error, ForwardBodyError::Connection(_)));
+        assert!(body.trailers().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn disabled_authorized_protocol_fails_before_dns_or_connect() {
+        for (enabled, requested) in [
+            (CompiledHttpVersion::Http1, Version::HTTP_2),
+            (CompiledHttpVersion::Http2, Version::HTTP_11),
+        ] {
+            let canonical = canonicalize_http_url("http://origin.example/resource").unwrap();
+            let egress = activate_with_versions(None, vec![enabled]);
+            let request = request_with_version(requested);
+            let (guard, resolver) = guard();
+
+            assert!(matches!(
+                resolve_forwarding_target(&canonical, &request, &egress, &guard).await,
+                Err(ResolveForwardingError::Protocol(
+                    OriginProtocolError::Disabled
+                ))
+            ));
+            assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn h2_authorized_request_remains_h2_on_plaintext_origin() {
+        let canonical = canonicalize_http_url("http://origin.example:8080/h2").unwrap();
+        let egress = activate_with_versions(None, vec![CompiledHttpVersion::Http2]);
+        let request = request_with_version(Version::HTTP_2);
+        let (guard, _) = guard();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        let (captured_tx, captured_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_h2(server, captured_tx));
+        let target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
+            .await
+            .unwrap();
+
+        let response =
+            forward_with_connector(request, &canonical, &egress, &guard, target, &connector)
+                .await
+                .unwrap();
+        finish_response(response).await;
+        let (uri, headers, body) = captured_rx.await.unwrap();
+        assert_eq!(uri, canonical.url);
+        assert!(!headers.contains_key(HOST));
+        assert_eq!(headers["authorization"], "Bearer origin-secret");
+        assert_eq!(body, b"request-body");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resolved_target_rejects_an_identical_but_foreign_egress_snapshot() {
+        let canonical = canonicalize_http_url("http://origin.example/resource").unwrap();
+        let original = activate(None);
+        let foreign = activate(None);
+        let request = request();
+        let (guard, _) = guard();
+        let (client, _server) = tokio::io::duplex(1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        let target = resolve_forwarding_target(&canonical, &request, &original, &guard)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            forward_with_connector(request, &canonical, &foreign, &guard, target, &connector).await,
+            Err(ForwardError::ResolvedTargetMismatch)
+        ));
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_forward_aborts_driver_and_writes_no_later_body_bytes() {
+        let canonical = canonicalize_http_url("http://origin.example/cancel").unwrap();
+        let egress = activate(None);
+        let (body_sender, body_receiver) =
+            tokio::sync::mpsc::channel::<Result<Bytes, io::Error>>(1);
+        let request = Request::builder()
+            .method(Method::POST)
+            .version(Version::HTTP_11)
+            .uri("/untrusted")
+            .body(Body::wrap_stream(
+                tokio_stream::wrappers::ReceiverStream::new(body_receiver),
+            ))
+            .unwrap();
+        let request = crate::proxy::headers::sanitize_untrusted_request(request).unwrap();
+        let (guard, _) = guard();
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        let (head_tx, head_rx) = oneshot::channel();
+        let (tail_tx, tail_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut head = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                server.read_exact(&mut byte).await.unwrap();
+                head.push(byte[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            head_tx.send(head).ok();
+            let mut tail = Vec::new();
+            server.read_to_end(&mut tail).await.unwrap();
+            tail_tx.send(tail).ok();
+        });
+        let target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
+            .await
+            .unwrap();
+        let mut forwarding = Box::pin(forward_with_connector(
+            request, &canonical, &egress, &guard, target, &connector,
+        ));
+
+        tokio::select! {
+            _ = &mut forwarding => panic!("forward unexpectedly completed"),
+            head = head_rx => assert!(head.unwrap().starts_with(b"POST /cancel HTTP/1.1\r\n")),
+        }
+        drop(forwarding);
+        drop(body_sender);
+        let tail = tokio::time::timeout(std::time::Duration::from_secs(1), tail_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            tail.is_empty(),
+            "cancelled request wrote bytes after its head"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -871,14 +1143,15 @@ mod tests {
         let (captured_tx, captured_rx) = oneshot::channel();
         let server = tokio::spawn(serve_h1(server, captured_tx));
 
-        let target = resolve_forwarding_target(&canonical, &egress, &guard)
+        let request = request();
+        let target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
             .await
             .unwrap();
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
         assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
 
         let response =
-            forward_with_connector(request(), &canonical, &egress, &guard, target, &connector)
+            forward_with_connector(request, &canonical, &egress, &guard, target, &connector)
                 .await
                 .unwrap();
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
@@ -903,12 +1176,13 @@ mod tests {
         let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
         let (captured_tx, captured_rx) = oneshot::channel();
         let server = tokio::spawn(serve_h1(server, captured_tx));
-        let target = resolve_forwarding_target(&canonical, &egress, &guard)
+        let request = request();
+        let target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
             .await
             .unwrap();
 
         let response =
-            forward_with_connector(request(), &canonical, &egress, &guard, target, &connector)
+            forward_with_connector(request, &canonical, &egress, &guard, target, &connector)
                 .await
                 .unwrap();
         finish_response(response).await;
@@ -932,12 +1206,13 @@ mod tests {
             let tls = tls_acceptor(b"http/1.1").accept(server).await.unwrap();
             serve_h1(tls, captured_tx).await;
         });
-        let target = resolve_forwarding_target(&canonical, &egress, &guard)
+        let request = request();
+        let target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
             .await
             .unwrap();
 
         let response =
-            forward_with_connector(request(), &canonical, &egress, &guard, target, &connector)
+            forward_with_connector(request, &canonical, &egress, &guard, target, &connector)
                 .await
                 .unwrap();
         finish_response(response).await;
@@ -975,12 +1250,13 @@ mod tests {
             let tls = tls_acceptor(b"http/1.1").accept(server).await.unwrap();
             serve_h1(tls, origin_tx).await;
         });
-        let target = resolve_forwarding_target(&canonical, &egress, &guard)
+        let request = request();
+        let target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
             .await
             .unwrap();
 
         let response =
-            forward_with_connector(request(), &canonical, &egress, &guard, target, &connector)
+            forward_with_connector(request, &canonical, &egress, &guard, target, &connector)
                 .await
                 .unwrap();
         finish_response(response).await;
