@@ -219,7 +219,7 @@ pub(crate) enum ProductRuntimeError {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+    use std::net::{SocketAddr, TcpListener};
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -310,21 +310,6 @@ mod tests {
         }
     }
 
-    fn available_addresses<const N: usize>() -> [SocketAddr; N] {
-        let listeners: Vec<_> = (0..N)
-            .map(|_| TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), 0)).unwrap())
-            .collect();
-        let addresses = listeners
-            .iter()
-            .map(|listener| listener.local_addr().unwrap())
-            .collect::<Vec<_>>()
-            .try_into()
-            .ok()
-            .unwrap();
-        drop(listeners);
-        addresses
-    }
-
     fn config(explicit_http: SocketAddr, control: SocketAddr, extra: &str) -> String {
         format!(
             r#"schema_version = 3
@@ -363,17 +348,10 @@ default = "deny"
         (directory, loaded)
     }
 
-    fn assert_bindable(addresses: impl IntoIterator<Item = SocketAddr>) {
-        for address in addresses {
-            TcpListener::bind(address)
-                .unwrap_or_else(|error| panic!("expected {address} to be released: {error}"));
-        }
-    }
-
     #[tokio::test]
     async fn publication_before_ingress_confirmation_stays_not_ready() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = available_addresses::<2>();
+        let addresses = super::super::available_listener_addresses::<2>(&_test);
         let (_directory, loaded) = loaded(&config(addresses[0], addresses[1], ""));
         let product = ProductRuntime::prepare(loaded).await.unwrap();
 
@@ -397,13 +375,13 @@ default = "deny"
         assert!(!connect.http2_denied);
 
         product.shutdown().await;
-        assert_bindable(addresses);
+        super::super::assert_listener_addresses_released(&_test, addresses);
     }
 
     #[tokio::test]
     async fn ingress_confirmation_before_publication_stays_not_ready() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = available_addresses::<2>();
+        let addresses = super::super::available_listener_addresses::<2>(&_test);
         let (_directory, loaded) = loaded(&config(addresses[0], addresses[1], ""));
         let product = ProductRuntime::prepare(loaded).await.unwrap();
 
@@ -415,13 +393,13 @@ default = "deny"
         assert!(product.runtime().is_ready());
 
         product.shutdown().await;
-        assert_bindable(addresses);
+        super::super::assert_listener_addresses_released(&_test, addresses);
     }
 
     #[tokio::test]
     async fn failed_initial_activation_joins_shutdown_and_releases_every_socket() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = available_addresses::<2>();
+        let addresses = super::super::available_listener_addresses::<2>(&_test);
         let missing_variable = "ACL_PROXY_RUNNER_TEST_MISSING_REDACTION_LITERAL";
         std::env::remove_var(missing_variable);
         let extra = format!(
@@ -445,13 +423,13 @@ rules = [{{ literal_environment_variables = ["{missing_variable}"] }}]
             crate::runtime::LifecycleState::Stopped
         );
         assert!(!product.runtime().is_ready());
-        assert_bindable(addresses);
+        super::super::assert_listener_addresses_released(&_test, addresses);
     }
 
     #[tokio::test]
     async fn later_prebind_failure_releases_earlier_proxy_and_control_sockets() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = available_addresses::<2>();
+        let addresses = super::super::available_listener_addresses::<2>(&_test);
         let blocker = TcpListener::bind(addresses[1]).unwrap();
         let (_directory, loaded) = loaded(&config(addresses[0], addresses[1], ""));
 
@@ -463,15 +441,15 @@ rules = [{{ literal_environment_variables = ["{missing_variable}"] }}]
                 ProductStaticResourcesError::Control(_)
             ))
         ));
-        assert_bindable([addresses[0]]);
+        super::super::assert_listener_addresses_released(&_test, [addresses[0]]);
         drop(blocker);
-        assert_bindable([addresses[1]]);
+        super::super::assert_listener_addresses_released(&_test, [addresses[1]]);
     }
 
     #[tokio::test]
     async fn static_asset_failure_occurs_before_prebinding_and_leaves_every_socket_free() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = available_addresses::<3>();
+        let addresses = super::super::available_listener_addresses::<3>(&_test);
         let extra = format!(
             r#"[listeners.explicit_https]
 bind = "{}"
@@ -496,13 +474,13 @@ private_key = "missing-server-key.pem"
                 ProductStaticResourcesError::IngressAssets(_)
             ))
         ));
-        assert_bindable(addresses);
+        super::super::assert_listener_addresses_released(&_test, addresses);
     }
 
     #[tokio::test]
     async fn partial_proxy_startup_rolls_back_and_joins_before_returning() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = available_addresses::<3>();
+        let addresses = super::super::available_listener_addresses::<3>(&_test);
         let extra = format!(
             r#"[listeners.transparent_http]
 bind = "{}"
@@ -534,13 +512,13 @@ http_versions = ["http1"]
             product.runtime().lifecycle(),
             crate::runtime::LifecycleState::Stopped
         );
-        assert_bindable(addresses);
+        super::super::assert_listener_addresses_released(&_test, addresses);
     }
 
     #[tokio::test]
     async fn terminal_proxy_failure_drives_shutdown_and_supervisors_join_once() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = available_addresses::<2>();
+        let addresses = super::super::available_listener_addresses::<2>(&_test);
         let (_directory, loaded) = loaded(&config(addresses[0], addresses[1], ""));
         let product = ProductRuntime::prepare(loaded).await.unwrap();
         product.activate_initial().await.unwrap();
@@ -571,7 +549,7 @@ http_versions = ["http1"]
         product.shutdown().await;
         product.shutdown().await;
         assert_eq!(starter.supervisors[0].joins(), 1);
-        assert_bindable(addresses);
+        super::super::assert_listener_addresses_released(&_test, addresses);
     }
 
     #[test]

@@ -647,7 +647,6 @@ pub(crate) enum ProductStaticResourcesError {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
     use std::path::Path;
     use std::time::Duration;
 
@@ -669,21 +668,6 @@ mod tests {
                 let _ = signal.send(());
             }
         }
-    }
-
-    fn available_addresses<const N: usize>() -> [SocketAddr; N] {
-        let listeners: Vec<_> = (0..N)
-            .map(|_| TcpListener::bind((Ipv4Addr::new(127, 0, 0, 2), 0)).unwrap())
-            .collect();
-        let addresses = listeners
-            .iter()
-            .map(|listener| listener.local_addr().unwrap())
-            .collect::<Vec<_>>()
-            .try_into()
-            .ok()
-            .unwrap();
-        drop(listeners);
-        addresses
     }
 
     fn static_config(addresses: [SocketAddr; 5], identity_directory: &Path) -> StaticProductConfig {
@@ -792,17 +776,10 @@ header = "x-acl-proxy-request-id"
         config
     }
 
-    fn assert_bindable(addresses: impl IntoIterator<Item = SocketAddr>) {
-        for address in addresses {
-            TcpListener::bind(address)
-                .unwrap_or_else(|error| panic!("expected {address} to be released: {error}"));
-        }
-    }
-
     #[tokio::test]
     async fn preparation_reserves_every_configured_listener_and_is_one_shot() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = available_addresses::<5>();
+        let addresses = super::super::available_listener_addresses::<5>(&_test);
         let directory = tempfile::tempdir().unwrap();
         let resources =
             ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
@@ -820,13 +797,13 @@ header = "x-acl-proxy-request-id"
         ));
 
         StaticResources::shutdown(resources.as_ref()).await;
-        assert_bindable(addresses);
+        super::super::assert_listener_addresses_released(&_test, addresses);
     }
 
     #[tokio::test]
     async fn later_proxy_bind_failure_releases_earlier_sockets() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = available_addresses::<5>();
+        let addresses = super::super::available_listener_addresses::<5>(&_test);
         let blocker = TcpListener::bind(addresses[2]).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let resources =
@@ -837,7 +814,10 @@ header = "x-acl-proxy-request-id"
             Err(ProductStaticResourcesError::ProxyListenerBind(error))
                 if error.name == "explicit_https" && error.address == addresses[2]
         ));
-        assert_bindable([addresses[0], addresses[1], addresses[3], addresses[4]]);
+        super::super::assert_listener_addresses_released(
+            &_test,
+            [addresses[0], addresses[1], addresses[3], addresses[4]],
+        );
 
         drop(blocker);
         StaticResources::shutdown(resources.as_ref()).await;
@@ -846,7 +826,7 @@ header = "x-acl-proxy-request-id"
     #[tokio::test]
     async fn control_adoption_failure_releases_all_prebound_sockets() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = available_addresses::<5>();
+        let addresses = super::super::available_listener_addresses::<5>(&_test);
         let directory = tempfile::tempdir().unwrap();
         let resources =
             ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
@@ -859,7 +839,7 @@ header = "x-acl-proxy-request-id"
                 ControlServerError::RuntimeUnavailable
             ))
         ));
-        assert_bindable(addresses);
+        super::super::assert_listener_addresses_released(&_test, addresses);
 
         StaticResources::shutdown(resources.as_ref()).await;
     }
@@ -867,7 +847,7 @@ header = "x-acl-proxy-request-id"
     #[tokio::test]
     async fn shutdown_releases_prepared_but_unstarted_proxy_sockets() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = available_addresses::<5>();
+        let addresses = super::super::available_listener_addresses::<5>(&_test);
         let directory = tempfile::tempdir().unwrap();
         let resources =
             ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
@@ -875,7 +855,7 @@ header = "x-acl-proxy-request-id"
 
         StaticResources::shutdown(resources.as_ref()).await;
 
-        assert_bindable(addresses);
+        super::super::assert_listener_addresses_released(&_test, addresses);
         assert!(matches!(
             resources.take_prepared_proxy_listeners_for_supervisor_start(),
             Err(ProductStaticResourcesError::IngressAlreadyAdopted)
@@ -885,18 +865,19 @@ header = "x-acl-proxy-request-id"
     #[tokio::test]
     async fn construction_does_not_bind_configured_sockets() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = available_addresses::<5>();
+        let addresses = super::super::available_listener_addresses::<5>(&_test);
         let directory = tempfile::tempdir().unwrap();
         let resources =
             ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
 
-        assert_bindable(addresses);
+        super::super::assert_listener_addresses_released(&_test, addresses);
         drop(resources);
     }
 
     #[tokio::test]
     async fn static_owner_closes_and_joins_runtime_owned_upgrade_tasks() {
-        let addresses = available_addresses::<5>();
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let addresses = super::super::available_listener_addresses::<5>(&_test);
         let directory = tempfile::tempdir().unwrap();
         let resources =
             ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
