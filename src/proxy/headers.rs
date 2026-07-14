@@ -95,8 +95,15 @@ pub(crate) fn prepare_origin_request(
     mut sanitized: SanitizedRequest,
     canonical: &CanonicalUrl,
     target_form: RequestTargetForm,
+    protocol: OriginProtocol,
 ) -> Result<Request<Body>, HeaderPreparationError> {
-    let use_http2 = sanitized.protocol.is_http2();
+    let use_http2 = protocol.is_http2();
+    if sanitized.protocol.is_http2()
+        && !use_http2
+        && te_is_trailers_only(sanitized.request.headers())
+    {
+        sanitized.request.headers_mut().remove(TE);
+    }
     if sanitized.request.headers().keys().any(|name| {
         is_hop_by_hop(name)
             && !(use_http2 && *name == TE && te_is_trailers_only(sanitized.request.headers()))
@@ -230,8 +237,13 @@ mod tests {
             canonicalize_http_url("https://EXAMPLE.com:8443/a%2fb/../c?project=group%2fproject")
                 .unwrap();
         let sanitized = sanitize_untrusted_request(request("/untrusted")).unwrap();
-        let prepared =
-            prepare_origin_request(sanitized, &canonical, RequestTargetForm::Origin).unwrap();
+        let prepared = prepare_origin_request(
+            sanitized,
+            &canonical,
+            RequestTargetForm::Origin,
+            OriginProtocol::Http1,
+        )
+        .unwrap();
 
         assert_eq!(prepared.uri().to_string(), "/c?project=group%2Fproject");
         assert_eq!(prepared.headers()[HOST], "example.com:8443");
@@ -247,8 +259,13 @@ mod tests {
     fn h1_parent_uses_exact_absolute_form() {
         let canonical = canonicalize_http_url("http://example.com/a%2fb?q=%7e").unwrap();
         let sanitized = sanitize_untrusted_request(request("/untrusted")).unwrap();
-        let prepared =
-            prepare_origin_request(sanitized, &canonical, RequestTargetForm::Absolute).unwrap();
+        let prepared = prepare_origin_request(
+            sanitized,
+            &canonical,
+            RequestTargetForm::Absolute,
+            OriginProtocol::Http1,
+        )
+        .unwrap();
 
         assert_eq!(prepared.uri().to_string(), canonical.url);
         assert_eq!(prepared.headers()[HOST], canonical.authority);
@@ -260,8 +277,13 @@ mod tests {
         let mut request = request("/untrusted");
         *request.version_mut() = Version::HTTP_2;
         let sanitized = sanitize_untrusted_request(request).unwrap();
-        let prepared =
-            prepare_origin_request(sanitized, &canonical, RequestTargetForm::Origin).unwrap();
+        let prepared = prepare_origin_request(
+            sanitized,
+            &canonical,
+            RequestTargetForm::Origin,
+            OriginProtocol::Http2,
+        )
+        .unwrap();
 
         assert_eq!(prepared.uri().to_string(), canonical.url);
         assert_eq!(prepared.version(), Version::HTTP_2);
@@ -296,8 +318,13 @@ mod tests {
             .insert(TE, HeaderValue::from_static("trailers"));
 
         let sanitized = sanitize_untrusted_request(request).unwrap();
-        let prepared =
-            prepare_origin_request(sanitized, &canonical, RequestTargetForm::Origin).unwrap();
+        let prepared = prepare_origin_request(
+            sanitized,
+            &canonical,
+            RequestTargetForm::Origin,
+            OriginProtocol::Http1,
+        )
+        .unwrap();
 
         assert!(!prepared.headers().contains_key(TE));
     }
@@ -311,8 +338,13 @@ mod tests {
             .insert(TE, HeaderValue::from_static("Trailers"));
         *trailers.version_mut() = Version::HTTP_2;
         let trailers = sanitize_untrusted_request(trailers).unwrap();
-        let trailers =
-            prepare_origin_request(trailers, &canonical, RequestTargetForm::Origin).unwrap();
+        let trailers = prepare_origin_request(
+            trailers,
+            &canonical,
+            RequestTargetForm::Origin,
+            OriginProtocol::Http2,
+        )
+        .unwrap();
         assert_eq!(trailers.headers()[TE], "trailers");
 
         let mut invalid = request("/untrusted");
@@ -321,8 +353,13 @@ mod tests {
             .insert(TE, HeaderValue::from_static("trailers, deflate"));
         *invalid.version_mut() = Version::HTTP_2;
         let invalid = sanitize_untrusted_request(invalid).unwrap();
-        let invalid =
-            prepare_origin_request(invalid, &canonical, RequestTargetForm::Origin).unwrap();
+        let invalid = prepare_origin_request(
+            invalid,
+            &canonical,
+            RequestTargetForm::Origin,
+            OriginProtocol::Http2,
+        )
+        .unwrap();
         assert!(!invalid.headers().contains_key(TE));
     }
 
@@ -342,8 +379,13 @@ mod tests {
         sanitized
             .headers_mut()
             .insert("x-injected", HeaderValue::from_static("trusted"));
-        let prepared =
-            prepare_origin_request(sanitized, &canonical, RequestTargetForm::Origin).unwrap();
+        let prepared = prepare_origin_request(
+            sanitized,
+            &canonical,
+            RequestTargetForm::Origin,
+            OriginProtocol::Http1,
+        )
+        .unwrap();
         assert_eq!(prepared.headers()["x-injected"], "trusted");
     }
 
@@ -356,9 +398,60 @@ mod tests {
             .insert(CONNECTION, HeaderValue::from_static("close"));
 
         assert!(matches!(
-            prepare_origin_request(sanitized, &canonical, RequestTargetForm::Origin),
+            prepare_origin_request(
+                sanitized,
+                &canonical,
+                RequestTargetForm::Origin,
+                OriginProtocol::Http1,
+            ),
             Err(HeaderPreparationError::Unsanitized)
         ));
+    }
+
+    #[test]
+    fn h2_trailers_te_is_removed_when_selected_origin_is_h1() {
+        let canonical = canonicalize_http_url("http://example.com/resource").unwrap();
+        let mut request = request("/untrusted");
+        *request.version_mut() = Version::HTTP_2;
+        request
+            .headers_mut()
+            .insert(TE, HeaderValue::from_static("trailers"));
+        let sanitized = sanitize_untrusted_request(request).unwrap();
+
+        let prepared = prepare_origin_request(
+            sanitized,
+            &canonical,
+            RequestTargetForm::Origin,
+            OriginProtocol::Http1,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.version(), Version::HTTP_11);
+        assert_eq!(prepared.uri(), "/resource");
+        assert_eq!(prepared.headers()[HOST], "example.com");
+        assert!(!prepared.headers().contains_key(TE));
+    }
+
+    #[test]
+    fn trusted_trailers_te_is_retained_when_selected_origin_is_h2() {
+        let canonical = canonicalize_http_url("https://example.com/resource").unwrap();
+        let mut sanitized = sanitize_untrusted_request(request("/untrusted")).unwrap();
+        sanitized
+            .headers_mut()
+            .insert(TE, HeaderValue::from_static("trailers"));
+
+        let prepared = prepare_origin_request(
+            sanitized,
+            &canonical,
+            RequestTargetForm::Origin,
+            OriginProtocol::Http2,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.version(), Version::HTTP_2);
+        assert_eq!(prepared.uri().to_string(), canonical.url);
+        assert!(!prepared.headers().contains_key(HOST));
+        assert_eq!(prepared.headers()[TE], "trailers");
     }
 
     #[test]

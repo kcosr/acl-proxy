@@ -19,6 +19,7 @@
 ### Changed
 
 - Established one strict URL contract for policy evaluation and forwarding: DNS hosts use IDNA/STD3 validation, fragments and ambiguous double encoding are rejected, encoded delimiters remain opaque, and the exact canonical URL authorized by policy is forwarded upstream.
+- Decoupled ingress HTTP versions from selected outbound protocols, normalizing request targets, authority, Host, TE, and ALPN across direct and parent routes.
 - Split explicit HTTP and transparent HTTP handling onto separate configured sockets, and reject listener topology changes during reload. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
 - Graceful shutdown now closes idle keep-alive connections and drains in-flight requests across all configured listeners before exit. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
 - Generated minimal configurations now bind their deny-all listeners to IPv4 loopback instead of all interfaces.

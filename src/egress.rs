@@ -742,20 +742,35 @@ default = "deny"
     }
 
     #[test]
-    fn origin_protocol_selection_preserves_enabled_ingress_regardless_of_configured_order() {
-        for versions in [
+    fn origin_protocol_selection_preserves_enabled_ingress_and_falls_back_to_enabled_protocol() {
+        let snapshot = activate(direct_plan(
+            CompiledTlsTrust::Insecure,
+            None,
             vec![CompiledHttpVersion::Http1, CompiledHttpVersion::Http2],
-            vec![CompiledHttpVersion::Http2, CompiledHttpVersion::Http1],
+        ));
+        assert_eq!(
+            snapshot.origin_tls().select_protocol(OriginProtocol::Http1),
+            OriginProtocol::Http1
+        );
+        assert_eq!(
+            snapshot.origin_tls().select_protocol(OriginProtocol::Http2),
+            OriginProtocol::Http2
+        );
+
+        for (versions, ingress, expected) in [
+            (
+                vec![CompiledHttpVersion::Http1],
+                OriginProtocol::Http2,
+                OriginProtocol::Http1,
+            ),
+            (
+                vec![CompiledHttpVersion::Http2],
+                OriginProtocol::Http1,
+                OriginProtocol::Http2,
+            ),
         ] {
             let snapshot = activate(direct_plan(CompiledTlsTrust::Insecure, None, versions));
-            assert_eq!(
-                snapshot.origin_tls().select_protocol(OriginProtocol::Http1),
-                OriginProtocol::Http1
-            );
-            assert_eq!(
-                snapshot.origin_tls().select_protocol(OriginProtocol::Http2),
-                OriginProtocol::Http2
-            );
+            assert_eq!(snapshot.origin_tls().select_protocol(ingress), expected);
         }
     }
 
