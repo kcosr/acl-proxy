@@ -18,6 +18,10 @@ const ENTRY_OPEN: u8 = 0;
 const ENTRY_CLOSING: u8 = 1;
 const ENTRY_CLOSED: u8 = 2;
 const ENTRY_CLOSE_REQUESTED: u8 = 3;
+const ENTRY_CLOSE_WAITING_SETUP: u8 = 4;
+const SETUP_IDLE: u8 = 0;
+const SETUP_POLLING: u8 = 1;
+const SETUP_SUCCEEDED: u8 = 2;
 const DEFAULT_ENTRY_CLEANUP_GRACE: Duration = Duration::from_secs(1);
 
 type UpgradeSetupTask =
@@ -315,7 +319,7 @@ struct EntryShared {
     timing: Mutex<EntryTiming>,
     cleanup_grace: Duration,
     winning_cause: Mutex<Option<UpgradeTerminalCause>>,
-    setup_transition: Mutex<SetupTransition>,
+    setup_state: AtomicU8,
     changed: Notify,
     terminal_state: AtomicU8,
     closed: Notify,
@@ -326,10 +330,6 @@ struct EntryTiming {
     application_stop: Instant,
     cleanup_cutoff: Instant,
     stop_cause: UpgradeTerminalCause,
-}
-
-struct SetupTransition {
-    succeeded: bool,
 }
 
 enum SupervisorCommand {
@@ -434,12 +434,50 @@ struct LinearizedSetupTask {
     setup: UpgradeSetupTask,
 }
 
+struct SetupPollGuard {
+    shared: Arc<EntryShared>,
+    succeeded: bool,
+}
+
+impl Drop for SetupPollGuard {
+    fn drop(&mut self) {
+        self.shared.setup_state.store(
+            if self.succeeded {
+                SETUP_SUCCEEDED
+            } else {
+                SETUP_IDLE
+            },
+            Ordering::Release,
+        );
+        self.shared.finish_close_request();
+    }
+}
+
 impl Future for LinearizedSetupTask {
     type Output = Result<UpgradeRelayPair, UpgradeTerminalCause>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let shared = self.shared.clone();
-        let mut transition = lock(&shared.setup_transition);
+        if shared.terminal_state.load(Ordering::Acquire) != ENTRY_OPEN {
+            return Poll::Ready(Err(lock(&shared.timing).stop_cause));
+        }
+        if shared
+            .setup_state
+            .compare_exchange(
+                SETUP_IDLE,
+                SETUP_POLLING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            context.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        let mut guard = SetupPollGuard {
+            shared: shared.clone(),
+            succeeded: false,
+        };
         let timing = *lock(&shared.timing);
         if shared.terminal_state.load(Ordering::Acquire) != ENTRY_OPEN
             || Instant::now() >= timing.application_stop
@@ -448,7 +486,7 @@ impl Future for LinearizedSetupTask {
         }
         let result = self.setup.as_mut().poll(context);
         if matches!(result, Poll::Ready(Ok(_))) {
-            transition.succeeded = true;
+            guard.succeeded = true;
         }
         result
     }
@@ -1044,7 +1082,7 @@ impl UpgradeHandshake {
             }),
             cleanup_grace: self.inner.limits.cleanup_grace,
             winning_cause: Mutex::new(None),
-            setup_transition: Mutex::new(SetupTransition { succeeded: false }),
+            setup_state: AtomicU8::new(SETUP_IDLE),
             changed: Notify::new(),
             terminal_state: AtomicU8::new(ENTRY_OPEN),
             closed: Notify::new(),
@@ -1149,7 +1187,6 @@ impl CommittedUpgrade {
 
 impl EntryShared {
     fn lower_for_shutdown(&self, deadline: Instant) {
-        let _transition = lock(&self.setup_transition);
         {
             let mut timing = lock(&self.timing);
             if deadline <= timing.application_stop {
@@ -1174,7 +1211,6 @@ impl EntryShared {
         {
             return;
         }
-        let _transition = lock(&self.setup_transition);
         *lock(&self.winning_cause) = Some(cause);
         let cause_cutoff = now.checked_add(cleanup_grace).unwrap_or(now);
         let mut timing = lock(&self.timing);
@@ -1185,6 +1221,24 @@ impl EntryShared {
             .terminal_state
             .compare_exchange(
                 ENTRY_CLOSE_REQUESTED,
+                ENTRY_CLOSE_WAITING_SETUP,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            self.finish_close_request();
+        }
+    }
+
+    fn finish_close_request(&self) {
+        if self.setup_state.load(Ordering::Acquire) == SETUP_POLLING {
+            return;
+        }
+        if self
+            .terminal_state
+            .compare_exchange(
+                ENTRY_CLOSE_WAITING_SETUP,
                 ENTRY_CLOSING,
                 Ordering::Release,
                 Ordering::Acquire,
@@ -1475,8 +1529,8 @@ async fn run_entry_coordinator_with_hooks<RawHook, SetupHook, CloseHook>(
         if shared.terminal_state.load(Ordering::Acquire) == ENTRY_CLOSING {
             let cause =
                 lock(&shared.winning_cause).expect("closing entry has a winning terminal cause");
-            let established =
-                phase == EntryPhase::Established || lock(&shared.setup_transition).succeeded;
+            let established = phase == EntryPhase::Established
+                || shared.setup_state.load(Ordering::Acquire) == SETUP_SUCCEEDED;
             let control = terminal_control
                 .take()
                 .expect("entry cleanup owns terminal control");
@@ -1492,6 +1546,15 @@ async fn run_entry_coordinator_with_hooks<RawHook, SetupHook, CloseHook>(
             )
             .await;
             return;
+        }
+
+        match shared.terminal_state.load(Ordering::Acquire) {
+            ENTRY_CLOSE_REQUESTED | ENTRY_CLOSE_WAITING_SETUP => {
+                changed.await;
+                continue;
+            }
+            ENTRY_CLOSED => return,
+            _ => {}
         }
 
         if let Some((build, snapshot)) = pending_setup.take() {
@@ -2128,7 +2191,7 @@ mod tests {
             }),
             cleanup_grace: Duration::from_millis(100),
             winning_cause: Mutex::new(None),
-            setup_transition: Mutex::new(SetupTransition { succeeded: false }),
+            setup_state: AtomicU8::new(SETUP_IDLE),
             changed: Notify::new(),
             terminal_state: AtomicU8::new(ENTRY_OPEN),
             closed: Notify::new(),
@@ -2172,7 +2235,7 @@ mod tests {
             }),
             cleanup_grace: Duration::from_millis(100),
             winning_cause: Mutex::new(None),
-            setup_transition: Mutex::new(SetupTransition { succeeded: false }),
+            setup_state: AtomicU8::new(SETUP_IDLE),
             changed: Notify::new(),
             terminal_state: AtomicU8::new(ENTRY_OPEN),
             closed: Notify::new(),
@@ -2216,7 +2279,7 @@ mod tests {
             }),
             cleanup_grace: Duration::from_millis(100),
             winning_cause: Mutex::new(None),
-            setup_transition: Mutex::new(SetupTransition { succeeded: false }),
+            setup_state: AtomicU8::new(SETUP_IDLE),
             changed: Notify::new(),
             terminal_state: AtomicU8::new(ENTRY_OPEN),
             closed: Notify::new(),
@@ -2285,7 +2348,7 @@ mod tests {
                 }),
                 cleanup_grace: Duration::from_millis(100),
                 winning_cause: Mutex::new(None),
-                setup_transition: Mutex::new(SetupTransition { succeeded: false }),
+                setup_state: AtomicU8::new(SETUP_IDLE),
                 changed: Notify::new(),
                 terminal_state: AtomicU8::new(ENTRY_OPEN),
                 closed: Notify::new(),
@@ -2948,6 +3011,7 @@ mod tests {
             );
             assert_eq!(raw_aborts.load(Ordering::SeqCst), 1);
             assert_eq!(established_closes.load(Ordering::SeqCst), 0);
+            assert_eq!(entry.shared.setup_state.load(Ordering::Acquire), SETUP_IDLE);
             runtime.shutdown_and_wait(Some(Instant::now())).await;
         }
     }
@@ -3095,7 +3159,7 @@ mod tests {
             }),
             cleanup_grace: Duration::from_millis(100),
             winning_cause: Mutex::new(None),
-            setup_transition: Mutex::new(SetupTransition { succeeded: false }),
+            setup_state: AtomicU8::new(SETUP_IDLE),
             changed: Notify::new(),
             terminal_state: AtomicU8::new(ENTRY_OPEN),
             closed: Notify::new(),
@@ -3163,7 +3227,7 @@ mod tests {
             }),
             cleanup_grace: Duration::from_millis(100),
             winning_cause: Mutex::new(None),
-            setup_transition: Mutex::new(SetupTransition { succeeded: false }),
+            setup_state: AtomicU8::new(SETUP_IDLE),
             changed: Notify::new(),
             terminal_state: AtomicU8::new(ENTRY_OPEN),
             closed: Notify::new(),
@@ -3244,7 +3308,7 @@ mod tests {
                     }),
                     cleanup_grace: Duration::from_millis(100),
                     winning_cause: Mutex::new(None),
-                    setup_transition: Mutex::new(SetupTransition { succeeded: false }),
+                    setup_state: AtomicU8::new(SETUP_IDLE),
                     changed: Notify::new(),
                     terminal_state: AtomicU8::new(ENTRY_OPEN),
                     closed: Notify::new(),
@@ -3317,7 +3381,8 @@ mod tests {
                 });
                 transition_started_rx.recv().unwrap();
                 tokio::time::timeout(Duration::from_secs(1), async {
-                    while shared.terminal_state.load(Ordering::Acquire) != ENTRY_CLOSE_REQUESTED {
+                    while shared.terminal_state.load(Ordering::Acquire) != ENTRY_CLOSE_WAITING_SETUP
+                    {
                         tokio::task::yield_now().await;
                     }
                 })
@@ -3330,7 +3395,7 @@ mod tests {
                     .expect("coordinator did not resolve the setup/terminal race")
                     .unwrap();
                 assert_eq!(setup_completed.load(Ordering::SeqCst), 1);
-                assert!(lock(&shared.setup_transition).succeeded);
+                assert_eq!(shared.setup_state.load(Ordering::Acquire), SETUP_SUCCEEDED);
                 assert_eq!(established_closes.load(Ordering::SeqCst), 1);
                 assert_eq!(relay_polls.load(Ordering::SeqCst), 0);
                 assert_eq!(raw_aborts.load(Ordering::SeqCst), 1);
@@ -3355,7 +3420,7 @@ mod tests {
             }),
             cleanup_grace: Duration::from_millis(100),
             winning_cause: Mutex::new(None),
-            setup_transition: Mutex::new(SetupTransition { succeeded: false }),
+            setup_state: AtomicU8::new(SETUP_IDLE),
             changed: Notify::new(),
             terminal_state: AtomicU8::new(ENTRY_OPEN),
             closed: Notify::new(),
@@ -3416,7 +3481,188 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn blocked_terminal_submission_cannot_reopen_closed_entry() {
+    async fn setup_poll_can_reentrantly_submit_terminal_without_deadlock() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let established_closes = Arc::new(AtomicUsize::new(0));
+        let relay_polls = Arc::new(AtomicUsize::new(0));
+        let (entry_for_setup_tx, entry_for_setup_rx) = oneshot::channel();
+        let (entry_tx, entry_rx) = oneshot::channel();
+        let (terminal_returned_tx, terminal_returned_rx) = oneshot::channel();
+        let (setup_release_tx, setup_release_rx) = std_mpsc::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), {
+                let established_closes = established_closes.clone();
+                let relay_polls = relay_polls.clone();
+                move |handshake| async move {
+                    let entry = handshake
+                        .commit(
+                            None,
+                            UpgradeEntryPlan::new(
+                                UpgradeTerminalControl::new(
+                                    inert_raw_teardown(),
+                                    move |_| async move {
+                                        established_closes.fetch_add(1, Ordering::SeqCst);
+                                    },
+                                ),
+                                move |_| async move {
+                                    let entry: CommittedUpgrade = entry_for_setup_rx.await.unwrap();
+                                    entry.submit_terminal(UpgradeTerminalCause::Cancelled);
+                                    let _ = terminal_returned_tx.send(());
+                                    setup_release_rx.recv().unwrap();
+                                    let first_polls = relay_polls.clone();
+                                    let second_polls = relay_polls;
+                                    Ok(UpgradeRelayPair::new(
+                                        async move {
+                                            first_polls.fetch_add(1, Ordering::SeqCst);
+                                            UpgradeTerminalCause::PeerClosed
+                                        },
+                                        async move {
+                                            second_polls.fetch_add(1, Ordering::SeqCst);
+                                            UpgradeTerminalCause::PeerClosed
+                                        },
+                                    ))
+                                },
+                            ),
+                        )
+                        .unwrap();
+                    entry_for_setup_tx.send(entry.clone()).unwrap();
+                    entry_tx.send(entry).unwrap();
+                }
+            })
+            .unwrap();
+        let entry = entry_rx.await.unwrap();
+        terminal_returned_rx
+            .await
+            .expect("reentrant terminal submission did not return");
+        assert_eq!(
+            entry.shared.terminal_state.load(Ordering::Acquire),
+            ENTRY_CLOSE_WAITING_SETUP
+        );
+        assert_eq!(
+            entry.shared.setup_state.load(Ordering::Acquire),
+            SETUP_POLLING
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(
+            entry.shared.terminal_state.load(Ordering::Acquire),
+            ENTRY_CLOSE_WAITING_SETUP
+        );
+        setup_release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entry.wait_closed())
+            .await
+            .expect("entry did not close after reentrant terminal setup poll returned");
+        assert_eq!(
+            entry.terminal_cause(),
+            Some(UpgradeTerminalCause::Cancelled)
+        );
+        assert_eq!(
+            entry.shared.setup_state.load(Ordering::Acquire),
+            SETUP_SUCCEEDED
+        );
+        assert_eq!(established_closes.load(Ordering::SeqCst), 1);
+        assert_eq!(relay_polls.load(Ordering::SeqCst), 0);
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn setup_poll_can_reentrantly_begin_shutdown_without_deadlock() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let relay_polls = Arc::new(AtomicUsize::new(0));
+        let shutdown_returns = Arc::new(AtomicUsize::new(0));
+        let (entry_tx, entry_rx) = oneshot::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), {
+                let setup_runtime = runtime.clone();
+                let relay_polls = relay_polls.clone();
+                let shutdown_returns = shutdown_returns.clone();
+                move |handshake| async move {
+                    let entry = handshake
+                        .commit(
+                            None,
+                            UpgradeEntryPlan::new(inert_control(), move |_| async move {
+                                setup_runtime.begin_shutdown(Some(Instant::now()));
+                                shutdown_returns.fetch_add(1, Ordering::SeqCst);
+                                let first_polls = relay_polls.clone();
+                                let second_polls = relay_polls;
+                                Ok(UpgradeRelayPair::new(
+                                    async move {
+                                        first_polls.fetch_add(1, Ordering::SeqCst);
+                                        UpgradeTerminalCause::PeerClosed
+                                    },
+                                    async move {
+                                        second_polls.fetch_add(1, Ordering::SeqCst);
+                                        UpgradeTerminalCause::PeerClosed
+                                    },
+                                ))
+                            }),
+                        )
+                        .unwrap();
+                    entry_tx.send(entry).unwrap();
+                }
+            })
+            .unwrap();
+        let entry = entry_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entry.wait_closed())
+            .await
+            .expect("entry did not close after reentrant shutdown setup poll returned");
+        assert_eq!(shutdown_returns.load(Ordering::SeqCst), 1);
+        assert_eq!(entry.terminal_cause(), Some(UpgradeTerminalCause::Shutdown));
+        assert_eq!(
+            entry.shared.setup_state.load(Ordering::Acquire),
+            SETUP_SUCCEEDED
+        );
+        assert_eq!(relay_polls.load(Ordering::SeqCst), 0);
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
+
+    #[tokio::test]
+    async fn setup_poll_panic_clears_polling_and_finishes_reentrant_terminal() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let now = Instant::now();
+        let shared = Arc::new(EntryShared {
+            timing: Mutex::new(EntryTiming {
+                application_stop: now + Duration::from_secs(1),
+                cleanup_cutoff: now + Duration::from_secs(2),
+                stop_cause: UpgradeTerminalCause::LifetimeExpired,
+            }),
+            cleanup_grace: Duration::from_millis(100),
+            winning_cause: Mutex::new(None),
+            setup_state: AtomicU8::new(SETUP_IDLE),
+            changed: Notify::new(),
+            terminal_state: AtomicU8::new(ENTRY_OPEN),
+            closed: Notify::new(),
+        });
+        let entry = CommittedUpgrade {
+            _inner: runtime.inner.clone(),
+            id: 0,
+            shared: shared.clone(),
+        };
+        let setup = LinearizedSetupTask {
+            shared: shared.clone(),
+            setup: Box::pin(async move {
+                entry.submit_terminal(UpgradeTerminalCause::Cancelled);
+                panic!("setup panic after reentrant terminal submission");
+                #[allow(unreachable_code)]
+                Err(UpgradeTerminalCause::SetupFailed)
+            }),
+        };
+
+        let error = match tokio::spawn(setup).await {
+            Err(error) => error,
+            Ok(_) => panic!("setup task did not panic"),
+        };
+        assert!(error.is_panic());
+        assert_eq!(shared.setup_state.load(Ordering::Acquire), SETUP_IDLE);
+        assert_eq!(shared.terminal_state.load(Ordering::Acquire), ENTRY_CLOSING);
+        assert_eq!(
+            *lock(&shared.winning_cause),
+            Some(UpgradeTerminalCause::Cancelled)
+        );
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn waiting_terminal_submission_cannot_reopen_closed_entry() {
         let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
         let (entry_tx, entry_rx) = oneshot::channel();
         let (setup_entered_tx, setup_entered_rx) = std_mpsc::channel();
@@ -3441,20 +3687,14 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("setup did not enter its gated poll");
 
-        let submitter = entry.clone();
-        let (submit_started_tx, submit_started_rx) = std_mpsc::channel();
-        let submit = tokio::task::spawn_blocking(move || {
-            submit_started_tx.send(()).unwrap();
-            submitter.submit_terminal(UpgradeTerminalCause::Cancelled);
-        });
-        submit_started_rx.recv().unwrap();
+        entry.submit_terminal(UpgradeTerminalCause::Cancelled);
         tokio::time::timeout(Duration::from_secs(1), async {
-            while entry.shared.terminal_state.load(Ordering::Acquire) != ENTRY_CLOSE_REQUESTED {
+            while entry.shared.terminal_state.load(Ordering::Acquire) != ENTRY_CLOSE_WAITING_SETUP {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("terminal submission did not block on the setup transition");
+        .expect("terminal submission did not wait for the active setup poll");
 
         runtime.inner.close_entry(entry.id());
         tokio::time::timeout(Duration::from_secs(1), entry.wait_closed())
@@ -3466,7 +3706,7 @@ mod tests {
         );
 
         setup_release_tx.send(()).unwrap();
-        submit.await.unwrap();
+        tokio::task::yield_now().await;
         assert_eq!(
             entry.shared.terminal_state.load(Ordering::Acquire),
             ENTRY_CLOSED
