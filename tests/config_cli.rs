@@ -1,307 +1,210 @@
+use std::fs;
 use std::io::Write;
+use std::net::{Ipv4Addr, TcpListener};
 use std::process::Command;
 
 use assert_cmd::prelude::*;
-use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use tempfile::{NamedTempFile, TempDir};
 
-#[test]
-fn config_validate_succeeds_for_valid_config() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    writeln!(
-        file,
-        r#"
-schema_version = "2"
+const MINIMAL: &str = r#"schema_version = 3
 
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
+[listeners.explicit_http]
+bind = "127.0.0.1:8881"
+http_versions = ["http1"]
 
-[logging]
-directory = "logs"
-level = "info"
+[listeners.explicit_http.connect]
+http1 = "deny"
 
 [policy]
 default = "deny"
-        "#
-    )
-    .expect("write config");
+"#;
 
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("config")
-        .arg("validate")
-        .arg("--config")
-        .arg(file.path());
+fn config_file(contents: &str) -> NamedTempFile {
+    let mut file = NamedTempFile::new().expect("create temporary config");
+    file.write_all(contents.as_bytes()).expect("write config");
+    file
+}
 
-    cmd.assert()
-        .success()
-        .stdout(contains("Configuration is valid"));
+fn command() -> Command {
+    Command::new(assert_cmd::cargo_bin!("acl-proxy"))
 }
 
 #[test]
-fn config_validate_warns_for_incomplete_redaction_env_marker() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    writeln!(
-        file,
-        r#"
-schema_version = "2"
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[logging]
-directory = "logs"
-level = "info"
-
-[redaction.profiles.secrets]
-
-[[redaction.profiles.secrets.rules]]
-literals = ["pass${{word"]
-
-[policy]
-default = "deny"
-
-[[policy.rules]]
-action = "allow"
-pattern = "https://example.com/**"
-redaction_profile = "secrets"
-        "#
-    )
-    .expect("write config");
-
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("config")
-        .arg("validate")
-        .arg("--config")
-        .arg(file.path());
-
-    cmd.assert()
-        .success()
-        .stdout(contains("Configuration is valid"))
-        .stderr(
-            contains(
-                "warning: redaction.profiles.secrets.rules[0].literals[0] contains '${' but is not a complete placeholder",
-            )
-            .and(contains("pass${word").not()),
-        );
-}
-
-#[test]
-fn config_validate_rejects_schema_version_one() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    writeln!(
-        file,
-        r#"
-schema_version = "1"
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[logging]
-directory = "logs"
-level = "info"
-
-[policy]
-default = "deny"
-        "#
-    )
-    .expect("write config");
-
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("config")
-        .arg("validate")
-        .arg("--config")
-        .arg(file.path());
-
-    cmd.assert()
-        .failure()
-        .stderr(contains("unsupported schema_version 1, expected 2"));
-}
-
-#[test]
-fn config_validate_fails_for_invalid_loop_protection_header_name() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    writeln!(
-        file,
-        r#"
-schema_version = "2"
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[loop_protection]
-header_name = "invalid header"
-
-[policy]
-default = "deny"
-        "#
-    )
-    .expect("write config");
-
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("config")
-        .arg("validate")
-        .arg("--config")
-        .arg(file.path());
-
-    cmd.assert().failure().stderr(contains(
-        "loop_protection.header_name must be a valid HTTP header name",
-    ));
-}
-
-#[test]
-fn env_overrides_are_applied() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    writeln!(
-        file,
-        r#"
-schema_version = "2"
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[logging]
-directory = "logs"
-level = "info"
-
-[policy]
-default = "deny"
-        "#
-    )
-    .expect("write config");
-
-    // Use a small helper binary run via `cargo run`-style to inspect overrides.
-    // For now, just ensure that `config validate` still succeeds with overrides set.
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("config")
-        .arg("validate")
-        .arg("--config")
+fn config_validate_accepts_strict_schema_three() {
+    let file = config_file(MINIMAL);
+    command()
+        .args(["config", "validate", "--config"])
         .arg(file.path())
-        .env("PROXY_EXPLICIT_HTTP_BIND", "0.0.0.0:9999")
-        .env("LOG_LEVEL", "debug");
-
-    cmd.assert()
+        .assert()
         .success()
         .stdout(contains("Configuration is valid"));
 }
 
 #[test]
-fn config_validate_fails_for_malformed_toml() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    // Missing value for schema_version to force a parse error.
-    writeln!(
-        file,
-        r#"
-schema_version =
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-        "#
-    )
-    .expect("write config");
-
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("config")
-        .arg("validate")
-        .arg("--config")
-        .arg(file.path());
-
-    cmd.assert()
-        .failure()
-        .stderr(contains("failed to parse config"));
+fn config_validate_rejects_old_missing_and_future_schema_versions() {
+    for (name, contents) in [
+        (
+            "old",
+            MINIMAL.replace("schema_version = 3", "schema_version = 2"),
+        ),
+        ("missing", MINIMAL.replace("schema_version = 3\n\n", "")),
+        (
+            "future",
+            MINIMAL.replace("schema_version = 3", "schema_version = 4"),
+        ),
+    ] {
+        let file = config_file(&contents);
+        command()
+            .args(["config", "validate", "--config"])
+            .arg(file.path())
+            .assert()
+            .failure()
+            .stderr(contains("strict schema v3 TOML"))
+            .stderr(contains(if name == "missing" {
+                "missing required field"
+            } else {
+                "invalid value"
+            }));
+    }
 }
 
 #[test]
-fn run_fails_when_logging_directory_cannot_initialize() {
-    let temp_dir = TempDir::new().expect("create temp dir");
-    let log_file = temp_dir.path().join("not-a-directory");
-    std::fs::write(&log_file, "not a directory").expect("write log path file");
+fn config_validate_reports_sanitized_syntax_errors() {
+    let file = config_file("schema_version =\nsecret-value-that-must-not-leak");
+    let output = command()
+        .args(["config", "validate", "--config"])
+        .arg(file.path())
+        .output()
+        .expect("run config validate");
 
-    let mut file = NamedTempFile::new().expect("create temp config");
-    writeln!(
-        file,
-        r#"
-schema_version = "2"
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("syntax error"), "{stderr}");
+    assert!(!stderr.contains("secret-value-that-must-not-leak"));
+}
 
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:1"
+#[test]
+fn static_cli_commands_never_execute_provider_or_resolve_secrets() {
+    let directory = TempDir::new().expect("create temporary directory");
+    let marker = directory.path().join("provider-ran");
+    let logging_target = directory.path().join("logging-target-is-a-file");
+    fs::write(&logging_target, "keep").unwrap();
+    let occupied = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let bind = occupied.local_addr().unwrap();
+    let path = directory.path().join("acl-proxy.toml");
+    fs::write(
+        &path,
+        format!(
+            r#"schema_version = 3
 
-[logging]
-directory = "{}"
-level = "info"
+[control]
+bind = "127.0.0.1:8898"
+
+[control.tls]
+certificate_chain = "missing-control-cert.pem"
+private_key = "missing-control-key.pem"
+
+[listeners.explicit_http]
+bind = "{bind}"
+http_versions = ["http1"]
+
+[listeners.explicit_http.connect]
+http1 = "deny"
+
+[authorization.providers.marker]
+kind = "process"
+command = "/bin/sh"
+args = ["-c", "printf ran > {marker}"]
+
+[credentials.sources.missing_file]
+source = "file"
+path = "missing-credential"
+
+[redaction.profiles.missing_environment]
+rules = [{{ literal_environment_variables = ["ACL_PROXY_STATIC_CLI_MISSING"] }}]
+
+[observation.logging]
+directory = "{logging_target}"
 
 [policy]
 default = "deny"
-        "#,
-        log_file.display()
+"#,
+            marker = marker.display(),
+            logging_target = logging_target.display(),
+        ),
     )
-    .expect("write config");
+    .unwrap();
 
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("--config").arg(file.path());
-
-    cmd.assert()
-        .failure()
-        .stderr(contains("failed to create logging directory"));
+    for arguments in [
+        ["config", "validate", "--config"],
+        ["policy", "dump", "--config"],
+    ] {
+        command()
+            .args(arguments)
+            .arg(&path)
+            .env_remove("ACL_PROXY_STATIC_CLI_MISSING")
+            .assert()
+            .success();
+        assert!(!marker.exists(), "static command spawned the provider");
+        assert_eq!(fs::read_to_string(&logging_target).unwrap(), "keep");
+        assert!(
+            TcpListener::bind(bind).is_err(),
+            "static command disturbed the occupied listener"
+        );
+    }
 }
 
 #[test]
-fn missing_default_config_suggests_init() {
-    let temp_dir = TempDir::new().expect("create temp dir");
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("config")
-        .arg("validate")
-        // No --config and no ACL_PROXY_CONFIG: should use default path and fail with hint.
-        .current_dir(temp_dir.path());
+fn config_init_writes_a_strict_loopback_template_that_validates() {
+    let directory = TempDir::new().expect("create temporary directory");
+    let target = directory.path().join("nested/acl-proxy.toml");
 
-    cmd.assert().failure().stderr(contains("config init"));
-}
-
-#[test]
-fn config_init_creates_file_at_path() {
-    let temp_dir = TempDir::new().expect("create temp dir");
-    let target = temp_dir.path().join("acl-proxy.toml");
-
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("config").arg("init").arg(&target);
-
-    cmd.assert()
+    command()
+        .args(["config", "init"])
+        .arg(&target)
+        .assert()
         .success()
         .stdout(contains("Wrote default config"));
 
-    assert!(target.exists(), "config file should be created");
-    let contents = std::fs::read_to_string(&target).expect("read generated config");
-    assert!(
-        contents.contains("schema_version"),
-        "generated config should contain schema_version"
-    );
-    assert!(
-        contents.contains("[proxy]"),
-        "generated config should contain [proxy] section"
-    );
-    assert_eq!(
-        contents.matches("127.0.0.1:").count(),
-        2,
-        "every generated listener should bind to loopback"
-    );
-    assert!(
-        !contents.contains("0.0.0.0:"),
-        "generated deny-all config must not expose listeners on all interfaces"
-    );
+    let contents = fs::read_to_string(&target).unwrap();
+    assert!(contents.starts_with("schema_version = 3\n"));
+    assert!(contents.contains("[listeners.explicit_http]"));
+    assert!(contents.contains("127.0.0.1:8881"));
+    assert!(!contents.contains("[proxy]"));
+    assert!(!contents.contains("0.0.0.0"));
+
+    command()
+        .args(["config", "validate", "--config"])
+        .arg(&target)
+        .assert()
+        .success();
 }
 
 #[test]
-fn config_init_refuses_to_overwrite_existing_file() {
-    let temp_dir = TempDir::new().expect("create temp dir");
-    let target = temp_dir.path().join("acl-proxy.toml");
+fn config_init_never_overwrites_an_existing_file() {
+    let directory = TempDir::new().expect("create temporary directory");
+    let target = directory.path().join("acl-proxy.toml");
+    fs::write(&target, "existing = true\n").unwrap();
 
-    {
-        let mut file = std::fs::File::create(&target).expect("create existing config");
-        writeln!(file, "existing = true").expect("write existing config");
-    }
+    command()
+        .args(["config", "init"])
+        .arg(&target)
+        .assert()
+        .failure()
+        .stderr(contains("already exists"));
+    assert_eq!(fs::read_to_string(target).unwrap(), "existing = true\n");
+}
 
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("config").arg("init").arg(&target);
-
-    cmd.assert().failure().stderr(contains("already exists"));
+#[test]
+fn config_path_environment_is_the_only_static_command_override() {
+    let file = config_file(MINIMAL);
+    command()
+        .args(["config", "validate"])
+        .env("ACL_PROXY_CONFIG", file.path())
+        .env("PROXY_EXPLICIT_HTTP_BIND", "not-an-address")
+        .env("LOG_LEVEL", "not-a-level")
+        .assert()
+        .success()
+        .stdout(contains("Configuration is valid"));
 }

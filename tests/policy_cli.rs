@@ -1,776 +1,173 @@
-use std::env;
-use std::io::Write;
+use std::fs;
 use std::process::Command;
-use std::sync::{Mutex, MutexGuard};
 
 use assert_cmd::prelude::*;
-use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use serde_json::Value;
-use tempfile::NamedTempFile;
+use tempfile::TempDir;
 
-static ENV_LOCK: Mutex<()> = Mutex::new(());
+fn policy_config(schema_version: u32) -> String {
+    format!(
+        r#"schema_version = {schema_version}
 
-struct EnvGuard {
-    _lock: MutexGuard<'static, ()>,
-    saved: Vec<(String, Option<String>)>,
-}
+[listeners.explicit_http]
+bind = "127.0.0.1:8881"
+http_versions = ["http1"]
 
-impl EnvGuard {
-    fn new(keys: &[&str]) -> Self {
-        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let saved = keys
-            .iter()
-            .map(|key| ((*key).to_string(), env::var(key).ok()))
-            .collect();
+[listeners.explicit_http.connect]
+http1 = "deny"
 
-        Self { _lock: lock, saved }
-    }
+[authorization.providers.approval]
+kind = "process"
+command = "missing-provider"
 
-    fn set(&self, key: &str, value: &str) {
-        unsafe {
-            env::set_var(key, value);
-        }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (key, value) in self.saved.iter().rev() {
-            unsafe {
-                match value {
-                    Some(value) => env::set_var(key, value),
-                    None => env::remove_var(key),
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn config_validate_succeeds_for_policy_with_macros_and_rulesets() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    file.write_all(
-        br#"
-schema_version = "2"
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[logging]
-directory = "logs"
-level = "info"
-
-[policy]
-default = "deny"
-
-[policy.macros]
-repo = ["user/ts-test-1", "user/ts-test-2"]
-
-[[policy.rulesets.gitlab_repo]]
-action = "allow"
-pattern = "https://gitlab.internal/api/v4/projects/{repo}?**"
-
-[[policy.rules]]
-include = "gitlab_repo"
-add_url_enc_variants = true
-        "#,
-    )
-    .expect("write config");
-
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("config")
-        .arg("validate")
-        .arg("--config")
-        .arg(file.path());
-
-    cmd.assert()
-        .success()
-        .stdout(contains("Configuration is valid"));
-}
-
-#[test]
-fn config_validate_fails_for_missing_macro_in_ruleset() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    file.write_all(
-        br#"
-schema_version = "2"
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[logging]
-directory = "logs"
-level = "info"
-
-[policy]
-default = "deny"
-
-[[policy.rulesets.gitlab_repo]]
-action = "allow"
-pattern = "https://gitlab.internal/api/v4/projects/{repo}?**"
-
-[[policy.rules]]
-include = "gitlab_repo"
-add_url_enc_variants = true
-        "#,
-    )
-    .expect("write config");
-
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("config")
-        .arg("validate")
-        .arg("--config")
-        .arg(file.path());
-
-    cmd.assert()
-        .failure()
-        .stderr(contains("Policy macro not found: repo"));
-}
-
-#[test]
-fn config_validate_fails_for_missing_macro_in_direct_rule() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    file.write_all(
-        br#"
-schema_version = "2"
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[logging]
-directory = "logs"
-level = "info"
-
-[policy]
-default = "deny"
-
-[[policy.rules]]
-action = "allow"
-pattern = "https://gitlab.internal/api/v4/projects/{repo}?**"
-add_url_enc_variants = true
-        "#,
-    )
-    .expect("write config");
-
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("config")
-        .arg("validate")
-        .arg("--config")
-        .arg(file.path());
-
-    cmd.assert()
-        .failure()
-        .stderr(contains("Policy macro not found: repo"));
-}
-
-#[test]
-fn policy_dump_defaults_to_json_on_non_tty() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    file.write_all(
-        br#"
-schema_version = "2"
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[logging]
-directory = "logs"
-level = "info"
-
-[policy]
-default = "deny"
-
-[[policy.rules]]
-action = "allow"
-pattern = "https://example.com/api/**"
-methods = ["GET"]
-description = "Allow API"
-subnets = ["10.0.0.0/8"]
-        "#,
-    )
-    .expect("write config");
-
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("policy")
-        .arg("dump")
-        .arg("--config")
-        .arg(file.path());
-
-    let assert = cmd.assert().success();
-    let stdout =
-        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is valid UTF-8");
-
-    let value: Value = serde_json::from_str(&stdout).expect("output is valid JSON");
-    assert_eq!(value["default"], "deny");
-
-    let rules = value["rules"].as_array().expect("rules is an array");
-    assert_eq!(rules.len(), 1);
-
-    let rule = &rules[0];
-    assert_eq!(rule["index"], 0);
-    assert_eq!(rule["action"], "allow");
-    assert_eq!(rule["pattern"], "https://example.com/api/**");
-    assert_eq!(rule["description"], "Allow API");
-
-    let methods = rule["methods"].as_array().expect("methods is an array");
-    assert_eq!(methods.len(), 1);
-    assert_eq!(methods[0], "GET");
-
-    let subnets = rule["subnets"].as_array().expect("subnets is an array");
-    assert_eq!(subnets.len(), 1);
-    assert_eq!(subnets[0], "10.0.0.0/8");
-}
-
-#[test]
-fn policy_dump_masks_env_sourced_header_action_values() {
-    let env_guard = EnvGuard::new(&["ACL_PROXY_TEST_POLICY_DUMP_TOKEN"]);
-    env_guard.set("ACL_PROXY_TEST_POLICY_DUMP_TOKEN", "policy-dump-secret");
-
-    let mut file = NamedTempFile::new().expect("create temp config");
-    file.write_all(
-        br#"
-schema_version = "2"
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[logging]
-directory = "logs"
-level = "info"
-
-[policy]
-default = "deny"
-
-[[policy.rules]]
-action = "allow"
-pattern = "https://example.com/api/**"
-
-[[policy.rules.header_actions]]
-direction = "request"
-action = "set"
-name = "authorization"
-value = "${ACL_PROXY_TEST_POLICY_DUMP_TOKEN}"
-        "#,
-    )
-    .expect("write config");
-
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("policy")
-        .arg("dump")
-        .arg("--format")
-        .arg("json")
-        .arg("--config")
-        .arg(file.path());
-
-    let assert = cmd.assert().success();
-    let stdout =
-        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is valid UTF-8");
-
-    assert!(!stdout.contains("policy-dump-secret"));
-    let value: Value = serde_json::from_str(&stdout).expect("output is valid JSON");
-    let action = &value["rules"][0]["header_actions"][0];
-    assert_eq!(action["values"][0], "[REDACTED]");
-}
-
-#[test]
-fn policy_dump_prints_config_load_warnings_to_stderr() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    file.write_all(
-        br#"
-schema_version = "2"
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[logging]
-directory = "logs"
-level = "info"
+[credentials.sources.api_token]
+source = "environment"
+variable = "POLICY_DUMP_SECRET_VARIABLE"
 
 [redaction.profiles.secrets]
-
-[[redaction.profiles.secrets.rules]]
-literals = ["pass${word"]
+rules = [{{ literals = ["literal-secret-value"] }}]
 
 [policy]
 default = "deny"
 
 [[policy.rules]]
-action = "allow"
-pattern = "https://example.com/api/**"
-        "#,
+id = "delegated-api"
+description = "Delegate API"
+decision = "delegate"
+urls = ["https://example.test/api/**", "https://example.test/status"]
+methods = ["get"]
+client_cidrs = ["10.0.0.0/8"]
+request_timeout = "5s"
+allow_upgrades = true
+authorization_provider = "approval"
+redaction_profile = "secrets"
+
+[policy.rules.headers]
+absent_any = ["x-blocked"]
+present_all = ["x-identity"]
+all = {{ x-tenant = ["engineering"] }}
+none = {{ x-channel = ["untrusted"] }}
+
+[[policy.rules.request_headers]]
+operation = "set"
+when = "always"
+name = "x-route"
+value = "literal-secret-value"
+
+[[policy.rules.response_headers]]
+operation = "remove"
+when = "always"
+name = "x-remove-me"
+
+[[policy.rules.credential_actions]]
+kind = "bearer"
+credential = "api_token"
+"#
     )
-    .expect("write config");
+}
 
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("policy")
-        .arg("dump")
-        .arg("--config")
-        .arg(file.path());
+fn fixture(schema_version: u32) -> (TempDir, std::path::PathBuf) {
+    let directory = TempDir::new().expect("create temporary directory");
+    let path = directory.path().join("acl-proxy.toml");
+    fs::write(&path, policy_config(schema_version)).unwrap();
+    (directory, path)
+}
 
-    let assert = cmd.assert().success().stderr(
-        contains(
-            "warning: redaction.profiles.secrets.rules[0].literals[0] contains '${' but is not a complete placeholder",
-        )
-        .and(contains("pass${word").not()),
-    );
-    let stdout =
-        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is valid UTF-8");
-    let value: Value = serde_json::from_str(&stdout).expect("output is valid JSON");
-    assert_eq!(value["default"], "deny");
+fn command() -> Command {
+    Command::new(assert_cmd::cargo_bin!("acl-proxy"))
 }
 
 #[test]
-fn policy_dump_table_format_contains_expected_fields() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    file.write_all(
-        br#"
-schema_version = "2"
+fn policy_dump_defaults_to_stable_secret_free_json_off_tty() {
+    let (_directory, path) = fixture(3);
+    let output = command()
+        .args(["policy", "dump", "--config"])
+        .arg(path)
+        .output()
+        .expect("run policy dump");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for excluded in [
+        "POLICY_DUMP_SECRET_VARIABLE",
+        "literal-secret-value",
+        "missing-provider",
+    ] {
+        assert!(!stdout.contains(excluded), "dump disclosed {excluded}");
+    }
+    let value: Value = serde_json::from_str(&stdout).expect("policy dump JSON");
+    assert_eq!(value["default"], "deny");
+    let rule = &value["rules"][0];
+    assert_eq!(rule["index"], 0);
+    assert_eq!(rule["id"], "delegated-api");
+    assert_eq!(rule["decision"], "delegate");
+    assert_eq!(rule["urls"][0], "https://example.test/api/**");
+    assert_eq!(rule["urls"][1], "https://example.test/status");
+    assert_eq!(rule["methods"][0], "GET");
+    assert_eq!(rule["client_cidrs"][0], "10.0.0.0/8");
+    assert_eq!(rule["headers"]["absent_any"][0], "x-blocked");
+    assert_eq!(rule["headers"]["present_all"][0], "x-identity");
+    assert_eq!(rule["headers"]["all"][0]["name"], "x-tenant");
+    assert_eq!(rule["headers"]["none"][0]["name"], "x-channel");
+    assert_eq!(rule["request_timeout_ms"], 5000);
+    assert_eq!(rule["allow_upgrades"], true);
+    assert_eq!(rule["authorization_provider"], "approval");
+    assert_eq!(rule["redaction_profile"], "secrets");
+    assert_eq!(rule["request_header_mutations"][0]["operation"], "set");
+    assert_eq!(rule["response_header_mutations"][0]["operation"], "remove");
+    assert_eq!(rule["credential_mutations"][0]["kind"], "bearer");
+    assert_eq!(rule["credential_mutations"][0]["credential"], "api_token");
+}
 
-[logging]
-directory = "logs"
-level = "info"
-
-[policy]
-default = "deny"
-
-[[policy.rules]]
-action = "allow"
-pattern = "https://example.com/api/**"
-methods = ["GET"]
-description = "Allow API"
-subnets = ["10.0.0.0/8"]
-        "#,
-    )
-    .expect("write config");
-
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("policy")
-        .arg("dump")
-        .arg("--format")
-        .arg("table")
-        .arg("--config")
-        .arg(file.path());
-
-    cmd.assert()
+#[test]
+fn policy_dump_table_uses_the_same_compiled_projection() {
+    let (_directory, path) = fixture(3);
+    command()
+        .args(["policy", "dump", "--format", "table", "--config"])
+        .arg(path)
+        .assert()
         .success()
         .stdout(contains("Default action: deny"))
-        .stdout(contains("INDEX"))
-        .stdout(contains("https://example.com/api/**"))
-        .stdout(contains("Allow API"));
+        .stdout(contains("INDEX\tDECISION\tURLS"))
+        .stdout(contains(
+            "https://example.test/api/**,https://example.test/status",
+        ))
+        .stdout(contains("absent:x-blocked"))
+        .stdout(contains("present:x-identity"))
+        .stdout(contains("x-tenant=engineering"))
+        .stdout(contains("x-channel!=untrusted"))
+        .stdout(contains("approval"))
+        .stdout(contains("request:set:x-route"))
+        .stdout(contains("response:remove:x-remove-me"))
+        .stdout(contains("credential:bearer:api_token"));
 }
 
 #[test]
-fn policy_dump_json_expands_patterns_to_singular_effective_rules() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    file.write_all(
-        br#"
-schema_version = "2"
+fn explicit_json_format_is_machine_readable() {
+    let (_directory, path) = fixture(3);
+    let output = command()
+        .args(["policy", "dump", "--format", "json", "--config"])
+        .arg(path)
+        .output()
+        .unwrap();
 
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[logging]
-directory = "logs"
-level = "info"
-
-[policy]
-default = "deny"
-
-[[policy.rules]]
-action = "allow"
-patterns = [
-  "https://developers.openai.com/**",
-  "https://github.com/openai/**",
-]
-methods = ["GET"]
-description = "OpenAI docs and repositories"
-        "#,
-    )
-    .expect("write config");
-
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("policy")
-        .arg("dump")
-        .arg("--format")
-        .arg("json")
-        .arg("--config")
-        .arg(file.path());
-
-    let assert = cmd.assert().success();
-    let stdout =
-        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is valid UTF-8");
-    let value: Value = serde_json::from_str(&stdout).expect("output is valid JSON");
-    let rules = value["rules"].as_array().expect("rules is an array");
-
-    assert_eq!(rules.len(), 2);
-    assert_eq!(rules[0]["index"], 0);
-    assert_eq!(rules[0]["pattern"], "https://developers.openai.com/**");
-    assert_eq!(rules[0]["description"], "OpenAI docs and repositories");
-    assert_eq!(rules[1]["index"], 1);
-    assert_eq!(rules[1]["pattern"], "https://github.com/openai/**");
-    assert_eq!(rules[1]["description"], "OpenAI docs and repositories");
-    assert!(rules[0].get("patterns").is_none());
+    assert!(output.status.success());
+    serde_json::from_slice::<Value>(&output.stdout).expect("explicit JSON output");
 }
 
 #[test]
-fn policy_dump_json_renders_delegate_action_and_external_auth_profile() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    file.write_all(
-        br#"
-schema_version = "2"
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[logging]
-directory = "logs"
-level = "info"
-
-[policy]
-default = "deny"
-
-[policy.external_auth_profiles.example_delegate]
-webhook_url = "https://auth.internal/start"
-timeout_ms = 5000
-
-[[policy.rules]]
-action = "delegate"
-pattern = "https://example.com/**"
-external_auth_profile = "example_delegate"
-description = "Delegate example"
-        "#,
-    )
-    .expect("write config");
-
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("policy")
-        .arg("dump")
-        .arg("--format")
-        .arg("json")
-        .arg("--config")
-        .arg(file.path());
-
-    let assert = cmd.assert().success();
-    let stdout =
-        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is valid UTF-8");
-    let value: Value = serde_json::from_str(&stdout).expect("output is valid JSON");
-    let rules = value["rules"].as_array().expect("rules is an array");
-    assert_eq!(rules.len(), 1);
-
-    let rule = &rules[0];
-    assert_eq!(rule["action"], "delegate");
-    assert_eq!(rule["pattern"], "https://example.com/**");
-    assert_eq!(rule["description"], "Delegate example");
-    assert_eq!(rule["external_auth"]["profile"], "example_delegate");
-}
-
-#[test]
-fn policy_dump_table_expands_patterns_to_rows() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    file.write_all(
-        br#"
-schema_version = "2"
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[logging]
-directory = "logs"
-level = "info"
-
-[policy]
-default = "deny"
-
-[[policy.rules]]
-action = "allow"
-patterns = [
-  "https://developers.openai.com/**",
-  "https://github.com/openai/**",
-]
-headers_match = { "x-workload-id" = "worker-123" }
-description = "OpenAI docs and repositories"
-        "#,
-    )
-    .expect("write config");
-
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("policy")
-        .arg("dump")
-        .arg("--format")
-        .arg("table")
-        .arg("--config")
-        .arg(file.path());
-
-    cmd.assert()
-        .success()
-        .stdout(contains("https://developers.openai.com/**"))
-        .stdout(contains("https://github.com/openai/**"))
-        .stdout(contains("x-workload-id=worker-123"))
-        .stdout(contains("OpenAI docs and repositories"));
-}
-
-#[test]
-fn policy_dump_json_includes_headers_absent() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    file.write_all(
-        br#"
-schema_version = "2"
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[logging]
-directory = "logs"
-level = "info"
-
-[policy]
-default = "deny"
-
-[[policy.rules]]
-action = "deny"
-pattern = "**"
-headers_absent = ["x-workload-id"]
-        "#,
-    )
-    .expect("write config");
-
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("policy")
-        .arg("dump")
-        .arg("--config")
-        .arg(file.path());
-
-    let assert = cmd.assert().success();
-    let stdout =
-        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is valid UTF-8");
-
-    let value: Value = serde_json::from_str(&stdout).expect("output is valid JSON");
-    let rules = value["rules"].as_array().expect("rules is an array");
-    assert_eq!(rules.len(), 1);
-    assert_eq!(rules[0]["headers_absent"][0], "x-workload-id");
-    assert_eq!(
-        rules[0]["headers_match"]
-            .as_object()
-            .expect("headers_match is object")
-            .len(),
-        0
-    );
-}
-
-#[test]
-fn policy_dump_table_includes_headers_absent_column() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    file.write_all(
-        br#"
-schema_version = "2"
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[logging]
-directory = "logs"
-level = "info"
-
-[policy]
-default = "deny"
-
-[[policy.rules]]
-action = "deny"
-pattern = "**"
-headers_absent = ["x-workload-id"]
-description = "Deny missing identity"
-        "#,
-    )
-    .expect("write config");
-
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("policy")
-        .arg("dump")
-        .arg("--format")
-        .arg("table")
-        .arg("--config")
-        .arg(file.path());
-
-    cmd.assert()
-        .success()
-        .stdout(contains("HEADERS_ABSENT"))
-        .stdout(contains("HEADERS_MATCH"))
-        .stdout(contains("x-workload-id"))
-        .stdout(contains("Deny missing identity"));
-}
-
-#[test]
-fn policy_dump_json_includes_headers_match_values() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    file.write_all(
-        br#"
-schema_version = "2"
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[logging]
-directory = "logs"
-level = "info"
-
-[policy]
-default = "deny"
-
-[[policy.rules]]
-action = "allow"
-pattern = "https://example.com/**"
-headers_match = { "x-workload-id" = ["worker-123", "worker-456"], "x-tenant-id" = "tenant-a" }
-        "#,
-    )
-    .expect("write config");
-
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("policy")
-        .arg("dump")
-        .arg("--config")
-        .arg(file.path());
-
-    let assert = cmd.assert().success();
-    let stdout =
-        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is valid UTF-8");
-
-    let value: Value = serde_json::from_str(&stdout).expect("output is valid JSON");
-    let rules = value["rules"].as_array().expect("rules is an array");
-    assert_eq!(rules.len(), 1);
-    assert_eq!(rules[0]["headers_match"]["x-tenant-id"][0], "tenant-a");
-    assert_eq!(rules[0]["headers_match"]["x-workload-id"][0], "worker-123");
-    assert_eq!(rules[0]["headers_match"]["x-workload-id"][1], "worker-456");
-}
-
-#[test]
-fn policy_dump_table_includes_headers_match_column_values() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    file.write_all(
-        br#"
-schema_version = "2"
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[logging]
-directory = "logs"
-level = "info"
-
-[policy]
-default = "deny"
-
-[[policy.rules]]
-action = "allow"
-pattern = "https://example.com/**"
-headers_match = { "x-workload-id" = ["worker-123", "worker-456"], "x-tenant-id" = "tenant-a" }
-description = "Allow trusted identity values"
-        "#,
-    )
-    .expect("write config");
-
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("policy")
-        .arg("dump")
-        .arg("--format")
-        .arg("table")
-        .arg("--config")
-        .arg(file.path());
-
-    cmd.assert()
-        .success()
-        .stdout(contains("HEADERS_MATCH"))
-        .stdout(contains("x-tenant-id=tenant-a"))
-        .stdout(contains("x-workload-id=worker-123|worker-456"))
-        .stdout(contains("Allow trusted identity values"));
-}
-
-#[test]
-fn policy_dump_json_includes_headers_not_match_values() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    file.write_all(
-        br#"
-schema_version = "2"
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[logging]
-directory = "logs"
-level = "info"
-
-[policy]
-default = "deny"
-
-[[policy.rules]]
-action = "deny"
-pattern = "https://example.com/**"
-headers_not_match = { "x-aw-policy-context" = ["internal"], "x-channel" = "trusted" }
-        "#,
-    )
-    .expect("write config");
-
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("policy")
-        .arg("dump")
-        .arg("--config")
-        .arg(file.path());
-
-    let assert = cmd.assert().success();
-    let stdout =
-        String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is valid UTF-8");
-
-    let value: Value = serde_json::from_str(&stdout).expect("output is valid JSON");
-    let rules = value["rules"].as_array().expect("rules is an array");
-    assert_eq!(rules.len(), 1);
-    assert_eq!(
-        rules[0]["headers_not_match"]["x-aw-policy-context"][0],
-        "internal"
-    );
-    assert_eq!(rules[0]["headers_not_match"]["x-channel"][0], "trusted");
-}
-
-#[test]
-fn policy_dump_table_includes_headers_not_match_column_values() {
-    let mut file = NamedTempFile::new().expect("create temp config");
-    file.write_all(
-        br#"
-schema_version = "2"
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[logging]
-directory = "logs"
-level = "info"
-
-[policy]
-default = "deny"
-
-[[policy.rules]]
-action = "deny"
-pattern = "https://example.com/**"
-headers_not_match = { "x-aw-policy-context" = ["internal"], "x-channel" = "trusted" }
-description = "Deny non-internal contexts"
-        "#,
-    )
-    .expect("write config");
-
-    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
-    cmd.arg("policy")
-        .arg("dump")
-        .arg("--format")
-        .arg("table")
-        .arg("--config")
-        .arg(file.path());
-
-    cmd.assert()
-        .success()
-        .stdout(contains("HEADERS_NOT_MATCH"))
-        .stdout(contains("x-aw-policy-context!=internal"))
-        .stdout(contains("x-channel!=trusted"))
-        .stdout(contains("Deny non-internal contexts"));
+fn policy_dump_rejects_non_schema_three_without_fallback() {
+    let (_directory, path) = fixture(2);
+    command()
+        .args(["policy", "dump", "--config"])
+        .arg(path)
+        .assert()
+        .failure()
+        .stderr(contains("strict schema v3 TOML"))
+        .stderr(contains("invalid value"));
 }

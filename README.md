@@ -561,8 +561,12 @@ acl-proxy policy dump --format table
 acl-proxy policy dump --format json
 ```
 
-`policy dump` defaults to table output on a TTY and JSON otherwise. It includes `headers_match` and `headers_not_match` values — treat output as sensitive when those values represent credentials. Header action values loaded from `${NAME}` env placeholders are shown as `[REDACTED]`.
-When a rule uses `patterns`, the dump shows one effective row/object per expanded pattern with a singular `pattern` field.
+`policy dump` defaults to table output on a TTY and JSON otherwise. It renders
+the strict compiled policy, including stable rule/provider/redaction/credential
+source IDs and typed mutation kinds. It never renders credential locators,
+provider commands, redaction literals, header mutation values, or resolved
+material. Header predicate values remain visible and should not contain
+secrets.
 
 ## Configuration Reference
 
@@ -574,7 +578,8 @@ The proxy resolves the config path in this order:
 2. `ACL_PROXY_CONFIG` environment variable
 3. `config/acl-proxy.toml` (relative to the current working directory)
 
-If the default path is missing, the CLI suggests running `acl-proxy config init`.
+If the selected path is missing, the command reports that path without trying
+another configuration shape or location.
 
 ### Schema 1 To 2 Migration
 
@@ -1276,9 +1281,13 @@ acl-proxy policy dump --format json
 
 `policy dump` defaults to table output on a TTY and JSON otherwise.
 
-**Warnings**:
-- `config validate` uses the same `${NAME}` env interpolation as startup — missing/malformed placeholders fail validation.
-- `policy dump` masks header action values loaded from `${NAME}` env placeholders as `[REDACTED]`. Other configured match values remain visible, so treat redirected output and CI logs as sensitive when policy match values include credentials.
+`config validate` and `policy dump` perform strict schema-3 parsing and pure
+compilation only. They do not resolve credential or redaction sources, open
+referenced TLS/credential files, initialize logging, bind listeners, contact
+providers, or spawn process providers. Consequently, static validation may
+succeed while `run` activation fails because runtime material is unavailable.
+Only `ACL_PROXY_CONFIG` participates in config-path selection when `--config`
+is absent; legacy field override environment variables are ignored.
 
 ### `acl-proxy-extract-capture-body`
 

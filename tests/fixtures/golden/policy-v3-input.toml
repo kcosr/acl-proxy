@@ -1,0 +1,40 @@
+schema_version = 3
+
+[listeners.explicit_http]
+bind = "127.0.0.1:1"
+http_versions = ["http1"]
+
+[listeners.explicit_http.connect]
+http1 = "deny"
+
+[authorization.providers.approval]
+kind = "process"
+command = "missing-provider"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "deny-admin"
+decision = "deny"
+urls = ["https://example.com/admin/**"]
+description = "deny administration"
+
+[[policy.rules]]
+id = "delegate-app"
+decision = "delegate"
+urls = ["https://example.com/app/**"]
+description = "delegate application"
+authorization_provider = "approval"
+
+[[policy.rules]]
+id = "allow-app-after-pass"
+decision = "allow"
+urls = ["https://example.com/app/**"]
+description = "allow after delegate pass"
+
+[[policy.rules]]
+id = "allow-public"
+decision = "allow"
+urls = ["https://example.com/public/**"]
+description = "allow public"

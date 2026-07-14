@@ -1,0 +1,73 @@
+{
+  "default": "deny",
+  "rules": [
+    {
+      "index": 0,
+      "id": "deny-admin",
+      "description": "deny administration",
+      "decision": "deny",
+      "urls": ["https://example.com/admin/**"],
+      "methods": [],
+      "client_cidrs": [],
+      "headers": {"absent_any": [], "present_all": [], "all": [], "none": []},
+      "request_timeout_ms": null,
+      "allow_upgrades": false,
+      "authorization_provider": null,
+      "redaction_profile": null,
+      "request_header_mutations": [],
+      "response_header_mutations": [],
+      "credential_mutations": []
+    },
+    {
+      "index": 1,
+      "id": "delegate-app",
+      "description": "delegate application",
+      "decision": "delegate",
+      "urls": ["https://example.com/app/**"],
+      "methods": [],
+      "client_cidrs": [],
+      "headers": {"absent_any": [], "present_all": [], "all": [], "none": []},
+      "request_timeout_ms": null,
+      "allow_upgrades": false,
+      "authorization_provider": "approval",
+      "redaction_profile": null,
+      "request_header_mutations": [],
+      "response_header_mutations": [],
+      "credential_mutations": []
+    },
+    {
+      "index": 2,
+      "id": "allow-app-after-pass",
+      "description": "allow after delegate pass",
+      "decision": "allow",
+      "urls": ["https://example.com/app/**"],
+      "methods": [],
+      "client_cidrs": [],
+      "headers": {"absent_any": [], "present_all": [], "all": [], "none": []},
+      "request_timeout_ms": null,
+      "allow_upgrades": false,
+      "authorization_provider": null,
+      "redaction_profile": null,
+      "request_header_mutations": [],
+      "response_header_mutations": [],
+      "credential_mutations": []
+    },
+    {
+      "index": 3,
+      "id": "allow-public",
+      "description": "allow public",
+      "decision": "allow",
+      "urls": ["https://example.com/public/**"],
+      "methods": [],
+      "client_cidrs": [],
+      "headers": {"absent_any": [], "present_all": [], "all": [], "none": []},
+      "request_timeout_ms": null,
+      "allow_upgrades": false,
+      "authorization_provider": null,
+      "redaction_profile": null,
+      "request_header_mutations": [],
+      "response_header_mutations": [],
+      "credential_mutations": []
+    }
+  ]
+}

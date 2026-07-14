@@ -6,7 +6,10 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::app::{AppState, SharedAppState};
-use crate::config::{Config, ConfigError, ConfigPathKind};
+use crate::config::{
+    load_and_compile_config, write_default_config_template, Config, ConfigError, ConfigPathKind,
+    PolicyDump,
+};
 use crate::proxy::explicit_https::ExplicitHttpsError;
 use crate::proxy::http::HttpProxyError;
 use crate::proxy::https_transparent::HttpsTransparentError;
@@ -15,6 +18,9 @@ use crate::proxy::https_transparent::HttpsTransparentError;
 pub enum CliError {
     #[error(transparent)]
     Config(#[from] ConfigError),
+
+    #[error("{0}")]
+    StaticConfig(String),
 
     #[error(transparent)]
     AppState(#[from] crate::app::AppStateError),
@@ -159,8 +165,8 @@ pub fn run() -> Result<ExitCode, CliError> {
         }
         Command::Config { command } => match command {
             ConfigCommand::Validate => {
-                let config = load_config_for_cli(config_path)?;
-                print_config_load_warnings(&config);
+                load_and_compile_config(config_path)
+                    .map_err(|error| CliError::StaticConfig(error.to_string()))?;
                 println!("Configuration is valid");
                 Ok(ExitCode::from(0))
             }
@@ -173,19 +179,17 @@ pub fn run() -> Result<ExitCode, CliError> {
                     return Ok(ExitCode::from(1));
                 }
 
-                crate::config::write_default_config(&path)?;
+                write_default_config_template(&path)
+                    .map_err(|error| CliError::StaticConfig(error.to_string()))?;
                 println!("Wrote default config to {}", path.display());
                 Ok(ExitCode::from(0))
             }
         },
         Command::Policy { command } => match command {
             PolicyCommand::Dump { format } => {
-                let config = load_config_for_cli(config_path)?;
-                print_config_load_warnings(&config);
-                let effective = crate::policy::EffectivePolicy::from_config(&config.policy)
-                    .map_err(|e| {
-                        CliError::Config(crate::config::ConfigError::Invalid(e.to_string()))
-                    })?;
+                let compiled = load_and_compile_config(config_path)
+                    .map_err(|error| CliError::StaticConfig(error.to_string()))?;
+                let policy = PolicyDump::from_compiled(&compiled.compiled);
 
                 let use_table = match format {
                     Some(OutputFormat::Table) => true,
@@ -194,9 +198,9 @@ pub fn run() -> Result<ExitCode, CliError> {
                 };
 
                 if use_table {
-                    print_policy_table(&effective);
+                    print_policy_table(&policy);
                 } else {
-                    match serde_json::to_writer_pretty(std::io::stdout(), &effective) {
+                    match serde_json::to_writer_pretty(std::io::stdout(), &policy) {
                         Ok(()) => {
                             println!();
                         }
@@ -213,77 +217,34 @@ pub fn run() -> Result<ExitCode, CliError> {
     }
 }
 
-fn print_policy_table(policy: &crate::policy::EffectivePolicy) {
+fn print_policy_table(policy: &PolicyDump) {
+    println!("Default action: {}", policy.default.as_str());
     println!(
-        "Default action: {}",
-        match policy.default {
-            crate::config::PolicyDefaultAction::Allow => "allow",
-            crate::config::PolicyDefaultAction::Deny => "deny",
-        }
-    );
-    println!(
-        "INDEX\tACTION\tPATTERN\tMETHODS\tSUBNETS\tHEADERS_ABSENT\tHEADERS_MATCH\tHEADERS_NOT_MATCH\tDESCRIPTION"
+        "INDEX\tDECISION\tURLS\tMETHODS\tCLIENT_CIDRS\tHEADER_PREDICATES\tDESCRIPTION\tAUTHORIZATION_PROVIDER\tREDACTION_PROFILE\tMUTATIONS"
     );
 
-    for rule in &policy.rules {
-        let action = match rule.action {
-            crate::config::PolicyRuleAction::Allow => "allow",
-            crate::config::PolicyRuleAction::Deny => "deny",
-            crate::config::PolicyRuleAction::Delegate => "delegate",
-        };
-
-        let pattern = rule.pattern.as_deref().unwrap_or("-");
-        let methods = if rule.methods.is_empty() {
-            "-".to_string()
-        } else {
-            rule.methods.join(",")
-        };
-        let subnets = if rule.subnets.is_empty() {
-            "-".to_string()
-        } else {
-            rule.subnets
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        let headers_absent = if rule.headers_absent.is_empty() {
-            "-".to_string()
-        } else {
-            rule.headers_absent.join(",")
-        };
-        let headers_match = if rule.headers_match.is_empty() {
-            "-".to_string()
-        } else {
-            rule.headers_match
-                .iter()
-                .map(|(name, values)| format!("{name}={}", values.join("|")))
-                .collect::<Vec<_>>()
-                .join(";")
-        };
-        let headers_not_match = if rule.headers_not_match.is_empty() {
-            "-".to_string()
-        } else {
-            rule.headers_not_match
-                .iter()
-                .map(|(name, values)| format!("{name}!={}", values.join("|")))
-                .collect::<Vec<_>>()
-                .join(";")
-        };
-        let description = rule.description.as_deref().unwrap_or("-");
-
+    for row in policy.table_rows() {
         println!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            rule.index,
-            action,
-            pattern,
-            methods,
-            subnets,
-            headers_absent,
-            headers_match,
-            headers_not_match,
-            description
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            row.index,
+            row.decision,
+            table_value(&row.urls),
+            table_value(&row.methods),
+            table_value(&row.client_cidrs),
+            table_value(&row.header_predicates),
+            table_value(&row.description),
+            table_value(&row.authorization_provider),
+            table_value(&row.redaction_profile),
+            table_value(&row.mutations),
         );
+    }
+}
+
+fn table_value(value: &str) -> &str {
+    if value.is_empty() {
+        "-"
+    } else {
+        value
     }
 }
 
@@ -499,12 +460,6 @@ fn log_config_load_warnings(config: &Config) {
 fn log_config_load_warning_messages(warnings: &[String]) {
     for warning in warnings {
         tracing::warn!(target: "acl_proxy::config", "{warning}");
-    }
-}
-
-fn print_config_load_warnings(config: &Config) {
-    for warning in &config.load_warnings {
-        eprintln!("warning: {warning}");
     }
 }
 

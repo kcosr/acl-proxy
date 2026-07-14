@@ -121,7 +121,7 @@ fn effective_policy_dump_matches_golden_corpus() {
             "--format",
             "json",
             "--config",
-            "tests/fixtures/golden/policy-input.toml",
+            "tests/fixtures/golden/policy-v3-input.toml",
         ])
         .output()
         .expect("run policy dump");
@@ -134,7 +134,7 @@ fn effective_policy_dump_matches_golden_corpus() {
     let actual: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("parse policy dump output");
     let expected: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/golden/policy-dump.json"))
+        serde_json::from_str(include_str!("fixtures/golden/policy-v3-dump.json"))
             .expect("parse golden policy dump");
     assert_eq!(actual, expected);
 }
