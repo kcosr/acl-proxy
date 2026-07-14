@@ -387,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_limit_succeeds_and_one_byte_short_allocates_nothing() {
+    fn webhook_request_allocation_is_bounded_and_charged() {
         let request = WebhookRequest {
             request_id: "a\\\"\n",
             rule_id: "b",

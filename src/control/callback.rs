@@ -734,7 +734,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claimed_shape_and_framing_failures_have_distinct_terminal_outcomes() {
+    async fn callback_claimed_body_validates_terminal_framing() {
         let malformed = admit(4096, 128 * 1024);
         malformed.teardown.complete();
         let body = format!(
@@ -794,7 +794,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callback_static_limit_and_charge_failure_map_to_fixed_statuses() {
+    async fn callback_response_charge_failure_consumes_and_restores() {
         let oversized = admit(4096, 128 * 1024);
         let mut store = ParserStore::try_new().unwrap();
         let mut reader = tokio::io::empty();

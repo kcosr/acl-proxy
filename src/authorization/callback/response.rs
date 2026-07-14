@@ -826,7 +826,7 @@ mod tests {
     }
 
     #[test]
-    fn callback_prefix_is_exact_redacted_and_replay_stable() {
+    fn callback_token_prefix_budget_and_canonical_encoding() {
         let parsed = CallbackResponsePrefix::parse(PREFIX).unwrap();
         let replay = CallbackResponsePrefix::parse(PREFIX).unwrap();
         assert_eq!(parsed.digest(), replay.digest());
@@ -1046,7 +1046,7 @@ mod tests {
     }
 
     #[test]
-    fn callback_response_charge_failure_releases_partial_secret_storage() {
+    fn callback_response_allocation_is_guarded_and_aggregate_bounded() {
         let outputs = outputs(false);
         let response = body(
             "\"type\":\"response\",\"decision\":\"allow\",\"values\":{\"api_token\":\"secret\"}}",

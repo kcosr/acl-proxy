@@ -468,7 +468,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callback_route_precedence_and_unknown_token_close_exactly() {
+    async fn callback_early_outcome_closes_unread_framing() {
         let cases: &[(&[u8], &[u8])] = &[
             (
                 b"GET /_acl-proxy/external-auth/callback HTTP/1.1\r\nContent-Type: text/plain\r\n\r\nignored",

@@ -1249,7 +1249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn h2c_and_upgrade_requests_close_without_application_response() {
+    async fn control_http1_only_and_parser_arena_is_bounded() {
         for request in [
             b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".as_slice(),
             b"GET /_acl-proxy/ready HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
@@ -1263,6 +1263,15 @@ mod tests {
             let mut response = Vec::new();
             client.read_to_end(&mut response).await.unwrap();
             assert!(response.is_empty());
+            wait_for(|| server.arena_counts().live == 0).await;
+            assert_eq!(
+                server.arena_counts(),
+                ControlArenaCounts {
+                    maximum: 1,
+                    live: 0,
+                    available: 1,
+                }
+            );
             server.close_and_join().await.unwrap();
         }
     }

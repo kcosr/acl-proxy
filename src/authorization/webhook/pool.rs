@@ -493,7 +493,7 @@ mod tests {
     const BUFFER_BYTES: usize = 64 * 1024;
 
     #[test]
-    fn admission_saturates_without_waiting_and_reuses_released_capacity() {
+    fn webhook_delivery_admission_and_transport_pool_are_bounded() {
         let arena = WebhookTransportArena::try_new(2, BUFFER_BYTES, 4 * BUFFER_BYTES).unwrap();
         let first = arena.try_acquire().unwrap();
         let second = arena.try_acquire().unwrap();
@@ -646,7 +646,7 @@ mod tests {
     }
 
     #[test]
-    fn lease_wipes_both_buffers_before_releasing_accounting() {
+    fn webhook_application_protocol_buffers_zeroize_on_every_exit() {
         let arena = WebhookTransportArena::try_new(1, BUFFER_BYTES, 2 * BUFFER_BYTES).unwrap();
         let mut lease = arena.try_acquire().unwrap();
         lease.outbound_mut().fill(0xa5);

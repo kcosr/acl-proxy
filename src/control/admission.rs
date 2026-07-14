@@ -342,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn control_keep_alive_reuse_requires_an_empty_store_and_full_wipe() {
+    fn control_keep_alive_callback_parser_store_zeroizes_between_requests() {
         let arena = ControlParserArena::try_new(1).unwrap();
         let mut lease = arena.try_acquire().unwrap();
         lease.parser_store_mut().append(b"handled request").unwrap();
