@@ -20,6 +20,7 @@ mod observation;
 pub mod policy;
 pub mod proxy;
 pub mod redaction;
+mod request_decision;
 mod runtime;
 mod safety;
 mod sensitive;
