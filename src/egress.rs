@@ -4,9 +4,6 @@ use std::sync::Arc;
 
 use http::header::HeaderMap;
 use http::Uri;
-use hyper::client::HttpConnector;
-use hyper::{Body, Client};
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use rustls::{ClientConfig, ServerName};
 
 use crate::config::compiler::{
@@ -23,8 +20,6 @@ use crate::tls::{
 };
 use crate::url::canonicalize_tls_server_name;
 
-pub(crate) type OriginClient = Client<HttpsConnector<HttpConnector>, Body>;
-
 /// Generation-owned outbound transport policy and material.
 ///
 /// Activation consumes every path and logical credential name from the pure
@@ -32,9 +27,7 @@ pub(crate) type OriginClient = Client<HttpsConnector<HttpConnector>, Body>;
 /// header effects, and runtime credential indices.
 pub(crate) struct EgressSnapshot {
     route: EgressRoute,
-    origin_client: OriginClient,
-    origin_trust: CompiledTlsTrust,
-    origin_http_versions: Box<[CompiledHttpVersion]>,
+    origin_tls: OriginTls,
     request_headers: Box<[HeaderEffectPlan]>,
     credential_actions: Box<[ResolvedCredentialAction]>,
 }
@@ -56,6 +49,13 @@ pub(crate) struct ParentEndpoint {
 pub(crate) enum ParentTransport {
     Http,
     Https(ParentTls),
+}
+
+pub(crate) struct OriginTls {
+    trust: CompiledTlsTrust,
+    http_versions: Box<[CompiledHttpVersion]>,
+    http1_config: Option<Arc<ClientConfig>>,
+    http2_config: Option<Arc<ClientConfig>>,
 }
 
 pub(crate) struct ParentTls {
@@ -95,6 +95,14 @@ pub(crate) enum ParentAlpnError {
     Incompatible,
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum OriginProtocolError {
+    #[error("the selected origin HTTP protocol is not enabled")]
+    Disabled,
+    #[error("origin TLS did not negotiate the selected HTTP protocol")]
+    IncompatibleAlpn,
+}
+
 impl EgressSnapshot {
     pub(crate) fn activate(
         plan: EgressPlan,
@@ -108,9 +116,7 @@ impl EgressSnapshot {
             request_headers,
             credential_actions,
         } = plan;
-        let origin_trust = origin_tls.trust;
-        let origin_http_versions = origin_tls.http_versions.clone().into_boxed_slice();
-        let origin_client = build_origin_client(origin_tls, &mut is_cancelled)?;
+        let origin_tls = OriginTls::activate(origin_tls, &mut is_cancelled)?;
         let route = match (route, parent_proxy) {
             (CompiledEgressRoute::Direct, None) => EgressRoute::Direct,
             (CompiledEgressRoute::ParentProxy, Some(parent)) => {
@@ -126,9 +132,7 @@ impl EgressSnapshot {
 
         Ok(Self {
             route,
-            origin_client,
-            origin_trust,
-            origin_http_versions,
+            origin_tls,
             request_headers: request_headers.into_boxed_slice(),
             credential_actions,
         })
@@ -138,16 +142,8 @@ impl EgressSnapshot {
         &self.route
     }
 
-    pub(crate) fn origin_client(&self) -> OriginClient {
-        self.origin_client.clone()
-    }
-
-    pub(crate) fn origin_trust(&self) -> CompiledTlsTrust {
-        self.origin_trust
-    }
-
-    pub(crate) fn origin_http_versions(&self) -> &[CompiledHttpVersion] {
-        &self.origin_http_versions
+    pub(crate) fn origin_tls(&self) -> &OriginTls {
+        &self.origin_tls
     }
 
     pub(crate) fn apply_request_headers(
@@ -167,16 +163,8 @@ impl crate::runtime::EgressSnapshot for EgressSnapshot {
         EgressSnapshot::route(self)
     }
 
-    fn origin_client(&self) -> OriginClient {
-        EgressSnapshot::origin_client(self)
-    }
-
-    fn origin_trust(&self) -> CompiledTlsTrust {
-        EgressSnapshot::origin_trust(self)
-    }
-
-    fn origin_http_versions(&self) -> &[CompiledHttpVersion] {
-        EgressSnapshot::origin_http_versions(self)
+    fn origin_tls(&self) -> &OriginTls {
+        EgressSnapshot::origin_tls(self)
     }
 
     fn apply_request_headers(&self, headers: &mut HeaderMap) -> Result<(), HeaderEffectError> {
@@ -319,30 +307,81 @@ impl ParentTls {
     }
 }
 
-fn build_origin_client(
-    plan: TransportTlsPlan,
-    is_cancelled: &mut dyn FnMut() -> bool,
-) -> Result<OriginClient, EgressActivationError> {
-    let http1 = plan.http_versions.contains(&CompiledHttpVersion::Http1);
-    let http2 = plan.http_versions.contains(&CompiledHttpVersion::Http2);
-    if !http1 && !http2 {
-        return Err(EgressActivationError::Route);
+impl OriginTls {
+    fn activate(
+        plan: TransportTlsPlan,
+        is_cancelled: &mut dyn FnMut() -> bool,
+    ) -> Result<Self, EgressActivationError> {
+        Self::activate_with_loader(plan, |trust, ca_certificate| {
+            load_client_trust(trust, ca_certificate, is_cancelled).map_err(Into::into)
+        })
     }
-    // hyper-rustls owns origin ALPN construction from the enabled protocol
-    // set and requires the supplied rustls config to start with no ALPN list.
-    let loaded_trust = load_client_trust(plan.trust, plan.ca_certificate.as_deref(), is_cancelled)?;
-    warn_if_insecure("origin", plan.trust);
-    let tls = build_client_config(&loaded_trust, ClientAlpn::None, true);
-    let protocols = HttpsConnectorBuilder::new()
-        .with_tls_config(tls)
-        .https_or_http();
-    let connector = match (http1, http2) {
-        (true, true) => protocols.enable_http1().enable_http2().build(),
-        (true, false) => protocols.enable_http1().build(),
-        (false, true) => protocols.enable_http2().build(),
-        (false, false) => unreachable!("empty protocol list rejected above"),
-    };
-    Ok(Client::builder().build(connector))
+
+    fn activate_with_loader<F>(
+        plan: TransportTlsPlan,
+        load: F,
+    ) -> Result<Self, EgressActivationError>
+    where
+        F: FnOnce(CompiledTlsTrust, Option<&Path>) -> Result<ClientTrust, EgressActivationError>,
+    {
+        let TransportTlsPlan {
+            trust,
+            ca_certificate,
+            http_versions,
+        } = plan;
+        let http1 = http_versions.contains(&CompiledHttpVersion::Http1);
+        let http2 = http_versions.contains(&CompiledHttpVersion::Http2);
+        if !http1 && !http2 {
+            return Err(EgressActivationError::Route);
+        }
+
+        let loaded_trust = load(trust, ca_certificate.as_deref())?;
+        warn_if_insecure("origin", trust);
+        Ok(Self {
+            trust,
+            http_versions: http_versions.into_boxed_slice(),
+            http1_config: http1
+                .then(|| Arc::new(build_client_config(&loaded_trust, ClientAlpn::Http1, true))),
+            http2_config: http2
+                .then(|| Arc::new(build_client_config(&loaded_trust, ClientAlpn::Http2, true))),
+        })
+    }
+
+    pub(crate) fn trust(&self) -> CompiledTlsTrust {
+        self.trust
+    }
+
+    pub(crate) fn http_versions(&self) -> &[CompiledHttpVersion] {
+        &self.http_versions
+    }
+
+    pub(crate) fn client_config(
+        &self,
+        use_http2: bool,
+    ) -> Result<Arc<ClientConfig>, OriginProtocolError> {
+        let config = if use_http2 {
+            &self.http2_config
+        } else {
+            &self.http1_config
+        };
+        config.clone().ok_or(OriginProtocolError::Disabled)
+    }
+
+    pub(crate) fn validate_negotiated_alpn(
+        &self,
+        use_http2: bool,
+        negotiated: Option<&[u8]>,
+    ) -> Result<(), OriginProtocolError> {
+        self.client_config(use_http2)?;
+        let compatible = if use_http2 {
+            negotiated == Some(b"h2")
+        } else {
+            negotiated.is_none() || negotiated == Some(b"http/1.1")
+        };
+        compatible
+            .then_some(())
+            .ok_or(OriginProtocolError::IncompatibleAlpn)
+    }
 }
 
 fn warn_if_insecure(scope: &'static str, trust: CompiledTlsTrust) {
@@ -568,12 +607,27 @@ default = "deny"
                 vec![CompiledHttpVersion::Http1, CompiledHttpVersion::Http2],
             ));
             assert!(matches!(snapshot.route(), EgressRoute::Direct));
-            assert!(snapshot.origin_trust() == trust);
+            assert!(snapshot.origin_tls().trust() == trust);
             assert_eq!(
-                snapshot.origin_http_versions(),
+                snapshot.origin_tls().http_versions(),
                 [CompiledHttpVersion::Http1, CompiledHttpVersion::Http2]
             );
-            drop(snapshot.origin_client());
+            assert_eq!(
+                snapshot
+                    .origin_tls()
+                    .client_config(false)
+                    .unwrap()
+                    .alpn_protocols,
+                [b"http/1.1".to_vec()]
+            );
+            assert_eq!(
+                snapshot
+                    .origin_tls()
+                    .client_config(true)
+                    .unwrap()
+                    .alpn_protocols,
+                [b"h2".to_vec()]
+            );
         }
     }
 
@@ -581,8 +635,48 @@ default = "deny"
     fn direct_route_honors_single_origin_protocols() {
         for version in [CompiledHttpVersion::Http1, CompiledHttpVersion::Http2] {
             let snapshot = activate(direct_plan(CompiledTlsTrust::Insecure, None, vec![version]));
-            assert_eq!(snapshot.origin_http_versions(), [version]);
+            assert_eq!(snapshot.origin_tls().http_versions(), [version]);
+            let use_http2 = version == CompiledHttpVersion::Http2;
+            assert!(snapshot.origin_tls().client_config(use_http2).is_ok());
+            assert_eq!(
+                snapshot.origin_tls().client_config(!use_http2).err(),
+                Some(OriginProtocolError::Disabled)
+            );
         }
+    }
+
+    #[test]
+    fn origin_tls_loads_trust_once_and_validates_exact_protocol() {
+        let load_count = Cell::new(0);
+        let tls = OriginTls::activate_with_loader(
+            direct_plan(
+                CompiledTlsTrust::Insecure,
+                None,
+                vec![CompiledHttpVersion::Http1, CompiledHttpVersion::Http2],
+            )
+            .origin_tls,
+            |_trust, _ca_certificate| {
+                load_count.set(load_count.get() + 1);
+                Ok(ClientTrust::Insecure)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(load_count.get(), 1);
+        assert_eq!(tls.validate_negotiated_alpn(false, None), Ok(()));
+        assert_eq!(
+            tls.validate_negotiated_alpn(false, Some(b"http/1.1")),
+            Ok(())
+        );
+        assert_eq!(
+            tls.validate_negotiated_alpn(false, Some(b"h2")),
+            Err(OriginProtocolError::IncompatibleAlpn)
+        );
+        assert_eq!(tls.validate_negotiated_alpn(true, Some(b"h2")), Ok(()));
+        assert_eq!(
+            tls.validate_negotiated_alpn(true, None),
+            Err(OriginProtocolError::IncompatibleAlpn)
+        );
     }
 
     #[test]

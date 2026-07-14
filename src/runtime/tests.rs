@@ -70,16 +70,8 @@ impl EgressSnapshot for EmptySnapshot {
         panic!("empty test egress has no route")
     }
 
-    fn origin_client(&self) -> crate::egress::OriginClient {
-        panic!("empty test egress has no client")
-    }
-
-    fn origin_trust(&self) -> crate::config::compiler::CompiledTlsTrust {
-        panic!("empty test egress has no trust policy")
-    }
-
-    fn origin_http_versions(&self) -> &[crate::config::compiler::CompiledHttpVersion] {
-        &[]
+    fn origin_tls(&self) -> &crate::egress::OriginTls {
+        panic!("empty test egress has no origin TLS policy")
     }
 
     fn apply_request_headers(

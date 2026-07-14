@@ -157,11 +157,7 @@ pub(crate) trait PolicySnapshot: Send + Sync {
 pub(crate) trait EgressSnapshot: Send + Sync {
     fn route(&self) -> &crate::egress::EgressRoute;
 
-    fn origin_client(&self) -> crate::egress::OriginClient;
-
-    fn origin_trust(&self) -> crate::config::compiler::CompiledTlsTrust;
-
-    fn origin_http_versions(&self) -> &[crate::config::compiler::CompiledHttpVersion];
+    fn origin_tls(&self) -> &crate::egress::OriginTls;
 
     fn apply_request_headers(
         &self,

@@ -583,15 +583,14 @@ header = "x-acl-proxy-request-id"
             activated.egress.route(),
             crate::egress::EgressRoute::Direct
         ));
-        assert_eq!(activated.egress.origin_http_versions().len(), 2);
+        assert_eq!(activated.egress.origin_tls().http_versions().len(), 2);
         assert!(activated.egress.credential_actions().is_empty());
         let mut request_headers = http::HeaderMap::new();
         activated
             .egress
             .apply_request_headers(&mut request_headers)
             .unwrap();
-        let _origin_client = activated.egress.origin_client();
-        let _origin_trust = activated.egress.origin_trust();
+        let _origin_trust = activated.egress.origin_tls().trust();
 
         assert_eq!(activated.credentials.source_count(), 0);
         activated
