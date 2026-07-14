@@ -1,6 +1,4 @@
-use std::io::BufReader;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,7 +6,6 @@ use hyper::body::Body;
 use hyper::server::conn::Http;
 use hyper::service::service_fn;
 use hyper::Request;
-use rustls::{Certificate, PrivateKey, ServerConfig};
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
@@ -315,77 +312,17 @@ async fn handle_tls_connection(
 pub fn build_static_tls_acceptor(
     config: &ExplicitHttpsListenerConfig,
 ) -> Result<TlsAcceptor, ExplicitHttpsError> {
-    let certs = load_pem_certs(&config.cert_chain_path)?;
-    let key = load_private_key(&config.key_path)?;
-    crate::tls_identity::validate_certificate_key_match(&certs, &key)
-        .map_err(ExplicitHttpsError::TlsConfig)?;
-    let mut server = ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|err| ExplicitHttpsError::TlsConfig(err.to_string()))?;
-
-    server.alpn_protocols = if config.enable_http2 {
+    let alpn_protocols = if config.enable_http2 {
         vec![b"h2".to_vec(), b"http/1.1".to_vec()]
     } else {
         vec![b"http/1.1".to_vec()]
     };
-
-    Ok(TlsAcceptor::from(Arc::new(server)))
-}
-
-fn load_pem_certs(path: &Path) -> Result<Vec<Certificate>, ExplicitHttpsError> {
-    let file = std::fs::File::open(path).map_err(|err| {
-        ExplicitHttpsError::TlsConfig(format!(
-            "failed to read cert_chain_path {}: {err}",
-            path.display()
-        ))
-    })?;
-    let mut reader = BufReader::new(file);
-    let certs = rustls_pemfile::certs(&mut reader).map_err(|err| {
-        ExplicitHttpsError::TlsConfig(format!(
-            "cert_chain_path {} must contain valid PEM certificates: {err}",
-            path.display()
-        ))
-    })?;
-    if certs.is_empty() {
-        return Err(ExplicitHttpsError::TlsConfig(format!(
-            "cert_chain_path {} must contain at least one PEM certificate",
-            path.display()
-        )));
-    }
-    Ok(certs.into_iter().map(Certificate).collect())
-}
-
-fn load_private_key(path: &Path) -> Result<PrivateKey, ExplicitHttpsError> {
-    for loader in [
-        rustls_pemfile::pkcs8_private_keys
-            as fn(&mut dyn std::io::BufRead) -> Result<Vec<Vec<u8>>, std::io::Error>,
-        rustls_pemfile::rsa_private_keys
-            as fn(&mut dyn std::io::BufRead) -> Result<Vec<Vec<u8>>, std::io::Error>,
-        rustls_pemfile::ec_private_keys
-            as fn(&mut dyn std::io::BufRead) -> Result<Vec<Vec<u8>>, std::io::Error>,
-    ] {
-        let file = std::fs::File::open(path).map_err(|err| {
-            ExplicitHttpsError::TlsConfig(format!(
-                "failed to read key_path {}: {err}",
-                path.display()
-            ))
-        })?;
-        let mut reader = BufReader::new(file);
-        let mut keys = loader(&mut reader).map_err(|err| {
-            ExplicitHttpsError::TlsConfig(format!(
-                "key_path {} must contain a valid PEM private key: {err}",
-                path.display()
-            ))
-        })?;
-        if !keys.is_empty() {
-            return Ok(PrivateKey(keys.remove(0)));
-        }
-    }
-
-    Err(ExplicitHttpsError::TlsConfig(format!(
-        "key_path {} must contain a supported PEM private key",
-        path.display()
-    )))
+    crate::tls_identity::load_static_tls_acceptor(
+        &config.cert_chain_path,
+        &config.key_path,
+        alpn_protocols,
+    )
+    .map_err(|err| {
+        ExplicitHttpsError::TlsConfig(err.describe_with_fields("cert_chain_path", "key_path"))
+    })
 }
