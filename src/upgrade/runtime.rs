@@ -8,7 +8,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use tokio::runtime::Handle;
-use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
+use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
 use tokio::task::{AbortHandle, Id as TaskId, JoinHandle, JoinSet};
 use tokio::time::Instant;
 
@@ -151,24 +151,23 @@ struct ActiveUpgradeTerminalControl {
 }
 
 struct RawTeardownOwner {
-    task: Option<JoinHandle<()>>,
-    abort: AbortHandle,
+    cancel: Option<oneshot::Sender<()>>,
+    joined: Option<oneshot::Receiver<Result<(), tokio::task::JoinError>>>,
 }
 
 impl RawTeardownOwner {
-    fn spawn(task: UpgradeRawTeardownTask) -> Self {
-        let task = tokio::spawn(task);
-        let abort = task.abort_handle();
-        Self {
-            task: Some(task),
-            abort,
-        }
-    }
-
     async fn abort_and_join(mut self) {
-        self.abort.abort();
-        let task = self.task.take().expect("raw teardown task is joined once");
-        if let Err(error) = task.await {
+        let _ = self
+            .cancel
+            .take()
+            .expect("raw teardown task is cancelled once")
+            .send(());
+        let joined = self
+            .joined
+            .take()
+            .expect("raw teardown task is joined once")
+            .await;
+        if let Ok(Err(error)) = joined {
             if !error.is_cancelled() {
                 tracing::error!(%error, "upgrade raw teardown task failed");
             }
@@ -178,7 +177,7 @@ impl RawTeardownOwner {
 
 impl Drop for RawTeardownOwner {
     fn drop(&mut self) {
-        self.abort.abort();
+        self.cancel.take();
     }
 }
 
@@ -199,11 +198,20 @@ impl UpgradeTerminalControl {
         }
     }
 
-    fn activate(self) -> ActiveUpgradeTerminalControl {
-        ActiveUpgradeTerminalControl {
-            raw_teardown: RawTeardownOwner::spawn((self.raw_teardown)()),
+    async fn activate_with_hook<Hook>(
+        self,
+        inner: &Arc<RuntimeInner>,
+        before_raw_start: Hook,
+    ) -> Result<ActiveUpgradeTerminalControl, ()>
+    where
+        Hook: FnOnce() + Send + 'static,
+    {
+        Ok(ActiveUpgradeTerminalControl {
+            raw_teardown: inner
+                .spawn_raw_teardown((self.raw_teardown)(), before_raw_start)
+                .await?,
             established_close: self.established_close,
-        }
+        })
     }
 }
 
@@ -263,7 +271,6 @@ pub(crate) enum UpgradeTerminalCause {
 pub(crate) struct UpgradeRuntime {
     inner: Arc<RuntimeInner>,
     supervisor: AsyncMutex<Option<JoinHandle<()>>>,
-    supervisor_abort: AbortHandle,
 }
 
 struct RuntimeInner {
@@ -322,7 +329,18 @@ struct EntryTiming {
 
 enum SupervisorCommand {
     Track(OwnedTask),
+    SpawnJoinable {
+        task: UpgradeRawTeardownTask,
+        joined: oneshot::Sender<Result<(), tokio::task::JoinError>>,
+        started: oneshot::Sender<()>,
+        before_start: Box<dyn FnOnce() + Send + 'static>,
+    },
     Stop,
+}
+
+enum SupervisorTaskCompletion {
+    Tracked(TaskId),
+    Joinable,
 }
 
 struct OwnedTask {
@@ -435,11 +453,9 @@ impl UpgradeRuntime {
         let supervisor = handle.spawn(async move {
             run_task_supervisor(receiver).await;
         });
-        let supervisor_abort = supervisor.abort_handle();
         Ok(Arc::new(Self {
             inner,
             supervisor: AsyncMutex::new(Some(supervisor)),
-            supervisor_abort,
         }))
     }
 
@@ -647,7 +663,8 @@ impl Drop for UpgradeRuntime {
     fn drop(&mut self) {
         // Emergency abandonment only. Managed shutdown uses shutdown_and_wait
         // so every coordinator explicitly shuts down and joins its children.
-        self.supervisor_abort.abort();
+        // The detached root supervisor still drains every task it owns.
+        let _ = self.inner.supervisor_tasks.send(SupervisorCommand::Stop);
     }
 }
 
@@ -738,6 +755,61 @@ impl RuntimeInner {
             })
     }
 
+    async fn spawn_raw_teardown<Hook>(
+        self: &Arc<Self>,
+        raw: UpgradeRawTeardownTask,
+        before_start: Hook,
+    ) -> Result<RawTeardownOwner, ()>
+    where
+        Hook: FnOnce() + Send + 'static,
+    {
+        let counted = Arc::new(AtomicBool::new(true));
+        let completion = TrackedTaskCompletion {
+            inner: self.clone(),
+            counted,
+        };
+        let (cancel, cancelled) = oneshot::channel();
+        let (joined, join_result) = oneshot::channel();
+        let (started, registered) = oneshot::channel();
+        let task = Box::pin(async move {
+            let _completion = completion;
+            tokio::select! {
+                biased;
+                _ = cancelled => {}
+                _ = raw => {}
+            }
+        });
+        {
+            let mut state = lock(&self.state);
+            state.tracked_tasks = state
+                .tracked_tasks
+                .checked_add(1)
+                .expect("tracked task count cannot overflow bounded upgrade metadata");
+        }
+        if let Err(error) = self
+            .supervisor_tasks
+            .send(SupervisorCommand::SpawnJoinable {
+                task,
+                joined,
+                started,
+                before_start: Box::new(before_start),
+            })
+        {
+            let SupervisorCommand::SpawnJoinable { task, joined, .. } = error.0 else {
+                unreachable!("only a joinable task was sent")
+            };
+            drop(task);
+            drop(joined);
+        }
+        self.changed.notify_waiters();
+        let owner = RawTeardownOwner {
+            cancel: Some(cancel),
+            joined: Some(join_result),
+        };
+        registered.await.map_err(|_| ())?;
+        Ok(owner)
+    }
+
     fn complete_handshake(&self, id: u64) {
         let released = {
             let mut state = lock(&self.state);
@@ -807,6 +879,7 @@ impl RuntimeInner {
             inner: self.clone(),
             id,
         };
+        let coordinator_inner = self.clone();
         let counted = Arc::new(AtomicBool::new(true));
         let task_completion = TrackedTaskCompletion {
             inner: self.clone(),
@@ -820,7 +893,8 @@ impl RuntimeInner {
                 let Ok(start) = started.await else {
                     return;
                 };
-                run_entry_coordinator(start.shared, start.snapshot, start.plan).await;
+                run_entry_coordinator(coordinator_inner, start.shared, start.snapshot, start.plan)
+                    .await;
             }
             .await;
         });
@@ -1014,6 +1088,7 @@ impl fmt::Debug for CommittedUpgrade {
 
 impl CommittedUpgrade {
     pub(crate) fn submit_terminal(&self, cause: UpgradeTerminalCause) {
+        let _timing = lock(&self.shared.timing);
         let mut requested = lock(&self.shared.requested_cause);
         if requested.is_none() {
             *requested = Some(cause);
@@ -1101,6 +1176,8 @@ impl Drop for EntryCompletionGuard {
 async fn run_task_supervisor(mut receiver: mpsc::UnboundedReceiver<SupervisorCommand>) {
     let mut tasks = JoinSet::new();
     let mut aborts = HashMap::<TaskId, AbortHandle>::new();
+    let mut join_waiters =
+        HashMap::<TaskId, oneshot::Sender<Result<(), tokio::task::JoinError>>>::new();
     let mut stopping = false;
     loop {
         if stopping && tasks.is_empty() {
@@ -1108,11 +1185,30 @@ async fn run_task_supervisor(mut receiver: mpsc::UnboundedReceiver<SupervisorCom
         }
         tokio::select! {
             biased;
-            joined = tasks.join_next(), if !tasks.is_empty() => {
-                let id = joined
-                    .expect("non-empty supervisor task set yields a task")
-                    .expect("owned task wrapper does not panic");
-                aborts.remove(&id);
+            joined = tasks.join_next_with_id(), if !tasks.is_empty() => {
+                let joined = joined.expect("non-empty supervisor task set yields a task");
+                let (id, completion, result) = match joined {
+                    Ok((id, completion)) => (id, Some(completion), Ok(())),
+                    Err(error) => (error.id(), None, Err(error)),
+                };
+                let tracked_id = match completion {
+                    Some(SupervisorTaskCompletion::Tracked(id)) => Some(id),
+                    Some(SupervisorTaskCompletion::Joinable) | None => None,
+                };
+                aborts.remove(&tracked_id.unwrap_or(id));
+                if let Some(waiter) = join_waiters.remove(&id) {
+                    if let Err(result) = waiter.send(result) {
+                        if let Err(error) = result {
+                            if !error.is_cancelled() {
+                                tracing::error!(%error, "unobserved upgrade raw teardown task failure");
+                            }
+                        }
+                    }
+                } else if let Err(error) = result {
+                    if !error.is_cancelled() {
+                        tracing::error!(%error, "upgrade supervisor task failed");
+                    }
+                }
             }
             command = receiver.recv(), if !stopping => {
                 match command {
@@ -1122,8 +1218,26 @@ async fn run_task_supervisor(mut receiver: mpsc::UnboundedReceiver<SupervisorCom
                         debug_assert!(replaced.is_none(), "Tokio task identifiers are unique");
                         tasks.spawn(async move {
                             task.await;
-                            id
+                            SupervisorTaskCompletion::Tracked(id)
                         });
+                    }
+                    Some(SupervisorCommand::SpawnJoinable {
+                        task,
+                        joined,
+                        started,
+                        before_start,
+                    }) => {
+                        before_start();
+                        let abort = tasks.spawn(async move {
+                            task.await;
+                            SupervisorTaskCompletion::Joinable
+                        });
+                        let id = abort.id();
+                        let replaced = aborts.insert(id, abort);
+                        debug_assert!(replaced.is_none(), "Tokio task identifiers are unique");
+                        let replaced = join_waiters.insert(id, joined);
+                        debug_assert!(replaced.is_none(), "joinable task identifiers are unique");
+                        let _ = started.send(());
                     }
                     Some(SupervisorCommand::Stop) | None => {
                         for abort in aborts.values() {
@@ -1146,9 +1260,32 @@ fn handle_entry_task_completion(
 ) {
     match (*phase, joined) {
         (EntryPhase::Establishing, Ok(EntryTaskResult::Setup(Ok(pair)))) => {
-            tasks.spawn(async move { EntryTaskResult::Relay(pair.first.await) });
-            tasks.spawn(async move { EntryTaskResult::Relay(pair.second.await) });
             *phase = EntryPhase::Established;
+            let mut pair = Some(pair);
+            let rejected = {
+                let timing = lock(&shared.timing);
+                let mut requested = lock(&shared.requested_cause);
+                let now = Instant::now();
+                if shared.terminal_state.load(Ordering::Acquire) == ENTRY_OPEN
+                    && now < timing.application_stop
+                    && requested.is_none()
+                {
+                    let pair = pair.take().expect("relay pair is promoted once");
+                    tasks.spawn(async move { EntryTaskResult::Relay(pair.first.await) });
+                    tasks.spawn(async move { EntryTaskResult::Relay(pair.second.await) });
+                    None
+                } else if let Some(cause) = requested.take() {
+                    Some((cause, now))
+                } else if now >= timing.application_stop {
+                    Some((timing.stop_cause, timing.application_stop))
+                } else {
+                    None
+                }
+            };
+            drop(pair);
+            if let Some((cause, at)) = rejected {
+                shared.begin_closing(cause, at, cleanup_grace);
+            }
         }
         (EntryPhase::Establishing, Ok(EntryTaskResult::Setup(Err(cause)))) => {
             shared.begin_closing(cause, Instant::now(), cleanup_grace);
@@ -1187,9 +1324,9 @@ async fn finish_entry_cleanup_with_hook<Hook>(
     Hook: FnOnce(),
 {
     let (raw_teardown, established_close) = terminal_control.into_parts();
+    tasks.shutdown().await;
     'cleanup: {
         if !established {
-            tasks.shutdown().await;
             break 'cleanup;
         }
         if Instant::now() >= lock(&shared.timing).cleanup_cutoff {
@@ -1242,27 +1379,45 @@ async fn finish_entry_cleanup_with_hook<Hook>(
 }
 
 async fn run_entry_coordinator(
+    inner: Arc<RuntimeInner>,
     shared: Arc<EntryShared>,
     snapshot: UpgradedStreamSnapshot,
     plan: UpgradeEntryPlan,
 ) {
-    run_entry_coordinator_with_hooks(shared, snapshot, plan, || {}, || {}).await;
+    run_entry_coordinator_with_hooks(inner, shared, snapshot, plan, || {}, || {}, || {}).await;
 }
 
-async fn run_entry_coordinator_with_hooks<SetupHook, CloseHook>(
+async fn run_entry_coordinator_with_hooks<RawHook, SetupHook, CloseHook>(
+    inner: Arc<RuntimeInner>,
     shared: Arc<EntryShared>,
     snapshot: UpgradedStreamSnapshot,
     plan: UpgradeEntryPlan,
+    before_raw_start: RawHook,
     before_setup_authorization: SetupHook,
     before_close_authorization: CloseHook,
 ) where
+    RawHook: FnOnce() + Send + 'static,
     SetupHook: FnOnce(),
     CloseHook: FnOnce(),
 {
     let cleanup_grace = shared.cleanup_grace;
     let mut tasks = JoinSet::new();
     let mut phase = EntryPhase::Establishing;
-    let mut terminal_control = Some(plan.terminal_control.activate());
+    let mut terminal_control = match plan
+        .terminal_control
+        .activate_with_hook(&inner, before_raw_start)
+        .await
+    {
+        Ok(control) => Some(control),
+        Err(()) => {
+            shared.begin_closing(
+                UpgradeTerminalCause::SetupFailed,
+                Instant::now(),
+                cleanup_grace,
+            );
+            return;
+        }
+    };
     let mut pending_setup = Some((plan.setup, snapshot));
     let mut before_setup_authorization = Some(before_setup_authorization);
     let mut before_close_authorization = Some(before_close_authorization);
@@ -1769,6 +1924,256 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_drop_drains_supervised_raw_teardown() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let raw_drops = Arc::new(AtomicUsize::new(0));
+        let (raw_dropped_tx, raw_dropped_rx) = oneshot::channel();
+        let (setup_started_tx, setup_started_rx) = oneshot::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), {
+                let raw_drops = raw_drops.clone();
+                move |handshake| async move {
+                    handshake
+                        .commit(
+                            None,
+                            UpgradeEntryPlan::new(
+                                UpgradeTerminalControl::new(
+                                    raw_teardown_with_guard((
+                                        DropSignal(Some(raw_dropped_tx)),
+                                        DropCount(raw_drops),
+                                    )),
+                                    |_| async {},
+                                ),
+                                move |_| async move {
+                                    let _ = setup_started_tx.send(());
+                                    std::future::pending::<
+                                        Result<UpgradeRelayPair, UpgradeTerminalCause>,
+                                    >()
+                                    .await
+                                },
+                            ),
+                        )
+                        .unwrap();
+                }
+            })
+            .unwrap();
+        setup_started_rx.await.unwrap();
+
+        drop(runtime);
+
+        tokio::time::timeout(Duration::from_secs(2), raw_dropped_rx)
+            .await
+            .expect("runtime drop abandoned a supervised raw teardown")
+            .unwrap();
+        assert_eq!(raw_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn coordinator_panic_leaves_raw_teardown_joinable_by_supervisor() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let raw_drops = Arc::new(AtomicUsize::new(0));
+        let now = Instant::now();
+        let shared = Arc::new(EntryShared {
+            timing: Mutex::new(EntryTiming {
+                application_stop: now + Duration::from_secs(1),
+                cleanup_cutoff: now + Duration::from_secs(2),
+                stop_cause: UpgradeTerminalCause::LifetimeExpired,
+            }),
+            cleanup_grace: Duration::from_millis(100),
+            requested_cause: Mutex::new(None),
+            winning_cause: Mutex::new(None),
+            changed: Notify::new(),
+            terminal_state: AtomicU8::new(ENTRY_OPEN),
+            closed: Notify::new(),
+        });
+        let coordinator = tokio::spawn(run_entry_coordinator_with_hooks(
+            runtime.inner.clone(),
+            shared,
+            UpgradedStreamSnapshot::new(2, None),
+            UpgradeEntryPlan::new(
+                UpgradeTerminalControl::new(
+                    raw_teardown_with_guard(DropCount(raw_drops.clone())),
+                    |_| async {},
+                ),
+                |_| async {
+                    std::future::pending::<Result<UpgradeRelayPair, UpgradeTerminalCause>>().await
+                },
+            ),
+            || {},
+            || panic!("coordinator authorization panic"),
+            || {},
+        ));
+
+        let error = coordinator.await.unwrap_err();
+        assert!(error.is_panic());
+        wait_for_counts(&runtime, |counts| counts.tracked_tasks == 0).await;
+        assert_eq!(raw_drops.load(Ordering::SeqCst), 1);
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn coordinator_abort_leaves_raw_teardown_joinable_by_supervisor() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let raw_drops = Arc::new(AtomicUsize::new(0));
+        let (setup_started_tx, setup_started_rx) = oneshot::channel();
+        let now = Instant::now();
+        let shared = Arc::new(EntryShared {
+            timing: Mutex::new(EntryTiming {
+                application_stop: now + Duration::from_secs(1),
+                cleanup_cutoff: now + Duration::from_secs(2),
+                stop_cause: UpgradeTerminalCause::LifetimeExpired,
+            }),
+            cleanup_grace: Duration::from_millis(100),
+            requested_cause: Mutex::new(None),
+            winning_cause: Mutex::new(None),
+            changed: Notify::new(),
+            terminal_state: AtomicU8::new(ENTRY_OPEN),
+            closed: Notify::new(),
+        });
+        let coordinator = tokio::spawn(run_entry_coordinator(
+            runtime.inner.clone(),
+            shared,
+            UpgradedStreamSnapshot::new(2, None),
+            UpgradeEntryPlan::new(
+                UpgradeTerminalControl::new(
+                    raw_teardown_with_guard(DropCount(raw_drops.clone())),
+                    |_| async {},
+                ),
+                move |_| async move {
+                    let _ = setup_started_tx.send(());
+                    std::future::pending::<Result<UpgradeRelayPair, UpgradeTerminalCause>>().await
+                },
+            ),
+        ));
+        setup_started_rx.await.unwrap();
+
+        coordinator.abort();
+        assert!(coordinator.await.unwrap_err().is_cancelled());
+        wait_for_counts(&runtime, |counts| counts.tracked_tasks == 0).await;
+        assert_eq!(raw_drops.load(Ordering::SeqCst), 1);
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn setup_waits_for_supervisor_raw_registration_acknowledgment() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let setup_polls = Arc::new(AtomicUsize::new(0));
+        let raw_polls = Arc::new(AtomicUsize::new(0));
+        let raw_drops = Arc::new(AtomicUsize::new(0));
+        let now = Instant::now();
+        let shared = Arc::new(EntryShared {
+            timing: Mutex::new(EntryTiming {
+                application_stop: now + Duration::from_secs(1),
+                cleanup_cutoff: now + Duration::from_secs(2),
+                stop_cause: UpgradeTerminalCause::LifetimeExpired,
+            }),
+            cleanup_grace: Duration::from_millis(100),
+            requested_cause: Mutex::new(None),
+            winning_cause: Mutex::new(None),
+            changed: Notify::new(),
+            terminal_state: AtomicU8::new(ENTRY_OPEN),
+            closed: Notify::new(),
+        });
+        let (registration_tx, registration_rx) = std_mpsc::channel();
+        let (registration_release_tx, registration_release_rx) = std_mpsc::channel();
+        let coordinator = tokio::spawn(run_entry_coordinator_with_hooks(
+            runtime.inner.clone(),
+            shared,
+            UpgradedStreamSnapshot::new(2, None),
+            UpgradeEntryPlan::new(
+                UpgradeTerminalControl::new(
+                    counted_raw_teardown_with_guard(
+                        DropCount(raw_drops.clone()),
+                        raw_polls.clone(),
+                    ),
+                    |_| async {},
+                ),
+                {
+                    let setup_polls = setup_polls.clone();
+                    move |_| async move {
+                        setup_polls.fetch_add(1, Ordering::SeqCst);
+                        Err(UpgradeTerminalCause::SetupFailed)
+                    }
+                },
+            ),
+            move || {
+                registration_tx.send(()).unwrap();
+                registration_release_rx.recv().unwrap();
+            },
+            || {},
+            || {},
+        ));
+
+        registration_rx.recv().unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(setup_polls.load(Ordering::SeqCst), 0);
+        assert_eq!(raw_polls.load(Ordering::SeqCst), 0);
+        registration_release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), coordinator)
+            .await
+            .expect("coordinator did not continue after raw registration")
+            .unwrap();
+        assert_eq!(setup_polls.load(Ordering::SeqCst), 1);
+        assert_eq!(raw_drops.load(Ordering::SeqCst), 1);
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
+
+    #[tokio::test]
+    async fn stopped_supervisor_rejects_setup_before_first_poll() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+        let setup_polls = Arc::new(AtomicUsize::new(0));
+        let raw_polls = Arc::new(AtomicUsize::new(0));
+        let raw_drops = Arc::new(AtomicUsize::new(0));
+        let now = Instant::now();
+        let shared = Arc::new(EntryShared {
+            timing: Mutex::new(EntryTiming {
+                application_stop: now + Duration::from_secs(1),
+                cleanup_cutoff: now + Duration::from_secs(2),
+                stop_cause: UpgradeTerminalCause::LifetimeExpired,
+            }),
+            cleanup_grace: Duration::from_millis(100),
+            requested_cause: Mutex::new(None),
+            winning_cause: Mutex::new(None),
+            changed: Notify::new(),
+            terminal_state: AtomicU8::new(ENTRY_OPEN),
+            closed: Notify::new(),
+        });
+
+        run_entry_coordinator(
+            runtime.inner.clone(),
+            shared.clone(),
+            UpgradedStreamSnapshot::new(2, None),
+            UpgradeEntryPlan::new(
+                UpgradeTerminalControl::new(
+                    counted_raw_teardown_with_guard(
+                        DropCount(raw_drops.clone()),
+                        raw_polls.clone(),
+                    ),
+                    |_| async {},
+                ),
+                {
+                    let setup_polls = setup_polls.clone();
+                    move |_| async move {
+                        setup_polls.fetch_add(1, Ordering::SeqCst);
+                        Err(UpgradeTerminalCause::SetupFailed)
+                    }
+                },
+            ),
+        )
+        .await;
+
+        assert_eq!(setup_polls.load(Ordering::SeqCst), 0);
+        assert_eq!(raw_polls.load(Ordering::SeqCst), 0);
+        assert_eq!(raw_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *lock(&shared.winning_cause),
+            Some(UpgradeTerminalCause::SetupFailed)
+        );
+        assert_eq!(runtime.counts().tracked_tasks, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn upgrade_commit_shutdown_race_linearizes_registration() {
         let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
         let setup_effects = Arc::new(AtomicUsize::new(0));
@@ -2023,6 +2428,94 @@ mod tests {
         runtime.begin_shutdown(Some(Instant::now()));
         runtime.wait_until_drained().await;
         runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn lifetime_and_shutdown_closing_stop_relays_before_close_grace() {
+        for cause in [
+            UpgradeTerminalCause::LifetimeExpired,
+            UpgradeTerminalCause::Shutdown,
+        ] {
+            let lifetime = if cause == UpgradeTerminalCause::LifetimeExpired {
+                Duration::from_millis(30)
+            } else {
+                Duration::from_secs(60)
+            };
+            let runtime =
+                UpgradeRuntime::try_new(short_limits(lifetime, Duration::from_millis(200)))
+                    .unwrap();
+            let frames = Arc::new(AtomicUsize::new(0));
+            let pulse = Arc::new(Notify::new());
+            let (relay_started_tx, relay_started_rx) = oneshot::channel();
+            let (close_started_tx, close_started_rx) = oneshot::channel();
+            let (close_release_tx, close_release_rx) = oneshot::channel();
+            let (entry_tx, entry_rx) = oneshot::channel();
+            runtime
+                .try_spawn_handshake(allocation(0, 0), {
+                    let frames = frames.clone();
+                    let pulse = pulse.clone();
+                    move |handshake| async move {
+                        let entry = handshake
+                            .commit(
+                                None,
+                                UpgradeEntryPlan::new(
+                                    UpgradeTerminalControl::new(
+                                        inert_raw_teardown(),
+                                        move |_| async move {
+                                            let _ = close_started_tx.send(());
+                                            let _ = close_release_rx.await;
+                                        },
+                                    ),
+                                    move |_| async move {
+                                        Ok(UpgradeRelayPair::new(
+                                            async move {
+                                                let _ = relay_started_tx.send(());
+                                                loop {
+                                                    pulse.notified().await;
+                                                    frames.fetch_add(1, Ordering::SeqCst);
+                                                }
+                                            },
+                                            async {
+                                                std::future::pending::<()>().await;
+                                                UpgradeTerminalCause::PeerClosed
+                                            },
+                                        ))
+                                    },
+                                ),
+                            )
+                            .unwrap();
+                        entry_tx.send(entry).unwrap();
+                    }
+                })
+                .unwrap();
+            let entry = entry_rx.await.unwrap();
+            relay_started_rx.await.unwrap();
+            pulse.notify_one();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while frames.load(Ordering::SeqCst) != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("relay did not process the pre-stop frame");
+
+            if cause == UpgradeTerminalCause::Shutdown {
+                entry.submit_terminal(UpgradeTerminalCause::Shutdown);
+            }
+            close_started_rx.await.unwrap();
+            pulse.notify_one();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert_eq!(
+                frames.load(Ordering::SeqCst),
+                1,
+                "relay processed a frame after {cause:?} application stop"
+            );
+
+            close_release_tx.send(()).unwrap();
+            entry.wait_closed().await;
+            assert_eq!(entry.terminal_cause(), Some(cause));
+            runtime.shutdown_and_wait(Some(Instant::now())).await;
+        }
     }
 
     #[tokio::test]
@@ -2437,6 +2930,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn shutdown_between_setup_check_and_authorization_prevents_setup_poll() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
         let setup_effects = Arc::new(AtomicUsize::new(0));
         let raw_cancellations = Arc::new(AtomicUsize::new(0));
         let established_closes = Arc::new(AtomicUsize::new(0));
@@ -2457,6 +2951,7 @@ mod tests {
         let (authorization_tx, authorization_rx) = std_mpsc::channel();
         let (resume_tx, resume_rx) = std_mpsc::channel();
         let coordinator = tokio::spawn(run_entry_coordinator_with_hooks(
+            runtime.inner.clone(),
             shared.clone(),
             UpgradedStreamSnapshot::new(2, None),
             UpgradeEntryPlan::new(
@@ -2477,6 +2972,7 @@ mod tests {
                     }
                 },
             ),
+            || {},
             move || {
                 authorization_tx.send(()).unwrap();
                 resume_rx.recv().unwrap();
@@ -2497,10 +2993,12 @@ mod tests {
             *lock(&shared.winning_cause),
             Some(UpgradeTerminalCause::Shutdown)
         );
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn lowered_cutoff_before_close_authorization_prevents_close_poll() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
         let close_effects = Arc::new(AtomicUsize::new(0));
         let raw_cancellations = Arc::new(AtomicUsize::new(0));
         let relay_drops = Arc::new(AtomicUsize::new(0));
@@ -2521,6 +3019,7 @@ mod tests {
         let (authorization_tx, authorization_rx) = std_mpsc::channel();
         let (resume_tx, resume_rx) = std_mpsc::channel();
         let coordinator = tokio::spawn(run_entry_coordinator_with_hooks(
+            runtime.inner.clone(),
             shared.clone(),
             UpgradedStreamSnapshot::new(2, None),
             UpgradeEntryPlan::new(
@@ -2549,6 +3048,7 @@ mod tests {
                 },
             ),
             || {},
+            || {},
             move || {
                 authorization_tx.send(()).unwrap();
                 resume_rx.recv().unwrap();
@@ -2568,71 +3068,93 @@ mod tests {
             *lock(&shared.winning_cause),
             Some(UpgradeTerminalCause::PeerClosed)
         );
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn setup_completion_terminal_race_runs_one_cleanup_owner() {
-        for _ in 0..32 {
-            let raw_aborts = Arc::new(AtomicUsize::new(0));
-            let established_closes = Arc::new(AtomicUsize::new(0));
-            let now = Instant::now();
-            let shared = Arc::new(EntryShared {
-                timing: Mutex::new(EntryTiming {
-                    application_stop: now + Duration::from_secs(1),
-                    cleanup_cutoff: now + Duration::from_secs(2),
-                    stop_cause: UpgradeTerminalCause::LifetimeExpired,
-                }),
-                cleanup_grace: Duration::from_millis(100),
-                requested_cause: Mutex::new(None),
-                winning_cause: Mutex::new(None),
-                changed: Notify::new(),
-                terminal_state: AtomicU8::new(ENTRY_OPEN),
-                closed: Notify::new(),
-            });
-            let (setup_started_tx, setup_started_rx) = oneshot::channel();
-            let (setup_release_tx, setup_release_rx) = oneshot::channel();
-            let setup_shared = shared.clone();
-            let coordinator = tokio::spawn(run_entry_coordinator(
-                shared.clone(),
-                UpgradedStreamSnapshot::new(2, None),
-                UpgradeEntryPlan::new(
-                    UpgradeTerminalControl::new(
-                        raw_teardown_with_guard(DropCount(raw_aborts.clone())),
-                        {
-                            let established_closes = established_closes.clone();
-                            move |_| async move {
-                                established_closes.fetch_add(1, Ordering::SeqCst);
+    async fn terminal_or_deadline_pending_setup_completion_drops_relays_unpolled() {
+        for winning_cause in [
+            UpgradeTerminalCause::Cancelled,
+            UpgradeTerminalCause::LifetimeExpired,
+        ] {
+            for _ in 0..16 {
+                let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+                let raw_aborts = Arc::new(AtomicUsize::new(0));
+                let established_closes = Arc::new(AtomicUsize::new(0));
+                let relay_polls = Arc::new(AtomicUsize::new(0));
+                let now = Instant::now();
+                let shared = Arc::new(EntryShared {
+                    timing: Mutex::new(EntryTiming {
+                        application_stop: now + Duration::from_secs(1),
+                        cleanup_cutoff: now + Duration::from_secs(2),
+                        stop_cause: UpgradeTerminalCause::LifetimeExpired,
+                    }),
+                    cleanup_grace: Duration::from_millis(100),
+                    requested_cause: Mutex::new(None),
+                    winning_cause: Mutex::new(None),
+                    changed: Notify::new(),
+                    terminal_state: AtomicU8::new(ENTRY_OPEN),
+                    closed: Notify::new(),
+                });
+                let (setup_started_tx, setup_started_rx) = oneshot::channel();
+                let (setup_release_tx, setup_release_rx) = oneshot::channel();
+                let setup_shared = shared.clone();
+                let setup_relay_polls = relay_polls.clone();
+                let coordinator = tokio::spawn(run_entry_coordinator(
+                    runtime.inner.clone(),
+                    shared.clone(),
+                    UpgradedStreamSnapshot::new(2, None),
+                    UpgradeEntryPlan::new(
+                        UpgradeTerminalControl::new(
+                            raw_teardown_with_guard(DropCount(raw_aborts.clone())),
+                            {
+                                let established_closes = established_closes.clone();
+                                move |_| async move {
+                                    established_closes.fetch_add(1, Ordering::SeqCst);
+                                }
+                            },
+                        ),
+                        move |_| async move {
+                            let _ = setup_started_tx.send(());
+                            let _ = setup_release_rx.await;
+                            if winning_cause == UpgradeTerminalCause::Cancelled {
+                                *lock(&setup_shared.requested_cause) = Some(winning_cause);
+                            } else {
+                                let mut timing = lock(&setup_shared.timing);
+                                timing.application_stop = Instant::now();
+                                timing.stop_cause = winning_cause;
                             }
+                            setup_shared.changed.notify_waiters();
+                            let first_polls = setup_relay_polls.clone();
+                            let second_polls = setup_relay_polls;
+                            Ok(UpgradeRelayPair::new(
+                                async move {
+                                    first_polls.fetch_add(1, Ordering::SeqCst);
+                                    std::future::pending::<()>().await;
+                                    UpgradeTerminalCause::PeerClosed
+                                },
+                                async move {
+                                    second_polls.fetch_add(1, Ordering::SeqCst);
+                                    std::future::pending::<()>().await;
+                                    UpgradeTerminalCause::PeerClosed
+                                },
+                            ))
                         },
                     ),
-                    move |_| async move {
-                        let _ = setup_started_tx.send(());
-                        let _ = setup_release_rx.await;
-                        *lock(&setup_shared.requested_cause) =
-                            Some(UpgradeTerminalCause::Cancelled);
-                        setup_shared.changed.notify_waiters();
-                        Ok(UpgradeRelayPair::new(
-                            async {
-                                std::future::pending::<()>().await;
-                                UpgradeTerminalCause::PeerClosed
-                            },
-                            async {
-                                std::future::pending::<()>().await;
-                                UpgradeTerminalCause::PeerClosed
-                            },
-                        ))
-                    },
-                ),
-            ));
+                ));
 
-            setup_started_rx.await.unwrap();
-            setup_release_tx.send(()).unwrap();
-            tokio::time::timeout(Duration::from_secs(1), coordinator)
-                .await
-                .expect("coordinator did not resolve the setup/terminal race")
-                .unwrap();
-            assert_eq!(established_closes.load(Ordering::SeqCst), 1);
-            assert_eq!(raw_aborts.load(Ordering::SeqCst), 1);
+                setup_started_rx.await.unwrap();
+                setup_release_tx.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(1), coordinator)
+                    .await
+                    .expect("coordinator did not resolve the setup/terminal race")
+                    .unwrap();
+                assert_eq!(established_closes.load(Ordering::SeqCst), 1);
+                assert_eq!(relay_polls.load(Ordering::SeqCst), 0);
+                assert_eq!(raw_aborts.load(Ordering::SeqCst), 1);
+                assert_eq!(*lock(&shared.winning_cause), Some(winning_cause));
+                runtime.shutdown_and_wait(Some(Instant::now())).await;
+            }
         }
     }
 
