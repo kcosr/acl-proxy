@@ -17,8 +17,14 @@ use crate::config::compiler::{
     RedactionLiteralInterval as Interval, RedactionLiteralNode as SecretNode, RedactionPlan,
     RedactionProfilePlan, RedactionRulePlan, MAX_REDACTION_MATCHER_SCRATCH_BYTES,
 };
+use crate::observation::{
+    CaptureAllocationCharge, CaptureAllocationError, CaptureBody, CaptureExactBytes,
+    CaptureOperation, ReservedCaptureBodyBuilder,
+};
 use crate::runtime::{RedactionProfileIndex, RedactionProfileRegistry};
-use crate::safety::wire_body::{GuardedAllocationCharge, WireBodyBufferError};
+use crate::safety::wire_body::{
+    GuardedAllocationCharge, ReservedGuardedBodyBuilder, WireBodyBufferError,
+};
 use crate::safety::{GuardedBody, HttpWireBodyGuard};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,10 +63,25 @@ pub(crate) struct GuardedRedactedPayload {
     pub(crate) replacements: usize,
 }
 
+pub(crate) struct CaptureRedactedPayload {
+    pub(crate) body: CaptureBody,
+    pub(crate) replacements: usize,
+}
+
 impl fmt::Debug for GuardedRedactedPayload {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("GuardedRedactedPayload")
+            .field("body", &self.body)
+            .field("replacements", &self.replacements)
+            .finish()
+    }
+}
+
+impl fmt::Debug for CaptureRedactedPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CaptureRedactedPayload")
             .field("body", &self.body)
             .field("replacements", &self.replacements)
             .finish()
@@ -149,6 +170,154 @@ pub(crate) enum SnapshotError {
 
     #[error("redaction guarded-body operation failed")]
     GuardedBody(#[source] WireBodyBufferError),
+
+    #[error("redaction capture-body operation failed")]
+    CaptureBody(#[source] CaptureAllocationError),
+}
+
+trait StableRedactionBody {
+    fn len(&self) -> usize;
+
+    fn try_for_each_segment<E>(
+        &self,
+        callback: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), E>;
+}
+
+impl StableRedactionBody for GuardedBody {
+    fn len(&self) -> usize {
+        GuardedBody::len(self)
+    }
+
+    fn try_for_each_segment<E>(
+        &self,
+        mut callback: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for segment in self.segments() {
+            callback(segment)?;
+        }
+        Ok(())
+    }
+}
+
+impl StableRedactionBody for CaptureBody {
+    fn len(&self) -> usize {
+        CaptureBody::len(self)
+    }
+
+    fn try_for_each_segment<E>(
+        &self,
+        mut callback: impl FnMut(&[u8]) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for segment in self.segments() {
+            callback(segment)?;
+        }
+        Ok(())
+    }
+}
+
+trait StableRedactionBuilder {
+    fn try_extend_redacted(&mut self, bytes: &[u8]) -> Result<(), SnapshotError>;
+}
+
+trait ExactRedactionBytes {
+    fn as_slice(&self) -> &[u8];
+    fn as_mut_slice(&mut self) -> &mut [u8];
+}
+
+impl ExactRedactionBytes for CaptureExactBytes {
+    fn as_slice(&self) -> &[u8] {
+        CaptureExactBytes::as_slice(self)
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        CaptureExactBytes::as_mut_slice(self)
+    }
+}
+
+impl StableRedactionBuilder for ReservedGuardedBodyBuilder {
+    fn try_extend_redacted(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        self.try_extend_from_slice(bytes)
+            .map_err(SnapshotError::GuardedBody)
+    }
+}
+
+impl StableRedactionBuilder for ReservedCaptureBodyBuilder {
+    fn try_extend_redacted(&mut self, bytes: &[u8]) -> Result<(), SnapshotError> {
+        self.try_extend_from_slice(bytes)
+            .map_err(SnapshotError::CaptureBody)
+    }
+}
+
+trait StableRedactionContext {
+    type Body: StableRedactionBody;
+    type Reserved: StableRedactionBuilder;
+    type Charge;
+    type Exact: ExactRedactionBytes;
+
+    fn validate_body(&self, body: &Self::Body) -> Result<(), SnapshotError>;
+    fn reserve_exact(&self, len: usize) -> Result<Self::Reserved, SnapshotError>;
+    fn finish_reserved(&self, body: Self::Reserved) -> Result<Self::Body, SnapshotError>;
+    fn charge_exact(&self, bytes: usize) -> Result<Self::Charge, SnapshotError>;
+    fn exact_bytes(&self, len: usize) -> Result<Self::Exact, SnapshotError>;
+}
+
+impl StableRedactionContext for HttpWireBodyGuard {
+    type Body = GuardedBody;
+    type Reserved = ReservedGuardedBodyBuilder;
+    type Charge = GuardedAllocationCharge;
+    type Exact = WireExactBytes;
+
+    fn validate_body(&self, body: &Self::Body) -> Result<(), SnapshotError> {
+        HttpWireBodyGuard::validate_body(self, body).map_err(SnapshotError::GuardedBody)
+    }
+
+    fn reserve_exact(&self, len: usize) -> Result<Self::Reserved, SnapshotError> {
+        self.reserve_exact_buffer(len)
+            .map_err(SnapshotError::GuardedBody)
+    }
+
+    fn finish_reserved(&self, body: Self::Reserved) -> Result<Self::Body, SnapshotError> {
+        body.finish().map_err(SnapshotError::GuardedBody)
+    }
+
+    fn charge_exact(&self, bytes: usize) -> Result<Self::Charge, SnapshotError> {
+        self.charge_exact_allocation(bytes)
+            .map_err(SnapshotError::GuardedBody)
+    }
+
+    fn exact_bytes(&self, len: usize) -> Result<Self::Exact, SnapshotError> {
+        WireExactBytes::allocate(self, len)
+    }
+}
+
+impl StableRedactionContext for CaptureOperation {
+    type Body = CaptureBody;
+    type Reserved = ReservedCaptureBodyBuilder;
+    type Charge = CaptureAllocationCharge;
+    type Exact = CaptureExactBytes;
+
+    fn validate_body(&self, body: &Self::Body) -> Result<(), SnapshotError> {
+        CaptureOperation::validate_body(self, body).map_err(SnapshotError::CaptureBody)
+    }
+
+    fn reserve_exact(&self, len: usize) -> Result<Self::Reserved, SnapshotError> {
+        self.reserve_exact_body(len)
+            .map_err(SnapshotError::CaptureBody)
+    }
+
+    fn finish_reserved(&self, body: Self::Reserved) -> Result<Self::Body, SnapshotError> {
+        body.finish().map_err(SnapshotError::CaptureBody)
+    }
+
+    fn charge_exact(&self, bytes: usize) -> Result<Self::Charge, SnapshotError> {
+        self.charge_exact_allocation(bytes)
+            .map_err(SnapshotError::CaptureBody)
+    }
+
+    fn exact_bytes(&self, len: usize) -> Result<Self::Exact, SnapshotError> {
+        CaptureOperation::exact_bytes(self, len).map_err(SnapshotError::CaptureBody)
+    }
 }
 
 pub(crate) struct RedactionSnapshot {
@@ -345,57 +514,105 @@ impl ProfileHandle {
         guard: &HttpWireBodyGuard,
         payload: GuardedBody,
     ) -> Result<GuardedRedactedPayload, SnapshotError> {
-        guard
-            .validate_body(&payload)
-            .map_err(SnapshotError::GuardedBody)?;
-        check_size(
-            payload.len(),
-            self.0.limits.max_decoded_body_bytes,
-            PayloadLimit::DecodedHttpBody,
-        )?;
+        let (body, replacements) = self.redact_stable_decoded_http_body(guard, payload)?;
+        Ok(GuardedRedactedPayload { body, replacements })
+    }
 
-        let class = if guarded_utf8_valid(&payload) {
+    /// Redacts the complete decoded capture body. Capture truncation is a
+    /// separate artifact step and must happen only after this succeeds.
+    pub(crate) fn redact_capture_decoded_http_body(
+        &self,
+        operation: &CaptureOperation,
+        payload: CaptureBody,
+    ) -> Result<CaptureRedactedPayload, SnapshotError> {
+        let (body, replacements) = self.redact_stable_decoded_http_body(operation, payload)?;
+        Ok(CaptureRedactedPayload { body, replacements })
+    }
+
+    /// Redacts one complete decoded WebSocket message under capture accounting.
+    pub(crate) fn redact_capture_websocket_message(
+        &self,
+        operation: &CaptureOperation,
+        payload: CaptureBody,
+        class: PayloadClass,
+    ) -> Result<CaptureRedactedPayload, SnapshotError> {
+        let (body, replacements) = self.redact_stable_complete(
+            operation,
+            payload,
+            class,
+            self.0.limits.max_message_bytes,
+            PayloadLimit::WebSocketMessage,
+        )?;
+        Ok(CaptureRedactedPayload { body, replacements })
+    }
+
+    fn redact_stable_decoded_http_body<C: StableRedactionContext>(
+        &self,
+        context: &C,
+        payload: C::Body,
+    ) -> Result<(C::Body, usize), SnapshotError> {
+        context.validate_body(&payload)?;
+        let class = if stable_utf8_valid(&payload) {
             PayloadClass::Text
         } else {
             PayloadClass::Binary
         };
+        self.redact_stable_complete(
+            context,
+            payload,
+            class,
+            self.0.limits.max_decoded_body_bytes,
+            PayloadLimit::DecodedHttpBody,
+        )
+    }
+
+    fn redact_stable_complete<C: StableRedactionContext>(
+        &self,
+        context: &C,
+        payload: C::Body,
+        class: PayloadClass,
+        limit: usize,
+        payload_limit: PayloadLimit,
+    ) -> Result<(C::Body, usize), SnapshotError> {
+        context.validate_body(&payload)?;
+        check_size(payload.len(), limit, payload_limit)?;
+        if matches!(class, PayloadClass::Text) && !stable_utf8_valid(&payload) {
+            return Err(SnapshotError::InvalidText);
+        }
         let literal_matcher = match class {
             PayloadClass::Text => &self.0.text_literals,
             PayloadClass::Binary => &self.0.binary_literals,
         };
-        let (mut output, mut replacements) = literal_matcher.replace_guarded(
-            guard,
+        let (mut output, mut replacements) = literal_matcher.replace_stable(
+            context,
             payload,
             &self.0.replacement,
-            self.0.limits.max_decoded_body_bytes,
-            PayloadLimit::DecodedHttpBody,
+            limit,
+            payload_limit,
         )?;
         if matches!(class, PayloadClass::Text) && !self.0.text_expressions.is_empty() {
-            let mut current = GuardedExactBytes::from_body(guard, output)?;
+            let mut current = exact_bytes_from_body(context, output)?;
             for expression in &self.0.text_expressions {
-                let (next, count) = replace_regex_guarded(
-                    guard,
+                let (next, count) = replace_regex_stable(
+                    context,
                     &current,
                     expression,
                     &self.0.replacement,
-                    self.0.limits.max_decoded_body_bytes,
-                    PayloadLimit::DecodedHttpBody,
+                    limit,
+                    payload_limit,
                 )?;
                 current = next;
                 replacements =
                     replacements
                         .checked_add(count)
                         .ok_or(SnapshotError::PayloadTooLarge {
-                            payload: PayloadLimit::DecodedHttpBody,
-                            limit: self.0.limits.max_decoded_body_bytes,
+                            payload: payload_limit,
+                            limit,
                         })?;
             }
-            output = current.into_body(guard)?;
+            output = exact_bytes_into_body(context, current)?;
         }
-        Ok(GuardedRedactedPayload {
-            body: output,
-            replacements,
-        })
+        Ok((output, replacements))
     }
 
     pub(crate) fn redact_websocket_message(
@@ -712,20 +929,20 @@ impl LiteralMatcher {
         Ok((output, count))
     }
 
-    fn replace_guarded(
+    fn replace_stable<C: StableRedactionContext>(
         &self,
-        guard: &HttpWireBodyGuard,
-        input: GuardedBody,
+        context: &C,
+        input: C::Body,
         replacement: &[u8],
         limit: usize,
         payload_limit: PayloadLimit,
-    ) -> Result<(GuardedBody, usize), SnapshotError> {
+    ) -> Result<(C::Body, usize), SnapshotError> {
         if self.matcher.is_none() {
             return Ok((input, 0));
         }
         let mut removed = 0usize;
         let mut count = 0usize;
-        self.for_each_merged_interval_guarded(guard, &input, |interval| {
+        self.for_each_merged_interval_stable(context, &input, |interval| {
             removed = removed.checked_add(interval.end - interval.start).ok_or(
                 SnapshotError::PayloadTooLarge {
                     payload: payload_limit,
@@ -749,20 +966,16 @@ impl LiteralMatcher {
         if count == 0 {
             return Ok((input, 0));
         }
-        let mut output = guard
-            .reserve_exact_buffer(output_len)
-            .map_err(SnapshotError::GuardedBody)?;
+        let mut output = context.reserve_exact(output_len)?;
         let mut cursor = 0usize;
-        self.for_each_merged_interval_guarded(guard, &input, |interval| {
-            copy_guarded_range(&input, cursor, interval.start, &mut output)?;
-            output
-                .try_extend_from_slice(replacement)
-                .map_err(SnapshotError::GuardedBody)?;
+        self.for_each_merged_interval_stable(context, &input, |interval| {
+            copy_stable_range(&input, cursor, interval.start, &mut output)?;
+            output.try_extend_redacted(replacement)?;
             cursor = interval.end;
             Ok(())
         })?;
-        copy_guarded_range(&input, cursor, input.len(), &mut output)?;
-        let output = output.finish().map_err(SnapshotError::GuardedBody)?;
+        copy_stable_range(&input, cursor, input.len(), &mut output)?;
+        let output = context.finish_reserved(output)?;
         drop(input);
         Ok((output, count))
     }
@@ -790,15 +1003,15 @@ impl LiteralMatcher {
         pending.flush_all(&mut callback)
     }
 
-    fn for_each_merged_interval_guarded(
+    fn for_each_merged_interval_stable<C: StableRedactionContext>(
         &self,
-        guard: &HttpWireBodyGuard,
-        input: &GuardedBody,
+        context: &C,
+        input: &C::Body,
         mut callback: impl FnMut(Interval) -> Result<(), SnapshotError>,
     ) -> Result<(), SnapshotError> {
-        let mut pending = PendingIntervals::new_guarded(self.max_pattern_len, guard)?;
+        let mut pending = PendingIntervals::new_stable(self.max_pattern_len, context)?;
         if let Some(matcher) = &self.matcher {
-            matcher.for_each_guarded_match(input, |interval| {
+            matcher.for_each_stable_match(input, |interval| {
                 let finalized_end = interval.end.saturating_sub(self.max_pattern_len);
                 pending.flush_through(finalized_end, &mut callback)?;
                 pending.merge(interval)
@@ -808,43 +1021,42 @@ impl LiteralMatcher {
     }
 }
 
-struct PendingIntervals {
+struct PendingIntervals<Charge = ()> {
     storage: ZeroizingBox<Interval>,
-    _charge: Option<GuardedAllocationCharge>,
+    _charge: Charge,
     head: usize,
     len: usize,
 }
 
-impl PendingIntervals {
+impl PendingIntervals<()> {
     fn new(interval_capacity: usize) -> Result<Self, SnapshotError> {
         checked_matcher_scratch_bytes(interval_capacity)?;
         let storage = ZeroizingBox::filled(interval_capacity, Interval::default())?;
         Ok(Self {
             storage,
-            _charge: None,
+            _charge: (),
             head: 0,
             len: 0,
         })
     }
 
-    fn new_guarded(
+    fn new_stable<C: StableRedactionContext>(
         interval_capacity: usize,
-        guard: &HttpWireBodyGuard,
-    ) -> Result<Self, SnapshotError> {
+        context: &C,
+    ) -> Result<PendingIntervals<C::Charge>, SnapshotError> {
         let bytes = checked_matcher_scratch_bytes(interval_capacity)?;
-        let charge = guard
-            .charge_exact_allocation(bytes)
-            .map_err(SnapshotError::GuardedBody)?;
+        let charge = context.charge_exact(bytes)?;
         let storage = ZeroizingBox::filled(interval_capacity, Interval::default())?;
-        debug_assert_eq!(storage.layout.size(), charge.bytes());
-        Ok(Self {
+        Ok(PendingIntervals {
             storage,
-            _charge: Some(charge),
+            _charge: charge,
             head: 0,
             len: 0,
         })
     }
+}
 
+impl<Charge> PendingIntervals<Charge> {
     fn merge(&mut self, mut interval: Interval) -> Result<(), SnapshotError> {
         while let Some(existing) = self.back() {
             if existing.end <= interval.start {
@@ -1254,28 +1466,30 @@ impl ZeroizingAhoCorasick {
         }
     }
 
-    fn for_each_guarded_match(
+    fn for_each_stable_match<B: StableRedactionBody>(
         &self,
-        input: &GuardedBody,
+        input: &B,
         mut callback: impl FnMut(Interval) -> Result<(), SnapshotError>,
     ) -> Result<(), SnapshotError> {
         let mut state = 0usize;
         let mut index = 0usize;
-        for byte in input.segments().flatten().copied() {
-            while state != 0 && self.transition(state, byte).is_none() {
-                state = self.nodes[state].failure;
+        input.try_for_each_segment(|segment| {
+            for &byte in segment {
+                while state != 0 && self.transition(state, byte).is_none() {
+                    state = self.nodes[state].failure;
+                }
+                state = self.transition(state, byte).unwrap_or(0);
+                index += 1;
+                let length = self.nodes[state].output_len;
+                if length != 0 {
+                    callback(Interval {
+                        start: index - length,
+                        end: index,
+                    })?;
+                }
             }
-            state = self.transition(state, byte).unwrap_or(0);
-            index += 1;
-            let length = self.nodes[state].output_len;
-            if length != 0 {
-                callback(Interval {
-                    start: index - length,
-                    end: index,
-                })?;
-            }
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     fn matches<'matcher, 'input>(
@@ -1579,58 +1793,70 @@ impl ResolvedRule {
     }
 }
 
-struct GuardedExactBytes {
+struct WireExactBytes {
     storage: ZeroizingBox<u8>,
     _charge: GuardedAllocationCharge,
 }
 
-impl GuardedExactBytes {
+impl WireExactBytes {
     fn allocate(guard: &HttpWireBodyGuard, len: usize) -> Result<Self, SnapshotError> {
         let charge = guard
             .charge_exact_allocation(len)
             .map_err(SnapshotError::GuardedBody)?;
         let storage = ZeroizingBox::filled(len, 0u8)?;
-        debug_assert_eq!(storage.layout.size(), charge.bytes());
         Ok(Self {
             storage,
             _charge: charge,
         })
     }
+}
 
-    fn from_body(guard: &HttpWireBodyGuard, body: GuardedBody) -> Result<Self, SnapshotError> {
-        let mut contiguous = Self::allocate(guard, body.len())?;
-        let mut offset = 0usize;
-        for segment in body.segments() {
-            let end = offset + segment.len();
-            contiguous.storage[offset..end].copy_from_slice(segment);
-            offset = end;
-        }
-        drop(body);
-        Ok(contiguous)
+impl ExactRedactionBytes for WireExactBytes {
+    fn as_slice(&self) -> &[u8] {
+        &self.storage
     }
 
-    fn into_body(self, guard: &HttpWireBodyGuard) -> Result<GuardedBody, SnapshotError> {
-        let mut output = guard
-            .reserve_exact_buffer(self.storage.len())
-            .map_err(SnapshotError::GuardedBody)?;
-        output
-            .try_extend_from_slice(&self.storage)
-            .map_err(SnapshotError::GuardedBody)?;
-        let output = output.finish().map_err(SnapshotError::GuardedBody)?;
-        drop(self);
-        Ok(output)
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.storage
     }
 }
 
-fn replace_regex_guarded(
-    guard: &HttpWireBodyGuard,
-    input: &GuardedExactBytes,
+fn exact_bytes_from_body<C: StableRedactionContext>(
+    context: &C,
+    body: C::Body,
+) -> Result<C::Exact, SnapshotError> {
+    let mut contiguous = context.exact_bytes(body.len())?;
+    let mut offset = 0usize;
+    body.try_for_each_segment(|segment| {
+        let end = offset + segment.len();
+        contiguous.as_mut_slice()[offset..end].copy_from_slice(segment);
+        offset = end;
+        Ok(())
+    })?;
+    drop(body);
+    Ok(contiguous)
+}
+
+fn exact_bytes_into_body<C: StableRedactionContext>(
+    context: &C,
+    bytes: C::Exact,
+) -> Result<C::Body, SnapshotError> {
+    let mut output = context.reserve_exact(bytes.as_slice().len())?;
+    output.try_extend_redacted(bytes.as_slice())?;
+    let output = context.finish_reserved(output)?;
+    drop(bytes);
+    Ok(output)
+}
+
+fn replace_regex_stable<C: StableRedactionContext>(
+    context: &C,
+    input: &C::Exact,
     expression: &DfaRegex,
     replacement: &[u8],
     limit: usize,
     payload_limit: PayloadLimit,
-) -> Result<(GuardedExactBytes, usize), SnapshotError> {
-    let bytes: &[u8] = &input.storage;
+) -> Result<(C::Exact, usize), SnapshotError> {
+    let bytes = input.as_slice();
     let (output_len, count) = replacement_shape(
         bytes.len(),
         expression.find_iter(bytes).map(|matched| matched.len()),
@@ -1639,59 +1865,59 @@ fn replace_regex_guarded(
         payload_limit,
     )?;
     if count == 0 {
-        let mut output = GuardedExactBytes::allocate(guard, bytes.len())?;
-        output.storage.copy_from_slice(bytes);
+        let mut output = context.exact_bytes(bytes.len())?;
+        output.as_mut_slice().copy_from_slice(bytes);
         return Ok((output, 0));
     }
-    let mut output = GuardedExactBytes::allocate(guard, output_len)?;
+    let mut output = context.exact_bytes(output_len)?;
     let mut source = 0usize;
     let mut target = 0usize;
     for matched in expression.find_iter(bytes) {
         let retained = &bytes[source..matched.start()];
         let retained_end = target + retained.len();
-        output.storage[target..retained_end].copy_from_slice(retained);
+        output.as_mut_slice()[target..retained_end].copy_from_slice(retained);
         target = retained_end;
         let replacement_end = target + replacement.len();
-        output.storage[target..replacement_end].copy_from_slice(replacement);
+        output.as_mut_slice()[target..replacement_end].copy_from_slice(replacement);
         target = replacement_end;
         source = matched.end();
     }
-    output.storage[target..].copy_from_slice(&bytes[source..]);
+    output.as_mut_slice()[target..].copy_from_slice(&bytes[source..]);
     Ok((output, count))
 }
 
-fn copy_guarded_range(
-    input: &GuardedBody,
+fn copy_stable_range<B: StableRedactionBody, R: StableRedactionBuilder>(
+    input: &B,
     start: usize,
     end: usize,
-    output: &mut crate::safety::wire_body::ReservedGuardedBodyBuilder,
+    output: &mut R,
 ) -> Result<(), SnapshotError> {
     let mut offset = 0usize;
-    for segment in input.segments() {
+    input.try_for_each_segment(|segment| {
         let segment_end = offset + segment.len();
         if segment_end > start && offset < end {
             let local_start = start.saturating_sub(offset);
             let local_end = (end - offset).min(segment.len());
-            output
-                .try_extend_from_slice(&segment[local_start..local_end])
-                .map_err(SnapshotError::GuardedBody)?;
-        }
-        if segment_end >= end {
-            break;
+            output.try_extend_redacted(&segment[local_start..local_end])?;
         }
         offset = segment_end;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
-fn guarded_utf8_valid(input: &GuardedBody) -> bool {
+fn stable_utf8_valid<B: StableRedactionBody>(input: &B) -> bool {
     let mut carry = [0u8; 4];
     let mut carry_len = 0usize;
-    for mut segment in input.segments() {
+    let mut valid = true;
+    let result: Result<(), std::convert::Infallible> = input.try_for_each_segment(|mut segment| {
+        if !valid {
+            return Ok(());
+        }
         if carry_len != 0 {
             let width = utf8_width(carry[0]);
             if width == 0 {
-                return false;
+                valid = false;
+                return Ok(());
             }
             let needed = width - carry_len;
             let copied = needed.min(segment.len());
@@ -1699,30 +1925,37 @@ fn guarded_utf8_valid(input: &GuardedBody) -> bool {
             carry_len += copied;
             segment = &segment[copied..];
             if carry_len != width {
-                continue;
+                return Ok(());
             }
             if std::str::from_utf8(&carry[..width]).is_err() {
-                return false;
+                valid = false;
+                return Ok(());
             }
             carry_len = 0;
         }
         if segment.is_empty() {
-            continue;
+            return Ok(());
         }
         if let Err(error) = std::str::from_utf8(segment) {
             if error.error_len().is_some() {
-                return false;
+                valid = false;
+                return Ok(());
             }
-            let valid = error.valid_up_to();
-            let tail = &segment[valid..];
+            let valid_up_to = error.valid_up_to();
+            let tail = &segment[valid_up_to..];
             if tail.len() > 3 {
-                return false;
+                valid = false;
+                return Ok(());
             }
             carry[..tail.len()].copy_from_slice(tail);
             carry_len = tail.len();
         }
+        Ok(())
+    });
+    match result {
+        Ok(()) => valid && carry_len == 0,
+        Err(never) => match never {},
     }
-    carry_len == 0
 }
 
 fn utf8_width(first: u8) -> usize {
@@ -1906,9 +2139,13 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::config::compiler::{
+        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledLogLevel,
+        ObservationPlan, PolicyDecisionLoggingPlan, ReloadableLoggingPlan,
         MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE,
         MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT,
     };
+    use crate::observation::{CapturePool, ProductObservationSnapshot};
+    use crate::safety::allocation::{body_allocation_bytes, MAX_BUFFER_GROWTH_BYTES};
     use crate::safety::{WireBodyPool, WireBodyQuotaKey};
 
     fn activate(plan: RedactionPlan) -> Result<RedactionActivation, SnapshotError> {
@@ -2006,6 +2243,192 @@ mod tests {
         let mut body = guard.buffer();
         body.try_extend_from_slice(bytes).unwrap();
         body.finish()
+    }
+
+    fn capture_pool(redaction: &RedactionActivation, limit: usize) -> Arc<CapturePool> {
+        let pool = CapturePool::new();
+        let activation = ProductObservationSnapshot::activate(
+            ObservationPlan {
+                logging: ReloadableLoggingPlan {
+                    level: CompiledLogLevel::Info,
+                    policy_decisions: PolicyDecisionLoggingPlan {
+                        allows: false,
+                        denies: false,
+                        allow_level: CompiledLogLevel::Info,
+                        deny_level: CompiledLogLevel::Warn,
+                    },
+                },
+                capture: Some(CapturePlan {
+                    events: vec![CompiledCaptureEvent::RequestAllowed],
+                    redaction_profile: "main".to_owned(),
+                    sink: crate::capture::CaptureSinkSpec::new(
+                        std::path::PathBuf::from("/capture-redaction-tests"),
+                        "capture-{requestId}-{suffix}.json".to_owned(),
+                        1,
+                        1024,
+                    )
+                    .unwrap(),
+                    max_body_bytes: 1,
+                    max_inflight_body_bytes: limit,
+                    working_set: CaptureWorkingSetPlan::default(),
+                }),
+            },
+            redaction,
+            pool.clone(),
+        )
+        .expect("capture observation activation");
+        let (_snapshot, owner) = activation.into_parts();
+        let mut publication = owner.publication_guard().expect("publication guard");
+        publication.commit();
+        pool
+    }
+
+    fn capture_body(operation: &CaptureOperation, bytes: &[u8]) -> CaptureBody {
+        let mut body = operation.body_buffer();
+        body.try_extend_from_slice(bytes).unwrap();
+        body.finish()
+    }
+
+    #[test]
+    fn capture_redaction_reuses_generation_matchers_for_literals_and_expressions() {
+        let redaction = activate(plan(profile(None))).unwrap();
+        let profile = redaction.profile("main").unwrap();
+        let pool = capture_pool(&redaction, 8 * 1024 * 1024);
+        let operation = pool.try_admit().expect("capture admission");
+        let original = capture_body(&operation, b"literal and token-123 remain");
+
+        let redacted = profile
+            .redact_capture_decoded_http_body(&operation, original)
+            .unwrap();
+        assert_eq!(redacted.replacements, 2);
+        assert_eq!(
+            redacted
+                .body
+                .segments()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
+            b"[MASKED] and [MASKED] remain"
+        );
+
+        drop(redacted);
+        assert_eq!(operation.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn capture_websocket_redaction_uses_explicit_complete_message_class() {
+        let redaction = activate(plan(profile(None))).unwrap();
+        let profile = redaction.profile("main").unwrap();
+        let pool = capture_pool(&redaction, 8 * 1024 * 1024);
+        let operation = pool.try_admit().expect("capture admission");
+
+        let text = profile
+            .redact_capture_websocket_message(
+                &operation,
+                capture_body(&operation, b"literal token-123"),
+                PayloadClass::Text,
+            )
+            .unwrap();
+        assert_eq!(text.replacements, 2);
+        assert_eq!(
+            text.body.segments().flatten().copied().collect::<Vec<_>>(),
+            b"[MASKED] [MASKED]"
+        );
+        drop(text);
+
+        let binary = profile
+            .redact_capture_websocket_message(
+                &operation,
+                capture_body(&operation, b"literal token-123"),
+                PayloadClass::Binary,
+            )
+            .unwrap();
+        assert_eq!(binary.replacements, 0);
+        assert_eq!(
+            binary
+                .body
+                .segments()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
+            b"literal token-123"
+        );
+        drop(binary);
+        assert_eq!(operation.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn capture_literal_redaction_crosses_stable_body_segment_boundary() {
+        let mut profile_plan = profile(None);
+        profile_plan.max_body_bytes = 96 * 1024;
+        profile_plan.max_decoded_body_bytes = 96 * 1024;
+        let redaction = activate(plan(profile_plan)).unwrap();
+        let profile = redaction.profile("main").unwrap();
+        let pool = capture_pool(&redaction, 8 * 1024 * 1024);
+        let operation = pool.try_admit().expect("capture admission");
+        let mut original = operation.body_buffer();
+        original
+            .try_extend_from_slice(&vec![b'a'; MAX_BUFFER_GROWTH_BYTES - 3])
+            .unwrap();
+        original.try_extend_from_slice(b"literal tail").unwrap();
+
+        let redacted = profile
+            .redact_capture_decoded_http_body(&operation, original.finish())
+            .unwrap();
+        assert_eq!(redacted.replacements, 1);
+        let suffix = redacted
+            .body
+            .segments()
+            .flatten()
+            .copied()
+            .skip(MAX_BUFFER_GROWTH_BYTES - 3)
+            .collect::<Vec<_>>();
+        assert_eq!(suffix, b"[MASKED] tail");
+
+        drop(redacted);
+        assert_eq!(operation.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn capture_redaction_allocation_failure_restores_every_charge() {
+        let redaction = activate(plan(profile(None))).unwrap();
+        let profile = redaction.profile("main").unwrap();
+        let one_body = body_allocation_bytes(1).unwrap();
+        let pool = capture_pool(&redaction, 2 * one_body);
+        let operation = pool.try_admit().expect("capture admission");
+        let original = capture_body(&operation, b"literal");
+
+        assert!(matches!(
+            profile.redact_capture_decoded_http_body(&operation, original),
+            Err(SnapshotError::CaptureBody(
+                CaptureAllocationError::CeilingExceeded
+            ))
+        ));
+        assert_eq!(operation.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn capture_redaction_rejects_foreign_operation_and_releases_input() {
+        let redaction = activate(plan(profile(None))).unwrap();
+        let profile = redaction.profile("main").unwrap();
+        let pool = capture_pool(&redaction, 8 * 1024 * 1024);
+        let owner = pool.try_admit().expect("owner admission");
+        let foreign = pool.try_admit().expect("foreign admission");
+        let original = capture_body(&owner, b"literal");
+
+        assert!(matches!(
+            profile.redact_capture_decoded_http_body(&foreign, original),
+            Err(SnapshotError::CaptureBody(
+                CaptureAllocationError::ForeignAuthority
+            ))
+        ));
+        assert_eq!(owner.charged_bytes(), 0);
+        assert_eq!(foreign.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
     }
 
     #[test]

@@ -47,6 +47,75 @@ pub(crate) struct ExactAllocationLease<A: AllocationAuthority> {
     bytes: usize,
 }
 
+pub(crate) struct StableExactBytes<A: AllocationAuthority> {
+    authority: A,
+    storage: Option<FallibleBox<[u8]>>,
+    charged_bytes: usize,
+}
+
+impl<A: AllocationAuthority> StableExactBytes<A> {
+    pub(crate) fn try_zeroed(authority: A, len: usize) -> Result<Self, A::Error> {
+        let mut charge = ExactAllocationLease::try_new(authority.clone(), len)?;
+        #[cfg(test)]
+        if authority.take_allocation_failure() {
+            return Err(A::allocation_error());
+        }
+        let mut storage =
+            FallibleBox::<[u8]>::try_new_uninit_slice(len).map_err(|_| A::allocation_error())?;
+        for byte in storage.iter_mut() {
+            byte.write(0);
+        }
+        let storage = unsafe { storage.assume_init() };
+        Ok(Self {
+            authority,
+            storage: Some(storage),
+            charged_bytes: charge.commit(),
+        })
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.charged_bytes
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.charged_bytes == 0
+    }
+
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        self.storage.as_deref().expect("exact byte storage exists")
+    }
+
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.storage
+            .as_deref_mut()
+            .expect("exact byte storage exists")
+    }
+
+    pub(crate) fn belongs_to(&self, authority: &A) -> bool {
+        self.authority.is_same(authority)
+    }
+}
+
+impl<A: AllocationAuthority> fmt::Debug for StableExactBytes<A> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("StableExactBytes")
+            .field("len", &self.charged_bytes)
+            .finish()
+    }
+}
+
+impl<A: AllocationAuthority> Drop for StableExactBytes<A> {
+    fn drop(&mut self) {
+        if let Some(storage) = self.storage.as_deref_mut() {
+            storage.zeroize();
+        }
+        drop(self.storage.take());
+        self.authority
+            .release(std::mem::take(&mut self.charged_bytes));
+    }
+}
+
 impl<A: AllocationAuthority> ExactAllocationLease<A> {
     pub(crate) fn try_new(authority: A, bytes: usize) -> Result<Self, A::Error> {
         authority.try_charge(bytes)?;
@@ -333,6 +402,48 @@ impl<A: AllocationAuthority> StableBody<A> {
 
     pub(crate) fn belongs_to(&self, authority: &A) -> bool {
         self.authority.is_same(authority)
+    }
+
+    pub(crate) fn truncate(&mut self, new_len: usize) {
+        if new_len >= self.len {
+            return;
+        }
+        let retained_charge = body_allocation_bytes(new_len)
+            .expect("a smaller stable body has a representable allocation layout");
+        let released_charge = self
+            .charged_bytes
+            .checked_sub(retained_charge)
+            .expect("stable body charge covers its retained layout");
+
+        if new_len == 0 {
+            drop_secret_chain(self.head.take());
+        } else {
+            let mut remaining = new_len;
+            let mut current = self
+                .head
+                .as_deref_mut()
+                .expect("a nonempty stable body has a head chunk");
+            loop {
+                if remaining < current.initialized {
+                    current.bytes[remaining..current.initialized].zeroize();
+                    current.initialized = remaining;
+                    drop_secret_chain(current.next.take());
+                    break;
+                }
+                remaining -= current.initialized;
+                if remaining == 0 {
+                    drop_secret_chain(current.next.take());
+                    break;
+                }
+                current = current
+                    .next
+                    .as_deref_mut()
+                    .expect("retained length is covered by stable body chunks");
+            }
+        }
+        self.len = new_len;
+        self.charged_bytes = retained_charge;
+        self.authority.release(released_charge);
     }
 
     pub(crate) fn current_chunk(&self, offset: usize) -> &[u8] {

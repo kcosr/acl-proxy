@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::SystemTime;
 
-use base64::{engine::general_purpose, Engine as _};
+use base64::{encoded_len as base64_encoded_len, engine::general_purpose, Engine as _};
 use fs2::FileExt;
 use once_cell::sync::Lazy;
 use serde::ser::SerializeStruct;
@@ -15,9 +15,21 @@ use serde_json::Value as JsonValue;
 
 use crate::config::{CaptureConfig, Config};
 use crate::filesystem::create_private_dir_all;
-use crate::sensitive::redact_url_for_sink;
+use crate::http_body::{
+    decode_capture_http_body, decode_capture_websocket_permessage_deflate, CaptureContentEncoding,
+    CaptureHttpDecodeError,
+};
+use crate::observation::{
+    CaptureAllocationError, CaptureBody as OwnedCaptureBody, CaptureEpoch, CaptureEvent,
+    CaptureExactBytes, CaptureOperation,
+};
+use crate::redaction::{PayloadClass, SnapshotError as RedactionSnapshotError};
+use crate::sensitive::{is_sensitive_header_name, redact_url_for_sink, REDACTED};
 
 mod worker;
+
+pub(crate) use worker::CaptureWorkerStartError;
+use worker::{BoundedCaptureWorker, CaptureSubmitError as WorkerSubmitError};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -185,6 +197,376 @@ pub struct CaptureRecord {
     pub provider_replacement_size: Option<usize>,
 }
 
+pub(crate) struct CaptureArtifactBody {
+    total_len: usize,
+    stored_len: usize,
+    data: CaptureExactBytes,
+    content_type: Option<String>,
+    content_encoding: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CaptureArtifactBodyError {
+    #[error("capture base64 length overflow")]
+    LengthOverflow,
+    #[error("capture base64 allocation failed")]
+    Allocation(#[from] CaptureAllocationError),
+    #[error("capture base64 encoding failed")]
+    Encode(#[source] std::io::Error),
+}
+
+pub(crate) struct CaptureArtifactJob {
+    operation: CaptureOperation,
+    epoch: Arc<CaptureEpoch>,
+    metadata: SanitizedCaptureMetadata,
+    payload: CaptureArtifactPayload,
+    max_expansion_ratio: usize,
+}
+
+struct SanitizedCaptureMetadata {
+    record: CaptureRecord,
+}
+
+impl SanitizedCaptureMetadata {
+    fn from_record(mut record: CaptureRecord) -> Self {
+        record.url = redact_url_for_sink(&record.url);
+        if let Some(headers) = record.headers.as_mut() {
+            for (name, value) in headers {
+                if is_sensitive_header_name(name) {
+                    *value = JsonValue::String(REDACTED.to_owned());
+                }
+            }
+        }
+        Self { record }
+    }
+}
+
+enum CaptureArtifactPayload {
+    Unavailable,
+    Http {
+        encoded: OwnedCaptureBody,
+        encoding: CaptureContentEncoding,
+        content_type: Option<String>,
+        content_encoding_present: bool,
+    },
+    WebSocket {
+        encoded: OwnedCaptureBody,
+        compressed: bool,
+        class: PayloadClass,
+    },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CaptureArtifactJobError {
+    #[error("capture metadata already contains a body outcome")]
+    MetadataAlreadyHasBodyOutcome,
+    #[error("capture payload belongs to another operation")]
+    ForeignBody(#[from] CaptureAllocationError),
+}
+
+#[derive(Debug, thiserror::Error)]
+enum CaptureArtifactProcessError {
+    #[error("capture HTTP decode omitted the payload")]
+    HttpDecode(#[from] CaptureHttpDecodeError),
+    #[error("capture redaction omitted the payload")]
+    Redaction(#[from] RedactionSnapshotError),
+    #[error("capture artifact encoding omitted the payload")]
+    Artifact(#[from] CaptureArtifactBodyError),
+    #[error("capture WebSocket compression is not enabled by the selected profile")]
+    UnsupportedWebSocketCompression,
+}
+
+pub(crate) struct CaptureArtifactWorker {
+    worker: BoundedCaptureWorker<CaptureArtifactJob>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CaptureArtifactSubmitError {
+    Full,
+    Closed,
+}
+
+impl CaptureArtifactJob {
+    pub(crate) fn try_begin(
+        epoch: Arc<CaptureEpoch>,
+        event: CaptureEvent,
+        metadata: CaptureRecord,
+        max_expansion_ratio: usize,
+    ) -> Result<Option<Self>, CaptureArtifactJobError> {
+        if metadata.body.is_some() || metadata.body_truncated.is_some() {
+            return Err(CaptureArtifactJobError::MetadataAlreadyHasBodyOutcome);
+        }
+        let Some(operation) = epoch.capture().and_then(|policy| policy.try_admit(event)) else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            operation,
+            epoch,
+            metadata: SanitizedCaptureMetadata::from_record(metadata),
+            payload: CaptureArtifactPayload::Unavailable,
+            max_expansion_ratio,
+        }))
+    }
+
+    pub(crate) fn operation(&self) -> &CaptureOperation {
+        &self.operation
+    }
+
+    pub(crate) fn complete_http_body(
+        &mut self,
+        encoded: OwnedCaptureBody,
+        encoding: CaptureContentEncoding,
+        content_type: Option<String>,
+        content_encoding_present: bool,
+    ) -> Result<(), CaptureArtifactJobError> {
+        self.operation.validate_body(&encoded)?;
+        if self.metadata.record.provider_replacement_omitted.is_some()
+            || self.metadata.record.provider_replacement_size.is_some()
+        {
+            return Err(CaptureArtifactJobError::MetadataAlreadyHasBodyOutcome);
+        }
+        self.payload = CaptureArtifactPayload::Http {
+            encoded,
+            encoding,
+            content_type,
+            content_encoding_present,
+        };
+        Ok(())
+    }
+
+    pub(crate) fn omit_body(&mut self) {
+        self.payload = CaptureArtifactPayload::Unavailable;
+    }
+
+    pub(crate) fn complete_websocket_message(
+        &mut self,
+        encoded: OwnedCaptureBody,
+        compressed: bool,
+        class: PayloadClass,
+    ) -> Result<(), CaptureArtifactJobError> {
+        self.operation.validate_body(&encoded)?;
+        if self.metadata.record.provider_replacement_omitted.is_some()
+            || self.metadata.record.provider_replacement_size.is_some()
+        {
+            return Err(CaptureArtifactJobError::MetadataAlreadyHasBodyOutcome);
+        }
+        self.payload = CaptureArtifactPayload::WebSocket {
+            encoded,
+            compressed,
+            class,
+        };
+        Ok(())
+    }
+
+    fn process(mut self) {
+        let body = self.process_body().map_err(|error| {
+            tracing::debug!(error = %error, "capture payload omitted during artifact processing");
+            error
+        });
+        let Some(policy) = self.epoch.capture() else {
+            return;
+        };
+        let result = match body {
+            Ok(Some(body)) => {
+                write_borrowed_capture_record(policy.sink(), &self.metadata.record, &body)
+            }
+            Ok(None) | Err(_) => write_capture_record(policy.sink(), &self.metadata.record),
+        };
+        if let Err(error) = result {
+            tracing::warn!(error = %error, "capture artifact write failed");
+        }
+    }
+
+    fn process_body(&mut self) -> Result<Option<CaptureArtifactBody>, CaptureArtifactProcessError> {
+        let payload = std::mem::replace(&mut self.payload, CaptureArtifactPayload::Unavailable);
+        let Some(policy) = self.epoch.capture() else {
+            return Ok(None);
+        };
+        match payload {
+            CaptureArtifactPayload::Unavailable => Ok(None),
+            CaptureArtifactPayload::Http {
+                encoded,
+                encoding,
+                content_type,
+                content_encoding_present,
+            } => {
+                let decoded = decode_capture_http_body(
+                    encoding,
+                    encoded,
+                    &self.operation,
+                    policy.profile(),
+                    self.max_expansion_ratio,
+                )?;
+                let redacted = policy
+                    .profile()
+                    .redact_capture_decoded_http_body(&self.operation, decoded)?;
+                let body = CaptureArtifactBody::encode(
+                    &self.operation,
+                    redacted.body,
+                    policy.max_body_bytes(),
+                    content_type,
+                    content_encoding_present.then(|| "identity".to_owned()),
+                )?;
+                Ok(Some(body))
+            }
+            CaptureArtifactPayload::WebSocket {
+                encoded,
+                compressed,
+                class,
+            } => {
+                let limits = policy.profile().limits();
+                let decoded = if compressed {
+                    if !limits.allow_permessage_deflate {
+                        return Err(CaptureArtifactProcessError::UnsupportedWebSocketCompression);
+                    }
+                    decode_capture_websocket_permessage_deflate(
+                        encoded,
+                        &self.operation,
+                        limits.max_message_bytes,
+                    )?
+                } else {
+                    encoded
+                };
+                let redacted = policy.profile().redact_capture_websocket_message(
+                    &self.operation,
+                    decoded,
+                    class,
+                )?;
+                let body = CaptureArtifactBody::encode(
+                    &self.operation,
+                    redacted.body,
+                    policy.max_body_bytes(),
+                    None,
+                    None,
+                )?;
+                Ok(Some(body))
+            }
+        }
+    }
+}
+
+impl CaptureArtifactWorker {
+    pub(crate) fn start(capacity: usize) -> Result<Self, CaptureWorkerStartError> {
+        Ok(Self {
+            worker: BoundedCaptureWorker::start(capacity, CaptureArtifactJob::process)?,
+        })
+    }
+
+    pub(crate) fn try_submit(
+        &self,
+        job: CaptureArtifactJob,
+    ) -> Result<(), CaptureArtifactSubmitError> {
+        self.worker.try_submit(job).map_err(|error| match error {
+            WorkerSubmitError::Full(_) => CaptureArtifactSubmitError::Full,
+            WorkerSubmitError::Closed(_) => CaptureArtifactSubmitError::Closed,
+        })
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        self.worker.begin_shutdown();
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.worker.shutdown().await;
+    }
+}
+
+impl CaptureArtifactBody {
+    pub(crate) fn encode(
+        operation: &CaptureOperation,
+        mut body: OwnedCaptureBody,
+        max_body_bytes: usize,
+        content_type: Option<String>,
+        content_encoding: Option<String>,
+    ) -> Result<Self, CaptureArtifactBodyError> {
+        operation.validate_body(&body)?;
+        let total_len = body.len();
+        body.truncate(max_body_bytes.min(total_len));
+        let stored_len = body.len();
+        let encoded_len =
+            base64_encoded_len(stored_len, true).ok_or(CaptureArtifactBodyError::LengthOverflow)?;
+        let mut data = operation.exact_bytes(encoded_len)?;
+        {
+            let output = data.as_mut_slice();
+            let mut encoder = base64::write::EncoderWriter::new(output, &general_purpose::STANDARD);
+            for segment in body.segments() {
+                encoder
+                    .write_all(segment)
+                    .map_err(CaptureArtifactBodyError::Encode)?;
+            }
+            let remaining = encoder.finish().map_err(CaptureArtifactBodyError::Encode)?;
+            debug_assert!(remaining.is_empty(), "checked base64 length is exact");
+        }
+        drop(body);
+        Ok(Self {
+            total_len,
+            stored_len,
+            data,
+            content_type,
+            content_encoding,
+        })
+    }
+
+    pub(crate) fn total_len(&self) -> usize {
+        self.total_len
+    }
+
+    pub(crate) fn data(&self) -> &str {
+        std::str::from_utf8(self.data.as_slice()).expect("base64 output is ASCII")
+    }
+
+    pub(crate) fn is_truncated(&self) -> bool {
+        self.stored_len < self.total_len
+    }
+}
+
+#[derive(Serialize)]
+struct BorrowedCaptureArtifactBody<'a> {
+    encoding: &'static str,
+    length: usize,
+    data: &'a str,
+    #[serde(rename = "contentType", skip_serializing_if = "Option::is_none")]
+    content_type: Option<&'a str>,
+    #[serde(rename = "contentEncoding", skip_serializing_if = "Option::is_none")]
+    content_encoding: Option<&'a str>,
+}
+
+struct BorrowedCaptureArtifactRecord<'a> {
+    metadata: &'a CaptureRecord,
+    body: &'a CaptureArtifactBody,
+}
+
+impl Serialize for BorrowedCaptureArtifactRecord<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if self.metadata.body.is_some()
+            || self.metadata.body_truncated.is_some()
+            || self.metadata.provider_replacement_omitted.is_some()
+            || self.metadata.provider_replacement_size.is_some()
+        {
+            return Err(serde::ser::Error::custom(
+                "capture artifact metadata already contains a body outcome",
+            ));
+        }
+        let body = BorrowedCaptureArtifactBody {
+            encoding: "base64",
+            length: self.body.total_len,
+            data: self.body.data(),
+            content_type: self.body.content_type.as_deref(),
+            content_encoding: self.body.content_encoding.as_deref(),
+        };
+        let mut state = serializer.serialize_struct("CaptureRecord", 15)?;
+        serialize_capture_metadata(&mut state, self.metadata)?;
+        state.serialize_field("body", &body)?;
+        if self.body.is_truncated() {
+            state.serialize_field("bodyTruncated", &true)?;
+        }
+        state.end()
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CaptureRecordInvariantError {
     #[error("bodyTruncated must be present only as true for a shorter base64 body prefix")]
@@ -328,29 +710,7 @@ impl Serialize for CaptureRecord {
         self.validate_invariants()
             .map_err(serde::ser::Error::custom)?;
         let mut state = serializer.serialize_struct("CaptureRecord", 18)?;
-        state.serialize_field("timestamp", &self.timestamp)?;
-        state.serialize_field("requestId", &self.request_id)?;
-        state.serialize_field("kind", &self.kind)?;
-        state.serialize_field("decision", &self.decision)?;
-        state.serialize_field("mode", &self.mode)?;
-        state.serialize_field("url", &self.url)?;
-        state.serialize_field("method", &self.method)?;
-        if let Some(value) = &self.status_code {
-            state.serialize_field("statusCode", value)?;
-        }
-        if let Some(value) = &self.status_message {
-            state.serialize_field("statusMessage", value)?;
-        }
-        state.serialize_field("client", &self.client)?;
-        if let Some(value) = &self.target {
-            state.serialize_field("target", value)?;
-        }
-        if let Some(value) = &self.http_version {
-            state.serialize_field("httpVersion", value)?;
-        }
-        if let Some(value) = &self.headers {
-            state.serialize_field("headers", value)?;
-        }
+        serialize_capture_metadata(&mut state, self)?;
         if let Some(value) = &self.body {
             state.serialize_field("body", value)?;
         }
@@ -365,6 +725,36 @@ impl Serialize for CaptureRecord {
         }
         state.end()
     }
+}
+
+fn serialize_capture_metadata<S>(state: &mut S, record: &CaptureRecord) -> Result<(), S::Error>
+where
+    S: SerializeStruct,
+{
+    state.serialize_field("timestamp", &record.timestamp)?;
+    state.serialize_field("requestId", &record.request_id)?;
+    state.serialize_field("kind", &record.kind)?;
+    state.serialize_field("decision", &record.decision)?;
+    state.serialize_field("mode", &record.mode)?;
+    state.serialize_field("url", &record.url)?;
+    state.serialize_field("method", &record.method)?;
+    if let Some(value) = &record.status_code {
+        state.serialize_field("statusCode", value)?;
+    }
+    if let Some(value) = &record.status_message {
+        state.serialize_field("statusMessage", value)?;
+    }
+    state.serialize_field("client", &record.client)?;
+    if let Some(value) = &record.target {
+        state.serialize_field("target", value)?;
+    }
+    if let Some(value) = &record.http_version {
+        state.serialize_field("httpVersion", value)?;
+    }
+    if let Some(value) = &record.headers {
+        state.serialize_field("headers", value)?;
+    }
+    Ok(())
 }
 
 impl<'de> Deserialize<'de> for CaptureRecord {
@@ -711,7 +1101,27 @@ pub fn write_capture_record(
     sink: &CaptureSinkSpec,
     record: &CaptureRecord,
 ) -> Result<PathBuf, CaptureError> {
-    let requested_path = resolve_capture_path(sink, record);
+    write_capture_value(sink, record, record)
+}
+
+fn write_borrowed_capture_record(
+    sink: &CaptureSinkSpec,
+    metadata: &CaptureRecord,
+    body: &CaptureArtifactBody,
+) -> Result<PathBuf, CaptureError> {
+    write_capture_value(
+        sink,
+        metadata,
+        &BorrowedCaptureArtifactRecord { metadata, body },
+    )
+}
+
+fn write_capture_value<T: Serialize>(
+    sink: &CaptureSinkSpec,
+    naming_record: &CaptureRecord,
+    value: &T,
+) -> Result<PathBuf, CaptureError> {
+    let requested_path = resolve_capture_path(sink, naming_record);
     let directory = requested_path.parent().unwrap_or_else(|| Path::new("."));
     create_private_dir_all(directory).map_err(|source| CaptureError::CreateDir {
         path: directory.to_path_buf(),
@@ -754,7 +1164,7 @@ pub fn write_capture_record(
             path: requested_path.clone(),
             source,
         })?;
-    if let Err(error) = write_capture_artifact(&mut temp_file, record) {
+    if let Err(error) = write_capture_artifact(&mut temp_file, value) {
         drop(temp_file);
         let _ = fs::remove_file(&temp_path);
         return Err(match error {
@@ -791,11 +1201,11 @@ enum CaptureArtifactWriteError {
     Io(std::io::Error),
 }
 
-fn write_capture_artifact(
+fn write_capture_artifact<T: Serialize>(
     file: &mut File,
-    record: &CaptureRecord,
+    value: &T,
 ) -> Result<(), CaptureArtifactWriteError> {
-    serde_json::to_writer(&mut *file, record).map_err(CaptureArtifactWriteError::Serialize)?;
+    serde_json::to_writer(&mut *file, value).map_err(CaptureArtifactWriteError::Serialize)?;
     file.write_all(b"\n")
         .map_err(CaptureArtifactWriteError::Io)?;
     sync_capture_file(file).map_err(CaptureArtifactWriteError::Io)
@@ -999,8 +1409,18 @@ fn sync_capture_file(file: &File) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use crate::config::compiler::{
+        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledLogLevel,
+        CompiledRedactionPayloads, ObservationPlan, PolicyDecisionLoggingPlan, RedactionPlan,
+        RedactionProfilePlan, RedactionRulePlan, ReloadableLoggingPlan,
+    };
     use crate::config::Config as AppConfig;
+    use crate::observation::{CapturePool, ProductObservationSnapshot};
+    use crate::redaction::RedactionSnapshot;
+    use crate::runtime::GenerationOwner;
 
     fn minimal_config_with_capture() -> AppConfig {
         let toml = r#"
@@ -1067,6 +1487,260 @@ default = "deny"
             body_truncated: None,
             provider_replacement_omitted: None,
             provider_replacement_size: None,
+        }
+    }
+
+    fn capture_engine_epoch(
+        directory: &Path,
+        max_body_bytes: usize,
+        allow_permessage_deflate: bool,
+    ) -> (
+        Arc<crate::observation::CaptureEpoch>,
+        Arc<dyn GenerationOwner>,
+    ) {
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "capture".to_owned(),
+            RedactionProfilePlan {
+                replacement: b"REDACTED".to_vec(),
+                max_body_bytes: 1024,
+                max_decoded_body_bytes: 1024,
+                max_frame_bytes: 1024,
+                max_message_bytes: 1024,
+                allow_permessage_deflate,
+                max_environment_literal_sources: 0,
+                max_environment_literal_bytes: 0,
+                max_environment_literal_total_bytes: 0,
+                rules: vec![RedactionRulePlan {
+                    literals: vec![b"secret".to_vec()],
+                    literal_environment_variables: Vec::new(),
+                    expressions: Vec::new(),
+                    payloads: CompiledRedactionPayloads::Both,
+                }],
+            },
+        );
+        let redaction = RedactionSnapshot::activate(RedactionPlan { profiles }, || false)
+            .expect("redaction activation");
+        let pool = CapturePool::new();
+        let activation = ProductObservationSnapshot::activate(
+            ObservationPlan {
+                logging: ReloadableLoggingPlan {
+                    level: CompiledLogLevel::Info,
+                    policy_decisions: PolicyDecisionLoggingPlan {
+                        allows: false,
+                        denies: false,
+                        allow_level: CompiledLogLevel::Info,
+                        deny_level: CompiledLogLevel::Warn,
+                    },
+                },
+                capture: Some(CapturePlan {
+                    events: vec![
+                        CompiledCaptureEvent::RequestAllowed,
+                        CompiledCaptureEvent::ResponseAllowed,
+                    ],
+                    redaction_profile: "capture".to_owned(),
+                    sink: CaptureSinkSpec::new(
+                        directory.to_path_buf(),
+                        "{requestId}-{suffix}.json".to_owned(),
+                        16,
+                        1024 * 1024,
+                    )
+                    .expect("capture sink"),
+                    max_body_bytes,
+                    max_inflight_body_bytes: 1024 * 1024,
+                    working_set: CaptureWorkingSetPlan::default(),
+                }),
+            },
+            &redaction,
+            pool.clone(),
+        )
+        .expect("observation activation");
+        let (_snapshot, owner) = activation.into_parts();
+        owner
+            .publication_guard()
+            .expect("capture publication")
+            .commit();
+        (pool.current_epoch(), owner)
+    }
+
+    fn operation_body(job: &CaptureArtifactJob, bytes: &[u8]) -> OwnedCaptureBody {
+        let mut body = job.operation().body_buffer();
+        body.try_extend_from_slice(bytes).expect("capture body");
+        body.finish()
+    }
+
+    fn read_only_capture_record(directory: &Path) -> CaptureRecord {
+        let mut records = fs::read_dir(directory)
+            .expect("capture directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 1, "one capture artifact must be published");
+        let bytes = fs::read(records.pop().unwrap()).expect("capture artifact");
+        serde_json::from_slice(&bytes).expect("valid capture artifact")
+    }
+
+    #[tokio::test]
+    async fn artifact_worker_redacts_before_truncation_and_base64_serialization() {
+        let directory = tempfile::tempdir().unwrap();
+        let (epoch, _owner) = capture_engine_epoch(directory.path(), 5, false);
+        let mut job = CaptureArtifactJob::try_begin(
+            epoch,
+            crate::observation::CaptureEvent::RequestAllowed,
+            sample_record_with_body(None),
+            16,
+        )
+        .unwrap()
+        .expect("capture admission");
+        let encoded = operation_body(&job, b"AAsecretBB");
+        job.complete_http_body(encoded, CaptureContentEncoding::Identity, None, false)
+            .unwrap();
+
+        let worker = CaptureArtifactWorker::start(1).unwrap();
+        worker.try_submit(job).unwrap();
+        worker.shutdown().await;
+
+        let record = read_only_capture_record(directory.path());
+        assert_eq!(record.decode_body_bytes().unwrap(), b"AARED");
+        assert_eq!(record.body.as_ref().unwrap().length, 12);
+        assert_eq!(record.body_truncated, Some(true));
+        assert!(!fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read(entry.path()).ok())
+            .any(|bytes| bytes
+                .windows(b"secret".len())
+                .any(|window| window == b"secret")));
+    }
+
+    #[tokio::test]
+    async fn artifact_worker_emits_metadata_only_when_http_decode_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let (epoch, _owner) = capture_engine_epoch(directory.path(), 1024, false);
+        let mut job = CaptureArtifactJob::try_begin(
+            epoch,
+            crate::observation::CaptureEvent::RequestAllowed,
+            sample_record_with_body(None),
+            16,
+        )
+        .unwrap()
+        .expect("capture admission");
+        let encoded = operation_body(&job, b"not-a-gzip-stream");
+        job.complete_http_body(encoded, CaptureContentEncoding::Gzip, None, true)
+            .unwrap();
+
+        let worker = CaptureArtifactWorker::start(1).unwrap();
+        worker.try_submit(job).unwrap();
+        worker.shutdown().await;
+
+        let record = read_only_capture_record(directory.path());
+        assert!(record.body.is_none());
+        assert!(record.body_truncated.is_none());
+    }
+
+    #[tokio::test]
+    async fn artifact_worker_redacts_complete_websocket_text_messages() {
+        let directory = tempfile::tempdir().unwrap();
+        let (epoch, _owner) = capture_engine_epoch(directory.path(), 1024, false);
+        let mut metadata = sample_record_with_body(None);
+        metadata.request_id = "websocket".to_owned();
+        let mut job = CaptureArtifactJob::try_begin(
+            epoch,
+            crate::observation::CaptureEvent::ResponseAllowed,
+            metadata,
+            16,
+        )
+        .unwrap()
+        .expect("capture admission");
+        let encoded = operation_body(&job, b"before secret after");
+        job.complete_websocket_message(encoded, false, PayloadClass::Text)
+            .unwrap();
+
+        let worker = CaptureArtifactWorker::start(1).unwrap();
+        worker.try_submit(job).unwrap();
+        worker.shutdown().await;
+
+        let record = read_only_capture_record(directory.path());
+        assert_eq!(
+            record.decode_body_bytes().unwrap(),
+            b"before REDACTED after"
+        );
+        assert_eq!(record.body_truncated, None);
+    }
+
+    #[tokio::test]
+    async fn artifact_worker_sanitizes_metadata_at_the_queue_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let (epoch, _owner) = capture_engine_epoch(directory.path(), 1024, false);
+        let mut metadata = sample_record_with_body(None);
+        metadata.request_id = "credential-metadata".to_owned();
+        metadata.url =
+            "https://alice:url-password@example.com/path?token=query-secret#fragment".to_owned();
+        metadata.headers = Some(HeaderMap::from([
+            (
+                "Authorization".to_owned(),
+                JsonValue::String("Bearer authorization-secret".to_owned()),
+            ),
+            (
+                "COOKIE".to_owned(),
+                JsonValue::Array(vec![JsonValue::String("session=cookie-secret".to_owned())]),
+            ),
+            (
+                "content-type".to_owned(),
+                JsonValue::String("text/plain".to_owned()),
+            ),
+        ]));
+        let job = CaptureArtifactJob::try_begin(
+            epoch,
+            crate::observation::CaptureEvent::RequestAllowed,
+            metadata,
+            16,
+        )
+        .unwrap()
+        .expect("capture admission");
+
+        let worker = CaptureArtifactWorker::start(1).unwrap();
+        worker.try_submit(job).unwrap();
+        worker.shutdown().await;
+
+        let record = read_only_capture_record(directory.path());
+        assert_eq!(record.url, "https://example.com/path?REDACTED");
+        let headers = record.headers.as_ref().unwrap();
+        assert_eq!(
+            headers.get("Authorization"),
+            Some(&JsonValue::String(REDACTED.to_owned()))
+        );
+        assert_eq!(
+            headers.get("COOKIE"),
+            Some(&JsonValue::String(REDACTED.to_owned()))
+        );
+        assert_eq!(
+            headers.get("content-type"),
+            Some(&JsonValue::String("text/plain".to_owned()))
+        );
+        let artifact = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .and_then(|path| fs::read(path).ok())
+            .expect("persisted capture artifact");
+        for secret in [
+            b"url-password".as_slice(),
+            b"query-secret".as_slice(),
+            b"authorization-secret".as_slice(),
+            b"cookie-secret".as_slice(),
+        ] {
+            assert!(!artifact
+                .windows(secret.len())
+                .any(|window| window == secret));
         }
     }
 

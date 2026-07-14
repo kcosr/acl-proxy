@@ -1,6 +1,10 @@
 use std::ffi::c_void;
+use std::future::Future;
 use std::mem::{size_of, MaybeUninit};
+use std::pin::pin;
 use std::ptr;
+use std::sync::Arc;
+use std::task::{Context, Poll, Wake, Waker};
 
 use bytes::Buf;
 use http::header::{HeaderMap, CONTENT_ENCODING, TRAILER};
@@ -10,9 +14,18 @@ use miniz_oxide::{DataFormat, MZFlush, MZStatus};
 use tokio::time::Instant;
 
 use crate::config::compiler::HttpBodyReadLimits;
+use crate::observation::{
+    CaptureBody, CaptureBodyBuilder, CaptureOperation, CaptureScratch, CaptureWorkspace,
+    CaptureWorkspaceAllocation,
+};
+use crate::redaction::ProfileHandle;
+use crate::safety::allocation::{
+    AllocationAuthority, StableBody, StableBodyBuilder, StableScratch, StableWorkspace,
+    StableWorkspaceAllocation,
+};
 use crate::safety::wire_body::{
-    GuardedBodyBuilder, GuardedBodySegments, GuardedScratch, GuardedWorkspace, WireBodyBufferError,
-    MAX_BUFFER_GROWTH_BYTES,
+    GuardedBodyBuilder, GuardedBodySegments, GuardedScratch, GuardedWorkspaceAllocation,
+    WireAllocationAuthority, WireBodyBufferError, MAX_BUFFER_GROWTH_BYTES,
 };
 use crate::safety::{GuardedBody, HttpWireBodyGuard};
 
@@ -48,6 +61,8 @@ const ZSTD_LIBRARY_WINDOW_LOG_MAX: u32 = if usize::BITS == 32 {
 const CONTENT_DECODING_FLOOR_BYTES: usize = MIB;
 const ARENA_ALIGNMENT: usize = 16;
 const ZSTD_FRAME_HEADER_MAX_BYTES: usize = zstd_sys::ZSTD_FRAMEHEADERSIZE_MAX as usize;
+const WEBSOCKET_DEFLATE_SCRATCH_BYTES: usize = 64 * 1024;
+const PERMESSAGE_DEFLATE_TAIL: &[u8] = &[0x00, 0x00, 0xff, 0xff];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HttpDecoderWorkspaceSizes {
@@ -105,12 +120,75 @@ pub(crate) fn zstd_window_limit() -> Option<usize> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ContentEncoding {
+pub(crate) enum CaptureContentEncoding {
     Identity,
     Gzip,
     Deflate,
     Brotli,
     Zstd,
+}
+
+type ContentEncoding = CaptureContentEncoding;
+
+trait DecodeContext {
+    type Authority: AllocationAuthority + Send + Sync;
+
+    fn validate_body(&self, body: &StableBody<Self::Authority>) -> Result<(), HttpBodyReadError>;
+    fn body_buffer(&self) -> StableBodyBuilder<Self::Authority>;
+    fn scratch(&self) -> Result<StableScratch<Self::Authority>, HttpBodyReadError>;
+    fn workspace_allocation(
+        &self,
+        bytes: usize,
+    ) -> Result<StableWorkspaceAllocation<Self::Authority>, HttpBodyReadError>;
+}
+
+impl DecodeContext for HttpWireBodyGuard {
+    type Authority = WireAllocationAuthority;
+
+    fn validate_body(&self, body: &GuardedBody) -> Result<(), HttpBodyReadError> {
+        HttpWireBodyGuard::validate_body(self, body).map_err(Into::into)
+    }
+
+    fn body_buffer(&self) -> GuardedBodyBuilder {
+        self.buffer()
+    }
+
+    fn scratch(&self) -> Result<GuardedScratch, HttpBodyReadError> {
+        self.stream_scratch().map_err(Into::into)
+    }
+
+    fn workspace_allocation(
+        &self,
+        bytes: usize,
+    ) -> Result<GuardedWorkspaceAllocation, HttpBodyReadError> {
+        self.codec_workspace_allocation(bytes).map_err(Into::into)
+    }
+}
+
+impl DecodeContext for CaptureOperation {
+    type Authority = crate::observation::CaptureAllocationAuthority;
+
+    fn validate_body(&self, body: &CaptureBody) -> Result<(), HttpBodyReadError> {
+        CaptureOperation::validate_body(self, body)
+            .map_err(|_| HttpBodyReadError::ResourceExhausted)
+    }
+
+    fn body_buffer(&self) -> CaptureBodyBuilder {
+        self.body_buffer()
+    }
+
+    fn scratch(&self) -> Result<CaptureScratch, HttpBodyReadError> {
+        self.scratch()
+            .map_err(|_| HttpBodyReadError::ResourceExhausted)
+    }
+
+    fn workspace_allocation(
+        &self,
+        bytes: usize,
+    ) -> Result<CaptureWorkspaceAllocation, HttpBodyReadError> {
+        self.workspace_allocation(bytes)
+            .map_err(|_| HttpBodyReadError::ResourceExhausted)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,6 +256,46 @@ pub(crate) enum HttpBodyReadError {
     ResourceExhausted,
 }
 
+/// Sanitized capture-only outcome. Every variant omits the observed payload;
+/// none is allowed to affect the wire request or response.
+#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum CaptureHttpDecodeError {
+    #[error("capture payload content encoding is unsupported")]
+    UnsupportedContentEncoding,
+    #[error("capture payload uses stacked content encodings")]
+    StackedContentEncoding,
+    #[error("capture payload exceeds the encoded profile limit")]
+    EncodedLimitExceeded,
+    #[error("capture payload exceeds the decoded profile limit")]
+    DecodedLimitExceeded,
+    #[error("capture payload exceeds the content-decoding expansion ratio")]
+    ExpansionRatioExceeded,
+    #[error("capture payload content encoding is invalid")]
+    InvalidContentEncoding,
+    #[error("capture payload content-encoding window is too large")]
+    DecoderWindowExceeded,
+    #[error("capture payload resources are exhausted")]
+    ResourceExhausted,
+}
+
+impl From<HttpBodyReadError> for CaptureHttpDecodeError {
+    fn from(error: HttpBodyReadError) -> Self {
+        match error {
+            HttpBodyReadError::UnsupportedContentEncoding => Self::UnsupportedContentEncoding,
+            HttpBodyReadError::StackedContentEncoding => Self::StackedContentEncoding,
+            HttpBodyReadError::EncodedLimitExceeded => Self::EncodedLimitExceeded,
+            HttpBodyReadError::DecodedLimitExceeded => Self::DecodedLimitExceeded,
+            HttpBodyReadError::ExpansionRatioExceeded => Self::ExpansionRatioExceeded,
+            HttpBodyReadError::InvalidContentEncoding => Self::InvalidContentEncoding,
+            HttpBodyReadError::DecoderWindowExceeded => Self::DecoderWindowExceeded,
+            HttpBodyReadError::ReadFailed
+            | HttpBodyReadError::RequestTrailersUnsupported
+            | HttpBodyReadError::TimedOut
+            | HttpBodyReadError::ResourceExhausted => Self::ResourceExhausted,
+        }
+    }
+}
+
 impl From<WireBodyBufferError> for HttpBodyReadError {
     fn from(_: WireBodyBufferError) -> Self {
         Self::ResourceExhausted
@@ -192,23 +310,54 @@ fn check_deadline(deadline: Instant) -> Result<(), HttpBodyReadError> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct DecodeControl {
+    deadline: Option<Instant>,
+}
+
+impl DecodeControl {
+    fn wire(deadline: Instant) -> Self {
+        Self {
+            deadline: Some(deadline),
+        }
+    }
+
+    fn capture() -> Self {
+        Self { deadline: None }
+    }
+
+    fn check(self) -> Result<(), HttpBodyReadError> {
+        self.deadline.map_or(Ok(()), check_deadline)
+    }
+
+    async fn checkpoint(self) -> Result<(), HttpBodyReadError> {
+        self.check()?;
+        if self.deadline.is_some() {
+            tokio::task::yield_now().await;
+        } else {
+            std::thread::yield_now();
+        }
+        self.check()
+    }
+}
+
 async fn cooperative_checkpoint(deadline: Instant) -> Result<(), HttpBodyReadError> {
     check_deadline(deadline)?;
     tokio::task::yield_now().await;
     check_deadline(deadline)
 }
 
-async fn allocate_codec_workspace(
-    guard: &HttpWireBodyGuard,
+async fn allocate_codec_workspace<C: DecodeContext>(
+    guard: &C,
     bytes: usize,
-    deadline: Instant,
-) -> Result<GuardedWorkspace, HttpBodyReadError> {
-    check_deadline(deadline)?;
-    let mut allocation = guard.codec_workspace_allocation(bytes)?;
+    control: DecodeControl,
+) -> Result<StableWorkspace<C::Authority>, HttpBodyReadError> {
+    control.check()?;
+    let mut allocation = guard.workspace_allocation(bytes)?;
     while !allocation.is_initialized() {
-        check_deadline(deadline)?;
+        control.check()?;
         allocation.initialize_next(MAX_BUFFER_GROWTH_BYTES);
-        cooperative_checkpoint(deadline).await?;
+        control.checkpoint().await?;
     }
     Ok(allocation.finish())
 }
@@ -271,14 +420,211 @@ where
     }
 
     let encoded = encoded.finish();
+    let encoded_len = encoded.len();
+    let decoded = decode_complete_http_body(
+        encoding,
+        encoded,
+        guard,
+        limits.max_decoded_bytes(),
+        max_expansion_ratio,
+        DecodeControl::wire(deadline),
+    )
+    .await?;
+    Ok(GuardedRequestBody {
+        encoded_len,
+        body: decoded,
+    })
+}
+
+pub(crate) fn decode_capture_http_body(
+    encoding: CaptureContentEncoding,
+    encoded: CaptureBody,
+    operation: &CaptureOperation,
+    profile: &ProfileHandle,
+    max_expansion_ratio: usize,
+) -> Result<CaptureBody, CaptureHttpDecodeError> {
+    poll_capture_decode(decode_capture_http_body_inner(
+        encoding,
+        encoded,
+        operation,
+        profile,
+        max_expansion_ratio,
+    ))
+}
+
+async fn decode_capture_http_body_inner(
+    encoding: CaptureContentEncoding,
+    encoded: CaptureBody,
+    operation: &CaptureOperation,
+    profile: &ProfileHandle,
+    max_expansion_ratio: usize,
+) -> Result<CaptureBody, CaptureHttpDecodeError> {
+    operation
+        .validate_body(&encoded)
+        .map_err(|_| CaptureHttpDecodeError::ResourceExhausted)?;
+    let limits = profile.limits();
+    if encoded.len() > limits.max_body_bytes {
+        return Err(CaptureHttpDecodeError::EncodedLimitExceeded);
+    }
+    decode_complete_http_body(
+        encoding,
+        encoded,
+        operation,
+        limits.max_decoded_body_bytes,
+        max_expansion_ratio,
+        DecodeControl::capture(),
+    )
+    .await
+    .map_err(Into::into)
+}
+
+pub(crate) fn parse_capture_content_encoding(
+    headers: &HeaderMap,
+) -> Result<CaptureContentEncoding, CaptureHttpDecodeError> {
+    parse_content_encoding(headers).map_err(Into::into)
+}
+
+pub(crate) fn decode_capture_websocket_permessage_deflate(
+    encoded: CaptureBody,
+    operation: &CaptureOperation,
+    max_message_bytes: usize,
+) -> Result<CaptureBody, CaptureHttpDecodeError> {
+    poll_capture_decode(decode_capture_websocket_permessage_deflate_inner(
+        encoded,
+        operation,
+        max_message_bytes,
+    ))
+}
+
+async fn decode_capture_websocket_permessage_deflate_inner(
+    encoded: CaptureBody,
+    operation: &CaptureOperation,
+    max_message_bytes: usize,
+) -> Result<CaptureBody, CaptureHttpDecodeError> {
+    operation
+        .validate_body(&encoded)
+        .map_err(|_| CaptureHttpDecodeError::ResourceExhausted)?;
+    if encoded.len() > max_message_bytes {
+        return Err(CaptureHttpDecodeError::EncodedLimitExceeded);
+    }
+
+    let control = DecodeControl::capture();
+    let mut session = CaptureWebSocketInflateSession::new(operation, control).await?;
+    let mut cursor = EncodedCursor::with_suffix(&encoded, PERMESSAGE_DEFLATE_TAIL)?;
+    let mut output = operation.body_buffer();
+    let mut decoded = 0usize;
+    loop {
+        control.check()?;
+        let (result, output_bytes, output_capacity) = session.inflate(cursor.current());
+        cursor.advance(result.bytes_consumed)?;
+        decoded = decoded
+            .checked_add(output_bytes.len())
+            .filter(|decoded| *decoded <= max_message_bytes)
+            .ok_or(CaptureHttpDecodeError::DecodedLimitExceeded)?;
+        output
+            .try_extend_from_slice(output_bytes)
+            .map_err(|_| CaptureHttpDecodeError::ResourceExhausted)?;
+
+        match result.status {
+            Ok(MZStatus::StreamEnd) if cursor.is_end() => break,
+            Ok(MZStatus::Ok) if cursor.is_end() && output_bytes.len() < output_capacity => break,
+            Ok(MZStatus::Ok) => {
+                if result.bytes_consumed == 0 && output_bytes.is_empty() {
+                    return Err(CaptureHttpDecodeError::InvalidContentEncoding);
+                }
+            }
+            Ok(MZStatus::NeedDict) | Err(_) => {
+                return Err(CaptureHttpDecodeError::InvalidContentEncoding)
+            }
+            Ok(MZStatus::StreamEnd) => return Err(CaptureHttpDecodeError::InvalidContentEncoding),
+        }
+        control.checkpoint().await?;
+    }
+    drop(session);
+    drop(encoded);
+    Ok(output.finish())
+}
+
+fn poll_capture_decode<F: Future>(future: F) -> F::Output {
+    struct CaptureDecodeWake;
+
+    impl Wake for CaptureDecodeWake {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    let waker = Waker::from(Arc::new(CaptureDecodeWake));
+    let mut context = Context::from_waker(&waker);
+    let mut future = pin!(future);
+    loop {
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => return output,
+            Poll::Pending => std::thread::yield_now(),
+        }
+    }
+}
+
+struct CaptureWebSocketInflateSession {
+    state: *mut InflateState,
+    output_offset: usize,
+    workspace: CaptureWorkspace,
+}
+
+unsafe impl Send for CaptureWebSocketInflateSession {}
+
+impl CaptureWebSocketInflateSession {
+    async fn new(
+        operation: &CaptureOperation,
+        control: DecodeControl,
+    ) -> Result<Self, CaptureHttpDecodeError> {
+        let mut workspace =
+            allocate_codec_workspace(operation, WEBSOCKET_DEFLATE_SCRATCH_BYTES, control)
+                .await
+                .map_err(CaptureHttpDecodeError::from)?;
+        let output_offset = align_up(size_of::<InflateState>(), std::mem::align_of::<u128>())
+            .filter(|offset| *offset < workspace.len())
+            .ok_or(CaptureHttpDecodeError::ResourceExhausted)?;
+        if !(workspace.as_mut_ptr() as usize).is_multiple_of(std::mem::align_of::<InflateState>()) {
+            return Err(CaptureHttpDecodeError::ResourceExhausted);
+        }
+        let state = workspace.as_mut_ptr().cast::<InflateState>();
+        unsafe { state.write(InflateState::new(DataFormat::Raw)) };
+        Ok(Self {
+            state,
+            output_offset,
+            workspace,
+        })
+    }
+
+    fn inflate(&mut self, input: &[u8]) -> (miniz_oxide::StreamResult, &[u8], usize) {
+        let output = &mut self.workspace.as_mut_bytes()[self.output_offset..];
+        let capacity = output.len();
+        let result = inflate(unsafe { &mut *self.state }, input, output, MZFlush::Sync);
+        (result, &output[..result.bytes_written], capacity)
+    }
+}
+
+impl Drop for CaptureWebSocketInflateSession {
+    fn drop(&mut self) {
+        unsafe { ptr::drop_in_place(self.state) };
+        self.state = ptr::null_mut();
+        self.workspace.reset();
+    }
+}
+
+async fn decode_complete_http_body<C: DecodeContext>(
+    encoding: ContentEncoding,
+    encoded: StableBody<C::Authority>,
+    context: &C,
+    max_decoded: usize,
+    max_expansion_ratio: usize,
+    control: DecodeControl,
+) -> Result<StableBody<C::Authority>, HttpBodyReadError> {
+    context.validate_body(&encoded)?;
     if encoding == ContentEncoding::Identity {
-        if encoded.len() > limits.max_decoded_bytes() {
+        if encoded.len() > max_decoded {
             return Err(HttpBodyReadError::DecodedLimitExceeded);
         }
-        return Ok(GuardedRequestBody {
-            encoded_len: encoded.len(),
-            body: encoded,
-        });
+        return Ok(encoded);
     }
 
     let workspace_sizes =
@@ -288,54 +634,50 @@ where
         ContentEncoding::Gzip => {
             decode_gzip(
                 &encoded,
-                guard,
+                context,
                 workspace_sizes.deflate,
-                limits.max_decoded_bytes(),
+                max_decoded,
                 max_expansion_ratio,
-                deadline,
+                control,
             )
             .await?
         }
         ContentEncoding::Deflate => {
             decode_deflate(
                 &encoded,
-                guard,
+                context,
                 workspace_sizes.deflate,
-                limits.max_decoded_bytes(),
+                max_decoded,
                 max_expansion_ratio,
-                deadline,
+                control,
             )
             .await?
         }
         ContentEncoding::Brotli => {
             decode_brotli(
                 &encoded,
-                guard,
+                context,
                 workspace_sizes.brotli,
-                limits.max_decoded_bytes(),
+                max_decoded,
                 max_expansion_ratio,
-                deadline,
+                control,
             )
             .await?
         }
         ContentEncoding::Zstd => {
             decode_zstd(
                 &encoded,
-                guard,
+                context,
                 workspace_sizes.zstd,
-                limits.max_decoded_bytes(),
+                max_decoded,
                 max_expansion_ratio,
-                deadline,
+                control,
             )
             .await?
         }
     };
-    let encoded_len = encoded.len();
     drop(encoded);
-    Ok(GuardedRequestBody {
-        encoded_len,
-        body: decoded,
-    })
+    Ok(decoded)
 }
 
 fn parse_content_encoding(headers: &HeaderMap) -> Result<ContentEncoding, HttpBodyReadError> {
@@ -375,10 +717,11 @@ struct EncodedCursor<'a> {
     offset: usize,
     consumed: usize,
     total: usize,
+    suffix: Option<&'static [u8]>,
 }
 
 impl<'a> EncodedCursor<'a> {
-    fn new(body: &'a GuardedBody) -> Self {
+    fn new<A: AllocationAuthority>(body: &'a StableBody<A>) -> Self {
         let mut segments = body.segments();
         let current = segments.next().unwrap_or_default();
         Self {
@@ -387,7 +730,24 @@ impl<'a> EncodedCursor<'a> {
             offset: 0,
             consumed: 0,
             total: body.len(),
+            suffix: None,
         }
+    }
+
+    fn with_suffix<A: AllocationAuthority>(
+        body: &'a StableBody<A>,
+        suffix: &'static [u8],
+    ) -> Result<Self, HttpBodyReadError> {
+        let mut cursor = Self::new(body);
+        cursor.total = cursor
+            .total
+            .checked_add(suffix.len())
+            .ok_or(HttpBodyReadError::InvalidContentEncoding)?;
+        cursor.suffix = Some(suffix);
+        if cursor.current.is_empty() {
+            cursor.current = cursor.suffix.take().unwrap_or_default();
+        }
+        Ok(cursor)
     }
 
     fn current(&self) -> &'a [u8] {
@@ -398,7 +758,11 @@ impl<'a> EncodedCursor<'a> {
         while bytes != 0 {
             let available = self.current.len().saturating_sub(self.offset);
             if available == 0 {
-                self.current = self.segments.next().unwrap_or_default();
+                self.current = self
+                    .segments
+                    .next()
+                    .or_else(|| self.suffix.take())
+                    .unwrap_or_default();
                 self.offset = 0;
                 if self.current.is_empty() {
                     return Err(HttpBodyReadError::InvalidContentEncoding);
@@ -414,7 +778,11 @@ impl<'a> EncodedCursor<'a> {
             bytes -= taken;
         }
         if self.offset == self.current.len() {
-            self.current = self.segments.next().unwrap_or_default();
+            self.current = self
+                .segments
+                .next()
+                .or_else(|| self.suffix.take())
+                .unwrap_or_default();
             self.offset = 0;
         }
         Ok(())
@@ -460,18 +828,18 @@ struct DecodeProgress {
     decoded: usize,
     max_decoded: usize,
     ratio: usize,
-    deadline: Instant,
+    control: DecodeControl,
 }
 
 impl DecodeProgress {
-    async fn emit(
+    async fn emit<A: AllocationAuthority>(
         &mut self,
         output: &[u8],
         encoded_consumed: usize,
-        builder: &mut GuardedBodyBuilder,
+        builder: &mut StableBodyBuilder<A>,
     ) -> Result<(), HttpBodyReadError> {
         if output.is_empty() {
-            return cooperative_checkpoint(self.deadline).await;
+            return self.control.checkpoint().await;
         }
         let next = validate_decoded_growth(
             self.decoded,
@@ -480,13 +848,15 @@ impl DecodeProgress {
             self.ratio,
             encoded_consumed,
         )?;
-        builder.try_extend_from_slice(output)?;
+        builder
+            .try_extend_from_slice(output)
+            .map_err(|_| HttpBodyReadError::ResourceExhausted)?;
         self.decoded = next;
-        cooperative_checkpoint(self.deadline).await
+        self.control.checkpoint().await
     }
 
     fn check_deadline(&self) -> Result<(), HttpBodyReadError> {
-        check_deadline(self.deadline)
+        self.control.check()
     }
 }
 
@@ -512,23 +882,23 @@ fn validate_decoded_growth(
     Ok(next)
 }
 
-struct InflateSession {
+struct InflateSession<A: AllocationAuthority> {
     state: *mut InflateState,
-    workspace: GuardedWorkspace,
+    workspace: StableWorkspace<A>,
 }
 
 // The pointer targets this session's heap-stable guarded workspace. Decoder
 // access is synchronous and exclusive even if the owning future moves threads.
-unsafe impl Send for InflateSession {}
+unsafe impl<A: AllocationAuthority + Send> Send for InflateSession<A> {}
 
-impl InflateSession {
-    async fn new(
-        guard: &HttpWireBodyGuard,
+impl<A: AllocationAuthority + Send + Sync> InflateSession<A> {
+    async fn new<C: DecodeContext<Authority = A>>(
+        guard: &C,
         workspace_bytes: usize,
         format: DataFormat,
-        deadline: Instant,
+        control: DecodeControl,
     ) -> Result<Self, HttpBodyReadError> {
-        let mut workspace = allocate_codec_workspace(guard, workspace_bytes, deadline).await?;
+        let mut workspace = allocate_codec_workspace(guard, workspace_bytes, control).await?;
         if workspace.len() < size_of::<InflateState>()
             || !(workspace.as_mut_ptr() as usize)
                 .is_multiple_of(std::mem::align_of::<InflateState>())
@@ -552,7 +922,7 @@ impl InflateSession {
     }
 }
 
-impl Drop for InflateSession {
+impl<A: AllocationAuthority> Drop for InflateSession<A> {
     fn drop(&mut self) {
         // InflateState owns no external allocation. Drop it before the backing
         // workspace is wiped and released.
@@ -561,11 +931,11 @@ impl Drop for InflateSession {
     }
 }
 
-async fn inflate_cursor(
+async fn inflate_cursor<A: AllocationAuthority + Send + Sync>(
     cursor: &mut EncodedCursor<'_>,
-    session: &mut InflateSession,
-    staging: &mut GuardedScratch,
-    output: &mut GuardedBodyBuilder,
+    session: &mut InflateSession<A>,
+    staging: &mut StableScratch<A>,
+    output: &mut StableBodyBuilder<A>,
     progress: &mut DecodeProgress,
     mut crc: Option<&mut crc32fast::Hasher>,
 ) -> Result<(), HttpBodyReadError> {
@@ -602,21 +972,21 @@ async fn inflate_cursor(
     }
 }
 
-async fn decode_deflate(
-    encoded: &GuardedBody,
-    guard: &HttpWireBodyGuard,
+async fn decode_deflate<C: DecodeContext>(
+    encoded: &StableBody<C::Authority>,
+    guard: &C,
     workspace_bytes: usize,
     max_decoded: usize,
     ratio: usize,
-    deadline: Instant,
-) -> Result<GuardedBody, HttpBodyReadError> {
+    control: DecodeControl,
+) -> Result<StableBody<C::Authority>, HttpBodyReadError> {
     match decode_deflate_attempt(
         encoded,
         guard,
         workspace_bytes,
         max_decoded,
         ratio,
-        deadline,
+        control,
         DataFormat::Zlib,
     )
     .await
@@ -628,7 +998,7 @@ async fn decode_deflate(
                 workspace_bytes,
                 max_decoded,
                 ratio,
-                deadline,
+                control,
                 DataFormat::Raw,
             )
             .await
@@ -637,27 +1007,27 @@ async fn decode_deflate(
     }
 }
 
-async fn decode_deflate_attempt(
-    encoded: &GuardedBody,
-    guard: &HttpWireBodyGuard,
+async fn decode_deflate_attempt<C: DecodeContext>(
+    encoded: &StableBody<C::Authority>,
+    guard: &C,
     workspace_bytes: usize,
     max_decoded: usize,
     ratio: usize,
-    deadline: Instant,
+    control: DecodeControl,
     format: DataFormat,
-) -> Result<GuardedBody, HttpBodyReadError> {
-    check_deadline(deadline)?;
+) -> Result<StableBody<C::Authority>, HttpBodyReadError> {
+    control.check()?;
     let mut cursor = EncodedCursor::new(encoded);
-    let mut output = guard.buffer();
+    let mut output = guard.body_buffer();
     let mut progress = DecodeProgress {
         decoded: 0,
         max_decoded,
         ratio,
-        deadline,
+        control,
     };
-    let mut session = InflateSession::new(guard, workspace_bytes, format, deadline).await?;
-    check_deadline(deadline)?;
-    let mut staging = guard.stream_scratch()?;
+    let mut session = InflateSession::new(guard, workspace_bytes, format, control).await?;
+    control.check()?;
+    let mut staging = guard.scratch()?;
     inflate_cursor(
         &mut cursor,
         &mut session,
@@ -673,31 +1043,30 @@ async fn decode_deflate_attempt(
     Ok(output.finish())
 }
 
-async fn decode_gzip(
-    encoded: &GuardedBody,
-    guard: &HttpWireBodyGuard,
+async fn decode_gzip<C: DecodeContext>(
+    encoded: &StableBody<C::Authority>,
+    guard: &C,
     workspace_bytes: usize,
     max_decoded: usize,
     ratio: usize,
-    deadline: Instant,
-) -> Result<GuardedBody, HttpBodyReadError> {
+    control: DecodeControl,
+) -> Result<StableBody<C::Authority>, HttpBodyReadError> {
     let mut cursor = EncodedCursor::new(encoded);
-    let mut output = guard.buffer();
+    let mut output = guard.body_buffer();
     let mut progress = DecodeProgress {
         decoded: 0,
         max_decoded,
         ratio,
-        deadline,
+        control,
     };
-    check_deadline(deadline)?;
-    let mut session =
-        InflateSession::new(guard, workspace_bytes, DataFormat::Raw, deadline).await?;
-    check_deadline(deadline)?;
-    let mut staging = guard.stream_scratch()?;
+    control.check()?;
+    let mut session = InflateSession::new(guard, workspace_bytes, DataFormat::Raw, control).await?;
+    control.check()?;
+    let mut staging = guard.scratch()?;
     let mut members = 0usize;
     while !cursor.is_end() {
         progress.check_deadline()?;
-        parse_gzip_header(&mut cursor, deadline).await?;
+        parse_gzip_header(&mut cursor, control).await?;
         let member_start = progress.decoded;
         let mut crc = crc32fast::Hasher::new();
         session.reset(DataFormat::Raw);
@@ -718,7 +1087,7 @@ async fn decode_gzip(
             return Err(HttpBodyReadError::InvalidContentEncoding);
         }
         members += 1;
-        cooperative_checkpoint(deadline).await?;
+        control.checkpoint().await?;
     }
     if members == 0 {
         return Err(HttpBodyReadError::InvalidContentEncoding);
@@ -728,9 +1097,9 @@ async fn decode_gzip(
 
 async fn parse_gzip_header(
     cursor: &mut EncodedCursor<'_>,
-    deadline: Instant,
+    control: DecodeControl,
 ) -> Result<(), HttpBodyReadError> {
-    check_deadline(deadline)?;
+    control.check()?;
     let mut header_crc = crc32fast::Hasher::new();
     let id1 = read_gzip_header_byte(cursor, &mut header_crc)?;
     let id2 = read_gzip_header_byte(cursor, &mut header_crc)?;
@@ -746,11 +1115,11 @@ async fn parse_gzip_header(
         let low = read_gzip_header_byte(cursor, &mut header_crc)?;
         let high = read_gzip_header_byte(cursor, &mut header_crc)?;
         let length = u16::from_le_bytes([low, high]) as usize;
-        read_gzip_header_bytes(cursor, &mut header_crc, length, deadline).await?;
+        read_gzip_header_bytes(cursor, &mut header_crc, length, control).await?;
     }
     for mask in [0x08, 0x10] {
         if flags & mask != 0 {
-            read_zero_terminated_gzip_header_field(cursor, &mut header_crc, deadline).await?;
+            read_zero_terminated_gzip_header_field(cursor, &mut header_crc, control).await?;
         }
     }
     if flags & 0x02 != 0 {
@@ -775,10 +1144,10 @@ async fn read_gzip_header_bytes(
     cursor: &mut EncodedCursor<'_>,
     crc: &mut crc32fast::Hasher,
     mut remaining: usize,
-    deadline: Instant,
+    control: DecodeControl,
 ) -> Result<(), HttpBodyReadError> {
     while remaining != 0 {
-        check_deadline(deadline)?;
+        control.check()?;
         let current = cursor.current();
         if current.is_empty() {
             return Err(HttpBodyReadError::InvalidContentEncoding);
@@ -787,7 +1156,7 @@ async fn read_gzip_header_bytes(
         crc.update(&current[..consumed]);
         cursor.advance(consumed)?;
         remaining -= consumed;
-        cooperative_checkpoint(deadline).await?;
+        control.checkpoint().await?;
     }
     Ok(())
 }
@@ -795,10 +1164,10 @@ async fn read_gzip_header_bytes(
 async fn read_zero_terminated_gzip_header_field(
     cursor: &mut EncodedCursor<'_>,
     crc: &mut crc32fast::Hasher,
-    deadline: Instant,
+    control: DecodeControl,
 ) -> Result<(), HttpBodyReadError> {
     loop {
-        check_deadline(deadline)?;
+        control.check()?;
         let current = cursor.current();
         if current.is_empty() {
             return Err(HttpBodyReadError::InvalidContentEncoding);
@@ -811,7 +1180,7 @@ async fn read_zero_terminated_gzip_header_field(
         let terminated = bounded[consumed - 1] == 0;
         crc.update(&bounded[..consumed]);
         cursor.advance(consumed)?;
-        cooperative_checkpoint(deadline).await?;
+        control.checkpoint().await?;
         if terminated {
             return Ok(());
         }
@@ -840,7 +1209,9 @@ struct BrotliArenaBlock {
     used: usize,
 }
 
-fn initialize_brotli_arena(workspace: &mut GuardedWorkspace) -> Option<*mut BrotliArenaState> {
+fn initialize_brotli_arena<A: AllocationAuthority>(
+    workspace: &mut StableWorkspace<A>,
+) -> Option<*mut BrotliArenaState> {
     let base = workspace.as_mut_ptr();
     let len = workspace.len();
     let first_block = align_up(size_of::<BrotliArenaState>(), ARENA_ALIGNMENT)?;
@@ -967,23 +1338,23 @@ fn coalesce_brotli_arena(arena: &mut BrotliArenaState) {
     }
 }
 
-struct BrotliSession {
+struct BrotliSession<A: AllocationAuthority> {
     state: *mut compu_brotli_sys::BrotliDecoderState,
     arena: *mut BrotliArenaState,
-    workspace: GuardedWorkspace,
+    workspace: StableWorkspace<A>,
 }
 
 // The C state and allocator metadata both live in the heap-stable guarded
 // workspace and are touched only by the owning future.
-unsafe impl Send for BrotliSession {}
+unsafe impl<A: AllocationAuthority + Send> Send for BrotliSession<A> {}
 
-impl BrotliSession {
-    async fn new(
-        guard: &HttpWireBodyGuard,
+impl<A: AllocationAuthority + Send + Sync> BrotliSession<A> {
+    async fn new<C: DecodeContext<Authority = A>>(
+        guard: &C,
         workspace_bytes: usize,
-        deadline: Instant,
+        control: DecodeControl,
     ) -> Result<Self, HttpBodyReadError> {
-        let mut workspace = allocate_codec_workspace(guard, workspace_bytes, deadline).await?;
+        let mut workspace = allocate_codec_workspace(guard, workspace_bytes, control).await?;
         let arena =
             initialize_brotli_arena(&mut workspace).ok_or(HttpBodyReadError::ResourceExhausted)?;
         let state = unsafe {
@@ -1019,7 +1390,7 @@ impl BrotliSession {
     }
 }
 
-impl Drop for BrotliSession {
+impl<A: AllocationAuthority> Drop for BrotliSession<A> {
     fn drop(&mut self) {
         unsafe { compu_brotli_sys::BrotliDecoderDestroyInstance(self.state) };
         self.state = ptr::null_mut();
@@ -1027,14 +1398,14 @@ impl Drop for BrotliSession {
     }
 }
 
-async fn decode_brotli(
-    encoded: &GuardedBody,
-    guard: &HttpWireBodyGuard,
+async fn decode_brotli<C: DecodeContext>(
+    encoded: &StableBody<C::Authority>,
+    guard: &C,
     workspace_bytes: usize,
     max_decoded: usize,
     ratio: usize,
-    deadline: Instant,
-) -> Result<GuardedBody, HttpBodyReadError> {
+    control: DecodeControl,
+) -> Result<StableBody<C::Authority>, HttpBodyReadError> {
     let first = EncodedCursor::new(encoded)
         .current()
         .first()
@@ -1048,17 +1419,17 @@ async fn decode_brotli(
         return Err(HttpBodyReadError::DecoderWindowExceeded);
     }
 
-    check_deadline(deadline)?;
-    let session = BrotliSession::new(guard, workspace_bytes, deadline).await?;
+    control.check()?;
+    let session = BrotliSession::new(guard, workspace_bytes, control).await?;
     let mut cursor = EncodedCursor::new(encoded);
-    check_deadline(deadline)?;
-    let mut staging = guard.stream_scratch()?;
-    let mut output = guard.buffer();
+    control.check()?;
+    let mut staging = guard.scratch()?;
+    let mut output = guard.body_buffer();
     let mut progress = DecodeProgress {
         decoded: 0,
         max_decoded,
         ratio,
-        deadline,
+        control,
     };
     loop {
         progress.check_deadline()?;
@@ -1129,22 +1500,22 @@ fn brotli_window_bits(first: u8) -> Result<u32, HttpBodyReadError> {
     }
 }
 
-struct ZstdSession {
+struct ZstdSession<A: AllocationAuthority> {
     stream: *mut zstd_sys::ZSTD_DStream,
-    workspace: GuardedWorkspace,
+    workspace: StableWorkspace<A>,
 }
 
 // The static DStream pointer targets the session's heap-stable guarded
 // workspace and is used exclusively by the owning future.
-unsafe impl Send for ZstdSession {}
+unsafe impl<A: AllocationAuthority + Send> Send for ZstdSession<A> {}
 
-impl ZstdSession {
-    async fn new(
-        guard: &HttpWireBodyGuard,
+impl<A: AllocationAuthority + Send + Sync> ZstdSession<A> {
+    async fn new<C: DecodeContext<Authority = A>>(
+        guard: &C,
         workspace_bytes: usize,
-        deadline: Instant,
+        control: DecodeControl,
     ) -> Result<Self, HttpBodyReadError> {
-        let mut workspace = allocate_codec_workspace(guard, workspace_bytes, deadline).await?;
+        let mut workspace = allocate_codec_workspace(guard, workspace_bytes, control).await?;
         let stream = unsafe {
             zstd_sys::ZSTD_initStaticDStream(
                 workspace.as_mut_ptr().cast::<c_void>(),
@@ -1170,7 +1541,7 @@ impl ZstdSession {
     }
 }
 
-impl Drop for ZstdSession {
+impl<A: AllocationAuthority> Drop for ZstdSession<A> {
     fn drop(&mut self) {
         // Static DStreams have no free call. Wiping their caller-owned backing
         // store destroys all state and history before the guard releases it.
@@ -1179,25 +1550,25 @@ impl Drop for ZstdSession {
     }
 }
 
-async fn decode_zstd(
-    encoded: &GuardedBody,
-    guard: &HttpWireBodyGuard,
+async fn decode_zstd<C: DecodeContext>(
+    encoded: &StableBody<C::Authority>,
+    guard: &C,
     workspace_bytes: usize,
     max_decoded: usize,
     ratio: usize,
-    deadline: Instant,
-) -> Result<GuardedBody, HttpBodyReadError> {
-    check_deadline(deadline)?;
-    let session = ZstdSession::new(guard, workspace_bytes, deadline).await?;
+    control: DecodeControl,
+) -> Result<StableBody<C::Authority>, HttpBodyReadError> {
+    control.check()?;
+    let session = ZstdSession::new(guard, workspace_bytes, control).await?;
     let mut cursor = EncodedCursor::new(encoded);
-    check_deadline(deadline)?;
-    let mut staging = guard.stream_scratch()?;
-    let mut output = guard.buffer();
+    control.check()?;
+    let mut staging = guard.scratch()?;
+    let mut output = guard.body_buffer();
     let mut progress = DecodeProgress {
         decoded: 0,
         max_decoded,
         ratio,
-        deadline,
+        control,
     };
     let window_limit = zstd_window_limit().ok_or(HttpBodyReadError::ResourceExhausted)?;
     let mut at_frame_start = true;
@@ -1242,7 +1613,7 @@ async fn decode_zstd(
         }
         if result == 0 {
             at_frame_start = true;
-            cooperative_checkpoint(deadline).await?;
+            control.checkpoint().await?;
         }
         if input_pos == 0 && output_pos == 0 {
             return Err(HttpBodyReadError::InvalidContentEncoding);
@@ -1279,18 +1650,28 @@ fn validate_zstd_frame_window(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::io::Write;
     use std::net::{IpAddr, Ipv4Addr};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
 
     use bytes::Bytes;
     use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
-    use flate2::Compression;
+    use flate2::{Compress, Compression, FlushCompress, Status};
     use http::HeaderValue;
     use hyper::Body;
     use tokio_stream::StreamExt;
 
+    use crate::capture::CaptureSinkSpec;
+    use crate::config::compiler::{
+        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledLogLevel,
+        CompiledRedactionPayloads, ObservationPlan, PolicyDecisionLoggingPlan, RedactionPlan,
+        RedactionProfilePlan, RedactionRulePlan, ReloadableLoggingPlan,
+    };
+    use crate::observation::{CapturePool, ProductObservationSnapshot};
+    use crate::redaction::RedactionSnapshot;
     use crate::safety::wire_body::{
         guarded_body_allocation_bytes, guarded_workspace_allocation_bytes, WireBodyPool,
         WireBodyQuotaKey,
@@ -1348,6 +1729,81 @@ mod tests {
         body.body.segments().flatten().copied().collect()
     }
 
+    fn capture_body_bytes(body: &CaptureBody) -> Vec<u8> {
+        body.segments().flatten().copied().collect()
+    }
+
+    fn capture_context(
+        limit: usize,
+        max_encoded: usize,
+        max_decoded: usize,
+    ) -> (CaptureOperation, ProfileHandle, Arc<CapturePool>) {
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "capture".to_owned(),
+            RedactionProfilePlan {
+                replacement: b"[REDACTED]".to_vec(),
+                max_body_bytes: max_encoded,
+                max_decoded_body_bytes: max_decoded,
+                max_frame_bytes: max_encoded,
+                max_message_bytes: max_decoded,
+                allow_permessage_deflate: false,
+                max_environment_literal_sources: 1,
+                max_environment_literal_bytes: 64,
+                max_environment_literal_total_bytes: 64,
+                rules: vec![RedactionRulePlan {
+                    literals: vec![b"secret".to_vec()],
+                    literal_environment_variables: Vec::new(),
+                    expressions: Vec::new(),
+                    payloads: CompiledRedactionPayloads::Both,
+                }],
+            },
+        );
+        let redaction = RedactionSnapshot::activate(RedactionPlan { profiles }, || false).unwrap();
+        let profile = redaction.profile("capture").unwrap();
+        let pool = CapturePool::new();
+        let activation = ProductObservationSnapshot::activate(
+            ObservationPlan {
+                logging: ReloadableLoggingPlan {
+                    level: CompiledLogLevel::Info,
+                    policy_decisions: PolicyDecisionLoggingPlan {
+                        allows: false,
+                        denies: true,
+                        allow_level: CompiledLogLevel::Info,
+                        deny_level: CompiledLogLevel::Warn,
+                    },
+                },
+                capture: Some(CapturePlan {
+                    events: vec![CompiledCaptureEvent::RequestDenied],
+                    redaction_profile: "capture".to_owned(),
+                    sink: CaptureSinkSpec::new(
+                        PathBuf::from("/capture-http-decode-tests"),
+                        "capture-{requestId}-{suffix}.json".to_owned(),
+                        1,
+                        1,
+                    )
+                    .unwrap(),
+                    max_body_bytes: max_decoded,
+                    max_inflight_body_bytes: limit,
+                    working_set: CaptureWorkingSetPlan::default(),
+                }),
+            },
+            &redaction,
+            pool.clone(),
+        )
+        .unwrap();
+        let (_, owner) = activation.into_parts();
+        owner.publication_guard().unwrap().commit();
+        let operation = pool.try_admit().unwrap();
+        (operation, profile, pool)
+    }
+
+    fn capture_body(operation: &CaptureOperation, bytes: &[u8]) -> CaptureBody {
+        let mut body = operation.body_buffer();
+        body.try_extend_from_slice(bytes).unwrap();
+        body.finish()
+    }
+
     fn gzip(input: &[u8]) -> Vec<u8> {
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(input).unwrap();
@@ -1364,6 +1820,20 @@ mod tests {
         let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(input).unwrap();
         encoder.finish().unwrap()
+    }
+
+    fn permessage_deflate(input: &[u8]) -> Vec<u8> {
+        let mut encoder = Compress::new(Compression::default(), false);
+        let mut output = Vec::with_capacity(input.len() + 64);
+        assert_eq!(
+            encoder
+                .compress_vec(input, &mut output, FlushCompress::Sync)
+                .unwrap(),
+            Status::Ok
+        );
+        assert!(output.ends_with(PERMESSAGE_DEFLATE_TAIL));
+        output.truncate(output.len() - PERMESSAGE_DEFLATE_TAIL.len());
+        output
     }
 
     fn brotli_with_window(input: &[u8], window_bits: u32) -> Vec<u8> {
@@ -1419,6 +1889,164 @@ mod tests {
         assert_eq!(large.brotli, small.brotli);
         assert_eq!(large.zstd, small.zstd);
         assert_eq!(large.maximum(), large.brotli);
+    }
+
+    #[test]
+    fn capture_content_encoding_is_parsed_before_queueing() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            parse_capture_content_encoding(&headers).unwrap(),
+            CaptureContentEncoding::Identity
+        );
+        headers.insert(CONTENT_ENCODING, HeaderValue::from_static("br"));
+        assert_eq!(
+            parse_capture_content_encoding(&headers).unwrap(),
+            CaptureContentEncoding::Brotli
+        );
+        headers.append(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+        assert_eq!(
+            parse_capture_content_encoding(&headers).unwrap_err(),
+            CaptureHttpDecodeError::StackedContentEncoding
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_identity_decode_transfers_input_without_copy() {
+        let bytes = b"identity capture body";
+        let charge = guarded_body_allocation_bytes(bytes.len()).unwrap();
+        let (operation, profile, pool) = capture_context(charge, bytes.len(), bytes.len());
+        let encoded = capture_body(&operation, bytes);
+        let pointer = encoded.segments().next().unwrap().as_ptr();
+        let charged = operation.charged_bytes();
+
+        let decoded = decode_capture_http_body(
+            CaptureContentEncoding::Identity,
+            encoded,
+            &operation,
+            &profile,
+            128,
+        )
+        .unwrap();
+
+        assert_eq!(decoded.segments().next().unwrap().as_ptr(), pointer);
+        assert_eq!(capture_body_bytes(&decoded), bytes);
+        assert_eq!(operation.charged_bytes(), charged);
+        drop(decoded);
+        assert_eq!(operation.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn capture_decode_supports_every_http_codec_with_exact_restoration() {
+        let plain = b"capture codec body".repeat(4096);
+        let sizes = http_decoder_workspace_sizes().unwrap();
+        let cases = [
+            (CaptureContentEncoding::Gzip, gzip(&plain), sizes.deflate),
+            (
+                CaptureContentEncoding::Deflate,
+                raw_deflate(&plain),
+                sizes.deflate,
+            ),
+            (CaptureContentEncoding::Brotli, brotli(&plain), sizes.brotli),
+            (CaptureContentEncoding::Zstd, zstd(&plain), sizes.zstd),
+        ];
+
+        for (encoding, encoded_bytes, workspace) in cases {
+            let limit = guarded_body_allocation_bytes(encoded_bytes.len()).unwrap()
+                + guarded_body_allocation_bytes(plain.len()).unwrap()
+                + guarded_body_allocation_bytes(HTTP_DECODER_OUTPUT_STAGING_BYTES).unwrap()
+                + guarded_workspace_allocation_bytes(workspace).unwrap();
+            let (operation, profile, pool) =
+                capture_context(limit, encoded_bytes.len(), plain.len());
+            let encoded = capture_body(&operation, &encoded_bytes);
+
+            let decoded = decode_capture_http_body(encoding, encoded, &operation, &profile, 128)
+                .unwrap_or_else(|error| panic!("encoding {encoding:?}: {error:?}"));
+            assert_eq!(capture_body_bytes(&decoded), plain, "{encoding:?}");
+            drop(decoded);
+            assert_eq!(operation.charged_bytes(), 0, "{encoding:?}");
+            assert_eq!(pool.used(), 0, "{encoding:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_decode_failures_restore_every_charge() {
+        let invalid = vec![0u8; 128];
+        let limit = compiled_peak(invalid.len(), 1024);
+        let (operation, profile, pool) = capture_context(limit, invalid.len(), 1024);
+        let encoded = capture_body(&operation, &invalid);
+        let error = decode_capture_http_body(
+            CaptureContentEncoding::Gzip,
+            encoded,
+            &operation,
+            &profile,
+            128,
+        )
+        .unwrap_err();
+        assert_eq!(error, CaptureHttpDecodeError::InvalidContentEncoding);
+        assert_eq!(operation.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
+
+        let input_charge = guarded_body_allocation_bytes(invalid.len()).unwrap();
+        let (operation, profile, pool) = capture_context(input_charge, invalid.len(), 1024);
+        let encoded = capture_body(&operation, &invalid);
+        let error = decode_capture_http_body(
+            CaptureContentEncoding::Gzip,
+            encoded,
+            &operation,
+            &profile,
+            128,
+        )
+        .unwrap_err();
+        assert_eq!(error, CaptureHttpDecodeError::ResourceExhausted);
+        assert_eq!(operation.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn capture_websocket_permessage_deflate_uses_one_bounded_scratch() {
+        let plain = b"websocket capture message".repeat(4096);
+        let encoded_bytes = permessage_deflate(&plain);
+        let limit = guarded_body_allocation_bytes(encoded_bytes.len()).unwrap()
+            + guarded_body_allocation_bytes(plain.len()).unwrap()
+            + guarded_workspace_allocation_bytes(WEBSOCKET_DEFLATE_SCRATCH_BYTES).unwrap();
+        let (operation, _profile, pool) = capture_context(limit, encoded_bytes.len(), plain.len());
+        let encoded = capture_body(&operation, &encoded_bytes);
+
+        let decoded =
+            decode_capture_websocket_permessage_deflate(encoded, &operation, plain.len()).unwrap();
+
+        assert_eq!(capture_body_bytes(&decoded), plain);
+        drop(decoded);
+        assert_eq!(operation.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn capture_websocket_deflate_failures_restore_every_charge() {
+        let plain = b"bounded websocket message".repeat(1024);
+        let encoded_bytes = permessage_deflate(&plain);
+        let limit = guarded_body_allocation_bytes(encoded_bytes.len()).unwrap()
+            + guarded_body_allocation_bytes(plain.len()).unwrap()
+            + guarded_workspace_allocation_bytes(WEBSOCKET_DEFLATE_SCRATCH_BYTES).unwrap();
+        let (operation, _profile, pool) = capture_context(limit, encoded_bytes.len(), plain.len());
+        let encoded = capture_body(&operation, &encoded_bytes);
+        let error =
+            decode_capture_websocket_permessage_deflate(encoded, &operation, plain.len() - 1)
+                .unwrap_err();
+        assert_eq!(error, CaptureHttpDecodeError::DecodedLimitExceeded);
+        assert_eq!(operation.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
+
+        let input_charge = guarded_body_allocation_bytes(encoded_bytes.len()).unwrap();
+        let (operation, _profile, pool) =
+            capture_context(input_charge, encoded_bytes.len(), plain.len());
+        let encoded = capture_body(&operation, &encoded_bytes);
+        let error = decode_capture_websocket_permessage_deflate(encoded, &operation, plain.len())
+            .unwrap_err();
+        assert_eq!(error, CaptureHttpDecodeError::ResourceExhausted);
+        assert_eq!(operation.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
     }
 
     #[test]
@@ -1740,8 +2368,12 @@ mod tests {
         let guard = pool.begin_for_test(charged, key());
         let observed_pool = pool.clone();
         let task = tokio::spawn(async move {
-            allocate_codec_workspace(&guard, requested, Instant::now() + Duration::from_secs(30))
-                .await
+            allocate_codec_workspace(
+                &guard,
+                requested,
+                DecodeControl::wire(Instant::now() + Duration::from_secs(30)),
+            )
+            .await
         });
         while observed_pool.global_charge() == 0 {
             tokio::task::yield_now().await;
@@ -1823,7 +2455,7 @@ mod tests {
             workspace_bytes,
             plain.len(),
             128,
-            Instant::now() + Duration::from_secs(5),
+            DecodeControl::wire(Instant::now() + Duration::from_secs(5)),
         )
         .await
         .unwrap_err();
@@ -2072,7 +2704,7 @@ mod tests {
                         sizes.deflate,
                         plain.len(),
                         128,
-                        Instant::now(),
+                        DecodeControl::wire(Instant::now()),
                     )
                     .await
                 }
@@ -2083,7 +2715,7 @@ mod tests {
                         sizes.deflate,
                         plain.len(),
                         128,
-                        Instant::now(),
+                        DecodeControl::wire(Instant::now()),
                     )
                     .await
                 }
@@ -2094,7 +2726,7 @@ mod tests {
                         sizes.brotli,
                         plain.len(),
                         128,
-                        Instant::now(),
+                        DecodeControl::wire(Instant::now()),
                     )
                     .await
                 }
@@ -2105,7 +2737,7 @@ mod tests {
                         sizes.zstd,
                         plain.len(),
                         128,
-                        Instant::now(),
+                        DecodeControl::wire(Instant::now()),
                     )
                     .await
                 }

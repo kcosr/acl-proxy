@@ -6,7 +6,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
-use crate::capture::CaptureSinkSpec;
+use crate::capture::{
+    CaptureArtifactJob, CaptureArtifactSubmitError, CaptureArtifactWorker, CaptureSinkSpec,
+    CaptureWorkerStartError,
+};
 use crate::config::compiler::{
     CapturePlan, CompiledCaptureEvent, CompiledLogLevel, ObservationPlan,
     PolicyDecisionLoggingPlan, ReloadableLoggingPlan,
@@ -16,9 +19,9 @@ use crate::runtime::{GenerationOwner, ObservationSnapshot, RedactionProfileIndex
 
 use capture::CaptureEpochUpdate;
 pub(crate) use capture::{
-    CaptureAllocationCharge, CaptureAllocationError, CaptureBody, CaptureBodyBuilder,
-    CaptureOperation, CapturePool, CaptureScratch, CaptureWorkspace, CaptureWorkspaceAllocation,
-    ReservedCaptureBodyBuilder,
+    CaptureAllocationAuthority, CaptureAllocationCharge, CaptureAllocationError, CaptureBody,
+    CaptureBodyBuilder, CaptureExactBytes, CaptureOperation, CapturePool, CaptureScratch,
+    CaptureWorkspace, CaptureWorkspaceAllocation, ReservedCaptureBodyBuilder,
 };
 
 /// Process-owned observation state shared by all candidate, active, and
@@ -27,13 +30,15 @@ pub(crate) use capture::{
 /// shared admission handles.
 pub(crate) struct ProductObservationRuntime {
     capture_pool: Arc<CapturePool>,
+    capture_worker: CaptureArtifactWorker,
 }
 
 impl ProductObservationRuntime {
-    pub(crate) fn new() -> Self {
-        Self {
+    pub(crate) fn try_new(max_pending_records: usize) -> Result<Self, CaptureWorkerStartError> {
+        Ok(Self {
             capture_pool: CapturePool::new(),
-        }
+            capture_worker: CaptureArtifactWorker::start(max_pending_records)?,
+        })
     }
 
     pub(crate) fn activate(
@@ -50,8 +55,21 @@ impl ProductObservationRuntime {
         self.capture_pool.current_epoch()
     }
 
+    pub(crate) fn try_submit_capture(
+        &self,
+        job: CaptureArtifactJob,
+    ) -> Result<(), CaptureArtifactSubmitError> {
+        self.capture_worker.try_submit(job)
+    }
+
     pub(crate) fn begin_shutdown(&self) {
         self.capture_pool.close();
+        self.capture_worker.begin_shutdown();
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.begin_shutdown();
+        self.capture_worker.shutdown().await;
     }
 
     #[cfg(test)]
@@ -349,6 +367,10 @@ impl CapturePolicy {
 
     pub(crate) fn profile(&self) -> &ProfileHandle {
         &self.profile
+    }
+
+    pub(crate) fn sink(&self) -> &CaptureSinkSpec {
+        &self.sink
     }
 
     pub(crate) fn directory(&self) -> &Path {
@@ -727,9 +749,9 @@ mod tests {
         drop(disabled_snapshot);
     }
 
-    #[test]
-    fn shutdown_disables_new_epochs_without_invalidating_a_lease() {
-        let runtime = ProductObservationRuntime::new();
+    #[tokio::test]
+    async fn shutdown_disables_new_epochs_without_invalidating_a_lease() {
+        let runtime = ProductObservationRuntime::try_new(1).expect("capture worker");
         let redaction = redaction([("profile", 8)]);
         let activation = runtime
             .activate(
@@ -747,11 +769,12 @@ mod tests {
         assert!(!runtime.current_capture_epoch().is_enabled());
         assert_eq!(runtime.committed_capture_limit(), 0);
         assert!(leased.is_enabled());
+        runtime.shutdown().await;
     }
 
-    #[test]
-    fn shutdown_closure_rejects_stale_candidate_and_old_epoch_zero_byte_admission() {
-        let runtime = ProductObservationRuntime::new();
+    #[tokio::test]
+    async fn shutdown_closure_rejects_stale_candidate_and_old_epoch_zero_byte_admission() {
+        let runtime = ProductObservationRuntime::try_new(1).expect("capture worker");
         let redaction = redaction([("profile", 8)]);
         let activation = runtime
             .activate(
@@ -780,6 +803,7 @@ mod tests {
             owner.publication_guard(),
             Err(RuntimeError::ShuttingDown)
         ));
+        runtime.shutdown().await;
     }
 
     #[test]

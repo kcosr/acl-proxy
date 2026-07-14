@@ -986,6 +986,35 @@ mod linked_tests {
         assert_eq!(pool.quota_charge(&quota_key), 0);
     }
 
+    #[test]
+    fn stable_body_truncation_wipes_tail_and_releases_exact_chunks() {
+        let three = allocation(3);
+        let two = allocation(2);
+        let pool = WireBodyPool::new(three, three);
+        let guard = pool.begin(three, key());
+        let mut builder = guard.buffer();
+        builder
+            .try_extend_from_slice(&vec![0xa5; 2 * MAX_BUFFER_GROWTH_BYTES + 17])
+            .unwrap();
+        let mut body = builder.finish();
+        assert_eq!(guard.live_bytes(), three);
+
+        body.truncate(MAX_BUFFER_GROWTH_BYTES + 9);
+        assert_eq!(body.len(), MAX_BUFFER_GROWTH_BYTES + 9);
+        assert_eq!(body.charged_bytes(), two);
+        assert_eq!(guard.live_bytes(), two);
+        assert_eq!(
+            body.segments().map(<[u8]>::len).collect::<Vec<_>>(),
+            [MAX_BUFFER_GROWTH_BYTES, 9]
+        );
+
+        body.truncate(0);
+        assert_eq!(body.len(), 0);
+        assert_eq!(body.charged_bytes(), 0);
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+    }
+
     #[tokio::test]
     async fn guarded_http_body_releases_consumed_chunks_without_copying() {
         let two = allocation(2);

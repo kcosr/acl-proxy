@@ -8,6 +8,7 @@ use crate::authorization::callback::PendingTerminalCause;
 use crate::authorization::webhook::runtime::{
     WebhookAuthorizationRuntime, WebhookAuthorizationRuntimeError,
 };
+use crate::capture::CaptureWorkerStartError;
 use crate::config::{StaticFingerprint, StaticFingerprintError, StaticProductConfig};
 use crate::control::server::{
     ControlServer, ControlServerError, ControlServerFailureObserver, ControlServerRunError,
@@ -100,10 +101,16 @@ impl ProductStaticResources {
             static_config.service.upgrade_relay_buffer_bytes,
             static_config.service.max_upgrade_lifetime,
         ))?;
+        let static_fingerprint = StaticFingerprint::from_config(static_config)?;
+        // Start the process-owned worker last so construction cannot return an
+        // error after a worker thread has been created.
+        let observation_runtime = Arc::new(ProductObservationRuntime::try_new(
+            static_config.capture.max_pending_records,
+        )?);
         Ok(Arc::new(Self {
             readiness: Arc::new(ServiceReadiness::new()),
             brand: StaticResourceBrand::new(),
-            static_fingerprint: StaticFingerprint::from_config(static_config)?,
+            static_fingerprint,
             shutdown_drain_timeout: static_config.service.shutdown_drain_timeout,
             shutdown_started: AtomicBool::new(false),
             shutdown_deadline: Mutex::new(None),
@@ -129,7 +136,7 @@ impl ProductStaticResources {
                     .service
                     .max_inflight_wire_body_bytes_per_quota_key,
             ),
-            observation_runtime: Arc::new(ProductObservationRuntime::new()),
+            observation_runtime,
             authorization_runtime,
             upgrade_runtime,
         }))
@@ -613,6 +620,7 @@ impl StaticResources for ProductStaticResources {
             self.proxy_shutdown
                 .get_or_init(|| self.shutdown_proxy_supervisors())
                 .await;
+            self.observation_runtime.shutdown().await;
         })
     }
 }
@@ -627,6 +635,8 @@ pub(crate) enum ProductStaticResourcesError {
     Authorization(#[from] WebhookAuthorizationRuntimeError),
     #[error("static upgrade runtime construction failed")]
     Upgrade(#[from] UpgradeRuntimeError),
+    #[error("static capture worker construction failed")]
+    CaptureWorker(#[from] CaptureWorkerStartError),
     #[error("control server construction failed")]
     Control(#[from] ControlServerError),
     #[error(transparent)]

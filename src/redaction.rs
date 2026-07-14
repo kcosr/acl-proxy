@@ -5,8 +5,8 @@ mod snapshot;
 
 #[allow(unused_imports)]
 pub(crate) use snapshot::{
-    GuardedRedactedPayload, PayloadClass, PayloadLimit, ProfileHandle, RedactedPayload,
-    RedactionActivation, RedactionLimits, RedactionSnapshot, SnapshotError,
+    CaptureRedactedPayload, GuardedRedactedPayload, PayloadClass, PayloadLimit, ProfileHandle,
+    RedactedPayload, RedactionActivation, RedactionLimits, RedactionSnapshot, SnapshotError,
 };
 
 #[derive(Debug, Clone)]

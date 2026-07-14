@@ -35,7 +35,7 @@ struct ShutdownCompletion {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum CaptureWorkerStartError {
+pub(crate) enum CaptureWorkerStartError {
     #[error("capture queue capacity must be at least one")]
     ZeroCapacity,
     #[error("failed to start capture worker: {0}")]

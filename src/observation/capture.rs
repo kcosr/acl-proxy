@@ -10,7 +10,7 @@ use super::CaptureEpoch;
 use crate::runtime::{BoxFuture, CleanupReason, GenerationOwner, PublicationGuard, RuntimeError};
 use crate::safety::allocation::{
     AllocationAuthority, ExactAllocationLease, ReservedStableBodyBuilder, StableBody,
-    StableBodyBuilder, StableScratch, StableWorkspace, StableWorkspaceAllocation,
+    StableBodyBuilder, StableExactBytes, StableScratch, StableWorkspace, StableWorkspaceAllocation,
 };
 
 struct PublishedCaptureState {
@@ -249,6 +249,7 @@ pub(crate) type CaptureAllocationCharge = ExactAllocationLease<CaptureAllocation
 pub(crate) type CaptureBodyBuilder = StableBodyBuilder<CaptureAllocationAuthority>;
 pub(crate) type ReservedCaptureBodyBuilder = ReservedStableBodyBuilder<CaptureAllocationAuthority>;
 pub(crate) type CaptureBody = StableBody<CaptureAllocationAuthority>;
+pub(crate) type CaptureExactBytes = StableExactBytes<CaptureAllocationAuthority>;
 pub(crate) type CaptureScratch = StableScratch<CaptureAllocationAuthority>;
 pub(crate) type CaptureWorkspace = StableWorkspace<CaptureAllocationAuthority>;
 pub(crate) type CaptureWorkspaceAllocation = StableWorkspaceAllocation<CaptureAllocationAuthority>;
@@ -284,6 +285,13 @@ impl CaptureOperation {
         CaptureScratch::try_new(self.authority.clone())
     }
 
+    pub(crate) fn exact_bytes(
+        &self,
+        len: usize,
+    ) -> Result<CaptureExactBytes, CaptureAllocationError> {
+        CaptureExactBytes::try_zeroed(self.authority.clone(), len)
+    }
+
     pub(crate) fn workspace_allocation(
         &self,
         bytes: usize,
@@ -293,6 +301,17 @@ impl CaptureOperation {
 
     pub(crate) fn validate_body(&self, body: &CaptureBody) -> Result<(), CaptureAllocationError> {
         if body.belongs_to(&self.authority) {
+            Ok(())
+        } else {
+            Err(CaptureAllocationError::ForeignAuthority)
+        }
+    }
+
+    pub(crate) fn validate_exact_bytes(
+        &self,
+        bytes: &CaptureExactBytes,
+    ) -> Result<(), CaptureAllocationError> {
+        if bytes.belongs_to(&self.authority) {
             Ok(())
         } else {
             Err(CaptureAllocationError::ForeignAuthority)
@@ -492,6 +511,7 @@ mod tests {
     use crate::safety::allocation::{
         body_allocation_bytes, workspace_allocation_bytes, MAX_BUFFER_GROWTH_BYTES,
     };
+    use base64::Engine as _;
 
     fn accounting_capture_activation(
         pool: Arc<CapturePool>,
@@ -752,6 +772,88 @@ mod tests {
         assert!(matches!(
             operation.workspace_allocation(17),
             Err(CaptureAllocationError::AllocationFailed)
+        ));
+        assert_eq!(operation.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn capture_exact_bytes_are_branded_and_restore_allocation_failures() {
+        let pool = enabled_pool(32);
+        let owner = try_admit_current(&pool).expect("owner");
+        let foreign = try_admit_current(&pool).expect("foreign operation");
+        let mut bytes = owner.exact_bytes(32).unwrap();
+        bytes.as_mut_slice().copy_from_slice(&[0xa5; 32]);
+
+        assert_eq!(bytes.len(), 32);
+        assert!(!bytes.is_empty());
+        assert_eq!(owner.validate_exact_bytes(&bytes), Ok(()));
+        assert_eq!(
+            foreign.validate_exact_bytes(&bytes),
+            Err(CaptureAllocationError::ForeignAuthority)
+        );
+        assert_eq!(owner.charged_bytes(), 32);
+        assert_eq!(pool.used(), 32);
+        drop(bytes);
+        assert_eq!(owner.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
+
+        pool.fail_next_allocation();
+        assert!(matches!(
+            owner.exact_bytes(32),
+            Err(CaptureAllocationError::AllocationFailed)
+        ));
+        assert_eq!(owner.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn capture_artifact_base64_uses_exact_charge_after_in_place_truncation() {
+        let payload_len = MAX_BUFFER_GROWTH_BYTES + 17;
+        let stored_len = MAX_BUFFER_GROWTH_BYTES + 1;
+        let encoded_len = base64::encoded_len(stored_len, true).unwrap();
+        let peak = body_allocation_bytes(payload_len).unwrap() + encoded_len;
+        let pool = enabled_pool(peak);
+        let operation = try_admit_current(&pool).expect("operation");
+        let payload = (0..payload_len)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut builder = operation.body_buffer();
+        builder.try_extend_from_slice(&payload).unwrap();
+        let body = builder.finish();
+
+        let artifact = crate::capture::CaptureArtifactBody::encode(
+            &operation,
+            body,
+            stored_len,
+            Some("application/octet-stream".to_owned()),
+            Some("identity".to_owned()),
+        )
+        .unwrap();
+
+        assert_eq!(artifact.total_len(), payload_len);
+        assert!(artifact.is_truncated());
+        assert_eq!(operation.charged_bytes(), encoded_len);
+        assert_eq!(pool.used(), encoded_len);
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(artifact.data())
+                .unwrap(),
+            payload[..stored_len]
+        );
+        drop(artifact);
+        assert_eq!(operation.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
+
+        let mut builder = operation.body_buffer();
+        builder.try_extend_from_slice(&payload).unwrap();
+        let body = builder.finish();
+        pool.fail_next_allocation();
+        assert!(matches!(
+            crate::capture::CaptureArtifactBody::encode(&operation, body, stored_len, None, None,),
+            Err(crate::capture::CaptureArtifactBodyError::Allocation(
+                CaptureAllocationError::AllocationFailed
+            ))
         ));
         assert_eq!(operation.charged_bytes(), 0);
         assert_eq!(pool.used(), 0);
