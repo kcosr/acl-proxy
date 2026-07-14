@@ -134,14 +134,14 @@ async fn wait_for_single_allow_capture_version_pair(
     panic!("expected one complete request/response capture pair for {context}; last seen {last_by_id:?}");
 }
 
-async fn wait_for_mixed_capture_pairs(
+async fn wait_for_two_capture_pairs(
     capture_dir: &Path,
 ) -> std::collections::HashMap<String, (CaptureDecision, usize, usize)> {
     use std::collections::HashMap;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{sleep, Duration, Instant};
 
-    let mut last_by_id = HashMap::new();
-    for _ in 0..40 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
         let mut by_id: HashMap<String, (CaptureDecision, usize, usize)> = HashMap::new();
         if capture_dir.is_dir() {
             for entry in std::fs::read_dir(capture_dir).expect("read capture dir") {
@@ -180,11 +180,11 @@ async fn wait_for_mixed_capture_pairs(
         {
             return by_id;
         }
-        last_by_id = by_id;
+        if Instant::now() >= deadline {
+            panic!("expected two complete capture pairs; last seen {by_id:?}");
+        }
         sleep(Duration::from_millis(50)).await;
     }
-
-    panic!("expected two complete mixed-decision capture pairs; last seen {last_by_id:?}");
 }
 
 async fn start_upstream_https_echo_server() -> SocketAddr {
@@ -2476,57 +2476,10 @@ async fn concurrent_h2_streams_share_connection_and_are_captured() {
     assert_eq!(String::from_utf8_lossy(&body_bytes1), "ok");
     assert_eq!(String::from_utf8_lossy(&body_bytes2), "ok");
 
-    // Ensure at least two capture files exist for HTTPS transparent traffic
-    // and that each logical stream has a unique requestId with both request
-    // and response records.
-    use tokio::time::{sleep, Duration};
-
+    // Wait until both logical streams have flushed complete request/response
+    // capture pairs rather than observing an intermediate file count.
     let capture_dir = temp_dir.path().join("captures");
-    for _ in 0..10 {
-        if capture_dir.is_dir() && capture_record_file_count(&capture_dir) >= 2 {
-            break;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-
-    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
-    let mut files = Vec::new();
-    while let Some(entry) = entries.next() {
-        let entry = entry.expect("dir entry");
-        if entry.file_type().expect("file type").is_file() {
-            files.push(entry.path());
-        }
-    }
-    assert!(
-        files.len() >= 2,
-        "expected at least two capture files for concurrent H2 streams"
-    );
-
-    let mut records = Vec::new();
-    for path in files {
-        let mut contents = String::new();
-        std::fs::File::open(&path)
-            .expect("open capture")
-            .read_to_string(&mut contents)
-            .expect("read capture");
-        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
-        assert_eq!(record.mode, CaptureMode::HttpsTransparent);
-        assert_eq!(record.decision, CaptureDecision::Allow);
-        records.push(record);
-    }
-
-    // We expect exactly two logical requestIds (one per stream), each with
-    // both a request and a response record.
-    use std::collections::HashMap;
-
-    let mut by_id: HashMap<String, (usize, usize)> = HashMap::new();
-    for rec in records {
-        let entry = by_id.entry(rec.request_id.clone()).or_insert((0, 0));
-        match rec.kind {
-            CaptureKind::Request => entry.0 += 1,
-            CaptureKind::Response => entry.1 += 1,
-        }
-    }
+    let by_id = wait_for_two_capture_pairs(&capture_dir).await;
 
     assert_eq!(
         by_id.len(),
@@ -2535,7 +2488,8 @@ async fn concurrent_h2_streams_share_connection_and_are_captured() {
         by_id.len()
     );
 
-    for (req_id, (req_count, res_count)) in by_id {
+    for (req_id, (decision, req_count, res_count)) in by_id {
+        assert_eq!(decision, CaptureDecision::Allow);
         assert!(
             req_count >= 1,
             "expected at least one request capture for {req_id}"
@@ -2685,7 +2639,7 @@ async fn concurrent_h2_streams_mixed_allow_and_deny() {
 
     // Inspect capture to ensure separate requestIds and per-stream decisions.
     let capture_dir = temp_dir.path().join("captures");
-    let by_id = wait_for_mixed_capture_pairs(&capture_dir).await;
+    let by_id = wait_for_two_capture_pairs(&capture_dir).await;
 
     let mut allow_seen = 0;
     let mut deny_seen = 0;

@@ -57,7 +57,7 @@ struct Inner {
     #[cfg(test)]
     cleanup_reasons: Mutex<Vec<CleanupReason>>,
     #[cfg(test)]
-    reader_assignment_gate: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    reader_correlation_gate: Mutex<Option<Arc<tokio::sync::Barrier>>>,
 }
 
 struct SpawnConfig {
@@ -75,6 +75,7 @@ struct ProcessState {
     retirement_deadline: Option<Instant>,
     epoch: u64,
     child: Option<Child>,
+    process_group_id: Option<u32>,
     writer: Option<Arc<AsyncMutex<ChildStdin>>>,
     cancellation: EpochCancellation,
 }
@@ -139,7 +140,8 @@ struct EpochCancellationInner {
 
 struct EpochReader {
     epoch: u64,
-    task: JoinHandle<()>,
+    task: Option<JoinHandle<()>>,
+    abort: tokio::task::AbortHandle,
 }
 
 enum SupervisorEvent {
@@ -149,6 +151,7 @@ enum SupervisorEvent {
 
 struct SpawnedChild {
     child: Child,
+    process_group_id: Option<u32>,
     stdin: ChildStdin,
     stdout: ChildStdout,
 }
@@ -252,7 +255,7 @@ impl ProcessProvider {
         check_cancellation(&mut is_cancelled)?;
         let spawned = spawn_child(&spawn).await?;
         if let Err(error) = check_cancellation(&mut is_cancelled) {
-            terminate_child(spawned.child).await;
+            terminate_child(spawned.child, spawned.process_group_id).await;
             return Err(error);
         }
 
@@ -275,6 +278,7 @@ impl ProcessProvider {
                 retirement_deadline: None,
                 epoch: 1,
                 child: Some(spawned.child),
+                process_group_id: spawned.process_group_id,
                 writer: None,
                 cancellation: EpochCancellation::new(),
             }),
@@ -295,7 +299,7 @@ impl ProcessProvider {
             #[cfg(test)]
             cleanup_reasons: Mutex::new(Vec::new()),
             #[cfg(test)]
-            reader_assignment_gate: Mutex::new(None),
+            reader_correlation_gate: Mutex::new(None),
         });
         install_io_tasks(&inner, 1, spawned.stdin, spawned.stdout);
         let supervisor_inner = inner.clone();
@@ -757,17 +761,24 @@ async fn spawn_child(config: &SpawnConfig) -> Result<SpawnedChild, ProcessActiva
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
     let mut child = command.spawn().map_err(|_| ProcessActivationError::Spawn)?;
+    #[cfg(unix)]
+    let process_group_id = child.id();
+    #[cfg(not(unix))]
+    let process_group_id = None;
     let Some(stdin) = child.stdin.take() else {
-        terminate_child(child).await;
+        terminate_child(child, process_group_id).await;
         return Err(ProcessActivationError::Spawn);
     };
     let Some(stdout) = child.stdout.take() else {
-        terminate_child(child).await;
+        terminate_child(child, process_group_id).await;
         return Err(ProcessActivationError::Spawn);
     };
     Ok(SpawnedChild {
         child,
+        process_group_id,
         stdin,
         stdout,
     })
@@ -789,9 +800,11 @@ fn install_io_tasks(inner: &Arc<Inner>, epoch: u64, stdin: ChildStdin, stdout: C
         }
         run_reader(reader_inner, epoch, stdout).await;
     });
+    let abort = reader_task.abort_handle();
     let previous = lock(&inner.reader).replace(EpochReader {
         epoch,
-        task: reader_task,
+        task: Some(reader_task),
+        abort,
     });
     debug_assert!(previous.is_none(), "process-provider reader was not joined");
     let _ = start.send(());
@@ -803,11 +816,19 @@ async fn run_reader(inner: Arc<Inner>, epoch: u64, stdout: ChildStdout) {
         let continuation =
             match read_provider_response_prefix(&mut stdout, inner.max_stdout_line_bytes).await {
                 Ok(Some(continuation)) => continuation,
+                Ok(None) if inner.clean_exit_reader_eof(epoch) => return,
                 Ok(None) | Err(_) => {
                     inner.report_fatal(epoch);
                     return;
                 }
             };
+        #[cfg(test)]
+        let correlation_gate = { lock(&inner.reader_correlation_gate).clone() };
+        #[cfg(test)]
+        if let Some(gate) = correlation_gate {
+            gate.wait().await;
+            gate.wait().await;
+        }
         let pending = inner.assign_pending_response(epoch, continuation.id());
         let Some(pending) = pending else {
             inner.report_fatal(epoch);
@@ -820,13 +841,6 @@ async fn run_reader(inner: Arc<Inner>, epoch: u64, stdout: ChildStdout) {
             &inner.response_schema,
         )
         .await;
-        #[cfg(test)]
-        let assignment_gate = { lock(&inner.reader_assignment_gate).clone() };
-        #[cfg(test)]
-        if let Some(gate) = assignment_gate {
-            gate.wait().await;
-            gate.wait().await;
-        }
         match parsed {
             Ok(response) => {
                 if let Some(error) = inner.assigned_delivery_error(epoch, pending.request_deadline)
@@ -879,7 +893,10 @@ impl From<DecisionOnlyProviderDecision> for ProcessDecision {
 impl Inner {
     fn assign_pending_response(&self, epoch: u64, id: &str) -> Option<PendingRequest> {
         let mut state = lock(&self.state);
-        if state.epoch != epoch || !state.available || state.reader_assigned {
+        if state.epoch != epoch
+            || (!state.available && !state.exit_draining)
+            || state.reader_assigned
+        {
             return None;
         }
         let mut requests = lock(&self.requests);
@@ -901,7 +918,12 @@ impl Inner {
             return false;
         }
         state.reader_assigned = false;
-        state.available
+        state.available || state.exit_draining
+    }
+
+    fn clean_exit_reader_eof(&self, epoch: u64) -> bool {
+        let state = lock(&self.state);
+        state.epoch == epoch && state.exit_draining
     }
 
     fn check_dispatch_epoch(
@@ -956,20 +978,30 @@ impl Inner {
         };
         if should_report {
             self.fail_all();
+            self.abort_epoch_reader(epoch);
             let _ = self.events.send(SupervisorEvent::Fatal { epoch });
         }
     }
 
-    fn begin_child_exit_drain(&self, epoch: u64) -> Option<bool> {
+    fn abort_epoch_reader(&self, epoch: u64) {
+        if let Some(reader) = lock(&self.reader)
+            .as_ref()
+            .filter(|reader| reader.epoch == epoch)
+        {
+            reader.abort.abort();
+        }
+    }
+
+    fn begin_child_exit_drain(&self, epoch: u64) -> bool {
         let mut state = lock(&self.state);
         if state.epoch != epoch || !state.available || state.phase == Phase::Stopped {
-            return None;
+            return false;
         }
         state.available = false;
         state.exit_draining = true;
         state.writer.take();
         state.cancellation.cancel();
-        Some(state.reader_assigned)
+        true
     }
 
     fn finish_child_exit_drain(&self, epoch: u64) {
@@ -1028,8 +1060,8 @@ async fn run_supervisor(inner: Arc<Inner>, mut events: mpsc::UnboundedReceiver<S
                 };
                 if let Some((epoch, exited)) = child_status {
                     if exited {
-                        if let Some(drain_reader) = inner.begin_child_exit_drain(epoch) {
-                            handle_child_exit(&inner, epoch, drain_reader, &mut restart_at).await;
+                        if inner.begin_child_exit_drain(epoch) {
+                            handle_child_exit(&inner, epoch, &mut restart_at).await;
                         }
                     } else {
                         inner.report_fatal(epoch);
@@ -1045,17 +1077,17 @@ async fn run_supervisor(inner: Arc<Inner>, mut events: mpsc::UnboundedReceiver<S
 }
 
 async fn handle_fatal(inner: &Arc<Inner>, epoch: u64, restart_at: &mut Option<Instant>) {
-    let child = {
+    let (child, process_group_id) = {
         let mut state = lock(&inner.state);
         if state.epoch != epoch {
             return;
         }
         state.writer.take();
-        state.child.take()
+        (state.child.take(), state.process_group_id.take())
     };
     stop_epoch_reader(inner, Some(epoch)).await;
     if let Some(child) = child {
-        terminate_child(child).await;
+        terminate_child(child, process_group_id).await;
     }
     let should_restart = {
         let state = lock(&inner.state);
@@ -1066,27 +1098,20 @@ async fn handle_fatal(inner: &Arc<Inner>, epoch: u64, restart_at: &mut Option<In
     }
 }
 
-async fn handle_child_exit(
-    inner: &Arc<Inner>,
-    epoch: u64,
-    drain_reader: bool,
-    restart_at: &mut Option<Instant>,
-) {
-    let child = {
+async fn handle_child_exit(inner: &Arc<Inner>, epoch: u64, restart_at: &mut Option<Instant>) {
+    let (child, process_group_id) = {
         let mut state = lock(&inner.state);
         if state.epoch != epoch {
             return;
         }
-        state.child.take()
+        (state.child.take(), state.process_group_id.take())
     };
+    #[cfg(unix)]
+    kill_process_group(process_group_id, libc::SIGKILL);
     if let Some(child) = child {
-        terminate_child(child).await;
+        terminate_child(child, process_group_id).await;
     }
-    if drain_reader {
-        drain_epoch_reader(inner, epoch).await;
-    } else {
-        stop_epoch_reader(inner, Some(epoch)).await;
-    }
+    drain_epoch_reader(inner, epoch).await;
     inner.finish_child_exit_drain(epoch);
     let should_restart = {
         let state = lock(&inner.state);
@@ -1113,10 +1138,12 @@ async fn restart_if_active(inner: &Arc<Inner>, restart_at: &mut Option<Instant>)
     };
     let SpawnedChild {
         child,
+        process_group_id,
         stdin,
         stdout,
     } = spawned;
     let mut child = Some(child);
+    let mut process_group_id = process_group_id;
     let epoch = {
         let mut state = lock(&inner.state);
         if state.phase != Phase::Active || state.available || state.child.is_some() {
@@ -1128,6 +1155,7 @@ async fn restart_if_active(inner: &Arc<Inner>, restart_at: &mut Option<Instant>)
             state.reader_assigned = false;
             state.cancellation = EpochCancellation::new();
             state.child = child.take();
+            state.process_group_id = process_group_id.take();
             Some(state.epoch)
         } else {
             state.phase = Phase::Stopped;
@@ -1135,26 +1163,26 @@ async fn restart_if_active(inner: &Arc<Inner>, restart_at: &mut Option<Instant>)
         }
     };
     let Some(epoch) = epoch else {
-        terminate_child(child.expect("uninstalled restart child")).await;
+        terminate_child(child.expect("uninstalled restart child"), process_group_id).await;
         return;
     };
     install_io_tasks(inner, epoch, stdin, stdout);
 }
 
 async fn stop_supervisor(inner: &Arc<Inner>) {
-    let child = {
+    let (child, process_group_id) = {
         let mut state = lock(&inner.state);
         state.phase = Phase::Stopped;
         state.available = false;
         state.exit_draining = false;
         state.writer.take();
         state.cancellation.cancel();
-        state.child.take()
+        (state.child.take(), state.process_group_id.take())
     };
     inner.fail_all();
     stop_epoch_reader(inner, None).await;
     if let Some(child) = child {
-        terminate_child(child).await;
+        terminate_child(child, process_group_id).await;
     }
     let tasks = std::mem::take(&mut *lock(&inner.event_tasks));
     for task in tasks {
@@ -1176,28 +1204,30 @@ async fn stop_epoch_reader(inner: &Arc<Inner>, epoch: Option<u64>) {
         }
     };
     if let Some(reader) = reader {
-        reader.task.abort();
-        let _ = reader.task.await;
+        reader.abort.abort();
+        if let Some(task) = reader.task {
+            let _ = task.await;
+        }
     }
 }
 
 async fn drain_epoch_reader(inner: &Arc<Inner>, epoch: u64) {
-    let reader = {
+    let task = {
         let mut reader = lock(&inner.reader);
-        if reader.as_ref().is_some_and(|reader| reader.epoch == epoch) {
-            reader.take()
-        } else {
-            None
-        }
+        reader
+            .as_mut()
+            .filter(|reader| reader.epoch == epoch)
+            .and_then(|reader| reader.task.take())
     };
-    if let Some(mut reader) = reader {
-        if time::timeout(TERMINATE_GRACE, &mut reader.task)
-            .await
-            .is_err()
-        {
-            reader.task.abort();
-            let _ = reader.task.await;
+    if let Some(mut task) = task {
+        if time::timeout(TERMINATE_GRACE, &mut task).await.is_err() {
+            task.abort();
+            let _ = task.await;
         }
+    }
+    let mut reader = lock(&inner.reader);
+    if reader.as_ref().is_some_and(|reader| reader.epoch == epoch) {
+        reader.take();
     }
 }
 
@@ -1209,21 +1239,60 @@ async fn sleep_until_optional(deadline: Option<Instant>) {
     }
 }
 
-async fn terminate_child(mut child: Child) {
+async fn terminate_child(mut child: Child, process_group_id: Option<u32>) {
     #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        // SAFETY: kill does not dereference pointers, and the PID came from this child handle.
-        unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    {
+        let deadline = Instant::now() + TERMINATE_GRACE;
+        kill_process_group(process_group_id, libc::SIGTERM);
+        let child_exited = time::timeout_at(deadline, child.wait()).await.is_ok();
+        if !wait_for_process_group_exit(process_group_id, deadline).await {
+            kill_process_group(process_group_id, libc::SIGKILL);
+        }
+        if !child_exited {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
         }
     }
     #[cfg(not(unix))]
-    let _ = child.start_kill();
-
-    if time::timeout(TERMINATE_GRACE, child.wait()).await.is_err() {
+    {
         let _ = child.start_kill();
         let _ = child.wait().await;
     }
+}
+
+#[cfg(unix)]
+fn kill_process_group(process_group_id: Option<u32>, signal: libc::c_int) {
+    let Some(process_group_id) = process_group_id.filter(|id| *id <= libc::pid_t::MAX as u32)
+    else {
+        return;
+    };
+    // SAFETY: kill does not dereference pointers, and the process group came from Child::id.
+    unsafe {
+        libc::kill(-(process_group_id as libc::pid_t), signal);
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_process_group_exit(process_group_id: Option<u32>, deadline: Instant) -> bool {
+    loop {
+        if !process_group_exists(process_group_id) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        time::sleep(CHILD_EXIT_POLL_INTERVAL).await;
+    }
+}
+
+#[cfg(unix)]
+fn process_group_exists(process_group_id: Option<u32>) -> bool {
+    let Some(process_group_id) = process_group_id.filter(|id| *id <= libc::pid_t::MAX as u32)
+    else {
+        return false;
+    };
+    // SAFETY: signal zero does not affect the process and the group came from Child::id.
+    unsafe { libc::kill(-(process_group_id as libc::pid_t), 0) == 0 }
 }
 
 fn candidate_not_live() -> RuntimeError {
@@ -1408,16 +1477,22 @@ for request, decision in ((second, "deny"), (first, "allow")):
     }
 
     #[tokio::test]
-    async fn parsed_response_wins_over_child_exit_and_only_waiting_requests_fail() {
+    async fn clean_exit_drains_complete_responses_and_fails_only_unanswered_requests() {
         let directory = TempDir::new().unwrap();
         let first_read = directory.path().join("first-read");
+        let second_read = directory.path().join("second-read");
+        let third_read = directory.path().join("third-read");
         let script = write_python(
             &directory,
             r#"import json, pathlib, sys
 first = json.loads(sys.stdin.readline())
 pathlib.Path("first-read").write_text("ready")
+second = json.loads(sys.stdin.readline())
+pathlib.Path("second-read").write_text("ready")
 json.loads(sys.stdin.readline())
+pathlib.Path("third-read").write_text("ready")
 print(json.dumps({"id": first["id"], "type": "response", "decision": "allow"}, separators=(",", ":")), flush=True)
+print(json.dumps({"id": second["id"], "type": "response", "decision": "deny"}, separators=(",", ":")), flush=True)
 "#,
         );
         let mut provider_plan = plan(&directory, &script);
@@ -1427,8 +1502,8 @@ print(json.dumps({"id": first["id"], "type": "response", "decision": "allow"}, s
             .unwrap();
         commit(&provider);
 
-        let assignment_gate = Arc::new(tokio::sync::Barrier::new(2));
-        *lock(&provider.inner.reader_assignment_gate) = Some(assignment_gate.clone());
+        let correlation_gate = Arc::new(tokio::sync::Barrier::new(2));
+        *lock(&provider.inner.reader_correlation_gate) = Some(correlation_gate.clone());
 
         let first_provider = provider.clone();
         let first = tokio::spawn(async move {
@@ -1443,8 +1518,16 @@ print(json.dumps({"id": first["id"], "type": "response", "decision": "allow"}, s
                 .decide(request("second"), &body_guard(), request_deadline())
                 .await
         });
+        wait_for_file(&second_read).await;
+        let third_provider = provider.clone();
+        let third = tokio::spawn(async move {
+            third_provider
+                .decide(request("third"), &body_guard(), request_deadline())
+                .await
+        });
+        wait_for_file(&third_read).await;
 
-        assignment_gate.wait().await;
+        correlation_gate.wait().await;
         for _ in 0..100 {
             if !lock(&provider.inner.state).available {
                 break;
@@ -1452,10 +1535,12 @@ print(json.dumps({"id": first["id"], "type": "response", "decision": "allow"}, s
             time::sleep(Duration::from_millis(10)).await;
         }
         assert!(!lock(&provider.inner.state).available);
-        assignment_gate.wait().await;
+        *lock(&provider.inner.reader_correlation_gate) = None;
+        correlation_gate.wait().await;
 
         assert_eq!(first.await.unwrap(), Ok(ProcessDecision::Allow));
-        assert_eq!(second.await.unwrap(), Err(ProcessRequestError::Unavailable));
+        assert_eq!(second.await.unwrap(), Ok(ProcessDecision::Deny));
+        assert_eq!(third.await.unwrap(), Err(ProcessRequestError::Unavailable));
         assert_eq!(provider.inner.pending_count.load(Ordering::Acquire), 0);
         cleanup(&provider).await;
     }
@@ -2121,6 +2206,7 @@ for line in sys.stdin:
             retirement_deadline: Some(retirement_deadline),
             epoch: 1,
             child: None,
+            process_group_id: None,
             writer: None,
             cancellation: EpochCancellation::new(),
         };
@@ -2194,6 +2280,40 @@ for line in sys.stdin:
 
         let ((), ()) = tokio::join!(cleanup(&provider), cleanup(&provider));
         assert!(!process_alive(pid));
+    }
+
+    #[tokio::test]
+    async fn cleanup_kills_same_group_descendant_that_ignores_sigterm() {
+        let directory = TempDir::new().unwrap();
+        let descendant_pid = directory.path().join("descendant-pid");
+        let script = write_python(
+            &directory,
+            r#"import subprocess, sys, time
+code = 'import os,pathlib,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); pathlib.Path("descendant-pid").write_text(str(os.getpid())); time.sleep(30)'
+subprocess.Popen([sys.executable, "-c", code])
+while True:
+    time.sleep(1)
+"#,
+        );
+        let provider = ProcessProvider::activate(plan(&directory, &script), || false)
+            .await
+            .unwrap();
+        commit(&provider);
+        wait_for_file(&descendant_pid).await;
+        let descendant_pid = fs::read_to_string(descendant_pid)
+            .unwrap()
+            .parse::<u32>()
+            .unwrap();
+        assert!(process_alive(descendant_pid));
+
+        cleanup(&provider).await;
+        for _ in 0..100 {
+            if !process_alive(descendant_pid) {
+                return;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("same-group descendant survived provider cleanup");
     }
 
     #[tokio::test]
