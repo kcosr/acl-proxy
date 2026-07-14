@@ -476,15 +476,14 @@ impl ServerCertVerifier for NoVerifyServerCert {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::{Mutex, Once};
 
     use http::header::AUTHORIZATION;
     use rcgen::generate_simple_self_signed;
     use tempfile::TempDir;
-    use tracing::subscriber::with_default;
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
@@ -494,11 +493,22 @@ mod tests {
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
-    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
+    #[derive(Clone, Copy)]
+    struct TestLogWriterFactory;
 
-    impl Write for CapturedLogWriter {
+    struct TestLogWriter(Option<CapturedLogs>);
+
+    thread_local! {
+        static ACTIVE_LOG_CAPTURE: RefCell<Option<CapturedLogs>> = const { RefCell::new(None) };
+    }
+
+    static TEST_LOG_SUBSCRIBER: Once = Once::new();
+
+    impl Write for TestLogWriter {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
+            if let Some(logs) = &self.0 {
+                logs.0.lock().unwrap().extend_from_slice(bytes);
+            }
             Ok(bytes.len())
         }
 
@@ -507,11 +517,11 @@ mod tests {
         }
     }
 
-    impl<'writer> MakeWriter<'writer> for CapturedLogs {
-        type Writer = CapturedLogWriter;
+    impl<'writer> MakeWriter<'writer> for TestLogWriterFactory {
+        type Writer = TestLogWriter;
 
         fn make_writer(&'writer self) -> Self::Writer {
-            CapturedLogWriter(self.0.clone())
+            TestLogWriter(ACTIVE_LOG_CAPTURE.with(|capture| capture.borrow().clone()))
         }
     }
 
@@ -521,18 +531,39 @@ mod tests {
         }
     }
 
-    fn capture_logs(operation: impl FnOnce()) -> String {
-        let logs = CapturedLogs::default();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(logs.clone())
-            .finish();
-        with_default(subscriber, || {
-            tracing::callsite::rebuild_interest_cache();
-            operation();
+    struct ActiveLogCapture;
+
+    impl Drop for ActiveLogCapture {
+        fn drop(&mut self) {
+            ACTIVE_LOG_CAPTURE.with(|capture| {
+                capture.borrow_mut().take();
+            });
+        }
+    }
+
+    fn initialize_test_log_subscriber() {
+        TEST_LOG_SUBSCRIBER.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(TestLogWriterFactory)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("test tracing subscriber must be installed only once");
         });
+    }
+
+    fn capture_logs(operation: impl FnOnce()) -> String {
+        initialize_test_log_subscriber();
+        let logs = CapturedLogs::default();
+        ACTIVE_LOG_CAPTURE.with(|capture| {
+            let previous = capture.borrow_mut().replace(logs.clone());
+            assert!(previous.is_none(), "test log captures must not be nested");
+        });
+        let capture = ActiveLogCapture;
+        operation();
+        drop(capture);
         logs.text()
     }
 

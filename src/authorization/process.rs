@@ -555,9 +555,9 @@ impl GenerationOwner for ProcessProvider {
             state.cancellation.cancel();
             return Err(candidate_not_live());
         };
-        match child.try_wait() {
-            Ok(None) => Ok(Box::new(ProcessPublicationGuard { state })),
-            Ok(Some(_)) | Err(_) => {
+        match observe_child_exit(child) {
+            Ok(false) => Ok(Box::new(ProcessPublicationGuard { state })),
+            Ok(true) | Err(()) => {
                 state.available = false;
                 state.cancellation.cancel();
                 let epoch = state.epoch;
@@ -761,12 +761,12 @@ async fn spawn_child(config: &SpawnConfig) -> Result<SpawnedChild, ProcessActiva
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     command.process_group(0);
     let mut child = command.spawn().map_err(|_| ProcessActivationError::Spawn)?;
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     let process_group_id = child.id();
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     let process_group_id = None;
     let Some(stdin) = child.stdin.take() else {
         terminate_child(child, process_group_id).await;
@@ -1049,10 +1049,10 @@ async fn run_supervisor(inner: Arc<Inner>, mut events: mpsc::UnboundedReceiver<S
                 let child_status = {
                     let mut state = lock(&inner.state);
                     if state.available {
-                        match state.child.as_mut().map(Child::try_wait) {
-                            Some(Ok(Some(_))) => Some((state.epoch, true)),
-                            Some(Err(_)) | None => Some((state.epoch, false)),
-                            Some(Ok(None)) => None,
+                        match state.child.as_mut().map(observe_child_exit) {
+                            Some(Ok(true)) => Some((state.epoch, true)),
+                            Some(Err(())) | None => Some((state.epoch, false)),
+                            Some(Ok(false)) => None,
                         }
                     } else {
                         None
@@ -1106,10 +1106,10 @@ async fn handle_child_exit(inner: &Arc<Inner>, epoch: u64, restart_at: &mut Opti
         }
         (state.child.take(), state.process_group_id.take())
     };
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     kill_process_group(process_group_id, libc::SIGKILL);
     if let Some(child) = child {
-        terminate_child(child, process_group_id).await;
+        reap_child(child).await;
     }
     drain_epoch_reader(inner, epoch).await;
     inner.finish_child_exit_drain(epoch);
@@ -1240,59 +1240,92 @@ async fn sleep_until_optional(deadline: Option<Instant>) {
 }
 
 async fn terminate_child(mut child: Child, process_group_id: Option<u32>) {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         let deadline = Instant::now() + TERMINATE_GRACE;
         kill_process_group(process_group_id, libc::SIGTERM);
-        let child_exited = time::timeout_at(deadline, child.wait()).await.is_ok();
-        if !wait_for_process_group_exit(process_group_id, deadline).await {
-            kill_process_group(process_group_id, libc::SIGKILL);
-        }
-        if !child_exited {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
+        loop {
+            match observe_child_exit(&mut child) {
+                Ok(true) => {
+                    kill_process_group(process_group_id, libc::SIGKILL);
+                    reap_child(child).await;
+                    return;
+                }
+                Ok(false) if Instant::now() < deadline => {
+                    time::sleep(CHILD_EXIT_POLL_INTERVAL).await;
+                }
+                Ok(false) => {
+                    kill_process_group(process_group_id, libc::SIGKILL);
+                    let _ = child.start_kill();
+                    reap_child(child).await;
+                    return;
+                }
+                Err(()) => {
+                    // This owner has not reaped the child, and a failed waitid does not reap it,
+                    // so the leader still reserves the owned PID/PGID for this final signal.
+                    kill_process_group(process_group_id, libc::SIGKILL);
+                    let _ = child.start_kill();
+                    reap_child(child).await;
+                    return;
+                }
+            }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {
         let _ = child.start_kill();
-        let _ = child.wait().await;
+        reap_child(child).await;
     }
 }
 
-#[cfg(unix)]
+async fn reap_child(mut child: Child) {
+    let _ = child.wait().await;
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn kill_process_group(process_group_id: Option<u32>, signal: libc::c_int) {
     let Some(process_group_id) = process_group_id.filter(|id| *id <= libc::pid_t::MAX as u32)
     else {
         return;
     };
+    // Callers retain the unreaped Child leader, so this numeric PGID cannot be recycled.
     // SAFETY: kill does not dereference pointers, and the process group came from Child::id.
     unsafe {
         libc::kill(-(process_group_id as libc::pid_t), signal);
     }
 }
 
-#[cfg(unix)]
-async fn wait_for_process_group_exit(process_group_id: Option<u32>, deadline: Instant) -> bool {
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn observe_child_exit(child: &mut Child) -> Result<bool, ()> {
+    let pid = child.id().ok_or(())?;
     loop {
-        if !process_group_exists(process_group_id) {
-            return true;
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: waitid writes one siginfo_t, WNOWAIT preserves the waitable child,
+        // and the PID comes from the still-owned Child handle.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            // SAFETY: successful waitid initialized the siginfo_t value.
+            return Ok(unsafe { info.assume_init().si_pid() } != 0);
         }
-        if Instant::now() >= deadline {
-            return false;
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return Err(());
         }
-        time::sleep(CHILD_EXIT_POLL_INTERVAL).await;
     }
 }
 
-#[cfg(unix)]
-fn process_group_exists(process_group_id: Option<u32>) -> bool {
-    let Some(process_group_id) = process_group_id.filter(|id| *id <= libc::pid_t::MAX as u32)
-    else {
-        return false;
-    };
-    // SAFETY: signal zero does not affect the process and the group came from Child::id.
-    unsafe { libc::kill(-(process_group_id as libc::pid_t), 0) == 0 }
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn observe_child_exit(child: &mut Child) -> Result<bool, ()> {
+    child
+        .try_wait()
+        .map(|status| status.is_some())
+        .map_err(|_| ())
 }
 
 fn candidate_not_live() -> RuntimeError {
@@ -1716,6 +1749,7 @@ print(json.dumps({"id": second["id"], "type": "response", "decision": "allow"}, 
         cleanup(&provider).await;
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
     async fn inherited_old_stdout_is_joined_before_same_logical_id_restarts() {
         let directory = TempDir::new().unwrap();
@@ -2282,6 +2316,7 @@ for line in sys.stdin:
         assert!(!process_alive(pid));
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
     async fn cleanup_kills_same_group_descendant_that_ignores_sigterm() {
         let directory = TempDir::new().unwrap();
@@ -2314,6 +2349,35 @@ while True:
             time::sleep(Duration::from_millis(10)).await;
         }
         panic!("same-group descendant survived provider cleanup");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[tokio::test]
+    async fn exit_observation_preserves_leader_until_group_signal_is_complete() {
+        let mut command = Command::new("/usr/bin/python3");
+        command
+            .arg("-c")
+            .arg("raise SystemExit(0)")
+            .process_group(0)
+            .kill_on_drop(true);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id().unwrap();
+
+        let mut exited = false;
+        for _ in 0..100 {
+            if observe_child_exit(&mut child).unwrap() {
+                exited = true;
+                break;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(exited);
+        assert_eq!(child.id(), Some(pid));
+        assert!(process_alive(pid));
+
+        kill_process_group(Some(pid), libc::SIGKILL);
+        reap_child(child).await;
+        assert!(!process_alive(pid));
     }
 
     #[tokio::test]

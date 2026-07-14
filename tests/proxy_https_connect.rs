@@ -1,11 +1,11 @@
 #![allow(clippy::while_let_on_iterator)]
 
-use std::io::Read;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use acl_proxy::app::AppState;
-use acl_proxy::capture::{CaptureMode, CaptureRecord};
+use acl_proxy::capture::{CaptureDecision, CaptureKind, CaptureMode, CaptureRecord};
 use acl_proxy::config::Config;
 use acl_proxy::proxy::http::run_http_proxy_on_listener;
 use http::header::{HeaderValue, CONNECTION, UPGRADE};
@@ -33,6 +33,61 @@ struct SeenForwardedRequest {
 struct TestWebSocketFrame {
     opcode: u8,
     payload: Vec<u8>,
+}
+
+async fn wait_for_complete_capture_pair(
+    capture_dir: &Path,
+    context: &str,
+    expected: impl Fn(&CaptureRecord) -> bool,
+) -> Vec<CaptureRecord> {
+    use std::collections::HashMap;
+    use tokio::time::{sleep, Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut records = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(capture_dir) {
+            for entry in entries.flatten() {
+                if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                    continue;
+                }
+                let Ok(contents) = std::fs::read_to_string(entry.path()) else {
+                    continue;
+                };
+                let Ok(record) = serde_json::from_str::<CaptureRecord>(&contents) else {
+                    continue;
+                };
+                if expected(&record) {
+                    records.push(record);
+                }
+            }
+        }
+
+        let mut by_id = HashMap::<String, (bool, bool)>::new();
+        for record in &records {
+            let pair = by_id
+                .entry(record.request_id.clone())
+                .or_insert((false, false));
+            match record.kind {
+                CaptureKind::Request => pair.0 = true,
+                CaptureKind::Response => pair.1 = true,
+            }
+        }
+        if let Some(complete_id) = by_id
+            .into_iter()
+            .find_map(|(request_id, pair)| (pair == (true, true)).then_some(request_id))
+        {
+            records.retain(|record| record.request_id == complete_id);
+            return records;
+        }
+
+        if Instant::now() >= deadline {
+            panic!(
+                "expected complete capture pair for {context}; last matching records {records:?}"
+            );
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
 }
 
 async fn start_upstream_https_echo_server() -> SocketAddr {
@@ -573,50 +628,21 @@ async fn allowed_https_via_connect_is_proxied_and_captured() {
     assert_eq!(status, StatusCode::OK.as_u16());
     assert_eq!(body, "ok");
 
-    // Ensure capture files exist and are tagged as https_connect.
-    use tokio::time::{sleep, Duration};
-
     let capture_dir = temp_dir.path().join("captures");
-    // Wait for async capture tasks to flush to disk and ensure at least one file.
-    for _ in 0..10 {
-        if capture_dir.is_dir()
-            && std::fs::read_dir(&capture_dir)
-                .expect("read capture dir")
-                .filter_map(Result::ok)
-                .any(|entry| {
-                    entry.file_type().is_ok_and(|kind| kind.is_file())
-                        && entry.path().extension().is_some_and(|ext| ext == "json")
-                })
-        {
-            break;
-        }
-        sleep(Duration::from_millis(50)).await;
+    let records = wait_for_complete_capture_pair(&capture_dir, "CONNECT allow", |record| {
+        record.mode == CaptureMode::HttpsConnect
+            && record.decision == CaptureDecision::Allow
+            && record.url.ends_with("/ok")
+    })
+    .await;
+    for record in records {
+        assert_eq!(record.mode, CaptureMode::HttpsConnect);
+        assert!(
+            record.url.starts_with("https://"),
+            "url should be https, got {}",
+            record.url
+        );
     }
-    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
-    let mut files = Vec::new();
-    while let Some(entry) = entries.next() {
-        let entry = entry.expect("dir entry");
-        if entry.file_type().expect("file type").is_file() {
-            files.push(entry.path());
-        }
-    }
-    assert!(
-        !files.is_empty(),
-        "expected capture files for CONNECT traffic"
-    );
-
-    let mut contents = String::new();
-    std::fs::File::open(&files[0])
-        .expect("open capture")
-        .read_to_string(&mut contents)
-        .expect("read capture");
-    let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
-    assert_eq!(record.mode, CaptureMode::HttpsConnect);
-    assert!(
-        record.url.starts_with("https://"),
-        "url should be https, got {}",
-        record.url
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -65,15 +65,59 @@ async fn transparent_h2_test_guard() -> AsyncMutexGuard<'static, ()> {
     TRANSPARENT_H2_TEST_LOCK.lock().await
 }
 
-fn capture_record_file_count(capture_dir: &Path) -> usize {
-    std::fs::read_dir(capture_dir)
-        .expect("read capture dir")
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry.file_type().is_ok_and(|kind| kind.is_file())
-                && entry.path().extension().is_some_and(|ext| ext == "json")
-        })
-        .count()
+async fn wait_for_complete_capture_pair(
+    capture_dir: &Path,
+    context: &str,
+    expected: impl Fn(&CaptureRecord) -> bool,
+) -> Vec<CaptureRecord> {
+    use std::collections::HashMap;
+    use tokio::time::{sleep, Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut records = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(capture_dir) {
+            for entry in entries.flatten() {
+                if !entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                    continue;
+                }
+                let Ok(contents) = std::fs::read_to_string(entry.path()) else {
+                    continue;
+                };
+                let Ok(record) = serde_json::from_str::<CaptureRecord>(&contents) else {
+                    continue;
+                };
+                if expected(&record) {
+                    records.push(record);
+                }
+            }
+        }
+
+        let mut by_id = HashMap::<String, (bool, bool)>::new();
+        for record in &records {
+            let pair = by_id
+                .entry(record.request_id.clone())
+                .or_insert((false, false));
+            match record.kind {
+                CaptureKind::Request => pair.0 = true,
+                CaptureKind::Response => pair.1 = true,
+            }
+        }
+        if let Some(complete_id) = by_id
+            .into_iter()
+            .find_map(|(request_id, pair)| (pair == (true, true)).then_some(request_id))
+        {
+            records.retain(|record| record.request_id == complete_id);
+            return records;
+        }
+
+        if Instant::now() >= deadline {
+            panic!(
+                "expected complete capture pair for {context}; last matching records {records:?}"
+            );
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
 }
 
 async fn wait_for_single_allow_capture_version_pair(
@@ -1427,43 +1471,22 @@ async fn allowed_https_transparent_is_proxied_and_captured() {
     assert_eq!(status, StatusCode::OK.as_u16());
     assert_eq!(body, "ok");
 
-    // Ensure capture files exist and are tagged as https_transparent.
-    use tokio::time::{sleep, Duration};
-
     let capture_dir = temp_dir.path().join("captures");
-    // Wait briefly for async capture tasks to flush to disk.
-    for _ in 0..10 {
-        if capture_dir.is_dir() && capture_record_file_count(&capture_dir) > 0 {
-            break;
-        }
-        sleep(Duration::from_millis(50)).await;
+    let records =
+        wait_for_complete_capture_pair(&capture_dir, "transparent HTTPS allow", |record| {
+            record.mode == CaptureMode::HttpsTransparent
+                && record.decision == CaptureDecision::Allow
+                && record.url.ends_with("/ok")
+        })
+        .await;
+    for record in records {
+        assert_eq!(record.mode, CaptureMode::HttpsTransparent);
+        assert!(
+            record.url.starts_with("https://"),
+            "url should be https, got {}",
+            record.url
+        );
     }
-
-    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
-    let mut files = Vec::new();
-    while let Some(entry) = entries.next() {
-        let entry = entry.expect("dir entry");
-        if entry.file_type().expect("file type").is_file() {
-            files.push(entry.path());
-        }
-    }
-    assert!(
-        !files.is_empty(),
-        "expected capture files for transparent HTTPS traffic"
-    );
-
-    let mut contents = String::new();
-    std::fs::File::open(&files[0])
-        .expect("open capture")
-        .read_to_string(&mut contents)
-        .expect("read capture");
-    let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
-    assert_eq!(record.mode, CaptureMode::HttpsTransparent);
-    assert!(
-        record.url.starts_with("https://"),
-        "url should be https, got {}",
-        record.url
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2176,37 +2199,16 @@ async fn allowed_https_transparent_h2_is_proxied_and_captured() {
     assert_eq!(status, StatusCode::OK.as_u16());
     assert_eq!(body, "ok");
 
-    use tokio::time::{sleep, Duration};
-
     let capture_dir = temp_dir.path().join("captures");
-    for _ in 0..10 {
-        if capture_dir.is_dir() && capture_record_file_count(&capture_dir) > 0 {
-            break;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-
-    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
-    let mut files = Vec::new();
-    while let Some(entry) = entries.next() {
-        let entry = entry.expect("dir entry");
-        if entry.file_type().expect("file type").is_file() {
-            files.push(entry.path());
-        }
-    }
-    assert!(
-        !files.is_empty(),
-        "expected capture files for transparent HTTPS traffic"
-    );
-
+    let records =
+        wait_for_complete_capture_pair(&capture_dir, "transparent HTTPS H2 allow", |record| {
+            record.mode == CaptureMode::HttpsTransparent
+                && record.decision == CaptureDecision::Allow
+                && record.url.ends_with("/ok")
+        })
+        .await;
     let mut found_request = false;
-    for path in files {
-        let mut contents = String::new();
-        std::fs::File::open(&path)
-            .expect("open capture")
-            .read_to_string(&mut contents)
-            .expect("read capture");
-        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
+    for record in records {
         assert_eq!(record.mode, CaptureMode::HttpsTransparent);
 
         if record.kind != CaptureKind::Request {
@@ -2295,46 +2297,28 @@ async fn upstream_failure_https_transparent_is_captured() {
     assert_eq!(status, StatusCode::BAD_GATEWAY.as_u16());
     assert_eq!(body, "Bad Gateway");
 
-    use tokio::time::{sleep, Duration};
-
     let capture_dir = temp_dir.path().join("captures");
-    for _ in 0..10 {
-        if capture_dir.is_dir() && capture_record_file_count(&capture_dir) > 0 {
-            break;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-
-    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
+    let records = wait_for_complete_capture_pair(&capture_dir, "upstream failure", |record| {
+        record.mode == CaptureMode::HttpsTransparent
+            && record.decision == CaptureDecision::Allow
+            && record.url.ends_with("/upstream-fail")
+    })
+    .await;
     let mut found_request = false;
     let mut found_response = false;
-    while let Some(entry) = entries.next() {
-        let entry = entry.expect("dir entry");
-        if !entry.file_type().expect("file type").is_file() {
-            continue;
-        }
-
-        let mut contents = String::new();
-        std::fs::File::open(entry.path())
-            .expect("open capture")
-            .read_to_string(&mut contents)
-            .expect("read capture");
-        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
+    for record in records {
         assert_eq!(record.mode, CaptureMode::HttpsTransparent);
-
-        if record.url.ends_with("/upstream-fail") && record.decision == CaptureDecision::Allow {
-            match record.kind {
-                CaptureKind::Request => {
-                    found_request = true;
-                }
-                CaptureKind::Response => {
-                    assert_eq!(
-                        record.status_code,
-                        Some(StatusCode::BAD_GATEWAY.as_u16()),
-                        "expected 502 statusCode for upstream failure capture"
-                    );
-                    found_response = true;
-                }
+        match record.kind {
+            CaptureKind::Request => {
+                found_request = true;
+            }
+            CaptureKind::Response => {
+                assert_eq!(
+                    record.status_code,
+                    Some(StatusCode::BAD_GATEWAY.as_u16()),
+                    "expected 502 statusCode for upstream failure capture"
+                );
+                found_response = true;
             }
         }
     }
@@ -2718,45 +2702,20 @@ async fn large_h2_request_body_is_truncated_in_capture() {
     assert_eq!(status, StatusCode::OK.as_u16());
     assert_eq!(resp_body, "ok");
 
-    use tokio::time::{sleep, Duration};
-
     let capture_dir = temp_dir.path().join("captures");
-    for _ in 0..10 {
-        if capture_dir.is_dir() && capture_record_file_count(&capture_dir) > 0 {
-            break;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-
-    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
-    let mut files = Vec::new();
-    while let Some(entry) = entries.next() {
-        let entry = entry.expect("dir entry");
-        if entry.file_type().expect("file type").is_file() {
-            files.push(entry.path());
-        }
-    }
-    assert!(
-        !files.is_empty(),
-        "expected capture files for large H2 request"
-    );
+    let records = wait_for_complete_capture_pair(&capture_dir, "large H2 request", |record| {
+        record.mode == CaptureMode::HttpsTransparent
+            && record.decision == CaptureDecision::Allow
+            && record.url.ends_with("/large-request")
+    })
+    .await;
 
     // Find the request capture for the large POST and ensure body
     // length reflects the full payload while captured bytes are
     // bounded by DEFAULT_MAX_BODY_BYTES.
     let mut found_request = false;
-    for path in files {
-        let mut contents = String::new();
-        std::fs::File::open(&path)
-            .expect("open capture")
-            .read_to_string(&mut contents)
-            .expect("read capture");
-        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
-
-        if record.kind == CaptureKind::Request
-            && record.decision == CaptureDecision::Allow
-            && record.url.ends_with("/large-request")
-        {
+    for record in records {
+        if record.kind == CaptureKind::Request {
             let body = record.body.as_ref().expect("expected captured body");
             let decoded = record.decode_body_bytes().expect("decode capture body");
             assert!(
@@ -2855,52 +2814,22 @@ async fn large_h2_response_body_is_truncated_in_capture() {
     assert_eq!(status, StatusCode::OK.as_u16());
     assert_eq!(body.len(), LARGE_BODY_BYTES);
 
-    use tokio::time::{sleep, Duration};
-
     let capture_dir = temp_dir.path().join("captures");
     eprintln!(
         "large_h2_response: waiting for capture dir at {:?}",
         capture_dir
     );
-    let mut found_response: Option<CaptureRecord> = None;
     eprintln!("large_h2_response: scanning capture files for response record");
-    for _ in 0..20 {
-        if !capture_dir.is_dir() {
-            sleep(Duration::from_millis(50)).await;
-            continue;
-        }
-
-        let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
-        while let Some(entry) = entries.next() {
-            let entry = entry.expect("dir entry");
-            if !entry.file_type().expect("file type").is_file() {
-                continue;
-            }
-
-            let mut contents = String::new();
-            std::fs::File::open(entry.path())
-                .expect("open capture")
-                .read_to_string(&mut contents)
-                .expect("read capture");
-            let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
-
-            if record.kind == CaptureKind::Response
-                && record.decision == CaptureDecision::Allow
-                && record.url.ends_with("/large-response")
-            {
-                found_response = Some(record);
-                break;
-            }
-        }
-
-        if found_response.is_some() {
-            break;
-        }
-
-        sleep(Duration::from_millis(50)).await;
-    }
-
-    let record = found_response.expect("did not find large H2 response capture record");
+    let records = wait_for_complete_capture_pair(&capture_dir, "large H2 response", |record| {
+        record.mode == CaptureMode::HttpsTransparent
+            && record.decision == CaptureDecision::Allow
+            && record.url.ends_with("/large-response")
+    })
+    .await;
+    let record = records
+        .into_iter()
+        .find(|record| record.kind == CaptureKind::Response)
+        .expect("complete pair must contain a response record");
     let body = record.body.as_ref().expect("expected captured body");
     assert_eq!(
         body.length, LARGE_BODY_BYTES,
@@ -3121,41 +3050,17 @@ async fn denied_https_transparent_returns_403() {
     assert_eq!(json["error"], "Forbidden");
     assert_eq!(json["message"], "Blocked by URL policy");
 
-    // Capture records for denied HTTP/1.1 traffic should exist and have
-    // httpVersion = "1.1" with consistent structure.
-    use tokio::time::{sleep, Duration};
-
     let capture_dir = temp_dir.path().join("captures");
-    for _ in 0..10 {
-        if capture_dir.is_dir() && capture_record_file_count(&capture_dir) > 0 {
-            break;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-
-    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
-    let mut files = Vec::new();
-    while let Some(entry) = entries.next() {
-        let entry = entry.expect("dir entry");
-        if entry.file_type().expect("file type").is_file() {
-            files.push(entry.path());
-        }
-    }
-    assert!(
-        files.len() >= 2,
-        "expected at least two capture files for denied HTTPS transparent traffic"
-    );
+    let records = wait_for_complete_capture_pair(&capture_dir, "denied HTTP/1.1", |record| {
+        record.mode == CaptureMode::HttpsTransparent
+            && record.decision == CaptureDecision::Deny
+            && record.url.ends_with("/denied")
+    })
+    .await;
 
     let mut saw_request = false;
     let mut saw_response = false;
-    for path in files {
-        let mut contents = String::new();
-        std::fs::File::open(&path)
-            .expect("open capture")
-            .read_to_string(&mut contents)
-            .expect("read capture");
-        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
-
+    for record in records {
         assert_eq!(record.mode, CaptureMode::HttpsTransparent);
         assert_eq!(record.decision, CaptureDecision::Deny);
         assert_eq!(
@@ -3432,41 +3337,17 @@ async fn denied_https_transparent_h2_returns_403() {
     assert_eq!(json["error"], "Forbidden");
     assert_eq!(json["message"], "Blocked by URL policy");
 
-    // Capture records for denied HTTP/2 transparent traffic should mirror
-    // the HTTP/1.1 shape but with httpVersion = "2".
-    use tokio::time::{sleep, Duration};
-
     let capture_dir = temp_dir.path().join("captures");
-    for _ in 0..10 {
-        if capture_dir.is_dir() && capture_record_file_count(&capture_dir) > 0 {
-            break;
-        }
-        sleep(Duration::from_millis(50)).await;
-    }
-
-    let mut entries = std::fs::read_dir(&capture_dir).expect("read capture dir");
-    let mut files = Vec::new();
-    while let Some(entry) = entries.next() {
-        let entry = entry.expect("dir entry");
-        if entry.file_type().expect("file type").is_file() {
-            files.push(entry.path());
-        }
-    }
-    assert!(
-        files.len() >= 2,
-        "expected at least two capture files for denied H2 transparent traffic"
-    );
+    let records = wait_for_complete_capture_pair(&capture_dir, "denied HTTP/2", |record| {
+        record.mode == CaptureMode::HttpsTransparent
+            && record.decision == CaptureDecision::Deny
+            && record.url.ends_with("/denied")
+    })
+    .await;
 
     let mut saw_request = false;
     let mut saw_response = false;
-    for path in files {
-        let mut contents = String::new();
-        std::fs::File::open(&path)
-            .expect("open capture")
-            .read_to_string(&mut contents)
-            .expect("read capture");
-        let record: CaptureRecord = serde_json::from_str(&contents).expect("decode capture");
-
+    for record in records {
         assert_eq!(record.mode, CaptureMode::HttpsTransparent);
         assert_eq!(record.decision, CaptureDecision::Deny);
         assert_eq!(
