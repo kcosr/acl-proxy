@@ -299,6 +299,10 @@ impl HttpBody for ForwardBody {
             && self.data_done
             && self.body.is_none()
             && self.driver.is_finished()
+            && self
+                .trailers
+                .as_ref()
+                .is_none_or(|trailers| trailers.is_none())
     }
 
     fn size_hint(&self) -> SizeHint {
@@ -1045,6 +1049,7 @@ mod tests {
 
         assert_eq!(body.data().await.unwrap().unwrap(), "with-trailer");
         assert!(body.data().await.is_none());
+        assert!(!body.is_end_stream());
         let trailers = body.trailers().await.unwrap().unwrap();
         assert_eq!(trailers["x-checksum"], "verified");
         assert!(!trailers.contains_key("proxy-authenticate"));
