@@ -12,6 +12,7 @@ use std::thread;
 use tracing::Level;
 use tracing_subscriber::fmt::SubscriberBuilder;
 
+use crate::config::compiler::StaticLoggingConfig;
 use crate::config::{LoggingConfig, LoggingPolicyDecisionsConfig, PolicyRuleAction};
 use crate::filesystem::{
     create_private_dir_all, open_private_file_for_append, open_private_file_for_write,
@@ -74,6 +75,25 @@ pub struct LoggingGuards {
 }
 
 impl LoggingSettings {
+    /// Builds the process-lifetime sink from strict compiled configuration.
+    /// Generation-owned observation policy performs event filtering, so the
+    /// static subscriber must admit every level across reloads.
+    pub(crate) fn from_static_config(cfg: &StaticLoggingConfig) -> Self {
+        Self {
+            level: Level::TRACE,
+            policy_decisions: PolicyDecisionLogging {
+                log_allows: true,
+                log_denies: true,
+                level_allows: Level::TRACE,
+                level_denies: Level::TRACE,
+            },
+            directory: cfg.directory.clone(),
+            max_bytes: cfg.max_bytes,
+            max_files: cfg.max_files,
+            console: cfg.console,
+        }
+    }
+
     pub fn from_config(cfg: &LoggingConfig) -> Result<Self, LoggingError> {
         let level = parse_level(&cfg.level).map_err(|value| LoggingError::InvalidLevel {
             field: "logging.level",
@@ -626,6 +646,23 @@ mod tests {
         assert_eq!(settings.level, Level::DEBUG);
         assert_eq!(settings.policy_decisions.level_allows, Level::INFO);
         assert_eq!(settings.policy_decisions.level_denies, Level::WARN);
+    }
+
+    #[test]
+    fn strict_static_logging_admits_reloadable_observation_levels() {
+        let cfg = StaticLoggingConfig {
+            directory: Some(PathBuf::from("strict-logs")),
+            max_bytes: 4096,
+            max_files: 3,
+            console: false,
+        };
+
+        let settings = LoggingSettings::from_static_config(&cfg);
+        assert_eq!(settings.level, Level::TRACE);
+        assert_eq!(settings.directory, cfg.directory);
+        assert_eq!(settings.max_bytes, 4096);
+        assert_eq!(settings.max_files, 3);
+        assert!(!settings.console);
     }
 
     #[test]
