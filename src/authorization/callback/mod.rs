@@ -5,7 +5,7 @@ mod token;
 pub(crate) use pending::{
     CallbackClaim, CallbackClaimError, CallbackClaimResult, CapabilityStoreCounts,
     FinalCancellation, PendingAdmission, PendingAdmissionError, PendingAdmissionErrorKind,
-    PendingCapabilityStore, PendingDeadline, PendingOperationHandle, PendingStoreError,
+    PendingCapabilityStore, PendingDeadline, PendingOperationGuard, PendingOperationSignal,
     PendingTerminalCause, PendingTerminalResult, TerminalOperation,
 };
 #[allow(unused_imports)]

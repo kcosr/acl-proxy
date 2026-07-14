@@ -1,6 +1,7 @@
 use std::collections::{hash_map, HashMap, HashSet};
 use std::fmt;
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -10,9 +11,9 @@ use tokio::time::Instant;
 use super::token::{
     generate_resume_token, OsResumeTokenSource, ResumeToken, ResumeTokenDigest, ResumeTokenSource,
 };
+use crate::config::compiler::PendingOperationLimit;
 
 const MAX_TOKEN_ATTEMPTS: usize = 8;
-static NEXT_STORE_BRAND: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PendingTerminalCause {
@@ -118,8 +119,6 @@ struct StoreState<P> {
 }
 
 struct StoreInner<P> {
-    brand: u64,
-    maximum: usize,
     state: Mutex<StoreState<P>>,
     changed: Notify,
     #[cfg(test)]
@@ -143,7 +142,6 @@ impl<P> fmt::Debug for PendingCapabilityStore<P> {
         let counts = self.counts();
         formatter
             .debug_struct("PendingCapabilityStore")
-            .field("maximum", &counts.maximum)
             .field("accepting", &counts.accepting)
             .field("occupancy", &counts.occupancy)
             .field("pending", &counts.pending)
@@ -153,19 +151,9 @@ impl<P> fmt::Debug for PendingCapabilityStore<P> {
 }
 
 impl<P> PendingCapabilityStore<P> {
-    pub(crate) fn try_new(maximum: usize) -> Result<Self, PendingStoreError> {
-        if maximum == 0 {
-            return Err(PendingStoreError::ZeroCapacity);
-        }
-        let brand = NEXT_STORE_BRAND
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| PendingStoreError::BrandExhausted)?;
-        Ok(Self {
+    pub(crate) fn new() -> Self {
+        Self {
             inner: Arc::new(StoreInner {
-                brand,
-                maximum,
                 state: Mutex::new(StoreState {
                     accepting: true,
                     shutdown_deadline: None,
@@ -180,12 +168,12 @@ impl<P> PendingCapabilityStore<P> {
                 #[cfg(test)]
                 fail_next_reservation: std::sync::atomic::AtomicBool::new(false),
             }),
-        })
+        }
     }
 
     pub(crate) fn try_admit(
         &self,
-        captured_limit: usize,
+        captured_limit: PendingOperationLimit,
         deadline: PendingDeadline,
         payload: P,
     ) -> Result<PendingAdmission<P>, PendingAdmissionError<P>> {
@@ -194,7 +182,7 @@ impl<P> PendingCapabilityStore<P> {
 
     fn try_admit_with_source(
         &self,
-        captured_limit: usize,
+        captured_limit: PendingOperationLimit,
         deadline: PendingDeadline,
         payload: P,
         source: &mut impl ResumeTokenSource,
@@ -214,13 +202,7 @@ impl<P> PendingCapabilityStore<P> {
                 payload,
             ));
         }
-        if captured_limit == 0 || captured_limit > self.inner.maximum {
-            return Err(PendingAdmissionError::new(
-                PendingAdmissionErrorKind::InvalidLimit,
-                payload,
-            ));
-        }
-        if state.occupancy >= captured_limit {
+        if state.occupancy >= captured_limit.get() {
             return Err(PendingAdmissionError::new(
                 PendingAdmissionErrorKind::AtCapacity,
                 payload,
@@ -306,10 +288,10 @@ impl<P> PendingCapabilityStore<P> {
 
         Ok(PendingAdmission {
             token: Some(token),
-            handle: Some(PendingOperationHandle {
+            handle: Some(PendingOperationGuard {
                 store: self.clone(),
-                brand: self.inner.brand,
                 operation,
+                deadline,
             }),
         })
     }
@@ -379,7 +361,6 @@ impl<P> PendingCapabilityStore<P> {
         debug_assert_counts(&state);
         Ok(CallbackClaimResult::Claimed(CallbackClaim {
             store: self.clone(),
-            brand: self.inner.brand,
             operation,
             payload: Some(entry.payload),
         }))
@@ -486,7 +467,6 @@ impl<P> PendingCapabilityStore<P> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         CapabilityStoreCounts {
-            maximum: self.inner.maximum,
             accepting: state.accepting,
             occupancy: state.occupancy,
             pending: state.pending.len(),
@@ -511,7 +491,7 @@ fn debug_assert_counts<P>(state: &StoreState<P>) {
 #[must_use = "a pending admission must be transferred to its operation coordinator"]
 pub(crate) struct PendingAdmission<P> {
     token: Option<ResumeToken>,
-    handle: Option<PendingOperationHandle<P>>,
+    handle: Option<PendingOperationGuard<P>>,
 }
 
 impl<P> PendingAdmission<P> {
@@ -521,7 +501,7 @@ impl<P> PendingAdmission<P> {
             .expect("an active pending admission owns its resume token")
     }
 
-    pub(crate) fn into_parts(mut self) -> (ResumeToken, PendingOperationHandle<P>) {
+    pub(crate) fn into_parts(mut self) -> (ResumeToken, PendingOperationGuard<P>) {
         let token = self
             .token
             .take()
@@ -543,46 +523,30 @@ impl<P> fmt::Debug for PendingAdmission<P> {
     }
 }
 
-impl<P> Drop for PendingAdmission<P> {
-    fn drop(&mut self) {
-        let Some(handle) = self.handle.take() else {
-            return;
-        };
-        if let PendingTerminalResult::Won(operation) =
-            handle.finish_pending(PendingTerminalCause::RequestCancelled)
-        {
-            drop(operation);
-        }
-    }
-}
-
-pub(crate) struct PendingOperationHandle<P> {
+pub(crate) struct PendingOperationGuard<P> {
     store: PendingCapabilityStore<P>,
-    brand: u64,
     operation: OperationId,
+    deadline: PendingDeadline,
 }
 
-impl<P> Clone for PendingOperationHandle<P> {
-    fn clone(&self) -> Self {
-        Self {
-            store: self.store.clone(),
-            brand: self.brand,
-            operation: self.operation,
-        }
-    }
-}
-
-impl<P> fmt::Debug for PendingOperationHandle<P> {
+impl<P> fmt::Debug for PendingOperationGuard<P> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("PendingOperationHandle")
+            .debug_struct("PendingOperationGuard")
             .finish_non_exhaustive()
     }
 }
 
-impl<P> PendingOperationHandle<P> {
+impl<P> PendingOperationGuard<P> {
+    pub(crate) fn signal_handle(&self) -> PendingOperationSignal<P> {
+        PendingOperationSignal {
+            store: self.store.clone(),
+            operation: self.operation,
+        }
+    }
+
     pub(crate) fn finish_pending(&self, cause: PendingTerminalCause) -> PendingTerminalResult<P> {
-        self.finish_pending_inner(cause, None)
+        self.signal_handle().finish_pending(cause)
     }
 
     #[cfg(test)]
@@ -591,17 +555,78 @@ impl<P> PendingOperationHandle<P> {
         cause: PendingTerminalCause,
         occurred_at: Instant,
     ) -> PendingTerminalResult<P> {
-        self.finish_pending_inner(cause, Some(occurred_at))
+        self.signal_handle().finish_pending_at(cause, occurred_at)
+    }
+
+    pub(crate) async fn expire_at_deadline(&self) -> PendingTerminalResult<P> {
+        tokio::time::sleep_until(self.deadline.at()).await;
+        self.finish_pending(self.deadline.cause())
+    }
+}
+
+impl<P> Drop for PendingOperationGuard<P> {
+    fn drop(&mut self) {
+        if let PendingTerminalResult::Won(operation) = self
+            .signal_handle()
+            .finish_pending_after_owner_drop(PendingTerminalCause::RequestCancelled)
+        {
+            drop(operation);
+        }
+    }
+}
+
+pub(crate) struct PendingOperationSignal<P> {
+    store: PendingCapabilityStore<P>,
+    operation: OperationId,
+}
+
+impl<P> Clone for PendingOperationSignal<P> {
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            operation: self.operation,
+        }
+    }
+}
+
+impl<P> fmt::Debug for PendingOperationSignal<P> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingOperationSignal")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<P> PendingOperationSignal<P> {
+    pub(crate) fn finish_pending(&self, cause: PendingTerminalCause) -> PendingTerminalResult<P> {
+        self.finish_pending_inner(cause, None, false)
+    }
+
+    #[cfg(test)]
+    fn finish_pending_at(
+        &self,
+        cause: PendingTerminalCause,
+        occurred_at: Instant,
+    ) -> PendingTerminalResult<P> {
+        self.finish_pending_inner(cause, Some(occurred_at), false)
+    }
+
+    fn finish_pending_after_owner_drop(
+        &self,
+        cause: PendingTerminalCause,
+    ) -> PendingTerminalResult<P> {
+        self.finish_pending_inner(cause, None, true)
     }
 
     fn finish_pending_inner(
         &self,
         cause: PendingTerminalCause,
         fixed_now: Option<Instant>,
+        recover_poison: bool,
     ) -> PendingTerminalResult<P> {
-        debug_assert_eq!(self.brand, self.store.inner.brand);
         let mut state = match self.store.inner.state.lock() {
             Ok(state) => state,
+            Err(poisoned) if recover_poison => poisoned.into_inner(),
             Err(_) => return PendingTerminalResult::Poisoned,
         };
         let occurred_at = fixed_now.unwrap_or_else(Instant::now);
@@ -643,7 +668,6 @@ impl<P> PendingOperationHandle<P> {
 
 pub(crate) struct CallbackClaim<P> {
     store: PendingCapabilityStore<P>,
-    brand: u64,
     operation: OperationId,
     payload: Option<P>,
 }
@@ -713,7 +737,6 @@ impl<P> CallbackClaim<P> {
     }
 
     fn release_occupancy(&mut self, clock: CompletionClock) -> Option<PendingTerminalCause> {
-        debug_assert_eq!(self.brand, self.store.inner.brand);
         let mut state = self
             .store
             .inner
@@ -863,31 +886,11 @@ impl<P> fmt::Debug for FinalCancellation<P> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CapabilityStoreCounts {
-    pub(crate) maximum: usize,
     pub(crate) accepting: bool,
     pub(crate) occupancy: usize,
     pub(crate) pending: usize,
     pub(crate) claimed: usize,
 }
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PendingStoreError {
-    ZeroCapacity,
-    BrandExhausted,
-}
-
-impl fmt::Display for PendingStoreError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ZeroCapacity => formatter.write_str("pending capability store capacity is zero"),
-            Self::BrandExhausted => {
-                formatter.write_str("pending capability store brand space is exhausted")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PendingStoreError {}
 
 pub(crate) struct PendingAdmissionError<P> {
     kind: PendingAdmissionErrorKind,
@@ -928,7 +931,6 @@ impl<P> std::error::Error for PendingAdmissionError<P> {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PendingAdmissionErrorKind {
     Closed,
-    InvalidLimit,
     AtCapacity,
     Allocation,
     RandomSource,
@@ -941,7 +943,6 @@ impl fmt::Display for PendingAdmissionErrorKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Closed => formatter.write_str("pending capability admission is closed"),
-            Self::InvalidLimit => formatter.write_str("pending capability limit is invalid"),
             Self::AtCapacity => formatter.write_str("pending capability store is at capacity"),
             Self::Allocation => formatter.write_str("pending capability store allocation failed"),
             Self::RandomSource => formatter.write_str("resume token random source failed"),
@@ -1021,6 +1022,24 @@ mod tests {
         }
     }
 
+    fn operation_limit(value: usize) -> PendingOperationLimit {
+        PendingOperationLimit::try_new(value).expect("test limit is within the compiled hard bound")
+    }
+
+    #[test]
+    fn pending_operation_limit_enforces_exact_binary_boundaries() {
+        assert_eq!(PendingOperationLimit::try_new(0), None);
+        assert_eq!(
+            PendingOperationLimit::try_new(crate::config::compiler::MAX_PENDING_OPERATIONS)
+                .map(PendingOperationLimit::get),
+            Some(crate::config::compiler::MAX_PENDING_OPERATIONS)
+        );
+        assert_eq!(
+            PendingOperationLimit::try_new(crate::config::compiler::MAX_PENDING_OPERATIONS + 1),
+            None
+        );
+    }
+
     fn admit_fixed<P>(
         store: &PendingCapabilityStore<P>,
         limit: usize,
@@ -1029,7 +1048,7 @@ mod tests {
     ) -> PendingAdmission<P> {
         store
             .try_admit_with_source(
-                limit,
+                operation_limit(limit),
                 future_deadline(),
                 payload,
                 &mut SequenceSource::repeated([byte; RESUME_TOKEN_RANDOM_BYTES], 1),
@@ -1059,7 +1078,7 @@ mod tests {
 
     #[test]
     fn callback_capability_binding_and_replay_matrix() {
-        let store = PendingCapabilityStore::try_new(4).unwrap();
+        let store = PendingCapabilityStore::new();
         let admission = admit_fixed(&store, 4, "generation-7", 1);
         let digest = admission.token().digest();
         let (_token, handle) = admission.into_parts();
@@ -1092,7 +1111,7 @@ mod tests {
 
     #[test]
     fn callback_admission_is_atomic_and_never_evicts() {
-        let store = PendingCapabilityStore::try_new(2).unwrap();
+        let store = PendingCapabilityStore::new();
         let first = admit_fixed(&store, 2, "first", 1);
         let second = admit_fixed(&store, 2, "second", 2);
 
@@ -1124,7 +1143,7 @@ mod tests {
     ) -> PendingAdmissionError<P> {
         store
             .try_admit_with_source(
-                limit,
+                operation_limit(limit),
                 future_deadline(),
                 payload,
                 &mut SequenceSource::repeated([byte; RESUME_TOKEN_RANDOM_BYTES], 1),
@@ -1141,10 +1160,10 @@ mod tests {
 
     #[test]
     fn callback_token_generation_is_bounded_and_fail_closed() {
-        let fresh = PendingCapabilityStore::try_new(1).unwrap();
+        let fresh = PendingCapabilityStore::new();
         let mut failing = SequenceSource::failing();
         let error = fresh
-            .try_admit_with_source(1, future_deadline(), "rng", &mut failing)
+            .try_admit_with_source(operation_limit(1), future_deadline(), "rng", &mut failing)
             .unwrap_err();
         assert_eq!(error.kind(), PendingAdmissionErrorKind::RandomSource);
         let state = fresh.inner.state.lock().unwrap();
@@ -1154,12 +1173,17 @@ mod tests {
         assert_eq!(state.claimed.capacity(), 0);
         drop(state);
 
-        let store = PendingCapabilityStore::try_new(3).unwrap();
+        let store = PendingCapabilityStore::new();
         let existing = admit_fixed(&store, 3, "existing", 9);
         let mut collisions = SequenceSource::repeated([9; RESUME_TOKEN_RANDOM_BYTES], 8);
         let collision_calls = collisions.calls.clone();
         let error = store
-            .try_admit_with_source(3, future_deadline(), "collision", &mut collisions)
+            .try_admit_with_source(
+                operation_limit(3),
+                future_deadline(),
+                "collision",
+                &mut collisions,
+            )
             .unwrap_err();
         assert_eq!(error.kind(), PendingAdmissionErrorKind::CollisionExhausted);
         assert_eq!(error.into_payload(), "collision");
@@ -1168,7 +1192,7 @@ mod tests {
         let mut failing = SequenceSource::failing();
         let failure_calls = failing.calls.clone();
         let error = store
-            .try_admit_with_source(3, future_deadline(), "rng", &mut failing)
+            .try_admit_with_source(operation_limit(3), future_deadline(), "rng", &mut failing)
             .unwrap_err();
         assert_eq!(error.kind(), PendingAdmissionErrorKind::RandomSource);
         assert_eq!(error.into_payload(), "rng");
@@ -1181,6 +1205,15 @@ mod tests {
     fn webhook_three_way_deadline_defaults_and_equality() {
         let start = Instant::now();
         let request = start + Duration::from_secs(30);
+
+        let request_wins = PendingDeadline::earliest(
+            start,
+            start + Duration::from_secs(5),
+            Duration::from_secs(30),
+            Duration::from_secs(20),
+        );
+        assert_eq!(request_wins.at(), start + Duration::from_secs(5));
+        assert_eq!(request_wins.cause(), PendingTerminalCause::RequestDeadline);
 
         let ttl_wins = PendingDeadline::earliest(
             start,
@@ -1234,10 +1267,10 @@ mod tests {
             Duration::from_secs(10),
             Duration::from_secs(20),
         );
-        let store = PendingCapabilityStore::try_new(2).unwrap();
+        let store = PendingCapabilityStore::new();
         let admission = store
             .try_admit_with_source(
-                2,
+                operation_limit(2),
                 deadline,
                 "expired-before-claim",
                 &mut SequenceSource::repeated([1; RESUME_TOKEN_RANDOM_BYTES], 1),
@@ -1257,7 +1290,7 @@ mod tests {
 
         let admission = store
             .try_admit_with_source(
-                2,
+                operation_limit(2),
                 deadline,
                 "expired-before-completion",
                 &mut SequenceSource::repeated([2; RESUME_TOKEN_RANDOM_BYTES], 1),
@@ -1277,12 +1310,144 @@ mod tests {
         assert_eq!(store.counts().occupancy, 0);
     }
 
+    #[tokio::test]
+    async fn pending_operation_guard_abort_releases_record_and_payload() {
+        let store = PendingCapabilityStore::new();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let admission = admit_fixed(&store, 1, DropObserved(drops.clone()), 1);
+        let digest = admission.token().digest();
+        let (_token, guard) = admission.into_parts();
+        let inert_signal = guard.signal_handle();
+        drop(inert_signal);
+        assert_eq!(store.counts().occupancy, 1);
+
+        let coordinator = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        coordinator.abort();
+        assert!(coordinator.await.unwrap_err().is_cancelled());
+
+        assert_eq!(store.counts().occupancy, 0);
+        assert_eq!(drops.load(Ordering::Acquire), 1);
+        assert_eq!(
+            store.try_claim_at(digest, Instant::now()).unwrap_err(),
+            CallbackClaimError::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_operation_guard_abort_after_claim_signals_exclusive_owner() {
+        let store = PendingCapabilityStore::new();
+        let admission = admit_fixed(&store, 1, 43usize, 1);
+        let digest = admission.token().digest();
+        let (_token, guard) = admission.into_parts();
+        let coordinator = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        let claim = claim_live(&store, digest);
+
+        coordinator.abort();
+        assert!(coordinator.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            claim.terminal_signal(),
+            Some(PendingTerminalCause::RequestCancelled)
+        );
+        assert_eq!(store.counts().occupancy, 1);
+        let operation = claim.complete_at(Instant::now()).unwrap_err();
+        assert_eq!(operation.cause(), PendingTerminalCause::RequestCancelled);
+        assert_eq!(operation.into_payload(), 43);
+        assert_eq!(store.counts().occupancy, 0);
+    }
+
+    #[tokio::test]
+    async fn request_owned_deadline_future_expires_unclaimed_record() {
+        let store = PendingCapabilityStore::new();
+        let start = Instant::now();
+        let deadline = PendingDeadline::earliest(
+            start,
+            start,
+            Duration::from_secs(30),
+            Duration::from_secs(20),
+        );
+        let admission = store
+            .try_admit_with_source(
+                operation_limit(1),
+                deadline,
+                "expired",
+                &mut SequenceSource::repeated([4; RESUME_TOKEN_RANDOM_BYTES], 1),
+            )
+            .unwrap();
+        let digest = admission.token().digest();
+        let (_token, guard) = admission.into_parts();
+
+        let operation = match guard.expire_at_deadline().await {
+            PendingTerminalResult::Won(operation) => operation,
+            other => panic!("deadline did not own terminal transition: {other:?}"),
+        };
+        assert_eq!(operation.cause(), PendingTerminalCause::RequestDeadline);
+        assert_eq!(operation.into_payload(), "expired");
+        assert_eq!(store.counts().occupancy, 0);
+        assert_eq!(
+            store.try_claim_at(digest, Instant::now()).unwrap_err(),
+            CallbackClaimError::Unknown
+        );
+    }
+
+    #[test]
+    fn reloadable_pending_limit_can_raise_and_lower_without_eviction() {
+        let store = PendingCapabilityStore::new();
+        let old_first = admit_fixed(&store, 2, "old-first", 1);
+        let old_first_digest = old_first.token().digest();
+        let (_token, old_first_guard) = old_first.into_parts();
+
+        let lowered = admit_error(&store, 1, "lowered", 2);
+        assert_eq!(lowered.kind(), PendingAdmissionErrorKind::AtCapacity);
+        assert_eq!(lowered.into_payload(), "lowered");
+
+        let old_second = admit_fixed(&store, 2, "old-second", 3);
+        let old_second_digest = old_second.token().digest();
+        let (_token, old_second_guard) = old_second.into_parts();
+
+        let successor = admit_fixed(&store, 3, "successor", 4);
+        let successor_digest = successor.token().digest();
+        let (_token, successor_guard) = successor.into_parts();
+        assert_eq!(store.counts().occupancy, 3);
+
+        let rejected = admit_error(&store, 1, "still-lowered", 5);
+        assert_eq!(rejected.kind(), PendingAdmissionErrorKind::AtCapacity);
+        assert_eq!(rejected.into_payload(), "still-lowered");
+        assert_eq!(store.counts().occupancy, 3);
+
+        assert_eq!(
+            claim_live(&store, old_first_digest).complete().unwrap(),
+            "old-first"
+        );
+        assert_eq!(
+            claim_live(&store, old_second_digest).complete().unwrap(),
+            "old-second"
+        );
+        assert_eq!(
+            claim_live(&store, successor_digest).complete().unwrap(),
+            "successor"
+        );
+        drop((old_first_guard, old_second_guard, successor_guard));
+        assert_eq!(store.counts().occupancy, 0);
+    }
+
     #[test]
     fn callback_admission_allocation_failure_restores_payload_and_occupancy() {
-        let store = PendingCapabilityStore::try_new(1).unwrap();
+        let store = PendingCapabilityStore::new();
         store.fail_next_reservation();
         let error = store
-            .try_admit(1, future_deadline(), String::from("owned payload"))
+            .try_admit(
+                operation_limit(1),
+                future_deadline(),
+                String::from("owned payload"),
+            )
             .unwrap_err();
         assert_eq!(error.kind(), PendingAdmissionErrorKind::Allocation);
         assert_eq!(error.into_payload(), "owned payload");
@@ -1291,7 +1456,7 @@ mod tests {
 
     #[test]
     fn callback_deadline_delivery_and_cancellation_races_linearize() {
-        let store = PendingCapabilityStore::try_new(1).unwrap();
+        let store = PendingCapabilityStore::new();
         let handle = admit_fixed(&store, 1, 17usize, 1).into_parts().1;
         let causes = [
             PendingTerminalCause::DeliveryFailed,
@@ -1299,12 +1464,13 @@ mod tests {
             PendingTerminalCause::RequestDeadline,
         ];
         let barrier = Arc::new(Barrier::new(causes.len()));
+        let signal = handle.signal_handle();
         let workers = causes.map(|cause| {
-            let handle = handle.clone();
+            let signal = signal.clone();
             let barrier = barrier.clone();
             thread::spawn(move || {
                 barrier.wait();
-                handle.finish_pending(cause)
+                signal.finish_pending(cause)
             })
         });
         let mut winners = Vec::new();
@@ -1324,7 +1490,7 @@ mod tests {
 
     #[test]
     fn callback_claim_delivery_deadline_and_cancellation_races_linearize() {
-        let store = PendingCapabilityStore::try_new(1).unwrap();
+        let store = PendingCapabilityStore::new();
         let admission = admit_fixed(&store, 1, 23usize, 1);
         let digest = admission.token().digest();
         let handle = admission.into_parts().1;
@@ -1335,12 +1501,13 @@ mod tests {
             PendingTerminalCause::RequestCancelled,
         ];
         let barrier = Arc::new(Barrier::new(causes.len()));
+        let signal = handle.signal_handle();
         let workers = causes.map(|cause| {
-            let handle = handle.clone();
+            let signal = signal.clone();
             let barrier = barrier.clone();
             thread::spawn(move || {
                 barrier.wait();
-                (cause, handle.finish_pending(cause))
+                (cause, signal.finish_pending(cause))
             })
         });
         let mut recorded = 0;
@@ -1363,7 +1530,7 @@ mod tests {
 
     #[test]
     fn callback_claim_drop_and_terminal_signal_race_release_exactly_once() {
-        let store = PendingCapabilityStore::try_new(1).unwrap();
+        let store = PendingCapabilityStore::new();
         let drops = Arc::new(AtomicUsize::new(0));
         let admission = admit_fixed(&store, 1, DropObserved(drops.clone()), 1);
         let digest = admission.token().digest();
@@ -1394,7 +1561,7 @@ mod tests {
 
     #[test]
     fn callback_shutdown_drain_and_claim_races_linearize() {
-        let store = PendingCapabilityStore::try_new(1).unwrap();
+        let store = PendingCapabilityStore::new();
         let admission = admit_fixed(&store, 1, 29usize, 1);
         let digest = admission.token().digest();
         let barrier = Arc::new(Barrier::new(2));
@@ -1444,13 +1611,13 @@ mod tests {
 
     #[test]
     fn webhook_shutdown_admission_race_linearizes() {
-        let store = PendingCapabilityStore::try_new(1).unwrap();
+        let store = PendingCapabilityStore::new();
         let barrier = Arc::new(Barrier::new(2));
         let admission_store = store.clone();
         let admission_barrier = barrier.clone();
         let admission = thread::spawn(move || {
             admission_barrier.wait();
-            admission_store.try_admit(1, future_deadline(), 31usize)
+            admission_store.try_admit(operation_limit(1), future_deadline(), 31usize)
         });
         let close_store = store.clone();
         let close_barrier = barrier.clone();
@@ -1476,7 +1643,9 @@ mod tests {
                 assert_eq!(error.into_payload(), 31);
             }
         }
-        let later = store.try_admit(1, future_deadline(), 37usize).unwrap_err();
+        let later = store
+            .try_admit(operation_limit(1), future_deadline(), 37usize)
+            .unwrap_err();
         assert_eq!(later.kind(), PendingAdmissionErrorKind::Closed);
         assert_eq!(later.into_payload(), 37);
     }
@@ -1491,11 +1660,11 @@ mod tests {
             Duration::from_secs(20),
         );
         let drain_deadline = start + Duration::from_secs(5);
-        let store = PendingCapabilityStore::try_new(2).unwrap();
+        let store = PendingCapabilityStore::new();
 
         let pending = store
             .try_admit_with_source(
-                2,
+                operation_limit(2),
                 operation_deadline,
                 "pending",
                 &mut SequenceSource::repeated([7; RESUME_TOKEN_RANDOM_BYTES], 1),
@@ -1505,7 +1674,7 @@ mod tests {
         let _pending_handle = pending.into_parts().1;
         let claimed = store
             .try_admit_with_source(
-                2,
+                operation_limit(2),
                 operation_deadline,
                 "claimed",
                 &mut SequenceSource::repeated([8; RESUME_TOKEN_RANDOM_BYTES], 1),
@@ -1537,7 +1706,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_store_empty_waiter_wakes_for_pending_and_claimed_release() {
-        let store = PendingCapabilityStore::try_new(2).unwrap();
+        let store = PendingCapabilityStore::new();
         let pending = admit_fixed(&store, 2, "pending", 1);
         let pending_handle = pending.into_parts().1;
         let claimed = admit_fixed(&store, 2, "claimed", 2);
@@ -1568,7 +1737,7 @@ mod tests {
             output_schema: u64,
         }
 
-        let store = PendingCapabilityStore::try_new(4).unwrap();
+        let store = PendingCapabilityStore::new();
         let old = admit_fixed(
             &store,
             4,
@@ -1619,7 +1788,7 @@ mod tests {
 
     #[tokio::test]
     async fn post_claim_terminal_signal_wakes_the_exclusive_claim_owner() {
-        let store = PendingCapabilityStore::try_new(1).unwrap();
+        let store = PendingCapabilityStore::new();
         let admission = admit_fixed(&store, 1, 41usize, 1);
         let digest = admission.token().digest();
         let handle = admission.into_parts().1;

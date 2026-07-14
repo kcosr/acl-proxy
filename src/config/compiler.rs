@@ -41,7 +41,7 @@ const MAX_CONTROL_CONNECTIONS: usize = 65_536;
 const MAX_CONTROL_BODY_BYTES: usize = MIB;
 const MAX_ENDPOINT_BYTES: usize = 8 * 1024;
 const CALLBACK_ROUTE_SUFFIX: &str = "/external-auth/callback";
-const MAX_PENDING_CALLBACKS: usize = 65_536;
+pub(crate) const MAX_PENDING_OPERATIONS: usize = 65_536;
 const MAX_RETIRING_GENERATIONS: usize = 8;
 const MAX_ACTIVE_UPGRADES: usize = 65_536;
 const MAX_ACTIVE_WEBHOOK_DELIVERIES: usize = 4_096;
@@ -425,7 +425,20 @@ pub(crate) struct AuthorizationPlan {
 #[derive(Clone)]
 pub(crate) struct AuthorizationCallbackPlan {
     pub(crate) resume_token_ttl: Duration,
-    pub(crate) max_pending_operations: usize,
+    pub(crate) max_pending_operations: PendingOperationLimit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingOperationLimit(usize);
+
+impl PendingOperationLimit {
+    pub(crate) fn try_new(value: usize) -> Option<Self> {
+        (value > 0 && value <= MAX_PENDING_OPERATIONS).then_some(Self(value))
+    }
+
+    pub(crate) fn get(self) -> usize {
+        self.0
+    }
 }
 
 #[derive(Clone)]
@@ -1262,7 +1275,7 @@ fn validate_positive_limits(
         check_range(
             "authorization.callback.max_pending_operations",
             callback.max_pending_operations,
-            MAX_PENDING_CALLBACKS,
+            MAX_PENDING_OPERATIONS,
         )?;
     }
     if config.authorization.providers.len() > MAX_PROVIDERS {
@@ -4243,7 +4256,10 @@ fn compile_authorization_plan(
             .as_ref()
             .map(|callback| AuthorizationCallbackPlan {
                 resume_token_ttl: callback.resume_token_ttl.get(),
-                max_pending_operations: callback.max_pending_operations,
+                max_pending_operations: PendingOperationLimit::try_new(
+                    callback.max_pending_operations,
+                )
+                .expect("callback pending-operation limit was validated before compilation"),
             }),
         providers,
     })
@@ -5928,7 +5944,8 @@ redaction_profile = "terminal"
                     .as_ref()
                     .map(|callback| format!(
                         "{:?}:{}",
-                        callback.resume_token_ttl, callback.max_pending_operations
+                        callback.resume_token_ttl,
+                        callback.max_pending_operations.get()
                     ))
                     .unwrap_or_default()
             ),

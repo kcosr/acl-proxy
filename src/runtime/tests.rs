@@ -14,6 +14,7 @@ use tokio::sync::{Notify, Semaphore};
 use crate::authorization::callback::{
     CallbackClaimResult, PendingCapabilityStore, PendingDeadline,
 };
+use crate::config::compiler::PendingOperationLimit;
 use crate::config::{compile_config_text, CompiledConfig, ConfigTextInput};
 
 use super::*;
@@ -1109,8 +1110,14 @@ async fn pending_and_claimed_callback_retention_hold_the_exact_retiring_generati
         std::time::Duration::from_secs(30),
         std::time::Duration::from_secs(20),
     );
-    let store = PendingCapabilityStore::try_new(1).unwrap();
-    let admission = store.try_admit(1, deadline, retention).unwrap();
+    let store = PendingCapabilityStore::new();
+    let admission = store
+        .try_admit(
+            PendingOperationLimit::try_new(1).unwrap(),
+            deadline,
+            retention,
+        )
+        .unwrap();
     let digest = admission.token().digest();
     let (_token, _handle) = admission.into_parts();
 
