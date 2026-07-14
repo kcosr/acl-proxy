@@ -359,9 +359,12 @@ default = "deny"
     #[tokio::test]
     async fn publication_before_ingress_confirmation_stays_not_ready() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = super::super::available_listener_addresses::<2>(&_test);
+        let reservations = super::super::reserve_listeners::<2>(&_test);
+        let addresses = reservations.addresses();
         let (_directory, loaded) = loaded(&config(addresses[0], addresses[1], ""));
-        let product = ProductRuntime::prepare(loaded).await.unwrap();
+        let product = ProductRuntime::prepare_from_prebound(loaded, reservations.into_listeners())
+            .await
+            .unwrap();
 
         assert!(!product.runtime().is_ready());
         for address in addresses {
@@ -389,9 +392,12 @@ default = "deny"
     #[tokio::test]
     async fn ingress_confirmation_before_publication_stays_not_ready() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = super::super::available_listener_addresses::<2>(&_test);
+        let reservations = super::super::reserve_listeners::<2>(&_test);
+        let addresses = reservations.addresses();
         let (_directory, loaded) = loaded(&config(addresses[0], addresses[1], ""));
-        let product = ProductRuntime::prepare(loaded).await.unwrap();
+        let product = ProductRuntime::prepare_from_prebound(loaded, reservations.into_listeners())
+            .await
+            .unwrap();
 
         let mut starter = FakeStarter::default();
         product.start_proxy_supervisors(&mut starter).await.unwrap();
@@ -407,7 +413,8 @@ default = "deny"
     #[tokio::test]
     async fn failed_initial_activation_joins_shutdown_and_releases_every_socket() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = super::super::available_listener_addresses::<2>(&_test);
+        let reservations = super::super::reserve_listeners::<2>(&_test);
+        let addresses = reservations.addresses();
         let missing_variable = "ACL_PROXY_RUNNER_TEST_MISSING_REDACTION_LITERAL";
         std::env::remove_var(missing_variable);
         let extra = format!(
@@ -416,7 +423,9 @@ rules = [{{ literal_environment_variables = ["{missing_variable}"] }}]
 "#
         );
         let (_directory, loaded) = loaded(&config(addresses[0], addresses[1], &extra));
-        let product = ProductRuntime::prepare(loaded).await.unwrap();
+        let product = ProductRuntime::prepare_from_prebound(loaded, reservations.into_listeners())
+            .await
+            .unwrap();
 
         let result = product.activate_initial().await;
 
@@ -437,11 +446,13 @@ rules = [{{ literal_environment_variables = ["{missing_variable}"] }}]
     #[tokio::test]
     async fn later_prebind_failure_releases_earlier_proxy_and_control_sockets() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = super::super::available_listener_addresses::<2>(&_test);
-        let blocker = TcpListener::bind(addresses[1]).unwrap();
+        let reservations = super::super::reserve_listeners::<2>(&_test);
+        let addresses = reservations.addresses();
+        let mut listeners = reservations.into_listeners();
+        let blocker = listeners.remove(1);
         let (_directory, loaded) = loaded(&config(addresses[0], addresses[1], ""));
 
-        let result = ProductRuntime::prepare(loaded).await;
+        let result = ProductRuntime::prepare_from_prebound(loaded, listeners).await;
 
         assert!(matches!(
             result,
@@ -457,7 +468,8 @@ rules = [{{ literal_environment_variables = ["{missing_variable}"] }}]
     #[tokio::test]
     async fn static_asset_failure_occurs_before_prebinding_and_leaves_every_socket_free() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = super::super::available_listener_addresses::<3>(&_test);
+        let reservations = super::super::reserve_listeners::<3>(&_test);
+        let addresses = reservations.addresses();
         let extra = format!(
             r#"[listeners.explicit_https]
 bind = "{}"
@@ -474,7 +486,8 @@ private_key = "missing-server-key.pem"
         );
         let (_directory, loaded) = loaded(&config(addresses[0], addresses[1], &extra));
 
-        let result = ProductRuntime::prepare(loaded).await;
+        let result =
+            ProductRuntime::prepare_from_prebound(loaded, reservations.into_listeners()).await;
 
         assert!(matches!(
             result,
@@ -488,7 +501,8 @@ private_key = "missing-server-key.pem"
     #[tokio::test]
     async fn partial_proxy_startup_rolls_back_and_joins_before_returning() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = super::super::available_listener_addresses::<3>(&_test);
+        let reservations = super::super::reserve_listeners::<3>(&_test);
+        let addresses = reservations.addresses();
         let extra = format!(
             r#"[listeners.transparent_http]
 bind = "{}"
@@ -497,7 +511,9 @@ http_versions = ["http1"]
             addresses[2]
         );
         let (_directory, loaded) = loaded(&config(addresses[0], addresses[1], &extra));
-        let product = ProductRuntime::prepare(loaded).await.unwrap();
+        let product = ProductRuntime::prepare_from_prebound(loaded, reservations.into_listeners())
+            .await
+            .unwrap();
         let mut starter = FakeStarter {
             fail_at: Some(1),
             supervisors: Vec::new(),
@@ -526,9 +542,12 @@ http_versions = ["http1"]
     #[tokio::test]
     async fn terminal_proxy_failure_drives_shutdown_and_supervisors_join_once() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = super::super::available_listener_addresses::<2>(&_test);
+        let reservations = super::super::reserve_listeners::<2>(&_test);
+        let addresses = reservations.addresses();
         let (_directory, loaded) = loaded(&config(addresses[0], addresses[1], ""));
-        let product = ProductRuntime::prepare(loaded).await.unwrap();
+        let product = ProductRuntime::prepare_from_prebound(loaded, reservations.into_listeners())
+            .await
+            .unwrap();
         product.activate_initial().await.unwrap();
         let mut starter = FakeStarter::default();
         product.start_proxy_supervisors(&mut starter).await.unwrap();

@@ -789,12 +789,15 @@ header = "x-acl-proxy-request-id"
     #[tokio::test]
     async fn preparation_reserves_every_configured_listener_and_is_one_shot() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = super::super::available_listener_addresses::<5>(&_test);
+        let reservations = super::super::reserve_listeners::<5>(&_test);
+        let addresses = reservations.addresses();
         let directory = tempfile::tempdir().unwrap();
         let resources =
             ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
 
-        resources.prepare_ingress().unwrap();
+        resources
+            .prepare_ingress_from_prebound(reservations.into_listeners())
+            .unwrap();
         for address in addresses {
             assert!(
                 TcpListener::bind(address).is_err(),
@@ -813,14 +816,16 @@ header = "x-acl-proxy-request-id"
     #[tokio::test]
     async fn later_proxy_bind_failure_releases_earlier_sockets() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = super::super::available_listener_addresses::<5>(&_test);
-        let blocker = TcpListener::bind(addresses[2]).unwrap();
+        let reservations = super::super::reserve_listeners::<5>(&_test);
+        let addresses = reservations.addresses();
+        let mut listeners = reservations.into_listeners();
+        let blocker = listeners.remove(2);
         let directory = tempfile::tempdir().unwrap();
         let resources =
             ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
 
         assert!(matches!(
-            resources.prepare_ingress(),
+            resources.prepare_ingress_from_prebound(listeners),
             Err(ProductStaticResourcesError::ProxyListenerBind(error))
                 if error.name == "explicit_https" && error.address == addresses[2]
         ));
@@ -836,15 +841,17 @@ header = "x-acl-proxy-request-id"
     #[tokio::test]
     async fn control_adoption_failure_releases_all_prebound_sockets() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = super::super::available_listener_addresses::<5>(&_test);
+        let reservations = super::super::reserve_listeners::<5>(&_test);
+        let addresses = reservations.addresses();
         let directory = tempfile::tempdir().unwrap();
         let resources =
             ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
 
         assert!(matches!(
-            resources.prepare_ingress_with(TcpListener::bind, |_config, _listener, _observer| {
-                Err(ControlServerError::RuntimeUnavailable)
-            }),
+            resources.prepare_ingress_with(
+                reservations.into_binder(),
+                |_config, _listener, _observer| Err(ControlServerError::RuntimeUnavailable)
+            ),
             Err(ProductStaticResourcesError::Control(
                 ControlServerError::RuntimeUnavailable
             ))
@@ -857,11 +864,14 @@ header = "x-acl-proxy-request-id"
     #[tokio::test]
     async fn shutdown_releases_prepared_but_unstarted_proxy_sockets() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = super::super::available_listener_addresses::<5>(&_test);
+        let reservations = super::super::reserve_listeners::<5>(&_test);
+        let addresses = reservations.addresses();
         let directory = tempfile::tempdir().unwrap();
         let resources =
             ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
-        resources.prepare_ingress().unwrap();
+        resources
+            .prepare_ingress_from_prebound(reservations.into_listeners())
+            .unwrap();
 
         StaticResources::shutdown(resources.as_ref()).await;
 
@@ -875,19 +885,28 @@ header = "x-acl-proxy-request-id"
     #[tokio::test]
     async fn construction_does_not_bind_configured_sockets() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = super::super::available_listener_addresses::<5>(&_test);
+        let reservations = super::super::reserve_listeners::<5>(&_test);
+        let addresses = reservations.addresses();
         let directory = tempfile::tempdir().unwrap();
         let resources =
             ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
 
-        super::super::assert_listener_addresses_released(&_test, addresses);
+        for address in addresses {
+            assert!(
+                TcpListener::bind(address).is_err(),
+                "fixture reservation for {address} was lost during construction"
+            );
+        }
         drop(resources);
+        drop(reservations);
+        super::super::assert_listener_addresses_released(&_test, addresses);
     }
 
     #[tokio::test]
     async fn static_owner_closes_and_joins_runtime_owned_upgrade_tasks() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
-        let addresses = super::super::available_listener_addresses::<5>(&_test);
+        let reservations = super::super::reserve_listeners::<5>(&_test);
+        let addresses = reservations.addresses();
         let directory = tempfile::tempdir().unwrap();
         let resources =
             ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();

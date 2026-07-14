@@ -59,9 +59,52 @@ pub(super) struct ListenerTestGuard<'a> {
 }
 
 #[cfg(test)]
-pub(super) fn available_listener_addresses<const N: usize>(
+pub(super) struct ListenerReservations<const N: usize> {
+    listeners: [std::net::TcpListener; N],
+}
+
+#[cfg(test)]
+impl<const N: usize> ListenerReservations<N> {
+    pub(super) fn addresses(&self) -> [std::net::SocketAddr; N] {
+        std::array::from_fn(|index| {
+            self.listeners[index]
+                .local_addr()
+                .expect("fixture listener has an address")
+        })
+    }
+
+    pub(super) fn into_listeners(self) -> Vec<std::net::TcpListener> {
+        self.listeners.into_iter().collect()
+    }
+
+    pub(super) fn into_binder(
+        self,
+    ) -> impl FnMut(std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
+        let mut listeners = self
+            .listeners
+            .into_iter()
+            .map(|listener| {
+                let address = listener
+                    .local_addr()
+                    .expect("fixture listener has an address");
+                (address, listener)
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        move |address| {
+            listeners.remove(&address).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    format!("no fixture listener reserved for {address}"),
+                )
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn reserve_listeners<const N: usize>(
     _guard: &ListenerTestGuard<'_>,
-) -> [std::net::SocketAddr; N] {
+) -> ListenerReservations<N> {
     use std::io::ErrorKind;
     use std::net::{SocketAddr, TcpListener};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -93,17 +136,10 @@ pub(super) fn available_listener_addresses<const N: usize>(
     }
 
     assert_eq!(listeners.len(), N, "listener fixture port range exhausted");
-    listeners
-        .iter()
-        .map(|listener| {
-            listener
-                .local_addr()
-                .expect("fixture listener has an address")
-        })
-        .collect::<Vec<_>>()
+    let listeners = listeners
         .try_into()
-        .ok()
-        .expect("fixture listener count matches requested array")
+        .expect("fixture listener count matches requested array");
+    ListenerReservations { listeners }
 }
 
 #[cfg(test)]
@@ -111,24 +147,10 @@ pub(super) fn assert_listener_addresses_released(
     _guard: &ListenerTestGuard<'_>,
     addresses: impl IntoIterator<Item = std::net::SocketAddr>,
 ) {
-    use std::io::ErrorKind;
     use std::net::TcpListener;
-    use std::time::{Duration, Instant};
-
-    const RELEASE_TIMEOUT: Duration = Duration::from_millis(250);
-    const RETRY_DELAY: Duration = Duration::from_millis(1);
 
     for address in addresses {
-        let deadline = Instant::now() + RELEASE_TIMEOUT;
-        loop {
-            match TcpListener::bind(address) {
-                Ok(_) => break,
-                Err(error) if error.kind() == ErrorKind::AddrInUse && Instant::now() < deadline => {
-                    std::thread::yield_now();
-                    std::thread::sleep(RETRY_DELAY);
-                }
-                Err(error) => panic!("expected {address} to be released: {error}"),
-            }
-        }
+        TcpListener::bind(address)
+            .unwrap_or_else(|error| panic!("expected {address} to be released: {error}"));
     }
 }
