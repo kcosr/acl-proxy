@@ -1,6 +1,7 @@
 use std::io;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::sync::watch;
 use tokio::time::Instant;
 
 use crate::authorization::webhook::runtime::WebhookAuthorizationRuntime;
@@ -15,6 +16,21 @@ use super::response::ControlResponse;
 use super::router::{ControlRoute, ControlRouter};
 use super::wire::write_control_response;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ControlConnectionSignal {
+    Running,
+    CloseAfterRequest,
+    Abort,
+}
+
+pub(crate) struct ControlConnectionContext<'a> {
+    pub(crate) router: &'a ControlRouter,
+    pub(crate) authorization: &'a WebhookAuthorizationRuntime,
+    pub(crate) readiness: &'a ServiceReadiness,
+    pub(crate) config: &'a StaticControlConfig,
+    pub(crate) shutdown: &'a mut watch::Receiver<ControlConnectionSignal>,
+}
+
 /// Serves one admitted control connection without spawning work.
 /// Dropping the consumed lease wipes and returns its parser store atomically
 /// with the connection slot on every exit.
@@ -22,17 +38,16 @@ pub(crate) async fn serve_control_connection<S>(
     mut stream: S,
     mut lease: ControlConnectionLease,
     first_header_deadline: Instant,
-    router: &ControlRouter,
-    runtime: &WebhookAuthorizationRuntime,
-    readiness: &ServiceReadiness,
-    config: &StaticControlConfig,
+    context: ControlConnectionContext<'_>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut header_deadline = first_header_deadline;
     loop {
-        let Some(head) = read_request_head(&mut stream, &mut lease, header_deadline).await? else {
+        let Some(head) =
+            read_request_head(&mut stream, &mut lease, header_deadline, context.shutdown).await?
+        else {
             return Ok(());
         };
 
@@ -43,15 +58,15 @@ where
         }
 
         let client_closes = head.connection_close;
-        let body_deadline = Instant::now() + config.request_body_timeout;
-        let outcome = match router.classify(&head) {
+        let body_deadline = Instant::now() + context.config.request_body_timeout;
+        let outcome = match context.router.classify(&head) {
             ControlRoute::Callback => {
                 let outcome = handle_callback_entity(
                     &mut stream,
                     lease.parser_store_mut(),
                     head.framing,
-                    runtime,
-                    config.max_request_body_bytes,
+                    context.authorization,
+                    context.config.max_request_body_bytes,
                     body_deadline,
                 )
                 .await;
@@ -61,7 +76,7 @@ where
                 }
             }
             ControlRoute::Readiness => RequestOutcome {
-                response: Some(ControlResponse::readiness(readiness.is_ready())),
+                response: Some(ControlResponse::readiness(context.readiness.is_ready())),
                 reusable: matches!(
                     head.framing,
                     BodyFraming::None | BodyFraming::ContentLength(0)
@@ -73,8 +88,11 @@ where
             },
         };
 
-        let reusable =
-            prepare_parser_store_for_response(&mut lease, outcome.reusable, client_closes);
+        let reusable = prepare_parser_store_for_response(
+            &mut lease,
+            outcome.reusable,
+            client_closes || connection_should_close(context.shutdown),
+        );
         if let Some(response) = outcome.response {
             write_control_response(&mut stream, response, !reusable).await?;
         } else {
@@ -83,7 +101,7 @@ where
         if !reusable {
             return Ok(());
         }
-        header_deadline = Instant::now() + config.request_header_timeout;
+        header_deadline = Instant::now() + context.config.request_header_timeout;
     }
 }
 
@@ -108,6 +126,7 @@ async fn read_request_head<S>(
     stream: &mut S,
     lease: &mut ControlConnectionLease,
     deadline: Instant,
+    shutdown: &mut watch::Receiver<ControlConnectionSignal>,
 ) -> io::Result<Option<RequestHead>>
 where
     S: AsyncRead + Unpin,
@@ -123,7 +142,21 @@ where
         if store.writable().is_empty() {
             return Ok(None);
         }
-        let read = match tokio::time::timeout_at(deadline, stream.read(store.writable())).await {
+        let idle = store.initialized_len() == 0;
+        if idle && connection_should_close(shutdown) {
+            return Ok(None);
+        }
+        let reading = tokio::time::timeout_at(deadline, stream.read(store.writable()));
+        tokio::pin!(reading);
+        let read = match if idle {
+            tokio::select! {
+                biased;
+                _ = wait_for_connection_close(shutdown) => return Ok(None),
+                result = &mut reading => result,
+            }
+        } else {
+            reading.await
+        } {
             Ok(result) => result?,
             Err(_) => return Ok(None),
         };
@@ -132,6 +165,21 @@ where
         }
         if store.commit_written(read).is_err() {
             return Ok(None);
+        }
+    }
+}
+
+fn connection_should_close(shutdown: &watch::Receiver<ControlConnectionSignal>) -> bool {
+    *shutdown.borrow() != ControlConnectionSignal::Running
+}
+
+async fn wait_for_connection_close(shutdown: &mut watch::Receiver<ControlConnectionSignal>) {
+    if connection_should_close(shutdown) {
+        return;
+    }
+    while shutdown.changed().await.is_ok() {
+        if connection_should_close(shutdown) {
+            return;
         }
     }
 }
@@ -168,24 +216,51 @@ mod tests {
         server: DuplexStream,
         config: StaticControlConfig,
     ) -> tokio::task::JoinHandle<io::Result<()>> {
+        let (shutdown, shutdown_rx) = watch::channel(ControlConnectionSignal::Running);
+        tokio::spawn(async move {
+            let _shutdown = shutdown;
+            run_server(server, config, shutdown_rx).await
+        })
+    }
+
+    fn start_server_with_shutdown(
+        server: DuplexStream,
+        config: StaticControlConfig,
+    ) -> (
+        tokio::task::JoinHandle<io::Result<()>>,
+        watch::Sender<ControlConnectionSignal>,
+    ) {
+        let (shutdown, shutdown_rx) = watch::channel(ControlConnectionSignal::Running);
+        (
+            tokio::spawn(run_server(server, config, shutdown_rx)),
+            shutdown,
+        )
+    }
+
+    async fn run_server(
+        server: DuplexStream,
+        config: StaticControlConfig,
+        mut shutdown: watch::Receiver<ControlConnectionSignal>,
+    ) -> io::Result<()> {
         let arena = ControlParserArena::try_new(1).unwrap();
         let lease = arena.try_acquire().unwrap();
         let router = ControlRouter::try_new(&config.base_path).unwrap();
         let runtime = WebhookAuthorizationRuntime::for_test(None);
         let readiness = ServiceReadiness::new();
         let first_header_deadline = Instant::now() + config.request_header_timeout;
-        tokio::spawn(async move {
-            serve_control_connection(
-                server,
-                lease,
-                first_header_deadline,
-                &router,
-                &runtime,
-                &readiness,
-                &config,
-            )
-            .await
-        })
+        serve_control_connection(
+            server,
+            lease,
+            first_header_deadline,
+            ControlConnectionContext {
+                router: &router,
+                authorization: &runtime,
+                readiness: &readiness,
+                config: &config,
+                shutdown: &mut shutdown,
+            },
+        )
+        .await
     }
 
     async fn read_response(client: &mut DuplexStream) -> Vec<u8> {
@@ -237,6 +312,35 @@ mod tests {
         assert!(second
             .windows(b"Connection: close".len())
             .any(|window| window == b"Connection: close"));
+        assert!(task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn graceful_close_ends_an_idle_keep_alive_without_another_request() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let (task, shutdown) = start_server_with_shutdown(
+            server,
+            config(Duration::from_secs(30), Duration::from_secs(1)),
+        );
+
+        client
+            .write_all(b"GET /_acl-proxy/ready HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let response = read_response(&mut client).await;
+        assert!(!response
+            .windows(b"Connection: close".len())
+            .any(|window| window == b"Connection: close"));
+
+        shutdown
+            .send(ControlConnectionSignal::CloseAfterRequest)
+            .unwrap();
+        let mut trailing = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut trailing))
+            .await
+            .expect("an idle keep-alive must close promptly")
+            .unwrap();
+        assert!(trailing.is_empty());
         assert!(task.await.unwrap().is_ok());
     }
 

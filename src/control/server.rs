@@ -7,7 +7,7 @@ use std::time::Duration;
 #[cfg(test)]
 use std::collections::VecDeque;
 #[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
@@ -26,12 +26,15 @@ use super::admission::{
     ControlAdmissionError, ControlArenaCounts, ControlArenaError, ControlConnectionLease,
     ControlParserArena,
 };
-use super::connection::serve_control_connection;
+use super::connection::{
+    serve_control_connection, ControlConnectionContext, ControlConnectionSignal,
+};
 use super::router::{ControlRouter, ControlRouterError};
 
 const HTTP1_ALPN: &[u8] = b"http/1.1";
 const TRANSIENT_ACCEPT_RETRY: Duration = Duration::from_millis(10);
 const RESOURCE_ACCEPT_RETRY: Duration = Duration::from_secs(1);
+const MAX_CONSECUTIVE_BACKOFF_ACCEPT_FAILURES: usize = 30;
 
 pub(crate) struct ControlServer {
     stop: watch::Sender<ControlStop>,
@@ -117,6 +120,23 @@ impl ControlServer {
             ControlListener::with_accept_errors(listener, errors),
             local_addr,
         )
+    }
+
+    #[cfg(test)]
+    fn from_prebound_with_connection_panic(
+        config: &StaticControlConfig,
+        listener: StdTcpListener,
+        authorization: Arc<WebhookAuthorizationRuntime>,
+        readiness: Arc<ServiceReadiness>,
+        failure_observer: Arc<dyn ControlServerFailureObserver>,
+    ) -> Result<Arc<Self>, ControlServerError> {
+        let prepared =
+            PreparedControlServer::try_new(config, authorization, readiness, failure_observer)?;
+        prepared
+            .context
+            .panic_next_connection
+            .store(true, Ordering::Release);
+        Self::start(prepared, listener)
     }
 
     fn start_listener(
@@ -253,6 +273,8 @@ impl PreparedControlServer {
                 failure_observer,
                 config: config.clone(),
                 tls,
+                #[cfg(test)]
+                panic_next_connection: AtomicBool::new(false),
             }),
         })
     }
@@ -266,6 +288,8 @@ struct ControlServerContext {
     failure_observer: Arc<dyn ControlServerFailureObserver>,
     config: StaticControlConfig,
     tls: Option<TlsAcceptor>,
+    #[cfg(test)]
+    panic_next_connection: AtomicBool,
 }
 
 struct ControlListener {
@@ -343,7 +367,8 @@ async fn run_control_supervisor(
     #[cfg(test)] spawned_connections: Arc<AtomicUsize>,
 ) -> Result<(), Arc<ControlServerRunError>> {
     let mut connections = JoinSet::new();
-    let (connection_stop, _) = watch::channel(false);
+    let (connection_stop, _) = watch::channel(ControlConnectionSignal::Running);
+    let mut accept_failures = AcceptFailureTracker::default();
     let exit = loop {
         tokio::select! {
             biased;
@@ -357,7 +382,11 @@ async fn run_control_supervisor(
                 let (stream, _) = match accepted {
                     Ok(accepted) => accepted,
                     Err(error) => {
-                        let retry_after = match classify_accept_error(&error) {
+                        let retry_after = match accept_failures.on_error(&error) {
+                            AcceptErrorDisposition::RetryNow => {
+                                tokio::task::yield_now().await;
+                                continue;
+                            }
                             AcceptErrorDisposition::RetryAfter(retry_after) => retry_after,
                             AcceptErrorDisposition::Fatal => {
                                 break SupervisorExit::Error(Arc::new(ControlServerRunError::Accept(error)));
@@ -383,6 +412,7 @@ async fn run_control_supervisor(
                         continue;
                     }
                 };
+                accept_failures.on_success();
                 let first_header_deadline = Instant::now() + context.config.request_header_timeout;
                 let gate = stop_gate
                     .lock()
@@ -400,21 +430,27 @@ async fn run_control_supervisor(
                 #[cfg(test)]
                 spawned_connections.fetch_add(1, Ordering::AcqRel);
                 let context = context.clone();
-                let connection_stop = connection_stop.subscribe();
+                let connection_close = connection_stop.subscribe();
+                let connection_abort = connection_stop.subscribe();
                 connections.spawn(async move {
+                    #[cfg(test)]
+                    if context.panic_next_connection.swap(false, Ordering::AcqRel) {
+                        panic!("injected control connection task panic");
+                    }
                     serve_admitted_connection(
                         stream,
                         lease,
                         first_header_deadline,
                         context,
-                        connection_stop,
+                        connection_close,
+                        connection_abort,
                     ).await;
                 });
                 drop(gate);
             }
             completed = connections.join_next(), if !connections.is_empty() => {
                 if let Some(Err(error)) = completed {
-                    break SupervisorExit::Error(Arc::new(ControlServerRunError::ConnectionJoin(error)));
+                    tracing::error!(error = %error, "control connection task panicked");
                 }
             }
         }
@@ -431,8 +467,10 @@ async fn run_control_supervisor(
         SupervisorExit::Error(_) | SupervisorExit::Stop(ControlStop::AbortAndJoin)
     );
     if abort {
-        let _ = connection_stop.send(true);
+        let _ = connection_stop.send(ControlConnectionSignal::Abort);
         connections.abort_all();
+    } else {
+        let _ = connection_stop.send(ControlConnectionSignal::CloseAfterRequest);
     }
     let mut cleanup_error = None;
     while !connections.is_empty() {
@@ -445,7 +483,7 @@ async fn run_control_supervisor(
                     let requested = *stop.borrow_and_update();
                     if changed.is_err() || requested == ControlStop::AbortAndJoin {
                         abort = true;
-                        let _ = connection_stop.send(true);
+                        let _ = connection_stop.send(ControlConnectionSignal::Abort);
                         connections.abort_all();
                     }
                     continue;
@@ -471,8 +509,38 @@ async fn run_control_supervisor(
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum AcceptErrorDisposition {
+    RetryNow,
     RetryAfter(Duration),
     Fatal,
+}
+
+#[derive(Default)]
+struct AcceptFailureTracker {
+    consecutive_backoff_failures: usize,
+}
+
+impl AcceptFailureTracker {
+    fn on_error(&mut self, error: &io::Error) -> AcceptErrorDisposition {
+        match classify_accept_error(error) {
+            AcceptErrorDisposition::RetryNow => {
+                self.on_success();
+                AcceptErrorDisposition::RetryNow
+            }
+            AcceptErrorDisposition::RetryAfter(retry_after) => {
+                self.consecutive_backoff_failures += 1;
+                if self.consecutive_backoff_failures >= MAX_CONSECUTIVE_BACKOFF_ACCEPT_FAILURES {
+                    AcceptErrorDisposition::Fatal
+                } else {
+                    AcceptErrorDisposition::RetryAfter(retry_after)
+                }
+            }
+            AcceptErrorDisposition::Fatal => AcceptErrorDisposition::Fatal,
+        }
+    }
+
+    fn on_success(&mut self) {
+        self.consecutive_backoff_failures = 0;
+    }
 }
 
 fn classify_accept_error(error: &io::Error) -> AcceptErrorDisposition {
@@ -484,8 +552,8 @@ fn classify_accept_error(error: &io::Error) -> AcceptErrorDisposition {
         | io::ErrorKind::WouldBlock
         | io::ErrorKind::ConnectionAborted
         | io::ErrorKind::ConnectionReset
-        | io::ErrorKind::ConnectionRefused
-        | io::ErrorKind::TimedOut => AcceptErrorDisposition::RetryAfter(TRANSIENT_ACCEPT_RETRY),
+        | io::ErrorKind::ConnectionRefused => AcceptErrorDisposition::RetryNow,
+        io::ErrorKind::TimedOut => AcceptErrorDisposition::RetryAfter(TRANSIENT_ACCEPT_RETRY),
         _ => AcceptErrorDisposition::RetryAfter(RESOURCE_ACCEPT_RETRY),
     }
 }
@@ -530,7 +598,8 @@ async fn serve_admitted_connection(
     lease: ControlConnectionLease,
     first_header_deadline: Instant,
     context: Arc<ControlServerContext>,
-    mut stop: watch::Receiver<bool>,
+    mut close: watch::Receiver<ControlConnectionSignal>,
+    mut abort: watch::Receiver<ControlConnectionSignal>,
 ) {
     let serving = async {
         if let Some(acceptor) = &context.tls {
@@ -552,10 +621,13 @@ async fn serve_admitted_connection(
                 &mut stream,
                 lease,
                 first_header_deadline,
-                &context.router,
-                &context.authorization,
-                &context.readiness,
-                &context.config,
+                ControlConnectionContext {
+                    router: &context.router,
+                    authorization: &context.authorization,
+                    readiness: &context.readiness,
+                    config: &context.config,
+                    shutdown: &mut close,
+                },
             )
             .await;
             let _ = stream.shutdown().await;
@@ -565,10 +637,13 @@ async fn serve_admitted_connection(
                 &mut stream,
                 lease,
                 first_header_deadline,
-                &context.router,
-                &context.authorization,
-                &context.readiness,
-                &context.config,
+                ControlConnectionContext {
+                    router: &context.router,
+                    authorization: &context.authorization,
+                    readiness: &context.readiness,
+                    config: &context.config,
+                    shutdown: &mut close,
+                },
             )
             .await;
             let _ = stream.shutdown().await;
@@ -577,17 +652,17 @@ async fn serve_admitted_connection(
     tokio::pin!(serving);
     tokio::select! {
         biased;
-        _ = wait_for_stop(&mut stop) => {}
+        _ = wait_for_abort(&mut abort) => {}
         _ = &mut serving => {}
     }
 }
 
-async fn wait_for_stop(stop: &mut watch::Receiver<bool>) {
-    if *stop.borrow() {
+async fn wait_for_abort(stop: &mut watch::Receiver<ControlConnectionSignal>) {
+    if *stop.borrow() == ControlConnectionSignal::Abort {
         return;
     }
     while stop.changed().await.is_ok() {
-        if *stop.borrow_and_update() {
+        if *stop.borrow_and_update() == ControlConnectionSignal::Abort {
             return;
         }
     }
@@ -820,6 +895,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_connection_task_panic_does_not_fail_the_control_supervisor() {
+        let config = config(1);
+        let server = ControlServer::from_prebound_with_connection_panic(
+            &config,
+            prebound(),
+            WebhookAuthorizationRuntime::for_test(None),
+            Arc::new(ServiceReadiness::new()),
+            Arc::new(IgnoreControlServerFailure),
+        )
+        .unwrap();
+
+        let mut panicking = tokio::net::TcpStream::connect(server.local_addr())
+            .await
+            .unwrap();
+        wait_for(|| server.spawned_connections() == 1).await;
+        let mut trailing = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), panicking.read_to_end(&mut trailing))
+            .await
+            .expect("the panicking connection task must release its stream")
+            .unwrap();
+        assert!(trailing.is_empty());
+
+        let mut healthy = tokio::net::TcpStream::connect(server.local_addr())
+            .await
+            .unwrap();
+        healthy
+            .write_all(b"GET /_acl-proxy/ready HTTP/1.1\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), healthy.read_to_end(&mut response))
+            .await
+            .expect("the supervisor must serve a connection after an isolated panic")
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+        server.close_and_join().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn graceful_close_finishes_an_admitted_request_before_joining() {
         let server = start(1);
         let mut client = tokio::net::TcpStream::connect(server.local_addr())
@@ -840,6 +954,9 @@ mod tests {
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
         assert!(response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+        assert!(response
+            .windows(b"Connection: close".len())
+            .any(|window| window == b"Connection: close"));
         joining.await.unwrap().unwrap();
         assert_eq!(server.arena_counts().live, 0);
     }
@@ -851,7 +968,7 @@ mod tests {
                 io::ErrorKind::ConnectionAborted,
                 "transient",
             )),
-            AcceptErrorDisposition::RetryAfter(TRANSIENT_ACCEPT_RETRY)
+            AcceptErrorDisposition::RetryNow
         );
         assert_eq!(
             classify_accept_error(&io::Error::new(io::ErrorKind::InvalidInput, "fatal")),
@@ -873,6 +990,25 @@ mod tests {
                 AcceptErrorDisposition::Fatal
             );
         }
+    }
+
+    #[test]
+    fn persistent_backoff_accept_failures_exhaust_the_retry_budget() {
+        let error = io::Error::other("persistent platform accept failure");
+        let mut tracker = AcceptFailureTracker::default();
+        for _ in 1..MAX_CONSECUTIVE_BACKOFF_ACCEPT_FAILURES {
+            assert_eq!(
+                tracker.on_error(&error),
+                AcceptErrorDisposition::RetryAfter(RESOURCE_ACCEPT_RETRY)
+            );
+        }
+        assert_eq!(tracker.on_error(&error), AcceptErrorDisposition::Fatal);
+
+        tracker.on_success();
+        assert_eq!(
+            tracker.on_error(&error),
+            AcceptErrorDisposition::RetryAfter(RESOURCE_ACCEPT_RETRY)
+        );
     }
 
     #[cfg(unix)]

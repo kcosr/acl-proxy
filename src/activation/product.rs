@@ -393,6 +393,63 @@ header = "x-acl-proxy-request-id"
     }
 
     #[tokio::test]
+    async fn unbounded_product_shutdown_closes_an_idle_control_keep_alive() {
+        let minimal = MINIMAL.replace(
+            "shutdown_drain_timeout = \"30s\"",
+            "shutdown_drain_timeout = \"unbounded\"",
+        );
+        let text = format!(
+            "{minimal}\n[control]\nbind = \"127.0.0.1:8898\"\nbase_path = \"/_acl-proxy\"\nrequest_header_timeout = \"30s\"\nrequest_body_timeout = \"1s\"\nmax_connections = 1\nmax_request_body_bytes = 65536\n"
+        );
+        let compiled = compile(&text);
+        let resources = ProductStaticResources::try_new(&compiled.static_config).unwrap();
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = resources
+            .start_control_with_listener(listener)
+            .unwrap()
+            .unwrap();
+        let control = resources.control_server().unwrap();
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(b"GET /_acl-proxy/ready HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+
+        let mut response = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            client.read_exact(&mut byte).await.unwrap();
+            response.push(byte[0]);
+            if response.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let head = std::str::from_utf8(&response).unwrap();
+        let body_len = head
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        let head_len = response.len();
+        response.resize(head_len + body_len, 0);
+        client.read_exact(&mut response[head_len..]).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::runtime::StaticResources::shutdown(resources.as_ref()),
+        )
+        .await
+        .expect("unbounded product shutdown must not permit keep-alive renewal");
+        let mut trailing = Vec::new();
+        client.read_to_end(&mut trailing).await.unwrap();
+        assert!(trailing.is_empty());
+        assert_eq!(control.arena_counts().live, 0);
+        assert_eq!(control.arena_counts().available, 1);
+    }
+
+    #[tokio::test]
     async fn control_graceful_join_escalates_at_the_static_shutdown_deadline() {
         let minimal = MINIMAL.replace(
             "shutdown_drain_timeout = \"30s\"",
