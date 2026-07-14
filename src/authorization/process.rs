@@ -1500,7 +1500,8 @@ mod tests {
     use http::HeaderValue;
 
     use crate::authorization::protocol::{
-        GuardedProviderBody, IncludedHeader, ProviderRequestHeaders,
+        GuardedProviderBody, IncludedHeader, ProviderBodyReplacementDecodeError,
+        ProviderRequestHeaders,
     };
     use crate::config::compiler::ProviderOutputPlan;
     use crate::safety::{WireBodyPool, WireBodyQuotaKey};
@@ -2211,11 +2212,6 @@ for line in sys.stdin:
                 1024,
             ),
             (
-                "oversized-replacement",
-                r#"{"type":"response","decision":"allow","values":{"token":"present"},"requestBody":{"encoding":"base64","data":"e30="}}"#,
-                1,
-            ),
-            (
                 "noncanonical-base64-tail-bits",
                 r#"{"type":"response","decision":"allow","values":{"token":"present"},"requestBody":{"encoding":"base64","data":"Zh=="}}"#,
                 1024,
@@ -2260,6 +2256,52 @@ for line in sys.stdin:
             assert_eq!(pool.global_charge(), 0, "{name} leaked guarded bytes");
             cleanup(&provider).await;
         }
+    }
+
+    #[tokio::test]
+    async fn expanded_response_preserves_provider_overflow_for_terminal_classification() {
+        let directory = TempDir::new().unwrap();
+        let script = write_python(
+            &directory,
+            r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    response = {
+        "id": request["id"],
+        "type": "response",
+        "decision": "allow",
+        "requestBody": {"encoding": "base64", "data": "e30="}
+    }
+    print(json.dumps(response, separators=(",", ":")), flush=True)
+"#,
+        );
+        let mut provider_plan = plan(&directory, &script);
+        provider_plan.allow_request_body_replacement = true;
+        provider_plan.max_decoded_request_body_bytes = 1;
+        let provider = ProcessProvider::activate(provider_plan, || false)
+            .await
+            .unwrap();
+        commit(&provider);
+
+        let (pool, guard) = body_guard_with_pool();
+        let decision = provider
+            .decide(request("oversized-replacement"), &guard, request_deadline())
+            .await
+            .unwrap();
+        let ProcessDecision::AllowWithOutputs {
+            credentials,
+            replacement: Some(replacement),
+        } = decision
+        else {
+            panic!("a canonical replacement must reach terminal classification");
+        };
+        drop(credentials);
+        assert!(matches!(
+            replacement.decode_with_limits(&guard, 1, usize::MAX),
+            Err(ProviderBodyReplacementDecodeError::ProviderBodyLimit)
+        ));
+        assert_eq!(pool.global_charge(), 0);
+        cleanup(&provider).await;
     }
 
     #[tokio::test]

@@ -585,8 +585,10 @@ enum ProviderBodyReplacementStorage {
 
 #[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum ProviderBodyReplacementDecodeError {
-    #[error("authorization provider replacement exceeds the terminal body limit")]
-    BodyLimit,
+    #[error("authorization provider replacement exceeds the provider body limit")]
+    ProviderBodyLimit,
+    #[error("authorization provider replacement exceeds the redaction body limit")]
+    RedactionBodyLimit,
     #[error("authorization provider replacement decode failed")]
     InvalidBody,
 }
@@ -633,13 +635,14 @@ impl ProviderBodyReplacement {
         guard: &HttpWireBodyGuard,
     ) -> Result<(Option<String>, Option<String>, GuardedBody), ProviderBodyReplacementDecodeError>
     {
-        self.decode_with_limit(guard, usize::MAX)
+        self.decode_with_limits(guard, usize::MAX, usize::MAX)
     }
 
-    pub(crate) fn decode_with_limit(
+    pub(crate) fn decode_with_limits(
         self,
         guard: &HttpWireBodyGuard,
-        max_decoded_bytes: usize,
+        provider_max_decoded_bytes: usize,
+        redaction_max_decoded_bytes: usize,
     ) -> Result<(Option<String>, Option<String>, GuardedBody), ProviderBodyReplacementDecodeError>
     {
         let decoded_bytes = match &self.storage {
@@ -647,9 +650,13 @@ impl ProviderBodyReplacement {
             ProviderBodyReplacementStorage::Decoded(bytes) => bytes.len(),
             ProviderBodyReplacementStorage::Encoded { decoded_bytes, .. } => *decoded_bytes,
         };
-        if decoded_bytes > max_decoded_bytes {
-            return Err(ProviderBodyReplacementDecodeError::BodyLimit);
+        if decoded_bytes > provider_max_decoded_bytes {
+            return Err(ProviderBodyReplacementDecodeError::ProviderBodyLimit);
         }
+        if decoded_bytes > redaction_max_decoded_bytes {
+            return Err(ProviderBodyReplacementDecodeError::RedactionBodyLimit);
+        }
+        let max_decoded_bytes = provider_max_decoded_bytes.min(redaction_max_decoded_bytes);
         let decoded = match self.storage {
             #[cfg(test)]
             ProviderBodyReplacementStorage::Decoded(bytes) => guard

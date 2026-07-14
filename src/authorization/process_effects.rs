@@ -428,23 +428,23 @@ impl<'a> AssignedProcessEffectsParser<'a> {
                 .expect("an active parser owns guarded effect storage")
                 .finish(),
         );
-        let replacement =
-            if let Some(range) = self.replacement_range {
-                let max = self.max_decoded_replacement_bytes.ok_or(
-                    ProcessEffectsParseError::Assigned(AssignedResponseError::BodyNotAllowed),
-                )?;
-                let decoded_bytes = validate_base64(&storage, range, max)
-                    .map_err(ProcessEffectsParseError::Assigned)?;
-                Some(ProviderBodyReplacement::from_encoded(
-                    self.content_type,
-                    self.content_encoding,
-                    storage.clone(),
-                    range,
-                    decoded_bytes,
-                ))
-            } else {
-                None
-            };
+        let replacement = if let Some(range) = self.replacement_range {
+            self.max_decoded_replacement_bytes
+                .ok_or(ProcessEffectsParseError::Assigned(
+                    AssignedResponseError::BodyNotAllowed,
+                ))?;
+            let decoded_bytes =
+                validate_base64(&storage, range).map_err(ProcessEffectsParseError::Assigned)?;
+            Some(ProviderBodyReplacement::from_encoded(
+                self.content_type,
+                self.content_encoding,
+                storage.clone(),
+                range,
+                decoded_bytes,
+            ))
+        } else {
+            None
+        };
         let credentials =
             ProviderCredentialSet::from_process_segmented(ProcessProviderCredentials::new(
                 self.outputs.id(),
@@ -798,7 +798,6 @@ fn hex(byte: u8) -> Option<u16> {
 fn validate_base64(
     storage: &crate::safety::GuardedBody,
     range: ProcessEffectRange,
-    max_decoded_bytes: usize,
 ) -> Result<usize, AssignedResponseError> {
     let mut quartet = [0u8; 4];
     let mut quartet_len = 0usize;
@@ -822,7 +821,6 @@ fn validate_base64(
             };
             decoded_len = decoded_len
                 .checked_add(3 - padding)
-                .filter(|len| *len <= max_decoded_bytes)
                 .ok_or(AssignedResponseError::InvalidBody)?;
             let mut decoded = [0u8; 3];
             let written = BASE64_STANDARD
