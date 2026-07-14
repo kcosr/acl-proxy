@@ -1528,6 +1528,28 @@ mod tests {
         }
     }
 
+    async fn wait_for_complete_json_frame(path: &Path) -> (String, serde_json::Value) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let last_observation = match fs::read_to_string(path) {
+                Ok(contents) => match serde_json::from_str(&contents) {
+                    Ok(frame) => return (contents, frame),
+                    Err(error) => {
+                        format!("file contents {contents:?} are not a complete JSON frame: {error}")
+                    }
+                },
+                Err(error) => format!("file could not be read: {error}"),
+            };
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for complete JSON frame in {}: {last_observation}",
+                    path.display(),
+                );
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     #[tokio::test]
     async fn publication_rejects_a_child_that_exited_after_eager_spawn() {
         let directory = TempDir::new().unwrap();
@@ -1733,16 +1755,14 @@ time.sleep(30)
                 .decide(request("first"), &body_guard(), request_deadline())
                 .await
         });
-        wait_for_file(&observed).await;
+        wait_for_complete_json_frame(&observed).await;
         assert_eq!(
             provider
                 .decide(request("second"), &body_guard(), request_deadline())
                 .await,
             Err(ProcessRequestError::AtCapacity)
         );
-        time::sleep(Duration::from_millis(25)).await;
-        let written = fs::read_to_string(&observed).unwrap();
-        let frame: serde_json::Value = serde_json::from_str(&written).unwrap();
+        let (written, frame) = wait_for_complete_json_frame(&observed).await;
         assert!(frame["id"].as_str().unwrap().starts_with('p'));
         assert_eq!(frame["requestId"], "first");
         assert_eq!(written.lines().count(), 1);
