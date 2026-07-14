@@ -146,13 +146,16 @@ struct ResponseLimitExceeded;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AcknowledgementError {
     BytesAfterResponse,
+    Cancelled,
     CloseDelimitedBodyForbidden,
     Framing(FramingError),
     Head(HeadError),
     NonSuccessStatus(u16),
     ParserFailed,
+    Read,
     ResponseBodyTooLarge,
     ResponseLimitUnrepresentable,
+    StoreCapacityExceeded,
     UnexpectedEndOfStream,
 }
 
@@ -162,6 +165,7 @@ impl fmt::Display for AcknowledgementError {
             Self::BytesAfterResponse => {
                 formatter.write_str("bytes follow the framed webhook acknowledgement")
             }
+            Self::Cancelled => formatter.write_str("webhook acknowledgement read was cancelled"),
             Self::CloseDelimitedBodyForbidden => {
                 formatter.write_str("close-delimited webhook acknowledgements are forbidden")
             }
@@ -174,11 +178,15 @@ impl fmt::Display for AcknowledgementError {
                 )
             }
             Self::ParserFailed => formatter.write_str("webhook acknowledgement parser failed"),
+            Self::Read => formatter.write_str("webhook acknowledgement socket read failed"),
             Self::ResponseBodyTooLarge => {
                 formatter.write_str("webhook acknowledgement entity exceeds its configured limit")
             }
             Self::ResponseLimitUnrepresentable => formatter
                 .write_str("webhook acknowledgement entity limit is not representable as u64"),
+            Self::StoreCapacityExceeded => {
+                formatter.write_str("webhook acknowledgement parser store capacity was exceeded")
+            }
             Self::UnexpectedEndOfStream => {
                 formatter.write_str("webhook acknowledgement ended before framing completed")
             }
