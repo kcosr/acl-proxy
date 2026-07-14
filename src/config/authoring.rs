@@ -1161,7 +1161,7 @@ fn default_capture_max_body_bytes() -> usize {
 }
 
 fn default_capture_max_inflight_body_bytes() -> usize {
-    64 * 1024 * 1024
+    128 * 1024 * 1024
 }
 
 pub(super) fn default_capture_max_pending_records() -> usize {
@@ -1453,7 +1453,7 @@ payloads = "both"
 events = ["request.denied", "response.denied"]
 redaction_profile = "secrets"
 directory = "captures"
-max_inflight_body_bytes = 67108864
+max_inflight_body_bytes = 134217728
 "#
         );
 
@@ -1503,7 +1503,7 @@ max_inflight_body_bytes = 67108864
         let capture = parsed.observation.capture.unwrap();
         assert_eq!(capture.events.len(), 2);
         assert_eq!(capture.redaction_profile, "secrets");
-        assert_eq!(capture.max_inflight_body_bytes, 64 * 1024 * 1024);
+        assert_eq!(capture.max_inflight_body_bytes, 128 * 1024 * 1024);
         assert_eq!(capture.max_pending_records, 1024);
     }
 

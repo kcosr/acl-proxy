@@ -15,7 +15,11 @@ use crate::redaction::{ProfileHandle, RedactionActivation, RedactionSnapshot};
 use crate::runtime::{GenerationOwner, ObservationSnapshot, RedactionProfileIndex};
 
 use capture::CaptureEpochUpdate;
-pub(crate) use capture::{CaptureOperation, CapturePool};
+pub(crate) use capture::{
+    CaptureAllocationCharge, CaptureAllocationError, CaptureBody, CaptureBodyBuilder,
+    CaptureOperation, CapturePool, CaptureScratch, CaptureWorkspace, CaptureWorkspaceAllocation,
+    ReservedCaptureBodyBuilder,
+};
 
 /// Process-owned observation state shared by all candidate, active, and
 /// retiring generations. Static sink construction will live behind this same
@@ -286,6 +290,7 @@ pub(crate) struct CapturePolicy {
     profile: ProfileHandle,
     sink: CaptureSinkSpec,
     max_body_bytes: usize,
+    working_set: crate::config::compiler::CaptureWorkingSetPlan,
     pool: Weak<CapturePool>,
 }
 
@@ -314,6 +319,7 @@ impl CapturePolicy {
             sink,
             max_body_bytes,
             max_inflight_body_bytes: _,
+            working_set,
         } = plan;
         Self {
             events: CaptureEventSet::from_compiled(events),
@@ -321,6 +327,7 @@ impl CapturePolicy {
             profile,
             sink,
             max_body_bytes,
+            working_set,
             pool,
         }
     }
@@ -329,11 +336,11 @@ impl CapturePolicy {
         self.events.contains(event)
     }
 
-    pub(crate) fn try_admit(&self, event: CaptureEvent, bytes: usize) -> Option<CaptureOperation> {
+    pub(crate) fn try_admit(&self, event: CaptureEvent) -> Option<CaptureOperation> {
         if !self.captures(event) {
             return None;
         }
-        self.pool.upgrade()?.try_admit(bytes)
+        self.pool.upgrade()?.try_admit()
     }
 
     pub(crate) fn profile_index(&self) -> RedactionProfileIndex {
@@ -354,6 +361,10 @@ impl CapturePolicy {
 
     pub(crate) fn max_body_bytes(&self) -> usize {
         self.max_body_bytes
+    }
+
+    pub(crate) fn working_set(&self) -> crate::config::compiler::CaptureWorkingSetPlan {
+        self.working_set
     }
 
     pub(crate) fn max_files(&self) -> usize {
@@ -421,7 +432,8 @@ mod tests {
 
     use super::*;
     use crate::config::compiler::{
-        CompiledRedactionPayloads, RedactionPlan, RedactionProfilePlan, RedactionRulePlan,
+        CaptureWorkingSetPlan, CompiledRedactionPayloads, RedactionPlan, RedactionProfilePlan,
+        RedactionRulePlan,
     };
     use crate::redaction::RedactionSnapshot;
     use crate::runtime::{CleanupReason, RuntimeError};
@@ -457,6 +469,7 @@ mod tests {
                 .unwrap(),
                 max_body_bytes: 8,
                 max_inflight_body_bytes: limit,
+                working_set: CaptureWorkingSetPlan::default(),
             }),
         }
     }
@@ -608,7 +621,8 @@ mod tests {
 
         assert_eq!(pool.committed_limit(), 8);
         assert!(Arc::ptr_eq(&pool.current_epoch(), &original_epoch));
-        assert!(pool.try_admit(9).is_none());
+        let operation = pool.try_admit().expect("enabled admission");
+        assert!(operation.charge_exact_allocation(9).is_err());
     }
 
     #[test]
@@ -626,7 +640,8 @@ mod tests {
 
         assert_eq!(pool.committed_limit(), 32);
         assert!(Arc::ptr_eq(&pool.current_epoch(), snapshot.capture_epoch()));
-        assert!(pool.try_admit(32).is_some());
+        let operation = pool.try_admit().expect("enabled admission");
+        assert!(operation.charge_exact_allocation(32).is_ok());
     }
 
     #[test]
@@ -674,7 +689,7 @@ mod tests {
         assert!(enabled_snapshot
             .capture()
             .expect("enabled capture policy")
-            .try_admit(CaptureEvent::RequestAllowed, 0)
+            .try_admit(CaptureEvent::RequestAllowed)
             .is_none());
         assert!(disabled_snapshot.capture().is_none());
     }
@@ -759,7 +774,7 @@ mod tests {
         assert!(old_epoch
             .capture()
             .expect("old capture policy")
-            .try_admit(CaptureEvent::RequestAllowed, 0)
+            .try_admit(CaptureEvent::RequestAllowed)
             .is_none());
         assert!(matches!(
             owner.publication_guard(),
@@ -789,27 +804,31 @@ mod tests {
         let (second_snapshot, second_owner) = second.into_parts();
         commit(&second_owner);
 
-        let first_permit = first_snapshot
+        let first_operation = first_snapshot
             .capture()
             .expect("first capture")
-            .try_admit(CaptureEvent::RequestAllowed, 6)
+            .try_admit(CaptureEvent::RequestAllowed)
             .expect("first admission");
-        let second_permit = second_snapshot
+        let first_charge = first_operation.charge_exact_allocation(6).unwrap();
+        let second_operation = second_snapshot
             .capture()
             .expect("second capture")
-            .try_admit(CaptureEvent::RequestAllowed, 4)
+            .try_admit(CaptureEvent::RequestAllowed)
             .expect("second admission");
-        assert!(second_snapshot
+        let second_charge = second_operation.charge_exact_allocation(4).unwrap();
+        let third_operation = second_snapshot
             .capture()
             .expect("second capture")
-            .try_admit(CaptureEvent::RequestAllowed, 1)
-            .is_none());
+            .try_admit(CaptureEvent::RequestAllowed)
+            .expect("admission does not reserve bytes");
+        assert!(third_operation.charge_exact_allocation(1).is_err());
         assert!(first_snapshot
             .capture()
             .expect("first capture")
-            .try_admit(CaptureEvent::ResponseAllowed, 0)
+            .try_admit(CaptureEvent::ResponseAllowed)
             .is_none());
-        drop((first_permit, second_permit));
+        drop((first_charge, second_charge));
+        drop((first_operation, second_operation, third_operation));
         assert_eq!(pool.used(), 0);
     }
 

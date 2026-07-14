@@ -1,4 +1,6 @@
 use std::fmt;
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, TryLockError};
 
@@ -6,6 +8,10 @@ use arc_swap::ArcSwap;
 
 use super::CaptureEpoch;
 use crate::runtime::{BoxFuture, CleanupReason, GenerationOwner, PublicationGuard, RuntimeError};
+use crate::safety::allocation::{
+    AllocationAuthority, ExactAllocationLease, ReservedStableBodyBuilder, StableBody,
+    StableBodyBuilder, StableScratch, StableWorkspace, StableWorkspaceAllocation,
+};
 
 struct PublishedCaptureState {
     epoch: Arc<CaptureEpoch>,
@@ -48,6 +54,8 @@ pub(crate) struct CapturePool {
     publication_gate: RwLock<()>,
     published: ArcSwap<PublishedCaptureState>,
     used: AtomicUsize,
+    #[cfg(test)]
+    fail_next_allocation: AtomicBool,
 }
 
 impl fmt::Debug for CapturePool {
@@ -72,21 +80,19 @@ impl CapturePool {
                 0,
             )),
             used: AtomicUsize::new(0),
+            #[cfg(test)]
+            fail_next_allocation: AtomicBool::new(false),
         })
     }
 
     /// Starts one bounded capture operation under the currently published
     /// enabled state and ceiling. Failure is immediate and observation-only;
     /// callers omit the payload rather than wait.
-    pub(crate) fn try_admit(self: &Arc<Self>, bytes: usize) -> Option<CaptureOperation> {
-        self.try_admit_with_hook(bytes, || {})
+    pub(crate) fn try_admit(self: &Arc<Self>) -> Option<CaptureOperation> {
+        self.try_admit_with_hook(|| {})
     }
 
-    fn try_admit_with_hook(
-        self: &Arc<Self>,
-        bytes: usize,
-        hook: impl FnOnce(),
-    ) -> Option<CaptureOperation> {
+    fn try_admit_with_hook(self: &Arc<Self>, hook: impl FnOnce()) -> Option<CaptureOperation> {
         let _publication = match self.publication_gate.try_read() {
             Ok(guard) => guard,
             Err(TryLockError::WouldBlock) => return None,
@@ -97,25 +103,12 @@ impl CapturePool {
         if !published.enabled {
             return None;
         }
-        let mut used = self.used.load(Ordering::Acquire);
-        loop {
-            let next = used.checked_add(bytes)?;
-            if next > published.limit {
-                return None;
-            }
-            match self
-                .used
-                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => break,
-                Err(current) => used = current,
-            }
-        }
-        Some(CaptureOperation {
+        let authority = CaptureAllocationAuthority(Arc::new(CaptureAccount {
             pool: self.clone(),
             ceiling: published.limit,
-            charged: bytes,
-        })
+            live_bytes: AtomicUsize::new(0),
+        }));
+        Some(CaptureOperation { authority })
     }
 
     pub(crate) fn committed_limit(&self) -> usize {
@@ -191,6 +184,9 @@ impl CapturePool {
     }
 
     fn release(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
         assert!(
             self.used
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
@@ -200,85 +196,195 @@ impl CapturePool {
             "capture operation accounting underflow"
         );
     }
-}
 
-/// Incremental byte budget for one observation-only capture attempt.
-///
-/// The ceiling is captured at admission. Reload cannot invalidate an admitted
-/// operation. New operations through leased policies use the currently
-/// published enabled state and ceiling.
-pub(crate) struct CaptureOperation {
-    pool: Arc<CapturePool>,
-    ceiling: usize,
-    charged: usize,
-}
-
-impl CaptureOperation {
-    pub(crate) fn charged_bytes(&self) -> usize {
-        self.charged
-    }
-
-    pub(crate) fn ceiling(&self) -> usize {
-        self.ceiling
-    }
-
-    /// Charges additional capture-owned memory before allocation. Exhaustion
-    /// or arithmetic overflow leaves both the operation and pool unchanged.
-    pub(crate) fn try_grow(&mut self, additional: usize) -> bool {
-        if additional == 0 {
-            return true;
+    fn try_charge(&self, bytes: usize, ceiling: usize) -> Result<(), CaptureAllocationError> {
+        if bytes == 0 {
+            return Ok(());
         }
-        let Some(next_charge) = self.charged.checked_add(additional) else {
-            return false;
-        };
-        if next_charge > self.ceiling {
-            return false;
-        }
-
-        let mut used = self.pool.used.load(Ordering::Acquire);
+        let mut used = self.used.load(Ordering::Acquire);
         loop {
-            let Some(next_used) = used.checked_add(additional) else {
-                return false;
-            };
-            if next_used > self.ceiling {
-                return false;
+            let next = used
+                .checked_add(bytes)
+                .ok_or(CaptureAllocationError::CeilingExceeded)?;
+            if next > ceiling {
+                return Err(CaptureAllocationError::CeilingExceeded);
             }
-            match self.pool.used.compare_exchange_weak(
-                used,
-                next_used,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    self.charged = next_charge;
-                    return true;
-                }
+            match self
+                .used
+                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return Ok(()),
                 Err(current) => used = current,
             }
         }
     }
 
-    /// Releases bytes as capture-owned buffers are discarded.
-    pub(crate) fn shrink(&mut self, bytes: usize) {
-        assert!(bytes <= self.charged, "capture operation shrink underflow");
-        self.pool.release(bytes);
-        self.charged -= bytes;
+    #[cfg(test)]
+    fn fail_next_allocation(&self) {
+        self.fail_next_allocation.store(true, Ordering::Release);
     }
+
+    #[cfg(test)]
+    fn take_allocation_failure(&self) -> bool {
+        self.fail_next_allocation.swap(false, Ordering::AcqRel)
+    }
+}
+
+/// Allocation account for one observation-only capture attempt. Every owned
+/// allocation carries an exact RAII lease against this account.
+pub(crate) struct CaptureOperation {
+    authority: CaptureAllocationAuthority,
+}
+
+struct CaptureAccount {
+    pool: Arc<CapturePool>,
+    ceiling: usize,
+    live_bytes: AtomicUsize,
+}
+
+#[derive(Clone)]
+pub(crate) struct CaptureAllocationAuthority(Arc<CaptureAccount>);
+
+pub(crate) type CaptureAllocationCharge = ExactAllocationLease<CaptureAllocationAuthority>;
+pub(crate) type CaptureBodyBuilder = StableBodyBuilder<CaptureAllocationAuthority>;
+pub(crate) type ReservedCaptureBodyBuilder = ReservedStableBodyBuilder<CaptureAllocationAuthority>;
+pub(crate) type CaptureBody = StableBody<CaptureAllocationAuthority>;
+pub(crate) type CaptureScratch = StableScratch<CaptureAllocationAuthority>;
+pub(crate) type CaptureWorkspace = StableWorkspace<CaptureAllocationAuthority>;
+pub(crate) type CaptureWorkspaceAllocation = StableWorkspaceAllocation<CaptureAllocationAuthority>;
+
+impl CaptureOperation {
+    pub(crate) fn charged_bytes(&self) -> usize {
+        self.authority.0.live_bytes.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn ceiling(&self) -> usize {
+        self.authority.0.ceiling
+    }
+
+    pub(crate) fn charge_exact_allocation(
+        &self,
+        bytes: usize,
+    ) -> Result<CaptureAllocationCharge, CaptureAllocationError> {
+        CaptureAllocationCharge::try_new(self.authority.clone(), bytes)
+    }
+
+    pub(crate) fn body_buffer(&self) -> CaptureBodyBuilder {
+        CaptureBodyBuilder::new(self.authority.clone())
+    }
+
+    pub(crate) fn reserve_exact_body(
+        &self,
+        exact_len: usize,
+    ) -> Result<ReservedCaptureBodyBuilder, CaptureAllocationError> {
+        CaptureBodyBuilder::reserve_exact(self.authority.clone(), exact_len)
+    }
+
+    pub(crate) fn scratch(&self) -> Result<CaptureScratch, CaptureAllocationError> {
+        CaptureScratch::try_new(self.authority.clone())
+    }
+
+    pub(crate) fn workspace_allocation(
+        &self,
+        bytes: usize,
+    ) -> Result<CaptureWorkspaceAllocation, CaptureAllocationError> {
+        CaptureWorkspaceAllocation::try_new(self.authority.clone(), bytes)
+    }
+
+    pub(crate) fn validate_body(&self, body: &CaptureBody) -> Result<(), CaptureAllocationError> {
+        if body.belongs_to(&self.authority) {
+            Ok(())
+        } else {
+            Err(CaptureAllocationError::ForeignAuthority)
+        }
+    }
+}
+
+impl AllocationAuthority for CaptureAllocationAuthority {
+    type Error = CaptureAllocationError;
+
+    fn try_charge(&self, bytes: usize) -> Result<(), Self::Error> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        try_atomic_account_add(&self.0.live_bytes, bytes, self.0.ceiling)?;
+        if let Err(error) = self.0.pool.try_charge(bytes, self.0.ceiling) {
+            self.0.live_bytes.fetch_sub(bytes, Ordering::AcqRel);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn release(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        self.0.pool.release(bytes);
+        let live_before = self.0.live_bytes.fetch_sub(bytes, Ordering::AcqRel);
+        assert!(live_before >= bytes, "capture account accounting underflow");
+    }
+
+    fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    fn limit_error() -> Self::Error {
+        CaptureAllocationError::CeilingExceeded
+    }
+
+    fn allocation_error() -> Self::Error {
+        CaptureAllocationError::AllocationFailed
+    }
+
+    fn reservation_error() -> Self::Error {
+        CaptureAllocationError::ReservedLengthMismatch
+    }
+
+    #[cfg(test)]
+    fn take_allocation_failure(&self) -> bool {
+        self.0.pool.take_allocation_failure()
+    }
+}
+
+fn try_atomic_account_add(
+    counter: &AtomicUsize,
+    bytes: usize,
+    ceiling: usize,
+) -> Result<(), CaptureAllocationError> {
+    let mut current = counter.load(Ordering::Acquire);
+    loop {
+        let next = current
+            .checked_add(bytes)
+            .ok_or(CaptureAllocationError::CeilingExceeded)?;
+        if next > ceiling {
+            return Err(CaptureAllocationError::CeilingExceeded);
+        }
+        match counter.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Ok(()),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum CaptureAllocationError {
+    #[error("capture operation ceiling exceeded")]
+    CeilingExceeded,
+    #[error("capture allocation failed")]
+    AllocationFailed,
+    #[error("capture buffer belongs to another operation")]
+    ForeignAuthority,
+    #[error("capture exact reservation length was not satisfied")]
+    ReservedLengthMismatch,
 }
 
 impl fmt::Debug for CaptureOperation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CaptureOperation")
-            .field("ceiling", &self.ceiling)
-            .field("charged", &self.charged)
+            .field("ceiling", &self.ceiling())
+            .field("charged", &self.charged_bytes())
             .finish()
-    }
-}
-
-impl Drop for CaptureOperation {
-    fn drop(&mut self) {
-        self.pool.release(self.charged);
     }
 }
 
@@ -377,12 +483,15 @@ mod tests {
 
     use super::*;
     use crate::config::compiler::{
-        CapturePlan, CompiledCaptureEvent, CompiledLogLevel, CompiledRedactionPayloads,
-        ObservationPlan, PolicyDecisionLoggingPlan, RedactionPlan, RedactionProfilePlan,
-        RedactionRulePlan, ReloadableLoggingPlan,
+        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledLogLevel,
+        CompiledRedactionPayloads, ObservationPlan, PolicyDecisionLoggingPlan, RedactionPlan,
+        RedactionProfilePlan, RedactionRulePlan, ReloadableLoggingPlan,
     };
     use crate::observation::{CaptureEvent, ObservationActivation, ProductObservationSnapshot};
     use crate::redaction::RedactionSnapshot;
+    use crate::safety::allocation::{
+        body_allocation_bytes, workspace_allocation_bytes, MAX_BUFFER_GROWTH_BYTES,
+    };
 
     fn accounting_capture_activation(
         pool: Arc<CapturePool>,
@@ -434,6 +543,7 @@ mod tests {
                     .unwrap(),
                     max_body_bytes: 1,
                     max_inflight_body_bytes: limit,
+                    working_set: CaptureWorkingSetPlan::default(),
                 }),
             },
             &redaction,
@@ -454,8 +564,8 @@ mod tests {
         pool
     }
 
-    fn try_admit_current(pool: &Arc<CapturePool>, bytes: usize) -> Option<CaptureOperation> {
-        pool.try_admit(bytes)
+    fn try_admit_current(pool: &Arc<CapturePool>) -> Option<CaptureOperation> {
+        pool.try_admit()
     }
 
     #[test]
@@ -487,7 +597,8 @@ mod tests {
     #[test]
     fn admitted_operation_survives_disablement_and_new_admission_is_rejected() {
         let pool = enabled_pool(16);
-        let mut old = try_admit_current(&pool, 12).expect("old operation");
+        let old = try_admit_current(&pool).expect("old operation");
+        let first = old.charge_exact_allocation(12).expect("first allocation");
         let old_epoch = pool.current_epoch();
         let update = CaptureEpochUpdate::new(pool.clone(), Arc::new(CaptureEpoch::disabled()), 4);
         update
@@ -496,65 +607,207 @@ mod tests {
             .commit();
 
         assert_eq!(pool.used(), 12);
-        assert!(old.try_grow(4));
+        let second = old
+            .charge_exact_allocation(4)
+            .expect("old ceiling survives");
         assert_eq!(pool.used(), 16);
         assert!(old_epoch
             .capture()
             .expect("old policy")
-            .try_admit(CaptureEvent::RequestAllowed, 0)
+            .try_admit(CaptureEvent::RequestAllowed)
             .is_none());
+        drop((first, second));
         drop(old);
         assert_eq!(pool.used(), 0);
-        assert!(try_admit_current(&pool, 0).is_none());
-        assert!(try_admit_current(&pool, 4).is_none());
+        assert!(try_admit_current(&pool).is_none());
     }
 
     #[test]
     fn exact_operations_saturate_without_waiting() {
         let pool = enabled_pool(10);
-        let first = try_admit_current(&pool, 6).expect("first");
-        let second = try_admit_current(&pool, 4).expect("second");
-        assert!(try_admit_current(&pool, 1).is_none());
+        let first = try_admit_current(&pool).expect("first");
+        let second = try_admit_current(&pool).expect("second");
+        let first_charge = first.charge_exact_allocation(6).unwrap();
+        let second_charge = second.charge_exact_allocation(4).unwrap();
+        let third = try_admit_current(&pool).expect("admission does not reserve bytes");
+        assert!(matches!(
+            third.charge_exact_allocation(1),
+            Err(CaptureAllocationError::CeilingExceeded)
+        ));
         assert_eq!(pool.used(), 10);
-        drop((first, second));
+        drop((first_charge, second_charge, first, second, third));
         assert_eq!(pool.used(), 0);
     }
 
     #[test]
-    fn operation_grows_and_shrinks_with_exact_drop_restoration() {
+    fn exact_allocation_leases_restore_on_each_drop() {
         let pool = enabled_pool(20);
-        let mut operation = try_admit_current(&pool, 3).expect("operation");
+        let operation = try_admit_current(&pool).expect("operation");
 
         assert_eq!(operation.ceiling(), 20);
-        assert_eq!(operation.charged_bytes(), 3);
-        assert!(operation.try_grow(9));
+        assert_eq!(operation.charged_bytes(), 0);
+        let first = operation.charge_exact_allocation(3).unwrap();
+        let second = operation.charge_exact_allocation(9).unwrap();
         assert_eq!(operation.charged_bytes(), 12);
         assert_eq!(pool.used(), 12);
 
-        operation.shrink(5);
-        assert_eq!(operation.charged_bytes(), 7);
-        assert_eq!(pool.used(), 7);
+        drop(first);
+        assert_eq!(operation.charged_bytes(), 9);
+        assert_eq!(pool.used(), 9);
 
+        drop(second);
         drop(operation);
         assert_eq!(pool.used(), 0);
     }
 
     #[test]
-    fn failed_growth_leaves_operation_and_pool_unchanged() {
-        let pool = enabled_pool(10);
-        let mut operation = try_admit_current(&pool, 6).expect("operation");
-        let contention = try_admit_current(&pool, 4).expect("contention");
+    fn capture_body_allocation_failure_restores_every_charge() {
+        let allocation = body_allocation_bytes(1).unwrap();
+        let pool = enabled_pool(allocation);
+        let operation = try_admit_current(&pool).expect("operation");
+        let mut builder = operation.body_buffer();
 
-        assert!(!operation.try_grow(1));
+        pool.fail_next_allocation();
+        assert_eq!(
+            builder.try_extend_from_slice(b"secret"),
+            Err(CaptureAllocationError::AllocationFailed)
+        );
+        assert_eq!(builder.len(), 0);
+        assert_eq!(builder.charged_bytes(), 0);
+        assert!(!builder.has_allocated_segments_for_test());
+        assert_eq!(operation.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn capture_second_chunk_failure_is_terminal_and_releases_the_first_chunk() {
+        let one = body_allocation_bytes(1).unwrap();
+        let pool = enabled_pool(one * 2);
+        let operation = try_admit_current(&pool).expect("operation");
+        let mut builder = operation.body_buffer();
+        builder
+            .try_extend_from_slice(&vec![0xa5; MAX_BUFFER_GROWTH_BYTES])
+            .unwrap();
+        assert_eq!(pool.used(), one);
+
+        pool.fail_next_allocation();
+        assert_eq!(
+            builder.try_extend_from_slice(b"tail"),
+            Err(CaptureAllocationError::AllocationFailed)
+        );
+        assert_eq!(builder.len(), 0);
+        assert_eq!(builder.charged_bytes(), 0);
+        assert!(!builder.has_allocated_segments_for_test());
+        assert_eq!(operation.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn capture_body_cannot_cross_operation_authorities() {
+        let allocation = body_allocation_bytes(1).unwrap();
+        let pool = enabled_pool(allocation);
+        let owner = try_admit_current(&pool).expect("owner");
+        let foreign = try_admit_current(&pool).expect("foreign operation");
+        let mut builder = owner.body_buffer();
+        builder.try_extend_from_slice(b"secret").unwrap();
+        let body = builder.finish();
+
+        assert_eq!(owner.validate_body(&body), Ok(()));
+        assert_eq!(
+            foreign.validate_body(&body),
+            Err(CaptureAllocationError::ForeignAuthority)
+        );
+        assert_eq!(pool.used(), allocation);
+        drop(body);
+        assert_eq!(owner.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn capture_scratch_and_workspace_restore_exact_projected_charges() {
+        let scratch_bytes = body_allocation_bytes(1).unwrap();
+        let workspace_bytes = workspace_allocation_bytes(17).unwrap();
+        let pool = enabled_pool(scratch_bytes.max(workspace_bytes));
+        let operation = try_admit_current(&pool).expect("operation");
+
+        let scratch = operation.scratch().unwrap();
+        assert_eq!(operation.charged_bytes(), scratch_bytes);
+        assert_eq!(pool.used(), scratch_bytes);
+        drop(scratch);
+        assert_eq!(operation.charged_bytes(), 0);
+
+        let mut pending = operation.workspace_allocation(17).unwrap();
+        assert_eq!(pending.len(), workspace_bytes);
+        assert_eq!(operation.charged_bytes(), workspace_bytes);
+        while !pending.is_initialized() {
+            pending.initialize_next(7);
+        }
+        let workspace = pending.finish();
+        assert_eq!(operation.charged_bytes(), workspace_bytes);
+        drop(workspace);
+        assert_eq!(operation.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
+
+        pool.fail_next_allocation();
+        assert!(matches!(
+            operation.workspace_allocation(17),
+            Err(CaptureAllocationError::AllocationFailed)
+        ));
+        assert_eq!(operation.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn owned_capture_body_survives_disablement_and_releases_normally() {
+        let allocation = body_allocation_bytes(1).unwrap();
+        let pool = enabled_pool(allocation);
+        let operation = try_admit_current(&pool).expect("operation");
+        let mut builder = operation.body_buffer();
+        builder.try_extend_from_slice(b"secret").unwrap();
+        let body = builder.finish();
+
+        let update = CaptureEpochUpdate::new(pool.clone(), Arc::new(CaptureEpoch::disabled()), 0);
+        update
+            .publication_guard()
+            .expect("publication guard")
+            .commit();
+
+        assert!(try_admit_current(&pool).is_none());
+        assert_eq!(pool.used(), allocation);
+        assert_eq!(operation.validate_body(&body), Ok(()));
+        drop(body);
+        assert_eq!(operation.charged_bytes(), 0);
+        assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn failed_charge_leaves_operation_and_pool_unchanged() {
+        let pool = enabled_pool(10);
+        let operation = try_admit_current(&pool).expect("operation");
+        let operation_charge = operation.charge_exact_allocation(6).unwrap();
+        let contention = try_admit_current(&pool).expect("contention");
+        let contention_charge = contention.charge_exact_allocation(4).unwrap();
+
+        assert!(matches!(
+            operation.charge_exact_allocation(1),
+            Err(CaptureAllocationError::CeilingExceeded)
+        ));
         assert_eq!(operation.charged_bytes(), 6);
         assert_eq!(pool.used(), 10);
 
-        drop(contention);
-        assert!(!operation.try_grow(5));
-        assert!(!operation.try_grow(usize::MAX));
+        drop((contention_charge, contention));
+        assert!(matches!(
+            operation.charge_exact_allocation(5),
+            Err(CaptureAllocationError::CeilingExceeded)
+        ));
+        assert!(matches!(
+            operation.charge_exact_allocation(usize::MAX),
+            Err(CaptureAllocationError::CeilingExceeded)
+        ));
         assert_eq!(operation.charged_bytes(), 6);
         assert_eq!(pool.used(), 6);
 
+        drop(operation_charge);
         drop(operation);
         assert_eq!(pool.used(), 0);
     }
@@ -562,8 +815,14 @@ mod tests {
     #[test]
     fn arithmetic_overflow_is_an_observation_only_omission() {
         let pool = enabled_pool(usize::MAX);
-        let operation = try_admit_current(&pool, usize::MAX).expect("maximum operation");
-        assert!(try_admit_current(&pool, 1).is_none());
+        let operation = try_admit_current(&pool).expect("maximum operation");
+        let charge = operation.charge_exact_allocation(usize::MAX).unwrap();
+        let second = try_admit_current(&pool).unwrap();
+        assert!(matches!(
+            second.charge_exact_allocation(1),
+            Err(CaptureAllocationError::CeilingExceeded)
+        ));
+        drop(charge);
         drop(operation);
         assert_eq!(pool.used(), 0);
     }
@@ -578,7 +837,7 @@ mod tests {
             let first_entered = first_entered.clone();
             let finish_first = finish_first.clone();
             move || {
-                first_pool.try_admit_with_hook(4, || {
+                first_pool.try_admit_with_hook(|| {
                     first_entered.wait();
                     finish_first.wait();
                 })
@@ -586,12 +845,12 @@ mod tests {
         });
 
         first_entered.wait();
-        let second = try_admit_current(&pool, 4)
+        let second = try_admit_current(&pool)
             .expect("another admission may enter while the first holds a read gate");
         finish_first.wait();
         let first = first.join().expect("first admission thread").unwrap();
 
-        assert_eq!(pool.used(), 8);
+        assert_eq!(pool.used(), 0);
         drop((first, second));
         assert_eq!(pool.used(), 0);
     }
@@ -600,7 +859,8 @@ mod tests {
     fn enabled_lower_limit_preserves_admitted_ceiling_and_rebinds_old_epoch_admission() {
         let pool = enabled_pool(16);
         let old_epoch = pool.current_epoch();
-        let mut existing = try_admit_current(&pool, 6).expect("existing operation");
+        let existing = try_admit_current(&pool).expect("existing operation");
+        let first = existing.charge_exact_allocation(6).unwrap();
         let candidate = accounting_capture_activation(pool.clone(), 8);
         let (snapshot, _owner) = candidate.into_parts();
         let new_epoch = snapshot.capture_epoch().clone();
@@ -622,7 +882,7 @@ mod tests {
         });
 
         publication_entered.wait();
-        assert!(try_admit_current(&pool, 1).is_none());
+        assert!(try_admit_current(&pool).is_none());
         finish_publication.wait();
         publisher.join().expect("publisher");
 
@@ -632,23 +892,32 @@ mod tests {
         let reloaded_old = old_epoch
             .capture()
             .expect("old policy")
-            .try_admit(CaptureEvent::RequestAllowed, 0)
+            .try_admit(CaptureEvent::RequestAllowed)
             .expect("old leased policy uses newly published enabled ceiling");
         assert_eq!(reloaded_old.ceiling(), 8);
-        let mut current = try_admit_current(&pool, 0).expect("new epoch operation");
+        let current = try_admit_current(&pool).expect("new epoch operation");
         assert_eq!(current.ceiling(), 8);
-        assert!(existing.try_grow(10));
+        let second = existing.charge_exact_allocation(10).unwrap();
         assert_eq!(existing.charged_bytes(), 16);
         assert_eq!(pool.used(), 16);
-        assert!(!existing.try_grow(1));
-        assert!(!current.try_grow(1));
+        assert!(matches!(
+            existing.charge_exact_allocation(1),
+            Err(CaptureAllocationError::CeilingExceeded)
+        ));
+        assert!(matches!(
+            current.charge_exact_allocation(1),
+            Err(CaptureAllocationError::CeilingExceeded)
+        ));
         assert_eq!(current.charged_bytes(), 0);
         drop((current, reloaded_old));
+        drop((first, second));
         drop(existing);
         assert_eq!(pool.used(), 0);
-        let current = try_admit_current(&pool, 8).expect("new ceiling");
+        let current = try_admit_current(&pool).expect("new ceiling");
+        let charge = current.charge_exact_allocation(8).unwrap();
         assert_eq!(current.charged_bytes(), 8);
         assert_eq!(current.ceiling(), 8);
+        drop(charge);
     }
 
     #[test]
@@ -704,7 +973,7 @@ mod tests {
         let candidate = accounting_capture_activation(pool.clone(), 32);
         let (_snapshot, owner) = candidate.into_parts();
         let mut stale_guard = owner.publication_guard().expect("pre-shutdown guard");
-        let pre_shutdown_zero = try_admit_current(&pool, 0).expect("open zero-byte admission");
+        let pre_shutdown_zero = try_admit_current(&pool).expect("open admission");
         drop(pre_shutdown_zero);
 
         pool.close();
@@ -716,8 +985,7 @@ mod tests {
         assert_eq!(pool.committed_limit(), 0);
         assert!(!closed_epoch.is_enabled());
         assert!(Arc::ptr_eq(&pool.current_epoch(), &closed_epoch));
-        assert!(try_admit_current(&pool, 0).is_none());
-        assert!(try_admit_current(&pool, 1).is_none());
+        assert!(try_admit_current(&pool).is_none());
         assert!(matches!(
             owner.publication_guard(),
             Err(RuntimeError::ShuttingDown)
@@ -767,7 +1035,7 @@ mod tests {
         assert_eq!(limit, 0);
         assert!(!enabled);
         assert!(!epoch.is_enabled());
-        assert!(try_admit_current(&pool, 0).is_none());
+        assert!(try_admit_current(&pool).is_none());
     }
 
     #[test]
@@ -786,6 +1054,6 @@ mod tests {
         assert_eq!(limit, 0);
         assert!(!enabled);
         assert!(Arc::ptr_eq(&epoch, &closed_epoch));
-        assert!(try_admit_current(&pool, 0).is_none());
+        assert!(try_admit_current(&pool).is_none());
     }
 }

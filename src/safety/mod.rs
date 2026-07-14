@@ -1,3 +1,4 @@
+pub(crate) mod allocation;
 pub(crate) mod wire_body;
 
 use std::fmt;

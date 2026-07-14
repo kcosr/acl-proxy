@@ -5,6 +5,7 @@ use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
+use base64::encoded_len as base64_encoded_len;
 use http::header::{HeaderName, HeaderValue};
 use http::Method;
 use regex_automata::{
@@ -895,6 +896,29 @@ pub(crate) struct CapturePlan {
     pub(crate) sink: CaptureSinkSpec,
     pub(crate) max_body_bytes: usize,
     pub(crate) max_inflight_body_bytes: usize,
+    pub(crate) working_set: CaptureWorkingSetPlan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CaptureWorkingSetPlan {
+    pub(crate) decode_peak_bytes: usize,
+    pub(crate) literal_redaction_peak_bytes: usize,
+    pub(crate) expression_successor_peak_bytes: usize,
+    pub(crate) serialization_peak_bytes: usize,
+    pub(crate) maximum_peak_bytes: usize,
+}
+
+#[cfg(test)]
+impl Default for CaptureWorkingSetPlan {
+    fn default() -> Self {
+        Self {
+            decode_peak_bytes: 0,
+            literal_redaction_peak_bytes: 0,
+            expression_successor_peak_bytes: 0,
+            serialization_peak_bytes: 0,
+            maximum_peak_bytes: 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4164,6 +4188,116 @@ fn decode_peak(encoded: usize, decoded: usize) -> Result<usize, ConfigCompileErr
     )
 }
 
+fn compile_capture_working_set(
+    config: &super::authoring::AuthoringConfig,
+) -> Result<Option<CaptureWorkingSetPlan>, ConfigCompileError> {
+    let Some(capture) = &config.observation.capture else {
+        return Ok(None);
+    };
+    let profile = config
+        .redaction
+        .profiles
+        .get(&capture.redaction_profile)
+        .expect("capture profile references validated before capture compilation");
+    let matcher_scratch_bytes = configured_profile_literal_scratch_bytes(
+        profile,
+        &format!("redaction.profiles.{}", capture.redaction_profile),
+    )?;
+    let has_text_expressions = profile.rules.iter().any(|rule| {
+        !rule.expressions.is_empty() && !matches!(rule.payloads, RedactionPayloads::Binary)
+    });
+    let plan = capture_working_set_plan(
+        profile.max_body_bytes,
+        profile.max_decoded_body_bytes,
+        profile.max_message_bytes,
+        profile.allow_permessage_deflate,
+        matcher_scratch_bytes,
+        has_text_expressions,
+        capture.max_body_bytes,
+    )?;
+    if plan.maximum_peak_bytes > capture.max_inflight_body_bytes {
+        return Err(ConfigCompileError::at(
+            "observation.capture.max_inflight_body_bytes",
+            format!(
+                "must hold one maximum capture operation of {} bytes",
+                plan.maximum_peak_bytes
+            ),
+        ));
+    }
+    Ok(Some(plan))
+}
+
+fn capture_working_set_plan(
+    max_encoded_bytes: usize,
+    max_decoded_bytes: usize,
+    max_message_bytes: usize,
+    allow_permessage_deflate: bool,
+    matcher_scratch_bytes: usize,
+    has_text_expressions: bool,
+    max_stored_body_bytes: usize,
+) -> Result<CaptureWorkingSetPlan, ConfigCompileError> {
+    const PATH: &str = "observation.capture.max_inflight_body_bytes";
+    const OVERFLOW: &str = "capture working-set arithmetic overflow";
+
+    let encoded = project_guarded_body_allocation(max_encoded_bytes, PATH, OVERFLOW)?;
+    let decoded = project_guarded_body_allocation(max_decoded_bytes, PATH, OVERFLOW)?;
+    let staging =
+        project_guarded_body_allocation(HTTP_DECODER_OUTPUT_STAGING_BYTES, PATH, OVERFLOW)?;
+    let workspace = http_decoder_workspace_sizes()
+        .and_then(|sizes| guarded_workspace_allocation_bytes(sizes.maximum()))
+        .ok_or_else(|| ConfigCompileError::at(PATH, OVERFLOW))?;
+    let http_decode_peak = [encoded, decoded, staging, workspace]
+        .into_iter()
+        .try_fold(0usize, |peak, allocation| {
+            checked_add(peak, allocation, PATH, OVERFLOW)
+        })?;
+    let message = project_guarded_body_allocation(max_message_bytes, PATH, OVERFLOW)?;
+    let websocket_decode_peak = if allow_permessage_deflate {
+        let deflate_scratch =
+            project_guarded_body_allocation(WEBSOCKET_DEFLATE_SCRATCH_BYTES, PATH, OVERFLOW)?;
+        checked_add(
+            checked_add(message, message, PATH, OVERFLOW)?,
+            deflate_scratch,
+            PATH,
+            OVERFLOW,
+        )?
+    } else {
+        message
+    };
+    let decode_peak_bytes = http_decode_peak.max(websocket_decode_peak);
+
+    let maximum_decoded = decoded.max(message);
+    let literal_redaction_peak_bytes = checked_add(
+        checked_add(maximum_decoded, matcher_scratch_bytes, PATH, OVERFLOW)?,
+        maximum_decoded,
+        PATH,
+        OVERFLOW,
+    )?;
+    let expression_successor_peak_bytes = if has_text_expressions {
+        checked_add(maximum_decoded, maximum_decoded, PATH, OVERFLOW)?
+    } else {
+        0
+    };
+
+    let stored_prefix_bytes = max_stored_body_bytes.min(max_decoded_bytes.max(max_message_bytes));
+    let stored_prefix = project_guarded_body_allocation(stored_prefix_bytes, PATH, OVERFLOW)?;
+    let padded_base64 = base64_encoded_len(stored_prefix_bytes, true)
+        .ok_or_else(|| ConfigCompileError::at(PATH, OVERFLOW))?;
+    let serialization_peak_bytes = checked_add(stored_prefix, padded_base64, PATH, OVERFLOW)?;
+    let maximum_peak_bytes = decode_peak_bytes
+        .max(literal_redaction_peak_bytes)
+        .max(expression_successor_peak_bytes)
+        .max(serialization_peak_bytes);
+
+    Ok(CaptureWorkingSetPlan {
+        decode_peak_bytes,
+        literal_redaction_peak_bytes,
+        expression_successor_peak_bytes,
+        serialization_peak_bytes,
+        maximum_peak_bytes,
+    })
+}
+
 fn guarded_body_stage_peak<const N: usize>(
     payload_bytes: [usize; N],
     path: &str,
@@ -4236,6 +4370,7 @@ fn compile_reloadable_plan(
     resource_plan: CompiledResourcePlan,
 ) -> Result<ReloadableProductPlan, ConfigCompileError> {
     let http_body_read_plans_by_cursor = compile_http_body_read_plans(config)?;
+    let capture_working_set = compile_capture_working_set(config)?;
     Ok(ReloadableProductPlan {
         request_timeout: config.service.request_timeout.get(),
         max_content_decoding_expansion_ratio: config.service.max_content_decoding_expansion_ratio,
@@ -4248,7 +4383,7 @@ fn compile_reloadable_plan(
         authorization: compile_authorization_plan(&config.authorization, working_directory)?,
         credentials: compile_credentials_plan(&config.credentials)?,
         redaction: compile_redaction_plan(&config.redaction)?,
-        observation: compile_observation_plan(&config.observation)?,
+        observation: compile_observation_plan(&config.observation, capture_working_set)?,
         safety: compile_safety_plan(&config.safety)?,
         resource_plan,
     })
@@ -4960,6 +5095,7 @@ fn compile_redaction_plan(value: &RedactionConfig) -> Result<RedactionPlan, Conf
 
 fn compile_observation_plan(
     value: &ObservationConfig,
+    capture_working_set: Option<CaptureWorkingSetPlan>,
 ) -> Result<ObservationPlan, ConfigCompileError> {
     Ok(ObservationPlan {
         logging: ReloadableLoggingPlan {
@@ -4977,7 +5113,12 @@ fn compile_observation_plan(
                 )?,
             },
         },
-        capture: value.capture.as_ref().map(compile_capture_plan),
+        capture: value.capture.as_ref().map(|capture| {
+            compile_capture_plan(
+                capture,
+                capture_working_set.expect("enabled capture has a compiled working-set plan"),
+            )
+        }),
     })
 }
 
@@ -4995,7 +5136,10 @@ fn compile_log_level(value: &str, path: &str) -> Result<CompiledLogLevel, Config
     }
 }
 
-fn compile_capture_plan(value: &super::authoring::AuthoringCaptureConfig) -> CapturePlan {
+fn compile_capture_plan(
+    value: &super::authoring::AuthoringCaptureConfig,
+    working_set: CaptureWorkingSetPlan,
+) -> CapturePlan {
     CapturePlan {
         events: value
             .events
@@ -5025,6 +5169,7 @@ fn compile_capture_plan(value: &super::authoring::AuthoringCaptureConfig) -> Cap
         .expect("validated observation capture sink"),
         max_body_bytes: value.max_body_bytes,
         max_inflight_body_bytes: value.max_inflight_body_bytes,
+        working_set,
     }
 }
 
@@ -6776,6 +6921,271 @@ redaction_profile = "terminal"
         assert!(sizes.zstd > sizes.deflate);
     }
 
+    #[test]
+    fn capture_working_set_projects_each_required_peak_exactly() {
+        let encoded_bytes = 3 * HTTP_DECODER_OUTPUT_STAGING_BYTES + 1;
+        let decoded_bytes = 5 * HTTP_DECODER_OUTPUT_STAGING_BYTES + 1;
+        let matcher_scratch_bytes = 3 * std::mem::size_of::<RedactionLiteralInterval>();
+        let stored_bytes = 2 * HTTP_DECODER_OUTPUT_STAGING_BYTES + 1;
+        let encoded = guarded(encoded_bytes);
+        let decoded = guarded(decoded_bytes);
+        let staging = guarded(HTTP_DECODER_OUTPUT_STAGING_BYTES);
+        let workspace =
+            guarded_workspace_allocation_bytes(http_decoder_workspace_sizes().unwrap().maximum())
+                .unwrap();
+        let padded_base64 = base64_encoded_len(stored_bytes, true).unwrap();
+
+        let plan = capture_working_set_plan(
+            encoded_bytes,
+            decoded_bytes,
+            decoded_bytes,
+            false,
+            matcher_scratch_bytes,
+            true,
+            stored_bytes,
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.decode_peak_bytes,
+            encoded + decoded + staging + workspace
+        );
+        assert_eq!(
+            plan.literal_redaction_peak_bytes,
+            decoded + matcher_scratch_bytes + decoded
+        );
+        assert_eq!(plan.expression_successor_peak_bytes, decoded + decoded);
+        assert_eq!(
+            plan.serialization_peak_bytes,
+            guarded(stored_bytes) + padded_base64
+        );
+        assert_eq!(
+            plan.maximum_peak_bytes,
+            [
+                plan.decode_peak_bytes,
+                plan.literal_redaction_peak_bytes,
+                plan.expression_successor_peak_bytes,
+                plan.serialization_peak_bytes,
+            ]
+            .into_iter()
+            .max()
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn capture_working_set_omits_unreachable_expression_successor_and_caps_stored_prefix() {
+        let decoded_bytes = HTTP_DECODER_OUTPUT_STAGING_BYTES;
+        let plan =
+            capture_working_set_plan(1, decoded_bytes, decoded_bytes, false, 0, false, usize::MAX)
+                .unwrap();
+
+        assert_eq!(plan.expression_successor_peak_bytes, 0);
+        assert_eq!(
+            plan.serialization_peak_bytes,
+            guarded(decoded_bytes) + base64_encoded_len(decoded_bytes, true).unwrap()
+        );
+    }
+
+    #[test]
+    fn capture_working_set_covers_maximum_websocket_decode_redaction_and_serialization() {
+        let message_bytes = 256 * MIB;
+        let stored_bytes = MIB;
+        let matcher_scratch = redaction_literal_scratch_bytes("secret".len()).unwrap();
+        let expected = capture_working_set_plan(
+            1,
+            1,
+            message_bytes,
+            true,
+            matcher_scratch,
+            false,
+            stored_bytes,
+        )
+        .unwrap();
+        let message = guarded(message_bytes);
+        let deflate_scratch = guarded(WEBSOCKET_DEFLATE_SCRATCH_BYTES);
+        assert_eq!(expected.decode_peak_bytes, 2 * message + deflate_scratch);
+        assert_eq!(
+            expected.literal_redaction_peak_bytes,
+            2 * message + matcher_scratch
+        );
+        assert_eq!(
+            expected.serialization_peak_bytes,
+            guarded(stored_bytes) + base64_encoded_len(stored_bytes, true).unwrap()
+        );
+        assert_eq!(
+            expected.maximum_peak_bytes,
+            expected
+                .decode_peak_bytes
+                .max(expected.literal_redaction_peak_bytes)
+        );
+
+        let input = format!(
+            r#"{MINIMAL}
+
+[redaction.profiles.capture]
+max_body_bytes = 1
+max_decoded_body_bytes = 1
+max_frame_bytes = 1
+max_message_bytes = {message_bytes}
+allow_permessage_deflate = true
+rules = [{{ literals = ["secret"] }}]
+
+[observation.capture]
+events = ["request.denied"]
+redaction_profile = "capture"
+directory = "captures"
+filename = "{{requestId}}-{{suffix}}.json"
+max_body_bytes = {stored_bytes}
+max_inflight_body_bytes = {}
+max_pending_records = 1
+max_files = 1
+max_total_bytes = {stored_bytes}
+"#,
+            128 * MIB
+        );
+        let error = compile(&input).expect_err("the HTTP-only pool projection underfits WebSocket");
+        assert_eq!(error.path, "observation.capture.max_inflight_body_bytes");
+        assert_eq!(
+            error.message,
+            format!(
+                "must hold one maximum capture operation of {} bytes",
+                expected.maximum_peak_bytes
+            )
+        );
+
+        let input = input.replace(
+            &format!("max_inflight_body_bytes = {}", 128 * MIB),
+            &format!("max_inflight_body_bytes = {}", expected.maximum_peak_bytes),
+        );
+        let compiled = compile(&input).unwrap();
+        let capture = compiled.reloadable_plan.observation.capture.unwrap();
+        assert_eq!(capture.working_set, expected);
+    }
+
+    #[test]
+    fn capture_working_set_overflow_is_a_config_error() {
+        let error = capture_working_set_plan(usize::MAX, 1, 1, false, 0, false, 1).unwrap_err();
+
+        assert_eq!(error.path, "observation.capture.max_inflight_body_bytes");
+        assert_eq!(error.message, "capture working-set arithmetic overflow");
+    }
+
+    fn one_byte_capture_config(max_inflight_body_bytes: usize) -> String {
+        format!(
+            r#"{MINIMAL}
+
+[redaction.profiles.capture]
+max_body_bytes = 1
+max_decoded_body_bytes = 1
+rules = [{{ literals = ["secret"] }}]
+
+[observation.capture]
+events = ["request.denied"]
+redaction_profile = "capture"
+directory = "captures"
+filename = "{{requestId}}-{{suffix}}.json"
+max_body_bytes = 1
+max_inflight_body_bytes = {max_inflight_body_bytes}
+max_pending_records = 1
+max_files = 1
+max_total_bytes = 1
+"#
+        )
+    }
+
+    #[test]
+    fn capture_requires_capacity_for_one_compiled_maximum_operation() {
+        let expected = capture_working_set_plan(
+            1,
+            1,
+            MIB,
+            false,
+            redaction_literal_scratch_bytes("secret".len()).unwrap(),
+            false,
+            1,
+        )
+        .unwrap();
+        let error = compile(&one_byte_capture_config(1))
+            .expect_err("the old stored-body-only capacity check was underprovisioned");
+        assert_eq!(error.path, "observation.capture.max_inflight_body_bytes");
+        assert_eq!(
+            error.message,
+            format!(
+                "must hold one maximum capture operation of {} bytes",
+                expected.maximum_peak_bytes
+            )
+        );
+
+        let compiled = compile(&one_byte_capture_config(expected.maximum_peak_bytes)).unwrap();
+        let capture = compiled.reloadable_plan.observation.capture.unwrap();
+        assert_eq!(capture.working_set, expected);
+        assert_eq!(capture.max_inflight_body_bytes, expected.maximum_peak_bytes);
+    }
+
+    #[test]
+    fn capture_expression_profile_publishes_successor_peak() {
+        let expected = capture_working_set_plan(1, 1, MIB, false, 0, true, 1).unwrap();
+        let input = one_byte_capture_config(expected.maximum_peak_bytes).replace(
+            "rules = [{ literals = [\"secret\"] }]",
+            "rules = [{ expressions = [\"s\"] }]",
+        );
+
+        let compiled = compile(&input).unwrap();
+        let plan = compiled
+            .reloadable_plan
+            .observation
+            .capture
+            .unwrap()
+            .working_set;
+
+        assert_eq!(plan, expected);
+        assert_eq!(plan.expression_successor_peak_bytes, 2 * guarded(MIB));
+    }
+
+    #[test]
+    fn default_capture_pool_fits_default_environment_profile_working_set() {
+        let input = format!(
+            r#"{MINIMAL}
+
+[redaction.profiles.capture]
+rules = [{{ literal_environment_variables = ["CAPTURE_SECRET"] }}]
+
+[observation.capture]
+events = ["request.denied"]
+redaction_profile = "capture"
+directory = "captures"
+filename = "{{requestId}}-{{suffix}}.json"
+"#
+        );
+
+        let authored: super::super::authoring::AuthoringConfig =
+            toml::from_str(&input).expect("default capture input deserializes");
+        let profile = &authored.redaction.profiles["capture"];
+        let authored_capture = authored
+            .observation
+            .capture
+            .as_ref()
+            .expect("capture is enabled");
+        let expected = capture_working_set_plan(
+            profile.max_body_bytes,
+            profile.max_decoded_body_bytes,
+            profile.max_message_bytes,
+            profile.allow_permessage_deflate,
+            redaction_literal_scratch_bytes(profile.max_environment_literal_bytes).unwrap(),
+            false,
+            authored_capture.max_body_bytes,
+        )
+        .unwrap();
+        let compiled = compile(&input).unwrap();
+        let capture = compiled.reloadable_plan.observation.capture.unwrap();
+
+        assert_eq!(capture.working_set, expected);
+        assert_eq!(expected.maximum_peak_bytes, 105_957_376);
+        assert_eq!(capture.max_inflight_body_bytes, 128 * MIB);
+        assert!(capture.max_inflight_body_bytes >= expected.maximum_peak_bytes);
+    }
+
     fn reloadable_ownership_observations(plan: &ReloadableProductPlan) -> Vec<String> {
         let egress_route = match plan.egress.route {
             CompiledEgressRoute::Direct => "direct",
@@ -6931,7 +7341,7 @@ redaction_profile = "audit"
 directory = "captures-a"
 filename = "{{requestId}}-{{suffix}}.json"
 max_body_bytes = 1024
-max_inflight_body_bytes = 4096
+max_inflight_body_bytes = 134217728
 {pending}max_files = 10
 max_total_bytes = 16384
 "#
@@ -6982,8 +7392,8 @@ max_total_bytes = 16384
             )
             .replace("max_body_bytes = 1024", "max_body_bytes = 2048")
             .replace(
-                "max_inflight_body_bytes = 4096",
-                "max_inflight_body_bytes = 8192",
+                "max_inflight_body_bytes = 134217728",
+                "max_inflight_body_bytes = 268435456",
             )
             .replace("max_files = 10", "max_files = 11")
             .replace("max_total_bytes = 16384", "max_total_bytes = 32768");
@@ -7002,7 +7412,7 @@ max_total_bytes = 16384
             "{requestId}.next-{suffix}.json"
         );
         assert_eq!(capture.max_body_bytes, 2048);
-        assert_eq!(capture.max_inflight_body_bytes, 8192);
+        assert_eq!(capture.max_inflight_body_bytes, 268435456);
         assert_eq!(capture.sink.max_files(), 11);
         assert_eq!(capture.sink.max_total_bytes(), 32768);
     }
@@ -7223,7 +7633,7 @@ header = "x-acl-proxy-request-id"
                 "{baseline}\n[credentials.sources.token]\nsource = \"environment\"\nvariable = \"TEST_TOKEN\"\n"
             )),
             ("redaction and capture", format!(
-                "{baseline}\n[redaction.profiles.audit]\nrules = [{{ literals = [\"marker\"] }}]\n\n[observation.capture]\nevents = [\"request.denied\"]\nredaction_profile = \"audit\"\ndirectory = \"captures\"\n"
+                "{baseline}\n[redaction.profiles.audit]\nrules = [{{ literals = [\"marker\"] }}]\n\n[observation.capture]\nevents = [\"request.denied\"]\nredaction_profile = \"audit\"\ndirectory = \"captures\"\nmax_inflight_body_bytes = 134217728\n"
             )),
             ("egress effects", format!(
                 "{baseline}\n[[egress.request_headers]]\noperation = \"remove\"\nwhen = \"always\"\nname = \"x-test-header\"\n"

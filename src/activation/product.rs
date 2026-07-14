@@ -257,6 +257,9 @@ mod tests {
     #[cfg(unix)]
     use tempfile::TempDir;
 
+    const INITIAL_CAPTURE_LIMIT: usize = 128 * 1024 * 1024;
+    const LOWER_CAPTURE_LIMIT: usize = 112 * 1024 * 1024;
+
     const MINIMAL: &str = r#"schema_version = 3
 
 [service]
@@ -694,7 +697,7 @@ redaction_profile = "environment"
     #[tokio::test]
     async fn complete_candidate_uses_static_pools_and_commits_capture_limit_at_publication() {
         let text = format!(
-            "{MINIMAL}\n[redaction.profiles.audit]\nrules = [{{ literals = [\"marker\"] }}]\n\n[observation.capture]\nevents = [\"request.denied\"]\nredaction_profile = \"audit\"\ndirectory = \"captures\"\nmax_body_bytes = 1024\nmax_inflight_body_bytes = 8192\n"
+            "{MINIMAL}\n[redaction.profiles.audit]\nrules = [{{ literals = [\"marker\"] }}]\n\n[observation.capture]\nevents = [\"request.denied\"]\nredaction_profile = \"audit\"\ndirectory = \"captures\"\nmax_body_bytes = 1024\nmax_inflight_body_bytes = {INITIAL_CAPTURE_LIMIT}\n"
         );
         let compiled = compile(&text);
         let activator = product_activator(&compiled.static_config);
@@ -769,12 +772,15 @@ redaction_profile = "environment"
         assert_eq!(observation_runtime.committed_capture_limit(), 0);
         let mut publication = activated.owner.publication_guard().unwrap();
         publication.commit();
-        assert_eq!(observation_runtime.committed_capture_limit(), 8192);
+        assert_eq!(
+            observation_runtime.committed_capture_limit(),
+            INITIAL_CAPTURE_LIMIT
+        );
         drop(publication);
 
         let successor = compile(&text.replace(
-            "max_inflight_body_bytes = 8192",
-            "max_inflight_body_bytes = 4096",
+            &format!("max_inflight_body_bytes = {INITIAL_CAPTURE_LIMIT}"),
+            &format!("max_inflight_body_bytes = {LOWER_CAPTURE_LIMIT}"),
         ));
         let successor = activator
             .activate_generation(
@@ -783,10 +789,16 @@ redaction_profile = "environment"
             )
             .await
             .expect("successor candidate activation succeeds");
-        assert_eq!(observation_runtime.committed_capture_limit(), 8192);
+        assert_eq!(
+            observation_runtime.committed_capture_limit(),
+            INITIAL_CAPTURE_LIMIT
+        );
         let mut successor_publication = successor.owner.publication_guard().unwrap();
         successor_publication.commit();
-        assert_eq!(observation_runtime.committed_capture_limit(), 4096);
+        assert_eq!(
+            observation_runtime.committed_capture_limit(),
+            LOWER_CAPTURE_LIMIT
+        );
         drop(successor_publication);
 
         activated.owner.cleanup(CleanupReason::Shutdown).await;
@@ -812,7 +824,7 @@ redaction_profile = "environment"
     #[tokio::test]
     async fn product_candidate_publication_reports_runtime_shutdown() {
         let text = format!(
-            "{MINIMAL}\n[redaction.profiles.audit]\nrules = [{{ literals = [\"marker\"] }}]\n\n[observation.capture]\nevents = [\"request.denied\"]\nredaction_profile = \"audit\"\ndirectory = \"captures\"\nmax_body_bytes = 1024\nmax_inflight_body_bytes = 8192\n"
+            "{MINIMAL}\n[redaction.profiles.audit]\nrules = [{{ literals = [\"marker\"] }}]\n\n[observation.capture]\nevents = [\"request.denied\"]\nredaction_profile = \"audit\"\ndirectory = \"captures\"\nmax_body_bytes = 1024\n"
         );
         let compiled = compile(&text);
         let activator = product_activator(&compiled.static_config);
@@ -991,7 +1003,7 @@ default = "deny""#
     #[tokio::test]
     async fn same_config_activators_own_isolated_capture_pools() {
         let text = format!(
-            "{MINIMAL}\n[redaction.profiles.audit]\nrules = [{{ literals = [\"marker\"] }}]\n\n[observation.capture]\nevents = [\"request.denied\"]\nredaction_profile = \"audit\"\ndirectory = \"captures\"\nmax_body_bytes = 1024\nmax_inflight_body_bytes = 8192\n"
+            "{MINIMAL}\n[redaction.profiles.audit]\nrules = [{{ literals = [\"marker\"] }}]\n\n[observation.capture]\nevents = [\"request.denied\"]\nredaction_profile = \"audit\"\ndirectory = \"captures\"\nmax_body_bytes = 1024\nmax_inflight_body_bytes = {INITIAL_CAPTURE_LIMIT}\n"
         );
         let first_config = compile(&text);
         let second_config = compile(&text);
@@ -1029,12 +1041,15 @@ default = "deny""#
         let mut publication = activated.owner.publication_guard().unwrap();
         publication.commit();
 
-        assert_eq!(first_observation.committed_capture_limit(), 8192);
+        assert_eq!(
+            first_observation.committed_capture_limit(),
+            INITIAL_CAPTURE_LIMIT
+        );
         assert_eq!(second_observation.committed_capture_limit(), 0);
 
         let second_plan = compile(&text.replace(
-            "max_inflight_body_bytes = 8192",
-            "max_inflight_body_bytes = 4096",
+            &format!("max_inflight_body_bytes = {INITIAL_CAPTURE_LIMIT}"),
+            &format!("max_inflight_body_bytes = {LOWER_CAPTURE_LIMIT}"),
         ));
         assert_eq!(second.static_fingerprint(), &second_plan.static_fingerprint);
         let second_activated = second
@@ -1047,8 +1062,14 @@ default = "deny""#
         let mut second_publication = second_activated.owner.publication_guard().unwrap();
         second_publication.commit();
 
-        assert_eq!(first_observation.committed_capture_limit(), 8192);
-        assert_eq!(second_observation.committed_capture_limit(), 4096);
+        assert_eq!(
+            first_observation.committed_capture_limit(),
+            INITIAL_CAPTURE_LIMIT
+        );
+        assert_eq!(
+            second_observation.committed_capture_limit(),
+            LOWER_CAPTURE_LIMIT
+        );
 
         drop(publication);
         drop(second_publication);

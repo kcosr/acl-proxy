@@ -1,39 +1,31 @@
-use allocator_api2::boxed::Box as FallibleBox;
 use bytes::Buf;
 use hyper::body::{HttpBody, SizeHint};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::mem::MaybeUninit;
 use std::net::IpAddr;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use zeroize::Zeroize;
 
 use crate::network::canonical_ip;
+use crate::safety::allocation::{
+    self, AllocationAuthority, ExactAllocationLease, ReservedStableBodyBuilder, StableBody,
+    StableBodyBuilder, StableBodySegments, StableScratch, StableWorkspace,
+    StableWorkspaceAllocation,
+};
 
 const QUOTA_SHARD_COUNT: usize = 16;
-pub(crate) const MAX_BUFFER_GROWTH_BYTES: usize = 64 * 1024;
-const WORKSPACE_ALIGNMENT: usize = std::mem::align_of::<u128>();
+pub(crate) use crate::safety::allocation::MAX_BUFFER_GROWTH_BYTES;
 
 pub(crate) fn guarded_body_allocation_bytes(payload_bytes: usize) -> Option<usize> {
-    if payload_bytes == 0 {
-        return Some(0);
-    }
-    let chunks = payload_bytes.checked_add(MAX_BUFFER_GROWTH_BYTES - 1)? / MAX_BUFFER_GROWTH_BYTES;
-    chunks.checked_mul(MAX_BUFFER_GROWTH_BYTES.checked_add(std::mem::size_of::<SecretChunk>())?)
+    allocation::body_allocation_bytes(payload_bytes)
 }
 
 pub(crate) fn guarded_workspace_allocation_bytes(payload_bytes: usize) -> Option<usize> {
-    if payload_bytes == 0 {
-        return Some(0);
-    }
-    payload_bytes
-        .checked_add(WORKSPACE_ALIGNMENT - 1)
-        .map(|bytes| bytes / WORKSPACE_ALIGNMENT * WORKSPACE_ALIGNMENT)
+    allocation::workspace_allocation_bytes(payload_bytes)
 }
 
 type QuotaShard = Mutex<HashMap<WireBodyQuotaKey, Arc<QuotaEntry>>>;
@@ -296,84 +288,32 @@ impl fmt::Debug for HttpWireBodyGuard {
 
 impl HttpWireBodyGuard {
     pub(crate) fn buffer(&self) -> GuardedBodyBuilder {
-        GuardedBodyBuilder {
-            guard: self.inner.clone(),
-            reverse: None,
-            len: 0,
-            charged_bytes: 0,
-        }
+        GuardedBodyBuilder::new(self.authority())
     }
 
     pub(crate) fn reserve_exact_buffer(
         &self,
         exact_len: usize,
     ) -> Result<ReservedGuardedBodyBuilder, WireBodyBufferError> {
-        let chunk_count = if exact_len == 0 {
-            0
-        } else {
-            exact_len
-                .checked_add(MAX_BUFFER_GROWTH_BYTES - 1)
-                .ok_or(WireBodyBufferError::CursorPeakExceeded)?
-                / MAX_BUFFER_GROWTH_BYTES
-        };
-        let mut inner = self.buffer();
-        for _ in 0..chunk_count {
-            if let Err(error) = inner.try_allocate_chunk() {
-                inner.clear_and_release();
-                return Err(error);
-            }
-        }
-        Ok(ReservedGuardedBodyBuilder {
-            inner,
-            exact_len,
-            valid: true,
-        })
+        GuardedBodyBuilder::reserve_exact(self.authority(), exact_len)
     }
 
     pub(crate) fn stream_scratch(&self) -> Result<GuardedScratch, WireBodyBufferError> {
-        let (chunk, charged_bytes) = allocate_secret_chunk(&self.inner)?;
-        Ok(GuardedScratch {
-            guard: self.inner.clone(),
-            chunk,
-            charged_bytes,
-        })
+        GuardedScratch::try_new(self.authority())
     }
 
     pub(crate) fn codec_workspace_allocation(
         &self,
         bytes: usize,
     ) -> Result<GuardedWorkspaceAllocation, WireBodyBufferError> {
-        let charged_bytes = guarded_workspace_allocation_bytes(bytes)
-            .ok_or(WireBodyBufferError::CursorPeakExceeded)?;
-        self.inner.try_charge(charged_bytes)?;
-        let mut charge = PendingCharge {
-            guard: self.inner.clone(),
-            bytes: charged_bytes,
-        };
-        #[cfg(test)]
-        if self.inner.pool.take_allocation_failure() {
-            return Err(WireBodyBufferError::AllocationFailed);
-        }
-        let words = charged_bytes / WORKSPACE_ALIGNMENT;
-        let storage = FallibleBox::<[u128]>::try_new_uninit_slice(words)
-            .map_err(|_| WireBodyBufferError::AllocationFailed)?;
-        Ok(GuardedWorkspaceAllocation {
-            guard: self.inner.clone(),
-            storage: Some(storage),
-            charged_bytes: charge.commit(),
-            initialized_words: 0,
-        })
+        GuardedWorkspaceAllocation::try_new(self.authority(), bytes)
     }
 
     pub(crate) fn charge_exact_allocation(
         &self,
         bytes: usize,
     ) -> Result<GuardedAllocationCharge, WireBodyBufferError> {
-        self.inner.try_charge(bytes)?;
-        Ok(GuardedAllocationCharge {
-            guard: self.inner.clone(),
-            bytes,
-        })
+        GuardedAllocationCharge::try_new(self.authority(), bytes)
     }
 
     pub(crate) fn provider_response_charge(&self) -> ProviderResponseCharge {
@@ -399,41 +339,35 @@ impl HttpWireBodyGuard {
     }
 
     pub(crate) fn validate_body(&self, body: &GuardedBody) -> Result<(), WireBodyBufferError> {
-        if Arc::ptr_eq(&self.inner, &body.guard) {
+        if body.belongs_to(&self.authority()) {
             Ok(())
         } else {
             Err(WireBodyBufferError::ForeignGuard)
         }
     }
-}
 
-pub(crate) struct GuardedAllocationCharge {
-    guard: Arc<GuardInner>,
-    bytes: usize,
-}
-
-impl GuardedAllocationCharge {
-    pub(crate) fn bytes(&self) -> usize {
-        self.bytes
-    }
-}
-
-impl Drop for GuardedAllocationCharge {
-    fn drop(&mut self) {
-        self.guard.release(std::mem::take(&mut self.bytes));
+    fn authority(&self) -> WireAllocationAuthority {
+        WireAllocationAuthority(self.inner.clone())
     }
 }
 
 impl ProviderResponseCharge {
     pub(crate) fn buffer(&self) -> GuardedBodyBuilder {
-        GuardedBodyBuilder {
-            guard: self.inner.clone(),
-            reverse: None,
-            len: 0,
-            charged_bytes: 0,
-        }
+        GuardedBodyBuilder::new(WireAllocationAuthority(self.inner.clone()))
     }
 }
+
+#[derive(Clone)]
+pub(crate) struct WireAllocationAuthority(Arc<GuardInner>);
+
+pub(crate) type GuardedAllocationCharge = ExactAllocationLease<WireAllocationAuthority>;
+pub(crate) type GuardedBodyBuilder = StableBodyBuilder<WireAllocationAuthority>;
+pub(crate) type ReservedGuardedBodyBuilder = ReservedStableBodyBuilder<WireAllocationAuthority>;
+pub(crate) type GuardedBody = StableBody<WireAllocationAuthority>;
+pub(crate) type GuardedBodySegments<'a> = StableBodySegments<'a>;
+pub(crate) type GuardedScratch = StableScratch<WireAllocationAuthority>;
+pub(crate) type GuardedWorkspace = StableWorkspace<WireAllocationAuthority>;
+pub(crate) type GuardedWorkspaceAllocation = StableWorkspaceAllocation<WireAllocationAuthority>;
 
 struct GuardInner {
     pool: Arc<WireBodyPool>,
@@ -474,369 +408,37 @@ impl GuardInner {
     }
 }
 
-pub(crate) struct GuardedBodyBuilder {
-    guard: Arc<GuardInner>,
-    reverse: Option<FallibleBox<SecretChunk>>,
-    len: usize,
-    charged_bytes: usize,
-}
+impl AllocationAuthority for WireAllocationAuthority {
+    type Error = WireBodyBufferError;
 
-pub(crate) struct ReservedGuardedBodyBuilder {
-    inner: GuardedBodyBuilder,
-    exact_len: usize,
-    valid: bool,
-}
-
-impl fmt::Debug for GuardedBodyBuilder {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("GuardedBodyBuilder")
-            .field("len", &self.len)
-            .field("charged_bytes", &self.charged_bytes)
-            .finish()
-    }
-}
-
-impl GuardedBodyBuilder {
-    pub(crate) fn len(&self) -> usize {
-        self.len
+    fn try_charge(&self, bytes: usize) -> Result<(), Self::Error> {
+        self.0.try_charge(bytes)
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len == 0
+    fn release(&self, bytes: usize) {
+        self.0.release(bytes);
     }
 
-    pub(crate) fn charged_bytes(&self) -> usize {
-        self.charged_bytes
+    fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 
-    pub(crate) fn try_extend_from_slice(
-        &mut self,
-        mut input: &[u8],
-    ) -> Result<(), WireBodyBufferError> {
-        let result = (|| {
-            let final_len = self
-                .len
-                .checked_add(input.len())
-                .ok_or(WireBodyBufferError::CursorPeakExceeded)?;
-            while !input.is_empty() {
-                if self
-                    .reverse
-                    .as_ref()
-                    .is_none_or(|chunk| chunk.initialized == chunk.bytes.len())
-                {
-                    self.try_allocate_chunk()?;
-                }
-                let chunk = self.reverse.as_mut().expect("chunk was allocated");
-                let copied = chunk.extend_from_slice(input);
-                input = &input[copied..];
-            }
-            self.len = final_len;
-            Ok(())
-        })();
-        if result.is_err() {
-            // An append can initialize a chunk before a later allocation fails.
-            // Make failure terminal for the accumulated body rather than expose
-            // bytes that are inconsistent with `len`.
-            self.clear_and_release();
-        }
-        result
+    fn limit_error() -> Self::Error {
+        WireBodyBufferError::CursorPeakExceeded
     }
 
-    fn clear_and_release(&mut self) {
-        drop_secret_chain(self.reverse.take());
-        self.len = 0;
-        let released = std::mem::take(&mut self.charged_bytes);
-        self.guard.release(released);
+    fn allocation_error() -> Self::Error {
+        WireBodyBufferError::AllocationFailed
     }
 
-    fn try_allocate_chunk(&mut self) -> Result<(), WireBodyBufferError> {
-        let (mut chunk, charged_bytes) = allocate_secret_chunk(&self.guard)?;
-        chunk.next = self.reverse.take();
-        self.reverse = Some(chunk);
-        self.charged_bytes += charged_bytes;
-        Ok(())
-    }
-
-    pub(crate) fn finish(mut self) -> GuardedBody {
-        let mut reverse = self.reverse.take();
-        let mut forward = None;
-        while let Some(mut chunk) = reverse {
-            let next = chunk.next.take();
-            chunk.next = forward;
-            forward = Some(chunk);
-            reverse = next;
-        }
-        GuardedBody {
-            guard: self.guard.clone(),
-            head: forward,
-            len: self.len,
-            charged_bytes: std::mem::take(&mut self.charged_bytes),
-        }
-    }
-}
-
-impl ReservedGuardedBodyBuilder {
-    pub(crate) fn len(&self) -> usize {
-        self.inner.len
-    }
-
-    pub(crate) fn charged_bytes(&self) -> usize {
-        self.inner.charged_bytes
-    }
-
-    pub(crate) fn try_extend_from_slice(
-        &mut self,
-        mut input: &[u8],
-    ) -> Result<(), WireBodyBufferError> {
-        let Some(final_len) = self.inner.len.checked_add(input.len()) else {
-            self.invalidate();
-            return Err(WireBodyBufferError::ReservedLengthMismatch);
-        };
-        if !self.valid || final_len > self.exact_len {
-            self.invalidate();
-            return Err(WireBodyBufferError::ReservedLengthMismatch);
-        }
-
-        while !input.is_empty() {
-            let chunk = self
-                .inner
-                .reverse
-                .as_deref_mut()
-                .and_then(SecretChunk::oldest_with_capacity)
-                .expect("an exact reservation has enough initialized storage");
-            let copied = chunk.extend_from_slice(input);
-            input = &input[copied..];
-        }
-        self.inner.len = final_len;
-        Ok(())
-    }
-
-    pub(crate) fn finish(mut self) -> Result<GuardedBody, WireBodyBufferError> {
-        if !self.valid || self.inner.len != self.exact_len {
-            self.invalidate();
-            return Err(WireBodyBufferError::ReservedLengthMismatch);
-        }
-        Ok(self.inner.finish())
-    }
-
-    fn invalidate(&mut self) {
-        if self.valid {
-            self.inner.clear_and_release();
-            self.valid = false;
-        }
-    }
-}
-
-pub(crate) struct GuardedScratch {
-    guard: Arc<GuardInner>,
-    chunk: FallibleBox<SecretChunk>,
-    charged_bytes: usize,
-}
-
-pub(crate) struct GuardedWorkspace {
-    guard: Arc<GuardInner>,
-    storage: FallibleBox<[u128]>,
-    charged_bytes: usize,
-}
-
-pub(crate) struct GuardedWorkspaceAllocation {
-    guard: Arc<GuardInner>,
-    storage: Option<FallibleBox<[MaybeUninit<u128>]>>,
-    charged_bytes: usize,
-    initialized_words: usize,
-}
-
-impl GuardedWorkspaceAllocation {
-    pub(crate) fn len(&self) -> usize {
-        self.charged_bytes
-    }
-
-    pub(crate) fn is_initialized(&self) -> bool {
-        self.initialized_words
-            == self
-                .storage
-                .as_deref()
-                .map(<[MaybeUninit<u128>]>::len)
-                .unwrap_or(0)
-    }
-
-    pub(crate) fn initialize_next(&mut self, max_bytes: usize) {
-        let storage = self
-            .storage
-            .as_deref_mut()
-            .expect("pending workspace storage exists until finish");
-        let max_words = max_bytes.div_ceil(WORKSPACE_ALIGNMENT).max(1);
-        let end = self
-            .initialized_words
-            .saturating_add(max_words)
-            .min(storage.len());
-        for word in &mut storage[self.initialized_words..end] {
-            word.write(0);
-        }
-        self.initialized_words = end;
-    }
-
-    pub(crate) fn finish(mut self) -> GuardedWorkspace {
-        assert!(
-            self.is_initialized(),
-            "workspace must be initialized before use"
-        );
-        let storage = self
-            .storage
-            .take()
-            .expect("pending workspace storage exists until finish");
-        // Every word was initialized before ownership is converted.
-        let storage = unsafe { storage.assume_init() };
-        GuardedWorkspace {
-            guard: self.guard.clone(),
-            storage,
-            charged_bytes: std::mem::take(&mut self.charged_bytes),
-        }
-    }
-}
-
-impl fmt::Debug for GuardedWorkspaceAllocation {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("GuardedWorkspaceAllocation")
-            .field("charged_bytes", &self.charged_bytes)
-            .field("initialized_words", &self.initialized_words)
-            .finish()
-    }
-}
-
-impl Drop for GuardedWorkspaceAllocation {
-    fn drop(&mut self) {
-        if let Some(storage) = self.storage.as_deref_mut() {
-            for word in &mut storage[..self.initialized_words] {
-                // Initialized words may already contain sensitive codec state.
-                unsafe { word.assume_init_mut() }.zeroize();
-            }
-        }
-        self.guard.release(std::mem::take(&mut self.charged_bytes));
-    }
-}
-
-impl GuardedWorkspace {
-    pub(crate) fn len(&self) -> usize {
-        self.charged_bytes
-    }
-
-    pub(crate) fn as_mut_bytes(&mut self) -> &mut [u8] {
-        // The allocation is u128-aligned and covers exactly `charged_bytes` bytes.
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.storage.as_mut_ptr().cast::<u8>(),
-                self.charged_bytes,
-            )
-        }
-    }
-
-    pub(crate) fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.storage.as_mut_ptr().cast::<u8>()
-    }
-
-    pub(crate) fn reset(&mut self) {
-        self.storage.zeroize();
+    fn reservation_error() -> Self::Error {
+        WireBodyBufferError::ReservedLengthMismatch
     }
 
     #[cfg(test)]
-    pub(crate) fn is_zeroed_for_test(&self) -> bool {
-        self.storage.iter().all(|word| *word == 0)
+    fn take_allocation_failure(&self) -> bool {
+        self.0.pool.take_allocation_failure()
     }
-}
-
-impl fmt::Debug for GuardedWorkspace {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("GuardedWorkspace")
-            .field("charged_bytes", &self.charged_bytes)
-            .finish()
-    }
-}
-
-impl Drop for GuardedWorkspace {
-    fn drop(&mut self) {
-        self.reset();
-        self.guard.release(std::mem::take(&mut self.charged_bytes));
-    }
-}
-
-impl GuardedScratch {
-    pub(crate) fn capacity(&self) -> usize {
-        self.chunk.bytes.len()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.chunk.initialized == 0
-    }
-
-    pub(crate) fn remaining(&self) -> usize {
-        self.capacity() - self.chunk.initialized
-    }
-
-    pub(crate) fn extend_from_slice(&mut self, input: &[u8]) -> usize {
-        self.chunk.extend_from_slice(input)
-    }
-
-    pub(crate) fn as_slice(&self) -> &[u8] {
-        self.chunk.initialized()
-    }
-
-    pub(crate) fn writable(&mut self) -> &mut [u8] {
-        self.reset();
-        &mut self.chunk.bytes
-    }
-
-    pub(crate) fn set_initialized(&mut self, initialized: usize) {
-        assert!(initialized <= self.chunk.bytes.len());
-        self.chunk.initialized = initialized;
-    }
-
-    pub(crate) fn reset(&mut self) {
-        let initialized = self.chunk.initialized;
-        self.chunk.bytes[..initialized].zeroize();
-        self.chunk.initialized = 0;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_zeroed_for_test(&self) -> bool {
-        self.chunk.bytes.iter().all(|byte| *byte == 0)
-    }
-}
-
-impl fmt::Debug for GuardedScratch {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("GuardedScratch")
-            .field("capacity", &self.capacity())
-            .field("initialized", &self.chunk.initialized)
-            .field("charged_bytes", &self.charged_bytes)
-            .finish()
-    }
-}
-
-impl Drop for GuardedScratch {
-    fn drop(&mut self) {
-        self.reset();
-        self.guard.release(std::mem::take(&mut self.charged_bytes));
-    }
-}
-
-impl Drop for GuardedBodyBuilder {
-    fn drop(&mut self) {
-        drop_secret_chain(self.reverse.take());
-        let released = std::mem::take(&mut self.charged_bytes);
-        self.guard.release(released);
-    }
-}
-
-pub(crate) struct GuardedBody {
-    guard: Arc<GuardInner>,
-    head: Option<FallibleBox<SecretChunk>>,
-    len: usize,
-    charged_bytes: usize,
 }
 
 /// One-shot Hyper body that keeps decoded bytes in their request guard until
@@ -878,51 +480,22 @@ impl fmt::Debug for GuardedBodyData {
         formatter
             .debug_struct("GuardedBodyData")
             .field("remaining", &self.remaining())
-            .field("charged_bytes", &self.body.charged_bytes)
+            .field("charged_bytes", &self.body.charged_bytes())
             .finish()
     }
 }
 
 impl Buf for GuardedBodyData {
     fn remaining(&self) -> usize {
-        self.body.len
+        self.body.len()
     }
 
     fn chunk(&self) -> &[u8] {
-        self.body
-            .head
-            .as_deref()
-            .map(|head| &head.initialized()[self.head_offset..])
-            .unwrap_or_default()
+        self.body.current_chunk(self.head_offset)
     }
 
-    fn advance(&mut self, mut count: usize) {
-        assert!(count <= self.remaining(), "guarded body advance overflow");
-        while count != 0 {
-            let available = self
-                .body
-                .head
-                .as_deref()
-                .map(|head| head.initialized - self.head_offset)
-                .expect("a nonempty guarded body has a head chunk");
-            if count < available {
-                let head = self.body.head.as_deref_mut().expect("head exists");
-                head.bytes[self.head_offset..self.head_offset + count].zeroize();
-                self.head_offset += count;
-                self.body.len -= count;
-                return;
-            }
-
-            count -= available;
-            self.head_offset = 0;
-            let mut consumed = self.body.head.take().expect("head exists");
-            self.body.head = consumed.next.take();
-            self.body.len -= available;
-            let allocation = secret_chunk_allocation_bytes();
-            self.body.charged_bytes -= allocation;
-            self.body.guard.release(allocation);
-            drop(consumed);
-        }
+    fn advance(&mut self, count: usize) {
+        self.body.consume(count, &mut self.head_offset);
     }
 }
 
@@ -956,163 +529,6 @@ impl HttpBody for GuardedHttpBody {
     }
 }
 
-impl GuardedBody {
-    pub(crate) fn segments(&self) -> GuardedBodySegments<'_> {
-        GuardedBodySegments {
-            next: self.head.as_deref(),
-        }
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.len
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub(crate) fn charged_bytes(&self) -> usize {
-        self.charged_bytes
-    }
-}
-
-impl fmt::Debug for GuardedBody {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("GuardedBody")
-            .field("len", &self.len)
-            .field("charged_bytes", &self.charged_bytes)
-            .finish()
-    }
-}
-
-impl Drop for GuardedBody {
-    fn drop(&mut self) {
-        drop_secret_chain(self.head.take());
-        let released = std::mem::take(&mut self.charged_bytes);
-        self.guard.release(released);
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct GuardedBodySegments<'a> {
-    next: Option<&'a SecretChunk>,
-}
-
-impl<'a> Iterator for GuardedBodySegments<'a> {
-    type Item = &'a [u8];
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let chunk = self.next?;
-        self.next = chunk.next.as_deref();
-        Some(chunk.initialized())
-    }
-}
-
-struct PendingCharge {
-    guard: Arc<GuardInner>,
-    bytes: usize,
-}
-
-fn allocate_secret_chunk(
-    guard: &Arc<GuardInner>,
-) -> Result<(FallibleBox<SecretChunk>, usize), WireBodyBufferError> {
-    let allocation_bytes = secret_chunk_allocation_bytes();
-    guard.try_charge(allocation_bytes)?;
-    let mut charge = PendingCharge {
-        guard: guard.clone(),
-        bytes: allocation_bytes,
-    };
-    #[cfg(test)]
-    if guard.pool.take_allocation_failure() {
-        return Err(WireBodyBufferError::AllocationFailed);
-    }
-    let mut bytes = FallibleBox::<[u8]>::try_new_uninit_slice(MAX_BUFFER_GROWTH_BYTES)
-        .map_err(|_| WireBodyBufferError::AllocationFailed)?;
-    for byte in bytes.iter_mut() {
-        byte.write(0);
-    }
-    // Every element was initialized to zero above.
-    let bytes = unsafe { bytes.assume_init() };
-    let chunk = FallibleBox::try_new(SecretChunk {
-        bytes,
-        initialized: 0,
-        next: None,
-    })
-    .map_err(|_| WireBodyBufferError::AllocationFailed)?;
-    Ok((chunk, charge.commit()))
-}
-
-fn secret_chunk_allocation_bytes() -> usize {
-    MAX_BUFFER_GROWTH_BYTES + std::mem::size_of::<SecretChunk>()
-}
-
-impl PendingCharge {
-    fn commit(&mut self) -> usize {
-        std::mem::take(&mut self.bytes)
-    }
-}
-
-impl Drop for PendingCharge {
-    fn drop(&mut self) {
-        self.guard.release(self.bytes);
-    }
-}
-
-struct SecretChunk {
-    bytes: FallibleBox<[u8]>,
-    initialized: usize,
-    next: Option<FallibleBox<SecretChunk>>,
-}
-
-impl SecretChunk {
-    fn initialized(&self) -> &[u8] {
-        &self.bytes[..self.initialized]
-    }
-
-    fn extend_from_slice(&mut self, input: &[u8]) -> usize {
-        let copied = input.len().min(self.bytes.len() - self.initialized);
-        self.bytes[self.initialized..self.initialized + copied].copy_from_slice(&input[..copied]);
-        self.initialized += copied;
-        copied
-    }
-
-    fn oldest_with_capacity(&mut self) -> Option<&mut Self> {
-        let next_has_capacity = self
-            .next
-            .as_deref()
-            .is_some_and(SecretChunk::chain_has_capacity);
-        if next_has_capacity {
-            return self
-                .next
-                .as_deref_mut()
-                .and_then(SecretChunk::oldest_with_capacity);
-        }
-        (self.initialized < self.bytes.len()).then_some(self)
-    }
-
-    fn chain_has_capacity(&self) -> bool {
-        self.initialized < self.bytes.len()
-            || self
-                .next
-                .as_deref()
-                .is_some_and(SecretChunk::chain_has_capacity)
-    }
-}
-
-impl Drop for SecretChunk {
-    fn drop(&mut self) {
-        self.bytes.zeroize();
-    }
-}
-
-fn drop_secret_chain(mut chain: Option<FallibleBox<SecretChunk>>) {
-    while let Some(mut chunk) = chain {
-        chain = chunk.next.take();
-        drop(chunk);
-    }
-}
-
 #[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum WireBodyBufferError {
     #[error("wire-body cursor peak exceeded")]
@@ -1140,7 +556,7 @@ mod linked_tests {
     }
 
     fn allocation(chunks: usize) -> usize {
-        chunks * (MAX_BUFFER_GROWTH_BYTES + std::mem::size_of::<SecretChunk>())
+        guarded_body_allocation_bytes(chunks * MAX_BUFFER_GROWTH_BYTES).unwrap()
     }
 
     fn body_bytes(body: &GuardedBody) -> Vec<u8> {
@@ -1164,7 +580,7 @@ mod linked_tests {
         assert_eq!(scratch.remaining(), 0);
         scratch.reset();
         assert!(scratch.is_empty());
-        assert!(scratch.chunk.bytes.iter().all(|byte| *byte == 0));
+        assert!(scratch.is_zeroed_for_test());
         assert_eq!(guard.live_bytes(), one);
 
         assert_eq!(scratch.extend_from_slice(b"reused"), 6);
@@ -1201,7 +617,10 @@ mod linked_tests {
         let mut workspace = allocation.finish();
 
         assert_eq!(workspace.len(), charged);
-        assert_eq!(workspace.as_mut_ptr() as usize % WORKSPACE_ALIGNMENT, 0);
+        assert_eq!(
+            workspace.as_mut_ptr() as usize % std::mem::align_of::<u128>(),
+            0
+        );
         assert_eq!(guard.live_bytes(), charged);
         workspace.as_mut_bytes().fill(0xa5);
         workspace.reset();
@@ -1266,17 +685,9 @@ mod linked_tests {
         builder
             .try_extend_from_slice(&vec![1; MAX_BUFFER_GROWTH_BYTES])
             .unwrap();
-        let first_pointer = builder.reverse.as_ref().unwrap().bytes.as_ptr();
+        let first_pointer = builder.newest_storage_ptr_for_test().unwrap();
         builder.try_extend_from_slice(b"tail").unwrap();
-        let older_pointer = builder
-            .reverse
-            .as_ref()
-            .unwrap()
-            .next
-            .as_ref()
-            .unwrap()
-            .bytes
-            .as_ptr();
+        let older_pointer = builder.next_storage_ptr_for_test().unwrap();
         assert_eq!(older_pointer, first_pointer);
 
         let body = builder.finish();
@@ -1319,7 +730,10 @@ mod linked_tests {
             Err(WireBodyBufferError::CursorPeakExceeded)
         );
         assert_eq!(builder.len(), 0);
-        assert!(builder.reverse.is_none(), "no initialized segments remain");
+        assert!(
+            !builder.has_allocated_segments_for_test(),
+            "no initialized segments remain"
+        );
         assert_eq!(builder.charged_bytes(), 0);
         assert_eq!(guard.live_bytes(), 0);
         assert_eq!(pool.global_charge(), 0);
@@ -1376,6 +790,55 @@ mod linked_tests {
             guard.stream_scratch(),
             Err(WireBodyBufferError::AllocationFailed)
         ));
+    }
+
+    #[test]
+    fn exact_reservation_preserves_order_across_many_preallocated_chunks() {
+        const CHUNKS: usize = 96;
+        let charged = allocation(CHUNKS);
+        let exact_len = CHUNKS * MAX_BUFFER_GROWTH_BYTES;
+        let pool = WireBodyPool::new(charged, charged);
+        let guard = pool.begin(charged, key());
+        let mut reserved = guard.reserve_exact_buffer(exact_len).unwrap();
+
+        for index in 0..CHUNKS {
+            let marker = (index as u8).wrapping_mul(37);
+            reserved
+                .try_extend_from_slice(&vec![marker; MAX_BUFFER_GROWTH_BYTES])
+                .unwrap();
+        }
+
+        let body = reserved.finish().unwrap();
+        assert_eq!(body.segments().count(), CHUNKS);
+        for (index, segment) in body.segments().enumerate() {
+            let marker = (index as u8).wrapping_mul(37);
+            assert_eq!(segment.len(), MAX_BUFFER_GROWTH_BYTES);
+            assert!(segment.iter().all(|byte| *byte == marker));
+        }
+        drop(body);
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+    }
+
+    #[test]
+    fn dropping_partial_many_chunk_reservation_releases_every_charge() {
+        const CHUNKS: usize = 32;
+        let charged = allocation(CHUNKS);
+        let pool = WireBodyPool::new(charged, charged);
+        let quota_key = key();
+        let guard = pool.begin(charged, quota_key.clone());
+        let mut reserved = guard
+            .reserve_exact_buffer(CHUNKS * MAX_BUFFER_GROWTH_BYTES)
+            .unwrap();
+        reserved
+            .try_extend_from_slice(&vec![0xa5; MAX_BUFFER_GROWTH_BYTES + 17])
+            .unwrap();
+        assert_eq!(guard.live_bytes(), charged);
+
+        drop(reserved);
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+        assert_eq!(pool.quota_charge(&quota_key), 0);
     }
 
     #[test]
@@ -1549,8 +1012,7 @@ mod linked_tests {
 
         data.advance(17);
         assert_eq!(data.remaining(), MAX_BUFFER_GROWTH_BYTES + 4 - 17);
-        let head = data.body.head.as_deref().unwrap();
-        assert!(head.bytes[..17].iter().all(|byte| *byte == 0));
+        assert!(data.body.current_chunk_prefix_is_zeroed_for_test(17));
         assert_eq!(guard.live_bytes(), two);
 
         data.advance(MAX_BUFFER_GROWTH_BYTES - 17);
