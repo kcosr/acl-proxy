@@ -1384,6 +1384,8 @@ fn control_parser_arena_bytes(
 struct ListenerFacts {
     binds: BTreeSet<SocketAddr>,
     mitm_required: bool,
+    uses_http1: bool,
+    uses_http2: bool,
 }
 
 fn validate_listener_control_mitm_matrix(
@@ -1409,6 +1411,7 @@ fn validate_listener_control_mitm_matrix(
             &listener.http_versions,
             "listeners.explicit_http.http_versions",
         )?;
+        facts.record_http_versions(&listener.http_versions);
         facts.mitm_required |= validate_connect(
             &listener.http_versions,
             &listener.connect,
@@ -1422,6 +1425,7 @@ fn validate_listener_control_mitm_matrix(
             &listener.http_versions,
             "listeners.transparent_http.http_versions",
         )?;
+        facts.record_http_versions(&listener.http_versions);
     }
     if let Some(listener) = &listeners.explicit_https {
         let bind = validate_bind(listener.bind, "listeners.explicit_https.bind", false)?;
@@ -1430,6 +1434,7 @@ fn validate_listener_control_mitm_matrix(
             &listener.http_versions,
             "listeners.explicit_https.http_versions",
         )?;
+        facts.record_http_versions(&listener.http_versions);
         validate_listener_limits(
             listener.max_connections,
             listener.max_concurrent_streams,
@@ -1448,6 +1453,7 @@ fn validate_listener_control_mitm_matrix(
             &listener.http_versions,
             "listeners.transparent_https.http_versions",
         )?;
+        facts.record_http_versions(&listener.http_versions);
         validate_listener_limits(
             listener.max_connections,
             listener.max_concurrent_streams,
@@ -1515,6 +1521,17 @@ fn validate_listener_control_mitm_matrix(
         check_range("mitm.max_cached_certificates", cache, MAX_MITM_CERTIFICATES)?;
     }
     Ok(facts)
+}
+
+impl ListenerFacts {
+    fn record_http_versions(&mut self, versions: &[HttpVersion]) {
+        for version in versions {
+            match version {
+                HttpVersion::Http1 => self.uses_http1 = true,
+                HttpVersion::Http2 => self.uses_http2 = true,
+            }
+        }
+    }
 }
 
 fn validate_bind(
@@ -1667,6 +1684,15 @@ fn validate_tls_and_parent_matrix(
     listeners: &ListenerFacts,
 ) -> Result<(), ConfigCompileError> {
     validate_transport_tls(&config.egress.origin_tls, "egress.origin_tls")?;
+    let origin_versions = &config.egress.origin_tls.http_versions;
+    if (listeners.uses_http1 && !origin_versions.contains(&HttpVersion::Http1))
+        || (listeners.uses_http2 && !origin_versions.contains(&HttpVersion::Http2))
+    {
+        return Err(ConfigCompileError::at(
+            "egress.origin_tls.http_versions",
+            "must enable every HTTP version enabled by a proxy listener",
+        ));
+    }
     match config.egress.route {
         EgressRoute::Direct => {
             if config.egress.parent_proxy.is_some() {
@@ -6904,6 +6930,43 @@ trust = "system"
         ] {
             let error = compile(&input).unwrap_err();
             assert!(error.to_string().contains(expected), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn every_listener_protocol_must_be_enabled_for_origin_egress() {
+        let h2_listener_h1_egress = MINIMAL
+            .replace(
+                "http_versions = [\"http1\"]\n\n[listeners.explicit_http.connect]",
+                "http_versions = [\"http1\", \"http2\"]\n\n[listeners.explicit_http.connect]",
+            )
+            .replace(
+                "http1 = \"deny\"\n\n[policy]",
+                "http1 = \"deny\"\nhttp2 = \"deny\"\n\n[egress.origin_tls]\nhttp_versions = [\"http1\"]\n\n[policy]",
+            );
+        let h1_listener_h2_egress = MINIMAL.replace(
+            "http1 = \"deny\"\n\n[policy]",
+            "http1 = \"deny\"\n\n[egress.origin_tls]\nhttp_versions = [\"http2\"]\n\n[policy]",
+        );
+
+        for (name, input) in [
+            (
+                "HTTP/2 listener with HTTP/1-only egress",
+                h2_listener_h1_egress,
+            ),
+            (
+                "HTTP/1 listener with HTTP/2-only egress",
+                h1_listener_h2_egress,
+            ),
+        ] {
+            let error = compile(&input).expect_err(name);
+            assert_eq!(error.path, "egress.origin_tls.http_versions");
+            assert!(
+                error
+                    .to_string()
+                    .contains("must enable every HTTP version enabled by a proxy listener"),
+                "{name}: {error}"
+            );
         }
     }
 
