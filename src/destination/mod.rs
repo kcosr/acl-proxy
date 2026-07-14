@@ -997,7 +997,9 @@ mod tests {
         );
 
         assert!(matches!(
-            guard.resolve(DestinationTarget::webhook(&callback_url)).await,
+            guard
+                .resolve(DestinationTarget::webhook(&callback_url))
+                .await,
             Err(DestinationGuardError::ReservedControlSubtree)
         ));
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
