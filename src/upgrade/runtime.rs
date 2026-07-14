@@ -319,6 +319,8 @@ struct EntryShared {
     timing: Mutex<EntryTiming>,
     cleanup_grace: Duration,
     winning_cause: Mutex<Option<UpgradeTerminalCause>>,
+    // These two atomics form one handshake. SeqCst prevents the setup poll and
+    // closer from each missing the other's publication via store buffering.
     setup_state: AtomicU8,
     changed: Notify,
     terminal_state: AtomicU8,
@@ -449,7 +451,7 @@ impl Drop for SetupPollGuard {
             } else {
                 SETUP_IDLE
             },
-            Ordering::Release,
+            Ordering::SeqCst,
         );
         self.shared.finish_close_request();
     }
@@ -460,7 +462,7 @@ impl Future for LinearizedSetupTask {
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let shared = self.shared.clone();
-        if shared.terminal_state.load(Ordering::Acquire) != ENTRY_OPEN {
+        if shared.terminal_state.load(Ordering::SeqCst) != ENTRY_OPEN {
             return Poll::Ready(Err(lock(&shared.timing).stop_cause));
         }
         if shared
@@ -468,8 +470,8 @@ impl Future for LinearizedSetupTask {
             .compare_exchange(
                 SETUP_IDLE,
                 SETUP_POLLING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
             )
             .is_err()
         {
@@ -481,7 +483,7 @@ impl Future for LinearizedSetupTask {
             succeeded: false,
         };
         let timing = *lock(&shared.timing);
-        if shared.terminal_state.load(Ordering::Acquire) != ENTRY_OPEN
+        if shared.terminal_state.load(Ordering::SeqCst) != ENTRY_OPEN
             || Instant::now() >= timing.application_stop
         {
             return Poll::Ready(Err(timing.stop_cause));
@@ -945,7 +947,7 @@ impl RuntimeInner {
         if let Some(abort) = abort_origin {
             abort.abort();
         }
-        shared.terminal_state.store(ENTRY_CLOSED, Ordering::Release);
+        shared.terminal_state.store(ENTRY_CLOSED, Ordering::SeqCst);
         shared.closed.notify_waiters();
         self.changed.notify_waiters();
     }
@@ -1163,7 +1165,7 @@ impl fmt::Debug for CommittedUpgrade {
             .field("id", &self.id)
             .field(
                 "terminal_state",
-                &self.shared.terminal_state.load(Ordering::Acquire),
+                &self.shared.terminal_state.load(Ordering::SeqCst),
             )
             .field("terminal_cause", &self.terminal_cause())
             .finish()
@@ -1179,7 +1181,7 @@ impl CommittedUpgrade {
     pub(crate) async fn wait_closed(&self) {
         loop {
             let notified = self.shared.closed.notified();
-            if self.shared.terminal_state.load(Ordering::Acquire) == ENTRY_CLOSED {
+            if self.shared.terminal_state.load(Ordering::SeqCst) == ENTRY_CLOSED {
                 return;
             }
             notified.await;
@@ -1219,8 +1221,8 @@ impl EntryShared {
             .compare_exchange(
                 ENTRY_OPEN,
                 ENTRY_CLOSE_REQUESTED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
             )
             .is_err()
         {
@@ -1237,8 +1239,8 @@ impl EntryShared {
             .compare_exchange(
                 ENTRY_CLOSE_REQUESTED,
                 ENTRY_CLOSE_WAITING_SETUP,
-                Ordering::Release,
-                Ordering::Acquire,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
             )
             .is_ok()
         {
@@ -1247,7 +1249,7 @@ impl EntryShared {
     }
 
     fn finish_close_request(&self) {
-        if self.setup_state.load(Ordering::Acquire) == SETUP_POLLING {
+        if self.setup_state.load(Ordering::SeqCst) == SETUP_POLLING {
             return;
         }
         if self
@@ -1255,8 +1257,8 @@ impl EntryShared {
             .compare_exchange(
                 ENTRY_CLOSE_WAITING_SETUP,
                 ENTRY_CLOSING,
-                Ordering::Release,
-                Ordering::Acquire,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
             )
             .is_ok()
         {
@@ -1374,14 +1376,14 @@ fn handle_entry_task_completion(
             let rejected = {
                 let timing = lock(&shared.timing);
                 let now = Instant::now();
-                if shared.terminal_state.load(Ordering::Acquire) == ENTRY_OPEN
+                if shared.terminal_state.load(Ordering::SeqCst) == ENTRY_OPEN
                     && now < timing.application_stop
                 {
                     let pair = pair.take().expect("relay pair is promoted once");
                     tasks.spawn(async move { EntryTaskResult::Relay(pair.first.await) });
                     tasks.spawn(async move { EntryTaskResult::Relay(pair.second.await) });
                     None
-                } else if shared.terminal_state.load(Ordering::Acquire) == ENTRY_OPEN
+                } else if shared.terminal_state.load(Ordering::SeqCst) == ENTRY_OPEN
                     && now >= timing.application_stop
                 {
                     Some((timing.stop_cause, timing.application_stop))
@@ -1534,18 +1536,18 @@ async fn run_entry_coordinator_with_hooks<RawHook, SetupHook, CloseHook>(
             handle_entry_task_completion(&shared, cleanup_grace, &mut tasks, &mut phase, joined);
         }
         let changed = shared.changed.notified();
-        if shared.terminal_state.load(Ordering::Acquire) == ENTRY_OPEN {
+        if shared.terminal_state.load(Ordering::SeqCst) == ENTRY_OPEN {
             let timing = *lock(&shared.timing);
             if Instant::now() >= timing.application_stop {
                 shared.begin_closing(timing.stop_cause, timing.application_stop, cleanup_grace);
             }
         }
 
-        if shared.terminal_state.load(Ordering::Acquire) == ENTRY_CLOSING {
+        if shared.terminal_state.load(Ordering::SeqCst) == ENTRY_CLOSING {
             let cause =
                 lock(&shared.winning_cause).expect("closing entry has a winning terminal cause");
             let established = phase == EntryPhase::Established
-                || shared.setup_state.load(Ordering::Acquire) == SETUP_SUCCEEDED;
+                || shared.setup_state.load(Ordering::SeqCst) == SETUP_SUCCEEDED;
             let control = terminal_control
                 .take()
                 .expect("entry cleanup owns terminal control");
@@ -1563,7 +1565,7 @@ async fn run_entry_coordinator_with_hooks<RawHook, SetupHook, CloseHook>(
             return;
         }
 
-        match shared.terminal_state.load(Ordering::Acquire) {
+        match shared.terminal_state.load(Ordering::SeqCst) {
             ENTRY_CLOSE_REQUESTED | ENTRY_CLOSE_WAITING_SETUP => {
                 changed.await;
                 continue;
@@ -1579,7 +1581,7 @@ async fn run_entry_coordinator_with_hooks<RawHook, SetupHook, CloseHook>(
             let mut pending = Some((build, snapshot));
             let (admitted, stop) = {
                 let timing = lock(&shared.timing);
-                if shared.terminal_state.load(Ordering::Acquire) == ENTRY_OPEN
+                if shared.terminal_state.load(Ordering::SeqCst) == ENTRY_OPEN
                     && Instant::now() < timing.application_stop
                 {
                     let (build, snapshot) = pending.take().expect("setup is admitted once");
@@ -1600,7 +1602,7 @@ async fn run_entry_coordinator_with_hooks<RawHook, SetupHook, CloseHook>(
             };
             drop(pending);
             if !admitted {
-                if shared.terminal_state.load(Ordering::Acquire) == ENTRY_OPEN {
+                if shared.terminal_state.load(Ordering::SeqCst) == ENTRY_OPEN {
                     let timing = stop.expect("rejected setup has terminal timing");
                     shared.begin_closing(timing.stop_cause, timing.application_stop, cleanup_grace);
                 }
@@ -3028,7 +3030,7 @@ mod tests {
             );
             assert_eq!(raw_aborts.load(Ordering::SeqCst), 1);
             assert_eq!(established_closes.load(Ordering::SeqCst), 0);
-            assert_eq!(entry.shared.setup_state.load(Ordering::Acquire), SETUP_IDLE);
+            assert_eq!(entry.shared.setup_state.load(Ordering::SeqCst), SETUP_IDLE);
             runtime.shutdown_and_wait(Some(Instant::now())).await;
         }
     }
@@ -3385,7 +3387,7 @@ mod tests {
                 setup_started_rx.await.unwrap();
                 setup_release_tx.send(()).unwrap();
                 final_poll_blocked_rx.await.unwrap();
-                assert_eq!(shared.terminal_state.load(Ordering::Acquire), ENTRY_OPEN);
+                assert_eq!(shared.terminal_state.load(Ordering::SeqCst), ENTRY_OPEN);
                 let terminal_shared = shared.clone();
                 let (transition_started_tx, transition_started_rx) = std_mpsc::channel();
                 let terminal = tokio::task::spawn_blocking(move || {
@@ -3398,7 +3400,7 @@ mod tests {
                 });
                 transition_started_rx.recv().unwrap();
                 tokio::time::timeout(Duration::from_secs(1), async {
-                    while shared.terminal_state.load(Ordering::Acquire) != ENTRY_CLOSE_WAITING_SETUP
+                    while shared.terminal_state.load(Ordering::SeqCst) != ENTRY_CLOSE_WAITING_SETUP
                     {
                         tokio::task::yield_now().await;
                     }
@@ -3412,7 +3414,7 @@ mod tests {
                     .expect("coordinator did not resolve the setup/terminal race")
                     .unwrap();
                 assert_eq!(setup_completed.load(Ordering::SeqCst), 1);
-                assert_eq!(shared.setup_state.load(Ordering::Acquire), SETUP_SUCCEEDED);
+                assert_eq!(shared.setup_state.load(Ordering::SeqCst), SETUP_SUCCEEDED);
                 assert_eq!(established_closes.load(Ordering::SeqCst), 1);
                 assert_eq!(relay_polls.load(Ordering::SeqCst), 0);
                 assert_eq!(raw_aborts.load(Ordering::SeqCst), 1);
@@ -3481,7 +3483,7 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(shared.terminal_state.load(Ordering::Acquire), ENTRY_CLOSING);
+        assert_eq!(shared.terminal_state.load(Ordering::SeqCst), ENTRY_CLOSING);
         let _ = setup_release_tx.send(());
         tokio::time::timeout(Duration::from_secs(1), coordinator)
             .await
@@ -3552,16 +3554,16 @@ mod tests {
             .await
             .expect("reentrant terminal submission did not return");
         assert_eq!(
-            entry.shared.terminal_state.load(Ordering::Acquire),
+            entry.shared.terminal_state.load(Ordering::SeqCst),
             ENTRY_CLOSE_WAITING_SETUP
         );
         assert_eq!(
-            entry.shared.setup_state.load(Ordering::Acquire),
+            entry.shared.setup_state.load(Ordering::SeqCst),
             SETUP_POLLING
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(
-            entry.shared.terminal_state.load(Ordering::Acquire),
+            entry.shared.terminal_state.load(Ordering::SeqCst),
             ENTRY_CLOSE_WAITING_SETUP
         );
         setup_release_tx.send(()).unwrap();
@@ -3573,7 +3575,7 @@ mod tests {
             Some(UpgradeTerminalCause::Cancelled)
         );
         assert_eq!(
-            entry.shared.setup_state.load(Ordering::Acquire),
+            entry.shared.setup_state.load(Ordering::SeqCst),
             SETUP_SUCCEEDED
         );
         assert_eq!(established_closes.load(Ordering::SeqCst), 1);
@@ -3634,17 +3636,17 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("setup builder did not execute inside its guarded poll");
         assert_eq!(
-            entry.shared.setup_state.load(Ordering::Acquire),
+            entry.shared.setup_state.load(Ordering::SeqCst),
             SETUP_POLLING
         );
         entry.submit_terminal(UpgradeTerminalCause::Cancelled);
         assert_eq!(
-            entry.shared.terminal_state.load(Ordering::Acquire),
+            entry.shared.terminal_state.load(Ordering::SeqCst),
             ENTRY_CLOSE_WAITING_SETUP
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(
-            entry.shared.terminal_state.load(Ordering::Acquire),
+            entry.shared.terminal_state.load(Ordering::SeqCst),
             ENTRY_CLOSE_WAITING_SETUP
         );
         builder_release_tx.send(()).unwrap();
@@ -3652,7 +3654,7 @@ mod tests {
             .await
             .expect("entry did not close after guarded setup builder returned");
         assert_eq!(
-            entry.shared.setup_state.load(Ordering::Acquire),
+            entry.shared.setup_state.load(Ordering::SeqCst),
             SETUP_SUCCEEDED
         );
         assert_eq!(established_closes.load(Ordering::SeqCst), 1);
@@ -3699,7 +3701,7 @@ mod tests {
         let result = setup.await;
         assert!(result.is_err());
         assert_eq!(builds.load(Ordering::SeqCst), 0);
-        assert_eq!(shared.setup_state.load(Ordering::Acquire), SETUP_IDLE);
+        assert_eq!(shared.setup_state.load(Ordering::SeqCst), SETUP_IDLE);
         runtime.shutdown_and_wait(Some(Instant::now())).await;
     }
 
@@ -3747,7 +3749,7 @@ mod tests {
         assert_eq!(shutdown_returns.load(Ordering::SeqCst), 1);
         assert_eq!(entry.terminal_cause(), Some(UpgradeTerminalCause::Shutdown));
         assert_eq!(
-            entry.shared.setup_state.load(Ordering::Acquire),
+            entry.shared.setup_state.load(Ordering::SeqCst),
             SETUP_SUCCEEDED
         );
         assert_eq!(relay_polls.load(Ordering::SeqCst), 0);
@@ -3791,8 +3793,8 @@ mod tests {
             Ok(_) => panic!("setup task did not panic"),
         };
         assert!(error.is_panic());
-        assert_eq!(shared.setup_state.load(Ordering::Acquire), SETUP_IDLE);
-        assert_eq!(shared.terminal_state.load(Ordering::Acquire), ENTRY_CLOSING);
+        assert_eq!(shared.setup_state.load(Ordering::SeqCst), SETUP_IDLE);
+        assert_eq!(shared.terminal_state.load(Ordering::SeqCst), ENTRY_CLOSING);
         assert_eq!(
             *lock(&shared.winning_cause),
             Some(UpgradeTerminalCause::Cancelled)
@@ -3828,7 +3830,7 @@ mod tests {
 
         entry.submit_terminal(UpgradeTerminalCause::Cancelled);
         tokio::time::timeout(Duration::from_secs(1), async {
-            while entry.shared.terminal_state.load(Ordering::Acquire) != ENTRY_CLOSE_WAITING_SETUP {
+            while entry.shared.terminal_state.load(Ordering::SeqCst) != ENTRY_CLOSE_WAITING_SETUP {
                 tokio::task::yield_now().await;
             }
         })
@@ -3840,14 +3842,14 @@ mod tests {
             .await
             .expect("forced coordinator completion did not close the entry");
         assert_eq!(
-            entry.shared.terminal_state.load(Ordering::Acquire),
+            entry.shared.terminal_state.load(Ordering::SeqCst),
             ENTRY_CLOSED
         );
 
         setup_release_tx.send(()).unwrap();
         tokio::task::yield_now().await;
         assert_eq!(
-            entry.shared.terminal_state.load(Ordering::Acquire),
+            entry.shared.terminal_state.load(Ordering::SeqCst),
             ENTRY_CLOSED
         );
         runtime.shutdown_and_wait(Some(Instant::now())).await;
