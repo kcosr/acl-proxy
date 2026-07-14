@@ -22,7 +22,14 @@ pub(crate) struct ParserStore {
 
 impl ParserStore {
     pub(crate) fn try_new() -> Result<Self, ParserStoreAllocationError> {
-        let mut bytes = FallibleBox::<[u8]>::try_new_uninit_slice(PARSER_STORE_BYTES)
+        Self::try_with_capacity(PARSER_STORE_BYTES)
+    }
+
+    pub(crate) fn try_with_capacity(capacity: usize) -> Result<Self, ParserStoreAllocationError> {
+        if capacity < PARSER_STORE_BYTES {
+            return Err(ParserStoreAllocationError);
+        }
+        let mut bytes = FallibleBox::<[u8]>::try_new_uninit_slice(capacity)
             .map_err(|_| ParserStoreAllocationError)?;
         for byte in bytes.iter_mut() {
             byte.write(0);
@@ -210,7 +217,7 @@ impl fmt::Display for ParserStoreAllocationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "could not allocate the fixed HTTP/1 parser store"
+            "could not allocate the requested HTTP/1 parser store"
         )
     }
 }
@@ -255,6 +262,19 @@ mod tests {
         store.wipe();
 
         assert_eq!(store.initialized_len(), 0);
+        assert!(store.complete_storage().iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn caller_selected_capacity_preserves_minimum_protocol_head_space() {
+        assert!(ParserStore::try_with_capacity(PARSER_STORE_BYTES - 1).is_err());
+
+        let capacity = PARSER_STORE_BYTES + 4096;
+        let mut store = ParserStore::try_with_capacity(capacity).unwrap();
+        assert_eq!(store.capacity(), capacity);
+        store.writable().fill(0xa5);
+        store.commit_written(capacity).unwrap();
+        store.wipe();
         assert!(store.complete_storage().iter().all(|byte| *byte == 0));
     }
 

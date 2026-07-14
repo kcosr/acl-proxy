@@ -160,14 +160,15 @@ pub(crate) fn parse_response_head(
 
 fn complete_head_len(store: &mut ParserStore) -> Result<Option<usize>, HeadError> {
     match store.scan_head_end() {
-        Ok(Some(head_len)) => Ok(Some(head_len)),
+        Ok(Some(head_len)) if head_len <= PARSER_STORE_BYTES => Ok(Some(head_len)),
+        Ok(Some(_)) => Err(HeadError::HeadTooLarge),
         Ok(None) => incomplete_or_too_large(store.initialized_len()),
         Err(HeadScanError::NonCanonicalLineEnding) => Err(HeadError::NonCanonicalLineEnding),
     }
 }
 
 fn incomplete_or_too_large(len: usize) -> Result<Option<usize>, HeadError> {
-    if len == PARSER_STORE_BYTES {
+    if len >= PARSER_STORE_BYTES {
         Err(HeadError::HeadTooLarge)
     } else {
         Ok(None)
