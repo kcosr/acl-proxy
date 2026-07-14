@@ -755,6 +755,7 @@ redaction_profile = "environment"
         assert!(activated.redaction.compiled_matcher_resident_bytes() > 0);
         let capture = activated
             .observation
+            .capture_epoch()
             .capture()
             .expect("capture policy is generation-owned");
         assert!(activated

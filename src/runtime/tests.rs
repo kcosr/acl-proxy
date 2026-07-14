@@ -171,8 +171,10 @@ impl ObservationSnapshot for EmptySnapshot {
         panic!("empty test observation has no logging policy")
     }
 
-    fn capture(&self) -> Option<&crate::observation::CapturePolicy> {
-        None
+    fn capture_epoch(&self) -> &Arc<crate::observation::CaptureEpoch> {
+        static DISABLED: std::sync::LazyLock<Arc<crate::observation::CaptureEpoch>> =
+            std::sync::LazyLock::new(|| Arc::new(crate::observation::CaptureEpoch::disabled()));
+        &DISABLED
     }
 }
 impl SafetySnapshot for EmptySnapshot {

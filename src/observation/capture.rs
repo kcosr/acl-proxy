@@ -2,14 +2,22 @@ use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock, TryLockError};
 
+use arc_swap::ArcSwap;
+
+use super::CaptureEpoch;
 use crate::runtime::{BoxFuture, CleanupReason, GenerationOwner, PublicationGuard, RuntimeError};
+
+struct PublishedCaptureState {
+    epoch: Arc<CaptureEpoch>,
+    limit: usize,
+}
 
 /// One process-wide capture byte pool shared by every active and retiring
 /// observation epoch. Admission uses atomic accounting and never waits or delays
 /// the wire path.
 pub(crate) struct CapturePool {
     publication_gate: RwLock<()>,
-    committed_limit: AtomicUsize,
+    published: ArcSwap<PublishedCaptureState>,
     used: AtomicUsize,
 }
 
@@ -29,7 +37,10 @@ impl CapturePool {
     pub(crate) fn new(initial_limit: usize) -> Arc<Self> {
         Arc::new(Self {
             publication_gate: RwLock::new(()),
-            committed_limit: AtomicUsize::new(initial_limit),
+            published: ArcSwap::from_pointee(PublishedCaptureState {
+                epoch: Arc::new(CaptureEpoch::disabled()),
+                limit: initial_limit,
+            }),
             used: AtomicUsize::new(0),
         })
     }
@@ -51,10 +62,11 @@ impl CapturePool {
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
         };
         hook();
+        let published = self.published.load();
         let mut used = self.used.load(Ordering::Acquire);
         loop {
             let next = used.checked_add(bytes)?;
-            if next > self.committed_limit.load(Ordering::Acquire) {
+            if next > published.limit {
                 return None;
             }
             match self
@@ -72,29 +84,41 @@ impl CapturePool {
     }
 
     pub(crate) fn committed_limit(&self) -> usize {
-        self.committed_limit.load(Ordering::Acquire)
+        self.published.load().limit
+    }
+
+    pub(crate) fn current_epoch(&self) -> Arc<CaptureEpoch> {
+        self.published.load().epoch.clone()
+    }
+
+    #[cfg(test)]
+    fn published_for_test(&self) -> (Arc<CaptureEpoch>, usize) {
+        let published = self.published.load();
+        (published.epoch.clone(), published.limit)
     }
 
     pub(crate) fn used(&self) -> usize {
         self.used.load(Ordering::Acquire)
     }
 
-    fn commit_limit(&self, limit: usize) {
+    pub(super) fn publish(&self, epoch: Arc<CaptureEpoch>, limit: usize) {
         let _publication = self
             .publication_gate
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.committed_limit.store(limit, Ordering::Release);
+        self.published
+            .store(Arc::new(PublishedCaptureState { epoch, limit }));
     }
 
     #[cfg(test)]
-    fn commit_limit_with_hook(&self, limit: usize, hook: impl FnOnce()) {
+    fn publish_with_hook(&self, epoch: Arc<CaptureEpoch>, limit: usize, hook: impl FnOnce()) {
         let _publication = self
             .publication_gate
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         hook();
-        self.committed_limit.store(limit, Ordering::Release);
+        self.published
+            .store(Arc::new(PublishedCaptureState { epoch, limit }));
     }
 
     fn release(&self, bytes: usize) {
@@ -130,31 +154,39 @@ impl Drop for CapturePermit {
 }
 
 /// Candidate-owned publication effect. Constructing or dropping an update has
-/// no effect on the active capture ceiling; only publication commit changes it.
-pub(crate) struct CaptureLimitUpdate {
+/// no effect on the active capture epoch or ceiling; commit publishes both as
+/// one immutable state.
+pub(crate) struct CaptureEpochUpdate {
     pool: Arc<CapturePool>,
+    proposed_epoch: Arc<CaptureEpoch>,
     proposed_limit: usize,
 }
 
-impl fmt::Debug for CaptureLimitUpdate {
+impl fmt::Debug for CaptureEpochUpdate {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("CaptureLimitUpdate")
+            .debug_struct("CaptureEpochUpdate")
+            .field("capture_enabled", &self.proposed_epoch.is_enabled())
             .field("proposed_limit", &self.proposed_limit)
             .finish()
     }
 }
 
-impl CaptureLimitUpdate {
-    pub(crate) fn new(pool: Arc<CapturePool>, proposed_limit: usize) -> Self {
+impl CaptureEpochUpdate {
+    pub(crate) fn new(
+        pool: Arc<CapturePool>,
+        proposed_epoch: Arc<CaptureEpoch>,
+        proposed_limit: usize,
+    ) -> Self {
         Self {
             pool,
+            proposed_epoch,
             proposed_limit,
         }
     }
 
-    pub(crate) fn publication_guard(&self) -> CaptureLimitPublicationGuard<'_> {
-        CaptureLimitPublicationGuard {
+    pub(crate) fn publication_guard(&self) -> CaptureEpochPublicationGuard<'_> {
+        CaptureEpochPublicationGuard {
             update: self,
             committed: false,
         }
@@ -165,9 +197,9 @@ impl CaptureLimitUpdate {
     }
 }
 
-impl GenerationOwner for CaptureLimitUpdate {
+impl GenerationOwner for CaptureEpochUpdate {
     fn publication_guard(&self) -> Result<Box<dyn PublicationGuard + '_>, RuntimeError> {
-        Ok(Box::new(CaptureLimitUpdate::publication_guard(self)))
+        Ok(Box::new(CaptureEpochUpdate::publication_guard(self)))
     }
 
     fn retirement_started(&self, _reason: CleanupReason) {}
@@ -177,15 +209,18 @@ impl GenerationOwner for CaptureLimitUpdate {
     }
 }
 
-pub(crate) struct CaptureLimitPublicationGuard<'update> {
-    update: &'update CaptureLimitUpdate,
+pub(crate) struct CaptureEpochPublicationGuard<'update> {
+    update: &'update CaptureEpochUpdate,
     committed: bool,
 }
 
-impl PublicationGuard for CaptureLimitPublicationGuard<'_> {
+impl PublicationGuard for CaptureEpochPublicationGuard<'_> {
     fn commit(&mut self) {
         if !self.committed {
-            self.update.pool.commit_limit(self.update.proposed_limit);
+            self.update.pool.publish(
+                self.update.proposed_epoch.clone(),
+                self.update.proposed_limit,
+            );
             self.committed = true;
         }
     }
@@ -201,28 +236,33 @@ mod tests {
     #[test]
     fn rejected_update_does_not_change_the_committed_limit() {
         let pool = CapturePool::new(16);
-        let update = CaptureLimitUpdate::new(pool.clone(), 32);
+        let original = pool.current_epoch();
+        let proposed = Arc::new(CaptureEpoch::disabled());
+        let update = CaptureEpochUpdate::new(pool.clone(), proposed, 32);
         {
             let _rejected_guard = update.publication_guard();
         }
         assert_eq!(pool.committed_limit(), 16);
+        assert!(Arc::ptr_eq(&pool.current_epoch(), &original));
     }
 
     #[test]
     fn publication_commit_changes_the_limit_once() {
         let pool = CapturePool::new(16);
-        let update = CaptureLimitUpdate::new(pool.clone(), 32);
+        let proposed = Arc::new(CaptureEpoch::disabled());
+        let update = CaptureEpochUpdate::new(pool.clone(), proposed.clone(), 32);
         let mut guard = update.publication_guard();
         guard.commit();
         guard.commit();
         assert_eq!(pool.committed_limit(), 32);
+        assert!(Arc::ptr_eq(&pool.current_epoch(), &proposed));
     }
 
     #[test]
     fn old_permits_survive_a_lower_limit_and_new_admission_uses_it() {
         let pool = CapturePool::new(16);
         let old = pool.try_acquire(12).expect("old permit");
-        let update = CaptureLimitUpdate::new(pool.clone(), 4);
+        let update = CaptureEpochUpdate::new(pool.clone(), Arc::new(CaptureEpoch::disabled()), 4);
         update.publication_guard().commit();
 
         assert_eq!(pool.used(), 12);
@@ -292,7 +332,7 @@ mod tests {
             let publication_entered = publication_entered.clone();
             let finish_publication = finish_publication.clone();
             move || {
-                publication_pool.commit_limit_with_hook(8, || {
+                publication_pool.publish_with_hook(Arc::new(CaptureEpoch::disabled()), 8, || {
                     publication_entered.wait();
                     finish_publication.wait();
                 });
@@ -307,5 +347,37 @@ mod tests {
         assert_eq!(pool.committed_limit(), 8);
         assert!(pool.try_acquire(1).is_none());
         drop(existing);
+    }
+
+    #[test]
+    fn capture_epoch_publication_is_atomic_with_limit() {
+        let pool = CapturePool::new(16);
+        let old_epoch = pool.current_epoch();
+        let new_epoch = Arc::new(CaptureEpoch::disabled());
+        let publication_entered = Arc::new(Barrier::new(2));
+        let finish_publication = Arc::new(Barrier::new(2));
+        let publication_pool = pool.clone();
+        let publisher = thread::spawn({
+            let publication_entered = publication_entered.clone();
+            let finish_publication = finish_publication.clone();
+            let new_epoch = new_epoch.clone();
+            move || {
+                publication_pool.publish_with_hook(new_epoch, 32, || {
+                    publication_entered.wait();
+                    finish_publication.wait();
+                });
+            }
+        });
+
+        publication_entered.wait();
+        let (epoch_during_publication, limit_during_publication) = pool.published_for_test();
+        assert!(Arc::ptr_eq(&epoch_during_publication, &old_epoch));
+        assert_eq!(limit_during_publication, 16);
+        finish_publication.wait();
+        publisher.join().expect("publisher");
+
+        let (published_epoch, published_limit) = pool.published_for_test();
+        assert!(Arc::ptr_eq(&published_epoch, &new_epoch));
+        assert_eq!(published_limit, 32);
     }
 }

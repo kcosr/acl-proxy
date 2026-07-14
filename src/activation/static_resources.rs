@@ -554,6 +554,7 @@ impl StaticResources for ProductStaticResources {
             .shutdown_deadline
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = deadline;
+        self.observation_runtime.begin_shutdown();
         self.authorization_runtime.begin_shutdown(deadline);
         self.upgrade_runtime.begin_shutdown(deadline);
     }

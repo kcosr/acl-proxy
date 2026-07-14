@@ -2,7 +2,7 @@ mod capture;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::config::compiler::{
     CapturePlan, CompiledCaptureEvent, CompiledLogLevel, ObservationPlan,
@@ -11,7 +11,7 @@ use crate::config::compiler::{
 use crate::redaction::{ProfileHandle, RedactionActivation, RedactionSnapshot};
 use crate::runtime::{GenerationOwner, ObservationSnapshot, RedactionProfileIndex};
 
-use capture::CaptureLimitUpdate;
+use capture::CaptureEpochUpdate;
 pub(crate) use capture::{CapturePermit, CapturePool};
 
 /// Process-owned observation state shared by all candidate, active, and
@@ -37,15 +37,69 @@ impl ProductObservationRuntime {
         ProductObservationSnapshot::activate(plan, redaction, self.capture_pool.clone())
     }
 
+    /// Leases the capture-only state currently published for established
+    /// streams. The returned handle has no generation backreference.
+    pub(crate) fn current_capture_epoch(&self) -> Arc<CaptureEpoch> {
+        self.capture_pool.current_epoch()
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        self.capture_pool
+            .publish(Arc::new(CaptureEpoch::disabled()), 0);
+    }
+
     #[cfg(test)]
     pub(crate) fn committed_capture_limit(&self) -> usize {
         self.capture_pool.committed_limit()
     }
 }
 
+/// Immutable capture-only state. Ordinary requests retain the epoch embedded
+/// in their generation, while established streams lease the independently
+/// published current epoch at a logical-message boundary.
+pub(crate) struct CaptureEpoch {
+    capture: Option<CapturePolicy>,
+}
+
+impl CaptureEpoch {
+    pub(crate) fn disabled() -> Self {
+        Self { capture: None }
+    }
+
+    fn enabled(capture: CapturePolicy) -> Self {
+        Self {
+            capture: Some(capture),
+        }
+    }
+
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.capture.is_some()
+    }
+
+    pub(crate) fn capture(&self) -> Option<&CapturePolicy> {
+        self.capture.as_ref()
+    }
+}
+
+impl fmt::Debug for CaptureEpoch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CaptureEpoch")
+            .field("capture_enabled", &self.is_enabled())
+            .field(
+                "capture_event_count",
+                &self
+                    .capture
+                    .as_ref()
+                    .map_or(0, |capture| capture.events.len()),
+            )
+            .finish()
+    }
+}
+
 pub(crate) struct ProductObservationSnapshot {
     logging: ObservationLoggingPolicy,
-    capture: Option<CapturePolicy>,
+    capture_epoch: Arc<CaptureEpoch>,
 }
 
 impl fmt::Debug for ProductObservationSnapshot {
@@ -53,12 +107,12 @@ impl fmt::Debug for ProductObservationSnapshot {
         formatter
             .debug_struct("ProductObservationSnapshot")
             .field("logging_level", &log_level_name(self.logging.level))
-            .field("capture_enabled", &self.capture.is_some())
+            .field("capture_enabled", &self.capture_epoch.is_enabled())
             .field(
                 "capture_event_count",
                 &self
-                    .capture
-                    .as_ref()
+                    .capture_epoch
+                    .capture()
                     .map_or(0, |capture| capture.events.len()),
             )
             .finish()
@@ -73,8 +127,8 @@ impl ProductObservationSnapshot {
     ) -> Result<ObservationActivation, ObservationActivationError> {
         let ObservationPlan { logging, capture } = plan;
         let logging = ObservationLoggingPolicy::from_plan(logging);
-        let (capture, proposed_limit) = match capture {
-            None => (None, 0),
+        let (capture_epoch, proposed_limit) = match capture {
+            None => (Arc::new(CaptureEpoch::disabled()), 0),
             Some(plan) => {
                 let profile_name = &plan.redaction_profile;
                 let profile_index = redaction
@@ -84,19 +138,26 @@ impl ProductObservationSnapshot {
                     .ok_or(ObservationActivationError::MissingCaptureProfile)?;
                 let proposed_limit = plan.max_inflight_body_bytes;
                 (
-                    Some(CapturePolicy::activate(
+                    Arc::new(CaptureEpoch::enabled(CapturePolicy::activate(
                         plan,
                         profile_index,
                         profile,
-                        capture_pool.clone(),
-                    )),
+                        Arc::downgrade(&capture_pool),
+                    ))),
                     proposed_limit,
                 )
             }
         };
-        let owner = Arc::new(CaptureLimitUpdate::new(capture_pool, proposed_limit));
+        let owner = Arc::new(CaptureEpochUpdate::new(
+            capture_pool,
+            capture_epoch.clone(),
+            proposed_limit,
+        ));
         Ok(ObservationActivation {
-            snapshot: Self { logging, capture },
+            snapshot: Self {
+                logging,
+                capture_epoch,
+            },
             owner,
         })
     }
@@ -105,8 +166,12 @@ impl ProductObservationSnapshot {
         &self.logging
     }
 
+    pub(crate) fn capture_epoch(&self) -> &Arc<CaptureEpoch> {
+        &self.capture_epoch
+    }
+
     pub(crate) fn capture(&self) -> Option<&CapturePolicy> {
-        self.capture.as_ref()
+        self.capture_epoch.capture()
     }
 }
 
@@ -115,14 +180,14 @@ impl ObservationSnapshot for ProductObservationSnapshot {
         ProductObservationSnapshot::logging(self)
     }
 
-    fn capture(&self) -> Option<&CapturePolicy> {
-        ProductObservationSnapshot::capture(self)
+    fn capture_epoch(&self) -> &Arc<CaptureEpoch> {
+        ProductObservationSnapshot::capture_epoch(self)
     }
 }
 
 pub(crate) struct ObservationActivation {
     snapshot: ProductObservationSnapshot,
-    owner: Arc<CaptureLimitUpdate>,
+    owner: Arc<CaptureEpochUpdate>,
 }
 
 impl fmt::Debug for ObservationActivation {
@@ -222,7 +287,7 @@ pub(crate) struct CapturePolicy {
     max_body_bytes: usize,
     max_files: usize,
     max_total_bytes: u64,
-    pool: Arc<CapturePool>,
+    pool: Weak<CapturePool>,
 }
 
 impl fmt::Debug for CapturePolicy {
@@ -242,7 +307,7 @@ impl CapturePolicy {
         plan: CapturePlan,
         profile_index: RedactionProfileIndex,
         profile: ProfileHandle,
-        pool: Arc<CapturePool>,
+        pool: Weak<CapturePool>,
     ) -> Self {
         let CapturePlan {
             events,
@@ -275,7 +340,7 @@ impl CapturePolicy {
         if !self.captures(event) {
             return None;
         }
-        self.pool.try_acquire(bytes)
+        self.pool.upgrade()?.try_acquire(bytes)
     }
 
     pub(crate) fn profile_index(&self) -> RedactionProfileIndex {
@@ -400,6 +465,13 @@ mod tests {
         }
     }
 
+    fn disabled_plan() -> ObservationPlan {
+        ObservationPlan {
+            logging: logging(),
+            capture: None,
+        }
+    }
+
     fn profile_plan(max_body_bytes: usize) -> RedactionProfilePlan {
         RedactionProfilePlan {
             replacement: b"[REMOVED]".to_vec(),
@@ -509,6 +581,7 @@ mod tests {
     #[test]
     fn rejected_candidate_does_not_change_capture_admission() {
         let pool = CapturePool::new(8);
+        let original_epoch = pool.current_epoch();
         let activation = activate(
             pool.clone(),
             "profile",
@@ -523,6 +596,7 @@ mod tests {
         drop(owner);
 
         assert_eq!(pool.committed_limit(), 8);
+        assert!(Arc::ptr_eq(&pool.current_epoch(), &original_epoch));
         assert!(pool.try_acquire(9).is_none());
     }
 
@@ -536,11 +610,112 @@ mod tests {
             32,
             8,
         );
-        let (_snapshot, owner) = activation.into_parts();
+        let (snapshot, owner) = activation.into_parts();
         commit(&owner);
 
         assert_eq!(pool.committed_limit(), 32);
+        assert!(Arc::ptr_eq(&pool.current_epoch(), snapshot.capture_epoch()));
         assert!(pool.try_acquire(32).is_some());
+    }
+
+    #[test]
+    fn capture_disablement_publishes_a_new_epoch() {
+        let pool = CapturePool::new(0);
+        let enabled = activate(
+            pool.clone(),
+            "profile",
+            vec![CompiledCaptureEvent::RequestAllowed],
+            16,
+            8,
+        );
+        let (enabled_snapshot, enabled_owner) = enabled.into_parts();
+        commit(&enabled_owner);
+        let enabled_epoch = pool.current_epoch();
+        assert!(enabled_epoch.is_enabled());
+        assert!(Arc::ptr_eq(
+            &enabled_epoch,
+            enabled_snapshot.capture_epoch()
+        ));
+
+        let disabled_redaction = redaction(std::iter::empty());
+        let disabled = ProductObservationSnapshot::activate(
+            disabled_plan(),
+            &disabled_redaction,
+            pool.clone(),
+        )
+        .expect("disabled observation activation");
+        let (disabled_snapshot, disabled_owner) = disabled.into_parts();
+        let disabled_epoch = disabled_snapshot.capture_epoch().clone();
+
+        assert!(Arc::ptr_eq(&pool.current_epoch(), &enabled_epoch));
+        assert_eq!(pool.committed_limit(), 16);
+        commit(&disabled_owner);
+
+        let published = pool.current_epoch();
+        assert!(!published.is_enabled());
+        assert!(Arc::ptr_eq(&published, &disabled_epoch));
+        assert!(!Arc::ptr_eq(&published, &enabled_epoch));
+        assert_eq!(pool.committed_limit(), 0);
+
+        // The retired generation's immutable epoch remains usable as a narrow
+        // handle without changing what new message boundaries observe.
+        assert!(enabled_snapshot.capture().is_some());
+        assert!(disabled_snapshot.capture().is_none());
+    }
+
+    #[test]
+    fn ordinary_snapshot_retains_epoch_without_current_publication_ownership() {
+        let pool = CapturePool::new(0);
+        let activation = activate(
+            pool.clone(),
+            "profile",
+            vec![CompiledCaptureEvent::RequestAllowed],
+            16,
+            8,
+        );
+        let (snapshot, owner) = activation.into_parts();
+        let epoch = snapshot.capture_epoch().clone();
+        let weak = Arc::downgrade(&epoch);
+        commit(&owner);
+        drop(epoch);
+
+        let disabled_redaction = redaction(std::iter::empty());
+        let disabled =
+            ProductObservationSnapshot::activate(disabled_plan(), &disabled_redaction, pool)
+                .expect("disabled observation activation");
+        let (disabled_snapshot, disabled_owner) = disabled.into_parts();
+        commit(&disabled_owner);
+        drop((owner, disabled_owner));
+
+        assert!(
+            weak.upgrade().is_some(),
+            "the ordinary snapshot owns its epoch"
+        );
+        drop(snapshot);
+        assert!(weak.upgrade().is_none());
+        drop(disabled_snapshot);
+    }
+
+    #[test]
+    fn shutdown_disables_new_epochs_without_invalidating_a_lease() {
+        let runtime = ProductObservationRuntime::new();
+        let redaction = redaction([("profile", 8)]);
+        let activation = runtime
+            .activate(
+                plan("profile", vec![CompiledCaptureEvent::RequestAllowed], 16),
+                &redaction,
+            )
+            .expect("observation activation");
+        let (_snapshot, owner) = activation.into_parts();
+        commit(&owner);
+        let leased = runtime.current_capture_epoch();
+        assert!(leased.is_enabled());
+
+        runtime.begin_shutdown();
+
+        assert!(!runtime.current_capture_epoch().is_enabled());
+        assert_eq!(runtime.committed_capture_limit(), 0);
+        assert!(leased.is_enabled());
     }
 
     #[test]

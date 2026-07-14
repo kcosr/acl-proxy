@@ -198,7 +198,7 @@ pub(crate) trait RedactionSnapshot: Send + Sync {
 pub(crate) trait ObservationSnapshot: Send + Sync {
     fn logging(&self) -> &crate::observation::ObservationLoggingPolicy;
 
-    fn capture(&self) -> Option<&crate::observation::CapturePolicy>;
+    fn capture_epoch(&self) -> &Arc<crate::observation::CaptureEpoch>;
 }
 pub(crate) trait AuthorizationSnapshot: Send + Sync {
     fn internal_context_headers(&self) -> &[http::HeaderName];
