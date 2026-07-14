@@ -44,8 +44,7 @@ impl ProductObservationRuntime {
     }
 
     pub(crate) fn begin_shutdown(&self) {
-        self.capture_pool
-            .publish(Arc::new(CaptureEpoch::disabled()), 0);
+        self.capture_pool.close();
     }
 
     #[cfg(test)]
@@ -431,7 +430,7 @@ mod tests {
         CompiledRedactionPayloads, RedactionPlan, RedactionProfilePlan, RedactionRulePlan,
     };
     use crate::redaction::RedactionSnapshot;
-    use crate::runtime::CleanupReason;
+    use crate::runtime::{CleanupReason, RuntimeError};
 
     fn logging() -> ReloadableLoggingPlan {
         ReloadableLoggingPlan {
@@ -716,6 +715,40 @@ mod tests {
         assert!(!runtime.current_capture_epoch().is_enabled());
         assert_eq!(runtime.committed_capture_limit(), 0);
         assert!(leased.is_enabled());
+    }
+
+    #[test]
+    fn shutdown_closure_rejects_stale_candidate_and_old_epoch_zero_byte_admission() {
+        let runtime = ProductObservationRuntime::new();
+        let redaction = redaction([("profile", 8)]);
+        let activation = runtime
+            .activate(
+                plan("profile", vec![CompiledCaptureEvent::RequestAllowed], 16),
+                &redaction,
+            )
+            .expect("observation activation");
+        let (snapshot, owner) = activation.into_parts();
+        let old_epoch = snapshot.capture_epoch().clone();
+        let mut publication = owner
+            .publication_guard()
+            .expect("candidate is live before shutdown");
+
+        runtime.begin_shutdown();
+        publication.commit();
+
+        assert!(!runtime.current_capture_epoch().is_enabled());
+        assert_eq!(runtime.committed_capture_limit(), 0);
+        assert!(old_epoch.is_enabled());
+        assert!(old_epoch
+            .capture()
+            .expect("old capture policy")
+            .try_admit(CaptureEvent::RequestAllowed, 0)
+            .is_none());
+        assert!(matches!(
+            owner.publication_guard(),
+            Err(RuntimeError::CandidateNotLive(message))
+                if message == "capture runtime is permanently closed"
+        ));
     }
 
     #[test]
