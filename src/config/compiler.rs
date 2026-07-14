@@ -919,7 +919,7 @@ pub(crate) struct CompiledResourcePlan {
     pub(crate) wire_body_quota_key_full_peak_capacity: Capacity,
     pub(crate) webhook_request_allocation_bytes_by_rule: Vec<Option<usize>>,
     pub(crate) webhook_callback_allocation_bytes_by_rule: Vec<Option<usize>>,
-    pub(crate) upgrade_allocation_bytes_by_rule: Vec<Option<usize>>,
+    pub(crate) upgrade_wire_working_set_bytes_by_rule: Vec<Option<usize>>,
     pub(crate) max_upgrade_allocation_per_stream: usize,
     pub(crate) max_upgrade_allocation_all_streams: usize,
 }
@@ -3553,7 +3553,7 @@ fn compile_resource_plan(
         .upgrade_relay_buffer_bytes
         .checked_mul(2)
         .ok_or_else(|| ConfigCompileError::at("service", "upgrade buffer arithmetic overflow"))?;
-    let upgrade_allocation_bytes_by_rule = config
+    let upgrade_wire_working_set_bytes_by_rule = config
         .policy
         .rules
         .iter()
@@ -3582,19 +3582,21 @@ fn compile_resource_plan(
                 })
                 .transpose()?
                 .unwrap_or(0);
-            transport
-                .checked_add(wire_working_set)
-                .map(Some)
-                .ok_or_else(|| {
-                    ConfigCompileError::at("service", "upgrade buffer arithmetic overflow")
-                })
+            Ok(Some(wire_working_set))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let per_stream = upgrade_allocation_bytes_by_rule
+    let max_wire_working_set = upgrade_wire_working_set_bytes_by_rule
         .iter()
         .flatten()
         .copied()
-        .max()
+        .max();
+    let per_stream = max_wire_working_set
+        .map(|wire_working_set| {
+            transport.checked_add(wire_working_set).ok_or_else(|| {
+                ConfigCompileError::at("service", "upgrade buffer arithmetic overflow")
+            })
+        })
+        .transpose()?
         .unwrap_or(0);
     let all_streams = per_stream
         .checked_mul(config.service.max_active_upgrades)
@@ -3615,7 +3617,7 @@ fn compile_resource_plan(
         wire_body_quota_key_full_peak_capacity,
         webhook_request_allocation_bytes_by_rule,
         webhook_callback_allocation_bytes_by_rule,
-        upgrade_allocation_bytes_by_rule,
+        upgrade_wire_working_set_bytes_by_rule,
         max_upgrade_allocation_per_stream: per_stream,
         max_upgrade_allocation_all_streams: all_streams,
     })
@@ -8093,7 +8095,7 @@ redaction_profile = "expanding"
     }
 
     #[test]
-    fn upgrade_rules_publish_exact_transport_and_wire_shares() {
+    fn upgrade_rules_publish_wire_only_working_sets_and_total_capacity() {
         let input = resource_config(
             "",
             r#"
@@ -8127,6 +8129,11 @@ decision = "allow"
 methods = ["PUT"]
 allow_upgrades = true
 redaction_profile = "deflate"
+
+[[policy.rules]]
+id = "ordinary-http"
+decision = "allow"
+methods = ["DELETE"]
 "#,
         );
         let compiled = compile(&input).unwrap();
@@ -8136,17 +8143,56 @@ redaction_profile = "deflate"
         let deflate_scratch =
             redaction_literal_scratch_bytes("deflate-test-literal".len()).unwrap();
         assert_eq!(
-            plan.upgrade_allocation_bytes_by_rule,
+            plan.upgrade_wire_working_set_bytes_by_rule,
             vec![
-                Some(transport),
-                Some(transport + 3 * MIB + plain_scratch),
-                Some(transport + 4 * MIB + deflate_scratch + WEBSOCKET_DEFLATE_SCRATCH_BYTES),
+                Some(0),
+                Some(3 * MIB + plain_scratch),
+                Some(4 * MIB + deflate_scratch + WEBSOCKET_DEFLATE_SCRATCH_BYTES),
+                None,
             ]
         );
+        assert_eq!(
+            crate::upgrade::UpgradeAllocation::from_compiled_rule(
+                0,
+                plan.upgrade_wire_working_set_bytes_by_rule[0],
+            )
+            .unwrap()
+            .wire_bytes(),
+            0
+        );
+        assert!(crate::upgrade::UpgradeAllocation::from_compiled_rule(
+            3,
+            plan.upgrade_wire_working_set_bytes_by_rule[3],
+        )
+        .is_err());
         assert_eq!(
             plan.max_upgrade_allocation_per_stream,
             transport + 4 * MIB + deflate_scratch + WEBSOCKET_DEFLATE_SCRATCH_BYTES
         );
+        assert_eq!(
+            plan.max_upgrade_allocation_all_streams,
+            compiled.static_config.service.max_active_upgrades
+                * (transport + 4 * MIB + deflate_scratch + WEBSOCKET_DEFLATE_SCRATCH_BYTES)
+        );
+
+        let no_upgrades = compile(&resource_config(
+            "",
+            "",
+            r#"
+[[policy.rules]]
+id = "ordinary-http"
+decision = "allow"
+methods = ["GET"]
+"#,
+        ))
+        .unwrap();
+        let no_upgrades = &no_upgrades.reloadable_plan.resource_plan;
+        assert_eq!(
+            no_upgrades.upgrade_wire_working_set_bytes_by_rule,
+            vec![None]
+        );
+        assert_eq!(no_upgrades.max_upgrade_allocation_per_stream, 0);
+        assert_eq!(no_upgrades.max_upgrade_allocation_all_streams, 0);
     }
 
     #[test]

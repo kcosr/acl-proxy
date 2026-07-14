@@ -42,7 +42,7 @@ impl ProductSafetySnapshot {
         wire_body_pool: Arc<WireBodyPool>,
     ) -> Result<Self, SafetyActivationError> {
         let expected_cursor_count = resources
-            .upgrade_allocation_bytes_by_rule
+            .upgrade_wire_working_set_bytes_by_rule
             .len()
             .checked_add(1)
             .ok_or(SafetyActivationError::InvalidHttpWireBodyPlans)?;
@@ -142,7 +142,7 @@ mod tests {
                 wire_body_quota_key_full_peak_capacity: Capacity::Finite(4),
                 webhook_request_allocation_bytes_by_rule: vec![None],
                 webhook_callback_allocation_bytes_by_rule: vec![None],
-                upgrade_allocation_bytes_by_rule: vec![None],
+                upgrade_wire_working_set_bytes_by_rule: vec![None],
                 max_upgrade_allocation_per_stream: 0,
                 max_upgrade_allocation_all_streams: 0,
             },
@@ -258,7 +258,7 @@ mod tests {
                 wire_body_quota_key_full_peak_capacity: Capacity::Finite(4),
                 webhook_request_allocation_bytes_by_rule: vec![None],
                 webhook_callback_allocation_bytes_by_rule: vec![None],
-                upgrade_allocation_bytes_by_rule: vec![None],
+                upgrade_wire_working_set_bytes_by_rule: vec![None],
                 max_upgrade_allocation_per_stream: 0,
                 max_upgrade_allocation_all_streams: 0,
             },
