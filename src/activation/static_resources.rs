@@ -17,6 +17,7 @@ use crate::observation::ProductObservationRuntime;
 use crate::runtime::{BoxFuture, ServiceReadiness, StaticResourceBrand, StaticResources};
 use crate::safety::WireBodyPool;
 
+use super::assets::{ProductIngressAssets, ProductIngressAssetsError};
 use super::listeners::{
     PreparedProxyListeners, ProxyListenerBindError, ProxySupervisor, ProxySupervisorFailure,
 };
@@ -40,6 +41,7 @@ pub(crate) struct ProductStaticResources {
     proxy_shutdown_error: Mutex<Option<Arc<ProxySupervisorFailure>>>,
     proxy_supervisors: Mutex<Vec<Arc<dyn ProxySupervisor>>>,
     proxy_shutdown: tokio::sync::OnceCell<()>,
+    ingress_assets: Arc<ProductIngressAssets>,
     ingress: Mutex<IngressOwnership>,
     control: Mutex<ControlOwnership>,
     wire_body_pool: Arc<WireBodyPool>,
@@ -84,6 +86,11 @@ impl ProductStaticResources {
     ) -> Result<Arc<Self>, ProductStaticResourcesError> {
         let (control_failure, _) = watch::channel(None);
         let (proxy_failure, _) = watch::channel(None);
+        let ingress_assets = ProductIngressAssets::from_static(static_config)?;
+        let authorization_runtime = WebhookAuthorizationRuntime::try_new(
+            static_config,
+            ingress_assets.destination_guard().clone(),
+        )?;
         Ok(Arc::new(Self {
             readiness: Arc::new(ServiceReadiness::new()),
             brand: StaticResourceBrand::new(),
@@ -97,6 +104,7 @@ impl ProductStaticResources {
             proxy_shutdown_error: Mutex::new(None),
             proxy_supervisors: Mutex::new(Vec::new()),
             proxy_shutdown: tokio::sync::OnceCell::new(),
+            ingress_assets,
             ingress: Mutex::new(IngressOwnership {
                 config: static_config.listeners.clone(),
                 state: IngressState::Unprepared,
@@ -112,7 +120,7 @@ impl ProductStaticResources {
                     .max_inflight_wire_body_bytes_per_quota_key,
             ),
             observation_runtime: Arc::new(ProductObservationRuntime::new()),
-            authorization_runtime: WebhookAuthorizationRuntime::try_new(static_config)?,
+            authorization_runtime,
         }))
     }
 
@@ -134,6 +142,10 @@ impl ProductStaticResources {
 
     pub(crate) fn authorization_runtime(&self) -> Arc<WebhookAuthorizationRuntime> {
         self.authorization_runtime.clone()
+    }
+
+    pub(crate) fn ingress_assets(&self) -> &Arc<ProductIngressAssets> {
+        &self.ingress_assets
     }
 
     pub(crate) fn activator(self: &Arc<Self>) -> Arc<ProductActivator> {
@@ -553,6 +565,8 @@ impl StaticResources for ProductStaticResources {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ProductStaticResourcesError {
+    #[error(transparent)]
+    IngressAssets(#[from] ProductIngressAssetsError),
     #[error("static fingerprint derivation failed")]
     StaticFingerprint(#[from] StaticFingerprintError),
     #[error("static authorization runtime construction failed")]
@@ -578,13 +592,13 @@ pub(crate) enum ProductStaticResourcesError {
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::time::Duration;
 
     use super::*;
     use crate::config::compiler::{
         CompiledTlsIdentity, StaticCleartextListener, StaticExplicitHttpsListener,
-        StaticTransparentHttpsListener,
+        StaticMitmConfig, StaticTransparentHttpsListener,
     };
     use crate::config::{compile_config_text, ConfigTextInput};
 
@@ -603,7 +617,7 @@ mod tests {
         addresses
     }
 
-    fn static_config(addresses: [SocketAddr; 5]) -> StaticProductConfig {
+    fn static_config(addresses: [SocketAddr; 5], identity_directory: &Path) -> StaticProductConfig {
         let [explicit_http, transparent_http, explicit_https, transparent_https, control] =
             addresses;
         let text = format!(
@@ -664,6 +678,16 @@ header = "x-acl-proxy-request-id"
             http_versions: versions.clone(),
             connect: None,
         });
+        std::fs::create_dir_all(identity_directory).unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let certificate_chain = identity_directory.join("server.pem");
+        let private_key = identity_directory.join("server-key.pem");
+        std::fs::write(&certificate_chain, certificate.pem()).unwrap();
+        std::fs::write(&private_key, key.serialize_pem()).unwrap();
         config.listeners.explicit_https = Some(StaticExplicitHttpsListener {
             bind: explicit_https,
             http_versions: versions.clone(),
@@ -673,8 +697,8 @@ header = "x-acl-proxy-request-id"
             max_concurrent_streams: 8,
             connect,
             tls: CompiledTlsIdentity {
-                certificate_chain: PathBuf::from("/tmp/static-ingress/server.pem"),
-                private_key: PathBuf::from("/tmp/static-ingress/server-key.pem"),
+                certificate_chain,
+                private_key,
             },
         });
         config.listeners.transparent_https = Some(StaticTransparentHttpsListener {
@@ -684,6 +708,11 @@ header = "x-acl-proxy-request-id"
             request_header_timeout: Duration::from_secs(1),
             max_connections: 2,
             max_concurrent_streams: 8,
+        });
+        config.mitm = Some(StaticMitmConfig::Generated {
+            directory: identity_directory.join("mitm"),
+            max_cached_certificates: 4,
+            persist_leaf_certificates: false,
         });
         config
     }
@@ -699,7 +728,9 @@ header = "x-acl-proxy-request-id"
     async fn preparation_reserves_every_configured_listener_and_is_one_shot() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let addresses = available_addresses::<5>();
-        let resources = ProductStaticResources::try_new(&static_config(addresses)).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let resources =
+            ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
 
         resources.prepare_ingress().unwrap();
         for address in addresses {
@@ -722,7 +753,9 @@ header = "x-acl-proxy-request-id"
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let addresses = available_addresses::<5>();
         let blocker = TcpListener::bind(addresses[2]).unwrap();
-        let resources = ProductStaticResources::try_new(&static_config(addresses)).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let resources =
+            ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
 
         assert!(matches!(
             resources.prepare_ingress(),
@@ -739,7 +772,9 @@ header = "x-acl-proxy-request-id"
     async fn control_adoption_failure_releases_all_prebound_sockets() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let addresses = available_addresses::<5>();
-        let resources = ProductStaticResources::try_new(&static_config(addresses)).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let resources =
+            ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
 
         assert!(matches!(
             resources.prepare_ingress_with(TcpListener::bind, |_config, _listener, _observer| {
@@ -758,7 +793,9 @@ header = "x-acl-proxy-request-id"
     async fn shutdown_releases_prepared_but_unstarted_proxy_sockets() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let addresses = available_addresses::<5>();
-        let resources = ProductStaticResources::try_new(&static_config(addresses)).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let resources =
+            ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
         resources.prepare_ingress().unwrap();
 
         StaticResources::shutdown(resources.as_ref()).await;
@@ -774,7 +811,9 @@ header = "x-acl-proxy-request-id"
     async fn construction_does_not_bind_configured_sockets() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let addresses = available_addresses::<5>();
-        let resources = ProductStaticResources::try_new(&static_config(addresses)).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let resources =
+            ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
 
         assert_bindable(addresses);
         drop(resources);

@@ -17,7 +17,9 @@ use crate::authorization::callback::{
 use crate::authorization::protocol::{ProviderCredentialSet, ProviderDecision};
 use crate::config::compiler::AuthorizationCallbackPlan;
 use crate::config::StaticProductConfig;
-use crate::destination::{DestinationFacts, DestinationGuard, DestinationGuardError};
+#[cfg(test)]
+use crate::destination::DestinationFacts;
+use crate::destination::{DestinationGuard, DestinationGuardError};
 use crate::runtime::{AuthorizationDispatchContext, GenerationRetention, GenerationRetentionError};
 use crate::safety::wire_body::ProviderResponseCharge;
 use crate::safety::HttpWireBodyGuard;
@@ -25,7 +27,7 @@ use crate::url::{canonicalize_http_url, CanonicalUrl, UrlError};
 
 pub(crate) struct WebhookAuthorizationRuntime {
     transport: WebhookTransportArena,
-    destination: DestinationGuard,
+    destination: Arc<DestinationGuard>,
     pending: PendingCapabilityStore<PendingWebhookOperation>,
     callback_url: Option<CanonicalUrl>,
     accepting: Mutex<bool>,
@@ -104,6 +106,7 @@ pub(crate) enum WebhookDispatchError {
 impl WebhookAuthorizationRuntime {
     pub(crate) fn try_new(
         static_config: &StaticProductConfig,
+        destination: Arc<DestinationGuard>,
     ) -> Result<Arc<Self>, WebhookAuthorizationRuntimeError> {
         let callback_url = static_config
             .callback_public_url
@@ -116,7 +119,7 @@ impl WebhookAuthorizationRuntime {
                 static_config.service.webhook_transport_buffer_bytes,
                 static_config.service.max_webhook_transport_bytes,
             )?,
-            destination: DestinationGuard::system(DestinationFacts::from_static(static_config)?),
+            destination,
             pending: PendingCapabilityStore::new(),
             callback_url,
             accepting: Mutex::new(true),
@@ -138,7 +141,7 @@ impl WebhookAuthorizationRuntime {
     ) -> Arc<Self> {
         Arc::new(Self {
             transport: WebhookTransportArena::try_new(1, 64 * 1024, 128 * 1024).unwrap(),
-            destination,
+            destination: Arc::new(destination),
             pending: PendingCapabilityStore::new(),
             callback_url: callback_url.map(|url| canonicalize_http_url(url).unwrap()),
             accepting: Mutex::new(true),
@@ -178,7 +181,7 @@ impl WebhookAuthorizationRuntime {
         }
     }
 
-    pub(crate) fn destination_guard(&self) -> &DestinationGuard {
+    pub(crate) fn destination_guard(&self) -> &Arc<DestinationGuard> {
         &self.destination
     }
 

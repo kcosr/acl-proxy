@@ -1,3 +1,4 @@
+pub(crate) mod assets;
 pub(crate) mod listeners;
 pub(crate) mod owner;
 pub(crate) mod product;

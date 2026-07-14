@@ -5,6 +5,8 @@ use std::sync::Arc;
 use crate::config::compiler::StaticListenersConfig;
 use crate::runtime::BoxFuture;
 
+use super::assets::ProductIngressAssets;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProxyListenerKind {
     ExplicitHttp,
@@ -39,6 +41,7 @@ pub(crate) trait ProxySupervisorStarter {
         &mut self,
         kind: ProxyListenerKind,
         listener: TcpListener,
+        assets: &Arc<ProductIngressAssets>,
         failure_observer: Arc<dyn ProxySupervisorFailureObserver>,
     ) -> Result<Arc<dyn ProxySupervisor>, ProxySupervisorStartError>;
 }

@@ -15,6 +15,7 @@ use rustls::{Certificate as RustlsCertificate, PrivateKey, ServerConfig};
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
+use crate::config::compiler::StaticMitmConfig;
 use crate::config::CertificatesConfig;
 use crate::filesystem::{create_private_dir_all, write_private_file};
 
@@ -62,6 +63,13 @@ pub enum CertError {
 
     #[error("certificate generation is already in progress")]
     GenerationBusy,
+
+    #[error("CA certificate and private key do not form a valid identity")]
+    CaIdentityMismatch,
+
+    #[cfg(unix)]
+    #[error("CA private key {path} must not grant group or other permissions")]
+    InsecureCaKeyPermissions { path: PathBuf },
 }
 
 struct CaMaterial {
@@ -81,13 +89,199 @@ struct Inner {
     ca_cert_der: Vec<u8>,
     cache_capacity: NonZeroUsize,
     generation_permits: Semaphore,
-    server_configs: Mutex<LruCache<String, Arc<ServerConfig>>>,
+    server_configs: Mutex<LruCache<ServerConfigCacheKey, Arc<ServerConfig>>>,
     sni_acceptor: Mutex<Option<TlsAcceptor>>,
 }
 
 #[derive(Clone)]
 pub struct CertManager {
     inner: Arc<Inner>,
+}
+
+#[derive(Clone)]
+pub(crate) struct MitmCertificateManager {
+    inner: Arc<Inner>,
+}
+
+impl MitmCertificateManager {
+    pub(crate) fn from_static(config: &StaticMitmConfig) -> Result<Self, CertError> {
+        let (
+            directory,
+            ca_cert_path,
+            ca_material,
+            max_cached_certificates,
+            persist_leaf_certificates,
+        ) = match config {
+            StaticMitmConfig::Generated {
+                directory,
+                max_cached_certificates,
+                persist_leaf_certificates,
+            } => {
+                create_private_dir_all(directory).map_err(|source| CertError::CreateDir {
+                    path: directory.clone(),
+                    source,
+                })?;
+                let key = directory.join("ca-key.pem");
+                let certificate = directory.join("ca-cert.pem");
+                let material = match (key.exists(), certificate.exists()) {
+                    (false, false) => generate_ca(&key, &certificate)?,
+                    (true, true) => {
+                        validate_private_key_permissions(&key)?;
+                        load_ca_from_files(&key, &certificate)?
+                    }
+                    (false, true) => {
+                        return Err(CertError::ReadCaKey {
+                            path: key,
+                            source: IoError::new(
+                                IoErrorKind::NotFound,
+                                "generated CA private key is missing",
+                            ),
+                        })
+                    }
+                    (true, false) => {
+                        return Err(CertError::ReadCaCert {
+                            path: certificate,
+                            source: IoError::new(
+                                IoErrorKind::NotFound,
+                                "generated CA certificate is missing",
+                            ),
+                        })
+                    }
+                };
+                (
+                    directory.clone(),
+                    certificate,
+                    material,
+                    *max_cached_certificates,
+                    *persist_leaf_certificates,
+                )
+            }
+            StaticMitmConfig::Files {
+                ca_certificate,
+                ca_private_key,
+                directory,
+                max_cached_certificates,
+                persist_leaf_certificates,
+            } => {
+                create_private_dir_all(directory).map_err(|source| CertError::CreateDir {
+                    path: directory.clone(),
+                    source,
+                })?;
+                validate_private_key_permissions(ca_private_key)?;
+                (
+                    directory.clone(),
+                    ca_certificate.clone(),
+                    load_ca_from_files(ca_private_key, ca_certificate)?,
+                    *max_cached_certificates,
+                    *persist_leaf_certificates,
+                )
+            }
+        };
+        validate_ca_identity(&ca_material)?;
+        let cache_capacity =
+            NonZeroUsize::new(max_cached_certificates).ok_or(CertError::InvalidCacheSize {
+                value: max_cached_certificates,
+            })?;
+        let dynamic_dir = directory.join("dynamic");
+        if persist_leaf_certificates {
+            create_private_dir_all(&dynamic_dir).map_err(|source| CertError::CreateDir {
+                path: dynamic_dir.clone(),
+                source,
+            })?;
+        }
+        Ok(Self {
+            inner: Arc::new(Inner {
+                ca_cert_path,
+                dynamic_dir,
+                persist_dynamic_certs: persist_leaf_certificates,
+                ca_cert: ca_material.cert,
+                ca_key: ca_material.key,
+                ca_cert_pem: ca_material.cert_pem,
+                ca_cert_der: ca_material.cert_der,
+                cache_capacity,
+                generation_permits: Semaphore::new(1),
+                server_configs: Mutex::new(LruCache::new(cache_capacity)),
+                sni_acceptor: Mutex::new(None),
+            }),
+        })
+    }
+
+    pub(crate) fn tls_acceptor_with_sni(
+        &self,
+        alpn_protocols: &[Vec<u8>],
+    ) -> Result<TlsAcceptor, CertError> {
+        build_sni_acceptor(&self.inner, alpn_protocols.to_vec())
+    }
+
+    pub(crate) fn tls_acceptor_for_host(
+        &self,
+        host: &str,
+        alpn_protocols: &[Vec<u8>],
+    ) -> Result<TlsAcceptor, CertError> {
+        tls_acceptor_for_host(&self.inner, host, alpn_protocols)
+    }
+
+    #[cfg(test)]
+    fn cache_capacity(&self) -> usize {
+        self.inner.cache_capacity.get()
+    }
+
+    #[cfg(test)]
+    fn persists_leaf_certificates(&self) -> bool {
+        self.inner.persist_dynamic_certs
+    }
+
+    #[cfg(test)]
+    fn server_config_for_host_for_test(
+        &self,
+        host: &str,
+        alpn_protocols: &[Vec<u8>],
+    ) -> Result<Arc<ServerConfig>, CertError> {
+        server_config_for_host(&self.inner, host, alpn_protocols)
+    }
+
+    #[cfg(test)]
+    fn sni_server_config_for_test(
+        &self,
+        alpn_protocols: &[Vec<u8>],
+    ) -> Result<ServerConfig, CertError> {
+        build_sni_server_config(&self.inner, alpn_protocols.to_vec())
+    }
+}
+
+fn validate_ca_identity(material: &CaMaterial) -> Result<(), CertError> {
+    let private_key = PrivateKey(material.key.serialize_der());
+    crate::tls_identity::validate_certificate_key_match(
+        &[RustlsCertificate(material.cert_der.clone())],
+        &private_key,
+    )
+    .map_err(|_| CertError::CaIdentityMismatch)
+}
+
+#[cfg(unix)]
+fn validate_private_key_permissions(path: &Path) -> Result<(), CertError> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let metadata = fs::metadata(path).map_err(|source| CertError::ReadCaKey {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(CertError::InsecureCaKeyPermissions {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_key_permissions(path: &Path) -> Result<(), CertError> {
+    fs::metadata(path)
+        .map(|_| ())
+        .map_err(|source| CertError::ReadCaKey {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 impl CertManager {
@@ -157,99 +351,134 @@ impl CertManager {
     /// proxy terminates TLS directly from clients and must choose a
     /// certificate matching the requested hostname.
     pub fn tls_acceptor_with_sni(&self) -> Result<TlsAcceptor, CertError> {
-        {
-            let guard = self.inner.sni_acceptor.lock().unwrap();
-            if let Some(acceptor) = guard.as_ref() {
-                return Ok(acceptor.clone());
-            }
-        }
-
-        // Seed the config with a placeholder certificate; the dynamic
-        // `cert_resolver` below will be responsible for choosing the real
-        // certificate based on SNI.
-        let (cert_chain, key) = generate_host_certificate(
-            &self.inner.ca_cert,
-            &self.inner.ca_key,
-            &self.inner.ca_cert_pem,
-            &self.inner.ca_cert_der,
-            &self.inner.dynamic_dir,
-            self.inner.persist_dynamic_certs,
-            "default",
-        )?;
-
-        let mut config = ServerConfig::builder()
-            .with_safe_defaults()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, key)
-            .map_err(|e| CertError::BuildServerConfig(format!("{e}")))?;
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        config.cert_resolver = Arc::new(SniResolver::new(self.inner.clone()));
-
-        let acceptor = TlsAcceptor::from(Arc::new(config));
-        let mut guard = self.inner.sni_acceptor.lock().unwrap();
-        if let Some(existing) = guard.as_ref() {
-            return Ok(existing.clone());
-        }
-        *guard = Some(acceptor.clone());
-        Ok(acceptor)
+        tls_acceptor_with_sni(&self.inner)
     }
 
     /// Build a `TlsAcceptor` for the given host, generating and caching a
     /// per-host certificate if needed.
     pub fn tls_acceptor_for_host(&self, host: &str) -> Result<TlsAcceptor, CertError> {
-        let config = self.server_config_for_host(host)?;
-        Ok(TlsAcceptor::from(config))
+        tls_acceptor_for_host(&self.inner, host, &[b"http/1.1".to_vec()])
     }
 
     fn server_config_for_host(&self, host: &str) -> Result<Arc<ServerConfig>, CertError> {
-        let host = host.to_ascii_lowercase();
-        {
-            let mut cache = self.inner.server_configs.lock().unwrap();
-            if let Some(cfg) = cache.get(&host) {
-                return Ok(cfg.clone());
-            }
-        }
-
-        let _generation_permit = self
-            .inner
-            .generation_permits
-            .try_acquire()
-            .map_err(|_| CertError::GenerationBusy)?;
-
-        {
-            let mut cache = self.inner.server_configs.lock().unwrap();
-            if let Some(cfg) = cache.get(&host) {
-                return Ok(cfg.clone());
-            }
-        }
-
-        let (cert_chain, key) = generate_host_certificate(
-            &self.inner.ca_cert,
-            &self.inner.ca_key,
-            &self.inner.ca_cert_pem,
-            &self.inner.ca_cert_der,
-            &self.inner.dynamic_dir,
-            self.inner.persist_dynamic_certs,
-            &host,
-        )?;
-
-        let mut config = ServerConfig::builder()
-            .with_safe_defaults()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, key)
-            .map_err(|e| CertError::BuildServerConfig(format!("{e}")))?;
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
-
-        let cfg = Arc::new(config);
-        let mut cache = self.inner.server_configs.lock().unwrap();
-        cache.put(host.clone(), cfg.clone());
-        Ok(cfg)
+        server_config_for_host(&self.inner, host, &[b"http/1.1".to_vec()])
     }
 
     /// Path to the CA certificate on disk.
     pub fn ca_cert_path(&self) -> &Path {
         &self.inner.ca_cert_path
     }
+}
+
+fn tls_acceptor_with_sni(inner: &Arc<Inner>) -> Result<TlsAcceptor, CertError> {
+    {
+        let guard = inner.sni_acceptor.lock().unwrap();
+        if let Some(acceptor) = guard.as_ref() {
+            return Ok(acceptor.clone());
+        }
+    }
+    let acceptor = build_sni_acceptor(inner, vec![b"h2".to_vec(), b"http/1.1".to_vec()])?;
+    let mut guard = inner.sni_acceptor.lock().unwrap();
+    if let Some(existing) = guard.as_ref() {
+        return Ok(existing.clone());
+    }
+    *guard = Some(acceptor.clone());
+    Ok(acceptor)
+}
+
+fn build_sni_acceptor(
+    inner: &Arc<Inner>,
+    alpn_protocols: Vec<Vec<u8>>,
+) -> Result<TlsAcceptor, CertError> {
+    build_sni_server_config(inner, alpn_protocols).map(|config| TlsAcceptor::from(Arc::new(config)))
+}
+
+fn build_sni_server_config(
+    inner: &Arc<Inner>,
+    alpn_protocols: Vec<Vec<u8>>,
+) -> Result<ServerConfig, CertError> {
+    let (cert_chain, key) = generate_host_certificate(
+        &inner.ca_cert,
+        &inner.ca_key,
+        &inner.ca_cert_pem,
+        &inner.ca_cert_der,
+        &inner.dynamic_dir,
+        inner.persist_dynamic_certs,
+        "default",
+    )?;
+    let mut config = ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, key)
+        .map_err(|e| CertError::BuildServerConfig(format!("{e}")))?;
+    config.alpn_protocols = alpn_protocols;
+    config.cert_resolver = Arc::new(SniResolver::new(inner.clone()));
+    Ok(config)
+}
+
+fn tls_acceptor_for_host(
+    inner: &Arc<Inner>,
+    host: &str,
+    alpn_protocols: &[Vec<u8>],
+) -> Result<TlsAcceptor, CertError> {
+    server_config_for_host(inner, host, alpn_protocols).map(TlsAcceptor::from)
+}
+
+fn server_config_for_host(
+    inner: &Arc<Inner>,
+    host: &str,
+    alpn_protocols: &[Vec<u8>],
+) -> Result<Arc<ServerConfig>, CertError> {
+    let cache_key = ServerConfigCacheKey {
+        host: host.to_ascii_lowercase(),
+        alpn_protocols: alpn_protocols.to_vec().into_boxed_slice(),
+    };
+    {
+        let mut cache = inner.server_configs.lock().unwrap();
+        if let Some(cfg) = cache.get(&cache_key) {
+            return Ok(cfg.clone());
+        }
+    }
+
+    let _generation_permit = inner
+        .generation_permits
+        .try_acquire()
+        .map_err(|_| CertError::GenerationBusy)?;
+
+    {
+        let mut cache = inner.server_configs.lock().unwrap();
+        if let Some(cfg) = cache.get(&cache_key) {
+            return Ok(cfg.clone());
+        }
+    }
+
+    let (cert_chain, key) = generate_host_certificate(
+        &inner.ca_cert,
+        &inner.ca_key,
+        &inner.ca_cert_pem,
+        &inner.ca_cert_der,
+        &inner.dynamic_dir,
+        inner.persist_dynamic_certs,
+        &cache_key.host,
+    )?;
+
+    let mut config = ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, key)
+        .map_err(|e| CertError::BuildServerConfig(format!("{e}")))?;
+    config.alpn_protocols = alpn_protocols.to_vec();
+
+    let cfg = Arc::new(config);
+    let mut cache = inner.server_configs.lock().unwrap();
+    cache.put(cache_key, cfg.clone());
+    Ok(cfg)
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct ServerConfigCacheKey {
+    host: String,
+    alpn_protocols: Box<[Vec<u8>]>,
 }
 
 struct SniResolver {
@@ -888,5 +1117,179 @@ mod tests {
                 || msg.contains("failed to parse CA"),
             "expected error about explicit CA paths, got: {msg}"
         );
+    }
+
+    #[test]
+    fn strict_generated_mitm_uses_exact_cache_persistence_and_private_storage() {
+        let tmp = TempDir::new().expect("tempdir");
+        let directory = tmp.path().join("generated");
+        let config = StaticMitmConfig::Generated {
+            directory: directory.clone(),
+            max_cached_certificates: 7,
+            persist_leaf_certificates: true,
+        };
+
+        let manager = MitmCertificateManager::from_static(&config).expect("strict manager");
+
+        assert_eq!(manager.cache_capacity(), 7);
+        assert!(manager.persists_leaf_certificates());
+        assert!(directory.join("ca-cert.pem").is_file());
+        assert!(directory.join("ca-key.pem").is_file());
+        manager
+            .tls_acceptor_for_host("strict.example.test", &[b"http/1.1".to_vec()])
+            .expect("host acceptor");
+        assert!(directory.join("dynamic/strict.example.test.key").is_file());
+        #[cfg(unix)]
+        {
+            assert_eq!(mode(&directory), 0o700);
+            assert_eq!(mode(&directory.join("dynamic")), 0o700);
+            assert_eq!(mode(&directory.join("ca-key.pem")), 0o600);
+        }
+    }
+
+    #[test]
+    fn strict_files_mitm_uses_exact_material_without_leaf_persistence() {
+        let tmp = TempDir::new().expect("tempdir");
+        let source = tmp.path().join("source");
+        let generated = StaticMitmConfig::Generated {
+            directory: source.clone(),
+            max_cached_certificates: 2,
+            persist_leaf_certificates: false,
+        };
+        MitmCertificateManager::from_static(&generated).expect("source CA");
+        let directory = tmp.path().join("files-runtime");
+        let configured_ca_certificate = source.join("ca-cert.pem");
+        let files = StaticMitmConfig::Files {
+            ca_certificate: configured_ca_certificate.clone(),
+            ca_private_key: source.join("ca-key.pem"),
+            directory: directory.clone(),
+            max_cached_certificates: 3,
+            persist_leaf_certificates: false,
+        };
+
+        let manager = MitmCertificateManager::from_static(&files).expect("file manager");
+
+        assert_eq!(manager.cache_capacity(), 3);
+        assert!(!manager.persists_leaf_certificates());
+        assert_eq!(manager.inner.ca_cert_path, configured_ca_certificate);
+        manager
+            .tls_acceptor_with_sni(&[b"h2".to_vec()])
+            .expect("transparent acceptor");
+        assert!(!directory.join("dynamic").exists());
+        #[cfg(unix)]
+        assert_eq!(mode(&directory), 0o700);
+    }
+
+    #[test]
+    fn strict_files_mitm_rejects_missing_and_mismatched_material() {
+        let tmp = TempDir::new().expect("tempdir");
+        let missing = StaticMitmConfig::Files {
+            ca_certificate: tmp.path().join("missing-cert.pem"),
+            ca_private_key: tmp.path().join("missing-key.pem"),
+            directory: tmp.path().join("runtime"),
+            max_cached_certificates: 1,
+            persist_leaf_certificates: false,
+        };
+        assert!(matches!(
+            MitmCertificateManager::from_static(&missing),
+            Err(CertError::ReadCaKey { .. })
+        ));
+
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        for directory in [&first, &second] {
+            MitmCertificateManager::from_static(&StaticMitmConfig::Generated {
+                directory: directory.clone(),
+                max_cached_certificates: 1,
+                persist_leaf_certificates: false,
+            })
+            .expect("generate CA");
+        }
+        let mismatched = StaticMitmConfig::Files {
+            ca_certificate: first.join("ca-cert.pem"),
+            ca_private_key: second.join("ca-key.pem"),
+            directory: tmp.path().join("mismatched-runtime"),
+            max_cached_certificates: 1,
+            persist_leaf_certificates: false,
+        };
+        assert!(matches!(
+            MitmCertificateManager::from_static(&mismatched),
+            Err(CertError::CaIdentityMismatch)
+        ));
+    }
+
+    #[test]
+    fn strict_generated_mitm_rejects_partial_existing_ca_state() {
+        let tmp = TempDir::new().expect("tempdir");
+        let directory = tmp.path().join("partial");
+        create_private_dir_all(&directory).unwrap();
+        write_private_file(&directory.join("ca-cert.pem"), b"not-used").unwrap();
+        let config = StaticMitmConfig::Generated {
+            directory,
+            max_cached_certificates: 1,
+            persist_leaf_certificates: false,
+        };
+
+        assert!(matches!(
+            MitmCertificateManager::from_static(&config),
+            Err(CertError::ReadCaKey { .. })
+        ));
+    }
+
+    #[test]
+    fn strict_mitm_preserves_single_and_dual_protocol_alpn_sets() {
+        let tmp = TempDir::new().expect("tempdir");
+        let manager = MitmCertificateManager::from_static(&StaticMitmConfig::Generated {
+            directory: tmp.path().join("mitm"),
+            max_cached_certificates: 4,
+            persist_leaf_certificates: false,
+        })
+        .unwrap();
+        let single = vec![b"http/1.1".to_vec()];
+        let dual = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        let single_host = manager
+            .server_config_for_host_for_test("alpn.example.test", &single)
+            .unwrap();
+        let dual_host = manager
+            .server_config_for_host_for_test("alpn.example.test", &dual)
+            .unwrap();
+        assert_eq!(single_host.alpn_protocols, single);
+        assert_eq!(dual_host.alpn_protocols, dual);
+        assert!(!Arc::ptr_eq(&single_host, &dual_host));
+
+        let single_sni = manager.sni_server_config_for_test(&single).unwrap();
+        let dual_sni = manager.sni_server_config_for_test(&dual).unwrap();
+        assert_eq!(single_sni.alpn_protocols, single);
+        assert_eq!(dual_sni.alpn_protocols, dual);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_files_mitm_rejects_group_readable_private_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let source = tmp.path().join("source");
+        MitmCertificateManager::from_static(&StaticMitmConfig::Generated {
+            directory: source.clone(),
+            max_cached_certificates: 1,
+            persist_leaf_certificates: false,
+        })
+        .expect("generate CA");
+        let key = source.join("ca-key.pem");
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o640)).unwrap();
+        let config = StaticMitmConfig::Files {
+            ca_certificate: source.join("ca-cert.pem"),
+            ca_private_key: key,
+            directory: tmp.path().join("runtime"),
+            max_cached_certificates: 1,
+            persist_leaf_certificates: false,
+        };
+
+        assert!(matches!(
+            MitmCertificateManager::from_static(&config),
+            Err(CertError::InsecureCaKeyPermissions { .. })
+        ));
     }
 }

@@ -98,7 +98,12 @@ impl ProductRuntime {
             });
         let mut supervisors = Vec::new();
         for (kind, listener) in prepared.into_entries() {
-            match starter.start(kind, listener, observer.clone()) {
+            match starter.start(
+                kind,
+                listener,
+                self.static_resources.ingress_assets(),
+                observer.clone(),
+            ) {
                 Ok(supervisor) => supervisors.push(supervisor),
                 Err(error) => {
                     rollback_proxy_supervisors(supervisors).await;
@@ -257,6 +262,7 @@ mod tests {
             &mut self,
             kind: super::super::listeners::ProxyListenerKind,
             _listener: TcpListener,
+            _assets: &Arc<super::super::assets::ProductIngressAssets>,
             observer: Arc<dyn ProxySupervisorFailureObserver>,
         ) -> Result<Arc<dyn ProxySupervisor>, ProxySupervisorStartError> {
             if self.fail_at == Some(self.supervisors.len()) {
@@ -425,6 +431,37 @@ rules = [{{ literal_environment_variables = ["{missing_variable}"] }}]
         assert_bindable([addresses[0]]);
         drop(blocker);
         assert_bindable([addresses[1]]);
+    }
+
+    #[tokio::test]
+    async fn static_asset_failure_occurs_before_prebinding_and_leaves_every_socket_free() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let addresses = available_addresses::<3>();
+        let extra = format!(
+            r#"[listeners.explicit_https]
+bind = "{}"
+http_versions = ["http1"]
+
+[listeners.explicit_https.connect]
+http1 = "deny"
+
+[listeners.explicit_https.tls]
+certificate_chain = "missing-server.pem"
+private_key = "missing-server-key.pem"
+"#,
+            addresses[2]
+        );
+        let (_directory, loaded) = loaded(&config(addresses[0], addresses[1], &extra));
+
+        let result = ProductRuntime::prepare(loaded).await;
+
+        assert!(matches!(
+            result,
+            Err(ProductRuntimeError::StaticResources(
+                ProductStaticResourcesError::IngressAssets(_)
+            ))
+        ));
+        assert_bindable(addresses);
     }
 
     #[tokio::test]
