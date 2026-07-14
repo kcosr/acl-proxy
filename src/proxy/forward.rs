@@ -392,7 +392,7 @@ impl HttpBody for ForwardBody {
         self.body
             .as_ref()
             .map(HttpBody::size_hint)
-            .unwrap_or_else(SizeHint::new)
+            .unwrap_or_default()
     }
 }
 

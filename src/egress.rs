@@ -34,7 +34,7 @@ pub(crate) struct EgressSnapshot {
 
 pub(crate) enum EgressRoute {
     Direct,
-    Parent(ParentEndpoint),
+    Parent(Box<ParentEndpoint>),
 }
 
 pub(crate) struct ParentEndpoint {
@@ -137,9 +137,9 @@ impl EgressSnapshot {
         let origin_tls = OriginTls::activate(origin_tls, &mut is_cancelled)?;
         let route = match (route, parent_proxy) {
             (CompiledEgressRoute::Direct, None) => EgressRoute::Direct,
-            (CompiledEgressRoute::ParentProxy, Some(parent)) => {
-                EgressRoute::Parent(ParentEndpoint::activate(parent, &mut is_cancelled)?)
-            }
+            (CompiledEgressRoute::ParentProxy, Some(parent)) => EgressRoute::Parent(Box::new(
+                ParentEndpoint::activate(parent, &mut is_cancelled)?,
+            )),
             _ => return Err(EgressActivationError::Route),
         };
         let credential_actions = credential_actions
