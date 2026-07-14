@@ -244,15 +244,15 @@ impl CaptureRecord {
         }
         if let Some(body) = &self.body {
             if body.encoding == "base64" {
-                let Ok(stored) = general_purpose::STANDARD.decode(&body.data) else {
+                let Some(stored_len) = canonical_base64_decoded_len(&body.data) else {
                     return self
                         .body_truncated
                         .is_none()
                         .then_some(())
                         .ok_or(CaptureRecordInvariantError::InvalidBodyTruncated);
                 };
-                let truncated = stored.len() < body.length;
-                if stored.len() > body.length || self.body_truncated != truncated.then_some(true) {
+                let truncated = stored_len < body.length;
+                if stored_len > body.length || self.body_truncated != truncated.then_some(true) {
                     return Err(CaptureRecordInvariantError::InvalidBodyTruncated);
                 }
             } else if self.body_truncated.is_some() {
@@ -268,6 +268,54 @@ impl CaptureRecord {
         self.provider_replacement_omitted = Some(true);
         self.provider_replacement_size = Some(size);
     }
+}
+
+fn canonical_base64_decoded_len(encoded: &str) -> Option<usize> {
+    let bytes = encoded.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    if bytes.is_empty() {
+        return Some(0);
+    }
+
+    let padding = if bytes.ends_with(b"==") {
+        2
+    } else if bytes.ends_with(b"=") {
+        1
+    } else {
+        0
+    };
+    let payload_len = bytes.len().checked_sub(padding)?;
+    let mut last_sextet = 0;
+    for (index, &byte) in bytes[..payload_len].iter().enumerate() {
+        let sextet = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        };
+        if index + 1 == payload_len {
+            last_sextet = sextet;
+        }
+    }
+    if bytes[payload_len..].iter().any(|&byte| byte != b'=') {
+        return None;
+    }
+    match padding {
+        1 if payload_len % 4 != 3 || last_sextet & 0b11 != 0 => return None,
+        2 if payload_len % 4 != 2 || last_sextet & 0b1111 != 0 => return None,
+        0 if payload_len % 4 != 0 => return None,
+        _ => {}
+    }
+
+    bytes
+        .len()
+        .checked_div(4)?
+        .checked_mul(3)?
+        .checked_sub(padding)
 }
 
 impl Serialize for CaptureRecord {
@@ -1097,6 +1145,38 @@ default = "deny"
     }
 
     #[test]
+    fn canonical_base64_length_is_computed_without_decoding() {
+        for (encoded, decoded_len) in [
+            ("", 0),
+            ("Zg==", 1),
+            ("Zm8=", 2),
+            ("Zm9v", 3),
+            ("/w==", 1),
+            ("//8=", 2),
+            ("////", 3),
+        ] {
+            assert_eq!(
+                canonical_base64_decoded_len(encoded),
+                Some(decoded_len),
+                "canonical input {encoded:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_base64_length_rejects_invalid_alphabet_padding_and_pad_bits() {
+        for encoded in [
+            "Zg", "Zg=", "Zg===", "=Zg=", "Z=g=", "Zg==\\n", "Zg-_", "====", "Zh==", "Zm9=",
+        ] {
+            assert_eq!(
+                canonical_base64_decoded_len(encoded),
+                None,
+                "invalid input {encoded:?}"
+            );
+        }
+    }
+
+    #[test]
     fn truncated_body_marker_is_exact_and_round_trips() {
         let record = build_capture_record(CaptureRecordOptions {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
@@ -1150,6 +1230,16 @@ default = "deny"
             "data": general_purpose::STANDARD.encode(b"short")
         });
         assert!(serde_json::from_value::<CaptureRecord>(value).is_err());
+
+        let mut record = sample_record_with_body(Some(CaptureBody {
+            encoding: "base64".to_string(),
+            length: 2,
+            data: "Zh==".to_string(),
+            content_type: None,
+            content_encoding: None,
+        }));
+        record.body_truncated = Some(true);
+        assert!(serde_json::to_value(record).is_err());
     }
 
     #[test]
