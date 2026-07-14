@@ -2,7 +2,7 @@ use http::HeaderValue;
 
 use crate::authorization::callback::ResumeToken;
 use crate::authorization::protocol::ProviderRequestHeaders;
-use crate::safety::wire_body::{GuardedBodyBuilder, WireBodyBufferError};
+use crate::safety::wire_body::{ReservedGuardedBodyBuilder, WireBodyBufferError};
 use crate::safety::{GuardedBody, HttpWireBodyGuard};
 
 const MAX_IDENTIFIER_BYTES: usize = 4096;
@@ -15,6 +15,10 @@ pub(crate) struct WebhookRequest<'a> {
     pub(crate) method: &'a str,
     pub(crate) client_ip: &'a str,
     pub(crate) headers: Option<&'a ProviderRequestHeaders<'a>>,
+}
+
+pub(crate) struct PreparedWebhookRequest {
+    output: ReservedGuardedBodyBuilder,
 }
 
 #[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
@@ -69,19 +73,18 @@ impl WebhookRequest<'_> {
         Ok(length)
     }
 
-    pub(crate) fn encode(
+    pub(crate) fn prepare(
         &self,
         callback_url: &str,
-        token: &ResumeToken,
         max_request_bytes: usize,
         guard: &HttpWireBodyGuard,
-    ) -> Result<GuardedBody, WebhookRequestError> {
+    ) -> Result<PreparedWebhookRequest, WebhookRequestError> {
         let expected = self.encoded_len(callback_url)?;
         if expected > max_request_bytes {
             return Err(WebhookRequestError::TooLarge);
         }
 
-        let mut output = guard.buffer();
+        let mut output = guard.reserve_exact_buffer(expected)?;
         append(&mut output, b"{\"type\":\"request\",\"requestId\":")?;
         append_json_string(&mut output, self.request_id)?;
         append(&mut output, b",\"ruleId\":")?;
@@ -113,10 +116,8 @@ impl WebhookRequest<'_> {
         append(&mut output, b",\"callbackUrl\":")?;
         append_json_string(&mut output, callback_url)?;
         append(&mut output, b",\"resumeToken\":\"")?;
-        append(&mut output, token.as_bytes())?;
-        append(&mut output, b"\"}")?;
-        debug_assert_eq!(output.len(), expected);
-        Ok(output.finish())
+        debug_assert_eq!(output.len() + 45, expected);
+        Ok(PreparedWebhookRequest { output })
     }
 
     fn validate(&self) -> Result<(), WebhookRequestError> {
@@ -165,6 +166,17 @@ impl WebhookRequest<'_> {
     }
 }
 
+impl PreparedWebhookRequest {
+    pub(crate) fn finish(
+        mut self,
+        token: &ResumeToken,
+    ) -> Result<GuardedBody, WebhookRequestError> {
+        append(&mut self.output, token.as_bytes())?;
+        append(&mut self.output, b"\"}")?;
+        self.output.finish().map_err(Into::into)
+    }
+}
+
 fn header_text(value: &HeaderValue) -> Result<&str, WebhookRequestError> {
     value
         .to_str()
@@ -195,12 +207,15 @@ fn add_json_string_len(length: &mut usize, value: &str) -> Result<(), WebhookReq
     add_literal(length, b"\"")
 }
 
-fn append(output: &mut GuardedBodyBuilder, bytes: &[u8]) -> Result<(), WebhookRequestError> {
+fn append(
+    output: &mut ReservedGuardedBodyBuilder,
+    bytes: &[u8],
+) -> Result<(), WebhookRequestError> {
     output.try_extend_from_slice(bytes).map_err(Into::into)
 }
 
 fn append_json_string(
-    output: &mut GuardedBodyBuilder,
+    output: &mut ReservedGuardedBodyBuilder,
     value: &str,
 ) -> Result<(), WebhookRequestError> {
     append(output, b"\"")?;
@@ -286,12 +301,13 @@ mod tests {
         let expected_prefix = b"{\"type\":\"request\",\"requestId\":\"request-1\",\"ruleId\":\"rule-1\",\"url\":\"https://example.test/a?b=c\",\"method\":\"GET\",\"clientIp\":\"127.0.0.1\",\"headers\":{\"x-example\":[\"first\",\"second\"]},\"callbackUrl\":\"https://proxy.test/_acl/external-auth/callback\",\"resumeToken\":\"";
         let guard = guard(128 * 1024);
         let body = request
-            .encode(
+            .prepare(
                 "https://proxy.test/_acl/external-auth/callback",
-                &token,
                 16 * 1024,
                 &guard,
             )
+            .unwrap()
+            .finish(&token)
             .unwrap();
         let bytes = body.segments().flatten().copied().collect::<Vec<_>>();
         assert!(bytes.starts_with(expected_prefix));
@@ -323,11 +339,16 @@ mod tests {
         let exact = request.encoded_len(callback).unwrap();
         let guard = guard(128 * 1024);
         assert!(matches!(
-            request.encode(callback, &token, exact - 1, &guard),
+            request.prepare(callback, exact - 1, &guard),
             Err(WebhookRequestError::TooLarge)
         ));
         assert_eq!(guard.live_bytes(), 0);
-        let body = request.encode(callback, &token, exact, &guard).unwrap();
+        let prepared = request.prepare(callback, exact, &guard).unwrap();
+        assert!(
+            guard.live_bytes() > 0,
+            "request storage is charged before token use"
+        );
+        let body = prepared.finish(&token).unwrap();
         let bytes = body.segments().flatten().copied().collect::<Vec<_>>();
         assert_eq!(bytes.len(), exact);
         assert_eq!(

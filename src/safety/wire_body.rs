@@ -277,6 +277,32 @@ impl HttpWireBodyGuard {
         }
     }
 
+    pub(crate) fn reserve_exact_buffer(
+        &self,
+        exact_len: usize,
+    ) -> Result<ReservedGuardedBodyBuilder, WireBodyBufferError> {
+        let chunk_count = if exact_len == 0 {
+            0
+        } else {
+            exact_len
+                .checked_add(MAX_BUFFER_GROWTH_BYTES - 1)
+                .ok_or(WireBodyBufferError::CursorPeakExceeded)?
+                / MAX_BUFFER_GROWTH_BYTES
+        };
+        let mut inner = self.buffer();
+        for _ in 0..chunk_count {
+            if let Err(error) = inner.try_allocate_chunk() {
+                inner.clear_and_release();
+                return Err(error);
+            }
+        }
+        Ok(ReservedGuardedBodyBuilder {
+            inner,
+            exact_len,
+            valid: true,
+        })
+    }
+
     pub(crate) fn stream_scratch(&self) -> Result<GuardedScratch, WireBodyBufferError> {
         let (chunk, charged_bytes) = allocate_secret_chunk(&self.inner)?;
         Ok(GuardedScratch {
@@ -369,6 +395,12 @@ pub(crate) struct GuardedBodyBuilder {
     charged_bytes: usize,
 }
 
+pub(crate) struct ReservedGuardedBodyBuilder {
+    inner: GuardedBodyBuilder,
+    exact_len: usize,
+    valid: bool,
+}
+
 impl fmt::Debug for GuardedBodyBuilder {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -454,6 +486,58 @@ impl GuardedBodyBuilder {
             head: forward,
             len: self.len,
             charged_bytes: std::mem::take(&mut self.charged_bytes),
+        }
+    }
+}
+
+impl ReservedGuardedBodyBuilder {
+    pub(crate) fn len(&self) -> usize {
+        self.inner.len
+    }
+
+    pub(crate) fn charged_bytes(&self) -> usize {
+        self.inner.charged_bytes
+    }
+
+    pub(crate) fn try_extend_from_slice(
+        &mut self,
+        mut input: &[u8],
+    ) -> Result<(), WireBodyBufferError> {
+        let Some(final_len) = self.inner.len.checked_add(input.len()) else {
+            self.invalidate();
+            return Err(WireBodyBufferError::ReservedLengthMismatch);
+        };
+        if !self.valid || final_len > self.exact_len {
+            self.invalidate();
+            return Err(WireBodyBufferError::ReservedLengthMismatch);
+        }
+
+        while !input.is_empty() {
+            let chunk = self
+                .inner
+                .reverse
+                .as_deref_mut()
+                .and_then(SecretChunk::oldest_with_capacity)
+                .expect("an exact reservation has enough initialized storage");
+            let copied = chunk.extend_from_slice(input);
+            input = &input[copied..];
+        }
+        self.inner.len = final_len;
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> Result<GuardedBody, WireBodyBufferError> {
+        if !self.valid || self.inner.len != self.exact_len {
+            self.invalidate();
+            return Err(WireBodyBufferError::ReservedLengthMismatch);
+        }
+        Ok(self.inner.finish())
+    }
+
+    fn invalidate(&mut self) {
+        if self.valid {
+            self.inner.clear_and_release();
+            self.valid = false;
         }
     }
 }
@@ -647,6 +731,28 @@ impl SecretChunk {
         self.initialized += copied;
         copied
     }
+
+    fn oldest_with_capacity(&mut self) -> Option<&mut Self> {
+        let next_has_capacity = self
+            .next
+            .as_deref()
+            .is_some_and(SecretChunk::chain_has_capacity);
+        if next_has_capacity {
+            return self
+                .next
+                .as_deref_mut()
+                .and_then(SecretChunk::oldest_with_capacity);
+        }
+        (self.initialized < self.bytes.len()).then_some(self)
+    }
+
+    fn chain_has_capacity(&self) -> bool {
+        self.initialized < self.bytes.len()
+            || self
+                .next
+                .as_deref()
+                .is_some_and(SecretChunk::chain_has_capacity)
+    }
 }
 
 impl Drop for SecretChunk {
@@ -674,6 +780,8 @@ pub(crate) enum WireBodyBufferError {
     AllocationFailed,
     #[error("wire-body buffer belongs to another request guard")]
     ForeignGuard,
+    #[error("wire-body exact reservation length was not satisfied")]
+    ReservedLengthMismatch,
 }
 
 #[cfg(test)]
@@ -855,6 +963,88 @@ mod linked_tests {
             .unwrap();
         assert_eq!(builder.charged_bytes(), two);
         drop(builder);
+        assert_eq!(pool.global_charge(), 0);
+    }
+
+    #[test]
+    fn exact_reservation_preallocates_and_preserves_multi_chunk_order() {
+        let two = allocation(2);
+        let exact_len = MAX_BUFFER_GROWTH_BYTES + 7;
+        let pool = WireBodyPool::new(two, two);
+        let guard = pool.begin(two, key());
+        let mut reserved = guard.reserve_exact_buffer(exact_len).unwrap();
+        assert_eq!(reserved.charged_bytes(), two);
+        assert_eq!(guard.live_bytes(), two);
+
+        pool.fail_next_allocation();
+        reserved
+            .try_extend_from_slice(&vec![0xa5; MAX_BUFFER_GROWTH_BYTES])
+            .unwrap();
+        reserved.try_extend_from_slice(b"ordered").unwrap();
+        let body = reserved.finish().unwrap();
+        assert_eq!(body.len(), exact_len);
+        assert_eq!(body_bytes(&body)[MAX_BUFFER_GROWTH_BYTES..], *b"ordered");
+
+        drop(body);
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+        assert!(matches!(
+            guard.stream_scratch(),
+            Err(WireBodyBufferError::AllocationFailed)
+        ));
+    }
+
+    #[test]
+    fn exact_reservation_failure_is_atomic_after_partial_allocation() {
+        let one = allocation(1);
+        let pool = WireBodyPool::new(one, one);
+        let guard = pool.begin(one, key());
+
+        assert!(matches!(
+            guard.reserve_exact_buffer(MAX_BUFFER_GROWTH_BYTES + 1),
+            Err(WireBodyBufferError::CursorPeakExceeded)
+        ));
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+        assert_eq!(pool.quota_charge(&key()), 0);
+    }
+
+    #[test]
+    fn exact_reservation_overfill_is_terminal_and_releases_charge() {
+        let one = allocation(1);
+        let pool = WireBodyPool::new(one, one);
+        let guard = pool.begin(one, key());
+        let mut reserved = guard.reserve_exact_buffer(6).unwrap();
+        reserved.try_extend_from_slice(b"secret").unwrap();
+
+        assert_eq!(
+            reserved.try_extend_from_slice(b"x"),
+            Err(WireBodyBufferError::ReservedLengthMismatch)
+        );
+        assert_eq!(reserved.len(), 0);
+        assert_eq!(reserved.charged_bytes(), 0);
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+        assert!(matches!(
+            reserved.finish(),
+            Err(WireBodyBufferError::ReservedLengthMismatch)
+        ));
+    }
+
+    #[test]
+    fn exact_reservation_underfill_releases_charge() {
+        let one = allocation(1);
+        let pool = WireBodyPool::new(one, one);
+        let guard = pool.begin(one, key());
+        let mut reserved = guard.reserve_exact_buffer(7).unwrap();
+        reserved.try_extend_from_slice(b"six123").unwrap();
+        assert_eq!(guard.live_bytes(), one);
+
+        assert!(matches!(
+            reserved.finish(),
+            Err(WireBodyBufferError::ReservedLengthMismatch)
+        ));
+        assert_eq!(guard.live_bytes(), 0);
         assert_eq!(pool.global_charge(), 0);
     }
 
