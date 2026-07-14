@@ -18,7 +18,7 @@ use crate::runtime::CredentialSourceRegistry;
 use crate::tls::{
     build_client_config, load_client_trust, ClientAlpn, ClientTrust, TlsActivationError,
 };
-use crate::url::canonicalize_tls_server_name;
+use crate::url::{canonicalize_http_authority, canonicalize_tls_server_name, CanonicalAuthority};
 
 /// Generation-owned outbound transport policy and material.
 ///
@@ -41,8 +41,7 @@ pub(crate) struct ParentEndpoint {
     kind: CompiledParentProxyKind,
     canonical_url: String,
     uri: Uri,
-    host: String,
-    port: u16,
+    authority: CanonicalAuthority,
     transport: ParentTransport,
 }
 
@@ -54,8 +53,19 @@ pub(crate) enum ParentTransport {
 pub(crate) struct OriginTls {
     trust: CompiledTlsTrust,
     http_versions: Box<[CompiledHttpVersion]>,
-    http1_config: Option<Arc<ClientConfig>>,
-    http2_config: Option<Arc<ClientConfig>>,
+    client_config: Arc<ClientConfig>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OriginProtocol {
+    Http1,
+    Http2,
+}
+
+impl OriginProtocol {
+    pub(crate) fn is_http2(self) -> bool {
+        self == Self::Http2
+    }
 }
 
 pub(crate) struct ParentTls {
@@ -97,9 +107,7 @@ pub(crate) enum ParentAlpnError {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum OriginProtocolError {
-    #[error("the selected origin HTTP protocol is not enabled")]
-    Disabled,
-    #[error("origin TLS did not negotiate the selected HTTP protocol")]
+    #[error("origin TLS did not negotiate an enabled HTTP protocol")]
     IncompatibleAlpn,
 }
 
@@ -197,12 +205,21 @@ impl ParentEndpoint {
             ("https", Some(tls)) => ParentTransport::Https(ParentTls::activate(tls, is_cancelled)?),
             _ => return Err(EgressActivationError::Route),
         };
+        let authority = canonicalize_http_authority(
+            scheme,
+            uri.authority()
+                .ok_or(EgressActivationError::ParentUrl)?
+                .as_str(),
+        )
+        .map_err(|_| EgressActivationError::ParentUrl)?;
+        if authority.host != host || authority.port != port {
+            return Err(EgressActivationError::Route);
+        }
         Ok(Self {
             kind,
             canonical_url: url,
             uri,
-            host,
-            port,
+            authority,
             transport,
         })
     }
@@ -220,11 +237,15 @@ impl ParentEndpoint {
     }
 
     pub(crate) fn host(&self) -> &str {
-        &self.host
+        &self.authority.host
     }
 
     pub(crate) fn port(&self) -> u16 {
-        self.port
+        self.authority.port
+    }
+
+    pub(crate) fn authority(&self) -> &CanonicalAuthority {
+        &self.authority
     }
 
     pub(crate) fn transport(&self) -> &ParentTransport {
@@ -337,13 +358,16 @@ impl OriginTls {
 
         let loaded_trust = load(trust, ca_certificate.as_deref())?;
         warn_if_insecure("origin", trust);
+        let alpn = match (http1, http2) {
+            (true, true) => ClientAlpn::Http2AndHttp1,
+            (true, false) => ClientAlpn::Http1,
+            (false, true) => ClientAlpn::Http2,
+            (false, false) => unreachable!("empty protocol list rejected above"),
+        };
         Ok(Self {
             trust,
             http_versions: http_versions.into_boxed_slice(),
-            http1_config: http1
-                .then(|| Arc::new(build_client_config(&loaded_trust, ClientAlpn::Http1, true))),
-            http2_config: http2
-                .then(|| Arc::new(build_client_config(&loaded_trust, ClientAlpn::Http2, true))),
+            client_config: Arc::new(build_client_config(&loaded_trust, alpn, true)),
         })
     }
 
@@ -355,32 +379,33 @@ impl OriginTls {
         &self.http_versions
     }
 
-    pub(crate) fn client_config(
-        &self,
-        use_http2: bool,
-    ) -> Result<Arc<ClientConfig>, OriginProtocolError> {
-        let config = if use_http2 {
-            &self.http2_config
-        } else {
-            &self.http1_config
-        };
-        config.clone().ok_or(OriginProtocolError::Disabled)
+    pub(crate) fn client_config(&self) -> Arc<ClientConfig> {
+        self.client_config.clone()
     }
 
-    pub(crate) fn validate_negotiated_alpn(
-        &self,
-        use_http2: bool,
-        negotiated: Option<&[u8]>,
-    ) -> Result<(), OriginProtocolError> {
-        self.client_config(use_http2)?;
-        let compatible = if use_http2 {
-            negotiated == Some(b"h2")
+    pub(crate) fn plaintext_protocol(&self) -> OriginProtocol {
+        if self.http_versions.contains(&CompiledHttpVersion::Http1) {
+            OriginProtocol::Http1
         } else {
-            negotiated.is_none() || negotiated == Some(b"http/1.1")
-        };
-        compatible
-            .then_some(())
-            .ok_or(OriginProtocolError::IncompatibleAlpn)
+            OriginProtocol::Http2
+        }
+    }
+
+    pub(crate) fn negotiated_protocol(
+        &self,
+        negotiated: Option<&[u8]>,
+    ) -> Result<OriginProtocol, OriginProtocolError> {
+        match negotiated {
+            Some(b"h2") if self.http_versions.contains(&CompiledHttpVersion::Http2) => {
+                Ok(OriginProtocol::Http2)
+            }
+            Some(b"http/1.1") | None
+                if self.http_versions.contains(&CompiledHttpVersion::Http1) =>
+            {
+                Ok(OriginProtocol::Http1)
+            }
+            _ => Err(OriginProtocolError::IncompatibleAlpn),
+        }
     }
 }
 
@@ -613,20 +638,8 @@ default = "deny"
                 [CompiledHttpVersion::Http1, CompiledHttpVersion::Http2]
             );
             assert_eq!(
-                snapshot
-                    .origin_tls()
-                    .client_config(false)
-                    .unwrap()
-                    .alpn_protocols,
-                [b"http/1.1".to_vec()]
-            );
-            assert_eq!(
-                snapshot
-                    .origin_tls()
-                    .client_config(true)
-                    .unwrap()
-                    .alpn_protocols,
-                [b"h2".to_vec()]
+                snapshot.origin_tls().client_config().alpn_protocols,
+                [b"h2".to_vec(), b"http/1.1".to_vec()]
             );
         }
     }
@@ -636,11 +649,56 @@ default = "deny"
         for version in [CompiledHttpVersion::Http1, CompiledHttpVersion::Http2] {
             let snapshot = activate(direct_plan(CompiledTlsTrust::Insecure, None, vec![version]));
             assert_eq!(snapshot.origin_tls().http_versions(), [version]);
-            let use_http2 = version == CompiledHttpVersion::Http2;
-            assert!(snapshot.origin_tls().client_config(use_http2).is_ok());
             assert_eq!(
-                snapshot.origin_tls().client_config(!use_http2).err(),
-                Some(OriginProtocolError::Disabled)
+                snapshot.origin_tls().client_config().alpn_protocols,
+                [if version == CompiledHttpVersion::Http2 {
+                    b"h2".to_vec()
+                } else {
+                    b"http/1.1".to_vec()
+                }]
+            );
+            assert_eq!(
+                snapshot.origin_tls().plaintext_protocol(),
+                if version == CompiledHttpVersion::Http2 {
+                    OriginProtocol::Http2
+                } else {
+                    OriginProtocol::Http1
+                }
+            );
+            let expected = if version == CompiledHttpVersion::Http2 {
+                OriginProtocol::Http2
+            } else {
+                OriginProtocol::Http1
+            };
+            let expected_alpn: &[u8] = if version == CompiledHttpVersion::Http2 {
+                b"h2"
+            } else {
+                b"http/1.1"
+            };
+            assert_eq!(
+                snapshot
+                    .origin_tls()
+                    .negotiated_protocol(Some(expected_alpn)),
+                Ok(expected)
+            );
+            assert_eq!(
+                snapshot.origin_tls().negotiated_protocol(None),
+                if version == CompiledHttpVersion::Http1 {
+                    Ok(OriginProtocol::Http1)
+                } else {
+                    Err(OriginProtocolError::IncompatibleAlpn)
+                }
+            );
+            let incompatible: &[u8] = if version == CompiledHttpVersion::Http2 {
+                b"http/1.1"
+            } else {
+                b"h2"
+            };
+            assert_eq!(
+                snapshot
+                    .origin_tls()
+                    .negotiated_protocol(Some(incompatible)),
+                Err(OriginProtocolError::IncompatibleAlpn)
             );
         }
     }
@@ -663,18 +721,22 @@ default = "deny"
         .unwrap();
 
         assert_eq!(load_count.get(), 1);
-        assert_eq!(tls.validate_negotiated_alpn(false, None), Ok(()));
         assert_eq!(
-            tls.validate_negotiated_alpn(false, Some(b"http/1.1")),
-            Ok(())
+            tls.client_config().alpn_protocols,
+            [b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        assert_eq!(tls.plaintext_protocol(), OriginProtocol::Http1);
+        assert_eq!(tls.negotiated_protocol(None), Ok(OriginProtocol::Http1));
+        assert_eq!(
+            tls.negotiated_protocol(Some(b"http/1.1")),
+            Ok(OriginProtocol::Http1)
         );
         assert_eq!(
-            tls.validate_negotiated_alpn(false, Some(b"h2")),
-            Err(OriginProtocolError::IncompatibleAlpn)
+            tls.negotiated_protocol(Some(b"h2")),
+            Ok(OriginProtocol::Http2)
         );
-        assert_eq!(tls.validate_negotiated_alpn(true, Some(b"h2")), Ok(()));
         assert_eq!(
-            tls.validate_negotiated_alpn(true, None),
+            tls.negotiated_protocol(Some(b"http/3")),
             Err(OriginProtocolError::IncompatibleAlpn)
         );
     }

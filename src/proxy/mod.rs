@@ -1,5 +1,7 @@
 pub(crate) mod authority;
 pub mod explicit_https;
+pub(crate) mod forward;
+pub(crate) mod headers;
 pub mod http;
 pub mod https_connect;
 pub mod https_transparent;

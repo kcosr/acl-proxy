@@ -35,6 +35,7 @@ pub(crate) enum ClientAlpn {
     None,
     Http1,
     Http2,
+    Http2AndHttp1,
 }
 
 impl ClientAlpn {
@@ -43,6 +44,7 @@ impl ClientAlpn {
             Self::None => Vec::new(),
             Self::Http1 => vec![b"http/1.1".to_vec()],
             Self::Http2 => vec![b"h2".to_vec()],
+            Self::Http2AndHttp1 => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
         }
     }
 }
