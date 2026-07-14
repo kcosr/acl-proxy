@@ -82,6 +82,7 @@ pub(crate) struct ForwardBody {
     terminal_error: Option<ForwardBodyError>,
     terminal_drain_timeout: Duration,
     terminal_drain_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    terminal_driver_abort_started: bool,
     driver: DriverTask,
 }
 
@@ -156,6 +157,7 @@ impl ForwardBody {
             terminal_error: None,
             terminal_drain_timeout: TERMINAL_DRIVER_DRAIN_TIMEOUT,
             terminal_drain_deadline: None,
+            terminal_driver_abort_started: false,
             driver,
         }
     }
@@ -173,7 +175,10 @@ impl ForwardBody {
         }
     }
 
-    fn poll_terminal_drain_timeout(&mut self, context: &mut Context<'_>) -> Poll<ForwardBodyError> {
+    fn poll_incomplete_response_timeout(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<ForwardBodyError> {
         let Some(deadline) = self.terminal_drain_deadline.as_mut() else {
             return Poll::Pending;
         };
@@ -187,6 +192,32 @@ impl ForwardBody {
         self.poll_terminal_error_join(context)
     }
 
+    fn poll_aborted_terminal_driver_join(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), ForwardBodyError>> {
+        match self.driver.poll(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(_) => Poll::Ready(Ok(())),
+        }
+    }
+
+    fn poll_driver_drain_timeout(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), ForwardBodyError>> {
+        let Some(deadline) = self.terminal_drain_deadline.as_mut() else {
+            return Poll::Pending;
+        };
+        if deadline.as_mut().poll(context).is_pending() {
+            return Poll::Pending;
+        }
+
+        self.terminal_driver_abort_started = true;
+        self.driver.abort();
+        self.poll_aborted_terminal_driver_join(context)
+    }
+
     fn poll_response_trailers(
         &mut self,
         context: &mut Context<'_>,
@@ -196,7 +227,7 @@ impl ForwardBody {
         }
         let trailers = match self.body.as_mut() {
             Some(body) => match Pin::new(body).poll_trailers(context) {
-                Poll::Pending => return self.poll_terminal_drain_timeout(context).map(Err),
+                Poll::Pending => return self.poll_incomplete_response_timeout(context).map(Err),
                 Poll::Ready(Ok(trailers)) => trailers,
                 Poll::Ready(Err(error)) => {
                     self.body.take();
@@ -238,8 +269,11 @@ impl ForwardBody {
         if self.terminal_error.is_some() {
             return self.poll_terminal_error_join(context).map(Err);
         }
+        if self.terminal_driver_abort_started {
+            return self.poll_aborted_terminal_driver_join(context);
+        }
         match self.driver.poll(context) {
-            Poll::Pending => self.poll_terminal_drain_timeout(context).map(Err),
+            Poll::Pending => self.poll_driver_drain_timeout(context),
             Poll::Ready(Ok(Ok(()))) => Poll::Ready(Ok(())),
             Poll::Ready(Ok(Err(error))) => {
                 let error = ForwardBodyError::Connection(std::sync::Arc::new(error));
@@ -1088,7 +1122,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_driver_drain_timeout_is_sticky_and_aborts_driver() {
+    async fn pending_trailer_timeout_is_sticky_and_aborts_driver() {
         let (started_tx, started_rx) = oneshot::channel();
         let (dropped_tx, dropped_rx) = oneshot::channel();
         let signal = DropSignal(Some(dropped_tx));
@@ -1098,16 +1132,56 @@ mod tests {
             std::future::pending::<Result<(), hyper::Error>>().await
         });
         started_rx.await.unwrap();
-        let mut body = ForwardBody::new(Body::empty(), DriverTask::from_handle(driver))
+        let (pending_sender, pending_body) = Body::channel();
+        let mut body = ForwardBody::new(pending_body, DriverTask::from_handle(driver))
             .with_terminal_drain_timeout(Duration::ZERO);
+        body.data_done = true;
+        body.begin_terminal_drain();
 
         let error = body.data().await.unwrap().unwrap_err();
+        drop(pending_sender);
         assert!(matches!(error, ForwardBodyError::Timeout));
         let error = body.data().await.unwrap().unwrap_err();
         assert!(matches!(error, ForwardBodyError::Timeout));
         let error = body.trailers().await.unwrap_err();
         assert!(matches!(error, ForwardBodyError::Timeout));
         assert!(!body.is_end_stream());
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn driver_drain_timeout_preserves_complete_body_and_trailers() {
+        let (mut sender, upstream_body) = Body::channel();
+        tokio::spawn(async move {
+            sender
+                .send_data(Bytes::from_static(b"complete"))
+                .await
+                .unwrap();
+            let mut trailers = http::HeaderMap::new();
+            trailers.insert("grpc-status", HeaderValue::from_static("0"));
+            sender.send_trailers(trailers).await.unwrap();
+        });
+        let (started_tx, started_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let signal = DropSignal(Some(dropped_tx));
+        let driver = tokio::spawn(async move {
+            let _signal = signal;
+            started_tx.send(()).ok();
+            std::future::pending::<Result<(), hyper::Error>>().await
+        });
+        started_rx.await.unwrap();
+        let mut body = ForwardBody::new(upstream_body, DriverTask::from_handle(driver))
+            .with_terminal_drain_timeout(Duration::ZERO);
+
+        assert_eq!(body.data().await.unwrap().unwrap(), "complete");
+        assert!(body.data().await.is_none());
+        assert!(!body.is_end_stream());
+        let trailers = body.trailers().await.unwrap().unwrap();
+        assert_eq!(trailers["grpc-status"], "0");
+        assert!(body.is_end_stream());
         tokio::time::timeout(Duration::from_secs(1), dropped_rx)
             .await
             .unwrap()
