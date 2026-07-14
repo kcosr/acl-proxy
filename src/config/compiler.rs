@@ -3414,12 +3414,26 @@ fn configured_profile_literal_scratch_bytes(
 fn compile_resource_plan(
     config: &super::authoring::AuthoringConfig,
 ) -> Result<CompiledResourcePlan, ConfigCompileError> {
+    let body_read_plans = compile_http_body_read_plans(config)?;
     let rule_schedules = config
         .policy
         .rules
         .iter()
         .map(|rule| compile_http_rule_schedule(config, rule))
         .collect::<Result<Vec<_>, _>>()?;
+    // Mandatory decoding happens from the starting cursor before a rule is
+    // selected. A body-free rule can therefore retain that cursor's merged
+    // decoded body while any body-free suffix stage runs. Locally bounded
+    // rules are excluded because runtime enforces their smaller limit first.
+    let mut body_free_stage_bytes_by_cursor = vec![0usize; rule_schedules.len() + 1];
+    for index in (0..rule_schedules.len()).rev() {
+        body_free_stage_bytes_by_cursor[index] = body_free_stage_bytes_by_cursor[index + 1];
+        let schedule = &rule_schedules[index];
+        if schedule.local_body_allocation.is_none() {
+            body_free_stage_bytes_by_cursor[index] = body_free_stage_bytes_by_cursor[index]
+                .max(schedule.max_incoming_additional_bytes());
+        }
+    }
     let webhook_request_allocation_bytes_by_rule = rule_schedules
         .iter()
         .map(|schedule| schedule.webhook_request_allocation)
@@ -3483,12 +3497,24 @@ fn compile_resource_plan(
     for index in (0..config.policy.rules.len()).rev() {
         cursor_peaks[index] = cursor_peaks[index + 1].max(path_peaks[index]);
     }
-    let body_read_plans = compile_http_body_read_plans(config)?;
-    for (cursor_peak, read_plan) in cursor_peaks.iter_mut().zip(body_read_plans) {
+    for (index, (cursor_peak, read_plan)) in
+        cursor_peaks.iter_mut().zip(body_read_plans).enumerate()
+    {
         if let Some(limits) = read_plan.limits() {
             *cursor_peak = (*cursor_peak).max(decode_peak(
                 limits.max_encoded_bytes(),
                 limits.max_decoded_bytes(),
+            )?);
+            let merged_original = project_guarded_body_allocation(
+                limits.max_decoded_bytes(),
+                "policy.rules",
+                "post-decode merged body allocation arithmetic overflow",
+            )?;
+            *cursor_peak = (*cursor_peak).max(checked_add(
+                merged_original,
+                body_free_stage_bytes_by_cursor[index],
+                "policy.rules",
+                "post-decode body-free rule arithmetic overflow",
             )?);
         }
     }
@@ -3598,6 +3624,7 @@ fn compile_resource_plan(
 #[derive(Debug)]
 struct HttpRuleAllocationSchedule {
     initial_peak: usize,
+    local_body_allocation: Option<usize>,
     retained_original_after_pass: Option<usize>,
     incoming_stages: Vec<IncomingBodyStage>,
     webhook_request_allocation: Option<usize>,
@@ -3652,6 +3679,15 @@ fn compile_http_rule_schedule(
         })
         .transpose()?;
     let effective_body_limits = effective_http_body_limits(process_body, profile);
+    let local_body_allocation = effective_body_limits
+        .map(|(_, original_limit)| {
+            project_guarded_body_allocation(
+                original_limit,
+                "policy.rules",
+                "local decoded body allocation arithmetic overflow",
+            )
+        })
+        .transpose()?;
 
     let mut initial_peak = 0usize;
     let mut incoming_stages = Vec::with_capacity(6);
@@ -3797,11 +3833,8 @@ fn compile_http_rule_schedule(
     }
     if let Some((encoded_limit, original_limit)) = effective_body_limits {
         initial_peak = initial_peak.max(decode_peak(encoded_limit, original_limit)?);
-        let original_allocation = project_guarded_body_allocation(
-            original_limit,
-            "policy.rules",
-            "webhook body-retention arithmetic overflow",
-        )?;
+        let original_allocation =
+            local_body_allocation.expect("effective body limits have a local allocation");
         for allocation in [webhook_request_allocation, webhook_callback_allocation]
             .into_iter()
             .flatten()
@@ -3976,16 +4009,9 @@ fn compile_http_rule_schedule(
 
     Ok(HttpRuleAllocationSchedule {
         initial_peak,
+        local_body_allocation,
         retained_original_after_pass: if matches!(rule.decision, RuleDecision::Delegate) {
-            effective_body_limits
-                .map(|(_, original_limit)| {
-                    project_guarded_body_allocation(
-                        original_limit,
-                        "policy.rules",
-                        "delegate-pass body retention arithmetic overflow",
-                    )
-                })
-                .transpose()?
+            local_body_allocation
         } else {
             None
         },
@@ -4113,7 +4139,7 @@ fn decode_peak(encoded: usize, decoded: usize) -> Result<usize, ConfigCompileErr
         "service",
         "mandatory body-plan arithmetic overflow",
     )?;
-    let workspace = http_decoder_workspace_sizes(decoded)
+    let workspace = http_decoder_workspace_sizes()
         .and_then(|sizes| guarded_workspace_allocation_bytes(sizes.maximum()))
         .ok_or_else(|| {
             ConfigCompileError::at("service", "mandatory decoder workspace arithmetic overflow")
@@ -5620,6 +5646,80 @@ methods = ["POST"]
     }
 
     #[test]
+    fn upstream_body_free_delegate_holds_merged_body_across_provider_stages() {
+        let output_headers = (0..128)
+            .map(|index| format!("\"x-output-{index}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let outputs = (0..128)
+            .map(|index| {
+                format!(
+                    r#"
+[authorization.providers.first.outputs.value_{index}]
+kind = "custom_header"
+header = "x-output-{index}"
+"#
+                )
+            })
+            .collect::<String>();
+        let definitions = format!(
+            r#"
+[credentials]
+allowed_custom_headers = [{output_headers}]
+
+[authorization.providers.first]
+kind = "process"
+command = "/bin/first-provider"
+max_stdout_line_bytes = {MAX_PROCESS_STDOUT_LINE_BYTES}
+retire_timeout = "1s"
+{outputs}
+
+[authorization.providers.later]
+kind = "process"
+command = "/bin/later-provider"
+include_request_body = true
+max_request_body_bytes = {MIB}
+max_decoded_request_body_bytes = {MIB}
+max_stdout_line_bytes = 80
+retire_timeout = "1s"
+"#
+        );
+        let input = resource_config(
+            "",
+            &definitions,
+            r#"
+[[policy.rules]]
+id = "first"
+decision = "delegate"
+authorization_provider = "first"
+methods = ["POST"]
+
+[[policy.rules]]
+id = "later"
+decision = "delegate"
+authorization_provider = "later"
+methods = ["POST"]
+"#,
+        );
+        let authored: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
+        let first = compile_http_rule_schedule(&authored, &authored.policy.rules[0]).unwrap();
+        let compiled = compile(&input).unwrap();
+        let merged_original = guarded(MIB);
+        let first_provider_stage = first.max_incoming_additional_bytes();
+        let decode = decode_peak(MIB, MIB).unwrap();
+
+        assert_eq!(first.local_body_allocation, None);
+        assert!(merged_original + first_provider_stage > decode);
+        assert_eq!(
+            compiled
+                .reloadable_plan
+                .resource_plan
+                .http_wire_body_peak_bytes_by_cursor,
+            [merged_original + first_provider_stage, decode, 0]
+        );
+    }
+
+    #[test]
     fn skipped_predicate_keeps_later_mandatory_body_read_reachable() {
         let compiled = compile(&resource_config(
             "",
@@ -6614,7 +6714,7 @@ redaction_profile = "terminal"
         );
         let mut encoded = guard.buffer();
         let mut decoded = guard.buffer();
-        let decoder_sizes = crate::http_body::http_decoder_workspace_sizes(1).unwrap();
+        let decoder_sizes = crate::http_body::http_decoder_workspace_sizes().unwrap();
         let decoder_workspace = guard
             .codec_workspace_allocation(decoder_sizes.maximum())
             .unwrap();
@@ -6635,29 +6735,24 @@ redaction_profile = "terminal"
     }
 
     #[test]
-    fn authored_http_body_ceilings_fit_the_zstd_library_window() {
-        for authored_limit in [MAX_PROCESS_BODY_BYTES, MAX_REDACTION_BODY_BYTES] {
-            assert_eq!(
-                crate::http_body::zstd_window_limit(authored_limit),
-                Some(authored_limit)
-            );
-        }
+    fn fixed_zstd_standard_window_fits_the_library() {
+        assert_eq!(crate::http_body::zstd_window_limit(), Some(8 * MIB));
     }
 
     #[test]
     fn mandatory_decoder_peak_selects_largest_codec_workspace() {
         let encoded = 10 * MIB;
         let decoded = 50 * MIB;
-        let sizes = crate::http_body::http_decoder_workspace_sizes(decoded).unwrap();
+        let sizes = crate::http_body::http_decoder_workspace_sizes().unwrap();
         let expected = guarded(encoded)
             + guarded(decoded)
             + guarded(HTTP_DECODER_OUTPUT_STAGING_BYTES)
             + guarded_workspace_allocation_bytes(sizes.maximum()).unwrap();
 
         assert_eq!(decode_peak(encoded, decoded).unwrap(), expected);
-        assert_eq!(sizes.maximum(), sizes.zstd);
-        assert!(sizes.zstd > sizes.brotli);
-        assert!(sizes.brotli > sizes.deflate);
+        assert_eq!(sizes.maximum(), sizes.brotli);
+        assert!(sizes.brotli > sizes.zstd);
+        assert!(sizes.zstd > sizes.deflate);
     }
 
     fn reloadable_ownership_observations(plan: &ReloadableProductPlan) -> Vec<String> {

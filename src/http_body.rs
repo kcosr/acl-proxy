@@ -26,16 +26,15 @@ const BROTLI_FIXED_WORKSPACE_BYTES: usize = 4 * MIB;
 const BROTLI_MAX_TREE_COUNT: usize = 256;
 const BROTLI_HUFFMAN_CODE_BYTES: usize = 4;
 const BROTLI_HUFFMAN_POINTER_BYTES: usize = size_of::<usize>();
-const BROTLI_HUFFMAN_SECOND_LEVEL_TABLE_ENTRIES: usize = 376;
-const BROTLI_LITERAL_ALPHABET_ENTRIES: usize = 256;
-const BROTLI_COMMAND_ALPHABET_ENTRIES: usize = 704;
-const BROTLI_DISTANCE_ALPHABET_ENTRIES: usize = 520;
+const BROTLI_LITERAL_HUFFMAN_TABLE_ENTRIES: usize = 630;
+const BROTLI_COMMAND_HUFFMAN_TABLE_ENTRIES: usize = 1080;
+const BROTLI_DISTANCE_HUFFMAN_TABLE_ENTRIES: usize = 920;
 const BROTLI_DECODER_STATE_BUDGET_BYTES: usize = 8 * KIB;
 const BROTLI_SHARED_DICTIONARY_BUDGET_BYTES: usize = 2 * KIB;
 const BROTLI_BLOCK_TREE_BUDGET_BYTES: usize = 16 * KIB;
 const BROTLI_CONTEXT_BUDGET_BYTES: usize = 18 * KIB;
 const BROTLI_ARENA_ALLOCATION_COUNT: usize = 10;
-const ZSTD_MIN_WINDOW_BYTES: usize = KIB;
+const ZSTD_STANDARD_WINDOW_BYTES: usize = 8 * MIB;
 const ZSTD_LIBRARY_WINDOW_LOG_MAX: u32 = if usize::BITS == 32 {
     zstd_sys::ZSTD_WINDOWLOG_MAX_32
 } else {
@@ -58,13 +57,11 @@ impl HttpDecoderWorkspaceSizes {
     }
 }
 
-pub(crate) fn http_decoder_workspace_sizes(
-    max_decoded_bytes: usize,
-) -> Option<HttpDecoderWorkspaceSizes> {
+pub(crate) fn http_decoder_workspace_sizes() -> Option<HttpDecoderWorkspaceSizes> {
     let brotli = BROTLI_FIXED_WORKSPACE_BYTES
         .checked_add(BROTLI_MAX_WINDOW_BYTES)?
         .checked_add(BROTLI_RING_WRITE_AHEAD_SLACK_BYTES)?;
-    let zstd_window = zstd_window_limit(max_decoded_bytes)?;
+    let zstd_window = zstd_window_limit()?;
     // This estimator and `ZSTD_initStaticDStream` are a paired API. The
     // returned reservation contains the context and the bounded history window
     // and therefore performs no allocator callback while decoding.
@@ -79,10 +76,8 @@ pub(crate) fn http_decoder_workspace_sizes(
     })
 }
 
-const fn brotli_huffman_group_budget(alphabet_entries: usize) -> usize {
-    BROTLI_MAX_TREE_COUNT
-        * (alphabet_entries + BROTLI_HUFFMAN_SECOND_LEVEL_TABLE_ENTRIES)
-        * BROTLI_HUFFMAN_CODE_BYTES
+const fn brotli_huffman_group_budget(maximum_table_entries: usize) -> usize {
+    BROTLI_MAX_TREE_COUNT * maximum_table_entries * BROTLI_HUFFMAN_CODE_BYTES
         + BROTLI_MAX_TREE_COUNT * BROTLI_HUFFMAN_POINTER_BYTES
 }
 
@@ -93,18 +88,15 @@ const fn brotli_fixed_workspace_required_bytes() -> usize {
         + BROTLI_SHARED_DICTIONARY_BUDGET_BYTES
         + BROTLI_BLOCK_TREE_BUDGET_BYTES
         + BROTLI_CONTEXT_BUDGET_BYTES
-        + brotli_huffman_group_budget(BROTLI_LITERAL_ALPHABET_ENTRIES)
-        + brotli_huffman_group_budget(BROTLI_COMMAND_ALPHABET_ENTRIES)
-        + brotli_huffman_group_budget(BROTLI_DISTANCE_ALPHABET_ENTRIES)
+        + brotli_huffman_group_budget(BROTLI_LITERAL_HUFFMAN_TABLE_ENTRIES)
+        + brotli_huffman_group_budget(BROTLI_COMMAND_HUFFMAN_TABLE_ENTRIES)
+        + brotli_huffman_group_budget(BROTLI_DISTANCE_HUFFMAN_TABLE_ENTRIES)
         + BROTLI_ARENA_ALLOCATION_COUNT * size_of::<BrotliArenaBlock>()
 }
 
-pub(crate) fn zstd_window_limit(max_decoded_bytes: usize) -> Option<usize> {
-    let authored = max_decoded_bytes
-        .max(ZSTD_MIN_WINDOW_BYTES)
-        .checked_next_power_of_two()?;
+pub(crate) fn zstd_window_limit() -> Option<usize> {
     let library = 1usize.checked_shl(ZSTD_LIBRARY_WINDOW_LOG_MAX)?;
-    Some(authored.min(library))
+    (ZSTD_STANDARD_WINDOW_BYTES <= library).then_some(ZSTD_STANDARD_WINDOW_BYTES)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -275,8 +267,8 @@ where
         return Ok(GuardedRequestBody { body: encoded });
     }
 
-    let workspace_sizes = http_decoder_workspace_sizes(limits.max_decoded_bytes())
-        .ok_or(HttpBodyReadError::ResourceExhausted)?;
+    let workspace_sizes =
+        http_decoder_workspace_sizes().ok_or(HttpBodyReadError::ResourceExhausted)?;
     let decoded = match encoding {
         ContentEncoding::Identity => unreachable!("identity returned above"),
         ContentEncoding::Gzip => {
@@ -1132,7 +1124,6 @@ impl ZstdSession {
     async fn new(
         guard: &HttpWireBodyGuard,
         workspace_bytes: usize,
-        max_decoded: usize,
         deadline: Instant,
     ) -> Result<Self, HttpBodyReadError> {
         let mut workspace = allocate_codec_workspace(guard, workspace_bytes, deadline).await?;
@@ -1145,7 +1136,7 @@ impl ZstdSession {
         if stream.is_null() {
             return Err(HttpBodyReadError::ResourceExhausted);
         }
-        let window = zstd_window_limit(max_decoded).ok_or(HttpBodyReadError::ResourceExhausted)?;
+        let window = zstd_window_limit().ok_or(HttpBodyReadError::ResourceExhausted)?;
         let window_log = (usize::BITS - window.leading_zeros() - 1) as i32;
         let result = unsafe {
             zstd_sys::ZSTD_DCtx_setParameter(
@@ -1179,7 +1170,7 @@ async fn decode_zstd(
     deadline: Instant,
 ) -> Result<GuardedBody, HttpBodyReadError> {
     check_deadline(deadline)?;
-    let session = ZstdSession::new(guard, workspace_bytes, max_decoded, deadline).await?;
+    let session = ZstdSession::new(guard, workspace_bytes, deadline).await?;
     let mut cursor = EncodedCursor::new(encoded);
     check_deadline(deadline)?;
     let mut staging = guard.stream_scratch()?;
@@ -1190,8 +1181,7 @@ async fn decode_zstd(
         ratio,
         deadline,
     };
-    let window_limit =
-        zstd_window_limit(max_decoded).ok_or(HttpBodyReadError::ResourceExhausted)?;
+    let window_limit = zstd_window_limit().ok_or(HttpBodyReadError::ResourceExhausted)?;
     let mut at_frame_start = true;
     loop {
         progress.check_deadline()?;
@@ -1302,10 +1292,8 @@ mod tests {
         guarded_body_allocation_bytes(encoded).unwrap()
             + guarded_body_allocation_bytes(decoded).unwrap()
             + guarded_body_allocation_bytes(HTTP_DECODER_OUTPUT_STAGING_BYTES).unwrap()
-            + guarded_workspace_allocation_bytes(
-                http_decoder_workspace_sizes(decoded).unwrap().maximum(),
-            )
-            .unwrap()
+            + guarded_workspace_allocation_bytes(http_decoder_workspace_sizes().unwrap().maximum())
+                .unwrap()
     }
 
     async fn invoke(
@@ -1375,9 +1363,6 @@ mod tests {
 
     fn zstd(input: &[u8]) -> Vec<u8> {
         let mut encoder = zstd::stream::Encoder::new(Vec::new(), 1).unwrap();
-        let window = input.len().max(ZSTD_MIN_WINDOW_BYTES).next_power_of_two();
-        let window_log = usize::BITS - window.leading_zeros() - 1;
-        encoder.window_log(window_log).unwrap();
         encoder.write_all(input).unwrap();
         encoder.finish().unwrap()
     }
@@ -1401,7 +1386,7 @@ mod tests {
 
     #[test]
     fn workspace_selection_includes_each_bounded_codec() {
-        let small = http_decoder_workspace_sizes(KIB).unwrap();
+        let small = http_decoder_workspace_sizes().unwrap();
         assert_eq!(small.maximum(), small.brotli);
         assert!(small.deflate > 0);
         assert_eq!(
@@ -1410,12 +1395,12 @@ mod tests {
                 + BROTLI_MAX_WINDOW_BYTES
                 + BROTLI_RING_WRITE_AHEAD_SLACK_BYTES
         );
-        assert!(small.zstd > ZSTD_MIN_WINDOW_BYTES);
+        assert!(small.zstd > ZSTD_STANDARD_WINDOW_BYTES);
 
-        let large = http_decoder_workspace_sizes(32 * MIB).unwrap();
+        let large = http_decoder_workspace_sizes().unwrap();
         assert_eq!(large.brotli, small.brotli);
-        assert!(large.zstd > small.zstd);
-        assert_eq!(large.maximum(), large.zstd);
+        assert_eq!(large.zstd, small.zstd);
+        assert_eq!(large.maximum(), large.brotli);
     }
 
     #[test]
@@ -1460,6 +1445,25 @@ mod tests {
             let (result, guard, pool) =
                 invoke(encoded.clone(), Some("br"), encoded.len(), plain.len(), 128).await;
             assert_eq!(body_bytes(&result.unwrap()), plain, "window {window_bits}");
+            drop(guard);
+            assert_eq!(pool.global_charge(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn zstd_standard_window_is_independent_of_decoded_body_limit() {
+        let plain = b"default streaming zstd body".repeat(4096);
+        let decoded_limit = MIB;
+        for encoded in [zstd(&plain), zstd_with_window(&plain, 23)] {
+            let (result, guard, pool) = invoke(
+                encoded.clone(),
+                Some("zstd"),
+                encoded.len(),
+                decoded_limit,
+                128,
+            )
+            .await;
+            assert_eq!(body_bytes(&result.unwrap()), plain);
             drop(guard);
             assert_eq!(pool.global_charge(), 0);
         }
@@ -1729,22 +1733,22 @@ mod tests {
             (
                 "gzip",
                 gzip(&plain),
-                http_decoder_workspace_sizes(plain.len()).unwrap().deflate,
+                http_decoder_workspace_sizes().unwrap().deflate,
             ),
             (
                 "deflate",
                 raw_deflate(&plain),
-                http_decoder_workspace_sizes(plain.len()).unwrap().deflate,
+                http_decoder_workspace_sizes().unwrap().deflate,
             ),
             (
                 "br",
                 brotli(&plain),
-                http_decoder_workspace_sizes(plain.len()).unwrap().brotli,
+                http_decoder_workspace_sizes().unwrap().brotli,
             ),
             (
                 "zstd",
                 zstd(&plain),
-                http_decoder_workspace_sizes(plain.len()).unwrap().zstd,
+                http_decoder_workspace_sizes().unwrap().zstd,
             ),
         ];
         for (encoding, encoded, workspace) in cases {
@@ -1968,9 +1972,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_concatenated_zstd_frame_enforces_the_authored_window() {
+    async fn every_concatenated_zstd_frame_enforces_the_standard_window() {
         let first = zstd(b"first");
-        let oversized = zstd_with_window(b"second", 20);
+        let oversized = zstd_with_window(b"second", 24);
         let encoded = [first, oversized].concat();
         let decoded_limit = 64 * KIB;
         let (result, guard, pool) = invoke(
@@ -2027,7 +2031,7 @@ mod tests {
             (ContentEncoding::Zstd, zstd(&plain)),
         ];
         for (encoding, bytes) in cases {
-            let sizes = http_decoder_workspace_sizes(plain.len()).unwrap();
+            let sizes = http_decoder_workspace_sizes().unwrap();
             let peak = compiled_peak(bytes.len(), plain.len());
             let pool = WireBodyPool::new(peak, peak);
             let guard = pool.begin_for_test(peak, key());
