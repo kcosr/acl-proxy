@@ -419,7 +419,7 @@ enum ResolvedForwardingRoute {
 /// The opaque result is consumed exactly once by `forward_request`.
 pub(crate) async fn resolve_forwarding_target<'egress>(
     canonical: &CanonicalUrl,
-    request: &SanitizedRequest,
+    request: &SanitizedRequest<impl Sized>,
     egress: &'egress dyn EgressSnapshot,
     destinations: &DestinationGuard,
 ) -> Result<ResolvedForwardingTarget<'egress>, ResolveForwardingError> {
@@ -452,13 +452,18 @@ pub(crate) async fn resolve_forwarding_target<'egress>(
 /// Sends one already-authorized logical origin request without connection reuse.
 /// The destination token carries the only DNS result; connect performs the
 /// synchronous pre- and post-connect validation before any outbound bytes.
-pub(crate) async fn forward_request<'egress>(
-    request: SanitizedRequest,
+pub(crate) async fn forward_request<'egress, B>(
+    request: SanitizedRequest<B>,
     canonical: &CanonicalUrl,
     egress: &'egress dyn EgressSnapshot,
     destinations: &DestinationGuard,
     target: ResolvedForwardingTarget<'egress>,
-) -> Result<ForwardedResponse, ForwardError> {
+) -> Result<ForwardedResponse, ForwardError>
+where
+    B: HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
     forward_with_connector(
         request,
         canonical,
@@ -470,8 +475,8 @@ pub(crate) async fn forward_request<'egress>(
     .await
 }
 
-async fn forward_with_connector<'egress, C>(
-    request: SanitizedRequest,
+async fn forward_with_connector<'egress, C, B>(
+    request: SanitizedRequest<B>,
     canonical: &CanonicalUrl,
     egress: &'egress dyn EgressSnapshot,
     destinations: &DestinationGuard,
@@ -481,6 +486,9 @@ async fn forward_with_connector<'egress, C>(
 where
     C: DestinationConnector,
     C::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let selected_origin_protocol = egress.origin_tls().select_protocol(request.protocol());
     if target.canonical_url != canonical.url
@@ -524,8 +532,8 @@ where
     }
 }
 
-async fn forward_direct<S>(
-    request: SanitizedRequest,
+async fn forward_direct<S, B>(
+    request: SanitizedRequest<B>,
     canonical: &CanonicalUrl,
     egress: &dyn EgressSnapshot,
     protocol: OriginProtocol,
@@ -533,6 +541,9 @@ async fn forward_direct<S>(
 ) -> Result<ForwardedResponse, ForwardError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     if canonical.scheme == "https" {
         let stream = connect_origin_tls(stream, canonical, egress, protocol).await?;
@@ -546,8 +557,8 @@ where
     }
 }
 
-async fn forward_via_parent<S>(
-    request: SanitizedRequest,
+async fn forward_via_parent<S, B>(
+    request: SanitizedRequest<B>,
     canonical: &CanonicalUrl,
     egress: &dyn EgressSnapshot,
     parent: &ParentEndpoint,
@@ -556,6 +567,9 @@ async fn forward_via_parent<S>(
 ) -> Result<ForwardedResponse, ForwardError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     if canonical.scheme == "https" {
         // CONNECT is deliberately HTTP/1.1 and contains no logical-origin
@@ -689,13 +703,16 @@ where
     }
 }
 
-async fn send_request<S>(
+async fn send_request<S, B>(
     stream: S,
-    request: Request<Body>,
+    request: Request<B>,
     protocol: OriginProtocol,
 ) -> Result<ForwardedResponse, ForwardError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let mut builder = conn::Builder::new();
     if protocol.is_http2() {

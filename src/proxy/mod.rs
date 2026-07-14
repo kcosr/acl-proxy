@@ -1,4 +1,5 @@
 pub(crate) mod authority;
+pub(crate) mod cleartext;
 pub mod explicit_https;
 pub(crate) mod forward;
 pub(crate) mod headers;

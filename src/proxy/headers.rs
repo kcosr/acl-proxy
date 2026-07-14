@@ -31,12 +31,12 @@ pub(crate) enum HeaderPreparationError {
     InvalidConnection,
 }
 
-pub(crate) struct SanitizedRequest {
-    request: Request<Body>,
+pub(crate) struct SanitizedRequest<B = Body> {
+    request: Request<B>,
     protocol: OriginProtocol,
 }
 
-impl SanitizedRequest {
+impl<B> SanitizedRequest<B> {
     pub(crate) fn headers_mut(&mut self) -> &mut HeaderMap {
         self.request.headers_mut()
     }
@@ -44,13 +44,29 @@ impl SanitizedRequest {
     pub(crate) fn protocol(&self) -> OriginProtocol {
         self.protocol
     }
+
+    pub(crate) fn into_parts(self) -> (http::request::Parts, B, OriginProtocol) {
+        let (parts, body) = self.request.into_parts();
+        (parts, body, self.protocol)
+    }
+
+    pub(crate) fn from_parts(
+        parts: http::request::Parts,
+        body: B,
+        protocol: OriginProtocol,
+    ) -> Self {
+        Self {
+            request: Request::from_parts(parts, body),
+            protocol,
+        }
+    }
 }
 
 /// Removes attacker-controlled hop-by-hop headers before any trusted request
 /// effect, credential, identity, or loop-marker mutation is applied.
-pub(crate) fn sanitize_untrusted_request(
-    mut request: Request<Body>,
-) -> Result<SanitizedRequest, HeaderPreparationError> {
+pub(crate) fn sanitize_untrusted_request<B>(
+    mut request: Request<B>,
+) -> Result<SanitizedRequest<B>, HeaderPreparationError> {
     if request.method() == http::Method::CONNECT {
         return Err(HeaderPreparationError::ConnectUnsupported);
     }
@@ -91,12 +107,12 @@ fn strict_connection_header_tokens(
     Ok(tokens)
 }
 
-pub(crate) fn prepare_origin_request(
-    mut sanitized: SanitizedRequest,
+pub(crate) fn prepare_origin_request<B>(
+    mut sanitized: SanitizedRequest<B>,
     canonical: &CanonicalUrl,
     target_form: RequestTargetForm,
     protocol: OriginProtocol,
-) -> Result<Request<Body>, HeaderPreparationError> {
+) -> Result<Request<B>, HeaderPreparationError> {
     let use_http2 = protocol.is_http2();
     if !use_http2 && te_is_trailers_only(sanitized.request.headers()) {
         sanitized.request.headers_mut().remove(TE);
