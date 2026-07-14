@@ -21,7 +21,7 @@ use base64::Engine;
 use http::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
 use zeroize::Zeroize;
 
-use crate::config::v3_compile::{
+use crate::config::compiler::{
     CredentialActionPlan, CredentialSourcePlan, CredentialsPlan, InboundCredentialPlan,
 };
 use crate::runtime::{

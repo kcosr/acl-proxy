@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 
 use thiserror::Error;
 
-use super::authoring::ConfigV3;
+use super::authoring::AuthoringConfig;
 
 const CONFIG_PATH_ENV: &str = "ACL_PROXY_CONFIG";
 const DEFAULT_CONFIG_PATH: &str = "config/acl-proxy.toml";
@@ -26,8 +26,8 @@ pub(super) struct SelectedConfigPath {
 }
 
 #[derive(Debug)]
-pub(super) struct LoadedConfigV3 {
-    pub authored: ConfigV3,
+pub(super) struct LoadedConfig {
+    pub authored: AuthoringConfig,
     pub path: PathBuf,
     pub config_root: PathBuf,
     pub path_source: ConfigPathSource,
@@ -87,7 +87,7 @@ impl fmt::Display for SanitizedTomlDiagnostic {
 }
 
 #[derive(Debug, Error)]
-pub(super) enum V3LoadError {
+pub(super) enum ConfigLoadError {
     #[error("failed to determine the current directory while resolving the configuration path: {source}")]
     CurrentDirectory {
         #[source]
@@ -124,7 +124,7 @@ pub(super) enum V3LoadError {
     },
 }
 
-pub(super) fn load_config_v3(explicit_path: Option<&Path>) -> Result<LoadedConfigV3, V3LoadError> {
+pub(super) fn load_config(explicit_path: Option<&Path>) -> Result<LoadedConfig, ConfigLoadError> {
     let environment_path = if explicit_path.is_none() {
         env::var(CONFIG_PATH_ENV).ok()
     } else {
@@ -132,8 +132,8 @@ pub(super) fn load_config_v3(explicit_path: Option<&Path>) -> Result<LoadedConfi
     };
     let selected = select_config_path(explicit_path, environment_path.as_deref());
     let current_dir =
-        env::current_dir().map_err(|source| V3LoadError::CurrentDirectory { source })?;
-    load_selected_config_v3(selected, &current_dir)
+        env::current_dir().map_err(|source| ConfigLoadError::CurrentDirectory { source })?;
+    load_selected_config(selected, &current_dir)
 }
 
 pub(super) fn select_config_path(
@@ -158,24 +158,24 @@ pub(super) fn select_config_path(
     }
 }
 
-fn load_selected_config_v3(
+fn load_selected_config(
     selected: SelectedConfigPath,
     current_dir: &Path,
-) -> Result<LoadedConfigV3, V3LoadError> {
+) -> Result<LoadedConfig, ConfigLoadError> {
     let path = absolute_normalized_path(&selected.path, current_dir);
     let config_root = path
         .parent()
-        .ok_or_else(|| V3LoadError::InvalidPath { path: path.clone() })?
+        .ok_or_else(|| ConfigLoadError::InvalidPath { path: path.clone() })?
         .to_path_buf();
 
     let bytes = read_bounded(&path)?;
-    let text = std::str::from_utf8(&bytes).map_err(|source| V3LoadError::InvalidUtf8 {
+    let text = std::str::from_utf8(&bytes).map_err(|source| ConfigLoadError::InvalidUtf8 {
         path: path.clone(),
         valid_up_to: source.valid_up_to(),
     })?;
     let authored = parse_config_text(text, &path)?;
 
-    Ok(LoadedConfigV3 {
+    Ok(LoadedConfig {
         authored,
         path,
         config_root,
@@ -183,14 +183,17 @@ fn load_selected_config_v3(
     })
 }
 
-pub(super) fn parse_config_text(text: &str, path: &Path) -> Result<ConfigV3, V3LoadError> {
+pub(super) fn parse_config_text(
+    text: &str,
+    path: &Path,
+) -> Result<AuthoringConfig, ConfigLoadError> {
     if text.len() > MAX_CONFIG_BYTES {
-        return Err(V3LoadError::TooLarge {
+        return Err(ConfigLoadError::TooLarge {
             path: path.to_path_buf(),
             max_bytes: MAX_CONFIG_BYTES,
         });
     }
-    toml::from_str(text).map_err(|source| V3LoadError::ParseToml {
+    toml::from_str(text).map_err(|source| ConfigLoadError::ParseToml {
         path: path.to_path_buf(),
         diagnostic: sanitize_toml_error(text, &source),
     })
@@ -235,20 +238,20 @@ fn toml_location(text: &str, byte_offset: usize) -> TomlLocation {
     TomlLocation { line, column }
 }
 
-fn read_bounded(path: &Path) -> Result<Vec<u8>, V3LoadError> {
-    let file = File::open(path).map_err(|source| V3LoadError::Open {
+fn read_bounded(path: &Path) -> Result<Vec<u8>, ConfigLoadError> {
+    let file = File::open(path).map_err(|source| ConfigLoadError::Open {
         path: path.to_path_buf(),
         source,
     })?;
     let mut bytes = Vec::new();
     file.take((MAX_CONFIG_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
-        .map_err(|source| V3LoadError::Read {
+        .map_err(|source| ConfigLoadError::Read {
             path: path.to_path_buf(),
             source,
         })?;
     if bytes.len() > MAX_CONFIG_BYTES {
-        return Err(V3LoadError::TooLarge {
+        return Err(ConfigLoadError::TooLarge {
             path: path.to_path_buf(),
             max_bytes: MAX_CONFIG_BYTES,
         });
@@ -291,7 +294,7 @@ mod tests {
 
     use super::*;
 
-    const MINIMAL_V3: &str = r#"
+    const MINIMAL_CONFIG: &str = r#"
 schema_version = 3
 
 [listeners.explicit_http]
@@ -336,13 +339,13 @@ default = "deny"
         let config_dir = directory.path().join("configs");
         fs::create_dir(&config_dir).unwrap();
         let config_path = config_dir.join("acl-proxy.toml");
-        fs::write(&config_path, MINIMAL_V3).unwrap();
+        fs::write(&config_path, MINIMAL_CONFIG).unwrap();
 
         let selected = SelectedConfigPath {
             path: PathBuf::from("other/../configs/./acl-proxy.toml"),
             source: ConfigPathSource::Explicit,
         };
-        let loaded = load_selected_config_v3(selected, directory.path()).unwrap();
+        let loaded = load_selected_config(selected, directory.path()).unwrap();
 
         assert_eq!(loaded.path, config_path);
         assert_eq!(loaded.config_root, config_dir);
@@ -352,11 +355,11 @@ default = "deny"
     }
 
     #[test]
-    fn strict_v3_parse_does_not_resolve_referenced_files_secrets_or_processes() {
+    fn strict_parse_does_not_resolve_referenced_files_secrets_or_processes() {
         let directory = tempdir().unwrap();
         let config_path = directory.path().join("acl-proxy.toml");
         let config = format!(
-            r#"{MINIMAL_V3}
+            r#"{MINIMAL_CONFIG}
 
 [control]
 bind = "127.0.0.1:8898"
@@ -371,7 +374,7 @@ command = "missing-provider"
 
 [credentials.sources.token]
 source = "environment"
-variable = "MISSING_V3_LOADER_TEST_SECRET"
+variable = "MISSING_CONFIG_LOADER_TEST_SECRET"
 
 [credentials.sources.file_token]
 source = "file"
@@ -380,12 +383,12 @@ path = "missing-secret"
 [redaction.profiles.secrets]
 
 [[redaction.profiles.secrets.rules]]
-literal_environment_variables = ["MISSING_V3_LOADER_REDACTION_SECRET"]
+literal_environment_variables = ["MISSING_CONFIG_LOADER_REDACTION_SECRET"]
 "#
         );
         fs::write(&config_path, config).unwrap();
 
-        let loaded = load_selected_config_v3(
+        let loaded = load_selected_config(
             SelectedConfigPath {
                 path: config_path.clone(),
                 source: ConfigPathSource::Explicit,
@@ -411,7 +414,7 @@ literal_environment_variables = ["MISSING_V3_LOADER_REDACTION_SECRET"]
         let error = load_path(&config_path).unwrap_err();
         assert!(matches!(
             error,
-            V3LoadError::TooLarge {
+            ConfigLoadError::TooLarge {
                 max_bytes: MAX_CONFIG_BYTES,
                 ..
             }
@@ -422,7 +425,7 @@ literal_environment_variables = ["MISSING_V3_LOADER_REDACTION_SECRET"]
     fn exact_size_limit_is_accepted() {
         let directory = tempdir().unwrap();
         let config_path = directory.path().join("maximum.toml");
-        let mut bytes = MINIMAL_V3.as_bytes().to_vec();
+        let mut bytes = MINIMAL_CONFIG.as_bytes().to_vec();
         bytes.resize(MAX_CONFIG_BYTES, b' ');
         fs::write(&config_path, bytes).unwrap();
 
@@ -437,7 +440,7 @@ literal_environment_variables = ["MISSING_V3_LOADER_REDACTION_SECRET"]
 
         assert!(matches!(
             load_path(&config_path).unwrap_err(),
-            V3LoadError::InvalidUtf8 { valid_up_to: 0, .. }
+            ConfigLoadError::InvalidUtf8 { valid_up_to: 0, .. }
         ));
     }
 
@@ -447,16 +450,16 @@ literal_environment_variables = ["MISSING_V3_LOADER_REDACTION_SECRET"]
         let config_path = directory.path().join("invalid.toml");
         fs::write(
             &config_path,
-            MINIMAL_V3.replace("schema_version = 3", "schema_version = 2"),
+            MINIMAL_CONFIG.replace("schema_version = 3", "schema_version = 2"),
         )
         .unwrap();
         let wrong_version = load_path(&config_path).unwrap_err();
-        assert!(matches!(wrong_version, V3LoadError::ParseToml { .. }));
+        assert!(matches!(wrong_version, ConfigLoadError::ParseToml { .. }));
         assert!(wrong_version.to_string().contains("invalid value"));
 
-        fs::write(&config_path, format!("{MINIMAL_V3}\nlegacy = true\n")).unwrap();
+        fs::write(&config_path, format!("{MINIMAL_CONFIG}\nlegacy = true\n")).unwrap();
         let unknown = load_path(&config_path).unwrap_err();
-        assert!(matches!(unknown, V3LoadError::ParseToml { .. }));
+        assert!(matches!(unknown, ConfigLoadError::ParseToml { .. }));
         assert!(unknown.to_string().contains("unknown field"));
     }
 
@@ -469,7 +472,7 @@ literal_environment_variables = ["MISSING_V3_LOADER_REDACTION_SECRET"]
         fs::write(
             &config_path,
             format!(
-                r#"{MINIMAL_V3}
+                r#"{MINIMAL_CONFIG}
 
 [credentials.sources.token]
 source = "environment"
@@ -492,7 +495,7 @@ variable = "{SECRET_MARKER}
         fs::write(
             &config_path,
             format!(
-                r#"{MINIMAL_V3}
+                r#"{MINIMAL_CONFIG}
 
 [redaction.profiles.secrets]
 rules = [{{ literals = "{SECRET_MARKER}" }}]
@@ -511,12 +514,12 @@ rules = [{{ literals = "{SECRET_MARKER}" }}]
         let config_path = directory.path().join("missing.toml");
 
         let error = load_path(&config_path).unwrap_err();
-        assert!(matches!(error, V3LoadError::Open { .. }));
+        assert!(matches!(error, ConfigLoadError::Open { .. }));
         assert!(error.to_string().contains(config_path.to_str().unwrap()));
     }
 
-    fn load_path(path: &Path) -> Result<LoadedConfigV3, V3LoadError> {
-        load_selected_config_v3(
+    fn load_path(path: &Path) -> Result<LoadedConfig, ConfigLoadError> {
+        load_selected_config(
             SelectedConfigPath {
                 path: path.to_path_buf(),
                 source: ConfigPathSource::Explicit,
@@ -526,11 +529,11 @@ rules = [{{ literals = "{SECRET_MARKER}" }}]
     }
 
     fn assert_parse_diagnostic_is_sanitized(
-        error: &V3LoadError,
+        error: &ConfigLoadError,
         secret_marker: &str,
         expected_category: &str,
     ) {
-        assert!(matches!(error, V3LoadError::ParseToml { .. }));
+        assert!(matches!(error, ConfigLoadError::ParseToml { .. }));
 
         let display = error.to_string();
         let debug = format!("{error:?}");

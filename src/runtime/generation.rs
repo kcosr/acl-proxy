@@ -9,7 +9,7 @@ use http::header::HeaderMap;
 
 use tokio::sync::Notify;
 
-use crate::config::v3_compile::CompiledResourcePlan;
+use crate::config::compiler::CompiledResourcePlan;
 
 use super::activation::{BoxFuture, RuntimeError};
 

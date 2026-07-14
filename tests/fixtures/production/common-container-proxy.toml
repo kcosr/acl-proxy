@@ -3,6 +3,9 @@ schema_version = 3
 [service]
 request_timeout = "2h"
 shutdown_drain_timeout = "30s"
+max_active_webhook_deliveries = 256
+webhook_transport_buffer_bytes = 65536
+max_webhook_transport_bytes = 67108864
 max_inflight_wire_body_bytes = 8589934592
 max_inflight_wire_body_bytes_per_quota_key = 1073741824
 min_wire_body_concurrency = 64
@@ -11,6 +14,7 @@ max_content_decoding_expansion_ratio = 128
 [control]
 bind = "127.0.0.1:8898"
 base_path = "/_acl-proxy"
+request_body_timeout = "10s"
 
 [listeners.explicit_http]
 bind = "0.0.0.0:8881"

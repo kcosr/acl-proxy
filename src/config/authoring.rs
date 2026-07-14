@@ -37,7 +37,7 @@ impl<'de> Deserialize<'de> for SchemaVersion {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct ConfigV3 {
+pub(super) struct AuthoringConfig {
     pub schema_version: SchemaVersion,
 
     #[serde(default)]
@@ -87,6 +87,15 @@ pub(super) struct ServiceConfig {
     #[serde(default = "default_max_active_upgrades")]
     pub max_active_upgrades: usize,
 
+    #[serde(default = "default_max_active_webhook_deliveries")]
+    pub max_active_webhook_deliveries: usize,
+
+    #[serde(default = "default_webhook_transport_buffer_bytes")]
+    pub webhook_transport_buffer_bytes: usize,
+
+    #[serde(default = "default_max_webhook_transport_bytes")]
+    pub max_webhook_transport_bytes: usize,
+
     #[serde(default = "default_upgrade_relay_buffer_bytes")]
     pub upgrade_relay_buffer_bytes: usize,
 
@@ -116,6 +125,9 @@ impl Default for ServiceConfig {
             shutdown_drain_timeout: default_shutdown_drain_timeout(),
             max_retiring_generations: default_max_retiring_generations(),
             max_active_upgrades: default_max_active_upgrades(),
+            max_active_webhook_deliveries: default_max_active_webhook_deliveries(),
+            webhook_transport_buffer_bytes: default_webhook_transport_buffer_bytes(),
+            max_webhook_transport_bytes: default_max_webhook_transport_bytes(),
             upgrade_relay_buffer_bytes: default_upgrade_relay_buffer_bytes(),
             max_upgrade_buffer_bytes: default_max_upgrade_buffer_bytes(),
             max_upgrade_lifetime: default_max_upgrade_lifetime(),
@@ -142,6 +154,18 @@ fn default_max_retiring_generations() -> usize {
 
 fn default_max_active_upgrades() -> usize {
     256
+}
+
+fn default_max_active_webhook_deliveries() -> usize {
+    256
+}
+
+fn default_webhook_transport_buffer_bytes() -> usize {
+    64 * 1024
+}
+
+fn default_max_webhook_transport_bytes() -> usize {
+    64 * 1024 * 1024
 }
 
 fn default_upgrade_relay_buffer_bytes() -> usize {
@@ -183,6 +207,9 @@ pub(super) struct ControlConfig {
     #[serde(default = "default_listener_timeout")]
     pub request_header_timeout: PositiveDuration,
 
+    #[serde(default = "default_control_request_body_timeout")]
+    pub request_body_timeout: PositiveDuration,
+
     #[serde(default = "default_control_max_connections")]
     pub max_connections: usize,
 
@@ -199,6 +226,10 @@ fn default_control_base_path() -> String {
 
 fn default_control_max_connections() -> usize {
     128
+}
+
+fn default_control_request_body_timeout() -> PositiveDuration {
+    seconds(10)
 }
 
 fn default_control_max_request_body_bytes() -> usize {
@@ -626,7 +657,7 @@ pub(super) struct AuthorizationCallbackConfig {
 }
 
 fn default_resume_token_ttl() -> PositiveDuration {
-    seconds(5 * 60)
+    seconds(20)
 }
 
 fn default_max_pending_operations() -> usize {
@@ -653,6 +684,9 @@ pub(super) struct WebhookProviderConfig {
 
     #[serde(default)]
     pub include_headers: Vec<String>,
+
+    #[serde(default = "default_webhook_max_request_bytes")]
+    pub max_request_bytes: usize,
 
     #[serde(default = "default_max_response_bytes")]
     pub max_response_bytes: usize,
@@ -733,6 +767,10 @@ fn default_provider_timeout() -> PositiveDuration {
 }
 
 fn default_max_response_bytes() -> usize {
+    64 * 1024
+}
+
+fn default_webhook_max_request_bytes() -> usize {
     64 * 1024
 }
 
@@ -961,15 +999,15 @@ pub(super) enum RedactionPayloads {
 #[serde(deny_unknown_fields)]
 pub(super) struct ObservationConfig {
     #[serde(default)]
-    pub logging: LoggingConfigV3,
+    pub logging: AuthoringLoggingConfig,
 
     #[serde(default)]
-    pub capture: Option<CaptureConfigV3>,
+    pub capture: Option<AuthoringCaptureConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct LoggingConfigV3 {
+pub(super) struct AuthoringLoggingConfig {
     #[serde(default = "default_logging_level")]
     pub level: String,
 
@@ -989,7 +1027,7 @@ pub(super) struct LoggingConfigV3 {
     pub policy_decisions: PolicyDecisionLoggingConfig,
 }
 
-impl Default for LoggingConfigV3 {
+impl Default for AuthoringLoggingConfig {
     fn default() -> Self {
         Self {
             level: default_logging_level(),
@@ -1059,7 +1097,7 @@ fn default_deny_log_level() -> String {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct CaptureConfigV3 {
+pub(super) struct AuthoringCaptureConfig {
     pub events: Vec<CaptureEvent>,
     pub redaction_profile: String,
     pub directory: PathBuf,
@@ -1179,8 +1217,8 @@ header = "x-acl-proxy-request-id"
 "#;
 
     #[test]
-    fn minimal_v3_config_parses_with_secure_defaults() {
-        let config: ConfigV3 = toml::from_str(MINIMAL).unwrap();
+    fn minimal_authoring_config_parses_with_secure_defaults() {
+        let config: AuthoringConfig = toml::from_str(MINIMAL).unwrap();
         assert_eq!(
             config.service.request_timeout.get(),
             Duration::from_secs(30)
@@ -1233,6 +1271,9 @@ header = "x-acl-proxy-request-id"
             r#"shutdown_drain_timeout = "unbounded"
 max_retiring_generations = 4
 max_active_upgrades = 512
+max_active_webhook_deliveries = 64
+webhook_transport_buffer_bytes = 131072
+max_webhook_transport_bytes = 16777216
 upgrade_relay_buffer_bytes = 131072
 max_upgrade_buffer_bytes = 3221225472
 max_upgrade_lifetime = "12h"
@@ -1242,13 +1283,16 @@ min_wire_body_concurrency = 128
 max_content_decoding_expansion_ratio = 96"#,
         );
 
-        let parsed: ConfigV3 = toml::from_str(&authored).unwrap();
+        let parsed: AuthoringConfig = toml::from_str(&authored).unwrap();
         assert_eq!(
             parsed.service.shutdown_drain_timeout,
             DrainTimeout::Unbounded
         );
         assert_eq!(parsed.service.max_retiring_generations, 4);
         assert_eq!(parsed.service.max_active_upgrades, 512);
+        assert_eq!(parsed.service.max_active_webhook_deliveries, 64);
+        assert_eq!(parsed.service.webhook_transport_buffer_bytes, 128 * 1024);
+        assert_eq!(parsed.service.max_webhook_transport_bytes, 16 * 1024 * 1024);
         assert_eq!(parsed.service.upgrade_relay_buffer_bytes, 128 * 1024);
         assert_eq!(
             parsed.service.max_upgrade_buffer_bytes,
@@ -1277,20 +1321,20 @@ max_content_decoding_expansion_ratio = 96"#,
             MINIMAL.replacen("schema_version = 3", "schema_version = 4", 1),
             MINIMAL.replacen("schema_version = 3", "schema_version = \"3\"", 1),
         ] {
-            assert!(toml::from_str::<ConfigV3>(&invalid).is_err());
+            assert!(toml::from_str::<AuthoringConfig>(&invalid).is_err());
         }
     }
 
     #[test]
     fn unknown_fields_are_rejected_at_nested_and_top_levels() {
         let top = format!("{MINIMAL}\nlegacy = true\n");
-        assert!(toml::from_str::<ConfigV3>(&top).is_err());
+        assert!(toml::from_str::<AuthoringConfig>(&top).is_err());
 
         let nested = MINIMAL.replace(
             "http_versions = [\"http1\"]",
             "http_versions = [\"http1\"]\nenable_http2 = true",
         );
-        assert!(toml::from_str::<ConfigV3>(&nested).is_err());
+        assert!(toml::from_str::<AuthoringConfig>(&nested).is_err());
     }
 
     #[test]
@@ -1298,22 +1342,22 @@ max_content_decoding_expansion_ratio = 96"#,
         let generated_with_file = format!(
             "{MINIMAL}\n[mitm]\nmode = \"generated\"\ndirectory = \"certs\"\nca_certificate = \"ca.pem\"\n"
         );
-        assert!(toml::from_str::<ConfigV3>(&generated_with_file).is_err());
+        assert!(toml::from_str::<AuthoringConfig>(&generated_with_file).is_err());
 
         let webhook_with_process_field = format!(
             "{MINIMAL}\n[authorization.providers.approval]\nkind = \"webhook\"\nurl = \"https://example.test/auth\"\ncommand = \"/bin/false\"\n"
         );
-        assert!(toml::from_str::<ConfigV3>(&webhook_with_process_field).is_err());
+        assert!(toml::from_str::<AuthoringConfig>(&webhook_with_process_field).is_err());
 
         let bearer_with_basic_field = format!(
             "{MINIMAL}\n[[egress.credential_actions]]\nkind = \"bearer\"\ncredential = \"token\"\nusername = \"wrong\"\n"
         );
-        assert!(toml::from_str::<ConfigV3>(&bearer_with_basic_field).is_err());
+        assert!(toml::from_str::<AuthoringConfig>(&bearer_with_basic_field).is_err());
 
         let remove_with_value = format!(
             "{MINIMAL}\n[[egress.request_headers]]\noperation = \"remove\"\nwhen = \"always\"\nname = \"x-test\"\nvalue = \"wrong\"\n"
         );
-        assert!(toml::from_str::<ConfigV3>(&remove_with_value).is_err());
+        assert!(toml::from_str::<AuthoringConfig>(&remove_with_value).is_err());
     }
 
     #[test]
@@ -1387,9 +1431,10 @@ max_inflight_body_bytes = 67108864
 "#
         );
 
-        let parsed: ConfigV3 = toml::from_str(&config).unwrap();
+        let parsed: AuthoringConfig = toml::from_str(&config).unwrap();
         let control = parsed.control.as_ref().unwrap();
         assert_eq!(control.max_request_body_bytes, 64 * 1024);
+        assert_eq!(control.request_body_timeout.get(), Duration::from_secs(10));
         assert_eq!(
             parsed
                 .authorization
@@ -1398,7 +1443,7 @@ max_inflight_body_bytes = 67108864
                 .unwrap()
                 .resume_token_ttl
                 .get(),
-            Duration::from_secs(5 * 60)
+            Duration::from_secs(20)
         );
         assert_eq!(parsed.authorization.providers.len(), 2);
         assert_eq!(parsed.authorization.internal_context_headers.len(), 1);
@@ -1409,6 +1454,7 @@ max_inflight_body_bytes = 67108864
         };
         assert_eq!(webhook.timeout.get(), Duration::from_secs(30));
         assert_eq!(webhook.on_failure, ProviderFailureMode::Deny);
+        assert_eq!(webhook.max_request_bytes, 64 * 1024);
         assert_eq!(webhook.max_response_bytes, 64 * 1024);
 
         let process = match &parsed.authorization.providers["local"] {
@@ -1465,7 +1511,7 @@ variable = "AW_IDENTITY_TOKEN"
 "#
         );
 
-        let parsed: ConfigV3 = toml::from_str(&config).unwrap();
+        let parsed: AuthoringConfig = toml::from_str(&config).unwrap();
         let rule = &parsed.policy.rules[0];
         assert_eq!(rule.headers.present_all, ["x-aw-identity-token"]);
         assert!(matches!(
@@ -1507,28 +1553,28 @@ ca_private_key = "ca-key.pem"
 directory = "certs"
 "#;
 
-        let parsed: ConfigV3 = toml::from_str(&config).unwrap();
+        let parsed: AuthoringConfig = toml::from_str(&config).unwrap();
         let parent = parsed.egress.parent_proxy.unwrap();
         assert_eq!(parent.kind, ParentProxyKind::AclProxy);
 
         let missing_parent_kind = config.replace("kind = \"acl_proxy\"\n", "");
-        assert!(toml::from_str::<ConfigV3>(&missing_parent_kind).is_err());
+        assert!(toml::from_str::<AuthoringConfig>(&missing_parent_kind).is_err());
 
         let missing_mitm_directory = config.replace("directory = \"certs\"\n", "");
-        assert!(toml::from_str::<ConfigV3>(&missing_mitm_directory).is_err());
+        assert!(toml::from_str::<AuthoringConfig>(&missing_mitm_directory).is_err());
     }
 
     #[test]
     fn removed_v2_authoring_shapes_are_not_accepted() {
         let legacy_rule =
             format!("{MINIMAL}\n[[policy.rules]]\naction = \"allow\"\npattern = \"**\"\n");
-        assert!(toml::from_str::<ConfigV3>(&legacy_rule).is_err());
+        assert!(toml::from_str::<AuthoringConfig>(&legacy_rule).is_err());
 
         let legacy_top = MINIMAL.replace(
             "[listeners.explicit_http]",
             "[proxy.listeners.explicit_http]",
         );
-        assert!(toml::from_str::<ConfigV3>(&legacy_top).is_err());
+        assert!(toml::from_str::<AuthoringConfig>(&legacy_top).is_err());
 
         for obsolete in [
             MINIMAL.replace("inject = true", "enabled = true\ninject = true"),
@@ -1536,7 +1582,7 @@ directory = "certs"
                 "{MINIMAL}\n[redaction.profiles.legacy]\nunsupported_extensions = \"deny\"\nrules = []\n"
             ),
         ] {
-            assert!(toml::from_str::<ConfigV3>(&obsolete).is_err());
+            assert!(toml::from_str::<AuthoringConfig>(&obsolete).is_err());
         }
     }
 }

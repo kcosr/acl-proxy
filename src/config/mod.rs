@@ -1,18 +1,18 @@
 mod authoring;
+pub(crate) mod compiler;
 mod duration;
 mod facade;
-pub(crate) mod v3_compile;
-mod v3_loader;
-mod v3_template;
+mod loader;
+mod template;
 
+#[allow(unused_imports)]
+pub(crate) use compiler::{
+    ReloadableProductPlan, StaticFingerprint, StaticFingerprintError, StaticProductConfig,
+};
 #[allow(unused_imports)]
 pub(crate) use facade::{
     compile_config_text, load_and_compile_config, CompiledConfig, ConfigFacadeError,
     ConfigFileMetadata, ConfigPathSource, ConfigTextInput, LoadedCompiledConfig,
-};
-#[allow(unused_imports)]
-pub(crate) use v3_compile::{
-    ReloadableProductPlan, StaticFingerprint, StaticFingerprintError, StaticProductConfig,
 };
 
 use std::env;

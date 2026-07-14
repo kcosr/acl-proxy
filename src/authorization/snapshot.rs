@@ -7,7 +7,7 @@ use super::process::{
     ProcessActivationError, ProcessDecision, ProcessProvider, ProcessRequestError,
 };
 use super::protocol::ProviderRequest;
-use crate::config::v3_compile::{
+use crate::config::compiler::{
     AuthorizationPlan, AuthorizationProviderPlan, CompiledProviderFailureMode,
 };
 use crate::runtime::{
@@ -335,7 +335,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::config::v3_compile::{CompiledProviderFailureMode, ProcessProviderPlan};
+    use crate::config::compiler::{CompiledProviderFailureMode, ProcessProviderPlan};
     use crate::runtime::{PublicationGuard, RuntimeError};
     use crate::safety::{WireBodyPool, WireBodyQuotaKey};
 

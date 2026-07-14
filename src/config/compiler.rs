@@ -36,9 +36,21 @@ const GIB: usize = 1024 * MIB;
 const MAX_CONFIG_BYTES: usize = 10 * MIB;
 const MAX_CONTROL_CONNECTIONS: usize = 65_536;
 const MAX_CONTROL_BODY_BYTES: usize = MIB;
+const CONTROL_PARSER_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_ENDPOINT_BYTES: usize = 8 * 1024;
+const MIN_CALLBACK_BODY_BYTES: usize = 97;
+const CALLBACK_PREFIX_BYTES: usize = 61;
 const MAX_PENDING_CALLBACKS: usize = 65_536;
 const MAX_RETIRING_GENERATIONS: usize = 8;
 const MAX_ACTIVE_UPGRADES: usize = 65_536;
+const MAX_ACTIVE_WEBHOOK_DELIVERIES: usize = 4_096;
+const MIN_WEBHOOK_TRANSPORT_BUFFER_BYTES: usize = 64 * 1024;
+const MAX_WEBHOOK_TRANSPORT_BUFFER_BYTES: usize = MIB;
+const MAX_WEBHOOK_TRANSPORT_BYTES: usize = 8 * GIB;
+const MAX_WEBHOOK_BODY_BYTES: usize = MIB;
+// Compact request without the callback URL. Canonical endpoint URLs contain no
+// JSON-escaped bytes, so the provider-specific floor is this plus its URL size.
+const MIN_WEBHOOK_REQUEST_FIXED_BYTES: usize = 171;
 const MAX_UPGRADE_RELAY_BUFFER_BYTES: usize = 16 * MIB;
 const MAX_UPGRADE_BUFFER_BYTES: usize = 4 * GIB;
 const MAX_WIRE_BODY_BYTES: usize = 64 * GIB;
@@ -107,6 +119,9 @@ pub(crate) struct StaticServiceConfig {
     pub(crate) shutdown_drain_timeout: Option<Duration>,
     pub(crate) max_retiring_generations: usize,
     pub(crate) max_active_upgrades: usize,
+    pub(crate) max_active_webhook_deliveries: usize,
+    pub(crate) webhook_transport_buffer_bytes: usize,
+    pub(crate) max_webhook_transport_bytes: usize,
     pub(crate) upgrade_relay_buffer_bytes: usize,
     pub(crate) max_upgrade_buffer_bytes: usize,
     pub(crate) max_upgrade_lifetime: Duration,
@@ -120,7 +135,9 @@ pub(crate) struct StaticControlConfig {
     pub(crate) bind: SocketAddr,
     pub(crate) base_path: String,
     pub(crate) request_header_timeout: Duration,
+    pub(crate) request_body_timeout: Duration,
     pub(crate) max_connections: usize,
+    pub(crate) parser_arena_bytes: usize,
     pub(crate) max_request_body_bytes: usize,
     pub(crate) tls: Option<CompiledTlsIdentity>,
 }
@@ -425,6 +442,7 @@ pub(crate) struct WebhookProviderPlan {
     pub(crate) timeout: Duration,
     pub(crate) on_failure: CompiledProviderFailureMode,
     pub(crate) include_headers: Vec<HeaderName>,
+    pub(crate) max_request_bytes: usize,
     pub(crate) max_response_bytes: usize,
     pub(crate) outputs: BTreeMap<String, ProviderOutputPlan>,
     pub(crate) tls: Option<WebhookTlsPlan>,
@@ -823,6 +841,8 @@ pub(crate) struct CompiledResourcePlan {
     pub(crate) max_reachable_http_wire_body_peak_bytes: usize,
     pub(crate) wire_body_full_peak_capacity: Capacity,
     pub(crate) wire_body_quota_key_full_peak_capacity: Capacity,
+    pub(crate) webhook_request_allocation_bytes_by_rule: Vec<Option<usize>>,
+    pub(crate) webhook_callback_allocation_bytes_by_rule: Vec<Option<usize>>,
     pub(crate) upgrade_allocation_bytes_by_rule: Vec<Option<usize>>,
     pub(crate) max_upgrade_allocation_per_stream: usize,
     pub(crate) max_upgrade_allocation_all_streams: usize,
@@ -877,13 +897,13 @@ impl fmt::Debug for CompiledProductConfig {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("invalid v3 configuration at {path}: {message}")]
-pub(super) struct V3CompileError {
+#[error("invalid configuration at {path}: {message}")]
+pub(super) struct ConfigCompileError {
     path: String,
     message: String,
 }
 
-impl V3CompileError {
+impl ConfigCompileError {
     fn at(path: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             path: path.into(),
@@ -892,10 +912,10 @@ impl V3CompileError {
     }
 }
 
-pub(super) fn compile_v3(
-    mut config: super::authoring::ConfigV3,
+pub(super) fn compile_config(
+    mut config: super::authoring::AuthoringConfig,
     config_root: &Path,
-) -> Result<CompiledProductConfig, V3CompileError> {
+) -> Result<CompiledProductConfig, ConfigCompileError> {
     let config_root = normalize_config_root(config_root)?;
     normalize_authored_paths(&mut config, &config_root)?;
     normalize_endpoint_urls(&mut config)?;
@@ -914,7 +934,7 @@ pub(super) fn compile_v3(
         resource_plan,
     )?;
     let static_fingerprint = StaticFingerprint::from_config(&static_config)
-        .map_err(|error| V3CompileError::at("schema_version", error.to_string()))?;
+        .map_err(|error| ConfigCompileError::at("schema_version", error.to_string()))?;
 
     Ok(CompiledProductConfig {
         static_fingerprint,
@@ -923,7 +943,9 @@ pub(super) fn compile_v3(
     })
 }
 
-fn normalize_endpoint_urls(config: &mut super::authoring::ConfigV3) -> Result<(), V3CompileError> {
+fn normalize_endpoint_urls(
+    config: &mut super::authoring::AuthoringConfig,
+) -> Result<(), ConfigCompileError> {
     if let Some(parent) = config.egress.parent_proxy.as_mut() {
         parent.url = canonical_endpoint_url(&parent.url, "egress.parent_proxy.url")?;
     }
@@ -942,21 +964,21 @@ fn normalize_endpoint_urls(config: &mut super::authoring::ConfigV3) -> Result<()
     Ok(())
 }
 
-fn canonical_endpoint_url(value: &str, path: &str) -> Result<String, V3CompileError> {
+fn canonical_endpoint_url(value: &str, path: &str) -> Result<String, ConfigCompileError> {
     canonicalize_http_url(value)
         .map(|url| url.url)
-        .map_err(|error| V3CompileError::at(path, error.to_string()))
+        .map_err(|error| ConfigCompileError::at(path, error.to_string()))
 }
 
-fn normalize_config_root(root: &Path) -> Result<PathBuf, V3CompileError> {
+fn normalize_config_root(root: &Path) -> Result<PathBuf, ConfigCompileError> {
     if !root.is_absolute() {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             "config root",
             "the loader must provide an absolute config-file directory",
         ));
     }
     lexical_normalize_absolute(root).ok_or_else(|| {
-        V3CompileError::at(
+        ConfigCompileError::at(
             "config root",
             "could not normalize the config-file directory",
         )
@@ -964,9 +986,9 @@ fn normalize_config_root(root: &Path) -> Result<PathBuf, V3CompileError> {
 }
 
 fn normalize_authored_paths(
-    config: &mut super::authoring::ConfigV3,
+    config: &mut super::authoring::AuthoringConfig,
     root: &Path,
-) -> Result<(), V3CompileError> {
+) -> Result<(), ConfigCompileError> {
     if let Some(control) = config.control.as_mut() {
         if let Some(tls) = control.tls.as_mut() {
             normalize_tls_identity_paths(tls, root, "control.tls")?;
@@ -1045,7 +1067,7 @@ fn normalize_tls_identity_paths(
     identity: &mut StaticTlsIdentityConfig,
     root: &Path,
     prefix: &str,
-) -> Result<(), V3CompileError> {
+) -> Result<(), ConfigCompileError> {
     identity.certificate_chain = normalize_authored_path(
         root,
         &identity.certificate_chain,
@@ -1063,7 +1085,7 @@ fn normalize_transport_tls_paths(
     tls: &mut TransportTlsConfig,
     root: &Path,
     prefix: &str,
-) -> Result<(), V3CompileError> {
+) -> Result<(), ConfigCompileError> {
     if let Some(path) = tls.ca_certificate.as_mut() {
         *path = normalize_authored_path(root, path, &format!("{prefix}.ca_certificate"))?;
     }
@@ -1074,13 +1096,13 @@ fn normalize_authored_path(
     root: &Path,
     value: &Path,
     field: &str,
-) -> Result<PathBuf, V3CompileError> {
+) -> Result<PathBuf, ConfigCompileError> {
     if value.as_os_str().is_empty() {
-        return Err(V3CompileError::at(field, "path must not be empty"));
+        return Err(ConfigCompileError::at(field, "path must not be empty"));
     }
     if value.is_absolute() {
         return lexical_normalize_absolute(value)
-            .ok_or_else(|| V3CompileError::at(field, "absolute path could not be normalized"));
+            .ok_or_else(|| ConfigCompileError::at(field, "absolute path could not be normalized"));
     }
 
     let mut relative = PathBuf::new();
@@ -1090,19 +1112,22 @@ fn normalize_authored_path(
             Component::Normal(part) => relative.push(part),
             Component::ParentDir => {
                 if !relative.pop() {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         field,
                         "relative path must not escape the configuration directory",
                     ));
                 }
             }
             Component::RootDir | Component::Prefix(_) => {
-                return Err(V3CompileError::at(field, "invalid relative path component"));
+                return Err(ConfigCompileError::at(
+                    field,
+                    "invalid relative path component",
+                ));
             }
         }
     }
     if relative.as_os_str().is_empty() {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             field,
             "path must identify a child entry",
         ));
@@ -1128,7 +1153,9 @@ fn lexical_normalize_absolute(path: &Path) -> Option<PathBuf> {
     normalized.is_absolute().then_some(normalized)
 }
 
-fn validate_positive_limits(config: &super::authoring::ConfigV3) -> Result<(), V3CompileError> {
+fn validate_positive_limits(
+    config: &super::authoring::AuthoringConfig,
+) -> Result<(), ConfigCompileError> {
     check_range(
         "service.max_retiring_generations",
         config.service.max_retiring_generations,
@@ -1139,6 +1166,46 @@ fn validate_positive_limits(config: &super::authoring::ConfigV3) -> Result<(), V
         config.service.max_active_upgrades,
         MAX_ACTIVE_UPGRADES,
     )?;
+    check_range(
+        "service.max_active_webhook_deliveries",
+        config.service.max_active_webhook_deliveries,
+        MAX_ACTIVE_WEBHOOK_DELIVERIES,
+    )?;
+    if !(MIN_WEBHOOK_TRANSPORT_BUFFER_BYTES..=MAX_WEBHOOK_TRANSPORT_BUFFER_BYTES)
+        .contains(&config.service.webhook_transport_buffer_bytes)
+    {
+        return Err(ConfigCompileError::at(
+            "service.webhook_transport_buffer_bytes",
+            format!(
+                "must be between {MIN_WEBHOOK_TRANSPORT_BUFFER_BYTES} and {MAX_WEBHOOK_TRANSPORT_BUFFER_BYTES}"
+            ),
+        ));
+    }
+    check_range(
+        "service.max_webhook_transport_bytes",
+        config.service.max_webhook_transport_bytes,
+        MAX_WEBHOOK_TRANSPORT_BYTES,
+    )?;
+    let webhook_transport_per_delivery = config
+        .service
+        .webhook_transport_buffer_bytes
+        .checked_mul(2)
+        .ok_or_else(|| {
+            ConfigCompileError::at("service", "webhook transport arithmetic overflow")
+        })?;
+    let required_webhook_transport = config
+        .service
+        .max_active_webhook_deliveries
+        .checked_mul(webhook_transport_per_delivery)
+        .ok_or_else(|| {
+            ConfigCompileError::at("service", "webhook transport arithmetic overflow")
+        })?;
+    if required_webhook_transport > config.service.max_webhook_transport_bytes {
+        return Err(ConfigCompileError::at(
+            "service.max_webhook_transport_bytes",
+            "must hold two transport buffers for every active webhook delivery",
+        ));
+    }
     check_range(
         "service.upgrade_relay_buffer_bytes",
         config.service.upgrade_relay_buffer_bytes,
@@ -1173,9 +1240,9 @@ fn validate_positive_limits(config: &super::authoring::ConfigV3) -> Result<(), V
         .service
         .max_inflight_wire_body_bytes_per_quota_key
         .checked_mul(4)
-        .ok_or_else(|| V3CompileError::at("service", "wire-body quota arithmetic overflow"))?;
+        .ok_or_else(|| ConfigCompileError::at("service", "wire-body quota arithmetic overflow"))?;
     if four_quota > config.service.max_inflight_wire_body_bytes {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             "service.max_inflight_wire_body_bytes_per_quota_key",
             "four quota-key sub-limits must fit in the global wire-body pool",
         ));
@@ -1191,6 +1258,7 @@ fn validate_positive_limits(config: &super::authoring::ConfigV3) -> Result<(), V
             control.max_request_body_bytes,
             MAX_CONTROL_BODY_BYTES,
         )?;
+        control_parser_arena_bytes(control)?;
     }
     if let Some(callback) = &config.authorization.callback {
         check_range(
@@ -1200,7 +1268,7 @@ fn validate_positive_limits(config: &super::authoring::ConfigV3) -> Result<(), V
         )?;
     }
     if config.authorization.providers.len() > MAX_PROVIDERS {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             "authorization.providers",
             format!("must contain no more than {MAX_PROVIDERS} providers"),
         ));
@@ -1212,7 +1280,7 @@ fn validate_positive_limits(config: &super::authoring::ConfigV3) -> Result<(), V
         .filter(|provider| matches!(provider, AuthorizationProviderConfig::Process(_)))
         .count();
     if process_count > MAX_PROCESS_PROVIDERS {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             "authorization.providers",
             format!("must contain no more than {MAX_PROCESS_PROVIDERS} process providers"),
         ));
@@ -1223,14 +1291,23 @@ fn validate_positive_limits(config: &super::authoring::ConfigV3) -> Result<(), V
     Ok(())
 }
 
-fn check_range(path: &str, value: usize, maximum: usize) -> Result<(), V3CompileError> {
+fn check_range(path: &str, value: usize, maximum: usize) -> Result<(), ConfigCompileError> {
     if value == 0 || value > maximum {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             path,
             format!("must be between 1 and {maximum}"),
         ));
     }
     Ok(())
+}
+
+fn control_parser_arena_bytes(
+    control: &super::authoring::ControlConfig,
+) -> Result<usize, ConfigCompileError> {
+    control
+        .max_connections
+        .checked_mul(CONTROL_PARSER_BUFFER_BYTES)
+        .ok_or_else(|| ConfigCompileError::at("control", "parser-arena arithmetic overflow"))
 }
 
 #[derive(Default)]
@@ -1240,8 +1317,8 @@ struct ListenerFacts {
 }
 
 fn validate_listener_control_mitm_matrix(
-    config: &super::authoring::ConfigV3,
-) -> Result<ListenerFacts, V3CompileError> {
+    config: &super::authoring::AuthoringConfig,
+) -> Result<ListenerFacts, ConfigCompileError> {
     let mut facts = ListenerFacts::default();
     let listeners = &config.listeners;
     if listeners.explicit_http.is_none()
@@ -1249,19 +1326,15 @@ fn validate_listener_control_mitm_matrix(
         && listeners.explicit_https.is_none()
         && listeners.transparent_https.is_none()
     {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             "listeners",
             "at least one proxy listener must be configured",
         ));
     }
 
     if let Some(listener) = &listeners.explicit_http {
-        validate_bind(listener.bind, "listeners.explicit_http.bind", false)?;
-        insert_unique_bind(
-            &mut facts.binds,
-            listener.bind,
-            "listeners.explicit_http.bind",
-        )?;
+        let bind = validate_bind(listener.bind, "listeners.explicit_http.bind", false)?;
+        insert_unique_bind(&mut facts.binds, bind, "listeners.explicit_http.bind")?;
         validate_http_versions(
             &listener.http_versions,
             "listeners.explicit_http.http_versions",
@@ -1273,24 +1346,16 @@ fn validate_listener_control_mitm_matrix(
         )?;
     }
     if let Some(listener) = &listeners.transparent_http {
-        validate_bind(listener.bind, "listeners.transparent_http.bind", false)?;
-        insert_unique_bind(
-            &mut facts.binds,
-            listener.bind,
-            "listeners.transparent_http.bind",
-        )?;
+        let bind = validate_bind(listener.bind, "listeners.transparent_http.bind", false)?;
+        insert_unique_bind(&mut facts.binds, bind, "listeners.transparent_http.bind")?;
         validate_http_versions(
             &listener.http_versions,
             "listeners.transparent_http.http_versions",
         )?;
     }
     if let Some(listener) = &listeners.explicit_https {
-        validate_bind(listener.bind, "listeners.explicit_https.bind", false)?;
-        insert_unique_bind(
-            &mut facts.binds,
-            listener.bind,
-            "listeners.explicit_https.bind",
-        )?;
+        let bind = validate_bind(listener.bind, "listeners.explicit_https.bind", false)?;
+        insert_unique_bind(&mut facts.binds, bind, "listeners.explicit_https.bind")?;
         validate_http_versions(
             &listener.http_versions,
             "listeners.explicit_https.http_versions",
@@ -1307,12 +1372,8 @@ fn validate_listener_control_mitm_matrix(
         )?;
     }
     if let Some(listener) = &listeners.transparent_https {
-        validate_bind(listener.bind, "listeners.transparent_https.bind", false)?;
-        insert_unique_bind(
-            &mut facts.binds,
-            listener.bind,
-            "listeners.transparent_https.bind",
-        )?;
+        let bind = validate_bind(listener.bind, "listeners.transparent_https.bind", false)?;
+        insert_unique_bind(&mut facts.binds, bind, "listeners.transparent_https.bind")?;
         validate_http_versions(
             &listener.http_versions,
             "listeners.transparent_https.http_versions",
@@ -1325,35 +1386,42 @@ fn validate_listener_control_mitm_matrix(
         facts.mitm_required = true;
     }
     if let Some(control) = &config.control {
-        validate_bind(control.bind, "control.bind", true)?;
+        let bind = validate_bind(control.bind, "control.bind", true)?;
         if facts
             .binds
             .iter()
-            .any(|listener| socket_binds_overlap(*listener, control.bind))
+            .any(|listener| socket_binds_overlap(*listener, bind))
         {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 "control.bind",
                 "must differ from every proxy listener bind",
             ));
         }
-        if !canonical_socket_addr(control.bind).ip().is_loopback() && control.tls.is_none() {
-            return Err(V3CompileError::at(
+        if !bind.ip().is_loopback() && control.tls.is_none() {
+            return Err(ConfigCompileError::at(
                 "control.tls",
                 "is required for a non-loopback control bind",
             ));
         }
         validate_base_path(&control.base_path)?;
+        let callback_target = format!("{}/external-auth/callback", control.base_path);
+        if callback_target.len() > MAX_ENDPOINT_BYTES {
+            return Err(ConfigCompileError::at(
+                "control.base_path",
+                format!("encoded callback target must be at most {MAX_ENDPOINT_BYTES} bytes"),
+            ));
+        }
     }
 
     match (&config.mitm, facts.mitm_required) {
         (None, true) => {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 "mitm",
                 "is required by transparent HTTPS or an HTTP/1 CONNECT MITM policy",
             ));
         }
         (Some(_), false) => {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 "mitm",
                 "must be absent when no listener uses MITM",
             ));
@@ -1374,29 +1442,30 @@ fn validate_bind(
     bind: SocketAddr,
     path: &str,
     forbid_unspecified: bool,
-) -> Result<(), V3CompileError> {
+) -> Result<SocketAddr, ConfigCompileError> {
+    let bind = canonical_socket_addr(bind);
     if bind.port() == 0 {
-        return Err(V3CompileError::at(path, "port 0 is not allowed"));
+        return Err(ConfigCompileError::at(path, "port 0 is not allowed"));
     }
     if forbid_unspecified && bind.ip().is_unspecified() {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             path,
             "an unspecified control address is not allowed",
         ));
     }
-    Ok(())
+    Ok(bind)
 }
 
 fn insert_unique_bind(
     binds: &mut BTreeSet<SocketAddr>,
     bind: SocketAddr,
     path: &str,
-) -> Result<(), V3CompileError> {
+) -> Result<(), ConfigCompileError> {
     if binds
         .iter()
         .any(|existing| socket_binds_overlap(*existing, bind))
     {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             path,
             "overlaps another proxy listener bind",
         ));
@@ -1423,9 +1492,9 @@ fn canonical_socket_addr(address: SocketAddr) -> SocketAddr {
     }
 }
 
-fn validate_http_versions(versions: &[HttpVersion], path: &str) -> Result<(), V3CompileError> {
+fn validate_http_versions(versions: &[HttpVersion], path: &str) -> Result<(), ConfigCompileError> {
     if versions.is_empty() {
-        return Err(V3CompileError::at(path, "must not be empty"));
+        return Err(ConfigCompileError::at(path, "must not be empty"));
     }
     let mut seen = BTreeSet::new();
     for version in versions {
@@ -1434,7 +1503,7 @@ fn validate_http_versions(versions: &[HttpVersion], path: &str) -> Result<(), V3
             HttpVersion::Http2 => 2,
         };
         if !seen.insert(key) {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 path,
                 "must not contain duplicate versions",
             ));
@@ -1447,17 +1516,17 @@ fn validate_connect(
     versions: &[HttpVersion],
     connect: &super::authoring::ConnectConfig,
     path: &str,
-) -> Result<bool, V3CompileError> {
+) -> Result<bool, ConfigCompileError> {
     let has_http1 = versions.iter().any(|v| matches!(v, HttpVersion::Http1));
     let has_http2 = versions.iter().any(|v| matches!(v, HttpVersion::Http2));
     if has_http1 != connect.http1.is_some() {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             format!("{path}.http1"),
             "must be present exactly when HTTP/1 is enabled",
         ));
     }
     if has_http2 != connect.http2.is_some() {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             format!("{path}.http2"),
             "must be present exactly when HTTP/2 is enabled",
         ));
@@ -1469,14 +1538,14 @@ fn validate_listener_limits(
     connections: usize,
     streams: u32,
     prefix: &str,
-) -> Result<(), V3CompileError> {
+) -> Result<(), ConfigCompileError> {
     check_range(
         &format!("{prefix}.max_connections"),
         connections,
         MAX_LISTENER_CONNECTIONS,
     )?;
     if streams == 0 || streams > MAX_LISTENER_STREAMS {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             format!("{prefix}.max_concurrent_streams"),
             format!("must be between 1 and {MAX_LISTENER_STREAMS}"),
         ));
@@ -1484,7 +1553,7 @@ fn validate_listener_limits(
     Ok(())
 }
 
-fn validate_base_path(base: &str) -> Result<(), V3CompileError> {
+fn validate_base_path(base: &str) -> Result<(), ConfigCompileError> {
     if !base.starts_with('/')
         || base == "/"
         || base.ends_with('/')
@@ -1492,7 +1561,7 @@ fn validate_base_path(base: &str) -> Result<(), V3CompileError> {
         || base.contains('\\')
         || base.contains('%')
     {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             "control.base_path",
             "must be a normalized absolute non-root path without a trailing slash",
         ));
@@ -1502,7 +1571,7 @@ fn validate_base_path(base: &str) -> Result<(), V3CompileError> {
             .bytes()
             .any(|byte| byte.is_ascii_control() || byte == b'?' || byte == b'#')
     {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             "control.base_path",
             "contains an unsafe path component",
         ));
@@ -1511,20 +1580,20 @@ fn validate_base_path(base: &str) -> Result<(), V3CompileError> {
 }
 
 fn validate_tls_and_parent_matrix(
-    config: &super::authoring::ConfigV3,
+    config: &super::authoring::AuthoringConfig,
     listeners: &ListenerFacts,
-) -> Result<(), V3CompileError> {
+) -> Result<(), ConfigCompileError> {
     validate_transport_tls(&config.egress.origin_tls, "egress.origin_tls")?;
     match config.egress.route {
         EgressRoute::Direct => {
             if config.egress.parent_proxy.is_some() {
-                return Err(V3CompileError::at(
+                return Err(ConfigCompileError::at(
                     "egress.parent_proxy",
                     "must be absent when egress.route is direct",
                 ));
             }
             if !config.safety.loop_detection.inject {
-                return Err(V3CompileError::at(
+                return Err(ConfigCompileError::at(
                     "safety.loop_detection.inject",
                     "must be true for direct egress",
                 ));
@@ -1532,7 +1601,7 @@ fn validate_tls_and_parent_matrix(
         }
         EgressRoute::ParentProxy => {
             let parent = config.egress.parent_proxy.as_ref().ok_or_else(|| {
-                V3CompileError::at(
+                ConfigCompileError::at(
                     "egress.parent_proxy",
                     "is required when egress.route is parent_proxy",
                 )
@@ -1540,14 +1609,14 @@ fn validate_tls_and_parent_matrix(
             let url = validate_endpoint_url(&parent.url, "egress.parent_proxy.url", true)?;
             match url.scheme() {
                 "http" if parent.tls.is_some() => {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         "egress.parent_proxy.tls",
                         "must be absent for an HTTP parent URL",
                     ));
                 }
                 "https" => {
                     let tls = parent.tls.as_ref().ok_or_else(|| {
-                        V3CompileError::at(
+                        ConfigCompileError::at(
                             "egress.parent_proxy.tls",
                             "is required for an HTTPS parent URL",
                         )
@@ -1570,7 +1639,7 @@ fn validate_tls_and_parent_matrix(
                 if config.control.as_ref().is_some_and(|control| {
                     socket_binds_overlap(canonical_socket_addr(control.bind), address)
                 }) {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         "egress.parent_proxy.url",
                         "must not target the control listener",
                     ));
@@ -1580,13 +1649,13 @@ fn validate_tls_and_parent_matrix(
                     .iter()
                     .any(|listener| socket_binds_overlap(*listener, address))
                 {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         "egress.parent_proxy.url",
                         "must not target a proxy listener",
                     ));
                 }
                 if address.ip().is_loopback() {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         "egress.parent_proxy.url",
                         "must not target a literal loopback address",
                     ));
@@ -1597,7 +1666,7 @@ fn validate_tls_and_parent_matrix(
                 .as_ref()
                 .is_some_and(|control| !canonical_socket_addr(control.bind).ip().is_loopback())
             {
-                return Err(V3CompileError::at(
+                return Err(ConfigCompileError::at(
                     "control.bind",
                     "parent routing requires a loopback control bind",
                 ));
@@ -1605,7 +1674,7 @@ fn validate_tls_and_parent_matrix(
             if matches!(parent.kind, ParentProxyKind::Generic)
                 && !config.safety.loop_detection.inject
             {
-                return Err(V3CompileError::at(
+                return Err(ConfigCompileError::at(
                     "safety.loop_detection.inject",
                     "must be true when the parent proxy kind is generic",
                 ));
@@ -1616,17 +1685,19 @@ fn validate_tls_and_parent_matrix(
     for (name, provider) in &config.authorization.providers {
         if let AuthorizationProviderConfig::Webhook(webhook) = provider {
             let prefix = format!("authorization.providers.{name}");
+            validate_endpoint_length(&webhook.url, &format!("{prefix}.url"))?;
             let url = validate_endpoint_url(&webhook.url, &format!("{prefix}.url"), false)?;
+            validate_encoded_target_length(&url, &format!("{prefix}.url"))?;
             match url.scheme() {
                 "http" => {
                     if !url_host_is_loopback(&url) {
-                        return Err(V3CompileError::at(
+                        return Err(ConfigCompileError::at(
                             format!("{prefix}.url"),
                             "plain HTTP is allowed only for a loopback webhook",
                         ));
                     }
                     if webhook.tls.is_some() {
-                        return Err(V3CompileError::at(
+                        return Err(ConfigCompileError::at(
                             format!("{prefix}.tls"),
                             "must be absent for an HTTP webhook",
                         ));
@@ -1649,7 +1720,10 @@ fn validate_tls_and_parent_matrix(
     Ok(())
 }
 
-fn validate_transport_tls(tls: &TransportTlsConfig, prefix: &str) -> Result<(), V3CompileError> {
+fn validate_transport_tls(
+    tls: &TransportTlsConfig,
+    prefix: &str,
+) -> Result<(), ConfigCompileError> {
     validate_trust_matrix(tls.trust, tls.ca_certificate.as_deref(), prefix)?;
     validate_http_versions(&tls.http_versions, &format!("{prefix}.http_versions"))
 }
@@ -1658,10 +1732,10 @@ fn validate_trust_matrix(
     trust: TlsTrust,
     ca: Option<&Path>,
     prefix: &str,
-) -> Result<(), V3CompileError> {
+) -> Result<(), ConfigCompileError> {
     let requires_ca = matches!(trust, TlsTrust::Custom | TlsTrust::SystemPlusCustom);
     if requires_ca != ca.is_some() {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             format!("{prefix}.ca_certificate"),
             if requires_ca {
                 "is required for custom trust"
@@ -1673,23 +1747,24 @@ fn validate_trust_matrix(
     Ok(())
 }
 
-fn validate_endpoint_url(value: &str, path: &str, parent: bool) -> Result<Url, V3CompileError> {
-    let url = Url::parse(value)
-        .map_err(|error| V3CompileError::at(path, format!("must be an absolute URL: {error}")))?;
+fn validate_endpoint_url(value: &str, path: &str, parent: bool) -> Result<Url, ConfigCompileError> {
+    let url = Url::parse(value).map_err(|error| {
+        ConfigCompileError::at(path, format!("must be an absolute URL: {error}"))
+    })?;
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             path,
             "must use HTTP or HTTPS and include a host",
         ));
     }
     if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             path,
             "must not contain userinfo or a fragment",
         ));
     }
     if parent && (url.path() != "/" || url.query().is_some()) {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             path,
             "parent URL must not contain a path or query",
         ));
@@ -1697,20 +1772,20 @@ fn validate_endpoint_url(value: &str, path: &str, parent: bool) -> Result<Url, V
     Ok(url)
 }
 
-fn validate_dns_server_name(value: &str, path: &str) -> Result<(), V3CompileError> {
+fn validate_dns_server_name(value: &str, path: &str) -> Result<(), ConfigCompileError> {
     if value.is_empty()
         || value.ends_with('.')
         || value.contains('*')
         || value.contains(':')
         || value.parse::<IpAddr>().is_ok()
     {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             path,
             "must be a non-wildcard DNS name without a port or root dot",
         ));
     }
     if !dns_name_has_safe_ascii_shape(value) {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             path,
             "must use valid lowercase ASCII DNS labels",
         ));
@@ -1752,7 +1827,9 @@ fn url_host_is_loopback(url: &Url) -> bool {
     }
 }
 
-fn validate_callback_matrix(config: &super::authoring::ConfigV3) -> Result<(), V3CompileError> {
+fn validate_callback_matrix(
+    config: &super::authoring::AuthoringConfig,
+) -> Result<(), ConfigCompileError> {
     let webhook_delegated = config.policy.rules.iter().any(|rule| {
         rule.authorization_provider.as_ref().is_some_and(|name| {
             matches!(
@@ -1762,13 +1839,13 @@ fn validate_callback_matrix(config: &super::authoring::ConfigV3) -> Result<(), V
         })
     });
     if webhook_delegated && config.control.is_none() {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             "control",
             "is required when a rule delegates to a webhook provider",
         ));
     }
     if webhook_delegated && config.authorization.callback.is_none() {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             "authorization.callback",
             "is required when a rule delegates to a webhook provider",
         ));
@@ -1777,24 +1854,84 @@ fn validate_callback_matrix(config: &super::authoring::ConfigV3) -> Result<(), V
         return Ok(());
     };
     let control = config.control.as_ref().ok_or_else(|| {
-        V3CompileError::at("authorization.callback", "requires the control listener")
+        ConfigCompileError::at("authorization.callback", "requires the control listener")
     })?;
+    if control.max_request_body_bytes < MIN_CALLBACK_BODY_BYTES {
+        return Err(ConfigCompileError::at(
+            "control.max_request_body_bytes",
+            format!("must be at least {MIN_CALLBACK_BODY_BYTES} when callbacks are configured"),
+        ));
+    }
+    let expected_path = format!("{}/external-auth/callback", control.base_path);
+    validate_endpoint_length(&callback.public_url, "authorization.callback.public_url")?;
     let url = validate_endpoint_url(
         &callback.public_url,
         "authorization.callback.public_url",
         false,
     )?;
-    let expected_path = format!("{}/external-auth/callback", control.base_path);
     if url.path() != expected_path || url.query().is_some() {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             "authorization.callback.public_url",
             format!("path must be exactly {expected_path} with no query"),
         ));
     }
-    if url.scheme() == "http" && (!url_host_is_loopback(&url) || !control.bind.ip().is_loopback()) {
-        return Err(V3CompileError::at(
+    let control_bind = canonical_socket_addr(control.bind);
+    if url.scheme() == "http" && (!url_host_is_loopback(&url) || !control_bind.ip().is_loopback()) {
+        return Err(ConfigCompileError::at(
             "authorization.callback.public_url",
             "plain HTTP requires both a loopback URL host and loopback control bind",
+        ));
+    }
+    let callback_url = canonicalize_http_url(&callback.public_url)
+        .expect("callback URL was canonicalized before validation");
+    for (name, provider) in &config.authorization.providers {
+        let AuthorizationProviderConfig::Webhook(provider) = provider else {
+            continue;
+        };
+        let provider_url = canonicalize_http_url(&provider.url)
+            .expect("provider URL was canonicalized before validation");
+        let provider_in_control_subtree = provider_url.path == control.base_path
+            || provider_url
+                .path
+                .strip_prefix(&control.base_path)
+                .is_some_and(|suffix| suffix.starts_with('/'));
+        if provider_url.host == callback_url.host
+            && provider_url.port == callback_url.port
+            && provider_in_control_subtree
+        {
+            return Err(ConfigCompileError::at(
+                format!("authorization.providers.{name}.url"),
+                "must not target the callback authority's control subtree",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_endpoint_length(value: &str, path: &str) -> Result<(), ConfigCompileError> {
+    if value.len() > MAX_ENDPOINT_BYTES {
+        return Err(ConfigCompileError::at(
+            path,
+            format!("canonical URL must be at most {MAX_ENDPOINT_BYTES} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_encoded_target_length(url: &Url, path: &str) -> Result<(), ConfigCompileError> {
+    let query_length = url.query().map_or(Ok(0), |query| {
+        query
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| ConfigCompileError::at(path, "request-target arithmetic overflow"))
+    })?;
+    let length = query_length
+        .checked_add(url.path().len())
+        .ok_or_else(|| ConfigCompileError::at(path, "request-target arithmetic overflow"))?;
+    if length > MAX_ENDPOINT_BYTES {
+        return Err(ConfigCompileError::at(
+            path,
+            format!("encoded request target must be at most {MAX_ENDPOINT_BYTES} bytes"),
         ));
     }
     Ok(())
@@ -1805,8 +1942,8 @@ struct ValidationFacts {
 }
 
 fn validate_references_and_security_boundaries(
-    config: &super::authoring::ConfigV3,
-) -> Result<ValidationFacts, V3CompileError> {
+    config: &super::authoring::AuthoringConfig,
+) -> Result<ValidationFacts, ConfigCompileError> {
     validate_named_maps(config)?;
     let credential_destinations = validate_credentials(config)?;
     validate_internal_context(config)?;
@@ -1819,7 +1956,9 @@ fn validate_references_and_security_boundaries(
     })
 }
 
-fn validate_named_maps(config: &super::authoring::ConfigV3) -> Result<(), V3CompileError> {
+fn validate_named_maps(
+    config: &super::authoring::AuthoringConfig,
+) -> Result<(), ConfigCompileError> {
     for (prefix, names) in [
         (
             "authorization.providers",
@@ -1845,13 +1984,13 @@ fn validate_named_maps(config: &super::authoring::ConfigV3) -> Result<(), V3Comp
     Ok(())
 }
 
-fn validate_identifier(value: &str, path: &str) -> Result<(), V3CompileError> {
+fn validate_identifier(value: &str, path: &str) -> Result<(), ConfigCompileError> {
     if value.is_empty()
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
     {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             path,
             "identifier must use only ASCII letters, digits, '_', '-', or '.'",
         ));
@@ -1860,8 +1999,8 @@ fn validate_identifier(value: &str, path: &str) -> Result<(), V3CompileError> {
 }
 
 fn validate_credentials(
-    config: &super::authoring::ConfigV3,
-) -> Result<BTreeSet<String>, V3CompileError> {
+    config: &super::authoring::AuthoringConfig,
+) -> Result<BTreeSet<String>, ConfigCompileError> {
     let loop_header = normalize_header_name(
         &config.safety.loop_detection.header,
         "safety.loop_detection.header",
@@ -1874,7 +2013,7 @@ fn validate_credentials(
         )?;
         reject_base_protected_header(&header, &loop_header, "credentials.allowed_custom_headers")?;
         if !allowed_custom.insert(header) {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 "credentials.allowed_custom_headers",
                 "must be case-insensitively duplicate-free",
             ));
@@ -1884,7 +2023,7 @@ fn validate_credentials(
         match source {
             CredentialSourceConfig::Environment(value) => {
                 if !valid_environment_name(&value.variable) {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         format!("credentials.sources.{name}.variable"),
                         "must be a valid environment variable name",
                     ));
@@ -1892,7 +2031,7 @@ fn validate_credentials(
             }
             CredentialSourceConfig::File(value) => {
                 if !value.path.is_absolute() {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         format!("credentials.sources.{name}.path"),
                         "must be normalized by the config-root compiler",
                     ));
@@ -1909,13 +2048,13 @@ fn validate_credentials(
         )?;
         reject_base_protected_header(&header, &loop_header, "credentials.inbound")?;
         if !inbound_headers.insert(header.clone()) {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 format!("credentials.inbound.{name}.header"),
                 "duplicates another inbound credential header",
             ));
         }
         if inbound.process_providers.is_empty() {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 format!("credentials.inbound.{name}.process_providers"),
                 "must not be empty",
             ));
@@ -1923,7 +2062,7 @@ fn validate_credentials(
         let mut providers = BTreeSet::new();
         for provider_name in &inbound.process_providers {
             if !providers.insert(provider_name) {
-                return Err(V3CompileError::at(
+                return Err(ConfigCompileError::at(
                     format!("credentials.inbound.{name}.process_providers"),
                     "must not contain duplicates",
                 ));
@@ -1931,13 +2070,13 @@ fn validate_credentials(
             let Some(AuthorizationProviderConfig::Process(provider)) =
                 config.authorization.providers.get(provider_name)
             else {
-                return Err(V3CompileError::at(
+                return Err(ConfigCompileError::at(
                     format!("credentials.inbound.{name}.process_providers"),
                     format!("{provider_name:?} must name a process provider"),
                 ));
             };
             if !contains_header(&provider.include_headers, &header) {
-                return Err(V3CompileError::at(
+                return Err(ConfigCompileError::at(
                     format!("credentials.inbound.{name}.process_providers"),
                     format!("process provider {provider_name:?} must include the inbound header"),
                 ));
@@ -1948,7 +2087,7 @@ fn validate_credentials(
     let all_credential_destinations = collect_all_credential_destinations(config, &allowed_custom)?;
     for destination in &all_credential_destinations {
         if inbound_headers.contains(destination) {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 "credentials.inbound",
                 "outbound and inbound credential destinations must be disjoint",
             ));
@@ -1971,9 +2110,9 @@ fn validate_credentials(
 }
 
 fn collect_all_credential_destinations(
-    config: &super::authoring::ConfigV3,
+    config: &super::authoring::AuthoringConfig,
     allowed_custom: &BTreeSet<String>,
-) -> Result<BTreeSet<String>, V3CompileError> {
+) -> Result<BTreeSet<String>, ConfigCompileError> {
     let mut all = credential_action_destinations(
         &config.egress.credential_actions,
         &config.credentials,
@@ -2003,7 +2142,7 @@ fn collect_all_credential_destinations(
                     &format!("authorization.providers.{provider_name}.outputs"),
                 )? {
                     if !local.insert(destination) {
-                        return Err(V3CompileError::at(
+                        return Err(ConfigCompileError::at(
                             format!("policy.rules[{index}]"),
                             "credential destinations collide between rule actions and provider outputs",
                         ));
@@ -2012,7 +2151,7 @@ fn collect_all_credential_destinations(
             }
         }
         if local.iter().any(|destination| global.contains(destination)) {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 format!("policy.rules[{index}]"),
                 "credential destination collides with a global egress credential action",
             ));
@@ -2027,9 +2166,9 @@ fn credential_action_destinations(
     credentials: &CredentialsConfig,
     path: &str,
     allowed_custom: &BTreeSet<String>,
-) -> Result<BTreeSet<String>, V3CompileError> {
+) -> Result<BTreeSet<String>, ConfigCompileError> {
     if actions.len() > MAX_EFFECTS_PER_SCOPE {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             path,
             "contains too many credential actions",
         ));
@@ -2043,7 +2182,7 @@ fn credential_action_destinations(
             }
             CredentialActionConfig::Basic(value) => {
                 if value.username.is_empty() || value.username.contains(':') {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         format!("{path}[{index}].username"),
                         "must be nonempty and must not contain ':'",
                     ));
@@ -2056,7 +2195,7 @@ fn credential_action_destinations(
                 let header =
                     normalize_header_name(&value.header, &format!("{path}[{index}].header"))?;
                 if !allowed_custom.contains(&header) {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         format!("{path}[{index}].header"),
                         "must be declared in credentials.allowed_custom_headers",
                     ));
@@ -2065,7 +2204,7 @@ fn credential_action_destinations(
             }
         };
         if !destinations.insert(destination) {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 path,
                 "contains duplicate credential destinations",
             ));
@@ -2078,9 +2217,9 @@ fn require_credential_source(
     credentials: &CredentialsConfig,
     source: &str,
     path: &str,
-) -> Result<(), V3CompileError> {
+) -> Result<(), ConfigCompileError> {
     if !credentials.sources.contains_key(source) {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             path,
             format!("references unknown credential source {source:?}"),
         ));
@@ -2092,13 +2231,13 @@ fn provider_output_destinations(
     provider: &AuthorizationProviderConfig,
     allowed_custom: &BTreeSet<String>,
     path: &str,
-) -> Result<BTreeSet<String>, V3CompileError> {
+) -> Result<BTreeSet<String>, ConfigCompileError> {
     let outputs = match provider {
         AuthorizationProviderConfig::Webhook(value) => &value.outputs,
         AuthorizationProviderConfig::Process(value) => &value.outputs,
     };
     if outputs.len() > MAX_PROVIDER_ITEMS {
-        return Err(V3CompileError::at(path, "contains too many outputs"));
+        return Err(ConfigCompileError::at(path, "contains too many outputs"));
     }
     let mut destinations = BTreeSet::new();
     for (name, output) in outputs {
@@ -2107,7 +2246,7 @@ fn provider_output_destinations(
             super::authoring::ProviderOutputConfig::Bearer(_) => "authorization".to_string(),
             super::authoring::ProviderOutputConfig::Basic(value) => {
                 if value.username.is_empty() || value.username.contains(':') {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         format!("{path}.{name}.username"),
                         "must be nonempty and must not contain ':'",
                     ));
@@ -2118,7 +2257,7 @@ fn provider_output_destinations(
                 let header =
                     normalize_header_name(&value.header, &format!("{path}.{name}.header"))?;
                 if !allowed_custom.contains(&header) {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         format!("{path}.{name}.header"),
                         "must be declared in credentials.allowed_custom_headers",
                     ));
@@ -2127,7 +2266,7 @@ fn provider_output_destinations(
             }
         };
         if !destinations.insert(destination) {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 path,
                 "contains duplicate credential destinations",
             ));
@@ -2136,7 +2275,9 @@ fn provider_output_destinations(
     Ok(destinations)
 }
 
-fn validate_internal_context(config: &super::authoring::ConfigV3) -> Result<(), V3CompileError> {
+fn validate_internal_context(
+    config: &super::authoring::AuthoringConfig,
+) -> Result<(), ConfigCompileError> {
     let mut names = BTreeSet::new();
     for (index, name) in config
         .authorization
@@ -2149,7 +2290,7 @@ fn validate_internal_context(config: &super::authoring::ConfigV3) -> Result<(), 
             &format!("authorization.internal_context_headers[{index}]"),
         )?;
         if !names.insert(name.clone()) {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 "authorization.internal_context_headers",
                 "must be case-insensitively duplicate-free",
             ));
@@ -2164,7 +2305,7 @@ fn validate_internal_context(config: &super::authoring::ConfigV3) -> Result<(), 
             })
             .collect();
         if matching.len() != 1 {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 "authorization.internal_context_headers",
                 format!("{name:?} requires exactly one global egress literal action"),
             ));
@@ -2174,7 +2315,7 @@ fn validate_internal_context(config: &super::authoring::ConfigV3) -> Result<(), 
             HeaderEffectConfig::Remove(value) if matches!(value.when, HeaderEffectWhen::Always) => {
             }
             _ => {
-                return Err(V3CompileError::at(
+                return Err(ConfigCompileError::at(
                     "authorization.internal_context_headers",
                     format!("{name:?} requires an unconditional set or remove action"),
                 ));
@@ -2185,9 +2326,9 @@ fn validate_internal_context(config: &super::authoring::ConfigV3) -> Result<(), 
 }
 
 fn validate_provider_security(
-    config: &super::authoring::ConfigV3,
+    config: &super::authoring::AuthoringConfig,
     credential_destinations: &BTreeSet<String>,
-) -> Result<(), V3CompileError> {
+) -> Result<(), ConfigCompileError> {
     let loop_header = normalize_header_name(
         &config.safety.loop_detection.header,
         "safety.loop_detection.header",
@@ -2216,7 +2357,7 @@ fn validate_provider_security(
             AuthorizationProviderConfig::Process(value) => (&value.include_headers, true),
         };
         if headers.len() > MAX_PROVIDER_ITEMS {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 format!("authorization.providers.{name}.include_headers"),
                 "contains too many headers",
             ));
@@ -2226,23 +2367,23 @@ fn validate_provider_security(
             let path = format!("authorization.providers.{name}.include_headers[{index}]");
             let header = normalize_header_name(header, &path)?;
             if !seen.insert(header.clone()) {
-                return Err(V3CompileError::at(path, "duplicates an earlier header"));
+                return Err(ConfigCompileError::at(path, "duplicates an earlier header"));
             }
             if base_protected_headers().contains(header.as_str()) || header == loop_header {
-                return Err(V3CompileError::at(
+                return Err(ConfigCompileError::at(
                     path,
                     "provider may not receive a protected header",
                 ));
             }
             if credential_destinations.contains(&header) {
-                return Err(V3CompileError::at(
+                return Err(ConfigCompileError::at(
                     path,
                     "provider may not receive an outbound credential destination",
                 ));
             }
             if let Some(providers) = inbound.get(&header) {
                 if !is_process || !providers.contains(name) {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         path,
                         "inbound credential header is not authorized for this provider",
                     ));
@@ -2250,7 +2391,7 @@ fn validate_provider_security(
             }
             if contexts.contains(&header) && (!is_process || !context_is_consuming(config, &header))
             {
-                return Err(V3CompileError::at(
+                return Err(ConfigCompileError::at(
                     path,
                     "internal context headers may be sent only to a consuming process provider",
                 ));
@@ -2260,7 +2401,7 @@ fn validate_provider_security(
     Ok(())
 }
 
-fn context_is_consuming(config: &super::authoring::ConfigV3, header: &str) -> bool {
+fn context_is_consuming(config: &super::authoring::AuthoringConfig, header: &str) -> bool {
     config.egress.request_headers.iter().any(|effect| {
         matches!(effect, HeaderEffectConfig::Remove(value)
             if value.name.eq_ignore_ascii_case(header)
@@ -2269,10 +2410,10 @@ fn context_is_consuming(config: &super::authoring::ConfigV3, header: &str) -> bo
 }
 
 fn validate_policy(
-    config: &super::authoring::ConfigV3,
-) -> Result<Vec<Vec<CompiledUrlPattern>>, V3CompileError> {
+    config: &super::authoring::AuthoringConfig,
+) -> Result<Vec<Vec<CompiledUrlPattern>>, ConfigCompileError> {
     if config.policy.rules.len() > MAX_POLICY_RULES {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             "policy.rules",
             "contains too many rules",
         ));
@@ -2294,7 +2435,7 @@ fn validate_policy(
     for (index, rule) in config.policy.rules.iter().enumerate() {
         let prefix = format!("policy.rules[{index}]");
         if rule.id.trim().is_empty() || !ids.insert(rule.id.clone()) {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 format!("{prefix}.id"),
                 "must be nonempty and unique",
             ));
@@ -2307,13 +2448,13 @@ fn validate_policy(
             + rule.headers.all.len()
             + rule.headers.none.len();
         if predicate_count == 0 {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 &prefix,
                 "must define at least one request predicate",
             ));
         }
         if rule.urls.len() > MAX_URLS_PER_RULE {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 format!("{prefix}.urls"),
                 "contains too many URL patterns",
             ));
@@ -2324,7 +2465,10 @@ fn validate_policy(
             .enumerate()
             .map(|(pattern_index, pattern)| {
                 CompiledUrlPattern::compile(pattern).map_err(|error| {
-                    V3CompileError::at(format!("{prefix}.urls[{pattern_index}]"), error.to_string())
+                    ConfigCompileError::at(
+                        format!("{prefix}.urls[{pattern_index}]"),
+                        error.to_string(),
+                    )
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -2335,13 +2479,13 @@ fn validate_policy(
         match rule.decision {
             RuleDecision::Delegate => {
                 let provider = rule.authorization_provider.as_ref().ok_or_else(|| {
-                    V3CompileError::at(
+                    ConfigCompileError::at(
                         format!("{prefix}.authorization_provider"),
                         "is required for a delegate rule",
                     )
                 })?;
                 if !config.authorization.providers.contains_key(provider) {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         format!("{prefix}.authorization_provider"),
                         format!("references unknown provider {provider:?}"),
                     ));
@@ -2349,7 +2493,7 @@ fn validate_policy(
             }
             RuleDecision::Allow | RuleDecision::Deny => {
                 if rule.authorization_provider.is_some() {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         format!("{prefix}.authorization_provider"),
                         "is valid only for a delegate rule",
                     ));
@@ -2358,13 +2502,13 @@ fn validate_policy(
         }
         if let Some(profile) = &rule.redaction_profile {
             if matches!(rule.decision, RuleDecision::Deny) {
-                return Err(V3CompileError::at(
+                return Err(ConfigCompileError::at(
                     format!("{prefix}.redaction_profile"),
                     "is forbidden on a deny rule",
                 ));
             }
             if !config.redaction.profiles.contains_key(profile) {
-                return Err(V3CompileError::at(
+                return Err(ConfigCompileError::at(
                     format!("{prefix}.redaction_profile"),
                     format!("references unknown profile {profile:?}"),
                 ));
@@ -2375,7 +2519,7 @@ fn validate_policy(
                 || !rule.response_headers.is_empty()
                 || !rule.credential_actions.is_empty())
         {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 &prefix,
                 "deny rules cannot contain forwarding effects",
             ));
@@ -2384,20 +2528,23 @@ fn validate_policy(
             || rule.response_headers.len() > MAX_EFFECTS_PER_SCOPE
             || rule.credential_actions.len() > MAX_EFFECTS_PER_SCOPE
         {
-            return Err(V3CompileError::at(&prefix, "contains too many effects"));
+            return Err(ConfigCompileError::at(&prefix, "contains too many effects"));
         }
     }
     Ok(compiled_urls_by_rule)
 }
 
-fn validate_methods(methods: &[String], path: &str) -> Result<(), V3CompileError> {
+fn validate_methods(methods: &[String], path: &str) -> Result<(), ConfigCompileError> {
     let mut seen = BTreeSet::new();
     for method in methods {
         if method.is_empty() || !method.bytes().all(is_http_token_byte) {
-            return Err(V3CompileError::at(path, "contains an invalid HTTP token"));
+            return Err(ConfigCompileError::at(
+                path,
+                "contains an invalid HTTP token",
+            ));
         }
         if !seen.insert(method.to_ascii_uppercase()) {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 path,
                 "contains duplicate methods after normalization",
             ));
@@ -2432,13 +2579,13 @@ fn validate_header_predicates(
     prefix: &str,
     contexts: &BTreeSet<String>,
     inbound: &BTreeSet<String>,
-) -> Result<(), V3CompileError> {
+) -> Result<(), ConfigCompileError> {
     let count = rule.headers.absent_any.len()
         + rule.headers.present_all.len()
         + rule.headers.all.values().map(Vec::len).sum::<usize>()
         + rule.headers.none.values().map(Vec::len).sum::<usize>();
     if count > MAX_HEADER_PREDICATES_PER_RULE {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             format!("{prefix}.headers"),
             "contains too many names",
         ));
@@ -2451,13 +2598,13 @@ fn validate_header_predicates(
         for name in names {
             let header = normalize_header_name(name, &format!("{prefix}.headers.{kind}"))?;
             if contexts.contains(&header) {
-                return Err(V3CompileError::at(
+                return Err(ConfigCompileError::at(
                     format!("{prefix}.headers.{kind}"),
                     "internal context headers cannot be policy predicates",
                 ));
             }
             if !all_names.insert(header) {
-                return Err(V3CompileError::at(
+                return Err(ConfigCompileError::at(
                     format!("{prefix}.headers"),
                     "predicate names must be unique across predicate kinds",
                 ));
@@ -2471,27 +2618,27 @@ fn validate_header_predicates(
                 || inbound.contains(&header)
                 || base_sensitive_value_headers().contains(header.as_str())
             {
-                return Err(V3CompileError::at(
+                return Err(ConfigCompileError::at(
                     format!("{prefix}.headers.{kind}"),
                     "protected or credential-bearing headers cannot be value predicates",
                 ));
             }
             if expected.is_empty() {
-                return Err(V3CompileError::at(
+                return Err(ConfigCompileError::at(
                     format!("{prefix}.headers.{kind}.{name}"),
                     "must contain at least one value",
                 ));
             }
             for value in expected {
                 HeaderValue::from_str(value).map_err(|error| {
-                    V3CompileError::at(
+                    ConfigCompileError::at(
                         format!("{prefix}.headers.{kind}.{name}"),
                         format!("contains an invalid header value: {error}"),
                     )
                 })?;
             }
             if !all_names.insert(header) {
-                return Err(V3CompileError::at(
+                return Err(ConfigCompileError::at(
                     format!("{prefix}.headers"),
                     "predicate names must be unique across predicate kinds",
                 ));
@@ -2502,12 +2649,12 @@ fn validate_header_predicates(
 }
 
 fn validate_all_literal_effects(
-    config: &super::authoring::ConfigV3,
+    config: &super::authoring::AuthoringConfig,
     loop_header: &str,
     credential_destinations: &BTreeSet<String>,
     inbound_headers: &BTreeSet<String>,
     internal_context_headers: &BTreeSet<String>,
-) -> Result<(), V3CompileError> {
+) -> Result<(), ConfigCompileError> {
     validate_literal_effects(
         &config.egress.request_headers,
         "egress.request_headers",
@@ -2548,9 +2695,9 @@ fn validate_literal_effects(
     inbound_headers: &BTreeSet<String>,
     internal_context_headers: &BTreeSet<String>,
     allow_internal_context_headers: bool,
-) -> Result<(), V3CompileError> {
+) -> Result<(), ConfigCompileError> {
     if effects.len() > MAX_EFFECTS_PER_SCOPE {
-        return Err(V3CompileError::at(path, "contains too many effects"));
+        return Err(ConfigCompileError::at(path, "contains too many effects"));
     }
     for (index, effect) in effects.iter().enumerate() {
         let name = effect_header_name(effect).expect("every effect has a header name");
@@ -2561,7 +2708,7 @@ fn validate_literal_effects(
             || inbound_headers.contains(&name)
             || (!allow_internal_context_headers && internal_context_headers.contains(&name))
         {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 format!("{path}[{index}].name"),
                 "literal effects cannot target a protected or credential destination header",
             ));
@@ -2572,7 +2719,7 @@ fn validate_literal_effects(
                     (Some(value), None) => vec![value],
                     (None, Some(values)) if !values.is_empty() => values.iter().collect(),
                     _ => {
-                        return Err(V3CompileError::at(
+                        return Err(ConfigCompileError::at(
                             format!("{path}[{index}]"),
                             "must define exactly one of value or nonempty values",
                         ));
@@ -2580,19 +2727,19 @@ fn validate_literal_effects(
                 };
                 for value in values {
                     if value.len() > MAX_HEADER_FIELD_BYTES {
-                        return Err(V3CompileError::at(
+                        return Err(ConfigCompileError::at(
                             format!("{path}[{index}]"),
                             "header value exceeds the 64 KiB field limit",
                         ));
                     }
                     if value.contains("${") {
-                        return Err(V3CompileError::at(
+                        return Err(ConfigCompileError::at(
                             format!("{path}[{index}]"),
-                            "generic environment interpolation is not valid in v3",
+                            "generic environment interpolation is not valid in this schema",
                         ));
                     }
                     HeaderValue::from_str(value).map_err(|error| {
-                        V3CompileError::at(
+                        ConfigCompileError::at(
                             format!("{path}[{index}]"),
                             format!("contains an invalid header value: {error}"),
                         )
@@ -2604,13 +2751,13 @@ fn validate_literal_effects(
                 if value.search.len() > MAX_HEADER_FIELD_BYTES
                     || value.replace.len() > MAX_HEADER_FIELD_BYTES
                 {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         format!("{path}[{index}]"),
                         "header search or replacement text exceeds the 64 KiB field limit",
                     ));
                 }
                 if value.search.is_empty() {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         format!("{path}[{index}].search"),
                         "must not be empty",
                     ));
@@ -2618,7 +2765,7 @@ fn validate_literal_effects(
                 if HeaderValue::from_str(&value.search).is_err()
                     || HeaderValue::from_str(&value.replace).is_err()
                 {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         format!("{path}[{index}]"),
                         "replacement text must contain only valid HTTP header-value bytes",
                     ));
@@ -2637,12 +2784,12 @@ fn effect_header_name(effect: &HeaderEffectConfig) -> Option<String> {
     })
 }
 
-fn validate_capture(config: &super::authoring::ConfigV3) -> Result<(), V3CompileError> {
+fn validate_capture(config: &super::authoring::AuthoringConfig) -> Result<(), ConfigCompileError> {
     let Some(capture) = &config.observation.capture else {
         return Ok(());
     };
     if capture.events.is_empty() {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             "observation.capture.events",
             "must not be empty",
         ));
@@ -2656,7 +2803,7 @@ fn validate_capture(config: &super::authoring::ConfigV3) -> Result<(), V3Compile
             super::authoring::CaptureEvent::ResponseDenied => 4,
         };
         if !events.insert(key) {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 "observation.capture.events",
                 "must not contain duplicates",
             ));
@@ -2667,7 +2814,7 @@ fn validate_capture(config: &super::authoring::ConfigV3) -> Result<(), V3Compile
         .profiles
         .contains_key(&capture.redaction_profile)
     {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             "observation.capture.redaction_profile",
             "must name an existing redaction profile",
         ));
@@ -2676,7 +2823,7 @@ fn validate_capture(config: &super::authoring::ConfigV3) -> Result<(), V3Compile
     Ok(())
 }
 
-fn validate_capture_filename(filename: &str) -> Result<(), V3CompileError> {
+fn validate_capture_filename(filename: &str) -> Result<(), ConfigCompileError> {
     if filename.is_empty()
         || filename.contains('/')
         || filename.contains('\\')
@@ -2685,14 +2832,14 @@ fn validate_capture_filename(filename: &str) -> Result<(), V3CompileError> {
         || !filename.contains("{requestId}")
         || !filename.contains("{suffix}")
     {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             "observation.capture.filename",
             "must be a basename containing {requestId} and {suffix}",
         ));
     }
     let stripped = filename.replace("{requestId}", "").replace("{suffix}", "");
     if stripped.contains('{') || stripped.contains('}') {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             "observation.capture.filename",
             "contains an unknown template variable",
         ));
@@ -2700,15 +2847,41 @@ fn validate_capture_filename(filename: &str) -> Result<(), V3CompileError> {
     Ok(())
 }
 
-fn validate_provider_limits(config: &super::authoring::ConfigV3) -> Result<(), V3CompileError> {
+fn validate_provider_limits(
+    config: &super::authoring::AuthoringConfig,
+) -> Result<(), ConfigCompileError> {
     for (name, provider) in &config.authorization.providers {
         match provider {
             AuthorizationProviderConfig::Webhook(value) => {
                 check_range(
+                    &format!("authorization.providers.{name}.max_request_bytes"),
+                    value.max_request_bytes,
+                    MAX_WEBHOOK_BODY_BYTES,
+                )?;
+                check_range(
                     &format!("authorization.providers.{name}.max_response_bytes"),
                     value.max_response_bytes,
-                    MAX_CONTROL_BODY_BYTES,
+                    MAX_WEBHOOK_BODY_BYTES,
                 )?;
+                if value.max_response_bytes < MIN_CALLBACK_BODY_BYTES {
+                    return Err(ConfigCompileError::at(
+                        format!("authorization.providers.{name}.max_response_bytes"),
+                        format!(
+                            "must be at least {MIN_CALLBACK_BODY_BYTES} bytes to fit a callback response"
+                        ),
+                    ));
+                }
+                if let Some(callback) = &config.authorization.callback {
+                    let minimum = minimum_webhook_request_bytes(&callback.public_url)?;
+                    if value.max_request_bytes < minimum {
+                        return Err(ConfigCompileError::at(
+                            format!("authorization.providers.{name}.max_request_bytes"),
+                            format!(
+                                "must be at least {minimum} bytes to fit the provider's minimum compact request envelope"
+                            ),
+                        ));
+                    }
+                }
             }
             AuthorizationProviderConfig::Process(value) => {
                 check_range(
@@ -2727,7 +2900,7 @@ fn validate_provider_limits(config: &super::authoring::ConfigV3) -> Result<(), V
                     MAX_PROCESS_STDOUT_LINE_BYTES,
                 )?;
                 if value.max_stdout_line_bytes < PROCESS_PROVIDER_MIN_DECISION_RESPONSE_BYTES {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         format!("authorization.providers.{name}.max_stdout_line_bytes"),
                         format!(
                             "must be at least {PROCESS_PROVIDER_MIN_DECISION_RESPONSE_BYTES} bytes to fit a process-provider decision response"
@@ -2740,13 +2913,13 @@ fn validate_provider_limits(config: &super::authoring::ConfigV3) -> Result<(), V
                     MAX_PROCESS_PENDING_REQUESTS,
                 )?;
                 if value.max_decoded_request_body_bytes < value.max_request_body_bytes {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         format!("authorization.providers.{name}"),
                         "decoded request-body limit must be at least the encoded limit",
                     ));
                 }
                 if value.allow_request_body_replacement && !value.include_request_body {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         format!("authorization.providers.{name}.allow_request_body_replacement"),
                         "requires include_request_body = true",
                     ));
@@ -2774,7 +2947,7 @@ fn validate_provider_limits(config: &super::authoring::ConfigV3) -> Result<(), V
                 if greatest_request_timeout
                     .is_some_and(|timeout| value.retire_timeout.get() < timeout)
                 {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         format!("authorization.providers.{name}.retire_timeout"),
                         "must cover the greatest effective request timeout of every referencing rule",
                     ));
@@ -2785,14 +2958,25 @@ fn validate_provider_limits(config: &super::authoring::ConfigV3) -> Result<(), V
     Ok(())
 }
 
+fn minimum_webhook_request_bytes(callback_url: &str) -> Result<usize, ConfigCompileError> {
+    MIN_WEBHOOK_REQUEST_FIXED_BYTES
+        .checked_add(callback_url.len())
+        .ok_or_else(|| {
+            ConfigCompileError::at(
+                "authorization.callback.public_url",
+                "minimum webhook request-envelope arithmetic overflow",
+            )
+        })
+}
+
 fn validate_process_environment(
     name: &str,
     value: &super::authoring::ProcessProviderConfig,
-) -> Result<(), V3CompileError> {
+) -> Result<(), ConfigCompileError> {
     let mut names = BTreeSet::new();
     for environment_name in &value.pass_environment {
         if !valid_environment_name(environment_name) || !names.insert(environment_name) {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 format!("authorization.providers.{name}.pass_environment"),
                 "must contain unique valid environment variable names",
             ));
@@ -2800,13 +2984,13 @@ fn validate_process_environment(
     }
     for environment_name in value.environment.keys() {
         if !valid_environment_name(environment_name) {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 format!("authorization.providers.{name}.environment"),
                 "contains an invalid environment variable name",
             ));
         }
         if names.contains(environment_name) {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 format!("authorization.providers.{name}.environment"),
                 "must not overlap pass_environment",
             ));
@@ -2815,9 +2999,11 @@ fn validate_process_environment(
     Ok(())
 }
 
-fn validate_redaction_limits(config: &super::authoring::ConfigV3) -> Result<(), V3CompileError> {
+fn validate_redaction_limits(
+    config: &super::authoring::AuthoringConfig,
+) -> Result<(), ConfigCompileError> {
     if config.redaction.profiles.len() > MAX_REDACTION_PROFILES {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             "redaction.profiles",
             "contains too many profiles",
         ));
@@ -2863,13 +3049,13 @@ fn validate_redaction_limits(config: &super::authoring::ConfigV3) -> Result<(), 
         )?;
         configured_profile_literal_scratch_bytes(profile, &prefix)?;
         if profile.max_decoded_body_bytes < profile.max_body_bytes {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 &prefix,
                 "max_decoded_body_bytes must be at least max_body_bytes",
             ));
         }
         if profile.max_message_bytes < profile.max_frame_bytes {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 &prefix,
                 "max_message_bytes must be at least max_frame_bytes",
             ));
@@ -2881,13 +3067,13 @@ fn validate_redaction_limits(config: &super::authoring::ConfigV3) -> Result<(), 
             &prefix,
         )?;
         if profile.replacement.contains("${") {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 format!("{prefix}.replacement"),
-                "generic environment interpolation is not valid in v3",
+                "generic environment interpolation is not valid in this schema",
             ));
         }
         if profile.rules.is_empty() || profile.rules.len() > MAX_REDACTION_RULES {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 format!("{prefix}.rules"),
                 format!("must contain between 1 and {MAX_REDACTION_RULES} rules"),
             ));
@@ -2899,11 +3085,13 @@ fn validate_redaction_limits(config: &super::authoring::ConfigV3) -> Result<(), 
             .try_fold((0usize, 0usize), |(count, bytes), expression| {
                 Some((count.checked_add(1)?, bytes.checked_add(expression.len())?))
             })
-            .ok_or_else(|| V3CompileError::at(&prefix, "expression budget arithmetic overflow"))?;
+            .ok_or_else(|| {
+                ConfigCompileError::at(&prefix, "expression budget arithmetic overflow")
+            })?;
         if expression_count > MAX_REDACTION_EXPRESSIONS
             || expression_bytes > MAX_REDACTION_EXPRESSION_BYTES_PER_PROFILE
         {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 &prefix,
                 "regular-expression count or byte ceiling exceeded",
             ));
@@ -2917,13 +3105,13 @@ fn validate_redaction_limits(config: &super::authoring::ConfigV3) -> Result<(), 
                 && rule.literal_environment_variables.is_empty()
                 && rule.expressions.is_empty()
             {
-                return Err(V3CompileError::at(
+                return Err(ConfigCompileError::at(
                     &rule_path,
                     "must define a literal, environment literal source, or expression",
                 ));
             }
             if matches!(rule.payloads, RedactionPayloads::Binary) && !rule.expressions.is_empty() {
-                return Err(V3CompileError::at(
+                return Err(ConfigCompileError::at(
                     format!("{rule_path}.expressions"),
                     "binary-only rules cannot contain regular expressions",
                 ));
@@ -2931,23 +3119,23 @@ fn validate_redaction_limits(config: &super::authoring::ConfigV3) -> Result<(), 
             literal_count = literal_count
                 .checked_add(rule.literals.len())
                 .ok_or_else(|| {
-                    V3CompileError::at(&rule_path, "literal count arithmetic overflow")
+                    ConfigCompileError::at(&rule_path, "literal count arithmetic overflow")
                 })?;
             for literal in &rule.literals {
                 if literal.is_empty() || literal.contains("${") {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         format!("{rule_path}.literals"),
                         "literals must be nonempty and cannot use generic interpolation",
                     ));
                 }
                 literal_bytes = literal_bytes.checked_add(literal.len()).ok_or_else(|| {
-                    V3CompileError::at(&rule_path, "literal byte arithmetic overflow")
+                    ConfigCompileError::at(&rule_path, "literal byte arithmetic overflow")
                 })?;
             }
             let mut sources = BTreeSet::new();
             for (source_index, source) in rule.literal_environment_variables.iter().enumerate() {
                 if !valid_environment_name(source) || !sources.insert(source) {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         format!("{rule_path}.literal_environment_variables[{source_index}]"),
                         "source metadata is invalid or duplicates another source in this rule",
                     ));
@@ -2956,19 +3144,19 @@ fn validate_redaction_limits(config: &super::authoring::ConfigV3) -> Result<(), 
             profile_sources = profile_sources
                 .checked_add(rule.literal_environment_variables.len())
                 .ok_or_else(|| {
-                    V3CompileError::at(&rule_path, "source count arithmetic overflow")
+                    ConfigCompileError::at(&rule_path, "source count arithmetic overflow")
                 })?;
         }
         if literal_count > MAX_TOML_REDACTION_LITERALS_PER_PROFILE
             || literal_bytes > MAX_TOML_REDACTION_LITERAL_BYTES_PER_PROFILE
         {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 &prefix,
                 "TOML literal count or byte ceiling exceeded",
             ));
         }
         if profile_sources > profile.max_environment_literal_sources {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 &prefix,
                 "environment literal source count exceeds the authored profile limit",
             ));
@@ -2976,26 +3164,26 @@ fn validate_redaction_limits(config: &super::authoring::ConfigV3) -> Result<(), 
         snapshot_source_count = snapshot_source_count
             .checked_add(profile_sources)
             .ok_or_else(|| {
-                V3CompileError::at("redaction.profiles", "snapshot source count overflow")
+                ConfigCompileError::at("redaction.profiles", "snapshot source count overflow")
             })?;
         if profile_sources != 0 {
             let source_byte_budget = profile_sources
                 .checked_mul(profile.max_environment_literal_bytes)
                 .ok_or_else(|| {
-                    V3CompileError::at("redaction.profiles", "snapshot byte budget overflow")
+                    ConfigCompileError::at("redaction.profiles", "snapshot byte budget overflow")
                 })?
                 .min(profile.max_environment_literal_total_bytes);
             snapshot_source_byte_budget = snapshot_source_byte_budget
                 .checked_add(source_byte_budget)
                 .ok_or_else(|| {
-                    V3CompileError::at("redaction.profiles", "snapshot byte budget overflow")
+                    ConfigCompileError::at("redaction.profiles", "snapshot byte budget overflow")
                 })?;
         }
     }
     if snapshot_source_count > MAX_REDACTION_ENV_SOURCES_PER_SNAPSHOT
         || snapshot_source_byte_budget > MAX_REDACTION_ENV_BYTES_PER_SNAPSHOT
     {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             "redaction.profiles",
             "snapshot-wide environment source or byte ceiling exceeded",
         ));
@@ -3008,13 +3196,13 @@ fn validate_ratio_pair(
     decoded: usize,
     ratio: usize,
     path: &str,
-) -> Result<(), V3CompileError> {
-    let proportional = encoded
-        .checked_mul(ratio)
-        .ok_or_else(|| V3CompileError::at(path, "content-decoding ratio arithmetic overflow"))?;
+) -> Result<(), ConfigCompileError> {
+    let proportional = encoded.checked_mul(ratio).ok_or_else(|| {
+        ConfigCompileError::at(path, "content-decoding ratio arithmetic overflow")
+    })?;
     let maximum = proportional.max(MIB);
     if decoded > maximum {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             path,
             "decoded limit exceeds the configured proportional decoding bound",
         ));
@@ -3023,11 +3211,11 @@ fn validate_ratio_pair(
 }
 
 fn validate_logging_capture_limits(
-    config: &super::authoring::ConfigV3,
-) -> Result<(), V3CompileError> {
+    config: &super::authoring::AuthoringConfig,
+) -> Result<(), ConfigCompileError> {
     let logging = &config.observation.logging;
     if logging.max_bytes == 0 || logging.max_bytes > MAX_LOG_BYTES {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             "observation.logging.max_bytes",
             format!("must be between 1 and {MAX_LOG_BYTES}"),
         ));
@@ -3049,7 +3237,7 @@ fn validate_logging_capture_limits(
         ),
     ] {
         if !matches!(level, "trace" | "debug" | "info" | "warn" | "error") {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 path,
                 "must be trace, debug, info, warn, or error",
             ));
@@ -3072,7 +3260,7 @@ fn validate_logging_capture_limits(
             MAX_CAPTURE_FILES,
         )?;
         if capture.max_total_bytes == 0 || capture.max_total_bytes > MAX_CAPTURE_TOTAL_BYTES {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 "observation.capture.max_total_bytes",
                 format!("must be between 1 and {MAX_CAPTURE_TOTAL_BYTES}"),
             ));
@@ -3080,7 +3268,7 @@ fn validate_logging_capture_limits(
         if capture.max_inflight_body_bytes < capture.max_body_bytes
             || capture.max_total_bytes < capture.max_body_bytes as u64
         {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 "observation.capture",
                 "in-flight and total limits must each hold at least one maximum capture body",
             ));
@@ -3092,7 +3280,7 @@ fn validate_logging_capture_limits(
 fn configured_profile_literal_scratch_bytes(
     profile: &super::authoring::RedactionProfileConfig,
     path: &str,
-) -> Result<usize, V3CompileError> {
+) -> Result<usize, ConfigCompileError> {
     let mut max_pattern_len = 0usize;
     let mut has_environment_source = false;
     for rule in &profile.rules {
@@ -3109,7 +3297,7 @@ fn configured_profile_literal_scratch_bytes(
         max_pattern_len = max_pattern_len.max(profile.max_environment_literal_bytes);
     }
     redaction_literal_scratch_bytes(max_pattern_len).ok_or_else(|| {
-        V3CompileError::at(
+        ConfigCompileError::at(
             path,
             "configured literal horizon exceeds the matcher scratch ceiling",
         )
@@ -3117,14 +3305,22 @@ fn configured_profile_literal_scratch_bytes(
 }
 
 fn compile_resource_plan(
-    config: &super::authoring::ConfigV3,
-) -> Result<CompiledResourcePlan, V3CompileError> {
+    config: &super::authoring::AuthoringConfig,
+) -> Result<CompiledResourcePlan, ConfigCompileError> {
     let rule_schedules = config
         .policy
         .rules
         .iter()
         .map(|rule| compile_http_rule_schedule(config, rule))
         .collect::<Result<Vec<_>, _>>()?;
+    let webhook_request_allocation_bytes_by_rule = rule_schedules
+        .iter()
+        .map(|schedule| schedule.webhook_request_allocation)
+        .collect();
+    let webhook_callback_allocation_bytes_by_rule = rule_schedules
+        .iter()
+        .map(|schedule| schedule.webhook_callback_allocation)
+        .collect();
     // Rule-local schedules describe live allocations, not cumulative work.
     // A provider pass retains only the decoded original. A later compatible
     // rule reuses that allocation and adds only its simultaneously live stage.
@@ -3186,7 +3382,7 @@ fn compile_resource_plan(
         Capacity::Unbounded
     } else {
         if max_wire_peak > config.service.max_inflight_wire_body_bytes_per_quota_key {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 "service.max_inflight_wire_body_bytes_per_quota_key",
                 "must hold the largest pass-reachable mandatory body working set",
             ));
@@ -3194,10 +3390,10 @@ fn compile_resource_plan(
         let required = max_wire_peak
             .checked_mul(config.service.min_wire_body_concurrency)
             .ok_or_else(|| {
-                V3CompileError::at("service", "wire-body capacity arithmetic overflow")
+                ConfigCompileError::at("service", "wire-body capacity arithmetic overflow")
             })?;
         if required > config.service.max_inflight_wire_body_bytes {
-            return Err(V3CompileError::at(
+            return Err(ConfigCompileError::at(
                 "service.min_wire_body_concurrency",
                 "the requested minimum concurrency does not fit the global wire-body pool",
             ));
@@ -3214,7 +3410,7 @@ fn compile_resource_plan(
         .service
         .upgrade_relay_buffer_bytes
         .checked_mul(2)
-        .ok_or_else(|| V3CompileError::at("service", "upgrade buffer arithmetic overflow"))?;
+        .ok_or_else(|| ConfigCompileError::at("service", "upgrade buffer arithmetic overflow"))?;
     let upgrade_allocation_bytes_by_rule = config
         .policy
         .rules
@@ -3247,7 +3443,9 @@ fn compile_resource_plan(
             transport
                 .checked_add(wire_working_set)
                 .map(Some)
-                .ok_or_else(|| V3CompileError::at("service", "upgrade buffer arithmetic overflow"))
+                .ok_or_else(|| {
+                    ConfigCompileError::at("service", "upgrade buffer arithmetic overflow")
+                })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let per_stream = upgrade_allocation_bytes_by_rule
@@ -3258,9 +3456,11 @@ fn compile_resource_plan(
         .unwrap_or(0);
     let all_streams = per_stream
         .checked_mul(config.service.max_active_upgrades)
-        .ok_or_else(|| V3CompileError::at("service", "upgrade aggregate arithmetic overflow"))?;
+        .ok_or_else(|| {
+            ConfigCompileError::at("service", "upgrade aggregate arithmetic overflow")
+        })?;
     if all_streams > config.service.max_upgrade_buffer_bytes {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             "service.max_upgrade_buffer_bytes",
             "cannot hold the configured transport and maximum reachable reassembly buffers",
         ));
@@ -3271,6 +3471,8 @@ fn compile_resource_plan(
         max_reachable_http_wire_body_peak_bytes: max_wire_peak,
         wire_body_full_peak_capacity,
         wire_body_quota_key_full_peak_capacity,
+        webhook_request_allocation_bytes_by_rule,
+        webhook_callback_allocation_bytes_by_rule,
         upgrade_allocation_bytes_by_rule,
         max_upgrade_allocation_per_stream: per_stream,
         max_upgrade_allocation_all_streams: all_streams,
@@ -3282,6 +3484,8 @@ struct HttpRuleAllocationSchedule {
     initial_peak: usize,
     retained_original_after_pass: Option<usize>,
     incoming_stages: Vec<IncomingBodyStage>,
+    webhook_request_allocation: Option<usize>,
+    webhook_callback_allocation: Option<usize>,
 }
 
 impl HttpRuleAllocationSchedule {
@@ -3300,12 +3504,18 @@ struct IncomingBodyStage {
 }
 
 fn compile_http_rule_schedule(
-    config: &super::authoring::ConfigV3,
+    config: &super::authoring::AuthoringConfig,
     rule: &PolicyRuleConfig,
-) -> Result<HttpRuleAllocationSchedule, V3CompileError> {
+) -> Result<HttpRuleAllocationSchedule, ConfigCompileError> {
     let process_provider = rule.authorization_provider.as_ref().and_then(|name| {
         match config.authorization.providers.get(name) {
             Some(AuthorizationProviderConfig::Process(provider)) => Some(provider),
+            _ => None,
+        }
+    });
+    let webhook_provider = rule.authorization_provider.as_ref().and_then(|name| {
+        match config.authorization.providers.get(name) {
+            Some(AuthorizationProviderConfig::Webhook(provider)) => Some(provider),
             _ => None,
         }
     });
@@ -3341,7 +3551,49 @@ fn compile_http_rule_schedule(
     };
 
     let mut initial_peak = 0usize;
-    let mut incoming_stages = Vec::with_capacity(4);
+    let mut incoming_stages = Vec::with_capacity(6);
+    let webhook_request_allocation = webhook_provider
+        .map(|provider| {
+            project_guarded_body_allocation(
+                provider.max_request_bytes,
+                "policy.rules",
+                "webhook request allocation arithmetic overflow",
+            )
+        })
+        .transpose()?;
+    let webhook_callback_allocation = webhook_provider
+        .map(|provider| {
+            let control = config
+                .control
+                .as_ref()
+                .expect("reachable webhook provider requires validated control config");
+            let full_body_limit = control
+                .max_request_body_bytes
+                .min(provider.max_response_bytes);
+            let suffix_bytes = full_body_limit
+                .checked_sub(CALLBACK_PREFIX_BYTES)
+                .ok_or_else(|| {
+                    ConfigCompileError::at(
+                        "control.max_request_body_bytes",
+                        "cannot hold the fixed callback capability prefix",
+                    )
+                })?;
+            project_guarded_body_allocation(
+                suffix_bytes,
+                "policy.rules",
+                "webhook callback allocation arithmetic overflow",
+            )
+        })
+        .transpose()?;
+    for allocation in [webhook_request_allocation, webhook_callback_allocation]
+        .into_iter()
+        .flatten()
+    {
+        initial_peak = initial_peak.max(allocation);
+        incoming_stages.push(IncomingBodyStage {
+            additional_bytes: allocation,
+        });
+    }
     let request_stream_scratch_allocation = process_provider
         .map(|_| {
             project_guarded_body_allocation(
@@ -3386,6 +3638,22 @@ fn compile_http_rule_schedule(
     }
     if let Some((encoded_limit, original_limit)) = effective_body_limits {
         initial_peak = initial_peak.max(decode_peak(encoded_limit, original_limit)?);
+        let original_allocation = project_guarded_body_allocation(
+            original_limit,
+            "policy.rules",
+            "webhook body-retention arithmetic overflow",
+        )?;
+        for allocation in [webhook_request_allocation, webhook_callback_allocation]
+            .into_iter()
+            .flatten()
+        {
+            initial_peak = initial_peak.max(checked_add(
+                original_allocation,
+                allocation,
+                "policy.rules",
+                "webhook body-retention arithmetic overflow",
+            )?);
+        }
         if process_provider.is_some() {
             initial_peak = initial_peak.max(guarded_body_stage_peak(
                 [original_limit, PROVIDER_REQUEST_STREAM_SCRATCH_BYTES],
@@ -3500,19 +3768,21 @@ fn compile_http_rule_schedule(
             None
         },
         incoming_stages,
+        webhook_request_allocation,
+        webhook_callback_allocation,
     })
 }
 
 fn provider_response_guarded_suffix_bytes(
     max_stdout_line_bytes: usize,
     path: &str,
-) -> Result<usize, V3CompileError> {
+) -> Result<usize, ConfigCompileError> {
     max_stdout_line_bytes
         .checked_sub(
             PROCESS_PROVIDER_RESPONSE_PREFIX_BYTES + PROCESS_PROVIDER_RESPONSE_TERMINATOR_BYTES,
         )
         .ok_or_else(|| {
-            V3CompileError::at(
+            ConfigCompileError::at(
                 path,
                 "cannot hold the fixed process-provider response prefix and terminator",
             )
@@ -3522,7 +3792,7 @@ fn provider_response_guarded_suffix_bytes(
 fn replacement_decode_peak(
     response_continuation_bytes: usize,
     max_decoded_replacement_bytes: usize,
-) -> Result<usize, V3CompileError> {
+) -> Result<usize, ConfigCompileError> {
     guarded_body_stage_peak(
         [
             response_continuation_bytes,
@@ -3534,7 +3804,7 @@ fn replacement_decode_peak(
     )
 }
 
-fn decode_peak(encoded: usize, decoded: usize) -> Result<usize, V3CompileError> {
+fn decode_peak(encoded: usize, decoded: usize) -> Result<usize, ConfigCompileError> {
     guarded_body_stage_peak(
         [encoded, decoded, DECODER_SCRATCH_BYTES],
         "service",
@@ -3546,7 +3816,7 @@ fn guarded_body_stage_peak<const N: usize>(
     payload_bytes: [usize; N],
     path: &str,
     message: &str,
-) -> Result<usize, V3CompileError> {
+) -> Result<usize, ConfigCompileError> {
     payload_bytes.into_iter().try_fold(0usize, |peak, bytes| {
         checked_add(
             peak,
@@ -3561,8 +3831,9 @@ fn project_guarded_body_allocation(
     payload_bytes: usize,
     path: &str,
     message: &str,
-) -> Result<usize, V3CompileError> {
-    guarded_body_allocation_bytes(payload_bytes).ok_or_else(|| V3CompileError::at(path, message))
+) -> Result<usize, ConfigCompileError> {
+    guarded_body_allocation_bytes(payload_bytes)
+        .ok_or_else(|| ConfigCompileError::at(path, message))
 }
 
 fn checked_add(
@@ -3570,16 +3841,16 @@ fn checked_add(
     right: usize,
     path: &str,
     message: &str,
-) -> Result<usize, V3CompileError> {
+) -> Result<usize, ConfigCompileError> {
     left.checked_add(right)
-        .ok_or_else(|| V3CompileError::at(path, message))
+        .ok_or_else(|| ConfigCompileError::at(path, message))
 }
 
 fn upgrade_wire_peak(
     max_message_bytes: usize,
     allow_permessage_deflate: bool,
     matcher_scratch_bytes: usize,
-) -> Result<usize, V3CompileError> {
+) -> Result<usize, ConfigCompileError> {
     let mut peak = max_message_bytes;
     if allow_permessage_deflate {
         peak = checked_add(
@@ -3607,11 +3878,11 @@ fn upgrade_wire_peak(
 }
 
 fn compile_reloadable_plan(
-    config: &super::authoring::ConfigV3,
+    config: &super::authoring::AuthoringConfig,
     working_directory: &Path,
     compiled_urls_by_rule: Vec<Vec<CompiledUrlPattern>>,
     resource_plan: CompiledResourcePlan,
-) -> Result<ReloadableProductPlan, V3CompileError> {
+) -> Result<ReloadableProductPlan, ConfigCompileError> {
     Ok(ReloadableProductPlan {
         request_timeout: config.service.request_timeout.get(),
         max_content_decoding_expansion_ratio: config.service.max_content_decoding_expansion_ratio,
@@ -3626,7 +3897,7 @@ fn compile_reloadable_plan(
     })
 }
 
-fn compile_egress_plan(value: &EgressConfig) -> Result<EgressPlan, V3CompileError> {
+fn compile_egress_plan(value: &EgressConfig) -> Result<EgressPlan, ConfigCompileError> {
     Ok(EgressPlan {
         route: match value.route {
             EgressRoute::Direct => CompiledEgressRoute::Direct,
@@ -3665,9 +3936,9 @@ fn compile_tls_trust(value: TlsTrust) -> CompiledTlsTrust {
 
 fn compile_parent_proxy_plan(
     value: &super::authoring::ParentProxyConfig,
-) -> Result<ParentProxyPlan, V3CompileError> {
+) -> Result<ParentProxyPlan, ConfigCompileError> {
     let canonical = canonicalize_http_url(&value.url).map_err(|error| {
-        V3CompileError::at("egress.parent_proxy.url", format!("invalid URL: {error}"))
+        ConfigCompileError::at("egress.parent_proxy.url", format!("invalid URL: {error}"))
     })?;
     Ok(ParentProxyPlan {
         kind: match value.kind {
@@ -3691,9 +3962,9 @@ fn compile_parent_proxy_plan(
 fn compile_policy_plan(
     value: &PolicyConfig,
     compiled_urls_by_rule: Vec<Vec<CompiledUrlPattern>>,
-) -> Result<PolicyPlan, V3CompileError> {
+) -> Result<PolicyPlan, ConfigCompileError> {
     if compiled_urls_by_rule.len() != value.rules.len() {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             "policy.rules",
             "compiled URL rule count does not match the authored rule count",
         ));
@@ -3718,7 +3989,7 @@ fn compile_policy_rule_plan(
     value: &PolicyRuleConfig,
     urls: Vec<CompiledUrlPattern>,
     index: usize,
-) -> Result<PolicyRulePlan, V3CompileError> {
+) -> Result<PolicyRulePlan, ConfigCompileError> {
     let prefix = format!("policy.rules[{index}]");
     Ok(PolicyRulePlan {
         id: value.id.clone(),
@@ -3735,7 +4006,7 @@ fn compile_policy_rule_plan(
             .enumerate()
             .map(|(method_index, method)| {
                 Method::from_bytes(method.to_ascii_uppercase().as_bytes()).map_err(|error| {
-                    V3CompileError::at(
+                    ConfigCompileError::at(
                         format!("{prefix}.methods[{method_index}]"),
                         format!("invalid method after validation: {error}"),
                     )
@@ -3770,7 +4041,7 @@ fn compile_policy_rule_plan(
 fn compile_client_cidrs(
     values: &[ipnet::IpNet],
     path: &str,
-) -> Result<Vec<ipnet::IpNet>, V3CompileError> {
+) -> Result<Vec<ipnet::IpNet>, ConfigCompileError> {
     let mapped_base = std::net::Ipv4Addr::UNSPECIFIED.to_ipv6_mapped();
     values
         .iter()
@@ -3779,7 +4050,7 @@ fn compile_client_cidrs(
             ipnet::IpNet::V4(network) => Ok(ipnet::IpNet::V4(*network)),
             ipnet::IpNet::V6(network) => {
                 if network.prefix_len() < 96 && network.contains(&mapped_base) {
-                    return Err(V3CompileError::at(
+                    return Err(ConfigCompileError::at(
                         format!("{path}[{index}]"),
                         "IPv6 CIDR ambiguously mixes mapped IPv4 and native IPv6 addresses",
                     ));
@@ -3788,13 +4059,13 @@ fn compile_client_cidrs(
                     return Ok(ipnet::IpNet::V6(*network));
                 };
                 let prefix = network.prefix_len().checked_sub(96).ok_or_else(|| {
-                    V3CompileError::at(
+                    ConfigCompileError::at(
                         format!("{path}[{index}]"),
                         "invalid mapped IPv4 CIDR prefix",
                     )
                 })?;
                 let canonical = ipnet::Ipv4Net::new(mapped, prefix).map_err(|_| {
-                    V3CompileError::at(format!("{path}[{index}]"), "invalid mapped IPv4 CIDR")
+                    ConfigCompileError::at(format!("{path}[{index}]"), "invalid mapped IPv4 CIDR")
                 })?;
                 Ok(ipnet::IpNet::V4(canonical))
             }
@@ -3805,7 +4076,7 @@ fn compile_client_cidrs(
 fn compile_header_predicates_plan(
     value: &super::authoring::HeaderPredicatesConfig,
     prefix: &str,
-) -> Result<HeaderPredicatesPlan, V3CompileError> {
+) -> Result<HeaderPredicatesPlan, ConfigCompileError> {
     Ok(HeaderPredicatesPlan {
         absent_any: compile_header_names(
             &value.absent_any,
@@ -3823,7 +4094,7 @@ fn compile_header_predicates_plan(
 fn compile_header_value_predicates(
     values: &BTreeMap<String, Vec<String>>,
     path: &str,
-) -> Result<Vec<HeaderValuePredicatePlan>, V3CompileError> {
+) -> Result<Vec<HeaderValuePredicatePlan>, ConfigCompileError> {
     values
         .iter()
         .map(|(name, values)| {
@@ -3833,7 +4104,7 @@ fn compile_header_value_predicates(
                     .iter()
                     .map(|value| {
                         HeaderValue::from_bytes(value.as_bytes()).map_err(|error| {
-                            V3CompileError::at(
+                            ConfigCompileError::at(
                                 path,
                                 format!("invalid header value after validation: {error}"),
                             )
@@ -3848,7 +4119,7 @@ fn compile_header_value_predicates(
 fn compile_header_effects(
     values: &[HeaderEffectConfig],
     path: &str,
-) -> Result<Vec<HeaderEffectPlan>, V3CompileError> {
+) -> Result<Vec<HeaderEffectPlan>, ConfigCompileError> {
     values
         .iter()
         .enumerate()
@@ -3859,7 +4130,7 @@ fn compile_header_effects(
 fn compile_header_effect(
     value: &HeaderEffectConfig,
     path: &str,
-) -> Result<HeaderEffectPlan, V3CompileError> {
+) -> Result<HeaderEffectPlan, ConfigCompileError> {
     match value {
         HeaderEffectConfig::Set(value) => Ok(HeaderEffectPlan::Set {
             when: compile_header_effect_when(value.when),
@@ -3893,11 +4164,11 @@ fn compile_header_effect(
 fn compile_header_values<'a>(
     values: impl Iterator<Item = &'a String>,
     path: &str,
-) -> Result<Vec<HeaderValue>, V3CompileError> {
+) -> Result<Vec<HeaderValue>, ConfigCompileError> {
     values
         .map(|value| {
             HeaderValue::from_bytes(value.as_bytes()).map_err(|error| {
-                V3CompileError::at(
+                ConfigCompileError::at(
                     path,
                     format!("invalid header value after validation: {error}"),
                 )
@@ -3917,7 +4188,7 @@ fn compile_header_effect_when(value: HeaderEffectWhen) -> CompiledHeaderEffectWh
 fn compile_credential_actions(
     values: &[CredentialActionConfig],
     path: &str,
-) -> Result<Vec<CredentialActionPlan>, V3CompileError> {
+) -> Result<Vec<CredentialActionPlan>, ConfigCompileError> {
     values
         .iter()
         .enumerate()
@@ -3942,7 +4213,7 @@ fn compile_credential_actions(
 fn compile_authorization_plan(
     value: &AuthorizationConfig,
     working_directory: &Path,
-) -> Result<AuthorizationPlan, V3CompileError> {
+) -> Result<AuthorizationPlan, ConfigCompileError> {
     let providers = value
         .providers
         .iter()
@@ -3971,7 +4242,7 @@ fn compile_provider_plan(
     name: &str,
     value: &AuthorizationProviderConfig,
     working_directory: &Path,
-) -> Result<AuthorizationProviderPlan, V3CompileError> {
+) -> Result<AuthorizationProviderPlan, ConfigCompileError> {
     let prefix = format!("authorization.providers.{name}");
     Ok(match value {
         AuthorizationProviderConfig::Webhook(value) => {
@@ -3983,6 +4254,7 @@ fn compile_provider_plan(
                     &value.include_headers,
                     &format!("{prefix}.include_headers"),
                 )?,
+                max_request_bytes: value.max_request_bytes,
                 max_response_bytes: value.max_response_bytes,
                 outputs: compile_provider_outputs(&value.outputs, &format!("{prefix}.outputs"))?,
                 tls: value.tls.as_ref().map(|tls| WebhookTlsPlan {
@@ -4031,7 +4303,7 @@ fn compile_provider_failure(
 fn compile_provider_outputs(
     values: &BTreeMap<String, super::authoring::ProviderOutputConfig>,
     path: &str,
-) -> Result<BTreeMap<String, ProviderOutputPlan>, V3CompileError> {
+) -> Result<BTreeMap<String, ProviderOutputPlan>, ConfigCompileError> {
     values
         .iter()
         .map(|(name, value)| {
@@ -4060,7 +4332,9 @@ fn compile_provider_outputs(
         .collect()
 }
 
-fn compile_credentials_plan(value: &CredentialsConfig) -> Result<CredentialsPlan, V3CompileError> {
+fn compile_credentials_plan(
+    value: &CredentialsConfig,
+) -> Result<CredentialsPlan, ConfigCompileError> {
     let inbound = value
         .inbound
         .iter()
@@ -4076,7 +4350,7 @@ fn compile_credentials_plan(value: &CredentialsConfig) -> Result<CredentialsPlan
                 },
             ))
         })
-        .collect::<Result<BTreeMap<_, _>, V3CompileError>>()?;
+        .collect::<Result<BTreeMap<_, _>, ConfigCompileError>>()?;
     let sources = value
         .sources
         .iter()
@@ -4165,7 +4439,7 @@ fn authored_literal_resident_bytes(
         .ok_or(AuthoredLiteralProjectionError::Matcher)
 }
 
-fn compile_redaction_plan(value: &RedactionConfig) -> Result<RedactionPlan, V3CompileError> {
+fn compile_redaction_plan(value: &RedactionConfig) -> Result<RedactionPlan, ConfigCompileError> {
     let mut snapshot_matcher_resident_bytes = 0usize;
     let profiles = value
         .profiles
@@ -4175,7 +4449,7 @@ fn compile_redaction_plan(value: &RedactionConfig) -> Result<RedactionPlan, V3Co
             let snapshot_remaining = MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT
                 .checked_sub(snapshot_matcher_resident_bytes)
                 .ok_or_else(|| {
-                    V3CompileError::at(&prefix, "compiled matcher snapshot memory ceiling exceeded")
+                    ConfigCompileError::at(&prefix, "compiled matcher snapshot memory ceiling exceeded")
                 })?;
             let text_literal_bytes = authored_literal_resident_bytes(
                 value,
@@ -4191,7 +4465,7 @@ fn compile_redaction_plan(value: &RedactionConfig) -> Result<RedactionPlan, V3Co
                         "bounded text literal matcher build ceiling exceeded"
                     }
                 };
-                V3CompileError::at(&prefix, message)
+                ConfigCompileError::at(&prefix, message)
             })?;
             let binary_literal_budget = MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE
                 .checked_sub(text_literal_bytes)
@@ -4199,7 +4473,7 @@ fn compile_redaction_plan(value: &RedactionConfig) -> Result<RedactionPlan, V3Co
                     profile_remaining.min(snapshot_remaining.saturating_sub(text_literal_bytes))
                 })
                 .ok_or_else(|| {
-                    V3CompileError::at(&prefix, "compiled matcher profile memory ceiling exceeded")
+                    ConfigCompileError::at(&prefix, "compiled matcher profile memory ceiling exceeded")
                 })?;
             let binary_literal_bytes = authored_literal_resident_bytes(
                 value,
@@ -4215,12 +4489,12 @@ fn compile_redaction_plan(value: &RedactionConfig) -> Result<RedactionPlan, V3Co
                         "bounded binary literal matcher build ceiling exceeded"
                     }
                 };
-                V3CompileError::at(&prefix, message)
+                ConfigCompileError::at(&prefix, message)
             })?;
             let literal_bytes = text_literal_bytes
                 .checked_add(binary_literal_bytes)
                 .ok_or_else(|| {
-                    V3CompileError::at(&prefix, "compiled matcher size accounting overflow")
+                    ConfigCompileError::at(&prefix, "compiled matcher size accounting overflow")
                 })?;
             let (mut profile_matcher_resident_bytes, new_snapshot_bytes) =
                 checked_redaction_matcher_resident_bytes(
@@ -4229,7 +4503,7 @@ fn compile_redaction_plan(value: &RedactionConfig) -> Result<RedactionPlan, V3Co
                     literal_bytes,
                 )
                 .ok_or_else(|| {
-                    V3CompileError::at(&prefix, "compiled matcher memory ceiling exceeded")
+                    ConfigCompileError::at(&prefix, "compiled matcher memory ceiling exceeded")
                 })?;
             snapshot_matcher_resident_bytes = new_snapshot_bytes;
             let rules = value
@@ -4258,21 +4532,21 @@ fn compile_redaction_plan(value: &RedactionConfig) -> Result<RedactionPlan, V3Co
                                         snapshot_matcher_resident_bytes,
                                     )
                                     .ok_or_else(|| {
-                                        V3CompileError::at(
+                                        ConfigCompileError::at(
                                             &expression_path,
                                             "compiled matcher memory ceiling exceeded",
                                         )
                                     })?;
                                 let matcher = build_redaction_regex(expression, remaining_budget)
                                     .map_err(|_| {
-                                    V3CompileError::at(
+                                    ConfigCompileError::at(
                                         &expression_path,
                                         "invalid regular expression or unsupported by the bounded matcher",
                                     )
                                 })?;
                                 let bytes = redaction_regex_resident_bytes(&matcher)
                                     .ok_or_else(|| {
-                                        V3CompileError::at(
+                                        ConfigCompileError::at(
                                             &expression_path,
                                             "bounded regular-expression size accounting overflow",
                                         )
@@ -4284,7 +4558,7 @@ fn compile_redaction_plan(value: &RedactionConfig) -> Result<RedactionPlan, V3Co
                                         bytes,
                                     )
                                     .ok_or_else(|| {
-                                        V3CompileError::at(
+                                        ConfigCompileError::at(
                                             &expression_path,
                                             "compiled matcher memory ceiling exceeded",
                                         )
@@ -4301,7 +4575,7 @@ fn compile_redaction_plan(value: &RedactionConfig) -> Result<RedactionPlan, V3Co
                         },
                     })
                 })
-                .collect::<Result<Vec<_>, V3CompileError>>()?;
+                .collect::<Result<Vec<_>, ConfigCompileError>>()?;
             Ok((
                 name.clone(),
                 RedactionProfilePlan {
@@ -4318,11 +4592,13 @@ fn compile_redaction_plan(value: &RedactionConfig) -> Result<RedactionPlan, V3Co
                 },
             ))
         })
-        .collect::<Result<BTreeMap<_, _>, V3CompileError>>()?;
+        .collect::<Result<BTreeMap<_, _>, ConfigCompileError>>()?;
     Ok(RedactionPlan { profiles })
 }
 
-fn compile_observation_plan(value: &ObservationConfig) -> Result<ObservationPlan, V3CompileError> {
+fn compile_observation_plan(
+    value: &ObservationConfig,
+) -> Result<ObservationPlan, ConfigCompileError> {
     Ok(ObservationPlan {
         logging: ReloadableLoggingPlan {
             level: compile_log_level(&value.logging.level, "observation.logging.level")?,
@@ -4343,21 +4619,21 @@ fn compile_observation_plan(value: &ObservationConfig) -> Result<ObservationPlan
     })
 }
 
-fn compile_log_level(value: &str, path: &str) -> Result<CompiledLogLevel, V3CompileError> {
+fn compile_log_level(value: &str, path: &str) -> Result<CompiledLogLevel, ConfigCompileError> {
     match value {
         "trace" => Ok(CompiledLogLevel::Trace),
         "debug" => Ok(CompiledLogLevel::Debug),
         "info" => Ok(CompiledLogLevel::Info),
         "warn" => Ok(CompiledLogLevel::Warn),
         "error" => Ok(CompiledLogLevel::Error),
-        _ => Err(V3CompileError::at(
+        _ => Err(ConfigCompileError::at(
             path,
             "invalid log level after validation",
         )),
     }
 }
 
-fn compile_capture_plan(value: &super::authoring::CaptureConfigV3) -> CapturePlan {
+fn compile_capture_plan(value: &super::authoring::AuthoringCaptureConfig) -> CapturePlan {
     CapturePlan {
         events: value
             .events
@@ -4387,7 +4663,7 @@ fn compile_capture_plan(value: &super::authoring::CaptureConfigV3) -> CapturePla
     }
 }
 
-fn compile_safety_plan(value: &SafetyConfig) -> Result<SafetyPlan, V3CompileError> {
+fn compile_safety_plan(value: &SafetyConfig) -> Result<SafetyPlan, ConfigCompileError> {
     Ok(SafetyPlan {
         loop_detection: LoopDetectionPlan {
             inject: value.loop_detection.inject,
@@ -4399,17 +4675,20 @@ fn compile_safety_plan(value: &SafetyConfig) -> Result<SafetyPlan, V3CompileErro
     })
 }
 
-fn compile_header_names(values: &[String], path: &str) -> Result<Vec<HeaderName>, V3CompileError> {
+fn compile_header_names(
+    values: &[String],
+    path: &str,
+) -> Result<Vec<HeaderName>, ConfigCompileError> {
     values
         .iter()
         .map(|value| compile_header_name(value, path))
         .collect()
 }
 
-fn compile_header_name(value: &str, path: &str) -> Result<HeaderName, V3CompileError> {
+fn compile_header_name(value: &str, path: &str) -> Result<HeaderName, ConfigCompileError> {
     let normalized = normalize_header_name(value, path)?;
     HeaderName::from_bytes(normalized.as_bytes()).map_err(|error| {
-        V3CompileError::at(
+        ConfigCompileError::at(
             path,
             format!("invalid header name after validation: {error}"),
         )
@@ -4417,9 +4696,9 @@ fn compile_header_name(value: &str, path: &str) -> Result<HeaderName, V3CompileE
 }
 
 fn compile_static_config(
-    config: &super::authoring::ConfigV3,
+    config: &super::authoring::AuthoringConfig,
     config_root: PathBuf,
-) -> Result<StaticProductConfig, V3CompileError> {
+) -> Result<StaticProductConfig, ConfigCompileError> {
     Ok(StaticProductConfig {
         schema_version: config.schema_version.number(),
         config_root,
@@ -4428,6 +4707,9 @@ fn compile_static_config(
             shutdown_drain_timeout: config.service.shutdown_drain_timeout.bounded(),
             max_retiring_generations: config.service.max_retiring_generations,
             max_active_upgrades: config.service.max_active_upgrades,
+            max_active_webhook_deliveries: config.service.max_active_webhook_deliveries,
+            webhook_transport_buffer_bytes: config.service.webhook_transport_buffer_bytes,
+            max_webhook_transport_bytes: config.service.max_webhook_transport_bytes,
             upgrade_relay_buffer_bytes: config.service.upgrade_relay_buffer_bytes,
             max_upgrade_buffer_bytes: config.service.max_upgrade_buffer_bytes,
             max_upgrade_lifetime: config.service.max_upgrade_lifetime.get(),
@@ -4459,7 +4741,10 @@ fn compile_control(value: &super::authoring::ControlConfig) -> StaticControlConf
         bind: canonical_socket_addr(value.bind),
         base_path: value.base_path.clone(),
         request_header_timeout: value.request_header_timeout.get(),
+        request_body_timeout: value.request_body_timeout.get(),
         max_connections: value.max_connections,
+        parser_arena_bytes: control_parser_arena_bytes(value)
+            .expect("control parser-arena arithmetic was validated"),
         max_request_body_bytes: value.max_request_body_bytes,
         tls: value.tls.as_ref().map(compile_tls_identity),
     }
@@ -4553,16 +4838,16 @@ fn compile_mitm(value: &MitmConfig) -> StaticMitmConfig {
     }
 }
 
-fn normalize_header_name(value: &str, path: &str) -> Result<String, V3CompileError> {
+fn normalize_header_name(value: &str, path: &str) -> Result<String, ConfigCompileError> {
     if value.starts_with(':') {
-        return Err(V3CompileError::at(
+        return Err(ConfigCompileError::at(
             path,
             "HTTP pseudo-headers are not authorable",
         ));
     }
     HeaderName::from_bytes(value.as_bytes())
         .map(|name| name.as_str().to_ascii_lowercase())
-        .map_err(|error| V3CompileError::at(path, format!("invalid header name: {error}")))
+        .map_err(|error| ConfigCompileError::at(path, format!("invalid header name: {error}")))
 }
 
 fn contains_header(values: &[String], expected: &str) -> bool {
@@ -4602,9 +4887,12 @@ fn reject_base_protected_header(
     name: &str,
     loop_header: &str,
     path: &str,
-) -> Result<(), V3CompileError> {
+) -> Result<(), ConfigCompileError> {
     if base_protected_headers().contains(name) || name == loop_header {
-        return Err(V3CompileError::at(path, "header is reserved by the proxy"));
+        return Err(ConfigCompileError::at(
+            path,
+            "header is reserved by the proxy",
+        ));
     }
     Ok(())
 }
@@ -4636,10 +4924,10 @@ http1 = "deny"
 default = "deny"
 "#;
 
-    fn compile(toml: &str) -> Result<CompiledProductConfig, V3CompileError> {
-        let config: super::super::authoring::ConfigV3 =
+    fn compile(toml: &str) -> Result<CompiledProductConfig, ConfigCompileError> {
+        let config: super::super::authoring::AuthoringConfig =
             toml::from_str(toml).expect("test input should deserialize");
-        compile_v3(config, Path::new("/etc/acl-proxy"))
+        compile_config(config, Path::new("/etc/acl-proxy"))
     }
 
     #[test]
@@ -4832,6 +5120,169 @@ default = "deny"
             .expect("test payload must have a guarded allocation projection")
     }
 
+    fn webhook_config(max_request_bytes: usize, max_response_bytes: usize) -> String {
+        format!(
+            r#"
+schema_version = 3
+
+[control]
+bind = "127.0.0.1:8898"
+max_request_body_bytes = 65536
+
+[authorization.callback]
+public_url = "http://127.0.0.1:8898/_acl-proxy/external-auth/callback"
+
+[authorization.providers.approval]
+kind = "webhook"
+url = "https://approval.example.test/authorize"
+max_request_bytes = {max_request_bytes}
+max_response_bytes = {max_response_bytes}
+
+[listeners.explicit_http]
+bind = "127.0.0.1:8881"
+http_versions = ["http1"]
+
+[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "approval"
+decision = "delegate"
+authorization_provider = "approval"
+methods = ["POST"]
+"#
+        )
+    }
+
+    #[test]
+    fn webhook_minimum_request_envelope_limits_compile() {
+        const CALLBACK_URL: &str = "http://127.0.0.1:8898/_acl-proxy/external-auth/callback";
+        let minimum = MIN_WEBHOOK_REQUEST_FIXED_BYTES + CALLBACK_URL.len();
+        assert_eq!(minimum, 226);
+        let compiled = compile(&webhook_config(minimum, MIN_CALLBACK_BODY_BYTES))
+            .expect("the exact compact request-envelope floor must compile");
+        let provider = match &compiled.reloadable_plan.authorization.providers["approval"] {
+            AuthorizationProviderPlan::Webhook(provider) => provider,
+            AuthorizationProviderPlan::Process(_) => panic!("expected webhook provider"),
+        };
+        assert_eq!(provider.max_request_bytes, minimum);
+
+        let error = compile(&webhook_config(minimum - 1, MIN_CALLBACK_BODY_BYTES))
+            .expect_err("one byte below the exact compact request envelope must fail");
+        assert!(error.to_string().contains(&format!("at least {minimum}")));
+    }
+
+    #[test]
+    fn webhook_request_configured_limit_drives_resource_plan() {
+        let configured_request_limit = 4_097;
+        let compiled = compile(&webhook_config(
+            configured_request_limit,
+            MIN_CALLBACK_BODY_BYTES,
+        ))
+        .unwrap();
+        let resources = &compiled.reloadable_plan.resource_plan;
+        let request_allocation = guarded(configured_request_limit);
+        let callback_allocation = guarded(MIN_CALLBACK_BODY_BYTES - CALLBACK_PREFIX_BYTES);
+        assert_eq!(
+            resources.webhook_request_allocation_bytes_by_rule,
+            [Some(request_allocation)]
+        );
+        assert_eq!(
+            resources.webhook_callback_allocation_bytes_by_rule,
+            [Some(callback_allocation)]
+        );
+        assert_eq!(
+            resources.http_wire_body_peak_bytes_by_cursor,
+            [request_allocation, 0]
+        );
+        assert_eq!(
+            resources.max_reachable_http_wire_body_peak_bytes,
+            request_allocation
+        );
+    }
+
+    #[test]
+    fn callback_minimum_envelope_limits_compile() {
+        let control_error = compile(&webhook_config(4_097, MIN_CALLBACK_BODY_BYTES).replace(
+            "max_request_body_bytes = 65536",
+            "max_request_body_bytes = 96",
+        ))
+        .expect_err("callback control limit cannot be one byte below the envelope floor");
+        assert_eq!(control_error.path, "control.max_request_body_bytes");
+
+        let provider_error = compile(&webhook_config(4_097, MIN_CALLBACK_BODY_BYTES - 1))
+            .expect_err("provider response limit cannot be one byte below the envelope floor");
+        assert_eq!(
+            provider_error.path,
+            "authorization.providers.approval.max_response_bytes"
+        );
+    }
+
+    #[test]
+    fn webhook_delivery_static_limits_are_checked() {
+        let input = MINIMAL.replace(
+            "[policy]",
+            r#"[service]
+max_active_webhook_deliveries = 2
+webhook_transport_buffer_bytes = 65536
+max_webhook_transport_bytes = 262143
+
+[policy]"#,
+        );
+        let error = compile(&input).expect_err("two buffers per delivery must fit the pool");
+        assert_eq!(error.path, "service.max_webhook_transport_bytes");
+
+        let exact = compile(&input.replace("262143", "262144")).unwrap();
+        assert_eq!(
+            exact.static_config.service.max_webhook_transport_bytes,
+            262_144
+        );
+    }
+
+    #[test]
+    fn webhook_public_callback_route_is_never_provider_endpoint() {
+        let input = webhook_config(4_097, MIN_CALLBACK_BODY_BYTES)
+            .replace("127.0.0.1:8898/_acl-proxy", "LOCALHOST:8898/_acl-proxy")
+            .replace(
+                "https://approval.example.test/authorize",
+                "http://localhost:8898/_acl-proxy/provider?mode=approval",
+            );
+        let error = compile(&input)
+            .expect_err("canonical callback authority and control subtree must be reserved");
+        assert_eq!(error.path, "authorization.providers.approval.url");
+        assert!(error.to_string().contains("control subtree"));
+    }
+
+    #[test]
+    fn callback_and_webhook_endpoint_lengths_are_bounded() {
+        let oversized_provider = format!(
+            "https://approval.example.test/{}",
+            "a".repeat(MAX_ENDPOINT_BYTES)
+        );
+        let provider_error = compile(&webhook_config(4_097, MIN_CALLBACK_BODY_BYTES).replace(
+            "https://approval.example.test/authorize",
+            &oversized_provider,
+        ))
+        .expect_err("the complete canonical provider URL must fit its fixed ceiling");
+        assert_eq!(provider_error.path, "authorization.providers.approval.url");
+        assert!(provider_error.to_string().contains("canonical URL"));
+
+        let oversized_base = format!("/{}", "a".repeat(MAX_ENDPOINT_BYTES));
+        let control_input = MINIMAL.replace(
+            "[policy]",
+            &format!(
+                "[control]\nbind = \"127.0.0.1:8898\"\nbase_path = \"{oversized_base}\"\n\n[policy]"
+            ),
+        );
+        let target_error = compile(&control_input)
+            .expect_err("the product-generated callback target must fit its fixed ceiling");
+        assert_eq!(target_error.path, "control.base_path");
+        assert!(target_error.to_string().contains("encoded callback target"));
+    }
+
     fn one_byte_body_provider_config(service: &str) -> String {
         resource_config(
             service,
@@ -4871,7 +5322,7 @@ authorization_provider = "body"
     #[test]
     fn provider_schedule_projects_original_stream_scratch_and_retention() {
         let input = one_byte_body_provider_config("");
-        let config: super::super::authoring::ConfigV3 = toml::from_str(&input).unwrap();
+        let config: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
         let schedule = compile_http_rule_schedule(&config, &config.policy.rules[0]).unwrap();
 
         assert_eq!(schedule.initial_peak, 3 * guarded(1));
@@ -4907,7 +5358,7 @@ methods = ["GET"]
 authorization_provider = "decision"
 "#,
         );
-        let config: super::super::authoring::ConfigV3 = toml::from_str(&input).unwrap();
+        let config: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
         let schedule = compile_http_rule_schedule(&config, &config.policy.rules[0]).unwrap();
         let request_scratch = guarded(PROVIDER_REQUEST_STREAM_SCRATCH_BYTES);
         let response = guarded(response_bytes);
@@ -4956,7 +5407,7 @@ authorization_provider = "decision"
 redaction_profile = "small"
 "#,
         );
-        let config: super::super::authoring::ConfigV3 = toml::from_str(&input).unwrap();
+        let config: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
         let schedule = compile_http_rule_schedule(&config, &config.policy.rules[0]).unwrap();
         let retained = guarded(1);
         let response = guarded(response_bytes);
@@ -5010,7 +5461,7 @@ methods = ["POST"]
 authorization_provider = "later"
 "#,
         );
-        let config: super::super::authoring::ConfigV3 = toml::from_str(&input).unwrap();
+        let config: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
         let first = compile_http_rule_schedule(&config, &config.policy.rules[0]).unwrap();
         let second = compile_http_rule_schedule(&config, &config.policy.rules[1]).unwrap();
         let resources = compile(&input).unwrap().reloadable_plan.resource_plan;
@@ -5049,7 +5500,7 @@ methods = ["GET"]
 authorization_provider = "decision"
 "#,
         );
-        let config: super::super::authoring::ConfigV3 = toml::from_str(&input).unwrap();
+        let config: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
         let error = compile_http_rule_schedule(&config, &config.policy.rules[0]).unwrap_err();
 
         assert_eq!(
@@ -5096,7 +5547,7 @@ methods = ["POST"]
 authorization_provider = "later"
 "#,
         );
-        let config: super::super::authoring::ConfigV3 = toml::from_str(&input).unwrap();
+        let config: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
         let first = compile_http_rule_schedule(&config, &config.policy.rules[0]).unwrap();
         let second = compile_http_rule_schedule(&config, &config.policy.rules[1]).unwrap();
         let resources = compile(&input).unwrap().reloadable_plan.resource_plan;
@@ -5312,7 +5763,7 @@ methods = ["POST"]
 redaction_profile = "terminal"
 "#,
         );
-        let config: super::super::authoring::ConfigV3 = toml::from_str(&input).unwrap();
+        let config: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
         let first = compile_http_rule_schedule(&config, &config.policy.rules[0]).unwrap();
         let second = compile_http_rule_schedule(&config, &config.policy.rules[1]).unwrap();
         let retained = first.retained_original_after_pass.unwrap();
@@ -5411,6 +5862,23 @@ redaction_profile = "terminal"
             CompiledLogLevel::Warn => "warn",
             CompiledLogLevel::Error => "error",
         };
+        let providers = plan
+            .authorization
+            .providers
+            .iter()
+            .map(|(name, provider)| match provider {
+                AuthorizationProviderPlan::Webhook(provider) => format!(
+                    "{name}:webhook:{}:{}:{}",
+                    provider.url, provider.max_request_bytes, provider.max_response_bytes
+                ),
+                AuthorizationProviderPlan::Process(provider) => format!(
+                    "{name}:process:{}:{}",
+                    provider.command.display(),
+                    provider.max_pending_requests
+                ),
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         vec![
             format!("request_timeout={:?}", plan.request_timeout),
             format!("decode_ratio={}", plan.max_content_decoding_expansion_ratio),
@@ -5422,7 +5890,7 @@ redaction_profile = "terminal"
             ),
             format!("policy={policy_default}:{}", plan.policy.rules.len()),
             format!(
-                "authorization={}:{}:{}",
+                "authorization={}:{}:{}:{providers}",
                 plan.authorization.internal_context_headers.len(),
                 plan.authorization.providers.len(),
                 plan.authorization
@@ -5466,7 +5934,7 @@ redaction_profile = "terminal"
 
     #[test]
     fn minimal_config_compiles_without_runtime_side_effects() {
-        let compiled = compile(MINIMAL).expect("minimal v3 config should compile");
+        let compiled = compile(MINIMAL).expect("minimal config should compile");
         assert_eq!(compiled.static_config.max_config_bytes, 10 * MIB);
         assert_eq!(
             compiled
@@ -5584,6 +6052,9 @@ request_timeout = "30s"
 shutdown_drain_timeout = "30s"
 max_retiring_generations = 2
 max_active_upgrades = 256
+max_active_webhook_deliveries = 256
+webhook_transport_buffer_bytes = 65536
+max_webhook_transport_bytes = 67108864
 upgrade_relay_buffer_bytes = 65536
 max_upgrade_buffer_bytes = 2147483648
 max_upgrade_lifetime = "8h"
@@ -5596,6 +6067,7 @@ max_content_decoding_expansion_ratio = 128
 bind = "127.0.0.1:8898"
 base_path = "/_acl-proxy"
 request_header_timeout = "10s"
+request_body_timeout = "10s"
 max_connections = 128
 max_request_body_bytes = 65536
 
@@ -5606,6 +6078,12 @@ internal_context_headers = []
 public_url = "http://127.0.0.1:8898/_acl-proxy/external-auth/callback"
 resume_token_ttl = "5m"
 max_pending_operations = 32
+
+[authorization.providers.approval]
+kind = "webhook"
+url = "https://approval.example.test/authorize"
+max_request_bytes = 65536
+max_response_bytes = 65536
 
 [listeners.explicit_http]
 bind = "127.0.0.1:8881"
@@ -5649,6 +6127,9 @@ header = "x-acl-proxy-request-id"
             ("service shutdown", baseline.replace("shutdown_drain_timeout = \"30s\"", "shutdown_drain_timeout = \"31s\"")),
             ("retiring generations", baseline.replace("max_retiring_generations = 2", "max_retiring_generations = 3")),
             ("upgrade admission", baseline.replace("max_active_upgrades = 256", "max_active_upgrades = 255")),
+            ("webhook admission", baseline.replace("max_active_webhook_deliveries = 256", "max_active_webhook_deliveries = 255")),
+            ("webhook transport buffer", baseline.replace("webhook_transport_buffer_bytes = 65536", "webhook_transport_buffer_bytes = 65537")),
+            ("webhook transport aggregate", baseline.replace("max_webhook_transport_bytes = 67108864", "max_webhook_transport_bytes = 67108865")),
             ("upgrade relay", baseline.replace("upgrade_relay_buffer_bytes = 65536", "upgrade_relay_buffer_bytes = 65537")),
             ("upgrade aggregate", baseline.replace("max_upgrade_buffer_bytes = 2147483648", "max_upgrade_buffer_bytes = 2147483649")),
             ("upgrade lifetime", baseline.replace("max_upgrade_lifetime = \"8h\"", "max_upgrade_lifetime = \"9h\"")),
@@ -5658,6 +6139,7 @@ header = "x-acl-proxy-request-id"
             ("control tuple", baseline.replace("8898", "8897")),
             ("control route", baseline.replace("/_acl-proxy", "/_control")),
             ("control timeout", baseline.replace("request_header_timeout = \"10s\"", "request_header_timeout = \"11s\"")),
+            ("control body timeout", baseline.replace("request_body_timeout = \"10s\"", "request_body_timeout = \"11s\"")),
             ("control connections", baseline.replace("max_connections = 128", "max_connections = 129")),
             ("control body limit", baseline.replace("max_request_body_bytes = 65536", "max_request_body_bytes = 65537")),
             ("control identity", baseline.replace(
@@ -5693,6 +6175,8 @@ header = "x-acl-proxy-request-id"
             ("policy default", baseline.replace("default = \"deny\"", "default = \"allow\"")),
             ("callback TTL", baseline.replace("resume_token_ttl = \"5m\"", "resume_token_ttl = \"6m\"")),
             ("callback admission", baseline.replace("max_pending_operations = 32", "max_pending_operations = 33")),
+            ("webhook request limit", baseline.replace("max_request_bytes = 65536", "max_request_bytes = 65535")),
+            ("webhook response limit", baseline.replace("max_response_bytes = 65536", "max_response_bytes = 65535")),
             ("logging level", baseline.replace("level = \"info\"", "level = \"debug\"")),
             ("decision logging", baseline.replace("allows = false", "allows = true")),
             ("loop header", baseline.replace("x-acl-proxy-request-id", "x-acl-proxy-next-id")),
@@ -6034,7 +6518,7 @@ trust = "system"
     fn authored_bind_requires_nonzero_socket_addr() {
         let hostname = MINIMAL.replace("127.0.0.1:8881", "proxy.example.test:8881");
         assert!(
-            toml::from_str::<super::super::authoring::ConfigV3>(&hostname).is_err(),
+            toml::from_str::<super::super::authoring::AuthoringConfig>(&hostname).is_err(),
             "bind hostnames must be rejected by the authored SocketAddr type"
         );
 
@@ -6160,6 +6644,44 @@ public_url = "http://127.0.0.1:8898/not-the-callback"
     }
 
     #[test]
+    fn mapped_ipv6_unspecified_control_bind_is_rejected() {
+        let input = format!(
+            r#"{MINIMAL}
+
+[control]
+bind = "[::ffff:0.0.0.0]:8898"
+"#
+        );
+        let error = compile(&input).expect_err("mapped unspecified control bind must be rejected");
+        assert_eq!(error.path, "control.bind");
+        assert!(error.to_string().contains("unspecified"));
+    }
+
+    #[test]
+    fn mapped_ipv6_loopback_control_and_callback_compile_canonically() {
+        let input = format!(
+            r#"{MINIMAL}
+
+[control]
+bind = "[::ffff:127.0.0.1]:8898"
+
+[authorization.callback]
+public_url = "http://[::ffff:127.0.0.1]:8898/_acl-proxy/external-auth/callback"
+"#
+        );
+        let compiled =
+            compile(&input).expect("mapped loopback control and plaintext callback must compile");
+        assert_eq!(
+            compiled.static_config.control.as_ref().unwrap().bind,
+            "127.0.0.1:8898".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            compiled.static_config.callback_public_url.as_deref(),
+            Some("http://127.0.0.1:8898/_acl-proxy/external-auth/callback")
+        );
+    }
+
+    #[test]
     fn inbound_credential_header_is_rejected_in_value_predicates() {
         let input = MINIMAL.replace(
             "[policy]\ndefault = \"deny\"",
@@ -6187,7 +6709,7 @@ x-aw-identity-token = ["secret"]"#,
     }
 
     #[test]
-    fn sanitized_production_roles_compile_as_strict_v3() {
+    fn sanitized_production_roles_compile_as_strict_schema() {
         for (name, fixture) in [
             (
                 "host",
@@ -6204,6 +6726,27 @@ x-aw-identity-token = ["secret"]"#,
         ] {
             let compiled =
                 compile(fixture).unwrap_or_else(|error| panic!("{name} fixture failed: {error}"));
+            assert_eq!(
+                compiled.static_config.service.max_active_webhook_deliveries,
+                256
+            );
+            assert_eq!(
+                compiled
+                    .static_config
+                    .service
+                    .webhook_transport_buffer_bytes,
+                64 * 1024
+            );
+            let control = compiled
+                .static_config
+                .control
+                .as_ref()
+                .expect("production fixture must retain its control topology");
+            assert_eq!(control.request_body_timeout, Duration::from_secs(10));
+            assert_eq!(
+                control.parser_arena_bytes,
+                control.max_connections * CONTROL_PARSER_BUFFER_BYTES
+            );
             assert!(
                 compiled
                     .reloadable_plan

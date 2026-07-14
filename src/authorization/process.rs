@@ -22,7 +22,7 @@ use super::protocol::{
     read_provider_response_prefix, DirectProviderStdout, ProviderRequest, RequestStreamError,
     PROCESS_PROVIDER_CORRELATION_ID_BYTES,
 };
-use crate::config::v3_compile::{CompiledProviderFailureMode, ProcessProviderPlan};
+use crate::config::compiler::{CompiledProviderFailureMode, ProcessProviderPlan};
 use crate::runtime::{BoxFuture, CleanupReason, GenerationOwner, PublicationGuard, RuntimeError};
 use crate::safety::{HttpWireBodyGuard, ProviderResponseCharge};
 
@@ -1171,7 +1171,7 @@ mod tests {
     use crate::authorization::protocol::{
         GuardedProviderBody, IncludedHeader, ProviderRequestHeaders,
     };
-    use crate::config::v3_compile::ProviderOutputPlan;
+    use crate::config::compiler::ProviderOutputPlan;
     use crate::safety::{WireBodyPool, WireBodyQuotaKey};
 
     fn write_python(directory: &TempDir, source: &str) -> PathBuf {

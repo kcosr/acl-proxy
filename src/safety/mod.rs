@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use http::header::{HeaderMap, HeaderValue};
 
-use crate::config::v3_compile::{CompiledResourcePlan, SafetyPlan};
+use crate::config::compiler::{CompiledResourcePlan, SafetyPlan};
 use crate::policy::{HttpWireBodyPlanBrand, HttpWireBodyPlanIndex};
 use crate::runtime::SafetySnapshot;
 
@@ -119,9 +119,7 @@ mod tests {
     use http::Method;
 
     use super::*;
-    use crate::config::v3_compile::{
-        Capacity, CompiledResourcePlan, LoopDetectionPlan, SafetyPlan,
-    };
+    use crate::config::compiler::{Capacity, CompiledResourcePlan, LoopDetectionPlan, SafetyPlan};
     use crate::config::{compile_config_text, ConfigTextInput};
     use crate::policy::CompiledPolicySnapshot;
     use crate::runtime::{CredentialSourceRegistry, ProviderRegistry, RedactionProfileRegistry};
@@ -142,6 +140,8 @@ mod tests {
                 max_reachable_http_wire_body_peak_bytes: peak,
                 wire_body_full_peak_capacity: Capacity::Finite(8),
                 wire_body_quota_key_full_peak_capacity: Capacity::Finite(4),
+                webhook_request_allocation_bytes_by_rule: vec![None],
+                webhook_callback_allocation_bytes_by_rule: vec![None],
                 upgrade_allocation_bytes_by_rule: vec![None],
                 max_upgrade_allocation_per_stream: 0,
                 max_upgrade_allocation_all_streams: 0,
@@ -256,6 +256,8 @@ mod tests {
                 max_reachable_http_wire_body_peak_bytes: peak,
                 wire_body_full_peak_capacity: Capacity::Finite(8),
                 wire_body_quota_key_full_peak_capacity: Capacity::Finite(4),
+                webhook_request_allocation_bytes_by_rule: vec![None],
+                webhook_callback_allocation_bytes_by_rule: vec![None],
                 upgrade_allocation_bytes_by_rule: vec![None],
                 max_upgrade_allocation_per_stream: 0,
                 max_upgrade_allocation_all_streams: 0,

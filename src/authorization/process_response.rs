@@ -3,7 +3,7 @@ use std::fmt;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::protocol::{AssignedResponseError, DirectProviderStdout, ProviderResponseContinuation};
-use crate::config::v3_compile::ProcessProviderPlan;
+use crate::config::compiler::ProcessProviderPlan;
 use crate::safety::wire_body::{GuardedBodySegments, WireBodyBufferError};
 #[cfg(test)]
 use crate::safety::HttpWireBodyGuard;
@@ -566,7 +566,7 @@ mod tests {
 
     use super::*;
     use crate::authorization::protocol::read_provider_response_prefix_for_test;
-    use crate::config::v3_compile::{CompiledProviderFailureMode, ProviderOutputPlan};
+    use crate::config::compiler::{CompiledProviderFailureMode, ProviderOutputPlan};
     use crate::safety::wire_body::guarded_body_allocation_bytes;
     use crate::safety::{WireBodyPool, WireBodyQuotaKey};
 

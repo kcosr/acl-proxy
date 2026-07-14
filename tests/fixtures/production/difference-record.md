@@ -159,7 +159,7 @@ destinations and paths are replaced, but the stated counts apply to each row.
 
 ## Required Integration Assertions
 
-1. Parse the three v3 fixtures through `ConfigV3` and compile them with temporary
+1. Parse the three v3 fixtures through `AuthoringConfig` and compile them with temporary
    CA files and five deterministic redaction environment values.
 2. Reject all three sanitized v1 shapes through the strict runtime and CLI.
 3. Assert the exact rule IDs, counts, pattern counts, method sets, wildcard

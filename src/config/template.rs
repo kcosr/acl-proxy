@@ -1,10 +1,13 @@
-pub(super) const DEFAULT_CONFIG_V3: &str = r#"schema_version = 3
+pub(super) const DEFAULT_CONFIG: &str = r#"schema_version = 3
 
 [service]
 request_timeout = "30s"
 shutdown_drain_timeout = "30s"
 max_retiring_generations = 2
 max_active_upgrades = 256
+max_active_webhook_deliveries = 256
+webhook_transport_buffer_bytes = 65536
+max_webhook_transport_bytes = 67108864
 upgrade_relay_buffer_bytes = 65536
 max_upgrade_buffer_bytes = 2147483648
 max_upgrade_lifetime = "8h"
@@ -39,10 +42,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn generated_template_is_strict_v3_and_purely_compilable() {
-        let authored: super::super::authoring::ConfigV3 =
-            toml::from_str(DEFAULT_CONFIG_V3).expect("default template must parse");
-        let compiled = super::super::v3_compile::compile_v3(authored, Path::new("/tmp/config"))
+    fn generated_template_is_strict_and_purely_compilable() {
+        let authored: super::super::authoring::AuthoringConfig =
+            toml::from_str(DEFAULT_CONFIG).expect("default template must parse");
+        let compiled = super::super::compiler::compile_config(authored, Path::new("/tmp/config"))
             .expect("default template must compile without activation");
         assert_eq!(
             compiled
@@ -55,5 +58,20 @@ mod tests {
             8881
         );
         assert!(compiled.static_config.control.is_none());
+        assert_eq!(
+            compiled.static_config.service.max_active_webhook_deliveries,
+            256
+        );
+        assert_eq!(
+            compiled
+                .static_config
+                .service
+                .webhook_transport_buffer_bytes,
+            64 * 1024
+        );
+        assert_eq!(
+            compiled.static_config.service.max_webhook_transport_bytes,
+            64 * 1024 * 1024
+        );
     }
 }

@@ -12,7 +12,7 @@ use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use rustls::client::{ServerCertVerified, ServerCertVerifier};
 use rustls::{Certificate, ClientConfig, Error as RustlsError, RootCertStore, ServerName};
 
-use crate::config::v3_compile::{
+use crate::config::compiler::{
     CompiledEgressRoute, CompiledHttpVersion, CompiledParentProxyKind, CompiledTlsTrust,
     EgressPlan, HeaderEffectPlan, ParentProxyPlan, ParentProxyTlsPlan, TransportTlsPlan,
 };
@@ -488,7 +488,7 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
-    use crate::config::v3_compile::{CredentialActionPlan, ParentProxyTlsPlan};
+    use crate::config::compiler::{CredentialActionPlan, ParentProxyTlsPlan};
     use crate::config::{compile_config_text, ConfigTextInput};
 
     #[derive(Clone, Default)]

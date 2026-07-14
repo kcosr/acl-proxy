@@ -4,7 +4,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::config::v3_compile::{
+use crate::config::compiler::{
     CapturePlan, CompiledCaptureEvent, CompiledLogLevel, ObservationPlan,
     PolicyDecisionLoggingPlan, ReloadableLoggingPlan,
 };
@@ -354,7 +354,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::config::v3_compile::{
+    use crate::config::compiler::{
         CompiledRedactionPayloads, RedactionPlan, RedactionProfilePlan, RedactionRulePlan,
     };
     use crate::redaction::RedactionSnapshot;

@@ -1,13 +1,13 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use super::v3_compile::{
-    compile_v3, CompiledProductConfig, ReloadableProductPlan, StaticFingerprint,
+use super::compiler::{
+    compile_config, CompiledProductConfig, ReloadableProductPlan, StaticFingerprint,
     StaticProductConfig,
 };
-use super::v3_loader;
+use super::loader;
 
-pub(crate) use super::v3_loader::ConfigPathSource;
+pub(crate) use super::loader::ConfigPathSource;
 
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ConfigFileMetadata {
@@ -105,7 +105,7 @@ impl std::error::Error for ConfigFacadeError {}
 pub(crate) fn load_and_compile_config(
     explicit_path: Option<&Path>,
 ) -> Result<LoadedCompiledConfig, ConfigFacadeError> {
-    let loaded = v3_loader::load_config_v3(explicit_path).map_err(load_error)?;
+    let loaded = loader::load_config(explicit_path).map_err(load_error)?;
     let metadata = ConfigFileMetadata {
         path: loaded.path,
         config_root: loaded.config_root,
@@ -118,25 +118,24 @@ pub(crate) fn load_and_compile_config(
 pub(crate) fn compile_config_text(
     input: ConfigTextInput<'_>,
 ) -> Result<CompiledConfig, ConfigFacadeError> {
-    let authored =
-        v3_loader::parse_config_text(input.text, input.source_path).map_err(load_error)?;
+    let authored = loader::parse_config_text(input.text, input.source_path).map_err(load_error)?;
     compile_authored(authored, input.config_root, input.source_path)
 }
 
 fn compile_authored(
-    authored: super::authoring::ConfigV3,
+    authored: super::authoring::AuthoringConfig,
     config_root: &Path,
     source_path: &Path,
 ) -> Result<CompiledConfig, ConfigFacadeError> {
     let compiled =
-        compile_v3(authored, config_root).map_err(|source| ConfigFacadeError::Compile {
+        compile_config(authored, config_root).map_err(|source| ConfigFacadeError::Compile {
             source_path: source_path.to_path_buf(),
             message: source.to_string(),
         })?;
     Ok(split_compiled(compiled))
 }
 
-fn load_error(source: super::v3_loader::V3LoadError) -> ConfigFacadeError {
+fn load_error(source: super::loader::ConfigLoadError) -> ConfigFacadeError {
     ConfigFacadeError::Load {
         message: source.to_string(),
     }
@@ -157,7 +156,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::config::v3_compile::AuthorizationProviderPlan;
+    use crate::config::compiler::AuthorizationProviderPlan;
 
     const MINIMAL: &str = r#"
 schema_version = 3
@@ -244,6 +243,61 @@ rules = [{ literal_environment_variables = ["MISSING_REDACTION_SECRET"] }]
         );
         assert_eq!(compiled.reloadable_plan.credentials.sources.len(), 2);
         assert_eq!(compiled.reloadable_plan.redaction.profiles.len(), 1);
+    }
+
+    #[test]
+    fn facade_projects_webhook_and_control_compiler_contract() {
+        let input = MINIMAL.replace(
+            "[policy]",
+            r#"[service]
+max_active_webhook_deliveries = 32
+webhook_transport_buffer_bytes = 65536
+max_webhook_transport_bytes = 4194304
+
+[control]
+bind = "127.0.0.1:8898"
+request_body_timeout = "7s"
+max_connections = 16
+
+[authorization.callback]
+public_url = "http://127.0.0.1:8898/_acl-proxy/external-auth/callback"
+
+[authorization.providers.approval]
+kind = "webhook"
+url = "https://approval.example.test/authorize"
+max_request_bytes = 4097
+max_response_bytes = 97
+
+[policy]"#,
+        );
+        let compiled = compile_config_text(ConfigTextInput {
+            text: &input,
+            source_path: Path::new("/tmp/config.toml"),
+            config_root: Path::new("/tmp"),
+        })
+        .unwrap();
+
+        assert_eq!(
+            compiled.static_config.service.max_active_webhook_deliveries,
+            32
+        );
+        assert_eq!(
+            compiled.static_config.service.max_webhook_transport_bytes,
+            4 * 1024 * 1024
+        );
+        let control = compiled.static_config.control.as_ref().unwrap();
+        assert_eq!(
+            control.request_body_timeout,
+            std::time::Duration::from_secs(7)
+        );
+        assert_eq!(control.parser_arena_bytes, 16 * 64 * 1024);
+        let AuthorizationProviderPlan::Webhook(provider) =
+            &compiled.reloadable_plan.authorization.providers["approval"]
+        else {
+            panic!("approval must be a webhook provider");
+        };
+        assert_eq!(provider.max_request_bytes, 4097);
+        assert_eq!(provider.max_response_bytes, 97);
     }
 
     #[test]

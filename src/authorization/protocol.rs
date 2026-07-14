@@ -22,7 +22,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::ChildStdout;
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::config::v3_compile::ProviderOutputPlan;
+use crate::config::compiler::ProviderOutputPlan;
 use crate::safety::wire_body::GuardedScratch;
 use crate::safety::{GuardedBody, HttpWireBodyGuard};
 

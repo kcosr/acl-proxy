@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use regex_automata::dfa::regex::Regex as DfaRegex;
 
-use crate::config::v3_compile::{
+use crate::config::compiler::{
     build_redaction_regex, checked_redaction_matcher_resident_bytes, redaction_literal_projection,
     redaction_literal_reference_bytes, redaction_literal_scratch_bytes,
     redaction_regex_resident_bytes, remaining_redaction_matcher_resident_bytes,
@@ -1524,7 +1524,7 @@ mod tests {
     use std::env;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::config::v3_compile::{
+    use crate::config::compiler::{
         MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE,
         MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT,
     };

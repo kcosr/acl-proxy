@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::authorization::{
     AuthorizationActivation, AuthorizationActivationError, ProductAuthorizationSnapshot,
 };
-use crate::config::v3_compile::ReloadableProductPlan;
+use crate::config::compiler::ReloadableProductPlan;
 use crate::config::{StaticFingerprint, StaticFingerprintError, StaticProductConfig};
 use crate::credentials::CredentialResolverSnapshot;
 use crate::egress::{EgressActivationError, EgressSnapshot};

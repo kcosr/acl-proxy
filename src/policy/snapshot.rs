@@ -9,8 +9,8 @@ use http::Method;
 use memchr::memmem::Finder;
 
 #[cfg(test)]
-use crate::config::v3_compile::CredentialActionPlan;
-use crate::config::v3_compile::{
+use crate::config::compiler::CredentialActionPlan;
+use crate::config::compiler::{
     CompiledDefaultDecision, CompiledHeaderEffectWhen, CompiledRuleDecision, HeaderEffectPlan,
     HeaderPredicatesPlan, PolicyPlan, PolicyRulePlan,
 };
@@ -812,7 +812,7 @@ mod tests {
     use ipnet::IpNet;
 
     use super::*;
-    use crate::config::v3_compile::{HeaderValuePredicatePlan, PolicyRulePlan};
+    use crate::config::compiler::{HeaderValuePredicatePlan, PolicyRulePlan};
     use crate::url::{canonicalize_http_url, CompiledUrlPattern};
 
     fn provider_index(index: usize) -> ProviderIndex {
