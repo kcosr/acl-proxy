@@ -98,10 +98,7 @@ pub(crate) fn prepare_origin_request(
     protocol: OriginProtocol,
 ) -> Result<Request<Body>, HeaderPreparationError> {
     let use_http2 = protocol.is_http2();
-    if sanitized.protocol.is_http2()
-        && !use_http2
-        && te_is_trailers_only(sanitized.request.headers())
-    {
+    if !use_http2 && te_is_trailers_only(sanitized.request.headers()) {
         sanitized.request.headers_mut().remove(TE);
     }
     if sanitized.request.headers().keys().any(|name| {
@@ -452,6 +449,28 @@ mod tests {
         assert_eq!(prepared.uri().to_string(), canonical.url);
         assert!(!prepared.headers().contains_key(HOST));
         assert_eq!(prepared.headers()[TE], "trailers");
+    }
+
+    #[test]
+    fn trusted_trailers_te_is_removed_when_selected_origin_is_h1() {
+        let canonical = canonicalize_http_url("http://example.com/resource").unwrap();
+        let mut sanitized = sanitize_untrusted_request(request("/untrusted")).unwrap();
+        sanitized
+            .headers_mut()
+            .insert(TE, HeaderValue::from_static("trailers"));
+
+        let prepared = prepare_origin_request(
+            sanitized,
+            &canonical,
+            RequestTargetForm::Origin,
+            OriginProtocol::Http1,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.version(), Version::HTTP_11);
+        assert_eq!(prepared.uri(), "/resource");
+        assert_eq!(prepared.headers()[HOST], "example.com");
+        assert!(!prepared.headers().contains_key(TE));
     }
 
     #[test]
