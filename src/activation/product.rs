@@ -336,8 +336,12 @@ header = "x-acl-proxy-request-id"
 
     #[tokio::test]
     async fn product_static_owner_keeps_control_open_until_joined_shutdown() {
+        let minimal = MINIMAL.replace(
+            "shutdown_drain_timeout = \"30s\"",
+            "shutdown_drain_timeout = \"1s\"",
+        );
         let text = format!(
-            "{MINIMAL}\n[control]\nbind = \"127.0.0.1:8898\"\nbase_path = \"/_acl-proxy\"\nrequest_header_timeout = \"1s\"\nrequest_body_timeout = \"1s\"\nmax_connections = 2\nmax_request_body_bytes = 65536\n"
+            "{minimal}\n[control]\nbind = \"127.0.0.1:8898\"\nbase_path = \"/_acl-proxy\"\nrequest_header_timeout = \"100ms\"\nrequest_body_timeout = \"1s\"\nmax_connections = 2\nmax_request_body_bytes = 65536\n"
         );
         let compiled = compile(&text);
         let resources = ProductStaticResources::try_new(&compiled.static_config).unwrap();
@@ -365,11 +369,127 @@ header = "x-acl-proxy-request-id"
         crate::runtime::StaticResources::begin_shutdown(resources.as_ref());
         assert!(readiness(address).await.starts_with(b"HTTP/1.1 503"));
 
-        crate::runtime::StaticResources::shutdown(resources.as_ref()).await;
-        assert!(tokio::net::TcpStream::connect(address).await.is_err());
         let control = resources.control_server().unwrap();
+        let mut admitted = tokio::net::TcpStream::connect(address).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while control.arena_counts().live != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the shutdown observer must be admitted");
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            crate::runtime::StaticResources::shutdown(resources.as_ref()),
+        )
+        .await
+        .expect("joined shutdown must stay within its compiled deadline");
+        let mut trailing = Vec::new();
+        admitted.read_to_end(&mut trailing).await.unwrap();
+        assert!(trailing.is_empty());
         assert_eq!(control.arena_counts().live, 0);
         assert_eq!(control.arena_counts().available, 2);
+    }
+
+    #[tokio::test]
+    async fn control_graceful_join_escalates_at_the_static_shutdown_deadline() {
+        let minimal = MINIMAL.replace(
+            "shutdown_drain_timeout = \"30s\"",
+            "shutdown_drain_timeout = \"50ms\"",
+        );
+        let text = format!(
+            "{minimal}\n[control]\nbind = \"127.0.0.1:8898\"\nbase_path = \"/_acl-proxy\"\nrequest_header_timeout = \"5s\"\nrequest_body_timeout = \"1s\"\nmax_connections = 1\nmax_request_body_bytes = 65536\n"
+        );
+        let compiled = compile(&text);
+        let resources = ProductStaticResources::try_new(&compiled.static_config).unwrap();
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = resources
+            .start_control_with_listener(listener)
+            .unwrap()
+            .unwrap();
+        let control = resources.control_server().unwrap();
+        let mut stalled = tokio::net::TcpStream::connect(address).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while control.arena_counts().live != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the stalled connection must be admitted");
+
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            crate::runtime::StaticResources::shutdown(resources.as_ref()),
+        )
+        .await
+        .expect("the original static deadline must bound graceful connection drain");
+        let mut trailing = Vec::new();
+        stalled.read_to_end(&mut trailing).await.unwrap();
+        assert!(trailing.is_empty());
+        assert_eq!(control.arena_counts().live, 0);
+        assert_eq!(control.arena_counts().available, 1);
+    }
+
+    #[tokio::test]
+    async fn fatal_control_failure_is_observed_and_shutdown_does_not_panic() {
+        let text = format!(
+            "{MINIMAL}\n[control]\nbind = \"127.0.0.1:8898\"\nbase_path = \"/_acl-proxy\"\nrequest_header_timeout = \"1s\"\nrequest_body_timeout = \"1s\"\nmax_connections = 1\nmax_request_body_bytes = 65536\n"
+        );
+        let compiled = compile(&text);
+        let resources = ProductStaticResources::try_new(&compiled.static_config).unwrap();
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        resources
+            .start_control_with_accept_errors(
+                listener,
+                [std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "injected fatal accept failure",
+                )],
+            )
+            .unwrap();
+
+        let failure =
+            tokio::time::timeout(Duration::from_secs(1), resources.wait_for_control_failure())
+                .await
+                .expect("fatal supervisor failure must be observable")
+                .expect("the failure channel must retain the fatal error");
+        assert!(matches!(
+            failure.as_ref(),
+            crate::control::server::ControlServerRunError::Accept(error)
+                if error.kind() == std::io::ErrorKind::InvalidInput
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !resources.shutdown_started_for_test() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the static owner must begin shutdown after control failure");
+        assert!(
+            !resources
+                .authorization_runtime()
+                .transport_counts()
+                .accepting
+        );
+        assert!(
+            !resources
+                .authorization_runtime()
+                .pending_store()
+                .counts()
+                .accepting
+        );
+        assert!(matches!(
+            resources.start_control(),
+            Err(crate::activation::static_resources::ProductStaticResourcesError::ShuttingDown)
+        ));
+
+        crate::runtime::StaticResources::shutdown(resources.as_ref()).await;
+        assert!(matches!(
+            resources.control_shutdown_error().as_deref(),
+            Some(crate::control::server::ControlServerShutdownError::Supervisor(error))
+                if matches!(error.as_ref(), crate::control::server::ControlServerRunError::Accept(_))
+        ));
     }
 
     #[tokio::test]

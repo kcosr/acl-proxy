@@ -1,7 +1,11 @@
 use std::fmt;
+use std::io;
 use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
+#[cfg(test)]
+use std::collections::VecDeque;
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -26,12 +30,13 @@ use super::connection::serve_control_connection;
 use super::router::{ControlRouter, ControlRouterError};
 
 const HTTP1_ALPN: &[u8] = b"http/1.1";
+const TRANSIENT_ACCEPT_RETRY: Duration = Duration::from_millis(10);
+const RESOURCE_ACCEPT_RETRY: Duration = Duration::from_secs(1);
 
 pub(crate) struct ControlServer {
     stop: watch::Sender<ControlStop>,
     stop_gate: Arc<StdMutex<ControlStop>>,
     task: AsyncMutex<ControlTaskState>,
-    failure: watch::Receiver<Option<Arc<ControlServerRunError>>>,
     arena: ControlParserArena,
     local_addr: SocketAddr,
     #[cfg(test)]
@@ -48,8 +53,10 @@ impl ControlServer {
         config: &StaticControlConfig,
         authorization: Arc<WebhookAuthorizationRuntime>,
         readiness: Arc<ServiceReadiness>,
+        failure_observer: Arc<dyn ControlServerFailureObserver>,
     ) -> Result<Arc<Self>, ControlServerError> {
-        let prepared = PreparedControlServer::try_new(config, authorization, readiness)?;
+        let prepared =
+            PreparedControlServer::try_new(config, authorization, readiness, failure_observer)?;
         let listener =
             StdTcpListener::bind(config.bind).map_err(|source| ControlServerError::Bind {
                 address: config.bind,
@@ -64,8 +71,10 @@ impl ControlServer {
         listener: StdTcpListener,
         authorization: Arc<WebhookAuthorizationRuntime>,
         readiness: Arc<ServiceReadiness>,
+        failure_observer: Arc<dyn ControlServerFailureObserver>,
     ) -> Result<Arc<Self>, ControlServerError> {
-        let prepared = PreparedControlServer::try_new(config, authorization, readiness)?;
+        let prepared =
+            PreparedControlServer::try_new(config, authorization, readiness, failure_observer)?;
         Self::start(prepared, listener)
     }
 
@@ -73,8 +82,6 @@ impl ControlServer {
         prepared: PreparedControlServer,
         listener: StdTcpListener,
     ) -> Result<Arc<Self>, ControlServerError> {
-        let runtime = tokio::runtime::Handle::try_current()
-            .map_err(|_| ControlServerError::RuntimeUnavailable)?;
         let local_addr = listener
             .local_addr()
             .map_err(ControlServerError::ListenerAddress)?;
@@ -83,10 +90,45 @@ impl ControlServer {
             .map_err(ControlServerError::ListenerNonblocking)?;
         let listener =
             TcpListener::from_std(listener).map_err(ControlServerError::ListenerAdopt)?;
+        Self::start_listener(prepared, ControlListener::new(listener), local_addr)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_prebound_with_accept_errors(
+        config: &StaticControlConfig,
+        listener: StdTcpListener,
+        authorization: Arc<WebhookAuthorizationRuntime>,
+        readiness: Arc<ServiceReadiness>,
+        errors: impl IntoIterator<Item = io::Error>,
+        failure_observer: Arc<dyn ControlServerFailureObserver>,
+    ) -> Result<Arc<Self>, ControlServerError> {
+        let prepared =
+            PreparedControlServer::try_new(config, authorization, readiness, failure_observer)?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(ControlServerError::ListenerAddress)?;
+        listener
+            .set_nonblocking(true)
+            .map_err(ControlServerError::ListenerNonblocking)?;
+        let listener =
+            TcpListener::from_std(listener).map_err(ControlServerError::ListenerAdopt)?;
+        Self::start_listener(
+            prepared,
+            ControlListener::with_accept_errors(listener, errors),
+            local_addr,
+        )
+    }
+
+    fn start_listener(
+        prepared: PreparedControlServer,
+        listener: ControlListener,
+        local_addr: SocketAddr,
+    ) -> Result<Arc<Self>, ControlServerError> {
+        let runtime = tokio::runtime::Handle::try_current()
+            .map_err(|_| ControlServerError::RuntimeUnavailable)?;
         let arena = prepared.context.arena.clone();
         let (stop, stop_rx) = watch::channel(ControlStop::Running);
         let stop_gate = Arc::new(StdMutex::new(ControlStop::Running));
-        let (failure_tx, failure) = watch::channel(None);
         #[cfg(test)]
         let spawned_connections = Arc::new(AtomicUsize::new(0));
         #[cfg(test)]
@@ -96,7 +138,6 @@ impl ControlServer {
             prepared.context,
             stop_rx,
             stop_gate.clone(),
-            failure_tx,
             #[cfg(test)]
             task_spawned_connections,
         ));
@@ -107,7 +148,6 @@ impl ControlServer {
                 handle: Some(task),
                 terminal: None,
             }),
-            failure,
             arena,
             local_addr,
             #[cfg(test)]
@@ -155,22 +195,6 @@ impl ControlServer {
         result
     }
 
-    pub(crate) fn failure(&self) -> Option<Arc<ControlServerRunError>> {
-        self.failure.borrow().clone()
-    }
-
-    pub(crate) async fn wait_for_failure(&self) -> Option<Arc<ControlServerRunError>> {
-        let mut failure = self.failure.clone();
-        loop {
-            if let Some(error) = failure.borrow().clone() {
-                return Some(error);
-            }
-            if failure.changed().await.is_err() {
-                return failure.borrow().clone();
-            }
-        }
-    }
-
     #[cfg(test)]
     fn spawned_connections(&self) -> usize {
         self.spawned_connections.load(Ordering::Acquire)
@@ -195,6 +219,7 @@ impl PreparedControlServer {
         config: &StaticControlConfig,
         authorization: Arc<WebhookAuthorizationRuntime>,
         readiness: Arc<ServiceReadiness>,
+        failure_observer: Arc<dyn ControlServerFailureObserver>,
     ) -> Result<Self, ControlServerError> {
         let expected_arena_bytes = config
             .max_connections
@@ -225,6 +250,7 @@ impl PreparedControlServer {
                 router,
                 authorization,
                 readiness,
+                failure_observer,
                 config: config.clone(),
                 tls,
             }),
@@ -237,8 +263,49 @@ struct ControlServerContext {
     router: ControlRouter,
     authorization: Arc<WebhookAuthorizationRuntime>,
     readiness: Arc<ServiceReadiness>,
+    failure_observer: Arc<dyn ControlServerFailureObserver>,
     config: StaticControlConfig,
     tls: Option<TlsAcceptor>,
+}
+
+struct ControlListener {
+    listener: TcpListener,
+    #[cfg(test)]
+    accept_errors: StdMutex<VecDeque<io::Error>>,
+}
+
+impl ControlListener {
+    fn new(listener: TcpListener) -> Self {
+        Self {
+            listener,
+            #[cfg(test)]
+            accept_errors: StdMutex::new(VecDeque::new()),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_accept_errors(
+        listener: TcpListener,
+        errors: impl IntoIterator<Item = io::Error>,
+    ) -> Self {
+        Self {
+            listener,
+            accept_errors: StdMutex::new(errors.into_iter().collect()),
+        }
+    }
+
+    async fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        #[cfg(test)]
+        if let Some(error) = self
+            .accept_errors
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .pop_front()
+        {
+            return Err(error);
+        }
+        self.listener.accept().await
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -269,11 +336,10 @@ const fn stop_rank(stop: ControlStop) -> u8 {
 }
 
 async fn run_control_supervisor(
-    listener: TcpListener,
+    listener: ControlListener,
     context: Arc<ControlServerContext>,
     mut stop: watch::Receiver<ControlStop>,
     stop_gate: Arc<StdMutex<ControlStop>>,
-    failure: watch::Sender<Option<Arc<ControlServerRunError>>>,
     #[cfg(test)] spawned_connections: Arc<AtomicUsize>,
 ) -> Result<(), Arc<ControlServerRunError>> {
     let mut connections = JoinSet::new();
@@ -290,7 +356,32 @@ async fn run_control_supervisor(
             accepted = listener.accept() => {
                 let (stream, _) = match accepted {
                     Ok(accepted) => accepted,
-                    Err(error) => break SupervisorExit::Error(Arc::new(ControlServerRunError::Accept(error))),
+                    Err(error) => {
+                        let retry_after = match classify_accept_error(&error) {
+                            AcceptErrorDisposition::RetryAfter(retry_after) => retry_after,
+                            AcceptErrorDisposition::Fatal => {
+                                break SupervisorExit::Error(Arc::new(ControlServerRunError::Accept(error)));
+                            }
+                        };
+                        tracing::warn!(
+                            error = %error,
+                            retry_after_ms = retry_after.as_millis(),
+                            "control listener accept failed transiently"
+                        );
+                        let retry = tokio::time::sleep(retry_after);
+                        tokio::pin!(retry);
+                        tokio::select! {
+                            biased;
+                            changed = stop.changed() => {
+                                let requested = *stop.borrow_and_update();
+                                if changed.is_err() || requested != ControlStop::Running {
+                                    break SupervisorExit::Stop(requested);
+                                }
+                            }
+                            _ = &mut retry => {}
+                        }
+                        continue;
+                    }
                 };
                 let first_header_deadline = Instant::now() + context.config.request_header_timeout;
                 let gate = stop_gate
@@ -328,17 +419,43 @@ async fn run_control_supervisor(
             }
         }
     };
+    drop(listener);
 
-    let _ = connection_stop.send(true);
-    let abort = matches!(
+    if let SupervisorExit::Error(error) = &exit {
+        context.readiness.begin_shutdown();
+        context.failure_observer.failed(error.clone());
+    }
+
+    let mut abort = matches!(
         exit,
         SupervisorExit::Error(_) | SupervisorExit::Stop(ControlStop::AbortAndJoin)
     );
     if abort {
+        let _ = connection_stop.send(true);
         connections.abort_all();
     }
     let mut cleanup_error = None;
-    while let Some(result) = connections.join_next().await {
+    while !connections.is_empty() {
+        let result = if abort {
+            connections.join_next().await
+        } else {
+            tokio::select! {
+                biased;
+                changed = stop.changed() => {
+                    let requested = *stop.borrow_and_update();
+                    if changed.is_err() || requested == ControlStop::AbortAndJoin {
+                        abort = true;
+                        let _ = connection_stop.send(true);
+                        connections.abort_all();
+                    }
+                    continue;
+                }
+                result = connections.join_next() => result,
+            }
+        };
+        let Some(result) = result else {
+            break;
+        };
         if let Err(error) = result {
             if !error.is_cancelled() && cleanup_error.is_none() {
                 cleanup_error = Some(Arc::new(ControlServerRunError::ConnectionJoin(error)));
@@ -346,15 +463,66 @@ async fn run_control_supervisor(
         }
     }
 
-    let result = match exit {
+    match exit {
         SupervisorExit::Error(error) => Err(error),
         SupervisorExit::Stop(_) => cleanup_error.map_or(Ok(()), Err),
-    };
-    if let Err(error) = &result {
-        context.readiness.begin_shutdown();
-        let _ = failure.send(Some(error.clone()));
     }
-    result
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcceptErrorDisposition {
+    RetryAfter(Duration),
+    Fatal,
+}
+
+fn classify_accept_error(error: &io::Error) -> AcceptErrorDisposition {
+    if is_fatal_accept_error(error) {
+        return AcceptErrorDisposition::Fatal;
+    }
+    match error.kind() {
+        io::ErrorKind::Interrupted
+        | io::ErrorKind::WouldBlock
+        | io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::TimedOut => AcceptErrorDisposition::RetryAfter(TRANSIENT_ACCEPT_RETRY),
+        _ => AcceptErrorDisposition::RetryAfter(RESOURCE_ACCEPT_RETRY),
+    }
+}
+
+fn is_fatal_accept_error(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::InvalidInput {
+        return true;
+    }
+    is_invalid_listener_error(error)
+}
+
+#[cfg(unix)]
+fn is_invalid_listener_error(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::EBADF | libc::ENOTSOCK))
+}
+
+#[cfg(windows)]
+fn is_invalid_listener_error(error: &io::Error) -> bool {
+    // WSAEINVAL, WSAENOTSOCK, and WSANOTINITIALISED respectively.
+    matches!(error.raw_os_error(), Some(10022 | 10038 | 10093))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn is_invalid_listener_error(_error: &io::Error) -> bool {
+    false
+}
+
+pub(crate) trait ControlServerFailureObserver: Send + Sync {
+    fn failed(&self, error: Arc<ControlServerRunError>);
+}
+
+#[cfg(test)]
+struct IgnoreControlServerFailure;
+
+#[cfg(test)]
+impl ControlServerFailureObserver for IgnoreControlServerFailure {
+    fn failed(&self, _error: Arc<ControlServerRunError>) {}
 }
 
 async fn serve_admitted_connection(
@@ -530,6 +698,7 @@ mod tests {
             prebound(),
             WebhookAuthorizationRuntime::for_test(None),
             Arc::new(ServiceReadiness::new()),
+            Arc::new(IgnoreControlServerFailure),
         )
         .unwrap()
     }
@@ -577,7 +746,6 @@ mod tests {
     fn server_with_blocked_supervisor(release: Arc<Notify>) -> Arc<ControlServer> {
         let arena = ControlParserArena::try_new(1).unwrap();
         let (stop, _) = watch::channel(ControlStop::Running);
-        let (_, failure) = watch::channel(None);
         let handle = tokio::spawn(async move {
             release.notified().await;
             Ok(())
@@ -589,7 +757,6 @@ mod tests {
                 handle: Some(handle),
                 terminal: None,
             }),
-            failure,
             arena,
             local_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1),
             spawned_connections: Arc::new(AtomicUsize::new(0)),
@@ -618,6 +785,115 @@ mod tests {
 
         server.close_and_join().await.unwrap();
         assert_eq!(server.arena_counts().live, 0);
+    }
+
+    #[tokio::test]
+    async fn transient_accept_error_retries_and_serves_the_next_connection() {
+        let config = config(1);
+        let server = ControlServer::from_prebound_with_accept_errors(
+            &config,
+            prebound(),
+            WebhookAuthorizationRuntime::for_test(None),
+            Arc::new(ServiceReadiness::new()),
+            [io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "injected transient accept failure",
+            )],
+            Arc::new(IgnoreControlServerFailure),
+        )
+        .unwrap();
+
+        let mut client = tokio::net::TcpStream::connect(server.local_addr())
+            .await
+            .unwrap();
+        client
+            .write_all(b"GET /_acl-proxy/ready HTTP/1.1\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), client.read_to_end(&mut response))
+            .await
+            .expect("the listener must recover after a transient accept error")
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+        server.close_and_join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn graceful_close_finishes_an_admitted_request_before_joining() {
+        let server = start(1);
+        let mut client = tokio::net::TcpStream::connect(server.local_addr())
+            .await
+            .unwrap();
+        client.write_all(b"GET /_acl-proxy").await.unwrap();
+        wait_for(|| server.arena_counts().live == 1).await;
+
+        let joining_server = server.clone();
+        let joining = tokio::spawn(async move { joining_server.close_and_join().await });
+        tokio::task::yield_now().await;
+        assert!(!joining.is_finished());
+
+        client
+            .write_all(b"/ready HTTP/1.1\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 503 Service Unavailable\r\n"));
+        joining.await.unwrap().unwrap();
+        assert_eq!(server.arena_counts().live, 0);
+    }
+
+    #[test]
+    fn accept_retry_policy_distinguishes_transient_capacity_and_fatal_errors() {
+        assert_eq!(
+            classify_accept_error(&io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "transient",
+            )),
+            AcceptErrorDisposition::RetryAfter(TRANSIENT_ACCEPT_RETRY)
+        );
+        assert_eq!(
+            classify_accept_error(&io::Error::new(io::ErrorKind::InvalidInput, "fatal")),
+            AcceptErrorDisposition::Fatal
+        );
+        assert_eq!(
+            classify_accept_error(&io::Error::other("platform-specific accept failure")),
+            AcceptErrorDisposition::RetryAfter(RESOURCE_ACCEPT_RETRY)
+        );
+
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                classify_accept_error(&io::Error::from_raw_os_error(libc::EMFILE)),
+                AcceptErrorDisposition::RetryAfter(RESOURCE_ACCEPT_RETRY)
+            );
+            assert_eq!(
+                classify_accept_error(&io::Error::from_raw_os_error(libc::EBADF)),
+                AcceptErrorDisposition::Fatal
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_interrupts_resource_exhaustion_accept_backoff() {
+        let config = config(1);
+        let server = ControlServer::from_prebound_with_accept_errors(
+            &config,
+            prebound(),
+            WebhookAuthorizationRuntime::for_test(None),
+            Arc::new(ServiceReadiness::new()),
+            [io::Error::from_raw_os_error(libc::EMFILE)],
+            Arc::new(IgnoreControlServerFailure),
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        tokio::time::timeout(Duration::from_millis(200), server.abort_and_join())
+            .await
+            .expect("stop must interrupt the one-second descriptor-pressure backoff")
+            .unwrap();
     }
 
     #[tokio::test]
@@ -756,6 +1032,7 @@ mod tests {
             &invalid,
             WebhookAuthorizationRuntime::for_test(None),
             Arc::new(ServiceReadiness::new()),
+            Arc::new(IgnoreControlServerFailure),
         )
         .err()
         .expect("mismatched capacity must fail");
