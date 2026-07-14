@@ -32,6 +32,17 @@ const MAX_PROVIDER_CREDENTIAL_BYTES: usize = 64 * 1024;
 const PROVIDER_STREAM_SCRATCH_BYTES: usize = 64 * 1024;
 static NEXT_OUTPUT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
 
+const MIN_WEBHOOK_REQUEST_WITHOUT_CALLBACK_URL_WIRE: &[u8] =
+    b"{\"type\":\"request\",\"requestId\":\"a\",\"ruleId\":\"a\",\"url\":\"http://a/\",\"method\":\"A\",\"clientIp\":\"::\",\"callbackUrl\":\"\",\"resumeToken\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}";
+const CALLBACK_RESPONSE_PREFIX_WIRE: &[u8] =
+    b"{\"resumeToken\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",";
+const MIN_CALLBACK_RESPONSE_WIRE: &[u8] = b"{\"resumeToken\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"type\":\"response\",\"decision\":\"deny\"}";
+
+pub(crate) const MIN_WEBHOOK_REQUEST_WITHOUT_CALLBACK_URL_BYTES: usize =
+    MIN_WEBHOOK_REQUEST_WITHOUT_CALLBACK_URL_WIRE.len();
+pub(crate) const CALLBACK_RESPONSE_PREFIX_BYTES: usize = CALLBACK_RESPONSE_PREFIX_WIRE.len();
+pub(crate) const MIN_CALLBACK_RESPONSE_BYTES: usize = MIN_CALLBACK_RESPONSE_WIRE.len();
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ProviderOutputIndex {
     registry_id: u64,
@@ -1549,6 +1560,23 @@ mod tests {
     use crate::safety::{WireBodyPool, WireBodyQuotaKey};
 
     const TEST_CORRELATION_ID: &str = "p0000000000000001-0000000000000001";
+
+    #[test]
+    fn webhook_callback_envelope_limits_follow_canonical_wire_literals() {
+        assert_eq!(
+            MIN_WEBHOOK_REQUEST_WITHOUT_CALLBACK_URL_BYTES,
+            MIN_WEBHOOK_REQUEST_WITHOUT_CALLBACK_URL_WIRE.len()
+        );
+        assert_eq!(
+            CALLBACK_RESPONSE_PREFIX_BYTES,
+            CALLBACK_RESPONSE_PREFIX_WIRE.len()
+        );
+        assert_eq!(
+            MIN_CALLBACK_RESPONSE_BYTES,
+            MIN_CALLBACK_RESPONSE_WIRE.len()
+        );
+        assert!(MIN_CALLBACK_RESPONSE_WIRE.starts_with(CALLBACK_RESPONSE_PREFIX_WIRE));
+    }
 
     struct PendingAsyncWriter {
         attempted: bool,

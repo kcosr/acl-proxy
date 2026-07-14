@@ -56,6 +56,8 @@ struct Inner {
     cleanup_starts: AtomicUsize,
     #[cfg(test)]
     cleanup_reasons: Mutex<Vec<CleanupReason>>,
+    #[cfg(test)]
+    reader_assignment_gate: Mutex<Option<Arc<tokio::sync::Barrier>>>,
 }
 
 struct SpawnConfig {
@@ -68,6 +70,8 @@ struct SpawnConfig {
 struct ProcessState {
     phase: Phase,
     available: bool,
+    exit_draining: bool,
+    reader_assigned: bool,
     retirement_deadline: Option<Instant>,
     epoch: u64,
     child: Option<Child>,
@@ -266,6 +270,8 @@ impl ProcessProvider {
             state: Mutex::new(ProcessState {
                 phase: Phase::Candidate,
                 available: true,
+                exit_draining: false,
+                reader_assigned: false,
                 retirement_deadline: None,
                 epoch: 1,
                 child: Some(spawned.child),
@@ -288,6 +294,8 @@ impl ProcessProvider {
             cleanup_starts: AtomicUsize::new(0),
             #[cfg(test)]
             cleanup_reasons: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            reader_assignment_gate: Mutex::new(None),
         });
         install_io_tasks(&inner, 1, spawned.stdin, spawned.stdout);
         let supervisor_inner = inner.clone();
@@ -321,7 +329,7 @@ impl ProcessProvider {
         }
         let operation_deadline =
             operation_deadline(Instant::now(), request_deadline, self.inner.timeout);
-        let (receiver, cancellation, epoch_cancellation) = match time::timeout_at(
+        let (receiver, cancellation) = match time::timeout_at(
             operation_deadline,
             self.dispatch_before_response(request, guard, request_deadline),
         )
@@ -330,16 +338,10 @@ impl ProcessProvider {
             Ok(result) => result?,
             Err(_) => return Err(ProcessRequestError::Timeout),
         };
-        let result = tokio::select! {
-            biased;
-            _ = epoch_cancellation.cancelled() => {
-                Err(self.inner.current_dispatch_error(request_deadline))
-            }
-            result = time::timeout_at(operation_deadline, receiver) => match result {
-                Ok(Ok(result)) => result.map(ProcessDecision::from),
-                Ok(Err(_)) => Err(ProcessRequestError::Unavailable),
-                Err(_) => Err(ProcessRequestError::Timeout),
-            }
+        let result = match time::timeout_at(operation_deadline, receiver).await {
+            Ok(Ok(result)) => result.map(ProcessDecision::from),
+            Ok(Err(_)) => Err(ProcessRequestError::Unavailable),
+            Err(_) => Err(ProcessRequestError::Timeout),
         };
         drop(cancellation);
         result
@@ -354,7 +356,6 @@ impl ProcessProvider {
         (
             oneshot::Receiver<Result<DecisionOnlyProviderDecision, ProcessRequestError>>,
             RequestCancellationGuard,
-            EpochCancellation,
         ),
         ProcessRequestError,
     > {
@@ -465,7 +466,7 @@ impl ProcessProvider {
             return Err(self.inner.current_dispatch_error(request_deadline));
         }
         drop(writer);
-        Ok((receiver, cancellation, epoch_cancellation))
+        Ok((receiver, cancellation))
     }
 
     fn begin_retirement(&self) {
@@ -807,18 +808,7 @@ async fn run_reader(inner: Arc<Inner>, epoch: u64, stdout: ChildStdout) {
                     return;
                 }
             };
-        let pending = {
-            let mut requests = lock(&inner.requests);
-            if requests
-                .pending
-                .get(continuation.id())
-                .is_some_and(|pending| pending.epoch == epoch)
-            {
-                requests.pending.remove(continuation.id())
-            } else {
-                None
-            }
-        };
+        let pending = inner.assign_pending_response(epoch, continuation.id());
         let Some(pending) = pending else {
             inner.report_fatal(epoch);
             return;
@@ -830,12 +820,20 @@ async fn run_reader(inner: Arc<Inner>, epoch: u64, stdout: ChildStdout) {
             &inner.response_schema,
         )
         .await;
+        #[cfg(test)]
+        let assignment_gate = { lock(&inner.reader_assignment_gate).clone() };
+        #[cfg(test)]
+        if let Some(gate) = assignment_gate {
+            gate.wait().await;
+            gate.wait().await;
+        }
         match parsed {
             Ok(response) => {
                 if let Some(error) = inner.assigned_delivery_error(epoch, pending.request_deadline)
                 {
                     pending.completed.store(true, Ordering::Release);
                     let _ = pending.response.send(Err(error));
+                    inner.finish_assigned_response(epoch);
                     inner.report_fatal(epoch);
                     return;
                 }
@@ -850,6 +848,9 @@ async fn run_reader(inner: Arc<Inner>, epoch: u64, stdout: ChildStdout) {
                             .send(Err(ProcessRequestError::InvalidResponse));
                     }
                 }
+                if !inner.finish_assigned_response(epoch) {
+                    return;
+                }
             }
             Err(_) => {
                 let error = inner.current_dispatch_error(pending.request_deadline);
@@ -857,6 +858,7 @@ async fn run_reader(inner: Arc<Inner>, epoch: u64, stdout: ChildStdout) {
                     pending.completed.store(true, Ordering::Release);
                 }
                 let _ = pending.response.send(Err(error));
+                inner.finish_assigned_response(epoch);
                 inner.report_fatal(epoch);
                 return;
             }
@@ -875,6 +877,33 @@ impl From<DecisionOnlyProviderDecision> for ProcessDecision {
 }
 
 impl Inner {
+    fn assign_pending_response(&self, epoch: u64, id: &str) -> Option<PendingRequest> {
+        let mut state = lock(&self.state);
+        if state.epoch != epoch || !state.available || state.reader_assigned {
+            return None;
+        }
+        let mut requests = lock(&self.requests);
+        if requests
+            .pending
+            .get(id)
+            .is_none_or(|pending| pending.epoch != epoch)
+        {
+            return None;
+        }
+        let pending = requests.pending.remove(id)?;
+        state.reader_assigned = true;
+        Some(pending)
+    }
+
+    fn finish_assigned_response(&self, epoch: u64) -> bool {
+        let mut state = lock(&self.state);
+        if state.epoch != epoch {
+            return false;
+        }
+        state.reader_assigned = false;
+        state.available
+    }
+
     fn check_dispatch_epoch(
         &self,
         epoch: u64,
@@ -900,7 +929,9 @@ impl Inner {
         deadline: Instant,
     ) -> Option<ProcessRequestError> {
         let state = lock(&self.state);
-        if state.epoch != epoch || !state.available {
+        if state.epoch != epoch
+            || !(state.available || state.exit_draining && state.reader_assigned)
+        {
             Some(rejection_for_state(&state, deadline))
         } else {
             expired_retirement_rejection(&state, deadline)
@@ -910,10 +941,14 @@ impl Inner {
     fn report_fatal(&self, epoch: u64) {
         let should_report = {
             let mut state = lock(&self.state);
-            if state.epoch != epoch || !state.available || state.phase == Phase::Stopped {
+            if state.epoch != epoch
+                || (!state.available && !state.exit_draining)
+                || state.phase == Phase::Stopped
+            {
                 false
             } else {
                 state.available = false;
+                state.exit_draining = false;
                 state.writer.take();
                 state.cancellation.cancel();
                 true
@@ -923,6 +958,28 @@ impl Inner {
             self.fail_all();
             let _ = self.events.send(SupervisorEvent::Fatal { epoch });
         }
+    }
+
+    fn begin_child_exit_drain(&self, epoch: u64) -> Option<bool> {
+        let mut state = lock(&self.state);
+        if state.epoch != epoch || !state.available || state.phase == Phase::Stopped {
+            return None;
+        }
+        state.available = false;
+        state.exit_draining = true;
+        state.writer.take();
+        state.cancellation.cancel();
+        Some(state.reader_assigned)
+    }
+
+    fn finish_child_exit_drain(&self, epoch: u64) {
+        let mut state = lock(&self.state);
+        if state.epoch == epoch {
+            state.exit_draining = false;
+            state.cancellation.cancel();
+        }
+        drop(state);
+        self.fail_all();
     }
 
     fn fail_all(&self) {
@@ -957,19 +1014,26 @@ async fn run_supervisor(inner: Arc<Inner>, mut events: mpsc::UnboundedReceiver<S
                 }
             },
             _ = poll.tick() => {
-                let fatal_epoch = {
+                let child_status = {
                     let mut state = lock(&inner.state);
                     if state.available {
                         match state.child.as_mut().map(Child::try_wait) {
-                            Some(Ok(Some(_))) | Some(Err(_)) | None => Some(state.epoch),
+                            Some(Ok(Some(_))) => Some((state.epoch, true)),
+                            Some(Err(_)) | None => Some((state.epoch, false)),
                             Some(Ok(None)) => None,
                         }
                     } else {
                         None
                     }
                 };
-                if let Some(epoch) = fatal_epoch {
-                    inner.report_fatal(epoch);
+                if let Some((epoch, exited)) = child_status {
+                    if exited {
+                        if let Some(drain_reader) = inner.begin_child_exit_drain(epoch) {
+                            handle_child_exit(&inner, epoch, drain_reader, &mut restart_at).await;
+                        }
+                    } else {
+                        inner.report_fatal(epoch);
+                    }
                 }
             },
             _ = sleep_until_optional(restart_at), if restart_at.is_some() => {
@@ -993,6 +1057,37 @@ async fn handle_fatal(inner: &Arc<Inner>, epoch: u64, restart_at: &mut Option<In
     if let Some(child) = child {
         terminate_child(child).await;
     }
+    let should_restart = {
+        let state = lock(&inner.state);
+        state.epoch == epoch && state.phase == Phase::Active
+    };
+    if should_restart {
+        *restart_at = Some(Instant::now() + inner.restart_backoff);
+    }
+}
+
+async fn handle_child_exit(
+    inner: &Arc<Inner>,
+    epoch: u64,
+    drain_reader: bool,
+    restart_at: &mut Option<Instant>,
+) {
+    let child = {
+        let mut state = lock(&inner.state);
+        if state.epoch != epoch {
+            return;
+        }
+        state.child.take()
+    };
+    if let Some(child) = child {
+        terminate_child(child).await;
+    }
+    if drain_reader {
+        drain_epoch_reader(inner, epoch).await;
+    } else {
+        stop_epoch_reader(inner, Some(epoch)).await;
+    }
+    inner.finish_child_exit_drain(epoch);
     let should_restart = {
         let state = lock(&inner.state);
         state.epoch == epoch && state.phase == Phase::Active
@@ -1029,6 +1124,8 @@ async fn restart_if_active(inner: &Arc<Inner>, restart_at: &mut Option<Instant>)
         } else if let Some(next_epoch) = state.epoch.checked_add(1) {
             state.epoch = next_epoch;
             state.available = true;
+            state.exit_draining = false;
+            state.reader_assigned = false;
             state.cancellation = EpochCancellation::new();
             state.child = child.take();
             Some(state.epoch)
@@ -1049,6 +1146,7 @@ async fn stop_supervisor(inner: &Arc<Inner>) {
         let mut state = lock(&inner.state);
         state.phase = Phase::Stopped;
         state.available = false;
+        state.exit_draining = false;
         state.writer.take();
         state.cancellation.cancel();
         state.child.take()
@@ -1080,6 +1178,26 @@ async fn stop_epoch_reader(inner: &Arc<Inner>, epoch: Option<u64>) {
     if let Some(reader) = reader {
         reader.task.abort();
         let _ = reader.task.await;
+    }
+}
+
+async fn drain_epoch_reader(inner: &Arc<Inner>, epoch: u64) {
+    let reader = {
+        let mut reader = lock(&inner.reader);
+        if reader.as_ref().is_some_and(|reader| reader.epoch == epoch) {
+            reader.take()
+        } else {
+            None
+        }
+    };
+    if let Some(mut reader) = reader {
+        if time::timeout(TERMINATE_GRACE, &mut reader.task)
+            .await
+            .is_err()
+        {
+            reader.task.abort();
+            let _ = reader.task.await;
+        }
     }
 }
 
@@ -1286,6 +1404,59 @@ for request, decision in ((second, "deny"), (first, "allow")):
         let (first, second) = tokio::join!(first, second);
         assert_eq!(first.unwrap(), ProcessDecision::Allow);
         assert_eq!(second.unwrap(), ProcessDecision::Deny);
+        cleanup(&provider).await;
+    }
+
+    #[tokio::test]
+    async fn parsed_response_wins_over_child_exit_and_only_waiting_requests_fail() {
+        let directory = TempDir::new().unwrap();
+        let first_read = directory.path().join("first-read");
+        let script = write_python(
+            &directory,
+            r#"import json, pathlib, sys
+first = json.loads(sys.stdin.readline())
+pathlib.Path("first-read").write_text("ready")
+json.loads(sys.stdin.readline())
+print(json.dumps({"id": first["id"], "type": "response", "decision": "allow"}, separators=(",", ":")), flush=True)
+"#,
+        );
+        let mut provider_plan = plan(&directory, &script);
+        provider_plan.restart_backoff = Duration::from_secs(30);
+        let provider = ProcessProvider::activate(provider_plan, || false)
+            .await
+            .unwrap();
+        commit(&provider);
+
+        let assignment_gate = Arc::new(tokio::sync::Barrier::new(2));
+        *lock(&provider.inner.reader_assignment_gate) = Some(assignment_gate.clone());
+
+        let first_provider = provider.clone();
+        let first = tokio::spawn(async move {
+            first_provider
+                .decide(request("first"), &body_guard(), request_deadline())
+                .await
+        });
+        wait_for_file(&first_read).await;
+        let second_provider = provider.clone();
+        let second = tokio::spawn(async move {
+            second_provider
+                .decide(request("second"), &body_guard(), request_deadline())
+                .await
+        });
+
+        assignment_gate.wait().await;
+        for _ in 0..100 {
+            if !lock(&provider.inner.state).available {
+                break;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!lock(&provider.inner.state).available);
+        assignment_gate.wait().await;
+
+        assert_eq!(first.await.unwrap(), Ok(ProcessDecision::Allow));
+        assert_eq!(second.await.unwrap(), Err(ProcessRequestError::Unavailable));
+        assert_eq!(provider.inner.pending_count.load(Ordering::Acquire), 0);
         cleanup(&provider).await;
     }
 
@@ -1945,6 +2116,8 @@ for line in sys.stdin:
         let state = ProcessState {
             phase: Phase::Retiring,
             available: false,
+            exit_draining: false,
+            reader_assigned: false,
             retirement_deadline: Some(retirement_deadline),
             epoch: 1,
             child: None,

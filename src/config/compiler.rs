@@ -16,8 +16,9 @@ use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
 use crate::authorization::protocol::{
-    PROCESS_PROVIDER_MIN_DECISION_RESPONSE_BYTES, PROCESS_PROVIDER_RESPONSE_PREFIX_BYTES,
-    PROCESS_PROVIDER_RESPONSE_TERMINATOR_BYTES,
+    CALLBACK_RESPONSE_PREFIX_BYTES, MIN_CALLBACK_RESPONSE_BYTES,
+    MIN_WEBHOOK_REQUEST_WITHOUT_CALLBACK_URL_BYTES, PROCESS_PROVIDER_MIN_DECISION_RESPONSE_BYTES,
+    PROCESS_PROVIDER_RESPONSE_PREFIX_BYTES, PROCESS_PROVIDER_RESPONSE_TERMINATOR_BYTES,
 };
 use crate::safety::wire_body::guarded_body_allocation_bytes;
 use crate::url::{canonicalize_http_url, CompiledUrlPattern};
@@ -38,8 +39,7 @@ const MAX_CONTROL_CONNECTIONS: usize = 65_536;
 const MAX_CONTROL_BODY_BYTES: usize = MIB;
 const CONTROL_PARSER_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_ENDPOINT_BYTES: usize = 8 * 1024;
-const MIN_CALLBACK_BODY_BYTES: usize = 97;
-const CALLBACK_PREFIX_BYTES: usize = 61;
+const CALLBACK_ROUTE_SUFFIX: &str = "/external-auth/callback";
 const MAX_PENDING_CALLBACKS: usize = 65_536;
 const MAX_RETIRING_GENERATIONS: usize = 8;
 const MAX_ACTIVE_UPGRADES: usize = 65_536;
@@ -48,9 +48,6 @@ const MIN_WEBHOOK_TRANSPORT_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_WEBHOOK_TRANSPORT_BUFFER_BYTES: usize = MIB;
 const MAX_WEBHOOK_TRANSPORT_BYTES: usize = 8 * GIB;
 const MAX_WEBHOOK_BODY_BYTES: usize = MIB;
-// Compact request without the callback URL. Canonical endpoint URLs contain no
-// JSON-escaped bytes, so the provider-specific floor is this plus its URL size.
-const MIN_WEBHOOK_REQUEST_FIXED_BYTES: usize = 171;
 const MAX_UPGRADE_RELAY_BUFFER_BYTES: usize = 16 * MIB;
 const MAX_UPGRADE_BUFFER_BYTES: usize = 4 * GIB;
 const MAX_WIRE_BODY_BYTES: usize = 64 * GIB;
@@ -1404,8 +1401,17 @@ fn validate_listener_control_mitm_matrix(
             ));
         }
         validate_base_path(&control.base_path)?;
-        let callback_target = format!("{}/external-auth/callback", control.base_path);
-        if callback_target.len() > MAX_ENDPOINT_BYTES {
+        let callback_target_bytes = control
+            .base_path
+            .len()
+            .checked_add(CALLBACK_ROUTE_SUFFIX.len())
+            .ok_or_else(|| {
+                ConfigCompileError::at(
+                    "control.base_path",
+                    "encoded callback target length overflow",
+                )
+            })?;
+        if callback_target_bytes > MAX_ENDPOINT_BYTES {
             return Err(ConfigCompileError::at(
                 "control.base_path",
                 format!("encoded callback target must be at most {MAX_ENDPOINT_BYTES} bytes"),
@@ -1567,9 +1573,7 @@ fn validate_base_path(base: &str) -> Result<(), ConfigCompileError> {
         ));
     }
     if base.split('/').any(|segment| matches!(segment, "." | ".."))
-        || base
-            .bytes()
-            .any(|byte| byte.is_ascii_control() || byte == b'?' || byte == b'#')
+        || !base.bytes().all(is_canonical_control_path_byte)
     {
         return Err(ConfigCompileError::at(
             "control.base_path",
@@ -1577,6 +1581,30 @@ fn validate_base_path(base: &str) -> Result<(), ConfigCompileError> {
         ));
     }
     Ok(())
+}
+
+fn is_canonical_control_path_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'/' | b'-'
+                | b'.'
+                | b'_'
+                | b'~'
+                | b'!'
+                | b'$'
+                | b'&'
+                | b'\''
+                | b'('
+                | b')'
+                | b'*'
+                | b'+'
+                | b','
+                | b';'
+                | b'='
+                | b':'
+                | b'@'
+        )
 }
 
 fn validate_tls_and_parent_matrix(
@@ -1856,13 +1884,13 @@ fn validate_callback_matrix(
     let control = config.control.as_ref().ok_or_else(|| {
         ConfigCompileError::at("authorization.callback", "requires the control listener")
     })?;
-    if control.max_request_body_bytes < MIN_CALLBACK_BODY_BYTES {
+    if control.max_request_body_bytes < MIN_CALLBACK_RESPONSE_BYTES {
         return Err(ConfigCompileError::at(
             "control.max_request_body_bytes",
-            format!("must be at least {MIN_CALLBACK_BODY_BYTES} when callbacks are configured"),
+            format!("must be at least {MIN_CALLBACK_RESPONSE_BYTES} when callbacks are configured"),
         ));
     }
-    let expected_path = format!("{}/external-auth/callback", control.base_path);
+    let expected_path = format!("{}{CALLBACK_ROUTE_SUFFIX}", control.base_path);
     validate_endpoint_length(&callback.public_url, "authorization.callback.public_url")?;
     let url = validate_endpoint_url(
         &callback.public_url,
@@ -2863,11 +2891,11 @@ fn validate_provider_limits(
                     value.max_response_bytes,
                     MAX_WEBHOOK_BODY_BYTES,
                 )?;
-                if value.max_response_bytes < MIN_CALLBACK_BODY_BYTES {
+                if value.max_response_bytes < MIN_CALLBACK_RESPONSE_BYTES {
                     return Err(ConfigCompileError::at(
                         format!("authorization.providers.{name}.max_response_bytes"),
                         format!(
-                            "must be at least {MIN_CALLBACK_BODY_BYTES} bytes to fit a callback response"
+                            "must be at least {MIN_CALLBACK_RESPONSE_BYTES} bytes to fit a callback response"
                         ),
                     ));
                 }
@@ -2959,7 +2987,7 @@ fn validate_provider_limits(
 }
 
 fn minimum_webhook_request_bytes(callback_url: &str) -> Result<usize, ConfigCompileError> {
-    MIN_WEBHOOK_REQUEST_FIXED_BYTES
+    MIN_WEBHOOK_REQUEST_WITHOUT_CALLBACK_URL_BYTES
         .checked_add(callback_url.len())
         .ok_or_else(|| {
             ConfigCompileError::at(
@@ -3571,7 +3599,7 @@ fn compile_http_rule_schedule(
                 .max_request_body_bytes
                 .min(provider.max_response_bytes);
             let suffix_bytes = full_body_limit
-                .checked_sub(CALLBACK_PREFIX_BYTES)
+                .checked_sub(CALLBACK_RESPONSE_PREFIX_BYTES)
                 .ok_or_else(|| {
                     ConfigCompileError::at(
                         "control.max_request_body_bytes",
@@ -5160,9 +5188,8 @@ methods = ["POST"]
     #[test]
     fn webhook_minimum_request_envelope_limits_compile() {
         const CALLBACK_URL: &str = "http://127.0.0.1:8898/_acl-proxy/external-auth/callback";
-        let minimum = MIN_WEBHOOK_REQUEST_FIXED_BYTES + CALLBACK_URL.len();
-        assert_eq!(minimum, 226);
-        let compiled = compile(&webhook_config(minimum, MIN_CALLBACK_BODY_BYTES))
+        let minimum = MIN_WEBHOOK_REQUEST_WITHOUT_CALLBACK_URL_BYTES + CALLBACK_URL.len();
+        let compiled = compile(&webhook_config(minimum, MIN_CALLBACK_RESPONSE_BYTES))
             .expect("the exact compact request-envelope floor must compile");
         let provider = match &compiled.reloadable_plan.authorization.providers["approval"] {
             AuthorizationProviderPlan::Webhook(provider) => provider,
@@ -5170,7 +5197,7 @@ methods = ["POST"]
         };
         assert_eq!(provider.max_request_bytes, minimum);
 
-        let error = compile(&webhook_config(minimum - 1, MIN_CALLBACK_BODY_BYTES))
+        let error = compile(&webhook_config(minimum - 1, MIN_CALLBACK_RESPONSE_BYTES))
             .expect_err("one byte below the exact compact request envelope must fail");
         assert!(error.to_string().contains(&format!("at least {minimum}")));
     }
@@ -5180,12 +5207,13 @@ methods = ["POST"]
         let configured_request_limit = 4_097;
         let compiled = compile(&webhook_config(
             configured_request_limit,
-            MIN_CALLBACK_BODY_BYTES,
+            MIN_CALLBACK_RESPONSE_BYTES,
         ))
         .unwrap();
         let resources = &compiled.reloadable_plan.resource_plan;
         let request_allocation = guarded(configured_request_limit);
-        let callback_allocation = guarded(MIN_CALLBACK_BODY_BYTES - CALLBACK_PREFIX_BYTES);
+        let callback_allocation =
+            guarded(MIN_CALLBACK_RESPONSE_BYTES - CALLBACK_RESPONSE_PREFIX_BYTES);
         assert_eq!(
             resources.webhook_request_allocation_bytes_by_rule,
             [Some(request_allocation)]
@@ -5206,14 +5234,17 @@ methods = ["POST"]
 
     #[test]
     fn callback_minimum_envelope_limits_compile() {
-        let control_error = compile(&webhook_config(4_097, MIN_CALLBACK_BODY_BYTES).replace(
+        let control_error = compile(&webhook_config(4_097, MIN_CALLBACK_RESPONSE_BYTES).replace(
             "max_request_body_bytes = 65536",
-            "max_request_body_bytes = 96",
+            &format!(
+                "max_request_body_bytes = {}",
+                MIN_CALLBACK_RESPONSE_BYTES - 1
+            ),
         ))
         .expect_err("callback control limit cannot be one byte below the envelope floor");
         assert_eq!(control_error.path, "control.max_request_body_bytes");
 
-        let provider_error = compile(&webhook_config(4_097, MIN_CALLBACK_BODY_BYTES - 1))
+        let provider_error = compile(&webhook_config(4_097, MIN_CALLBACK_RESPONSE_BYTES - 1))
             .expect_err("provider response limit cannot be one byte below the envelope floor");
         assert_eq!(
             provider_error.path,
@@ -5244,7 +5275,7 @@ max_webhook_transport_bytes = 262143
 
     #[test]
     fn webhook_public_callback_route_is_never_provider_endpoint() {
-        let input = webhook_config(4_097, MIN_CALLBACK_BODY_BYTES)
+        let input = webhook_config(4_097, MIN_CALLBACK_RESPONSE_BYTES)
             .replace("127.0.0.1:8898/_acl-proxy", "LOCALHOST:8898/_acl-proxy")
             .replace(
                 "https://approval.example.test/authorize",
@@ -5262,7 +5293,7 @@ max_webhook_transport_bytes = 262143
             "https://approval.example.test/{}",
             "a".repeat(MAX_ENDPOINT_BYTES)
         );
-        let provider_error = compile(&webhook_config(4_097, MIN_CALLBACK_BODY_BYTES).replace(
+        let provider_error = compile(&webhook_config(4_097, MIN_CALLBACK_RESPONSE_BYTES).replace(
             "https://approval.example.test/authorize",
             &oversized_provider,
         ))
@@ -5270,17 +5301,33 @@ max_webhook_transport_bytes = 262143
         assert_eq!(provider_error.path, "authorization.providers.approval.url");
         assert!(provider_error.to_string().contains("canonical URL"));
 
-        let oversized_base = format!("/{}", "a".repeat(MAX_ENDPOINT_BYTES));
-        let control_input = MINIMAL.replace(
-            "[policy]",
-            &format!(
-                "[control]\nbind = \"127.0.0.1:8898\"\nbase_path = \"{oversized_base}\"\n\n[policy]"
-            ),
+        let maximum_base_path = format!(
+            "/{}",
+            "a".repeat(MAX_ENDPOINT_BYTES - CALLBACK_ROUTE_SUFFIX.len() - 1)
         );
-        let target_error = compile(&control_input)
-            .expect_err("the product-generated callback target must fit its fixed ceiling");
+        let control_config = |base_path: &str| {
+            MINIMAL.replace(
+                "[policy]",
+                &format!(
+                    "[control]\nbind = \"127.0.0.1:8898\"\nbase_path = {base_path:?}\n\n[policy]"
+                ),
+            )
+        };
+        compile(&control_config(&maximum_base_path))
+            .expect("the exact generated callback target ceiling must compile");
+
+        let oversized_base = format!("{maximum_base_path}a");
+        let target_error = compile(&control_config(&oversized_base))
+            .expect_err("one byte beyond the generated callback target ceiling must fail");
         assert_eq!(target_error.path, "control.base_path");
         assert!(target_error.to_string().contains("encoded callback target"));
+
+        for noncanonical in ["/_acl proxy", "/_acl-proxy/é"] {
+            let error = compile(&control_config(noncanonical))
+                .expect_err("base paths that require percent encoding must fail");
+            assert_eq!(error.path, "control.base_path");
+            assert!(error.to_string().contains("unsafe path component"));
+        }
     }
 
     fn one_byte_body_provider_config(service: &str) -> String {
