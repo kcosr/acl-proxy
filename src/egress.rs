@@ -1,5 +1,3 @@
-use std::fs::File;
-use std::io::BufReader;
 use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -9,8 +7,7 @@ use http::Uri;
 use hyper::client::HttpConnector;
 use hyper::{Body, Client};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use rustls::client::{ServerCertVerified, ServerCertVerifier};
-use rustls::{Certificate, ClientConfig, Error as RustlsError, RootCertStore, ServerName};
+use rustls::{ClientConfig, ServerName};
 
 use crate::config::compiler::{
     CompiledEgressRoute, CompiledHttpVersion, CompiledParentProxyKind, CompiledTlsTrust,
@@ -21,6 +18,9 @@ use crate::credentials::{
 };
 use crate::policy::{apply_header_effects, HeaderEffectError};
 use crate::runtime::CredentialSourceRegistry;
+use crate::tls::{
+    build_client_config, load_client_trust, ClientAlpn, ClientTrust, TlsActivationError,
+};
 use crate::url::canonicalize_tls_server_name;
 
 pub(crate) type OriginClient = Client<HttpsConnector<HttpConnector>, Body>;
@@ -93,12 +93,6 @@ pub(crate) enum EgressActivationError {
 pub(crate) enum ParentAlpnError {
     #[error("parent proxy did not negotiate the required HTTP protocol")]
     Incompatible,
-}
-
-#[derive(Clone)]
-enum LoadedTlsTrust {
-    Roots(RootCertStore),
-    Insecure,
 }
 
 impl EgressSnapshot {
@@ -232,7 +226,7 @@ impl ParentTls {
         is_cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<Self, EgressActivationError> {
         Self::activate_with_loader(plan, |trust, ca_certificate| {
-            load_tls_trust(trust, ca_certificate, is_cancelled)
+            load_client_trust(trust, ca_certificate, is_cancelled).map_err(Into::into)
         })
     }
 
@@ -241,7 +235,7 @@ impl ParentTls {
         load: F,
     ) -> Result<Self, EgressActivationError>
     where
-        F: FnOnce(CompiledTlsTrust, Option<&Path>) -> Result<LoadedTlsTrust, EgressActivationError>,
+        F: FnOnce(CompiledTlsTrust, Option<&Path>) -> Result<ClientTrust, EgressActivationError>,
     {
         let server_name = canonicalize_tls_server_name(&plan.server_name)
             .map_err(|_| EgressActivationError::ParentServerName)?;
@@ -250,14 +244,14 @@ impl ParentTls {
         let enable_sni = server_name.parse::<IpAddr>().is_err();
         let loaded_trust = load(plan.trust, plan.ca_certificate.as_deref())?;
         warn_if_insecure("parent", plan.trust);
-        let http1_config = Arc::new(build_tls_config(
+        let http1_config = Arc::new(build_client_config(
             &loaded_trust,
-            vec![b"http/1.1".to_vec()],
+            ClientAlpn::Http1,
             enable_sni,
         ));
-        let http2_config = Arc::new(build_tls_config(
+        let http2_config = Arc::new(build_client_config(
             &loaded_trust,
-            vec![b"h2".to_vec()],
+            ClientAlpn::Http2,
             enable_sni,
         ));
         Ok(Self {
@@ -312,9 +306,9 @@ fn build_origin_client(
     }
     // hyper-rustls owns origin ALPN construction from the enabled protocol
     // set and requires the supplied rustls config to start with no ALPN list.
-    let loaded_trust = load_tls_trust(plan.trust, plan.ca_certificate.as_deref(), is_cancelled)?;
+    let loaded_trust = load_client_trust(plan.trust, plan.ca_certificate.as_deref(), is_cancelled)?;
     warn_if_insecure("origin", plan.trust);
-    let tls = build_tls_config(&loaded_trust, Vec::new(), true);
+    let tls = build_client_config(&loaded_trust, ClientAlpn::None, true);
     let protocols = HttpsConnectorBuilder::new()
         .with_tls_config(tls)
         .https_or_http();
@@ -327,58 +321,6 @@ fn build_origin_client(
     Ok(Client::builder().build(connector))
 }
 
-fn load_tls_trust(
-    trust: CompiledTlsTrust,
-    ca_certificate: Option<&Path>,
-    is_cancelled: &mut dyn FnMut() -> bool,
-) -> Result<LoadedTlsTrust, EgressActivationError> {
-    match trust {
-        CompiledTlsTrust::System => Ok(LoadedTlsTrust::Roots(root_store_with_native_roots(
-            is_cancelled,
-        )?)),
-        CompiledTlsTrust::Custom => Ok(LoadedTlsTrust::Roots(root_store_from_custom_ca(
-            ca_certificate.ok_or(EgressActivationError::CaUnavailable)?,
-            is_cancelled,
-        )?)),
-        CompiledTlsTrust::SystemPlusCustom => {
-            let mut roots = root_store_with_native_roots(is_cancelled)?;
-            add_custom_ca(
-                &mut roots,
-                ca_certificate.ok_or(EgressActivationError::CaUnavailable)?,
-                is_cancelled,
-            )?;
-            Ok(LoadedTlsTrust::Roots(roots))
-        }
-        CompiledTlsTrust::Insecure => Ok(LoadedTlsTrust::Insecure),
-    }
-}
-
-fn build_tls_config(
-    trust: &LoadedTlsTrust,
-    alpn_protocols: Vec<Vec<u8>>,
-    enable_sni: bool,
-) -> ClientConfig {
-    let mut config = match trust {
-        LoadedTlsTrust::Roots(roots) => ClientConfig::builder()
-            .with_safe_defaults()
-            .with_root_certificates(roots.clone())
-            .with_no_client_auth(),
-        LoadedTlsTrust::Insecure => {
-            let mut config = ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(RootCertStore::empty())
-                .with_no_client_auth();
-            config
-                .dangerous()
-                .set_certificate_verifier(Arc::new(NoVerifyServerCert));
-            config
-        }
-    };
-    config.alpn_protocols = alpn_protocols;
-    config.enable_sni = enable_sni;
-    config
-}
-
 fn warn_if_insecure(scope: &'static str, trust: CompiledTlsTrust) {
     if trust == CompiledTlsTrust::Insecure {
         tracing::warn!(
@@ -389,88 +331,16 @@ fn warn_if_insecure(scope: &'static str, trust: CompiledTlsTrust) {
     }
 }
 
-fn root_store_with_native_roots(
-    is_cancelled: &mut dyn FnMut() -> bool,
-) -> Result<RootCertStore, EgressActivationError> {
-    let mut roots = RootCertStore::empty();
-    check_activation_cancellation(is_cancelled)?;
-    let certificates = rustls_native_certs::load_native_certs();
-    check_activation_cancellation(is_cancelled)?;
-    let certificates = certificates.map_err(|_| EgressActivationError::NativeRoots)?;
-    for certificate in certificates {
-        roots
-            .add(&Certificate(certificate.0))
-            .map_err(|_| EgressActivationError::NativeRoots)?;
-    }
-    validate_native_root_store(roots)
-}
-
-fn validate_native_root_store(
-    roots: RootCertStore,
-) -> Result<RootCertStore, EgressActivationError> {
-    if roots.is_empty() {
-        Err(EgressActivationError::NativeRoots)
-    } else {
-        Ok(roots)
-    }
-}
-
-fn root_store_from_custom_ca(
-    path: &Path,
-    is_cancelled: &mut dyn FnMut() -> bool,
-) -> Result<RootCertStore, EgressActivationError> {
-    let mut roots = RootCertStore::empty();
-    add_custom_ca(&mut roots, path, is_cancelled)?;
-    Ok(roots)
-}
-
-fn add_custom_ca(
-    roots: &mut RootCertStore,
-    path: &Path,
-    is_cancelled: &mut dyn FnMut() -> bool,
-) -> Result<(), EgressActivationError> {
-    check_activation_cancellation(is_cancelled)?;
-    let file = File::open(path);
-    check_activation_cancellation(is_cancelled)?;
-    let file = file.map_err(|_| EgressActivationError::CaUnavailable)?;
-    check_activation_cancellation(is_cancelled)?;
-    let certificates = rustls_pemfile::certs(&mut BufReader::new(file));
-    check_activation_cancellation(is_cancelled)?;
-    let certificates = certificates.map_err(|_| EgressActivationError::CaInvalid)?;
-    if certificates.is_empty() {
-        return Err(EgressActivationError::CaEmpty);
-    }
-    for certificate in certificates {
-        roots
-            .add(&Certificate(certificate))
-            .map_err(|_| EgressActivationError::CaUnusable)?;
-    }
-    Ok(())
-}
-
-fn check_activation_cancellation(
-    is_cancelled: &mut dyn FnMut() -> bool,
-) -> Result<(), EgressActivationError> {
-    if is_cancelled() {
-        Err(EgressActivationError::ActivationCancelled)
-    } else {
-        Ok(())
-    }
-}
-
-struct NoVerifyServerCert;
-
-impl ServerCertVerifier for NoVerifyServerCert {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &Certificate,
-        _intermediates: &[Certificate],
-        _server_name: &ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
-        _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
-    ) -> Result<ServerCertVerified, RustlsError> {
-        Ok(ServerCertVerified::assertion())
+impl From<TlsActivationError> for EgressActivationError {
+    fn from(error: TlsActivationError) -> Self {
+        match error {
+            TlsActivationError::ActivationCancelled => Self::ActivationCancelled,
+            TlsActivationError::NativeRoots => Self::NativeRoots,
+            TlsActivationError::CaUnavailable => Self::CaUnavailable,
+            TlsActivationError::CaInvalid => Self::CaInvalid,
+            TlsActivationError::CaEmpty => Self::CaEmpty,
+            TlsActivationError::CaUnusable => Self::CaUnusable,
+        }
     }
 }
 
@@ -778,7 +648,7 @@ default = "deny"
             },
             |trust, ca_certificate| {
                 load_count.set(load_count.get() + 1);
-                load_tls_trust(trust, ca_certificate, &mut || false)
+                load_client_trust(trust, ca_certificate, &mut || false).map_err(Into::into)
             },
         )
         .unwrap();
@@ -859,14 +729,6 @@ default = "deny"
         );
         assert!(parent_logs.contains("tls_scope=\"parent\""));
         assert!(!parent_logs.contains("sensitive-parent-name.example"));
-    }
-
-    #[test]
-    fn empty_native_root_store_fails_activation() {
-        assert_eq!(
-            validate_native_root_store(RootCertStore::empty()).unwrap_err(),
-            EgressActivationError::NativeRoots
-        );
     }
 
     #[test]

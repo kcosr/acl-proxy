@@ -23,5 +23,6 @@ pub mod redaction;
 mod runtime;
 mod safety;
 mod sensitive;
+mod tls;
 mod tls_identity;
 mod url;
