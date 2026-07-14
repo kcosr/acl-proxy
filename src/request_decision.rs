@@ -89,11 +89,29 @@ pub(crate) enum RequestDecisionError {
     #[error("authorization provider dispatch failed")]
     Provider(#[source] AuthorizationDispatchError),
     #[error("authorization provider credential injection failed")]
-    ProviderCredentialInjection(#[from] ProviderCredentialInjectionError),
+    ProviderCredentialInjection {
+        #[source]
+        source: ProviderCredentialInjectionError,
+        body_provenance: TerminalRequestBodyProvenance,
+    },
     #[error("authorization provider replacement decode failed")]
-    ProviderReplacementDecode,
+    ProviderReplacementDecode {
+        body_provenance: TerminalRequestBodyProvenance,
+    },
     #[error("the effective request deadline exceeds the monotonic clock range")]
     RequestDeadlineOverflow,
+}
+
+impl RequestDecisionError {
+    pub(crate) fn body_provenance(&self) -> Option<TerminalRequestBodyProvenance> {
+        match self {
+            Self::ProviderCredentialInjection {
+                body_provenance, ..
+            }
+            | Self::ProviderReplacementDecode { body_provenance } => Some(*body_provenance),
+            _ => None,
+        }
+    }
 }
 
 impl<'generation> AllowedRequest<'generation> {
@@ -534,7 +552,10 @@ async fn evaluate_to_terminal<'generation>(
                             &guard,
                         )
                     })
-                    .transpose()?;
+                    .transpose()
+                    .map_err(|source| {
+                        provider_credential_injection_error(source, selected_provenance)
+                    })?;
                 drop(credentials);
                 let (body, body_provenance) = match redact_terminal_body(
                     lease,
@@ -594,6 +615,16 @@ async fn evaluate_to_terminal<'generation>(
     }
 }
 
+fn provider_credential_injection_error(
+    source: ProviderCredentialInjectionError,
+    body_provenance: TerminalRequestBodyProvenance,
+) -> RequestDecisionError {
+    RequestDecisionError::ProviderCredentialInjection {
+        source,
+        body_provenance,
+    }
+}
+
 enum TerminalBody {
     Ready {
         body: Option<GuardedRequestBody>,
@@ -643,7 +674,9 @@ fn select_terminal_body(
                     return Ok(TerminalBody::RedactionDenied { provenance })
                 }
                 Err(ProviderBodyReplacementDecodeError::InvalidBody) => {
-                    return Err(RequestDecisionError::ProviderReplacementDecode)
+                    return Err(RequestDecisionError::ProviderReplacementDecode {
+                        body_provenance: provenance,
+                    })
                 }
             };
         body = Some(GuardedRequestBody {
@@ -783,7 +816,7 @@ fn strip_internal_context(headers: &mut HeaderMap, names: &[HeaderName]) -> Head
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::path::Path;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -794,6 +827,8 @@ mod tests {
 
     use super::*;
     use crate::activation::static_resources::ProductStaticResources;
+    use crate::authorization::protocol::ProviderOutputRegistry;
+    use crate::config::compiler::ProviderOutputPlan;
     use crate::config::{compile_config_text, CompiledConfig, ConfigTextInput};
     use crate::runtime::{
         ActivationCancellation, BoxFuture, CandidateSource, ReloadTriggerResult, Runtime,
@@ -904,6 +939,92 @@ header = "x-test-loop"
             quota_key: WireBodyQuotaKey::from_peer(peer_ip, |_| false),
             started_at: Instant::now(),
         }
+    }
+
+    #[test]
+    fn replacement_decode_resource_failure_preserves_omission_provenance() {
+        let allocation = crate::safety::wire_body::guarded_body_allocation_bytes(1).unwrap();
+        let pool = crate::safety::WireBodyPool::new(2 * allocation, allocation);
+        let first_key = WireBodyQuotaKey::from_peer("192.0.2.1".parse().unwrap(), |_| false);
+        let second_key = WireBodyQuotaKey::from_peer("192.0.2.2".parse().unwrap(), |_| false);
+        let first = pool.begin_for_test(allocation, first_key);
+        let second = pool.begin_for_test(allocation, second_key);
+        let mut decoded = first.buffer();
+        decoded.try_extend_from_slice(b"secret").unwrap();
+        let replacement = ProviderBodyReplacement::from_decoded_for_test(decoded.finish());
+
+        let error = match select_terminal_body(
+            &second,
+            None,
+            TerminalRequestBodyProvenance::Unconsumed,
+            Some(replacement),
+            TerminalBodyLimits::unbounded(),
+        ) {
+            Ok(_) => panic!("a replacement owned by another guard must fail"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            RequestDecisionError::ProviderReplacementDecode { .. }
+        ));
+        assert_eq!(
+            error.body_provenance(),
+            Some(TerminalRequestBodyProvenance::ProviderReplacement { size: 6 })
+        );
+        assert!(!format!("{error:?} {error}").contains("secret"));
+        assert_eq!(pool.global_charge(), 0);
+    }
+
+    #[test]
+    fn credential_staging_failure_after_replacement_preserves_omission_provenance() {
+        let allocation = crate::safety::wire_body::guarded_body_allocation_bytes(1).unwrap();
+        let pool = crate::safety::WireBodyPool::new(allocation, allocation);
+        let key = WireBodyQuotaKey::from_peer("192.0.2.3".parse().unwrap(), |_| false);
+        let guard = pool.begin_for_test(allocation, key);
+        let mut decoded = guard.buffer();
+        decoded.try_extend_from_slice(b"replacement").unwrap();
+        let replacement = ProviderBodyReplacement::from_decoded_for_test(decoded.finish());
+        let TerminalBody::Ready { body, provenance } = select_terminal_body(
+            &guard,
+            None,
+            TerminalRequestBodyProvenance::Unconsumed,
+            Some(replacement),
+            TerminalBodyLimits::unbounded(),
+        )
+        .unwrap() else {
+            panic!("the same-guard replacement must be selected");
+        };
+        assert_eq!(
+            provenance,
+            TerminalRequestBodyProvenance::ProviderReplacement { size: 11 }
+        );
+
+        let outputs = ProviderOutputRegistry::activate(BTreeMap::from([(
+            "token".to_owned(),
+            ProviderOutputPlan::Bearer { required: true },
+        )]));
+        let index = outputs.index("token").unwrap();
+        let credentials = outputs.single_credential_for_test(index, b"secret-marker");
+        let source = outputs.stage_credentials(&credentials, &guard).unwrap_err();
+        assert_eq!(source, ProviderCredentialInjectionError::AllocationFailed);
+        let error = provider_credential_injection_error(source, provenance);
+        assert_eq!(error.body_provenance(), Some(provenance));
+        assert!(!format!("{error:?} {error}").contains("secret-marker"));
+
+        for provenance in [
+            TerminalRequestBodyProvenance::Unconsumed,
+            TerminalRequestBodyProvenance::CompleteOriginal,
+        ] {
+            let error = provider_credential_injection_error(
+                ProviderCredentialInjectionError::InvalidCredential,
+                provenance,
+            );
+            assert_eq!(error.body_provenance(), Some(provenance));
+        }
+
+        drop(body);
+        assert_eq!(pool.global_charge(), 0);
     }
 
     #[tokio::test]

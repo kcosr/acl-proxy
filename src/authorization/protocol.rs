@@ -144,6 +144,23 @@ impl ProviderOutputRegistry {
         &self.definitions
     }
 
+    #[cfg(test)]
+    pub(crate) fn single_credential_for_test(
+        &self,
+        index: ProviderOutputIndex,
+        value: &[u8],
+    ) -> ProviderCredentialSet {
+        assert_eq!(index.registry_id, self.id);
+        let mut values = std::iter::repeat_with(|| None)
+            .take(self.definitions.len())
+            .collect::<Vec<_>>();
+        values[index.ordinal] = Some(SecretBytes(value.to_vec()));
+        ProviderCredentialSet::Contiguous(ContiguousProviderCredentials {
+            registry_id: self.id,
+            values: values.into_boxed_slice(),
+        })
+    }
+
     pub(crate) fn stage_credentials(
         &self,
         credentials: &ProviderCredentialSet,
@@ -599,6 +616,15 @@ impl ProviderBodyReplacement {
             #[cfg(test)]
             ProviderBodyReplacementStorage::Decoded(bytes) => bytes.len(),
             ProviderBodyReplacementStorage::Encoded { decoded_bytes, .. } => *decoded_bytes,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_decoded_for_test(decoded: GuardedBody) -> Self {
+        Self {
+            content_type: None,
+            content_encoding: None,
+            storage: ProviderBodyReplacementStorage::Decoded(decoded),
         }
     }
 
