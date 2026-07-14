@@ -44,6 +44,8 @@ pub(crate) enum ForwardError {
     ParentProtocol(#[from] ParentAlpnError),
     #[error("HTTP forwarding failed")]
     Http(#[source] hyper::Error),
+    #[error("HTTP forwarding task failed")]
+    Task(#[source] tokio::task::JoinError),
     #[error("parent proxy rejected CONNECT with status {0}")]
     ParentConnect(StatusCode),
     #[error("the resolved forwarding target does not belong to this request and egress route")]
@@ -58,14 +60,14 @@ pub(crate) enum ResolveForwardingError {
     Destination(#[from] DestinationGuardError),
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub(crate) enum ForwardBodyError {
     #[error("upstream response body failed")]
-    Body(#[source] hyper::Error),
+    Body(#[source] std::sync::Arc<hyper::Error>),
     #[error("upstream connection failed")]
-    Connection(#[source] hyper::Error),
+    Connection(#[source] std::sync::Arc<hyper::Error>),
     #[error("upstream connection task failed")]
-    Task(#[source] tokio::task::JoinError),
+    Task(#[source] std::sync::Arc<tokio::task::JoinError>),
 }
 
 pub(crate) struct ForwardBody {
@@ -119,17 +121,12 @@ impl DriverTask {
     }
 
     async fn abort_and_join(mut self) {
-        if let Some(handle) = self.handle.take() {
-            handle.abort();
-            let _ = handle.await;
-        }
+        self.abort();
+        let _ = std::future::poll_fn(|context| self.poll(context)).await;
     }
 
     async fn join(mut self) -> Result<Result<(), hyper::Error>, tokio::task::JoinError> {
-        match self.handle.take() {
-            Some(handle) => handle.await,
-            None => Ok(Ok(())),
-        }
+        std::future::poll_fn(|context| self.poll(context)).await
     }
 
     fn is_finished(&self) -> bool {
@@ -144,15 +141,70 @@ impl Drop for DriverTask {
 }
 
 impl ForwardBody {
+    fn poll_response_trailers(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), ForwardBodyError>> {
+        if self.trailers.is_some() {
+            return Poll::Ready(Ok(()));
+        }
+        let trailers = match self.body.as_mut() {
+            Some(body) => match Pin::new(body).poll_trailers(context) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(trailers)) => trailers,
+                Poll::Ready(Err(error)) => {
+                    self.body.take();
+                    self.terminal_error = Some(ForwardBodyError::Body(std::sync::Arc::new(error)));
+                    return Poll::Ready(Err(self
+                        .terminal_error
+                        .as_ref()
+                        .expect("terminal response-body error was stored")
+                        .clone()));
+                }
+            },
+            None => None,
+        };
+        self.body.take();
+        self.trailers = Some(trailers.map(|mut headers| {
+            strip_response_hop_by_hop(&mut headers);
+            headers
+        }));
+        Poll::Ready(Ok(()))
+    }
+
     fn poll_terminal_error_join(&mut self, context: &mut Context<'_>) -> Poll<ForwardBodyError> {
         self.driver.abort();
         match self.driver.poll(context) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(_) => Poll::Ready(
                 self.terminal_error
-                    .take()
-                    .expect("terminal response-body error is present while joining"),
+                    .as_ref()
+                    .expect("terminal response-body error is present while joining")
+                    .clone(),
             ),
+        }
+    }
+
+    fn poll_driver_completion(
+        &mut self,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), ForwardBodyError>> {
+        if self.terminal_error.is_some() {
+            return self.poll_terminal_error_join(context).map(Err);
+        }
+        match self.driver.poll(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(Ok(()))) => Poll::Ready(Ok(())),
+            Poll::Ready(Ok(Err(error))) => {
+                let error = ForwardBodyError::Connection(std::sync::Arc::new(error));
+                self.terminal_error = Some(error.clone());
+                Poll::Ready(Err(error))
+            }
+            Poll::Ready(Err(error)) => {
+                let error = ForwardBodyError::Task(std::sync::Arc::new(error));
+                self.terminal_error = Some(error.clone());
+                Poll::Ready(Err(error))
+            }
         }
     }
 }
@@ -171,30 +223,44 @@ impl HttpBody for ForwardBody {
                 Poll::Ready(error) => Poll::Ready(Some(Err(error))),
             };
         }
-        if self.data_done {
-            return Poll::Ready(None);
-        }
-        if let Some(body) = self.body.as_mut() {
-            match Pin::new(body).poll_data(context) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Some(Ok(bytes))) => return Poll::Ready(Some(Ok(bytes))),
-                Poll::Ready(Some(Err(error))) => {
-                    self.body.take();
-                    self.trailers.take();
-                    self.terminal_error = Some(ForwardBodyError::Body(error));
-                    return match self.poll_terminal_error_join(context) {
-                        Poll::Pending => Poll::Pending,
-                        Poll::Ready(error) => Poll::Ready(Some(Err(error))),
-                    };
+        if !self.data_done {
+            if let Some(body) = self.body.as_mut() {
+                match Pin::new(body).poll_data(context) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Some(Ok(bytes))) => return Poll::Ready(Some(Ok(bytes))),
+                    Poll::Ready(Some(Err(error))) => {
+                        self.body.take();
+                        self.trailers.take();
+                        self.terminal_error =
+                            Some(ForwardBodyError::Body(std::sync::Arc::new(error)));
+                        return match self.poll_terminal_error_join(context) {
+                            Poll::Pending => Poll::Pending,
+                            Poll::Ready(error) => Poll::Ready(Some(Err(error))),
+                        };
+                    }
+                    Poll::Ready(None) => {
+                        self.data_done = true;
+                    }
                 }
-                Poll::Ready(None) => {
-                    self.data_done = true;
-                    return Poll::Ready(None);
-                }
+            } else {
+                self.data_done = true;
             }
         }
-        self.data_done = true;
-        Poll::Ready(None)
+        match self.poll_response_trailers(context) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(_)) => {
+                return match self.poll_terminal_error_join(context) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(error) => Poll::Ready(Some(Err(error))),
+                };
+            }
+        }
+        match self.poll_driver_completion(context) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => Poll::Ready(None),
+            Poll::Ready(Err(error)) => Poll::Ready(Some(Err(error))),
+        }
     }
 
     fn poll_trailers(
@@ -207,46 +273,24 @@ impl HttpBody for ForwardBody {
                 Poll::Ready(error) => Poll::Ready(Err(error)),
             };
         }
-        if self.trailers.is_none() {
-            let trailers = match self.body.as_mut() {
-                Some(body) => match Pin::new(body).poll_trailers(context) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Ok(trailers)) => trailers,
-                    Poll::Ready(Err(error)) => {
-                        self.body.take();
-                        self.trailers.take();
-                        self.terminal_error = Some(ForwardBodyError::Body(error));
-                        return match self.poll_terminal_error_join(context) {
-                            Poll::Pending => Poll::Pending,
-                            Poll::Ready(error) => Poll::Ready(Err(error)),
-                        };
-                    }
-                },
-                None => None,
-            };
-            self.body.take();
-            self.trailers = Some(trailers.map(|mut headers| {
-                strip_response_hop_by_hop(&mut headers);
-                headers
-            }));
+        match self.poll_response_trailers(context) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Ok(())) => {}
+            Poll::Ready(Err(_)) => {
+                return match self.poll_terminal_error_join(context) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(error) => Poll::Ready(Err(error)),
+                };
+            }
         }
 
-        if self.driver.is_finished() {
-            return Poll::Ready(Ok(self.trailers.take().flatten()));
-        }
-        match self.driver.poll(context) {
+        match self.poll_driver_completion(context) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(result) => match result {
-                Ok(Ok(())) => Poll::Ready(Ok(self.trailers.take().flatten())),
-                Ok(Err(error)) => {
-                    self.trailers.take();
-                    Poll::Ready(Err(ForwardBodyError::Connection(error)))
-                }
-                Err(error) => {
-                    self.trailers.take();
-                    Poll::Ready(Err(ForwardBodyError::Task(error)))
-                }
-            },
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(self.trailers.take().flatten())),
+            Poll::Ready(Err(error)) => {
+                self.trailers.take();
+                Poll::Ready(Err(error))
+            }
         }
     }
 
@@ -533,7 +577,7 @@ where
     match driver.join().await {
         Ok(Ok(())) => Ok(upgraded),
         Ok(Err(error)) => Err(ForwardError::Http(error)),
-        Err(error) => Err(ForwardError::Tls(std::io::Error::other(error))),
+        Err(error) => Err(ForwardError::Task(error)),
     }
 }
 
@@ -752,7 +796,9 @@ mod tests {
             .with_no_client_auth()
             .with_single_cert(vec![certificate], key)
             .unwrap();
-        config.alpn_protocols = vec![alpn.to_vec()];
+        if !alpn.is_empty() {
+            config.alpn_protocols = vec![alpn.to_vec()];
+        }
         TlsAcceptor::from(Arc::new(config))
     }
 
@@ -897,6 +943,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelling_driver_join_aborts_owned_task() {
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let signal = DropSignal(Some(dropped_tx));
+        let driver = DriverTask::from_handle(tokio::spawn(async move {
+            let _signal = signal;
+            std::future::pending::<Result<(), hyper::Error>>().await
+        }));
+        let (started_tx, started_rx) = oneshot::channel();
+        let join = tokio::spawn(async move {
+            started_tx.send(()).ok();
+            driver.join().await
+        });
+
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        join.abort();
+        assert!(join.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn response_body_error_aborts_owned_driver() {
         let (dropped_tx, dropped_rx) = oneshot::channel();
         let signal = DropSignal(Some(dropped_tx));
@@ -921,6 +991,31 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn response_body_error_remains_sticky_after_driver_join() {
+        let stream = tokio_stream::once(Err::<Bytes, _>(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "injected body failure",
+        )));
+        let driver =
+            tokio::spawn(async { std::future::pending::<Result<(), hyper::Error>>().await });
+        let mut body = ForwardBody {
+            body: Some(Body::wrap_stream(stream)),
+            data_done: false,
+            trailers: None,
+            terminal_error: None,
+            driver: DriverTask::from_handle(driver),
+        };
+
+        for _ in 0..2 {
+            let error = body.data().await.unwrap().unwrap_err();
+            assert!(matches!(error, ForwardBodyError::Body(_)));
+        }
+        let error = body.trailers().await.unwrap_err();
+        assert!(matches!(error, ForwardBodyError::Body(_)));
+        assert!(!body.is_end_stream());
     }
 
     #[tokio::test]
@@ -971,7 +1066,11 @@ mod tests {
             terminal_error: None,
             driver: DriverTask::from_handle(driver),
         };
-        assert!(body.data().await.is_none());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), body.data())
+                .await
+                .is_err()
+        );
 
         drop(body);
         tokio::time::timeout(std::time::Duration::from_secs(1), dropped_rx)
@@ -981,7 +1080,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_driver_error_is_not_swallowed_after_body_completion() {
+    async fn h1_driver_error_is_sticky_and_does_not_require_trailer_polling() {
         let (client, server) = tokio::io::duplex(1024);
         let (_sender, connection) = conn::Builder::new()
             .handshake::<_, Body>(client)
@@ -995,14 +1094,17 @@ mod tests {
             terminal_error: None,
             driver: DriverTask::spawn(connection),
         };
-        assert!(body.data().await.is_none());
-
-        let error = tokio::time::timeout(std::time::Duration::from_secs(1), body.trailers())
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), body.data())
             .await
+            .unwrap()
             .unwrap()
             .unwrap_err();
         assert!(matches!(error, ForwardBodyError::Connection(_)));
-        assert!(body.trailers().await.unwrap().is_none());
+        let error = body.data().await.unwrap().unwrap_err();
+        assert!(matches!(error, ForwardBodyError::Connection(_)));
+        let error = body.trailers().await.unwrap_err();
+        assert!(matches!(error, ForwardBodyError::Connection(_)));
+        assert!(!body.is_end_stream());
     }
 
     #[tokio::test]
@@ -1050,6 +1152,33 @@ mod tests {
         assert!(!headers.contains_key(HOST));
         assert_eq!(headers["authorization"], "Bearer origin-secret");
         assert_eq!(body, b"request-body");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_https_rejects_incompatible_origin_alpn_before_http() {
+        let canonical = canonicalize_http_url("https://origin.example/alpn").unwrap();
+        let egress = activate(None);
+        let request = request_with_version(Version::HTTP_2);
+        let (guard, _) = guard();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        let server = tokio::spawn(async move {
+            match tls_acceptor(b"").accept(server).await {
+                Ok(tls) => assert!(tls.get_ref().1.alpn_protocol().is_none()),
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::BrokenPipe),
+            }
+        });
+        let target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            forward_with_connector(request, &canonical, &egress, &guard, target, &connector).await,
+            Err(ForwardError::OriginProtocol(
+                OriginProtocolError::IncompatibleAlpn
+            ))
+        ));
         server.await.unwrap();
     }
 
@@ -1223,6 +1352,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn https_parent_rejects_incompatible_alpn_before_http() {
+        let canonical = canonicalize_http_url("http://origin.example:8080/alpn").unwrap();
+        let egress = activate(Some(("https://parent.example:8443/", true)));
+        let request = request_with_version(Version::HTTP_2);
+        let (guard, _) = guard();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        let server = tokio::spawn(async move {
+            match tls_acceptor(b"").accept(server).await {
+                Ok(tls) => assert!(tls.get_ref().1.alpn_protocol().is_none()),
+                Err(error) => assert_eq!(error.kind(), io::ErrorKind::BrokenPipe),
+            }
+        });
+        let target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            forward_with_connector(request, &canonical, &egress, &guard, target, &connector).await,
+            Err(ForwardError::ParentProtocol(ParentAlpnError::Incompatible))
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn parent_connect_carries_no_origin_credentials() {
         let canonical = canonicalize_http_url("https://origin.example/secure").unwrap();
         let egress = activate(Some(("http://parent.example:8443/", false)));
@@ -1283,6 +1437,73 @@ mod tests {
         assert_eq!(headers["cookie"], "origin-session=secret");
         assert_eq!(headers["x-workload-identity"], "workload-42");
         assert_eq!(headers["x-loop-marker"], "request-42");
+        assert_eq!(body, b"request-body");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn https_parent_connect_keeps_origin_credentials_inside_nested_tls() {
+        let canonical = canonicalize_http_url("https://origin.example/secure").unwrap();
+        let egress = activate(Some(("https://parent.example:8443/", true)));
+        let (guard, _) = guard();
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        let (connect_tx, connect_rx) = oneshot::channel();
+        let (origin_tx, origin_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut parent_tls = tls_acceptor(b"http/1.1").accept(server).await.unwrap();
+            let mut head = Vec::new();
+            loop {
+                let mut byte = [0_u8; 1];
+                parent_tls.read_exact(&mut byte).await.unwrap();
+                head.push(byte[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+                assert!(head.len() < 8 * 1024);
+            }
+            connect_tx.send(String::from_utf8(head).unwrap()).ok();
+            parent_tls
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            let origin_tls = tls_acceptor(b"http/1.1").accept(parent_tls).await.unwrap();
+            serve_h1(origin_tls, origin_tx).await;
+        });
+        let request = request();
+        let target = resolve_forwarding_target(&canonical, &request, &egress, &guard)
+            .await
+            .unwrap();
+
+        let response =
+            forward_with_connector(request, &canonical, &egress, &guard, target, &connector)
+                .await
+                .unwrap();
+        finish_response(response).await;
+
+        let connect = connect_rx.await.unwrap().to_ascii_lowercase();
+        assert!(connect.starts_with("connect origin.example:443 http/1.1\r\n"));
+        assert!(connect.contains("\r\nhost: origin.example:443\r\n"));
+        for forbidden in [
+            "authorization",
+            "proxy-authorization",
+            "cookie",
+            "x-workload-identity",
+            "x-loop-marker",
+            "request-body",
+            "/secure",
+        ] {
+            assert!(!connect.contains(forbidden), "CONNECT leaked {forbidden}");
+        }
+
+        let (uri, headers, body) = origin_rx.await.unwrap();
+        assert_eq!(uri, "/secure");
+        assert_eq!(headers[HOST], "origin.example");
+        assert_eq!(headers["authorization"], "Bearer origin-secret");
+        assert_eq!(headers["cookie"], "origin-session=secret");
+        assert_eq!(headers["x-workload-identity"], "workload-42");
+        assert_eq!(headers["x-loop-marker"], "request-42");
+        assert!(!headers.contains_key("proxy-authorization"));
         assert_eq!(body, b"request-body");
         server.await.unwrap();
     }
