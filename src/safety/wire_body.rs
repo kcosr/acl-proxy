@@ -452,6 +452,13 @@ pub(crate) struct GuardedBodyData {
     head_offset: usize,
 }
 
+impl GuardedBodyData {
+    pub(crate) fn capture_segments(&self) -> GuardedBodySegments<'_> {
+        debug_assert_eq!(self.head_offset, 0);
+        self.body.segments()
+    }
+}
+
 impl GuardedHttpBody {
     pub(crate) fn new(body: GuardedBody) -> Self {
         Self {

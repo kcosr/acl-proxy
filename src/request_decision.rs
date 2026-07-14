@@ -180,6 +180,10 @@ impl<'generation, 'request> PreparedRequest<'generation, 'request> {
         &self.guard
     }
 
+    pub(crate) fn headers_for_observation(&self) -> &HeaderMap {
+        &self.headers
+    }
+
     pub(crate) fn body_read_plan(&self) -> HttpBodyReadPlan {
         if self.early_deny.is_some() {
             HttpBodyReadPlan::Disabled

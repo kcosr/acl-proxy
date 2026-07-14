@@ -9,8 +9,9 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Buf;
+use chrono::Utc;
 use http::header::{CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRAILER};
-use http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
+use http::{HeaderMap, HeaderValue, Request, Response, StatusCode, Version};
 use hyper::body::{Bytes, HttpBody, SizeHint};
 use hyper::server::conn::Http;
 use hyper::service::service_fn;
@@ -26,27 +27,28 @@ use crate::activation::listeners::{
     ProxySupervisorFailure, ProxySupervisorFailureObserver, ProxySupervisorStartError,
     ProxySupervisorStarter,
 };
+use crate::capture::{
+    CaptureDecision, CaptureEndpoint, CaptureKind, CaptureMode, CaptureRecord, HttpCaptureTap,
+};
 use crate::config::compiler::{
     CompiledHttp1ConnectPolicy, CompiledHttpVersion, HttpBodyReadPlan, StaticCleartextListener,
 };
 use crate::http_body::{read_mandatory_request_body, HttpBodyReadError};
-use crate::observation::ProductObservationRuntime;
+use crate::observation::{CaptureEpoch, CaptureEvent, ProductObservationRuntime};
 use crate::policy::apply_header_effects;
-use crate::proxy::authority::{
-    reconcile_explicit_request, reconcile_transparent_http_request, AuthorityError,
-};
+use crate::proxy::authority::{reconcile_explicit_request, reconcile_transparent_http_request};
 use crate::proxy::forward::{
-    forward_request, resolve_forwarding_target, ForwardBody, ForwardBodyError, ForwardError,
-    ResolveForwardingError,
+    forward_request, resolve_forwarding_target, ForwardBody, ForwardBodyError,
 };
 use crate::proxy::headers::{sanitize_untrusted_request, HeaderPreparationError, SanitizedRequest};
 use crate::request_decision::{
     prepare_request, AllowedRequest, GuardedRequestBody as DecisionBody, RequestDecision,
-    RequestDecisionError, RequestInput,
+    RequestInput, TerminalRequestBodyProvenance,
 };
-use crate::runtime::{BoxFuture, GenerationRetentionError, Runtime};
+use crate::runtime::{BoxFuture, Runtime};
 use crate::safety::wire_body::{GuardedBodyData, GuardedHttpBody};
 use crate::safety::{InvalidLoopMarker, WireBodyQuotaKey};
+use crate::sensitive::{is_sensitive_header_name, REDACTED};
 
 /// Concrete process-runtime starter for the prebound product listener bundle.
 /// HTTPS variants are deliberately left for their dedicated executors.
@@ -676,6 +678,7 @@ impl HandledResponse {
         let response = Response::builder()
             .status(status)
             .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(http::header::CONTENT_LENGTH, message.len())
             .body(ProxyResponseBody::Local(Body::from(message)))
             .expect("fixed proxy responses are valid");
         Self {
@@ -685,28 +688,362 @@ impl HandledResponse {
     }
 }
 
+struct HttpCaptureContext {
+    runtime: Arc<ProductObservationRuntime>,
+    epoch: Arc<CaptureEpoch>,
+    request_id: String,
+    url: String,
+    method: String,
+    client: CaptureEndpoint,
+    target: Option<CaptureEndpoint>,
+    request_version: Version,
+    max_expansion_ratio: usize,
+}
+
+impl HttpCaptureContext {
+    fn new(
+        runtime: Arc<ProductObservationRuntime>,
+        epoch: Arc<CaptureEpoch>,
+        request_id: String,
+        peer: SocketAddr,
+        method: String,
+        request_version: Version,
+        max_expansion_ratio: usize,
+    ) -> Self {
+        Self {
+            runtime,
+            epoch,
+            request_id,
+            url: String::new(),
+            method,
+            client: CaptureEndpoint {
+                address: Some(peer.ip().to_string()),
+                port: Some(peer.port()),
+            },
+            target: None,
+            request_version,
+            max_expansion_ratio,
+        }
+    }
+
+    fn bind_target(&mut self, target: &crate::url::CanonicalUrl) {
+        self.url.clone_from(&target.url);
+        self.target = Some(CaptureEndpoint {
+            address: Some(target.host_for_capture.clone()),
+            port: Some(target.port),
+        });
+    }
+
+    fn begin(
+        &self,
+        event: CaptureEvent,
+        record: CaptureRecord,
+        body_headers: &HeaderMap,
+    ) -> Option<CaptureSubmission> {
+        HttpCaptureTap::try_begin(
+            self.epoch.clone(),
+            event,
+            record,
+            body_headers,
+            self.max_expansion_ratio,
+        )
+        .map(|tap| {
+            CaptureSubmission::new(
+                self.runtime.clone(),
+                tap,
+                body_headers.contains_key(TRAILER),
+            )
+        })
+    }
+
+    fn request_record(
+        &self,
+        decision: CaptureDecision,
+        headers: Option<&HeaderMap>,
+    ) -> CaptureRecord {
+        self.record(
+            CaptureKind::Request,
+            decision,
+            self.request_version,
+            headers,
+            None,
+            false,
+        )
+    }
+
+    fn response_record(
+        &self,
+        decision: CaptureDecision,
+        version: Version,
+        headers: Option<&HeaderMap>,
+        status: StatusCode,
+        include_status_message: bool,
+    ) -> CaptureRecord {
+        self.record(
+            CaptureKind::Response,
+            decision,
+            version,
+            headers,
+            Some(status),
+            include_status_message,
+        )
+    }
+
+    fn record(
+        &self,
+        kind: CaptureKind,
+        decision: CaptureDecision,
+        version: Version,
+        headers: Option<&HeaderMap>,
+        status: Option<StatusCode>,
+        include_status_message: bool,
+    ) -> CaptureRecord {
+        CaptureRecord {
+            timestamp: Utc::now().to_rfc3339(),
+            request_id: self.request_id.clone(),
+            kind,
+            decision,
+            mode: CaptureMode::HttpProxy,
+            url: self.url.clone(),
+            method: self.method.clone(),
+            status_code: status.map(|status| status.as_u16()),
+            status_message: if include_status_message {
+                status
+                    .and_then(|status| status.canonical_reason())
+                    .map(str::to_owned)
+            } else {
+                None
+            },
+            client: self.client.clone(),
+            target: self.target.clone(),
+            http_version: Some(http_version(version).to_owned()),
+            headers: headers.map(headers_to_capture_map),
+            body: None,
+            body_truncated: None,
+            provider_replacement_omitted: None,
+            provider_replacement_size: None,
+        }
+    }
+
+    fn begin_allowed_request(
+        &self,
+        headers: &HeaderMap,
+        body_headers: &HeaderMap,
+        provenance: TerminalRequestBodyProvenance,
+    ) -> Option<CaptureSubmission> {
+        let mut record = self.request_record(CaptureDecision::Allow, Some(headers));
+        if let TerminalRequestBodyProvenance::ProviderReplacement { size } = provenance {
+            record.mark_provider_replacement_omitted(size);
+            if let Some(mut submission) =
+                self.begin(CaptureEvent::RequestAllowed, record, body_headers)
+            {
+                submission.abandon();
+            }
+            return None;
+        }
+        self.begin(CaptureEvent::RequestAllowed, record, body_headers)
+    }
+
+    fn submit_denied_request(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: Option<DecisionBody>,
+        provenance: TerminalRequestBodyProvenance,
+    ) {
+        let mut record = self.request_record(CaptureDecision::Deny, headers);
+        let body_headers = body.as_ref().map(terminal_body_headers).unwrap_or_default();
+        if let TerminalRequestBodyProvenance::ProviderReplacement { size } = provenance {
+            record.mark_provider_replacement_omitted(size);
+        }
+        let Some(mut submission) = self.begin(CaptureEvent::RequestDenied, record, &body_headers)
+        else {
+            return;
+        };
+        match (provenance, body) {
+            (
+                TerminalRequestBodyProvenance::CompleteOriginal
+                | TerminalRequestBodyProvenance::CompleteWireRedacted,
+                Some(body),
+            ) => {
+                for segment in body.decoded.segments() {
+                    submission.push(segment);
+                }
+                submission.finish();
+            }
+            _ => submission.abandon(),
+        }
+    }
+
+    fn fixed_response(
+        &self,
+        decision: CaptureDecision,
+        status: StatusCode,
+        message: &'static str,
+        close_connection: bool,
+    ) -> HandledResponse {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; charset=utf-8"),
+        );
+        headers.insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&message.len().to_string())
+                .expect("fixed response length is a valid header"),
+        );
+        let record =
+            self.response_record(decision, self.request_version, Some(&headers), status, true);
+        let event = match decision {
+            CaptureDecision::Allow => CaptureEvent::ResponseAllowed,
+            CaptureDecision::Deny => CaptureEvent::ResponseDenied,
+        };
+        if let Some(mut submission) = self.begin(event, record, &headers) {
+            submission.push(message.as_bytes());
+            submission.finish();
+        }
+        HandledResponse::fixed(status, message, close_connection)
+    }
+
+    fn deny_metadata_only(
+        &self,
+        status: StatusCode,
+        message: &'static str,
+        close_connection: bool,
+    ) -> HandledResponse {
+        self.submit_denied_request(None, None, TerminalRequestBodyProvenance::Unconsumed);
+        self.fixed_response(CaptureDecision::Deny, status, message, close_connection)
+    }
+}
+
+struct CaptureSubmission {
+    runtime: Arc<ProductObservationRuntime>,
+    tap: Option<HttpCaptureTap>,
+    expect_trailers: bool,
+}
+
+impl CaptureSubmission {
+    fn new(
+        runtime: Arc<ProductObservationRuntime>,
+        tap: HttpCaptureTap,
+        expect_trailers: bool,
+    ) -> Self {
+        Self {
+            runtime,
+            tap: Some(tap),
+            expect_trailers,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        if let Some(tap) = self.tap.as_mut() {
+            tap.push(bytes);
+        }
+    }
+
+    fn finish(&mut self) {
+        if let Some(tap) = self.tap.take() {
+            self.submit(tap.finish());
+        }
+    }
+
+    fn finish_data_if_complete(&mut self, complete: bool) {
+        if complete && !self.expect_trailers {
+            self.finish();
+        }
+    }
+
+    fn abandon(&mut self) {
+        if let Some(tap) = self.tap.take() {
+            self.submit(tap.abandon());
+        }
+    }
+
+    fn submit(&self, job: crate::capture::CaptureArtifactJob) {
+        if let Err(error) = self.runtime.try_submit_capture(job) {
+            tracing::debug!(error = ?error, "capture artifact queue omitted record");
+        }
+    }
+}
+
+impl Drop for CaptureSubmission {
+    fn drop(&mut self) {
+        self.abandon();
+    }
+}
+
+fn terminal_body_headers(body: &DecisionBody) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Some(content_type) = body
+        .content_type
+        .as_deref()
+        .and_then(|value| HeaderValue::from_str(value).ok())
+    {
+        headers.insert(CONTENT_TYPE, content_type);
+    }
+    if let Some(content_encoding) = body
+        .content_encoding
+        .as_deref()
+        .and_then(|value| HeaderValue::from_str(value).ok())
+    {
+        headers.insert(CONTENT_ENCODING, content_encoding);
+    }
+    headers
+}
+
+fn headers_to_capture_map(headers: &HeaderMap) -> crate::capture::HeaderMap {
+    let mut captured = crate::capture::HeaderMap::new();
+    for (name, value) in headers {
+        let name = name.as_str().to_ascii_lowercase();
+        let value = if is_sensitive_header_name(&name) {
+            serde_json::Value::String(REDACTED.to_owned())
+        } else if let Ok(value) = value.to_str() {
+            serde_json::Value::String(value.to_owned())
+        } else {
+            continue;
+        };
+        match captured.entry(name) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(value);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => match entry.get_mut() {
+                serde_json::Value::String(existing) => {
+                    *entry.get_mut() = serde_json::Value::Array(vec![
+                        serde_json::Value::String(existing.clone()),
+                        value,
+                    ]);
+                }
+                serde_json::Value::Array(values) => values.push(value),
+                _ => unreachable!("capture headers contain only strings and string arrays"),
+            },
+        }
+    }
+    captured
+}
+
+fn http_version(version: Version) -> &'static str {
+    match version {
+        Version::HTTP_09 => "0.9",
+        Version::HTTP_10 => "1.0",
+        Version::HTTP_11 => "1.1",
+        Version::HTTP_2 => "2",
+        Version::HTTP_3 => "3",
+        _ => "unknown",
+    }
+}
+
 async fn execute_request(
     mode: CleartextMode,
     peer: SocketAddr,
     quota_key: WireBodyQuotaKey,
     runtime: Arc<Runtime>,
-    _observation_runtime: Arc<ProductObservationRuntime>,
+    observation_runtime: Arc<ProductObservationRuntime>,
     assets: Arc<ProductIngressAssets>,
     mut request: Request<Body>,
 ) -> HandledResponse {
     let started_at = Instant::now();
-    let target = match mode {
-        CleartextMode::Explicit => reconcile_explicit_request(&mut request),
-        CleartextMode::Transparent => reconcile_transparent_http_request(&mut request),
-    };
-    let target = match target {
-        Ok(target) => target,
-        Err(error) => return authority_failure(error),
-    };
-    let sanitized = match sanitize_untrusted_request(request) {
-        Ok(request) => request,
-        Err(error) => return header_failure(error),
-    };
+    let request_id = request_id();
+    let request_method = request.method().to_string();
+    let request_version = request.version();
     let Some(lease) = runtime.lease().await else {
         return HandledResponse::fixed(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -714,8 +1051,47 @@ async fn execute_request(
             true,
         );
     };
+    let mut capture = HttpCaptureContext::new(
+        observation_runtime,
+        lease.observation().capture_epoch().clone(),
+        request_id.clone(),
+        peer,
+        request_method,
+        request_version,
+        lease.max_content_decoding_expansion_ratio(),
+    );
     let Some(service_deadline) = started_at.checked_add(lease.request_timeout()) else {
-        return HandledResponse::fixed(StatusCode::INTERNAL_SERVER_ERROR, "request failed\n", true);
+        return capture.deny_metadata_only(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "request failed\n",
+            true,
+        );
+    };
+    let target = match mode {
+        CleartextMode::Explicit => reconcile_explicit_request(&mut request),
+        CleartextMode::Transparent => reconcile_transparent_http_request(&mut request),
+    };
+    let target = match target {
+        Ok(target) => target,
+        Err(_) => {
+            return capture.deny_metadata_only(
+                StatusCode::BAD_REQUEST,
+                "invalid request target\n",
+                true,
+            )
+        }
+    };
+    capture.bind_target(&target.url);
+    let sanitized = match sanitize_untrusted_request(request) {
+        Ok(request) => request,
+        Err(error) => {
+            let status = match error {
+                HeaderPreparationError::UpgradeUnsupported
+                | HeaderPreparationError::ConnectUnsupported => StatusCode::NOT_IMPLEMENTED,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            return capture.deny_metadata_only(status, "invalid request\n", true);
+        }
     };
 
     let resolved = match tokio::time::timeout_at(
@@ -730,20 +1106,30 @@ async fn execute_request(
     .await
     {
         Ok(Ok(resolved)) => resolved,
-        Ok(Err(error)) => return resolve_failure(error),
-        Err(_) => return timeout_failure(),
+        Ok(Err(_)) => {
+            return capture.deny_metadata_only(StatusCode::FORBIDDEN, "destination denied\n", true)
+        }
+        Err(_) => {
+            return capture.deny_metadata_only(
+                StatusCode::GATEWAY_TIMEOUT,
+                "request timed out\n",
+                true,
+            )
+        }
     };
 
     let (mut parts, ingress_body, protocol) = sanitized.into_parts();
     let ingress_was_complete = ingress_body.is_end_stream();
-    let body_headers = body_headers(&parts.headers);
+    let mut body_headers = body_headers(&parts.headers);
+    for value in parts.headers.get_all(CONTENT_TYPE).iter() {
+        body_headers.append(CONTENT_TYPE, value.clone());
+    }
     let content_type = parts
         .headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     let headers = std::mem::take(&mut parts.headers);
-    let request_id = request_id();
     let prepared = match prepare_request(
         &lease,
         RequestInput {
@@ -757,7 +1143,13 @@ async fn execute_request(
         },
     ) {
         Ok(prepared) => prepared,
-        Err(error) => return decision_failure(error),
+        Err(_) => {
+            return capture.deny_metadata_only(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request failed\n",
+                true,
+            )
+        }
     };
     let deadline = prepared.deadline();
     let body_plan = prepared.body_read_plan();
@@ -775,7 +1167,19 @@ async fn execute_request(
             .await
             {
                 Ok(body) => body,
-                Err(error) => return body_failure(error),
+                Err(error) => {
+                    capture.submit_denied_request(
+                        Some(prepared.headers_for_observation()),
+                        None,
+                        TerminalRequestBodyProvenance::Unconsumed,
+                    );
+                    return capture.fixed_response(
+                        CaptureDecision::Deny,
+                        body_failure_status(error),
+                        "request body denied\n",
+                        true,
+                    );
+                }
             };
             let encoded_len = body.encoded_len();
             (
@@ -790,38 +1194,97 @@ async fn execute_request(
             )
         }
     };
+    let decision_error_headers = sanitized_capture_headers(prepared.headers_for_observation());
     let decision = match prepared.decide(decision_body).await {
         Ok(decision) => decision,
-        Err(error) => return decision_failure(error),
+        Err(error) => {
+            capture.submit_denied_request(
+                Some(&decision_error_headers),
+                None,
+                error
+                    .body_provenance()
+                    .unwrap_or(TerminalRequestBodyProvenance::Unconsumed),
+            );
+            return capture.fixed_response(
+                CaptureDecision::Deny,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request failed\n",
+                true,
+            );
+        }
     };
     let mut allowed = match decision {
         RequestDecision::Allow(allowed) => allowed,
-        RequestDecision::Deny(_) => {
-            return HandledResponse::fixed(
+        RequestDecision::Deny(mut denied) => {
+            let body = denied.take_body_for_observation();
+            capture.submit_denied_request(
+                Some(&denied.common.headers),
+                body,
+                denied.body_provenance,
+            );
+            return capture.fixed_response(
+                CaptureDecision::Deny,
                 StatusCode::FORBIDDEN,
                 "request denied\n",
                 !normalized && !ingress_was_complete,
-            )
+            );
         }
     };
 
-    let origin_body = match prepare_allowed_request(
+    let allowed_body_headers = if normalized {
+        allowed
+            .body
+            .as_ref()
+            .map(terminal_body_headers)
+            .unwrap_or_default()
+    } else {
+        body_headers
+    };
+    let mut observable =
+        match prepare_observable_allowed_request(&lease, &mut allowed, origin_body, normalized) {
+            Ok(prepared) => prepared,
+            Err(_) => {
+                if let Some(mut submission) = capture.begin_allowed_request(
+                    &allowed.common.headers,
+                    &allowed_body_headers,
+                    allowed.body_provenance,
+                ) {
+                    submission.abandon();
+                }
+                return capture.fixed_response(
+                    CaptureDecision::Allow,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "request failed\n",
+                    true,
+                );
+            }
+        };
+    let mut request_capture = capture.begin_allowed_request(
+        &observable.headers,
+        &allowed_body_headers,
+        allowed.body_provenance,
+    );
+    if finalize_allowed_request(
         &lease,
         &request_id,
         &mut parts,
         &mut allowed,
-        origin_body,
-        normalized,
-    ) {
-        Ok(body) => body,
-        Err(_) => {
-            return HandledResponse::fixed(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "request failed\n",
-                true,
-            )
+        &mut observable,
+    )
+    .is_err()
+    {
+        if let Some(submission) = request_capture.as_mut() {
+            submission.abandon();
         }
-    };
+        return capture.fixed_response(
+            CaptureDecision::Allow,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "request failed\n",
+            true,
+        );
+    }
+    let mut origin_body = observable.body;
+    origin_body.set_capture(request_capture);
     let request = SanitizedRequest::from_parts(parts, origin_body, protocol);
     let mut response = match tokio::time::timeout_at(
         deadline,
@@ -836,25 +1299,58 @@ async fn execute_request(
     .await
     {
         Ok(Ok(response)) => response,
-        Ok(Err(error)) => return forward_failure(error),
-        Err(_) => return timeout_failure(),
+        Ok(Err(_)) => {
+            return capture.fixed_response(
+                CaptureDecision::Allow,
+                StatusCode::BAD_GATEWAY,
+                "upstream failed\n",
+                true,
+            )
+        }
+        Err(_) => {
+            return capture.fixed_response(
+                CaptureDecision::Allow,
+                StatusCode::GATEWAY_TIMEOUT,
+                "request timed out\n",
+                true,
+            )
+        }
     };
     let retention = match lease.retain_for_operation() {
         Ok(retention) => retention,
-        Err(error) => return generation_retention_failure(error),
+        Err(_) => {
+            return capture.fixed_response(
+                CaptureDecision::Allow,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service unavailable\n",
+                true,
+            )
+        }
     };
     response
         .body_mut()
         .bind_request_lifetime(deadline, retention);
     if apply_header_effects(allowed.response_header_effects(), response.headers_mut()).is_err() {
-        return HandledResponse::fixed(
+        return capture.fixed_response(
+            CaptureDecision::Allow,
             StatusCode::INTERNAL_SERVER_ERROR,
             "response failed\n",
             true,
         );
     }
+    let response_capture = capture.begin(
+        CaptureEvent::ResponseAllowed,
+        capture.response_record(
+            CaptureDecision::Allow,
+            response.version(),
+            Some(response.headers()),
+            response.status(),
+            false,
+        ),
+        response.headers(),
+    );
     HandledResponse {
-        response: response.map(ProxyResponseBody::Forwarded),
+        response: response.map(|body| ProxyResponseBody::forwarded(body, response_capture)),
         close_connection: false,
     }
 }
@@ -867,6 +1363,18 @@ fn body_headers(headers: &HeaderMap) -> HeaderMap {
         }
     }
     selected
+}
+
+fn sanitized_capture_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut sanitized = HeaderMap::new();
+    for (name, value) in headers {
+        if is_sensitive_header_name(name.as_str()) {
+            sanitized.append(name.clone(), HeaderValue::from_static(REDACTED));
+        } else {
+            sanitized.append(name.clone(), value.clone());
+        }
+    }
+    sanitized
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -887,29 +1395,20 @@ enum FinalRequestError {
     ContentType,
 }
 
-fn prepare_allowed_request(
+struct ObservableAllowedRequest {
+    headers: HeaderMap,
+    body: OriginRequestBody,
+}
+
+fn prepare_observable_allowed_request(
     lease: &crate::runtime::GenerationLease,
-    request_id: &str,
-    parts: &mut http::request::Parts,
     allowed: &mut AllowedRequest<'_>,
     opaque_body: Option<Body>,
     normalized: bool,
-) -> Result<OriginRequestBody, FinalRequestError> {
+) -> Result<ObservableAllowedRequest, FinalRequestError> {
     let mut headers = std::mem::take(&mut allowed.common.headers);
     apply_header_effects(allowed.request_header_effects(), &mut headers)?;
-    lease
-        .credentials()
-        .inject(allowed.credential_actions(), &mut headers)?;
-    if let Some(provider_credentials) = allowed.provider_credentials.take() {
-        provider_credentials.apply(&mut headers)?;
-    }
     lease.egress().apply_request_headers(&mut headers)?;
-    lease
-        .credentials()
-        .inject(lease.egress().credential_actions(), &mut headers)?;
-    lease
-        .safety()
-        .inject_loop_marker(&mut headers, request_id)?;
 
     let body = if normalized {
         let body = allowed
@@ -928,41 +1427,47 @@ fn prepare_allowed_request(
                 headers.remove(CONTENT_TYPE);
             }
         }
-        OriginRequestBody::Guarded(GuardedHttpBody::new(body.decoded))
+        OriginRequestBody::Guarded {
+            body: GuardedHttpBody::new(body.decoded),
+            capture: None,
+        }
     } else {
         if allowed.body.is_some() {
             return Err(FinalRequestError::UnexpectedNormalizedBody);
         }
-        OriginRequestBody::Opaque(opaque_body.expect("the opaque ingress body is retained"))
-    };
-    parts.headers = headers;
-    Ok(body)
-}
-
-fn authority_failure(_error: AuthorityError) -> HandledResponse {
-    HandledResponse::fixed(StatusCode::BAD_REQUEST, "invalid request target\n", true)
-}
-
-fn header_failure(error: HeaderPreparationError) -> HandledResponse {
-    let status = match error {
-        HeaderPreparationError::UpgradeUnsupported | HeaderPreparationError::ConnectUnsupported => {
-            StatusCode::NOT_IMPLEMENTED
+        OriginRequestBody::Opaque {
+            body: opaque_body.expect("the opaque ingress body is retained"),
+            capture: None,
         }
-        _ => StatusCode::BAD_REQUEST,
     };
-    HandledResponse::fixed(status, "invalid request\n", true)
+    Ok(ObservableAllowedRequest { headers, body })
 }
 
-fn resolve_failure(_error: ResolveForwardingError) -> HandledResponse {
-    HandledResponse::fixed(StatusCode::FORBIDDEN, "destination denied\n", true)
+fn finalize_allowed_request(
+    lease: &crate::runtime::GenerationLease,
+    request_id: &str,
+    parts: &mut http::request::Parts,
+    allowed: &mut AllowedRequest<'_>,
+    prepared: &mut ObservableAllowedRequest,
+) -> Result<(), FinalRequestError> {
+    lease
+        .credentials()
+        .inject(allowed.credential_actions(), &mut prepared.headers)?;
+    if let Some(provider_credentials) = allowed.provider_credentials.take() {
+        provider_credentials.apply(&mut prepared.headers)?;
+    }
+    lease
+        .credentials()
+        .inject(lease.egress().credential_actions(), &mut prepared.headers)?;
+    lease
+        .safety()
+        .inject_loop_marker(&mut prepared.headers, request_id)?;
+    parts.headers = std::mem::take(&mut prepared.headers);
+    Ok(())
 }
 
-fn decision_failure(_error: RequestDecisionError) -> HandledResponse {
-    HandledResponse::fixed(StatusCode::INTERNAL_SERVER_ERROR, "request failed\n", true)
-}
-
-fn body_failure(error: HttpBodyReadError) -> HandledResponse {
-    let status = match error {
+fn body_failure_status(error: HttpBodyReadError) -> StatusCode {
+    match error {
         HttpBodyReadError::UnsupportedContentEncoding
         | HttpBodyReadError::StackedContentEncoding
         | HttpBodyReadError::InvalidContentEncoding
@@ -975,24 +1480,7 @@ fn body_failure(error: HttpBodyReadError) -> HandledResponse {
             StatusCode::BAD_REQUEST
         }
         HttpBodyReadError::ResourceExhausted => StatusCode::SERVICE_UNAVAILABLE,
-    };
-    HandledResponse::fixed(status, "request body denied\n", true)
-}
-
-fn forward_failure(_error: ForwardError) -> HandledResponse {
-    HandledResponse::fixed(StatusCode::BAD_GATEWAY, "upstream failed\n", true)
-}
-
-fn timeout_failure() -> HandledResponse {
-    HandledResponse::fixed(StatusCode::GATEWAY_TIMEOUT, "request timed out\n", true)
-}
-
-fn generation_retention_failure(_error: GenerationRetentionError) -> HandledResponse {
-    HandledResponse::fixed(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "service unavailable\n",
-        true,
-    )
+    }
 }
 
 fn request_id() -> String {
@@ -1010,8 +1498,24 @@ fn request_id() -> String {
 }
 
 enum OriginRequestBody {
-    Opaque(Body),
-    Guarded(GuardedHttpBody),
+    Opaque {
+        body: Body,
+        capture: Option<CaptureSubmission>,
+    },
+    Guarded {
+        body: GuardedHttpBody,
+        capture: Option<CaptureSubmission>,
+    },
+}
+
+impl OriginRequestBody {
+    fn set_capture(&mut self, submission: Option<CaptureSubmission>) {
+        match self {
+            Self::Opaque { capture, .. } | Self::Guarded { capture, .. } => {
+                *capture = submission;
+            }
+        }
+    }
 }
 
 enum OriginRequestData {
@@ -1051,15 +1555,63 @@ impl HttpBody for OriginRequestBody {
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
         match self.get_mut() {
-            Self::Opaque(body) => Pin::new(body)
-                .poll_data(context)
-                .map(|item| item.map(|item| item.map(OriginRequestData::Opaque))),
-            Self::Guarded(body) => Pin::new(body).poll_data(context).map(|item| {
-                item.map(|item| match item {
-                    Ok(data) => Ok(OriginRequestData::Guarded(data)),
-                    Err(never) => match never {},
-                })
-            }),
+            Self::Opaque { body, capture } => {
+                let exact_remaining = body.size_hint().exact();
+                match Pin::new(&mut *body).poll_data(context) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Some(Ok(data))) => {
+                        let data_len = data.remaining();
+                        if let Some(capture) = capture.as_mut() {
+                            capture.push(data.chunk());
+                            capture.finish_data_if_complete(
+                                body.is_end_stream() || exact_remaining == Some(data_len as u64),
+                            );
+                        }
+                        Poll::Ready(Some(Ok(OriginRequestData::Opaque(data))))
+                    }
+                    Poll::Ready(Some(Err(error))) => {
+                        if let Some(capture) = capture.as_mut() {
+                            capture.abandon();
+                        }
+                        Poll::Ready(Some(Err(error)))
+                    }
+                    Poll::Ready(None) => {
+                        if body.is_end_stream() {
+                            if let Some(capture) = capture.as_mut() {
+                                capture.finish();
+                            }
+                        }
+                        Poll::Ready(None)
+                    }
+                }
+            }
+            Self::Guarded { body, capture } => {
+                let exact_remaining = body.size_hint().exact();
+                match Pin::new(&mut *body).poll_data(context) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Some(Ok(data))) => {
+                        let data_len = data.remaining();
+                        if let Some(capture) = capture.as_mut() {
+                            for segment in data.capture_segments() {
+                                capture.push(segment);
+                            }
+                            capture.finish_data_if_complete(
+                                body.is_end_stream() || exact_remaining == Some(data_len as u64),
+                            );
+                        }
+                        Poll::Ready(Some(Ok(OriginRequestData::Guarded(data))))
+                    }
+                    Poll::Ready(Some(Err(never))) => match never {},
+                    Poll::Ready(None) => {
+                        if body.is_end_stream() {
+                            if let Some(capture) = capture.as_mut() {
+                                capture.finish();
+                            }
+                        }
+                        Poll::Ready(None)
+                    }
+                }
+            }
         }
     }
 
@@ -1068,10 +1620,29 @@ impl HttpBody for OriginRequestBody {
         context: &mut Context<'_>,
     ) -> Poll<Result<Option<HeaderMap>, Self::Error>> {
         match self.get_mut() {
-            Self::Opaque(body) => Pin::new(body).poll_trailers(context),
-            Self::Guarded(body) => match Pin::new(body).poll_trailers(context) {
+            Self::Opaque { body, capture } => match Pin::new(body).poll_trailers(context) {
+                Poll::Ready(Ok(trailers)) => {
+                    if let Some(capture) = capture.as_mut() {
+                        capture.finish();
+                    }
+                    Poll::Ready(Ok(trailers))
+                }
+                Poll::Ready(Err(error)) => {
+                    if let Some(capture) = capture.as_mut() {
+                        capture.abandon();
+                    }
+                    Poll::Ready(Err(error))
+                }
                 Poll::Pending => Poll::Pending,
-                Poll::Ready(Ok(trailers)) => Poll::Ready(Ok(trailers)),
+            },
+            Self::Guarded { body, capture } => match Pin::new(body).poll_trailers(context) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(trailers)) => {
+                    if let Some(capture) = capture.as_mut() {
+                        capture.finish();
+                    }
+                    Poll::Ready(Ok(trailers))
+                }
                 Poll::Ready(Err(never)) => match never {},
             },
         }
@@ -1079,22 +1650,31 @@ impl HttpBody for OriginRequestBody {
 
     fn is_end_stream(&self) -> bool {
         match self {
-            Self::Opaque(body) => body.is_end_stream(),
-            Self::Guarded(body) => body.is_end_stream(),
+            Self::Opaque { body, .. } => body.is_end_stream(),
+            Self::Guarded { body, .. } => body.is_end_stream(),
         }
     }
 
     fn size_hint(&self) -> SizeHint {
         match self {
-            Self::Opaque(body) => body.size_hint(),
-            Self::Guarded(body) => body.size_hint(),
+            Self::Opaque { body, .. } => body.size_hint(),
+            Self::Guarded { body, .. } => body.size_hint(),
         }
     }
 }
 
 enum ProxyResponseBody {
     Local(Body),
-    Forwarded(ForwardBody),
+    Forwarded {
+        body: ForwardBody,
+        capture: Option<CaptureSubmission>,
+    },
+}
+
+impl ProxyResponseBody {
+    fn forwarded(body: ForwardBody, capture: Option<CaptureSubmission>) -> Self {
+        Self::Forwarded { body, capture }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1117,9 +1697,36 @@ impl HttpBody for ProxyResponseBody {
             Self::Local(body) => Pin::new(body)
                 .poll_data(context)
                 .map(|item| item.map(|item| item.map_err(ProxyResponseBodyError::Local))),
-            Self::Forwarded(body) => Pin::new(body)
-                .poll_data(context)
-                .map(|item| item.map(|item| item.map_err(ProxyResponseBodyError::Forwarded))),
+            Self::Forwarded { body, capture } => {
+                let exact_remaining = body.size_hint().exact();
+                match Pin::new(&mut *body).poll_data(context) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Some(Ok(data))) => {
+                        let data_len = data.remaining();
+                        if let Some(capture) = capture.as_mut() {
+                            capture.push(data.chunk());
+                            capture.finish_data_if_complete(
+                                body.is_end_stream() || exact_remaining == Some(data_len as u64),
+                            );
+                        }
+                        Poll::Ready(Some(Ok(data)))
+                    }
+                    Poll::Ready(Some(Err(error))) => {
+                        if let Some(capture) = capture.as_mut() {
+                            capture.abandon();
+                        }
+                        Poll::Ready(Some(Err(ProxyResponseBodyError::Forwarded(error))))
+                    }
+                    Poll::Ready(None) => {
+                        if body.is_end_stream() {
+                            if let Some(capture) = capture.as_mut() {
+                                capture.finish();
+                            }
+                        }
+                        Poll::Ready(None)
+                    }
+                }
+            }
         }
     }
 
@@ -1131,23 +1738,35 @@ impl HttpBody for ProxyResponseBody {
             Self::Local(body) => Pin::new(body)
                 .poll_trailers(context)
                 .map_err(ProxyResponseBodyError::Local),
-            Self::Forwarded(body) => Pin::new(body)
-                .poll_trailers(context)
-                .map_err(ProxyResponseBodyError::Forwarded),
+            Self::Forwarded { body, capture } => match Pin::new(body).poll_trailers(context) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(trailers)) => {
+                    if let Some(capture) = capture.as_mut() {
+                        capture.finish();
+                    }
+                    Poll::Ready(Ok(trailers))
+                }
+                Poll::Ready(Err(error)) => {
+                    if let Some(capture) = capture.as_mut() {
+                        capture.abandon();
+                    }
+                    Poll::Ready(Err(ProxyResponseBodyError::Forwarded(error)))
+                }
+            },
         }
     }
 
     fn is_end_stream(&self) -> bool {
         match self {
             Self::Local(body) => body.is_end_stream(),
-            Self::Forwarded(body) => body.is_end_stream(),
+            Self::Forwarded { body, .. } => body.is_end_stream(),
         }
     }
 
     fn size_hint(&self) -> SizeHint {
         match self {
             Self::Local(body) => body.size_hint(),
-            Self::Forwarded(body) => body.size_hint(),
+            Self::Forwarded { body, .. } => body.size_hint(),
         }
     }
 }
@@ -1259,6 +1878,253 @@ header = "x-test-loop"
         let body = to_bytes(body).await.unwrap();
         driver.await.unwrap().unwrap();
         Response::from_parts(parts, Body::from(body))
+    }
+
+    fn capture_config() -> &'static str {
+        r#"
+[redaction.profiles.capture]
+replacement = "[MASKED]"
+rules = [{ literals = ["capture-redaction-sentinel"], payloads = "both" }]
+
+[observation.capture]
+events = ["request.allowed", "response.allowed", "request.denied", "response.denied"]
+redaction_profile = "capture"
+directory = "captures"
+max_body_bytes = 1048576
+max_inflight_body_bytes = 134217728
+max_pending_records = 32
+max_files = 32
+max_total_bytes = 16777216
+"#
+    }
+
+    fn read_capture_records(directory: &std::path::Path) -> Vec<CaptureRecord> {
+        let mut records = fs::read_dir(directory.join("captures"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|value| value == "json")
+            })
+            .map(|entry| {
+                serde_json::from_slice::<CaptureRecord>(&fs::read(entry.path()).unwrap()).unwrap()
+            })
+            .collect::<Vec<_>>();
+        records.sort_by_key(|record| match record.kind {
+            CaptureKind::Request => 0,
+            CaptureKind::Response => 1,
+        });
+        records
+    }
+
+    async fn captured_success_round_trip() -> (Vec<CaptureRecord>, HeaderMap) {
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let (headers_tx, headers_rx) = oneshot::channel();
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin_listener.accept().await.unwrap();
+            let headers_tx = Arc::new(StdMutex::new(Some(headers_tx)));
+            Http::new()
+                .http1_only(true)
+                .serve_connection(
+                    stream,
+                    service_fn(move |request: Request<Body>| {
+                        let headers_tx = headers_tx.clone();
+                        async move {
+                            let (parts, body) = request.into_parts();
+                            assert_eq!(to_bytes(body).await.unwrap(), "request-body");
+                            headers_tx
+                                .lock()
+                                .unwrap()
+                                .take()
+                                .unwrap()
+                                .send(parts.headers)
+                                .ok();
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .header(http::header::SET_COOKIE, "origin-cookie-secret")
+                                    .header("x-origin-response", "visible")
+                                    .body(Body::from("response-body"))
+                                    .unwrap(),
+                            )
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let policy = format!(
+            r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "capture-allow"
+decision = "allow"
+urls = ["http://{origin}/capture"]
+methods = ["POST"]
+
+[[policy.rules.request_headers]]
+operation = "set"
+when = "always"
+name = "x-rule-visible"
+value = "yes"
+
+{}"#,
+            capture_config()
+        );
+        let config = base_config(proxy, "explicit_http", &policy);
+        let (directory, product) = product(config, listeners).await;
+        let response = send_request(
+            proxy,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri(format!("http://{origin}/capture?secret=query"))
+                .header(http::header::AUTHORIZATION, "Bearer inbound-secret")
+                .header(http::header::COOKIE, "cookie-secret")
+                .body(Body::from("request-body"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body()).await.unwrap(),
+            "response-body"
+        );
+        let origin_headers = headers_rx.await.unwrap();
+        product.shutdown().await;
+        origin_task.await.unwrap();
+        (read_capture_records(directory.path()), origin_headers)
+    }
+
+    #[tokio::test]
+    async fn active_executor_capture_event_and_secret_boundary_matrix() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+
+        let (records, origin_headers) = captured_success_round_trip().await;
+        assert_eq!(records.len(), 2);
+        let request = &records[0];
+        let response = &records[1];
+        assert_eq!(
+            (request.kind, request.decision),
+            (CaptureKind::Request, CaptureDecision::Allow)
+        );
+        assert_eq!(
+            (response.kind, response.decision),
+            (CaptureKind::Response, CaptureDecision::Allow)
+        );
+        assert_eq!(request.decode_body_bytes().unwrap(), b"request-body");
+        assert_eq!(response.decode_body_bytes().unwrap(), b"response-body");
+        assert!(!request.url.contains("secret=query"));
+        let request_headers = request.headers.as_ref().unwrap();
+        assert_eq!(request_headers["authorization"], REDACTED);
+        assert_eq!(request_headers["cookie"], REDACTED);
+        assert_eq!(request_headers["x-rule-visible"], "yes");
+        assert_eq!(request_headers["x-mutation-order"], "global");
+        assert!(!request_headers.contains_key("x-test-loop"));
+        assert!(origin_headers.contains_key("x-test-loop"));
+        assert_eq!(response.headers.as_ref().unwrap()["set-cookie"], REDACTED);
+        assert!(response.status_message.is_none());
+
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let policy = format!(
+            r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+
+{}"#,
+            capture_config()
+        );
+        let denied_origin = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let denied_origin_address = denied_origin.local_addr().unwrap();
+        let (directory, runtime_product) =
+            product(base_config(proxy, "explicit_http", &policy), listeners).await;
+        let response = send_request(
+            proxy,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri(format!("http://{denied_origin_address}/denied"))
+                .body(Body::from("must-not-be-drained"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        runtime_product.shutdown().await;
+        drop(denied_origin);
+        let records = read_capture_records(directory.path());
+        assert_eq!(records.len(), 2);
+        assert!(records
+            .iter()
+            .all(|record| record.decision == CaptureDecision::Deny));
+        assert!(records
+            .iter()
+            .find(|record| record.kind == CaptureKind::Request)
+            .unwrap()
+            .body
+            .is_none());
+        assert_eq!(
+            records
+                .iter()
+                .find(|record| record.kind == CaptureKind::Response)
+                .unwrap()
+                .decode_body_bytes()
+                .unwrap(),
+            b"request denied\n"
+        );
+
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let closed = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let origin = closed.local_addr().unwrap();
+        drop(closed);
+        let policy = format!(
+            r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "post-allow-failure"
+decision = "allow"
+urls = ["http://{origin}/failure"]
+
+{}"#,
+            capture_config()
+        );
+        let (directory, runtime_product) =
+            product(base_config(proxy, "explicit_http", &policy), listeners).await;
+        let response = send_request(
+            proxy,
+            Request::builder()
+                .uri(format!("http://{origin}/failure"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        runtime_product.shutdown().await;
+        let records = read_capture_records(directory.path());
+        assert_eq!(records.len(), 2);
+        assert!(records
+            .iter()
+            .all(|record| record.decision == CaptureDecision::Allow));
+        assert_eq!(
+            records
+                .iter()
+                .find(|record| record.kind == CaptureKind::Response)
+                .unwrap()
+                .status_code,
+            Some(502)
+        );
     }
 
     #[tokio::test]
