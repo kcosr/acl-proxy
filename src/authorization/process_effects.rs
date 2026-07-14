@@ -35,15 +35,14 @@ enum AfterString {
 #[derive(Clone, Copy)]
 enum Phase {
     CommaAfterId,
-    TypeKey(usize),
+    RequiredKeyStart,
+    RequiredKey,
     TypeColon,
     TypeValue(usize),
-    TypeComma,
-    DecisionKey(usize),
     DecisionColon,
     DecisionValueStart,
     DecisionValue,
-    AfterDecision,
+    AfterRequiredValue,
     EffectKeyStart,
     EffectKey,
     ValuesColon,
@@ -105,6 +104,8 @@ pub(super) struct AssignedProcessEffectsParser<'a> {
     builder: Option<GuardedBodyBuilder>,
     values: Vec<Option<ProcessEffectRange>>,
     phase: Phase,
+    seen_type: bool,
+    seen_decision: bool,
     decision: Option<Decision>,
     effect_key: Option<EffectKey>,
     body_key: Option<BodyKey>,
@@ -147,6 +148,8 @@ impl<'a> AssignedProcessEffectsParser<'a> {
                 .take(outputs.len())
                 .collect(),
             phase: Phase::CommaAfterId,
+            seen_type: false,
+            seen_decision: false,
             decision: None,
             effect_key: None,
             body_key: None,
@@ -182,19 +185,42 @@ impl<'a> AssignedProcessEffectsParser<'a> {
             return Ok(());
         }
         self.phase = match phase {
-            Phase::CommaAfterId if byte == b',' => Phase::TypeKey(0),
+            Phase::CommaAfterId if byte == b',' => Phase::RequiredKeyStart,
             Phase::CommaAfterId => return self.malformed(),
-            Phase::TypeKey(position) => match_fixed(byte, position, b"\"type\"", Phase::TypeColon)?,
+            Phase::RequiredKeyStart if byte == b'"' => {
+                self.key_len = 0;
+                Phase::RequiredKey
+            }
+            Phase::RequiredKeyStart => return self.malformed(),
+            Phase::RequiredKey if byte == b'"' => match &self.key[..self.key_len] {
+                b"type" if !self.seen_type => {
+                    self.seen_type = true;
+                    Phase::TypeColon
+                }
+                b"decision" if !self.seen_decision => {
+                    self.seen_decision = true;
+                    Phase::DecisionColon
+                }
+                b"type" | b"decision" => {
+                    return Err(ProcessEffectsParseError::Assigned(
+                        AssignedResponseError::DuplicateField,
+                    ))
+                }
+                b"id" => return Err(ProcessEffectsParseError::DuplicateId),
+                _ => {
+                    return Err(ProcessEffectsParseError::Assigned(
+                        AssignedResponseError::InvalidShape,
+                    ))
+                }
+            },
+            Phase::RequiredKey if valid_key_byte(byte) => {
+                self.append_key(byte)?;
+                Phase::RequiredKey
+            }
+            Phase::RequiredKey => return self.malformed(),
             Phase::TypeColon if byte == b':' => Phase::TypeValue(0),
             Phase::TypeColon => return self.malformed(),
-            Phase::TypeValue(position) => {
-                match_fixed(byte, position, b"\"response\"", Phase::TypeComma)?
-            }
-            Phase::TypeComma if byte == b',' => Phase::DecisionKey(0),
-            Phase::TypeComma => return self.malformed(),
-            Phase::DecisionKey(position) => {
-                match_fixed(byte, position, b"\"decision\"", Phase::DecisionColon)?
-            }
+            Phase::TypeValue(position) => match_type_value(byte, position)?,
             Phase::DecisionColon if byte == b':' => Phase::DecisionValueStart,
             Phase::DecisionColon => return self.malformed(),
             Phase::DecisionValueStart if byte == b'"' => {
@@ -212,7 +238,7 @@ impl<'a> AssignedProcessEffectsParser<'a> {
                         None
                     }
                 };
-                Phase::AfterDecision
+                Phase::AfterRequiredValue
             }
             Phase::DecisionValue
                 if byte.is_ascii_lowercase() && self.scalar_len < self.scalar.len() =>
@@ -222,14 +248,20 @@ impl<'a> AssignedProcessEffectsParser<'a> {
                 Phase::DecisionValue
             }
             Phase::DecisionValue => return self.malformed(),
-            Phase::AfterDecision if byte == b'}' => Phase::Trailing,
-            Phase::AfterDecision if byte == b',' => {
-                if self.decision != Some(Decision::Allow) {
-                    self.record(AssignedResponseError::InvalidShape);
-                }
-                Phase::EffectKeyStart
+            Phase::AfterRequiredValue if byte == b'}' && self.seen_type && self.seen_decision => {
+                Phase::Trailing
             }
-            Phase::AfterDecision => return self.malformed(),
+            Phase::AfterRequiredValue if byte == b',' => {
+                if self.seen_type && self.seen_decision {
+                    if self.decision != Some(Decision::Allow) {
+                        self.record(AssignedResponseError::InvalidShape);
+                    }
+                    Phase::EffectKeyStart
+                } else {
+                    Phase::RequiredKeyStart
+                }
+            }
+            Phase::AfterRequiredValue => return self.malformed(),
             Phase::EffectKeyStart if byte == b'"' => {
                 self.key_len = 0;
                 Phase::EffectKey
@@ -732,14 +764,12 @@ fn phase_accepts_whitespace(phase: Phase) -> bool {
     matches!(
         phase,
         Phase::CommaAfterId
-            | Phase::TypeKey(0)
+            | Phase::RequiredKeyStart
             | Phase::TypeColon
             | Phase::TypeValue(0)
-            | Phase::TypeComma
-            | Phase::DecisionKey(0)
             | Phase::DecisionColon
             | Phase::DecisionValueStart
-            | Phase::AfterDecision
+            | Phase::AfterRequiredValue
             | Phase::EffectKeyStart
             | Phase::ValuesColon
             | Phase::ValuesStart
@@ -759,26 +789,17 @@ fn phase_accepts_whitespace(phase: Phase) -> bool {
     )
 }
 
-fn match_fixed(
-    byte: u8,
-    position: usize,
-    literal: &[u8],
-    complete: Phase,
-) -> Result<Phase, ProcessEffectsParseError> {
+fn match_type_value(byte: u8, position: usize) -> Result<Phase, ProcessEffectsParseError> {
+    let literal = b"\"response\"";
     if literal.get(position) != Some(&byte) {
         return Err(ProcessEffectsParseError::Assigned(
             AssignedResponseError::InvalidShape,
         ));
     }
     Ok(if position + 1 == literal.len() {
-        complete
+        Phase::AfterRequiredValue
     } else {
-        match complete {
-            Phase::TypeColon => Phase::TypeKey(position + 1),
-            Phase::TypeComma => Phase::TypeValue(position + 1),
-            Phase::DecisionColon => Phase::DecisionKey(position + 1),
-            _ => return Err(ProcessEffectsParseError::Malformed),
-        }
+        Phase::TypeValue(position + 1)
     })
 }
 

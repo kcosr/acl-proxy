@@ -1121,6 +1121,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decision_only_and_expanded_accept_equivalent_required_field_order() {
+        let line = b"{\"id\":\"r\",\"decision\":\"allow\",\"type\":\"response\"}\n";
+        assert_eq!(
+            run(line, line.len()).await.0.unwrap(),
+            DecisionOnlyResponse::Decision(DecisionOnlyProviderDecision::Allow)
+        );
+
+        let mut reader = RecordingReader::new(line);
+        let continuation = read_provider_response_prefix_for_test(&mut reader, line.len())
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, guard, _) = guard_for(line.len());
+        let charge = guard.provider_response_charge();
+        let outputs = ProviderOutputRegistry::activate(BTreeMap::from([(
+            "token".to_string(),
+            ProviderOutputPlan::Bearer { required: false },
+        )]));
+        let response = read_expanded_response(&mut reader, continuation, &charge, &outputs, None)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            response,
+            ProcessResponse::Expanded(ProviderDecision::Allow { .. })
+        ));
+        drop(response);
+        assert_eq!(guard.live_bytes(), 0);
+    }
+
+    #[tokio::test]
     async fn expanded_parser_accepts_the_bounded_provider_output_name() {
         let output_name = "a".repeat(MAX_PROVIDER_OUTPUT_NAME_BYTES);
         let line = format!(
