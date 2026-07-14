@@ -2162,7 +2162,7 @@ for line in sys.stdin:
                     restarted = Some(decision);
                     break;
                 }
-                Err(ProcessRequestError::Unavailable) => {
+                Err(ProcessRequestError::Unavailable | ProcessRequestError::Timeout) => {
                     time::sleep(Duration::from_millis(10)).await;
                 }
                 other => panic!("unexpected timeout recovery result: {other:?}"),
