@@ -1,7 +1,7 @@
 use http::HeaderValue;
 
 use crate::authorization::callback::ResumeToken;
-use crate::authorization::protocol::ProviderRequestHeaders;
+use crate::authorization::protocol::{ProviderRequest, ProviderRequestHeaders};
 use crate::safety::wire_body::{ReservedGuardedBodyBuilder, WireBodyBufferError};
 use crate::safety::{GuardedBody, HttpWireBodyGuard};
 
@@ -166,6 +166,27 @@ impl WebhookRequest<'_> {
     }
 }
 
+impl<'a> WebhookRequest<'a> {
+    pub(crate) fn from_provider(rule_id: &'a str, request: ProviderRequest<'a>) -> Self {
+        let ProviderRequest {
+            request_id,
+            url,
+            method,
+            client_ip,
+            headers,
+            body: _,
+        } = request;
+        Self {
+            request_id,
+            rule_id,
+            url,
+            method,
+            client_ip,
+            headers,
+        }
+    }
+}
+
 impl PreparedWebhookRequest {
     pub(crate) fn finish(
         mut self,
@@ -280,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn webhook_request_is_exact_compact_body_free_protocol() {
+    fn webhook_wire_contract_is_strict_and_body_free() {
         let name = HeaderName::from_static("x-example");
         let values = [
             HeaderValue::from_static("first"),
@@ -321,6 +342,48 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(parsed.get("body").is_none());
         assert_eq!(parsed.as_object().unwrap().len(), 9);
+    }
+
+    #[test]
+    fn webhook_request_body_never_disclosed() {
+        use crate::authorization::protocol::GuardedProviderBody;
+
+        let guard = guard(256 * 1024);
+        let marker = b"request-body-marker-must-not-cross-webhook-boundary";
+        let mut body = guard.buffer();
+        body.try_extend_from_slice(marker).unwrap();
+        let body = body.finish();
+        let provider = ProviderRequest {
+            request_id: "request-1",
+            url: "https://example.test/resource",
+            method: "POST",
+            client_ip: "127.0.0.1",
+            headers: None,
+            body: Some(GuardedProviderBody {
+                content_type: Some("application/octet-stream"),
+                content_encoding: Some("identity"),
+                decoded: &body,
+            }),
+        };
+        let request = WebhookRequest::from_provider("rule-1", provider);
+        let token =
+            ResumeToken::from_encoded_for_test(*b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        let encoded = request
+            .prepare(
+                "https://proxy.test/_acl/external-auth/callback",
+                16 * 1024,
+                &guard,
+            )
+            .unwrap()
+            .finish(&token)
+            .unwrap();
+        let bytes = encoded.segments().flatten().copied().collect::<Vec<_>>();
+        assert!(!bytes.windows(marker.len()).any(|window| window == marker));
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(parsed.get("body").is_none());
+        assert!(parsed.get("requestBody").is_none());
+        assert!(parsed.get("contentType").is_none());
+        assert!(parsed.get("contentEncoding").is_none());
     }
 
     #[test]

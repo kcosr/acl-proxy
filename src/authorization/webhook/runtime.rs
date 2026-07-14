@@ -215,14 +215,7 @@ impl WebhookAuthorizationRuntime {
                 .callback_url()
                 .ok_or(WebhookDispatchError::CallbackUnavailable)?;
             let (rule_id, request, retention) = context.into_webhook_parts()?;
-            let request = WebhookRequest {
-                request_id: request.request_id,
-                rule_id,
-                url: request.url,
-                method: request.method,
-                client_ip: request.client_ip,
-                headers: request.headers,
-            };
+            let request = WebhookRequest::from_provider(rule_id, request);
             let prepared =
                 request.prepare(&callback_url.url, provider.max_request_bytes(), guard)?;
             let deadline = PendingDeadline::earliest(
