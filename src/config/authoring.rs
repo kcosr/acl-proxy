@@ -271,6 +271,16 @@ pub(super) enum HttpVersion {
 pub(super) struct ExplicitHttpListenerConfig {
     pub bind: SocketAddr,
     pub http_versions: Vec<HttpVersion>,
+
+    #[serde(default = "default_listener_timeout")]
+    pub request_header_timeout: PositiveDuration,
+
+    #[serde(default = "default_listener_max_connections")]
+    pub max_connections: usize,
+
+    #[serde(default = "default_listener_max_concurrent_streams")]
+    pub max_concurrent_streams: u32,
+
     pub connect: ConnectConfig,
 }
 
@@ -279,6 +289,15 @@ pub(super) struct ExplicitHttpListenerConfig {
 pub(super) struct TransparentHttpListenerConfig {
     pub bind: SocketAddr,
     pub http_versions: Vec<HttpVersion>,
+
+    #[serde(default = "default_listener_timeout")]
+    pub request_header_timeout: PositiveDuration,
+
+    #[serde(default = "default_listener_max_connections")]
+    pub max_connections: usize,
+
+    #[serde(default = "default_listener_max_concurrent_streams")]
+    pub max_concurrent_streams: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]

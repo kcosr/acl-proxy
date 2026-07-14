@@ -10,6 +10,7 @@ use hyper::client::conn;
 use hyper::Body;
 use rustls::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::time::Instant;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
@@ -21,7 +22,7 @@ use crate::egress::{
     EgressRoute, OriginProtocol, OriginProtocolError, ParentAlpnError, ParentEndpoint,
     ParentTransport,
 };
-use crate::runtime::EgressSnapshot;
+use crate::runtime::{EgressSnapshot, GenerationRetention};
 use crate::url::CanonicalUrl;
 
 use super::headers::{
@@ -82,6 +83,8 @@ pub(crate) struct ForwardBody {
     terminal_drain_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     terminal_driver_abort_started: bool,
     driver: DriverTask,
+    request_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    generation: Option<GenerationRetention>,
 }
 
 struct DriverTask {
@@ -157,7 +160,20 @@ impl ForwardBody {
             terminal_drain_deadline: None,
             terminal_driver_abort_started: false,
             driver,
+            request_deadline: None,
+            generation: None,
         }
+    }
+
+    pub(crate) fn bind_request_lifetime(
+        &mut self,
+        deadline: Instant,
+        generation: GenerationRetention,
+    ) {
+        debug_assert!(self.request_deadline.is_none());
+        debug_assert!(self.generation.is_none());
+        self.request_deadline = Some(Box::pin(tokio::time::sleep_until(deadline)));
+        self.generation = Some(generation);
     }
 
     #[cfg(test)]
@@ -166,11 +182,31 @@ impl ForwardBody {
         self
     }
 
+    #[cfg(test)]
+    fn with_request_deadline(mut self, deadline: Instant) -> Self {
+        self.request_deadline = Some(Box::pin(tokio::time::sleep_until(deadline)));
+        self
+    }
+
     fn begin_terminal_drain(&mut self) {
         if self.terminal_drain_deadline.is_none() {
             self.terminal_drain_deadline =
                 Some(Box::pin(tokio::time::sleep(self.terminal_drain_timeout)));
         }
+    }
+
+    fn poll_request_deadline(&mut self, context: &mut Context<'_>) -> Poll<ForwardBodyError> {
+        let Some(deadline) = self.request_deadline.as_mut() else {
+            return Poll::Pending;
+        };
+        if deadline.as_mut().poll(context).is_pending() {
+            return Poll::Pending;
+        }
+
+        self.body.take();
+        self.trailers.take();
+        self.terminal_error.get_or_insert(ForwardBodyError::Timeout);
+        self.poll_terminal_error_join(context)
     }
 
     fn poll_incomplete_response_timeout(
@@ -196,7 +232,11 @@ impl ForwardBody {
     ) -> Poll<Result<(), ForwardBodyError>> {
         match self.driver.poll(context) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(_) => Poll::Ready(Ok(())),
+            Poll::Ready(_) => {
+                self.request_deadline.take();
+                self.generation.take();
+                Poll::Ready(Ok(()))
+            }
         }
     }
 
@@ -251,12 +291,16 @@ impl ForwardBody {
         self.driver.abort();
         match self.driver.poll(context) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(_) => Poll::Ready(
-                self.terminal_error
-                    .as_ref()
-                    .expect("terminal response-body error is present while joining")
-                    .clone(),
-            ),
+            Poll::Ready(_) => {
+                self.request_deadline.take();
+                self.generation.take();
+                Poll::Ready(
+                    self.terminal_error
+                        .as_ref()
+                        .expect("terminal response-body error is present while joining")
+                        .clone(),
+                )
+            }
         }
     }
 
@@ -272,15 +316,23 @@ impl ForwardBody {
         }
         match self.driver.poll(context) {
             Poll::Pending => self.poll_driver_drain_timeout(context),
-            Poll::Ready(Ok(Ok(()))) => Poll::Ready(Ok(())),
+            Poll::Ready(Ok(Ok(()))) => {
+                self.request_deadline.take();
+                self.generation.take();
+                Poll::Ready(Ok(()))
+            }
             Poll::Ready(Ok(Err(error))) => {
                 let error = ForwardBodyError::Connection(std::sync::Arc::new(error));
                 self.terminal_error = Some(error.clone());
+                self.request_deadline.take();
+                self.generation.take();
                 Poll::Ready(Err(error))
             }
             Poll::Ready(Err(error)) => {
                 let error = ForwardBodyError::Task(std::sync::Arc::new(error));
                 self.terminal_error = Some(error.clone());
+                self.request_deadline.take();
+                self.generation.take();
                 Poll::Ready(Err(error))
             }
         }
@@ -300,6 +352,9 @@ impl HttpBody for ForwardBody {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(error) => Poll::Ready(Some(Err(error))),
             };
+        }
+        if let Poll::Ready(error) = self.poll_request_deadline(context) {
+            return Poll::Ready(Some(Err(error)));
         }
         if !self.data_done {
             if let Some(body) = self.body.as_mut() {
@@ -352,6 +407,9 @@ impl HttpBody for ForwardBody {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(error) => Poll::Ready(Err(error)),
             };
+        }
+        if let Poll::Ready(error) = self.poll_request_deadline(context) {
+            return Poll::Ready(Err(error));
         }
         match self.poll_response_trailers(context) {
             Poll::Pending => return Poll::Pending,
@@ -1323,6 +1381,23 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn absolute_request_deadline_aborts_pending_response_and_driver() {
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let signal = DropSignal(Some(dropped_tx));
+        let driver = tokio::spawn(async move {
+            let _signal = signal;
+            std::future::pending::<Result<(), hyper::Error>>().await
+        });
+        let (_sender, pending_body) = Body::channel();
+        let mut body = ForwardBody::new(pending_body, DriverTask::from_handle(driver))
+            .with_request_deadline(Instant::now() + Duration::from_millis(20));
+
+        let error = body.data().await.unwrap().unwrap_err();
+        assert!(matches!(error, ForwardBodyError::Timeout));
+        dropped_rx.await.unwrap();
     }
 
     #[tokio::test]

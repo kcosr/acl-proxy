@@ -162,6 +162,9 @@ pub(crate) struct StaticListenersConfig {
 pub(crate) struct StaticCleartextListener {
     pub(crate) bind: SocketAddr,
     pub(crate) http_versions: Vec<CompiledHttpVersion>,
+    pub(crate) request_header_timeout: Duration,
+    pub(crate) max_connections: usize,
+    pub(crate) max_concurrent_streams: u32,
     pub(crate) connect: Option<StaticConnectPolicy>,
 }
 
@@ -1412,6 +1415,11 @@ fn validate_listener_control_mitm_matrix(
             &listener.http_versions,
             "listeners.explicit_http.http_versions",
         )?;
+        validate_listener_limits(
+            listener.max_connections,
+            listener.max_concurrent_streams,
+            "listeners.explicit_http",
+        )?;
         facts.mitm_required |= validate_connect(
             &listener.http_versions,
             &listener.connect,
@@ -1424,6 +1432,11 @@ fn validate_listener_control_mitm_matrix(
         validate_http_versions(
             &listener.http_versions,
             "listeners.transparent_http.http_versions",
+        )?;
+        validate_listener_limits(
+            listener.max_connections,
+            listener.max_concurrent_streams,
+            "listeners.transparent_http",
         )?;
     }
     if let Some(listener) = &listeners.explicit_https {
@@ -5076,6 +5089,9 @@ fn compile_listeners(value: &ListenersConfig) -> StaticListenersConfig {
             .map(|listener| StaticCleartextListener {
                 bind: canonical_socket_addr(listener.bind),
                 http_versions: compile_http_versions(&listener.http_versions),
+                request_header_timeout: listener.request_header_timeout.get(),
+                max_connections: listener.max_connections,
+                max_concurrent_streams: listener.max_concurrent_streams,
                 connect: Some(compile_connect(&listener.connect)),
             }),
         transparent_http: value
@@ -5084,6 +5100,9 @@ fn compile_listeners(value: &ListenersConfig) -> StaticListenersConfig {
             .map(|listener| StaticCleartextListener {
                 bind: canonical_socket_addr(listener.bind),
                 http_versions: compile_http_versions(&listener.http_versions),
+                request_header_timeout: listener.request_header_timeout.get(),
+                max_connections: listener.max_connections,
+                max_concurrent_streams: listener.max_concurrent_streams,
                 connect: None,
             }),
         explicit_https: value
@@ -5182,6 +5201,8 @@ fn base_protected_headers() -> BTreeSet<&'static str> {
         "te",
         "trailer",
         "upgrade",
+        "content-length",
+        "content-encoding",
     ])
 }
 
@@ -7211,7 +7232,7 @@ public_url = "http://[::1]:8898/_acl-proxy/external-auth/callback"
     }
 
     #[test]
-    fn centralized_protected_headers_cover_proxy_authenticate() {
+    fn framing_and_sensitive_headers_are_centrally_protected() {
         assert_eq!(
             base_protected_headers(),
             BTreeSet::from([
@@ -7228,11 +7249,15 @@ public_url = "http://[::1]:8898/_acl-proxy/external-auth/callback"
                 "te",
                 "trailer",
                 "upgrade",
+                "content-length",
+                "content-encoding",
             ])
         );
-        let input = MINIMAL.replace(
-            "[policy]\ndefault = \"deny\"",
-            r#"[policy]
+        for header in ["proxy-authenticate", "content-length", "content-encoding"] {
+            let input = MINIMAL.replace(
+                "[policy]\ndefault = \"deny\"",
+                &format!(
+                    r#"[policy]
 default = "deny"
 
 [[policy.rules]]
@@ -7243,11 +7268,13 @@ methods = ["GET"]
 [[policy.rules.response_headers]]
 operation = "set"
 when = "always"
-name = "proxy-authenticate"
-value = "Basic realm=test""#,
-        );
-        let error = compile(&input).expect_err("proxy-authenticate must be protected");
-        assert!(error.to_string().contains("protected"));
+name = "{header}"
+value = "invalid-framing""#
+                ),
+            );
+            let error = compile(&input).expect_err("protected header must fail compilation");
+            assert!(error.to_string().contains("protected"), "{header}: {error}");
+        }
     }
 
     #[test]
@@ -7377,6 +7404,45 @@ trust = "system"
         ] {
             let error = compile(&input).unwrap_err();
             assert!(error.to_string().contains(expected), "{name}: {error}");
+        }
+    }
+
+    #[test]
+    fn cleartext_listener_limits_are_defaulted_validated_and_fingerprinted() {
+        let baseline = compile(MINIMAL).unwrap();
+        let listener = baseline
+            .static_config
+            .listeners
+            .explicit_http
+            .as_ref()
+            .unwrap();
+        assert_eq!(listener.request_header_timeout, Duration::from_secs(10));
+        assert_eq!(listener.max_connections, 1024);
+        assert_eq!(listener.max_concurrent_streams, 128);
+
+        let configured = MINIMAL.replace(
+            "http_versions = [\"http1\"]",
+            "http_versions = [\"http1\"]\nrequest_header_timeout = \"3s\"\nmax_connections = 7\nmax_concurrent_streams = 11",
+        );
+        let configured = compile(&configured).unwrap();
+        let listener = configured
+            .static_config
+            .listeners
+            .explicit_http
+            .as_ref()
+            .unwrap();
+        assert_eq!(listener.request_header_timeout, Duration::from_secs(3));
+        assert_eq!(listener.max_connections, 7);
+        assert_eq!(listener.max_concurrent_streams, 11);
+        assert_ne!(baseline.static_fingerprint, configured.static_fingerprint);
+
+        for (field, value) in [("max_connections", "0"), ("max_concurrent_streams", "0")] {
+            let invalid = MINIMAL.replace(
+                "http_versions = [\"http1\"]",
+                &format!("http_versions = [\"http1\"]\n{field} = {value}"),
+            );
+            let error = compile(&invalid).unwrap_err();
+            assert!(error.to_string().contains(field), "{field}: {error}");
         }
     }
 

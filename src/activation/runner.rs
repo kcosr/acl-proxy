@@ -46,10 +46,34 @@ impl ProductRuntime {
     pub(crate) async fn prepare(
         loaded: LoadedCompiledConfig,
     ) -> Result<Arc<Self>, ProductRuntimeError> {
+        Self::prepare_inner(loaded, None).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn prepare_from_prebound(
+        loaded: LoadedCompiledConfig,
+        listeners: Vec<std::net::TcpListener>,
+    ) -> Result<Arc<Self>, ProductRuntimeError> {
+        Self::prepare_inner(loaded, Some(listeners)).await
+    }
+
+    async fn prepare_inner(
+        loaded: LoadedCompiledConfig,
+        #[cfg_attr(not(test), allow(unused_variables))] prebound: Option<
+            Vec<std::net::TcpListener>,
+        >,
+    ) -> Result<Arc<Self>, ProductRuntimeError> {
         let LoadedCompiledConfig { metadata, compiled } = loaded;
         let static_resources = ProductStaticResources::try_new(&compiled.static_config)?;
 
-        if let Err(error) = static_resources.prepare_ingress() {
+        #[cfg(test)]
+        let prepared = match prebound {
+            Some(listeners) => static_resources.prepare_ingress_from_prebound(listeners),
+            None => static_resources.prepare_ingress(),
+        };
+        #[cfg(not(test))]
+        let prepared = static_resources.prepare_ingress();
+        if let Err(error) = prepared {
             StaticResources::shutdown(static_resources.as_ref()).await;
             return Err(error.into());
         }

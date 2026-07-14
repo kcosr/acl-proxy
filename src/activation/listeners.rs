@@ -234,11 +234,17 @@ mod tests {
             explicit_http: Some(StaticCleartextListener {
                 bind: addresses[0],
                 http_versions: vec![CompiledHttpVersion::Http1, CompiledHttpVersion::Http2],
+                request_header_timeout: Duration::from_secs(5),
+                max_connections: 17,
+                max_concurrent_streams: 19,
                 connect: Some(cleartext_connect.clone()),
             }),
             transparent_http: Some(StaticCleartextListener {
                 bind: addresses[1],
                 http_versions: vec![CompiledHttpVersion::Http1],
+                request_header_timeout: Duration::from_secs(7),
+                max_connections: 23,
+                max_concurrent_streams: 29,
                 connect: None,
             }),
             explicit_https: Some(StaticExplicitHttpsListener {

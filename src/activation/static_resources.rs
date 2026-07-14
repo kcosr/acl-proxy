@@ -164,9 +164,44 @@ impl ProductStaticResources {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn prepare_ingress_from_prebound(
+        self: &Arc<Self>,
+        listeners: Vec<TcpListener>,
+    ) -> Result<(), ProductStaticResourcesError> {
+        let mut listeners = listeners
+            .into_iter()
+            .map(|listener| {
+                let address = listener
+                    .local_addr()
+                    .expect("an injected prebound listener has a local address");
+                (address, listener)
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        self.prepare_ingress_with(
+            move |address| {
+                listeners.remove(&address).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::AddrNotAvailable,
+                        format!("no injected prebound listener for {address}"),
+                    )
+                })
+            },
+            |config, listener, failure_observer| {
+                ControlServer::from_prebound(
+                    config,
+                    listener,
+                    self.authorization_runtime.clone(),
+                    self.readiness.clone(),
+                    failure_observer,
+                )
+            },
+        )
+    }
+
     fn prepare_ingress_with(
         self: &Arc<Self>,
-        bind: impl FnMut(SocketAddr) -> std::io::Result<TcpListener>,
+        mut bind: impl FnMut(SocketAddr) -> std::io::Result<TcpListener>,
         start_control: impl FnOnce(
             &crate::config::compiler::StaticControlConfig,
             TcpListener,
@@ -184,7 +219,7 @@ impl ProductStaticResources {
             return Err(ProductStaticResourcesError::IngressAlreadyPrepared);
         }
 
-        let listeners = PreparedProxyListeners::bind(&ingress.config, bind)?;
+        let listeners = PreparedProxyListeners::bind(&ingress.config, &mut bind)?;
         let mut control = self
             .control
             .lock()
@@ -193,11 +228,10 @@ impl ProductStaticResources {
             return Err(ProductStaticResourcesError::ControlAlreadyStarted);
         }
         if let Some(config) = control.config.as_ref() {
-            let listener =
-                TcpListener::bind(config.bind).map_err(|source| ControlServerError::Bind {
-                    address: config.bind,
-                    source,
-                })?;
+            let listener = bind(config.bind).map_err(|source| ControlServerError::Bind {
+                address: config.bind,
+                source,
+            })?;
             let failure_observer = Arc::new(ProductControlFailureObserver {
                 owner: Arc::downgrade(self),
             });
@@ -673,9 +707,15 @@ header = "x-acl-proxy-request-id"
         let explicit = config.listeners.explicit_http.as_ref().unwrap();
         let versions = explicit.http_versions.clone();
         let connect = explicit.connect.clone().unwrap();
+        let request_header_timeout = explicit.request_header_timeout;
+        let max_connections = explicit.max_connections;
+        let max_concurrent_streams = explicit.max_concurrent_streams;
         config.listeners.transparent_http = Some(StaticCleartextListener {
             bind: transparent_http,
             http_versions: versions.clone(),
+            request_header_timeout,
+            max_connections,
+            max_concurrent_streams,
             connect: None,
         });
         std::fs::create_dir_all(identity_directory).unwrap();

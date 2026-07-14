@@ -1,20 +1,22 @@
+use std::collections::HashSet;
 use std::convert::Infallible;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use bytes::Buf;
-use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRAILER};
+use http::header::{CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRAILER};
 use http::{HeaderMap, HeaderValue, Request, Response, StatusCode};
 use hyper::body::{Bytes, HttpBody, SizeHint};
 use hyper::server::conn::Http;
 use hyper::service::service_fn;
 use hyper::Body;
 use tokio::net::TcpListener;
-use tokio::sync::{watch, Mutex as AsyncMutex, Notify};
+use tokio::sync::{watch, Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 
@@ -24,8 +26,9 @@ use crate::activation::listeners::{
     ProxySupervisorFailure, ProxySupervisorFailureObserver, ProxySupervisorStartError,
     ProxySupervisorStarter,
 };
-use crate::config::compiler::{CompiledHttpVersion, HttpBodyReadPlan, StaticCleartextListener};
-use crate::destination::{LocalAddressSource, SystemLocalAddressSource};
+use crate::config::compiler::{
+    CompiledHttp1ConnectPolicy, CompiledHttpVersion, HttpBodyReadPlan, StaticCleartextListener,
+};
 use crate::http_body::{read_mandatory_request_body, HttpBodyReadError};
 use crate::policy::apply_header_effects;
 use crate::proxy::authority::{
@@ -40,7 +43,7 @@ use crate::request_decision::{
     prepare_request, AllowedRequest, GuardedRequestBody as DecisionBody, RequestDecision,
     RequestDecisionError, RequestInput,
 };
-use crate::runtime::{BoxFuture, Runtime};
+use crate::runtime::{BoxFuture, GenerationRetentionError, Runtime};
 use crate::safety::wire_body::{GuardedBodyData, GuardedHttpBody};
 use crate::safety::{InvalidLoopMarker, WireBodyQuotaKey};
 
@@ -68,7 +71,7 @@ impl ProxySupervisorStarter for ProductProxySupervisorStarter {
             ProxyListenerConfig::ExplicitHttp(config) => CleartextProxySupervisor::start(
                 kind,
                 CleartextMode::Explicit,
-                *config,
+                ensure_cleartext_connect_supported(kind, *config)?,
                 listener.listener,
                 self.runtime.clone(),
                 assets.clone(),
@@ -95,10 +98,33 @@ impl ProxySupervisorStarter for ProductProxySupervisorStarter {
     }
 }
 
+fn ensure_cleartext_connect_supported(
+    kind: ProxyListenerKind,
+    config: StaticCleartextListener,
+) -> Result<StaticCleartextListener, ProxySupervisorStartError> {
+    if config
+        .connect
+        .as_ref()
+        .is_some_and(|connect| connect.http1 == Some(CompiledHttp1ConnectPolicy::Mitm))
+    {
+        return Err(ProxySupervisorStartError {
+            listener: kind,
+            message: "HTTP/1 CONNECT MITM requires the cleartext CONNECT executor".to_owned(),
+        });
+    }
+    Ok(config)
+}
+
 #[derive(Clone, Copy)]
 enum CleartextMode {
     Explicit,
     Transparent,
+}
+
+#[derive(Clone, Copy)]
+struct ListenerIdentity {
+    kind: ProxyListenerKind,
+    mode: CleartextMode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -121,7 +147,6 @@ struct SupervisorTaskState {
 }
 
 impl CleartextProxySupervisor {
-    #[allow(clippy::too_many_arguments)]
     fn start(
         kind: ProxyListenerKind,
         mode: CleartextMode,
@@ -143,13 +168,23 @@ impl CleartextProxySupervisor {
             })?;
         let (stop, stop_rx) = watch::channel(SupervisorStop::Running);
         let stop_gate = Arc::new(StdMutex::new(SupervisorStop::Running));
-        let task = executor.spawn(async move {
-            let result = run_listener(kind, mode, config, listener, runtime, assets, stop_rx).await;
-            if let Err(error) = &result {
-                failure_observer.failed(error.clone());
-            }
-            result
-        });
+        let quota_classifier = LocalQuotaClassifier::new().map_err(|error| {
+            start_error(
+                kind,
+                "cannot snapshot local addresses for quota classification",
+                error,
+            )
+        })?;
+        let listener_task = executor.spawn(run_listener(
+            ListenerIdentity { kind, mode },
+            config,
+            listener,
+            runtime,
+            assets,
+            quota_classifier,
+            stop_rx,
+        ));
+        let task = executor.spawn(observe_listener_task(kind, listener_task, failure_observer));
         Ok(Arc::new(Self {
             kind,
             stop,
@@ -190,6 +225,24 @@ impl CleartextProxySupervisor {
     }
 }
 
+async fn observe_listener_task(
+    kind: ProxyListenerKind,
+    listener_task: JoinHandle<Result<(), Arc<ProxySupervisorFailure>>>,
+    failure_observer: Arc<dyn ProxySupervisorFailureObserver>,
+) -> Result<(), Arc<ProxySupervisorFailure>> {
+    let result = match listener_task.await {
+        Ok(result) => result,
+        Err(error) => Err(Arc::new(ProxySupervisorFailure {
+            listener: kind,
+            message: format!("supervisor task did not join: {error}"),
+        })),
+    };
+    if let Err(error) = result.as_ref() {
+        failure_observer.failed(error.clone());
+    }
+    result
+}
+
 impl ProxySupervisor for CleartextProxySupervisor {
     fn begin_shutdown(&self) {
         request_stop(&self.stop_gate, &self.stop, SupervisorStop::CloseAndJoin);
@@ -228,66 +281,139 @@ fn start_error(
 }
 
 async fn run_listener(
-    kind: ProxyListenerKind,
-    mode: CleartextMode,
+    identity: ListenerIdentity,
     config: StaticCleartextListener,
     listener: TcpListener,
     runtime: Arc<Runtime>,
     assets: Arc<ProductIngressAssets>,
+    quota_classifier: LocalQuotaClassifier,
     mut stop: watch::Receiver<SupervisorStop>,
 ) -> Result<(), Arc<ProxySupervisorFailure>> {
+    let ListenerIdentity { kind, mode } = identity;
+    let connection_slots = Arc::new(Semaphore::new(config.max_connections));
+    let (refresh_stop, refresh_stop_rx) = watch::channel(false);
+    let mut refresh_task = tokio::spawn(refresh_local_addresses(
+        kind,
+        quota_classifier.clone(),
+        refresh_stop_rx,
+    ));
     let mut connections = JoinSet::new();
-    loop {
-        tokio::select! {
+    let mut terminal_failure = None;
+    'accept: loop {
+        let permit = tokio::select! {
             biased;
             changed = stop.changed() => {
                 if changed.is_err() || *stop.borrow() != SupervisorStop::Running {
-                    break;
+                    break 'accept;
                 }
+                continue;
             }
             Some(result) = connections.join_next(), if !connections.is_empty() => {
                 if let Err(error) = result {
                     tracing::debug!(listener = %kind, %error, "cleartext connection task failed");
                 }
+                continue;
             }
-            accepted = listener.accept() => {
-                let (stream, peer) = match accepted {
-                    Ok(accepted) => accepted,
-                    Err(error) => {
-                        crate::proxy::listener::handle_accept_error(kind.as_str(), error).await;
-                        continue;
-                    }
-                };
-                let quota_key = match transport_quota_key(peer) {
-                    Ok(key) => key,
-                    Err(error) => {
-                        tracing::warn!(listener = %kind, %peer, %error, "cannot classify transport quota key");
-                        continue;
-                    }
-                };
-                let runtime = runtime.clone();
-                let assets = assets.clone();
-                let versions = config.http_versions.clone();
-                let connection_stop = stop.clone();
-                connections.spawn(async move {
-                    serve_connection(
-                        kind,
-                        mode,
-                        versions,
-                        stream,
-                        peer,
-                        quota_key,
-                        runtime,
-                        assets,
-                        connection_stop,
-                    )
-                    .await;
-                });
+            result = &mut refresh_task => {
+                terminal_failure = Some(Arc::new(ProxySupervisorFailure {
+                    listener: kind,
+                    message: match result {
+                        Ok(Ok(())) => "local-address refresh task stopped unexpectedly".to_owned(),
+                        Ok(Err(error)) => error,
+                        Err(error) => format!("local-address refresh task did not join: {error}"),
+                    },
+                }));
+                break 'accept;
             }
-        }
+            permit = connection_slots.clone().acquire_owned() => {
+                permit.expect("the listener owns its connection-admission semaphore")
+            }
+        };
+
+        let accepted = tokio::select! {
+            biased;
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() != SupervisorStop::Running {
+                    break 'accept;
+                }
+                continue;
+            }
+            Some(result) = connections.join_next(), if !connections.is_empty() => {
+                if let Err(error) = result {
+                    tracing::debug!(listener = %kind, %error, "cleartext connection task failed");
+                }
+                continue;
+            }
+            result = &mut refresh_task => {
+                terminal_failure = Some(Arc::new(ProxySupervisorFailure {
+                    listener: kind,
+                    message: match result {
+                        Ok(Ok(())) => "local-address refresh task stopped unexpectedly".to_owned(),
+                        Ok(Err(error)) => error,
+                        Err(error) => format!("local-address refresh task did not join: {error}"),
+                    },
+                }));
+                break 'accept;
+            }
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, peer) = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                drop(permit);
+                match classify_accept_error(&error) {
+                    AcceptErrorAction::Retry => tokio::task::yield_now().await,
+                    AcceptErrorAction::Backoff => {
+                        tracing::warn!(listener = %kind, %error, "listener accept error; backing off before retry");
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                            _ = wait_for_supervisor_stop(&mut stop) => break 'accept,
+                        }
+                    }
+                    AcceptErrorAction::Fail => {
+                        terminal_failure = Some(Arc::new(ProxySupervisorFailure {
+                            listener: kind,
+                            message: format!("terminal listener accept error: {error}"),
+                        }));
+                        break 'accept;
+                    }
+                }
+                continue;
+            }
+        };
+        let quota_key = quota_classifier.classify(peer.ip());
+        let runtime = runtime.clone();
+        let assets = assets.clone();
+        let versions = config.http_versions.clone();
+        let request_header_timeout = config.request_header_timeout;
+        let max_concurrent_streams = config.max_concurrent_streams;
+        let connection_stop = stop.clone();
+        connections.spawn(async move {
+            serve_connection(
+                kind,
+                mode,
+                versions,
+                request_header_timeout,
+                max_concurrent_streams,
+                stream,
+                peer,
+                quota_key,
+                runtime,
+                assets,
+                connection_stop,
+                permit,
+            )
+            .await;
+        });
     }
 
-    let abort = *stop.borrow() == SupervisorStop::AbortAndJoin;
+    drop(listener);
+    refresh_stop.send_replace(true);
+    if !refresh_task.is_finished() {
+        let _ = refresh_task.await;
+    }
+
+    let abort = terminal_failure.is_some() || *stop.borrow() == SupervisorStop::AbortAndJoin;
     if abort {
         connections.abort_all();
     }
@@ -305,7 +431,105 @@ async fn run_listener(
             }
         }
     }
-    Ok(())
+    terminal_failure.map_or(Ok(()), Err)
+}
+
+#[derive(Clone)]
+struct LocalQuotaClassifier {
+    addresses: Arc<RwLock<HashSet<IpAddr>>>,
+}
+
+impl LocalQuotaClassifier {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            addresses: Arc::new(RwLock::new(snapshot_local_ips()?)),
+        })
+    }
+
+    fn classify(&self, peer: IpAddr) -> WireBodyQuotaKey {
+        let addresses = self
+            .addresses
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        WireBodyQuotaKey::from_peer(peer, |peer| addresses.contains(&peer))
+    }
+
+    fn replace(&self, addresses: HashSet<IpAddr>) {
+        *self
+            .addresses
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = addresses;
+    }
+}
+
+fn snapshot_local_ips() -> io::Result<HashSet<IpAddr>> {
+    let interfaces = if_addrs::get_if_addrs()?;
+    let mut addresses = HashSet::new();
+    addresses.try_reserve(interfaces.len()).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            format!("cannot reserve local-address quota cache: {error}"),
+        )
+    })?;
+    addresses.extend(
+        interfaces
+            .into_iter()
+            .map(|interface| crate::network::canonical_ip(interface.ip())),
+    );
+    Ok(addresses)
+}
+
+async fn refresh_local_addresses(
+    kind: ProxyListenerKind,
+    classifier: LocalQuotaClassifier,
+    mut stop: watch::Receiver<bool>,
+) -> Result<(), String> {
+    loop {
+        tokio::select! {
+            biased;
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return Ok(());
+                }
+            }
+            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+        match tokio::task::spawn_blocking(snapshot_local_ips).await {
+            Ok(Ok(addresses)) => classifier.replace(addresses),
+            Ok(Err(error)) => {
+                tracing::warn!(listener = %kind, %error, "cannot refresh local-address quota cache");
+            }
+            Err(error) => {
+                return Err(format!(
+                    "local-address refresh worker did not join: {error}"
+                ))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcceptErrorAction {
+    Retry,
+    Backoff,
+    Fail,
+}
+
+fn classify_accept_error(error: &io::Error) -> AcceptErrorAction {
+    match error.kind() {
+        io::ErrorKind::ConnectionAborted
+        | io::ErrorKind::ConnectionRefused
+        | io::ErrorKind::ConnectionReset
+        | io::ErrorKind::Interrupted
+        | io::ErrorKind::WouldBlock => AcceptErrorAction::Retry,
+        io::ErrorKind::InvalidInput
+        | io::ErrorKind::InvalidData
+        | io::ErrorKind::NotConnected
+        | io::ErrorKind::AddrNotAvailable
+        | io::ErrorKind::PermissionDenied
+        | io::ErrorKind::Unsupported => AcceptErrorAction::Fail,
+        _ => AcceptErrorAction::Backoff,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -313,12 +537,15 @@ async fn serve_connection(
     kind: ProxyListenerKind,
     mode: CleartextMode,
     versions: Vec<CompiledHttpVersion>,
+    request_header_timeout: Duration,
+    max_concurrent_streams: u32,
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
     quota_key: WireBodyQuotaKey,
     runtime: Arc<Runtime>,
     assets: Arc<ProductIngressAssets>,
     mut supervisor_stop: watch::Receiver<SupervisorStop>,
+    _admission: OwnedSemaphorePermit,
 ) {
     let close = Arc::new(ConnectionClose::default());
     let service_close = close.clone();
@@ -330,7 +557,12 @@ async fn serve_connection(
         async move {
             let close_entire_connection = request.version() != http::Version::HTTP_2;
             let handled = execute_request(mode, peer, quota_key, runtime, assets, request).await;
+            let mut handled = handled;
             if handled.close_connection && close_entire_connection {
+                handled
+                    .response
+                    .headers_mut()
+                    .insert(CONNECTION, HeaderValue::from_static("close"));
                 close.close();
             }
             Ok::<_, Infallible>(handled.response)
@@ -339,6 +571,8 @@ async fn serve_connection(
 
     let mut http = Http::new();
     http.http1_keep_alive(true);
+    http.http1_header_read_timeout(request_header_timeout);
+    http.http2_max_concurrent_streams(max_concurrent_streams);
     let http1 = versions.contains(&CompiledHttpVersion::Http1);
     let http2 = versions.contains(&CompiledHttpVersion::Http2);
     match (http1, http2) {
@@ -400,13 +634,6 @@ impl ConnectionClose {
         }
         self.notify.notified().await;
     }
-}
-
-fn transport_quota_key(peer: SocketAddr) -> io::Result<WireBodyQuotaKey> {
-    let local = SystemLocalAddressSource.snapshot()?;
-    Ok(WireBodyQuotaKey::from_peer(peer.ip(), |_| {
-        local.contains(SocketAddr::new(peer.ip(), 0))
-    }))
 }
 
 struct HandledResponse {
@@ -579,6 +806,13 @@ async fn execute_request(
         Ok(Err(error)) => return forward_failure(error),
         Err(_) => return timeout_failure(),
     };
+    let retention = match lease.retain_for_operation() {
+        Ok(retention) => retention,
+        Err(error) => return generation_retention_failure(error),
+    };
+    response
+        .body_mut()
+        .bind_request_lifetime(deadline, retention);
     if apply_header_effects(allowed.response_header_effects(), response.headers_mut()).is_err() {
         return HandledResponse::fixed(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -718,6 +952,14 @@ fn forward_failure(_error: ForwardError) -> HandledResponse {
 
 fn timeout_failure() -> HandledResponse {
     HandledResponse::fixed(StatusCode::GATEWAY_TIMEOUT, "request timed out\n", true)
+}
+
+fn generation_retention_failure(_error: GenerationRetentionError) -> HandledResponse {
+    HandledResponse::fixed(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "service unavailable\n",
+        true,
+    )
 }
 
 fn request_id() -> String {
@@ -896,7 +1138,17 @@ mod tests {
     use crate::activation::runner::ProductRuntime;
     use crate::config::load_and_compile_exact_config;
 
-    fn reserve_addresses<const N: usize>() -> [SocketAddr; N] {
+    struct ChannelFailureObserver(StdMutex<Option<oneshot::Sender<Arc<ProxySupervisorFailure>>>>);
+
+    impl ProxySupervisorFailureObserver for ChannelFailureObserver {
+        fn failed(&self, error: Arc<ProxySupervisorFailure>) {
+            if let Some(sender) = self.0.lock().unwrap().take() {
+                sender.send(error).ok();
+            }
+        }
+    }
+
+    fn prebound_listeners<const N: usize>() -> ([SocketAddr; N], Vec<StdTcpListener>) {
         let listeners = (0..N)
             .map(|_| StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
             .collect::<Vec<_>>();
@@ -907,16 +1159,20 @@ mod tests {
             .try_into()
             .ok()
             .unwrap();
-        drop(listeners);
-        addresses
+        (addresses, listeners)
     }
 
-    async fn product(text: String) -> (tempfile::TempDir, Arc<ProductRuntime>) {
+    async fn product(
+        text: String,
+        listeners: Vec<StdTcpListener>,
+    ) -> (tempfile::TempDir, Arc<ProductRuntime>) {
         let directory = tempdir().unwrap();
         let path = directory.path().join("acl-proxy.toml");
         fs::write(&path, text).unwrap();
         let loaded = load_and_compile_exact_config(&path).unwrap();
-        let product = ProductRuntime::prepare(loaded).await.unwrap();
+        let product = ProductRuntime::prepare_from_prebound(loaded, listeners)
+            .await
+            .unwrap();
         product.activate_initial().await.unwrap();
         let mut starter = ProductProxySupervisorStarter::new(product.runtime().clone());
         product.start_proxy_supervisors(&mut starter).await.unwrap();
@@ -970,9 +1226,9 @@ header = "x-test-loop"
     }
 
     #[tokio::test]
-    async fn proxy_listener_cannot_reach_control_callback() {
+    async fn proxy_egress_cannot_target_self_or_control_plane() {
         let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
-        let [proxy, control] = reserve_addresses::<2>();
+        let ([proxy, control], listeners) = prebound_listeners::<2>();
         let config = format!(
             r#"schema_version = 3
 
@@ -1011,7 +1267,7 @@ http1 = "deny"
 default = "allow"
 "#
         );
-        let (_directory, product) = product(config).await;
+        let (_directory, product) = product(config, listeners).await;
         let uri = format!("http://{control}/_acl-proxy/external-auth/callback");
         let response = send_request(
             proxy,
@@ -1019,6 +1275,15 @@ default = "allow"
         )
         .await;
 
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let response = send_request(
+            proxy,
+            Request::builder()
+                .uri(format!("http://{proxy}/self"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         product.shutdown().await;
         assert!(StdTcpListener::bind(proxy).is_ok());
@@ -1032,7 +1297,7 @@ default = "allow"
     }
 
     async fn normalized_round_trip(mode: CleartextMode) -> CapturedRoundTrip {
-        let [proxy] = reserve_addresses::<1>();
+        let ([proxy], listeners) = prebound_listeners::<1>();
         let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -1118,7 +1383,7 @@ value = "policy"
 "#
         );
         let config = base_config(proxy, listener_table, &policy);
-        let (_directory, product) = product(config).await;
+        let (_directory, product) = product(config, listeners).await;
 
         let plain = b"canonical decoded request bytes";
         let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
@@ -1186,9 +1451,182 @@ value = "policy"
     }
 
     #[tokio::test]
+    async fn cleartext_h2_prior_knowledge_translation_and_stream_local_body_failure() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let (captured_tx, captured_rx) = oneshot::channel();
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin_listener.accept().await.unwrap();
+            let captured_tx = Arc::new(StdMutex::new(Some(captured_tx)));
+            Http::new()
+                .http1_only(true)
+                .serve_connection(
+                    stream,
+                    service_fn(move |request: Request<Body>| {
+                        let captured_tx = captured_tx.clone();
+                        async move {
+                            let version = request.version();
+                            let body = to_bytes(request.into_body()).await.unwrap();
+                            captured_tx
+                                .lock()
+                                .unwrap()
+                                .take()
+                                .unwrap()
+                                .send((version, body))
+                                .ok();
+                            Ok::<_, Infallible>(Response::new(Body::from("h2 accepted")))
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let policy = format!(
+            r#"[listeners.explicit_http.connect]
+http2 = "deny"
+
+[redaction.profiles.wire]
+max_body_bytes = 8
+max_decoded_body_bytes = 8
+rules = [{{ literals = ["marker"], payloads = "text" }}]
+
+[policy]
+default = "allow"
+
+[[policy.rules]]
+id = "bounded-h2-body"
+decision = "allow"
+urls = ["http://{origin}/**"]
+methods = ["POST"]
+redaction_profile = "wire"
+"#
+        );
+        let config = base_config(proxy, "explicit_http", &policy).replacen(
+            "http_versions = [\"http1\"]",
+            "http_versions = [\"http2\"]",
+            1,
+        );
+        let (_directory, product) = product(config, listeners).await;
+        let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let mut builder = conn::Builder::new();
+        builder.http2_only(true);
+        let (mut sender, connection) = builder.handshake(stream).await.unwrap();
+        let driver = tokio::spawn(connection);
+
+        let rejected = sender
+            .send_request(
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri(format!("http://{origin}/too-large"))
+                    .body(Body::from("0123456789abcdef"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            to_bytes(rejected.into_body()).await.unwrap(),
+            "request body denied\n"
+        );
+
+        let accepted = sender
+            .send_request(
+                Request::builder()
+                    .uri(format!("http://{origin}/sibling"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        assert_eq!(to_bytes(accepted.into_body()).await.unwrap(), "h2 accepted");
+        let (version, body) = captured_rx.await.unwrap();
+        assert_eq!(version, http::Version::HTTP_11);
+        assert!(body.is_empty());
+
+        drop(sender);
+        product.shutdown().await;
+        driver.await.unwrap().unwrap();
+        origin_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unbounded_shutdown_finishes_at_the_finite_request_deadline() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let release_rx = Arc::new(StdMutex::new(Some(release_rx)));
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin_listener.accept().await.unwrap();
+            Http::new()
+                .http1_only(true)
+                .serve_connection(
+                    stream,
+                    service_fn(move |_request: Request<Body>| {
+                        let release_rx = release_rx.clone();
+                        async move {
+                            let (sender, body) = Body::channel();
+                            let release = release_rx.lock().unwrap().take().unwrap();
+                            tokio::spawn(async move {
+                                let _sender = sender;
+                                release.await.ok();
+                            });
+                            Ok::<_, Infallible>(Response::new(body))
+                        }
+                    }),
+                )
+                .await
+                .ok();
+        });
+        let policy = r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "allow"
+"#;
+        let config = base_config(proxy, "explicit_http", policy)
+            .replace("request_timeout = \"5s\"", "request_timeout = \"100ms\"")
+            .replace(
+                "shutdown_drain_timeout = \"1s\"",
+                "shutdown_drain_timeout = \"unbounded\"",
+            );
+        let (_directory, product) = product(config, listeners).await;
+        let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let (mut sender, connection) = conn::handshake(stream).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .uri(format!("http://{origin}/pending"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        tokio::time::timeout(Duration::from_secs(1), product.shutdown())
+            .await
+            .expect("unbounded drain must still finish at the request deadline");
+        assert!(to_bytes(response.into_body()).await.is_err());
+        drop(sender);
+        release_tx.send(()).ok();
+        driver.await.unwrap().ok();
+        origin_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn cleartext_supervisor_joins_and_releases_its_prebound_socket() {
         let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
-        let [proxy] = reserve_addresses::<1>();
+        let ([proxy], listeners) = prebound_listeners::<1>();
         let config = base_config(
             proxy,
             "explicit_http",
@@ -1199,7 +1637,7 @@ http1 = "deny"
 default = "deny"
 "#,
         );
-        let (_directory, product) = product(config).await;
+        let (_directory, product) = product(config, listeners).await;
         assert!(StdTcpListener::bind(proxy).is_err());
 
         product.shutdown().await;
@@ -1208,9 +1646,154 @@ default = "deny"
     }
 
     #[tokio::test]
-    async fn body_failure_closes_unread_http1_framing() {
+    async fn terminal_supervisor_panic_is_observed_promptly() {
+        let (failure_tx, failure_rx) = oneshot::channel();
+        let observer = Arc::new(ChannelFailureObserver(StdMutex::new(Some(failure_tx))));
+        let listener_task = tokio::spawn(async move {
+            panic!("injected listener failure");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+
+        let result =
+            observe_listener_task(ProxyListenerKind::ExplicitHttp, listener_task, observer).await;
+        let failure = failure_rx.await.unwrap();
+        assert!(result.is_err());
+        assert!(failure.message.contains("did not join"));
+    }
+
+    #[test]
+    fn accept_error_classification_separates_retry_backoff_and_terminal_failures() {
+        assert_eq!(
+            classify_accept_error(&io::Error::from(io::ErrorKind::Interrupted)),
+            AcceptErrorAction::Retry
+        );
+        assert_eq!(
+            classify_accept_error(&io::Error::from(io::ErrorKind::OutOfMemory)),
+            AcceptErrorAction::Backoff
+        );
+        assert_eq!(
+            classify_accept_error(&io::Error::from(io::ErrorKind::InvalidInput)),
+            AcceptErrorAction::Fail
+        );
+    }
+
+    #[test]
+    fn local_quota_cache_replaces_complete_live_snapshot_under_churn() {
+        let first = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 10));
+        let second = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 11));
+        let classifier = LocalQuotaClassifier {
+            addresses: Arc::new(RwLock::new(HashSet::from([first]))),
+        };
+        let accepted_key = classifier.classify(first);
+        assert!(matches!(accepted_key, WireBodyQuotaKey::LocalHost));
+
+        classifier.replace(HashSet::from([second]));
+
+        assert!(matches!(accepted_key, WireBodyQuotaKey::LocalHost));
+        assert!(matches!(
+            classifier.classify(first),
+            WireBodyQuotaKey::Peer(address) if address == first
+        ));
+        assert!(matches!(
+            classifier.classify(second),
+            WireBodyQuotaKey::LocalHost
+        ));
+        assert_eq!(classifier.addresses.read().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cleartext_mitm_fails_activation_until_executor_is_installed() {
         let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
-        let [proxy] = reserve_addresses::<1>();
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let directory = tempdir().unwrap();
+        let config = format!(
+            r#"schema_version = 3
+
+[listeners.explicit_http]
+bind = "{proxy}"
+http_versions = ["http1"]
+
+[listeners.explicit_http.connect]
+http1 = "mitm"
+
+[mitm]
+mode = "generated"
+directory = "{}"
+
+[policy]
+default = "deny"
+"#,
+            directory.path().join("mitm").display()
+        );
+        let path = directory.path().join("acl-proxy.toml");
+        fs::write(&path, config).unwrap();
+        let loaded = load_and_compile_exact_config(&path).unwrap();
+        let product = ProductRuntime::prepare_from_prebound(loaded, listeners)
+            .await
+            .unwrap();
+        product.activate_initial().await.unwrap();
+        let mut starter = ProductProxySupervisorStarter::new(product.runtime().clone());
+        let error = product
+            .start_proxy_supervisors(&mut starter)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("CONNECT MITM"));
+        assert!(StdTcpListener::bind(proxy).is_ok());
+    }
+
+    #[tokio::test]
+    async fn cleartext_connection_admission_and_h1_head_deadline_are_bounded() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let policy = r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "allow"
+"#;
+        let config = base_config(proxy, "explicit_http", policy).replacen(
+            "http_versions = [\"http1\"]",
+            "http_versions = [\"http1\"]\nrequest_header_timeout = \"100ms\"\nmax_connections = 1\nmax_concurrent_streams = 1",
+            1,
+        );
+        let (_directory, product) = product(config, listeners).await;
+        let mut first = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let mut second = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        second
+            .write_all(
+                format!(
+                    "GET http://{proxy}/self HTTP/1.1\r\nHost: {proxy}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut early = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), second.read(&mut early))
+                .await
+                .is_err(),
+            "a second connection bypassed the single admitted slot"
+        );
+        let mut first_end = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), first.read_to_end(&mut first_end))
+            .await
+            .unwrap()
+            .unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), second.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 403"));
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn http_body_failure_terminates_unread_framing() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
         let policy = r#"[listeners.explicit_http.connect]
 http1 = "deny"
 
@@ -1229,7 +1812,7 @@ methods = ["POST"]
 redaction_profile = "wire"
 "#;
         let config = base_config(proxy, "explicit_http", policy);
-        let (_directory, product) = product(config).await;
+        let (_directory, product) = product(config, listeners).await;
         let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
         stream
             .write_all(
@@ -1246,6 +1829,12 @@ redaction_profile = "wire"
             response.starts_with(b"HTTP/1.1 413"),
             "unexpected terminal response: {:?}",
             String::from_utf8_lossy(&response)
+        );
+        assert!(
+            String::from_utf8_lossy(&response)
+                .to_ascii_lowercase()
+                .contains("\r\nconnection: close\r\n"),
+            "terminal HTTP/1 response omitted Connection: close"
         );
 
         product.shutdown().await;
