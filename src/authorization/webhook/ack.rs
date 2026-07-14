@@ -70,9 +70,9 @@ impl AcknowledgementParser {
                         return Err(AcknowledgementError::ResponseBodyTooLarge);
                     }
                 }
-                BodyFraming::Chunked => {}
-                BodyFraming::CloseDelimited | BodyFraming::None => {
-                    return Err(AcknowledgementError::CloseDelimitedBodyForbidden);
+                BodyFraming::Chunked | BodyFraming::CloseDelimited => {}
+                BodyFraming::None => {
+                    unreachable!("responses without explicit framing are close-delimited")
                 }
             }
             self.state = ParserState::Body {
@@ -147,7 +147,6 @@ struct ResponseLimitExceeded;
 pub(crate) enum AcknowledgementError {
     BytesAfterResponse,
     Cancelled,
-    CloseDelimitedBodyForbidden,
     Framing(FramingError),
     Head(HeadError),
     NonSuccessStatus(u16),
@@ -166,9 +165,6 @@ impl fmt::Display for AcknowledgementError {
                 formatter.write_str("bytes follow the framed webhook acknowledgement")
             }
             Self::Cancelled => formatter.write_str("webhook acknowledgement read was cancelled"),
-            Self::CloseDelimitedBodyForbidden => {
-                formatter.write_str("close-delimited webhook acknowledgements are forbidden")
-            }
             Self::Framing(error) => error.fmt(formatter),
             Self::Head(error) => error.fmt(formatter),
             Self::NonSuccessStatus(status) => {
@@ -206,7 +202,9 @@ mod tests {
     #[test]
     fn webhook_delivery_ack_and_failure_matrix() {
         for wire in [
+            b"HTTP/1.1 204 No Content\r\n\r\n".as_slice(),
             b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"HTTP/1.1 200 OK\r\n\r\nbody".as_slice(),
             b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nbody".as_slice(),
             b"HTTP/1.1 299 Fine\r\nTransfer-Encoding: chunked\r\n\r\n4;safe=yes\r\nbody\r\n0\r\n\r\n"
                 .as_slice(),
@@ -241,10 +239,6 @@ mod tests {
                 AcknowledgementError::Head(HeadError::ArithmeticOverflow),
             ),
             (
-                b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody".as_slice(),
-                AcknowledgementError::CloseDelimitedBodyForbidden,
-            ),
-            (
                 b"HTTP/1.1 503 Unavailable\r\nContent-Length: 4\r\n\r\nbody".as_slice(),
                 AcknowledgementError::NonSuccessStatus(503),
             ),
@@ -274,6 +268,10 @@ mod tests {
                 b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n",
                 4,
             ),
+            Err(AcknowledgementError::ResponseBodyTooLarge)
+        );
+        assert_eq!(
+            parse_complete(b"HTTP/1.1 200 OK\r\n\r\n12345", 4),
             Err(AcknowledgementError::ResponseBodyTooLarge)
         );
     }
