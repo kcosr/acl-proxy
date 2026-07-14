@@ -432,7 +432,7 @@ impl<P> PendingCapabilityStore<P> {
                 signalled_claim = true;
             }
         }
-        if signalled_claim || state.occupancy == 0 {
+        if !pending.is_empty() || signalled_claim || state.occupancy == 0 {
             self.inner.changed.notify_waiters();
         }
         debug_assert_counts(&state);
@@ -1605,6 +1605,46 @@ mod tests {
 
         assert_eq!(claim.complete().unwrap(), 31);
         drop(handle);
+    }
+
+    #[tokio::test]
+    async fn final_cancellation_wakes_pending_delivery_with_already_signalled_claim() {
+        let store = PendingCapabilityStore::new();
+        let pending = admit_fixed(&store, 2, 43usize, 1);
+        let (_token, pending_guard) = pending.into_parts();
+        let pending_signal = pending_guard.signal_handle();
+        let pending_waiter = tokio::spawn(async move {
+            pending_signal.wait_until_not_pending().await;
+        });
+
+        let claimed = admit_fixed(&store, 2, 47usize, 2);
+        let claimed_digest = claimed.token().digest();
+        let (_token, claimed_guard) = claimed.into_parts();
+        let claim = claim_live(&store, claimed_digest);
+        assert!(matches!(
+            claimed_guard.finish_pending(PendingTerminalCause::DeliveryFailed),
+            PendingTerminalResult::ClaimOwns {
+                signal_recorded: true
+            }
+        ));
+        tokio::task::yield_now().await;
+
+        let cancelled = store
+            .final_cancel_all(PendingTerminalCause::Shutdown)
+            .collect::<Vec<_>>();
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled.into_iter().next().unwrap().into_payload(), 43);
+        tokio::time::timeout(Duration::from_secs(1), pending_waiter)
+            .await
+            .expect("draining pending work wakes its delivery cancellation")
+            .unwrap();
+
+        drop(pending_guard);
+        drop(claimed_guard);
+        let terminal = claim.complete_at(Instant::now()).unwrap_err();
+        assert_eq!(terminal.cause(), PendingTerminalCause::DeliveryFailed);
+        assert_eq!(terminal.into_payload(), 47);
+        assert_eq!(store.counts().occupancy, 0);
     }
 
     #[tokio::test]
