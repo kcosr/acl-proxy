@@ -26,7 +26,7 @@ pub(crate) struct RequestInput<'request> {
     pub(crate) peer_ip: IpAddr,
     pub(crate) headers: HeaderMap,
     pub(crate) quota_key: WireBodyQuotaKey,
-    pub(crate) deadline: Instant,
+    pub(crate) started_at: Instant,
 }
 
 pub(crate) enum RequestDecision<'generation> {
@@ -82,6 +82,8 @@ pub(crate) enum RequestDecisionError {
     ProviderCredentialInjection(#[from] ProviderCredentialInjectionError),
     #[error("authorization provider replacement decode failed")]
     ProviderReplacementDecode,
+    #[error("the effective request deadline exceeds the monotonic clock range")]
+    RequestDeadlineOverflow,
 }
 
 impl<'generation> AllowedRequest<'generation> {
@@ -132,6 +134,10 @@ pub(crate) struct PreparedRequest<'generation, 'request> {
 }
 
 impl<'generation, 'request> PreparedRequest<'generation, 'request> {
+    pub(crate) fn deadline(&self) -> Instant {
+        self.identity.deadline
+    }
+
     pub(crate) fn body_guard(&self) -> &HttpWireBodyGuard {
         &self.guard
     }
@@ -200,6 +206,15 @@ pub(crate) fn prepare_request<'generation, 'request>(
         &input.headers,
         &|name| inbound.is_present(name),
     );
+    let request_timeout = evaluation
+        .matched
+        .as_ref()
+        .and_then(PolicyRuleMatch::request_timeout)
+        .unwrap_or_else(|| lease.request_timeout());
+    let deadline = input
+        .started_at
+        .checked_add(request_timeout)
+        .ok_or(RequestDecisionError::RequestDeadlineOverflow)?;
     let guard = lease
         .safety()
         .begin_http_body(evaluation.wire_body_plan(), input.quota_key)?;
@@ -214,7 +229,7 @@ pub(crate) fn prepare_request<'generation, 'request>(
                 url: input.url,
                 method: input.method,
                 peer_ip: input.peer_ip,
-                deadline: input.deadline,
+                deadline,
             },
             headers: input.headers,
             inbound,
@@ -232,7 +247,7 @@ pub(crate) fn prepare_request<'generation, 'request>(
             url: input.url,
             method: input.method,
             peer_ip: input.peer_ip,
-            deadline: input.deadline,
+            deadline,
         },
         headers: input.headers,
         inbound,
@@ -773,7 +788,7 @@ header = "x-test-loop"
             peer_ip,
             headers,
             quota_key: WireBodyQuotaKey::from_peer(peer_ip, |_| false),
-            deadline: Instant::now() + Duration::from_secs(3),
+            started_at: Instant::now(),
         }
     }
 
@@ -923,6 +938,56 @@ rules = [{ literals = ["secret"], payloads = "text" }]"#,
         assert_eq!(denied.reason, DenyReason::LoopDetected);
 
         drop(denied);
+        drop(lease);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn initial_policy_match_owns_the_immutable_request_deadline() {
+        let initial = compile(&config(
+            r#"[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "first-delegate"
+decision = "delegate"
+methods = ["GET"]
+request_timeout = "2s"
+authorization_provider = "approval"
+
+[[policy.rules]]
+id = "later-allow"
+decision = "allow"
+methods = ["GET"]
+request_timeout = "9s""#,
+            r#"[authorization.providers.approval]
+kind = "process"
+command = "/bin/cat"
+timeout = "1s"
+retire_timeout = "10s""#,
+        ));
+        let (runtime, _source, _, _pool) = runtime(initial).await;
+        let lease = runtime.lease().await.unwrap();
+        let url = canonicalize_http_url("https://example.test/deadline").unwrap();
+        let started_at = Instant::now();
+        let mut request = input("deadline", &url, HeaderMap::new());
+        request.started_at = started_at;
+
+        let prepared = prepare_request(&lease, request).unwrap();
+
+        assert_eq!(prepared.deadline(), started_at + Duration::from_secs(2));
+        drop(prepared);
+
+        let default_started_at = Instant::now();
+        let mut unmatched = input("default-deadline", &url, HeaderMap::new());
+        unmatched.method = &Method::POST;
+        unmatched.started_at = default_started_at;
+        let prepared = prepare_request(&lease, unmatched).unwrap();
+        assert_eq!(
+            prepared.deadline(),
+            default_started_at + Duration::from_secs(5)
+        );
+        drop(prepared);
         drop(lease);
         runtime.shutdown().await;
     }
