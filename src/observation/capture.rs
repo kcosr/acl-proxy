@@ -10,7 +10,29 @@ use crate::runtime::{BoxFuture, CleanupReason, GenerationOwner, PublicationGuard
 struct PublishedCaptureState {
     epoch: Arc<CaptureEpoch>,
     limit: usize,
+    enabled: bool,
     closed: bool,
+}
+
+impl PublishedCaptureState {
+    fn open(epoch: Arc<CaptureEpoch>, limit: usize) -> Self {
+        let enabled = epoch.is_enabled() && limit != 0;
+        Self {
+            epoch,
+            limit,
+            enabled,
+            closed: false,
+        }
+    }
+
+    fn closed() -> Self {
+        Self {
+            epoch: Arc::new(CaptureEpoch::disabled()),
+            limit: 0,
+            enabled: false,
+            closed: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,16 +64,27 @@ impl fmt::Debug for CapturePool {
 impl CapturePool {
     /// Creates the pool owned once by `ProductActivator` and shared with every
     /// observation generation it activates.
-    pub(crate) fn new(initial_limit: usize) -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             publication_gate: RwLock::new(()),
-            published: ArcSwap::from_pointee(PublishedCaptureState {
-                epoch: Arc::new(CaptureEpoch::disabled()),
-                limit: initial_limit,
-                closed: false,
-            }),
+            published: ArcSwap::from_pointee(PublishedCaptureState::open(
+                Arc::new(CaptureEpoch::disabled()),
+                0,
+            )),
             used: AtomicUsize::new(0),
         })
+    }
+
+    #[cfg(test)]
+    pub(super) fn enabled_for_accounting_test(initial_limit: usize) -> Arc<Self> {
+        let pool = Self::new();
+        pool.published.store(Arc::new(PublishedCaptureState {
+            epoch: Arc::new(CaptureEpoch::disabled()),
+            limit: initial_limit,
+            enabled: true,
+            closed: false,
+        }));
+        pool
     }
 
     /// Attempts an exact capture-owned byte reservation. Failure is immediate
@@ -72,7 +105,7 @@ impl CapturePool {
         };
         hook();
         let published = self.published.load();
-        if published.closed {
+        if !published.enabled {
             return None;
         }
         let mut used = self.used.load(Ordering::Acquire);
@@ -108,9 +141,14 @@ impl CapturePool {
     }
 
     #[cfg(test)]
-    fn published_for_test(&self) -> (Arc<CaptureEpoch>, usize, bool) {
+    fn published_for_test(&self) -> (Arc<CaptureEpoch>, usize, bool, bool) {
         let published = self.published.load();
-        (published.epoch.clone(), published.limit, published.closed)
+        (
+            published.epoch.clone(),
+            published.limit,
+            published.enabled,
+            published.closed,
+        )
     }
 
     pub(crate) fn used(&self) -> usize {
@@ -125,11 +163,8 @@ impl CapturePool {
         if self.published.load().closed {
             return CapturePublicationResult::Closed;
         }
-        self.published.store(Arc::new(PublishedCaptureState {
-            epoch,
-            limit,
-            closed: false,
-        }));
+        self.published
+            .store(Arc::new(PublishedCaptureState::open(epoch, limit)));
         CapturePublicationResult::Published
     }
 
@@ -148,11 +183,8 @@ impl CapturePool {
         if self.published.load().closed {
             return CapturePublicationResult::Closed;
         }
-        self.published.store(Arc::new(PublishedCaptureState {
-            epoch,
-            limit,
-            closed: false,
-        }));
+        self.published
+            .store(Arc::new(PublishedCaptureState::open(epoch, limit)));
         CapturePublicationResult::Published
     }
 
@@ -164,11 +196,8 @@ impl CapturePool {
         if self.published.load().closed {
             return;
         }
-        self.published.store(Arc::new(PublishedCaptureState {
-            epoch: Arc::new(CaptureEpoch::disabled()),
-            limit: 0,
-            closed: true,
-        }));
+        self.published
+            .store(Arc::new(PublishedCaptureState::closed()));
     }
 
     fn release(&self, bytes: usize) {
@@ -242,9 +271,7 @@ impl CaptureEpochUpdate {
         // permanent pool state under the publication gate and becomes a no-op
         // if closure won. Acquisitions after closure fail deterministically.
         if self.pool.is_closed() {
-            return Err(RuntimeError::CandidateNotLive(
-                "capture runtime is permanently closed".to_owned(),
-            ));
+            return Err(RuntimeError::ShuttingDown);
         }
         Ok(CaptureEpochPublicationGuard {
             update: self,
@@ -277,10 +304,15 @@ pub(crate) struct CaptureEpochPublicationGuard<'update> {
 impl PublicationGuard for CaptureEpochPublicationGuard<'_> {
     fn commit(&mut self) {
         if !self.committed {
-            let _result = self.update.pool.publish(
+            let result = self.update.pool.publish(
                 self.update.proposed_epoch.clone(),
                 self.update.proposed_limit,
             );
+            if result == CapturePublicationResult::Closed {
+                tracing::warn!(
+                    "capture epoch publication skipped because the observation runtime is shutting down"
+                );
+            }
             self.committed = true;
         }
     }
@@ -295,7 +327,7 @@ mod tests {
 
     #[test]
     fn rejected_update_does_not_change_the_committed_limit() {
-        let pool = CapturePool::new(16);
+        let pool = CapturePool::enabled_for_accounting_test(16);
         let original = pool.current_epoch();
         let proposed = Arc::new(CaptureEpoch::disabled());
         let update = CaptureEpochUpdate::new(pool.clone(), proposed, 32);
@@ -308,7 +340,7 @@ mod tests {
 
     #[test]
     fn publication_commit_changes_the_limit_once() {
-        let pool = CapturePool::new(16);
+        let pool = CapturePool::enabled_for_accounting_test(16);
         let proposed = Arc::new(CaptureEpoch::disabled());
         let update = CaptureEpochUpdate::new(pool.clone(), proposed.clone(), 32);
         let mut guard = update.publication_guard().expect("publication guard");
@@ -319,8 +351,8 @@ mod tests {
     }
 
     #[test]
-    fn old_permits_survive_a_lower_limit_and_new_admission_uses_it() {
-        let pool = CapturePool::new(16);
+    fn old_permits_survive_disablement_and_new_admission_is_rejected() {
+        let pool = CapturePool::enabled_for_accounting_test(16);
         let old = pool.try_acquire(12).expect("old permit");
         let update = CaptureEpochUpdate::new(pool.clone(), Arc::new(CaptureEpoch::disabled()), 4);
         update
@@ -332,12 +364,13 @@ mod tests {
         assert!(pool.try_acquire(1).is_none());
         drop(old);
         assert_eq!(pool.used(), 0);
-        assert_eq!(pool.try_acquire(4).expect("new limit").bytes(), 4);
+        assert!(pool.try_acquire(0).is_none());
+        assert!(pool.try_acquire(4).is_none());
     }
 
     #[test]
     fn exact_permits_saturate_without_waiting() {
-        let pool = CapturePool::new(10);
+        let pool = CapturePool::enabled_for_accounting_test(10);
         let first = pool.try_acquire(6).expect("first");
         let second = pool.try_acquire(4).expect("second");
         assert!(pool.try_acquire(1).is_none());
@@ -348,7 +381,7 @@ mod tests {
 
     #[test]
     fn arithmetic_overflow_is_an_observation_only_omission() {
-        let pool = CapturePool::new(usize::MAX);
+        let pool = CapturePool::enabled_for_accounting_test(usize::MAX);
         let permit = pool.try_acquire(usize::MAX).expect("maximum permit");
         assert!(pool.try_acquire(1).is_none());
         drop(permit);
@@ -357,7 +390,7 @@ mod tests {
 
     #[test]
     fn concurrent_admissions_share_the_limit_gate() {
-        let pool = CapturePool::new(16);
+        let pool = CapturePool::enabled_for_accounting_test(16);
         let first_entered = Arc::new(Barrier::new(2));
         let finish_first = Arc::new(Barrier::new(2));
         let first_pool = pool.clone();
@@ -386,7 +419,7 @@ mod tests {
 
     #[test]
     fn lower_limit_publication_excludes_stale_limit_admission() {
-        let pool = CapturePool::new(16);
+        let pool = CapturePool::enabled_for_accounting_test(16);
         let existing = pool.try_acquire(8).expect("existing permit");
         let publication_entered = Arc::new(Barrier::new(2));
         let finish_publication = Arc::new(Barrier::new(2));
@@ -421,7 +454,7 @@ mod tests {
 
     #[test]
     fn capture_epoch_publication_is_atomic_with_limit() {
-        let pool = CapturePool::new(16);
+        let pool = CapturePool::enabled_for_accounting_test(16);
         let old_epoch = pool.current_epoch();
         let new_epoch = Arc::new(CaptureEpoch::disabled());
         let publication_entered = Arc::new(Barrier::new(2));
@@ -443,23 +476,30 @@ mod tests {
         });
 
         publication_entered.wait();
-        let (epoch_during_publication, limit_during_publication, closed_during_publication) =
-            pool.published_for_test();
+        let (
+            epoch_during_publication,
+            limit_during_publication,
+            enabled_during_publication,
+            closed_during_publication,
+        ) = pool.published_for_test();
         assert!(Arc::ptr_eq(&epoch_during_publication, &old_epoch));
         assert_eq!(limit_during_publication, 16);
+        assert!(enabled_during_publication);
         assert!(!closed_during_publication);
         finish_publication.wait();
         publisher.join().expect("publisher");
 
-        let (published_epoch, published_limit, published_closed) = pool.published_for_test();
+        let (published_epoch, published_limit, published_enabled, published_closed) =
+            pool.published_for_test();
         assert!(Arc::ptr_eq(&published_epoch, &new_epoch));
         assert_eq!(published_limit, 32);
+        assert!(!published_enabled);
         assert!(!published_closed);
     }
 
     #[test]
     fn permanent_closure_rejects_all_admission_and_publication() {
-        let pool = CapturePool::new(16);
+        let pool = CapturePool::enabled_for_accounting_test(16);
         let proposed = Arc::new(CaptureEpoch::disabled());
         let update = CaptureEpochUpdate::new(pool.clone(), proposed, 32);
         let mut stale_guard = update.publication_guard().expect("pre-shutdown guard");
@@ -479,14 +519,13 @@ mod tests {
         assert!(pool.try_acquire(1).is_none());
         assert!(matches!(
             update.publication_guard(),
-            Err(RuntimeError::CandidateNotLive(message))
-                if message == "capture runtime is permanently closed"
+            Err(RuntimeError::ShuttingDown)
         ));
     }
 
     #[test]
-    fn permanent_closure_wins_against_in_progress_publication() {
-        let pool = CapturePool::new(16);
+    fn publication_before_close_leaves_the_pool_permanently_closed() {
+        let pool = CapturePool::enabled_for_accounting_test(16);
         let proposed = Arc::new(CaptureEpoch::disabled());
         let publication_entered = Arc::new(Barrier::new(2));
         let finish_publication = Arc::new(Barrier::new(2));
@@ -520,10 +559,28 @@ mod tests {
             CapturePublicationResult::Published
         );
         closer.join().expect("closer");
-        let (epoch, limit, closed) = pool.published_for_test();
+        let (epoch, limit, enabled, closed) = pool.published_for_test();
         assert!(closed);
         assert_eq!(limit, 0);
+        assert!(!enabled);
         assert!(!epoch.is_enabled());
+        assert!(pool.try_acquire(0).is_none());
+    }
+
+    #[test]
+    fn close_before_publication_rejects_the_publication_and_preserves_closed_state() {
+        let pool = CapturePool::enabled_for_accounting_test(16);
+        pool.close();
+        let closed_epoch = pool.current_epoch();
+
+        let result = pool.publish_with_hook(Arc::new(CaptureEpoch::disabled()), 32, || {});
+
+        assert_eq!(result, CapturePublicationResult::Closed);
+        let (epoch, limit, enabled, closed) = pool.published_for_test();
+        assert!(closed);
+        assert_eq!(limit, 0);
+        assert!(!enabled);
+        assert!(Arc::ptr_eq(&epoch, &closed_epoch));
         assert!(pool.try_acquire(0).is_none());
     }
 }

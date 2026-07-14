@@ -25,7 +25,7 @@ pub(crate) struct ProductObservationRuntime {
 impl ProductObservationRuntime {
     pub(crate) fn new() -> Self {
         Self {
-            capture_pool: CapturePool::new(0),
+            capture_pool: CapturePool::new(),
         }
     }
 
@@ -520,7 +520,7 @@ mod tests {
 
     #[test]
     fn activation_resolves_the_named_typed_profile_from_one_activation() {
-        let pool = CapturePool::new(0);
+        let pool = CapturePool::new();
         let redaction = redaction([("first-profile", 17), ("private-profile-name", 73)]);
         let activation = ProductObservationSnapshot::activate(
             plan(
@@ -546,7 +546,7 @@ mod tests {
 
     #[test]
     fn event_set_and_decision_logging_are_immutable_typed_policy() {
-        let pool = CapturePool::new(0);
+        let pool = CapturePool::new();
         let activation = activate(
             pool,
             "profile",
@@ -579,7 +579,7 @@ mod tests {
 
     #[test]
     fn rejected_candidate_does_not_change_capture_admission() {
-        let pool = CapturePool::new(8);
+        let pool = CapturePool::enabled_for_accounting_test(8);
         let original_epoch = pool.current_epoch();
         let activation = activate(
             pool.clone(),
@@ -601,7 +601,7 @@ mod tests {
 
     #[test]
     fn committed_candidate_updates_the_shared_limit() {
-        let pool = CapturePool::new(8);
+        let pool = CapturePool::enabled_for_accounting_test(8);
         let activation = activate(
             pool.clone(),
             "profile",
@@ -619,7 +619,7 @@ mod tests {
 
     #[test]
     fn capture_disablement_publishes_a_new_epoch() {
-        let pool = CapturePool::new(0);
+        let pool = CapturePool::new();
         let enabled = activate(
             pool.clone(),
             "profile",
@@ -656,15 +656,20 @@ mod tests {
         assert!(!Arc::ptr_eq(&published, &enabled_epoch));
         assert_eq!(pool.committed_limit(), 0);
 
-        // The retired generation's immutable epoch remains usable as a narrow
-        // handle without changing what new message boundaries observe.
+        // The retired generation keeps its immutable policy, but admission is
+        // governed by the atomically published disabled epoch and limit.
         assert!(enabled_snapshot.capture().is_some());
+        assert!(enabled_snapshot
+            .capture()
+            .expect("enabled capture policy")
+            .try_admit(CaptureEvent::RequestAllowed, 0)
+            .is_none());
         assert!(disabled_snapshot.capture().is_none());
     }
 
     #[test]
     fn ordinary_snapshot_retains_epoch_without_current_publication_ownership() {
-        let pool = CapturePool::new(0);
+        let pool = CapturePool::new();
         let activation = activate(
             pool.clone(),
             "profile",
@@ -746,14 +751,13 @@ mod tests {
             .is_none());
         assert!(matches!(
             owner.publication_guard(),
-            Err(RuntimeError::CandidateNotLive(message))
-                if message == "capture runtime is permanently closed"
+            Err(RuntimeError::ShuttingDown)
         ));
     }
 
     #[test]
     fn epochs_share_one_pool_and_saturation_omits_without_waiting() {
-        let pool = CapturePool::new(0);
+        let pool = CapturePool::new();
         let first = activate(
             pool.clone(),
             "first-profile",
@@ -799,7 +803,7 @@ mod tests {
 
     #[test]
     fn debug_omits_profile_name_path_filename_and_matcher_material() {
-        let pool = CapturePool::new(0);
+        let pool = CapturePool::new();
         let activation = activate(
             pool,
             "secret-profile-name",
@@ -822,7 +826,7 @@ mod tests {
 
     #[test]
     fn missing_authored_profile_is_rejected() {
-        let pool = CapturePool::new(0);
+        let pool = CapturePool::new();
         let redaction = redaction([("different-profile", 8)]);
         assert_eq!(
             ProductObservationSnapshot::activate(
@@ -841,7 +845,7 @@ mod tests {
 
     #[tokio::test]
     async fn generation_owner_contract_is_noop_after_publication() {
-        let pool = CapturePool::new(8);
+        let pool = CapturePool::enabled_for_accounting_test(8);
         let activation = activate(
             pool.clone(),
             "profile",

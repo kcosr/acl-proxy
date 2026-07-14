@@ -809,6 +809,33 @@ redaction_profile = "environment"
         assert_eq!(observation_runtime.committed_capture_limit(), 0);
     }
 
+    #[tokio::test]
+    async fn product_candidate_publication_reports_runtime_shutdown() {
+        let text = format!(
+            "{MINIMAL}\n[redaction.profiles.audit]\nrules = [{{ literals = [\"marker\"] }}]\n\n[observation.capture]\nevents = [\"request.denied\"]\nredaction_profile = \"audit\"\ndirectory = \"captures\"\nmax_body_bytes = 1024\nmax_inflight_body_bytes = 8192\n"
+        );
+        let compiled = compile(&text);
+        let activator = product_activator(&compiled.static_config);
+        let activated = activator
+            .activate_generation(
+                compiled.reloadable_plan,
+                ActivationCancellation::new_for_test(),
+            )
+            .await
+            .expect("candidate activation succeeds");
+
+        activator.observation_runtime_handle().begin_shutdown();
+
+        assert!(matches!(
+            activated.owner.publication_guard(),
+            Err(RuntimeError::ShuttingDown)
+        ));
+        activated
+            .owner
+            .cleanup(CleanupReason::CandidateRejected)
+            .await;
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn process_provider_registry_and_owner_are_part_of_the_complete_candidate() {
