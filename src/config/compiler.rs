@@ -3470,6 +3470,15 @@ fn compile_resource_plan(
     for index in (0..config.policy.rules.len()).rev() {
         cursor_peaks[index] = cursor_peaks[index + 1].max(path_peaks[index]);
     }
+    let body_read_plans = compile_http_body_read_plans(config)?;
+    for (cursor_peak, read_plan) in cursor_peaks.iter_mut().zip(body_read_plans) {
+        if let Some(limits) = read_plan.limits() {
+            *cursor_peak = (*cursor_peak).max(decode_peak(
+                limits.max_encoded_bytes(),
+                limits.max_decoded_bytes(),
+            )?);
+        }
+    }
     let max_wire_peak = cursor_peaks.iter().copied().max().unwrap_or(0);
 
     let wire_body_full_peak_capacity = if max_wire_peak == 0 {
@@ -5535,6 +5544,61 @@ methods = ["POST"]
     }
 
     #[test]
+    fn merged_suffix_body_read_plan_is_folded_into_cursor_peak() {
+        let first_encoded = 16 * MIB;
+        let first_decoded = 16 * MIB;
+        let later_encoded = 8 * MIB;
+        let later_decoded = 32 * MIB;
+        let definitions = format!(
+            r#"
+[authorization.providers.wide-encoded]
+kind = "process"
+command = "/bin/wide-encoded"
+include_request_body = true
+max_request_body_bytes = {first_encoded}
+max_decoded_request_body_bytes = {first_decoded}
+retire_timeout = "1s"
+
+[authorization.providers.wide-decoded]
+kind = "process"
+command = "/bin/wide-decoded"
+include_request_body = true
+max_request_body_bytes = {later_encoded}
+max_decoded_request_body_bytes = {later_decoded}
+retire_timeout = "1s"
+"#
+        );
+        let compiled = compile(&resource_config(
+            "",
+            &definitions,
+            r#"
+[[policy.rules]]
+id = "first"
+decision = "delegate"
+authorization_provider = "wide-encoded"
+methods = ["POST"]
+
+[[policy.rules]]
+id = "continuation"
+decision = "delegate"
+authorization_provider = "wide-decoded"
+methods = ["POST"]
+"#,
+        ))
+        .unwrap();
+        let peaks = &compiled
+            .reloadable_plan
+            .resource_plan
+            .http_wire_body_peak_bytes_by_cursor;
+        let merged = decode_peak(first_encoded, later_decoded).unwrap();
+
+        assert_eq!(peaks[0], merged);
+        assert_eq!(peaks[1], decode_peak(later_encoded, later_decoded).unwrap());
+        assert!(merged > decode_peak(first_encoded, first_decoded).unwrap());
+        assert!(merged > peaks[1]);
+    }
+
+    #[test]
     fn skipped_predicate_keeps_later_mandatory_body_read_reachable() {
         let compiled = compile(&resource_config(
             "",
@@ -5999,10 +6063,11 @@ authorization_provider = "later"
 
         assert_eq!(continuation, 65 * guarded(1));
         assert_eq!(compact_credentials, 2 * guarded(1));
-        assert!(retained + rehome > decode_peak(1, 1).unwrap());
+        let initial_peak = (retained + rehome).max(decode_peak(1, 1).unwrap());
+        assert_eq!(initial_peak, decode_peak(1, 1).unwrap());
         assert_eq!(
             plan.http_wire_body_peak_bytes_by_cursor,
-            [retained + rehome, rehome, 0]
+            [initial_peak, rehome, 0]
         );
     }
 
@@ -6529,7 +6594,9 @@ redaction_profile = "terminal"
         let mut encoded = guard.buffer();
         let mut decoded = guard.buffer();
         let decoder_sizes = crate::http_body::http_decoder_workspace_sizes(1).unwrap();
-        let decoder_workspace = guard.codec_workspace(decoder_sizes.maximum()).unwrap();
+        let decoder_workspace = guard
+            .codec_workspace_allocation(decoder_sizes.maximum())
+            .unwrap();
         let decoder_staging = guard.stream_scratch().unwrap();
         encoded.try_extend_from_slice(&[1]).unwrap();
         decoded.try_extend_from_slice(&[2]).unwrap();
@@ -6547,6 +6614,16 @@ redaction_profile = "terminal"
     }
 
     #[test]
+    fn authored_http_body_ceilings_fit_the_zstd_library_window() {
+        for authored_limit in [MAX_PROCESS_BODY_BYTES, MAX_REDACTION_BODY_BYTES] {
+            assert_eq!(
+                crate::http_body::zstd_window_limit(authored_limit),
+                Some(authored_limit)
+            );
+        }
+    }
+
+    #[test]
     fn mandatory_decoder_peak_selects_largest_codec_workspace() {
         let encoded = 10 * MIB;
         let decoded = 50 * MIB;
@@ -6557,11 +6634,9 @@ redaction_profile = "terminal"
             + guarded_workspace_allocation_bytes(sizes.maximum()).unwrap();
 
         assert_eq!(decode_peak(encoded, decoded).unwrap(), expected);
-        assert!(
-            sizes.maximum() == sizes.deflate
-                || sizes.maximum() == sizes.brotli
-                || sizes.maximum() == sizes.zstd
-        );
+        assert_eq!(sizes.maximum(), sizes.zstd);
+        assert!(sizes.zstd > sizes.brotli);
+        assert!(sizes.brotli > sizes.deflate);
     }
 
     fn reloadable_ownership_observations(plan: &ReloadableProductPlan) -> Vec<String> {
@@ -7757,14 +7832,16 @@ redaction_profile = "expanding"
 "#,
         );
         let compiled = compile(&input).unwrap();
+        let merged_decode_peak = decode_peak(MIB, MIB).unwrap();
 
         assert_eq!(
             compiled
                 .reloadable_plan
                 .resource_plan
                 .http_wire_body_peak_bytes_by_cursor,
-            vec![2 * guarded(8 * MIB), 2 * guarded(8 * MIB), 0]
+            vec![merged_decode_peak, merged_decode_peak, 0]
         );
+        assert!(merged_decode_peak > 2 * guarded(8 * MIB));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::mem::MaybeUninit;
 use std::net::IpAddr;
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
@@ -338,10 +339,10 @@ impl HttpWireBodyGuard {
         })
     }
 
-    pub(crate) fn codec_workspace(
+    pub(crate) fn codec_workspace_allocation(
         &self,
         bytes: usize,
-    ) -> Result<GuardedWorkspace, WireBodyBufferError> {
+    ) -> Result<GuardedWorkspaceAllocation, WireBodyBufferError> {
         let charged_bytes = guarded_workspace_allocation_bytes(bytes)
             .ok_or(WireBodyBufferError::CursorPeakExceeded)?;
         self.inner.try_charge(charged_bytes)?;
@@ -354,17 +355,13 @@ impl HttpWireBodyGuard {
             return Err(WireBodyBufferError::AllocationFailed);
         }
         let words = charged_bytes / WORKSPACE_ALIGNMENT;
-        let mut storage = FallibleBox::<[u128]>::try_new_uninit_slice(words)
+        let storage = FallibleBox::<[u128]>::try_new_uninit_slice(words)
             .map_err(|_| WireBodyBufferError::AllocationFailed)?;
-        for word in storage.iter_mut() {
-            word.write(0);
-        }
-        // Every word was initialized to zero above.
-        let storage = unsafe { storage.assume_init() };
-        Ok(GuardedWorkspace {
+        Ok(GuardedWorkspaceAllocation {
             guard: self.inner.clone(),
-            storage,
+            storage: Some(storage),
             charged_bytes: charge.commit(),
+            initialized_words: 0,
         })
     }
 
@@ -643,6 +640,84 @@ pub(crate) struct GuardedWorkspace {
     charged_bytes: usize,
 }
 
+pub(crate) struct GuardedWorkspaceAllocation {
+    guard: Arc<GuardInner>,
+    storage: Option<FallibleBox<[MaybeUninit<u128>]>>,
+    charged_bytes: usize,
+    initialized_words: usize,
+}
+
+impl GuardedWorkspaceAllocation {
+    pub(crate) fn len(&self) -> usize {
+        self.charged_bytes
+    }
+
+    pub(crate) fn is_initialized(&self) -> bool {
+        self.initialized_words
+            == self
+                .storage
+                .as_deref()
+                .map(<[MaybeUninit<u128>]>::len)
+                .unwrap_or(0)
+    }
+
+    pub(crate) fn initialize_next(&mut self, max_bytes: usize) {
+        let storage = self
+            .storage
+            .as_deref_mut()
+            .expect("pending workspace storage exists until finish");
+        let max_words = max_bytes.div_ceil(WORKSPACE_ALIGNMENT).max(1);
+        let end = self
+            .initialized_words
+            .saturating_add(max_words)
+            .min(storage.len());
+        for word in &mut storage[self.initialized_words..end] {
+            word.write(0);
+        }
+        self.initialized_words = end;
+    }
+
+    pub(crate) fn finish(mut self) -> GuardedWorkspace {
+        assert!(
+            self.is_initialized(),
+            "workspace must be initialized before use"
+        );
+        let storage = self
+            .storage
+            .take()
+            .expect("pending workspace storage exists until finish");
+        // Every word was initialized before ownership is converted.
+        let storage = unsafe { storage.assume_init() };
+        GuardedWorkspace {
+            guard: self.guard.clone(),
+            storage,
+            charged_bytes: std::mem::take(&mut self.charged_bytes),
+        }
+    }
+}
+
+impl fmt::Debug for GuardedWorkspaceAllocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuardedWorkspaceAllocation")
+            .field("charged_bytes", &self.charged_bytes)
+            .field("initialized_words", &self.initialized_words)
+            .finish()
+    }
+}
+
+impl Drop for GuardedWorkspaceAllocation {
+    fn drop(&mut self) {
+        if let Some(storage) = self.storage.as_deref_mut() {
+            for word in &mut storage[..self.initialized_words] {
+                // Initialized words may already contain sensitive codec state.
+                unsafe { word.assume_init_mut() }.zeroize();
+            }
+        }
+        self.guard.release(std::mem::take(&mut self.charged_bytes));
+    }
+}
+
 impl GuardedWorkspace {
     pub(crate) fn len(&self) -> usize {
         self.charged_bytes
@@ -919,6 +994,7 @@ impl Drop for GuardedBody {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct GuardedBodySegments<'a> {
     next: Option<&'a SecretChunk>,
 }
@@ -1118,7 +1194,11 @@ mod linked_tests {
         let charged = guarded_workspace_allocation_bytes(requested).unwrap();
         let pool = WireBodyPool::new(charged, charged);
         let guard = pool.begin(charged, key());
-        let mut workspace = guard.codec_workspace(requested).unwrap();
+        let mut allocation = guard.codec_workspace_allocation(requested).unwrap();
+        while !allocation.is_initialized() {
+            allocation.initialize_next(MAX_BUFFER_GROWTH_BYTES);
+        }
+        let mut workspace = allocation.finish();
 
         assert_eq!(workspace.len(), charged);
         assert_eq!(workspace.as_mut_ptr() as usize % WORKSPACE_ALIGNMENT, 0);
@@ -1140,7 +1220,7 @@ mod linked_tests {
         pool.fail_next_allocation();
 
         assert!(matches!(
-            guard.codec_workspace(1),
+            guard.codec_workspace_allocation(1),
             Err(WireBodyBufferError::AllocationFailed)
         ));
         assert_eq!(guard.live_bytes(), 0);

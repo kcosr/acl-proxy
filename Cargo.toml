@@ -34,7 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 base64 = "0.22"
 bytes = "1"
 brotli = "8.0"
-compu-brotli-sys = "1.2"
+compu-brotli-sys = "=1.2.0"
 crc32fast = "1.4"
 flate2 = "1.0"
 miniz_oxide = { version = "0.8", default-features = false, features = ["std"] }

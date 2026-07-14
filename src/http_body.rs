@@ -1,5 +1,5 @@
 use std::ffi::c_void;
-use std::mem::size_of;
+use std::mem::{size_of, MaybeUninit};
 use std::ptr;
 
 use bytes::Buf;
@@ -11,7 +11,8 @@ use tokio::time::Instant;
 
 use crate::config::compiler::HttpBodyReadLimits;
 use crate::safety::wire_body::{
-    GuardedBodyBuilder, GuardedBodySegments, GuardedWorkspace, WireBodyBufferError,
+    GuardedBodyBuilder, GuardedBodySegments, GuardedScratch, GuardedWorkspace, WireBodyBufferError,
+    MAX_BUFFER_GROWTH_BYTES,
 };
 use crate::safety::{GuardedBody, HttpWireBodyGuard};
 
@@ -19,17 +20,30 @@ pub(crate) const HTTP_DECODER_OUTPUT_STAGING_BYTES: usize = 64 * 1024;
 
 const KIB: usize = 1024;
 const MIB: usize = 1024 * KIB;
-const BROTLI_MIN_WINDOW_BYTES: usize = KIB;
 const BROTLI_MAX_WINDOW_BYTES: usize = 16 * MIB;
 const BROTLI_RING_WRITE_AHEAD_SLACK_BYTES: usize = 542;
-// Three simultaneously live Huffman groups account for less than 2.5 MiB.
-// The remainder covers context maps, block trees, decoder state, and arena
-// allocation headers for a standard-window stream with no dictionary.
-const BROTLI_FIXED_WORKSPACE_BYTES: usize = 3 * MIB;
+const BROTLI_FIXED_WORKSPACE_BYTES: usize = 4 * MIB;
+const BROTLI_MAX_TREE_COUNT: usize = 256;
+const BROTLI_HUFFMAN_CODE_BYTES: usize = 4;
+const BROTLI_HUFFMAN_POINTER_BYTES: usize = size_of::<usize>();
+const BROTLI_HUFFMAN_SECOND_LEVEL_TABLE_ENTRIES: usize = 376;
+const BROTLI_LITERAL_ALPHABET_ENTRIES: usize = 256;
+const BROTLI_COMMAND_ALPHABET_ENTRIES: usize = 704;
+const BROTLI_DISTANCE_ALPHABET_ENTRIES: usize = 520;
+const BROTLI_DECODER_STATE_BUDGET_BYTES: usize = 8 * KIB;
+const BROTLI_SHARED_DICTIONARY_BUDGET_BYTES: usize = 2 * KIB;
+const BROTLI_BLOCK_TREE_BUDGET_BYTES: usize = 16 * KIB;
+const BROTLI_CONTEXT_BUDGET_BYTES: usize = 18 * KIB;
+const BROTLI_ARENA_ALLOCATION_COUNT: usize = 10;
 const ZSTD_MIN_WINDOW_BYTES: usize = KIB;
+const ZSTD_LIBRARY_WINDOW_LOG_MAX: u32 = if usize::BITS == 32 {
+    zstd_sys::ZSTD_WINDOWLOG_MAX_32
+} else {
+    zstd_sys::ZSTD_WINDOWLOG_MAX_64
+};
 const CONTENT_DECODING_FLOOR_BYTES: usize = MIB;
-const GZIP_HEADER_MAX_BYTES: usize = 16 * KIB;
 const ARENA_ALIGNMENT: usize = 16;
+const ZSTD_FRAME_HEADER_MAX_BYTES: usize = zstd_sys::ZSTD_FRAMEHEADERSIZE_MAX as usize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HttpDecoderWorkspaceSizes {
@@ -47,9 +61,8 @@ impl HttpDecoderWorkspaceSizes {
 pub(crate) fn http_decoder_workspace_sizes(
     max_decoded_bytes: usize,
 ) -> Option<HttpDecoderWorkspaceSizes> {
-    let brotli_window = brotli_window_limit(max_decoded_bytes)?;
     let brotli = BROTLI_FIXED_WORKSPACE_BYTES
-        .checked_add(brotli_window)?
+        .checked_add(BROTLI_MAX_WINDOW_BYTES)?
         .checked_add(BROTLI_RING_WRITE_AHEAD_SLACK_BYTES)?;
     let zstd_window = zstd_window_limit(max_decoded_bytes)?;
     // This estimator and `ZSTD_initStaticDStream` are a paired API. The
@@ -66,17 +79,32 @@ pub(crate) fn http_decoder_workspace_sizes(
     })
 }
 
-pub(crate) fn brotli_window_limit(max_decoded_bytes: usize) -> Option<usize> {
-    max_decoded_bytes
-        .max(BROTLI_MIN_WINDOW_BYTES)
-        .checked_next_power_of_two()
-        .map(|bytes| bytes.min(BROTLI_MAX_WINDOW_BYTES))
+const fn brotli_huffman_group_budget(alphabet_entries: usize) -> usize {
+    BROTLI_MAX_TREE_COUNT
+        * (alphabet_entries + BROTLI_HUFFMAN_SECOND_LEVEL_TABLE_ENTRIES)
+        * BROTLI_HUFFMAN_CODE_BYTES
+        + BROTLI_MAX_TREE_COUNT * BROTLI_HUFFMAN_POINTER_BYTES
 }
 
-fn zstd_window_limit(max_decoded_bytes: usize) -> Option<usize> {
-    max_decoded_bytes
+const fn brotli_fixed_workspace_required_bytes() -> usize {
+    size_of::<BrotliArenaState>()
+        + size_of::<BrotliArenaBlock>()
+        + BROTLI_DECODER_STATE_BUDGET_BYTES
+        + BROTLI_SHARED_DICTIONARY_BUDGET_BYTES
+        + BROTLI_BLOCK_TREE_BUDGET_BYTES
+        + BROTLI_CONTEXT_BUDGET_BYTES
+        + brotli_huffman_group_budget(BROTLI_LITERAL_ALPHABET_ENTRIES)
+        + brotli_huffman_group_budget(BROTLI_COMMAND_ALPHABET_ENTRIES)
+        + brotli_huffman_group_budget(BROTLI_DISTANCE_ALPHABET_ENTRIES)
+        + BROTLI_ARENA_ALLOCATION_COUNT * size_of::<BrotliArenaBlock>()
+}
+
+pub(crate) fn zstd_window_limit(max_decoded_bytes: usize) -> Option<usize> {
+    let authored = max_decoded_bytes
         .max(ZSTD_MIN_WINDOW_BYTES)
-        .checked_next_power_of_two()
+        .checked_next_power_of_two()?;
+    let library = 1usize.checked_shl(ZSTD_LIBRARY_WINDOW_LOG_MAX)?;
+    Some(authored.min(library))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,6 +181,35 @@ impl From<WireBodyBufferError> for HttpBodyReadError {
     }
 }
 
+fn check_deadline(deadline: Instant) -> Result<(), HttpBodyReadError> {
+    if Instant::now() >= deadline {
+        Err(HttpBodyReadError::TimedOut)
+    } else {
+        Ok(())
+    }
+}
+
+async fn cooperative_checkpoint(deadline: Instant) -> Result<(), HttpBodyReadError> {
+    check_deadline(deadline)?;
+    tokio::task::yield_now().await;
+    check_deadline(deadline)
+}
+
+async fn allocate_codec_workspace(
+    guard: &HttpWireBodyGuard,
+    bytes: usize,
+    deadline: Instant,
+) -> Result<GuardedWorkspace, HttpBodyReadError> {
+    check_deadline(deadline)?;
+    let mut allocation = guard.codec_workspace_allocation(bytes)?;
+    while !allocation.is_initialized() {
+        check_deadline(deadline)?;
+        allocation.initialize_next(MAX_BUFFER_GROWTH_BYTES);
+        cooperative_checkpoint(deadline).await?;
+    }
+    Ok(allocation.finish())
+}
+
 pub(crate) async fn read_mandatory_request_body<B>(
     headers: &HeaderMap,
     mut body: B,
@@ -171,6 +228,7 @@ where
     }
     let mut encoded = guard.buffer();
     loop {
+        check_deadline(deadline)?;
         let next = tokio::time::timeout_at(deadline, body.data())
             .await
             .map_err(|_| HttpBodyReadError::TimedOut)?;
@@ -178,8 +236,14 @@ where
             break;
         };
         let mut chunk = chunk.map_err(|_| HttpBodyReadError::ReadFailed)?;
+        if !chunk.has_remaining() {
+            cooperative_checkpoint(deadline).await?;
+            continue;
+        }
         while chunk.has_remaining() {
-            let bytes = chunk.chunk();
+            check_deadline(deadline)?;
+            let available = chunk.chunk();
+            let bytes = &available[..available.len().min(MAX_BUFFER_GROWTH_BYTES)];
             if bytes.is_empty() {
                 return Err(HttpBodyReadError::ReadFailed);
             }
@@ -192,6 +256,7 @@ where
             }
             encoded.try_extend_from_slice(bytes)?;
             chunk.advance(bytes.len());
+            cooperative_checkpoint(deadline).await?;
         }
     }
     let trailers = tokio::time::timeout_at(deadline, body.trailers())
@@ -293,6 +358,7 @@ fn parse_content_encoding(headers: &HeaderMap) -> Result<ContentEncoding, HttpBo
     }
 }
 
+#[derive(Clone)]
 struct EncodedCursor<'a> {
     segments: GuardedBodySegments<'a>,
     current: &'a [u8],
@@ -360,6 +426,24 @@ impl<'a> EncodedCursor<'a> {
     fn consumed(&self) -> usize {
         self.consumed
     }
+
+    fn copy_prefix(&self, destination: &mut [u8]) -> usize {
+        let mut cursor = self.clone();
+        let mut written = 0usize;
+        while written < destination.len() && !cursor.is_end() {
+            let current = cursor.current();
+            if current.is_empty() {
+                break;
+            }
+            let copied = current.len().min(destination.len() - written);
+            destination[written..written + copied].copy_from_slice(&current[..copied]);
+            if cursor.advance(copied).is_err() {
+                break;
+            }
+            written += copied;
+        }
+        written
+    }
 }
 
 struct DecodeProgress {
@@ -377,7 +461,7 @@ impl DecodeProgress {
         builder: &mut GuardedBodyBuilder,
     ) -> Result<(), HttpBodyReadError> {
         if output.is_empty() {
-            return self.check_deadline();
+            return cooperative_checkpoint(self.deadline).await;
         }
         let next = validate_decoded_growth(
             self.decoded,
@@ -388,17 +472,11 @@ impl DecodeProgress {
         )?;
         builder.try_extend_from_slice(output)?;
         self.decoded = next;
-        self.check_deadline()?;
-        tokio::task::yield_now().await;
-        self.check_deadline()
+        cooperative_checkpoint(self.deadline).await
     }
 
     fn check_deadline(&self) -> Result<(), HttpBodyReadError> {
-        if Instant::now() >= self.deadline {
-            Err(HttpBodyReadError::TimedOut)
-        } else {
-            Ok(())
-        }
+        check_deadline(self.deadline)
     }
 }
 
@@ -434,12 +512,13 @@ struct InflateSession {
 unsafe impl Send for InflateSession {}
 
 impl InflateSession {
-    fn new(
+    async fn new(
         guard: &HttpWireBodyGuard,
         workspace_bytes: usize,
         format: DataFormat,
+        deadline: Instant,
     ) -> Result<Self, HttpBodyReadError> {
-        let mut workspace = guard.codec_workspace(workspace_bytes)?;
+        let mut workspace = allocate_codec_workspace(guard, workspace_bytes, deadline).await?;
         if workspace.len() < size_of::<InflateState>()
             || !(workspace.as_mut_ptr() as usize)
                 .is_multiple_of(std::mem::align_of::<InflateState>())
@@ -457,6 +536,10 @@ impl InflateSession {
         // `state` points into the live, exclusively borrowed workspace.
         unsafe { &mut *self.state }
     }
+
+    fn reset(&mut self, format: DataFormat) {
+        self.state().reset(format);
+    }
 }
 
 impl Drop for InflateSession {
@@ -470,15 +553,12 @@ impl Drop for InflateSession {
 
 async fn inflate_cursor(
     cursor: &mut EncodedCursor<'_>,
-    guard: &HttpWireBodyGuard,
-    workspace_bytes: usize,
-    format: DataFormat,
+    session: &mut InflateSession,
+    staging: &mut GuardedScratch,
     output: &mut GuardedBodyBuilder,
     progress: &mut DecodeProgress,
     mut crc: Option<&mut crc32fast::Hasher>,
 ) -> Result<(), HttpBodyReadError> {
-    let mut session = InflateSession::new(guard, workspace_bytes, format)?;
-    let mut staging = guard.stream_scratch()?;
     loop {
         progress.check_deadline()?;
         let result = {
@@ -556,6 +636,7 @@ async fn decode_deflate_attempt(
     deadline: Instant,
     format: DataFormat,
 ) -> Result<GuardedBody, HttpBodyReadError> {
+    check_deadline(deadline)?;
     let mut cursor = EncodedCursor::new(encoded);
     let mut output = guard.buffer();
     let mut progress = DecodeProgress {
@@ -564,11 +645,13 @@ async fn decode_deflate_attempt(
         ratio,
         deadline,
     };
+    let mut session = InflateSession::new(guard, workspace_bytes, format, deadline).await?;
+    check_deadline(deadline)?;
+    let mut staging = guard.stream_scratch()?;
     inflate_cursor(
         &mut cursor,
-        guard,
-        workspace_bytes,
-        format,
+        &mut session,
+        &mut staging,
         &mut output,
         &mut progress,
         None,
@@ -596,17 +679,22 @@ async fn decode_gzip(
         ratio,
         deadline,
     };
+    check_deadline(deadline)?;
+    let mut session =
+        InflateSession::new(guard, workspace_bytes, DataFormat::Raw, deadline).await?;
+    check_deadline(deadline)?;
+    let mut staging = guard.stream_scratch()?;
     let mut members = 0usize;
     while !cursor.is_end() {
         progress.check_deadline()?;
-        parse_gzip_header(&mut cursor)?;
+        parse_gzip_header(&mut cursor, deadline).await?;
         let member_start = progress.decoded;
         let mut crc = crc32fast::Hasher::new();
+        session.reset(DataFormat::Raw);
         inflate_cursor(
             &mut cursor,
-            guard,
-            workspace_bytes,
-            DataFormat::Raw,
+            &mut session,
+            &mut staging,
             &mut output,
             &mut progress,
             Some(&mut crc),
@@ -620,6 +708,7 @@ async fn decode_gzip(
             return Err(HttpBodyReadError::InvalidContentEncoding);
         }
         members += 1;
+        cooperative_checkpoint(deadline).await?;
     }
     if members == 0 {
         return Err(HttpBodyReadError::InvalidContentEncoding);
@@ -627,34 +716,31 @@ async fn decode_gzip(
     Ok(output.finish())
 }
 
-fn parse_gzip_header(cursor: &mut EncodedCursor<'_>) -> Result<(), HttpBodyReadError> {
-    let header_start = cursor.consumed();
+async fn parse_gzip_header(
+    cursor: &mut EncodedCursor<'_>,
+    deadline: Instant,
+) -> Result<(), HttpBodyReadError> {
+    check_deadline(deadline)?;
     let mut header_crc = crc32fast::Hasher::new();
-    let id1 = read_gzip_header_byte(cursor, &mut header_crc, header_start)?;
-    let id2 = read_gzip_header_byte(cursor, &mut header_crc, header_start)?;
-    let method = read_gzip_header_byte(cursor, &mut header_crc, header_start)?;
-    let flags = read_gzip_header_byte(cursor, &mut header_crc, header_start)?;
+    let id1 = read_gzip_header_byte(cursor, &mut header_crc)?;
+    let id2 = read_gzip_header_byte(cursor, &mut header_crc)?;
+    let method = read_gzip_header_byte(cursor, &mut header_crc)?;
+    let flags = read_gzip_header_byte(cursor, &mut header_crc)?;
     if id1 != 0x1f || id2 != 0x8b || method != 8 || flags & 0xe0 != 0 {
         return Err(HttpBodyReadError::InvalidContentEncoding);
     }
     for _ in 0..6 {
-        read_gzip_header_byte(cursor, &mut header_crc, header_start)?;
+        read_gzip_header_byte(cursor, &mut header_crc)?;
     }
     if flags & 0x04 != 0 {
-        let low = read_gzip_header_byte(cursor, &mut header_crc, header_start)?;
-        let high = read_gzip_header_byte(cursor, &mut header_crc, header_start)?;
+        let low = read_gzip_header_byte(cursor, &mut header_crc)?;
+        let high = read_gzip_header_byte(cursor, &mut header_crc)?;
         let length = u16::from_le_bytes([low, high]) as usize;
-        for _ in 0..length {
-            read_gzip_header_byte(cursor, &mut header_crc, header_start)?;
-        }
+        read_gzip_header_bytes(cursor, &mut header_crc, length, deadline).await?;
     }
     for mask in [0x08, 0x10] {
         if flags & mask != 0 {
-            loop {
-                if read_gzip_header_byte(cursor, &mut header_crc, header_start)? == 0 {
-                    break;
-                }
-            }
+            read_zero_terminated_gzip_header_field(cursor, &mut header_crc, deadline).await?;
         }
     }
     if flags & 0x02 != 0 {
@@ -669,14 +755,57 @@ fn parse_gzip_header(cursor: &mut EncodedCursor<'_>) -> Result<(), HttpBodyReadE
 fn read_gzip_header_byte(
     cursor: &mut EncodedCursor<'_>,
     crc: &mut crc32fast::Hasher,
-    header_start: usize,
 ) -> Result<u8, HttpBodyReadError> {
-    if cursor.consumed().saturating_sub(header_start) >= GZIP_HEADER_MAX_BYTES {
-        return Err(HttpBodyReadError::InvalidContentEncoding);
-    }
     let byte = cursor.read_byte()?;
     crc.update(&[byte]);
     Ok(byte)
+}
+
+async fn read_gzip_header_bytes(
+    cursor: &mut EncodedCursor<'_>,
+    crc: &mut crc32fast::Hasher,
+    mut remaining: usize,
+    deadline: Instant,
+) -> Result<(), HttpBodyReadError> {
+    while remaining != 0 {
+        check_deadline(deadline)?;
+        let current = cursor.current();
+        if current.is_empty() {
+            return Err(HttpBodyReadError::InvalidContentEncoding);
+        }
+        let consumed = current.len().min(remaining).min(MAX_BUFFER_GROWTH_BYTES);
+        crc.update(&current[..consumed]);
+        cursor.advance(consumed)?;
+        remaining -= consumed;
+        cooperative_checkpoint(deadline).await?;
+    }
+    Ok(())
+}
+
+async fn read_zero_terminated_gzip_header_field(
+    cursor: &mut EncodedCursor<'_>,
+    crc: &mut crc32fast::Hasher,
+    deadline: Instant,
+) -> Result<(), HttpBodyReadError> {
+    loop {
+        check_deadline(deadline)?;
+        let current = cursor.current();
+        if current.is_empty() {
+            return Err(HttpBodyReadError::InvalidContentEncoding);
+        }
+        let bounded = &current[..current.len().min(MAX_BUFFER_GROWTH_BYTES)];
+        let consumed = bounded
+            .iter()
+            .position(|byte| *byte == 0)
+            .map_or(bounded.len(), |index| index + 1);
+        let terminated = bounded[consumed - 1] == 0;
+        crc.update(&bounded[..consumed]);
+        cursor.advance(consumed)?;
+        cooperative_checkpoint(deadline).await?;
+        if terminated {
+            return Ok(());
+        }
+    }
 }
 
 fn read_u32_le(cursor: &mut EncodedCursor<'_>) -> Result<u32, HttpBodyReadError> {
@@ -692,6 +821,7 @@ fn read_u32_le(cursor: &mut EncodedCursor<'_>) -> Result<u32, HttpBodyReadError>
 struct BrotliArenaState {
     base: *mut u8,
     len: usize,
+    exhausted: bool,
 }
 
 #[repr(C, align(16))]
@@ -716,7 +846,11 @@ fn initialize_brotli_arena(workspace: &mut GuardedWorkspace) -> Option<*mut Brot
     let block = unsafe { base.add(first_block).cast::<BrotliArenaBlock>() };
     // Both structures live in the aligned guarded workspace and are wiped with it.
     unsafe {
-        state.write(BrotliArenaState { base, len });
+        state.write(BrotliArenaState {
+            base,
+            len,
+            exhausted: false,
+        });
         block.write(BrotliArenaBlock {
             size: payload,
             used: 0,
@@ -737,9 +871,11 @@ unsafe extern "C" fn brotli_arena_alloc(opaque: *mut c_void, size: usize) -> *mu
     }
     let arena = unsafe { &mut *opaque.cast::<BrotliArenaState>() };
     let Some(requested) = align_up(size, ARENA_ALIGNMENT) else {
+        arena.exhausted = true;
         return ptr::null_mut();
     };
     let Some(mut offset) = align_up(size_of::<BrotliArenaState>(), ARENA_ALIGNMENT) else {
+        arena.exhausted = true;
         return ptr::null_mut();
     };
     while offset
@@ -753,6 +889,7 @@ unsafe extern "C" fn brotli_arena_alloc(opaque: *mut c_void, size: usize) -> *mu
                 .and_then(|end| end.checked_add(block.size))
                 .is_none_or(|end| end > arena.len)
         {
+            arena.exhausted = true;
             return ptr::null_mut();
         }
         if block.used == 0 && block.size >= requested {
@@ -771,6 +908,7 @@ unsafe extern "C" fn brotli_arena_alloc(opaque: *mut c_void, size: usize) -> *mu
         }
         offset += size_of::<BrotliArenaBlock>() + block.size;
     }
+    arena.exhausted = true;
     ptr::null_mut()
 }
 
@@ -821,6 +959,7 @@ fn coalesce_brotli_arena(arena: &mut BrotliArenaState) {
 
 struct BrotliSession {
     state: *mut compu_brotli_sys::BrotliDecoderState,
+    arena: *mut BrotliArenaState,
     workspace: GuardedWorkspace,
 }
 
@@ -829,8 +968,12 @@ struct BrotliSession {
 unsafe impl Send for BrotliSession {}
 
 impl BrotliSession {
-    fn new(guard: &HttpWireBodyGuard, workspace_bytes: usize) -> Result<Self, HttpBodyReadError> {
-        let mut workspace = guard.codec_workspace(workspace_bytes)?;
+    async fn new(
+        guard: &HttpWireBodyGuard,
+        workspace_bytes: usize,
+        deadline: Instant,
+    ) -> Result<Self, HttpBodyReadError> {
+        let mut workspace = allocate_codec_workspace(guard, workspace_bytes, deadline).await?;
         let arena =
             initialize_brotli_arena(&mut workspace).ok_or(HttpBodyReadError::ResourceExhausted)?;
         let state = unsafe {
@@ -854,7 +997,15 @@ impl BrotliSession {
             unsafe { compu_brotli_sys::BrotliDecoderDestroyInstance(state) };
             return Err(HttpBodyReadError::ResourceExhausted);
         }
-        Ok(Self { state, workspace })
+        Ok(Self {
+            state,
+            arena,
+            workspace,
+        })
+    }
+
+    fn arena_exhausted(&self) -> bool {
+        unsafe { (*self.arena).exhausted }
     }
 }
 
@@ -880,17 +1031,17 @@ async fn decode_brotli(
         .copied()
         .ok_or(HttpBodyReadError::InvalidContentEncoding)?;
     let window_bits = brotli_window_bits(first)?;
-    let window_limit =
-        brotli_window_limit(max_decoded).ok_or(HttpBodyReadError::ResourceExhausted)?;
     if 1usize
         .checked_shl(window_bits)
-        .is_none_or(|window| window > window_limit)
+        .is_none_or(|window| window > BROTLI_MAX_WINDOW_BYTES)
     {
         return Err(HttpBodyReadError::DecoderWindowExceeded);
     }
 
-    let session = BrotliSession::new(guard, workspace_bytes)?;
+    check_deadline(deadline)?;
+    let session = BrotliSession::new(guard, workspace_bytes, deadline).await?;
     let mut cursor = EncodedCursor::new(encoded);
+    check_deadline(deadline)?;
     let mut staging = guard.stream_scratch()?;
     let mut output = guard.buffer();
     let mut progress = DecodeProgress {
@@ -943,6 +1094,7 @@ async fn decode_brotli(
                     return Err(HttpBodyReadError::InvalidContentEncoding);
                 }
             }
+            _ if session.arena_exhausted() => return Err(HttpBodyReadError::ResourceExhausted),
             _ => return Err(HttpBodyReadError::InvalidContentEncoding),
         }
     }
@@ -977,12 +1129,13 @@ struct ZstdSession {
 unsafe impl Send for ZstdSession {}
 
 impl ZstdSession {
-    fn new(
+    async fn new(
         guard: &HttpWireBodyGuard,
         workspace_bytes: usize,
         max_decoded: usize,
+        deadline: Instant,
     ) -> Result<Self, HttpBodyReadError> {
-        let mut workspace = guard.codec_workspace(workspace_bytes)?;
+        let mut workspace = allocate_codec_workspace(guard, workspace_bytes, deadline).await?;
         let stream = unsafe {
             zstd_sys::ZSTD_initStaticDStream(
                 workspace.as_mut_ptr().cast::<c_void>(),
@@ -1025,8 +1178,10 @@ async fn decode_zstd(
     ratio: usize,
     deadline: Instant,
 ) -> Result<GuardedBody, HttpBodyReadError> {
-    let session = ZstdSession::new(guard, workspace_bytes, max_decoded)?;
+    check_deadline(deadline)?;
+    let session = ZstdSession::new(guard, workspace_bytes, max_decoded, deadline).await?;
     let mut cursor = EncodedCursor::new(encoded);
+    check_deadline(deadline)?;
     let mut staging = guard.stream_scratch()?;
     let mut output = guard.buffer();
     let mut progress = DecodeProgress {
@@ -1035,8 +1190,15 @@ async fn decode_zstd(
         ratio,
         deadline,
     };
+    let window_limit =
+        zstd_window_limit(max_decoded).ok_or(HttpBodyReadError::ResourceExhausted)?;
+    let mut at_frame_start = true;
     loop {
         progress.check_deadline()?;
+        if at_frame_start {
+            validate_zstd_frame_window(&cursor, window_limit)?;
+            at_frame_start = false;
+        }
         let (result, input_pos, output_pos) = {
             let input = cursor.current();
             let mut input_buffer = zstd_sys::ZSTD_inBuffer {
@@ -1070,10 +1232,41 @@ async fn decode_zstd(
         if result == 0 && cursor.is_end() {
             return Ok(output.finish());
         }
+        if result == 0 {
+            at_frame_start = true;
+            cooperative_checkpoint(deadline).await?;
+        }
         if input_pos == 0 && output_pos == 0 {
             return Err(HttpBodyReadError::InvalidContentEncoding);
         }
     }
+}
+
+fn validate_zstd_frame_window(
+    cursor: &EncodedCursor<'_>,
+    window_limit: usize,
+) -> Result<(), HttpBodyReadError> {
+    let mut prefix = [0u8; ZSTD_FRAME_HEADER_MAX_BYTES];
+    let prefix_len = cursor.copy_prefix(&mut prefix);
+    let mut header = MaybeUninit::<zstd_sys::ZSTD_FrameHeader>::uninit();
+    let result = unsafe {
+        zstd_sys::ZSTD_getFrameHeader(
+            header.as_mut_ptr(),
+            prefix.as_ptr().cast::<c_void>(),
+            prefix_len,
+        )
+    };
+    if unsafe { zstd_sys::ZSTD_isError(result) } != 0 || result != 0 {
+        return Err(HttpBodyReadError::InvalidContentEncoding);
+    }
+    // A zero return guarantees the library initialized the complete header.
+    let header = unsafe { header.assume_init() };
+    let window =
+        usize::try_from(header.windowSize).map_err(|_| HttpBodyReadError::DecoderWindowExceeded)?;
+    if window > window_limit {
+        return Err(HttpBodyReadError::DecoderWindowExceeded);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1167,13 +1360,17 @@ mod tests {
         encoder.finish().unwrap()
     }
 
-    fn brotli(input: &[u8]) -> Vec<u8> {
+    fn brotli_with_window(input: &[u8], window_bits: u32) -> Vec<u8> {
         let mut output = Vec::new();
         {
-            let mut encoder = brotli::CompressorWriter::new(&mut output, 4096, 5, 10);
+            let mut encoder = brotli::CompressorWriter::new(&mut output, 4096, 5, window_bits);
             encoder.write_all(input).unwrap();
         }
         output
+    }
+
+    fn brotli(input: &[u8]) -> Vec<u8> {
+        brotli_with_window(input, 22)
     }
 
     fn zstd(input: &[u8]) -> Vec<u8> {
@@ -1185,18 +1382,48 @@ mod tests {
         encoder.finish().unwrap()
     }
 
+    fn zstd_with_window(input: &[u8], window_log: u32) -> Vec<u8> {
+        let mut encoder = zstd::stream::Encoder::new(Vec::new(), 1).unwrap();
+        encoder.window_log(window_log).unwrap();
+        encoder.write_all(input).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn gzip_with_extra(input: &[u8], extra_len: usize) -> Vec<u8> {
+        let mut encoded = vec![0x1f, 0x8b, 8, 0x04, 0, 0, 0, 0, 0, 255];
+        encoded.extend_from_slice(&(extra_len as u16).to_le_bytes());
+        encoded.extend(std::iter::repeat_n(0x5a, extra_len));
+        encoded.extend_from_slice(&raw_deflate(input));
+        encoded.extend_from_slice(&crc32fast::hash(input).to_le_bytes());
+        encoded.extend_from_slice(&(input.len() as u32).to_le_bytes());
+        encoded
+    }
+
     #[test]
     fn workspace_selection_includes_each_bounded_codec() {
         let small = http_decoder_workspace_sizes(KIB).unwrap();
-        assert_eq!(small.maximum(), small.brotli.max(small.zstd));
+        assert_eq!(small.maximum(), small.brotli);
         assert!(small.deflate > 0);
-        assert!(small.brotli > BROTLI_FIXED_WORKSPACE_BYTES);
+        assert_eq!(
+            small.brotli,
+            BROTLI_FIXED_WORKSPACE_BYTES
+                + BROTLI_MAX_WINDOW_BYTES
+                + BROTLI_RING_WRITE_AHEAD_SLACK_BYTES
+        );
         assert!(small.zstd > ZSTD_MIN_WINDOW_BYTES);
 
         let large = http_decoder_workspace_sizes(32 * MIB).unwrap();
-        assert_eq!(brotli_window_limit(32 * MIB), Some(BROTLI_MAX_WINDOW_BYTES));
+        assert_eq!(large.brotli, small.brotli);
         assert!(large.zstd > small.zstd);
-        assert!(large.maximum() >= large.zstd);
+        assert_eq!(large.maximum(), large.zstd);
+    }
+
+    #[test]
+    fn pinned_brotli_arena_budget_covers_derived_standard_decoder_maximum() {
+        let required = brotli_fixed_workspace_required_bytes();
+        assert_eq!(BROTLI_HUFFMAN_POINTER_BYTES, size_of::<usize>());
+        assert!(required <= BROTLI_FIXED_WORKSPACE_BYTES);
+        assert!(BROTLI_FIXED_WORKSPACE_BYTES - required >= MIB);
     }
 
     #[tokio::test]
@@ -1221,6 +1448,19 @@ mod tests {
             assert_eq!(body_bytes(&body), plain, "encoding {encoding:?}");
             drop(body);
             assert_eq!(guard.live_bytes(), 0);
+            assert_eq!(pool.global_charge(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn brotli_standard_windows_are_independent_of_decoded_body_limit() {
+        let plain = b"small standard-window brotli body".repeat(64);
+        for window_bits in [22, 24] {
+            let encoded = brotli_with_window(&plain, window_bits);
+            let (result, guard, pool) =
+                invoke(encoded.clone(), Some("br"), encoded.len(), plain.len(), 128).await;
+            assert_eq!(body_bytes(&result.unwrap()), plain, "window {window_bits}");
+            drop(guard);
             assert_eq!(pool.global_charge(), 0);
         }
     }
@@ -1437,6 +1677,51 @@ mod tests {
         assert_eq!(observed_pool.global_charge(), 0);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn immediately_ready_large_data_chunk_is_cooperatively_cancellable() {
+        let max = 8 * MIB;
+        let peak = compiled_peak(max, max);
+        let pool = WireBodyPool::new(peak, peak);
+        let guard = pool.begin_for_test(peak, key());
+        let observed_pool = pool.clone();
+        let task = tokio::spawn(async move {
+            read_mandatory_request_body(
+                &HeaderMap::new(),
+                Body::from(vec![0x41; max]),
+                limits(max, max),
+                1,
+                Instant::now() + Duration::from_secs(30),
+                &guard,
+            )
+            .await
+        });
+        while observed_pool.global_charge() == 0 {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(observed_pool.global_charge(), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn partially_initialized_workspace_is_cooperatively_cancellable() {
+        let requested = 20 * MIB;
+        let charged = guarded_workspace_allocation_bytes(requested).unwrap();
+        let pool = WireBodyPool::new(charged, charged);
+        let guard = pool.begin_for_test(charged, key());
+        let observed_pool = pool.clone();
+        let task = tokio::spawn(async move {
+            allocate_codec_workspace(&guard, requested, Instant::now() + Duration::from_secs(30))
+                .await
+        });
+        while observed_pool.global_charge() == 0 {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(observed_pool.global_charge(), 0);
+    }
+
     #[tokio::test]
     async fn http_decoder_workspace_is_bounded_and_charged() {
         let plain = b"workspace accounting".repeat(4096);
@@ -1489,6 +1774,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn brotli_arena_exhaustion_is_not_classified_as_corrupt_input() {
+        let plain = b"valid brotli with an intentionally undersized arena";
+        let encoded_bytes = brotli_with_window(plain, 22);
+        let workspace_bytes = 64 * KIB;
+        let peak = guarded_body_allocation_bytes(encoded_bytes.len()).unwrap()
+            + guarded_body_allocation_bytes(plain.len()).unwrap()
+            + guarded_body_allocation_bytes(HTTP_DECODER_OUTPUT_STAGING_BYTES).unwrap()
+            + guarded_workspace_allocation_bytes(workspace_bytes).unwrap();
+        let pool = WireBodyPool::new(peak, peak);
+        let guard = pool.begin_for_test(peak, key());
+        let mut encoded = guard.buffer();
+        encoded.try_extend_from_slice(&encoded_bytes).unwrap();
+        let encoded = encoded.finish();
+
+        let error = decode_brotli(
+            &encoded,
+            &guard,
+            workspace_bytes,
+            plain.len(),
+            128,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, HttpBodyReadError::ResourceExhausted);
+        drop(encoded);
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+    }
+
+    #[tokio::test]
     async fn http_wire_body_guard_terminal_restoration_matrix() {
         let invalid_cases = [
             (
@@ -1499,7 +1815,7 @@ mod tests {
             (
                 Some("br"),
                 vec![0xff; 32],
-                HttpBodyReadError::DecoderWindowExceeded,
+                HttpBodyReadError::InvalidContentEncoding,
             ),
             (
                 Some("zstd"),
@@ -1516,16 +1832,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gzip_header_work_is_capped_before_payload_decoding() {
-        let mut encoded = vec![0x1f, 0x8b, 8, 0x08, 0, 0, 0, 0, 0, 255];
-        encoded.extend(std::iter::repeat_n(b'a', GZIP_HEADER_MAX_BYTES));
-        let limit = encoded.len();
-        let (result, guard, pool) = invoke(encoded, Some("gzip"), limit, limit, 128).await;
-        assert_eq!(
-            result.unwrap_err(),
-            HttpBodyReadError::InvalidContentEncoding
-        );
-        assert_eq!(guard.live_bytes(), 0);
+    async fn gzip_accepts_large_valid_extra_header_with_bounded_work() {
+        let plain = b"large gzip extra field";
+        let encoded = gzip_with_extra(plain, 48 * KIB);
+        let (result, guard, pool) = invoke(
+            encoded.clone(),
+            Some("gzip"),
+            encoded.len(),
+            encoded.len(),
+            128,
+        )
+        .await;
+        assert_eq!(body_bytes(&result.unwrap()), plain);
+        drop(guard);
         assert_eq!(pool.global_charge(), 0);
     }
 
@@ -1618,6 +1937,59 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn many_empty_gzip_members_reuse_workspace_and_yield() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let members = 512usize;
+        let encoded = gzip(&[]).repeat(members);
+        let finished = Arc::new(AtomicBool::new(false));
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let observer_finished = finished.clone();
+        let observer_ticks = ticks.clone();
+        let observer = async move {
+            while !observer_finished.load(Ordering::Acquire) {
+                observer_ticks.fetch_add(1, Ordering::AcqRel);
+                tokio::task::yield_now().await;
+            }
+        };
+        let decode_finished = finished.clone();
+        let decode = async move {
+            let limit = encoded.len();
+            let (result, guard, pool) = invoke(encoded, Some("gzip"), limit, limit, 128).await;
+            assert_eq!(body_bytes(&result.unwrap()), b"");
+            drop(guard);
+            assert_eq!(pool.global_charge(), 0);
+            decode_finished.store(true, Ordering::Release);
+        };
+
+        tokio::join!(decode, observer);
+        assert!(ticks.load(Ordering::Acquire) >= members);
+    }
+
+    #[tokio::test]
+    async fn every_concatenated_zstd_frame_enforces_the_authored_window() {
+        let first = zstd(b"first");
+        let oversized = zstd_with_window(b"second", 20);
+        let encoded = [first, oversized].concat();
+        let decoded_limit = 64 * KIB;
+        let (result, guard, pool) = invoke(
+            encoded.clone(),
+            Some("zstd"),
+            encoded.len(),
+            decoded_limit,
+            128,
+        )
+        .await;
+
+        assert_eq!(
+            result.unwrap_err(),
+            HttpBodyReadError::DecoderWindowExceeded
+        );
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+    }
+
     #[tokio::test]
     async fn decoded_limit_is_enforced_for_every_compressed_codec() {
         let plain = b"decoded limit vector".repeat(512);
@@ -1662,6 +2034,7 @@ mod tests {
             let mut encoded = guard.buffer();
             encoded.try_extend_from_slice(&bytes).unwrap();
             let encoded = encoded.finish();
+            let peak_before_decode = pool.peak_global_charge();
             let result = match encoding {
                 ContentEncoding::Gzip => {
                     decode_gzip(
@@ -1710,6 +2083,7 @@ mod tests {
                 ContentEncoding::Identity => unreachable!(),
             };
             assert_eq!(result.unwrap_err(), HttpBodyReadError::TimedOut);
+            assert_eq!(pool.peak_global_charge(), peak_before_decode);
             drop(encoded);
             assert_eq!(guard.live_bytes(), 0);
             assert_eq!(pool.global_charge(), 0);
