@@ -1412,11 +1412,11 @@ async fn run_entry_coordinator_with_hooks<RawHook, SetupHook, CloseHook>(
     {
         Ok(control) => Some(control),
         Err(()) => {
-            shared.begin_closing(
-                UpgradeTerminalCause::SetupFailed,
-                Instant::now(),
-                cleanup_grace,
-            );
+            let cause = match lock(&shared.timing).stop_cause {
+                UpgradeTerminalCause::Shutdown => UpgradeTerminalCause::Shutdown,
+                _ => UpgradeTerminalCause::SetupFailed,
+            };
+            shared.begin_closing(cause, Instant::now(), cleanup_grace);
             return;
         }
     };
@@ -1941,8 +1941,8 @@ mod tests {
                             UpgradeEntryPlan::new(
                                 UpgradeTerminalControl::new(
                                     raw_teardown_with_guard((
-                                        DropSignal(Some(raw_dropped_tx)),
                                         DropCount(raw_drops),
+                                        DropSignal(Some(raw_dropped_tx)),
                                     )),
                                     |_| async {},
                                 ),
@@ -2039,7 +2039,7 @@ mod tests {
                         UpgradeEntryPlan::new(
                             UpgradeTerminalControl::new(
                                 counted_raw_teardown_with_guard(
-                                    (DropSignal(Some(raw_dropped_tx)), DropCount(raw_drops)),
+                                    (DropCount(raw_drops), DropSignal(Some(raw_dropped_tx))),
                                     raw_polls,
                                 ),
                                 |_| async {},
@@ -2230,57 +2230,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stopped_supervisor_rejects_setup_before_first_poll() {
+    async fn stopped_supervisor_preserves_shutdown_stamp_or_uses_setup_failure_fallback() {
         let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
         runtime.shutdown_and_wait(Some(Instant::now())).await;
-        let setup_polls = Arc::new(AtomicUsize::new(0));
-        let raw_polls = Arc::new(AtomicUsize::new(0));
-        let raw_drops = Arc::new(AtomicUsize::new(0));
-        let now = Instant::now();
-        let shared = Arc::new(EntryShared {
-            timing: Mutex::new(EntryTiming {
-                application_stop: now + Duration::from_secs(1),
-                cleanup_cutoff: now + Duration::from_secs(2),
-                stop_cause: UpgradeTerminalCause::LifetimeExpired,
-            }),
-            cleanup_grace: Duration::from_millis(100),
-            requested_cause: Mutex::new(None),
-            winning_cause: Mutex::new(None),
-            changed: Notify::new(),
-            terminal_state: AtomicU8::new(ENTRY_OPEN),
-            closed: Notify::new(),
-        });
+        for (shutdown_stamped, expected) in [
+            (true, UpgradeTerminalCause::Shutdown),
+            (false, UpgradeTerminalCause::SetupFailed),
+        ] {
+            let setup_polls = Arc::new(AtomicUsize::new(0));
+            let raw_polls = Arc::new(AtomicUsize::new(0));
+            let raw_drops = Arc::new(AtomicUsize::new(0));
+            let now = Instant::now();
+            let shared = Arc::new(EntryShared {
+                timing: Mutex::new(EntryTiming {
+                    application_stop: now + Duration::from_secs(1),
+                    cleanup_cutoff: now + Duration::from_secs(2),
+                    stop_cause: UpgradeTerminalCause::LifetimeExpired,
+                }),
+                cleanup_grace: Duration::from_millis(100),
+                requested_cause: Mutex::new(None),
+                winning_cause: Mutex::new(None),
+                changed: Notify::new(),
+                terminal_state: AtomicU8::new(ENTRY_OPEN),
+                closed: Notify::new(),
+            });
+            if shutdown_stamped {
+                shared.lower_for_shutdown(now);
+            }
 
-        run_entry_coordinator(
-            runtime.inner.clone(),
-            shared.clone(),
-            UpgradedStreamSnapshot::new(2, None),
-            UpgradeEntryPlan::new(
-                UpgradeTerminalControl::new(
-                    counted_raw_teardown_with_guard(
-                        DropCount(raw_drops.clone()),
-                        raw_polls.clone(),
+            run_entry_coordinator(
+                runtime.inner.clone(),
+                shared.clone(),
+                UpgradedStreamSnapshot::new(2, None),
+                UpgradeEntryPlan::new(
+                    UpgradeTerminalControl::new(
+                        counted_raw_teardown_with_guard(
+                            DropCount(raw_drops.clone()),
+                            raw_polls.clone(),
+                        ),
+                        |_| async {},
                     ),
-                    |_| async {},
+                    {
+                        let setup_polls = setup_polls.clone();
+                        move |_| async move {
+                            setup_polls.fetch_add(1, Ordering::SeqCst);
+                            Err(UpgradeTerminalCause::SetupFailed)
+                        }
+                    },
                 ),
-                {
-                    let setup_polls = setup_polls.clone();
-                    move |_| async move {
-                        setup_polls.fetch_add(1, Ordering::SeqCst);
-                        Err(UpgradeTerminalCause::SetupFailed)
-                    }
-                },
-            ),
-        )
-        .await;
+            )
+            .await;
 
-        assert_eq!(setup_polls.load(Ordering::SeqCst), 0);
-        assert_eq!(raw_polls.load(Ordering::SeqCst), 0);
-        assert_eq!(raw_drops.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            *lock(&shared.winning_cause),
-            Some(UpgradeTerminalCause::SetupFailed)
-        );
+            assert_eq!(setup_polls.load(Ordering::SeqCst), 0);
+            assert_eq!(raw_polls.load(Ordering::SeqCst), 0);
+            assert_eq!(raw_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(*lock(&shared.winning_cause), Some(expected));
+        }
         assert_eq!(runtime.counts().tracked_tasks, 0);
     }
 
