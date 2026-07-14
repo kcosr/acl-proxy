@@ -47,6 +47,7 @@ pub(crate) struct DeniedRequest<'generation> {
     pub(crate) rule: Option<PolicyRuleMatch<'generation>>,
     pub(crate) reason: DenyReason,
     pub(crate) body_provenance: TerminalRequestBodyProvenance,
+    body: Option<GuardedRequestBody>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,6 +138,14 @@ impl<'generation> AllowedRequest<'generation> {
     }
 }
 
+impl DeniedRequest<'_> {
+    /// Transfers an ingress-owned complete body to the observation path.
+    /// Provider replacement bytes are never retained by a denied request.
+    pub(crate) fn take_body_for_observation(&mut self) -> Option<GuardedRequestBody> {
+        self.body.take()
+    }
+}
+
 pub(crate) async fn decide_request<'generation>(
     lease: &'generation GenerationLease,
     input: RequestInput<'_>,
@@ -199,6 +208,7 @@ impl<'generation, 'request> PreparedRequest<'generation, 'request> {
             TerminalRequestBodyProvenance::Unconsumed
         };
         if let Some(reason) = self.early_deny {
+            let body = denied_observation_body(body, body_provenance);
             return Ok(RequestDecision::Deny(DeniedRequest {
                 common: DecidedRequest {
                     headers: self.headers,
@@ -207,6 +217,7 @@ impl<'generation, 'request> PreparedRequest<'generation, 'request> {
                 rule: None,
                 reason,
                 body_provenance,
+                body,
             }));
         }
         evaluate_to_terminal(
@@ -340,6 +351,7 @@ async fn evaluate_to_terminal<'generation>(
                     None => None,
                 };
                 if let Some(reason) = local_failure {
+                    let body = denied_observation_body(body, body_provenance);
                     return Ok(RequestDecision::Deny(DeniedRequest {
                         common: DecidedRequest {
                             headers,
@@ -348,6 +360,7 @@ async fn evaluate_to_terminal<'generation>(
                         rule: matched,
                         reason,
                         body_provenance,
+                        body,
                     }));
                 }
                 let (body, selected_provenance) = match select_terminal_body(
@@ -382,6 +395,7 @@ async fn evaluate_to_terminal<'generation>(
                             rule: matched,
                             reason: DenyReason::RedactionFailure,
                             body_provenance: provenance,
+                            body: None,
                         }));
                     }
                 };
@@ -397,6 +411,7 @@ async fn evaluate_to_terminal<'generation>(
                 })));
             }
             PolicyOutcome::Deny => {
+                let body = denied_observation_body(body, body_provenance);
                 return Ok(RequestDecision::Deny(DeniedRequest {
                     common: DecidedRequest {
                         headers,
@@ -405,6 +420,7 @@ async fn evaluate_to_terminal<'generation>(
                     rule: evaluation.matched,
                     reason: DenyReason::Policy,
                     body_provenance,
+                    body,
                 }));
             }
             PolicyOutcome::Delegate => {}
@@ -434,6 +450,7 @@ async fn evaluate_to_terminal<'generation>(
         if let Some(reason) =
             validate_local_body_limits(lease, &matched, Some(metadata), body.as_ref())?
         {
+            let body = denied_observation_body(body, body_provenance);
             return Ok(RequestDecision::Deny(DeniedRequest {
                 common: DecidedRequest {
                     headers,
@@ -442,6 +459,7 @@ async fn evaluate_to_terminal<'generation>(
                 rule: Some(matched),
                 reason,
                 body_provenance,
+                body,
             }));
         }
         let provider_header_values = provider_header_values(
@@ -489,6 +507,7 @@ async fn evaluate_to_terminal<'generation>(
         {
             Ok(decision) => decision,
             Err(_error) if failure_mode == CompiledProviderFailureMode::Deny => {
+                let body = denied_observation_body(body, body_provenance);
                 return Ok(RequestDecision::Deny(DeniedRequest {
                     common: DecidedRequest {
                         headers,
@@ -497,6 +516,7 @@ async fn evaluate_to_terminal<'generation>(
                     rule: Some(matched),
                     reason: DenyReason::ProviderFailure,
                     body_provenance,
+                    body,
                 }));
             }
             Err(error) => return Err(RequestDecisionError::Provider(error)),
@@ -529,6 +549,7 @@ async fn evaluate_to_terminal<'generation>(
                             rule: Some(matched),
                             reason: DenyReason::ProviderBodyLimit,
                             body_provenance: provenance,
+                            body: None,
                         }));
                     }
                     TerminalBody::RedactionDenied { provenance } => {
@@ -540,6 +561,7 @@ async fn evaluate_to_terminal<'generation>(
                             rule: Some(matched),
                             reason: DenyReason::RedactionFailure,
                             body_provenance: provenance,
+                            body: None,
                         }));
                     }
                 };
@@ -577,6 +599,7 @@ async fn evaluate_to_terminal<'generation>(
                             rule: Some(matched),
                             reason: DenyReason::RedactionFailure,
                             body_provenance: provenance,
+                            body: None,
                         }));
                     }
                 };
@@ -592,6 +615,7 @@ async fn evaluate_to_terminal<'generation>(
                 })));
             }
             AuthorizationDecision::Deny => {
+                let body = denied_observation_body(body, body_provenance);
                 return Ok(RequestDecision::Deny(DeniedRequest {
                     common: DecidedRequest {
                         headers,
@@ -600,6 +624,7 @@ async fn evaluate_to_terminal<'generation>(
                     rule: Some(matched),
                     reason: DenyReason::Provider,
                     body_provenance,
+                    body,
                 }));
             }
             AuthorizationDecision::Pass => {
@@ -612,6 +637,18 @@ async fn evaluate_to_terminal<'generation>(
                 );
             }
         }
+    }
+}
+
+fn denied_observation_body(
+    body: Option<GuardedRequestBody>,
+    provenance: TerminalRequestBodyProvenance,
+) -> Option<GuardedRequestBody> {
+    match provenance {
+        TerminalRequestBodyProvenance::CompleteOriginal
+        | TerminalRequestBodyProvenance::CompleteWireRedacted => body,
+        TerminalRequestBodyProvenance::Unconsumed
+        | TerminalRequestBodyProvenance::ProviderReplacement { .. } => None,
     }
 }
 
@@ -1274,7 +1311,7 @@ rules = [{{ literals = ["x"] }}]"#,
         let mut decoded = prepared.body_guard().buffer();
         decoded.try_extend_from_slice(b"xx").unwrap();
 
-        let RequestDecision::Deny(denied) = prepared
+        let RequestDecision::Deny(mut denied) = prepared
             .decide(Some(GuardedRequestBody {
                 content_type: Some("text/plain".into()),
                 content_encoding: Some("identity".into()),
@@ -1293,6 +1330,11 @@ rules = [{{ literals = ["x"] }}]"#,
         );
         assert_eq!(denied.rule.as_ref().unwrap().id(), "strict-profile");
         assert!(!marker.exists(), "provider dispatch must not begin");
+        let retained = denied.take_body_for_observation().unwrap();
+        assert_eq!(retained.decoded.len(), 2);
+        assert_eq!(retained.encoded_len, 2);
+        assert!(denied.take_body_for_observation().is_none());
+        drop(retained);
         drop(denied);
         assert_eq!(pool.global_charge(), 0);
 
@@ -1395,7 +1437,7 @@ max_decoded_request_body_bytes = 16"#,
         let mut decoded = prepared.body_guard().buffer();
         decoded.try_extend_from_slice(b"x").unwrap();
 
-        let RequestDecision::Deny(denied) = prepared
+        let RequestDecision::Deny(mut denied) = prepared
             .decide(Some(GuardedRequestBody {
                 content_type: Some("text/plain".into()),
                 content_encoding: Some("identity".into()),
@@ -1418,6 +1460,10 @@ max_decoded_request_body_bytes = 16"#,
             !denied_marker.exists(),
             "rejected provider must not dispatch"
         );
+        let retained = denied.take_body_for_observation().unwrap();
+        assert_eq!(retained.decoded.len(), 1);
+        assert_eq!(retained.encoded_len, 2);
+        drop(retained);
         drop(denied);
         assert_eq!(pool.global_charge(), 0);
 
@@ -1467,7 +1513,7 @@ rules = [{ literals = ["x"] }]"#,
         let mut decoded = prepared.body_guard().buffer();
         decoded.try_extend_from_slice(b"x").unwrap();
 
-        let RequestDecision::Deny(denied) = prepared
+        let RequestDecision::Deny(mut denied) = prepared
             .decide(Some(GuardedRequestBody {
                 content_type: Some("text/plain".into()),
                 content_encoding: Some("identity".into()),
@@ -1485,6 +1531,10 @@ rules = [{ literals = ["x"] }]"#,
             TerminalRequestBodyProvenance::CompleteOriginal
         );
         assert_eq!(denied.rule.as_ref().unwrap().id(), "strict-terminal");
+        let retained = denied.take_body_for_observation().unwrap();
+        assert_eq!(retained.decoded.len(), 1);
+        assert_eq!(retained.encoded_len, 2);
+        drop(retained);
         drop(denied);
         assert_eq!(pool.global_charge(), 0);
 
@@ -1672,7 +1722,7 @@ authorization_provider = "terminal""#;
                     );
                     assert!(allowed.common.body_guard.cursor_peak_bytes() > 0);
                 }
-                (RequestDecision::Deny(denied), false) => {
+                (RequestDecision::Deny(mut denied), false) => {
                     assert_eq!(denied.rule.as_ref().unwrap().id(), "terminal");
                     assert_eq!(denied.reason, DenyReason::Provider);
                     assert_eq!(
@@ -1680,6 +1730,8 @@ authorization_provider = "terminal""#;
                         TerminalRequestBodyProvenance::CompleteOriginal
                     );
                     assert!(denied.common.body_guard.cursor_peak_bytes() > 0);
+                    let retained = denied.take_body_for_observation().unwrap();
+                    assert_eq!(retained.decoded.len(), 0);
                 }
                 _ => panic!("unexpected terminal provider decision"),
             }
@@ -1721,7 +1773,7 @@ authorization_provider = "terminal""#;
         assert_eq!(pool.global_charge(), 0);
 
         let url = canonicalize_http_url("https://example.test/default-deny").unwrap();
-        let RequestDecision::Deny(default) =
+        let RequestDecision::Deny(mut default) =
             decide_request(&lease, input("default-deny", &url, HeaderMap::new()))
                 .await
                 .unwrap()
@@ -1734,7 +1786,95 @@ authorization_provider = "terminal""#;
             default.body_provenance,
             TerminalRequestBodyProvenance::CompleteOriginal
         );
+        let retained = default.take_body_for_observation().unwrap();
+        assert_eq!(retained.decoded.len(), 0);
+        drop(retained);
         drop(default);
+        assert_eq!(pool.global_charge(), 0);
+
+        drop(lease);
+        runtime.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_failure_denial_retains_complete_original_body() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("invalid-response.sh");
+        std::fs::write(
+            &provider,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  printf 'not-json\n'
+done
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&provider).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&provider, permissions).unwrap();
+
+        let initial = compile(&config(
+            r#"[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "provider-failure"
+decision = "delegate"
+methods = ["GET"]
+authorization_provider = "invalid""#,
+            &format!(
+                r#"[authorization.providers.invalid]
+kind = "process"
+command = "{}"
+timeout = "2s"
+retire_timeout = "6s"
+on_failure = "deny"
+include_request_body = true
+max_request_body_bytes = 128
+max_decoded_request_body_bytes = 128"#,
+                provider.display()
+            ),
+        ));
+        let (runtime, _source, _, pool) = runtime(initial).await;
+        let lease = runtime.lease().await.unwrap();
+        let url = canonicalize_http_url("https://example.test/provider-failure").unwrap();
+        let prepared =
+            prepare_request(&lease, input("provider-failure", &url, HeaderMap::new())).unwrap();
+        let mut decoded = prepared.body_guard().buffer();
+        decoded.try_extend_from_slice(b"failure-body").unwrap();
+
+        let RequestDecision::Deny(mut denied) = prepared
+            .decide(Some(GuardedRequestBody {
+                content_type: Some("text/plain".into()),
+                content_encoding: None,
+                encoded_len: b"failure-body".len(),
+                decoded: decoded.finish(),
+            }))
+            .await
+            .unwrap()
+        else {
+            panic!("the configured provider failure mode must deny");
+        };
+        assert_eq!(denied.reason, DenyReason::ProviderFailure);
+        assert_eq!(
+            denied.body_provenance,
+            TerminalRequestBodyProvenance::CompleteOriginal
+        );
+        let retained = denied.take_body_for_observation().unwrap();
+        assert_eq!(
+            retained
+                .decoded
+                .segments()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
+            b"failure-body"
+        );
+        drop(retained);
+        drop(denied);
         assert_eq!(pool.global_charge(), 0);
 
         drop(lease);
@@ -1867,7 +2007,7 @@ authorization_provider = "replacing"
                 );
                 drop(allowed);
             } else {
-                let RequestDecision::Deny(denied) = decision else {
+                let RequestDecision::Deny(mut denied) = decision else {
                     panic!("replacement redaction limit failure must deny");
                 };
                 assert_eq!(denied.reason, DenyReason::RedactionFailure);
@@ -1883,6 +2023,7 @@ authorization_provider = "replacing"
                     .headers
                     .get(http::header::AUTHORIZATION)
                     .is_none());
+                assert!(denied.take_body_for_observation().is_none());
                 drop(denied);
             }
             assert_eq!(pool.global_charge(), 0);
@@ -1950,7 +2091,7 @@ redaction_profile = "wire""#;
             let decision = decide_request(&lease, input("replacement", &url, HeaderMap::new()))
                 .await
                 .expect("a replacement limit is a terminal denial, not a provider failure");
-            let RequestDecision::Deny(denied) = decision else {
+            let RequestDecision::Deny(mut denied) = decision else {
                 panic!("the over-limit replacement must deny");
             };
             assert_eq!(denied.reason, expected_reason);
@@ -1961,6 +2102,7 @@ redaction_profile = "wire""#;
                 }
             );
             assert_eq!(denied.rule.as_ref().unwrap().id(), "replace");
+            assert!(denied.take_body_for_observation().is_none());
             drop(denied);
             assert_eq!(pool.global_charge(), 0);
 

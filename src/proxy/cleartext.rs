@@ -30,6 +30,7 @@ use crate::config::compiler::{
     CompiledHttp1ConnectPolicy, CompiledHttpVersion, HttpBodyReadPlan, StaticCleartextListener,
 };
 use crate::http_body::{read_mandatory_request_body, HttpBodyReadError};
+use crate::observation::ProductObservationRuntime;
 use crate::policy::apply_header_effects;
 use crate::proxy::authority::{
     reconcile_explicit_request, reconcile_transparent_http_request, AuthorityError,
@@ -51,11 +52,18 @@ use crate::safety::{InvalidLoopMarker, WireBodyQuotaKey};
 /// HTTPS variants are deliberately left for their dedicated executors.
 pub(crate) struct ProductProxySupervisorStarter {
     runtime: Arc<Runtime>,
+    observation_runtime: Arc<ProductObservationRuntime>,
 }
 
 impl ProductProxySupervisorStarter {
-    pub(crate) fn new(runtime: Arc<Runtime>) -> Self {
-        Self { runtime }
+    pub(crate) fn new(
+        runtime: Arc<Runtime>,
+        observation_runtime: Arc<ProductObservationRuntime>,
+    ) -> Self {
+        Self {
+            runtime,
+            observation_runtime,
+        }
     }
 }
 
@@ -74,6 +82,7 @@ impl ProxySupervisorStarter for ProductProxySupervisorStarter {
                 ensure_cleartext_connect_supported(kind, *config)?,
                 listener.listener,
                 self.runtime.clone(),
+                self.observation_runtime.clone(),
                 assets.clone(),
                 failure_observer,
             )
@@ -84,6 +93,7 @@ impl ProxySupervisorStarter for ProductProxySupervisorStarter {
                 *config,
                 listener.listener,
                 self.runtime.clone(),
+                self.observation_runtime.clone(),
                 assets.clone(),
                 failure_observer,
             )
@@ -153,6 +163,7 @@ impl CleartextProxySupervisor {
         config: StaticCleartextListener,
         listener: std::net::TcpListener,
         runtime: Arc<Runtime>,
+        observation_runtime: Arc<ProductObservationRuntime>,
         assets: Arc<ProductIngressAssets>,
         failure_observer: Arc<dyn ProxySupervisorFailureObserver>,
     ) -> Result<Arc<Self>, ProxySupervisorStartError> {
@@ -180,6 +191,7 @@ impl CleartextProxySupervisor {
             config,
             listener,
             runtime,
+            observation_runtime,
             assets,
             quota_classifier,
             stop_rx,
@@ -285,6 +297,7 @@ async fn run_listener(
     config: StaticCleartextListener,
     listener: TcpListener,
     runtime: Arc<Runtime>,
+    observation_runtime: Arc<ProductObservationRuntime>,
     assets: Arc<ProductIngressAssets>,
     quota_classifier: LocalQuotaClassifier,
     mut stop: watch::Receiver<SupervisorStop>,
@@ -383,6 +396,7 @@ async fn run_listener(
         };
         let quota_key = quota_classifier.classify(peer.ip());
         let runtime = runtime.clone();
+        let observation_runtime = observation_runtime.clone();
         let assets = assets.clone();
         let versions = config.http_versions.clone();
         let request_header_timeout = config.request_header_timeout;
@@ -399,6 +413,7 @@ async fn run_listener(
                 peer,
                 quota_key,
                 runtime,
+                observation_runtime,
                 assets,
                 connection_stop,
                 permit,
@@ -543,6 +558,7 @@ async fn serve_connection(
     peer: SocketAddr,
     quota_key: WireBodyQuotaKey,
     runtime: Arc<Runtime>,
+    observation_runtime: Arc<ProductObservationRuntime>,
     assets: Arc<ProductIngressAssets>,
     mut supervisor_stop: watch::Receiver<SupervisorStop>,
     _admission: OwnedSemaphorePermit,
@@ -551,12 +567,22 @@ async fn serve_connection(
     let service_close = close.clone();
     let service = service_fn(move |request| {
         let runtime = runtime.clone();
+        let observation_runtime = observation_runtime.clone();
         let assets = assets.clone();
         let close = service_close.clone();
         let quota_key = quota_key.clone();
         async move {
             let close_entire_connection = request.version() != http::Version::HTTP_2;
-            let handled = execute_request(mode, peer, quota_key, runtime, assets, request).await;
+            let handled = execute_request(
+                mode,
+                peer,
+                quota_key,
+                runtime,
+                observation_runtime,
+                assets,
+                request,
+            )
+            .await;
             let mut handled = handled;
             if handled.close_connection && close_entire_connection {
                 handled
@@ -664,6 +690,7 @@ async fn execute_request(
     peer: SocketAddr,
     quota_key: WireBodyQuotaKey,
     runtime: Arc<Runtime>,
+    _observation_runtime: Arc<ProductObservationRuntime>,
     assets: Arc<ProductIngressAssets>,
     mut request: Request<Body>,
 ) -> HandledResponse {
@@ -1180,7 +1207,10 @@ mod tests {
             .await
             .unwrap();
         product.activate_initial().await.unwrap();
-        let mut starter = ProductProxySupervisorStarter::new(product.runtime().clone());
+        let mut starter = ProductProxySupervisorStarter::new(
+            product.runtime().clone(),
+            product.observation_runtime().clone(),
+        );
         product.start_proxy_supervisors(&mut starter).await.unwrap();
         (directory, product)
     }
@@ -1824,7 +1854,10 @@ default = "deny"
             .await
             .unwrap();
         product.activate_initial().await.unwrap();
-        let mut starter = ProductProxySupervisorStarter::new(product.runtime().clone());
+        let mut starter = ProductProxySupervisorStarter::new(
+            product.runtime().clone(),
+            product.observation_runtime().clone(),
+        );
         let error = product
             .start_proxy_supervisors(&mut starter)
             .await

@@ -26,8 +26,10 @@ use crate::observation::{
 use crate::redaction::{PayloadClass, SnapshotError as RedactionSnapshotError};
 use crate::sensitive::{is_sensitive_header_name, redact_url_for_sink, REDACTED};
 
+mod tap;
 mod worker;
 
+pub(crate) use tap::HttpCaptureTap;
 pub(crate) use worker::CaptureWorkerStartError;
 use worker::{BoundedCaptureWorker, CaptureSubmitError as WorkerSubmitError};
 

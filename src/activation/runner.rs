@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::config::{CompiledConfig, LoadedCompiledConfig};
+use crate::observation::ProductObservationRuntime;
 use crate::runtime::{GenerationId, Runtime, RuntimeError, StaticOwnership, StaticResources};
 
 use super::listeners::{
@@ -19,6 +20,7 @@ use super::static_resources::{ProductStaticResources, ProductStaticResourcesErro
 pub(crate) struct ProductRuntime {
     runtime: Arc<Runtime>,
     static_resources: Arc<ProductStaticResources>,
+    observation_runtime: Arc<ProductObservationRuntime>,
     initial: Mutex<Option<CompiledConfig>>,
 }
 
@@ -65,6 +67,7 @@ impl ProductRuntime {
     ) -> Result<Arc<Self>, ProductRuntimeError> {
         let LoadedCompiledConfig { metadata, compiled } = loaded;
         let static_resources = ProductStaticResources::try_new(&compiled.static_config)?;
+        let observation_runtime = static_resources.observation_runtime();
 
         #[cfg(test)]
         let prepared = match prebound {
@@ -90,12 +93,17 @@ impl ProductRuntime {
         Ok(Arc::new(Self {
             runtime,
             static_resources,
+            observation_runtime,
             initial: Mutex::new(Some(compiled)),
         }))
     }
 
     pub(crate) fn runtime(&self) -> &Arc<Runtime> {
         &self.runtime
+    }
+
+    pub(crate) fn observation_runtime(&self) -> &Arc<ProductObservationRuntime> {
+        &self.observation_runtime
     }
 
     /// Transfers the atomically prepared proxy socket bundle to the future
