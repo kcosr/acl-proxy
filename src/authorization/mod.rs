@@ -3,6 +3,7 @@ pub(crate) mod process;
 pub(crate) mod process_response;
 pub(crate) mod protocol;
 mod snapshot;
+pub(crate) mod webhook;
 
 #[allow(unused_imports)]
 pub(crate) use snapshot::{
