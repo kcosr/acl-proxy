@@ -212,24 +212,20 @@ mod tests {
         CompiledHttp1ConnectPolicy, CompiledHttpVersion, CompiledTlsIdentity, StaticConnectPolicy,
     };
 
-    fn available_addresses<const N: usize>() -> [SocketAddr; N] {
-        let listeners: Vec<_> = (0..N)
+    fn prebound_listeners<const N: usize>() -> [TcpListener; N] {
+        (0..N)
             .map(|_| TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap())
-            .collect();
-        let addresses = listeners
-            .iter()
-            .map(|listener| listener.local_addr().unwrap())
             .collect::<Vec<_>>()
             .try_into()
             .ok()
-            .unwrap();
-        drop(listeners);
-        addresses
+            .unwrap()
     }
 
     #[test]
     fn prepared_entries_retain_each_exact_compiled_listener_config() {
-        let addresses = available_addresses::<4>();
+        let listeners = prebound_listeners::<4>();
+        let addresses: [SocketAddr; 4] =
+            std::array::from_fn(|index| listeners[index].local_addr().unwrap());
         let cleartext_connect = StaticConnectPolicy {
             http1: Some(CompiledHttp1ConnectPolicy::Deny),
             http2_denied: true,
@@ -268,9 +264,12 @@ mod tests {
             }),
         };
 
-        let entries = PreparedProxyListeners::bind(&config, TcpListener::bind)
-            .unwrap()
-            .into_entries();
+        let mut listeners = listeners.into_iter();
+        let entries = PreparedProxyListeners::bind(&config, |_| {
+            Ok(listeners.next().expect("one prebound listener per config"))
+        })
+        .unwrap()
+        .into_entries();
         assert_eq!(entries.len(), 4);
         for (index, entry) in entries.iter().enumerate() {
             assert_eq!(
