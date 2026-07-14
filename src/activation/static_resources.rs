@@ -16,6 +16,7 @@ use crate::control::server::{
 use crate::observation::ProductObservationRuntime;
 use crate::runtime::{BoxFuture, ServiceReadiness, StaticResourceBrand, StaticResources};
 use crate::safety::WireBodyPool;
+use crate::upgrade::{UpgradeRuntime, UpgradeRuntimeError, UpgradeRuntimeLimits};
 
 use super::assets::{ProductIngressAssets, ProductIngressAssetsError};
 use super::listeners::{
@@ -41,12 +42,14 @@ pub(crate) struct ProductStaticResources {
     proxy_shutdown_error: Mutex<Option<Arc<ProxySupervisorFailure>>>,
     proxy_supervisors: Mutex<Vec<Arc<dyn ProxySupervisor>>>,
     proxy_shutdown: tokio::sync::OnceCell<()>,
+    upgrade_shutdown: tokio::sync::OnceCell<()>,
     ingress_assets: Arc<ProductIngressAssets>,
     ingress: Mutex<IngressOwnership>,
     control: Mutex<ControlOwnership>,
     wire_body_pool: Arc<WireBodyPool>,
     observation_runtime: Arc<ProductObservationRuntime>,
     authorization_runtime: Arc<WebhookAuthorizationRuntime>,
+    upgrade_runtime: Arc<UpgradeRuntime>,
 }
 
 struct IngressOwnership {
@@ -91,6 +94,12 @@ impl ProductStaticResources {
             static_config,
             ingress_assets.destination_guard().clone(),
         )?;
+        let upgrade_runtime = UpgradeRuntime::try_new(UpgradeRuntimeLimits::new(
+            static_config.service.max_active_upgrades,
+            static_config.service.max_upgrade_buffer_bytes,
+            static_config.service.upgrade_relay_buffer_bytes,
+            static_config.service.max_upgrade_lifetime,
+        ))?;
         Ok(Arc::new(Self {
             readiness: Arc::new(ServiceReadiness::new()),
             brand: StaticResourceBrand::new(),
@@ -104,6 +113,7 @@ impl ProductStaticResources {
             proxy_shutdown_error: Mutex::new(None),
             proxy_supervisors: Mutex::new(Vec::new()),
             proxy_shutdown: tokio::sync::OnceCell::new(),
+            upgrade_shutdown: tokio::sync::OnceCell::new(),
             ingress_assets,
             ingress: Mutex::new(IngressOwnership {
                 config: static_config.listeners.clone(),
@@ -121,6 +131,7 @@ impl ProductStaticResources {
             ),
             observation_runtime: Arc::new(ProductObservationRuntime::new()),
             authorization_runtime,
+            upgrade_runtime,
         }))
     }
 
@@ -142,6 +153,10 @@ impl ProductStaticResources {
 
     pub(crate) fn authorization_runtime(&self) -> Arc<WebhookAuthorizationRuntime> {
         self.authorization_runtime.clone()
+    }
+
+    pub(crate) fn upgrade_runtime(&self) -> Arc<UpgradeRuntime> {
+        self.upgrade_runtime.clone()
     }
 
     pub(crate) fn ingress_assets(&self) -> &Arc<ProductIngressAssets> {
@@ -540,6 +555,7 @@ impl StaticResources for ProductStaticResources {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = deadline;
         self.authorization_runtime.begin_shutdown(deadline);
+        self.upgrade_runtime.begin_shutdown(deadline);
     }
 
     fn shutdown(&self) -> BoxFuture<'_, ()> {
@@ -590,6 +606,9 @@ impl StaticResources for ProductStaticResources {
                 }
             }
             self.authorization_runtime.wait_until_drained().await;
+            self.upgrade_shutdown
+                .get_or_init(|| self.upgrade_runtime.shutdown_and_wait(deadline))
+                .await;
             self.proxy_shutdown
                 .get_or_init(|| self.shutdown_proxy_supervisors())
                 .await;
@@ -605,6 +624,8 @@ pub(crate) enum ProductStaticResourcesError {
     StaticFingerprint(#[from] StaticFingerprintError),
     #[error("static authorization runtime construction failed")]
     Authorization(#[from] WebhookAuthorizationRuntimeError),
+    #[error("static upgrade runtime construction failed")]
+    Upgrade(#[from] UpgradeRuntimeError),
     #[error("control server construction failed")]
     Control(#[from] ControlServerError),
     #[error(transparent)]
@@ -629,12 +650,25 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
 
+    use tokio::sync::oneshot;
+
     use super::*;
     use crate::config::compiler::{
         CompiledTlsIdentity, StaticCleartextListener, StaticExplicitHttpsListener,
         StaticMitmConfig, StaticTransparentHttpsListener,
     };
     use crate::config::{compile_config_text, ConfigTextInput};
+    use crate::upgrade::UpgradeAllocation;
+
+    struct DropSignal(Option<oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(signal) = self.0.take() {
+                let _ = signal.send(());
+            }
+        }
+    }
 
     fn available_addresses<const N: usize>() -> [SocketAddr; N] {
         let listeners: Vec<_> = (0..N)
@@ -857,5 +891,48 @@ header = "x-acl-proxy-request-id"
 
         assert_bindable(addresses);
         drop(resources);
+    }
+
+    #[tokio::test]
+    async fn static_owner_closes_and_joins_runtime_owned_upgrade_tasks() {
+        let addresses = available_addresses::<5>();
+        let directory = tempfile::tempdir().unwrap();
+        let resources =
+            ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
+        let runtime = resources.upgrade_runtime();
+        let counts = runtime.counts();
+        assert_eq!(counts.maximum_slots, 256);
+        assert_eq!(counts.maximum_bytes, 2_147_483_648);
+
+        let (started_tx, started_rx) = oneshot::channel();
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        runtime
+            .try_spawn_handshake(
+                UpgradeAllocation::from_compiled_rule(0, Some(0)).unwrap(),
+                move |_| async move {
+                    let _drop = DropSignal(Some(dropped_tx));
+                    let _ = started_tx.send(());
+                    std::future::pending::<()>().await;
+                },
+            )
+            .unwrap();
+        started_rx.await.unwrap();
+
+        StaticResources::begin_shutdown(resources.as_ref());
+        assert!(!runtime.counts().accepting);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            StaticResources::shutdown(resources.as_ref()),
+        )
+        .await
+        .expect("static shutdown did not join the upgrade task");
+        dropped_rx.await.unwrap();
+
+        let counts = runtime.counts();
+        assert_eq!(counts.reserved_slots, 0);
+        assert_eq!(counts.reserved_bytes, 0);
+        assert_eq!(counts.uncommitted, 0);
+        assert_eq!(counts.committed, 0);
+        assert_eq!(counts.tracked_tasks, 0);
     }
 }
