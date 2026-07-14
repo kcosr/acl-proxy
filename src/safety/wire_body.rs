@@ -1,5 +1,8 @@
 use allocator_api2::boxed::Box as FallibleBox;
+use bytes::Buf;
+use hyper::body::{HttpBody, SizeHint};
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::net::IpAddr;
@@ -658,6 +661,123 @@ pub(crate) struct GuardedBody {
     charged_bytes: usize,
 }
 
+/// One-shot Hyper body that keeps decoded bytes in their request guard until
+/// the transport consumes them.
+pub(crate) struct GuardedHttpBody {
+    data: Option<GuardedBodyData>,
+}
+
+pub(crate) struct GuardedBodyData {
+    body: GuardedBody,
+    head_offset: usize,
+}
+
+impl GuardedHttpBody {
+    pub(crate) fn new(body: GuardedBody) -> Self {
+        Self {
+            data: Some(GuardedBodyData {
+                body,
+                head_offset: 0,
+            }),
+        }
+    }
+}
+
+impl fmt::Debug for GuardedHttpBody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuardedHttpBody")
+            .field(
+                "remaining",
+                &self.data.as_ref().map(Buf::remaining).unwrap_or(0),
+            )
+            .finish()
+    }
+}
+
+impl fmt::Debug for GuardedBodyData {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GuardedBodyData")
+            .field("remaining", &self.remaining())
+            .field("charged_bytes", &self.body.charged_bytes)
+            .finish()
+    }
+}
+
+impl Buf for GuardedBodyData {
+    fn remaining(&self) -> usize {
+        self.body.len
+    }
+
+    fn chunk(&self) -> &[u8] {
+        self.body
+            .head
+            .as_deref()
+            .map(|head| &head.initialized()[self.head_offset..])
+            .unwrap_or_default()
+    }
+
+    fn advance(&mut self, mut count: usize) {
+        assert!(count <= self.remaining(), "guarded body advance overflow");
+        while count != 0 {
+            let available = self
+                .body
+                .head
+                .as_deref()
+                .map(|head| head.initialized - self.head_offset)
+                .expect("a nonempty guarded body has a head chunk");
+            if count < available {
+                let head = self.body.head.as_deref_mut().expect("head exists");
+                head.bytes[self.head_offset..self.head_offset + count].zeroize();
+                self.head_offset += count;
+                self.body.len -= count;
+                return;
+            }
+
+            count -= available;
+            self.head_offset = 0;
+            let mut consumed = self.body.head.take().expect("head exists");
+            self.body.head = consumed.next.take();
+            self.body.len -= available;
+            let allocation = secret_chunk_allocation_bytes();
+            self.body.charged_bytes -= allocation;
+            self.body.guard.release(allocation);
+            drop(consumed);
+        }
+    }
+}
+
+impl HttpBody for GuardedHttpBody {
+    type Data = GuardedBodyData;
+    type Error = Infallible;
+
+    fn poll_data(
+        mut self: std::pin::Pin<&mut Self>,
+        _context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Self::Data, Self::Error>>> {
+        match self.data.take() {
+            Some(data) if data.has_remaining() => std::task::Poll::Ready(Some(Ok(data))),
+            Some(_) | None => std::task::Poll::Ready(None),
+        }
+    }
+
+    fn poll_trailers(
+        self: std::pin::Pin<&mut Self>,
+        _context: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Option<http::HeaderMap>, Self::Error>> {
+        std::task::Poll::Ready(Ok(None))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.data.as_ref().is_none_or(|data| !data.has_remaining())
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        SizeHint::with_exact(self.data.as_ref().map(Buf::remaining).unwrap_or(0) as u64)
+    }
+}
+
 impl GuardedBody {
     pub(crate) fn segments(&self) -> GuardedBodySegments<'_> {
         GuardedBodySegments {
@@ -718,9 +838,7 @@ struct PendingCharge {
 fn allocate_secret_chunk(
     guard: &Arc<GuardInner>,
 ) -> Result<(FallibleBox<SecretChunk>, usize), WireBodyBufferError> {
-    let allocation_bytes = MAX_BUFFER_GROWTH_BYTES
-        .checked_add(std::mem::size_of::<SecretChunk>())
-        .ok_or(WireBodyBufferError::CursorPeakExceeded)?;
+    let allocation_bytes = secret_chunk_allocation_bytes();
     guard.try_charge(allocation_bytes)?;
     let mut charge = PendingCharge {
         guard: guard.clone(),
@@ -744,6 +862,10 @@ fn allocate_secret_chunk(
     })
     .map_err(|_| WireBodyBufferError::AllocationFailed)?;
     Ok((chunk, charge.commit()))
+}
+
+fn secret_chunk_allocation_bytes() -> usize {
+    MAX_BUFFER_GROWTH_BYTES + std::mem::size_of::<SecretChunk>()
 }
 
 impl PendingCharge {
@@ -1181,5 +1303,73 @@ mod linked_tests {
         assert_eq!(guard.live_bytes(), 0);
         assert_eq!(pool.global_charge(), 0);
         assert_eq!(pool.quota_charge(&quota_key), 0);
+    }
+
+    #[tokio::test]
+    async fn guarded_http_body_releases_consumed_chunks_without_copying() {
+        let two = allocation(2);
+        let quota_key = key();
+        let pool = WireBodyPool::new(two, two);
+        let guard = pool.begin(two, quota_key.clone());
+        let mut builder = guard.buffer();
+        builder
+            .try_extend_from_slice(&vec![0xa5; MAX_BUFFER_GROWTH_BYTES])
+            .unwrap();
+        builder.try_extend_from_slice(b"tail").unwrap();
+
+        let mut body = GuardedHttpBody::new(builder.finish());
+        assert_eq!(
+            body.size_hint().exact(),
+            Some((MAX_BUFFER_GROWTH_BYTES + 4) as u64)
+        );
+        assert_eq!(guard.live_bytes(), two);
+        assert_eq!(pool.quota_charge(&quota_key), two);
+
+        let mut data = body.data().await.unwrap().unwrap();
+        assert!(body.is_end_stream());
+        assert_eq!(data.chunk(), vec![0xa5; MAX_BUFFER_GROWTH_BYTES]);
+
+        data.advance(17);
+        assert_eq!(data.remaining(), MAX_BUFFER_GROWTH_BYTES + 4 - 17);
+        let head = data.body.head.as_deref().unwrap();
+        assert!(head.bytes[..17].iter().all(|byte| *byte == 0));
+        assert_eq!(guard.live_bytes(), two);
+
+        data.advance(MAX_BUFFER_GROWTH_BYTES - 17);
+        assert_eq!(data.chunk(), b"tail");
+        assert_eq!(guard.live_bytes(), allocation(1));
+        assert_eq!(pool.global_charge(), allocation(1));
+        assert_eq!(pool.quota_charge(&quota_key), allocation(1));
+
+        data.advance(4);
+        assert!(!data.has_remaining());
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+        assert_eq!(pool.quota_charge(&quota_key), 0);
+        assert!(body.data().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn guarded_http_body_cancellation_releases_all_charges() {
+        let one = allocation(1);
+        let quota_key = key();
+        let pool = WireBodyPool::new(one, one);
+        let guard = pool.begin(one, quota_key.clone());
+        let mut builder = guard.buffer();
+        builder.try_extend_from_slice(b"never forwarded").unwrap();
+
+        let body = GuardedHttpBody::new(builder.finish());
+        assert_eq!(guard.live_bytes(), one);
+        assert!(!format!("{body:?}").contains("never forwarded"));
+        drop(body);
+
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+        assert_eq!(pool.quota_charge(&quota_key), 0);
+
+        let mut empty = GuardedHttpBody::new(guard.buffer().finish());
+        assert!(empty.is_end_stream());
+        assert!(empty.data().await.is_none());
+        assert_eq!(empty.size_hint().exact(), Some(0));
     }
 }
