@@ -2597,7 +2597,7 @@ mod tests {
 
     use super::*;
     use crate::activation::runner::ProductRuntime;
-    use crate::config::load_and_compile_exact_config;
+    use crate::config::{compile_config_text, load_and_compile_exact_config, ConfigTextInput};
     use crate::destination::{
         DestinationFacts, DestinationGuard, DestinationResolveError, DestinationResolver,
         LocalAddressSnapshot, LocalAddressSource, ResolveFuture,
@@ -7982,6 +7982,419 @@ allow_upgrades = true
         client.read_exact(&mut body).await.unwrap();
         assert_eq!(&body, b"upgrade");
 
+        origin_task.await.unwrap();
+        product.shutdown().await;
+    }
+
+    fn bounded_response_wire_config(
+        proxy: SocketAddr,
+        origin: SocketAddr,
+        downstream_http2: bool,
+    ) -> String {
+        let connect_protocol = if downstream_http2 {
+            "http2 = \"deny\""
+        } else {
+            "http1 = \"deny\""
+        };
+        let policy = format!(
+            r#"[service.forwarding]
+connect_timeout = "1s"
+response_head_timeout = "1s"
+body_idle_timeout = "1s"
+upgrade_idle_timeout = "1s"
+max_request_wire_bytes = 64
+max_request_decoded_bytes = 64
+max_response_wire_bytes = 5
+max_response_decoded_bytes = 8
+chunk_bytes = 2
+preserve_request_trailers = true
+max_trailer_count = 4
+max_trailer_bytes = 32
+
+[listeners.explicit_http.connect]
+{connect_protocol}
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "bounded-response"
+decision = "allow"
+methods = ["GET"]
+urls = ["http://{origin}/**"]
+"#
+        );
+        let config = base_config(proxy, "explicit_http", &policy);
+        if downstream_http2 {
+            config.replacen(
+                "http_versions = [\"http1\"]",
+                "http_versions = [\"http2\"]",
+                1,
+            )
+        } else {
+            config
+        }
+    }
+
+    async fn serve_bounded_response_origin(listener: tokio::net::TcpListener, requests: usize) {
+        for _ in 0..requests {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_head(&mut stream).await;
+            let response = if request
+                .windows(b"/oversized".len())
+                .any(|window| window == b"/oversized")
+            {
+                b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nabcdef"
+                    .as_slice()
+            } else {
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".as_slice()
+            };
+            stream.write_all(response).await.unwrap();
+            stream.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn h1_response_wire_limit_closes_before_committing_a_partial_response() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(serve_bounded_response_origin(origin_listener, 1));
+        let (_directory, product) = product(
+            bounded_response_wire_config(proxy, origin, false),
+            listeners,
+        )
+        .await;
+
+        let response = send_raw_http(
+            proxy,
+            format!(
+                "GET http://{origin}/oversized HTTP/1.1\r\nHost: {origin}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(
+            response.is_empty(),
+            "over-limit response committed partial HTTP/1 bytes: {response:?}"
+        );
+
+        origin_task.await.unwrap();
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn h2_response_wire_limit_resets_only_the_failed_stream() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(serve_bounded_response_origin(origin_listener, 2));
+        let (_directory, product) =
+            product(bounded_response_wire_config(proxy, origin, true), listeners).await;
+        let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let mut builder = conn::Builder::new();
+        builder.http2_only(true);
+        let (mut sender, connection) = builder.handshake(stream).await.unwrap();
+        let driver = tokio::spawn(connection);
+
+        let oversized = sender
+            .send_request(
+                Request::builder()
+                    .uri(format!("http://{origin}/oversized"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert!(
+            oversized.is_err(),
+            "over-limit HTTP/2 response committed a response head"
+        );
+
+        let sibling = sender
+            .send_request(
+                Request::builder()
+                    .uri(format!("http://{origin}/sibling"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sibling.status(), StatusCode::OK);
+        assert_eq!(to_bytes(sibling.into_body()).await.unwrap(), "ok");
+
+        drop(sender);
+        product.shutdown().await;
+        driver.await.unwrap().unwrap();
+        origin_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ordinary_response_admission_saturates_before_origin_connect_and_releases() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let (first_head_tx, first_head_rx) = oneshot::channel();
+        let (check_tx, check_rx) = oneshot::channel();
+        let (checked_tx, checked_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let origin_task = tokio::spawn(async move {
+            let (mut first, _) = origin_listener.accept().await.unwrap();
+            let request = read_http_head(&mut first).await;
+            assert!(String::from_utf8_lossy(&request).contains("/first"));
+            first
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n")
+                .await
+                .unwrap();
+            first_head_tx.send(()).unwrap();
+
+            check_rx.await.unwrap();
+            let escaped =
+                tokio::time::timeout(Duration::from_millis(250), origin_listener.accept()).await;
+            assert!(
+                escaped.is_err(),
+                "response-admission saturation opened a second origin connection"
+            );
+            checked_tx.send(()).unwrap();
+
+            release_rx.await.unwrap();
+            first.write_all(b"a").await.unwrap();
+            drop(first);
+
+            let (mut third, _) =
+                tokio::time::timeout(Duration::from_secs(2), origin_listener.accept())
+                    .await
+                    .expect("released response admission did not permit another origin connection")
+                    .unwrap();
+            let request = read_http_head(&mut third).await;
+            assert!(String::from_utf8_lossy(&request).contains("/third"));
+            third
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nb")
+                .await
+                .unwrap();
+        });
+        let policy = format!(
+            r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "bounded-response"
+decision = "allow"
+methods = ["GET"]
+urls = ["http://{origin}/**"]
+"#
+        );
+        let forwarding = r#"
+[service.forwarding]
+max_request_wire_bytes = 1024
+max_request_decoded_bytes = 1024
+max_response_wire_bytes = 1024
+max_response_decoded_bytes = 1024
+chunk_bytes = 1024
+preserve_request_trailers = false
+max_trailer_count = 4
+max_trailer_bytes = 256
+"#;
+        let sizing_config = base_config(proxy, "explicit_http", &policy).replacen(
+            "\n[listeners.explicit_http]",
+            &format!("{forwarding}\n[listeners.explicit_http]"),
+            1,
+        );
+        let sizing_root = tempdir().unwrap();
+        let source_path = sizing_root.path().join("sizing.toml");
+        let compiled = compile_config_text(ConfigTextInput {
+            text: &sizing_config,
+            source_path: &source_path,
+            config_root: sizing_root.path(),
+        })
+        .unwrap_or_else(|error| panic!("response-admission sizing failed: {error}"));
+        let resources = &compiled.reloadable_plan.resource_plan;
+        let response_peak = resources.forward_response_peak_bytes;
+        let exchange_peak = resources.max_reachable_http_exchange_peak_bytes;
+        assert!(response_peak > 0);
+        assert!(exchange_peak >= response_peak);
+        let global_peak = exchange_peak.checked_mul(4).unwrap();
+        let config = sizing_config.replacen(
+            "shutdown_drain_timeout = \"1s\"",
+            &format!(
+                "shutdown_drain_timeout = \"1s\"\nmax_inflight_wire_body_bytes = {global_peak}\nmax_inflight_wire_body_bytes_per_quota_key = {exchange_peak}\nmin_wire_body_concurrency = 1"
+            ),
+            1,
+        );
+        let (_directory, product) = product(config, listeners).await;
+        let pool = product.wire_body_pool();
+
+        let mut first = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        first
+            .write_all(
+                format!(
+                    "GET http://{origin}/first HTTP/1.1\r\nHost: {origin}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let first_response = read_http_head(&mut first).await;
+        assert!(first_response.starts_with(b"HTTP/1.1 200"));
+        first_head_rx.await.unwrap();
+        assert!(
+            pool.global_charge() >= response_peak,
+            "the pending first response did not retain its admission reservation"
+        );
+
+        check_tx.send(()).unwrap();
+        let second_response = send_raw_http(
+            proxy,
+            format!(
+                "GET http://{origin}/second HTTP/1.1\r\nHost: {origin}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(
+            second_response.starts_with(b"HTTP/1.1 503"),
+            "unexpected saturated response: {}",
+            String::from_utf8_lossy(&second_response)
+        );
+        checked_rx.await.unwrap();
+
+        release_tx.send(()).unwrap();
+        let mut first_body = [0_u8; 1];
+        first.read_exact(&mut first_body).await.unwrap();
+        assert_eq!(&first_body, b"a");
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.global_charge() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completed response retained wire-body admission");
+
+        let third_response = send_raw_http(
+            proxy,
+            format!(
+                "GET http://{origin}/third HTTP/1.1\r\nHost: {origin}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        assert!(third_response.starts_with(b"HTTP/1.1 200"));
+        assert!(third_response.ends_with(b"b"));
+        origin_task.await.unwrap();
+        assert_eq!(pool.global_charge(), 0);
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn abandoned_uncommitted_upgrade_is_bounded_by_the_request_deadline() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin_listener.accept().await.unwrap();
+            let request = read_http_head(&mut stream).await;
+            let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            assert!(request.contains("\r\nconnection: upgrade\r\n"));
+            assert!(request.contains("\r\nupgrade: test-echo\r\n"));
+            accepted_tx.send(()).unwrap();
+
+            let mut byte = [0_u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+                .await
+                .expect("deadline-bounded upgrade kept its origin connection open")
+                .unwrap();
+            assert_eq!(read, 0, "abandoned upgrade wrote later origin bytes");
+        });
+        let policy = format!(
+            r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "deadline-bounded-upgrade"
+decision = "allow"
+methods = ["GET"]
+urls = ["http://{origin}/socket"]
+allow_upgrades = true
+"#
+        );
+        let config = base_config(proxy, "explicit_http", &policy).replacen(
+            "request_timeout = \"5s\"",
+            "request_timeout = \"500ms\"",
+            1,
+        );
+        let (_directory, product) = product(config, listeners).await;
+        let runtime = product.upgrade_runtime();
+        let pool = product.wire_body_pool();
+
+        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET http://{origin}/socket HTTP/1.1\r\nHost: {origin}\r\nConnection: Upgrade\r\nUpgrade: test-echo\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        accepted_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let counts = runtime.counts();
+                if counts.reserved_slots == 1
+                    && counts.reserved_bytes > 0
+                    && counts.uncommitted == 1
+                    && counts.committed == 0
+                    && counts.tracked_tasks == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("upgrade did not reach the uncommitted response-head wait");
+        assert!(
+            pool.global_charge() > 0,
+            "uncommitted upgrade did not retain response admission"
+        );
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let counts = runtime.counts();
+                if counts.reserved_slots == 0
+                    && counts.reserved_bytes == 0
+                    && counts.uncommitted == 0
+                    && counts.committed == 0
+                    && counts.tracked_tasks == 0
+                    && pool.global_charge() == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deadline-bounded upgrade retained runtime or wire-body admission");
         origin_task.await.unwrap();
         product.shutdown().await;
     }

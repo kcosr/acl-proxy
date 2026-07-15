@@ -71,40 +71,56 @@ pub(crate) enum ForwardError {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct ForwardingDeadlines {
-    connect: Instant,
+pub(crate) struct ForwardingTimeouts {
+    connect_timeout: Duration,
     response_head_timeout: Duration,
     absolute: Instant,
 }
 
-impl ForwardingDeadlines {
+impl ForwardingTimeouts {
     pub(crate) fn new(
         absolute: Instant,
         connect_timeout: Duration,
         response_head_timeout: Duration,
     ) -> Self {
-        let now = Instant::now();
         Self {
-            connect: now
-                .checked_add(connect_timeout)
-                .unwrap_or(absolute)
-                .min(absolute),
+            connect_timeout,
             response_head_timeout,
             absolute,
         }
     }
 
-    fn response_head(self) -> Instant {
-        Instant::now()
-            .checked_add(self.response_head_timeout)
-            .unwrap_or(self.absolute)
-            .min(self.absolute)
+    fn begin_connect(self) -> ForwardingDeadlines {
+        ForwardingDeadlines {
+            connect: Instant::now()
+                .checked_add(self.connect_timeout)
+                .unwrap_or(self.absolute)
+                .min(self.absolute),
+            response_head_timeout: self.response_head_timeout,
+            absolute: self.absolute,
+        }
     }
 
     #[cfg(test)]
     fn for_test() -> Self {
         let timeout = Duration::from_secs(3_600);
         Self::new(Instant::now() + timeout, timeout, timeout)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ForwardingDeadlines {
+    connect: Instant,
+    response_head_timeout: Duration,
+    absolute: Instant,
+}
+
+impl ForwardingDeadlines {
+    fn response_head(self) -> Instant {
+        Instant::now()
+            .checked_add(self.response_head_timeout)
+            .unwrap_or(self.absolute)
+            .min(self.absolute)
     }
 }
 
@@ -426,24 +442,6 @@ impl ForwardBody {
         self.poll_terminal_error_join(context)
     }
 
-    fn poll_incomplete_response_timeout(
-        &mut self,
-        context: &mut Context<'_>,
-    ) -> Poll<ForwardBodyError> {
-        let Some(deadline) = self.terminal_drain_deadline.as_mut() else {
-            return Poll::Pending;
-        };
-        if deadline.as_mut().poll(context).is_pending() {
-            return Poll::Pending;
-        }
-
-        self.body.take();
-        self.pending_data.take();
-        self.trailers.take();
-        self.terminal_error.get_or_insert(ForwardBodyError::Timeout);
-        self.poll_terminal_error_join(context)
-    }
-
     fn poll_aborted_terminal_driver_join(
         &mut self,
         context: &mut Context<'_>,
@@ -482,7 +480,7 @@ impl ForwardBody {
         }
         let trailers = match self.body.as_mut() {
             Some(body) => match Pin::new(body).poll_trailers(context) {
-                Poll::Pending => return self.poll_incomplete_response_timeout(context).map(Err),
+                Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(trailers)) => trailers,
                 Poll::Ready(Err(error)) => {
                     self.body.take();
@@ -510,6 +508,7 @@ impl ForwardBody {
         };
         self.response_idle_deadline.take();
         self.trailers = Some(trailers);
+        self.begin_terminal_drain();
         Poll::Ready(Ok(()))
     }
 
@@ -578,17 +577,16 @@ impl HttpBody for ForwardBody {
         if let Poll::Ready(error) = self.poll_request_deadline(context) {
             return Poll::Ready(Some(Err(error)));
         }
-        if let Poll::Ready(error) = self.poll_response_idle_deadline(context) {
-            return Poll::Ready(Some(Err(error)));
-        }
         if let Some(bytes) = self.next_data_slice() {
             return Poll::Ready(Some(Ok(bytes)));
+        }
+        if let Poll::Ready(error) = self.poll_response_idle_deadline(context) {
+            return Poll::Ready(Some(Err(error)));
         }
         if !self.data_done {
             for _ in 0..MAX_INTERNAL_RESPONSE_EVENTS_PER_POLL {
                 let Some(body) = self.body.as_mut() else {
                     self.data_done = true;
-                    self.begin_terminal_drain();
                     break;
                 };
                 match Pin::new(body).poll_data(context) {
@@ -623,7 +621,6 @@ impl HttpBody for ForwardBody {
                     }
                     Poll::Ready(None) => {
                         self.data_done = true;
-                        self.begin_terminal_drain();
                         break;
                     }
                 }
@@ -890,7 +887,7 @@ pub(crate) async fn forward_request<B>(
     egress: &dyn EgressSnapshot,
     destinations: &DestinationGuard,
     target: ResolvedForwardingTarget,
-    deadlines: ForwardingDeadlines,
+    timeouts: ForwardingTimeouts,
 ) -> Result<ForwardedResponse, ForwardError>
 where
     B: HttpBody + Send + 'static,
@@ -904,7 +901,7 @@ where
         destinations,
         target,
         &TcpDestinationConnector,
-        deadlines,
+        timeouts,
     )
     .await
 }
@@ -916,7 +913,7 @@ async fn forward_with_connector_timed<C, B>(
     destinations: &DestinationGuard,
     target: ResolvedForwardingTarget,
     connector: &C,
-    deadlines: ForwardingDeadlines,
+    timeouts: ForwardingTimeouts,
 ) -> Result<ForwardedResponse, ForwardError>
 where
     C: DestinationConnector,
@@ -934,6 +931,7 @@ where
         return Err(ForwardError::ResolvedTargetMismatch);
     }
 
+    let deadlines = timeouts.begin_connect();
     match (egress.route(), target.route) {
         (EgressRoute::Direct, ResolvedForwardingRoute::Direct(resolved)) => {
             let stream = connect_stage(deadlines, destinations.connect(resolved, connector))
@@ -997,7 +995,7 @@ where
         destinations,
         target,
         connector,
-        ForwardingDeadlines::for_test(),
+        ForwardingTimeouts::for_test(),
     )
     .await
 }
@@ -1012,7 +1010,7 @@ pub(crate) async fn forward_upgrade_request<B>(
     generation: &GenerationRetention,
     destinations: std::sync::Arc<DestinationGuard>,
     target: ResolvedForwardingTarget,
-    deadlines: ForwardingDeadlines,
+    timeouts: ForwardingTimeouts,
 ) -> Result<ForwardUpgradeResult, ForwardError>
 where
     B: HttpBody + Send + 'static,
@@ -1027,7 +1025,7 @@ where
         &destinations,
         target,
         &TcpDestinationConnector,
-        deadlines,
+        timeouts,
     )
     .await
 }
@@ -1039,7 +1037,7 @@ async fn forward_upgrade_with_connector_timed<C, B>(
     destinations: &DestinationGuard,
     target: ResolvedForwardingTarget,
     connector: &C,
-    deadlines: ForwardingDeadlines,
+    timeouts: ForwardingTimeouts,
 ) -> Result<ForwardUpgradeResult, ForwardError>
 where
     C: DestinationConnector,
@@ -1064,6 +1062,7 @@ where
         return Err(ForwardError::ResolvedTargetMismatch);
     }
 
+    let deadlines = timeouts.begin_connect();
     match (egress.route(), target.route) {
         (EgressRoute::Direct, ResolvedForwardingRoute::Direct(resolved)) => {
             let stream = connect_stage(deadlines, destinations.connect(resolved, connector))
@@ -1113,7 +1112,7 @@ where
         destinations,
         target,
         connector,
-        ForwardingDeadlines::for_test(),
+        ForwardingTimeouts::for_test(),
     )
     .await
 }
@@ -2407,10 +2406,15 @@ mod tests {
             assert_eq!(server.read(&mut byte).await.unwrap(), 0);
         });
 
-        let error = send_upgrade_request(client, request, intent, ForwardingDeadlines::for_test())
-            .await
-            .err()
-            .expect("an early 101 cannot establish an upgrade");
+        let error = send_upgrade_request(
+            client,
+            request,
+            intent,
+            ForwardingTimeouts::for_test().begin_connect(),
+        )
+        .await
+        .err()
+        .expect("an early 101 cannot establish an upgrade");
         assert!(matches!(error, ForwardError::UpgradeRequestBodyIncomplete));
         server.await.unwrap();
         assert_eq!(guard.live_bytes(), 0);
@@ -2449,6 +2453,23 @@ mod tests {
         assert_eq!(body.data().await.unwrap().unwrap(), "ef");
         assert!(body.data().await.is_none());
         assert_eq!(body.observed_wire_bytes, 6);
+    }
+
+    #[tokio::test]
+    async fn buffered_response_slice_precedes_idle_timeout_without_resetting_it() {
+        let (mut sender, upstream_body) = Body::channel();
+        sender.send_data(Bytes::from_static(b"abcd")).await.unwrap();
+        let driver =
+            tokio::spawn(async { std::future::pending::<Result<(), hyper::Error>>().await });
+        let mut body = ForwardBody::new(upstream_body, DriverTask::from_handle(driver))
+            .with_response_policy(response_policy(8, 2, 4, 128, 20));
+
+        assert_eq!(body.data().await.unwrap().unwrap(), "ab");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(body.data().await.unwrap().unwrap(), "cd");
+        let error = body.data().await.unwrap().unwrap_err();
+        assert!(matches!(error, ForwardBodyError::Timeout));
+        drop(sender);
     }
 
     #[tokio::test]
@@ -2508,11 +2529,12 @@ mod tests {
 
     #[tokio::test]
     async fn connect_stage_reports_its_own_timeout() {
-        let deadlines = ForwardingDeadlines::new(
+        let deadlines = ForwardingTimeouts::new(
             Instant::now() + Duration::from_secs(1),
             Duration::from_millis(1),
             Duration::from_secs(1),
-        );
+        )
+        .begin_connect();
         let error = connect_stage(
             deadlines,
             std::future::pending::<Result<(), ForwardError>>(),
@@ -2521,6 +2543,23 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, ForwardError::ConnectTimeout));
+    }
+
+    #[tokio::test]
+    async fn preconnect_work_does_not_age_the_connect_timeout() {
+        let timeouts = ForwardingTimeouts::new(
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        connect_stage(
+            timeouts.begin_connect(),
+            std::future::ready(Ok::<_, ForwardError>(())),
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -2538,11 +2577,12 @@ mod tests {
             .header(HOST, "origin.example")
             .body(Body::empty())
             .unwrap();
-        let deadlines = ForwardingDeadlines::new(
+        let deadlines = ForwardingTimeouts::new(
             Instant::now() + Duration::from_secs(1),
             Duration::from_secs(1),
             Duration::from_millis(20),
-        );
+        )
+        .begin_connect();
 
         let error = match send_request(client, request, OriginProtocol::Http1, deadlines).await {
             Ok(_) => panic!("a missing upstream response head must time out"),
@@ -2713,9 +2753,8 @@ mod tests {
         started_rx.await.unwrap();
         let (pending_sender, pending_body) = Body::channel();
         let mut body = ForwardBody::new(pending_body, DriverTask::from_handle(driver))
-            .with_terminal_drain_timeout(Duration::ZERO);
+            .with_response_policy(response_policy(8, 4, 4, 128, 20));
         body.data_done = true;
-        body.begin_terminal_drain();
 
         let error = body.data().await.unwrap().unwrap_err();
         drop(pending_sender);

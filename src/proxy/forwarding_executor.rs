@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +13,7 @@ use crate::http1::ingress::RequestDisposition;
 use crate::observation::CaptureEvent;
 use crate::proxy::forward::{
     forward_request, forward_upgrade_request, ForwardError, ForwardUpgradeResult,
-    ForwardedResponse, ForwardingDeadlines, ResolvedForwardingTarget,
+    ForwardedResponse, ForwardingTimeouts, ResolvedForwardingTarget,
 };
 use crate::proxy::headers::SanitizedRequest;
 use crate::proxy::ingress::{
@@ -56,7 +57,7 @@ impl ForwardingExecutor {
         let response_mutations = plan.response_mutation_batches().to_vec();
         let response_policy = plan.response();
         let stage_timeouts = plan.timeouts();
-        let forwarding_deadlines = ForwardingDeadlines::new(
+        let forwarding_timeouts = ForwardingTimeouts::new(
             dispatch.deadline,
             Duration::from_millis(stage_timeouts.connect_ms()),
             Duration::from_millis(stage_timeouts.response_head_ms()),
@@ -213,7 +214,7 @@ impl ForwardingExecutor {
                 protocol: upgrade_protocol,
                 response_admission,
                 response_policy,
-                forwarding_deadlines,
+                forwarding_timeouts,
                 upgrade_deadlines,
             })
             .await;
@@ -283,7 +284,7 @@ impl ForwardingExecutor {
                 dispatch.services.egress(),
                 &dispatch.destinations,
                 dispatch.resolved,
-                forwarding_deadlines,
+                forwarding_timeouts,
             ),
         )
         .await
@@ -367,7 +368,7 @@ struct StandaloneUpgradeExecution {
     protocol: HeaderValue,
     response_admission: crate::safety::ForwardResponseAdmission,
     response_policy: http_access_types::ResponsePolicy,
-    forwarding_deadlines: ForwardingDeadlines,
+    forwarding_timeouts: ForwardingTimeouts,
     upgrade_deadlines: UpgradeRelayDeadlines,
 }
 
@@ -375,6 +376,49 @@ enum UpgradeHandshakeResponse {
     Ordinary(Box<ForwardedResponse>),
     SwitchingProtocols(Response<Body>),
     Failed(StatusCode),
+}
+
+struct UpgradeHandshakeCancellation(Option<oneshot::Sender<()>>);
+
+impl UpgradeHandshakeCancellation {
+    fn new(sender: oneshot::Sender<()>) -> Self {
+        Self(Some(sender))
+    }
+}
+
+impl Drop for UpgradeHandshakeCancellation {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+async fn run_cancellable_upgrade_handshake<Task>(cancelled: oneshot::Receiver<()>, task: Task)
+where
+    Task: Future<Output = ()>,
+{
+    tokio::select! {
+        biased;
+        _ = cancelled => {}
+        _ = task => {}
+    }
+}
+
+async fn complete_upgrade_setup<Downstream, Upstream, DownstreamTask, UpstreamTask>(
+    deadline: Instant,
+    downstream: DownstreamTask,
+    upstream: UpstreamTask,
+) -> Result<(Downstream, Upstream), UpgradeTerminalCause>
+where
+    DownstreamTask: Future<Output = Result<Downstream, UpgradeTerminalCause>>,
+    UpstreamTask: Future<Output = Result<Upstream, UpgradeTerminalCause>>,
+{
+    match tokio::time::timeout_at(deadline, async { tokio::try_join!(downstream, upstream) }).await
+    {
+        Ok(result) => result,
+        Err(_) => Err(UpgradeTerminalCause::LifetimeExpired),
+    }
 }
 
 async fn execute_standalone_upgrade(
@@ -396,135 +440,151 @@ async fn execute_standalone_upgrade(
         protocol,
         response_admission,
         response_policy,
-        forwarding_deadlines,
+        forwarding_timeouts,
         upgrade_deadlines,
     } = execution;
     let (response_tx, response_rx) = oneshot::channel();
+    let (cancel_tx, cancel_rx) = oneshot::channel();
+    let cancellation = UpgradeHandshakeCancellation::new(cancel_tx);
     let allocation = binding.allocation;
     let wire_redaction = binding.wire_redaction;
     let task_profile = wire_redaction.clone();
     let runtime_for_task = upgrade_runtime.clone();
     upgrade_runtime
-        .try_spawn_handshake(allocation, move |handshake| async move {
-            let forwarded = tokio::time::timeout_at(
-                deadline,
-                forward_upgrade_request(
-                    request,
-                    &canonical,
-                    &retention,
-                    destinations,
-                    resolved,
-                    forwarding_deadlines,
-                ),
-            )
-            .await;
-            match forwarded {
-                Ok(Ok(ForwardUpgradeResult::Response(mut response))) => {
-                    if apply_standalone_response_mutations(
-                        &response_mutations,
-                        response.headers_mut(),
-                    )
-                    .is_err()
-                    {
-                        let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                        ));
-                        return;
-                    }
-                    response.body_mut().bind_response_lifetime(
-                        deadline,
-                        retention,
-                        response_admission,
-                        response_policy,
-                    );
-                    let _ = response_tx.send(UpgradeHandshakeResponse::Ordinary(response));
-                }
-                Ok(Ok(ForwardUpgradeResult::SwitchingProtocols(upgrade))) => {
-                    let (mut response, upstream_upgrade) = upgrade.into_parts();
-                    if apply_standalone_response_mutations(
-                        &response_mutations,
-                        response.headers_mut(),
-                    )
-                    .is_err()
-                    {
-                        let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                        ));
-                        return;
-                    }
-                    let kind = match EstablishedUpgradeKind::from_handshake(
-                        &protocol,
-                        &request_headers,
-                        response.headers(),
-                        task_profile.as_ref(),
-                    ) {
-                        Ok(kind) => kind,
-                        Err(_) => {
-                            let _ = response_tx
-                                .send(UpgradeHandshakeResponse::Failed(StatusCode::BAD_GATEWAY));
-                            return;
-                        }
-                    };
-                    let prepared_relay = match kind.prepare(
-                        runtime_for_task.limits().relay_buffer_bytes(),
-                        Some(upgrade_capture),
-                    ) {
-                        Ok(prepared_relay) => prepared_relay,
-                        Err(_) => {
+        .try_spawn_handshake(allocation, move |handshake| {
+            run_cancellable_upgrade_handshake(cancel_rx, async move {
+                let forwarded = tokio::time::timeout_at(
+                    deadline,
+                    forward_upgrade_request(
+                        request,
+                        &canonical,
+                        &retention,
+                        destinations,
+                        resolved,
+                        forwarding_timeouts,
+                    ),
+                )
+                .await;
+                match forwarded {
+                    Ok(Ok(ForwardUpgradeResult::Response(mut response))) => {
+                        if apply_standalone_response_mutations(
+                            &response_mutations,
+                            response.headers_mut(),
+                        )
+                        .is_err()
+                        {
                             let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
-                                StatusCode::SERVICE_UNAVAILABLE,
+                                StatusCode::INTERNAL_SERVER_ERROR,
                             ));
                             return;
                         }
-                    };
-                    let terminal_control =
-                        UpgradeTerminalControl::new(std::future::pending::<()>, |_| async {});
-                    let entry_plan =
-                        UpgradeEntryPlan::new(terminal_control, move |snapshot| async move {
-                            response_tx
-                                .send(UpgradeHandshakeResponse::SwitchingProtocols(response))
-                                .map_err(|_| UpgradeTerminalCause::DownstreamWriteFailed)?;
-                            let (downstream, upstream) =
-                                tokio::join!(downstream_upgrade, upstream_upgrade.complete());
-                            let downstream = downstream
-                                .map_err(|_| UpgradeTerminalCause::DownstreamWriteFailed)?;
-                            let upstream =
-                                upstream.map_err(|_| UpgradeTerminalCause::SetupFailed)?;
-                            Ok(prepared_relay.establish(
-                                downstream,
-                                upstream,
-                                snapshot,
-                                upgrade_deadlines,
-                            ))
-                        });
-                    if handshake.commit(wire_redaction, entry_plan).is_err() {
-                        return;
+                        response.body_mut().bind_response_lifetime(
+                            deadline,
+                            retention,
+                            response_admission,
+                            response_policy,
+                        );
+                        let _ = response_tx.send(UpgradeHandshakeResponse::Ordinary(response));
                     }
-                    drop(retention);
+                    Ok(Ok(ForwardUpgradeResult::SwitchingProtocols(upgrade))) => {
+                        let (mut response, upstream_upgrade) = upgrade.into_parts();
+                        if apply_standalone_response_mutations(
+                            &response_mutations,
+                            response.headers_mut(),
+                        )
+                        .is_err()
+                        {
+                            let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                            ));
+                            return;
+                        }
+                        let kind = match EstablishedUpgradeKind::from_handshake(
+                            &protocol,
+                            &request_headers,
+                            response.headers(),
+                            task_profile.as_ref(),
+                        ) {
+                            Ok(kind) => kind,
+                            Err(_) => {
+                                let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
+                                    StatusCode::BAD_GATEWAY,
+                                ));
+                                return;
+                            }
+                        };
+                        let prepared_relay = match kind.prepare(
+                            runtime_for_task.limits().relay_buffer_bytes(),
+                            Some(upgrade_capture),
+                        ) {
+                            Ok(prepared_relay) => prepared_relay,
+                            Err(_) => {
+                                let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
+                                    StatusCode::SERVICE_UNAVAILABLE,
+                                ));
+                                return;
+                            }
+                        };
+                        let terminal_control =
+                            UpgradeTerminalControl::new(std::future::pending::<()>, |_| async {});
+                        let entry_plan =
+                            UpgradeEntryPlan::new(terminal_control, move |snapshot| async move {
+                                response_tx
+                                    .send(UpgradeHandshakeResponse::SwitchingProtocols(response))
+                                    .map_err(|_| UpgradeTerminalCause::DownstreamWriteFailed)?;
+                                let (downstream, upstream) = complete_upgrade_setup(
+                                    deadline,
+                                    async {
+                                        downstream_upgrade.await.map_err(|_| {
+                                            UpgradeTerminalCause::DownstreamWriteFailed
+                                        })
+                                    },
+                                    async {
+                                        upstream_upgrade
+                                            .complete()
+                                            .await
+                                            .map_err(|_| UpgradeTerminalCause::SetupFailed)
+                                    },
+                                )
+                                .await?;
+                                Ok(prepared_relay.establish(
+                                    downstream,
+                                    upstream,
+                                    snapshot,
+                                    upgrade_deadlines,
+                                ))
+                            });
+                        if handshake.commit(wire_redaction, entry_plan).is_err() {
+                            return;
+                        }
+                        drop(retention);
+                    }
+                    Ok(Err(ForwardError::ConnectTimeout | ForwardError::ResponseHeadTimeout)) => {
+                        let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
+                            StatusCode::GATEWAY_TIMEOUT,
+                        ));
+                    }
+                    Ok(Err(_)) => {
+                        let _ = response_tx
+                            .send(UpgradeHandshakeResponse::Failed(StatusCode::BAD_GATEWAY));
+                    }
+                    Err(_) => {
+                        let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
+                            StatusCode::GATEWAY_TIMEOUT,
+                        ));
+                    }
                 }
-                Ok(Err(ForwardError::ConnectTimeout | ForwardError::ResponseHeadTimeout)) => {
-                    let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
-                        StatusCode::GATEWAY_TIMEOUT,
-                    ));
-                }
-                Ok(Err(_)) => {
-                    let _ =
-                        response_tx.send(UpgradeHandshakeResponse::Failed(StatusCode::BAD_GATEWAY));
-                }
-                Err(_) => {
-                    let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
-                        StatusCode::GATEWAY_TIMEOUT,
-                    ));
-                }
-            }
+            })
         })
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
 
-    match tokio::time::timeout_at(deadline, response_rx).await {
+    let outcome = match tokio::time::timeout_at(deadline, response_rx).await {
         Ok(Ok(response)) => Ok(response),
         Ok(Err(_)) => Err(StatusCode::SERVICE_UNAVAILABLE),
         Err(_) => Err(StatusCode::GATEWAY_TIMEOUT),
-    }
+    };
+    drop(cancellation);
+    outcome
 }
 
 fn apply_standalone_response_mutations(
@@ -543,4 +603,91 @@ fn body_headers(headers: &HeaderMap) -> HeaderMap {
         }
     }
     selected
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::upgrade::{UpgradeAllocation, UpgradeRuntimeLimits};
+
+    struct DropSignal(Option<oneshot::Sender<()>>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_releases_runtime_owned_uncommitted_handshake() {
+        let runtime =
+            UpgradeRuntime::try_new(UpgradeRuntimeLimits::new(1, 8, 2, Duration::from_secs(60)))
+                .unwrap();
+        let allocation = UpgradeAllocation::from_compiled_rule(0, Some(4)).unwrap();
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let cancellation = UpgradeHandshakeCancellation::new(cancel_tx);
+        let (dropped_tx, dropped_rx) = oneshot::channel();
+        let signal = DropSignal(Some(dropped_tx));
+        runtime
+            .try_spawn_handshake(allocation, move |handshake| {
+                run_cancellable_upgrade_handshake(cancel_rx, async move {
+                    let _handshake = handshake;
+                    let _signal = signal;
+                    std::future::pending::<()>().await;
+                })
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let counts = runtime.counts();
+                if counts.reserved_slots == 1
+                    && counts.reserved_bytes == 8
+                    && counts.uncommitted == 1
+                    && counts.tracked_tasks == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        drop(cancellation);
+        tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let counts = runtime.counts();
+                if counts.reserved_slots == 0
+                    && counts.reserved_bytes == 0
+                    && counts.uncommitted == 0
+                    && counts.tracked_tasks == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        runtime.shutdown_and_wait(None).await;
+    }
+
+    #[tokio::test]
+    async fn absolute_deadline_bounds_committed_upgrade_setup() {
+        let error = complete_upgrade_setup(
+            Instant::now() + Duration::from_millis(20),
+            std::future::ready(Ok::<_, UpgradeTerminalCause>(())),
+            std::future::pending::<Result<(), UpgradeTerminalCause>>(),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, UpgradeTerminalCause::LifetimeExpired);
+    }
 }
