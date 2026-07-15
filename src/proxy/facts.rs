@@ -6,7 +6,7 @@ use http::{Method, Version};
 use http_access_types::{
     BodyFraming, BodyMetadata, CanonicalUrl, HeaderField, HeaderName, HeaderValue, HttpMethod,
     HttpVersion, IngressMode, InterceptedRequestFacts, UpgradeIntent as NeutralUpgradeIntent,
-    ValueError,
+    UpgradeProtocol, ValueError,
 };
 
 use crate::proxy::headers::UpgradeIntent as ProductUpgradeIntent;
@@ -173,7 +173,7 @@ pub(crate) fn upgrade_intent(
             Ok(if protocol.eq_ignore_ascii_case("websocket") {
                 NeutralUpgradeIntent::WebSocket
             } else {
-                NeutralUpgradeIntent::Other
+                NeutralUpgradeIntent::Other(UpgradeProtocol::new(protocol)?)
             })
         })
         .transpose()
@@ -202,7 +202,7 @@ pub(crate) fn validate_request_fact_shape(
         url.clone(),
         Vec::new(),
         body,
-        upgrade,
+        upgrade.clone(),
     )?;
     Ok(ValidatedRequestFactShape {
         ingress_mode,
@@ -406,7 +406,9 @@ mod tests {
         let opaque = sanitized_upgrade("test-echo/1");
         assert_eq!(
             upgrade_intent(opaque.upgrade_intent()).unwrap(),
-            Some(NeutralUpgradeIntent::Other)
+            Some(NeutralUpgradeIntent::Other(
+                UpgradeProtocol::new("test-echo/1").unwrap()
+            ))
         );
         assert_eq!(upgrade_intent(None).unwrap(), None);
     }
@@ -431,7 +433,7 @@ mod tests {
         assert_eq!(facts.method().as_str(), "GET");
         assert_eq!(facts.url().as_str(), "http://example.test/socket");
         assert_eq!(facts.body().framing(), BodyFraming::ContentLength(0));
-        assert_eq!(facts.upgrade(), Some(NeutralUpgradeIntent::WebSocket));
+        assert_eq!(facts.upgrade(), Some(&NeutralUpgradeIntent::WebSocket));
         assert_eq!(facts.headers().len(), 2);
     }
 }

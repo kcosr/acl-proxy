@@ -1911,7 +1911,7 @@ retire_timeout = "10s""#,
             unmatched.facts.url().clone(),
             unmatched.facts.headers().to_vec(),
             unmatched.facts.body(),
-            unmatched.facts.upgrade(),
+            unmatched.facts.upgrade().cloned(),
         )
         .unwrap();
         unmatched.started_at = default_started_at;

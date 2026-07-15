@@ -21,6 +21,7 @@ dependencies = [
  "h2",
  "http",
  "http-access-conformance",
+ "http-access-policy-acl",
  "http-access-types",
  "http-access-url",
  "httparse",
@@ -696,11 +697,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-access-policy-acl"
+version = "0.1.0"
+dependencies = [
+ "http-access-types",
+ "http-access-url",
+]
+
+[[package]]
 name = "http-access-types"
 version = "0.1.0"
 dependencies = [
  "idna",
+ "memchr",
  "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -1003,9 +1015,9 @@ dependencies = [
 
 [[package]]
 name = "memchr"
-version = "2.7.6"
+version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
+checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "minimal-lexical"
