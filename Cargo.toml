@@ -58,6 +58,7 @@ fs2 = "0.4"
 humantime = "2.1"
 http-access-types = { path = "../access-runtime/crates/http-access-types", version = "=0.1.0" }
 http-access-url = { path = "../access-runtime/crates/http-access-url", version = "=0.1.0" }
+http-access-runtime = { path = "../access-runtime/crates/http-access-runtime", version = "=0.1.0" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

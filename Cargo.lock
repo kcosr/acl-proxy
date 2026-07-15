@@ -22,6 +22,7 @@ dependencies = [
  "http",
  "http-access-conformance",
  "http-access-policy-acl",
+ "http-access-runtime",
  "http-access-types",
  "http-access-url",
  "httparse",
@@ -418,6 +419,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "credential-core"
+version = "0.1.0"
+dependencies = [
+ "http-access-types",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -697,9 +705,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-access-mitm"
+version = "0.1.0"
+dependencies = [
+ "http-access-types",
+]
+
+[[package]]
 name = "http-access-policy-acl"
 version = "0.1.0"
 dependencies = [
+ "http-access-types",
+ "http-access-url",
+]
+
+[[package]]
+name = "http-access-redaction"
+version = "0.1.0"
+dependencies = [
+ "http-access-types",
+]
+
+[[package]]
+name = "http-access-runtime"
+version = "0.1.0"
+dependencies = [
+ "credential-core",
+ "http-access-mitm",
+ "http-access-redaction",
  "http-access-types",
  "http-access-url",
 ]

@@ -20,6 +20,7 @@ mod policy;
 mod proxy;
 mod redaction;
 mod request_decision;
+mod request_pipeline;
 mod runtime;
 mod safety;
 mod sensitive;
