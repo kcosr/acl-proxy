@@ -44,7 +44,7 @@ impl ProductRuntime {
     pub(crate) async fn prepare(
         loaded: LoadedCompiledConfig,
     ) -> Result<Arc<Self>, ProductRuntimeError> {
-        Self::prepare_inner(loaded, None).await
+        Self::prepare_inner(loaded, None, None).await
     }
 
     #[cfg(test)]
@@ -52,7 +52,16 @@ impl ProductRuntime {
         loaded: LoadedCompiledConfig,
         listeners: Vec<std::net::TcpListener>,
     ) -> Result<Arc<Self>, ProductRuntimeError> {
-        Self::prepare_inner(loaded, Some(listeners)).await
+        Self::prepare_inner(loaded, Some(listeners), None).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn prepare_from_prebound_with_destination_guard(
+        loaded: LoadedCompiledConfig,
+        listeners: Vec<std::net::TcpListener>,
+        destination_guard: Arc<crate::destination::DestinationGuard>,
+    ) -> Result<Arc<Self>, ProductRuntimeError> {
+        Self::prepare_inner(loaded, Some(listeners), Some(destination_guard)).await
     }
 
     async fn prepare_inner(
@@ -60,8 +69,20 @@ impl ProductRuntime {
         #[cfg_attr(not(test), allow(unused_variables))] prebound: Option<
             Vec<std::net::TcpListener>,
         >,
+        #[cfg_attr(not(test), allow(unused_variables))] destination_guard: Option<
+            Arc<crate::destination::DestinationGuard>,
+        >,
     ) -> Result<Arc<Self>, ProductRuntimeError> {
         let LoadedCompiledConfig { metadata, compiled } = loaded;
+        #[cfg(test)]
+        let static_resources = match destination_guard {
+            Some(destination_guard) => ProductStaticResources::try_new_with_destination_guard(
+                &compiled.static_config,
+                destination_guard,
+            )?,
+            None => ProductStaticResources::try_new(&compiled.static_config)?,
+        };
+        #[cfg(not(test))]
         let static_resources = ProductStaticResources::try_new(&compiled.static_config)?;
         let observation_runtime = static_resources.observation_runtime();
 

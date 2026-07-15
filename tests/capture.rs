@@ -3,14 +3,14 @@ use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
+use base64::engine::general_purpose;
+use base64::Engine as _;
 use tempfile::TempDir;
 
 use acl_proxy::capture::{
-    build_capture_record, should_capture, BodyCaptureBuffer, CaptureDecision, CaptureEndpoint,
-    CaptureKind, CaptureMode, CaptureRecordOptions, CaptureSinkSpec, HeaderMap,
-    DEFAULT_MAX_BODY_BYTES,
+    CaptureBody, CaptureDecision, CaptureEndpoint, CaptureKind, CaptureMode, CaptureRecord,
+    CaptureSinkSpec, HeaderMap,
 };
-use acl_proxy::config::Config;
 
 #[cfg(unix)]
 fn mode(path: &std::path::Path) -> u32 {
@@ -19,35 +19,39 @@ fn mode(path: &std::path::Path) -> u32 {
     fs::metadata(path).expect("metadata").permissions().mode() & 0o777
 }
 
-fn capture_record(request_id: &str) -> acl_proxy::capture::CaptureRecord {
-    build_capture_record(CaptureRecordOptions {
+fn capture_record(request_id: &str) -> CaptureRecord {
+    CaptureRecord {
         timestamp: "2024-01-01T00:00:00Z".to_string(),
         request_id: request_id.to_string(),
         kind: CaptureKind::Request,
         decision: CaptureDecision::Allow,
         mode: CaptureMode::HttpProxy,
         url: "http://example.com/echo".to_string(),
-        method: Some("GET".to_string()),
+        method: "GET".to_string(),
+        status_code: None,
+        status_message: None,
         client: CaptureEndpoint::default(),
         target: None,
         http_version: Some("1.1".to_string()),
         headers: None,
-        status_code: None,
-        status_message: None,
         body: None,
-    })
+        body_truncated: None,
+        provider_replacement_omitted: None,
+        provider_replacement_size: None,
+    }
 }
 
-fn capture_sink(config: &Config) -> CaptureSinkSpec {
+fn capture_sink(
+    directory: &std::path::Path,
+    filename_template: &str,
+    max_files: usize,
+    max_total_bytes: u64,
+) -> CaptureSinkSpec {
     CaptureSinkSpec::new(
-        config.capture.directory.clone().into(),
-        if config.capture.filename.trim().is_empty() {
-            "{requestId}-{suffix}.json".to_string()
-        } else {
-            config.capture.filename.clone()
-        },
-        config.capture.max_files,
-        config.capture.max_total_bytes,
+        directory.to_path_buf(),
+        filename_template.to_string(),
+        max_files,
+        max_total_bytes,
     )
     .unwrap()
 }
@@ -73,42 +77,36 @@ fn capture_write_creates_expected_file_and_json() {
     let temp_dir = TempDir::new().expect("create temp dir");
     let capture_dir = temp_dir.path().join("captures");
 
-    let mut config = Config::default();
-    config.capture.allowed_request = true;
-    config.capture.directory = capture_dir.to_string_lossy().to_string();
-
     let mut headers = HeaderMap::new();
     headers.insert(
         "Content-Type".to_string(),
         serde_json::Value::String("text/plain".to_string()),
     );
 
-    let mut buf = BodyCaptureBuffer::new(DEFAULT_MAX_BODY_BYTES);
-    buf.push(b"hello world");
-    let body_result = buf.finish();
-
-    let opts = CaptureRecordOptions {
-        timestamp: "2024-01-01T00:00:00Z".to_string(),
-        request_id: "req-1".to_string(),
-        kind: CaptureKind::Request,
-        decision: CaptureDecision::Allow,
-        mode: CaptureMode::HttpProxy,
-        url: "http://example.com/echo".to_string(),
-        method: Some("POST".to_string()),
-        client: CaptureEndpoint {
-            address: Some("127.0.0.1".to_string()),
-            port: Some(12345),
-        },
-        target: None,
-        http_version: Some("1.1".to_string()),
-        headers: Some(headers),
-        status_code: Some(200),
-        status_message: Some("OK".to_string()),
-        body: Some(body_result),
+    let mut record = capture_record("req-1");
+    record.method = "POST".to_string();
+    record.client = CaptureEndpoint {
+        address: Some("127.0.0.1".to_string()),
+        port: Some(12345),
     };
+    record.headers = Some(headers);
+    record.status_code = Some(200);
+    record.status_message = Some("OK".to_string());
+    record.body = Some(CaptureBody {
+        encoding: "base64".to_string(),
+        length: b"hello world".len(),
+        data: general_purpose::STANDARD.encode(b"hello world"),
+        content_type: Some("text/plain".to_string()),
+        content_encoding: None,
+    });
 
-    let record = build_capture_record(opts);
-    let path = acl_proxy::capture::write_capture_record(&capture_sink(&config), &record).unwrap();
+    let sink = capture_sink(
+        &capture_dir,
+        "{requestId}-{suffix}.json",
+        usize::MAX,
+        u64::MAX,
+    );
+    let path = acl_proxy::capture::write_capture_record(&sink, &record).unwrap();
 
     assert!(path.exists(), "capture file should exist");
     let contents = fs::read_to_string(&path).expect("read capture file");
@@ -130,14 +128,11 @@ fn capture_write_prunes_by_max_files() {
     let temp_dir = TempDir::new().expect("create temp dir");
     let capture_dir = temp_dir.path().join("captures");
 
-    let mut config = Config::default();
-    config.capture.directory = capture_dir.to_string_lossy().to_string();
-    config.capture.filename = "{requestId}.json".to_string();
-    config.capture.max_files = 2;
+    let sink = capture_sink(&capture_dir, "{requestId}.json", 2, u64::MAX);
 
     for request_id in ["req-001", "req-002", "req-003"] {
         let record = capture_record(request_id);
-        acl_proxy::capture::write_capture_record(&capture_sink(&config), &record).unwrap();
+        acl_proxy::capture::write_capture_record(&sink, &record).unwrap();
     }
 
     assert_eq!(
@@ -151,15 +146,11 @@ fn capture_write_prunes_by_max_total_bytes() {
     let temp_dir = TempDir::new().expect("create temp dir");
     let capture_dir = temp_dir.path().join("captures");
 
-    let mut config = Config::default();
-    config.capture.directory = capture_dir.to_string_lossy().to_string();
-    config.capture.filename = "{requestId}.json".to_string();
-    config.capture.max_files = 10;
-    config.capture.max_total_bytes = 1;
+    let sink = capture_sink(&capture_dir, "{requestId}.json", 10, 1);
 
     for request_id in ["req-001", "req-002", "req-003"] {
         let record = capture_record(request_id);
-        acl_proxy::capture::write_capture_record(&capture_sink(&config), &record).unwrap();
+        acl_proxy::capture::write_capture_record(&sink, &record).unwrap();
     }
 
     assert_eq!(
@@ -173,11 +164,7 @@ fn concurrent_capture_writes_prune_as_one_transaction_per_directory() {
     let temp_dir = TempDir::new().expect("create temp dir");
     let capture_dir = temp_dir.path().join("captures");
 
-    let mut config = Config::default();
-    config.capture.directory = capture_dir.to_string_lossy().to_string();
-    config.capture.filename = "{requestId}.json".to_string();
-    config.capture.max_files = 1;
-    let sink = Arc::new(capture_sink(&config));
+    let sink = Arc::new(capture_sink(&capture_dir, "{requestId}.json", 1, u64::MAX));
     let barrier = Arc::new(Barrier::new(9));
 
     let writers: Vec<_> = (0..8)
@@ -214,11 +201,7 @@ fn concurrent_filename_collisions_keep_complete_records() {
     let temp_dir = TempDir::new().expect("create temp dir");
     let capture_dir = temp_dir.path().join("captures");
 
-    let mut config = Config::default();
-    config.capture.directory = capture_dir.to_string_lossy().to_string();
-    config.capture.filename = "capture.json".to_string();
-    config.capture.max_files = 10;
-    let sink = Arc::new(capture_sink(&config));
+    let sink = Arc::new(capture_sink(&capture_dir, "capture.json", 10, u64::MAX));
     let barrier = Arc::new(Barrier::new(3));
 
     let writers: Vec<_> = ["first", "second"]
@@ -280,29 +263,22 @@ fn aliased_capture_directories_share_collision_and_retention_transaction() {
     let capture_dir = temp_dir.path().join("captures");
     fs::create_dir(&capture_dir).expect("create capture dir");
 
-    let mut direct = Config::default();
-    direct.capture.directory = capture_dir.to_string_lossy().to_string();
-    direct.capture.filename = "capture.json".to_string();
-    direct.capture.max_files = 10;
-
-    let mut aliased = direct.clone();
-    aliased.capture.directory = capture_dir
-        .join("..")
-        .join("captures")
-        .to_string_lossy()
-        .to_string();
+    let direct = capture_sink(&capture_dir, "capture.json", 10, u64::MAX);
+    let aliased = capture_sink(
+        &capture_dir.join("..").join("captures"),
+        "capture.json",
+        10,
+        u64::MAX,
+    );
 
     let barrier = Arc::new(Barrier::new(3));
     let writers: Vec<_> = [(direct, "direct"), (aliased, "aliased")]
         .into_iter()
-        .map(|(config, request_id)| {
+        .map(|(sink, request_id)| {
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 barrier.wait();
-                acl_proxy::capture::write_capture_record(
-                    &capture_sink(&config),
-                    &capture_record(request_id),
-                )
+                acl_proxy::capture::write_capture_record(&sink, &capture_record(request_id))
             })
         })
         .collect();
@@ -326,17 +302,10 @@ fn stale_internal_temp_files_do_not_consume_retention() {
     let stale_temp = capture_dir.join(".capture.123.456.tmp");
     fs::write(&stale_temp, vec![b'x'; 4096]).expect("seed stale capture temp");
 
-    let mut config = Config::default();
-    config.capture.directory = capture_dir.to_string_lossy().to_string();
-    config.capture.filename = "capture.json".to_string();
-    config.capture.max_files = 1;
-    config.capture.max_total_bytes = 1024;
+    let sink = capture_sink(&capture_dir, "capture.json", 1, 1024);
 
-    let path = acl_proxy::capture::write_capture_record(
-        &capture_sink(&config),
-        &capture_record("current"),
-    )
-    .expect("write capture with stale temp");
+    let path = acl_proxy::capture::write_capture_record(&sink, &capture_record("current"))
+        .expect("write capture with stale temp");
 
     assert_eq!(path.file_name().unwrap(), "capture.json");
     assert!(!stale_temp.exists(), "stale temp must be cleaned");
@@ -434,64 +403,20 @@ fn capture_subprocess_writer() {
         return;
     };
     let request_id = std::env::var("ACL_PROXY_CAPTURE_TEST_ID").expect("capture request ID");
-    let mut config = Config::default();
-    config.capture.directory = capture_dir;
-    config.capture.filename = "capture.json".to_string();
-    config.capture.max_files = std::env::var("ACL_PROXY_CAPTURE_TEST_MAX_FILES")
+    let max_files = std::env::var("ACL_PROXY_CAPTURE_TEST_MAX_FILES")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(16);
-    config.capture.max_total_bytes = std::env::var("ACL_PROXY_CAPTURE_TEST_MAX_BYTES")
+    let max_total_bytes = std::env::var("ACL_PROXY_CAPTURE_TEST_MAX_BYTES")
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(u64::MAX);
-    acl_proxy::capture::write_capture_record(&capture_sink(&config), &capture_record(&request_id))
+    let sink = capture_sink(
+        std::path::Path::new(&capture_dir),
+        "capture.json",
+        max_files,
+        max_total_bytes,
+    );
+    acl_proxy::capture::write_capture_record(&sink, &capture_record(&request_id))
         .expect("write subprocess capture");
-}
-
-#[test]
-fn should_capture_respects_flags_in_integration() {
-    let toml = r#"
-schema_version = "2"
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[logging]
-directory = "logs"
-level = "info"
-
-[capture]
-allowed_request = true
-allowed_response = false
-denied_request = false
-denied_response = true
-directory = "logs-capture"
-
-[policy]
-default = "deny"
-    "#;
-
-    let config: Config = toml::from_str(toml).expect("parse");
-
-    assert!(should_capture(
-        &config,
-        CaptureDecision::Allow,
-        CaptureKind::Request
-    ));
-    assert!(!should_capture(
-        &config,
-        CaptureDecision::Allow,
-        CaptureKind::Response
-    ));
-    assert!(!should_capture(
-        &config,
-        CaptureDecision::Deny,
-        CaptureKind::Request
-    ));
-    assert!(should_capture(
-        &config,
-        CaptureDecision::Deny,
-        CaptureKind::Response
-    ));
 }

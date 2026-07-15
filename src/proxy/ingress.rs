@@ -2805,6 +2805,15 @@ impl HttpBody for ProxyResponseBody {
 }
 
 #[cfg(test)]
+// Full parent-hop topology tests live separately from the focused ingress unit suite.
+#[path = "ingress_parent_tests.rs"]
+mod parent_tests;
+
+#[cfg(test)]
+#[path = "ingress_explicit_https_tests.rs"]
+mod explicit_https_tests;
+
+#[cfg(test)]
 mod tests {
     use std::fs;
     use std::io::Write;

@@ -294,6 +294,8 @@ pub(crate) struct DestinationGuard {
     facts: DestinationFacts,
     resolver: Arc<dyn DestinationResolver>,
     local_addresses: Arc<dyn LocalAddressSource>,
+    #[cfg(test)]
+    allow_local_parent: bool,
 }
 
 impl fmt::Debug for DestinationGuard {
@@ -324,6 +326,23 @@ impl DestinationGuard {
             facts,
             resolver,
             local_addresses,
+            #[cfg(test)]
+            allow_local_parent: false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_sources_allowing_local_parent_for_test(
+        facts: DestinationFacts,
+        resolver: Arc<dyn DestinationResolver>,
+        local_addresses: Arc<dyn LocalAddressSource>,
+    ) -> Self {
+        Self {
+            brand: Arc::new(()),
+            facts,
+            resolver,
+            local_addresses,
+            allow_local_parent: true,
         }
     }
 
@@ -523,6 +542,10 @@ impl DestinationGuard {
         }
 
         if route == DestinationRoute::Parent {
+            #[cfg(test)]
+            if self.allow_local_parent {
+                return Ok(());
+            }
             if endpoint.ip().is_loopback() {
                 return Err(DestinationGuardError::ProtectedDestination {
                     endpoint,

@@ -89,9 +89,26 @@ impl ProductStaticResources {
     pub(crate) fn try_new(
         static_config: &StaticProductConfig,
     ) -> Result<Arc<Self>, ProductStaticResourcesError> {
+        let ingress_assets = ProductIngressAssets::from_static(static_config)?;
+        Self::try_new_with_ingress_assets(static_config, ingress_assets)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_new_with_destination_guard(
+        static_config: &StaticProductConfig,
+        destination_guard: Arc<crate::destination::DestinationGuard>,
+    ) -> Result<Arc<Self>, ProductStaticResourcesError> {
+        let ingress_assets =
+            ProductIngressAssets::with_destination_guard(static_config, destination_guard)?;
+        Self::try_new_with_ingress_assets(static_config, ingress_assets)
+    }
+
+    fn try_new_with_ingress_assets(
+        static_config: &StaticProductConfig,
+        ingress_assets: Arc<ProductIngressAssets>,
+    ) -> Result<Arc<Self>, ProductStaticResourcesError> {
         let (control_failure, _) = watch::channel(None);
         let (proxy_failure, _) = watch::channel(None);
-        let ingress_assets = ProductIngressAssets::from_static(static_config)?;
         let authorization_runtime = WebhookAuthorizationRuntime::try_new(
             static_config,
             ingress_assets.destination_guard().clone(),

@@ -1444,57 +1444,20 @@ mod tests {
         CompiledRedactionPayloads, ObservationPlan, PolicyDecisionLoggingPlan, RedactionPlan,
         RedactionProfilePlan, RedactionRulePlan, ReloadableLoggingPlan,
     };
-    use crate::config::Config as AppConfig;
     use crate::observation::{CapturePool, ProductObservationSnapshot};
     use crate::redaction::RedactionSnapshot;
     use crate::runtime::GenerationOwner;
     use flate2::write::GzEncoder;
     use flate2::{Compress, Compression, FlushCompress, Status};
 
-    fn minimal_config_with_capture() -> AppConfig {
-        let toml = r#"
-schema_version = "2"
-
-[proxy]
-listeners.explicit_http.bind = "127.0.0.1:8080"
-
-[logging]
-directory = "logs"
-level = "info"
-
-[capture]
-allowed_request = true
-allowed_response = false
-denied_request = false
-denied_response = false
-directory = "logs-capture"
-filename = "{requestId}-{suffix}.json"
-
-[policy]
-default = "deny"
-        "#;
-
-        toml::from_str(toml).expect("parse config")
-    }
-
-    fn sink_from_config(config: &AppConfig) -> CaptureSinkSpec {
+    fn capture_sink(directory: PathBuf) -> CaptureSinkSpec {
         CaptureSinkSpec::new(
-            PathBuf::from(&config.capture.directory),
-            if config.capture.filename.trim().is_empty() {
-                "{requestId}-{suffix}.json".to_string()
-            } else {
-                config.capture.filename.clone()
-            },
-            config.capture.max_files,
-            config.capture.max_total_bytes,
+            directory,
+            "{requestId}-{suffix}.json".to_string(),
+            16,
+            1024 * 1024,
         )
         .unwrap()
-    }
-
-    fn sample_body_result(data: &[u8]) -> BodyCaptureResult {
-        let mut buf = BodyCaptureBuffer::new(DEFAULT_MAX_BODY_BYTES);
-        buf.push(data);
-        buf.finish()
     }
 
     fn sample_record_with_body(body: Option<CaptureBody>) -> CaptureRecord {
@@ -1848,62 +1811,6 @@ default = "deny"
     }
 
     #[test]
-    fn should_capture_respects_flags() {
-        let cfg = minimal_config_with_capture();
-
-        assert!(should_capture(
-            &cfg,
-            CaptureDecision::Allow,
-            CaptureKind::Request
-        ));
-        assert!(!should_capture(
-            &cfg,
-            CaptureDecision::Allow,
-            CaptureKind::Response
-        ));
-        assert!(!should_capture(
-            &cfg,
-            CaptureDecision::Deny,
-            CaptureKind::Request
-        ));
-        assert!(!should_capture(
-            &cfg,
-            CaptureDecision::Deny,
-            CaptureKind::Response
-        ));
-    }
-
-    #[test]
-    fn body_capture_truncates_at_max_size() {
-        let max = 16usize;
-        let mut buf = BodyCaptureBuffer::new(max);
-        let chunk1 = vec![1u8; 10];
-        let chunk2 = vec![2u8; 10];
-
-        buf.push(&chunk1);
-        buf.push(&chunk2);
-
-        let result = buf.finish();
-        assert_eq!(result.total_len, 20);
-        assert_eq!(result.captured.len(), max);
-    }
-
-    #[test]
-    fn body_capture_length_saturates_on_overflow() {
-        let mut buf = BodyCaptureBuffer {
-            max_bytes: 0,
-            captured: Vec::new(),
-            total_len: usize::MAX - 1,
-        };
-
-        buf.push(&[1, 2, 3, 4]);
-
-        let result = buf.finish();
-        assert_eq!(result.total_len, usize::MAX);
-        assert!(result.captured.is_empty());
-    }
-
-    #[test]
     fn capture_sink_spec_validates_path_and_retention_inputs() {
         let valid = CaptureSinkSpec::new(
             PathBuf::from("captures"),
@@ -1971,25 +1878,19 @@ default = "deny"
 
     #[test]
     fn truncated_body_marker_is_exact_and_round_trips() {
-        let record = build_capture_record(CaptureRecordOptions {
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-            request_id: "truncated".to_string(),
-            kind: CaptureKind::Response,
-            decision: CaptureDecision::Allow,
-            mode: CaptureMode::HttpProxy,
-            url: "http://example.com/".to_string(),
-            method: Some("GET".to_string()),
-            client: CaptureEndpoint::default(),
-            target: None,
-            http_version: None,
-            headers: None,
-            status_code: Some(200),
-            status_message: None,
-            body: Some(BodyCaptureResult {
-                captured: b"prefix".to_vec(),
-                total_len: 12,
-            }),
-        });
+        let mut record = sample_record_with_body(Some(CaptureBody {
+            encoding: "base64".to_string(),
+            length: 12,
+            data: general_purpose::STANDARD.encode(b"prefix"),
+            content_type: None,
+            content_encoding: None,
+        }));
+        record.request_id = "truncated".to_string();
+        record.kind = CaptureKind::Response;
+        record.url = "http://example.com/".to_string();
+        record.method = "GET".to_string();
+        record.http_version = None;
+        record.body_truncated = Some(true);
 
         let value = serde_json::to_value(&record).unwrap();
         assert_eq!(value["bodyTruncated"], true);
@@ -2147,8 +2048,6 @@ default = "deny"
 
     #[test]
     fn resolve_capture_path_uses_template_and_suffix() {
-        let cfg = minimal_config_with_capture();
-
         let record = CaptureRecord {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             request_id: "req-123".to_string(),
@@ -2169,15 +2068,12 @@ default = "deny"
             provider_replacement_size: None,
         };
 
-        let path = resolve_capture_path(&sink_from_config(&cfg), &record);
+        let path = resolve_capture_path(&capture_sink(PathBuf::from("logs-capture")), &record);
         assert_eq!(path, Path::new("logs-capture").join("req-123-req.json"));
     }
 
     #[test]
     fn capture_record_json_shape_matches_expectations() {
-        let mut cfg = minimal_config_with_capture();
-        cfg.capture.directory = "logs-capture-json".to_string();
-
         let mut headers = HeaderMap::new();
         headers.insert(
             "Content-Type".to_string(),
@@ -2189,16 +2085,16 @@ default = "deny"
         );
 
         let body_bytes = b"hello world";
-        let body_result = sample_body_result(body_bytes);
-
-        let opts = CaptureRecordOptions {
+        let record = CaptureRecord {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             request_id: "req-1".to_string(),
             kind: CaptureKind::Request,
             decision: CaptureDecision::Allow,
             mode: CaptureMode::HttpProxy,
             url: "http://example.com/echo".to_string(),
-            method: Some("POST".to_string()),
+            method: "POST".to_string(),
+            status_code: Some(200),
+            status_message: Some("OK".to_string()),
             client: CaptureEndpoint {
                 address: Some("127.0.0.1".to_string()),
                 port: Some(12345),
@@ -2209,12 +2105,18 @@ default = "deny"
             }),
             http_version: Some("1.1".to_string()),
             headers: Some(headers),
-            status_code: Some(200),
-            status_message: Some("OK".to_string()),
-            body: Some(body_result),
+            body: Some(CaptureBody {
+                encoding: "base64".to_string(),
+                length: body_bytes.len(),
+                data: general_purpose::STANDARD.encode(body_bytes),
+                content_type: Some("text/plain".to_string()),
+                content_encoding: Some("gzip".to_string()),
+            }),
+            body_truncated: None,
+            provider_replacement_omitted: None,
+            provider_replacement_size: None,
         };
 
-        let record = build_capture_record(opts);
         let json = serde_json::to_string_pretty(&record).expect("serialize");
 
         let decoded: CaptureRecord = serde_json::from_str(&json).expect("round trip");
@@ -2236,31 +2138,7 @@ default = "deny"
     }
 
     #[test]
-    fn build_capture_record_redacts_sensitive_url_parts() {
-        let record = build_capture_record(CaptureRecordOptions {
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-            request_id: "req-1".to_string(),
-            kind: CaptureKind::Request,
-            decision: CaptureDecision::Allow,
-            mode: CaptureMode::HttpProxy,
-            url: "http://user:pass@example.com/echo?token=secret".to_string(),
-            method: Some("GET".to_string()),
-            client: CaptureEndpoint::default(),
-            target: None,
-            http_version: Some("1.1".to_string()),
-            headers: None,
-            status_code: None,
-            status_message: None,
-            body: None,
-        });
-
-        assert_eq!(record.url, "http://example.com/echo?REDACTED");
-    }
-
-    #[test]
     fn resolve_capture_path_sanitizes_request_id() {
-        let cfg = minimal_config_with_capture();
-
         let raw_request_id = "../etc/passwd";
         let record = CaptureRecord {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
@@ -2286,7 +2164,7 @@ default = "deny"
         assert!(!sanitized.contains('/'));
         assert!(!sanitized.contains('.'));
 
-        let path = resolve_capture_path(&sink_from_config(&cfg), &record);
+        let path = resolve_capture_path(&capture_sink(PathBuf::from("logs-capture")), &record);
         let file_name = path
             .file_name()
             .expect("has file name")

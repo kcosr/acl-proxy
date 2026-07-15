@@ -267,6 +267,12 @@ Redaction profiles apply to normalized outbound HTTP bodies and protected
 client-to-upstream WebSocket messages. Environment-backed secret literals use
 an explicit typed list; `${NAME}` interpolation is not supported.
 
+For protected WebSocket traffic, text and binary application data is redacted
+before forwarding. Ping and pong payloads are treated as binary application
+data, while close reasons are treated as text; close status codes are
+preserved. Every resulting control frame remains within the protocol's
+125-byte payload limit.
+
 ```toml
 [redaction.profiles.sensitive]
 replacement = "[REDACTED]"
