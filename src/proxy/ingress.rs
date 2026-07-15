@@ -1213,13 +1213,13 @@ async fn execute_connect_request(
             config.connect.as_ref().and_then(|connect| connect.http1)
         }
         Version::HTTP_2 => {
-            return HandledResponse::fixed(StatusCode::FORBIDDEN, "CONNECT denied\n", false)
+            return HandledResponse::fixed(StatusCode::FORBIDDEN, "CONNECT denied\n", true)
         }
         _ => None,
     };
     match policy {
         Some(CompiledHttp1ConnectPolicy::Deny) => {
-            return HandledResponse::fixed(StatusCode::FORBIDDEN, "CONNECT denied\n", false)
+            return HandledResponse::fixed(StatusCode::FORBIDDEN, "CONNECT denied\n", true)
         }
         Some(CompiledHttp1ConnectPolicy::Mitm) => {}
         None => {
@@ -4791,6 +4791,62 @@ default = "allow"
             to_bytes(response.into_body()).await.unwrap(),
             "CONNECT denied\n"
         );
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn denied_connect_with_body_closes_before_pipelined_request() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let policy = r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "allow"
+"#;
+        let (_directory, product) =
+            product(base_config(proxy, "explicit_http", policy), listeners).await;
+        let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        stream
+            .write_all(
+                b"CONNECT 192.0.2.10:443 HTTP/1.1\r\n\
+Host: 192.0.2.10:443\r\n\
+Content-Length: 4\r\n\
+\r\n\
+bodyGET http://192.0.2.11/ HTTP/1.1\r\n\
+Host: 192.0.2.11\r\n\
+Connection: close\r\n\
+\r\n",
+            )
+            .await
+            .unwrap();
+
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .expect("denied CONNECT did not close the connection")
+            .unwrap();
+        let response_text = String::from_utf8(response).unwrap();
+        assert!(
+            response_text.starts_with("HTTP/1.1 403 "),
+            "{response_text}"
+        );
+        assert!(
+            response_text
+                .to_ascii_lowercase()
+                .contains("connection: close\r\n"),
+            "{response_text}"
+        );
+        assert_eq!(
+            response_text.matches("HTTP/1.1 ").count(),
+            1,
+            "{response_text}"
+        );
+        assert!(
+            response_text.ends_with("CONNECT denied\n"),
+            "{response_text}"
+        );
+
         product.shutdown().await;
     }
 

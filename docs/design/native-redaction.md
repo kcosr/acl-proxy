@@ -49,7 +49,7 @@ Unsupported encodings, oversized encoded bodies, oversized decoded bodies, inval
 
 ## WebSocket Behavior
 
-For a matched HTTP/1.1 WebSocket upgrade, acl-proxy validates/sanitizes the handshake, then runs a frame-aware relay after `101 Switching Protocols`. Only client-to-upstream text/binary data messages are redacted. Upstream-to-client data and all control frames are forwarded without redaction.
+For a matched HTTP/1.1 WebSocket upgrade, acl-proxy validates/sanitizes the handshake, then runs a frame-aware relay after `101 Switching Protocols`. Client-to-upstream text/binary messages are redacted. Ping/Pong application data is treated as binary, and Close reason text is treated as text; both are redacted while preserving the control opcode and Close status code. Upstream-to-client frames are forwarded without redaction.
 
 The relay buffers one complete client-to-upstream data message at a time, decompresses `permessage-deflate` messages when negotiated, applies the shared redaction profile, recompresses if needed, and reframes before forwarding upstream. Upstream-to-client data frames are forwarded without redaction or message reassembly, though the per-frame safety limit still applies in both directions.
 

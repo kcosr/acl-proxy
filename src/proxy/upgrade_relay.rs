@@ -3,6 +3,7 @@ use std::io::Read;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use allocator_api2::boxed::Box as FallibleBox;
 use chrono::Utc;
@@ -19,6 +20,7 @@ use crate::redaction::{PayloadClass, ProfileHandle};
 use crate::upgrade::{UpgradeRelayPair, UpgradeTerminalCause, UpgradedStreamSnapshot};
 
 const SEC_WEBSOCKET_EXTENSIONS: &str = "sec-websocket-extensions";
+const WEBSOCKET_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const CLOSE_PROTOCOL_ERROR: u16 = 1002;
 const CLOSE_MESSAGE_TOO_BIG: u16 = 1009;
 const DEFLATE_TAIL: [u8; 4] = [0x00, 0x00, 0xff, 0xff];
@@ -326,11 +328,16 @@ type RelayFuture = Pin<Box<dyn Future<Output = UpgradeTerminalCause> + Send + 's
 struct RelayTasks {
     client_to_upstream: RelayFuture,
     upstream_to_client: RelayFuture,
+    graceful_drain_timeout: Option<Duration>,
 }
 
 impl RelayTasks {
     fn into_pair(self) -> UpgradeRelayPair {
-        UpgradeRelayPair::new(self.client_to_upstream, self.upstream_to_client)
+        UpgradeRelayPair::new_with_graceful_drain_timeout(
+            self.client_to_upstream,
+            self.upstream_to_client,
+            self.graceful_drain_timeout,
+        )
     }
 }
 
@@ -363,6 +370,7 @@ where
                     upstream_to_client,
                     true,
                 )),
+                graceful_drain_timeout: None,
             }
         }
         PreparedUpgradeKind::ObservedWebSocket {
@@ -390,6 +398,7 @@ where
                     negotiation,
                     capture,
                 )),
+                graceful_drain_timeout: Some(WEBSOCKET_CLOSE_DRAIN_TIMEOUT),
             }
         }
         PreparedUpgradeKind::WebSocket {
@@ -416,6 +425,7 @@ where
                     WebSocketDirection::UpstreamToClient,
                     capture,
                 )),
+                graceful_drain_timeout: Some(WEBSOCKET_CLOSE_DRAIN_TIMEOUT),
             }
         }
     }
@@ -548,6 +558,8 @@ where
             && masked == direction.reads_masked()
             && !reserved_invalid
             && opcode.is_some();
+        let closes_direction =
+            frame_observable && fin && payload_len <= 125 && opcode == Some(OpCode::Close);
         let mut completed_capture = None;
         let mut frame_capture = match opcode {
             Some(opcode) if opcode.is_control() => {
@@ -648,6 +660,9 @@ where
         }
         if let Some(capture) = completed_capture {
             capture.finish();
+        }
+        if closes_direction {
+            return UpgradeTerminalCause::PeerClosed;
         }
     }
 }
@@ -784,7 +799,10 @@ where
         let header = match read_frame_header(&mut reader, direction.reads_masked(), &profile).await
         {
             Ok(Some(header)) => header,
-            Ok(None) => return UpgradeTerminalCause::PeerClosed,
+            Ok(None) => {
+                let _ = writer.shutdown().await;
+                return UpgradeTerminalCause::PeerClosed;
+            }
             Err(error) => {
                 let _ =
                     write_close(&mut writer, direction.writes_masked(), close_code(error)).await;
@@ -810,6 +828,19 @@ where
                         .await;
                     return UpgradeTerminalCause::RelayError;
                 }
+            };
+            let frame = if direction == WebSocketDirection::ClientToUpstream {
+                match redact_client_control_frame(frame, &profile) {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        let _ =
+                            write_close(&mut writer, direction.writes_masked(), close_code(error))
+                                .await;
+                        return UpgradeTerminalCause::RelayError;
+                    }
+                }
+            } else {
+                frame
             };
             let closing = frame.opcode == OpCode::Close;
             if write_frame(&mut writer, frame, direction.writes_masked())
@@ -988,6 +1019,46 @@ where
             }
         }
     }
+}
+
+fn redact_client_control_frame(
+    mut frame: Frame,
+    profile: &ProfileHandle,
+) -> Result<Frame, RelayProtocolError> {
+    let payload = std::mem::take(&mut frame.payload);
+    frame.payload = match frame.opcode {
+        OpCode::Ping | OpCode::Pong => {
+            redact_control_payload(profile, payload, PayloadClass::Binary)?
+        }
+        OpCode::Close => match payload.len() {
+            0 => Vec::new(),
+            1 => return Err(RelayProtocolError::Protocol),
+            _ => {
+                let mut output = payload[..2].to_vec();
+                let reason = payload[2..].to_vec();
+                std::str::from_utf8(&reason).map_err(|_| RelayProtocolError::Protocol)?;
+                let reason = redact_control_payload(profile, reason, PayloadClass::Text)?;
+                output.extend_from_slice(&reason);
+                output
+            }
+        },
+        _ => return Err(RelayProtocolError::Protocol),
+    };
+    if frame.payload.len() > 125 {
+        return Err(RelayProtocolError::FrameTooLarge);
+    }
+    Ok(frame)
+}
+
+fn redact_control_payload(
+    profile: &ProfileHandle,
+    payload: Vec<u8>,
+    class: PayloadClass,
+) -> Result<Vec<u8>, RelayProtocolError> {
+    let mut redacted = profile
+        .redact_websocket_message(payload, class)
+        .map_err(|_| RelayProtocolError::MessageTooLarge)?;
+    Ok(std::mem::take(&mut redacted.bytes))
 }
 
 async fn forward_websocket_message<Writer>(
@@ -1756,21 +1827,23 @@ mod tests {
         upstream.read_exact(&mut received).await.unwrap();
         assert_eq!(&received, b"client payload");
 
+        downstream.shutdown().await.unwrap();
+        assert_eq!(
+            client_to_upstream.await.unwrap(),
+            UpgradeTerminalCause::PeerClosed
+        );
+
         upstream.write_all(b"server payload").await.unwrap();
         let mut received = [0_u8; 14];
         downstream.read_exact(&mut received).await.unwrap();
         assert_eq!(&received, b"server payload");
 
-        drop(downstream);
-        drop(upstream);
-        assert_eq!(
-            client_to_upstream.await.unwrap(),
-            UpgradeTerminalCause::PeerClosed
-        );
+        upstream.shutdown().await.unwrap();
         assert_eq!(
             upstream_to_client.await.unwrap(),
             UpgradeTerminalCause::PeerClosed
         );
+        drop((downstream, upstream));
     }
 
     #[tokio::test]
@@ -1838,6 +1911,41 @@ mod tests {
         drop(upstream);
         client_to_upstream.await.unwrap();
         upstream_to_client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn protected_websocket_redacts_client_control_frame_application_data() {
+        let profile = profile(128, 256, false);
+        let (mut downstream, mut upstream, tasks) =
+            establish_test_streams(websocket_kind(&profile, false), 8);
+        let client_to_upstream = tokio::spawn(tasks.client_to_upstream);
+
+        for opcode in [0x9, 0xa] {
+            downstream
+                .write_all(&wire_frame(true, false, opcode, true, b"secret"))
+                .await
+                .unwrap();
+            let (_, _, relayed_opcode, payload) = read_wire_frame(&mut upstream).await;
+            assert_eq!(relayed_opcode, opcode);
+            assert_eq!(payload, b"[MASKED]");
+        }
+
+        let mut close = 1000_u16.to_be_bytes().to_vec();
+        close.extend_from_slice(b"secret");
+        downstream
+            .write_all(&wire_frame(true, false, 0x8, true, &close))
+            .await
+            .unwrap();
+        let (_, _, opcode, payload) = read_wire_frame(&mut upstream).await;
+        assert_eq!(opcode, 0x8);
+        let mut expected = 1000_u16.to_be_bytes().to_vec();
+        expected.extend_from_slice(b"[MASKED]");
+        assert_eq!(payload, expected);
+        assert_eq!(
+            client_to_upstream.await.unwrap(),
+            UpgradeTerminalCause::PeerClosed
+        );
+        drop(tasks.upstream_to_client);
     }
 
     #[tokio::test]
@@ -2066,6 +2174,31 @@ mod tests {
         assert_eq!(records[0].decode_body_bytes().unwrap(), b"client CAPTURED");
         assert_eq!(records[1].kind, CaptureKind::Response);
         assert_eq!(records[1].decode_body_bytes().unwrap(), b"server CAPTURED");
+    }
+
+    #[tokio::test]
+    async fn unprotected_websocket_close_finishes_after_forwarding_the_full_frame() {
+        let runtime = Arc::new(ProductObservationRuntime::try_new(1).unwrap());
+        let context = upgrade_capture_context(runtime.clone());
+        let (mut downstream, mut upstream, tasks) = establish_test_streams_with_capture(
+            observed_websocket_kind(None, None),
+            8,
+            Some(context),
+        );
+        let client_to_upstream = tokio::spawn(tasks.client_to_upstream);
+        let close = wire_frame(true, false, 0x8, true, &1000_u16.to_be_bytes());
+
+        downstream.write_all(&close).await.unwrap();
+
+        let (_, _, opcode, payload) = read_wire_frame(&mut upstream).await;
+        assert_eq!(opcode, 0x8);
+        assert_eq!(payload, 1000_u16.to_be_bytes());
+        assert_eq!(
+            client_to_upstream.await.unwrap(),
+            UpgradeTerminalCause::PeerClosed
+        );
+        drop(tasks.upstream_to_client);
+        runtime.shutdown().await;
     }
 
     #[tokio::test]

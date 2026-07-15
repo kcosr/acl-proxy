@@ -51,6 +51,8 @@ pub(crate) enum ForwardError {
     Http(#[source] hyper::Error),
     #[error("HTTP forwarding task failed")]
     Task(#[source] tokio::task::JoinError),
+    #[error("upstream returned unexpected informational status {0}")]
+    UnexpectedInformationalResponse(StatusCode),
     #[error("parent proxy rejected CONNECT with status {0}")]
     ParentConnect(StatusCode),
     #[error("the resolved forwarding target does not belong to this request and egress route")]
@@ -1157,6 +1159,11 @@ where
             return Err(ForwardError::Http(error));
         }
     };
+    if response.status().is_informational() {
+        let status = response.status();
+        driver.abort_and_join().await;
+        return Err(ForwardError::UnexpectedInformationalResponse(status));
+    }
     let (mut parts, body) = response.into_parts();
     strip_response_hop_by_hop(&mut parts.headers);
     Ok(Response::from_parts(parts, ForwardBody::new(body, driver)))
@@ -1708,6 +1715,44 @@ mod tests {
                 signal.send(()).ok();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn ordinary_forwarding_rejects_unsolicited_switching_protocols() {
+        let canonical = canonicalize_http_url("http://origin.example/ordinary").unwrap();
+        let egress = activate(None);
+        let request = request();
+        let (guard, _) = guard();
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let _ = read_http_head(&mut server).await;
+            let mut request_body = [0_u8; 12];
+            server.read_exact(&mut request_body).await.unwrap();
+            assert_eq!(&request_body, b"request-body");
+            server
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut byte = [0_u8; 1];
+            assert_eq!(server.read(&mut byte).await.unwrap(), 0);
+        });
+
+        let error =
+            forward_with_connector(request, &canonical, &egress, &guard, target, &connector)
+                .await
+                .err()
+                .expect("an ordinary request must reject an unsolicited 101");
+        assert!(matches!(
+            error,
+            ForwardError::UnexpectedInformationalResponse(StatusCode::SWITCHING_PROTOCOLS)
+        ));
+        server.await.unwrap();
     }
 
     #[tokio::test]

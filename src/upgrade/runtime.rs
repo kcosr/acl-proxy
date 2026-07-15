@@ -245,8 +245,7 @@ impl UpgradeEntryPlan {
 }
 
 pub(crate) struct UpgradeRelayPair {
-    first: UpgradeRelayTask,
-    second: UpgradeRelayTask,
+    relay: UpgradeRelayTask,
 }
 
 impl UpgradeRelayPair {
@@ -255,10 +254,61 @@ impl UpgradeRelayPair {
         First: Future<Output = UpgradeTerminalCause> + Send + 'static,
         Second: Future<Output = UpgradeTerminalCause> + Send + 'static,
     {
+        let mut first: UpgradeRelayTask = Box::pin(first);
+        let mut second: UpgradeRelayTask = Box::pin(second);
         Self {
-            first: Box::pin(first),
-            second: Box::pin(second),
+            relay: Box::pin(async move {
+                tokio::select! {
+                    cause = first.as_mut() => cause,
+                    cause = second.as_mut() => cause,
+                }
+            }),
         }
+    }
+
+    pub(crate) fn new_with_graceful_drain_timeout<First, Second>(
+        first: First,
+        second: Second,
+        graceful_drain_timeout: Option<Duration>,
+    ) -> Self
+    where
+        First: Future<Output = UpgradeTerminalCause> + Send + 'static,
+        Second: Future<Output = UpgradeTerminalCause> + Send + 'static,
+    {
+        let mut first: UpgradeRelayTask = Box::pin(first);
+        let mut second: UpgradeRelayTask = Box::pin(second);
+        Self {
+            relay: Box::pin(async move {
+                tokio::select! {
+                    cause = first.as_mut() => {
+                        if cause == UpgradeTerminalCause::PeerClosed {
+                            await_graceful_peer(second, graceful_drain_timeout).await
+                        } else {
+                            cause
+                        }
+                    }
+                    cause = second.as_mut() => {
+                        if cause == UpgradeTerminalCause::PeerClosed {
+                            await_graceful_peer(first, graceful_drain_timeout).await
+                        } else {
+                            cause
+                        }
+                    }
+                }
+            }),
+        }
+    }
+}
+
+async fn await_graceful_peer(
+    peer: UpgradeRelayTask,
+    drain_timeout: Option<Duration>,
+) -> UpgradeTerminalCause {
+    match drain_timeout {
+        Some(timeout) => tokio::time::timeout(timeout, peer)
+            .await
+            .unwrap_or(UpgradeTerminalCause::PeerClosed),
+        None => peer.await,
     }
 }
 
@@ -1380,8 +1430,7 @@ fn handle_entry_task_completion(
                     && now < timing.application_stop
                 {
                     let pair = pair.take().expect("relay pair is promoted once");
-                    tasks.spawn(async move { EntryTaskResult::Relay(pair.first.await) });
-                    tasks.spawn(async move { EntryTaskResult::Relay(pair.second.await) });
+                    tasks.spawn(async move { EntryTaskResult::Relay(pair.relay.await) });
                     None
                 } else if shared.terminal_state.load(Ordering::SeqCst) == ENTRY_OPEN
                     && now >= timing.application_stop
@@ -2623,6 +2672,67 @@ mod tests {
             assert!(counts.accepting);
         }
         runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
+
+    #[tokio::test]
+    async fn graceful_relay_half_close_waits_for_the_peer_direction() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let (entry_tx, entry_rx) = oneshot::channel();
+        let (reverse_release_tx, reverse_release_rx) = oneshot::channel();
+        runtime
+            .try_spawn_handshake(allocation(0, 0), move |handshake| async move {
+                let entry = handshake
+                    .commit(
+                        None,
+                        plan(|_| async move {
+                            Ok(UpgradeRelayPair::new_with_graceful_drain_timeout(
+                                async { UpgradeTerminalCause::PeerClosed },
+                                async move {
+                                    let _ = reverse_release_rx.await;
+                                    UpgradeTerminalCause::PeerClosed
+                                },
+                                None,
+                            ))
+                        }),
+                    )
+                    .unwrap();
+                entry_tx.send(entry).unwrap();
+            })
+            .unwrap();
+        let entry = entry_rx.await.unwrap();
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), entry.wait_closed())
+                .await
+                .is_err(),
+            "one graceful relay EOF must not abort the reverse direction"
+        );
+        reverse_release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), entry.wait_closed())
+            .await
+            .unwrap();
+        assert_eq!(
+            entry.terminal_cause(),
+            Some(UpgradeTerminalCause::PeerClosed)
+        );
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
+
+    #[tokio::test]
+    async fn graceful_relay_drain_timeout_bounds_an_unresponsive_peer() {
+        let pair = UpgradeRelayPair::new_with_graceful_drain_timeout(
+            async { UpgradeTerminalCause::PeerClosed },
+            async {
+                std::future::pending::<()>().await;
+                UpgradeTerminalCause::PeerClosed
+            },
+            Some(Duration::from_millis(20)),
+        );
+
+        let cause = tokio::time::timeout(Duration::from_secs(1), pair.relay)
+            .await
+            .expect("graceful relay drain timeout did not fire");
+        assert_eq!(cause, UpgradeTerminalCause::PeerClosed);
     }
 
     #[tokio::test]
