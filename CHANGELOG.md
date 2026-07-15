@@ -4,24 +4,38 @@
 
 ### Breaking Changes
 
-- Advanced `schema_version` to `"2"` for the breaking listener and parent-egress configuration redesign. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
-- Replaced the flat proxy listener settings with `proxy.listeners.*` sections for explicit HTTP, transparent HTTP, explicit HTTPS, and transparent HTTPS listeners. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
-- Changed `proxy.egress.default` to require an explicit parent-proxy `type` and `transport`. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
-- Replaced the `PROXY_PORT` and `PROXY_HOST` environment overrides with `PROXY_EXPLICIT_HTTP_BIND`. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
-- Replaced egress transport log value `chain` with `egress_type = "explicit_proxy"` and `egress_transport = "http"` or `"https"`. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
+- Replaced the unreleased schema-2 draft with the strict integer
+  `schema_version = 3` contract. Missing, string, schema-1, schema-2, and future
+  versions are rejected without migration aliases or fallback parsing.
+- Replaced the obsolete flat proxy, plugin, external-authorization, capture,
+  logging, certificate, and loop-protection shapes with explicit `service`,
+  `control`, `listeners`, `mitm`, `egress`, `policy`, `authorization`,
+  `credentials`, `redaction`, `observation`, and `safety` owners.
+- Moved readiness and authorization callbacks to the separate control listener;
+  proxy data listeners no longer expose control routes.
+- Removed per-policy-decision logging switches. The process-lifetime logging
+  level and sinks are now static configuration, while capture is the bounded
+  request/response observation mechanism.
 
 ### Added
 
-- Added an explicit HTTPS proxy listener with an operator-managed static proxy certificate and key. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
-- Added HTTPS parent-proxy egress forwarding with configurable TLS trust for system roots, custom CAs, combined system-plus-custom roots, or disabled verification. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
-- Added `proxy.shutdown_drain_timeout_ms` to optionally bound graceful shutdown draining; the default `0` waits indefinitely for in-flight requests. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
+- Added one common ingress runtime for explicit and transparent HTTP/HTTPS,
+  CONNECT MITM, HTTP/1.1, HTTP/2, upgrades, and direct or parent egress.
+- Added generation-owned process and webhook authorization providers, typed
+  credential injection, bounded body/capture pools, strict URL matching, and
+  sanitized production topology fixtures.
+- Added ordered file-backed CA-chain support, short-lived generated leaf
+  certificates, and bounded optional leaf-certificate persistence.
 
 ### Changed
 
 - Established one strict URL contract for policy evaluation and forwarding: DNS hosts use IDNA/STD3 validation, fragments and ambiguous double encoding are rejected, encoded delimiters remain opaque, and the exact canonical URL authorized by policy is forwarded upstream.
 - Decoupled ingress HTTP versions from selected outbound protocols, normalizing request targets, authority, Host, TE, and ALPN across direct and parent routes.
-- Split explicit HTTP and transparent HTTP handling onto separate configured sockets, and reject listener topology changes during reload. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
-- Graceful shutdown now closes idle keep-alive connections and drains in-flight requests across all configured listeners before exit. ([#57](https://github.com/kcosr/acl-proxy/pull/57))
+- Listener, control, MITM, logging, and shared resource capacities are static;
+  policy, providers, redaction, capture selection, and egress effects publish as
+  atomic generation snapshots.
+- Graceful shutdown closes idle keep-alive connections, interrupts stalled TLS
+  handshakes, and drains or bounds in-flight requests and upgrades.
 - Generated minimal configurations now bind their deny-all listeners to IPv4 loopback instead of all interfaces.
 
 ### Fixed

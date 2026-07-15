@@ -45,6 +45,7 @@ hyper = { version = "0.14", features = ["full"] }
 httparse = "1.10.1"
 tokio-stream = "0.1"
 chrono = { version = "0.4", features = ["serde", "clock"] }
+time = "0.3"
 http = "0.2"
 rustls = { version = "0.21", features = ["dangerous_configuration"] }
 rustls-native-certs = "0.6"

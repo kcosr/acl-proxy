@@ -121,7 +121,11 @@ Generated CA material is private process state. Distribute only the generated
 `ca_private_key` paths. The certificate file may contain an ordered PEM CA
 chain: its first certificate must match the private key and be CA-capable, and
 the complete chain is served with generated leaf certificates. Private keys
-must not grant group or other access.
+must not grant group or other access. Generated leaf certificates use a
+30-day validity window clamped to the signing CA. When leaf persistence is
+enabled, the dynamic directory retains at most `max_cached_certificates`
+distinct host certificate/key/chain sets and prunes older sets on startup and
+runtime generation.
 
 ### Egress
 

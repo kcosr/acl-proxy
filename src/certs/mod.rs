@@ -13,6 +13,7 @@ use rcgen::{
     DnType, IsCa, KeyPair,
 };
 use rustls::{Certificate as RustlsCertificate, PrivateKey, ServerConfig};
+use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::Semaphore;
 
 use crate::config::compiler::StaticMitmConfig;
@@ -52,6 +53,13 @@ pub enum CertError {
 
     #[error("failed to write certificate file {path}: {source}")]
     WriteFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to manage persisted certificate files in {path}: {source}")]
+    ManagePersistedCertificates {
         path: PathBuf,
         #[source]
         source: std::io::Error,
@@ -97,6 +105,7 @@ struct Inner {
     activation_open: AtomicBool,
     activation_workers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     server_configs: Mutex<LruCache<ServerConfigCacheKey, Arc<ServerConfig>>>,
+    persisted_hosts: Option<Mutex<LruCache<String, ()>>>,
 }
 
 #[derive(Clone)]
@@ -190,6 +199,10 @@ impl MitmCertificateManager {
                 source,
             })?;
         }
+        let persisted_hosts = persist_leaf_certificates
+            .then(|| load_persisted_hosts(&dynamic_dir, cache_capacity))
+            .transpose()?
+            .map(Mutex::new);
         Ok(Self {
             inner: Arc::new(Inner {
                 dynamic_dir,
@@ -204,6 +217,7 @@ impl MitmCertificateManager {
                 activation_open: AtomicBool::new(true),
                 activation_workers: Mutex::new(Vec::new()),
                 server_configs: Mutex::new(LruCache::new(cache_capacity)),
+                persisted_hosts,
             }),
         })
     }
@@ -368,6 +382,8 @@ fn generate_and_cache_server_config(
         .map_err(|e| CertError::BuildServerConfig(format!("{e}")))?;
     config.alpn_protocols = cache_key.alpn_protocols.to_vec();
 
+    record_persisted_host(inner, &cache_key.host)?;
+
     let cfg = Arc::new(config);
     let mut cache = inner
         .server_configs
@@ -375,6 +391,85 @@ fn generate_and_cache_server_config(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.put(cache_key, cfg.clone());
     Ok(cfg)
+}
+
+fn load_persisted_hosts(
+    directory: &Path,
+    capacity: NonZeroUsize,
+) -> Result<LruCache<String, ()>, CertError> {
+    let mut hosts = Vec::new();
+    let entries =
+        fs::read_dir(directory).map_err(|source| CertError::ManagePersistedCertificates {
+            path: directory.to_path_buf(),
+            source,
+        })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| CertError::ManagePersistedCertificates {
+            path: directory.to_path_buf(),
+            source,
+        })?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(host) = name.strip_suffix(".crt") else {
+            continue;
+        };
+        if host.ends_with("-chain") {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        hosts.push((modified, host.to_owned()));
+    }
+    hosts.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    let mut retained = LruCache::new(capacity);
+    for (_, host) in hosts {
+        if let Some((evicted, ())) = retained.push(host, ()) {
+            remove_persisted_host(directory, &evicted)?;
+        }
+    }
+    Ok(retained)
+}
+
+fn record_persisted_host(inner: &Inner, host: &str) -> Result<(), CertError> {
+    let Some(hosts) = &inner.persisted_hosts else {
+        return Ok(());
+    };
+    let mut hosts = hosts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if hosts.get(host).is_some() {
+        return Ok(());
+    }
+    if hosts.len() == hosts.cap().get() {
+        let evicted = hosts
+            .peek_lru()
+            .map(|(host, ())| host.clone())
+            .expect("a full persisted-host cache has an LRU entry");
+        if let Err(error) = remove_persisted_host(&inner.dynamic_dir, &evicted) {
+            let _ = remove_persisted_host(&inner.dynamic_dir, host);
+            return Err(error);
+        }
+        hosts.pop(&evicted);
+    }
+    hosts.put(host.to_owned(), ());
+    Ok(())
+}
+
+fn remove_persisted_host(directory: &Path, host: &str) -> Result<(), CertError> {
+    for suffix in [".crt", ".key", "-chain.crt"] {
+        let path = directory.join(format!("{host}{suffix}"));
+        if let Err(source) = fs::remove_file(&path) {
+            if source.kind() != IoErrorKind::NotFound {
+                return Err(CertError::ManagePersistedCertificates { path, source });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Eq, Hash, PartialEq)]
@@ -508,8 +603,15 @@ fn generate_host_certificate(
         dn
     };
 
-    params.not_before = ca_cert.params().not_before;
-    params.not_after = ca_cert.params().not_after;
+    let now = OffsetDateTime::now_utc();
+    params.not_before = (now - TimeDuration::minutes(5)).max(ca_cert.params().not_before);
+    params.not_after =
+        (now.max(params.not_before) + TimeDuration::days(30)).min(ca_cert.params().not_after);
+    if params.not_after <= params.not_before {
+        return Err(CertError::BuildServerConfig(
+            "CA validity does not contain a usable leaf-certificate window".to_owned(),
+        ));
+    }
 
     let leaf_key = KeyPair::generate().map_err(|e| CertError::BuildServerConfig(format!("{e}")))?;
     let leaf_cert = params
@@ -605,6 +707,14 @@ mod tests {
         assert!(leaf.is_file());
         assert!(key.is_file());
         assert!(chain.is_file());
+        let mut leaf_reader = Cursor::new(fs::read(&leaf).unwrap());
+        let leaf_der = rustls_pemfile::certs(&mut leaf_reader).unwrap().remove(0);
+        let leaf_params = CertificateParams::from_ca_cert_der(&leaf_der.as_slice().into()).unwrap();
+        let now = OffsetDateTime::now_utc();
+        assert!(leaf_params.not_before >= now - TimeDuration::minutes(10));
+        assert!(leaf_params.not_before <= now);
+        assert!(leaf_params.not_after > now + TimeDuration::days(29));
+        assert!(leaf_params.not_after <= now + TimeDuration::days(31));
         #[cfg(unix)]
         {
             assert_eq!(mode(&directory), 0o700);
@@ -626,6 +736,55 @@ mod tests {
             fs::read(directory.join("ca-key.pem")).unwrap(),
             original_key
         );
+    }
+
+    #[tokio::test]
+    async fn persisted_dynamic_certificates_are_bounded_across_runtime_and_restart() {
+        let tmp = TempDir::new().expect("tempdir");
+        let directory = tmp.path().join("generated");
+        let config = StaticMitmConfig::Generated {
+            directory: directory.clone(),
+            max_cached_certificates: 2,
+            persist_leaf_certificates: true,
+        };
+        let manager = MitmCertificateManager::from_static(&config).unwrap();
+        for host in [
+            "first.example.test",
+            "second.example.test",
+            "third.example.test",
+        ] {
+            manager
+                .server_config_for_host(host, &[b"http/1.1".to_vec()])
+                .await
+                .unwrap();
+        }
+        let dynamic = directory.join("dynamic");
+        assert!(!dynamic.join("first.example.test.crt").exists());
+        assert!(!dynamic.join("first.example.test.key").exists());
+        assert!(!dynamic.join("first.example.test-chain.crt").exists());
+        assert!(dynamic.join("second.example.test.crt").exists());
+        assert!(dynamic.join("third.example.test.crt").exists());
+
+        drop(manager);
+        for suffix in [".crt", ".key", "-chain.crt"] {
+            fs::write(
+                dynamic.join(format!("stale.example.test{suffix}")),
+                b"stale",
+            )
+            .unwrap();
+        }
+        let manager = MitmCertificateManager::from_static(&config).unwrap();
+        let leaf_count = fs::read_dir(&dynamic)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                name.ends_with(".crt") && !name.ends_with("-chain.crt")
+            })
+            .count();
+        assert_eq!(leaf_count, 2);
+        manager.shutdown_and_join().await;
     }
 
     #[tokio::test]
@@ -789,14 +948,13 @@ mod tests {
 
         let leaf_params =
             CertificateParams::from_ca_cert_der(&runtime_chain[0].0.as_slice().into()).unwrap();
-        assert_eq!(
-            leaf_params.not_before,
-            manager.inner.ca_cert.params().not_before
-        );
-        assert_eq!(
-            leaf_params.not_after,
-            manager.inner.ca_cert.params().not_after
-        );
+        let now = OffsetDateTime::now_utc();
+        assert!(leaf_params.not_before >= manager.inner.ca_cert.params().not_before);
+        assert!(leaf_params.not_before >= now - TimeDuration::minutes(10));
+        assert!(leaf_params.not_before <= now);
+        assert!(leaf_params.not_after <= manager.inner.ca_cert.params().not_after);
+        assert!(leaf_params.not_after > now + TimeDuration::days(29));
+        assert!(leaf_params.not_after <= now + TimeDuration::days(31));
     }
 
     #[test]
