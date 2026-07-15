@@ -3523,6 +3523,58 @@ default = "deny"
     }
 
     #[tokio::test]
+    async fn fixed_policy_denial_and_upstream_failure_wire_response_corpus() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let closed = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let unavailable_origin = closed.local_addr().unwrap();
+        drop(closed);
+        let policy = format!(
+            r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "allow-unavailable-origin"
+decision = "allow"
+urls = ["http://{unavailable_origin}/failure"]
+"#,
+        );
+        let (_directory, product) =
+            product(base_config(proxy, "explicit_http", &policy), listeners).await;
+
+        let corpus = [
+            (
+                "http://deny.example/resource".to_owned(),
+                StatusCode::FORBIDDEN,
+                b"request denied\n".as_slice(),
+            ),
+            (
+                format!("http://{unavailable_origin}/failure"),
+                StatusCode::BAD_GATEWAY,
+                b"upstream failed\n".as_slice(),
+            ),
+        ];
+        for (uri, expected_status, expected_body) in corpus {
+            let response = send_request(
+                proxy,
+                Request::builder().uri(uri).body(Body::empty()).unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), expected_status);
+            assert_eq!(
+                response.headers().get(CONTENT_TYPE).unwrap(),
+                "text/plain; charset=utf-8"
+            );
+            assert_eq!(to_bytes(response.into_body()).await.unwrap(), expected_body);
+        }
+
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn matched_rule_deadline_cancels_pending_resolution() {
         let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
         let ([proxy], listeners) = prebound_listeners::<1>();

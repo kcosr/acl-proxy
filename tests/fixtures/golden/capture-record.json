@@ -3,7 +3,7 @@
   "requestId": "golden-request",
   "kind": "request",
   "decision": "allow",
-  "mode": "https_connect",
+  "mode": "http_proxy",
   "url": "https://example.com/resource",
   "method": "POST",
   "statusCode": 200,

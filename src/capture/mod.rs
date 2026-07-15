@@ -1892,32 +1892,28 @@ mod tests {
     fn capture_record_json_shape_matches_expectations() {
         let mut headers = HeaderMap::new();
         headers.insert(
-            "Content-Type".to_string(),
+            "content-type".to_string(),
             JsonValue::String("text/plain".to_string()),
         );
-        headers.insert(
-            "Content-Encoding".to_string(),
-            JsonValue::String("gzip".to_string()),
-        );
 
-        let body_bytes = b"hello world";
+        let body_bytes = b"hello";
         let record = CaptureRecord {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
-            request_id: "req-1".to_string(),
+            request_id: "golden-request".to_string(),
             kind: CaptureKind::Request,
             decision: CaptureDecision::Allow,
             mode: CaptureMode::HttpProxy,
-            url: "http://example.com/echo".to_string(),
+            url: "https://example.com/resource".to_string(),
             method: "POST".to_string(),
             status_code: Some(200),
             status_message: Some("OK".to_string()),
             client: CaptureEndpoint {
                 address: Some("127.0.0.1".to_string()),
-                port: Some(12345),
+                port: Some(43210),
             },
             target: Some(CaptureEndpoint {
-                address: Some("127.0.0.1".to_string()),
-                port: Some(8080),
+                address: Some("203.0.113.10".to_string()),
+                port: Some(443),
             }),
             http_version: Some("1.1".to_string()),
             headers: Some(headers),
@@ -1926,31 +1922,20 @@ mod tests {
                 length: body_bytes.len(),
                 data: general_purpose::STANDARD.encode(body_bytes),
                 content_type: Some("text/plain".to_string()),
-                content_encoding: Some("gzip".to_string()),
+                content_encoding: None,
             }),
             body_truncated: None,
             provider_replacement_omitted: None,
             provider_replacement_size: None,
         };
 
-        let json = serde_json::to_string_pretty(&record).expect("serialize");
+        let actual = serde_json::to_value(&record).expect("serialize capture record");
+        let expected: JsonValue = serde_json::from_str(include_str!(
+            "../../tests/fixtures/golden/capture-record.json"
+        ))
+        .expect("parse capture record golden");
 
-        let decoded: CaptureRecord = serde_json::from_str(&json).expect("round trip");
-        assert_eq!(decoded.request_id, "req-1");
-        assert_eq!(decoded.method, "POST");
-        assert_eq!(decoded.status_code, Some(200));
-        assert!(decoded.body.is_some());
-
-        let body = decoded.body.unwrap();
-        assert_eq!(body.encoding, "base64");
-        assert_eq!(body.length, body_bytes.len());
-        assert_eq!(body.content_type.as_deref(), Some("text/plain"));
-        assert_eq!(body.content_encoding.as_deref(), Some("gzip"));
-
-        let data = general_purpose::STANDARD
-            .decode(body.data)
-            .expect("decode base64");
-        assert_eq!(data, body_bytes);
+        assert_eq!(actual, expected);
     }
 
     #[test]

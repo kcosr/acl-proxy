@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Cursor, Error as IoError, ErrorKind as IoErrorKind};
 use std::num::NonZeroUsize;
@@ -13,6 +14,7 @@ use rcgen::{
     DnType, IsCa, KeyPair,
 };
 use rustls::{Certificate as RustlsCertificate, PrivateKey, ServerConfig};
+use sha2::{Digest as _, Sha256};
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::Semaphore;
 
@@ -397,7 +399,12 @@ fn load_persisted_hosts(
     directory: &Path,
     capacity: NonZeroUsize,
 ) -> Result<LruCache<String, ()>, CertError> {
-    let mut hosts = Vec::new();
+    const LEAF: u8 = 1;
+    const KEY: u8 = 2;
+    const CHAIN: u8 = 4;
+    const COMPLETE: u8 = LEAF | KEY | CHAIN;
+
+    let mut discovered = BTreeMap::new();
     let entries =
         fs::read_dir(directory).map_err(|source| CertError::ManagePersistedCertificates {
             path: directory.to_path_buf(),
@@ -408,31 +415,61 @@ fn load_persisted_hosts(
             path: directory.to_path_buf(),
             source,
         })?;
+        let path = entry.path();
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
+            remove_persisted_file(&path)?;
             continue;
         };
-        let Some(host) = name.strip_suffix(".crt") else {
+        let Some((key, kind)) = persisted_file_key(name, LEAF, KEY, CHAIN) else {
+            remove_persisted_file(&path)?;
             continue;
         };
-        if host.ends_with("-chain") {
-            continue;
-        }
         let modified = entry
             .metadata()
             .and_then(|metadata| metadata.modified())
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-        hosts.push((modified, host.to_owned()));
+        let state = discovered
+            .entry(key.to_owned())
+            .or_insert((std::time::SystemTime::UNIX_EPOCH, 0_u8));
+        state.0 = state.0.max(modified);
+        state.1 |= kind;
+    }
+
+    let mut hosts = Vec::new();
+    for (key, (modified, files)) in discovered {
+        if files == COMPLETE {
+            hosts.push((modified, key));
+        } else {
+            remove_persisted_key(directory, &key)?;
+        }
     }
     hosts.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
 
     let mut retained = LruCache::new(capacity);
-    for (_, host) in hosts {
-        if let Some((evicted, ())) = retained.push(host, ()) {
-            remove_persisted_host(directory, &evicted)?;
+    for (_, key) in hosts {
+        if let Some((evicted, ())) = retained.push(key, ()) {
+            remove_persisted_key(directory, &evicted)?;
         }
     }
     Ok(retained)
+}
+
+fn persisted_file_key(name: &str, leaf: u8, private_key: u8, chain: u8) -> Option<(&str, u8)> {
+    let (opaque_key, kind) = if let Some(opaque_key) = name.strip_suffix(".leaf.crt") {
+        (opaque_key, leaf)
+    } else if let Some(opaque_key) = name.strip_suffix(".leaf.key") {
+        (opaque_key, private_key)
+    } else if let Some(opaque_key) = name.strip_suffix(".chain.crt") {
+        (opaque_key, chain)
+    } else {
+        return None;
+    };
+    (opaque_key.len() == 64
+        && opaque_key
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then_some((opaque_key, kind))
 }
 
 fn record_persisted_host(inner: &Inner, host: &str) -> Result<(), CertError> {
@@ -442,7 +479,8 @@ fn record_persisted_host(inner: &Inner, host: &str) -> Result<(), CertError> {
     let mut hosts = hosts
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if hosts.get(host).is_some() {
+    let key = persisted_host_key(host);
+    if hosts.get(&key).is_some() {
         return Ok(());
     }
     if hosts.len() == hosts.cap().get() {
@@ -450,23 +488,46 @@ fn record_persisted_host(inner: &Inner, host: &str) -> Result<(), CertError> {
             .peek_lru()
             .map(|(host, ())| host.clone())
             .expect("a full persisted-host cache has an LRU entry");
-        if let Err(error) = remove_persisted_host(&inner.dynamic_dir, &evicted) {
-            let _ = remove_persisted_host(&inner.dynamic_dir, host);
+        if let Err(error) = remove_persisted_key(&inner.dynamic_dir, &evicted) {
+            let _ = remove_persisted_key(&inner.dynamic_dir, &key);
             return Err(error);
         }
         hosts.pop(&evicted);
     }
-    hosts.put(host.to_owned(), ());
+    hosts.put(key, ());
     Ok(())
 }
 
-fn remove_persisted_host(directory: &Path, host: &str) -> Result<(), CertError> {
-    for suffix in [".crt", ".key", "-chain.crt"] {
-        let path = directory.join(format!("{host}{suffix}"));
-        if let Err(source) = fs::remove_file(&path) {
-            if source.kind() != IoErrorKind::NotFound {
-                return Err(CertError::ManagePersistedCertificates { path, source });
-            }
+fn persisted_host_key(host: &str) -> String {
+    format!("{:x}", Sha256::digest(host.as_bytes()))
+}
+
+fn persisted_certificate_paths(directory: &Path, host: &str) -> [PathBuf; 3] {
+    persisted_certificate_paths_for_key(directory, &persisted_host_key(host))
+}
+
+fn persisted_certificate_paths_for_key(directory: &Path, key: &str) -> [PathBuf; 3] {
+    [
+        directory.join(format!("{key}.leaf.crt")),
+        directory.join(format!("{key}.leaf.key")),
+        directory.join(format!("{key}.chain.crt")),
+    ]
+}
+
+fn remove_persisted_key(directory: &Path, key: &str) -> Result<(), CertError> {
+    for path in persisted_certificate_paths_for_key(directory, key) {
+        remove_persisted_file(&path)?;
+    }
+    Ok(())
+}
+
+fn remove_persisted_file(path: &Path) -> Result<(), CertError> {
+    if let Err(source) = fs::remove_file(path) {
+        if source.kind() != IoErrorKind::NotFound {
+            return Err(CertError::ManagePersistedCertificates {
+                path: path.to_path_buf(),
+                source,
+            });
         }
     }
     Ok(())
@@ -635,9 +696,7 @@ fn generate_host_certificate(
         let key_pem = leaf_key.serialize_pem();
         let chain_pem = format!("{leaf_pem}{ca_cert_chain_pem}");
 
-        let leaf_path = dynamic_dir.join(format!("{host}.crt"));
-        let key_path = dynamic_dir.join(format!("{host}.key"));
-        let chain_path = dynamic_dir.join(format!("{host}-chain.crt"));
+        let [leaf_path, key_path, chain_path] = persisted_certificate_paths(dynamic_dir, host);
 
         write_private_file(&leaf_path, leaf_pem.as_bytes()).map_err(|source| {
             CertError::WriteFile {
@@ -701,9 +760,7 @@ mod tests {
             .await
             .expect("host config");
         let dynamic = directory.join("dynamic");
-        let leaf = dynamic.join(format!("{host}.crt"));
-        let key = dynamic.join(format!("{host}.key"));
-        let chain = dynamic.join(format!("{host}-chain.crt"));
+        let [leaf, key, chain] = persisted_certificate_paths(&dynamic, host);
         assert!(leaf.is_file());
         assert!(key.is_file());
         assert!(chain.is_file());
@@ -759,31 +816,72 @@ mod tests {
                 .unwrap();
         }
         let dynamic = directory.join("dynamic");
-        assert!(!dynamic.join("first.example.test.crt").exists());
-        assert!(!dynamic.join("first.example.test.key").exists());
-        assert!(!dynamic.join("first.example.test-chain.crt").exists());
-        assert!(dynamic.join("second.example.test.crt").exists());
-        assert!(dynamic.join("third.example.test.crt").exists());
+        assert!(persisted_certificate_paths(&dynamic, "first.example.test")
+            .iter()
+            .all(|path| !path.exists()));
+        assert!(persisted_certificate_paths(&dynamic, "second.example.test")
+            .iter()
+            .all(|path| path.exists()));
+        assert!(persisted_certificate_paths(&dynamic, "third.example.test")
+            .iter()
+            .all(|path| path.exists()));
 
         drop(manager);
-        for suffix in [".crt", ".key", "-chain.crt"] {
-            fs::write(
-                dynamic.join(format!("stale.example.test{suffix}")),
-                b"stale",
-            )
-            .unwrap();
+        for path in persisted_certificate_paths(&dynamic, "stale.example.test") {
+            fs::write(path, b"stale").unwrap();
         }
+        let [partial_leaf, partial_key, partial_chain] =
+            persisted_certificate_paths(&dynamic, "partial.example.test");
+        fs::write(&partial_leaf, b"partial").unwrap();
         let manager = MitmCertificateManager::from_static(&config).unwrap();
-        let leaf_count = fs::read_dir(&dynamic)
+        let entries = fs::read_dir(&dynamic)
             .unwrap()
             .filter_map(Result::ok)
-            .filter(|entry| {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                name.ends_with(".crt") && !name.ends_with("-chain.crt")
-            })
+            .collect::<Vec<_>>();
+        let leaf_count = entries
+            .iter()
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".leaf.crt"))
             .count();
         assert_eq!(leaf_count, 2);
+        assert_eq!(entries.len(), 6);
+        assert!(!partial_leaf.exists());
+        assert!(!partial_key.exists());
+        assert!(!partial_chain.exists());
+        manager.shutdown_and_join().await;
+    }
+
+    #[tokio::test]
+    async fn persisted_chain_suffix_host_is_counted_and_evictable_after_restart() {
+        let tmp = TempDir::new().expect("tempdir");
+        let directory = tmp.path().join("generated");
+        let dynamic = directory.join("dynamic");
+        let config = StaticMitmConfig::Generated {
+            directory,
+            max_cached_certificates: 1,
+            persist_leaf_certificates: true,
+        };
+        let chain_suffix_host = "reachable.example-chain";
+        let manager = MitmCertificateManager::from_static(&config).unwrap();
+        manager
+            .server_config_for_host(chain_suffix_host, &[b"http/1.1".to_vec()])
+            .await
+            .unwrap();
+        let chain_suffix_paths = persisted_certificate_paths(&dynamic, chain_suffix_host);
+        assert!(chain_suffix_paths.iter().all(|path| path.exists()));
+        drop(manager);
+
+        let manager = MitmCertificateManager::from_static(&config).unwrap();
+        assert!(chain_suffix_paths.iter().all(|path| path.exists()));
+        manager
+            .server_config_for_host("replacement.example.test", &[b"http/1.1".to_vec()])
+            .await
+            .unwrap();
+        assert!(chain_suffix_paths.iter().all(|path| !path.exists()));
+        assert!(
+            persisted_certificate_paths(&dynamic, "replacement.example.test")
+                .iter()
+                .all(|path| path.exists())
+        );
         manager.shutdown_and_join().await;
     }
 
@@ -940,8 +1038,8 @@ mod tests {
             configured_chain
         );
 
-        let mut persisted_reader =
-            Cursor::new(fs::read(runtime.join(format!("dynamic/{host}-chain.crt"))).unwrap());
+        let [_, _, chain_path] = persisted_certificate_paths(&runtime.join("dynamic"), host);
+        let mut persisted_reader = Cursor::new(fs::read(chain_path).unwrap());
         let persisted_chain = rustls_pemfile::certs(&mut persisted_reader).unwrap();
         assert_eq!(persisted_chain[0], runtime_chain[0].0);
         assert_eq!(persisted_chain[1..], configured_chain);

@@ -125,7 +125,9 @@ must not grant group or other access. Generated leaf certificates use a
 30-day validity window clamped to the signing CA. When leaf persistence is
 enabled, the dynamic directory retains at most `max_cached_certificates`
 distinct host certificate/key/chain sets and prunes older sets on startup and
-runtime generation.
+runtime generation. Persisted sets use opaque SHA-256 host keys and distinct
+leaf, private-key, and chain suffixes so valid hostnames cannot collide in the
+managed directory.
 
 ### Egress
 
