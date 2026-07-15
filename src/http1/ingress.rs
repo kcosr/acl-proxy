@@ -18,6 +18,29 @@ use super::store::PARSER_STORE_BYTES;
 const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IngressFramingError {
+    AmbiguousBodyFraming,
+    ConflictingContentLength,
+    DuplicateContentLength,
+    DuplicateHost,
+    ObsoleteLineFolding,
+}
+
+impl fmt::Display for IngressFramingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::AmbiguousBodyFraming => "ambiguous HTTP/1 body framing",
+            Self::ConflictingContentLength => "conflicting HTTP/1 Content-Length",
+            Self::DuplicateContentLength => "duplicate HTTP/1 Content-Length",
+            Self::DuplicateHost => "duplicate HTTP/1 Host",
+            Self::ObsoleteLineFolding => "obsolete HTTP/1 line folding",
+        })
+    }
+}
+
+impl std::error::Error for IngressFramingError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestDisposition {
     ContinueHttp,
     SwitchProtocol,
@@ -285,6 +308,7 @@ struct IngressHeadTracker {
     fields: usize,
     content_length: Option<u64>,
     transfer_encoding: bool,
+    host: bool,
     connection_upgrade: bool,
     upgrade: bool,
     connect: bool,
@@ -679,7 +703,7 @@ impl IngressHeadTracker {
                             return Err(invalid_data("HTTP/1 head requires CRLF"));
                         }
                         if self.content_length.is_some() && self.transfer_encoding {
-                            return Err(invalid_data("conflicting HTTP/1 entity framing"));
+                            return Err(framing_error(IngressFramingError::AmbiguousBodyFraming));
                         }
                         let framing = match (self.content_length, self.transfer_encoding) {
                             (Some(length), false) => BodyFraming::ContentLength(length),
@@ -700,7 +724,7 @@ impl IngressHeadTracker {
                         ));
                     }
                     if matches!(input[0], b' ' | b'\t') {
-                        return Err(invalid_data("obsolete HTTP/1 line folding"));
+                        return Err(framing_error(IngressFramingError::ObsoleteLineFolding));
                     }
                     let mut colon = None;
                     for (index, byte) in input
@@ -748,6 +772,12 @@ impl IngressHeadTracker {
                             ..ConnectionValueScanner::default()
                         };
                         HeadLine::Connection
+                    } else if name.eq_ignore_ascii_case(b"host") {
+                        if self.host {
+                            return Err(framing_error(IngressFramingError::DuplicateHost));
+                        }
+                        self.host = true;
+                        HeadLine::Irrelevant
                     } else if name.eq_ignore_ascii_case(b"upgrade") {
                         self.upgrade = true;
                         HeadLine::Irrelevant
@@ -766,13 +796,17 @@ impl IngressHeadTracker {
                     let value = &input[value_start..length - 2];
                     match name {
                         RelevantHeader::ContentLength => {
-                            if self.content_length.is_some() {
-                                return Err(invalid_data("duplicate HTTP/1 Content-Length"));
+                            let length = parse_content_length(value)
+                                .map_err(|error| invalid_data(error.to_string()))?;
+                            if let Some(previous) = self.content_length {
+                                let error = if previous == length {
+                                    IngressFramingError::DuplicateContentLength
+                                } else {
+                                    IngressFramingError::ConflictingContentLength
+                                };
+                                return Err(framing_error(error));
                             }
-                            self.content_length = Some(
-                                parse_content_length(value)
-                                    .map_err(|error| invalid_data(error.to_string()))?,
-                            );
+                            self.content_length = Some(length);
                         }
                         RelevantHeader::TransferEncoding => {
                             if self.transfer_encoding {
@@ -1139,14 +1173,96 @@ fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
+fn framing_error(error: IngressFramingError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
+}
+
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
     use std::time::Duration;
 
-    use http_access_conformance::{load_raw_h1_suite, RawOutcome};
+    use http_access_conformance::{
+        load_raw_h1_suite, FixtureIngressMode, FramingErrorCode, RawAccepted, RawField, RawH1Case,
+        RawOutcome,
+    };
+    use http_access_types::IngressMode;
+    use http_access_url::AuthorityError;
+    use hyper::body::HttpBody as _;
+    use hyper::server::conn::Http;
+    use hyper::service::service_fn;
+    use hyper::{Body, Request, Response};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    use crate::proxy::authority::{reconcile_request, AuthorityAdapterError};
+    use crate::proxy::headers::sanitize_untrusted_request;
+
     use super::*;
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct ActualField {
+        name: Vec<u8>,
+        value: Vec<u8>,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct ActualAccepted {
+        method: Vec<u8>,
+        target: Vec<u8>,
+        fields: Vec<ActualField>,
+        body: Vec<u8>,
+        trailers: Vec<ActualField>,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum ActualOutcome {
+        Accepted(ActualAccepted),
+        Rejected(FramingErrorCode),
+        BodyError,
+    }
+
+    struct RecordingIo<T> {
+        inner: T,
+        replayed: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl<T: AsyncRead + Unpin> AsyncRead for RecordingIo<T> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            output: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let start = output.filled().len();
+            match Pin::new(&mut self.inner).poll_read(cx, output) {
+                Poll::Ready(Ok(())) => {
+                    self.replayed
+                        .lock()
+                        .unwrap()
+                        .extend_from_slice(&output.filled()[start..]);
+                    Poll::Ready(Ok(()))
+                }
+                other => other,
+            }
+        }
+    }
+
+    impl<T: AsyncWrite + Unpin> AsyncWrite for RecordingIo<T> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            input: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, input)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
 
     fn parse_ingress_head(input: &[u8]) -> Result<IngressRequestHead, io::Error> {
         let mut tracker = IngressHeadTracker::default();
@@ -1162,31 +1278,256 @@ mod tests {
         }
     }
 
-    #[test]
-    fn validator_consumes_the_shared_raw_h1_corpus() {
+    const fn fixture_ingress(mode: FixtureIngressMode) -> IngressMode {
+        match mode {
+            FixtureIngressMode::ExplicitHttp => IngressMode::ExplicitHttp,
+            FixtureIngressMode::ExplicitHttps => IngressMode::ExplicitHttps,
+            FixtureIngressMode::TransparentHttp => IngressMode::TransparentHttp,
+            FixtureIngressMode::ConnectMitmInner => IngressMode::ConnectMitmInner,
+            FixtureIngressMode::TransparentHttps => IngressMode::TransparentHttps,
+        }
+    }
+
+    fn fields(headers: &http::HeaderMap) -> Vec<ActualField> {
+        headers
+            .iter()
+            .map(|(name, value)| ActualField {
+                name: name.as_str().as_bytes().to_vec(),
+                value: value.as_bytes().to_vec(),
+            })
+            .collect()
+    }
+
+    fn fixture_error(error: AuthorityAdapterError) -> FramingErrorCode {
+        match error {
+            AuthorityAdapterError::Reconciliation(AuthorityError::DuplicateHost) => {
+                FramingErrorCode::DuplicateHost
+            }
+            AuthorityAdapterError::Reconciliation(AuthorityError::AuthorityMismatch) => {
+                FramingErrorCode::AuthorityMismatch
+            }
+            other => panic!("unexpected raw-H1 authority error: {other:?}"),
+        }
+    }
+
+    fn framing_error_code(error: IngressFramingError) -> FramingErrorCode {
+        match error {
+            IngressFramingError::AmbiguousBodyFraming => FramingErrorCode::AmbiguousBodyFraming,
+            IngressFramingError::ConflictingContentLength => {
+                FramingErrorCode::ConflictingContentLength
+            }
+            IngressFramingError::DuplicateContentLength => FramingErrorCode::DuplicateContentLength,
+            IngressFramingError::DuplicateHost => FramingErrorCode::DuplicateHost,
+            IngressFramingError::ObsoleteLineFolding => FramingErrorCode::ObsoleteLineFolding,
+        }
+    }
+
+    fn typed_framing_error(error: &io::Error) -> Option<FramingErrorCode> {
+        error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<IngressFramingError>())
+            .map(|error| framing_error_code(*error))
+    }
+
+    fn is_chunked(fields: &[ActualField]) -> bool {
+        fields.iter().any(|field| {
+            field.name.eq_ignore_ascii_case(b"transfer-encoding")
+                && field.value.eq_ignore_ascii_case(b"chunked")
+        })
+    }
+
+    fn decode_replayed_trailers(wire: &[u8]) -> Vec<ActualField> {
+        let head_end = wire
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .expect("accepted replay has a complete HTTP/1 head");
+        let mut cursor = head_end;
+        loop {
+            let line_end = wire[cursor..]
+                .windows(2)
+                .position(|window| window == b"\r\n")
+                .map(|index| cursor + index)
+                .expect("accepted replay has a complete chunk-size line");
+            let size = parse_chunk_line(&wire[cursor..line_end])
+                .expect("production-accepted replay has a valid chunk size");
+            cursor = line_end + 2;
+            if size == 0 {
+                break;
+            }
+            let size = usize::try_from(size).expect("fixture chunk fits usize");
+            cursor = cursor.checked_add(size).expect("fixture chunk end");
+            assert_eq!(&wire[cursor..cursor + 2], b"\r\n");
+            cursor += 2;
+        }
+
+        let mut storage = vec![httparse::EMPTY_HEADER; MAX_HEADER_FIELDS];
+        let parsed = httparse::parse_headers(&wire[cursor..], &mut storage)
+            .expect("production-accepted replay has valid trailer syntax");
+        let (consumed, headers) = match parsed {
+            httparse::Status::Complete(parsed) => parsed,
+            httparse::Status::Partial => panic!("production replay ended in a partial trailer"),
+        };
+        assert_eq!(cursor + consumed, wire.len());
+        headers
+            .iter()
+            .map(|header| ActualField {
+                name: header
+                    .name
+                    .as_bytes()
+                    .iter()
+                    .map(u8::to_ascii_lowercase)
+                    .collect(),
+                value: header.value.to_vec(),
+            })
+            .collect()
+    }
+
+    async fn execute_raw_h1(case: &RawH1Case) -> ActualOutcome {
+        let (mut client, server) = tokio::io::duplex(PARSER_STORE_BYTES);
+        let (validated, control) = ValidatedIngressIo::try_new(server, false).unwrap();
+        let replayed = Arc::new(Mutex::new(Vec::new()));
+        let recording = RecordingIo {
+            inner: validated,
+            replayed: replayed.clone(),
+        };
+        let actual = Arc::new(Mutex::new(None));
+        let service_actual = actual.clone();
+        let ingress_mode = fixture_ingress(case.ingress_mode);
+        let service = service_fn(move |mut request: Request<Body>| {
+            let control = control.clone();
+            let actual = service_actual.clone();
+            async move {
+                let ticket = control
+                    .claim(Some(IngressRequestKind::Ordinary))
+                    .expect("raw-H1 ticket claim")
+                    .expect("raw-H1 request has a ticket");
+                let method = request.method().as_str().as_bytes().to_vec();
+                let target = request.uri().to_string().into_bytes();
+                let request_fields = fields(request.headers());
+
+                let outcome = match reconcile_request(&mut request, ingress_mode, None, None, None)
+                {
+                    Ok(_) => {
+                        let sanitized = sanitize_untrusted_request(request)
+                            .expect("accepted raw-H1 request must sanitize");
+                        let (_, mut body, _) = sanitized.into_parts();
+                        let mut body_bytes = Vec::new();
+                        let mut body_error = false;
+                        while let Some(chunk) = body.data().await {
+                            match chunk {
+                                Ok(chunk) => body_bytes.extend_from_slice(&chunk),
+                                Err(_) => {
+                                    body_error = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if body_error {
+                            ActualOutcome::BodyError
+                        } else {
+                            ActualOutcome::Accepted(ActualAccepted {
+                                method,
+                                target,
+                                fields: request_fields,
+                                body: body_bytes,
+                                trailers: Vec::new(),
+                            })
+                        }
+                    }
+                    Err(error) => ActualOutcome::Rejected(fixture_error(error)),
+                };
+                let disposition = if matches!(outcome, ActualOutcome::Accepted(_)) {
+                    RequestDisposition::ContinueHttp
+                } else {
+                    RequestDisposition::Close
+                };
+                ticket
+                    .resolve(disposition)
+                    .expect("raw-H1 ticket resolution");
+                *actual.lock().unwrap() = Some(outcome);
+                Ok::<_, Infallible>(Response::new(Body::empty()))
+            }
+        });
+        let server = tokio::spawn(async move {
+            Http::new()
+                .http1_only(true)
+                .serve_connection(recording, service)
+                .await
+        });
+
+        client.write_all(case.wire_hex.as_bytes()).await.unwrap();
+        client.shutdown().await.unwrap();
+        drop(client);
+        let server_result = tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .expect("raw-H1 server timed out")
+            .expect("raw-H1 server task panicked");
+        if let Some(mut actual) = actual.lock().unwrap().take() {
+            if let ActualOutcome::Accepted(accepted) = &mut actual {
+                let replayed = replayed.lock().unwrap();
+                assert_eq!(replayed.as_slice(), case.wire_hex.as_bytes(), "{}", case.id);
+                if is_chunked(&accepted.fields) {
+                    // Hyper 0.14 validates but does not expose HTTP/1 request trailers.
+                    // Decode only the bytes replayed by the production framing guard.
+                    accepted.trailers = decode_replayed_trailers(&replayed);
+                }
+            }
+            return actual;
+        }
+        server_result.expect_err("raw-H1 request produced no product outcome");
+        let wire = case.wire_hex.as_bytes();
+        let head_len = wire
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .expect("raw-H1 fixture has a complete head");
+        let error = parse_ingress_head(&wire[..head_len])
+            .expect_err("Hyper rejected a head accepted by the ingress validator");
+        ActualOutcome::Rejected(
+            typed_framing_error(&error)
+                .unwrap_or_else(|| panic!("{}: rejection lost its typed framing error", case.id)),
+        )
+    }
+
+    fn assert_fields(actual: &[ActualField], expected: &[RawField], case_id: &str) {
+        assert_eq!(actual.len(), expected.len(), "{case_id}: field count");
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(
+                actual.name,
+                expected.name_hex.as_bytes(),
+                "{case_id}: field {index} name"
+            );
+            assert_eq!(
+                actual.value,
+                expected.value_hex.as_bytes(),
+                "{case_id}: field {index} value"
+            );
+        }
+    }
+
+    fn assert_accepted(actual: &ActualAccepted, expected: &RawAccepted, case_id: &str) {
+        assert_eq!(actual.method, expected.method_hex.as_bytes(), "{case_id}");
+        assert_eq!(actual.target, expected.target_hex.as_bytes(), "{case_id}");
+        assert_eq!(actual.body, expected.body_hex.as_bytes(), "{case_id}");
+        assert_fields(&actual.fields, &expected.fields, case_id);
+        assert_fields(&actual.trailers, &expected.trailers, case_id);
+    }
+
+    #[tokio::test]
+    async fn validator_consumes_the_shared_raw_h1_corpus() {
         let suite = load_raw_h1_suite().unwrap();
         for case in suite.cases() {
-            let wire = case.wire_hex.as_bytes();
-            let head_len = wire
-                .windows(4)
-                .position(|window| window == b"\r\n\r\n")
-                .map(|index| index + 4)
-                .expect("raw H1 fixture has a complete head");
-            let parsed = parse_ingress_head(&wire[..head_len]);
-            let rejected_at_wire_guard = matches!(
-                case.id.as_str(),
-                "h1-content-length-plus-transfer-encoding-rejected"
-                    | "h1-conflicting-content-length-rejected"
-                    | "h1-duplicate-content-length-rejected"
-                    | "h1-obs-fold-rejected"
-            );
-            if rejected_at_wire_guard {
-                assert!(parsed.is_err(), "{} reached Hyper", case.id);
-            } else {
-                assert!(parsed.is_ok(), "{}: {parsed:?}", case.id);
-            }
-            if matches!(&case.expected, RawOutcome::Accepted { .. }) {
-                assert!(parsed.is_ok(), "accepted corpus case {}", case.id);
+            match (&case.expected, execute_raw_h1(case).await) {
+                (RawOutcome::Accepted { value }, ActualOutcome::Accepted(actual)) => {
+                    assert_accepted(&actual, value, &case.id);
+                }
+                (RawOutcome::Rejected { error }, ActualOutcome::Rejected(actual)) => {
+                    assert_eq!(actual, *error, "{}", case.id);
+                }
+                (expected, actual) => {
+                    panic!("{}: expected {expected:?}, got {actual:?}", case.id)
+                }
             }
         }
     }

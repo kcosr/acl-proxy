@@ -31,6 +31,8 @@ pub(crate) enum HeaderPreparationError {
     Unsanitized,
     #[error("the Connection header contains an invalid nominated field name")]
     InvalidConnection,
+    #[error("HTTP/2 TE fields may contain only trailers")]
+    InvalidTe,
 }
 
 pub(crate) struct SanitizedRequest<B = Body> {
@@ -110,6 +112,9 @@ pub(crate) fn sanitize_untrusted_request<B>(
         Version::HTTP_2 => OriginProtocol::Http2,
         _ => return Err(HeaderPreparationError::UnsupportedVersion),
     };
+    if protocol.is_http2() {
+        validate_h2_te(request.headers())?;
+    }
     let connection_tokens = strict_connection_header_tokens(request.headers())?;
     let upgrade_intent =
         extract_upgrade_intent(request.version(), request.headers(), &connection_tokens)?;
@@ -279,6 +284,15 @@ fn prepare_origin_request_head<B>(
     protocol: OriginProtocol,
 ) -> Result<Request<B>, HeaderPreparationError> {
     let use_http2 = protocol.is_http2();
+    if use_http2 {
+        validate_h2_te(sanitized.request.headers())?;
+        if sanitized.request.headers().contains_key(TE) {
+            sanitized
+                .request
+                .headers_mut()
+                .insert(TE, HeaderValue::from_static("trailers"));
+        }
+    }
     if !use_http2 && te_is_trailers_only(sanitized.request.headers()) {
         sanitized.request.headers_mut().remove(TE);
     }
@@ -383,6 +397,13 @@ fn te_is_trailers_only(headers: &HeaderMap) -> bool {
     saw_value
 }
 
+fn validate_h2_te(headers: &HeaderMap) -> Result<(), HeaderPreparationError> {
+    if headers.contains_key(TE) && !te_is_trailers_only(headers) {
+        return Err(HeaderPreparationError::InvalidTe);
+    }
+    Ok(())
+}
+
 fn canonical_path_and_query(canonical: &CanonicalUrl) -> String {
     match canonical.query() {
         Some(query) => format!("{}?{query}", canonical.path()),
@@ -436,7 +457,13 @@ fn is_hop_by_hop(name: &HeaderName) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use http::header::{AUTHORIZATION, CONNECTION, HOST};
+    use http::{HeaderMap, HeaderName, HeaderValue, Method};
+    use http_access_conformance::{
+        load_translation_suite, FixtureHttpVersion, RawField, TranslationOutcome,
+    };
 
     use super::*;
     use http_access_url::canonicalize_http_url;
@@ -554,7 +581,7 @@ mod tests {
     }
 
     #[test]
-    fn h2_retains_only_the_normalized_trailers_te_value() {
+    fn h2_normalizes_trailers_te_and_rejects_every_other_value() {
         let canonical = canonicalize_http_url("https://example.com/resource").unwrap();
         let mut trailers = request("/untrusted");
         trailers
@@ -576,15 +603,192 @@ mod tests {
             .headers_mut()
             .insert(TE, HeaderValue::from_static("trailers, deflate"));
         *invalid.version_mut() = Version::HTTP_2;
-        let invalid = sanitize_untrusted_request(invalid).unwrap();
-        let invalid = prepare_origin_request(
-            invalid,
+        assert!(matches!(
+            sanitize_untrusted_request(invalid),
+            Err(HeaderPreparationError::InvalidTe)
+        ));
+
+        let mut trusted_invalid = sanitize_untrusted_request(request("/untrusted")).unwrap();
+        trusted_invalid
+            .headers_mut()
+            .insert(TE, HeaderValue::from_static("gzip"));
+        assert!(matches!(
+            prepare_origin_request(
+                trusted_invalid,
+                &canonical,
+                RequestTargetForm::Origin,
+                OriginProtocol::Http2,
+            ),
+            Err(HeaderPreparationError::InvalidTe)
+        ));
+
+        let mut trusted_ows = sanitize_untrusted_request(request("/untrusted")).unwrap();
+        trusted_ows
+            .headers_mut()
+            .insert(TE, HeaderValue::from_static(" \tTrailers\t "));
+        let trusted_ows = prepare_origin_request(
+            trusted_ows,
             &canonical,
             RequestTargetForm::Origin,
             OriginProtocol::Http2,
         )
         .unwrap();
-        assert!(!invalid.headers().contains_key(TE));
+        assert_eq!(trusted_ows.headers()[TE], "trailers");
+        assert_eq!(trusted_ows.headers().get_all(TE).iter().count(), 1);
+
+        let mut trusted_duplicates = sanitize_untrusted_request(request("/untrusted")).unwrap();
+        trusted_duplicates
+            .headers_mut()
+            .append(TE, HeaderValue::from_static("trailers"));
+        trusted_duplicates
+            .headers_mut()
+            .append(TE, HeaderValue::from_static("Trailers"));
+        let trusted_duplicates = prepare_origin_request(
+            trusted_duplicates,
+            &canonical,
+            RequestTargetForm::Origin,
+            OriginProtocol::Http2,
+        )
+        .unwrap();
+        assert_eq!(trusted_duplicates.headers()[TE], "trailers");
+        assert_eq!(trusted_duplicates.headers().get_all(TE).iter().count(), 1);
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct FixtureEntity {
+        body: Vec<u8>,
+        trailers: Vec<(Vec<u8>, Vec<u8>)>,
+    }
+
+    fn fixture_version(version: FixtureHttpVersion) -> Version {
+        match version {
+            FixtureHttpVersion::Http10 => Version::HTTP_10,
+            FixtureHttpVersion::Http11 => Version::HTTP_11,
+            FixtureHttpVersion::Http2 => Version::HTTP_2,
+        }
+    }
+
+    fn fixture_protocol(version: FixtureHttpVersion) -> OriginProtocol {
+        match version {
+            FixtureHttpVersion::Http10 | FixtureHttpVersion::Http11 => OriginProtocol::Http1,
+            FixtureHttpVersion::Http2 => OriginProtocol::Http2,
+        }
+    }
+
+    fn fixture_headers(fields: &[RawField]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for field in fields {
+            headers.append(
+                HeaderName::from_bytes(field.name_hex.as_bytes()).unwrap(),
+                HeaderValue::from_bytes(field.value_hex.as_bytes()).unwrap(),
+            );
+        }
+        headers
+    }
+
+    fn fixture_trailers(fields: &[RawField]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        fields
+            .iter()
+            .map(|field| {
+                (
+                    field.name_hex.as_bytes().to_vec(),
+                    field.value_hex.as_bytes().to_vec(),
+                )
+            })
+            .collect()
+    }
+
+    fn assert_fixture_headers(actual: &HeaderMap, expected: &[RawField], case_id: &str) {
+        let expected = fixture_headers(expected);
+        let actual_names = actual.keys().cloned().collect::<HashSet<_>>();
+        let expected_names = expected.keys().cloned().collect::<HashSet<_>>();
+        assert_eq!(actual_names, expected_names, "{case_id}: header membership");
+
+        for name in expected_names {
+            let actual_values = actual
+                .get_all(&name)
+                .iter()
+                .map(HeaderValue::as_bytes)
+                .collect::<Vec<_>>();
+            let expected_values = expected
+                .get_all(&name)
+                .iter()
+                .map(HeaderValue::as_bytes)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual_values, expected_values,
+                "{case_id}: ordered values for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_translation_matches_the_shared_fixture_corpus() {
+        for case in load_translation_suite().unwrap().into_cases() {
+            let canonical = canonicalize_http_url(&case.input.target).unwrap();
+            let request = Request::builder()
+                .method(Method::from_bytes(case.input.method.as_bytes()).unwrap())
+                .version(fixture_version(case.input.from))
+                .uri(&case.input.target)
+                .body(FixtureEntity {
+                    body: case.input.body_hex.as_bytes().to_vec(),
+                    trailers: fixture_trailers(&case.input.trailers),
+                })
+                .unwrap();
+            let (mut parts, body) = request.into_parts();
+            parts.headers = fixture_headers(&case.input.fields);
+            let request = Request::from_parts(parts, body);
+
+            let actual = sanitize_untrusted_request(request).and_then(|sanitized| {
+                prepare_origin_request(
+                    sanitized,
+                    &canonical,
+                    RequestTargetForm::Origin,
+                    fixture_protocol(case.input.to),
+                )
+            });
+
+            match (actual, case.expected) {
+                (Ok(actual), TranslationOutcome::Accepted { value }) => {
+                    let actual_target = if case.input.to == FixtureHttpVersion::Http2 {
+                        actual
+                            .uri()
+                            .path_and_query()
+                            .map_or("/", http::uri::PathAndQuery::as_str)
+                    } else {
+                        actual.uri().path_and_query().unwrap().as_str()
+                    };
+                    assert_eq!(actual_target, value.target, "{}: target", case.id);
+                    assert_fixture_headers(actual.headers(), &value.fields, &case.id);
+                    let entity = actual.into_body();
+                    assert_eq!(entity.body, value.body_hex.as_bytes(), "{}: body", case.id);
+                    assert_eq!(
+                        entity.trailers,
+                        fixture_trailers(&value.trailers),
+                        "{}: trailers",
+                        case.id
+                    );
+                }
+                (
+                    Err(HeaderPreparationError::InvalidTe),
+                    TranslationOutcome::Rejected { error },
+                ) => assert_eq!(
+                    error,
+                    http_access_conformance::TranslationErrorCode::InvalidTeField,
+                    "{}: error",
+                    case.id
+                ),
+                (Ok(_), TranslationOutcome::Rejected { error }) => {
+                    panic!("{}: expected {error:?}", case.id)
+                }
+                (Err(error), TranslationOutcome::Accepted { .. }) => {
+                    panic!("{}: unexpected {error:?}", case.id)
+                }
+                (Err(error), TranslationOutcome::Rejected { error: expected }) => {
+                    panic!("{}: expected {expected:?}, got {error:?}", case.id)
+                }
+            }
+        }
     }
 
     #[test]

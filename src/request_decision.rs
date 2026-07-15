@@ -1265,9 +1265,7 @@ process_providers = ["identity_sink"]"#,
             .headers()
             .iter()
             .all(|field| field.name().as_str() != "x-test-identity"));
-        assert!(!serde_json::to_string(&request_input.facts)
-            .unwrap()
-            .contains("secret"));
+        assert!(!format!("{:?}", request_input.facts).contains("secret"));
         assert!(request_input
             .inbound
             .is_present(&HeaderName::from_static("x-test-identity")));
