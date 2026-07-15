@@ -6589,7 +6589,7 @@ default = "allow"
     }
 
     #[tokio::test]
-    async fn connect_body_rejection_closes_before_pipelined_request() {
+    async fn connect_body_framing_closes_before_pipelined_request() {
         let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
         let ([proxy], listeners) = prebound_listeners::<1>();
         let policy = r#"[listeners.explicit_http.connect]
@@ -6620,26 +6620,7 @@ Connection: close\r\n\
             .await
             .expect("invalid CONNECT did not close the connection")
             .unwrap();
-        let response_text = String::from_utf8(response).unwrap();
-        assert!(
-            response_text.starts_with("HTTP/1.1 400 "),
-            "{response_text}"
-        );
-        assert!(
-            response_text
-                .to_ascii_lowercase()
-                .contains("connection: close\r\n"),
-            "{response_text}"
-        );
-        assert_eq!(
-            response_text.matches("HTTP/1.1 ").count(),
-            1,
-            "{response_text}"
-        );
-        assert!(
-            response_text.ends_with("CONNECT body is not allowed\n"),
-            "{response_text}"
-        );
+        assert!(response.is_empty(), "invalid CONNECT reached Hyper");
 
         product.shutdown().await;
     }

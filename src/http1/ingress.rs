@@ -24,6 +24,7 @@ enum IngressFramingError {
     DuplicateContentLength,
     DuplicateHost,
     ObsoleteLineFolding,
+    SwitchBodyFraming,
 }
 
 impl fmt::Display for IngressFramingError {
@@ -34,6 +35,7 @@ impl fmt::Display for IngressFramingError {
             Self::DuplicateContentLength => "duplicate HTTP/1 Content-Length",
             Self::DuplicateHost => "duplicate HTTP/1 Host",
             Self::ObsoleteLineFolding => "obsolete HTTP/1 line folding",
+            Self::SwitchBodyFraming => "HTTP/1 protocol switches cannot declare a body",
         })
     }
 }
@@ -702,6 +704,18 @@ impl IngressHeadTracker {
                         if input[1] != b'\n' {
                             return Err(invalid_data("HTTP/1 head requires CRLF"));
                         }
+                        let kind = if self.connect {
+                            IngressRequestKind::Connect
+                        } else if self.connection_upgrade && self.upgrade {
+                            IngressRequestKind::Upgrade
+                        } else {
+                            IngressRequestKind::Ordinary
+                        };
+                        if kind != IngressRequestKind::Ordinary
+                            && (self.content_length.is_some() || self.transfer_encoding)
+                        {
+                            return Err(framing_error(IngressFramingError::SwitchBodyFraming));
+                        }
                         if self.content_length.is_some() && self.transfer_encoding {
                             return Err(framing_error(IngressFramingError::AmbiguousBodyFraming));
                         }
@@ -710,13 +724,6 @@ impl IngressHeadTracker {
                             (None, true) => BodyFraming::Chunked,
                             (None, false) => BodyFraming::None,
                             (Some(_), true) => unreachable!("conflicting framing returned above"),
-                        };
-                        let kind = if self.connect {
-                            IngressRequestKind::Connect
-                        } else if self.connection_upgrade && self.upgrade {
-                            IngressRequestKind::Upgrade
-                        } else {
-                            IngressRequestKind::Ordinary
                         };
                         return Ok(HeadProgress::Complete(
                             2,
@@ -1106,6 +1113,9 @@ impl<T: AsyncRead + Unpin> AsyncRead for ValidatedIngressIo<T> {
                     }
                 }
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending if matches!(self.h1, Http1State::Boundary(_)) => {
+                    return Poll::Pending;
+                }
                 Poll::Pending if self.end == self.bytes.len() => {
                     return Poll::Ready(Err(invalid_data("HTTP/1 validation buffer exceeded")));
                 }
@@ -1319,6 +1329,9 @@ mod tests {
             IngressFramingError::DuplicateContentLength => FramingErrorCode::DuplicateContentLength,
             IngressFramingError::DuplicateHost => FramingErrorCode::DuplicateHost,
             IngressFramingError::ObsoleteLineFolding => FramingErrorCode::ObsoleteLineFolding,
+            IngressFramingError::SwitchBodyFraming => {
+                panic!("switch-body framing is not a shared raw-H1 outcome")
+            }
         }
     }
 
@@ -1552,6 +1565,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn switch_requests_reject_declared_body_framing() {
+        for head in [
+            b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\nContent-Length: 0\r\n\r\n"
+                .as_slice(),
+            b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"GET /socket HTTP/1.1\r\nHost: example.test\r\nConnection: upgrade\r\nUpgrade: test-echo/1\r\nContent-Length: 0\r\n\r\n",
+            b"GET /socket HTTP/1.1\r\nHost: example.test\r\nConnection: upgrade\r\nUpgrade: test-echo/1\r\nTransfer-Encoding: chunked\r\n\r\n",
+        ] {
+            let error = parse_ingress_head(head).unwrap_err();
+            assert_eq!(
+                error
+                    .get_ref()
+                    .and_then(|error| error.downcast_ref::<IngressFramingError>()),
+                Some(&IngressFramingError::SwitchBodyFraming)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn validated_cl0_head_is_replayed_before_boundary_gating() {
         let wire = b"POST http://example.test/ HTTP/1.1\r\nHost: example.test\r\nContent-Length: 0\r\n\r\n";
@@ -1614,32 +1646,113 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upgrade_bytes_wait_for_an_explicit_switch_disposition() {
-        let head = b"GET /socket HTTP/1.1\r\nHost: example.test\r\nConnection: upgrade\r\nUpgrade: test-echo/1\r\n\r\n";
-        let opaque = b"opaque-protocol-bytes";
-        let (mut client, server) = tokio::io::duplex(PARSER_STORE_BYTES);
-        let (mut validated, control) = ValidatedIngressIo::try_new(server, false).unwrap();
-        client.write_all(head).await.unwrap();
-        client.write_all(opaque).await.unwrap();
+    async fn large_opaque_bytes_wait_for_an_explicit_switch_disposition() {
+        for (head, kind) in [
+            (
+                b"GET /socket HTTP/1.1\r\nHost: example.test\r\nConnection: upgrade\r\nUpgrade: test-echo/1\r\n\r\n"
+                    .as_slice(),
+                IngressRequestKind::Upgrade,
+            ),
+            (
+                b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n"
+                    .as_slice(),
+                IngressRequestKind::Connect,
+            ),
+        ] {
+            let opaque = vec![b'o'; PARSER_STORE_BYTES * 2 + 17];
+            let expected = opaque.clone();
+            let wire_head = head.to_vec();
+            let (mut client, server) = tokio::io::duplex(PARSER_STORE_BYTES);
+            let (mut validated, control) = ValidatedIngressIo::try_new(server, false).unwrap();
+            let writer = tokio::spawn(async move {
+                client.write_all(&wire_head).await.unwrap();
+                client.write_all(&opaque).await.unwrap();
+            });
 
-        let mut replayed_head = vec![0; head.len()];
-        validated.read_exact(&mut replayed_head).await.unwrap();
-        assert_eq!(replayed_head, head);
-        let ticket = control
-            .claim(Some(IngressRequestKind::Upgrade))
+            let mut replayed_head = vec![0; head.len()];
+            validated.read_exact(&mut replayed_head).await.unwrap();
+            assert_eq!(replayed_head, head);
+            let ticket = control.claim(Some(kind)).unwrap().unwrap();
+
+            let mut one = [0_u8; 1];
+            assert!(tokio::time::timeout(
+                Duration::from_millis(20),
+                validated.read_exact(&mut one)
+            )
+            .await
+            .is_err());
+            ticket.resolve(RequestDisposition::SwitchProtocol).unwrap();
+            let mut replayed_opaque = vec![0; expected.len()];
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                validated.read_exact(&mut replayed_opaque),
+            )
+            .await
             .unwrap()
             .unwrap();
+            assert_eq!(replayed_opaque, expected);
+            writer.await.unwrap();
+        }
+    }
 
-        let mut replayed_opaque = vec![0; opaque.len()];
-        assert!(tokio::time::timeout(
-            Duration::from_millis(20),
-            validated.read_exact(&mut replayed_opaque)
+    #[tokio::test]
+    async fn large_pipelined_request_waits_without_filling_the_validation_buffer() {
+        let first_head = b"GET /one HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        let second_body = vec![b'b'; PARSER_STORE_BYTES * 2 + 17];
+        let second_head = format!(
+            "POST /two HTTP/1.1\r\nHost: example.test\r\nContent-Length: {}\r\n\r\n",
+            second_body.len()
+        );
+        let expected_body = second_body.clone();
+        let wire_second_head = second_head.clone();
+        let (mut client, server) = tokio::io::duplex(PARSER_STORE_BYTES);
+        let (mut validated, control) = ValidatedIngressIo::try_new(server, false).unwrap();
+        let writer = tokio::spawn(async move {
+            client.write_all(first_head).await.unwrap();
+            client.write_all(wire_second_head.as_bytes()).await.unwrap();
+            client.write_all(&second_body).await.unwrap();
+        });
+
+        let mut replayed_first = vec![0; first_head.len()];
+        validated.read_exact(&mut replayed_first).await.unwrap();
+        assert_eq!(replayed_first, first_head);
+        let first_ticket = control
+            .claim(Some(IngressRequestKind::Ordinary))
+            .unwrap()
+            .unwrap();
+        let mut one = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), validated.read_exact(&mut one))
+                .await
+                .is_err()
+        );
+
+        first_ticket
+            .resolve(RequestDisposition::ContinueHttp)
+            .unwrap();
+        let mut replayed_second_head = vec![0; second_head.len()];
+        validated
+            .read_exact(&mut replayed_second_head)
+            .await
+            .unwrap();
+        assert_eq!(replayed_second_head, second_head.as_bytes());
+        let second_ticket = control
+            .claim(Some(IngressRequestKind::Ordinary))
+            .unwrap()
+            .unwrap();
+        let mut replayed_body = vec![0; expected_body.len()];
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            validated.read_exact(&mut replayed_body),
         )
         .await
-        .is_err());
-        ticket.resolve(RequestDisposition::SwitchProtocol).unwrap();
-        validated.read_exact(&mut replayed_opaque).await.unwrap();
-        assert_eq!(replayed_opaque, opaque);
+        .unwrap()
+        .unwrap();
+        assert_eq!(replayed_body, expected_body);
+        second_ticket
+            .resolve(RequestDisposition::ContinueHttp)
+            .unwrap();
+        writer.await.unwrap();
     }
 
     #[tokio::test]
