@@ -1076,7 +1076,7 @@ fn observed_ingress_request_kind(request: &Request<Body>) -> Option<IngressReque
         value
             .as_bytes()
             .split(|byte| *byte == b',')
-            .any(|token| trim_ascii_whitespace(token).eq_ignore_ascii_case(b"upgrade"))
+            .any(|token| trim_http_ows(token).eq_ignore_ascii_case(b"upgrade"))
     });
     Some(
         if connection_upgrade && request.headers().contains_key(UPGRADE) {
@@ -1087,11 +1087,17 @@ fn observed_ingress_request_kind(request: &Request<Body>) -> Option<IngressReque
     )
 }
 
-fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
-    while value.first().is_some_and(u8::is_ascii_whitespace) {
+fn trim_http_ows(mut value: &[u8]) -> &[u8] {
+    while value
+        .first()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
         value = &value[1..];
     }
-    while value.last().is_some_and(u8::is_ascii_whitespace) {
+    while value
+        .last()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
         value = &value[..value.len() - 1];
     }
     value
@@ -7356,6 +7362,66 @@ default = "deny"
             response.starts_with(b"HTTP/1.1 400") && response.ends_with(b"invalid request\n"),
             "near-match Connection token was misclassified: {}",
             String::from_utf8_lossy(&response)
+        );
+
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn obs_text_around_upgrade_fails_closed_before_downstream_switching() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let Ok(Ok((mut stream, _))) =
+                tokio::time::timeout(Duration::from_millis(250), origin_listener.accept()).await
+            else {
+                return false;
+            };
+            let _ = read_http_head(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: test-echo\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            true
+        });
+        let policy = format!(
+            r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "upgrade"
+decision = "allow"
+methods = ["GET"]
+urls = ["http://{origin}/socket"]
+allow_upgrades = true
+"#
+        );
+        let (_directory, product) =
+            product(base_config(proxy, "explicit_http", &policy), listeners).await;
+
+        let mut wire =
+            format!("GET http://{origin}/socket HTTP/1.1\r\nHost: {origin}\r\nConnection: ")
+                .into_bytes();
+        wire.extend_from_slice(b"\xc2\xa0Upgrade\xc2\xa0");
+        wire.extend_from_slice(b"\r\nUpgrade: test-echo\r\n\r\n");
+        let response = send_raw_http(proxy, &wire).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 400") && response.ends_with(b"invalid request\n"),
+            "obs-text Connection token did not fail closed: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert!(
+            !origin_task.await.unwrap(),
+            "obs-text request reached a 101 origin"
         );
 
         product.shutdown().await;

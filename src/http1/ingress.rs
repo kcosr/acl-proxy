@@ -157,6 +157,14 @@ impl IngressValidationControl {
         {
             return Err(ValidationControlError::TicketMismatch);
         }
+        if disposition == RequestDisposition::SwitchProtocol
+            && !matches!(
+                kind,
+                IngressRequestKind::Upgrade | IngressRequestKind::Connect
+            )
+        {
+            return Err(ValidationControlError::TicketMismatch);
+        }
         record.disposition = Some(disposition);
         if disposition == RequestDisposition::Close {
             shared.forced_close = true;
@@ -1291,6 +1299,26 @@ mod tests {
         ticket.resolve(RequestDisposition::SwitchProtocol).unwrap();
         validated.read_exact(&mut replayed_opaque).await.unwrap();
         assert_eq!(replayed_opaque, opaque);
+    }
+
+    #[tokio::test]
+    async fn ordinary_ticket_rejects_switch_protocol_disposition() {
+        let head = b"GET /ordinary HTTP/1.1\r\nHost: example.test\r\n\r\n";
+        let (mut client, server) = tokio::io::duplex(PARSER_STORE_BYTES);
+        let (mut validated, control) = ValidatedIngressIo::try_new(server, false).unwrap();
+        client.write_all(head).await.unwrap();
+
+        let mut replayed = vec![0; head.len()];
+        validated.read_exact(&mut replayed).await.unwrap();
+        let ticket = control
+            .claim(Some(IngressRequestKind::Ordinary))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ticket.resolve(RequestDisposition::SwitchProtocol),
+            Err(ValidationControlError::TicketMismatch)
+        );
+        assert_eq!(validated.read(&mut [0_u8; 1]).await.unwrap(), 0);
     }
 
     #[tokio::test]

@@ -42,7 +42,7 @@ if [[ $(sed -n '1p' src/proxy/raw_h2_conformance.rs) != '#![cfg(test)]' ]]; then
 fi
 
 mapfile -t fact_materializers < <(
-    rg -n 'into_facts[[:space:]]*\(' src \
+    rg -n '\binto_facts\b' src \
         --glob '*.rs' \
         --glob '!src/proxy/facts.rs' \
         --glob '!src/proxy/raw_h2_conformance.rs'

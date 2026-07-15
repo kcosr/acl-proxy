@@ -223,16 +223,13 @@ fn strict_connection_header_tokens(
 ) -> Result<HashSet<HeaderName>, HeaderPreparationError> {
     let mut tokens = HashSet::new();
     for value in headers.get_all(http::header::CONNECTION).iter() {
-        let value = value
-            .to_str()
-            .map_err(|_| HeaderPreparationError::InvalidConnection)?;
-        for token in value.split(',') {
-            let token = token.trim();
+        for token in value.as_bytes().split(|byte| *byte == b',') {
+            let token = trim_http_ows(token);
             if token.is_empty() {
                 return Err(HeaderPreparationError::InvalidConnection);
             }
             tokens.insert(
-                HeaderName::from_bytes(token.as_bytes())
+                HeaderName::from_bytes(token)
                     .map_err(|_| HeaderPreparationError::InvalidConnection)?,
             );
         }
@@ -401,10 +398,25 @@ fn connection_header_tokens(headers: &HeaderMap) -> HashSet<HeaderName> {
     headers
         .get_all(http::header::CONNECTION)
         .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .filter_map(|token| HeaderName::from_bytes(token.trim().as_bytes()).ok())
+        .flat_map(|value| value.as_bytes().split(|byte| *byte == b','))
+        .filter_map(|token| HeaderName::from_bytes(trim_http_ows(token)).ok())
         .collect()
+}
+
+fn trim_http_ows(mut value: &[u8]) -> &[u8] {
+    while value
+        .first()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[1..];
+    }
+    while value
+        .last()
+        .is_some_and(|byte| matches!(byte, b' ' | b'\t'))
+    {
+        value = &value[..value.len() - 1];
+    }
+    value
 }
 
 fn is_hop_by_hop(name: &HeaderName) -> bool {
@@ -833,5 +845,28 @@ mod tests {
             sanitize_untrusted_request(request),
             Err(HeaderPreparationError::InvalidConnection)
         ));
+    }
+
+    #[test]
+    fn connection_tokens_trim_only_http_ows_and_reject_obs_text() {
+        let mut request = Request::builder()
+            .version(Version::HTTP_11)
+            .header(UPGRADE, "test-echo")
+            .body(Body::empty())
+            .unwrap();
+        request.headers_mut().insert(
+            CONNECTION,
+            HeaderValue::from_bytes(b"\xc2\xa0upgrade\xc2\xa0").unwrap(),
+        );
+        assert!(matches!(
+            sanitize_untrusted_request(request),
+            Err(HeaderPreparationError::InvalidConnection)
+        ));
+
+        assert_eq!(trim_http_ows(b" \tupgrade\t "), b"upgrade");
+        assert_eq!(
+            trim_http_ows(b"\xc2\xa0upgrade\xc2\xa0"),
+            b"\xc2\xa0upgrade\xc2\xa0"
+        );
     }
 }
