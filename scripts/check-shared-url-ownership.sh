@@ -69,6 +69,7 @@ expected = {
     "http-access-types": (None, root.parent / "access-runtime" / "crates" / "http-access-types"),
     "http-access-url": (None, root.parent / "access-runtime" / "crates" / "http-access-url"),
     "http-access-conformance": ("dev", root.parent / "access-runtime" / "crates" / "http-access-conformance"),
+    "http-access-policy-acl": ("dev", root.parent / "access-runtime" / "crates" / "http-access-policy-acl"),
 }
 for name, (kind, path) in expected.items():
     dependency = dependencies.get(name)

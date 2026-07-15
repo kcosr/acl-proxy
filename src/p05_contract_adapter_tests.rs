@@ -110,6 +110,9 @@ enum AdapterError {
     InvalidPlan,
     SharedBound,
     InvalidCheckedValue,
+    MutationInvalidShape,
+    MutationForbiddenHeader,
+    MutationInvalidValue,
 }
 
 fn compile_neutral_policy(
@@ -384,7 +387,7 @@ fn compile_header_mutation(plan: &HeaderEffectPlan) -> Result<HeaderMutation, Ad
             replace.as_bytes().to_vec(),
         ),
     }
-    .map_err(|_| AdapterError::InvalidCheckedValue)
+    .map_err(map_mutation_error)
 }
 
 const fn mutation_condition(value: CompiledHeaderEffectWhen) -> HeaderMutationCondition {
@@ -558,9 +561,9 @@ const fn map_contract_error(_error: ContractError) -> AdapterError {
 const fn map_mutation_error(error: MutationError) -> AdapterError {
     match error {
         MutationError::LimitExceeded => AdapterError::SharedBound,
-        MutationError::InvalidShape
-        | MutationError::ForbiddenHeader
-        | MutationError::InvalidValue => AdapterError::InvalidCheckedValue,
+        MutationError::InvalidShape => AdapterError::MutationInvalidShape,
+        MutationError::ForbiddenHeader => AdapterError::MutationForbiddenHeader,
+        MutationError::InvalidValue => AdapterError::MutationInvalidValue,
         _ => AdapterError::InvalidCheckedValue,
     }
 }
@@ -570,10 +573,21 @@ mod tests {
     use std::path::PathBuf;
 
     use http::{HeaderMap, HeaderName, HeaderValue, Method};
-    use http_access_policy_acl::{PolicyEvaluation, ProviderDisposition};
+    use http_access_conformance::{
+        load_cursor_scenario_suite, load_header_mutation_suite, load_request_binding_suite,
+        CursorScenarioCase, CursorScenarioOutcome, FixtureBodyFraming, FixtureBodyObservation,
+        FixtureBodyRepresentation, FixtureCursorError, FixtureEffectivePolicy, FixtureHeaderField,
+        FixtureHeaderMutation, FixtureHttpVersion, FixtureIngressMode, FixtureMutationCondition,
+        FixtureMutationError, FixtureMutationOperation, FixturePolicyDecision,
+        FixtureRequestBindingInput, FixtureUpgrade, HeaderMutationOutcome,
+    };
+    use http_access_policy_acl::{
+        AclError, EvaluationInput, PolicyEvaluation, ProviderDisposition,
+    };
     use http_access_types::{
-        BodyFraming, BodyMetadata, BodyObservation, BodyRepresentation, CanonicalUrl, HeaderField,
-        HttpVersion, IngressMode, InterceptedRequestFacts, PolicyHeaderFacts,
+        BodyFraming, BodyMetadata, BodyObservation, BodyRepresentation, CanonicalUrl,
+        EffectivePolicy, HeaderField, HttpVersion, IngressMode, InterceptedRequestFacts,
+        PolicyHeaderFacts, UpgradeIntent, UpgradeProtocol,
     };
     use http_access_url::{canonicalize_http_url, CompiledUrlPattern};
 
@@ -1006,6 +1020,514 @@ mod tests {
                 if name.as_str() == "x-global-token"
                     && credential.id().as_str() == "global-token"
         ));
+    }
+
+    fn fixture_effect(mutation: &FixtureHeaderMutation) -> Result<HeaderEffectPlan, AdapterError> {
+        let name = HeaderName::from_bytes(mutation.name.as_bytes())
+            .map_err(|_| AdapterError::InvalidCheckedValue)?;
+        let when = match mutation.condition {
+            FixtureMutationCondition::Always => CompiledHeaderEffectWhen::Always,
+            FixtureMutationCondition::IfPresent => CompiledHeaderEffectWhen::IfPresent,
+            FixtureMutationCondition::IfAbsent => CompiledHeaderEffectWhen::IfAbsent,
+        };
+        let values = mutation
+            .values_hex
+            .iter()
+            .map(|value| {
+                HeaderValue::from_bytes(value.as_bytes())
+                    .map_err(|_| AdapterError::MutationInvalidValue)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        match mutation.operation {
+            FixtureMutationOperation::Set => Ok(HeaderEffectPlan::Set { when, name, values }),
+            FixtureMutationOperation::Append => Ok(HeaderEffectPlan::Append { when, name, values }),
+            FixtureMutationOperation::Remove => Ok(HeaderEffectPlan::Remove { when, name }),
+            FixtureMutationOperation::Replace => {
+                let search = mutation
+                    .search_hex
+                    .as_ref()
+                    .ok_or(AdapterError::MutationInvalidShape)?;
+                let replacement = mutation
+                    .replacement_hex
+                    .as_ref()
+                    .ok_or(AdapterError::MutationInvalidShape)?;
+                Ok(HeaderEffectPlan::Replace {
+                    when,
+                    name,
+                    search: std::str::from_utf8(search.as_bytes())
+                        .map_err(|_| AdapterError::MutationInvalidValue)?
+                        .to_owned(),
+                    replace: std::str::from_utf8(replacement.as_bytes())
+                        .map_err(|_| AdapterError::MutationInvalidValue)?
+                        .to_owned(),
+                })
+            }
+        }
+    }
+
+    fn product_fixture_headers(fields: &[FixtureHeaderField]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for field in fields {
+            headers.append(
+                HeaderName::from_bytes(field.name.as_bytes()).unwrap(),
+                HeaderValue::from_bytes(field.value_hex.as_bytes()).unwrap(),
+            );
+        }
+        headers
+    }
+
+    fn neutral_fixture_headers(fields: &[FixtureHeaderField]) -> Vec<HeaderField> {
+        fields
+            .iter()
+            .map(|field| {
+                HeaderField::new(
+                    NeutralHeaderName::new(field.name.clone()).unwrap(),
+                    NeutralHeaderValue::new(field.value_hex.as_bytes().to_vec()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn fixture_pairs(fields: &[FixtureHeaderField]) -> Vec<(String, Vec<u8>)> {
+        fields
+            .iter()
+            .map(|field| (field.name.clone(), field.value_hex.as_bytes().to_vec()))
+            .collect()
+    }
+
+    const fn fixture_mutation_error(error: AdapterError) -> Option<FixtureMutationError> {
+        match error {
+            AdapterError::SharedBound => Some(FixtureMutationError::LimitExceeded),
+            AdapterError::MutationInvalidShape => Some(FixtureMutationError::InvalidShape),
+            AdapterError::MutationForbiddenHeader => Some(FixtureMutationError::ForbiddenHeader),
+            AdapterError::MutationInvalidValue => Some(FixtureMutationError::InvalidValue),
+            AdapterError::InvalidPlan | AdapterError::InvalidCheckedValue => None,
+        }
+    }
+
+    #[test]
+    fn shared_mutation_fixtures_execute_through_the_product_adapter() {
+        for case in load_header_mutation_suite().unwrap().into_cases() {
+            let effects = case
+                .mutations
+                .iter()
+                .map(fixture_effect)
+                .collect::<Result<Vec<_>, _>>();
+            let compiled = effects
+                .as_ref()
+                .map_err(|error| *error)
+                .and_then(|effects| compile_header_batch(effects));
+
+            match (&case.expected, effects, compiled) {
+                (HeaderMutationOutcome::Accepted { fields }, Ok(effects), Ok(Some(batch))) => {
+                    let mut product = product_fixture_headers(&case.initial);
+                    apply_header_effects(&effects, &mut product).unwrap();
+                    let neutral = http_access_types::apply_header_mutation_batches(
+                        &neutral_fixture_headers(&case.initial),
+                        &[batch],
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        product_pairs(&product),
+                        fixture_pairs(fields),
+                        "{}",
+                        case.id
+                    );
+                    assert_eq!(
+                        neutral_pairs(&neutral),
+                        fixture_pairs(fields),
+                        "{}",
+                        case.id
+                    );
+                }
+                (HeaderMutationOutcome::Rejected { error }, _, Err(actual)) => {
+                    assert_eq!(fixture_mutation_error(actual), Some(*error), "{}", case.id);
+                }
+                (expected, _, _) => {
+                    panic!("{}: unexpected adapter result for {expected:?}", case.id)
+                }
+            }
+        }
+    }
+
+    fn cursor_rule(
+        id: &str,
+        decision: FixturePolicyDecision,
+        url: &str,
+        matches: bool,
+    ) -> PolicyRulePlan {
+        let decision = match decision {
+            FixturePolicyDecision::Allow => CompiledRuleDecision::Allow,
+            FixturePolicyDecision::Deny => CompiledRuleDecision::Deny,
+            FixturePolicyDecision::Delegate => CompiledRuleDecision::Delegate,
+        };
+        let mut rule = simple_rule(
+            id,
+            decision,
+            if matches {
+                url
+            } else {
+                "https://cursor-nonmatch.test/**"
+            },
+        );
+        if decision == CompiledRuleDecision::Delegate {
+            rule.authorization_provider = Some(format!("provider-{id}"));
+        }
+        rule
+    }
+
+    fn cursor_source_plan(case: &CursorScenarioCase, url: &str) -> Option<PolicyPlan> {
+        let delegate_ordinal = case.cursor.next_ordinal.checked_sub(1)?;
+        let rules = (0..case.cursor.next_ordinal)
+            .map(|ordinal| {
+                if ordinal == delegate_ordinal {
+                    cursor_rule(
+                        &format!("cursor-source-{ordinal}"),
+                        FixturePolicyDecision::Delegate,
+                        url,
+                        true,
+                    )
+                } else {
+                    cursor_rule(
+                        &format!("cursor-source-{ordinal}"),
+                        FixturePolicyDecision::Deny,
+                        url,
+                        false,
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        Some(PolicyPlan {
+            default: CompiledDefaultDecision::Deny,
+            http_body_read_plans_by_cursor: vec![HttpBodyReadPlan::Disabled; rules.len() + 1],
+            rules,
+        })
+    }
+
+    fn cursor_selected_plan(case: &CursorScenarioCase, url: &str) -> PolicyPlan {
+        let rule_count = case
+            .snapshot
+            .rules
+            .iter()
+            .map(|rule| rule.ordinal as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let rules = (0..rule_count)
+            .map(|ordinal| {
+                let fixture = case
+                    .snapshot
+                    .rules
+                    .iter()
+                    .find(|rule| rule.ordinal as usize == ordinal);
+                fixture.map_or_else(
+                    || {
+                        cursor_rule(
+                            &format!("cursor-gap-{ordinal}"),
+                            FixturePolicyDecision::Deny,
+                            url,
+                            false,
+                        )
+                    },
+                    |rule| {
+                        cursor_rule(
+                            &rule.rule_id,
+                            rule.decision,
+                            url,
+                            case.resume.matching_rule_ordinals.contains(&rule.ordinal),
+                        )
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        PolicyPlan {
+            default: match case.snapshot.default {
+                FixturePolicyDecision::Allow => CompiledDefaultDecision::Allow,
+                FixturePolicyDecision::Deny => CompiledDefaultDecision::Deny,
+                FixturePolicyDecision::Delegate => {
+                    panic!("{}: a product snapshot cannot delegate by default", case.id)
+                }
+            },
+            http_body_read_plans_by_cursor: vec![HttpBodyReadPlan::Disabled; rules.len() + 1],
+            rules,
+        }
+    }
+
+    fn fixture_effective_policy(value: &EffectivePolicy) -> FixtureEffectivePolicy {
+        match value {
+            EffectivePolicy::Default => FixtureEffectivePolicy::Default,
+            EffectivePolicy::Rule { id, ordinal } => FixtureEffectivePolicy::Rule {
+                rule_id: id.as_str().to_owned(),
+                ordinal: *ordinal,
+            },
+        }
+    }
+
+    fn cursor_outcome(evaluation: PolicyEvaluation<NeutralRuleEffects>) -> CursorScenarioOutcome {
+        match evaluation {
+            PolicyEvaluation::Allow { provenance, .. } => CursorScenarioOutcome::Terminal {
+                decision: FixturePolicyDecision::Allow,
+                effective_policy: fixture_effective_policy(provenance.effective_policy()),
+            },
+            PolicyEvaluation::Deny { provenance } => CursorScenarioOutcome::Terminal {
+                decision: FixturePolicyDecision::Deny,
+                effective_policy: fixture_effective_policy(provenance.effective_policy()),
+            },
+            PolicyEvaluation::Delegate(delegated) => {
+                let EffectivePolicy::Rule { id, ordinal } =
+                    delegated.provenance().effective_policy()
+                else {
+                    panic!("a delegated product decision must identify its rule")
+                };
+                CursorScenarioOutcome::Delegate {
+                    rule_id: id.as_str().to_owned(),
+                    ordinal: *ordinal,
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_cursor_and_generation_fixtures_execute_through_the_product_adapter() {
+        for case in load_cursor_scenario_suite().unwrap().into_cases() {
+            let url = "https://cursor-product.test/match";
+            let source_identity = SnapshotIdentity::new();
+            let Some(source_plan) = cursor_source_plan(&case, url) else {
+                assert_eq!(
+                    case.expected,
+                    CursorScenarioOutcome::Rejected {
+                        error: FixtureCursorError::InvalidCursor,
+                    },
+                    "{}",
+                    case.id
+                );
+                continue;
+            };
+            let source = compile_neutral_policy(
+                &source_plan,
+                &product_egress_plan(),
+                &ObservationPlan { capture: None },
+                PolicyGeneration::new(case.cursor.policy_generation).unwrap(),
+                source_identity.clone(),
+                &[],
+            )
+            .unwrap();
+            let request_facts = facts(url, "GET");
+            let input = evaluation_input(&request_facts, &[]);
+            let PolicyEvaluation::Delegate(delegated) = source.snapshot.evaluate(&input).unwrap()
+            else {
+                panic!("{}: source plan did not produce a cursor", case.id)
+            };
+
+            let same_snapshot = case.cursor.snapshot_identity == case.snapshot.identity
+                && case.resume.snapshot_identity == case.snapshot.identity
+                && case.cursor.policy_generation == case.snapshot.policy_generation
+                && case.resume.policy_generation == case.snapshot.policy_generation;
+            let selected_identity = if same_snapshot {
+                source_identity
+            } else {
+                SnapshotIdentity::new()
+            };
+            let selected = compile_neutral_policy(
+                &cursor_selected_plan(&case, url),
+                &product_egress_plan(),
+                &ObservationPlan { capture: None },
+                PolicyGeneration::new(case.snapshot.policy_generation).unwrap(),
+                selected_identity,
+                &[],
+            )
+            .unwrap();
+            let actual =
+                selected
+                    .snapshot
+                    .resolve_delegate(delegated, ProviderDisposition::Pass, &input);
+
+            match (&case.expected, actual) {
+                (expected, Ok(evaluation)) => {
+                    assert_eq!(&cursor_outcome(evaluation), expected, "{}", case.id);
+                }
+                (
+                    CursorScenarioOutcome::Rejected {
+                        error: FixtureCursorError::ForeignSnapshot,
+                    },
+                    Err(AclError::ForeignSnapshot),
+                ) => {}
+                (
+                    CursorScenarioOutcome::Rejected {
+                        error: FixtureCursorError::GenerationMismatch,
+                    },
+                    Err(AclError::ForeignSnapshot),
+                ) => {
+                    // Product cursors bind the unforgeable snapshot identity. Publishing a
+                    // new generation selects a new identity, so this boundary intentionally
+                    // sanitizes both descriptive mismatch categories as ForeignSnapshot.
+                }
+                (expected, _) => {
+                    panic!("{}: unexpected product result for {expected:?}", case.id)
+                }
+            }
+        }
+    }
+
+    struct FixtureEvaluationParts {
+        facts: InterceptedRequestFacts,
+        peer_ip: IpAddr,
+        header_facts: PolicyHeaderFacts,
+        revision: u64,
+        body_representation: BodyRepresentation,
+        body_observation: BodyObservation,
+    }
+
+    fn fixture_evaluation_parts(input: &FixtureRequestBindingInput) -> FixtureEvaluationParts {
+        let ingress = match input.ingress_mode {
+            FixtureIngressMode::ExplicitHttp => IngressMode::ExplicitHttp,
+            FixtureIngressMode::ExplicitHttps => IngressMode::ExplicitHttps,
+            FixtureIngressMode::TransparentHttp => IngressMode::TransparentHttp,
+            FixtureIngressMode::ConnectMitmInner => IngressMode::ConnectMitmInner,
+            FixtureIngressMode::TransparentHttps => IngressMode::TransparentHttps,
+        };
+        let version = match input.http_version {
+            FixtureHttpVersion::Http10 => HttpVersion::Http10,
+            FixtureHttpVersion::Http11 => HttpVersion::Http11,
+            FixtureHttpVersion::Http2 => HttpVersion::Http2,
+        };
+        let framing = match input.body_framing {
+            FixtureBodyFraming::None => BodyFraming::None,
+            FixtureBodyFraming::ContentLength { length } => BodyFraming::ContentLength(length),
+            FixtureBodyFraming::Chunked => BodyFraming::Chunked,
+            FixtureBodyFraming::Http2Stream => BodyFraming::Http2Stream,
+        };
+        let upgrade = match &input.upgrade {
+            FixtureUpgrade::None => None,
+            FixtureUpgrade::Websocket => Some(UpgradeIntent::WebSocket),
+            FixtureUpgrade::Other { protocol } => Some(UpgradeIntent::Other(
+                UpgradeProtocol::new(protocol.clone()).unwrap(),
+            )),
+        };
+        let ordinary_headers = neutral_fixture_headers(&input.headers);
+        let facts = InterceptedRequestFacts::new(
+            ingress,
+            version,
+            HttpMethod::new(input.method.clone()).unwrap(),
+            canonicalize_http_url(&input.url).unwrap(),
+            ordinary_headers.clone(),
+            BodyMetadata::new(framing),
+            upgrade,
+        )
+        .unwrap();
+        let sensitive = input
+            .sensitive_header_presence
+            .iter()
+            .map(|name| NeutralHeaderName::new(name.clone()).unwrap())
+            .collect::<Vec<_>>();
+        let mut raw_headers = ordinary_headers;
+        raw_headers.extend(sensitive.iter().cloned().map(|name| {
+            HeaderField::new(name, NeutralHeaderValue::new(b"redacted".to_vec()).unwrap())
+        }));
+        raw_headers.sort_by(|left, right| left.name().cmp(right.name()));
+        let header_facts = PolicyHeaderFacts::new(raw_headers, sensitive).unwrap();
+        let body_representation = match input.body_representation {
+            FixtureBodyRepresentation::PreservedContentCoded => {
+                BodyRepresentation::PreservedContentCoded
+            }
+            FixtureBodyRepresentation::CanonicalIdentity => BodyRepresentation::CanonicalIdentity,
+        };
+        let body_observation = match &input.body_observation {
+            FixtureBodyObservation::Unobserved => BodyObservation::unobserved(),
+            FixtureBodyObservation::Complete { body_hex } => {
+                BodyObservation::complete(body_hex.as_bytes())
+            }
+            FixtureBodyObservation::Partial { .. } => {
+                panic!("partial bodies belong to the request-body-state suite")
+            }
+        };
+        FixtureEvaluationParts {
+            facts,
+            peer_ip: input.peer_ip.parse().unwrap(),
+            header_facts,
+            revision: input.revision,
+            body_representation,
+            body_observation,
+        }
+    }
+
+    fn fixture_input(parts: &FixtureEvaluationParts, revision: u64) -> EvaluationInput<'_> {
+        EvaluationInput::new(
+            &parts.facts,
+            parts.peer_ip,
+            parts.header_facts.clone(),
+            revision,
+            parts.body_representation,
+            parts.body_observation,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn shared_request_binding_fixtures_drive_product_cursor_binding() {
+        for case in load_request_binding_suite().unwrap().into_cases() {
+            let parts = fixture_evaluation_parts(&case.input);
+            let input = fixture_input(&parts, parts.revision);
+            assert_eq!(
+                input.request_binding().to_wire(),
+                case.expected.digest.as_str(),
+                "{}",
+                case.id
+            );
+
+            let mut delegate = simple_rule(
+                &format!("binding-{}", case.id),
+                CompiledRuleDecision::Delegate,
+                &case.input.url,
+            );
+            delegate.authorization_provider = Some(format!("binding-provider-{}", case.id));
+            let plan = PolicyPlan {
+                default: CompiledDefaultDecision::Allow,
+                rules: vec![delegate],
+                http_body_read_plans_by_cursor: vec![
+                    HttpBodyReadPlan::Disabled,
+                    HttpBodyReadPlan::Disabled,
+                ],
+            };
+            let compiled = compile_neutral_policy(
+                &plan,
+                &product_egress_plan(),
+                &ObservationPlan { capture: None },
+                PolicyGeneration::new(51).unwrap(),
+                SnapshotIdentity::new(),
+                &case
+                    .input
+                    .sensitive_header_presence
+                    .iter()
+                    .map(|name| HeaderName::from_bytes(name.as_bytes()).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+
+            let PolicyEvaluation::Delegate(unchanged) = compiled.snapshot.evaluate(&input).unwrap()
+            else {
+                panic!("{}: binding fixture did not match product rule", case.id)
+            };
+            assert!(matches!(
+                compiled
+                    .snapshot
+                    .resolve_delegate(unchanged, ProviderDisposition::Pass, &input,),
+                Ok(PolicyEvaluation::Allow { .. })
+            ));
+
+            let PolicyEvaluation::Delegate(changed) = compiled.snapshot.evaluate(&input).unwrap()
+            else {
+                panic!("{}: binding fixture did not match product rule", case.id)
+            };
+            let changed_input = fixture_input(&parts, parts.revision.wrapping_add(1));
+            assert!(matches!(
+                compiled.snapshot.resolve_delegate(
+                    changed,
+                    ProviderDisposition::Pass,
+                    &changed_input,
+                ),
+                Err(AclError::InputBindingMismatch)
+            ));
+        }
     }
 
     #[test]
