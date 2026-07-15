@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
-use http::header::{HeaderMap, HeaderName, HeaderValue, HOST, TE};
-use http::{Request, Uri, Version};
+use http::header::{HeaderMap, HeaderName, HeaderValue, CONNECTION, HOST, TE, UPGRADE};
+use http::{Request, StatusCode, Uri, Version};
 use hyper::Body;
 
 use crate::egress::OriginProtocol;
@@ -23,6 +23,8 @@ pub(crate) enum HeaderPreparationError {
     UnsupportedVersion,
     #[error("HTTP upgrade requests require the dedicated upgrade executor")]
     UpgradeUnsupported,
+    #[error("the HTTP upgrade handshake is malformed or unsupported")]
+    InvalidUpgrade,
     #[error("CONNECT requests require the dedicated CONNECT executor")]
     ConnectUnsupported,
     #[error("trusted request effects introduced a forbidden hop-by-hop header")]
@@ -34,6 +36,18 @@ pub(crate) enum HeaderPreparationError {
 pub(crate) struct SanitizedRequest<B = Body> {
     request: Request<B>,
     protocol: OriginProtocol,
+    upgrade_intent: Option<UpgradeIntent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UpgradeIntent {
+    protocol: HeaderValue,
+}
+
+impl UpgradeIntent {
+    pub(crate) fn protocol(&self) -> &HeaderValue {
+        &self.protocol
+    }
 }
 
 impl<B> SanitizedRequest<B> {
@@ -45,19 +59,28 @@ impl<B> SanitizedRequest<B> {
         self.protocol
     }
 
+    pub(crate) fn upgrade_intent(&self) -> Option<&UpgradeIntent> {
+        self.upgrade_intent.as_ref()
+    }
+
     pub(crate) fn into_parts(self) -> (http::request::Parts, B, OriginProtocol) {
-        let (parts, body) = self.request.into_parts();
+        let (mut parts, body) = self.request.into_parts();
+        if let Some(intent) = self.upgrade_intent {
+            parts.extensions.insert(intent);
+        }
         (parts, body, self.protocol)
     }
 
     pub(crate) fn from_parts(
-        parts: http::request::Parts,
+        mut parts: http::request::Parts,
         body: B,
         protocol: OriginProtocol,
     ) -> Self {
+        let upgrade_intent = parts.extensions.remove::<UpgradeIntent>();
         Self {
             request: Request::from_parts(parts, body),
             protocol,
+            upgrade_intent,
         }
     }
 }
@@ -76,13 +99,111 @@ pub(crate) fn sanitize_untrusted_request<B>(
         _ => return Err(HeaderPreparationError::UnsupportedVersion),
     };
     let connection_tokens = strict_connection_header_tokens(request.headers())?;
-    if request.headers().contains_key(http::header::UPGRADE)
-        || connection_tokens.contains(&http::header::UPGRADE)
-    {
-        return Err(HeaderPreparationError::UpgradeUnsupported);
-    }
+    let upgrade_intent =
+        extract_upgrade_intent(request.version(), request.headers(), &connection_tokens)?;
     strip_request_hop_by_hop(request.headers_mut(), protocol.is_http2());
-    Ok(SanitizedRequest { request, protocol })
+    Ok(SanitizedRequest {
+        request,
+        protocol,
+        upgrade_intent,
+    })
+}
+
+/// Sanitizes the outer HTTP/1 CONNECT control request before policy evaluation.
+/// CONNECT is never forwarded as an origin request, so it cannot carry an
+/// upgrade intent or retain caller-controlled hop-by-hop fields.
+pub(crate) fn sanitize_untrusted_connect_request<B>(
+    mut request: Request<B>,
+) -> Result<SanitizedRequest<B>, HeaderPreparationError> {
+    if request.method() != http::Method::CONNECT {
+        return Err(HeaderPreparationError::ConnectUnsupported);
+    }
+    if !matches!(request.version(), Version::HTTP_10 | Version::HTTP_11) {
+        return Err(HeaderPreparationError::UnsupportedVersion);
+    }
+    let connection_tokens = strict_connection_header_tokens(request.headers())?;
+    if extract_upgrade_intent(request.version(), request.headers(), &connection_tokens)?.is_some() {
+        return Err(HeaderPreparationError::InvalidUpgrade);
+    }
+    strip_request_hop_by_hop(request.headers_mut(), false);
+    Ok(SanitizedRequest {
+        request,
+        protocol: OriginProtocol::Http1,
+        upgrade_intent: None,
+    })
+}
+
+fn extract_upgrade_intent(
+    version: Version,
+    headers: &HeaderMap,
+    connection_tokens: &HashSet<HeaderName>,
+) -> Result<Option<UpgradeIntent>, HeaderPreparationError> {
+    let has_upgrade_header = headers.contains_key(UPGRADE);
+    let nominates_upgrade = connection_tokens.contains(&UPGRADE);
+    if !has_upgrade_header && !nominates_upgrade {
+        return Ok(None);
+    }
+    if version != Version::HTTP_11 || !has_upgrade_header || !nominates_upgrade {
+        return Err(HeaderPreparationError::InvalidUpgrade);
+    }
+    let protocol = single_upgrade_protocol(headers)?;
+    Ok(Some(UpgradeIntent { protocol }))
+}
+
+fn single_upgrade_protocol(headers: &HeaderMap) -> Result<HeaderValue, HeaderPreparationError> {
+    let mut values = headers.get_all(UPGRADE).iter();
+    let value = values
+        .next()
+        .ok_or(HeaderPreparationError::InvalidUpgrade)?;
+    if values.next().is_some() {
+        return Err(HeaderPreparationError::InvalidUpgrade);
+    }
+    let protocol = value
+        .to_str()
+        .map_err(|_| HeaderPreparationError::InvalidUpgrade)?;
+    if !valid_upgrade_protocol(protocol) {
+        return Err(HeaderPreparationError::InvalidUpgrade);
+    }
+    Ok(value.clone())
+}
+
+fn valid_upgrade_protocol(value: &str) -> bool {
+    let mut parts = value.split('/');
+    let Some(name) = parts.next() else {
+        return false;
+    };
+    if !is_http_token(name) {
+        return false;
+    }
+    match (parts.next(), parts.next()) {
+        (None, None) => true,
+        (Some(version), None) => is_http_token(version),
+        _ => false,
+    }
+}
+
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 fn strict_connection_header_tokens(
@@ -108,6 +229,41 @@ fn strict_connection_header_tokens(
 }
 
 pub(crate) fn prepare_origin_request<B>(
+    sanitized: SanitizedRequest<B>,
+    canonical: &CanonicalUrl,
+    target_form: RequestTargetForm,
+    protocol: OriginProtocol,
+) -> Result<Request<B>, HeaderPreparationError> {
+    if sanitized.upgrade_intent.is_some() {
+        return Err(HeaderPreparationError::UpgradeUnsupported);
+    }
+    prepare_origin_request_head(sanitized, canonical, target_form, protocol)
+}
+
+pub(crate) fn prepare_origin_upgrade_request<B>(
+    sanitized: SanitizedRequest<B>,
+    canonical: &CanonicalUrl,
+    target_form: RequestTargetForm,
+    protocol: OriginProtocol,
+) -> Result<Request<B>, HeaderPreparationError> {
+    if protocol.is_http2() {
+        return Err(HeaderPreparationError::InvalidUpgrade);
+    }
+    let intent = sanitized
+        .upgrade_intent
+        .clone()
+        .ok_or(HeaderPreparationError::InvalidUpgrade)?;
+    let mut request = prepare_origin_request_head(sanitized, canonical, target_form, protocol)?;
+    request
+        .headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("upgrade"));
+    request
+        .headers_mut()
+        .insert(UPGRADE, intent.protocol().clone());
+    Ok(request)
+}
+
+fn prepare_origin_request_head<B>(
     mut sanitized: SanitizedRequest<B>,
     canonical: &CanonicalUrl,
     target_form: RequestTargetForm,
@@ -142,6 +298,37 @@ pub(crate) fn prepare_origin_request<B>(
         );
     }
     Ok(sanitized.request)
+}
+
+/// Validates a `101 Switching Protocols` head and replaces its hop headers
+/// with the canonical downstream handshake for the accepted request intent.
+pub(crate) fn prepare_downstream_upgrade_response(
+    status: StatusCode,
+    headers: &mut HeaderMap,
+    request_intent: &UpgradeIntent,
+) -> Result<(), HeaderPreparationError> {
+    if status != StatusCode::SWITCHING_PROTOCOLS {
+        return Err(HeaderPreparationError::InvalidUpgrade);
+    }
+    let connection_tokens = strict_connection_header_tokens(headers)?;
+    if !connection_tokens.contains(&UPGRADE) {
+        return Err(HeaderPreparationError::InvalidUpgrade);
+    }
+    let response_protocol = single_upgrade_protocol(headers)?;
+    let response_protocol = response_protocol
+        .to_str()
+        .map_err(|_| HeaderPreparationError::InvalidUpgrade)?;
+    let request_protocol = request_intent
+        .protocol()
+        .to_str()
+        .map_err(|_| HeaderPreparationError::InvalidUpgrade)?;
+    if !response_protocol.eq_ignore_ascii_case(request_protocol) {
+        return Err(HeaderPreparationError::InvalidUpgrade);
+    }
+    strip_response_hop_by_hop(headers);
+    headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+    headers.insert(UPGRADE, request_intent.protocol().clone());
+    Ok(())
 }
 
 pub(crate) fn strip_response_hop_by_hop(headers: &mut HeaderMap) {
@@ -490,25 +677,121 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_intent_fails_before_hop_header_sanitization() {
+    fn valid_upgrade_intent_is_typed_before_hop_header_sanitization() {
+        let request = Request::builder()
+            .version(Version::HTTP_11)
+            .header(CONNECTION, "keep-alive, Upgrade, x-private")
+            .header(UPGRADE, "WebSocket/13")
+            .header("x-private", "remove-me")
+            .body(Body::empty())
+            .unwrap();
+
+        let sanitized = sanitize_untrusted_request(request).unwrap();
+        assert_eq!(
+            sanitized.upgrade_intent().unwrap().protocol(),
+            "WebSocket/13"
+        );
+        assert!(!sanitized.request.headers().contains_key(CONNECTION));
+        assert!(!sanitized.request.headers().contains_key(UPGRADE));
+        assert!(!sanitized.request.headers().contains_key("x-private"));
+
+        let (parts, body, protocol) = sanitized.into_parts();
+        let sanitized = SanitizedRequest::from_parts(parts, body, protocol);
+        assert_eq!(
+            sanitized.upgrade_intent().unwrap().protocol(),
+            "WebSocket/13"
+        );
+    }
+
+    #[test]
+    fn malformed_and_h2_upgrade_intents_fail_closed() {
         for request in [
             Request::builder()
                 .version(Version::HTTP_11)
                 .header(CONNECTION, "upgrade")
-                .header("upgrade", "websocket")
+                .header(UPGRADE, "websocket, h2c")
                 .body(Body::empty())
                 .unwrap(),
             Request::builder()
                 .version(Version::HTTP_11)
-                .header("upgrade", "custom")
+                .header(UPGRADE, "custom")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .version(Version::HTTP_11)
+                .header(CONNECTION, "upgrade")
+                .body(Body::empty())
+                .unwrap(),
+            Request::builder()
+                .version(Version::HTTP_2)
+                .header(CONNECTION, "upgrade")
+                .header(UPGRADE, "websocket")
                 .body(Body::empty())
                 .unwrap(),
         ] {
             assert!(matches!(
                 sanitize_untrusted_request(request),
-                Err(HeaderPreparationError::UpgradeUnsupported)
+                Err(HeaderPreparationError::InvalidUpgrade)
             ));
         }
+    }
+
+    #[test]
+    fn dedicated_upgrade_request_restores_only_canonical_handshake_headers() {
+        let canonical = canonicalize_http_url("https://example.com/socket").unwrap();
+        let request = Request::builder()
+            .version(Version::HTTP_11)
+            .header(CONNECTION, "Upgrade, x-private")
+            .header(UPGRADE, "WebSocket")
+            .header("x-private", "attacker")
+            .body(Body::empty())
+            .unwrap();
+        let sanitized = sanitize_untrusted_request(request).unwrap();
+
+        let prepared = prepare_origin_upgrade_request(
+            sanitized,
+            &canonical,
+            RequestTargetForm::Origin,
+            OriginProtocol::Http1,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.uri(), "/socket");
+        assert_eq!(prepared.headers()[HOST], "example.com");
+        assert_eq!(prepared.headers()[CONNECTION], "upgrade");
+        assert_eq!(prepared.headers()[UPGRADE], "WebSocket");
+        assert!(!prepared.headers().contains_key("x-private"));
+    }
+
+    #[test]
+    fn upgrade_response_is_validated_and_canonicalized() {
+        let request = Request::builder()
+            .version(Version::HTTP_11)
+            .header(CONNECTION, "upgrade")
+            .header(UPGRADE, "WebSocket")
+            .body(Body::empty())
+            .unwrap();
+        let intent = sanitize_untrusted_request(request)
+            .unwrap()
+            .upgrade_intent()
+            .unwrap()
+            .clone();
+        let mut headers = HeaderMap::new();
+        headers.insert(CONNECTION, HeaderValue::from_static("x-private, Upgrade"));
+        headers.insert(UPGRADE, HeaderValue::from_static("websocket"));
+        headers.insert("x-private", HeaderValue::from_static("remove-me"));
+
+        prepare_downstream_upgrade_response(StatusCode::SWITCHING_PROTOCOLS, &mut headers, &intent)
+            .unwrap();
+
+        assert_eq!(headers[CONNECTION], "upgrade");
+        assert_eq!(headers[UPGRADE], "WebSocket");
+        assert!(!headers.contains_key("x-private"));
+
+        assert!(matches!(
+            prepare_downstream_upgrade_response(StatusCode::OK, &mut headers, &intent),
+            Err(HeaderPreparationError::InvalidUpgrade)
+        ));
     }
 
     #[test]

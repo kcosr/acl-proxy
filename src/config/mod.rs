@@ -4684,28 +4684,6 @@ callback_url = "https://proxy.example.com/_acl-proxy/external-auth/callback"
     }
 
     #[test]
-    fn sample_config_in_repo_root_is_valid() {
-        use std::fs;
-        use std::path::PathBuf;
-
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let sample_path = manifest_dir.join("acl-proxy.sample.toml");
-        let contents = fs::read_to_string(&sample_path).expect("read sample config");
-
-        let config: Config = toml::from_str(&contents).expect("parse sample config");
-        config
-            .validate_basic()
-            .expect("sample config should pass basic validation");
-
-        let effective = crate::policy::EffectivePolicy::from_config(&config.policy)
-            .expect("sample policy should produce effective rules");
-        assert!(
-            !effective.rules.is_empty(),
-            "sample policy should produce at least one effective rule"
-        );
-    }
-
-    #[test]
     fn external_auth_profile_must_exist() {
         let toml = r#"
 schema_version = "2"

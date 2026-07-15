@@ -44,6 +44,7 @@ pub(crate) struct ProductStaticResources {
     proxy_supervisors: Mutex<Vec<Arc<dyn ProxySupervisor>>>,
     proxy_shutdown: tokio::sync::OnceCell<()>,
     upgrade_shutdown: tokio::sync::OnceCell<()>,
+    mitm_shutdown: tokio::sync::OnceCell<()>,
     ingress_assets: Arc<ProductIngressAssets>,
     ingress: Mutex<IngressOwnership>,
     control: Mutex<ControlOwnership>,
@@ -121,6 +122,7 @@ impl ProductStaticResources {
             proxy_supervisors: Mutex::new(Vec::new()),
             proxy_shutdown: tokio::sync::OnceCell::new(),
             upgrade_shutdown: tokio::sync::OnceCell::new(),
+            mitm_shutdown: tokio::sync::OnceCell::new(),
             ingress_assets,
             ingress: Mutex::new(IngressOwnership {
                 config: static_config.listeners.clone(),
@@ -564,6 +566,9 @@ impl StaticResources for ProductStaticResources {
         self.observation_runtime.begin_shutdown();
         self.authorization_runtime.begin_shutdown(deadline);
         self.upgrade_runtime.begin_shutdown(deadline);
+        if let Some(mitm) = self.ingress_assets.mitm() {
+            mitm.begin_shutdown();
+        }
     }
 
     fn shutdown(&self) -> BoxFuture<'_, ()> {
@@ -619,6 +624,13 @@ impl StaticResources for ProductStaticResources {
                 .await;
             self.proxy_shutdown
                 .get_or_init(|| self.shutdown_proxy_supervisors())
+                .await;
+            self.mitm_shutdown
+                .get_or_init(|| async {
+                    if let Some(mitm) = self.ingress_assets.mitm() {
+                        mitm.shutdown_and_join().await;
+                    }
+                })
                 .await;
             self.observation_runtime.shutdown().await;
         })

@@ -12,9 +12,11 @@ use crate::authorization::{AuthorizationDecision, AuthorizationDispatchError};
 use crate::config::compiler::{CompiledProviderFailureMode, HeaderEffectPlan, HttpBodyReadPlan};
 use crate::credentials::{CredentialError, InboundCredentials, ResolvedCredentialAction};
 use crate::policy::{PolicyEvaluation, PolicyOutcome, PolicyRuleMatch};
+use crate::redaction::ProfileHandle;
 use crate::runtime::{GenerationLease, ProviderIndex};
 use crate::safety::wire_body::WireBodyBufferError;
 use crate::safety::{GuardedBody, HttpWireBodyGuard, UnknownHttpWireBodyPlan, WireBodyQuotaKey};
+use crate::upgrade::UpgradeAllocation;
 use crate::url::CanonicalUrl;
 
 /// Strict request head. Body-bearing ingress prepares this first, then decodes
@@ -27,6 +29,7 @@ pub(crate) struct RequestInput<'request> {
     pub(crate) headers: HeaderMap,
     pub(crate) quota_key: WireBodyQuotaKey,
     pub(crate) started_at: Instant,
+    pub(crate) upgrade_intent: bool,
 }
 
 pub(crate) enum RequestDecision<'generation> {
@@ -38,8 +41,14 @@ pub(crate) struct AllowedRequest<'generation> {
     pub(crate) common: DecidedRequest,
     pub(crate) rule: Option<PolicyRuleMatch<'generation>>,
     pub(crate) provider_credentials: Option<StagedProviderCredentialMutation>,
+    pub(crate) upgrade: Option<UpgradeBinding>,
     pub(crate) body: Option<GuardedRequestBody>,
     pub(crate) body_provenance: TerminalRequestBodyProvenance,
+}
+
+pub(crate) struct UpgradeBinding {
+    pub(crate) allocation: UpgradeAllocation,
+    pub(crate) wire_redaction: Option<ProfileHandle>,
 }
 
 pub(crate) struct DeniedRequest<'generation> {
@@ -85,6 +94,8 @@ pub(crate) enum RequestDecisionError {
     MissingProvider,
     #[error("the policy redaction profile is missing from this generation")]
     MissingRedactionProfile,
+    #[error("the matched upgrade rule has no compiled upgrade allocation")]
+    MissingUpgradeAllocation,
     #[error("authorization request headers are invalid")]
     ProviderRequestHeaders,
     #[error("authorization provider dispatch failed")]
@@ -185,7 +196,9 @@ impl<'generation, 'request> PreparedRequest<'generation, 'request> {
     }
 
     pub(crate) fn body_read_plan(&self) -> HttpBodyReadPlan {
-        if self.early_deny.is_some() {
+        if self.early_deny.is_some()
+            || upgrade_is_disallowed(self.identity.upgrade_intent, &self.evaluation)
+        {
             HttpBodyReadPlan::Disabled
         } else {
             self.evaluation.body_read_plan()
@@ -193,7 +206,9 @@ impl<'generation, 'request> PreparedRequest<'generation, 'request> {
     }
 
     pub(crate) fn denies_without_resolution(&self) -> bool {
-        self.early_deny.is_some() || self.evaluation.outcome == PolicyOutcome::Deny
+        self.early_deny.is_some()
+            || self.evaluation.outcome == PolicyOutcome::Deny
+            || upgrade_is_disallowed(self.identity.upgrade_intent, &self.evaluation)
     }
 
     pub(crate) async fn decide(
@@ -286,6 +301,7 @@ pub(crate) fn prepare_request<'generation, 'request>(
                 method: input.method,
                 peer_ip: input.peer_ip,
                 deadline,
+                upgrade_intent: input.upgrade_intent,
             },
             headers: input.headers,
             inbound,
@@ -304,6 +320,7 @@ pub(crate) fn prepare_request<'generation, 'request>(
             method: input.method,
             peer_ip: input.peer_ip,
             deadline,
+            upgrade_intent: input.upgrade_intent,
         },
         headers: input.headers,
         inbound,
@@ -321,6 +338,7 @@ struct RequestIdentity<'request> {
     method: &'request Method,
     peer_ip: IpAddr,
     deadline: Instant,
+    upgrade_intent: bool,
 }
 
 struct DecisionState<'generation, 'request> {
@@ -349,9 +367,23 @@ async fn evaluate_to_terminal<'generation>(
         mut body_provenance,
     } = state;
     loop {
+        if upgrade_is_disallowed(input.upgrade_intent, &evaluation) {
+            let body = denied_observation_body(body, body_provenance);
+            return Ok(RequestDecision::Deny(DeniedRequest {
+                common: DecidedRequest {
+                    headers,
+                    body_guard: guard,
+                },
+                rule: evaluation.matched,
+                reason: DenyReason::Policy,
+                body_provenance,
+                body,
+            }));
+        }
         match evaluation.outcome {
             PolicyOutcome::Allow => {
                 let matched = evaluation.matched;
+                let upgrade = bind_upgrade(lease, input.upgrade_intent, matched.as_ref())?;
                 let local_failure = match matched.as_ref() {
                     Some(matched) => {
                         validate_local_body_limits(lease, matched, None, body.as_ref())?
@@ -414,6 +446,7 @@ async fn evaluate_to_terminal<'generation>(
                     },
                     rule: matched,
                     provider_credentials: None,
+                    upgrade,
                     body,
                     body_provenance,
                 })));
@@ -438,6 +471,7 @@ async fn evaluate_to_terminal<'generation>(
             .matched
             .take()
             .expect("delegate policy outcomes always identify their rule");
+        let upgrade = bind_upgrade(lease, input.upgrade_intent, Some(&matched))?;
         let provider = matched
             .authorization_provider()
             .expect("activated delegate rules always bind an authorization provider");
@@ -618,6 +652,7 @@ async fn evaluate_to_terminal<'generation>(
                     },
                     rule: Some(matched),
                     provider_credentials,
+                    upgrade,
                     body,
                     body_provenance,
                 })));
@@ -646,6 +681,47 @@ async fn evaluate_to_terminal<'generation>(
             }
         }
     }
+}
+
+fn upgrade_is_disallowed(upgrade_intent: bool, evaluation: &PolicyEvaluation<'_>) -> bool {
+    upgrade_intent
+        && evaluation.outcome != PolicyOutcome::Deny
+        && !evaluation
+            .matched
+            .as_ref()
+            .is_some_and(PolicyRuleMatch::allows_upgrades)
+}
+
+fn bind_upgrade(
+    lease: &GenerationLease,
+    upgrade_intent: bool,
+    rule: Option<&PolicyRuleMatch<'_>>,
+) -> Result<Option<UpgradeBinding>, RequestDecisionError> {
+    if !upgrade_intent {
+        return Ok(None);
+    }
+    let rule = rule.ok_or(RequestDecisionError::MissingUpgradeAllocation)?;
+    let compiled_wire_bytes = lease
+        .resource_plan()
+        .upgrade_wire_working_set_bytes_by_rule
+        .get(rule.index())
+        .copied()
+        .flatten();
+    let allocation = UpgradeAllocation::from_compiled_rule(rule.index(), compiled_wire_bytes)
+        .map_err(|_| RequestDecisionError::MissingUpgradeAllocation)?;
+    let wire_redaction = rule
+        .redaction_profile()
+        .map(|profile| {
+            lease
+                .redaction()
+                .profile(profile)
+                .ok_or(RequestDecisionError::MissingRedactionProfile)
+        })
+        .transpose()?;
+    Ok(Some(UpgradeBinding {
+        allocation,
+        wire_redaction,
+    }))
 }
 
 fn denied_observation_body(
@@ -983,6 +1059,18 @@ header = "x-test-loop"
             headers,
             quota_key: WireBodyQuotaKey::from_peer(peer_ip, |_| false),
             started_at: Instant::now(),
+            upgrade_intent: false,
+        }
+    }
+
+    fn upgrade_input<'a>(
+        request_id: &'a str,
+        url: &'a CanonicalUrl,
+        headers: HeaderMap,
+    ) -> RequestInput<'a> {
+        RequestInput {
+            upgrade_intent: true,
+            ..input(request_id, url, headers)
         }
     }
 
@@ -1234,6 +1322,138 @@ rules = [{ literals = ["secret"], payloads = "text" }]"#,
             denied.body_provenance,
             TerminalRequestBodyProvenance::Unconsumed
         );
+
+        drop(denied);
+        drop(lease);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn default_allow_does_not_authorize_an_upgrade() {
+        let initial = compile(&config(
+            r#"[policy]
+default = "allow""#,
+            "",
+        ));
+        let (runtime, _source, _, _pool) = runtime(initial).await;
+        let lease = runtime.lease().await.unwrap();
+        let url = canonicalize_http_url("https://example.test/socket").unwrap();
+
+        let prepared = prepare_request(
+            &lease,
+            upgrade_input("default-allow-upgrade", &url, HeaderMap::new()),
+        )
+        .unwrap();
+        assert!(prepared.denies_without_resolution());
+        assert_eq!(prepared.body_read_plan(), HttpBodyReadPlan::Disabled);
+        let RequestDecision::Deny(denied) = prepared.decide(None).await.unwrap() else {
+            panic!("default allow must not authorize an upgrade");
+        };
+        assert_eq!(denied.reason, DenyReason::Policy);
+        assert!(denied.rule.is_none());
+
+        drop(denied);
+        drop(lease);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn opted_in_rule_binds_compiled_upgrade_resources() {
+        let initial = compile(&config(
+            r#"[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "socket"
+decision = "allow"
+methods = ["GET"]
+allow_upgrades = true
+redaction_profile = "wire""#,
+            r#"[redaction.profiles.wire]
+max_message_bytes = 1048576
+allow_permessage_deflate = false
+rules = [{ literals = ["secret"] }]"#,
+        ));
+        let (runtime, _source, _, _pool) = runtime(initial).await;
+        let lease = runtime.lease().await.unwrap();
+        let url = canonicalize_http_url("https://example.test/socket").unwrap();
+
+        let RequestDecision::Allow(allowed) = decide_request(
+            &lease,
+            upgrade_input("bound-upgrade", &url, HeaderMap::new()),
+        )
+        .await
+        .unwrap() else {
+            panic!("the opted-in rule must authorize the upgrade");
+        };
+        let binding = allowed.upgrade.as_ref().expect("upgrade binding");
+        assert_eq!(binding.allocation.rule_index(), 0);
+        assert!(binding.allocation.wire_bytes() > 0);
+        assert!(binding.wire_redaction.is_some());
+
+        drop(allowed);
+        drop(lease);
+        runtime.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegate_without_upgrade_opt_in_denies_before_provider_dispatch() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("provider-dispatched");
+        let provider = directory.path().join("provider.sh");
+        std::fs::write(
+            &provider,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  printf x >> "{}"
+  id=$(printf "%s" "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  [ -n "$id" ] && printf '{{"id":"%s","type":"response","decision":"allow"}}\n' "$id"
+done
+"#,
+                marker.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&provider).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&provider, permissions).unwrap();
+
+        let initial = compile(&config(
+            r#"[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "ordinary-delegate"
+decision = "delegate"
+methods = ["GET"]
+authorization_provider = "provider""#,
+            &format!(
+                r#"[authorization.providers.provider]
+kind = "process"
+command = "{}"
+retire_timeout = "6s""#,
+                provider.display()
+            ),
+        ));
+        let (runtime, _source, _, _pool) = runtime(initial).await;
+        let lease = runtime.lease().await.unwrap();
+        let url = canonicalize_http_url("https://example.test/socket").unwrap();
+
+        let RequestDecision::Deny(denied) = decide_request(
+            &lease,
+            upgrade_input("delegate-upgrade", &url, HeaderMap::new()),
+        )
+        .await
+        .unwrap() else {
+            panic!("a delegate rule without upgrade opt-in must deny");
+        };
+        assert_eq!(denied.reason, DenyReason::Policy);
+        assert_eq!(denied.rule.as_ref().unwrap().id(), "ordinary-delegate");
+        assert!(!marker.exists(), "provider dispatch must not begin");
 
         drop(denied);
         drop(lease);

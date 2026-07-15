@@ -11,7 +11,6 @@ pub(crate) struct ProductIngressAssets {
     destination_guard: Arc<DestinationGuard>,
     explicit_https_tls: Option<TlsAcceptor>,
     explicit_https_alpn: Box<[Vec<u8>]>,
-    transparent_https_tls: Option<TlsAcceptor>,
     transparent_https_alpn: Box<[Vec<u8>]>,
     mitm: Option<Arc<MitmCertificateManager>>,
 }
@@ -60,21 +59,14 @@ impl ProductIngressAssets {
             .map(MitmCertificateManager::from_static)
             .transpose()?
             .map(Arc::new);
-        let transparent_https_tls = if config.listeners.transparent_https.is_some() {
-            Some(
-                mitm.as_ref()
-                    .ok_or(ProductIngressAssetsError::MissingMitmManager)?
-                    .tls_acceptor_with_sni(&transparent_https_alpn)?,
-            )
-        } else {
-            None
-        };
+        if config.listeners.transparent_https.is_some() && mitm.is_none() {
+            return Err(ProductIngressAssetsError::MissingMitmManager);
+        }
 
         Ok(Arc::new(Self {
             destination_guard,
             explicit_https_tls,
             explicit_https_alpn: explicit_https_alpn.into_boxed_slice(),
-            transparent_https_tls,
             transparent_https_alpn: transparent_https_alpn.into_boxed_slice(),
             mitm,
         }))
@@ -102,10 +94,6 @@ impl ProductIngressAssets {
 
     pub(crate) fn transparent_https_alpn(&self) -> &[Vec<u8>] {
         &self.transparent_https_alpn
-    }
-
-    pub(crate) fn transparent_https_tls(&self) -> Option<&TlsAcceptor> {
-        self.transparent_https_tls.as_ref()
     }
 
     pub(crate) fn mitm(&self) -> Option<&Arc<MitmCertificateManager>> {
@@ -176,6 +164,7 @@ http_versions = ["http1"]
 [mitm]
 mode = "generated"
 directory = "mitm"
+persist_leaf_certificates = true
 
 [policy]
 default = "deny"
@@ -195,9 +184,16 @@ default = "deny"
             assets.explicit_https_alpn(),
             [b"h2".to_vec(), b"http/1.1".to_vec()]
         );
-        assert!(assets.transparent_https_tls().is_some());
         assert_eq!(assets.transparent_https_alpn(), [b"http/1.1".to_vec()]);
         assert!(assets.mitm().is_some());
+        let dynamic_certificates = directory.path().join("mitm/dynamic");
+        assert!(dynamic_certificates.is_dir());
+        assert_eq!(
+            fs::read_dir(dynamic_certificates)
+                .expect("read dynamic certificate directory")
+                .count(),
+            0
+        );
         assert_eq!(Arc::strong_count(assets.destination_guard()), 1);
     }
 }

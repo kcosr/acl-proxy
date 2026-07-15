@@ -26,8 +26,9 @@ use crate::runtime::{EgressSnapshot, GenerationRetention};
 use crate::url::CanonicalUrl;
 
 use super::headers::{
-    prepare_origin_request, strip_response_hop_by_hop, HeaderPreparationError, RequestTargetForm,
-    SanitizedRequest,
+    prepare_downstream_upgrade_response, prepare_origin_request, prepare_origin_upgrade_request,
+    strip_response_hop_by_hop, HeaderPreparationError, RequestTargetForm, SanitizedRequest,
+    UpgradeIntent,
 };
 
 const TERMINAL_DRIVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -54,6 +55,10 @@ pub(crate) enum ForwardError {
     ParentConnect(StatusCode),
     #[error("the resolved forwarding target does not belong to this request and egress route")]
     ResolvedTargetMismatch,
+    #[error("HTTP upgrades require an HTTP/1 origin connection")]
+    UpgradeRequiresHttp1,
+    #[error("the upstream switched protocols before the request body completed")]
+    UpgradeRequestBodyIncomplete,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -456,13 +461,50 @@ impl HttpBody for ForwardBody {
 
 pub(crate) type ForwardedResponse = Response<ForwardBody>;
 
-pub(crate) struct PreparedForwardingTarget<'egress> {
+pub(crate) enum ForwardUpgradeResult {
+    Response(ForwardedResponse),
+    SwitchingProtocols(ForwardedUpgrade),
+}
+
+pub(crate) struct ForwardedUpgrade {
+    response: Response<Body>,
+    upstream: PendingUpstreamUpgrade,
+}
+
+impl ForwardedUpgrade {
+    pub(crate) fn into_parts(self) -> (Response<Body>, PendingUpstreamUpgrade) {
+        (self.response, self.upstream)
+    }
+}
+
+pub(crate) struct PendingUpstreamUpgrade {
+    on_upgrade: hyper::upgrade::OnUpgrade,
+    driver: DriverTask,
+}
+
+impl PendingUpstreamUpgrade {
+    pub(crate) async fn complete(self) -> Result<hyper::upgrade::Upgraded, ForwardError> {
+        let upgraded = match self.on_upgrade.await {
+            Ok(upgraded) => upgraded,
+            Err(error) => {
+                self.driver.abort_and_join().await;
+                return Err(ForwardError::Http(error));
+            }
+        };
+        match self.driver.join().await {
+            Ok(Ok(())) => Ok(upgraded),
+            Ok(Err(error)) => Err(ForwardError::Http(error)),
+            Err(error) => Err(ForwardError::Task(error)),
+        }
+    }
+}
+
+pub(crate) struct PreparedForwardingTarget {
     canonical_url: String,
     ingress_protocol: OriginProtocol,
     origin_protocol: OriginProtocol,
     egress_identity: usize,
     route: PreparedForwardingRoute,
-    _egress: std::marker::PhantomData<&'egress dyn EgressSnapshot>,
 }
 
 enum PreparedForwardingRoute {
@@ -473,13 +515,12 @@ enum PreparedForwardingRoute {
     },
 }
 
-pub(crate) struct ResolvedForwardingTarget<'egress> {
+pub(crate) struct ResolvedForwardingTarget {
     canonical_url: String,
     ingress_protocol: OriginProtocol,
     origin_protocol: OriginProtocol,
     egress_identity: usize,
     route: ResolvedForwardingRoute,
-    _egress: std::marker::PhantomData<&'egress dyn EgressSnapshot>,
 }
 
 enum ResolvedForwardingRoute {
@@ -491,12 +532,12 @@ enum ResolvedForwardingRoute {
 }
 
 /// Performs synchronous semantic destination checks before initial policy matching.
-pub(crate) fn preflight_forwarding_target<'egress>(
+pub(crate) fn preflight_forwarding_target(
     canonical: &CanonicalUrl,
     request: &SanitizedRequest<impl Sized>,
-    egress: &'egress dyn EgressSnapshot,
+    egress: &dyn EgressSnapshot,
     destinations: &DestinationGuard,
-) -> Result<PreparedForwardingTarget<'egress>, ResolveForwardingError> {
+) -> Result<PreparedForwardingTarget, ResolveForwardingError> {
     let ingress_protocol = request.protocol();
     let origin_protocol = egress.origin_tls().select_protocol(ingress_protocol);
     let egress_identity = egress.route() as *const EgressRoute as usize;
@@ -516,22 +557,20 @@ pub(crate) fn preflight_forwarding_target<'egress>(
         origin_protocol,
         egress_identity,
         route,
-        _egress: std::marker::PhantomData,
     })
 }
 
 /// Completes one pinned destination resolution under the request deadline.
-pub(crate) async fn resolve_forwarding_target<'egress>(
-    prepared: PreparedForwardingTarget<'egress>,
+pub(crate) async fn resolve_forwarding_target(
+    prepared: PreparedForwardingTarget,
     destinations: &DestinationGuard,
-) -> Result<ResolvedForwardingTarget<'egress>, ResolveForwardingError> {
+) -> Result<ResolvedForwardingTarget, ResolveForwardingError> {
     let PreparedForwardingTarget {
         canonical_url,
         ingress_protocol,
         origin_protocol,
         egress_identity,
         route,
-        _egress,
     } = prepared;
     let route = match route {
         PreparedForwardingRoute::Direct(destination) => {
@@ -551,7 +590,6 @@ pub(crate) async fn resolve_forwarding_target<'egress>(
         origin_protocol,
         egress_identity,
         route,
-        _egress,
     })
 }
 
@@ -563,7 +601,7 @@ pub(crate) async fn forward_request<'egress, B>(
     canonical: &CanonicalUrl,
     egress: &'egress dyn EgressSnapshot,
     destinations: &DestinationGuard,
-    target: ResolvedForwardingTarget<'egress>,
+    target: ResolvedForwardingTarget,
 ) -> Result<ForwardedResponse, ForwardError>
 where
     B: HttpBody + Send + 'static,
@@ -586,7 +624,7 @@ async fn forward_with_connector<'egress, C, B>(
     canonical: &CanonicalUrl,
     egress: &'egress dyn EgressSnapshot,
     destinations: &DestinationGuard,
-    target: ResolvedForwardingTarget<'egress>,
+    target: ResolvedForwardingTarget,
     connector: &C,
 ) -> Result<ForwardedResponse, ForwardError>
 where
@@ -635,6 +673,182 @@ where
             .await
         }
         _ => Err(ForwardError::ResolvedTargetMismatch),
+    }
+}
+
+/// Sends one already-authorized HTTP/1 upgrade request without connection
+/// reuse. A non-101 response remains an ordinary forwarded response. A valid
+/// 101 returns the canonical response head and an owned upstream upgrade whose
+/// connection driver remains live until `complete` joins it.
+pub(crate) async fn forward_upgrade_request<B>(
+    request: SanitizedRequest<B>,
+    canonical: &CanonicalUrl,
+    generation: &GenerationRetention,
+    destinations: std::sync::Arc<DestinationGuard>,
+    target: ResolvedForwardingTarget,
+) -> Result<ForwardUpgradeResult, ForwardError>
+where
+    B: HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let egress = generation.egress();
+    forward_upgrade_with_connector(
+        request,
+        canonical,
+        egress,
+        &destinations,
+        target,
+        &TcpDestinationConnector,
+    )
+    .await
+}
+
+async fn forward_upgrade_with_connector<'egress, C, B>(
+    request: SanitizedRequest<B>,
+    canonical: &CanonicalUrl,
+    egress: &'egress dyn EgressSnapshot,
+    destinations: &DestinationGuard,
+    target: ResolvedForwardingTarget,
+    connector: &C,
+) -> Result<ForwardUpgradeResult, ForwardError>
+where
+    C: DestinationConnector,
+    C::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let intent = request
+        .upgrade_intent()
+        .cloned()
+        .ok_or(HeaderPreparationError::InvalidUpgrade)?;
+    let selected_origin_protocol = egress.origin_tls().select_protocol(request.protocol());
+    if selected_origin_protocol.is_http2() {
+        return Err(ForwardError::UpgradeRequiresHttp1);
+    }
+    if target.canonical_url != canonical.url
+        || target.ingress_protocol != request.protocol()
+        || target.origin_protocol != selected_origin_protocol
+        || target.egress_identity != egress.route() as *const EgressRoute as usize
+    {
+        return Err(ForwardError::ResolvedTargetMismatch);
+    }
+
+    match (egress.route(), target.route) {
+        (EgressRoute::Direct, ResolvedForwardingRoute::Direct(resolved)) => {
+            let stream = destinations
+                .connect(resolved, connector)
+                .await?
+                .into_stream();
+            forward_upgrade_direct(request, canonical, egress, stream, intent).await
+        }
+        (
+            EgressRoute::Parent(parent),
+            ResolvedForwardingRoute::Parent {
+                parent_url,
+                destination: resolved,
+            },
+        ) if parent_url == parent.canonical_url() => {
+            let stream = destinations
+                .connect(resolved, connector)
+                .await?
+                .into_stream();
+            forward_upgrade_via_parent(request, canonical, egress, parent, stream, intent).await
+        }
+        _ => Err(ForwardError::ResolvedTargetMismatch),
+    }
+}
+
+async fn forward_upgrade_direct<S, B>(
+    request: SanitizedRequest<B>,
+    canonical: &CanonicalUrl,
+    egress: &dyn EgressSnapshot,
+    stream: S,
+    intent: UpgradeIntent,
+) -> Result<ForwardUpgradeResult, ForwardError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    if canonical.scheme == "https" {
+        let stream = connect_origin_tls(stream, canonical, egress, OriginProtocol::Http1).await?;
+        let request = prepare_origin_upgrade_request(
+            request,
+            canonical,
+            RequestTargetForm::Origin,
+            OriginProtocol::Http1,
+        )?;
+        send_upgrade_request(stream, request, intent).await
+    } else {
+        let request = prepare_origin_upgrade_request(
+            request,
+            canonical,
+            RequestTargetForm::Origin,
+            OriginProtocol::Http1,
+        )?;
+        send_upgrade_request(stream, request, intent).await
+    }
+}
+
+async fn forward_upgrade_via_parent<S, B>(
+    request: SanitizedRequest<B>,
+    canonical: &CanonicalUrl,
+    egress: &dyn EgressSnapshot,
+    parent: &ParentEndpoint,
+    stream: S,
+    intent: UpgradeIntent,
+) -> Result<ForwardUpgradeResult, ForwardError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    if canonical.scheme == "https" {
+        match parent.transport() {
+            ParentTransport::Http => {
+                let tunnel = connect_parent_tunnel(stream, canonical).await?;
+                let origin =
+                    connect_origin_tls(tunnel, canonical, egress, OriginProtocol::Http1).await?;
+                let request = prepare_origin_upgrade_request(
+                    request,
+                    canonical,
+                    RequestTargetForm::Origin,
+                    OriginProtocol::Http1,
+                )?;
+                send_upgrade_request(origin, request, intent).await
+            }
+            ParentTransport::Https(tls) => {
+                let parent_stream = connect_parent_tls(stream, tls, false).await?;
+                let tunnel = connect_parent_tunnel(parent_stream, canonical).await?;
+                let origin =
+                    connect_origin_tls(tunnel, canonical, egress, OriginProtocol::Http1).await?;
+                let request = prepare_origin_upgrade_request(
+                    request,
+                    canonical,
+                    RequestTargetForm::Origin,
+                    OriginProtocol::Http1,
+                )?;
+                send_upgrade_request(origin, request, intent).await
+            }
+        }
+    } else {
+        let request = prepare_origin_upgrade_request(
+            request,
+            canonical,
+            RequestTargetForm::Absolute,
+            OriginProtocol::Http1,
+        )?;
+        match parent.transport() {
+            ParentTransport::Http => send_upgrade_request(stream, request, intent).await,
+            ParentTransport::Https(tls) => {
+                let stream = connect_parent_tls(stream, tls, false).await?;
+                send_upgrade_request(stream, request, intent).await
+            }
+        }
     }
 }
 
@@ -809,6 +1023,113 @@ where
     }
 }
 
+async fn send_upgrade_request<S, B>(
+    stream: S,
+    request: Request<B>,
+    intent: UpgradeIntent,
+) -> Result<ForwardUpgradeResult, ForwardError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let (parts, body) = request.into_parts();
+    let (body, body_complete) = UpgradeRequestBody::new(body);
+    let request = Request::from_parts(parts, body);
+    let (mut sender, connection) = conn::Builder::new()
+        .handshake(stream)
+        .await
+        .map_err(ForwardError::Http)?;
+    let driver = DriverTask::spawn(connection);
+    let mut response = match sender.send_request(request).await {
+        Ok(response) => response,
+        Err(error) => {
+            driver.abort_and_join().await;
+            return Err(ForwardError::Http(error));
+        }
+    };
+
+    if response.status() != StatusCode::SWITCHING_PROTOCOLS {
+        let (mut parts, body) = response.into_parts();
+        strip_response_hop_by_hop(&mut parts.headers);
+        return Ok(ForwardUpgradeResult::Response(Response::from_parts(
+            parts,
+            ForwardBody::new(body, driver),
+        )));
+    }
+
+    if !body_complete.load(std::sync::atomic::Ordering::Acquire) {
+        driver.abort_and_join().await;
+        return Err(ForwardError::UpgradeRequestBodyIncomplete);
+    }
+
+    if let Err(error) =
+        prepare_downstream_upgrade_response(response.status(), response.headers_mut(), &intent)
+    {
+        driver.abort_and_join().await;
+        return Err(ForwardError::Header(error));
+    }
+    let on_upgrade = hyper::upgrade::on(&mut response);
+    let (parts, body) = response.into_parts();
+    drop(body);
+    Ok(ForwardUpgradeResult::SwitchingProtocols(ForwardedUpgrade {
+        response: Response::from_parts(parts, Body::empty()),
+        upstream: PendingUpstreamUpgrade { on_upgrade, driver },
+    }))
+}
+
+struct UpgradeRequestBody<B> {
+    inner: Pin<Box<B>>,
+    complete: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<B: HttpBody> UpgradeRequestBody<B> {
+    fn new(body: B) -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let complete =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(body.is_end_stream()));
+        (
+            Self {
+                inner: Box::pin(body),
+                complete: complete.clone(),
+            },
+            complete,
+        )
+    }
+}
+
+impl<B: HttpBody> HttpBody for UpgradeRequestBody<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_data(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
+        self.inner.as_mut().poll_data(context)
+    }
+
+    fn poll_trailers(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<Option<http::HeaderMap>, Self::Error>> {
+        let result = self.inner.as_mut().poll_trailers(context);
+        if matches!(result, Poll::Ready(Ok(_))) {
+            self.complete
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.as_ref().is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.as_ref().size_hint()
+    }
+}
+
 async fn send_request<S, B>(
     stream: S,
     request: Request<B>,
@@ -851,7 +1172,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use http::header::TE;
+    use http::header::{CONNECTION, TE, UPGRADE};
     use hyper::server::conn::Http;
     use hyper::service::service_fn;
     use rcgen::generate_simple_self_signed;
@@ -946,12 +1267,12 @@ mod tests {
         (guard, resolver)
     }
 
-    async fn prepare_and_resolve_target<'egress, B>(
+    async fn prepare_and_resolve_target<B>(
         canonical: &CanonicalUrl,
         request: &SanitizedRequest<B>,
-        egress: &'egress dyn EgressSnapshot,
+        egress: &dyn EgressSnapshot,
         destinations: &DestinationGuard,
-    ) -> Result<ResolvedForwardingTarget<'egress>, ResolveForwardingError> {
+    ) -> Result<ResolvedForwardingTarget, ResolveForwardingError> {
         let prepared = preflight_forwarding_target(canonical, request, egress, destinations)?;
         resolve_forwarding_target(prepared, destinations).await
     }
@@ -1018,6 +1339,34 @@ mod tests {
             .body(Body::from("request-body"))
             .unwrap();
         crate::proxy::headers::sanitize_untrusted_request(request).unwrap()
+    }
+
+    fn upgrade_request() -> SanitizedRequest {
+        let request = Request::builder()
+            .method(Method::GET)
+            .version(Version::HTTP_11)
+            .uri("/untrusted-client-target")
+            .header(HOST, "untrusted-client.example")
+            .header(CONNECTION, "keep-alive, Upgrade, x-private")
+            .header(UPGRADE, "WebSocket")
+            .header("x-private", "remove-me")
+            .body(Body::empty())
+            .unwrap();
+        crate::proxy::headers::sanitize_untrusted_request(request).unwrap()
+    }
+
+    async fn read_http_head(stream: &mut DuplexStream) -> String {
+        let mut head = Vec::new();
+        loop {
+            let mut byte = [0_u8; 1];
+            stream.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+            assert!(head.len() < 8 * 1024);
+        }
+        String::from_utf8(head).unwrap()
     }
 
     fn tls_acceptor(alpn: &[u8]) -> TlsAcceptor {
@@ -1359,6 +1708,200 @@ mod tests {
                 signal.send(()).ok();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn upgrade_handshake_preserves_driver_and_returns_canonical_owned_parts() {
+        let canonical = canonicalize_http_url("http://origin.example/socket?q=1").unwrap();
+        let egress = activate(None);
+        let request = upgrade_request();
+        let (guard, _) = guard();
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let head = read_http_head(&mut server).await;
+            server
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: x-private, Upgrade\r\nUpgrade: websocket\r\nx-private: remove-me\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut ping = [0_u8; 4];
+            server.read_exact(&mut ping).await.unwrap();
+            assert_eq!(&ping, b"ping");
+            server.write_all(b"pong").await.unwrap();
+            head
+        });
+
+        let result = forward_upgrade_with_connector(
+            request, &canonical, &egress, &guard, target, &connector,
+        )
+        .await
+        .unwrap();
+        let ForwardUpgradeResult::SwitchingProtocols(upgrade) = result else {
+            panic!("a valid 101 must return owned upgrade state");
+        };
+        let (response, pending) = upgrade.into_parts();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(response.headers()[CONNECTION], "upgrade");
+        assert_eq!(response.headers()[UPGRADE], "WebSocket");
+        assert!(!response.headers().contains_key("x-private"));
+
+        let mut upstream = tokio::time::timeout(Duration::from_secs(2), pending.complete())
+            .await
+            .expect("upstream OnUpgrade and its driver must complete")
+            .unwrap();
+        upstream.write_all(b"ping").await.unwrap();
+        let mut pong = [0_u8; 4];
+        upstream.read_exact(&mut pong).await.unwrap();
+        assert_eq!(&pong, b"pong");
+        drop(upstream);
+
+        let head = server.await.unwrap().to_ascii_lowercase();
+        assert!(head.starts_with("get /socket?q=1 http/1.1\r\n"));
+        assert!(head.contains("\r\nhost: origin.example\r\n"));
+        assert!(head.contains("\r\nconnection: upgrade\r\n"));
+        assert!(head.contains("\r\nupgrade: websocket\r\n"));
+        assert!(!head.contains("x-private"));
+    }
+
+    #[tokio::test]
+    async fn rejected_upgrade_remains_an_owned_ordinary_response() {
+        let canonical = canonicalize_http_url("http://origin.example/socket").unwrap();
+        let egress = activate(None);
+        let request = upgrade_request();
+        let (guard, _) = guard();
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let _ = read_http_head(&mut server).await;
+            server
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\nConnection: x-private\r\nx-private: remove-me\r\n\r\ndenied",
+                )
+                .await
+                .unwrap();
+        });
+
+        let result = forward_upgrade_with_connector(
+            request, &canonical, &egress, &guard, target, &connector,
+        )
+        .await
+        .unwrap();
+        let ForwardUpgradeResult::Response(response) = result else {
+            panic!("a non-101 response must remain an ordinary response");
+        };
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(!response.headers().contains_key(CONNECTION));
+        assert!(!response.headers().contains_key("x-private"));
+        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        assert_eq!(body, "denied");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_switching_protocols_response_aborts_the_driver() {
+        let canonical = canonicalize_http_url("http://origin.example/socket").unwrap();
+        let egress = activate(None);
+        let request = upgrade_request();
+        let (guard, _) = guard();
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
+            .await
+            .unwrap();
+        let server = tokio::spawn(async move {
+            let _ = read_http_head(&mut server).await;
+            server
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: h2c\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut byte = [0_u8; 1];
+            assert_eq!(server.read(&mut byte).await.unwrap(), 0);
+        });
+
+        let error = forward_upgrade_with_connector(
+            request, &canonical, &egress, &guard, target, &connector,
+        )
+        .await
+        .err()
+        .expect("mismatched 101 protocol must fail");
+        assert!(matches!(
+            error,
+            ForwardError::Header(HeaderPreparationError::InvalidUpgrade)
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn early_101_is_rejected_until_the_request_body_signals_completion() {
+        struct PendingTrailersBody;
+
+        impl HttpBody for PendingTrailersBody {
+            type Data = Bytes;
+            type Error = std::convert::Infallible;
+
+            fn poll_data(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+            ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
+                Poll::Ready(None)
+            }
+
+            fn poll_trailers(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+            ) -> Poll<Result<Option<http::HeaderMap>, Self::Error>> {
+                Poll::Pending
+            }
+        }
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .version(Version::HTTP_11)
+            .uri("/socket")
+            .header(HOST, "origin.example")
+            .header(CONNECTION, "upgrade")
+            .header(UPGRADE, "WebSocket")
+            .body(PendingTrailersBody)
+            .unwrap();
+        let sanitized = crate::proxy::headers::sanitize_untrusted_request(request).unwrap();
+        let intent = sanitized.upgrade_intent().unwrap().clone();
+        let canonical = canonicalize_http_url("http://origin.example/socket").unwrap();
+        let request = prepare_origin_upgrade_request(
+            sanitized,
+            &canonical,
+            RequestTargetForm::Origin,
+            OriginProtocol::Http1,
+        )
+        .unwrap();
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let _ = read_http_head(&mut server).await;
+            server
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut byte = [0_u8; 1];
+            assert_eq!(server.read(&mut byte).await.unwrap(), 0);
+        });
+
+        let error = send_upgrade_request(client, request, intent)
+            .await
+            .err()
+            .expect("an early 101 cannot establish an upgrade");
+        assert!(matches!(error, ForwardError::UpgradeRequestBodyIncomplete));
+        server.await.unwrap();
     }
 
     #[tokio::test]

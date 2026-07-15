@@ -2,6 +2,7 @@ use std::fs;
 use std::io::{Cursor, Error as IoError, ErrorKind as IoErrorKind};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use lru::LruCache;
@@ -64,6 +65,12 @@ pub enum CertError {
     #[error("certificate generation is already in progress")]
     GenerationBusy,
 
+    #[error("certificate activation worker failed")]
+    ActivationTask,
+
+    #[error("certificate activation is shutting down")]
+    ShuttingDown,
+
     #[error("CA certificate and private key do not form a valid identity")]
     CaIdentityMismatch,
 
@@ -88,7 +95,9 @@ struct Inner {
     ca_cert_pem: String,
     ca_cert_der: Vec<u8>,
     cache_capacity: NonZeroUsize,
-    generation_permits: Semaphore,
+    generation_permits: Arc<Semaphore>,
+    activation_open: AtomicBool,
+    activation_workers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     server_configs: Mutex<LruCache<ServerConfigCacheKey, Arc<ServerConfig>>>,
     sni_acceptor: Mutex<Option<TlsAcceptor>>,
 }
@@ -199,26 +208,94 @@ impl MitmCertificateManager {
                 ca_cert_pem: ca_material.cert_pem,
                 ca_cert_der: ca_material.cert_der,
                 cache_capacity,
-                generation_permits: Semaphore::new(1),
+                generation_permits: Arc::new(Semaphore::new(1)),
+                activation_open: AtomicBool::new(true),
+                activation_workers: Mutex::new(Vec::new()),
                 server_configs: Mutex::new(LruCache::new(cache_capacity)),
                 sni_acceptor: Mutex::new(None),
             }),
         })
     }
 
-    pub(crate) fn tls_acceptor_with_sni(
-        &self,
-        alpn_protocols: &[Vec<u8>],
-    ) -> Result<TlsAcceptor, CertError> {
-        build_sni_acceptor(&self.inner, alpn_protocols.to_vec())
-    }
-
-    pub(crate) fn tls_acceptor_for_host(
+    pub(crate) async fn server_config_for_host(
         &self,
         host: &str,
         alpn_protocols: &[Vec<u8>],
-    ) -> Result<TlsAcceptor, CertError> {
-        tls_acceptor_for_host(&self.inner, host, alpn_protocols)
+    ) -> Result<Arc<ServerConfig>, CertError> {
+        self.server_config_for_host_with_hook(host, alpn_protocols, || {})
+            .await
+    }
+
+    async fn server_config_for_host_with_hook<Hook>(
+        &self,
+        host: &str,
+        alpn_protocols: &[Vec<u8>],
+        before_generation: Hook,
+    ) -> Result<Arc<ServerConfig>, CertError>
+    where
+        Hook: FnOnce() + Send + 'static,
+    {
+        if !self.inner.activation_open.load(Ordering::Acquire) {
+            return Err(CertError::ShuttingDown);
+        }
+        let cache_key = ServerConfigCacheKey::new(host, alpn_protocols);
+        if let Some(config) = cached_server_config(&self.inner, &cache_key) {
+            return Ok(config);
+        }
+
+        let generation_permit = self
+            .inner
+            .generation_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| CertError::ShuttingDown)?;
+        if let Some(config) = cached_server_config(&self.inner, &cache_key) {
+            return Ok(config);
+        }
+
+        let (completed, result) = tokio::sync::oneshot::channel();
+        let inner = self.inner.clone();
+        {
+            let mut workers = self
+                .inner
+                .activation_workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !self.inner.activation_open.load(Ordering::Acquire) {
+                return Err(CertError::ShuttingDown);
+            }
+            workers.retain(|worker| !worker.is_finished());
+            workers.push(tokio::task::spawn_blocking(move || {
+                let _generation_permit = generation_permit;
+                before_generation();
+                let _ = completed.send(generate_and_cache_server_config(&inner, cache_key));
+            }));
+        }
+        result.await.map_err(|_| CertError::ActivationTask)?
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        if self.inner.activation_open.swap(false, Ordering::AcqRel) {
+            self.inner.generation_permits.close();
+        }
+    }
+
+    pub(crate) async fn shutdown_and_join(&self) {
+        self.begin_shutdown();
+        let workers = {
+            let mut workers = self
+                .inner
+                .activation_workers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *workers)
+        };
+        for worker in workers {
+            if let Err(error) = worker.await {
+                tracing::error!(%error, "certificate activation worker failed during shutdown");
+            }
+        }
     }
 
     #[cfg(test)]
@@ -229,23 +306,6 @@ impl MitmCertificateManager {
     #[cfg(test)]
     fn persists_leaf_certificates(&self) -> bool {
         self.inner.persist_dynamic_certs
-    }
-
-    #[cfg(test)]
-    fn server_config_for_host_for_test(
-        &self,
-        host: &str,
-        alpn_protocols: &[Vec<u8>],
-    ) -> Result<Arc<ServerConfig>, CertError> {
-        server_config_for_host(&self.inner, host, alpn_protocols)
-    }
-
-    #[cfg(test)]
-    fn sni_server_config_for_test(
-        &self,
-        alpn_protocols: &[Vec<u8>],
-    ) -> Result<ServerConfig, CertError> {
-        build_sni_server_config(&self.inner, alpn_protocols.to_vec())
     }
 }
 
@@ -335,7 +395,9 @@ impl CertManager {
             ca_cert_pem: ca_material.cert_pem,
             ca_cert_der: ca_material.cert_der,
             cache_capacity,
-            generation_permits: Semaphore::new(1),
+            generation_permits: Arc::new(Semaphore::new(1)),
+            activation_open: AtomicBool::new(true),
+            activation_workers: Mutex::new(Vec::new()),
             server_configs: Mutex::new(LruCache::new(cache_capacity)),
             sni_acceptor: Mutex::new(None),
         };
@@ -429,15 +491,9 @@ fn server_config_for_host(
     host: &str,
     alpn_protocols: &[Vec<u8>],
 ) -> Result<Arc<ServerConfig>, CertError> {
-    let cache_key = ServerConfigCacheKey {
-        host: host.to_ascii_lowercase(),
-        alpn_protocols: alpn_protocols.to_vec().into_boxed_slice(),
-    };
-    {
-        let mut cache = inner.server_configs.lock().unwrap();
-        if let Some(cfg) = cache.get(&cache_key) {
-            return Ok(cfg.clone());
-        }
+    let cache_key = ServerConfigCacheKey::new(host, alpn_protocols);
+    if let Some(config) = cached_server_config(inner, &cache_key) {
+        return Ok(config);
     }
 
     let _generation_permit = inner
@@ -445,13 +501,29 @@ fn server_config_for_host(
         .try_acquire()
         .map_err(|_| CertError::GenerationBusy)?;
 
-    {
-        let mut cache = inner.server_configs.lock().unwrap();
-        if let Some(cfg) = cache.get(&cache_key) {
-            return Ok(cfg.clone());
-        }
+    if let Some(config) = cached_server_config(inner, &cache_key) {
+        return Ok(config);
     }
 
+    generate_and_cache_server_config(inner, cache_key)
+}
+
+fn cached_server_config(
+    inner: &Inner,
+    cache_key: &ServerConfigCacheKey,
+) -> Option<Arc<ServerConfig>> {
+    inner
+        .server_configs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(cache_key)
+        .cloned()
+}
+
+fn generate_and_cache_server_config(
+    inner: &Arc<Inner>,
+    cache_key: ServerConfigCacheKey,
+) -> Result<Arc<ServerConfig>, CertError> {
     let (cert_chain, key) = generate_host_certificate(
         &inner.ca_cert,
         &inner.ca_key,
@@ -467,10 +539,13 @@ fn server_config_for_host(
         .with_no_client_auth()
         .with_single_cert(cert_chain, key)
         .map_err(|e| CertError::BuildServerConfig(format!("{e}")))?;
-    config.alpn_protocols = alpn_protocols.to_vec();
+    config.alpn_protocols = cache_key.alpn_protocols.to_vec();
 
     let cfg = Arc::new(config);
-    let mut cache = inner.server_configs.lock().unwrap();
+    let mut cache = inner
+        .server_configs
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     cache.put(cache_key, cfg.clone());
     Ok(cfg)
 }
@@ -479,6 +554,15 @@ fn server_config_for_host(
 struct ServerConfigCacheKey {
     host: String,
     alpn_protocols: Box<[Vec<u8>]>,
+}
+
+impl ServerConfigCacheKey {
+    fn new(host: &str, alpn_protocols: &[Vec<u8>]) -> Self {
+        Self {
+            host: host.to_ascii_lowercase(),
+            alpn_protocols: alpn_protocols.to_vec().into_boxed_slice(),
+        }
+    }
 }
 
 struct SniResolver {
@@ -1119,8 +1203,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn strict_generated_mitm_uses_exact_cache_persistence_and_private_storage() {
+    #[tokio::test]
+    async fn strict_generated_mitm_uses_exact_cache_persistence_and_private_storage() {
         let tmp = TempDir::new().expect("tempdir");
         let directory = tmp.path().join("generated");
         let config = StaticMitmConfig::Generated {
@@ -1136,8 +1220,9 @@ mod tests {
         assert!(directory.join("ca-cert.pem").is_file());
         assert!(directory.join("ca-key.pem").is_file());
         manager
-            .tls_acceptor_for_host("strict.example.test", &[b"http/1.1".to_vec()])
-            .expect("host acceptor");
+            .server_config_for_host("strict.example.test", &[b"http/1.1".to_vec()])
+            .await
+            .expect("host config");
         assert!(directory.join("dynamic/strict.example.test.key").is_file());
         #[cfg(unix)]
         {
@@ -1172,9 +1257,6 @@ mod tests {
         assert_eq!(manager.cache_capacity(), 3);
         assert!(!manager.persists_leaf_certificates());
         assert_eq!(manager.inner.ca_cert_path, configured_ca_certificate);
-        manager
-            .tls_acceptor_with_sni(&[b"h2".to_vec()])
-            .expect("transparent acceptor");
         assert!(!directory.join("dynamic").exists());
         #[cfg(unix)]
         assert_eq!(mode(&directory), 0o700);
@@ -1236,8 +1318,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn strict_mitm_preserves_single_and_dual_protocol_alpn_sets() {
+    #[tokio::test]
+    async fn strict_mitm_preserves_single_and_dual_protocol_alpn_sets() {
         let tmp = TempDir::new().expect("tempdir");
         let manager = MitmCertificateManager::from_static(&StaticMitmConfig::Generated {
             directory: tmp.path().join("mitm"),
@@ -1249,19 +1331,123 @@ mod tests {
         let dual = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
         let single_host = manager
-            .server_config_for_host_for_test("alpn.example.test", &single)
+            .server_config_for_host("alpn.example.test", &single)
+            .await
             .unwrap();
         let dual_host = manager
-            .server_config_for_host_for_test("alpn.example.test", &dual)
+            .server_config_for_host("alpn.example.test", &dual)
+            .await
             .unwrap();
         assert_eq!(single_host.alpn_protocols, single);
         assert_eq!(dual_host.alpn_protocols, dual);
         assert!(!Arc::ptr_eq(&single_host, &dual_host));
+    }
 
-        let single_sni = manager.sni_server_config_for_test(&single).unwrap();
-        let dual_sni = manager.sni_server_config_for_test(&dual).unwrap();
-        assert_eq!(single_sni.alpn_protocols, single);
-        assert_eq!(dual_sni.alpn_protocols, dual);
+    #[tokio::test]
+    async fn strict_mitm_async_activation_reuses_exact_cache_entry() {
+        let tmp = TempDir::new().expect("tempdir");
+        let manager = MitmCertificateManager::from_static(&StaticMitmConfig::Generated {
+            directory: tmp.path().join("mitm"),
+            max_cached_certificates: 4,
+            persist_leaf_certificates: false,
+        })
+        .unwrap();
+        let alpn = [b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        let first = manager
+            .server_config_for_host("CACHE.EXAMPLE.TEST", &alpn)
+            .await
+            .unwrap();
+        let second = manager
+            .server_config_for_host("cache.example.test", &alpn)
+            .await
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(second.alpn_protocols, alpn);
+    }
+
+    #[tokio::test]
+    async fn strict_mitm_activation_wait_is_cancellation_safe() {
+        let tmp = TempDir::new().expect("tempdir");
+        let manager = MitmCertificateManager::from_static(&StaticMitmConfig::Generated {
+            directory: tmp.path().join("mitm"),
+            max_cached_certificates: 4,
+            persist_leaf_certificates: false,
+        })
+        .unwrap();
+        let held = manager
+            .inner
+            .generation_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            manager.server_config_for_host("cancelled.example.test", &[b"http/1.1".to_vec()]),
+        )
+        .await;
+        assert!(cancelled.is_err());
+        assert_eq!(manager.inner.server_configs.lock().unwrap().len(), 0);
+
+        drop(held);
+        let config = manager
+            .server_config_for_host("active.example.test", &[b"http/1.1".to_vec()])
+            .await
+            .unwrap();
+        assert_eq!(config.alpn_protocols, [b"http/1.1".to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn post_spawn_cancellation_remains_joined_by_manager_shutdown() {
+        let tmp = TempDir::new().expect("tempdir");
+        let manager = MitmCertificateManager::from_static(&StaticMitmConfig::Generated {
+            directory: tmp.path().join("mitm"),
+            max_cached_certificates: 4,
+            persist_leaf_certificates: false,
+        })
+        .unwrap();
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let activating = manager.clone();
+        let activation = tokio::spawn(async move {
+            activating
+                .server_config_for_host_with_hook(
+                    "cancelled.example.test",
+                    &[b"http/1.1".to_vec()],
+                    move || {
+                        let _ = started.send(());
+                        release_rx.recv().expect("test releases worker");
+                    },
+                )
+                .await
+        });
+        started_rx.await.expect("blocking worker started");
+        activation.abort();
+        assert!(activation.await.unwrap_err().is_cancelled());
+
+        manager.begin_shutdown();
+        let draining = manager.clone();
+        let mut shutdown = tokio::spawn(async move { draining.shutdown_and_join().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut shutdown)
+                .await
+                .is_err(),
+            "shutdown must wait for the registered blocking worker"
+        );
+        release.send(()).unwrap();
+        shutdown.await.unwrap();
+
+        assert!(manager.inner.activation_workers.lock().unwrap().is_empty());
+        assert_eq!(manager.inner.server_configs.lock().unwrap().len(), 1);
+        assert!(matches!(
+            manager
+                .server_config_for_host("later.example.test", &[b"http/1.1".to_vec()])
+                .await,
+            Err(CertError::ShuttingDown)
+        ));
     }
 
     #[cfg(unix)]

@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use crate::config::{CompiledConfig, LoadedCompiledConfig};
 use crate::observation::ProductObservationRuntime;
 use crate::runtime::{GenerationId, Runtime, RuntimeError, StaticOwnership, StaticResources};
+use crate::upgrade::UpgradeRuntime;
 
 use super::listeners::{
     PreparedProxyListeners, ProxySupervisor, ProxySupervisorFailure,
@@ -25,9 +26,7 @@ pub(crate) struct ProductRuntime {
 }
 
 struct ProductProxyFailureObserver {
-    runtime: std::sync::Weak<Runtime>,
     static_resources: std::sync::Weak<ProductStaticResources>,
-    executor: tokio::runtime::Handle,
 }
 
 impl ProxySupervisorFailureObserver for ProductProxyFailureObserver {
@@ -38,9 +37,6 @@ impl ProxySupervisorFailureObserver for ProductProxyFailureObserver {
         tracing::error!(error = %error, "proxy supervisor failed");
         static_resources.record_proxy_failure(error);
         StaticResources::begin_shutdown(static_resources.as_ref());
-        if let Some(runtime) = self.runtime.upgrade() {
-            self.executor.spawn(async move { runtime.shutdown().await });
-        }
     }
 }
 
@@ -106,6 +102,10 @@ impl ProductRuntime {
         &self.observation_runtime
     }
 
+    pub(crate) fn upgrade_runtime(&self) -> Arc<UpgradeRuntime> {
+        self.static_resources.upgrade_runtime()
+    }
+
     /// Transfers the atomically prepared proxy socket bundle to the future
     /// synchronous supervisor-start path. That path must retain joined
     /// supervisor ownership before it confirms ingress startup.
@@ -124,9 +124,7 @@ impl ProductRuntime {
         let prepared = self.take_prepared_proxy_listeners_for_supervisor_start()?;
         let observer: Arc<dyn ProxySupervisorFailureObserver> =
             Arc::new(ProductProxyFailureObserver {
-                runtime: Arc::downgrade(&self.runtime),
                 static_resources: Arc::downgrade(&self.static_resources),
-                executor: tokio::runtime::Handle::current(),
             });
         let mut supervisors = Vec::new();
         for listener in prepared.into_entries() {
@@ -157,6 +155,12 @@ impl ProductRuntime {
 
     pub(crate) async fn wait_for_proxy_failure(&self) -> Option<Arc<ProxySupervisorFailure>> {
         self.static_resources.wait_for_proxy_failure().await
+    }
+
+    pub(crate) async fn wait_for_control_failure(
+        &self,
+    ) -> Option<Arc<crate::control::server::ControlServerRunError>> {
+        self.static_resources.wait_for_control_failure().await
     }
 
     pub(crate) async fn activate_initial(&self) -> Result<GenerationId, ProductRuntimeError> {
@@ -190,6 +194,19 @@ impl ProductRuntime {
 
     pub(crate) async fn shutdown(&self) {
         self.runtime.shutdown().await;
+    }
+
+    pub(crate) fn shutdown_diagnostic(&self) -> Option<String> {
+        let control = self.static_resources.control_shutdown_error();
+        let proxy = self.static_resources.proxy_shutdown_error();
+        match (control, proxy) {
+            (None, None) => None,
+            (Some(control), None) => Some(format!("control server shutdown failed: {control}")),
+            (None, Some(proxy)) => Some(format!("proxy supervisor shutdown failed: {proxy}")),
+            (Some(control), Some(proxy)) => Some(format!(
+                "control server shutdown failed: {control}; proxy supervisor shutdown failed: {proxy}"
+            )),
+        }
     }
 }
 
@@ -245,6 +262,7 @@ mod tests {
         shutdowns: AtomicUsize,
         graceful_joins: AtomicUsize,
         abort_joins: AtomicUsize,
+        fail_shutdown: bool,
     }
 
     impl FakeSupervisor {
@@ -270,7 +288,14 @@ mod tests {
         ) -> crate::runtime::BoxFuture<'_, Result<(), ProxySupervisorFailure>> {
             Box::pin(async move {
                 self.graceful_joins.fetch_add(1, Ordering::AcqRel);
-                Ok(())
+                if self.fail_shutdown {
+                    Err(ProxySupervisorFailure {
+                        listener: self.kind,
+                        message: "injected shutdown failure".to_string(),
+                    })
+                } else {
+                    Ok(())
+                }
             })
         }
 
@@ -279,7 +304,14 @@ mod tests {
         ) -> crate::runtime::BoxFuture<'_, Result<(), ProxySupervisorFailure>> {
             Box::pin(async move {
                 self.abort_joins.fetch_add(1, Ordering::AcqRel);
-                Ok(())
+                if self.fail_shutdown {
+                    Err(ProxySupervisorFailure {
+                        listener: self.kind,
+                        message: "injected shutdown failure".to_string(),
+                    })
+                } else {
+                    Ok(())
+                }
             })
         }
     }
@@ -289,6 +321,7 @@ mod tests {
         fail_at: Option<usize>,
         supervisors: Vec<Arc<FakeSupervisor>>,
         configs: Vec<ProxyListenerConfig>,
+        fail_shutdown: bool,
     }
 
     impl ProxySupervisorStarter for FakeStarter {
@@ -312,6 +345,7 @@ mod tests {
                 shutdowns: AtomicUsize::new(0),
                 graceful_joins: AtomicUsize::new(0),
                 abort_joins: AtomicUsize::new(0),
+                fail_shutdown: self.fail_shutdown,
             });
             self.supervisors.push(supervisor.clone());
             Ok(supervisor)
@@ -518,6 +552,7 @@ http_versions = ["http1"]
             fail_at: Some(1),
             supervisors: Vec::new(),
             configs: Vec::new(),
+            fail_shutdown: false,
         };
 
         let result = product.start_proxy_supervisors(&mut starter).await;
@@ -540,7 +575,7 @@ http_versions = ["http1"]
     }
 
     #[tokio::test]
-    async fn terminal_proxy_failure_drives_shutdown_and_supervisors_join_once() {
+    async fn terminal_proxy_failure_is_observed_and_coordinated_shutdown_joins_once() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let reservations = super::super::reserve_listeners::<2>(&_test);
         let addresses = reservations.addresses();
@@ -563,19 +598,42 @@ http_versions = ["http1"]
             failure.listener,
             super::super::listeners::ProxyListenerKind::ExplicitHttp
         );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while product.runtime().lifecycle() != crate::runtime::LifecycleState::Stopped {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
         assert!(!product.runtime().is_ready());
-        assert_eq!(starter.supervisors[0].joins(), 1);
+        assert_eq!(
+            product.runtime().lifecycle(),
+            crate::runtime::LifecycleState::Running
+        );
+        assert_eq!(starter.supervisors[0].joins(), 0);
 
         product.shutdown().await;
         product.shutdown().await;
         assert_eq!(starter.supervisors[0].joins(), 1);
+        super::super::assert_listener_addresses_released(&_test, addresses);
+    }
+
+    #[tokio::test]
+    async fn proxy_join_failure_is_exposed_after_shutdown() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<2>(&_test);
+        let addresses = reservations.addresses();
+        let (_directory, loaded) = loaded(&config(addresses[0], addresses[1], ""));
+        let product = ProductRuntime::prepare_from_prebound(loaded, reservations.into_listeners())
+            .await
+            .unwrap();
+        product.activate_initial().await.unwrap();
+        let mut starter = FakeStarter {
+            fail_shutdown: true,
+            ..FakeStarter::default()
+        };
+        product.start_proxy_supervisors(&mut starter).await.unwrap();
+
+        product.shutdown().await;
+
+        let diagnostic = product
+            .shutdown_diagnostic()
+            .expect("failed proxy join must remain observable");
+        assert!(diagnostic.contains("proxy supervisor shutdown failed"));
+        assert!(diagnostic.contains("injected shutdown failure"));
         super::super::assert_listener_addresses_released(&_test, addresses);
     }
 

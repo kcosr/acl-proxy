@@ -16,10 +16,15 @@ use hyper::body::{Bytes, HttpBody, SizeHint};
 use hyper::server::conn::Http;
 use hyper::service::service_fn;
 use hyper::Body;
+use rustls::server::Acceptor as RustlsAcceptor;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::{watch, Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{
+    mpsc, oneshot, watch, Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore,
+};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
+use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor};
 
 use crate::activation::assets::ProductIngressAssets;
 use crate::activation::listeners::{
@@ -30,42 +35,79 @@ use crate::activation::listeners::{
 use crate::capture::{
     CaptureDecision, CaptureEndpoint, CaptureKind, CaptureMode, CaptureRecord, HttpCaptureTap,
 };
+use crate::certs::MitmCertificateManager;
 use crate::config::compiler::{
-    CompiledHttp1ConnectPolicy, CompiledHttpVersion, HttpBodyReadPlan, StaticCleartextListener,
+    CompiledHttp1ConnectPolicy, CompiledHttpVersion, HeaderEffectPlan, HttpBodyReadPlan,
+    StaticCleartextListener, StaticExplicitHttpsListener, StaticTransparentHttpsListener,
 };
+use crate::destination::DestinationTarget;
 use crate::http_body::{read_mandatory_request_body, HttpBodyReadError};
 use crate::observation::{CaptureEpoch, CaptureEvent, ProductObservationRuntime};
 use crate::policy::apply_header_effects;
-use crate::proxy::authority::{reconcile_explicit_request, reconcile_transparent_http_request};
-use crate::proxy::forward::{
-    forward_request, preflight_forwarding_target, resolve_forwarding_target, ForwardBody,
-    ForwardBodyError,
+use crate::proxy::authority::{
+    reconcile_connect_inner_request, reconcile_connect_outer_request, reconcile_connect_sni,
+    reconcile_explicit_request, reconcile_transparent_http_request, CanonicalConnectTarget,
 };
-use crate::proxy::headers::{sanitize_untrusted_request, HeaderPreparationError, SanitizedRequest};
+use crate::proxy::forward::{
+    forward_request, forward_upgrade_request, preflight_forwarding_target,
+    resolve_forwarding_target, ForwardBody, ForwardBodyError, ForwardUpgradeResult,
+    ForwardedResponse, ResolvedForwardingTarget,
+};
+use crate::proxy::headers::{
+    sanitize_untrusted_connect_request, sanitize_untrusted_request, HeaderPreparationError,
+    SanitizedRequest,
+};
+use crate::proxy::original_destination::{
+    OriginalDestinationResolver, SystemOriginalDestinationResolver,
+};
+use crate::proxy::upgrade_relay::{EstablishedUpgradeKind, UpgradeCaptureContext};
 use crate::request_decision::{
     prepare_request, AllowedRequest, GuardedRequestBody as DecisionBody, RequestDecision,
-    RequestInput, TerminalRequestBodyProvenance,
+    RequestInput, TerminalRequestBodyProvenance, UpgradeBinding,
 };
-use crate::runtime::{BoxFuture, Runtime};
+use crate::runtime::{BoxFuture, GenerationRetention, Runtime};
 use crate::safety::wire_body::{GuardedBodyData, GuardedHttpBody};
 use crate::safety::{InvalidLoopMarker, WireBodyQuotaKey};
 use crate::sensitive::{is_sensitive_header_name, REDACTED};
+use crate::upgrade::{
+    UpgradeEntryPlan, UpgradeRuntime, UpgradeTerminalCause, UpgradeTerminalControl,
+};
+use crate::url::canonicalize_tls_server_name;
 
 /// Concrete process-runtime starter for the prebound product listener bundle.
-/// HTTPS variants are deliberately left for their dedicated executors.
 pub(crate) struct ProductProxySupervisorStarter {
     runtime: Arc<Runtime>,
     observation_runtime: Arc<ProductObservationRuntime>,
+    upgrade_runtime: Arc<UpgradeRuntime>,
+    original_destination: Arc<dyn OriginalDestinationResolver>,
 }
 
 impl ProductProxySupervisorStarter {
     pub(crate) fn new(
         runtime: Arc<Runtime>,
         observation_runtime: Arc<ProductObservationRuntime>,
+        upgrade_runtime: Arc<UpgradeRuntime>,
     ) -> Self {
         Self {
             runtime,
             observation_runtime,
+            upgrade_runtime,
+            original_destination: Arc::new(SystemOriginalDestinationResolver),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_original_destination_resolver(
+        runtime: Arc<Runtime>,
+        observation_runtime: Arc<ProductObservationRuntime>,
+        upgrade_runtime: Arc<UpgradeRuntime>,
+        original_destination: Arc<dyn OriginalDestinationResolver>,
+    ) -> Self {
+        Self {
+            runtime,
+            observation_runtime,
+            upgrade_runtime,
+            original_destination,
         }
     }
 }
@@ -79,65 +121,209 @@ impl ProxySupervisorStarter for ProductProxySupervisorStarter {
     ) -> Result<Arc<dyn ProxySupervisor>, ProxySupervisorStartError> {
         let kind = listener.kind();
         match listener.config {
-            ProxyListenerConfig::ExplicitHttp(config) => CleartextProxySupervisor::start(
-                kind,
-                CleartextMode::Explicit,
-                ensure_cleartext_connect_supported(kind, *config)?,
+            ProxyListenerConfig::ExplicitHttp(config) => {
+                require_connect_mitm_asset(kind, config.connect.as_ref(), assets)?;
+                ProductIngressSupervisor::start(
+                    IngressListenerConfig::cleartext(
+                        kind,
+                        ConfiguredRequestAuthority::Explicit,
+                        *config,
+                    ),
+                    listener.listener,
+                    self.runtime.clone(),
+                    self.observation_runtime.clone(),
+                    self.upgrade_runtime.clone(),
+                    assets.clone(),
+                    failure_observer,
+                )
+                .map(|supervisor| supervisor as Arc<dyn ProxySupervisor>)
+            }
+            ProxyListenerConfig::TransparentHttp(config) => ProductIngressSupervisor::start(
+                IngressListenerConfig::cleartext(
+                    kind,
+                    ConfiguredRequestAuthority::TransparentHttp,
+                    *config,
+                ),
                 listener.listener,
                 self.runtime.clone(),
                 self.observation_runtime.clone(),
+                self.upgrade_runtime.clone(),
                 assets.clone(),
                 failure_observer,
             )
             .map(|supervisor| supervisor as Arc<dyn ProxySupervisor>),
-            ProxyListenerConfig::TransparentHttp(config) => CleartextProxySupervisor::start(
-                kind,
-                CleartextMode::Transparent,
-                *config,
-                listener.listener,
-                self.runtime.clone(),
-                self.observation_runtime.clone(),
-                assets.clone(),
-                failure_observer,
-            )
-            .map(|supervisor| supervisor as Arc<dyn ProxySupervisor>),
-            ProxyListenerConfig::ExplicitHttps(_) | ProxyListenerConfig::TransparentHttps(_) => {
-                Err(ProxySupervisorStartError {
-                    listener: kind,
-                    message: "the HTTPS supervisor is not installed".to_owned(),
-                })
+            ProxyListenerConfig::ExplicitHttps(config) => {
+                require_connect_mitm_asset(kind, Some(&config.connect), assets)?;
+                let config = *config;
+                let acceptor = assets.explicit_https_tls().cloned().ok_or_else(|| {
+                    ProxySupervisorStartError {
+                        listener: kind,
+                        message: "the activated explicit HTTPS identity is missing".to_owned(),
+                    }
+                })?;
+                ProductIngressSupervisor::start(
+                    IngressListenerConfig::explicit_https(kind, config, acceptor),
+                    listener.listener,
+                    self.runtime.clone(),
+                    self.observation_runtime.clone(),
+                    self.upgrade_runtime.clone(),
+                    assets.clone(),
+                    failure_observer,
+                )
+                .map(|supervisor| supervisor as Arc<dyn ProxySupervisor>)
+            }
+            ProxyListenerConfig::TransparentHttps(config) => {
+                let mitm = assets
+                    .mitm()
+                    .cloned()
+                    .ok_or_else(|| ProxySupervisorStartError {
+                        listener: kind,
+                        message: "the activated MITM certificate manager is missing".to_owned(),
+                    })?;
+                ProductIngressSupervisor::start(
+                    IngressListenerConfig::transparent_https(
+                        kind,
+                        *config,
+                        mitm,
+                        assets.transparent_https_alpn().to_vec(),
+                        self.original_destination.clone(),
+                    ),
+                    listener.listener,
+                    self.runtime.clone(),
+                    self.observation_runtime.clone(),
+                    self.upgrade_runtime.clone(),
+                    assets.clone(),
+                    failure_observer,
+                )
+                .map(|supervisor| supervisor as Arc<dyn ProxySupervisor>)
             }
         }
     }
 }
 
-fn ensure_cleartext_connect_supported(
+fn require_connect_mitm_asset(
     kind: ProxyListenerKind,
-    config: StaticCleartextListener,
-) -> Result<StaticCleartextListener, ProxySupervisorStartError> {
-    if config
-        .connect
-        .as_ref()
-        .is_some_and(|connect| connect.http1 == Some(CompiledHttp1ConnectPolicy::Mitm))
+    connect: Option<&crate::config::compiler::StaticConnectPolicy>,
+    assets: &ProductIngressAssets,
+) -> Result<(), ProxySupervisorStartError> {
+    if connect.is_some_and(|connect| connect.http1 == Some(CompiledHttp1ConnectPolicy::Mitm))
+        && assets.mitm().is_none()
     {
         return Err(ProxySupervisorStartError {
             listener: kind,
-            message: "HTTP/1 CONNECT MITM requires the cleartext CONNECT executor".to_owned(),
+            message: "HTTP/1 CONNECT MITM requires an activated MITM certificate manager"
+                .to_owned(),
         });
     }
-    Ok(config)
+    Ok(())
 }
 
-#[derive(Clone, Copy)]
-enum CleartextMode {
+#[derive(Clone)]
+enum RequestAuthority {
     Explicit,
-    Transparent,
+    TransparentHttp,
+    ConnectInner(CanonicalConnectTarget),
+    TransparentHttps {
+        destination_port: u16,
+        sni: Arc<str>,
+    },
 }
 
 #[derive(Clone, Copy)]
-struct ListenerIdentity {
+enum ConfiguredRequestAuthority {
+    Explicit,
+    TransparentHttp,
+    DynamicTransparentHttps,
+}
+
+#[derive(Clone)]
+enum IngressTransport {
+    Cleartext,
+    StaticTls {
+        acceptor: TlsAcceptor,
+        handshake_timeout: Duration,
+    },
+    DynamicMitmTls {
+        manager: Arc<MitmCertificateManager>,
+        alpn_protocols: Arc<[Vec<u8>]>,
+        handshake_timeout: Duration,
+        original_destination: Arc<dyn OriginalDestinationResolver>,
+    },
+}
+
+#[derive(Clone)]
+struct IngressListenerConfig {
     kind: ProxyListenerKind,
-    mode: CleartextMode,
+    authority: ConfiguredRequestAuthority,
+    transport: IngressTransport,
+    http_versions: Vec<CompiledHttpVersion>,
+    request_header_timeout: Duration,
+    max_connections: usize,
+    max_concurrent_streams: u32,
+    connect: Option<crate::config::compiler::StaticConnectPolicy>,
+}
+
+impl IngressListenerConfig {
+    fn cleartext(
+        kind: ProxyListenerKind,
+        authority: ConfiguredRequestAuthority,
+        config: StaticCleartextListener,
+    ) -> Self {
+        Self {
+            kind,
+            authority,
+            transport: IngressTransport::Cleartext,
+            http_versions: config.http_versions,
+            request_header_timeout: config.request_header_timeout,
+            max_connections: config.max_connections,
+            max_concurrent_streams: config.max_concurrent_streams,
+            connect: config.connect,
+        }
+    }
+
+    fn explicit_https(
+        kind: ProxyListenerKind,
+        config: StaticExplicitHttpsListener,
+        acceptor: TlsAcceptor,
+    ) -> Self {
+        Self {
+            kind,
+            authority: ConfiguredRequestAuthority::Explicit,
+            transport: IngressTransport::StaticTls {
+                acceptor,
+                handshake_timeout: config.handshake_timeout,
+            },
+            http_versions: config.http_versions,
+            request_header_timeout: config.request_header_timeout,
+            max_connections: config.max_connections,
+            max_concurrent_streams: config.max_concurrent_streams,
+            connect: Some(config.connect),
+        }
+    }
+
+    fn transparent_https(
+        kind: ProxyListenerKind,
+        config: StaticTransparentHttpsListener,
+        manager: Arc<MitmCertificateManager>,
+        alpn_protocols: Vec<Vec<u8>>,
+        original_destination: Arc<dyn OriginalDestinationResolver>,
+    ) -> Self {
+        Self {
+            kind,
+            authority: ConfiguredRequestAuthority::DynamicTransparentHttps,
+            transport: IngressTransport::DynamicMitmTls {
+                manager,
+                alpn_protocols: alpn_protocols.into(),
+                handshake_timeout: config.handshake_timeout,
+                original_destination,
+            },
+            http_versions: config.http_versions,
+            request_header_timeout: config.request_header_timeout,
+            max_connections: config.max_connections,
+            max_concurrent_streams: config.max_concurrent_streams,
+            connect: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -147,7 +333,7 @@ enum SupervisorStop {
     AbortAndJoin,
 }
 
-struct CleartextProxySupervisor {
+struct ProductIngressSupervisor {
     kind: ProxyListenerKind,
     stop: watch::Sender<SupervisorStop>,
     stop_gate: Arc<StdMutex<SupervisorStop>>,
@@ -159,17 +345,17 @@ struct SupervisorTaskState {
     terminal: Option<Result<(), Arc<ProxySupervisorFailure>>>,
 }
 
-impl CleartextProxySupervisor {
+impl ProductIngressSupervisor {
     fn start(
-        kind: ProxyListenerKind,
-        mode: CleartextMode,
-        config: StaticCleartextListener,
+        config: IngressListenerConfig,
         listener: std::net::TcpListener,
         runtime: Arc<Runtime>,
         observation_runtime: Arc<ProductObservationRuntime>,
+        upgrade_runtime: Arc<UpgradeRuntime>,
         assets: Arc<ProductIngressAssets>,
         failure_observer: Arc<dyn ProxySupervisorFailureObserver>,
     ) -> Result<Arc<Self>, ProxySupervisorStartError> {
+        let kind = config.kind;
         listener
             .set_nonblocking(true)
             .map_err(|error| start_error(kind, "cannot mark the listener nonblocking", error))?;
@@ -190,11 +376,11 @@ impl CleartextProxySupervisor {
             )
         })?;
         let listener_task = executor.spawn(run_listener(
-            ListenerIdentity { kind, mode },
             config,
             listener,
             runtime,
             observation_runtime,
+            upgrade_runtime,
             assets,
             quota_classifier,
             stop_rx,
@@ -258,7 +444,7 @@ async fn observe_listener_task(
     result
 }
 
-impl ProxySupervisor for CleartextProxySupervisor {
+impl ProxySupervisor for ProductIngressSupervisor {
     fn begin_shutdown(&self) {
         request_stop(&self.stop_gate, &self.stop, SupervisorStop::CloseAndJoin);
     }
@@ -296,16 +482,16 @@ fn start_error(
 }
 
 async fn run_listener(
-    identity: ListenerIdentity,
-    config: StaticCleartextListener,
+    config: IngressListenerConfig,
     listener: TcpListener,
     runtime: Arc<Runtime>,
     observation_runtime: Arc<ProductObservationRuntime>,
+    upgrade_runtime: Arc<UpgradeRuntime>,
     assets: Arc<ProductIngressAssets>,
     quota_classifier: LocalQuotaClassifier,
     mut stop: watch::Receiver<SupervisorStop>,
 ) -> Result<(), Arc<ProxySupervisorFailure>> {
-    let ListenerIdentity { kind, mode } = identity;
+    let kind = config.kind;
     let connection_slots = Arc::new(Semaphore::new(config.max_connections));
     let (refresh_stop, refresh_stop_rx) = watch::channel(false);
     let mut refresh_task = tokio::spawn(refresh_local_addresses(
@@ -313,7 +499,9 @@ async fn run_listener(
         quota_classifier.clone(),
         refresh_stop_rx,
     ));
+    let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<ConnectTunnelPlan>(config.max_connections);
     let mut connections = JoinSet::new();
+    let mut tunnels = JoinSet::new();
     let mut terminal_failure = None;
     'accept: loop {
         let permit = tokio::select! {
@@ -326,8 +514,18 @@ async fn run_listener(
             }
             Some(result) = connections.join_next(), if !connections.is_empty() => {
                 if let Err(error) = result {
-                    tracing::debug!(listener = %kind, %error, "cleartext connection task failed");
+                    tracing::debug!(listener = %kind, %error, "ingress connection task failed");
                 }
+                continue;
+            }
+            Some(result) = tunnels.join_next(), if !tunnels.is_empty() => {
+                if let Err(error) = result {
+                    tracing::debug!(listener = %kind, %error, "CONNECT tunnel task failed");
+                }
+                continue;
+            }
+            Some(plan) = tunnel_rx.recv() => {
+                tunnels.spawn(plan.run());
                 continue;
             }
             result = &mut refresh_task => {
@@ -356,8 +554,18 @@ async fn run_listener(
             }
             Some(result) = connections.join_next(), if !connections.is_empty() => {
                 if let Err(error) = result {
-                    tracing::debug!(listener = %kind, %error, "cleartext connection task failed");
+                    tracing::debug!(listener = %kind, %error, "ingress connection task failed");
                 }
+                continue;
+            }
+            Some(result) = tunnels.join_next(), if !tunnels.is_empty() => {
+                if let Err(error) = result {
+                    tracing::debug!(listener = %kind, %error, "CONNECT tunnel task failed");
+                }
+                continue;
+            }
+            Some(plan) = tunnel_rx.recv() => {
+                tunnels.spawn(plan.run());
                 continue;
             }
             result = &mut refresh_task => {
@@ -400,25 +608,24 @@ async fn run_listener(
         let quota_key = quota_classifier.classify(peer.ip());
         let runtime = runtime.clone();
         let observation_runtime = observation_runtime.clone();
+        let upgrade_runtime = upgrade_runtime.clone();
         let assets = assets.clone();
-        let versions = config.http_versions.clone();
-        let request_header_timeout = config.request_header_timeout;
-        let max_concurrent_streams = config.max_concurrent_streams;
+        let connection_config = config.clone();
         let connection_stop = stop.clone();
+        let connection_tunnels = tunnel_tx.clone();
         connections.spawn(async move {
             serve_connection(
                 kind,
-                mode,
-                versions,
-                request_header_timeout,
-                max_concurrent_streams,
+                connection_config,
                 stream,
                 peer,
                 quota_key,
                 runtime,
                 observation_runtime,
+                upgrade_runtime,
                 assets,
                 connection_stop,
+                connection_tunnels,
                 permit,
             )
             .await;
@@ -426,25 +633,42 @@ async fn run_listener(
     }
 
     drop(listener);
+    drop(tunnel_tx);
     refresh_stop.send_replace(true);
     if !refresh_task.is_finished() {
         let _ = refresh_task.await;
     }
 
-    let abort = terminal_failure.is_some() || *stop.borrow() == SupervisorStop::AbortAndJoin;
+    let mut abort = terminal_failure.is_some() || *stop.borrow() == SupervisorStop::AbortAndJoin;
     if abort {
         connections.abort_all();
+        tunnels.abort_all();
+        tunnel_rx.close();
     }
-    while !connections.is_empty() {
+    while !connections.is_empty()
+        || !tunnels.is_empty()
+        || (!abort && (!tunnel_rx.is_closed() || !tunnel_rx.is_empty()))
+    {
         tokio::select! {
             changed = stop.changed(), if !abort => {
                 if changed.is_ok() && *stop.borrow() == SupervisorStop::AbortAndJoin {
+                    abort = true;
                     connections.abort_all();
+                    tunnels.abort_all();
+                    tunnel_rx.close();
                 }
             }
-            result = connections.join_next() => {
+            Some(plan) = tunnel_rx.recv(), if !abort => {
+                tunnels.spawn(plan.run());
+            }
+            result = connections.join_next(), if !connections.is_empty() => {
                 if let Some(Err(error)) = result {
-                    tracing::debug!(listener = %kind, %error, "cleartext connection task failed while joining");
+                    tracing::debug!(listener = %kind, %error, "ingress connection task failed while joining");
+                }
+            }
+            result = tunnels.join_next(), if !tunnels.is_empty() => {
+                if let Some(Err(error)) = result {
+                    tracing::debug!(listener = %kind, %error, "CONNECT tunnel task failed while joining");
                 }
             }
         }
@@ -553,39 +777,117 @@ fn classify_accept_error(error: &io::Error) -> AcceptErrorAction {
 #[allow(clippy::too_many_arguments)]
 async fn serve_connection(
     kind: ProxyListenerKind,
-    mode: CleartextMode,
-    versions: Vec<CompiledHttpVersion>,
-    request_header_timeout: Duration,
-    max_concurrent_streams: u32,
+    config: IngressListenerConfig,
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
     quota_key: WireBodyQuotaKey,
     runtime: Arc<Runtime>,
     observation_runtime: Arc<ProductObservationRuntime>,
+    upgrade_runtime: Arc<UpgradeRuntime>,
     assets: Arc<ProductIngressAssets>,
     mut supervisor_stop: watch::Receiver<SupervisorStop>,
-    _admission: OwnedSemaphorePermit,
+    tunnel_tx: mpsc::Sender<ConnectTunnelPlan>,
+    admission: OwnedSemaphorePermit,
+) {
+    let Some((stream, versions, authority)) = prepare_ingress_transport(
+        &config.transport,
+        config.authority,
+        &config.http_versions,
+        stream,
+        &mut supervisor_stop,
+    )
+    .await
+    else {
+        return;
+    };
+    let admission = Arc::new(StdMutex::new(Some(admission)));
+    serve_http_connection(
+        kind,
+        &config,
+        stream,
+        versions,
+        authority,
+        peer,
+        quota_key,
+        runtime,
+        observation_runtime,
+        upgrade_runtime,
+        assets,
+        &mut supervisor_stop,
+        tunnel_tx,
+        Some(admission),
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_http_connection(
+    kind: ProxyListenerKind,
+    config: &IngressListenerConfig,
+    stream: BoxedIngressIo,
+    versions: Vec<CompiledHttpVersion>,
+    authority: RequestAuthority,
+    peer: SocketAddr,
+    quota_key: WireBodyQuotaKey,
+    runtime: Arc<Runtime>,
+    observation_runtime: Arc<ProductObservationRuntime>,
+    upgrade_runtime: Arc<UpgradeRuntime>,
+    assets: Arc<ProductIngressAssets>,
+    supervisor_stop: &mut watch::Receiver<SupervisorStop>,
+    tunnel_tx: mpsc::Sender<ConnectTunnelPlan>,
+    admission: Option<Arc<StdMutex<Option<OwnedSemaphorePermit>>>>,
 ) {
     let close = Arc::new(ConnectionClose::default());
     let service_close = close.clone();
-    let service = service_fn(move |request| {
+    let service_config = config.clone();
+    let service_stop = supervisor_stop.clone();
+    let service = service_fn(move |mut request| {
         let runtime = runtime.clone();
         let observation_runtime = observation_runtime.clone();
+        let upgrade_runtime = upgrade_runtime.clone();
         let assets = assets.clone();
         let close = service_close.clone();
         let quota_key = quota_key.clone();
+        let authority = authority.clone();
+        let config = service_config.clone();
+        let tunnel_tx = tunnel_tx.clone();
+        let admission = admission.clone();
+        let tunnel_stop = service_stop.clone();
         async move {
             let close_entire_connection = request.version() != http::Version::HTTP_2;
-            let handled = execute_request(
-                mode,
-                peer,
-                quota_key,
-                runtime,
-                observation_runtime,
-                assets,
-                request,
-            )
-            .await;
+            let downstream_upgrade = hyper::upgrade::on(&mut request);
+            let handled = if request.method() == Method::CONNECT
+                && matches!(&authority, RequestAuthority::Explicit)
+            {
+                execute_connect_request(
+                    config,
+                    peer,
+                    quota_key,
+                    runtime,
+                    observation_runtime,
+                    upgrade_runtime,
+                    assets,
+                    request,
+                    downstream_upgrade,
+                    tunnel_tx,
+                    admission.expect("an outer explicit connection owns admission"),
+                    tunnel_stop,
+                )
+                .await
+            } else {
+                execute_request(
+                    authority,
+                    peer,
+                    quota_key,
+                    runtime,
+                    observation_runtime,
+                    upgrade_runtime,
+                    assets,
+                    request,
+                    downstream_upgrade,
+                )
+                .await
+            };
             let mut handled = handled;
             if handled.close_connection && close_entire_connection {
                 handled
@@ -600,13 +902,13 @@ async fn serve_connection(
 
     let mut http = Http::new();
     http.http1_keep_alive(true);
-    http.http1_header_read_timeout(request_header_timeout);
-    http.http2_max_concurrent_streams(max_concurrent_streams);
+    http.http1_header_read_timeout(config.request_header_timeout);
+    http.http2_max_concurrent_streams(config.max_concurrent_streams);
     let http1 = versions.contains(&CompiledHttpVersion::Http1);
     let http2 = versions.contains(&CompiledHttpVersion::Http2);
     if http2 {
-        http.http2_keep_alive_interval(request_header_timeout);
-        http.http2_keep_alive_timeout(request_header_timeout);
+        http.http2_keep_alive_interval(config.request_header_timeout);
+        http.http2_keep_alive_timeout(config.request_header_timeout);
     }
     match (http1, http2) {
         (true, false) => {
@@ -619,7 +921,7 @@ async fn serve_connection(
         (false, false) => return,
     }
 
-    let connection = http.serve_connection(stream, service);
+    let connection = http.serve_connection(stream, service).with_upgrades();
     tokio::pin!(connection);
     let result = tokio::select! {
         result = &mut connection => result,
@@ -627,14 +929,127 @@ async fn serve_connection(
             connection.as_mut().graceful_shutdown();
             connection.await
         }
-        _ = wait_for_supervisor_stop(&mut supervisor_stop) => {
+        _ = wait_for_supervisor_stop(supervisor_stop) => {
             connection.as_mut().graceful_shutdown();
             connection.await
         }
     };
     if let Err(error) = result {
-        tracing::debug!(listener = %kind, %peer, %error, "cleartext HTTP connection ended");
+        tracing::debug!(listener = %kind, %peer, %error, "HTTP ingress connection ended");
     }
+}
+
+trait IngressIo: AsyncRead + AsyncWrite {}
+
+impl<T> IngressIo for T where T: AsyncRead + AsyncWrite {}
+
+type BoxedIngressIo = Box<dyn IngressIo + Send + Unpin>;
+
+async fn prepare_ingress_transport(
+    transport: &IngressTransport,
+    configured_authority: ConfiguredRequestAuthority,
+    configured_versions: &[CompiledHttpVersion],
+    stream: tokio::net::TcpStream,
+    stop: &mut watch::Receiver<SupervisorStop>,
+) -> Option<(BoxedIngressIo, Vec<CompiledHttpVersion>, RequestAuthority)> {
+    match transport {
+        IngressTransport::Cleartext => Some((
+            Box::new(stream),
+            configured_versions.to_vec(),
+            establish_configured_authority(configured_authority)?,
+        )),
+        IngressTransport::StaticTls {
+            acceptor,
+            handshake_timeout,
+        } => {
+            let deadline = Instant::now().checked_add(*handshake_timeout)?;
+            let handshake = acceptor.accept(stream);
+            tokio::pin!(handshake);
+            let tls = tokio::select! {
+                biased;
+                _ = wait_for_supervisor_stop(stop) => return None,
+                _ = tokio::time::sleep_until(deadline) => return None,
+                result = &mut handshake => result.ok()?,
+            };
+            let selected =
+                select_tls_http_version(tls.get_ref().1.alpn_protocol(), configured_versions)?;
+            Some((
+                Box::new(tls),
+                vec![selected],
+                establish_configured_authority(configured_authority)?,
+            ))
+        }
+        IngressTransport::DynamicMitmTls {
+            manager,
+            alpn_protocols,
+            handshake_timeout,
+            original_destination,
+        } => {
+            let deadline = Instant::now().checked_add(*handshake_timeout)?;
+            let destination = original_destination.resolve(&stream).ok()?;
+            let hello = LazyConfigAcceptor::new(RustlsAcceptor::default(), stream);
+            tokio::pin!(hello);
+            let start = tokio::select! {
+                biased;
+                _ = wait_for_supervisor_stop(stop) => return None,
+                _ = tokio::time::sleep_until(deadline) => return None,
+                result = &mut hello => result.ok()?,
+            };
+            let sni = canonicalize_tls_server_name(start.client_hello().server_name()?).ok()?;
+            let server_config = {
+                let config_activation = manager.server_config_for_host(&sni, alpn_protocols);
+                tokio::pin!(config_activation);
+                tokio::select! {
+                    biased;
+                    _ = wait_for_supervisor_stop(stop) => return None,
+                    _ = tokio::time::sleep_until(deadline) => return None,
+                    result = &mut config_activation => result.ok()?,
+                }
+            };
+            let handshake = start.into_stream(server_config);
+            tokio::pin!(handshake);
+            let tls = tokio::select! {
+                biased;
+                _ = wait_for_supervisor_stop(stop) => return None,
+                _ = tokio::time::sleep_until(deadline) => return None,
+                result = &mut handshake => result.ok()?,
+            };
+            let selected =
+                select_tls_http_version(tls.get_ref().1.alpn_protocol(), configured_versions)?;
+            Some((
+                Box::new(tls),
+                vec![selected],
+                RequestAuthority::TransparentHttps {
+                    destination_port: destination.port(),
+                    sni: sni.into(),
+                },
+            ))
+        }
+    }
+}
+
+fn establish_configured_authority(
+    authority: ConfiguredRequestAuthority,
+) -> Option<RequestAuthority> {
+    match authority {
+        ConfiguredRequestAuthority::Explicit => Some(RequestAuthority::Explicit),
+        ConfiguredRequestAuthority::TransparentHttp => Some(RequestAuthority::TransparentHttp),
+        ConfiguredRequestAuthority::DynamicTransparentHttps => None,
+    }
+}
+
+fn select_tls_http_version(
+    negotiated: Option<&[u8]>,
+    configured: &[CompiledHttpVersion],
+) -> Option<CompiledHttpVersion> {
+    let selected = match negotiated {
+        Some(b"h2") => CompiledHttpVersion::Http2,
+        Some(b"http/1.1") => CompiledHttpVersion::Http1,
+        Some(_) => return None,
+        None if configured.contains(&CompiledHttpVersion::Http1) => CompiledHttpVersion::Http1,
+        None => return None,
+    };
+    configured.contains(&selected).then_some(selected)
 }
 
 async fn wait_for_supervisor_stop(stop: &mut watch::Receiver<SupervisorStop>) {
@@ -674,6 +1089,12 @@ struct HandledResponse {
     close_connection: bool,
 }
 
+enum UpgradeHandshakeResponse {
+    Ordinary(ForwardedResponse),
+    SwitchingProtocols(Response<Body>),
+    Failed(StatusCode),
+}
+
 impl HandledResponse {
     fn fixed(status: StatusCode, message: &'static str, close_connection: bool) -> Self {
         let response = Response::builder()
@@ -687,6 +1108,316 @@ impl HandledResponse {
             close_connection,
         }
     }
+}
+
+struct ConnectTunnelPlan {
+    kind: ProxyListenerKind,
+    config: IngressListenerConfig,
+    target: CanonicalConnectTarget,
+    server_config: Arc<rustls::ServerConfig>,
+    downstream_upgrade: hyper::upgrade::OnUpgrade,
+    peer: SocketAddr,
+    quota_key: WireBodyQuotaKey,
+    runtime: Arc<Runtime>,
+    observation_runtime: Arc<ProductObservationRuntime>,
+    upgrade_runtime: Arc<UpgradeRuntime>,
+    assets: Arc<ProductIngressAssets>,
+    stop: watch::Receiver<SupervisorStop>,
+    tunnel_tx: mpsc::Sender<ConnectTunnelPlan>,
+    _admission: OwnedSemaphorePermit,
+}
+
+impl ConnectTunnelPlan {
+    async fn run(mut self) {
+        let Some(deadline) = Instant::now().checked_add(self.config.request_header_timeout) else {
+            return;
+        };
+        let upgraded = tokio::select! {
+            biased;
+            _ = wait_for_supervisor_stop(&mut self.stop) => return,
+            _ = tokio::time::sleep_until(deadline) => return,
+            result = &mut self.downstream_upgrade => match result {
+                Ok(upgraded) => upgraded,
+                Err(_) => return,
+            },
+        };
+
+        let hello = LazyConfigAcceptor::new(RustlsAcceptor::default(), upgraded);
+        tokio::pin!(hello);
+        let start = tokio::select! {
+            biased;
+            _ = wait_for_supervisor_stop(&mut self.stop) => return,
+            _ = tokio::time::sleep_until(deadline) => return,
+            result = &mut hello => match result {
+                Ok(start) => start,
+                Err(_) => return,
+            },
+        };
+        if reconcile_connect_sni(&self.target, start.client_hello().server_name()).is_err() {
+            return;
+        }
+        let handshake = start.into_stream(self.server_config);
+        tokio::pin!(handshake);
+        let tls = tokio::select! {
+            biased;
+            _ = wait_for_supervisor_stop(&mut self.stop) => return,
+            _ = tokio::time::sleep_until(deadline) => return,
+            result = &mut handshake => match result {
+                Ok(tls) => tls,
+                Err(_) => return,
+            },
+        };
+        let Some(selected) =
+            select_tls_http_version(tls.get_ref().1.alpn_protocol(), &self.config.http_versions)
+        else {
+            return;
+        };
+        self.config.connect = None;
+        serve_http_connection(
+            self.kind,
+            &self.config,
+            Box::new(tls),
+            vec![selected],
+            RequestAuthority::ConnectInner(self.target),
+            self.peer,
+            self.quota_key,
+            self.runtime,
+            self.observation_runtime,
+            self.upgrade_runtime,
+            self.assets,
+            &mut self.stop,
+            self.tunnel_tx,
+            None,
+        )
+        .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_connect_request(
+    config: IngressListenerConfig,
+    peer: SocketAddr,
+    quota_key: WireBodyQuotaKey,
+    runtime: Arc<Runtime>,
+    observation_runtime: Arc<ProductObservationRuntime>,
+    upgrade_runtime: Arc<UpgradeRuntime>,
+    assets: Arc<ProductIngressAssets>,
+    mut request: Request<Body>,
+    downstream_upgrade: hyper::upgrade::OnUpgrade,
+    tunnel_tx: mpsc::Sender<ConnectTunnelPlan>,
+    admission: Arc<StdMutex<Option<OwnedSemaphorePermit>>>,
+    tunnel_stop: watch::Receiver<SupervisorStop>,
+) -> HandledResponse {
+    let policy = match request.version() {
+        Version::HTTP_10 | Version::HTTP_11 => {
+            config.connect.as_ref().and_then(|connect| connect.http1)
+        }
+        Version::HTTP_2 => {
+            return HandledResponse::fixed(StatusCode::FORBIDDEN, "CONNECT denied\n", false)
+        }
+        _ => None,
+    };
+    match policy {
+        Some(CompiledHttp1ConnectPolicy::Deny) => {
+            return HandledResponse::fixed(StatusCode::FORBIDDEN, "CONNECT denied\n", false)
+        }
+        Some(CompiledHttp1ConnectPolicy::Mitm) => {}
+        None => {
+            return HandledResponse::fixed(StatusCode::BAD_REQUEST, "CONNECT unsupported\n", true)
+        }
+    }
+    if !request.body().is_end_stream() {
+        return HandledResponse::fixed(
+            StatusCode::BAD_REQUEST,
+            "CONNECT body is not allowed\n",
+            true,
+        );
+    }
+
+    let target = match reconcile_connect_outer_request(&mut request) {
+        Ok(target) => target,
+        Err(_) => {
+            return HandledResponse::fixed(
+                StatusCode::BAD_REQUEST,
+                "invalid CONNECT target\n",
+                true,
+            )
+        }
+    };
+    let prepared_destination = match assets
+        .destination_guard()
+        .preflight(DestinationTarget::direct(&target.url))
+    {
+        Ok(destination) => destination,
+        Err(_) => {
+            return HandledResponse::fixed(StatusCode::FORBIDDEN, "destination denied\n", true)
+        }
+    };
+    let sanitized = match sanitize_untrusted_connect_request(request) {
+        Ok(request) => request,
+        Err(_) => {
+            return HandledResponse::fixed(
+                StatusCode::BAD_REQUEST,
+                "invalid CONNECT request\n",
+                true,
+            )
+        }
+    };
+    let (parts, _body, _protocol) = sanitized.into_parts();
+    let Some(lease) = runtime.lease().await else {
+        return HandledResponse::fixed(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service unavailable\n",
+            true,
+        );
+    };
+    let request_id = request_id();
+    let started_at = Instant::now();
+    let prepared = match prepare_request(
+        &lease,
+        RequestInput {
+            request_id: &request_id,
+            url: &target.url,
+            method: &parts.method,
+            peer_ip: peer.ip(),
+            headers: parts.headers,
+            quota_key: quota_key.clone(),
+            started_at,
+            upgrade_intent: false,
+        },
+    ) {
+        Ok(prepared) => prepared,
+        Err(_) => {
+            return HandledResponse::fixed(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request failed\n",
+                true,
+            )
+        }
+    };
+    let deadline = prepared.deadline();
+    if prepared.denies_without_resolution() {
+        return match prepared.decide(None).await {
+            Ok(RequestDecision::Deny(_)) => {
+                HandledResponse::fixed(StatusCode::FORBIDDEN, "request denied\n", true)
+            }
+            _ => {
+                HandledResponse::fixed(StatusCode::INTERNAL_SERVER_ERROR, "request failed\n", true)
+            }
+        };
+    }
+    match tokio::time::timeout_at(
+        deadline,
+        assets
+            .destination_guard()
+            .complete_resolution(prepared_destination),
+    )
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(_)) => {
+            return HandledResponse::fixed(StatusCode::FORBIDDEN, "destination denied\n", true)
+        }
+        Err(_) => {
+            return HandledResponse::fixed(StatusCode::GATEWAY_TIMEOUT, "request timed out\n", true)
+        }
+    }
+    match tokio::time::timeout_at(deadline, prepared.decide(None)).await {
+        Ok(Ok(RequestDecision::Allow(allowed))) => drop(allowed),
+        Ok(Ok(RequestDecision::Deny(_))) => {
+            return HandledResponse::fixed(StatusCode::FORBIDDEN, "request denied\n", true)
+        }
+        Ok(Err(_)) => {
+            return HandledResponse::fixed(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request failed\n",
+                true,
+            )
+        }
+        Err(_) => {
+            return HandledResponse::fixed(StatusCode::GATEWAY_TIMEOUT, "request timed out\n", true)
+        }
+    }
+    drop(lease);
+
+    let Some(manager) = assets.mitm().cloned() else {
+        return HandledResponse::fixed(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service unavailable\n",
+            true,
+        );
+    };
+    let alpn_protocols = connect_alpn_protocols(&config.http_versions);
+    let server_config = match tokio::time::timeout_at(
+        deadline,
+        manager.server_config_for_host(&target.authority.host, &alpn_protocols),
+    )
+    .await
+    {
+        Ok(Ok(config)) => config,
+        Ok(Err(_)) => {
+            return HandledResponse::fixed(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service unavailable\n",
+                true,
+            )
+        }
+        Err(_) => {
+            return HandledResponse::fixed(StatusCode::GATEWAY_TIMEOUT, "request timed out\n", true)
+        }
+    };
+    let Some(admission) = admission
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    else {
+        return HandledResponse::fixed(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service unavailable\n",
+            true,
+        );
+    };
+    let plan = ConnectTunnelPlan {
+        kind: config.kind,
+        config,
+        target,
+        server_config,
+        downstream_upgrade,
+        peer,
+        quota_key,
+        runtime,
+        observation_runtime,
+        upgrade_runtime,
+        assets,
+        stop: tunnel_stop,
+        tunnel_tx: tunnel_tx.clone(),
+        _admission: admission,
+    };
+    if tunnel_tx.try_send(plan).is_err() {
+        return HandledResponse::fixed(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service unavailable\n",
+            true,
+        );
+    }
+    HandledResponse {
+        response: Response::builder()
+            .status(StatusCode::OK)
+            .version(Version::HTTP_11)
+            .body(ProxyResponseBody::Local(Body::empty()))
+            .expect("CONNECT response is valid"),
+        close_connection: false,
+    }
+}
+
+fn connect_alpn_protocols(versions: &[CompiledHttpVersion]) -> Vec<Vec<u8>> {
+    versions
+        .iter()
+        .map(|version| match version {
+            CompiledHttpVersion::Http1 => b"http/1.1".to_vec(),
+            CompiledHttpVersion::Http2 => b"h2".to_vec(),
+        })
+        .collect()
 }
 
 struct HttpCaptureContext {
@@ -733,6 +1464,16 @@ impl HttpCaptureContext {
             address: Some(target.host_for_capture.clone()),
             port: Some(target.port),
         });
+    }
+
+    fn upgrade_capture_context(&self, target: &crate::url::CanonicalUrl) -> UpgradeCaptureContext {
+        let mut base = self.request_record(CaptureDecision::Allow, None);
+        base.url.clone_from(&target.url);
+        base.target = Some(CaptureEndpoint {
+            address: Some(target.host_for_capture.clone()),
+            port: Some(target.port),
+        });
+        UpgradeCaptureContext::new(self.runtime.clone(), base, self.max_expansion_ratio)
     }
 
     fn captures(&self, event: CaptureEvent) -> bool {
@@ -1056,14 +1797,130 @@ fn http_version(version: Version) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn execute_authorized_upgrade(
+    upgrade_runtime: Arc<UpgradeRuntime>,
+    upgrade_capture: UpgradeCaptureContext,
+    binding: UpgradeBinding,
+    request: SanitizedRequest<OriginRequestBody>,
+    canonical: crate::url::CanonicalUrl,
+    resolved: ResolvedForwardingTarget,
+    destinations: Arc<crate::destination::DestinationGuard>,
+    retention: GenerationRetention,
+    downstream_upgrade: hyper::upgrade::OnUpgrade,
+    deadline: Instant,
+    response_effects: Vec<HeaderEffectPlan>,
+    request_headers: HeaderMap,
+    protocol: HeaderValue,
+) -> Result<UpgradeHandshakeResponse, StatusCode> {
+    let (response_tx, response_rx) = oneshot::channel();
+    let allocation = binding.allocation;
+    let wire_redaction = binding.wire_redaction;
+    let task_profile = wire_redaction.clone();
+    let runtime_for_task = upgrade_runtime.clone();
+    upgrade_runtime
+        .try_spawn_handshake(allocation, move |handshake| async move {
+            let forwarded = tokio::time::timeout_at(
+                deadline,
+                forward_upgrade_request(request, &canonical, &retention, destinations, resolved),
+            )
+            .await;
+            match forwarded {
+                Ok(Ok(ForwardUpgradeResult::Response(mut response))) => {
+                    if apply_header_effects(&response_effects, response.headers_mut()).is_err() {
+                        let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                        ));
+                        return;
+                    }
+                    response
+                        .body_mut()
+                        .bind_request_lifetime(deadline, retention);
+                    let _ = response_tx.send(UpgradeHandshakeResponse::Ordinary(response));
+                }
+                Ok(Ok(ForwardUpgradeResult::SwitchingProtocols(upgrade))) => {
+                    let (mut response, upstream_upgrade) = upgrade.into_parts();
+                    if apply_header_effects(&response_effects, response.headers_mut()).is_err() {
+                        let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                        ));
+                        return;
+                    }
+                    let kind = match EstablishedUpgradeKind::from_handshake(
+                        &protocol,
+                        &request_headers,
+                        response.headers(),
+                        task_profile.as_ref(),
+                    ) {
+                        Ok(kind) => kind,
+                        Err(_) => {
+                            let _ = response_tx
+                                .send(UpgradeHandshakeResponse::Failed(StatusCode::BAD_GATEWAY));
+                            return;
+                        }
+                    };
+                    let prepared_relay = match kind.prepare(
+                        runtime_for_task.limits().relay_buffer_bytes(),
+                        Some(upgrade_capture),
+                    ) {
+                        Ok(prepared_relay) => prepared_relay,
+                        Err(_) => {
+                            let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
+                                StatusCode::SERVICE_UNAVAILABLE,
+                            ));
+                            return;
+                        }
+                    };
+                    let terminal_control =
+                        UpgradeTerminalControl::new(|| std::future::pending::<()>(), |_| async {});
+                    let entry_plan =
+                        UpgradeEntryPlan::new(terminal_control, move |snapshot| async move {
+                            response_tx
+                                .send(UpgradeHandshakeResponse::SwitchingProtocols(response))
+                                .map_err(|_| UpgradeTerminalCause::DownstreamWriteFailed)?;
+                            let (downstream, upstream) =
+                                tokio::join!(downstream_upgrade, upstream_upgrade.complete(),);
+                            let downstream = downstream
+                                .map_err(|_| UpgradeTerminalCause::DownstreamWriteFailed)?;
+                            let upstream =
+                                upstream.map_err(|_| UpgradeTerminalCause::SetupFailed)?;
+                            Ok(prepared_relay.establish(downstream, upstream, snapshot))
+                        });
+                    if handshake.commit(wire_redaction, entry_plan).is_err() {
+                        return;
+                    }
+                    drop(retention);
+                }
+                Ok(Err(_)) => {
+                    let _ =
+                        response_tx.send(UpgradeHandshakeResponse::Failed(StatusCode::BAD_GATEWAY));
+                }
+                Err(_) => {
+                    let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
+                        StatusCode::GATEWAY_TIMEOUT,
+                    ));
+                }
+            }
+        })
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+
+    match tokio::time::timeout_at(deadline, response_rx).await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(_)) => Err(StatusCode::SERVICE_UNAVAILABLE),
+        Err(_) => Err(StatusCode::GATEWAY_TIMEOUT),
+    }
+}
+
 async fn execute_request(
-    mode: CleartextMode,
+    authority: RequestAuthority,
     peer: SocketAddr,
     quota_key: WireBodyQuotaKey,
     runtime: Arc<Runtime>,
     observation_runtime: Arc<ProductObservationRuntime>,
+    upgrade_runtime: Arc<UpgradeRuntime>,
     assets: Arc<ProductIngressAssets>,
     mut request: Request<Body>,
+    downstream_upgrade: hyper::upgrade::OnUpgrade,
 ) -> HandledResponse {
     let started_at = Instant::now();
     let request_id = request_id();
@@ -1085,9 +1942,20 @@ async fn execute_request(
         request_version,
         lease.max_content_decoding_expansion_ratio(),
     );
-    let target = match mode {
-        CleartextMode::Explicit => reconcile_explicit_request(&mut request),
-        CleartextMode::Transparent => reconcile_transparent_http_request(&mut request),
+    let target = match authority {
+        RequestAuthority::Explicit => reconcile_explicit_request(&mut request),
+        RequestAuthority::TransparentHttp => reconcile_transparent_http_request(&mut request),
+        RequestAuthority::ConnectInner(target) => {
+            reconcile_connect_inner_request(&mut request, &target)
+        }
+        RequestAuthority::TransparentHttps {
+            destination_port,
+            sni,
+        } => crate::proxy::authority::reconcile_transparent_https_request(
+            &mut request,
+            destination_port,
+            Some(&sni),
+        ),
     };
     let target = match target {
         Ok(target) => target,
@@ -1123,6 +1991,10 @@ async fn execute_request(
         }
     };
 
+    let upgrade_protocol = sanitized
+        .upgrade_intent()
+        .map(|intent| intent.protocol().clone());
+    let upgrade_intent = upgrade_protocol.is_some();
     let (mut parts, ingress_body, protocol) = sanitized.into_parts();
     let ingress_was_complete = ingress_body.is_end_stream();
     let mut body_headers = body_headers(&parts.headers);
@@ -1145,6 +2017,7 @@ async fn execute_request(
             headers,
             quota_key,
             started_at,
+            upgrade_intent,
         },
     ) {
         Ok(prepared) => prepared,
@@ -1337,7 +2210,114 @@ async fn execute_request(
     }
     let mut origin_body = observable.body;
     origin_body.set_capture(request_capture);
+    let request_headers = parts.headers.clone();
     let request = SanitizedRequest::from_parts(parts, origin_body, protocol);
+    if let Some(binding) = allowed.upgrade.take() {
+        let Some(upgrade_protocol) = upgrade_protocol else {
+            return capture.fixed_response(
+                CaptureDecision::Allow,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request failed\n",
+                true,
+            );
+        };
+        let retention = match lease.retain_for_operation() {
+            Ok(retention) => retention,
+            Err(_) => {
+                return capture.fixed_response(
+                    CaptureDecision::Allow,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "service unavailable\n",
+                    true,
+                )
+            }
+        };
+        let response_effects = allowed.response_header_effects().to_vec();
+        let upgrade_capture = capture.upgrade_capture_context(&target.url);
+        drop(allowed);
+        drop(lease);
+        let outcome = execute_authorized_upgrade(
+            upgrade_runtime,
+            upgrade_capture,
+            binding,
+            request,
+            target.url.clone(),
+            resolved,
+            assets.destination_guard().clone(),
+            retention,
+            downstream_upgrade,
+            deadline,
+            response_effects,
+            request_headers,
+            upgrade_protocol,
+        )
+        .await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(StatusCode::GATEWAY_TIMEOUT) => {
+                return capture.fixed_response(
+                    CaptureDecision::Allow,
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "request timed out\n",
+                    true,
+                )
+            }
+            Err(status) => {
+                return capture.fixed_response(
+                    CaptureDecision::Allow,
+                    status,
+                    "upgrade failed\n",
+                    true,
+                )
+            }
+        };
+        return match outcome {
+            UpgradeHandshakeResponse::Ordinary(response) => {
+                let response_capture = capture.begin(
+                    CaptureEvent::ResponseAllowed,
+                    || {
+                        capture.response_record(
+                            CaptureDecision::Allow,
+                            response.version(),
+                            Some(response.headers()),
+                            response.status(),
+                            false,
+                        )
+                    },
+                    response.headers(),
+                );
+                HandledResponse {
+                    response: response
+                        .map(|body| ProxyResponseBody::forwarded(body, response_capture)),
+                    close_connection: false,
+                }
+            }
+            UpgradeHandshakeResponse::SwitchingProtocols(response) => {
+                if let Some(mut submission) = capture.begin(
+                    CaptureEvent::ResponseAllowed,
+                    || {
+                        capture.response_record(
+                            CaptureDecision::Allow,
+                            response.version(),
+                            Some(response.headers()),
+                            response.status(),
+                            false,
+                        )
+                    },
+                    response.headers(),
+                ) {
+                    submission.finish();
+                }
+                HandledResponse {
+                    response: response.map(ProxyResponseBody::Local),
+                    close_connection: false,
+                }
+            }
+            UpgradeHandshakeResponse::Failed(status) => {
+                capture.fixed_response(CaptureDecision::Allow, status, "upgrade failed\n", true)
+            }
+        };
+    }
     let mut response = match tokio::time::timeout_at(
         deadline,
         forward_request(
@@ -1836,9 +2816,12 @@ mod tests {
     use flate2::Compression;
     use hyper::body::to_bytes;
     use hyper::client::conn;
+    use rcgen::{CertificateParams, KeyPair};
+    use rustls::{Certificate, ClientConfig, RootCertStore, ServerName};
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
+    use tokio_rustls::TlsConnector;
 
     use super::*;
     use crate::activation::runner::ProductRuntime;
@@ -1887,6 +2870,30 @@ mod tests {
         let mut starter = ProductProxySupervisorStarter::new(
             product.runtime().clone(),
             product.observation_runtime().clone(),
+            product.upgrade_runtime(),
+        );
+        product.start_proxy_supervisors(&mut starter).await.unwrap();
+        (directory, product)
+    }
+
+    async fn product_with_original_destination(
+        text: String,
+        listeners: Vec<StdTcpListener>,
+        resolver: Arc<dyn OriginalDestinationResolver>,
+    ) -> (tempfile::TempDir, Arc<ProductRuntime>) {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("acl-proxy.toml");
+        fs::write(&path, text).unwrap();
+        let loaded = load_and_compile_exact_config(&path).unwrap();
+        let product = ProductRuntime::prepare_from_prebound(loaded, listeners)
+            .await
+            .unwrap();
+        product.activate_initial().await.unwrap();
+        let mut starter = ProductProxySupervisorStarter::with_original_destination_resolver(
+            product.runtime().clone(),
+            product.observation_runtime().clone(),
+            product.upgrade_runtime(),
+            resolver,
         );
         product.start_proxy_supervisors(&mut starter).await.unwrap();
         (directory, product)
@@ -1996,17 +3003,20 @@ mod tests {
     async fn execute_direct(
         product: &Arc<ProductRuntime>,
         assets: Arc<ProductIngressAssets>,
-        request: Request<Body>,
+        mut request: Request<Body>,
     ) -> HandledResponse {
         let peer = SocketAddr::from(([192, 0, 2, 44], 41_000));
+        let downstream_upgrade = hyper::upgrade::on(&mut request);
         execute_request(
-            CleartextMode::Explicit,
+            RequestAuthority::Explicit,
             peer,
             WireBodyQuotaKey::from_peer(peer.ip(), |_| false),
             product.runtime().clone(),
             product.observation_runtime().clone(),
+            product.upgrade_runtime(),
             assets,
             request,
+            downstream_upgrade,
         )
         .await
     }
@@ -2055,6 +3065,60 @@ header = "x-test-loop"
         let body = to_bytes(body).await.unwrap();
         driver.await.unwrap().unwrap();
         Response::from_parts(parts, Body::from(body))
+    }
+
+    async fn read_http_head(stream: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
+        let mut head = Vec::new();
+        let mut byte = [0_u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut byte))
+                .await
+                .expect("HTTP head read timed out")
+                .expect("HTTP head ended early");
+            head.push(byte[0]);
+            assert!(head.len() <= 32 * 1024, "HTTP head exceeded the test bound");
+        }
+        head
+    }
+
+    fn test_tls_identity() -> (tempfile::TempDir, Vec<u8>) {
+        let directory = tempdir().unwrap();
+        let key = KeyPair::generate().unwrap();
+        let certificate = CertificateParams::new(vec!["localhost".to_owned()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        fs::write(directory.path().join("server.pem"), certificate.pem()).unwrap();
+        fs::write(directory.path().join("server-key.pem"), key.serialize_pem()).unwrap();
+        (directory, certificate.der().to_vec())
+    }
+
+    fn test_tls_connector(certificate: Vec<u8>, alpn: Vec<Vec<u8>>) -> TlsConnector {
+        let mut roots = RootCertStore::empty();
+        roots.add(&Certificate(certificate)).unwrap();
+        let mut config = ClientConfig::builder()
+            .with_safe_defaults()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        config.alpn_protocols = alpn;
+        TlsConnector::from(Arc::new(config))
+    }
+
+    fn read_first_pem_certificate(path: &std::path::Path) -> Vec<u8> {
+        let mut reader = std::io::BufReader::new(fs::File::open(path).unwrap());
+        rustls_pemfile::certs(&mut reader).unwrap().remove(0)
+    }
+
+    struct FixedOriginalDestination(SocketAddr);
+
+    impl OriginalDestinationResolver for FixedOriginalDestination {
+        fn resolve(
+            &self,
+            _socket: &tokio::net::TcpStream,
+        ) -> Result<SocketAddr, crate::proxy::original_destination::OriginalDestinationError>
+        {
+            Ok(self.0)
+        }
     }
 
     fn capture_config() -> &'static str {
@@ -2761,7 +3825,13 @@ default = "allow"
         capture_records: Vec<CaptureRecord>,
     }
 
-    async fn normalized_round_trip(mode: CleartextMode) -> CapturedRoundTrip {
+    #[derive(Clone, Copy)]
+    enum TestCleartextMode {
+        Explicit,
+        Transparent,
+    }
+
+    async fn normalized_round_trip(mode: TestCleartextMode) -> CapturedRoundTrip {
         let ([proxy], listeners) = prebound_listeners::<1>();
         let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -2805,10 +3875,10 @@ default = "allow"
                 .unwrap();
         });
         let listener_table = match mode {
-            CleartextMode::Explicit => "explicit_http",
-            CleartextMode::Transparent => "transparent_http",
+            TestCleartextMode::Explicit => "explicit_http",
+            TestCleartextMode::Transparent => "transparent_http",
         };
-        let listener_connect = if matches!(mode, CleartextMode::Explicit) {
+        let listener_connect = if matches!(mode, TestCleartextMode::Explicit) {
             r#"
 [listeners.explicit_http.connect]
 http1 = "deny"
@@ -2859,8 +3929,8 @@ value = "policy"
         let encoded = encoder.finish().unwrap();
         assert_ne!(encoded, plain);
         let uri = match mode {
-            CleartextMode::Explicit => format!("http://{origin}/ingest"),
-            CleartextMode::Transparent => "/ingest".to_owned(),
+            TestCleartextMode::Explicit => format!("http://{origin}/ingest"),
+            TestCleartextMode::Transparent => "/ingest".to_owned(),
         };
         let request = Request::builder()
             .method(http::Method::POST)
@@ -2890,7 +3960,7 @@ value = "policy"
     #[tokio::test]
     async fn normalized_http_body_forwards_identity_without_recompression() {
         let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
-        let captured = normalized_round_trip(CleartextMode::Explicit).await;
+        let captured = normalized_round_trip(TestCleartextMode::Explicit).await;
 
         assert_eq!(captured.body, &b"canonical decoded request bytes"[..]);
         assert_eq!(
@@ -2926,7 +3996,7 @@ value = "policy"
     #[tokio::test]
     async fn normalized_http_body_removes_stale_coding_and_length() {
         let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
-        let captured = normalized_round_trip(CleartextMode::Transparent).await;
+        let captured = normalized_round_trip(TestCleartextMode::Transparent).await;
 
         assert_eq!(captured.body, &b"canonical decoded request bytes"[..]);
         assert!(!captured.headers.contains_key(CONTENT_ENCODING));
@@ -3218,6 +4288,400 @@ default = "deny"
     }
 
     #[tokio::test]
+    async fn explicit_https_uses_prebound_socket_static_identity_and_exact_alpn() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let (identity, certificate) = test_tls_identity();
+        let policy = r#"[listeners.explicit_https.connect]
+http1 = "deny"
+
+[listeners.explicit_https.tls]
+certificate_chain = "CERTIFICATE"
+private_key = "PRIVATE_KEY"
+
+[policy]
+default = "deny"
+"#
+        .replace(
+            "CERTIFICATE",
+            &identity.path().join("server.pem").display().to_string(),
+        )
+        .replace(
+            "PRIVATE_KEY",
+            &identity.path().join("server-key.pem").display().to_string(),
+        );
+        let config = base_config(proxy, "explicit_https", &policy).replacen(
+            "http_versions = [\"http1\"]",
+            "http_versions = [\"http1\"]\nhandshake_timeout = \"1s\"",
+            1,
+        );
+        let (_directory, product) = product(config, listeners).await;
+        let connector = test_tls_connector(certificate, vec![b"http/1.1".to_vec()]);
+        let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let stream = connector
+            .connect(ServerName::try_from("localhost").unwrap(), stream)
+            .await
+            .unwrap();
+        assert_eq!(
+            stream.get_ref().1.alpn_protocol(),
+            Some(b"http/1.1".as_slice())
+        );
+        let (mut sender, connection) = conn::handshake(stream).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .uri("https://example.test/denied")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            to_bytes(response.into_body()).await.unwrap(),
+            "request denied\n"
+        );
+        drop(sender);
+        product.shutdown().await;
+        driver.await.unwrap().unwrap();
+        assert!(StdTcpListener::bind(proxy).is_ok());
+    }
+
+    #[tokio::test]
+    async fn explicit_https_rejects_unsupported_alpn_and_accepts_no_alpn_as_http1() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let (identity, certificate) = test_tls_identity();
+        let policy = r#"[listeners.explicit_https.connect]
+http1 = "deny"
+
+[listeners.explicit_https.tls]
+certificate_chain = "CERTIFICATE"
+private_key = "PRIVATE_KEY"
+
+[policy]
+default = "deny"
+"#
+        .replace(
+            "CERTIFICATE",
+            &identity.path().join("server.pem").display().to_string(),
+        )
+        .replace(
+            "PRIVATE_KEY",
+            &identity.path().join("server-key.pem").display().to_string(),
+        );
+        let config = base_config(proxy, "explicit_https", &policy).replacen(
+            "http_versions = [\"http1\"]",
+            "http_versions = [\"http1\"]\nhandshake_timeout = \"1s\"",
+            1,
+        );
+        let (_directory, product) = product(config, listeners).await;
+
+        let unsupported = test_tls_connector(certificate.clone(), vec![b"acme/1".to_vec()]);
+        let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        assert!(unsupported
+            .connect(ServerName::try_from("localhost").unwrap(), stream)
+            .await
+            .is_err());
+
+        let no_alpn = test_tls_connector(certificate, Vec::new());
+        let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let stream = no_alpn
+            .connect(ServerName::try_from("localhost").unwrap(), stream)
+            .await
+            .unwrap();
+        assert_eq!(stream.get_ref().1.alpn_protocol(), None);
+        let (mut sender, connection) = conn::handshake(stream).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .uri("https://example.test/denied")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            to_bytes(response.into_body()).await.unwrap(),
+            "request denied\n"
+        );
+
+        drop(sender);
+        product.shutdown().await;
+        driver.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_https_negotiates_http2_and_serves_an_http2_request() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let (identity, certificate) = test_tls_identity();
+        let policy = r#"[listeners.explicit_https.connect]
+http2 = "deny"
+
+[listeners.explicit_https.tls]
+certificate_chain = "CERTIFICATE"
+private_key = "PRIVATE_KEY"
+
+[policy]
+default = "deny"
+"#
+        .replace(
+            "CERTIFICATE",
+            &identity.path().join("server.pem").display().to_string(),
+        )
+        .replace(
+            "PRIVATE_KEY",
+            &identity.path().join("server-key.pem").display().to_string(),
+        );
+        let config = base_config(proxy, "explicit_https", &policy).replacen(
+            "http_versions = [\"http1\"]",
+            "http_versions = [\"http2\"]\nhandshake_timeout = \"1s\"",
+            1,
+        );
+        let (_directory, product) = product(config, listeners).await;
+        let connector = test_tls_connector(certificate, vec![b"h2".to_vec()]);
+        let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let stream = connector
+            .connect(ServerName::try_from("localhost").unwrap(), stream)
+            .await
+            .unwrap();
+        assert_eq!(stream.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+        let mut builder = conn::Builder::new();
+        builder.http2_only(true);
+        let (mut sender, connection) = builder.handshake(stream).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .uri("https://example.test/denied")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.version(), Version::HTTP_2);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        to_bytes(response.into_body()).await.unwrap();
+
+        drop(sender);
+        product.shutdown().await;
+        driver.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn transparent_https_closes_a_stalled_client_hello_at_the_handshake_deadline() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let config = base_config(
+            proxy,
+            "transparent_https",
+            r#"[mitm]
+mode = "generated"
+directory = "mitm"
+
+[policy]
+default = "deny"
+"#,
+        )
+        .replacen(
+            "http_versions = [\"http1\"]",
+            "http_versions = [\"http1\"]\nhandshake_timeout = \"50ms\"",
+            1,
+        );
+        let original_destination = SocketAddr::from(([198, 51, 100, 17], 443));
+        let (_directory, product) = product_with_original_destination(
+            config,
+            listeners,
+            Arc::new(FixedOriginalDestination(original_destination)),
+        )
+        .await;
+        let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let mut byte = [0_u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
+            .await
+            .expect("stalled ClientHello must be closed at its handshake deadline")
+            .unwrap();
+        assert_eq!(read, 0);
+
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn transparent_https_uses_sni_and_original_destination_port() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let config = base_config(
+            proxy,
+            "transparent_https",
+            r#"[mitm]
+mode = "generated"
+directory = "mitm"
+
+[policy]
+default = "deny"
+"#,
+        )
+        .replacen(
+            "http_versions = [\"http1\"]",
+            "http_versions = [\"http1\"]\nhandshake_timeout = \"1s\"",
+            1,
+        );
+        let original_destination = SocketAddr::from(([198, 51, 100, 17], 8443));
+        let (directory, product) = product_with_original_destination(
+            config,
+            listeners,
+            Arc::new(FixedOriginalDestination(original_destination)),
+        )
+        .await;
+        let certificate = read_first_pem_certificate(&directory.path().join("mitm/ca-cert.pem"));
+        let connector = test_tls_connector(certificate, vec![b"http/1.1".to_vec()]);
+        let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let stream = connector
+            .connect(ServerName::try_from("transparent.test").unwrap(), stream)
+            .await
+            .unwrap();
+        let (mut sender, connection) = conn::handshake(stream).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .uri("/denied")
+                    .header(http::header::HOST, "transparent.test:8443")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            to_bytes(response.into_body()).await.unwrap(),
+            "request denied\n"
+        );
+        drop(sender);
+        product.shutdown().await;
+        driver.await.unwrap().unwrap();
+        assert!(StdTcpListener::bind(proxy).is_ok());
+    }
+
+    #[tokio::test]
+    async fn transparent_https_rejects_sni_and_host_authority_mismatch_through_listener() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let config = base_config(
+            proxy,
+            "transparent_https",
+            r#"[mitm]
+mode = "generated"
+directory = "mitm"
+
+[policy]
+default = "deny"
+"#,
+        )
+        .replacen(
+            "http_versions = [\"http1\"]",
+            "http_versions = [\"http1\"]\nhandshake_timeout = \"1s\"",
+            1,
+        );
+        let original_destination = SocketAddr::from(([198, 51, 100, 17], 8443));
+        let (directory, product) = product_with_original_destination(
+            config,
+            listeners,
+            Arc::new(FixedOriginalDestination(original_destination)),
+        )
+        .await;
+        let certificate = read_first_pem_certificate(&directory.path().join("mitm/ca-cert.pem"));
+        let connector = test_tls_connector(certificate, vec![b"http/1.1".to_vec()]);
+        let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let stream = connector
+            .connect(ServerName::try_from("transparent.test").unwrap(), stream)
+            .await
+            .unwrap();
+        let (mut sender, connection) = conn::handshake(stream).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .uri("/denied")
+                    .header(http::header::HOST, "other.test:8443")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            to_bytes(response.into_body()).await.unwrap(),
+            "invalid request target\n"
+        );
+
+        drop(sender);
+        product.shutdown().await;
+        driver.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn transparent_https_negotiates_http2_and_serves_an_http2_request() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let config = base_config(
+            proxy,
+            "transparent_https",
+            r#"[mitm]
+mode = "generated"
+directory = "mitm"
+
+[policy]
+default = "deny"
+"#,
+        )
+        .replacen(
+            "http_versions = [\"http1\"]",
+            "http_versions = [\"http2\"]\nhandshake_timeout = \"1s\"",
+            1,
+        );
+        let original_destination = SocketAddr::from(([198, 51, 100, 17], 443));
+        let (directory, product) = product_with_original_destination(
+            config,
+            listeners,
+            Arc::new(FixedOriginalDestination(original_destination)),
+        )
+        .await;
+        let certificate = read_first_pem_certificate(&directory.path().join("mitm/ca-cert.pem"));
+        let connector = test_tls_connector(certificate, vec![b"h2".to_vec()]);
+        let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let stream = connector
+            .connect(ServerName::try_from("transparent.test").unwrap(), stream)
+            .await
+            .unwrap();
+        assert_eq!(stream.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+        let mut builder = conn::Builder::new();
+        builder.http2_only(true);
+        let (mut sender, connection) = builder.handshake(stream).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .uri("https://transparent.test/denied")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.version(), Version::HTTP_2);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        to_bytes(response.into_body()).await.unwrap();
+
+        drop(sender);
+        product.shutdown().await;
+        driver.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn terminal_supervisor_panic_is_observed_promptly() {
         let (failure_tx, failure_rx) = oneshot::channel();
         let observer = Arc::new(ChannelFailureObserver(StdMutex::new(Some(failure_tx))));
@@ -3251,6 +4715,32 @@ default = "deny"
     }
 
     #[test]
+    fn tls_alpn_selection_obeys_the_exact_compiled_protocol_set() {
+        let both = [CompiledHttpVersion::Http2, CompiledHttpVersion::Http1];
+        assert_eq!(
+            select_tls_http_version(Some(b"h2"), &both),
+            Some(CompiledHttpVersion::Http2)
+        );
+        assert_eq!(
+            select_tls_http_version(Some(b"http/1.1"), &both),
+            Some(CompiledHttpVersion::Http1)
+        );
+        assert_eq!(
+            select_tls_http_version(None, &both),
+            Some(CompiledHttpVersion::Http1)
+        );
+        assert_eq!(
+            select_tls_http_version(None, &[CompiledHttpVersion::Http2]),
+            None
+        );
+        assert_eq!(
+            select_tls_http_version(Some(b"h2"), &[CompiledHttpVersion::Http1]),
+            None
+        );
+        assert_eq!(select_tls_http_version(Some(b"http/1.0"), &both), None);
+    }
+
+    #[test]
     fn local_quota_cache_replaces_complete_live_snapshot_under_churn() {
         let first = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 10));
         let second = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 11));
@@ -3275,46 +4765,372 @@ default = "deny"
     }
 
     #[tokio::test]
-    async fn cleartext_mitm_fails_activation_until_executor_is_installed() {
+    async fn connect_deny_policy_returns_forbidden_without_mitm_activation() {
         let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
         let ([proxy], listeners) = prebound_listeners::<1>();
-        let directory = tempdir().unwrap();
-        let config = format!(
-            r#"schema_version = 3
+        let policy = r#"[listeners.explicit_http.connect]
+http1 = "deny"
 
-[listeners.explicit_http]
-bind = "{proxy}"
-http_versions = ["http1"]
+[policy]
+default = "allow"
+"#;
+        let (_directory, product) =
+            product(base_config(proxy, "explicit_http", policy), listeners).await;
+        let response = send_request(
+            proxy,
+            Request::builder()
+                .method(Method::CONNECT)
+                .uri("192.0.2.10:443")
+                .header(http::header::HOST, "192.0.2.10:443")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            to_bytes(response.into_body()).await.unwrap(),
+            "CONNECT denied\n"
+        );
+        product.shutdown().await;
+    }
 
-[listeners.explicit_http.connect]
+    fn connect_mitm_policy(target: &str) -> String {
+        format!(
+            r#"[listeners.explicit_http.connect]
 http1 = "mitm"
 
 [mitm]
 mode = "generated"
-directory = "{}"
+directory = "mitm"
 
 [policy]
 default = "deny"
-"#,
-            directory.path().join("mitm").display()
-        );
-        let path = directory.path().join("acl-proxy.toml");
-        fs::write(&path, config).unwrap();
-        let loaded = load_and_compile_exact_config(&path).unwrap();
-        let product = ProductRuntime::prepare_from_prebound(loaded, listeners)
+
+[[policy.rules]]
+id = "connect-target"
+decision = "allow"
+urls = ["https://{target}/**"]
+"#
+        )
+    }
+
+    async fn open_connect(proxy: SocketAddr, target: &str) -> tokio::net::TcpStream {
+        let mut stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        stream
+            .write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
             .await
             .unwrap();
-        product.activate_initial().await.unwrap();
-        let mut starter = ProductProxySupervisorStarter::new(
-            product.runtime().clone(),
-            product.observation_runtime().clone(),
+        let head = read_http_head(&mut stream).await;
+        assert!(
+            head.starts_with(b"HTTP/1.1 200 "),
+            "unexpected CONNECT response: {}",
+            String::from_utf8_lossy(&head)
         );
-        let error = product
-            .start_proxy_supervisors(&mut starter)
+        stream
+    }
+
+    #[tokio::test]
+    async fn connect_mitm_forwards_inner_request_and_rejects_nested_connect() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
-            .unwrap_err();
-        assert!(error.to_string().contains("CONNECT MITM"));
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let (origin_identity, _) = test_tls_identity();
+        let origin_acceptor = crate::tls_identity::load_static_tls_acceptor(
+            &origin_identity.path().join("server.pem"),
+            &origin_identity.path().join("server-key.pem"),
+            vec![b"http/1.1".to_vec()],
+        )
+        .unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin_listener.accept().await.unwrap();
+            let tls = origin_acceptor.accept(stream).await.unwrap();
+            Http::new()
+                .http1_only(true)
+                .serve_connection(
+                    tls,
+                    service_fn(|_request| async {
+                        Ok::<_, Infallible>(Response::new(Body::from("connect origin")))
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let target = origin.to_string();
+        let config = base_config(proxy, "explicit_http", &connect_mitm_policy(&target)).replacen(
+            "trust = \"system\"",
+            "trust = \"insecure\"",
+            1,
+        );
+        let (directory, product) = product(config, listeners).await;
+
+        let stream = open_connect(proxy, &target).await;
+        let certificate = read_first_pem_certificate(&directory.path().join("mitm/ca-cert.pem"));
+        let connector = test_tls_connector(certificate, vec![b"http/1.1".to_vec()]);
+        let tls = connector
+            .connect(ServerName::try_from("127.0.0.1").unwrap(), stream)
+            .await
+            .unwrap();
+        let (mut sender, connection) = conn::handshake(tls).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .uri("/allowed")
+                    .header(http::header::HOST, &target)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body()).await.unwrap(),
+            "connect origin"
+        );
+
+        let nested = sender
+            .send_request(
+                Request::builder()
+                    .method(Method::CONNECT)
+                    .uri(&target)
+                    .header(http::header::HOST, &target)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(nested.status(), StatusCode::BAD_REQUEST);
+        to_bytes(nested.into_body()).await.unwrap();
+        drop(sender);
+        driver.await.unwrap().unwrap();
+        origin_task.await.unwrap();
+        product.shutdown().await;
         assert!(StdTcpListener::bind(proxy).is_ok());
+    }
+
+    #[tokio::test]
+    async fn connect_mitm_rejects_listener_loop_before_200() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let target = proxy.to_string();
+        let (_directory, product) = product(
+            base_config(proxy, "explicit_http", &connect_mitm_policy(&target)),
+            listeners,
+        )
+        .await;
+        let response = send_request(
+            proxy,
+            Request::builder()
+                .method(Method::CONNECT)
+                .uri(&target)
+                .header(http::header::HOST, &target)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn connect_mitm_rejects_mismatched_tls_sni() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let target = "192.0.2.10:443";
+        let (directory, product) = product(
+            base_config(proxy, "explicit_http", &connect_mitm_policy(target)),
+            listeners,
+        )
+        .await;
+        let stream = open_connect(proxy, target).await;
+        let certificate = read_first_pem_certificate(&directory.path().join("mitm/ca-cert.pem"));
+        let connector = test_tls_connector(certificate, vec![b"http/1.1".to_vec()]);
+        assert!(connector
+            .connect(ServerName::try_from("other.example").unwrap(), stream)
+            .await
+            .is_err());
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn connect_mitm_rejects_outer_and_inner_authority_mismatch() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let target = "192.0.2.10:443";
+        let (directory, product) = product(
+            base_config(proxy, "explicit_http", &connect_mitm_policy(target)),
+            listeners,
+        )
+        .await;
+
+        let outer = send_request(
+            proxy,
+            Request::builder()
+                .method(Method::CONNECT)
+                .uri(target)
+                .header(http::header::HOST, "other.example:443")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(outer.status(), StatusCode::BAD_REQUEST);
+
+        let stream = open_connect(proxy, target).await;
+        let certificate = read_first_pem_certificate(&directory.path().join("mitm/ca-cert.pem"));
+        let connector = test_tls_connector(certificate, vec![b"http/1.1".to_vec()]);
+        let tls = connector
+            .connect(ServerName::try_from("192.0.2.10").unwrap(), stream)
+            .await
+            .unwrap();
+        let (mut sender, connection) = conn::handshake(tls).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let inner = sender
+            .send_request(
+                Request::builder()
+                    .uri("https://other.example/denied")
+                    .header(http::header::HOST, target)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(inner.status(), StatusCode::BAD_REQUEST);
+        to_bytes(inner.into_body()).await.unwrap();
+        drop(sender);
+        driver.await.unwrap().unwrap();
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn explicit_https_listener_supports_http1_connect_mitm() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let target = "192.0.2.10:443";
+        let (identity, identity_certificate) = test_tls_identity();
+        let policy = format!(
+            "{}\n[listeners.explicit_https.tls]\ncertificate_chain = \"{}\"\nprivate_key = \"{}\"\n",
+            connect_mitm_policy(target)
+                .replace("listeners.explicit_http", "listeners.explicit_https"),
+            identity.path().join("server.pem").display(),
+            identity.path().join("server-key.pem").display(),
+        );
+        let (directory, product) =
+            product(base_config(proxy, "explicit_https", &policy), listeners).await;
+
+        let outer_connector = test_tls_connector(identity_certificate, vec![b"http/1.1".to_vec()]);
+        let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let mut outer_tls = outer_connector
+            .connect(ServerName::try_from("localhost").unwrap(), stream)
+            .await
+            .unwrap();
+        outer_tls
+            .write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let head = read_http_head(&mut outer_tls).await;
+        assert!(head.starts_with(b"HTTP/1.1 200 "));
+
+        let certificate = read_first_pem_certificate(&directory.path().join("mitm/ca-cert.pem"));
+        let inner_connector = test_tls_connector(certificate, vec![b"http/1.1".to_vec()]);
+        let inner_tls = inner_connector
+            .connect(ServerName::try_from("192.0.2.10").unwrap(), outer_tls)
+            .await
+            .unwrap();
+        let (mut sender, connection) = conn::handshake(inner_tls).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .uri("https://other.example/denied")
+                    .header(http::header::HOST, target)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        to_bytes(response.into_body()).await.unwrap();
+        drop(sender);
+        let _ = driver.await.unwrap();
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn connect_mitm_closes_stalled_client_hello_at_listener_deadline() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let target = "192.0.2.10:443";
+        let config = base_config(proxy, "explicit_http", &connect_mitm_policy(target)).replacen(
+            "http_versions = [\"http1\"]",
+            "http_versions = [\"http1\"]\nrequest_header_timeout = \"50ms\"",
+            1,
+        );
+        let (_directory, product) = product(config, listeners).await;
+        let mut stream = open_connect(proxy, target).await;
+        let mut byte = [0_u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
+            .await
+            .expect("stalled CONNECT ClientHello must be closed")
+            .unwrap();
+        assert_eq!(read, 0);
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn connect_mitm_shutdown_joins_pending_tunnel_and_releases_listener() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let target = "192.0.2.10:443";
+        let (_directory, product) = product(
+            base_config(proxy, "explicit_http", &connect_mitm_policy(target)),
+            listeners,
+        )
+        .await;
+        let mut stream = open_connect(proxy, target).await;
+        tokio::time::timeout(Duration::from_secs(2), product.shutdown())
+            .await
+            .expect("shutdown must join a pending CONNECT tunnel");
+        let mut byte = [0_u8; 1];
+        assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+        assert!(StdTcpListener::bind(proxy).is_ok());
+    }
+
+    #[tokio::test]
+    async fn connect_tunnel_retains_connection_admission_until_terminal_join() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let target = "192.0.2.10:443";
+        let config = base_config(proxy, "explicit_http", &connect_mitm_policy(target)).replacen(
+            "http_versions = [\"http1\"]",
+            "http_versions = [\"http1\"]\nmax_connections = 1",
+            1,
+        );
+        let (_directory, product) = product(config, listeners).await;
+        let first = open_connect(proxy, target).await;
+
+        let mut second = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        second
+            .write_all(format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let mut byte = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), second.read(&mut byte))
+                .await
+                .is_err(),
+            "a second connection bypassed the CONNECT tunnel's admission permit"
+        );
+
+        drop(first);
+        let head = tokio::time::timeout(Duration::from_secs(2), read_http_head(&mut second))
+            .await
+            .expect("the waiting connection must be admitted after tunnel join");
+        assert!(head.starts_with(b"HTTP/1.1 200 "));
+        drop(second);
+        product.shutdown().await;
     }
 
     #[tokio::test]
@@ -3412,6 +5228,424 @@ redaction_profile = "wire"
             "terminal HTTP/1 response omitted Connection: close"
         );
 
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn upgrade_requires_explicit_rule_opt_in_before_origin_connect() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let policy = r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "allow"
+"#;
+        let (_directory, product) =
+            product(base_config(proxy, "explicit_http", policy), listeners).await;
+
+        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET http://{origin}/socket HTTP/1.1\r\nHost: {origin}\r\nConnection: Upgrade\r\nUpgrade: test-echo\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response = read_http_head(&mut client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 403"),
+            "unexpected upgrade denial: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), origin_listener.accept())
+                .await
+                .is_err(),
+            "an upgrade without rule opt-in reached the origin"
+        );
+
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn opted_in_opaque_upgrade_relays_both_directions_and_releases_runtime() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin_listener.accept().await.unwrap();
+            let request = read_http_head(&mut stream).await;
+            let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            assert!(request_text.contains("\r\nconnection: upgrade\r\n"));
+            assert!(request_text.contains("\r\nupgrade: test-echo\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: test-echo\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut inbound = [0_u8; 4];
+            stream.read_exact(&mut inbound).await.unwrap();
+            assert_eq!(&inbound, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+        });
+        let policy = format!(
+            r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "opaque-upgrade"
+decision = "allow"
+methods = ["GET"]
+urls = ["http://{origin}/socket"]
+allow_upgrades = true
+"#
+        );
+        let (_directory, product) =
+            product(base_config(proxy, "explicit_http", &policy), listeners).await;
+
+        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET http://{origin}/socket HTTP/1.1\r\nHost: {origin}\r\nConnection: Upgrade\r\nUpgrade: test-echo\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response = read_http_head(&mut client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 101"),
+            "unexpected upgrade response: {}",
+            String::from_utf8_lossy(&response)
+        );
+        client.write_all(b"ping").await.unwrap();
+        let mut reply = [0_u8; 4];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"pong");
+        drop(client);
+        origin_task.await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let counts = product.upgrade_runtime().counts();
+                if counts.reserved_slots == 0
+                    && counts.reserved_bytes == 0
+                    && counts.uncommitted == 0
+                    && counts.committed == 0
+                    && counts.tracked_tasks == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the completed upgrade retained runtime resources");
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn opted_in_websocket_applies_wire_redaction_and_captures_the_logical_message() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin_listener.accept().await.unwrap();
+            let request = read_http_head(&mut stream).await;
+            let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            assert!(request_text.contains("\r\nconnection: upgrade\r\n"));
+            assert!(request_text.contains("\r\nupgrade: websocket\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            let mut header = [0_u8; 2];
+            stream.read_exact(&mut header).await.unwrap();
+            assert_eq!(header[0], 0x81);
+            assert_ne!(header[1] & 0x80, 0, "client WebSocket frame was not masked");
+            let payload_len = usize::from(header[1] & 0x7f);
+            assert!(payload_len < 126);
+            let mut mask = [0_u8; 4];
+            stream.read_exact(&mut mask).await.unwrap();
+            let mut payload = vec![0_u8; payload_len];
+            stream.read_exact(&mut payload).await.unwrap();
+            for (index, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask[index % mask.len()];
+            }
+            payload
+        });
+        let policy = format!(
+            r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[redaction.profiles.wire]
+replacement = "[WIRE]"
+max_frame_bytes = 1024
+max_message_bytes = 1024
+rules = [{{ literals = ["wire-redaction-sentinel"], payloads = "both" }}]
+
+[redaction.profiles.capture]
+replacement = "[CAPTURE]"
+max_frame_bytes = 1024
+max_message_bytes = 1024
+rules = [{{ literals = ["capture-redaction-sentinel"], payloads = "both" }}]
+
+[observation.capture]
+events = ["request.allowed"]
+redaction_profile = "capture"
+directory = "captures"
+max_body_bytes = 1048576
+max_inflight_body_bytes = 134217728
+max_pending_records = 32
+max_files = 32
+max_total_bytes = 16777216
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "observed-websocket"
+decision = "allow"
+methods = ["GET"]
+urls = ["http://{origin}/socket"]
+allow_upgrades = true
+redaction_profile = "wire"
+"#
+        );
+        let (directory, product) =
+            product(base_config(proxy, "explicit_http", &policy), listeners).await;
+
+        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET http://{origin}/socket HTTP/1.1\r\nHost: {origin}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGVzdC13ZWJzb2NrZXQta2V5\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response = read_http_head(&mut client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 101"),
+            "unexpected WebSocket response: {}",
+            String::from_utf8_lossy(&response)
+        );
+
+        let logical_message = b"wire-redaction-sentinel capture-redaction-sentinel";
+        let mask = [0x11, 0x22, 0x33, 0x44];
+        let mut frame = vec![0x81, 0x80 | logical_message.len() as u8];
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            logical_message
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ mask[index % mask.len()]),
+        );
+        client.write_all(&frame).await.unwrap();
+
+        let origin_payload = origin_task.await.unwrap();
+        assert_eq!(
+            origin_payload, b"[WIRE] capture-redaction-sentinel",
+            "the origin did not receive the wire-profile redaction"
+        );
+        assert!(!origin_payload
+            .windows(b"wire-redaction-sentinel".len())
+            .any(|window| window == b"wire-redaction-sentinel"));
+        drop(client);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let counts = product.upgrade_runtime().counts();
+                if counts.reserved_slots == 0
+                    && counts.reserved_bytes == 0
+                    && counts.uncommitted == 0
+                    && counts.committed == 0
+                    && counts.tracked_tasks == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the captured WebSocket retained upgrade runtime resources");
+        product.shutdown().await;
+
+        let records = read_capture_records(directory.path());
+        let message = records
+            .iter()
+            .find(|record| record.request_id.contains("-ws-request-"))
+            .expect("the WebSocket message capture artifact is missing");
+        let captured = message.decode_body_bytes().unwrap();
+        assert_eq!(captured, b"wire-redaction-sentinel [CAPTURE]");
+        assert!(!captured
+            .windows(b"capture-redaction-sentinel".len())
+            .any(|window| window == b"capture-redaction-sentinel"));
+    }
+
+    #[tokio::test]
+    async fn upstream_non_switching_response_remains_an_ordinary_http_response() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin_listener.accept().await.unwrap();
+            let _request = read_http_head(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 426 Upgrade Required\r\nContent-Length: 7\r\nConnection: close\r\n\r\nupgrade",
+                )
+                .await
+                .unwrap();
+        });
+        let policy = format!(
+            r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "upgrade-rejected"
+decision = "allow"
+urls = ["http://{origin}/socket"]
+allow_upgrades = true
+"#
+        );
+        let (_directory, product) =
+            product(base_config(proxy, "explicit_http", &policy), listeners).await;
+
+        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET http://{origin}/socket HTTP/1.1\r\nHost: {origin}\r\nConnection: Upgrade\r\nUpgrade: test-echo\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response = read_http_head(&mut client).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 426"),
+            "unexpected ordinary response: {}",
+            String::from_utf8_lossy(&response)
+        );
+        let mut body = [0_u8; 7];
+        client.read_exact(&mut body).await.unwrap();
+        assert_eq!(&body, b"upgrade");
+
+        origin_task.await.unwrap();
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn upgrade_admission_saturation_rejects_before_second_origin_connect() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let (established_tx, established_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin_listener.accept().await.unwrap();
+            let _request = read_http_head(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: test-echo\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            established_tx.send(()).unwrap();
+            release_rx.await.ok();
+            let second =
+                tokio::time::timeout(Duration::from_millis(100), origin_listener.accept()).await;
+            assert!(
+                second.is_err(),
+                "the saturated upgrade opened a second origin connection"
+            );
+        });
+        let policy = format!(
+            r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "one-upgrade"
+decision = "allow"
+urls = ["http://{origin}/**"]
+allow_upgrades = true
+"#
+        );
+        let config = base_config(proxy, "explicit_http", &policy).replacen(
+            "shutdown_drain_timeout = \"1s\"",
+            "shutdown_drain_timeout = \"1s\"\nmax_active_upgrades = 1",
+            1,
+        );
+        let (_directory, product) = product(config, listeners).await;
+
+        let mut first = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        first
+            .write_all(
+                format!(
+                    "GET http://{origin}/first HTTP/1.1\r\nHost: {origin}\r\nConnection: Upgrade\r\nUpgrade: test-echo\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let first_response = read_http_head(&mut first).await;
+        assert!(first_response.starts_with(b"HTTP/1.1 101"));
+        established_rx.await.unwrap();
+
+        let mut second = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        second
+            .write_all(
+                format!(
+                    "GET http://{origin}/second HTTP/1.1\r\nHost: {origin}\r\nConnection: Upgrade\r\nUpgrade: test-echo\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let second_response = read_http_head(&mut second).await;
+        assert!(
+            second_response.starts_with(b"HTTP/1.1 503"),
+            "unexpected saturation response: {}",
+            String::from_utf8_lossy(&second_response)
+        );
+        release_tx.send(()).unwrap();
+        drop(first);
+        origin_task.await.unwrap();
         product.shutdown().await;
     }
 }

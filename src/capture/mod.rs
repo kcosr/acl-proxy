@@ -310,7 +310,7 @@ impl CaptureArtifactJob {
         }))
     }
 
-    fn begin_admitted(
+    pub(crate) fn begin_admitted(
         epoch: Arc<CaptureEpoch>,
         operation: CaptureOperation,
         metadata: CaptureRecord,

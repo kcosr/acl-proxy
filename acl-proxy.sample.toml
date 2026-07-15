@@ -1,416 +1,132 @@
-# Example acl-proxy configuration
+# Strict schema-v3 sample. Unknown or obsolete fields are rejected.
+# This active configuration is loopback-only and deny-by-default.
+
+schema_version = 3
+
+[service]
+request_timeout = "30s"
+shutdown_drain_timeout = "30s"
+max_retiring_generations = 2
+max_active_upgrades = 256
+max_active_webhook_deliveries = 256
+webhook_transport_buffer_bytes = 65536
+max_webhook_transport_bytes = 67108864
+upgrade_relay_buffer_bytes = 65536
+max_upgrade_buffer_bytes = 2147483648
+max_upgrade_lifetime = "8h"
+max_inflight_wire_body_bytes = 8589934592
+max_inflight_wire_body_bytes_per_quota_key = 1073741824
+min_wire_body_concurrency = 64
+max_content_decoding_expansion_ratio = 128
+
+# Readiness and authorization callbacks belong only on this control listener.
+[control]
+bind = "127.0.0.1:8898"
+base_path = "/_acl-proxy"
+request_header_timeout = "10s"
+request_body_timeout = "10s"
+max_connections = 128
+max_request_body_bytes = 65536
+
+[listeners.explicit_http]
+bind = "127.0.0.1:8881"
+http_versions = ["http1"]
+request_header_timeout = "10s"
+max_connections = 1024
+max_concurrent_streams = 128
+
+[listeners.explicit_http.connect]
+http1 = "deny"
+
+[egress]
+route = "direct"
+
+[egress.origin_tls]
+trust = "system"
+http_versions = ["http1", "http2"]
+
+[policy]
+default = "deny"
+
+# Add narrowly scoped rules after reviewing canonical URL, method, client, and
+# header intent. An empty urls list means every canonical HTTP/HTTPS URL.
 #
-# This sample demonstrates a reasonably complete configuration for
-# running acl-proxy in front of internal services. It is safe to use
-# as a starting point, but you should review and customize values
-# (hosts, ports, directories, subnets, and policy rules) for your
-# environment before deploying.
+# [[policy.rules]]
+# id = "example-read-only"
+# description = "Example API reads"
+# decision = "allow"
+# urls = ["https://api.example.test/v1/**"]
+# methods = ["GET", "HEAD"]
+# client_cidrs = ["192.0.2.0/24"]
+# allow_upgrades = false
 #
-# To use this file:
-#   1. Copy it to config/acl-proxy.toml (the default path), e.g.:
-#        mkdir -p config
-#        cp acl-proxy.sample.toml config/acl-proxy.toml
-#   2. Adjust directories, ports, and policy rules as needed.
-#   3. Validate with:
-#        acl-proxy config validate --config config/acl-proxy.toml
-#
-# For a full schema reference, see README.md.
+# [policy.rules.headers]
+# present_all = ["x-workload-id"]
+# none = { x-blocked = ["true"] }
 
-schema_version = "2"
-
-###############################################################################
-# Proxy listeners
-###############################################################################
-
-[proxy]
-# Explicit HTTP proxy listener. Accepts absolute-form proxy requests and
-# CONNECT tunnels.
-listeners.explicit_http.bind = "0.0.0.0:8881"
-
-# Optional transparent HTTP listener for redirected port-80 traffic.
-# listeners.transparent_http.bind = "0.0.0.0:8882"
-
-# Transparent HTTPS listener. Missing listener sections are disabled.
-listeners.transparent_https.bind = "0.0.0.0:8889"
-
-# Timeout (ms) for upstream responses (0 disables).
-request_timeout_ms = 30000
-
-# Graceful shutdown drain timeout (ms). The default 0 waits indefinitely for
-# in-flight requests to finish; positive values abort remaining connection tasks
-# after the timeout.
-shutdown_drain_timeout_ms = 0
-
-# Transparent HTTPS listener slow-client protections. Set a value to 0 to
-# disable that limit.
-listeners.transparent_https.handshake_timeout_ms = 10000
-listeners.transparent_https.request_header_timeout_ms = 10000
-listeners.transparent_https.max_connections = 1024
-listeners.transparent_https.http2_max_concurrent_streams = 128
-
-# Base path for internal endpoints (readiness probe and external auth callbacks).
-internal_base_path = "/_acl-proxy"
-
-# Optional default egress forwarding destination. Leave this section absent to
-# preserve the default direct-to-origin behavior. When enabled, allowed proxy
-# request-forwarding paths dial this host/port instead of the original target,
-# while policy matching and Host header semantics stay tied to the original
-# request destination.
-#
-# [proxy.egress.default]
-# type = "explicit_proxy"
-# transport = "http"
-# host = "172.17.0.1"
-# port = 8881
-
-# Optional global outbound request header actions. These apply to every
-# forwarded request (explicit HTTP proxy, CONNECT inner requests, and
-# transparent HTTPS) after matched-rule/plugin request header actions.
-# They do not affect rule matching.
-#
-# [[proxy.egress.request_header_actions]]
-# action = "remove"
-# name = "x-aw-identity-token"
-# when = "if_present" # always | if_present | if_absent
-#
-# [[proxy.egress.request_header_actions]]
-# action = "set"
-# name = "x-egress-tag"
-# value = "edge-a"
-
-###############################################################################
-# Logging
-###############################################################################
-
-[logging]
-# When set, logs are written to {directory}/acl-proxy.log and rotated
-# by size.
-directory = "logs"
-
-# Global log level for acl-proxy (trace|debug|info|warn|error).
+[observation.logging]
 level = "info"
-
-# Maximum size in bytes before rotating the log file.
 max_bytes = 104857600
-
-# Number of rotated files to keep (excludes the active log file).
 max_files = 5
-
-# When true, logs are also written to stdout.
 console = true
 
-[logging.policy_decisions]
-# Control structured logging of allow/deny decisions.
-log_allows = false
-log_denies = true
-level_allows = "info"
-level_denies = "warn"
+[observation.logging.policy_decisions]
+allows = false
+denies = true
+allow_level = "info"
+deny_level = "warn"
 
-###############################################################################
-# Capture
-###############################################################################
+[safety.loop_detection]
+inject = true
+header = "x-acl-proxy-request-id"
 
-[capture]
-# Enable capture for allowed and denied traffic. Capture is optional;
-# you may want to start with denied-only in production.
-allowed_request = false
-allowed_response = false
-denied_request = true
-denied_response = true
-
-# Directory where JSON capture files are written. This must be
-# non-empty; the default is "logs-capture".
-directory = "logs-capture"
-
-# Template used to generate capture filenames. Supported placeholders:
-# {requestId}, {kind}, {suffix}. The default is "{requestId}-{suffix}.json".
-filename = "{requestId}-{kind}.json"
-
-# Maximum captured body bytes per request/response record. The full
-# logical length is still stored in body.length. Set to 0 to omit body
-# payload bytes while preserving metadata.
-max_body_bytes = 1048576
-
-# Capture retention limits. After each capture write, older regular files in
-# the capture directory are pruned until both limits are satisfied.
-max_files = 10000
-max_total_bytes = 1073741824
-
-###############################################################################
-# Native redaction (optional)
-###############################################################################
-
-# Named native redaction profiles can be attached to allow/delegate policy
-# rules with `redaction_profile = "secrets"`. Profiles redact outbound HTTP
-# request bodies and client-to-upstream WebSocket messages. Upstream-to-client
-# WebSocket messages and HTTP responses are not redacted.
+# CONNECT MITM or transparent HTTPS requires a MITM authority. Prefer generated
+# mode for local evaluation; distribute only ca-cert.pem to clients.
 #
-# [redaction.profiles.secrets]
+# [mitm]
+# mode = "generated"
+# directory = "runtime/certs"
+# max_cached_certificates = 1024
+# persist_leaf_certificates = false
+
+# Parent-proxy egress is an end-state alternative to direct egress.
+# Parent endpoints must not resolve to loopback or a local interface.
+#
+# [egress]
+# route = "parent_proxy"
+#
+# [egress.parent_proxy]
+# kind = "acl_proxy"
+# url = "http://parent-proxy.example.test:8881"
+
+# Typed environment credentials replace attacker-supplied destination values.
+# Generic ${NAME} interpolation is not supported.
+#
+# [credentials]
+# allowed_custom_headers = ["x-workload-token"]
+#
+# [credentials.sources.workload]
+# source = "environment"
+# variable = "WORKLOAD_TOKEN"
+#
+# [[egress.credential_actions]]
+# kind = "custom_header"
+# header = "x-workload-token"
+# credential = "workload"
+
+# Environment-backed redaction literals are explicit required sources resolved
+# at generation activation/reload. Values never enter config or policy dumps.
+#
+# [redaction.profiles.sensitive]
 # replacement = "[REDACTED]"
-# # replacement and literal entries may use exact env placeholders like
-# # "${REDACTION_REPLACEMENT}" or "${GITLAB_TOKEN}". Mixed strings such as
-# # "Bearer ${TOKEN}" are rejected. Literal strings containing complete
-# # "${...}" sequences should be supplied through env placeholders; regex
-# # expressions are not interpolated.
 # max_body_bytes = 10485760
 # max_decoded_body_bytes = 52428800
 # max_frame_bytes = 262144
 # max_message_bytes = 1048576
 # allow_permessage_deflate = false
-# unsupported_extensions = "deny" # deny | strip
 #
-# [[redaction.profiles.secrets.rules]]
-# literals = ["password", "api-token"]
-# expressions = ["(?i)bearer\\s+[a-z0-9._-]+"]
-# match = "text" # text | binary | both; expressions are text-only
-
-###############################################################################
-# Loop protection
-###############################################################################
-
-[loop_protection]
-# When enabled, acl-proxy rejects requests that already contain the
-# loop header and optionally injects the header into outbound requests.
-enabled = true
-add_header = true
-
-# Header name used for loop detection and injection. Must be a valid
-# HTTP header name.
-header_name = "x-acl-proxy-request-id"
-
-###############################################################################
-# Certificates and TLS
-###############################################################################
-
-[certificates]
-# Base directory for CA material and per-host certificates. A generated
-# CA key/cert will be placed here when ca_key_path/ca_cert_path are not
-# set.
-certs_dir = "certs"
-
-# Optional: use an existing CA by providing both key and cert paths.
-# When both are omitted or empty, acl-proxy generates its own CA under
-# {certs_dir}.
-# ca_key_path = "/path/to/ca-key.pem"
-# ca_cert_path = "/path/to/ca-cert.pem"
-
-# Maximum number of distinct per-host certificates cached in memory.
-# Implemented as a least-recently-used (LRU) cache. When the cache is
-# full and a new host is added, the least recently used entry is
-# evicted.
-max_cached_certs = 1024
-
-# Optional: persist generated per-host certificates under certs/dynamic/
-# for debugging. Disabled by default to avoid unbounded disk growth from
-# attacker-supplied hostnames.
-persist_dynamic_certs = false
-
-[tls]
-# Verify upstream HTTPS certificates by default. Set to false only in
-# controlled testing environments.
-verify_upstream = true
-
-# When true, enable HTTP/2 for upstream HTTPS connections where the
-# origin server supports it via ALPN. When false (the default), the
-# proxy uses HTTP/1.1-only upstream for maximum compatibility.
-enable_http2_upstream = false
-
-###############################################################################
-# URL policy
-###############################################################################
-
-[policy]
-# Fallback decision when no rule matches ("allow" or "deny").
-default = "deny"
-
-# Macros define reusable placeholders that can be referenced from
-# patterns and descriptions.
-[policy.macros]
-repo = [
-  # Example repositories on an internal Git server.
-  "team1/service-a",
-  "team2/service-b",
-]
-
-status_host = [
-  # Example status/health dashboard hosts.
-  "status.internal",
-  "status2.internal",
-]
-
-# Approval macros describe dynamic values that external approvers
-# can supply for header actions on approval-required rules.
-[policy.approval_macros]
-github_token = { label = "GitHub token", required = true, secret = true }
-reason       = { label = "Approval reason", required = false, secret = false }
-
-###############################################################################
-# External auth profiles (approval-required rules)
-###############################################################################
-
-# Global external auth settings. The callback_url is included in external auth
-# webhooks as `callbackUrl` so that external services know exactly where to
-# send approval decisions for this proxy instance. The inbound callback path
-# uses {proxy.internal_base_path}/external-auth/callback (defaults to
-# /_acl-proxy/external-auth/callback).
-[external_auth]
-callback_url = "http://localhost:8881/_acl-proxy/external-auth/callback"
-
-# External auth profiles let you mark certain allow rules as
-# approval-required. When such a rule matches, the proxy sends a
-# webhook to the configured service and waits for an allow/deny
-# callback before forwarding the request upstream.
-
-[policy.external_auth_profiles]
-
-[policy.external_auth_profiles.github_mfa]
-webhook_url = "https://auth.internal/github/mfa-start"
-timeout_ms = 5000
-webhook_timeout_ms = 1000
-on_webhook_failure = "error" # "deny" | "error" | "timeout"
-
-[policy.external_auth_profiles.url_allow]
-type = "plugin"
-command = "/usr/local/bin/url-allow"
-args = ["--config", "/etc/url-allow.json"]
-timeout_ms = 1000
-restart_delay_ms = 10000
-
-# Optional body-aware plugin delegation for AI/chat egress or other bounded
-# HTTP request bodies. When enabled, acl-proxy buffers the request body,
-# decompresses supported content encodings (gzip, deflate, br, zstd) before
-# sending decoded base64 content to the plugin, and recompresses an optional
-# plugin-provided replacement body with the original encoding before forwarding.
-# Deflate ingress accepts zlib-wrapped or raw DEFLATE; rewritten deflate egress
-# is zlib-wrapped. Zstd frame windows are capped by the decoded body limit.
-# Unsupported encodings and body-size limit failures fail the delegated request.
-#
-# include_request_body = true
-# max_request_body_bytes = 10485760 # 10 MiB encoded
-# max_decompressed_request_body_bytes = 52428800 # 50 MiB decoded
-
-###############################################################################
-# Rulesets
-###############################################################################
-
-# Rulesets are named collections of template rules that can be included
-# from top-level rules using [[policy.rules]] with `include = "..."`
-# and optional `with` overrides.
-
-[[policy.rulesets.git_repo]]
-action = "allow"
-pattern = "https://git.internal/{repo}.git/**"
-description = "Git HTTP(S) for {repo}"
-
-[[policy.rulesets.git_repo]]
-action = "allow"
-pattern = "https://git.internal/api/v4/projects/{repo}?**"
-description = "Git API for {repo}"
-
-###############################################################################
-# Top-level rules
-###############################################################################
-
-[[policy.rules]]
-# Example: fail closed when an expected identity header is missing.
-action = "deny"
-pattern = "**"
-headers_absent = ["x-workload-id"]
-description = "Deny requests missing workload identity"
-
-[[policy.rules]]
-# Example: require specific trusted header values before allowing API access.
-action = "allow"
-pattern = "https://api.internal.example.com/v1/**"
-headers_match = { "x-workload-id" = ["worker-123", "worker-456"], "x-tenant-id" = "tenant-a" }
-description = "Allow trusted workload identities"
-methods = ["GET", "POST"]
-
-[[policy.rules]]
-# Example: group several URL patterns that share the same rule attributes.
-action = "allow"
-patterns = [
-  "https://developers.openai.com/**",
-  "https://github.com/openai/**",
-  "https://raw.githubusercontent.com/openai/**",
-  "https://api.github.com/repos/openai/**",
-]
-description = "OpenAI docs and repositories"
-methods = ["GET"]
-
-[[policy.rules]]
-# Allow Git traffic (HTTP(S) and API) for repositories listed in
-# [policy.macros].repo from the 10.0.0.0/8 network, including URL
-# encoded variants of the {repo} placeholder.
-include = "git_repo"
-add_url_enc_variants = true
-subnets = ["10.0.0.0/8"]
-
-[[policy.rules]]
-# Allow internal status pages defined in [policy.macros].status_host
-# for all methods from a specific internal CIDR.
-action = "allow"
-pattern = "https://{status_host}/**"
-description = "Allow internal status dashboards"
-methods = ["GET", "HEAD"]
-subnets = ["10.1.0.0/16"]
-
-[[policy.rules]]
-# Example: allow direct HTTP access to example.com for local testing.
-action = "allow"
-pattern = "http://example.com/**"
-description = "Allow HTTP to example.com for development"
-methods = ["GET", "POST"]
-subnets = ["127.0.0.0/8"]
-
-[[policy.rules]]
-# Example: require external approval for GitHub API access.
-action = "delegate"
-pattern = "https://api.github.com/**"
-description = "GitHub API with external MFA"
-external_auth_profile = "github_mfa"
-
-[[policy.rules.header_actions]]
-direction = "request"
-action = "set"
-name = "authorization"
-value = "token {{github_token}}"
-
-[[policy.rules.header_actions]]
-direction = "request"
-action = "add"
-name = "x-approval-reason"
-value = "{{reason}}"
-
-# To source a static deployment token from the service environment at config
-# load/reload time, use an exact whole-string placeholder in a set/add
-# header action value:
-#
-# [[policy.rules.header_actions]]
-# direction = "request"
-# action = "set"
-# name = "authorization"
-# value = "${GITHUB_API_TOKEN}"
-#
-# Mixed strings like "Bearer ${GITHUB_API_TOKEN}" are rejected, and existing
-# literal ${...} strings in affected set/add values must be migrated.
-
-[[policy.rules]]
-# Example: use a sync plugin to allow a set of repository URLs.
-action = "delegate"
-pattern = "https://repo.internal/**"
-description = "Repo access via auth plugin"
-external_auth_profile = "url_allow"
-# Set allow_upgrades = false on protected HTTP/1.1 endpoints when WebSocket or
-# other upgrade tunnels should be denied before plugin/upstream forwarding.
-# allow_upgrades = false
-# To redact known request/WebSocket message secrets, define a
-# [redaction.profiles.<name>] section and reference it here:
-# redaction_profile = "secrets"
-
-[[policy.rules]]
-# Explicitly deny access to administrative paths on the Git server,
-# even if a previous rule might otherwise allow the host.
-action = "deny"
-pattern = "https://git.internal/admin/**"
-description = "Block Git admin area"
+# [[redaction.profiles.sensitive.rules]]
+# literals = ["safe-fixture-literal"]
+# literal_environment_variables = ["REDACT_SECRET_A", "REDACT_SECRET_B"]
+# expressions = ["token-[A-Za-z0-9_.-]{20,}"]
+# payloads = "text"

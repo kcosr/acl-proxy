@@ -556,6 +556,10 @@ impl GenerationRetention {
     pub(crate) fn id(&self) -> GenerationId {
         self.generation.id()
     }
+
+    pub(crate) fn egress(&self) -> &dyn EgressSnapshot {
+        self.generation.egress()
+    }
 }
 
 impl fmt::Debug for GenerationRetention {

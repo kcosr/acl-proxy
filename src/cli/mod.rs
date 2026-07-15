@@ -1,29 +1,24 @@
 use std::io::IsTerminal;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 
-use crate::app::{AppState, SharedAppState};
+use crate::activation::runner::ProductRuntime;
 use crate::config::{
-    load_and_compile_config, write_default_config_template, Config, ConfigError, ConfigPathKind,
-    PolicyDump,
+    load_and_compile_config, write_default_config_template, LoadedCompiledConfig, PolicyDump,
+    StaticProductConfig,
 };
-use crate::proxy::explicit_https::ExplicitHttpsError;
-use crate::proxy::http::HttpProxyError;
-use crate::proxy::https_transparent::HttpsTransparentError;
+use crate::logging::LoggingSettings;
+use crate::proxy::ingress::ProductProxySupervisorStarter;
+use crate::runtime::{ReloadTriggerResult, Runtime};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
-    #[error(transparent)]
-    Config(#[from] ConfigError),
-
     #[error("{0}")]
-    StaticConfig(String),
-
-    #[error(transparent)]
-    AppState(#[from] crate::app::AppStateError),
+    Config(String),
 
     #[error("failed to initialize async runtime: {0}")]
     Runtime(String),
@@ -31,14 +26,18 @@ pub enum CliError {
     #[error(transparent)]
     Logging(#[from] crate::logging::LoggingError),
 
-    #[error(transparent)]
-    Proxy(#[from] HttpProxyError),
+    #[error("{0}")]
+    Product(String),
 
-    #[error(transparent)]
-    ExplicitHttps(#[from] ExplicitHttpsError),
+    #[error("failed to install {signal} signal handling: {source}")]
+    Signal {
+        signal: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
 
-    #[error(transparent)]
-    HttpsTransparent(#[from] HttpsTransparentError),
+    #[error("{0}")]
+    Process(String),
 }
 
 #[derive(Debug, Parser)]
@@ -48,7 +47,7 @@ pub enum CliError {
     about = "ACL-aware HTTP/HTTPS proxy (Rust)"
 )]
 pub struct Cli {
-    /// Path to configuration file (TOML or JSON).
+    /// Path to the strict TOML configuration file.
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
@@ -58,7 +57,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Run the proxy (not yet implemented).
+    /// Run the proxy.
     Run,
 
     /// Configuration related subcommands.
@@ -102,73 +101,30 @@ pub enum OutputFormat {
     Table,
 }
 
-fn load_config_for_cli(config_path: Option<&std::path::Path>) -> Result<Config, CliError> {
-    let (path, kind) = Config::resolve_path(config_path);
-
-    match Config::load_from_sources(config_path) {
-        Ok(cfg) => Ok(cfg),
-        Err(ConfigError::Io { ref source, .. })
-            if source.kind() == std::io::ErrorKind::NotFound
-                && matches!(kind, ConfigPathKind::Default) =>
-        {
-            eprintln!(
-                "No configuration file found.\n\
-                 Searched default path: {path}\n\
-                 Pass --config or set ACL_PROXY_CONFIG, or run:\n  acl-proxy config init {path}",
-                path = path.display(),
-            );
-            Err(CliError::Config(ConfigError::Invalid(
-                "configuration file not found".to_string(),
-            )))
-        }
-        Err(e) => Err(CliError::Config(e)),
-    }
-}
-
 pub fn run() -> Result<ExitCode, CliError> {
     let cli = Cli::parse();
-
-    let config_path_owned = cli.config.clone();
-    let config_path = config_path_owned.as_deref();
+    let config_path = cli.config.as_deref();
 
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => {
-            let config = load_config_for_cli(config_path)?;
-            let shared_state = AppState::shared_from_config(config)?;
-
-            let _logging_guards = match shared_state.load().logging.init_tracing() {
-                Ok(guards) => {
-                    let state = shared_state.load();
-                    log_config_load_warnings(&state.config);
-                    log_startup(state.as_ref());
-                    Some(guards)
-                }
-                Err(err) => {
-                    return Err(CliError::Logging(err));
-                }
-            };
+            let loaded = load_and_compile_config(config_path)
+                .map_err(|error| CliError::Config(error.to_string()))?;
+            let logging =
+                LoggingSettings::from_static_config(&loaded.compiled.static_config.logging);
+            let _logging_guards = logging.init_tracing()?;
+            log_startup(&loaded.compiled.static_config);
 
             let runtime = tokio::runtime::Runtime::new()
-                .map_err(|e| CliError::Runtime(format!("failed to start tokio runtime: {e}")))?;
-
-            let result: Result<(), CliError> = runtime.block_on(async move {
-                run_proxy_with_signals(shared_state, config_path_owned.as_deref()).await
-            });
-
-            match result {
-                Ok(()) => Ok(ExitCode::from(0)),
-                Err(err) => {
-                    eprintln!("proxy server exited with error: {err}");
-                    Ok(ExitCode::from(1))
-                }
-            }
+                .map_err(|error| CliError::Runtime(error.to_string()))?;
+            runtime.block_on(run_product(loaded))?;
+            Ok(ExitCode::SUCCESS)
         }
         Command::Config { command } => match command {
             ConfigCommand::Validate => {
                 load_and_compile_config(config_path)
-                    .map_err(|error| CliError::StaticConfig(error.to_string()))?;
+                    .map_err(|error| CliError::Config(error.to_string()))?;
                 println!("Configuration is valid");
-                Ok(ExitCode::from(0))
+                Ok(ExitCode::SUCCESS)
             }
             ConfigCommand::Init { path } => {
                 if path.exists() {
@@ -180,15 +136,15 @@ pub fn run() -> Result<ExitCode, CliError> {
                 }
 
                 write_default_config_template(&path)
-                    .map_err(|error| CliError::StaticConfig(error.to_string()))?;
+                    .map_err(|error| CliError::Config(error.to_string()))?;
                 println!("Wrote default config to {}", path.display());
-                Ok(ExitCode::from(0))
+                Ok(ExitCode::SUCCESS)
             }
         },
         Command::Policy { command } => match command {
             PolicyCommand::Dump { format } => {
                 let compiled = load_and_compile_config(config_path)
-                    .map_err(|error| CliError::StaticConfig(error.to_string()))?;
+                    .map_err(|error| CliError::Config(error.to_string()))?;
                 let policy = PolicyDump::from_compiled(&compiled.compiled);
 
                 let use_table = match format {
@@ -199,21 +155,233 @@ pub fn run() -> Result<ExitCode, CliError> {
 
                 if use_table {
                     print_policy_table(&policy);
+                } else if let Err(error) = serde_json::to_writer_pretty(std::io::stdout(), &policy)
+                {
+                    return Err(CliError::Process(format!(
+                        "failed to serialize policy to JSON: {error}"
+                    )));
                 } else {
-                    match serde_json::to_writer_pretty(std::io::stdout(), &policy) {
-                        Ok(()) => {
-                            println!();
-                        }
-                        Err(err) => {
-                            eprintln!("failed to serialize policy to JSON: {err}");
-                            return Ok(ExitCode::from(1));
+                    println!();
+                }
+
+                Ok(ExitCode::SUCCESS)
+            }
+        },
+    }
+}
+
+async fn run_product(loaded: LoadedCompiledConfig) -> Result<(), CliError> {
+    let mut signals = ProcessSignals::install()?;
+    let product = ProductRuntime::prepare(loaded)
+        .await
+        .map_err(|error| CliError::Product(error.to_string()))?;
+    let mut starter = ProductProxySupervisorStarter::new(
+        product.runtime().clone(),
+        product.observation_runtime().clone(),
+        product.upgrade_runtime(),
+    );
+
+    product
+        .start_proxy_supervisors(&mut starter)
+        .await
+        .map_err(|error| CliError::Product(error.to_string()))?;
+    let generation = product
+        .activate_initial()
+        .await
+        .map_err(|error| CliError::Product(error.to_string()))?;
+    tracing::info!(
+        target: "acl_proxy::startup",
+        generation = generation.get(),
+        "acl-proxy is ready"
+    );
+
+    supervise_process(&product, &mut signals).await
+}
+
+async fn supervise_process(
+    product: &Arc<ProductRuntime>,
+    signals: &mut ProcessSignals,
+) -> Result<(), CliError> {
+    let runtime = product.runtime().clone();
+    let control_enabled = runtime.static_config().control.is_some();
+    let mut reload_task: Option<ReloadTask> = None;
+    let mut reload_again = false;
+
+    let terminal = loop {
+        tokio::select! {
+            signal = signals.next() => {
+                match signal? {
+                    ProcessSignal::Interrupt => {
+                        tracing::info!("received interrupt; initiating graceful shutdown");
+                        break Ok(());
+                    }
+                    ProcessSignal::Terminate => {
+                        tracing::info!("received SIGTERM; initiating graceful shutdown");
+                        break Ok(());
+                    }
+                    ProcessSignal::Reload => {
+                        if reload_task.is_some() {
+                            reload_again = true;
+                        } else {
+                            reload_task = Some(spawn_reload(runtime.clone()));
                         }
                     }
                 }
-
-                Ok(ExitCode::from(0))
             }
-        },
+            failure = product.wait_for_proxy_failure() => {
+                let message = failure.map_or_else(
+                    || "proxy failure observer closed without a terminal result".to_string(),
+                    |error| format!("proxy supervisor failed: {error}"),
+                );
+                break Err(CliError::Process(message));
+            }
+            failure = product.wait_for_control_failure(), if control_enabled => {
+                let message = failure.map_or_else(
+                    || "control failure observer closed without a terminal result".to_string(),
+                    |error| format!("control supervisor failed: {error}"),
+                );
+                break Err(CliError::Process(message));
+            }
+            completed = wait_for_reload(&mut reload_task), if reload_task.is_some() => {
+                reload_task = None;
+                match completed {
+                    Ok(result) => log_reload_result(result),
+                    Err(error) => break Err(CliError::Process(format!(
+                        "configuration reload coordinator failed: {error}"
+                    ))),
+                }
+                if reload_again {
+                    reload_again = false;
+                    reload_task = Some(spawn_reload(runtime.clone()));
+                }
+            }
+        }
+    };
+
+    product.shutdown().await;
+    let shutdown_diagnostic = product.shutdown_diagnostic();
+    if let Some(reload) = reload_task {
+        match reload.await {
+            Ok(Ok(_)) | Ok(Err(crate::runtime::RuntimeError::ShuttingDown)) => {}
+            Ok(Err(error)) => tracing::debug!(%error, "reload ended during process shutdown"),
+            Err(error) => {
+                return Err(CliError::Process(format!(
+                    "configuration reload coordinator did not join: {error}"
+                )));
+            }
+        }
+    }
+    match (terminal, shutdown_diagnostic) {
+        (Ok(()), None) => Ok(()),
+        (Err(error), None) => Err(error),
+        (Ok(()), Some(shutdown)) => Err(CliError::Process(shutdown)),
+        (Err(error), Some(shutdown)) => Err(CliError::Process(format!(
+            "{error}; additional shutdown failure: {shutdown}"
+        ))),
+    }
+}
+
+type ReloadTask =
+    tokio::task::JoinHandle<Result<ReloadTriggerResult, crate::runtime::RuntimeError>>;
+
+fn spawn_reload(runtime: Arc<Runtime>) -> ReloadTask {
+    tokio::spawn(async move { runtime.trigger_reload().await })
+}
+
+async fn wait_for_reload(
+    task: &mut Option<ReloadTask>,
+) -> Result<Result<ReloadTriggerResult, crate::runtime::RuntimeError>, tokio::task::JoinError> {
+    task.as_mut()
+        .expect("reload completion is selected only while a task is owned")
+        .await
+}
+
+fn log_reload_result(result: Result<ReloadTriggerResult, crate::runtime::RuntimeError>) {
+    match result {
+        Ok(ReloadTriggerResult::Coalesced) => {
+            tracing::info!("configuration reload coalesced with the active attempt");
+        }
+        Ok(ReloadTriggerResult::Completed {
+            attempts,
+            generation,
+        }) => {
+            tracing::info!(
+                attempts,
+                generation = generation.get(),
+                "configuration reload completed successfully"
+            );
+        }
+        Err(error) => tracing::error!(%error, "configuration reload failed"),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ProcessSignal {
+    Interrupt,
+    Terminate,
+    Reload,
+}
+
+#[cfg(unix)]
+struct ProcessSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+    reload: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ProcessSignals {
+    fn install() -> Result<Self, CliError> {
+        use tokio::signal::unix::{signal, SignalKind};
+
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt()).map_err(|source| CliError::Signal {
+                signal: "SIGINT",
+                source,
+            })?,
+            terminate: signal(SignalKind::terminate()).map_err(|source| CliError::Signal {
+                signal: "SIGTERM",
+                source,
+            })?,
+            reload: signal(SignalKind::hangup()).map_err(|source| CliError::Signal {
+                signal: "SIGHUP",
+                source,
+            })?,
+        })
+    }
+
+    async fn next(&mut self) -> Result<ProcessSignal, CliError> {
+        tokio::select! {
+            signal = self.interrupt.recv() => signal
+                .map(|()| ProcessSignal::Interrupt)
+                .ok_or_else(|| CliError::Process("SIGINT signal stream closed".to_string())),
+            signal = self.terminate.recv() => signal
+                .map(|()| ProcessSignal::Terminate)
+                .ok_or_else(|| CliError::Process("SIGTERM signal stream closed".to_string())),
+            signal = self.reload.recv() => signal
+                .map(|()| ProcessSignal::Reload)
+                .ok_or_else(|| CliError::Process("SIGHUP signal stream closed".to_string())),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct ProcessSignals;
+
+#[cfg(not(unix))]
+impl ProcessSignals {
+    fn install() -> Result<Self, CliError> {
+        Ok(Self)
+    }
+
+    async fn next(&mut self) -> Result<ProcessSignal, CliError> {
+        tokio::signal::ctrl_c()
+            .await
+            .map(|()| ProcessSignal::Interrupt)
+            .map_err(|source| CliError::Signal {
+                signal: "interrupt",
+                source,
+            })
     }
 }
 
@@ -248,336 +416,51 @@ fn table_value(value: &str) -> &str {
     }
 }
 
-async fn run_proxy_with_signals(
-    state: SharedAppState,
-    config_path: Option<&Path>,
-) -> Result<(), CliError> {
-    use tokio::sync::watch;
-    use tokio::task::JoinSet;
-
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-    // Spawn signal handlers: SIGHUP for reload (on Unix) and
-    // Ctrl+C/SIGTERM for graceful shutdown.
-    spawn_signal_handlers(state.clone(), config_path, shutdown_tx.clone());
-
-    let listeners = state.load().config.proxy.listeners.clone();
-    let mut tasks = JoinSet::new();
-
-    if listeners.explicit_http.is_some() {
-        let state = state.clone();
-        let shutdown = shutdown_rx.clone();
-        tasks.spawn(async move {
-            crate::proxy::http::run_explicit_http_proxy(state, wait_for_shutdown(shutdown))
-                .await
-                .map_err(CliError::Proxy)
-        });
-    }
-
-    if listeners.transparent_http.is_some() {
-        let state = state.clone();
-        let shutdown = shutdown_rx.clone();
-        tasks.spawn(async move {
-            crate::proxy::http::run_transparent_http_proxy(state, wait_for_shutdown(shutdown))
-                .await
-                .map_err(CliError::Proxy)
-        });
-    }
-
-    if listeners.explicit_https.is_some() {
-        let state = state.clone();
-        let shutdown = shutdown_rx.clone();
-        tasks.spawn(async move {
-            crate::proxy::explicit_https::run_explicit_https_proxy(
-                state,
-                wait_for_shutdown(shutdown),
-            )
-            .await
-            .map_err(CliError::ExplicitHttps)
-        });
-    }
-
-    if listeners.transparent_https.is_some() {
-        let state = state.clone();
-        let shutdown = shutdown_rx.clone();
-        tasks.spawn(async move {
-            crate::proxy::https_transparent::run_https_transparent_proxy(
-                state,
-                wait_for_shutdown(shutdown),
-            )
-            .await
-            .map_err(CliError::HttpsTransparent)
-        });
-    }
-
-    if tasks.is_empty() {
-        return Err(CliError::Config(ConfigError::Invalid(
-            "proxy.listeners must enable at least one listener".to_string(),
-        )));
-    }
-
-    let mut first_error = None;
-    while let Some(result) = tasks.join_next().await {
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                signal_shutdown(&shutdown_tx);
-                if first_error.is_none() {
-                    first_error = Some(err);
-                }
-            }
-            Err(err) => {
-                signal_shutdown(&shutdown_tx);
-                if first_error.is_none() {
-                    first_error = Some(CliError::Runtime(format!(
-                        "proxy listener task failed: {err}"
-                    )));
-                }
-            }
-        }
-    }
-
-    let (upgrade_sessions, drain_timeout) = {
-        let state = state.load();
-        (
-            state.upgrade_sessions.clone(),
-            state.config.proxy.shutdown_drain_timeout(),
-        )
-    };
-    upgrade_sessions.drain(drain_timeout).await;
-
-    match first_error {
-        Some(err) => Err(err),
-        None => Ok(()),
-    }
-}
-
-async fn wait_for_shutdown(mut shutdown: tokio::sync::watch::Receiver<bool>) {
-    if *shutdown.borrow() {
-        return;
-    }
-    while shutdown.changed().await.is_ok() {
-        if *shutdown.borrow() {
-            return;
-        }
-    }
-}
-
-fn signal_shutdown(shutdown: &tokio::sync::watch::Sender<bool>) {
-    let _ = shutdown.send(true);
-}
-
-fn spawn_signal_handlers(
-    state: SharedAppState,
-    config_path: Option<&Path>,
-    shutdown: tokio::sync::watch::Sender<bool>,
-) {
-    // Graceful shutdown on Ctrl+C (cross-platform).
-    let shutdown_clone = shutdown.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!("received interrupt (Ctrl+C); initiating graceful shutdown");
-            signal_shutdown(&shutdown_clone);
-        }
-    });
-
-    // Unix-specific signals: SIGHUP for reload, SIGTERM for shutdown.
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-
-        let state_for_reload = state.clone();
-        let config_path_for_reload = config_path.map(|p| p.to_path_buf());
-
-        tokio::spawn(async move {
-            let mut hup_stream = match signal(SignalKind::hangup()) {
-                Ok(s) => s,
-                Err(err) => {
-                    tracing::warn!("failed to install SIGHUP handler: {err}");
-                    return;
-                }
-            };
-
-            while hup_stream.recv().await.is_some() {
-                let state = state_for_reload.clone();
-                let config_path = config_path_for_reload.clone();
-                let reload_result = tokio::task::spawn_blocking(move || {
-                    reload_from_sources(&state, config_path.as_deref())
-                })
-                .await;
-
-                match reload_result {
-                    Ok(Ok(())) => {
-                        tracing::info!("configuration reload completed successfully");
-                    }
-                    Ok(Err(err)) => {
-                        tracing::error!("configuration reload failed: {err}");
-                    }
-                    Err(err) => {
-                        tracing::error!("configuration reload task failed: {err}");
-                    }
-                }
-            }
-        });
-
-        let shutdown_clone = shutdown.clone();
-        tokio::spawn(async move {
-            let mut term_stream = match signal(SignalKind::terminate()) {
-                Ok(s) => s,
-                Err(err) => {
-                    tracing::warn!("failed to install SIGTERM handler: {err}");
-                    return;
-                }
-            };
-
-            if term_stream.recv().await.is_some() {
-                tracing::info!("received SIGTERM; initiating graceful shutdown");
-                signal_shutdown(&shutdown_clone);
-            }
-        });
-    }
-}
-
-fn reload_from_sources(state: &SharedAppState, config_path: Option<&Path>) -> Result<(), String> {
-    let config = Config::load_from_sources(config_path).map_err(|e| e.to_string())?;
-    let load_warnings = config.load_warnings.clone();
-    let active_listeners = state.load().config.proxy.listeners.clone();
-    if active_listeners != config.proxy.listeners {
-        return Err(
-            "listener configuration changed; restart required for proxy.listeners changes"
-                .to_string(),
-        );
-    }
-    AppState::reload_shared_from_config(state, config).map_err(|e| e.to_string())?;
-    log_config_load_warning_messages(&load_warnings);
-    Ok(())
-}
-
-fn log_config_load_warnings(config: &Config) {
-    log_config_load_warning_messages(&config.load_warnings);
-}
-
-fn log_config_load_warning_messages(warnings: &[String]) {
-    for warning in warnings {
-        tracing::warn!(target: "acl_proxy::config", "{warning}");
-    }
-}
-
-fn log_startup(state: &AppState) {
-    let cfg = &state.config;
-
-    let explicit_http_bind = cfg
-        .proxy
-        .listeners
-        .explicit_http
-        .as_ref()
-        .map(|listener| listener.bind.as_str())
-        .unwrap_or("disabled");
-    let transparent_http_bind = cfg
-        .proxy
-        .listeners
-        .transparent_http
-        .as_ref()
-        .map(|listener| listener.bind.as_str())
-        .unwrap_or("disabled");
-    let explicit_https_bind = cfg
-        .proxy
-        .listeners
-        .explicit_https
-        .as_ref()
-        .map(|listener| listener.bind.as_str())
-        .unwrap_or("disabled");
-    let transparent_https_bind = cfg
-        .proxy
-        .listeners
-        .transparent_https
-        .as_ref()
-        .map(|listener| listener.bind.as_str())
-        .unwrap_or("disabled");
-    let explicit_http_http2_enabled = cfg
-        .proxy
-        .listeners
-        .explicit_http
-        .as_ref()
-        .map(|listener| listener.enable_http2)
-        .unwrap_or(false);
-    let transparent_http_http2_enabled = cfg
-        .proxy
-        .listeners
-        .transparent_http
-        .as_ref()
-        .map(|listener| listener.enable_http2)
-        .unwrap_or(false);
-    let explicit_https_http2_enabled = cfg
-        .proxy
-        .listeners
-        .explicit_https
-        .as_ref()
-        .map(|listener| listener.enable_http2)
-        .unwrap_or(false);
-    let transparent_https_http2_enabled = cfg.proxy.listeners.transparent_https.is_some();
-
-    let certs = &cfg.certificates;
-    let has_explicit_ca = certs
-        .ca_key_path
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .is_some()
-        && certs
-            .ca_cert_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .is_some();
-
-    let loop_cfg = &cfg.loop_protection;
-    let capture_cfg = &cfg.capture;
-
+fn log_startup(config: &StaticProductConfig) {
+    let listeners = &config.listeners;
     for (name, bind) in [
-        ("explicit_http", explicit_http_bind),
-        ("transparent_http", transparent_http_bind),
-        ("explicit_https", explicit_https_bind),
-        ("transparent_https", transparent_https_bind),
+        (
+            "explicit_http",
+            listeners.explicit_http.as_ref().map(|value| value.bind),
+        ),
+        (
+            "transparent_http",
+            listeners.transparent_http.as_ref().map(|value| value.bind),
+        ),
+        (
+            "explicit_https",
+            listeners.explicit_https.as_ref().map(|value| value.bind),
+        ),
+        (
+            "transparent_https",
+            listeners.transparent_https.as_ref().map(|value| value.bind),
+        ),
     ] {
-        warn_on_unspecified_bind(name, bind);
+        if let Some(bind) = bind {
+            warn_on_unspecified_bind(name, bind);
+        }
     }
 
     tracing::info!(
         target: "acl_proxy::startup",
-        explicit_http_bind = %explicit_http_bind,
-        transparent_http_bind = %transparent_http_bind,
-        explicit_https_bind = %explicit_https_bind,
-        transparent_https_bind = %transparent_https_bind,
-        loop_protection_enabled = loop_cfg.enabled,
-        loop_protection_add_header = loop_cfg.add_header,
-        loop_protection_header = %loop_cfg.header_name,
-        capture_allowed_request = capture_cfg.allowed_request,
-        capture_allowed_response = capture_cfg.allowed_response,
-        capture_denied_request = capture_cfg.denied_request,
-        capture_denied_response = capture_cfg.denied_response,
-        capture_directory = %capture_cfg.directory,
-        explicit_http_http2_enabled,
-        transparent_http_http2_enabled,
-        explicit_https_http2_enabled,
-        transparent_https_http2_enabled,
-        ca_mode = %if has_explicit_ca { "configured" } else { "generated" },
-        ca_certs_dir = %certs.certs_dir,
+        schema_version = config.schema_version,
+        explicit_http_bind = ?listeners.explicit_http.as_ref().map(|value| value.bind),
+        transparent_http_bind = ?listeners.transparent_http.as_ref().map(|value| value.bind),
+        explicit_https_bind = ?listeners.explicit_https.as_ref().map(|value| value.bind),
+        transparent_https_bind = ?listeners.transparent_https.as_ref().map(|value| value.bind),
+        control_bind = ?config.control.as_ref().map(|value| value.bind),
+        mitm_enabled = config.mitm.is_some(),
         "acl-proxy starting"
     );
 }
 
-fn warn_on_unspecified_bind(listener: &str, bind: &str) {
-    let Ok(addr) = bind.parse::<SocketAddr>() else {
-        return;
-    };
-
-    if addr.ip().is_unspecified() {
+fn warn_on_unspecified_bind(listener: &str, bind: SocketAddr) {
+    if bind.ip().is_unspecified() {
         tracing::warn!(
             target: "acl_proxy::startup",
             listener,
-            bind_address = %addr.ip(),
-            port = addr.port(),
+            bind_address = %bind.ip(),
+            port = bind.port(),
             "proxy listener is bound to all interfaces; restrict bind_address or firewall access when exposure is not intended"
         );
     }
