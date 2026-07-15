@@ -240,7 +240,6 @@ impl ProductActivator {
             egress: Arc::new(egress),
             authorization: Arc::new(authorization),
             credentials: Arc::new(credentials),
-            redaction: Arc::new(redaction),
             observation: Arc::new(observation),
             safety: Arc::new(safety),
             owner,
@@ -440,10 +439,14 @@ redaction_profile = "environment"
         let profile = lease.bindings().rules[0]
             .redaction_profile
             .expect("policy rule binds the environment redaction profile");
-        let redacted = lease
-            .redaction()
-            .profile(profile)
-            .unwrap()
+        let binding = lease
+            .standalone()
+            .activated()
+            .rule_redaction(0)
+            .expect("standalone generation binds the rule redaction profile");
+        assert_eq!(binding.profile(), profile);
+        let redacted = binding
+            .handle()
             .redact_decoded_http_body(input.to_vec())
             .unwrap();
         redacted.bytes.clone()
@@ -782,35 +785,12 @@ redaction_profile = "environment"
             .await
             .expect("candidate activation succeeds");
 
-        assert_eq!(activated.standalone.generation().get(), 1);
+        assert_eq!(activated.standalone.snapshot_lease().generation().get(), 1);
         assert!(activated
             .standalone
             .snapshot_lease()
             .owns(activated.standalone.identity()));
         let standalone_bindings = activated.standalone.activated();
-        assert!(Arc::ptr_eq(
-            standalone_bindings
-                .capture_epoch()
-                .expect("standalone capture is bound"),
-            activated.observation.capture_epoch(),
-        ));
-        let bound_redaction = &standalone_bindings.redactions()[0];
-        let activated_redaction = activated
-            .redaction
-            .profile(bound_redaction.profile())
-            .expect("standalone redaction index resolves in the product snapshot");
-        assert!(bound_redaction.handle().same_profile(&activated_redaction));
-        let resource_proof = standalone_bindings.resources();
-        assert_eq!(resource_proof.cursors().len(), 1);
-        assert_eq!(
-            resource_proof.cursors()[0].combined_peak_bytes(),
-            resource_proof.cursors()[0].product_incremental_peak_bytes()
-                + resource_proof.cursors()[0].runtime_replay_capacity_bytes(),
-        );
-        assert_eq!(
-            resource_proof.max_reachable_combined_peak_bytes(),
-            resource_proof.cursors()[0].combined_peak_bytes(),
-        );
         assert_eq!(activated.bindings.provider_count, 0);
         assert_eq!(activated.bindings.redaction_profile_count, 1);
         let url = http_access_url::canonicalize_http_url("https://example.test/resource").unwrap();
@@ -829,12 +809,8 @@ redaction_profile = "environment"
             crate::egress::EgressRoute::Direct
         ));
         assert_eq!(activated.egress.origin_tls().http_versions().len(), 2);
-        assert!(activated.egress.credential_actions().is_empty());
+        assert!(standalone_bindings.global_credentials().is_empty());
         let mut request_headers = http::HeaderMap::new();
-        activated
-            .egress
-            .apply_request_headers(&mut request_headers)
-            .unwrap();
         let _origin_trust = activated.egress.origin_tls().trust();
 
         activated

@@ -14,6 +14,7 @@ use base64::read::DecoderReader;
 use base64::Engine as _;
 use http::header::AUTHORIZATION;
 use http::{HeaderMap, HeaderName, HeaderValue};
+use http_access_types::{CredentialMutation, CredentialMutationKind};
 #[cfg(test)]
 use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
@@ -146,23 +147,6 @@ impl ProviderOutputRegistry {
         &self.definitions
     }
 
-    #[cfg(test)]
-    pub(crate) fn single_credential_for_test(
-        &self,
-        index: ProviderOutputIndex,
-        value: &[u8],
-    ) -> ProviderCredentialSet {
-        assert_eq!(index.registry_id, self.id);
-        let mut values = std::iter::repeat_with(|| None)
-            .take(self.definitions.len())
-            .collect::<Vec<_>>();
-        values[index.ordinal] = Some(SecretBytes(value.to_vec()));
-        ProviderCredentialSet::Contiguous(ContiguousProviderCredentials {
-            registry_id: self.id,
-            values: values.into_boxed_slice(),
-        })
-    }
-
     pub(crate) fn stage_credentials(
         &self,
         credentials: &ProviderCredentialSet,
@@ -256,6 +240,30 @@ enum StagedProviderRendering {
 }
 
 impl StagedProviderCredentialMutation {
+    pub(crate) fn matches_mutations(&self, mutations: &[CredentialMutation]) -> bool {
+        self.headers.len() == mutations.len()
+            && self
+                .headers
+                .iter()
+                .zip(mutations)
+                .all(
+                    |(staged, mutation)| match (&staged.rendering, mutation.kind()) {
+                        (StagedProviderRendering::Bearer, CredentialMutationKind::Bearer(_)) => {
+                            staged.destination == AUTHORIZATION
+                        }
+                        (
+                            StagedProviderRendering::Basic(staged_username),
+                            CredentialMutationKind::Basic { username, .. },
+                        ) => staged.destination == AUTHORIZATION && staged_username == username,
+                        (
+                            StagedProviderRendering::Custom,
+                            CredentialMutationKind::CustomHeader { name, .. },
+                        ) => staged.destination.as_str() == name.as_str(),
+                        _ => false,
+                    },
+                )
+    }
+
     pub(crate) fn apply(
         self,
         headers: &mut HeaderMap,

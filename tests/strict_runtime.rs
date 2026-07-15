@@ -285,6 +285,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_body(200, self.path.encode("ascii"), {
             "Content-Type": "text/plain",
             "X-Seen-Provider-Token": self.headers.get("x-provider-token", "missing"),
+            "X-Seen-Authorization": self.headers.get("authorization", "missing"),
         })
 
     def do_POST(self):
@@ -294,12 +295,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             request = json.loads(body)
             with open(event_file, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(request, sort_keys=True, separators=(",", ":")) + "\n")
-            decision = "deny" if request["url"].endswith("/webhook-deny") else "allow"
+            path = urllib.parse.urlsplit(request["url"]).path
+            decision = {
+                "/webhook-deny": "deny",
+                "/webhook-pass": "pass",
+            }.get(path, "allow")
             callback = {
                 "resumeToken": request["resumeToken"],
                 "type": "response",
                 "decision": decision,
             }
+            if decision == "allow" and path != "/webhook-error":
+                callback["values"] = {"token": "webhook-typed-secret"}
             self.send_body(204)
             threading.Thread(
                 target=deliver_callback,
@@ -310,6 +317,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_body(200, body, {
             "Content-Type": self.headers.get("content-type", "application/octet-stream"),
             "X-Seen-Provider-Token": self.headers.get("x-provider-token", "missing"),
+            "X-Seen-Authorization": self.headers.get("authorization", "missing"),
         })
 
     def log_message(self, _format, *_args):
@@ -413,9 +421,13 @@ required = true
 kind = "webhook"
 url = "http://{origin}/authorize"
 timeout = "3s"
-on_failure = "deny"
+on_failure = "error"
 max_request_bytes = 65536
 max_response_bytes = 65536
+
+[authorization.providers.approval.outputs.token]
+kind = "bearer"
+required = true
 
 [credentials]
 allowed_custom_headers = ["x-provider-token"]
@@ -477,7 +489,12 @@ value = "{generation}"
 [[policy.rules]]
 id = "webhook"
 decision = "delegate"
-urls = ["http://{origin}/webhook-allow", "http://{origin}/webhook-deny"]
+urls = [
+  "http://{origin}/webhook-allow",
+  "http://{origin}/webhook-deny",
+  "http://{origin}/webhook-error",
+  "http://{origin}/webhook-pass",
+]
 authorization_provider = "approval"
 
 [[policy.rules.response_headers]]
@@ -485,6 +502,11 @@ operation = "set"
 when = "always"
 name = "x-generation"
 value = "{generation}"
+
+[[policy.rules]]
+id = "webhook-passed"
+decision = "allow"
+urls = ["http://{origin}/webhook-pass"]
 
 [[policy.rules]]
 id = "reload"
@@ -660,6 +682,12 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
                 "redaction_profile": null
             },
             {
+                "id": "webhook-passed",
+                "decision": "allow",
+                "authorization_provider": null,
+                "redaction_profile": null
+            },
+            {
                 "id": "reload",
                 "decision": "allow",
                 "authorization_provider": null,
@@ -709,14 +737,37 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
     assert_eq!(replaced.body, b"provider [MASKED] body");
 
     let webhook_allow_url = format!("http://{origin}/webhook-allow");
+    let webhook_allow = proxy_request(data, "POST", &webhook_allow_url, b"webhook allow body");
+    assert_eq!(webhook_allow.status, 200);
     assert_eq!(
-        proxy_request(data, "GET", &webhook_allow_url, &[]).status,
-        200
+        webhook_allow.header("x-seen-authorization"),
+        Some("Bearer webhook-typed-secret")
     );
+    assert_eq!(
+        webhook_allow.header("x-seen-provider-token"),
+        Some("missing")
+    );
+    assert_eq!(webhook_allow.body, b"webhook allow body");
+
+    let webhook_pass_url = format!("http://{origin}/webhook-pass");
+    let webhook_pass = proxy_request(data, "POST", &webhook_pass_url, b"webhook pass body");
+    assert_eq!(webhook_pass.status, 200);
+    assert_eq!(webhook_pass.header("x-seen-authorization"), Some("missing"));
+    assert_eq!(
+        webhook_pass.header("x-seen-provider-token"),
+        Some("missing")
+    );
+    assert_eq!(webhook_pass.body, b"webhook pass body");
+
     let webhook_deny_url = format!("http://{origin}/webhook-deny");
     assert_eq!(
         proxy_request(data, "GET", &webhook_deny_url, &[]).status,
         403
+    );
+    let webhook_error_url = format!("http://{origin}/webhook-error");
+    assert_eq!(
+        proxy_request(data, "GET", &webhook_error_url, &[]).status,
+        500
     );
     let webhook_events = directory.path().join("webhook-events.jsonl");
     wait_for_file(&webhook_events);
@@ -725,11 +776,30 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(events.len(), 2);
+    assert_eq!(events.len(), 4);
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["url"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            webhook_allow_url.as_str(),
+            webhook_pass_url.as_str(),
+            webhook_deny_url.as_str(),
+            webhook_error_url.as_str(),
+        ]
+    );
     assert!(events.iter().all(|event| event["type"] == "request"));
-    assert!(events.iter().all(|event| event.get("body").is_none()));
-    assert!(events.iter().all(|event| event["callbackUrl"]
-        == format!("http://{control}/_acl-proxy/external-auth/callback")));
+    assert!(events
+        .iter()
+        .all(|event| event.get("body").is_none() && event.get("requestBody").is_none()));
+    let callback_url = format!("http://{control}/_acl-proxy/external-auth/callback");
+    assert!(events
+        .iter()
+        .all(|event| event["callbackUrl"] == callback_url));
+    assert!(events.iter().all(|event| event["resumeToken"]
+        .as_str()
+        .is_some_and(|token| token.len() == 43)));
 
     let captures = wait_for_records(&directory.path().join("captures"), &replace_url, 2);
     let request = captures

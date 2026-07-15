@@ -19,19 +19,13 @@ mod p05_contract_adapter_tests;
 mod policy;
 mod proxy;
 mod redaction;
-mod request_decision;
 mod request_pipeline;
 mod runtime;
-// Activated by the standalone provider in C03; C02 lands the reviewed adapter first.
-#[allow(dead_code)]
 mod runtime_body_source;
 mod safety;
 mod sensitive;
-#[allow(dead_code)]
 mod standalone;
-// Adopted by StandalonePolicyProvider in C03; C02 establishes the owned return boundary.
 mod standalone_policy_provider;
-#[allow(dead_code)]
 mod standalone_provider_result;
 mod tls;
 mod tls_identity;

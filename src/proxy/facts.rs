@@ -4,15 +4,17 @@ use http::header::{
 };
 use http::{Method, Request, Version};
 use http_access_types::{
-    BodyFraming, BodyMetadata, CanonicalUrl, HeaderField, HeaderName, HeaderValue, HttpMethod,
-    HttpVersion, IngressMode, InterceptedRequestFacts, UpgradeIntent as NeutralUpgradeIntent,
-    UpgradeProtocol, ValueError,
+    apply_header_mutation_batches, BodyFraming, BodyMetadata, CanonicalUrl, HeaderField,
+    HeaderMutationBatch, HeaderName, HeaderValue, HttpMethod, HttpScheme, HttpVersion, IngressMode,
+    InterceptedRequestFacts, UpgradeIntent as NeutralUpgradeIntent, UpgradeProtocol, ValueError,
 };
 
+use hyper::body::HttpBody;
 use hyper::Body;
 
 use crate::proxy::headers::{
-    sanitize_untrusted_ingress_request, HeaderPreparationError, SanitizedIngressRequest,
+    sanitize_untrusted_connect_ingress_request, sanitize_untrusted_ingress_request,
+    HeaderPreparationError, SanitizedConnectIngressRequest, SanitizedIngressRequest,
     UpgradeIntent as ProductUpgradeIntent,
 };
 
@@ -40,6 +42,14 @@ pub(crate) enum FactsError {
     Value(#[from] ValueError),
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ResponseMutationError {
+    #[error("response headers cannot be represented by the neutral contract")]
+    Facts(#[from] FactsError),
+    #[error("response header mutations are invalid")]
+    Mutation(#[from] http_access_types::MutationError),
+}
+
 /// A request identity whose transport-owned components have been checked before
 /// any product credential processing occurs. Header values are deliberately not
 /// retained here because configured inbound fields may contain secrets.
@@ -56,20 +66,30 @@ pub(crate) struct ValidatedRequestFactShape {
 /// request before product credential extraction.
 pub(crate) struct ValidatedStandaloneIngress {
     shape: ValidatedRequestFactShape,
-    ingress: SanitizedIngressRequest,
+    ingress: SanitizedStandaloneIngress,
+}
+
+pub(crate) enum SanitizedStandaloneIngress {
+    Ordinary(SanitizedIngressRequest),
+    OuterConnect(SanitizedConnectIngressRequest),
 }
 
 impl ValidatedStandaloneIngress {
-    #[allow(
-        dead_code,
-        reason = "P06 C03 preflights this owner only in focused tests before C04 listener cutover"
-    )]
-    pub(crate) fn ingress(&self) -> &SanitizedIngressRequest {
+    pub(crate) fn ingress(&self) -> &SanitizedStandaloneIngress {
         &self.ingress
     }
 
-    pub(crate) fn into_parts(self) -> (ValidatedRequestFactShape, SanitizedIngressRequest) {
+    pub(crate) fn into_parts(self) -> (ValidatedRequestFactShape, SanitizedStandaloneIngress) {
         (self.shape, self.ingress)
+    }
+}
+
+impl SanitizedStandaloneIngress {
+    pub(crate) fn sanitized(&self) -> &crate::proxy::headers::SanitizedRequest<Body> {
+        match self {
+            Self::Ordinary(ingress) => ingress.sanitized(),
+            Self::OuterConnect(ingress) => ingress.sanitized(),
+        }
     }
 }
 
@@ -79,12 +99,14 @@ pub(crate) enum ValidatedStandaloneIngressError {
     Facts(#[from] FactsError),
     #[error("request headers are invalid")]
     Headers(#[from] HeaderPreparationError),
+    #[error("outer CONNECT is valid only on an explicit listener")]
+    ConnectIngressMode,
+    #[error("outer CONNECT requires a canonical HTTPS root target")]
+    ConnectTarget,
+    #[error("outer CONNECT cannot carry a request body")]
+    ConnectBody,
 }
 
-#[allow(
-    dead_code,
-    reason = "P06 C03 lands the atomic ingress validator before the mandatory C04 listener cutover"
-)]
 pub(crate) fn validate_standalone_ingress_request(
     ingress_mode: IngressMode,
     canonical: CanonicalUrl,
@@ -101,7 +123,51 @@ pub(crate) fn validate_standalone_ingress_request(
         framing,
         ingress.upgrade_intent(),
     )?;
-    Ok(ValidatedStandaloneIngress { shape, ingress })
+    Ok(ValidatedStandaloneIngress {
+        shape,
+        ingress: SanitizedStandaloneIngress::Ordinary(ingress),
+    })
+}
+
+pub(crate) fn validate_standalone_connect_ingress_request(
+    ingress_mode: IngressMode,
+    canonical: CanonicalUrl,
+    request: Request<Body>,
+) -> Result<ValidatedStandaloneIngress, ValidatedStandaloneIngressError> {
+    if !matches!(
+        ingress_mode,
+        IngressMode::ExplicitHttp | IngressMode::ExplicitHttps
+    ) {
+        return Err(ValidatedStandaloneIngressError::ConnectIngressMode);
+    }
+    if canonical.scheme() != HttpScheme::Https
+        || canonical.path() != "/"
+        || canonical.query().is_some()
+    {
+        return Err(ValidatedStandaloneIngressError::ConnectTarget);
+    }
+    let framing = body_metadata(request.version(), request.headers())?;
+    if !matches!(
+        framing.framing(),
+        BodyFraming::None | BodyFraming::ContentLength(0)
+    ) || !request.body().is_end_stream()
+    {
+        return Err(ValidatedStandaloneIngressError::ConnectBody);
+    }
+    let ingress = sanitize_untrusted_connect_ingress_request(request)?;
+    let shape = validate_request_fact_shape(
+        ingress_mode,
+        ingress.version(),
+        ingress.method(),
+        canonical,
+        ingress.headers(),
+        framing,
+        None,
+    )?;
+    Ok(ValidatedStandaloneIngress {
+        shape,
+        ingress: SanitizedStandaloneIngress::OuterConnect(ingress),
+    })
 }
 
 pub(crate) fn http_version(version: Version) -> Result<HttpVersion, FactsError> {
@@ -152,6 +218,15 @@ pub(crate) fn product_headers(fields: &[HeaderField]) -> Result<HeaderMap, Facts
             .map_err(|_| FactsError::Capacity)?;
     }
     Ok(headers)
+}
+
+pub(crate) fn apply_response_mutations(
+    headers: &HeaderMap,
+    batches: &[HeaderMutationBatch],
+) -> Result<HeaderMap, ResponseMutationError> {
+    let neutral = neutral_headers(headers)?;
+    let mutated = apply_header_mutation_batches(&neutral, batches)?;
+    product_headers(&mutated).map_err(Into::into)
 }
 
 pub(crate) fn body_metadata(
@@ -411,6 +486,9 @@ mod tests {
             validate_standalone_ingress_request(IngressMode::ExplicitHttp, canonical, request)
                 .unwrap();
         let (shape, ingress) = validated.into_parts();
+        let SanitizedStandaloneIngress::Ordinary(ingress) = ingress else {
+            panic!("ordinary validation returned CONNECT ingress");
+        };
         let (mut parts, _body, protocol, downstream_upgrade) = ingress.into_parts();
         let headers = std::mem::take(&mut parts.headers);
         let facts = shape.into_facts(&headers).unwrap();
@@ -427,6 +505,124 @@ mod tests {
         assert_eq!(protocol, crate::egress::OriginProtocol::Http1);
         assert!(parts.extensions.get::<ProductUpgradeIntent>().is_some());
         assert!(downstream_upgrade.is_some());
+    }
+
+    #[test]
+    fn standalone_connect_ingress_atomically_binds_empty_facts_and_tunnel_transport() {
+        for ingress_mode in [IngressMode::ExplicitHttp, IngressMode::ExplicitHttps] {
+            let request = Request::builder()
+                .method(Method::CONNECT)
+                .version(Version::HTTP_11)
+                .uri("example.test:443")
+                .header("host", "example.test:443")
+                .header("content-length", "0")
+                .body(Body::empty())
+                .unwrap();
+            let canonical = canonicalize_http_url("https://example.test/").unwrap();
+
+            let validated =
+                validate_standalone_connect_ingress_request(ingress_mode, canonical, request)
+                    .unwrap();
+            let (shape, ingress) = validated.into_parts();
+            let SanitizedStandaloneIngress::OuterConnect(ingress) = ingress else {
+                panic!("CONNECT validation returned ordinary ingress");
+            };
+            let (mut parts, body, protocol, downstream_upgrade) = ingress.into_parts();
+            let headers = std::mem::take(&mut parts.headers);
+            let facts = shape.into_facts(&headers).unwrap();
+
+            assert_eq!(facts.ingress_mode(), ingress_mode);
+            assert_eq!(facts.method().as_str(), "CONNECT");
+            assert_eq!(facts.version(), HttpVersion::Http11);
+            assert_eq!(facts.body().framing(), BodyFraming::ContentLength(0));
+            assert!(facts.upgrade().is_none());
+            assert_eq!(facts.url().as_str(), "https://example.test/");
+            assert_eq!(parts.method, Method::CONNECT);
+            assert_eq!(parts.version, Version::HTTP_11);
+            assert!(body.is_end_stream());
+            assert_eq!(protocol, crate::egress::OriginProtocol::Http1);
+            drop(downstream_upgrade);
+        }
+    }
+
+    #[test]
+    fn standalone_connect_ingress_rejects_wrong_mode_target_framing_or_body() {
+        fn request(body: Body) -> Request<Body> {
+            Request::builder()
+                .method(Method::CONNECT)
+                .version(Version::HTTP_11)
+                .uri("example.test:443")
+                .header("host", "example.test:443")
+                .body(body)
+                .unwrap()
+        }
+
+        let https = || canonicalize_http_url("https://example.test/").unwrap();
+        assert!(matches!(
+            validate_standalone_connect_ingress_request(
+                IngressMode::TransparentHttp,
+                https(),
+                request(Body::empty()),
+            ),
+            Err(ValidatedStandaloneIngressError::ConnectIngressMode)
+        ));
+        assert!(matches!(
+            validate_standalone_connect_ingress_request(
+                IngressMode::ExplicitHttp,
+                canonicalize_http_url("http://example.test/").unwrap(),
+                request(Body::empty()),
+            ),
+            Err(ValidatedStandaloneIngressError::ConnectTarget)
+        ));
+
+        let framed = Request::builder()
+            .method(Method::CONNECT)
+            .version(Version::HTTP_11)
+            .uri("example.test:443")
+            .header("host", "example.test:443")
+            .header("content-length", "1")
+            .body(Body::empty())
+            .unwrap();
+        assert!(matches!(
+            validate_standalone_connect_ingress_request(IngressMode::ExplicitHttp, https(), framed,),
+            Err(ValidatedStandaloneIngressError::ConnectBody)
+        ));
+        assert!(matches!(
+            validate_standalone_connect_ingress_request(
+                IngressMode::ExplicitHttp,
+                https(),
+                request(Body::from("x")),
+            ),
+            Err(ValidatedStandaloneIngressError::ConnectBody)
+        ));
+
+        let (sender, pending) = Body::channel();
+        assert!(matches!(
+            validate_standalone_connect_ingress_request(
+                IngressMode::ExplicitHttp,
+                https(),
+                request(pending),
+            ),
+            Err(ValidatedStandaloneIngressError::ConnectBody)
+        ));
+        drop(sender);
+
+        let ordinary_connect = Request::builder()
+            .method(Method::CONNECT)
+            .version(Version::HTTP_11)
+            .uri("example.test:443")
+            .body(Body::empty())
+            .unwrap();
+        assert!(matches!(
+            validate_standalone_ingress_request(
+                IngressMode::ExplicitHttp,
+                https(),
+                ordinary_connect,
+            ),
+            Err(ValidatedStandaloneIngressError::Headers(
+                HeaderPreparationError::ConnectUnsupported
+            ))
+        ));
     }
 
     #[test]

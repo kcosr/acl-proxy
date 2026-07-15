@@ -43,13 +43,16 @@ pub(crate) struct SanitizedRequest<B = Body> {
 
 /// One sanitized Hyper request whose upgrade capability was captured from the
 /// same original request before ownership was split.
-#[allow(
-    dead_code,
-    reason = "P06 C03 lands the bound ingress owner before the mandatory C04 listener cutover"
-)]
 pub(crate) struct SanitizedIngressRequest {
     request: SanitizedRequest<Body>,
     downstream_upgrade: Option<hyper::upgrade::OnUpgrade>,
+}
+
+/// One sanitized outer CONNECT request whose tunnel upgrade capability was
+/// captured from the same raw request before ownership was split.
+pub(crate) struct SanitizedConnectIngressRequest {
+    request: SanitizedRequest<Body>,
+    downstream_upgrade: hyper::upgrade::OnUpgrade,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,6 +67,7 @@ impl UpgradeIntent {
 }
 
 impl<B> SanitizedRequest<B> {
+    #[cfg(test)]
     pub(crate) fn headers_mut(&mut self) -> &mut HeaderMap {
         self.request.headers_mut()
     }
@@ -110,10 +114,6 @@ impl<B> SanitizedRequest<B> {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "P06 C03 lands the bound ingress owner before the mandatory C04 listener cutover"
-)]
 impl SanitizedIngressRequest {
     pub(crate) fn sanitized(&self) -> &SanitizedRequest<Body> {
         &self.request
@@ -148,11 +148,37 @@ impl SanitizedIngressRequest {
     }
 }
 
+impl SanitizedConnectIngressRequest {
+    pub(crate) fn sanitized(&self) -> &SanitizedRequest<Body> {
+        &self.request
+    }
+
+    pub(crate) fn version(&self) -> Version {
+        self.request.version()
+    }
+
+    pub(crate) fn method(&self) -> &http::Method {
+        self.request.method()
+    }
+
+    pub(crate) fn headers(&self) -> &HeaderMap {
+        self.request.headers()
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        http::request::Parts,
+        Body,
+        OriginProtocol,
+        hyper::upgrade::OnUpgrade,
+    ) {
+        let (parts, body, protocol) = self.request.into_parts();
+        (parts, body, protocol, self.downstream_upgrade)
+    }
+}
+
 /// Sanitizes one ingress request while retaining only its own upgrade handle.
-#[allow(
-    dead_code,
-    reason = "P06 C03 lands the bound ingress owner before the mandatory C04 listener cutover"
-)]
 pub(crate) fn sanitize_untrusted_ingress_request(
     mut request: Request<Body>,
 ) -> Result<SanitizedIngressRequest, HeaderPreparationError> {
@@ -163,6 +189,19 @@ pub(crate) fn sanitize_untrusted_ingress_request(
         .is_some()
         .then_some(downstream_upgrade);
     Ok(SanitizedIngressRequest {
+        request,
+        downstream_upgrade,
+    })
+}
+
+/// Sanitizes one outer CONNECT request while retaining only its own tunnel
+/// upgrade handle. Ordinary ingress sanitization continues to reject CONNECT.
+pub(crate) fn sanitize_untrusted_connect_ingress_request(
+    mut request: Request<Body>,
+) -> Result<SanitizedConnectIngressRequest, HeaderPreparationError> {
+    let downstream_upgrade = hyper::upgrade::on(&mut request);
+    let request = sanitize_untrusted_connect_request(request)?;
+    Ok(SanitizedConnectIngressRequest {
         request,
         downstream_upgrade,
     })
@@ -533,6 +572,7 @@ mod tests {
     use http_access_conformance::{
         load_translation_suite, FixtureHttpVersion, RawField, TranslationOutcome,
     };
+    use hyper::body::HttpBody;
 
     use super::*;
     use http_access_url::canonicalize_http_url;
@@ -871,9 +911,10 @@ mod tests {
             .headers_mut()
             .insert("x-injected", HeaderValue::from_static("attacker"));
         let mut sanitized = sanitize_untrusted_request(request).unwrap();
-        assert!(!sanitized.headers_mut().contains_key("x-injected"));
+        assert!(!sanitized.request.headers().contains_key("x-injected"));
 
         sanitized
+            .request
             .headers_mut()
             .insert("x-injected", HeaderValue::from_static("trusted"));
         let prepared = prepare_origin_request(
@@ -1105,6 +1146,71 @@ mod tests {
                 Err(HeaderPreparationError::ConnectUnsupported)
             ));
         }
+    }
+
+    #[test]
+    fn connect_ingress_owner_captures_only_its_raw_http1_upgrade_handle() {
+        let request = Request::builder()
+            .method(http::Method::CONNECT)
+            .version(Version::HTTP_11)
+            .uri("example.test:443")
+            .header(HOST, "example.test:443")
+            .header(CONNECTION, "keep-alive, x-private")
+            .header("x-private", "remove-me")
+            .body(Body::empty())
+            .unwrap();
+
+        let ingress = sanitize_untrusted_connect_ingress_request(request).unwrap();
+        assert_eq!(ingress.method(), http::Method::CONNECT);
+        assert_eq!(ingress.version(), Version::HTTP_11);
+        assert_eq!(ingress.sanitized().protocol(), OriginProtocol::Http1);
+        assert!(!ingress.headers().contains_key(CONNECTION));
+        assert!(!ingress.headers().contains_key("x-private"));
+
+        let (parts, body, protocol, downstream_upgrade) = ingress.into_parts();
+        assert_eq!(parts.method, http::Method::CONNECT);
+        assert_eq!(parts.version, Version::HTTP_11);
+        assert!(body.is_end_stream());
+        assert_eq!(protocol, OriginProtocol::Http1);
+        drop(downstream_upgrade);
+    }
+
+    #[test]
+    fn connect_ingress_owner_rejects_non_connect_h2_and_upgrade_intent() {
+        let ordinary = Request::builder()
+            .method(http::Method::GET)
+            .version(Version::HTTP_11)
+            .uri("/")
+            .body(Body::empty())
+            .unwrap();
+        assert!(matches!(
+            sanitize_untrusted_connect_ingress_request(ordinary),
+            Err(HeaderPreparationError::ConnectUnsupported)
+        ));
+
+        let h2 = Request::builder()
+            .method(http::Method::CONNECT)
+            .version(Version::HTTP_2)
+            .uri("example.test:443")
+            .body(Body::empty())
+            .unwrap();
+        assert!(matches!(
+            sanitize_untrusted_connect_ingress_request(h2),
+            Err(HeaderPreparationError::UnsupportedVersion)
+        ));
+
+        let upgrade = Request::builder()
+            .method(http::Method::CONNECT)
+            .version(Version::HTTP_11)
+            .uri("example.test:443")
+            .header(CONNECTION, "upgrade")
+            .header(UPGRADE, "websocket")
+            .body(Body::empty())
+            .unwrap();
+        assert!(matches!(
+            sanitize_untrusted_connect_ingress_request(upgrade),
+            Err(HeaderPreparationError::InvalidUpgrade)
+        ));
     }
 
     #[test]

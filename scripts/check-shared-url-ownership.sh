@@ -19,7 +19,7 @@ if rg -n '^[[:space:]]*(pub([^[:space:]]*)?[[:space:]]+)?(struct|enum)[[:space:]
     exit 1
 fi
 
-for source in src/policy/*.rs src/request_decision.rs; do
+for source in src/policy/*.rs src/standalone_policy_provider.rs; do
     # Inline test-only helpers can appear before the production implementation.
     # Scan through those helpers and stop only at the final inline test module.
     if sed '/^mod tests {$/,$d' "$source" | rg -n 'canonicalize_http_'; then
@@ -48,7 +48,7 @@ mapfile -t fact_materializers < <(
         --glob '!src/proxy/raw_h2_conformance.rs'
 )
 if [[ ${#fact_materializers[@]} -ne 1 ]] \
-    || [[ ${fact_materializers[0]} != src/request_decision.rs:*'let facts = shape.into_facts(sanitized_headers)?;' ]]; then
+    || [[ ${fact_materializers[0]} != src/standalone_policy_provider.rs:*'let facts = shape.into_facts(&headers)?;' ]]; then
     printf 'request facts must be materialized exactly once, after typed credential extraction\n' >&2
     printf '%s\n' "${fact_materializers[@]}" >&2
     exit 1

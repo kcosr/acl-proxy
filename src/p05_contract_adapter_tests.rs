@@ -572,7 +572,7 @@ const fn map_mutation_error(error: MutationError) -> AdapterError {
 mod tests {
     use std::path::PathBuf;
 
-    use http::{HeaderMap, HeaderName, HeaderValue, Method};
+    use http::{HeaderName, HeaderValue, Method};
     use http_access_conformance::{
         load_cursor_scenario_suite, load_header_mutation_suite, load_request_binding_suite,
         CursorScenarioCase, CursorScenarioOutcome, FixtureBodyFraming, FixtureBodyObservation,
@@ -585,9 +585,9 @@ mod tests {
         AclError, EvaluationInput, PolicyEvaluation, ProviderDisposition,
     };
     use http_access_types::{
-        BodyFraming, BodyMetadata, BodyObservation, BodyRepresentation, CanonicalUrl,
-        EffectivePolicy, HeaderField, HttpVersion, IngressMode, InterceptedRequestFacts,
-        PolicyHeaderFacts, UpgradeIntent, UpgradeProtocol,
+        BodyFraming, BodyMetadata, BodyObservation, BodyRepresentation, EffectivePolicy,
+        HeaderField, HttpVersion, IngressMode, InterceptedRequestFacts, PolicyHeaderFacts,
+        UpgradeIntent, UpgradeProtocol,
     };
     use http_access_url::{canonicalize_http_url, CompiledUrlPattern};
 
@@ -597,7 +597,6 @@ mod tests {
         CaptureWorkingSetPlan, CompiledEgressRoute, CompiledHttpVersion, CompiledTlsTrust,
         HttpBodyReadLimits, TransportTlsPlan,
     };
-    use crate::policy::apply_header_effects;
 
     fn product_name(value: &'static str) -> HeaderName {
         HeaderName::from_static(value)
@@ -1065,17 +1064,6 @@ mod tests {
         }
     }
 
-    fn product_fixture_headers(fields: &[FixtureHeaderField]) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        for field in fields {
-            headers.append(
-                HeaderName::from_bytes(field.name.as_bytes()).unwrap(),
-                HeaderValue::from_bytes(field.value_hex.as_bytes()).unwrap(),
-            );
-        }
-        headers
-    }
-
     fn neutral_fixture_headers(fields: &[FixtureHeaderField]) -> Vec<HeaderField> {
         fields
             .iter()
@@ -1119,20 +1107,12 @@ mod tests {
                 .and_then(|effects| compile_header_batch(effects));
 
             match (&case.expected, effects, compiled) {
-                (HeaderMutationOutcome::Accepted { fields }, Ok(effects), Ok(Some(batch))) => {
-                    let mut product = product_fixture_headers(&case.initial);
-                    apply_header_effects(&effects, &mut product).unwrap();
+                (HeaderMutationOutcome::Accepted { fields }, Ok(_), Ok(Some(batch))) => {
                     let neutral = http_access_types::apply_header_mutation_batches(
                         &neutral_fixture_headers(&case.initial),
                         &[batch],
                     )
                     .unwrap();
-                    assert_eq!(
-                        product_pairs(&product),
-                        fixture_pairs(fields),
-                        "{}",
-                        case.id
-                    );
                     assert_eq!(
                         neutral_pairs(&neutral),
                         fixture_pairs(fields),
@@ -1531,7 +1511,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_mutations_match_current_product_effect_application() {
+    fn shared_mutations_compile_into_end_state_outbound_effects() {
         let plan = product_plan();
         let egress = product_egress_plan();
         let compiled = compile_neutral_policy(
@@ -1561,13 +1541,6 @@ mod tests {
             .outbound_effects(&effects, provider_credentials(compiled.snapshot.identity()))
             .unwrap();
 
-        let mut product_headers = HeaderMap::new();
-        product_headers.append(product_name("x-list"), product_value("a"));
-        product_headers.append(product_name("x-remove"), product_value("gone"));
-        product_headers.append(product_name("x-replace"), product_value("old-old"));
-        apply_header_effects(&plan.rules[0].request_headers, &mut product_headers).unwrap();
-        apply_header_effects(&egress.request_headers, &mut product_headers).unwrap();
-
         let neutral_headers = vec![
             HeaderField::new(
                 NeutralHeaderName::new("x-list").unwrap(),
@@ -1587,19 +1560,25 @@ mod tests {
             &outbound.request_header_batches,
         )
         .unwrap();
+        let neutral_headers = neutral_pairs(&neutral_headers);
         assert_eq!(
-            product_pairs(&product_headers),
-            neutral_pairs(&neutral_headers)
-        );
-        assert_eq!(product_headers["x-mutation-order"], "global");
-        assert_eq!(
-            product_headers
-                .get_all("x-list")
+            neutral_headers
                 .iter()
-                .map(HeaderValue::as_bytes)
+                .filter(|(name, _)| name == "x-list")
+                .map(|(_, value)| value.as_slice())
                 .collect::<Vec<_>>(),
             vec![b"a".as_slice(), b"b".as_slice(), b"global".as_slice()]
         );
+        assert!(neutral_headers
+            .iter()
+            .any(|(name, value)| name == "x-mutation-order" && value == b"global"));
+        assert!(neutral_headers
+            .iter()
+            .any(|(name, value)| name == "x-set" && value == b"new"));
+        assert!(neutral_headers
+            .iter()
+            .any(|(name, value)| name == "x-replace" && value == b"new-new"));
+        assert!(!neutral_headers.iter().any(|(name, _)| name == "x-remove"));
         assert!(matches!(
             outbound.credentials[0].kind(),
             CredentialMutationKind::Bearer(reference)
@@ -1665,10 +1644,6 @@ mod tests {
         };
         let outbound = compiled.outbound_effects(&effects, Vec::new()).unwrap();
 
-        let mut product_headers = HeaderMap::new();
-        product_headers.insert(product_name("x-removed-by-rule"), product_value("before"));
-        apply_header_effects(&plan.rules[0].request_headers, &mut product_headers).unwrap();
-        apply_header_effects(&egress.request_headers, &mut product_headers).unwrap();
         let neutral_headers = vec![HeaderField::new(
             NeutralHeaderName::new("x-removed-by-rule").unwrap(),
             NeutralHeaderValue::new(b"before".to_vec()).unwrap(),
@@ -1678,20 +1653,17 @@ mod tests {
             &outbound.request_header_batches,
         )
         .unwrap();
-
         assert_eq!(
-            product_pairs(&product_headers),
-            neutral_pairs(&neutral_headers)
-        );
-        assert_eq!(
-            product_headers
-                .get_all("x-created-by-rule")
+            neutral_headers
                 .iter()
-                .map(HeaderValue::as_bytes)
+                .filter(|field| field.name().as_str() == "x-created-by-rule")
+                .map(|field| field.value().as_bytes())
                 .collect::<Vec<_>>(),
             vec![b"rule".as_slice(), b"global".as_slice()]
         );
-        assert!(!product_headers.contains_key("x-removed-by-rule"));
+        assert!(!neutral_headers
+            .iter()
+            .any(|field| field.name().as_str() == "x-removed-by-rule"));
     }
 
     #[test]
@@ -1943,15 +1915,6 @@ mod tests {
         ));
     }
 
-    fn product_pairs(headers: &HeaderMap) -> Vec<(String, Vec<u8>)> {
-        let mut pairs = headers
-            .iter()
-            .map(|(name, value)| (name.as_str().to_owned(), value.as_bytes().to_vec()))
-            .collect::<Vec<_>>();
-        pairs.sort();
-        pairs
-    }
-
     fn neutral_pairs(headers: &[HeaderField]) -> Vec<(String, Vec<u8>)> {
         let mut pairs = headers
             .iter()
@@ -1965,14 +1928,4 @@ mod tests {
         pairs.sort();
         pairs
     }
-
-    #[allow(dead_code)]
-    fn shared_api_contains_only_neutral_effects(
-        snapshot: &TrafficPolicySnapshot<NeutralRuleEffects>,
-    ) -> &TrafficPolicySnapshot<NeutralRuleEffects> {
-        snapshot
-    }
-
-    #[allow(dead_code)]
-    fn canonical_url_is_a_shared_fact(_url: &CanonicalUrl) {}
 }

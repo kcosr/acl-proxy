@@ -6,4 +6,5 @@ pub(crate) mod ingress;
 pub(crate) mod original_destination;
 #[cfg(test)]
 mod raw_h2_conformance;
+pub(crate) mod standalone_body;
 pub(crate) mod upgrade_relay;

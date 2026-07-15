@@ -5,10 +5,12 @@ use std::pin::pin;
 use std::ptr;
 use std::task::{Context, Poll};
 
+#[cfg(test)]
 use bytes::Buf;
 use http::header::{HeaderMap, CONTENT_ENCODING, TRAILER};
 use http_access_runtime::{RuntimeError, RuntimeRequest};
-use http_access_types::BodyObservationState;
+use http_access_types::{BodyFraming, BodyObservationState};
+#[cfg(test)]
 use hyper::body::HttpBody;
 use miniz_oxide::inflate::stream::{inflate, InflateState};
 use miniz_oxide::{DataFormat, MZFlush, MZStatus};
@@ -380,7 +382,8 @@ async fn allocate_codec_workspace<C: DecodeContext>(
     Ok(allocation.finish())
 }
 
-pub(crate) async fn read_mandatory_request_body<B>(
+#[cfg(test)]
+async fn read_mandatory_request_body<B>(
     headers: &HeaderMap,
     mut body: B,
     limits: HttpBodyReadLimits,
@@ -461,6 +464,11 @@ pub(crate) async fn read_mandatory_runtime_request_body(
     deadline: Instant,
     guard: &HttpWireBodyGuard,
 ) -> Result<GuardedRequestBody, HttpBodyReadError> {
+    if let BodyFraming::ContentLength(length) = request.facts().body().framing() {
+        if usize::try_from(length).map_or(true, |length| length > limits.max_encoded_bytes()) {
+            return Err(HttpBodyReadError::EncodedLimitExceeded);
+        }
+    }
     if request
         .body_observation()
         .map_err(map_runtime_body_error)?
@@ -1872,6 +1880,20 @@ mod tests {
         bounds: BodyBounds,
         headers: Vec<HeaderField>,
     ) -> RuntimeRequest {
+        runtime_request_with_headers_and_framing(
+            source,
+            bounds,
+            headers,
+            BodyFraming::ContentLength(0),
+        )
+    }
+
+    fn runtime_request_with_headers_and_framing(
+        source: impl BodySource + 'static,
+        bounds: BodyBounds,
+        headers: Vec<HeaderField>,
+        framing: BodyFraming,
+    ) -> RuntimeRequest {
         let body = RuntimeBody::new(
             Box::pin(source),
             bounds,
@@ -1886,7 +1908,7 @@ mod tests {
             HttpMethod::new("POST").unwrap(),
             canonicalize_http_url("http://example.test/resource").unwrap(),
             headers,
-            BodyMetadata::new(BodyFraming::ContentLength(0)),
+            BodyMetadata::new(framing),
             None,
         )
         .unwrap();
@@ -2515,6 +2537,35 @@ mod tests {
         let error = read_mandatory_runtime_request_body(
             &mut request,
             limits(3, 4),
+            1,
+            Instant::now() + Duration::from_secs(1),
+            &guard,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, HttpBodyReadError::EncodedLimitExceeded);
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_request_reader_rejects_oversized_declared_length_before_polling() {
+        let max = 64;
+        let declared = max + 1;
+        let peak = compiled_peak(max, max);
+        let pool = WireBodyPool::new(peak, peak);
+        let guard = pool.begin_for_test(peak, key());
+        let mut request = runtime_request_with_headers_and_framing(
+            PendingSource,
+            BodyBounds::new(declared as u64, declared as u64, declared as u64, 0, 0, 100).unwrap(),
+            Vec::new(),
+            BodyFraming::ContentLength(declared as u64),
+        );
+
+        let error = read_mandatory_runtime_request_body(
+            &mut request,
+            limits(max, max),
             1,
             Instant::now() + Duration::from_secs(1),
             &guard,

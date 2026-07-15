@@ -1,31 +1,24 @@
-use std::collections::HashSet;
 use std::fmt;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use http::header::{HeaderMap, HeaderName, HeaderValue};
-use http::Method;
-use http_access_types::CanonicalUrl;
-use http_access_types::HttpMethod;
-use memchr::memmem::Finder;
-
-#[cfg(test)]
-use crate::config::compiler::CredentialActionPlan;
 use crate::config::compiler::{
-    CompiledDefaultDecision, CompiledHeaderEffectWhen, CompiledRuleDecision, HeaderEffectPlan,
-    HeaderPredicatesPlan, HttpBodyReadPlan, PolicyPlan, PolicyRulePlan,
-};
-use crate::credentials::{
-    resolve_credential_action, CredentialBindingError, ResolvedCredentialAction,
+    CompiledDefaultDecision, CompiledRuleDecision, CredentialActionPlan, HeaderPredicatesPlan,
+    HttpBodyReadPlan, PolicyPlan, PolicyRulePlan,
 };
 use crate::runtime::{
     CredentialSourceIndex, CredentialSourceRegistry, ProviderIndex, ProviderRegistry,
     RedactionProfileIndex, RedactionProfileRegistry, ResolvedBindings, ResolvedRuleBindings,
 };
+use http::header::{HeaderMap, HeaderName};
+use http::Method;
+use http_access_types::CanonicalUrl;
+use http_access_types::HttpMethod;
 
-const MAX_HEADER_FIELD_BYTES: usize = 64 * 1024;
-const MAX_HEADER_VALUE_BYTES: usize = 1024 * 1024;
+#[cfg(test)]
+use http::header::HeaderValue;
+
 static NEXT_WIRE_BODY_PLAN_BRAND: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,9 +111,7 @@ struct ActivatedPolicyRule {
     allow_upgrades: bool,
     authorization_provider: Option<ProviderIndex>,
     redaction_profile: Option<RedactionProfileIndex>,
-    request_headers: Vec<HeaderEffectPlan>,
-    response_headers: Vec<HeaderEffectPlan>,
-    credential_actions: Box<[ResolvedCredentialAction]>,
+    credential_sources: Box<[CredentialSourceIndex]>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -277,16 +268,10 @@ impl CompiledPolicySnapshot {
             .rules
             .iter()
             .filter_map(|rule| rule.redaction_profile.as_deref());
-        let credential_names = plan.rules.iter().flat_map(|rule| {
-            rule.credential_actions.iter().map(|action| match action {
-                CredentialActionPlan::Bearer { credential }
-                | CredentialActionPlan::CustomHeader { credential, .. } => credential.as_str(),
-                CredentialActionPlan::Basic {
-                    password_credential,
-                    ..
-                } => password_credential.as_str(),
-            })
-        });
+        let credential_names = plan
+            .rules
+            .iter()
+            .flat_map(|rule| rule.credential_actions.iter().map(credential_source_name));
         let provider_registry = ProviderRegistry::from_names(provider_names.map(str::to_owned));
         let redaction_profile_registry =
             RedactionProfileRegistry::from_names(profile_names.map(str::to_owned));
@@ -445,22 +430,6 @@ impl<'snapshot> PolicyRuleMatch<'snapshot> {
     pub(crate) fn authorization_provider(&self) -> Option<ProviderIndex> {
         self.rule.authorization_provider
     }
-
-    pub(crate) fn redaction_profile(&self) -> Option<RedactionProfileIndex> {
-        self.rule.redaction_profile
-    }
-
-    pub(crate) fn request_header_effects(&self) -> &'snapshot [HeaderEffectPlan] {
-        &self.rule.request_headers
-    }
-
-    pub(crate) fn response_header_effects(&self) -> &'snapshot [HeaderEffectPlan] {
-        &self.rule.response_headers
-    }
-
-    pub(crate) fn credential_actions(&self) -> &'snapshot [ResolvedCredentialAction] {
-        &self.rule.credential_actions
-    }
 }
 
 impl crate::runtime::PolicySnapshot for CompiledPolicySnapshot {
@@ -494,12 +463,7 @@ fn resolved_bindings(
         .map(|rule| ResolvedRuleBindings {
             authorization_provider: rule.authorization_provider,
             redaction_profile: rule.redaction_profile,
-            credentials: rule
-                .credential_actions
-                .iter()
-                .map(credential_source_index)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+            credentials: rule.credential_sources.clone(),
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
@@ -508,14 +472,6 @@ fn resolved_bindings(
         redaction_profile_count,
         credential_count,
         rules,
-    }
-}
-
-fn credential_source_index(action: &ResolvedCredentialAction) -> CredentialSourceIndex {
-    match action {
-        ResolvedCredentialAction::Bearer { source }
-        | ResolvedCredentialAction::Basic { source, .. }
-        | ResolvedCredentialAction::CustomHeader { source, .. } => *source,
     }
 }
 
@@ -542,17 +498,17 @@ fn activate_rule(
                 .ok_or(PolicyActivationError::RedactionProfile { rule_index })
         })
         .transpose()?;
-    let credential_actions = rule
+    let credential_sources = rule
         .credential_actions
         .into_iter()
         .enumerate()
         .map(|(action_index, action)| {
-            resolve_credential_action(action, credential_source_registry).map_err(
-                |CredentialBindingError::UnknownSource| PolicyActivationError::CredentialSource {
+            credential_source_registry
+                .get(credential_source_name(&action))
+                .ok_or(PolicyActivationError::CredentialSource {
                     rule_index,
                     action_index,
-                },
-            )
+                })
         })
         .collect::<Result<Vec<_>, _>>()?
         .into_boxed_slice();
@@ -567,10 +523,19 @@ fn activate_rule(
         allow_upgrades: rule.allow_upgrades,
         authorization_provider,
         redaction_profile,
-        request_headers: rule.request_headers,
-        response_headers: rule.response_headers,
-        credential_actions,
+        credential_sources,
     })
+}
+
+fn credential_source_name(action: &CredentialActionPlan) -> &str {
+    match action {
+        CredentialActionPlan::Bearer { credential }
+        | CredentialActionPlan::CustomHeader { credential, .. } => credential,
+        CredentialActionPlan::Basic {
+            password_credential,
+            ..
+        } => password_credential,
+    }
 }
 
 impl<'snapshot> PolicyCursor<'snapshot> {
@@ -667,255 +632,6 @@ fn outcome(decision: CompiledRuleDecision) -> PolicyOutcome {
         CompiledRuleDecision::Deny => PolicyOutcome::Deny,
         CompiledRuleDecision::Delegate => PolicyOutcome::Delegate,
     }
-}
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub(crate) enum HeaderEffectError {
-    #[error("header effect exceeds the per-field value limit")]
-    FieldLimit,
-    #[error("header effect exceeds the aggregate value limit")]
-    AggregateLimit,
-    #[error("header effect size arithmetic overflow")]
-    SizeOverflow,
-    #[error("header effect produced an invalid value")]
-    InvalidValue,
-}
-
-/// Applies a validated effect list in authored order.
-///
-/// Every `when` predicate observes the header set from before the first effect,
-/// and the caller's map is replaced only after every effect succeeds.
-/// Preexisting fields remain outside result-limit accounting until an applied
-/// effect targets their name, allowing unrelated effects to preserve inbound
-/// values and targeted set/remove/replace effects to remediate them.
-pub(crate) fn apply_header_effects(
-    effects: &[HeaderEffectPlan],
-    headers: &mut HeaderMap,
-) -> Result<(), HeaderEffectError> {
-    let original_presence: HashSet<HeaderName> = headers.keys().cloned().collect();
-    let mut staged = headers.clone();
-    let mut touched = HashSet::new();
-    let mut touched_bytes = 0usize;
-
-    for effect in effects {
-        let (when, name) = effect_when_and_name(effect);
-        let originally_present = original_presence.contains(name);
-        let applies = match when {
-            CompiledHeaderEffectWhen::Always => true,
-            CompiledHeaderEffectWhen::IfPresent => originally_present,
-            CompiledHeaderEffectWhen::IfAbsent => !originally_present,
-        };
-        if !applies {
-            continue;
-        }
-        let previously_touched = !touched.insert(name.clone());
-        let previous = named_value_bytes(&staged, name)?;
-        let other_touched_bytes = if previously_touched {
-            touched_bytes
-                .checked_sub(previous)
-                .ok_or(HeaderEffectError::SizeOverflow)?
-        } else {
-            touched_bytes
-        };
-
-        let resulting_named_bytes = match effect {
-            HeaderEffectPlan::Set { name, values, .. } => {
-                let replacement = effect_value_bytes(values)?;
-                ensure_changed_aggregate(other_touched_bytes, replacement)?;
-                staged.remove(name);
-                for value in values {
-                    staged.append(name.clone(), value.clone());
-                }
-                replacement
-            }
-            HeaderEffectPlan::Append { name, values, .. } => {
-                let appended = effect_value_bytes(values)?;
-                let replacement = previous
-                    .checked_add(appended)
-                    .ok_or(HeaderEffectError::SizeOverflow)?;
-                ensure_changed_aggregate(other_touched_bytes, replacement)?;
-                for value in values {
-                    staged.append(name.clone(), value.clone());
-                }
-                replacement
-            }
-            HeaderEffectPlan::Remove { name, .. } => {
-                staged.remove(name);
-                0
-            }
-            HeaderEffectPlan::Replace {
-                name,
-                search,
-                replace,
-                ..
-            } => replace_header_bytes(
-                &mut staged,
-                other_touched_bytes,
-                name,
-                search.as_bytes(),
-                replace.as_bytes(),
-            )?,
-        };
-        validate_named_header_limits(&staged, name)?;
-        touched_bytes = other_touched_bytes
-            .checked_add(resulting_named_bytes)
-            .ok_or(HeaderEffectError::SizeOverflow)?;
-    }
-
-    *headers = staged;
-    Ok(())
-}
-
-fn effect_when_and_name(effect: &HeaderEffectPlan) -> (CompiledHeaderEffectWhen, &HeaderName) {
-    match effect {
-        HeaderEffectPlan::Set { when, name, .. }
-        | HeaderEffectPlan::Append { when, name, .. }
-        | HeaderEffectPlan::Remove { when, name }
-        | HeaderEffectPlan::Replace { when, name, .. } => (*when, name),
-    }
-}
-
-fn replace_header_bytes(
-    headers: &mut HeaderMap,
-    other_touched_bytes: usize,
-    name: &HeaderName,
-    search: &[u8],
-    replacement: &[u8],
-) -> Result<usize, HeaderEffectError> {
-    if search.is_empty() {
-        return Err(HeaderEffectError::InvalidValue);
-    }
-    let finder = Finder::new(search);
-    let output_lengths: Vec<usize> = headers
-        .get_all(name)
-        .iter()
-        .map(|value| replaced_len(value.as_bytes(), &finder, search.len(), replacement))
-        .collect::<Result<_, _>>()?;
-    if output_lengths.is_empty() {
-        return Ok(0);
-    }
-    let replacement_total = checked_sum(output_lengths.iter().copied())?;
-    ensure_changed_aggregate(other_touched_bytes, replacement_total)?;
-
-    let values: Vec<HeaderValue> = headers
-        .get_all(name)
-        .iter()
-        .zip(output_lengths)
-        .map(|(value, output_len)| {
-            let replaced = replace_all(
-                value.as_bytes(),
-                &finder,
-                search.len(),
-                replacement,
-                output_len,
-            );
-            HeaderValue::from_bytes(&replaced).map_err(|_| HeaderEffectError::InvalidValue)
-        })
-        .collect::<Result<_, _>>()?;
-    headers.remove(name);
-    for value in values {
-        headers.append(name.clone(), value);
-    }
-    Ok(replacement_total)
-}
-
-fn replaced_len(
-    input: &[u8],
-    finder: &Finder<'_>,
-    search_len: usize,
-    replacement: &[u8],
-) -> Result<usize, HeaderEffectError> {
-    let matches = finder.find_iter(input).count();
-    let removed = matches
-        .checked_mul(search_len)
-        .ok_or(HeaderEffectError::SizeOverflow)?;
-    let inserted = matches
-        .checked_mul(replacement.len())
-        .ok_or(HeaderEffectError::SizeOverflow)?;
-    let output_len = input
-        .len()
-        .checked_sub(removed)
-        .and_then(|value| value.checked_add(inserted))
-        .ok_or(HeaderEffectError::SizeOverflow)?;
-    if output_len > MAX_HEADER_FIELD_BYTES {
-        return Err(HeaderEffectError::FieldLimit);
-    }
-    Ok(output_len)
-}
-
-fn replace_all(
-    input: &[u8],
-    finder: &Finder<'_>,
-    search_len: usize,
-    replacement: &[u8],
-    output_len: usize,
-) -> Vec<u8> {
-    let mut output = Vec::with_capacity(output_len);
-    let mut cursor = 0usize;
-    for index in finder.find_iter(input) {
-        output.extend_from_slice(&input[cursor..index]);
-        output.extend_from_slice(replacement);
-        cursor = index + search_len;
-    }
-    output.extend_from_slice(&input[cursor..]);
-    debug_assert_eq!(output.len(), output_len);
-    output
-}
-
-fn validate_named_header_limits(
-    headers: &HeaderMap,
-    name: &HeaderName,
-) -> Result<(), HeaderEffectError> {
-    for value in headers.get_all(name).iter() {
-        if value.as_bytes().len() > MAX_HEADER_FIELD_BYTES {
-            return Err(HeaderEffectError::FieldLimit);
-        }
-    }
-    Ok(())
-}
-
-fn named_value_bytes(headers: &HeaderMap, name: &HeaderName) -> Result<usize, HeaderEffectError> {
-    checked_sum(
-        headers
-            .get_all(name)
-            .iter()
-            .map(|value| value.as_bytes().len()),
-    )
-}
-
-fn effect_value_bytes(values: &[HeaderValue]) -> Result<usize, HeaderEffectError> {
-    for value in values {
-        if value.as_bytes().len() > MAX_HEADER_FIELD_BYTES {
-            return Err(HeaderEffectError::FieldLimit);
-        }
-    }
-    checked_sum(values.iter().map(|value| value.as_bytes().len()))
-}
-
-fn checked_sum(mut values: impl Iterator<Item = usize>) -> Result<usize, HeaderEffectError> {
-    values.try_fold(0usize, |sum, value| {
-        sum.checked_add(value)
-            .ok_or(HeaderEffectError::SizeOverflow)
-    })
-}
-
-fn ensure_aggregate_limit(value: usize) -> Result<(), HeaderEffectError> {
-    if value > MAX_HEADER_VALUE_BYTES {
-        Err(HeaderEffectError::AggregateLimit)
-    } else {
-        Ok(())
-    }
-}
-
-fn ensure_changed_aggregate(
-    other_touched_bytes: usize,
-    resulting_named_bytes: usize,
-) -> Result<(), HeaderEffectError> {
-    ensure_aggregate_limit(
-        other_touched_bytes
-            .checked_add(resulting_named_bytes)
-            .ok_or(HeaderEffectError::SizeOverflow)?,
-    )
 }
 
 #[cfg(test)]
@@ -1649,296 +1365,6 @@ mod tests {
     }
 
     #[test]
-    fn effects_are_ordered_and_when_uses_original_presence() {
-        let x = HeaderName::from_static("x-order");
-        let y = HeaderName::from_static("x-original");
-        let effects = vec![
-            HeaderEffectPlan::Append {
-                when: CompiledHeaderEffectWhen::IfAbsent,
-                name: x.clone(),
-                values: vec![HeaderValue::from_static("first")],
-            },
-            HeaderEffectPlan::Set {
-                when: CompiledHeaderEffectWhen::Always,
-                name: x.clone(),
-                values: vec![HeaderValue::from_static("second")],
-            },
-            HeaderEffectPlan::Append {
-                when: CompiledHeaderEffectWhen::IfAbsent,
-                name: x.clone(),
-                values: vec![HeaderValue::from_static("third")],
-            },
-            HeaderEffectPlan::Set {
-                when: CompiledHeaderEffectWhen::Always,
-                name: y.clone(),
-                values: vec![HeaderValue::from_static("added")],
-            },
-            HeaderEffectPlan::Remove {
-                when: CompiledHeaderEffectWhen::IfPresent,
-                name: y.clone(),
-            },
-        ];
-        let mut headers = HeaderMap::new();
-        apply_header_effects(&effects, &mut headers).unwrap();
-        let values: Vec<_> = headers
-            .get_all(&x)
-            .iter()
-            .map(|value| value.as_bytes())
-            .collect();
-        assert_eq!(values, vec![b"second".as_slice(), b"third".as_slice()]);
-        assert_eq!(headers.get(&y).unwrap(), "added");
-    }
-
-    #[test]
-    fn replacement_is_byte_exact_for_each_raw_field() {
-        let name = HeaderName::from_static("x-bytes");
-        let effects = [HeaderEffectPlan::Replace {
-            when: CompiledHeaderEffectWhen::Always,
-            name: name.clone(),
-            search: "a".to_string(),
-            replace: "z".to_string(),
-        }];
-        let mut headers = HeaderMap::new();
-        headers.append(name.clone(), HeaderValue::from_bytes(b"a\x80a").unwrap());
-        headers.append(name.clone(), HeaderValue::from_static("ba"));
-        apply_header_effects(&effects, &mut headers).unwrap();
-        let values: Vec<_> = headers
-            .get_all(&name)
-            .iter()
-            .map(|value| value.as_bytes())
-            .collect();
-        assert_eq!(values, vec![b"z\x80z".as_slice(), b"bz".as_slice()]);
-    }
-
-    #[test]
-    fn oversized_set_is_rejected_without_mutation() {
-        let name = HeaderName::from_static("x-value");
-        let effects = [HeaderEffectPlan::Set {
-            when: CompiledHeaderEffectWhen::Always,
-            name: name.clone(),
-            values: vec![HeaderValue::from_bytes(&vec![b'x'; MAX_HEADER_FIELD_BYTES + 1]).unwrap()],
-        }];
-        let mut headers = HeaderMap::new();
-        headers.insert(name, HeaderValue::from_static("original"));
-        let original = headers.clone();
-        assert_eq!(
-            apply_header_effects(&effects, &mut headers),
-            Err(HeaderEffectError::FieldLimit)
-        );
-        assert_eq!(headers, original);
-    }
-
-    #[test]
-    fn effects_may_remove_or_ignore_oversized_inbound_fields() {
-        let name = HeaderName::from_static("x-oversized");
-        let oversized = HeaderValue::from_bytes(&vec![b'x'; MAX_HEADER_FIELD_BYTES + 1]).unwrap();
-
-        let mut unchanged = HeaderMap::new();
-        unchanged.insert(name.clone(), oversized.clone());
-        let original = unchanged.clone();
-        apply_header_effects(&[], &mut unchanged).unwrap();
-        assert_eq!(unchanged, original);
-
-        let effects = [HeaderEffectPlan::Remove {
-            when: CompiledHeaderEffectWhen::Always,
-            name: name.clone(),
-        }];
-        let mut removed = HeaderMap::new();
-        removed.insert(name.clone(), oversized.clone());
-        apply_header_effects(&effects, &mut removed).unwrap();
-        assert!(!removed.contains_key(&name));
-
-        let unrelated = HeaderName::from_static("x-unrelated");
-        let effects = [HeaderEffectPlan::Set {
-            when: CompiledHeaderEffectWhen::Always,
-            name: unrelated.clone(),
-            values: vec![HeaderValue::from_static("changed")],
-        }];
-        let mut changed = original.clone();
-        apply_header_effects(&effects, &mut changed).unwrap();
-        assert_eq!(changed.get(&name).unwrap(), &oversized);
-        assert_eq!(changed.get(unrelated).unwrap(), "changed");
-
-        let effects = [HeaderEffectPlan::Append {
-            when: CompiledHeaderEffectWhen::Always,
-            name,
-            values: vec![HeaderValue::from_static("changed")],
-        }];
-        let mut rejected = original.clone();
-        assert_eq!(
-            apply_header_effects(&effects, &mut rejected),
-            Err(HeaderEffectError::FieldLimit)
-        );
-        assert_eq!(rejected, original);
-    }
-
-    #[test]
-    fn shrinking_replace_can_remediate_an_oversized_inbound_field() {
-        let name = HeaderName::from_static("x-shrink");
-        let oversized = HeaderValue::from_bytes(&vec![b'a'; MAX_HEADER_FIELD_BYTES + 1]).unwrap();
-        let effects = [HeaderEffectPlan::Replace {
-            when: CompiledHeaderEffectWhen::Always,
-            name: name.clone(),
-            search: "aa".to_string(),
-            replace: String::new(),
-        }];
-        let mut headers = HeaderMap::new();
-        headers.insert(name.clone(), oversized);
-
-        apply_header_effects(&effects, &mut headers).unwrap();
-
-        assert_eq!(headers.get(name).unwrap().as_bytes(), b"a");
-    }
-
-    #[test]
-    fn append_aggregate_limit_is_rejected_without_mutation() {
-        let existing = HeaderName::from_static("x-existing");
-        let full_field = HeaderValue::from_bytes(&vec![b'x'; MAX_HEADER_FIELD_BYTES]).unwrap();
-        let mut headers = HeaderMap::new();
-        for _ in 0..(MAX_HEADER_VALUE_BYTES / MAX_HEADER_FIELD_BYTES) {
-            headers.append(existing.clone(), full_field.clone());
-        }
-        let original = headers.clone();
-        let effects = [HeaderEffectPlan::Append {
-            when: CompiledHeaderEffectWhen::Always,
-            name: existing,
-            values: vec![HeaderValue::from_static("x")],
-        }];
-        assert_eq!(
-            apply_header_effects(&effects, &mut headers),
-            Err(HeaderEffectError::AggregateLimit)
-        );
-        assert_eq!(headers, original);
-    }
-
-    #[test]
-    fn changed_aggregate_limit_is_cumulative_across_touched_names() {
-        let first = HeaderName::from_static("x-first-changed");
-        let second = HeaderName::from_static("x-second-changed");
-        let full_field = HeaderValue::from_bytes(&vec![b'x'; MAX_HEADER_FIELD_BYTES]).unwrap();
-        let effects = [
-            HeaderEffectPlan::Set {
-                when: CompiledHeaderEffectWhen::Always,
-                name: first,
-                values: vec![full_field.clone(); 9],
-            },
-            HeaderEffectPlan::Set {
-                when: CompiledHeaderEffectWhen::Always,
-                name: second,
-                values: vec![full_field; 8],
-            },
-        ];
-        let mut headers = HeaderMap::new();
-
-        assert_eq!(
-            apply_header_effects(&effects, &mut headers),
-            Err(HeaderEffectError::AggregateLimit)
-        );
-        assert!(headers.is_empty());
-    }
-
-    #[test]
-    fn retargeted_name_replaces_its_prior_aggregate_contribution() {
-        let first = HeaderName::from_static("x-first-retargeted");
-        let second = HeaderName::from_static("x-second-retargeted");
-        let full_field = HeaderValue::from_bytes(&vec![b'x'; MAX_HEADER_FIELD_BYTES]).unwrap();
-        let effects = [
-            HeaderEffectPlan::Set {
-                when: CompiledHeaderEffectWhen::Always,
-                name: first.clone(),
-                values: vec![full_field.clone(); 9],
-            },
-            HeaderEffectPlan::Set {
-                when: CompiledHeaderEffectWhen::Always,
-                name: first.clone(),
-                values: vec![full_field.clone()],
-            },
-            HeaderEffectPlan::Set {
-                when: CompiledHeaderEffectWhen::Always,
-                name: second.clone(),
-                values: vec![full_field; 15],
-            },
-        ];
-        let mut headers = HeaderMap::new();
-
-        apply_header_effects(&effects, &mut headers).unwrap();
-
-        assert_eq!(headers.get_all(first).iter().count(), 1);
-        assert_eq!(headers.get_all(second).iter().count(), 15);
-    }
-
-    #[test]
-    fn set_replaces_a_name_that_occupies_the_aggregate_boundary() {
-        let name = HeaderName::from_static("x-full");
-        let full_field = HeaderValue::from_bytes(&vec![b'x'; MAX_HEADER_FIELD_BYTES]).unwrap();
-        let mut headers = HeaderMap::new();
-        for _ in 0..(MAX_HEADER_VALUE_BYTES / MAX_HEADER_FIELD_BYTES) {
-            headers.append(name.clone(), full_field.clone());
-        }
-        let effects = [HeaderEffectPlan::Set {
-            when: CompiledHeaderEffectWhen::Always,
-            name: name.clone(),
-            values: vec![HeaderValue::from_static("x")],
-        }];
-        apply_header_effects(&effects, &mut headers).unwrap();
-        assert_eq!(headers.get_all(name).iter().count(), 1);
-        assert_eq!(headers.values().next().unwrap(), "x");
-    }
-
-    #[test]
-    fn replacement_aggregate_expansion_is_rejected_without_mutation() {
-        let name = HeaderName::from_static("x-expand-many");
-        let input = HeaderValue::from_bytes(&vec![b'a'; 30_000]).unwrap();
-        let mut headers = HeaderMap::new();
-        for _ in 0..20 {
-            headers.append(name.clone(), input.clone());
-        }
-        let original = headers.clone();
-        let effects = [HeaderEffectPlan::Replace {
-            when: CompiledHeaderEffectWhen::Always,
-            name,
-            search: "a".to_string(),
-            replace: "aa".to_string(),
-        }];
-        assert_eq!(
-            apply_header_effects(&effects, &mut headers),
-            Err(HeaderEffectError::AggregateLimit)
-        );
-        assert_eq!(headers, original);
-    }
-
-    #[test]
-    fn replacement_expansion_rolls_back_prior_staged_effects() {
-        let changed = HeaderName::from_static("x-changed");
-        let expanded = HeaderName::from_static("x-expanded");
-        let effects = [
-            HeaderEffectPlan::Set {
-                when: CompiledHeaderEffectWhen::Always,
-                name: changed.clone(),
-                values: vec![HeaderValue::from_static("changed")],
-            },
-            HeaderEffectPlan::Replace {
-                when: CompiledHeaderEffectWhen::Always,
-                name: expanded.clone(),
-                search: "a".to_string(),
-                replace: "aa".to_string(),
-            },
-        ];
-        let mut headers = HeaderMap::new();
-        headers.insert(changed, HeaderValue::from_static("original"));
-        headers.insert(
-            expanded,
-            HeaderValue::from_bytes(&vec![b'a'; (MAX_HEADER_FIELD_BYTES / 2) + 1]).unwrap(),
-        );
-        let original = headers.clone();
-        assert_eq!(
-            apply_header_effects(&effects, &mut headers),
-            Err(HeaderEffectError::FieldLimit)
-        );
-        assert_eq!(headers, original);
-    }
-
-    #[test]
     fn deny_and_delegate_keep_stable_metadata() {
         let deny = rule(
             "deny-rule",
@@ -2020,26 +1446,6 @@ mod tests {
         assert_eq!(
             matched.authorization_provider(),
             provider_registry.get("provider-marker")
-        );
-        assert_eq!(
-            matched.redaction_profile(),
-            profile_registry.get("profile-marker")
-        );
-        assert_eq!(
-            matched.credential_actions(),
-            &[
-                ResolvedCredentialAction::Bearer {
-                    source: credential_registry.get("bearer-marker").unwrap(),
-                },
-                ResolvedCredentialAction::Basic {
-                    username: "buildbot".to_string(),
-                    source: credential_registry.get("password-marker").unwrap(),
-                },
-                ResolvedCredentialAction::CustomHeader {
-                    header: HeaderName::from_static("x-api-key"),
-                    source: credential_registry.get("custom-marker").unwrap(),
-                },
-            ]
         );
         assert_eq!(bindings.provider_count, provider_registry.len());
         assert_eq!(bindings.redaction_profile_count, profile_registry.len());

@@ -383,12 +383,6 @@ impl RedactionSnapshot {
     }
 }
 
-impl crate::runtime::RedactionSnapshot for RedactionSnapshot {
-    fn profile(&self, index: RedactionProfileIndex) -> Option<ProfileHandle> {
-        RedactionSnapshot::profile(self, index)
-    }
-}
-
 impl RedactionActivation {
     pub(crate) fn profile_index(&self, name: &str) -> Option<RedactionProfileIndex> {
         self.profile_registry.get(name)

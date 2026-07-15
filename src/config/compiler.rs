@@ -219,6 +219,15 @@ pub(crate) enum CompiledHttp1ConnectPolicy {
     Mitm,
 }
 
+impl StaticConnectPolicy {
+    pub(crate) fn http1_listener_denied(&self) -> Option<bool> {
+        self.http1.map(|mode| match mode {
+            CompiledHttp1ConnectPolicy::Deny => true,
+            CompiledHttp1ConnectPolicy::Mitm => false,
+        })
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub(crate) enum StaticMitmConfig {
     Generated {

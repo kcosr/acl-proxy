@@ -37,42 +37,40 @@ use crate::capture::{
 };
 use crate::certs::MitmCertificateManager;
 use crate::config::compiler::{
-    CompiledHttp1ConnectPolicy, CompiledHttpVersion, HeaderEffectPlan, HttpBodyReadPlan,
-    StaticCleartextListener, StaticExplicitHttpsListener, StaticTransparentHttpsListener,
+    CompiledHttpVersion, StaticCleartextListener, StaticExplicitHttpsListener,
+    StaticTransparentHttpsListener,
 };
-use crate::destination::DestinationTarget;
 use crate::http1::head::IngressRequestKind;
 use crate::http1::ingress::{RequestDisposition, ValidatedIngressIo};
-use crate::http_body::{read_mandatory_request_body, HttpBodyReadError};
 use crate::observation::{CaptureEpoch, CaptureEvent, ProductObservationRuntime};
-use crate::policy::apply_header_effects;
 use crate::proxy::authority::{reconcile_connect_outer_request, reconcile_request};
-use crate::proxy::facts::{body_metadata, validate_request_fact_shape};
+use crate::proxy::facts::{
+    validate_standalone_connect_ingress_request, validate_standalone_ingress_request,
+};
 use crate::proxy::forward::{
-    forward_request, forward_upgrade_request, preflight_forwarding_target,
-    resolve_forwarding_target, ForwardBody, ForwardBodyError, ForwardUpgradeResult,
-    ForwardedResponse, ResolvedForwardingTarget,
+    forward_request, forward_upgrade_request, preflight_forwarding_target, ForwardBody,
+    ForwardBodyError, ForwardUpgradeResult, ForwardedResponse, ResolvedForwardingTarget,
 };
-use crate::proxy::headers::{
-    sanitize_untrusted_connect_request, sanitize_untrusted_request, HeaderPreparationError,
-    SanitizedRequest,
-};
+use crate::proxy::headers::SanitizedRequest;
 use crate::proxy::original_destination::{
     OriginalDestinationResolver, SystemOriginalDestinationResolver,
 };
+use crate::proxy::standalone_body::StandaloneExchangeBody;
 use crate::proxy::upgrade_relay::{EstablishedUpgradeKind, UpgradeCaptureContext};
-use crate::request_decision::{
-    prepare_request, AllowedRequest, GuardedRequestBody as DecisionBody, RequestDecision,
-    RequestInput, TerminalRequestBodyProvenance, UpgradeBinding,
-};
+use crate::request_pipeline::{RequestPipeline, RequestPipelineError};
 use crate::runtime::{BoxFuture, GenerationRetention, Runtime};
-use crate::safety::wire_body::{GuardedBodyData, GuardedHttpBody};
-use crate::safety::{InvalidLoopMarker, WireBodyQuotaKey};
+use crate::safety::{GuardedBody, WireBodyQuotaKey};
 use crate::sensitive::{is_sensitive_header_name, REDACTED};
+use crate::standalone_policy_provider::{
+    StandaloneForwardDispatch, StandaloneIngressTransport, StandalonePolicyProvider,
+    StandaloneProviderInput, StandaloneResponseBodyProvenance, StandaloneResponseDispatch,
+    StandaloneTerminalService, TokioRuntimeClock,
+};
+use crate::standalone_provider_result::{StandaloneCaptureBody, StandaloneUpgradeBinding};
 use crate::upgrade::{
     UpgradeEntryPlan, UpgradeRuntime, UpgradeTerminalCause, UpgradeTerminalControl,
 };
-use http_access_types::{CanonicalHost, IngressMode};
+use http_access_types::{apply_header_mutation_batches, CanonicalHost, IngressMode, UpgradePolicy};
 use http_access_url::{
     canonicalize_tls_server_name, reconcile_connect_sni, CanonicalConnectTarget,
 };
@@ -125,7 +123,13 @@ impl ProxySupervisorStarter for ProductProxySupervisorStarter {
         let kind = listener.kind();
         match listener.config {
             ProxyListenerConfig::ExplicitHttp(config) => {
-                require_connect_mitm_asset(kind, config.connect.as_ref(), assets)?;
+                require_connect_mitm_asset(
+                    kind,
+                    config.connect.as_ref().and_then(
+                        crate::config::compiler::StaticConnectPolicy::http1_listener_denied,
+                    ) == Some(false),
+                    assets,
+                )?;
                 ProductIngressSupervisor::start(
                     IngressListenerConfig::cleartext(
                         kind,
@@ -156,7 +160,11 @@ impl ProxySupervisorStarter for ProductProxySupervisorStarter {
             )
             .map(|supervisor| supervisor as Arc<dyn ProxySupervisor>),
             ProxyListenerConfig::ExplicitHttps(config) => {
-                require_connect_mitm_asset(kind, Some(&config.connect), assets)?;
+                require_connect_mitm_asset(
+                    kind,
+                    config.connect.http1_listener_denied() == Some(false),
+                    assets,
+                )?;
                 let config = *config;
                 let acceptor = assets.explicit_https_tls().cloned().ok_or_else(|| {
                     ProxySupervisorStartError {
@@ -206,12 +214,10 @@ impl ProxySupervisorStarter for ProductProxySupervisorStarter {
 
 fn require_connect_mitm_asset(
     kind: ProxyListenerKind,
-    connect: Option<&crate::config::compiler::StaticConnectPolicy>,
+    connect_mitm: bool,
     assets: &ProductIngressAssets,
 ) -> Result<(), ProxySupervisorStartError> {
-    if connect.is_some_and(|connect| connect.http1 == Some(CompiledHttp1ConnectPolicy::Mitm))
-        && assets.mitm().is_none()
-    {
+    if connect_mitm && assets.mitm().is_none() {
         return Err(ProxySupervisorStartError {
             listener: kind,
             message: "HTTP/1 CONNECT MITM requires an activated MITM certificate manager"
@@ -295,7 +301,7 @@ struct IngressListenerConfig {
     request_header_timeout: Duration,
     max_connections: usize,
     max_concurrent_streams: u32,
-    connect: Option<crate::config::compiler::StaticConnectPolicy>,
+    connect_http1_denied: Option<bool>,
 }
 
 impl IngressListenerConfig {
@@ -312,7 +318,10 @@ impl IngressListenerConfig {
             request_header_timeout: config.request_header_timeout,
             max_connections: config.max_connections,
             max_concurrent_streams: config.max_concurrent_streams,
-            connect: config.connect,
+            connect_http1_denied: config
+                .connect
+                .as_ref()
+                .and_then(crate::config::compiler::StaticConnectPolicy::http1_listener_denied),
         }
     }
 
@@ -332,7 +341,7 @@ impl IngressListenerConfig {
             request_header_timeout: config.request_header_timeout,
             max_connections: config.max_connections,
             max_concurrent_streams: config.max_concurrent_streams,
-            connect: Some(config.connect),
+            connect_http1_denied: config.connect.http1_listener_denied(),
         }
     }
 
@@ -356,7 +365,7 @@ impl IngressListenerConfig {
             request_header_timeout: config.request_header_timeout,
             max_connections: config.max_connections,
             max_concurrent_streams: config.max_concurrent_streams,
-            connect: None,
+            connect_http1_denied: None,
         }
     }
 }
@@ -931,7 +940,7 @@ async fn serve_http_connection(connection: HttpConnection) {
     let service_config = config.clone();
     let service_stop = supervisor_stop.clone();
     let service_validation = validation.clone();
-    let service = service_fn(move |mut request| {
+    let service = service_fn(move |request| {
         let runtime = runtime.clone();
         let observation_runtime = observation_runtime.clone();
         let upgrade_runtime = upgrade_runtime.clone();
@@ -965,7 +974,6 @@ async fn serve_http_connection(connection: HttpConnection) {
                 }
             };
             let close_entire_connection = request.version() != http::Version::HTTP_2;
-            let downstream_upgrade = hyper::upgrade::on(&mut request);
             let handled = if request.method() == Method::CONNECT && authority.is_explicit() {
                 execute_connect_request(
                     ConnectRequestExecution {
@@ -983,11 +991,10 @@ async fn serve_http_connection(connection: HttpConnection) {
                         tunnel_stop,
                     },
                     request,
-                    downstream_upgrade,
                 )
                 .await
             } else {
-                execute_request(
+                execute_request_via_pipeline(
                     RequestExecution {
                         authority,
                         peer,
@@ -998,7 +1005,6 @@ async fn serve_http_connection(connection: HttpConnection) {
                         assets,
                     },
                     request,
-                    downstream_upgrade,
                 )
                 .await
             };
@@ -1353,7 +1359,7 @@ impl ConnectTunnelPlan {
         else {
             return;
         };
-        self.config.connect = None;
+        self.config.connect_http1_denied = None;
         serve_http_connection(HttpConnection {
             kind: self.kind,
             config: self.config,
@@ -1389,10 +1395,157 @@ struct ConnectRequestExecution {
     tunnel_stop: watch::Receiver<SupervisorStop>,
 }
 
+struct StandaloneConnectTerminal {
+    config: IngressListenerConfig,
+    target: CanonicalConnectTarget,
+    peer: SocketAddr,
+    quota_key: WireBodyQuotaKey,
+    runtime: Arc<Runtime>,
+    observation_runtime: Arc<ProductObservationRuntime>,
+    upgrade_runtime: Arc<UpgradeRuntime>,
+    assets: Arc<ProductIngressAssets>,
+    tunnel_tx: mpsc::Sender<ConnectTunnelPlan>,
+    admission: Arc<StdMutex<Option<OwnedSemaphorePermit>>>,
+    tunnel_stop: watch::Receiver<SupervisorStop>,
+    listener_denied: bool,
+}
+
+impl StandaloneTerminalService for StandaloneConnectTerminal {
+    type Output = HandledResponse;
+
+    fn fail_closed(self, _error: RequestPipelineError) -> BoxFuture<'static, Self::Output> {
+        Box::pin(async {
+            HandledResponse::fixed(StatusCode::INTERNAL_SERVER_ERROR, "request failed\n", true)
+        })
+    }
+
+    fn respond(self, dispatch: StandaloneResponseDispatch) -> BoxFuture<'static, Self::Output> {
+        Box::pin(async move {
+            let status = StatusCode::from_u16(dispatch.response.status())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let message = match status {
+                StatusCode::FORBIDDEN if self.listener_denied => "CONNECT denied\n",
+                StatusCode::FORBIDDEN => "request denied\n",
+                StatusCode::GATEWAY_TIMEOUT => "request timed out\n",
+                StatusCode::SERVICE_UNAVAILABLE => "service unavailable\n",
+                _ => "request failed\n",
+            };
+            HandledResponse::fixed(status, message, true)
+        })
+    }
+
+    fn forward(self, dispatch: StandaloneForwardDispatch) -> BoxFuture<'static, Self::Output> {
+        Box::pin(execute_connect_terminal(self, dispatch))
+    }
+}
+
+async fn execute_connect_terminal(
+    terminal: StandaloneConnectTerminal,
+    dispatch: StandaloneForwardDispatch,
+) -> HandledResponse {
+    let StandaloneForwardDispatch {
+        exchange,
+        generation,
+        request_id: _,
+        retention,
+        deadline,
+        destinations: _,
+        resolved: _,
+        sidecar,
+        transport,
+    } = dispatch;
+    let StandaloneIngressTransport::OuterConnect {
+        protocol,
+        downstream_upgrade,
+    } = transport
+    else {
+        return HandledResponse::fixed(StatusCode::INTERNAL_SERVER_ERROR, "request failed\n", true);
+    };
+    if protocol != crate::egress::OriginProtocol::Http1
+        || exchange.facts().method().as_str() != "CONNECT"
+        || exchange.plan().origin() != terminal.target.url()
+        || !matches!(exchange.plan().upgrade(), UpgradePolicy::Deny)
+    {
+        return HandledResponse::fixed(StatusCode::INTERNAL_SERVER_ERROR, "request failed\n", true);
+    }
+    drop((exchange, sidecar, retention, generation));
+
+    let Some(manager) = terminal.assets.mitm().cloned() else {
+        return HandledResponse::fixed(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service unavailable\n",
+            true,
+        );
+    };
+    let alpn_protocols = connect_alpn_protocols(&terminal.config.http_versions);
+    let server_config = match tokio::time::timeout_at(
+        deadline,
+        manager
+            .server_config_for_host(terminal.target.authority().host().as_str(), &alpn_protocols),
+    )
+    .await
+    {
+        Ok(Ok(config)) => config,
+        Ok(Err(_)) => {
+            return HandledResponse::fixed(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service unavailable\n",
+                true,
+            )
+        }
+        Err(_) => {
+            return HandledResponse::fixed(StatusCode::GATEWAY_TIMEOUT, "request timed out\n", true)
+        }
+    };
+    let Some(admission) = terminal
+        .admission
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    else {
+        return HandledResponse::fixed(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service unavailable\n",
+            true,
+        );
+    };
+    let plan = ConnectTunnelPlan {
+        kind: terminal.config.kind,
+        config: terminal.config,
+        target: terminal.target,
+        server_config,
+        downstream_upgrade,
+        peer: terminal.peer,
+        quota_key: terminal.quota_key,
+        runtime: terminal.runtime,
+        observation_runtime: terminal.observation_runtime,
+        upgrade_runtime: terminal.upgrade_runtime,
+        assets: terminal.assets,
+        stop: terminal.tunnel_stop,
+        tunnel_tx: terminal.tunnel_tx.clone(),
+        _admission: admission,
+    };
+    if terminal.tunnel_tx.try_send(plan).is_err() {
+        return HandledResponse::fixed(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service unavailable\n",
+            true,
+        );
+    }
+    HandledResponse {
+        response: Response::builder()
+            .status(StatusCode::OK)
+            .version(Version::HTTP_11)
+            .body(ProxyResponseBody::Local(Body::empty()))
+            .expect("CONNECT response is valid"),
+        close_connection: false,
+        request_disposition: RequestDisposition::SwitchProtocol,
+    }
+}
+
 async fn execute_connect_request(
     execution: ConnectRequestExecution,
     mut request: Request<Body>,
-    downstream_upgrade: hyper::upgrade::OnUpgrade,
 ) -> HandledResponse {
     let ConnectRequestExecution {
         config,
@@ -1413,24 +1566,6 @@ async fn execute_connect_request(
         .authority
         .ingress_mode()
         .expect("outer CONNECT is only dispatched on an explicit listener");
-    let body_metadata = match body_metadata(request.version(), request.headers()) {
-        Ok(metadata) => metadata,
-        Err(_) => {
-            return HandledResponse::fixed(
-                StatusCode::BAD_REQUEST,
-                "invalid CONNECT framing\n",
-                true,
-            )
-        }
-    };
-    if !request.body().is_end_stream() {
-        return HandledResponse::fixed(
-            StatusCode::BAD_REQUEST,
-            "CONNECT body is not allowed\n",
-            true,
-        );
-    }
-
     let target = match reconcile_connect_outer_request(&mut request) {
         Ok(target) => target,
         Err(_) => {
@@ -1441,55 +1576,28 @@ async fn execute_connect_request(
             )
         }
     };
-    let mut sanitized = match sanitize_untrusted_connect_request(request) {
-        Ok(request) => request,
+    let listener_denied = match request.version() {
+        Version::HTTP_10 | Version::HTTP_11 => config.connect_http1_denied,
+        _ => None,
+    };
+    let listener_denied = match listener_denied {
+        Some(denied) => denied,
+        None => {
+            return HandledResponse::fixed(StatusCode::BAD_REQUEST, "CONNECT unsupported\n", true)
+        }
+    };
+    let validated = match validate_standalone_connect_ingress_request(
+        ingress_mode,
+        target.url().clone(),
+        request,
+    ) {
+        Ok(validated) => validated,
         Err(_) => {
             return HandledResponse::fixed(
                 StatusCode::BAD_REQUEST,
                 "invalid CONNECT request\n",
                 true,
             )
-        }
-    };
-    let shape = match validate_request_fact_shape(
-        ingress_mode,
-        sanitized.version(),
-        sanitized.method(),
-        target.url().clone(),
-        sanitized.headers(),
-        body_metadata,
-        None,
-    ) {
-        Ok(shape) => shape,
-        Err(_) => {
-            return HandledResponse::fixed(StatusCode::BAD_REQUEST, "invalid CONNECT facts\n", true)
-        }
-    };
-    let policy = match sanitized.version() {
-        Version::HTTP_10 | Version::HTTP_11 => {
-            config.connect.as_ref().and_then(|connect| connect.http1)
-        }
-        Version::HTTP_2 => {
-            return HandledResponse::fixed(StatusCode::FORBIDDEN, "CONNECT denied\n", true)
-        }
-        _ => None,
-    };
-    match policy {
-        Some(CompiledHttp1ConnectPolicy::Deny) => {
-            return HandledResponse::fixed(StatusCode::FORBIDDEN, "CONNECT denied\n", true)
-        }
-        Some(CompiledHttp1ConnectPolicy::Mitm) => {}
-        None => {
-            return HandledResponse::fixed(StatusCode::BAD_REQUEST, "CONNECT unsupported\n", true)
-        }
-    }
-    let prepared_destination = match assets
-        .destination_guard()
-        .preflight(DestinationTarget::direct(target.url()))
-    {
-        Ok(destination) => destination,
-        Err(_) => {
-            return HandledResponse::fixed(StatusCode::FORBIDDEN, "destination denied\n", true)
         }
     };
     let Some(lease) = runtime.lease().await else {
@@ -1501,26 +1609,43 @@ async fn execute_connect_request(
     };
     let request_id = request_id();
     let started_at = Instant::now();
-    let input = match RequestInput::from_validated_shape(
-        &lease,
-        &request_id,
-        shape,
-        sanitized.headers_mut(),
-        peer.ip(),
-        quota_key.clone(),
-        started_at,
+    let preflight_target = match preflight_forwarding_target(
+        target.url(),
+        validated.ingress().sanitized(),
+        lease.egress(),
+        assets.destination_guard(),
     ) {
-        Ok(input) => input,
+        Ok(target) => target,
         Err(_) => {
-            return HandledResponse::fixed(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "request failed\n",
-                true,
-            )
+            return HandledResponse::fixed(StatusCode::FORBIDDEN, "destination denied\n", true)
         }
     };
-    let (_parts, _body, _protocol) = sanitized.into_parts();
-    let prepared = match prepare_request(&lease, input) {
+    let terminal = StandaloneConnectTerminal {
+        config,
+        target,
+        peer,
+        quota_key: quota_key.clone(),
+        runtime,
+        observation_runtime,
+        upgrade_runtime,
+        assets: assets.clone(),
+        tunnel_tx,
+        admission,
+        tunnel_stop,
+        listener_denied,
+    };
+    let input = StandaloneProviderInput {
+        request_id,
+        validated,
+        peer_ip: peer.ip(),
+        quota_key,
+        started_at,
+        preflight_target,
+        destinations: assets.destination_guard().clone(),
+        clock: TokioRuntimeClock::new(started_at),
+        listener_denied,
+    };
+    let (provider, request) = match StandalonePolicyProvider::prepare(lease, terminal, input) {
         Ok(prepared) => prepared,
         Err(_) => {
             return HandledResponse::fixed(
@@ -1530,120 +1655,7 @@ async fn execute_connect_request(
             )
         }
     };
-    let deadline = prepared.deadline();
-    if prepared.denies_without_resolution() {
-        return match prepared.decide(None).await {
-            Ok(RequestDecision::Deny(_)) => {
-                HandledResponse::fixed(StatusCode::FORBIDDEN, "request denied\n", true)
-            }
-            _ => {
-                HandledResponse::fixed(StatusCode::INTERNAL_SERVER_ERROR, "request failed\n", true)
-            }
-        };
-    }
-    match tokio::time::timeout_at(
-        deadline,
-        assets
-            .destination_guard()
-            .complete_resolution(prepared_destination),
-    )
-    .await
-    {
-        Ok(Ok(_)) => {}
-        Ok(Err(_)) => {
-            return HandledResponse::fixed(StatusCode::FORBIDDEN, "destination denied\n", true)
-        }
-        Err(_) => {
-            return HandledResponse::fixed(StatusCode::GATEWAY_TIMEOUT, "request timed out\n", true)
-        }
-    }
-    match tokio::time::timeout_at(deadline, prepared.decide(None)).await {
-        Ok(Ok(RequestDecision::Allow(allowed))) => drop(allowed),
-        Ok(Ok(RequestDecision::Deny(_))) => {
-            return HandledResponse::fixed(StatusCode::FORBIDDEN, "request denied\n", true)
-        }
-        Ok(Err(_)) => {
-            return HandledResponse::fixed(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "request failed\n",
-                true,
-            )
-        }
-        Err(_) => {
-            return HandledResponse::fixed(StatusCode::GATEWAY_TIMEOUT, "request timed out\n", true)
-        }
-    }
-    drop(lease);
-
-    let Some(manager) = assets.mitm().cloned() else {
-        return HandledResponse::fixed(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "service unavailable\n",
-            true,
-        );
-    };
-    let alpn_protocols = connect_alpn_protocols(&config.http_versions);
-    let server_config = match tokio::time::timeout_at(
-        deadline,
-        manager.server_config_for_host(target.authority().host().as_str(), &alpn_protocols),
-    )
-    .await
-    {
-        Ok(Ok(config)) => config,
-        Ok(Err(_)) => {
-            return HandledResponse::fixed(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "service unavailable\n",
-                true,
-            )
-        }
-        Err(_) => {
-            return HandledResponse::fixed(StatusCode::GATEWAY_TIMEOUT, "request timed out\n", true)
-        }
-    };
-    let Some(admission) = admission
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .take()
-    else {
-        return HandledResponse::fixed(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "service unavailable\n",
-            true,
-        );
-    };
-    let plan = ConnectTunnelPlan {
-        kind: config.kind,
-        config,
-        target,
-        server_config,
-        downstream_upgrade,
-        peer,
-        quota_key,
-        runtime,
-        observation_runtime,
-        upgrade_runtime,
-        assets,
-        stop: tunnel_stop,
-        tunnel_tx: tunnel_tx.clone(),
-        _admission: admission,
-    };
-    if tunnel_tx.try_send(plan).is_err() {
-        return HandledResponse::fixed(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "service unavailable\n",
-            true,
-        );
-    }
-    HandledResponse {
-        response: Response::builder()
-            .status(StatusCode::OK)
-            .version(Version::HTTP_11)
-            .body(ProxyResponseBody::Local(Body::empty()))
-            .expect("CONNECT response is valid"),
-        close_connection: false,
-        request_disposition: RequestDisposition::SwitchProtocol,
-    }
+    RequestPipeline::new().execute(provider, request).await
 }
 
 fn connect_alpn_protocols(versions: &[CompiledHttpVersion]) -> Vec<Vec<u8>> {
@@ -1667,6 +1679,19 @@ struct HttpCaptureContext {
     ingress_mode: IngressMode,
     request_version: Version,
     max_expansion_ratio: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalRequestBodyProvenance {
+    Unconsumed,
+    CompleteOriginal,
+    CompleteWireRedacted,
+    ProviderReplacement { size: usize },
+}
+
+struct DeniedCaptureBody {
+    headers: HeaderMap,
+    decoded: GuardedBody,
 }
 
 impl HttpCaptureContext {
@@ -1715,12 +1740,6 @@ impl HttpCaptureContext {
             port: Some(target.authority().effective_port()),
         });
         UpgradeCaptureContext::new(self.runtime.clone(), base, self.max_expansion_ratio)
-    }
-
-    fn captures(&self, event: CaptureEvent) -> bool {
-        self.epoch
-            .capture()
-            .is_some_and(|policy| policy.captures(event))
     }
 
     fn begin(
@@ -1847,10 +1866,13 @@ impl HttpCaptureContext {
     fn submit_denied_request(
         &self,
         headers: Option<&HeaderMap>,
-        body: Option<DecisionBody>,
+        body: Option<DeniedCaptureBody>,
         provenance: TerminalRequestBodyProvenance,
     ) {
-        let body_headers = body.as_ref().map(terminal_body_headers).unwrap_or_default();
+        let body_headers = body
+            .as_ref()
+            .map(|body| body.headers.clone())
+            .unwrap_or_default();
         let Some(mut submission) = self.begin(
             CaptureEvent::RequestDenied,
             || {
@@ -1922,7 +1944,7 @@ impl HttpCaptureContext {
     }
 }
 
-struct CaptureSubmission {
+pub(super) struct CaptureSubmission {
     runtime: Arc<ProductObservationRuntime>,
     tap: Option<HttpCaptureTap>,
     expect_trailers: bool,
@@ -1941,25 +1963,25 @@ impl CaptureSubmission {
         }
     }
 
-    fn push(&mut self, bytes: &[u8]) {
+    pub(super) fn push(&mut self, bytes: &[u8]) {
         if let Some(tap) = self.tap.as_mut() {
             tap.push(bytes);
         }
     }
 
-    fn finish(&mut self) {
+    pub(super) fn finish(&mut self) {
         if let Some(tap) = self.tap.take() {
             self.submit(tap.finish());
         }
     }
 
-    fn finish_data_if_complete(&mut self, complete: bool) {
+    pub(super) fn finish_data_if_complete(&mut self, complete: bool) {
         if complete && !self.expect_trailers {
             self.finish();
         }
     }
 
-    fn abandon(&mut self) {
+    pub(super) fn abandon(&mut self) {
         if let Some(tap) = self.tap.take() {
             self.submit(tap.abandon());
         }
@@ -1976,25 +1998,6 @@ impl Drop for CaptureSubmission {
     fn drop(&mut self) {
         self.abandon();
     }
-}
-
-fn terminal_body_headers(body: &DecisionBody) -> HeaderMap {
-    let mut headers = HeaderMap::new();
-    if let Some(content_type) = body
-        .content_type
-        .as_deref()
-        .and_then(|value| HeaderValue::from_str(value).ok())
-    {
-        headers.insert(CONTENT_TYPE, content_type);
-    }
-    if let Some(content_encoding) = body
-        .content_encoding
-        .as_deref()
-        .and_then(|value| HeaderValue::from_str(value).ok())
-    {
-        headers.insert(CONTENT_ENCODING, content_encoding);
-    }
-    headers
 }
 
 fn headers_to_capture_map(headers: &HeaderMap) -> crate::capture::HeaderMap {
@@ -2038,26 +2041,26 @@ fn http_version(version: Version) -> &'static str {
     }
 }
 
-struct AuthorizedUpgradeExecution {
+struct StandaloneUpgradeExecution {
     runtime: Arc<UpgradeRuntime>,
     capture: UpgradeCaptureContext,
-    binding: UpgradeBinding,
-    request: SanitizedRequest<OriginRequestBody>,
+    binding: StandaloneUpgradeBinding,
+    request: SanitizedRequest<StandaloneExchangeBody>,
     canonical: http_access_url::CanonicalUrl,
     resolved: ResolvedForwardingTarget,
     destinations: Arc<crate::destination::DestinationGuard>,
     retention: GenerationRetention,
     downstream_upgrade: hyper::upgrade::OnUpgrade,
     deadline: Instant,
-    response_effects: Vec<HeaderEffectPlan>,
+    response_mutations: Vec<http_access_types::HeaderMutationBatch>,
     request_headers: HeaderMap,
     protocol: HeaderValue,
 }
 
-async fn execute_authorized_upgrade(
-    execution: AuthorizedUpgradeExecution,
+async fn execute_standalone_upgrade(
+    execution: StandaloneUpgradeExecution,
 ) -> Result<UpgradeHandshakeResponse, StatusCode> {
-    let AuthorizedUpgradeExecution {
+    let StandaloneUpgradeExecution {
         runtime: upgrade_runtime,
         capture: upgrade_capture,
         binding,
@@ -2068,7 +2071,7 @@ async fn execute_authorized_upgrade(
         retention,
         downstream_upgrade,
         deadline,
-        response_effects,
+        response_mutations,
         request_headers,
         protocol,
     } = execution;
@@ -2086,7 +2089,12 @@ async fn execute_authorized_upgrade(
             .await;
             match forwarded {
                 Ok(Ok(ForwardUpgradeResult::Response(mut response))) => {
-                    if apply_header_effects(&response_effects, response.headers_mut()).is_err() {
+                    if apply_standalone_response_mutations(
+                        &response_mutations,
+                        response.headers_mut(),
+                    )
+                    .is_err()
+                    {
                         let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
                             StatusCode::INTERNAL_SERVER_ERROR,
                         ));
@@ -2099,7 +2107,12 @@ async fn execute_authorized_upgrade(
                 }
                 Ok(Ok(ForwardUpgradeResult::SwitchingProtocols(upgrade))) => {
                     let (mut response, upstream_upgrade) = upgrade.into_parts();
-                    if apply_header_effects(&response_effects, response.headers_mut()).is_err() {
+                    if apply_standalone_response_mutations(
+                        &response_mutations,
+                        response.headers_mut(),
+                    )
+                    .is_err()
+                    {
                         let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
                             StatusCode::INTERNAL_SERVER_ERROR,
                         ));
@@ -2138,7 +2151,7 @@ async fn execute_authorized_upgrade(
                                 .send(UpgradeHandshakeResponse::SwitchingProtocols(response))
                                 .map_err(|_| UpgradeTerminalCause::DownstreamWriteFailed)?;
                             let (downstream, upstream) =
-                                tokio::join!(downstream_upgrade, upstream_upgrade.complete(),);
+                                tokio::join!(downstream_upgrade, upstream_upgrade.complete());
                             let downstream = downstream
                                 .map_err(|_| UpgradeTerminalCause::DownstreamWriteFailed)?;
                             let upstream =
@@ -2170,6 +2183,14 @@ async fn execute_authorized_upgrade(
     }
 }
 
+fn apply_standalone_response_mutations(
+    batches: &[http_access_types::HeaderMutationBatch],
+    headers: &mut HeaderMap,
+) -> Result<(), ()> {
+    *headers = crate::proxy::facts::apply_response_mutations(headers, batches).map_err(|_| ())?;
+    Ok(())
+}
+
 struct RequestExecution {
     authority: RequestAuthority,
     peer: SocketAddr,
@@ -2180,10 +2201,406 @@ struct RequestExecution {
     assets: Arc<ProductIngressAssets>,
 }
 
-async fn execute_request(
+struct StandaloneHttpTerminal {
+    capture: HttpCaptureContext,
+    upgrade_runtime: Arc<UpgradeRuntime>,
+}
+
+impl StandaloneTerminalService for StandaloneHttpTerminal {
+    type Output = HandledResponse;
+
+    fn fail_closed(self, _error: RequestPipelineError) -> BoxFuture<'static, Self::Output> {
+        Box::pin(async move {
+            self.capture.fixed_response(
+                CaptureDecision::Deny,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request failed\n",
+                true,
+            )
+        })
+    }
+
+    fn respond(self, dispatch: StandaloneResponseDispatch) -> BoxFuture<'static, Self::Output> {
+        Box::pin(async move {
+            let status = StatusCode::from_u16(dispatch.response.status())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let message = match status {
+                StatusCode::FORBIDDEN => "request denied\n",
+                StatusCode::GATEWAY_TIMEOUT => "request timed out\n",
+                StatusCode::REQUEST_TIMEOUT => "request body denied\n",
+                StatusCode::PAYLOAD_TOO_LARGE => "request body denied\n",
+                StatusCode::UNSUPPORTED_MEDIA_TYPE => "request body denied\n",
+                StatusCode::BAD_REQUEST => "request body denied\n",
+                StatusCode::SERVICE_UNAVAILABLE => "service unavailable\n",
+                _ => "request failed\n",
+            };
+            let close_connection = dispatch
+                .observation
+                .as_ref()
+                .is_none_or(|observation| observation.close_connection);
+            match dispatch.observation {
+                Some(observation) => {
+                    let (body, provenance) = match (
+                        observation.body,
+                        observation.body_provenance,
+                    ) {
+                        (
+                            Some(body),
+                            body_provenance @ (
+                                StandaloneResponseBodyProvenance::CompleteOriginal
+                                | StandaloneResponseBodyProvenance::CompleteWireRedacted
+                            ),
+                        ) => {
+                            let mut body_headers = HeaderMap::new();
+                            if let Some(content_type) = body
+                                .content_type
+                                .as_deref()
+                                .and_then(|value| HeaderValue::from_str(value).ok())
+                            {
+                                body_headers.insert(CONTENT_TYPE, content_type);
+                            }
+                            body_headers
+                                .insert(CONTENT_ENCODING, HeaderValue::from_static("identity"));
+                            let provenance = match body_provenance {
+                                StandaloneResponseBodyProvenance::CompleteOriginal => {
+                                    TerminalRequestBodyProvenance::CompleteOriginal
+                                }
+                                StandaloneResponseBodyProvenance::CompleteWireRedacted => {
+                                    TerminalRequestBodyProvenance::CompleteWireRedacted
+                                }
+                                _ => unreachable!("the match arm restricts response provenance"),
+                            };
+                            (
+                                Some(DeniedCaptureBody {
+                                    headers: body_headers,
+                                    decoded: body.decoded,
+                                }),
+                                provenance,
+                            )
+                        }
+                        (
+                            None,
+                            StandaloneResponseBodyProvenance::ProviderReplacement { size },
+                        ) => (
+                            None,
+                            TerminalRequestBodyProvenance::ProviderReplacement { size },
+                        ),
+                        (None, StandaloneResponseBodyProvenance::Unconsumed) => {
+                            (None, TerminalRequestBodyProvenance::Unconsumed)
+                        }
+                        (None, StandaloneResponseBodyProvenance::CompleteOriginal) => {
+                            (None, TerminalRequestBodyProvenance::CompleteOriginal)
+                        }
+                        (None, StandaloneResponseBodyProvenance::CompleteWireRedacted) => {
+                            (None, TerminalRequestBodyProvenance::CompleteWireRedacted)
+                        }
+                        _ => (None, TerminalRequestBodyProvenance::Unconsumed),
+                    };
+                    self.capture.submit_denied_request(
+                        Some(&observation.headers),
+                        body,
+                        provenance,
+                    );
+                }
+                None => self.capture.submit_denied_request(
+                    None,
+                    None,
+                    TerminalRequestBodyProvenance::Unconsumed,
+                ),
+            }
+            self.capture
+                .fixed_response(CaptureDecision::Deny, status, message, close_connection)
+        })
+    }
+
+    fn forward(self, dispatch: StandaloneForwardDispatch) -> BoxFuture<'static, Self::Output> {
+        Box::pin(execute_standalone_forward(self, dispatch))
+    }
+}
+
+async fn execute_standalone_forward(
+    terminal: StandaloneHttpTerminal,
+    mut dispatch: StandaloneForwardDispatch,
+) -> HandledResponse {
+    let StandaloneIngressTransport::Ordinary {
+        mut parts,
+        protocol,
+        downstream_upgrade,
+    } = dispatch.transport
+    else {
+        return terminal.capture.fixed_response(
+            CaptureDecision::Allow,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "request failed\n",
+            true,
+        );
+    };
+    let plan = dispatch.exchange.plan();
+    let origin = plan.origin().clone();
+    let plan_binding = plan.binding();
+    let response_mutations = plan.response_mutation_batches().to_vec();
+    let upgrade = plan.upgrade().clone();
+    let upgrade_binding = match dispatch.sidecar.take_upgrade_binding(plan_binding) {
+        Ok(binding) => binding,
+        Err(_) => {
+            return terminal.capture.fixed_response(
+                CaptureDecision::Allow,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request failed\n",
+                true,
+            )
+        }
+    };
+    let neutral_headers = match apply_header_mutation_batches(
+        dispatch.exchange.facts().headers(),
+        plan.request_mutation_batches(),
+    ) {
+        Ok(headers) => headers,
+        Err(_) => {
+            if let Ok(headers) =
+                crate::proxy::facts::product_headers(dispatch.exchange.facts().headers())
+            {
+                let body_headers = body_headers(&headers);
+                if let Some(mut submission) = terminal.capture.begin_allowed_request(
+                    &headers,
+                    &body_headers,
+                    TerminalRequestBodyProvenance::Unconsumed,
+                ) {
+                    submission.abandon();
+                }
+            }
+            return terminal.capture.fixed_response(
+                CaptureDecision::Allow,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request failed\n",
+                true,
+            );
+        }
+    };
+    let mut headers = match crate::proxy::facts::product_headers(&neutral_headers) {
+        Ok(headers) => headers,
+        Err(_) => {
+            return terminal.capture.fixed_response(
+                CaptureDecision::Allow,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request failed\n",
+                true,
+            )
+        }
+    };
+    let capture_headers = headers.clone();
+    let mut capture_body_headers = body_headers(&headers);
+    let provenance = match dispatch.sidecar.capture_body() {
+        StandaloneCaptureBody::ProviderReplacement { size } => {
+            TerminalRequestBodyProvenance::ProviderReplacement { size }
+        }
+        StandaloneCaptureBody::Stream { canonical_identity } => {
+            if canonical_identity {
+                capture_body_headers.insert(CONTENT_ENCODING, HeaderValue::from_static("identity"));
+            }
+            if plan.redaction().is_some() {
+                TerminalRequestBodyProvenance::CompleteWireRedacted
+            } else {
+                TerminalRequestBodyProvenance::CompleteOriginal
+            }
+        }
+    };
+    let request_capture =
+        terminal
+            .capture
+            .begin_allowed_request(&capture_headers, &capture_body_headers, provenance);
+
+    let program = match dispatch.sidecar.take_credential_program(plan_binding) {
+        Ok(program) => program,
+        Err(_) => {
+            return terminal.capture.fixed_response(
+                CaptureDecision::Allow,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request failed\n",
+                true,
+            )
+        }
+    };
+    if program
+        .apply(
+            dispatch.exchange.plan(),
+            dispatch.generation.credentials(),
+            &mut headers,
+        )
+        .is_err()
+        || dispatch
+            .generation
+            .safety()
+            .inject_loop_marker(&mut headers, &dispatch.request_id)
+            .is_err()
+    {
+        return terminal.capture.fixed_response(
+            CaptureDecision::Allow,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "request failed\n",
+            true,
+        );
+    }
+    parts.headers = headers;
+    let request_headers = capture_headers;
+    let mut body = StandaloneExchangeBody::new(dispatch.exchange, dispatch.sidecar);
+    body.set_capture(request_capture);
+    let request = SanitizedRequest::from_parts(*parts, body, protocol);
+
+    if !matches!(upgrade, UpgradePolicy::Deny) {
+        let (Some(binding), Some(downstream_upgrade), Some(upgrade_protocol)) = (
+            upgrade_binding,
+            downstream_upgrade,
+            request
+                .upgrade_intent()
+                .map(|intent| intent.protocol().clone()),
+        ) else {
+            return terminal.capture.fixed_response(
+                CaptureDecision::Allow,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "upgrade failed\n",
+                true,
+            );
+        };
+        let upgrade_capture = terminal.capture.upgrade_capture_context(&origin);
+        let outcome = execute_standalone_upgrade(StandaloneUpgradeExecution {
+            runtime: terminal.upgrade_runtime,
+            capture: upgrade_capture,
+            binding,
+            request,
+            canonical: origin,
+            resolved: dispatch.resolved,
+            destinations: dispatch.destinations,
+            retention: dispatch.retention,
+            downstream_upgrade,
+            deadline: dispatch.deadline,
+            response_mutations,
+            request_headers,
+            protocol: upgrade_protocol,
+        })
+        .await;
+        return match outcome {
+            Ok(UpgradeHandshakeResponse::Ordinary(response)) => {
+                let response_capture = terminal.capture.begin(
+                    CaptureEvent::ResponseAllowed,
+                    || {
+                        terminal.capture.response_record(
+                            CaptureDecision::Allow,
+                            response.version(),
+                            Some(response.headers()),
+                            response.status(),
+                            false,
+                        )
+                    },
+                    response.headers(),
+                );
+                HandledResponse {
+                    response: response
+                        .map(|body| ProxyResponseBody::forwarded(body, response_capture)),
+                    close_connection: false,
+                    request_disposition: RequestDisposition::ContinueHttp,
+                }
+            }
+            Ok(UpgradeHandshakeResponse::SwitchingProtocols(response)) => {
+                if let Some(mut submission) = terminal.capture.begin(
+                    CaptureEvent::ResponseAllowed,
+                    || {
+                        terminal.capture.response_record(
+                            CaptureDecision::Allow,
+                            response.version(),
+                            Some(response.headers()),
+                            response.status(),
+                            false,
+                        )
+                    },
+                    response.headers(),
+                ) {
+                    submission.finish();
+                }
+                HandledResponse {
+                    response: response.map(ProxyResponseBody::Local),
+                    close_connection: false,
+                    request_disposition: RequestDisposition::SwitchProtocol,
+                }
+            }
+            Ok(UpgradeHandshakeResponse::Failed(status)) | Err(status) => terminal
+                .capture
+                .fixed_response(CaptureDecision::Allow, status, "upgrade failed\n", true),
+        };
+    }
+    if upgrade_binding.is_some() || downstream_upgrade.is_some() {
+        return terminal.capture.fixed_response(
+            CaptureDecision::Allow,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "request failed\n",
+            true,
+        );
+    }
+    let mut response = match tokio::time::timeout_at(
+        dispatch.deadline,
+        forward_request(
+            request,
+            &origin,
+            dispatch.generation.egress(),
+            &dispatch.destinations,
+            dispatch.resolved,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            tracing::error!(error = ?error, "upstream request failed");
+            return terminal.capture.fixed_response(
+                CaptureDecision::Allow,
+                StatusCode::BAD_GATEWAY,
+                "upstream failed\n",
+                true,
+            );
+        }
+        Err(_) => {
+            return terminal.capture.fixed_response(
+                CaptureDecision::Allow,
+                StatusCode::GATEWAY_TIMEOUT,
+                "request timed out\n",
+                true,
+            )
+        }
+    };
+    response
+        .body_mut()
+        .bind_request_lifetime(dispatch.deadline, dispatch.retention);
+    if apply_standalone_response_mutations(&response_mutations, response.headers_mut()).is_err() {
+        return terminal.capture.fixed_response(
+            CaptureDecision::Allow,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "response failed\n",
+            true,
+        );
+    }
+    let response_capture = terminal.capture.begin(
+        CaptureEvent::ResponseAllowed,
+        || {
+            terminal.capture.response_record(
+                CaptureDecision::Allow,
+                response.version(),
+                Some(response.headers()),
+                response.status(),
+                false,
+            )
+        },
+        response.headers(),
+    );
+    HandledResponse {
+        response: response.map(|body| ProxyResponseBody::forwarded(body, response_capture)),
+        close_connection: false,
+        request_disposition: RequestDisposition::ContinueHttp,
+    }
+}
+
+async fn execute_request_via_pipeline(
     execution: RequestExecution,
     mut request: Request<Body>,
-    downstream_upgrade: hyper::upgrade::OnUpgrade,
 ) -> HandledResponse {
     let RequestExecution {
         authority,
@@ -2196,18 +2613,7 @@ async fn execute_request(
     } = execution;
     let started_at = Instant::now();
     let request_id = request_id();
-    let request_version = request.version();
     let ingress_mode = authority.ingress_mode();
-    let body_metadata = match body_metadata(request_version, request.headers()) {
-        Ok(metadata) => metadata,
-        Err(_) => {
-            return HandledResponse::fixed(
-                StatusCode::BAD_REQUEST,
-                "invalid request framing\n",
-                true,
-            )
-        }
-    };
     let Some(lease) = runtime.lease().await else {
         return HandledResponse::fixed(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2236,14 +2642,13 @@ async fn execute_request(
             sni,
         } => (None, Some(sni), Some(*destination_port)),
     };
-    let target = reconcile_request(
+    let target = match reconcile_request(
         &mut request,
         ingress_mode,
         connect_target,
         sni,
         destination_port,
-    );
-    let target = match target {
+    ) {
         Ok(target) => target,
         Err(_) => {
             return capture.deny_metadata_only(
@@ -2254,463 +2659,54 @@ async fn execute_request(
         }
     };
     capture.bind_target(target.url());
-    let mut sanitized = match sanitize_untrusted_request(request) {
-        Ok(request) => request,
-        Err(error) => {
-            let status = match error {
-                HeaderPreparationError::UpgradeUnsupported
-                | HeaderPreparationError::ConnectUnsupported => StatusCode::NOT_IMPLEMENTED,
-                _ => StatusCode::BAD_REQUEST,
-            };
-            return capture.deny_metadata_only(status, "invalid request\n", true);
-        }
-    };
-    let shape = match validate_request_fact_shape(
-        ingress_mode,
-        sanitized.version(),
-        sanitized.method(),
-        target.url().clone(),
-        sanitized.headers(),
-        body_metadata,
-        sanitized.upgrade_intent(),
-    ) {
-        Ok(shape) => shape,
-        Err(_) => {
-            return capture.deny_metadata_only(
-                StatusCode::BAD_REQUEST,
-                "invalid request facts\n",
-                true,
-            )
-        }
-    };
-    let prepared_target = match preflight_forwarding_target(
-        target.url(),
-        &sanitized,
-        lease.egress(),
-        assets.destination_guard(),
-    ) {
-        Ok(target) => target,
-        Err(_) => {
-            return capture.deny_metadata_only(StatusCode::FORBIDDEN, "destination denied\n", true)
-        }
-    };
-    let prepared_target = match prepared_target.bind_for_request(
-        target.url(),
-        sanitized.protocol(),
-        lease.egress(),
-        assets.destination_guard(),
-    ) {
-        Ok(target) => target,
-        Err(_) => {
-            return capture.deny_metadata_only(StatusCode::FORBIDDEN, "destination denied\n", true)
-        }
-    };
-
-    let upgrade_protocol = sanitized
-        .upgrade_intent()
-        .map(|intent| intent.protocol().clone());
-    let input = match RequestInput::from_validated_shape(
-        &lease,
-        &request_id,
-        shape,
-        sanitized.headers_mut(),
-        peer.ip(),
-        quota_key,
-        started_at,
-    ) {
-        Ok(input) => input,
-        Err(_) => {
-            return capture.deny_metadata_only(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "request failed\n",
-                true,
-            )
-        }
-    };
-    let (mut parts, ingress_body, protocol) = sanitized.into_parts();
-    let ingress_was_complete = ingress_body.is_end_stream();
-    let mut body_headers = body_headers(&parts.headers);
-    for value in parts.headers.get_all(CONTENT_TYPE).iter() {
-        body_headers.append(CONTENT_TYPE, value.clone());
-    }
-    let content_type = parts
-        .headers
-        .get(CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    parts.headers.clear();
-    let prepared = match prepare_request(&lease, input) {
-        Ok(prepared) => prepared,
-        Err(_) => {
-            return capture.deny_metadata_only(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "request failed\n",
-                true,
-            )
-        }
-    };
-    let deadline = prepared.deadline();
-    if prepared.denies_without_resolution() {
-        let decision = match prepared.decide(None).await {
-            Ok(decision) => decision,
+    let validated =
+        match validate_standalone_ingress_request(ingress_mode, target.url().clone(), request) {
+            Ok(validated) => validated,
             Err(_) => {
                 return capture.deny_metadata_only(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "request failed\n",
+                    StatusCode::BAD_REQUEST,
+                    "invalid request\n",
                     true,
                 )
             }
         };
-        let RequestDecision::Deny(mut denied) = decision else {
-            return capture.deny_metadata_only(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "request failed\n",
-                true,
-            );
-        };
-        let body = denied.take_body_for_observation();
-        capture.submit_denied_request(Some(&denied.common.headers), body, denied.body_provenance);
-        return capture.fixed_response(
-            CaptureDecision::Deny,
-            StatusCode::FORBIDDEN,
-            "request denied\n",
-            !ingress_was_complete,
-        );
-    }
-    let resolved = match tokio::time::timeout_at(
-        deadline,
-        resolve_forwarding_target(prepared_target, assets.destination_guard()),
-    )
-    .await
-    {
-        Ok(Ok(resolved)) => resolved,
-        Ok(Err(_)) => {
+    let preflight_target = match preflight_forwarding_target(
+        target.url(),
+        validated.ingress().sanitized(),
+        lease.egress(),
+        assets.destination_guard(),
+    ) {
+        Ok(target) => target,
+        Err(_) => {
             return capture.deny_metadata_only(StatusCode::FORBIDDEN, "destination denied\n", true)
         }
+    };
+    let terminal = StandaloneHttpTerminal {
+        capture,
+        upgrade_runtime,
+    };
+    let input = StandaloneProviderInput {
+        request_id,
+        validated,
+        peer_ip: peer.ip(),
+        quota_key,
+        started_at,
+        preflight_target,
+        destinations: assets.destination_guard().clone(),
+        clock: TokioRuntimeClock::new(started_at),
+        listener_denied: false,
+    };
+    let (provider, request) = match StandalonePolicyProvider::prepare(lease, terminal, input) {
+        Ok(prepared) => prepared,
         Err(_) => {
-            return capture.deny_metadata_only(
-                StatusCode::GATEWAY_TIMEOUT,
-                "request timed out\n",
-                true,
-            )
-        }
-    };
-    let body_plan = prepared.body_read_plan();
-    let (decision_body, origin_body, normalized) = match body_plan {
-        HttpBodyReadPlan::Disabled => (None, Some(ingress_body), false),
-        HttpBodyReadPlan::Mandatory(limits) => {
-            let body = match read_mandatory_request_body(
-                &body_headers,
-                ingress_body,
-                limits,
-                lease.max_content_decoding_expansion_ratio(),
-                deadline,
-                prepared.body_guard(),
-            )
-            .await
-            {
-                Ok(body) => body,
-                Err(error) => {
-                    capture.submit_denied_request(
-                        Some(prepared.headers_for_observation()),
-                        None,
-                        TerminalRequestBodyProvenance::Unconsumed,
-                    );
-                    return capture.fixed_response(
-                        CaptureDecision::Deny,
-                        body_failure_status(error),
-                        "request body denied\n",
-                        true,
-                    );
-                }
-            };
-            let encoded_len = body.encoded_len();
-            (
-                Some(DecisionBody {
-                    content_type,
-                    content_encoding: Some("identity".to_owned()),
-                    encoded_len,
-                    decoded: body.into_guarded_body(),
-                }),
-                None,
-                true,
-            )
-        }
-    };
-    let decision_error_headers = capture
-        .captures(CaptureEvent::RequestDenied)
-        .then(|| sanitized_capture_headers(prepared.headers_for_observation()));
-    let decision = match prepared.decide(decision_body).await {
-        Ok(decision) => decision,
-        Err(error) => {
-            capture.submit_denied_request(
-                decision_error_headers.as_ref(),
-                None,
-                error
-                    .body_provenance()
-                    .unwrap_or(TerminalRequestBodyProvenance::Unconsumed),
-            );
-            return capture.fixed_response(
-                CaptureDecision::Deny,
+            return HandledResponse::fixed(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "request failed\n",
                 true,
-            );
-        }
-    };
-    let mut allowed = match decision {
-        RequestDecision::Allow(allowed) => allowed,
-        RequestDecision::Deny(mut denied) => {
-            let body = denied.take_body_for_observation();
-            capture.submit_denied_request(
-                Some(&denied.common.headers),
-                body,
-                denied.body_provenance,
-            );
-            return capture.fixed_response(
-                CaptureDecision::Deny,
-                StatusCode::FORBIDDEN,
-                "request denied\n",
-                !normalized && !ingress_was_complete,
-            );
-        }
-    };
-
-    let allowed_body_headers = if normalized {
-        allowed
-            .body
-            .as_ref()
-            .map(terminal_body_headers)
-            .unwrap_or_default()
-    } else {
-        body_headers
-    };
-    let mut observable =
-        match prepare_observable_allowed_request(&lease, &mut allowed, origin_body, normalized) {
-            Ok(prepared) => prepared,
-            Err((_error, headers)) => {
-                if let Some(mut submission) = capture.begin_allowed_request(
-                    &headers,
-                    &allowed_body_headers,
-                    allowed.body_provenance,
-                ) {
-                    submission.abandon();
-                }
-                return capture.fixed_response(
-                    CaptureDecision::Allow,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "request failed\n",
-                    true,
-                );
-            }
-        };
-    let mut request_capture = capture.begin_allowed_request(
-        &observable.headers,
-        &allowed_body_headers,
-        allowed.body_provenance,
-    );
-    if finalize_allowed_request(
-        &lease,
-        &request_id,
-        &mut parts,
-        &mut allowed,
-        &mut observable,
-    )
-    .is_err()
-    {
-        if let Some(submission) = request_capture.as_mut() {
-            submission.abandon();
-        }
-        return capture.fixed_response(
-            CaptureDecision::Allow,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "request failed\n",
-            true,
-        );
-    }
-    let mut origin_body = observable.body;
-    origin_body.set_capture(request_capture);
-    let request_headers = parts.headers.clone();
-    let request = SanitizedRequest::from_parts(parts, origin_body, protocol);
-    if let Some(binding) = allowed.upgrade.take() {
-        let Some(upgrade_protocol) = upgrade_protocol else {
-            return capture.fixed_response(
-                CaptureDecision::Allow,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "request failed\n",
-                true,
-            );
-        };
-        let retention = match lease.retain_for_operation() {
-            Ok(retention) => retention,
-            Err(_) => {
-                return capture.fixed_response(
-                    CaptureDecision::Allow,
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "service unavailable\n",
-                    true,
-                )
-            }
-        };
-        let response_effects = allowed.response_header_effects().to_vec();
-        let upgrade_capture = capture.upgrade_capture_context(target.url());
-        drop(allowed);
-        drop(lease);
-        let outcome = execute_authorized_upgrade(AuthorizedUpgradeExecution {
-            runtime: upgrade_runtime,
-            capture: upgrade_capture,
-            binding,
-            request,
-            canonical: target.url().clone(),
-            resolved,
-            destinations: assets.destination_guard().clone(),
-            retention,
-            downstream_upgrade,
-            deadline,
-            response_effects,
-            request_headers,
-            protocol: upgrade_protocol,
-        })
-        .await;
-        let outcome = match outcome {
-            Ok(outcome) => outcome,
-            Err(StatusCode::GATEWAY_TIMEOUT) => {
-                return capture.fixed_response(
-                    CaptureDecision::Allow,
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "request timed out\n",
-                    true,
-                )
-            }
-            Err(status) => {
-                return capture.fixed_response(
-                    CaptureDecision::Allow,
-                    status,
-                    "upgrade failed\n",
-                    true,
-                )
-            }
-        };
-        return match outcome {
-            UpgradeHandshakeResponse::Ordinary(response) => {
-                let response_capture = capture.begin(
-                    CaptureEvent::ResponseAllowed,
-                    || {
-                        capture.response_record(
-                            CaptureDecision::Allow,
-                            response.version(),
-                            Some(response.headers()),
-                            response.status(),
-                            false,
-                        )
-                    },
-                    response.headers(),
-                );
-                HandledResponse {
-                    response: response
-                        .map(|body| ProxyResponseBody::forwarded(body, response_capture)),
-                    close_connection: false,
-                    request_disposition: RequestDisposition::ContinueHttp,
-                }
-            }
-            UpgradeHandshakeResponse::SwitchingProtocols(response) => {
-                if let Some(mut submission) = capture.begin(
-                    CaptureEvent::ResponseAllowed,
-                    || {
-                        capture.response_record(
-                            CaptureDecision::Allow,
-                            response.version(),
-                            Some(response.headers()),
-                            response.status(),
-                            false,
-                        )
-                    },
-                    response.headers(),
-                ) {
-                    submission.finish();
-                }
-                HandledResponse {
-                    response: response.map(ProxyResponseBody::Local),
-                    close_connection: false,
-                    request_disposition: RequestDisposition::SwitchProtocol,
-                }
-            }
-            UpgradeHandshakeResponse::Failed(status) => {
-                capture.fixed_response(CaptureDecision::Allow, status, "upgrade failed\n", true)
-            }
-        };
-    }
-    let mut response = match tokio::time::timeout_at(
-        deadline,
-        forward_request(
-            request,
-            target.url(),
-            lease.egress(),
-            assets.destination_guard(),
-            resolved,
-        ),
-    )
-    .await
-    {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
-            tracing::error!(error = ?error, "upstream request failed");
-            return capture.fixed_response(
-                CaptureDecision::Allow,
-                StatusCode::BAD_GATEWAY,
-                "upstream failed\n",
-                true,
-            );
-        }
-        Err(_) => {
-            return capture.fixed_response(
-                CaptureDecision::Allow,
-                StatusCode::GATEWAY_TIMEOUT,
-                "request timed out\n",
-                true,
             )
         }
     };
-    let retention = match lease.retain_for_operation() {
-        Ok(retention) => retention,
-        Err(_) => {
-            return capture.fixed_response(
-                CaptureDecision::Allow,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "service unavailable\n",
-                true,
-            )
-        }
-    };
-    response
-        .body_mut()
-        .bind_request_lifetime(deadline, retention);
-    if apply_header_effects(allowed.response_header_effects(), response.headers_mut()).is_err() {
-        return capture.fixed_response(
-            CaptureDecision::Allow,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "response failed\n",
-            true,
-        );
-    }
-    let response_capture = capture.begin(
-        CaptureEvent::ResponseAllowed,
-        || {
-            capture.response_record(
-                CaptureDecision::Allow,
-                response.version(),
-                Some(response.headers()),
-                response.status(),
-                false,
-            )
-        },
-        response.headers(),
-    );
-    HandledResponse {
-        response: response.map(|body| ProxyResponseBody::forwarded(body, response_capture)),
-        close_connection: false,
-        request_disposition: RequestDisposition::ContinueHttp,
-    }
+    RequestPipeline::new().execute(provider, request).await
 }
 
 fn body_headers(headers: &HeaderMap) -> HeaderMap {
@@ -2721,129 +2717,6 @@ fn body_headers(headers: &HeaderMap) -> HeaderMap {
         }
     }
     selected
-}
-
-fn sanitized_capture_headers(headers: &HeaderMap) -> HeaderMap {
-    let mut sanitized = HeaderMap::new();
-    for (name, value) in headers {
-        if is_sensitive_header_name(name.as_str()) {
-            sanitized.append(name.clone(), HeaderValue::from_static(REDACTED));
-        } else {
-            sanitized.append(name.clone(), value.clone());
-        }
-    }
-    sanitized
-}
-
-#[derive(Debug, thiserror::Error)]
-enum FinalRequestError {
-    #[error(transparent)]
-    Header(#[from] crate::policy::HeaderEffectError),
-    #[error(transparent)]
-    Credential(#[from] crate::credentials::CredentialError),
-    #[error(transparent)]
-    ProviderCredential(#[from] crate::authorization::protocol::ProviderCredentialInjectionError),
-    #[error(transparent)]
-    LoopMarker(#[from] InvalidLoopMarker),
-    #[error("normalized request body is missing")]
-    MissingNormalizedBody,
-    #[error("an opaque request unexpectedly produced a normalized body")]
-    UnexpectedNormalizedBody,
-    #[error("normalized content type is invalid")]
-    ContentType,
-}
-
-struct ObservableAllowedRequest {
-    headers: HeaderMap,
-    body: OriginRequestBody,
-}
-
-fn prepare_observable_allowed_request(
-    lease: &crate::runtime::GenerationLease,
-    allowed: &mut AllowedRequest<'_>,
-    opaque_body: Option<Body>,
-    normalized: bool,
-) -> Result<ObservableAllowedRequest, (FinalRequestError, HeaderMap)> {
-    let mut headers = std::mem::take(&mut allowed.common.headers);
-    if let Err(error) = apply_header_effects(allowed.request_header_effects(), &mut headers) {
-        return Err((error.into(), headers));
-    }
-    if let Err(error) = lease.egress().apply_request_headers(&mut headers) {
-        return Err((error.into(), headers));
-    }
-
-    let body = if normalized {
-        let Some(body) = allowed.body.take() else {
-            return Err((FinalRequestError::MissingNormalizedBody, headers));
-        };
-        headers.remove(CONTENT_ENCODING);
-        headers.remove(CONTENT_LENGTH);
-        match body.content_type.as_deref() {
-            Some(value) => {
-                let value = match HeaderValue::from_str(value) {
-                    Ok(value) => value,
-                    Err(_) => return Err((FinalRequestError::ContentType, headers)),
-                };
-                headers.insert(CONTENT_TYPE, value);
-            }
-            None => {
-                headers.remove(CONTENT_TYPE);
-            }
-        }
-        OriginRequestBody::Guarded {
-            body: GuardedHttpBody::new(body.decoded),
-            capture: None,
-        }
-    } else {
-        if allowed.body.is_some() {
-            return Err((FinalRequestError::UnexpectedNormalizedBody, headers));
-        }
-        OriginRequestBody::Opaque {
-            body: opaque_body.expect("the opaque ingress body is retained"),
-            capture: None,
-        }
-    };
-    Ok(ObservableAllowedRequest { headers, body })
-}
-
-fn finalize_allowed_request(
-    lease: &crate::runtime::GenerationLease,
-    request_id: &str,
-    parts: &mut http::request::Parts,
-    allowed: &mut AllowedRequest<'_>,
-    prepared: &mut ObservableAllowedRequest,
-) -> Result<(), FinalRequestError> {
-    lease
-        .credentials()
-        .inject(allowed.credential_actions(), &mut prepared.headers)?;
-    if let Some(provider_credentials) = allowed.provider_credentials.take() {
-        provider_credentials.apply(&mut prepared.headers)?;
-    }
-    lease
-        .credentials()
-        .inject(lease.egress().credential_actions(), &mut prepared.headers)?;
-    lease
-        .safety()
-        .inject_loop_marker(&mut prepared.headers, request_id)?;
-    parts.headers = std::mem::take(&mut prepared.headers);
-    Ok(())
-}
-
-fn body_failure_status(error: HttpBodyReadError) -> StatusCode {
-    match error {
-        HttpBodyReadError::UnsupportedContentEncoding
-        | HttpBodyReadError::StackedContentEncoding
-        | HttpBodyReadError::InvalidContentEncoding
-        | HttpBodyReadError::DecoderWindowExceeded => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-        HttpBodyReadError::EncodedLimitExceeded
-        | HttpBodyReadError::DecodedLimitExceeded
-        | HttpBodyReadError::ExpansionRatioExceeded => StatusCode::PAYLOAD_TOO_LARGE,
-        HttpBodyReadError::TimedOut => StatusCode::REQUEST_TIMEOUT,
-        HttpBodyReadError::ReadFailed | HttpBodyReadError::RequestTrailersUnsupported => {
-            StatusCode::BAD_REQUEST
-        }
-        HttpBodyReadError::ResourceExhausted => StatusCode::SERVICE_UNAVAILABLE,
-    }
 }
 
 fn request_id() -> String {
@@ -2858,168 +2731,6 @@ fn request_id() -> String {
         let _ = write!(&mut id, "{byte:02x}");
     }
     id
-}
-
-enum OriginRequestBody {
-    Opaque {
-        body: Body,
-        capture: Option<CaptureSubmission>,
-    },
-    Guarded {
-        body: GuardedHttpBody,
-        capture: Option<CaptureSubmission>,
-    },
-}
-
-impl OriginRequestBody {
-    fn set_capture(&mut self, submission: Option<CaptureSubmission>) {
-        match self {
-            Self::Opaque { capture, .. } | Self::Guarded { capture, .. } => {
-                *capture = submission;
-            }
-        }
-    }
-}
-
-enum OriginRequestData {
-    Opaque(Bytes),
-    Guarded(GuardedBodyData),
-}
-
-impl Buf for OriginRequestData {
-    fn remaining(&self) -> usize {
-        match self {
-            Self::Opaque(data) => data.remaining(),
-            Self::Guarded(data) => data.remaining(),
-        }
-    }
-
-    fn chunk(&self) -> &[u8] {
-        match self {
-            Self::Opaque(data) => data.chunk(),
-            Self::Guarded(data) => data.chunk(),
-        }
-    }
-
-    fn advance(&mut self, count: usize) {
-        match self {
-            Self::Opaque(data) => data.advance(count),
-            Self::Guarded(data) => data.advance(count),
-        }
-    }
-}
-
-impl HttpBody for OriginRequestBody {
-    type Data = OriginRequestData;
-    type Error = hyper::Error;
-
-    fn poll_data(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
-        match self.get_mut() {
-            Self::Opaque { body, capture } => {
-                let exact_remaining = body.size_hint().exact();
-                match Pin::new(&mut *body).poll_data(context) {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(Some(Ok(data))) => {
-                        let data_len = data.remaining();
-                        if let Some(capture) = capture.as_mut() {
-                            capture.push(data.chunk());
-                            capture.finish_data_if_complete(
-                                body.is_end_stream() || exact_remaining == Some(data_len as u64),
-                            );
-                        }
-                        Poll::Ready(Some(Ok(OriginRequestData::Opaque(data))))
-                    }
-                    Poll::Ready(Some(Err(error))) => {
-                        if let Some(capture) = capture.as_mut() {
-                            capture.abandon();
-                        }
-                        Poll::Ready(Some(Err(error)))
-                    }
-                    Poll::Ready(None) => {
-                        if let Some(capture) = capture.as_mut() {
-                            capture.finish_data_if_complete(true);
-                        }
-                        Poll::Ready(None)
-                    }
-                }
-            }
-            Self::Guarded { body, capture } => {
-                let exact_remaining = body.size_hint().exact();
-                match Pin::new(&mut *body).poll_data(context) {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(Some(Ok(data))) => {
-                        let data_len = data.remaining();
-                        if let Some(capture) = capture.as_mut() {
-                            for segment in data.capture_segments() {
-                                capture.push(segment);
-                            }
-                            capture.finish_data_if_complete(
-                                body.is_end_stream() || exact_remaining == Some(data_len as u64),
-                            );
-                        }
-                        Poll::Ready(Some(Ok(OriginRequestData::Guarded(data))))
-                    }
-                    Poll::Ready(Some(Err(never))) => match never {},
-                    Poll::Ready(None) => {
-                        if let Some(capture) = capture.as_mut() {
-                            capture.finish_data_if_complete(true);
-                        }
-                        Poll::Ready(None)
-                    }
-                }
-            }
-        }
-    }
-
-    fn poll_trailers(
-        self: Pin<&mut Self>,
-        context: &mut Context<'_>,
-    ) -> Poll<Result<Option<HeaderMap>, Self::Error>> {
-        match self.get_mut() {
-            Self::Opaque { body, capture } => match Pin::new(body).poll_trailers(context) {
-                Poll::Ready(Ok(trailers)) => {
-                    if let Some(capture) = capture.as_mut() {
-                        capture.finish();
-                    }
-                    Poll::Ready(Ok(trailers))
-                }
-                Poll::Ready(Err(error)) => {
-                    if let Some(capture) = capture.as_mut() {
-                        capture.abandon();
-                    }
-                    Poll::Ready(Err(error))
-                }
-                Poll::Pending => Poll::Pending,
-            },
-            Self::Guarded { body, capture } => match Pin::new(body).poll_trailers(context) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Ok(trailers)) => {
-                    if let Some(capture) = capture.as_mut() {
-                        capture.finish();
-                    }
-                    Poll::Ready(Ok(trailers))
-                }
-                Poll::Ready(Err(never)) => match never {},
-            },
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        match self {
-            Self::Opaque { body, .. } => body.is_end_stream(),
-            Self::Guarded { body, .. } => body.is_end_stream(),
-        }
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        match self {
-            Self::Opaque { body, .. } => body.size_hint(),
-            Self::Guarded { body, .. } => body.size_hint(),
-        }
-    }
 }
 
 enum ProxyResponseBody {
@@ -3600,11 +3311,10 @@ mod tests {
     async fn execute_direct(
         product: &Arc<ProductRuntime>,
         assets: Arc<ProductIngressAssets>,
-        mut request: Request<Body>,
+        request: Request<Body>,
     ) -> HandledResponse {
         let peer = SocketAddr::from(([192, 0, 2, 44], 41_000));
-        let downstream_upgrade = hyper::upgrade::on(&mut request);
-        execute_request(
+        execute_request_via_pipeline(
             RequestExecution {
                 authority: RequestAuthority::ExplicitHttp,
                 peer,
@@ -3615,7 +3325,6 @@ mod tests {
                 assets,
             },
             request,
-            downstream_upgrade,
         )
         .await
     }
@@ -3845,6 +3554,775 @@ default = "deny"
         let response = read_raw_http_response(inner).await;
         assert_forbidden_http10(&response, "CONNECT MITM inner");
         runtime.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug)]
+    enum ProviderIngressCase {
+        ExplicitHttp,
+        ExplicitHttps,
+        TransparentHttp,
+        ConnectMitmInner,
+        TransparentHttps,
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ProviderIngressProtocol {
+        Http1,
+        Http2,
+    }
+
+    #[cfg(unix)]
+    impl ProviderIngressProtocol {
+        fn alpn(self) -> Vec<u8> {
+            match self {
+                Self::Http1 => b"http/1.1".to_vec(),
+                Self::Http2 => b"h2".to_vec(),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    trait ProviderTestIo: AsyncRead + AsyncWrite + Unpin + Send {}
+
+    #[cfg(unix)]
+    impl<T> ProviderTestIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+    #[cfg(unix)]
+    struct ProviderIngressFixture {
+        case: ProviderIngressCase,
+        proxy: SocketAddr,
+        origin: SocketAddr,
+        client_certificate: Vec<u8>,
+        _directory: tempfile::TempDir,
+        _marker_directory: tempfile::TempDir,
+        product: Arc<ProductRuntime>,
+        origin_task: tokio::task::JoinHandle<()>,
+    }
+
+    #[cfg(unix)]
+    impl ProviderIngressFixture {
+        async fn open_stream(&self) -> Box<dyn ProviderTestIo> {
+            self.open_stream_for(ProviderIngressProtocol::Http1).await
+        }
+
+        async fn open_stream_for(
+            &self,
+            protocol: ProviderIngressProtocol,
+        ) -> Box<dyn ProviderTestIo> {
+            match self.case {
+                ProviderIngressCase::ExplicitHttp | ProviderIngressCase::TransparentHttp => {
+                    Box::new(tokio::net::TcpStream::connect(self.proxy).await.unwrap())
+                }
+                ProviderIngressCase::ExplicitHttps | ProviderIngressCase::TransparentHttps => {
+                    let connector =
+                        test_tls_connector(self.client_certificate.clone(), vec![protocol.alpn()]);
+                    let stream = tokio::net::TcpStream::connect(self.proxy).await.unwrap();
+                    Box::new(
+                        connector
+                            .connect(ServerName::try_from("localhost").unwrap(), stream)
+                            .await
+                            .unwrap(),
+                    )
+                }
+                ProviderIngressCase::ConnectMitmInner => {
+                    let connector =
+                        test_tls_connector(self.client_certificate.clone(), vec![protocol.alpn()]);
+                    let stream = open_connect(self.proxy, &self.origin.to_string()).await;
+                    Box::new(
+                        connector
+                            .connect(ServerName::try_from("127.0.0.1").unwrap(), stream)
+                            .await
+                            .unwrap(),
+                    )
+                }
+            }
+        }
+
+        fn request_target(&self, path: &str) -> String {
+            match self.case {
+                ProviderIngressCase::ExplicitHttp => {
+                    format!("http://localhost:{}{path}", self.origin.port())
+                }
+                ProviderIngressCase::ExplicitHttps => {
+                    format!("https://localhost:{}{path}", self.origin.port())
+                }
+                ProviderIngressCase::TransparentHttp
+                | ProviderIngressCase::ConnectMitmInner
+                | ProviderIngressCase::TransparentHttps => path.to_owned(),
+            }
+        }
+
+        fn request_target_for(&self, path: &str, protocol: ProviderIngressProtocol) -> String {
+            if protocol == ProviderIngressProtocol::Http1 {
+                return self.request_target(path);
+            }
+            match self.case {
+                ProviderIngressCase::ExplicitHttp | ProviderIngressCase::TransparentHttp => {
+                    format!("http://localhost:{}{path}", self.origin.port())
+                }
+                ProviderIngressCase::ExplicitHttps | ProviderIngressCase::TransparentHttps => {
+                    format!("https://localhost:{}{path}", self.origin.port())
+                }
+                ProviderIngressCase::ConnectMitmInner => {
+                    format!("https://{}{path}", self.origin)
+                }
+            }
+        }
+
+        fn request_host(&self) -> String {
+            match self.case {
+                ProviderIngressCase::ConnectMitmInner => self.origin.to_string(),
+                _ => format!("localhost:{}", self.origin.port()),
+            }
+        }
+
+        async fn request(&self, path: &str, body: &'static str) -> Response<Body> {
+            let stream = self.open_stream().await;
+            let (mut sender, connection) = conn::handshake(stream).await.unwrap();
+            let driver = tokio::spawn(connection);
+            let response = sender
+                .send_request(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(self.request_target(path))
+                        .header(http::header::HOST, self.request_host())
+                        .header(CONTENT_TYPE, "text/plain")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            drop(sender);
+            let (parts, body) = response.into_parts();
+            let body = to_bytes(body).await.unwrap();
+            driver.await.unwrap().unwrap();
+            Response::from_parts(parts, Body::from(body))
+        }
+
+        async fn request_upgrade(&self) -> Vec<u8> {
+            let mut stream = self.open_stream().await;
+            stream
+                .write_all(
+                    format!(
+                        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: upgrade\r\nUpgrade: obs-text\r\n\r\n",
+                        self.request_target("/upgrade"),
+                        self.request_host(),
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            read_http_head(&mut stream).await
+        }
+
+        async fn begin_cancelled_request(&self) -> Box<dyn ProviderTestIo> {
+            let mut stream = self.open_stream().await;
+            let target = self.request_target("/cancel");
+            stream
+                .write_all(
+                    format!(
+                        "POST {target} HTTP/1.1\r\nHost: {}\r\nContent-Length: 4\r\nContent-Type: text/plain\r\n\r\nbody",
+                        self.request_host()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream
+        }
+    }
+
+    #[cfg(unix)]
+    fn provider_policy(origin: SocketAddr, marker: &std::path::Path) -> String {
+        format!(
+            r#"[authorization.providers.corpus]
+kind = "process"
+command = "/usr/bin/python3"
+args = ["-u", "-c", '''
+import json, sys, threading, time
+marker = {marker:?}
+lock = threading.Lock()
+
+def send(response):
+    with lock:
+        print(json.dumps(response, separators=(",", ":")), flush=True)
+
+def complete(request):
+    url = request["url"]
+    if url.endswith("/timeout") or url.endswith("/cancel"):
+        time.sleep(30)
+        send({{"id": request["id"], "type": "response", "decision": "allow", "values": {{"token": "late"}}}})
+    elif url.endswith("/pass"):
+        send({{"id": request["id"], "type": "response", "decision": "pass"}})
+    elif url.endswith("/deny"):
+        send({{"id": request["id"], "type": "response", "decision": "deny"}})
+    elif url.endswith("/error"):
+        send({{"id": request["id"], "type": "response", "decision": "invalid"}})
+    elif url.endswith("/invalid-encoding"):
+        send({{"id": request["id"], "type": "response", "decision": "allow", "values": {{"token": "typed-secret"}}, "requestBody": {{"encoding": "base64", "contentType": "text/plain", "contentEncoding": "gzip", "data": "cmVwbGFjZW1lbnQtYm9keQ=="}}}})
+    elif url.endswith("/upgrade"):
+        send({{"id": request["id"], "type": "response", "decision": "allow", "values": {{"token": "typed-secret"}}}})
+    else:
+        send({{"id": request["id"], "type": "response", "decision": "allow", "values": {{"token": "typed-secret"}}, "requestBody": {{"encoding": "base64", "contentType": "text/plain", "data": "cmVwbGFjZW1lbnQtYm9keQ=="}}}})
+
+for line in sys.stdin:
+    request = json.loads(line)
+    with open(marker, "a", encoding="utf-8") as output:
+        output.write(request["url"] + "\n")
+        output.flush()
+    threading.Thread(target=complete, args=(request,), daemon=True).start()
+''']
+timeout = "5s"
+retire_timeout = "6s"
+on_failure = "error"
+inherit_environment = false
+environment = {{ PATH = "/usr/bin:/bin" }}
+include_request_body = true
+allow_request_body_replacement = true
+max_request_body_bytes = 1024
+max_decoded_request_body_bytes = 1024
+max_stdout_line_bytes = 4096
+
+[authorization.providers.corpus.outputs.token]
+kind = "bearer"
+required = true
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "provider-timeout"
+decision = "delegate"
+urls = ["http://localhost:{port}/timeout", "https://localhost:{port}/timeout", "https://{origin}/timeout"]
+methods = ["POST"]
+authorization_provider = "corpus"
+request_timeout = "100ms"
+
+[[policy.rules]]
+id = "provider-corpus"
+decision = "delegate"
+urls = ["http://localhost:{port}/**", "https://localhost:{port}/**", "https://{origin}/**"]
+methods = ["POST"]
+authorization_provider = "corpus"
+
+[[policy.rules]]
+id = "provider-upgrade"
+decision = "delegate"
+urls = ["http://localhost:{port}/upgrade", "https://localhost:{port}/upgrade", "https://{origin}/upgrade"]
+methods = ["GET"]
+authorization_provider = "corpus"
+allow_upgrades = true
+
+[[policy.rules]]
+id = "after-provider-pass"
+decision = "allow"
+urls = ["http://localhost:{port}/pass", "https://localhost:{port}/pass", "https://{origin}/pass"]
+methods = ["POST"]
+"#,
+            marker = marker.display().to_string(),
+            port = origin.port(),
+        )
+    }
+
+    #[cfg(unix)]
+    async fn start_provider_origin(
+        tls: bool,
+    ) -> (
+        SocketAddr,
+        tempfile::TempDir,
+        tokio::sync::mpsc::UnboundedReceiver<(String, HeaderMap, Bytes)>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (identity, _) = test_tls_identity();
+        let acceptor = tls.then(|| {
+            crate::tls_identity::load_static_tls_acceptor(
+                &identity.path().join("server.pem"),
+                &identity.path().join("server-key.pem"),
+                vec![b"http/1.1".to_vec()],
+            )
+            .unwrap()
+        });
+        let (seen_tx, seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let seen_tx = seen_tx.clone();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let service = service_fn(move |mut request: Request<Body>| {
+                        let seen_tx = seen_tx.clone();
+                        async move {
+                            let upgrade = request.headers().get(UPGRADE).cloned();
+                            let _on_upgrade =
+                                upgrade.as_ref().map(|_| hyper::upgrade::on(&mut request));
+                            let (parts, body) = request.into_parts();
+                            let body = to_bytes(body).await.unwrap();
+                            seen_tx
+                                .send((parts.uri.path().to_owned(), parts.headers, body))
+                                .unwrap();
+                            match upgrade {
+                                Some(upgrade) => Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .status(StatusCode::SWITCHING_PROTOCOLS)
+                                        .header(CONNECTION, "upgrade")
+                                        .header(UPGRADE, upgrade)
+                                        .body(Body::empty())
+                                        .unwrap(),
+                                ),
+                                None => Ok(Response::new(Body::from("origin accepted"))),
+                            }
+                        }
+                    });
+                    if let Some(acceptor) = acceptor {
+                        let stream = acceptor.accept(stream).await.unwrap();
+                        Http::new()
+                            .http1_only(true)
+                            .serve_connection(stream, service)
+                            .with_upgrades()
+                            .await
+                            .unwrap();
+                    } else {
+                        Http::new()
+                            .http1_only(true)
+                            .serve_connection(stream, service)
+                            .with_upgrades()
+                            .await
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        (address, identity, seen_rx, task)
+    }
+
+    #[cfg(unix)]
+    async fn provider_ingress_fixture(
+        case: ProviderIngressCase,
+    ) -> (
+        ProviderIngressFixture,
+        tokio::sync::mpsc::UnboundedReceiver<(String, HeaderMap, Bytes)>,
+        std::path::PathBuf,
+    ) {
+        provider_ingress_fixture_for(case, ProviderIngressProtocol::Http1).await
+    }
+
+    #[cfg(unix)]
+    async fn provider_ingress_fixture_for(
+        case: ProviderIngressCase,
+        protocol: ProviderIngressProtocol,
+    ) -> (
+        ProviderIngressFixture,
+        tokio::sync::mpsc::UnboundedReceiver<(String, HeaderMap, Bytes)>,
+        std::path::PathBuf,
+    ) {
+        let tls_origin = matches!(
+            case,
+            ProviderIngressCase::ExplicitHttps
+                | ProviderIngressCase::ConnectMitmInner
+                | ProviderIngressCase::TransparentHttps
+        );
+        let (origin, origin_identity, seen, origin_task) = start_provider_origin(tls_origin).await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let marker_directory = tempdir().unwrap();
+        let marker = marker_directory.path().join("provider-calls");
+        let policy = provider_policy(origin, &marker);
+        let (incoming_identity, incoming_certificate) = test_tls_identity();
+        let listener_table;
+        let mut listener_policy;
+        match case {
+            ProviderIngressCase::ExplicitHttp => {
+                listener_table = "explicit_http";
+                listener_policy =
+                    format!("[listeners.explicit_http.connect]\nhttp1 = \"deny\"\n\n{policy}");
+            }
+            ProviderIngressCase::ExplicitHttps => {
+                listener_table = "explicit_https";
+                listener_policy = format!(
+                    "[listeners.explicit_https.connect]\nhttp1 = \"deny\"\n\n[listeners.explicit_https.tls]\ncertificate_chain = \"{}\"\nprivate_key = \"{}\"\n\n{policy}",
+                    incoming_identity.path().join("server.pem").display(),
+                    incoming_identity.path().join("server-key.pem").display(),
+                );
+            }
+            ProviderIngressCase::TransparentHttp => {
+                listener_table = "transparent_http";
+                listener_policy = policy;
+            }
+            ProviderIngressCase::ConnectMitmInner => {
+                listener_table = "explicit_http";
+                listener_policy = format!(
+                    "[listeners.explicit_http.connect]\nhttp1 = \"mitm\"\n\n[mitm]\nmode = \"generated\"\ndirectory = \"mitm\"\n\n[[policy.rules]]\nid = \"connect-target\"\ndecision = \"allow\"\nurls = [\"https://{origin}/**\"]\nmethods = [\"CONNECT\"]\n\n{policy}"
+                );
+            }
+            ProviderIngressCase::TransparentHttps => {
+                listener_table = "transparent_https";
+                listener_policy =
+                    format!("[mitm]\nmode = \"generated\"\ndirectory = \"mitm\"\n\n{policy}");
+            }
+        }
+        if protocol == ProviderIngressProtocol::Http2 {
+            match case {
+                ProviderIngressCase::ExplicitHttp | ProviderIngressCase::ExplicitHttps => {
+                    listener_policy = listener_policy.replacen(
+                        "http1 = \"deny\"",
+                        "http1 = \"deny\"\nhttp2 = \"deny\"",
+                        1,
+                    );
+                }
+                ProviderIngressCase::ConnectMitmInner => {
+                    listener_policy = listener_policy.replacen(
+                        "http1 = \"mitm\"",
+                        "http1 = \"mitm\"\nhttp2 = \"deny\"",
+                        1,
+                    );
+                }
+                ProviderIngressCase::TransparentHttp | ProviderIngressCase::TransparentHttps => {}
+            }
+        }
+        let mut config = base_config(proxy, listener_table, &listener_policy).replacen(
+            "trust = \"system\"",
+            "trust = \"insecure\"",
+            1,
+        );
+        if protocol == ProviderIngressProtocol::Http2 {
+            config = config.replacen(
+                "http_versions = [\"http1\"]",
+                "http_versions = [\"http1\", \"http2\"]",
+                1,
+            );
+        }
+        let (directory, product) = match case {
+            ProviderIngressCase::TransparentHttp | ProviderIngressCase::TransparentHttps => {
+                product_with_original_destination(
+                    config,
+                    listeners,
+                    Arc::new(FixedOriginalDestination(origin)),
+                )
+                .await
+            }
+            _ => product(config, listeners).await,
+        };
+        let client_certificate = match case {
+            ProviderIngressCase::ExplicitHttps => incoming_certificate,
+            ProviderIngressCase::ConnectMitmInner | ProviderIngressCase::TransparentHttps => {
+                read_first_pem_certificate(&directory.path().join("mitm/ca-cert.pem"))
+            }
+            _ => Vec::new(),
+        };
+        drop((origin_identity, incoming_identity));
+        (
+            ProviderIngressFixture {
+                case,
+                proxy,
+                origin,
+                client_certificate,
+                _directory: directory,
+                _marker_directory: marker_directory,
+                product,
+                origin_task,
+            },
+            seen,
+            marker,
+        )
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_provider_call(marker: &std::path::Path, suffix: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let calls = fs::read_to_string(marker).unwrap_or_default();
+                if calls.lines().any(|line| line.ends_with(suffix)) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("provider did not receive {suffix}"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_effects_and_release_corpus_covers_all_five_ingress_modes() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        for case in [
+            ProviderIngressCase::ExplicitHttp,
+            ProviderIngressCase::ExplicitHttps,
+            ProviderIngressCase::TransparentHttp,
+            ProviderIngressCase::ConnectMitmInner,
+            ProviderIngressCase::TransparentHttps,
+        ] {
+            let (fixture, mut seen, marker) = provider_ingress_fixture(case).await;
+            let pool = fixture.product.wire_body_pool();
+
+            let response = fixture.request("/pass", "pass-body").await;
+            assert_eq!(response.status(), StatusCode::OK, "{case:?} pass");
+            let (path, headers, body) = seen.recv().await.unwrap();
+            assert_eq!(path, "/pass", "{case:?}");
+            assert!(
+                !headers.contains_key(http::header::AUTHORIZATION),
+                "{case:?}"
+            );
+            assert_eq!(body, "pass-body", "{case:?}");
+            assert_eq!(pool.global_charge(), 0, "{case:?} pass leaked body charge");
+
+            let response = fixture.request("/replace", "original-body").await;
+            assert_eq!(response.status(), StatusCode::OK, "{case:?} replacement");
+            let (path, headers, body) = seen.recv().await.unwrap();
+            assert_eq!(path, "/replace", "{case:?}");
+            assert_eq!(
+                headers.get(http::header::AUTHORIZATION).unwrap(),
+                "Bearer typed-secret",
+                "{case:?}"
+            );
+            assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "text/plain", "{case:?}");
+            assert_eq!(
+                headers.get(CONTENT_LENGTH).unwrap().to_str().unwrap(),
+                b"replacement-body".len().to_string(),
+                "{case:?}"
+            );
+            assert!(!headers.contains_key(CONTENT_ENCODING), "{case:?}");
+            assert_eq!(body, "replacement-body", "{case:?}");
+            assert_eq!(
+                pool.global_charge(),
+                0,
+                "{case:?} replacement leaked body charge"
+            );
+
+            for (path, status) in [
+                ("/deny", StatusCode::FORBIDDEN),
+                ("/error", StatusCode::INTERNAL_SERVER_ERROR),
+                ("/invalid-encoding", StatusCode::INTERNAL_SERVER_ERROR),
+            ] {
+                let response = fixture.request(path, "terminal-body").await;
+                assert_eq!(response.status(), status, "{case:?} {path}");
+                let expected_body = if status == StatusCode::FORBIDDEN {
+                    "request denied\n"
+                } else {
+                    "request failed\n"
+                };
+                assert_eq!(
+                    to_bytes(response.into_body()).await.unwrap(),
+                    expected_body,
+                    "{case:?} {path} response bytes"
+                );
+                assert!(seen.try_recv().is_err(), "{case:?} {path} reached origin");
+                assert_eq!(
+                    pool.global_charge(),
+                    0,
+                    "{case:?} {path} leaked body charge"
+                );
+            }
+
+            let response = fixture.request_upgrade().await;
+            assert!(
+                response.starts_with(b"HTTP/1.1 101 "),
+                "unexpected {case:?} upgrade response: {}",
+                String::from_utf8_lossy(&response)
+            );
+            let (path, headers, body) = seen.recv().await.unwrap();
+            assert_eq!(path, "/upgrade", "{case:?}");
+            assert_eq!(
+                headers.get(http::header::AUTHORIZATION).unwrap(),
+                "Bearer typed-secret",
+                "{case:?}"
+            );
+            assert!(body.is_empty(), "{case:?}");
+
+            let response = fixture.request("/timeout", "timeout-body").await;
+            assert_eq!(
+                response.status(),
+                StatusCode::GATEWAY_TIMEOUT,
+                "{case:?} timeout"
+            );
+            assert!(seen.try_recv().is_err(), "{case:?} timeout reached origin");
+            assert_eq!(
+                pool.global_charge(),
+                0,
+                "{case:?} timeout leaked body charge"
+            );
+            let calls = fs::read_to_string(&marker).unwrap();
+            assert_eq!(calls.lines().count(), 7, "{case:?} provider call count");
+            for suffix in [
+                "/pass",
+                "/replace",
+                "/deny",
+                "/error",
+                "/invalid-encoding",
+                "/upgrade",
+                "/timeout",
+            ] {
+                assert_eq!(
+                    calls.lines().filter(|line| line.ends_with(suffix)).count(),
+                    1,
+                    "{case:?} {suffix} call count"
+                );
+            }
+
+            tokio::time::timeout(Duration::from_secs(2), fixture.product.shutdown())
+                .await
+                .unwrap_or_else(|_| panic!("{case:?} timeout shutdown did not complete"));
+            fixture.origin_task.abort();
+            let _ = fixture.origin_task.await;
+            assert!(
+                StdTcpListener::bind(fixture.proxy).is_ok(),
+                "{case:?} did not release its listener"
+            );
+
+            let (cancel_fixture, _cancel_seen, cancel_marker) =
+                provider_ingress_fixture(case).await;
+            let cancel_pool = cancel_fixture.product.wire_body_pool();
+            let cancelled = cancel_fixture.begin_cancelled_request().await;
+            wait_for_provider_call(&cancel_marker, "/cancel").await;
+            assert_eq!(
+                fs::read_to_string(&cancel_marker).unwrap().lines().count(),
+                1,
+                "{case:?} cancellation provider call count"
+            );
+            drop(cancelled);
+            tokio::time::timeout(Duration::from_secs(2), cancel_fixture.product.shutdown())
+                .await
+                .unwrap_or_else(|_| panic!("{case:?} shutdown did not cancel provider work"));
+            assert_eq!(
+                cancel_pool.global_charge(),
+                0,
+                "{case:?} cancellation leaked body charge"
+            );
+            cancel_fixture.origin_task.abort();
+            let _ = cancel_fixture.origin_task.await;
+            assert!(
+                StdTcpListener::bind(cancel_fixture.proxy).is_ok(),
+                "{case:?} cancellation did not release its listener"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http2_process_provider_equivalence_covers_all_five_ingress_modes() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        for case in [
+            ProviderIngressCase::ExplicitHttp,
+            ProviderIngressCase::ExplicitHttps,
+            ProviderIngressCase::TransparentHttp,
+            ProviderIngressCase::ConnectMitmInner,
+            ProviderIngressCase::TransparentHttps,
+        ] {
+            let (fixture, mut seen, marker) =
+                provider_ingress_fixture_for(case, ProviderIngressProtocol::Http2).await;
+            let pool = fixture.product.wire_body_pool();
+            let stream = fixture
+                .open_stream_for(ProviderIngressProtocol::Http2)
+                .await;
+            let mut builder = conn::Builder::new();
+            builder.http2_only(true);
+            let (mut sender, connection) = builder.handshake(stream).await.unwrap();
+            let driver = tokio::spawn(connection);
+
+            let replacement = sender
+                .send_request(
+                    Request::builder()
+                        .method(Method::POST)
+                        .version(Version::HTTP_2)
+                        .uri(fixture.request_target_for("/replace", ProviderIngressProtocol::Http2))
+                        .header(http::header::HOST, fixture.request_host())
+                        .header(CONTENT_TYPE, "text/plain")
+                        .body(Body::from("original-body"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(replacement.version(), Version::HTTP_2, "{case:?}");
+            assert_eq!(replacement.status(), StatusCode::OK, "{case:?}");
+            assert_eq!(
+                to_bytes(replacement.into_body()).await.unwrap(),
+                "origin accepted",
+                "{case:?} replacement response bytes"
+            );
+            let (path, headers, body) = seen.recv().await.unwrap();
+            assert_eq!(path, "/replace", "{case:?}");
+            assert_eq!(
+                headers.get(http::header::AUTHORIZATION).unwrap(),
+                "Bearer typed-secret",
+                "{case:?}"
+            );
+            assert_eq!(headers.get(CONTENT_TYPE).unwrap(), "text/plain", "{case:?}");
+            if let Some(length) = headers.get(CONTENT_LENGTH) {
+                assert_eq!(
+                    length.to_str().unwrap(),
+                    b"replacement-body".len().to_string(),
+                    "{case:?}"
+                );
+            }
+            assert!(!headers.contains_key(CONTENT_ENCODING), "{case:?}");
+            assert_eq!(body, "replacement-body", "{case:?}");
+            assert_eq!(
+                pool.global_charge(),
+                0,
+                "{case:?} replacement leaked body charge"
+            );
+
+            let denied = sender
+                .send_request(
+                    Request::builder()
+                        .method(Method::POST)
+                        .version(Version::HTTP_2)
+                        .uri(fixture.request_target_for("/deny", ProviderIngressProtocol::Http2))
+                        .header(http::header::HOST, fixture.request_host())
+                        .header(CONTENT_TYPE, "text/plain")
+                        .body(Body::from("denied-body"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(denied.version(), Version::HTTP_2, "{case:?}");
+            assert_eq!(denied.status(), StatusCode::FORBIDDEN, "{case:?}");
+            assert_eq!(
+                to_bytes(denied.into_body()).await.unwrap(),
+                "request denied\n",
+                "{case:?} denial response bytes"
+            );
+            assert!(seen.try_recv().is_err(), "{case:?} denial reached origin");
+            assert_eq!(
+                pool.global_charge(),
+                0,
+                "{case:?} denial leaked body charge"
+            );
+
+            let calls = fs::read_to_string(&marker).unwrap();
+            assert_eq!(calls.lines().count(), 2, "{case:?} provider call count");
+            for suffix in ["/replace", "/deny"] {
+                assert_eq!(
+                    calls.lines().filter(|line| line.ends_with(suffix)).count(),
+                    1,
+                    "{case:?} {suffix} call count"
+                );
+            }
+
+            drop(sender);
+            tokio::time::timeout(Duration::from_secs(2), fixture.product.shutdown())
+                .await
+                .unwrap_or_else(|_| panic!("{case:?} HTTP/2 shutdown did not complete"));
+            driver.await.unwrap().unwrap();
+            assert_eq!(
+                pool.global_charge(),
+                0,
+                "{case:?} shutdown leaked body charge"
+            );
+            fixture.origin_task.abort();
+            let _ = fixture.origin_task.await;
+            assert!(
+                StdTcpListener::bind(fixture.proxy).is_ok(),
+                "{case:?} did not release its HTTP/2 listener"
+            );
+        }
     }
 
     #[derive(Debug)]
@@ -4186,6 +4664,107 @@ methods = ["GET"]
             resolver.calls.load(Ordering::Acquire),
             0,
             "the second pipelined request reached destination resolution"
+        );
+
+        product.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn provider_denials_close_before_a_pipelined_request_can_execute() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let unused_origin = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let origin = unused_origin.local_addr().unwrap();
+        let resolver = Arc::new(DelayedResolver {
+            calls: AtomicUsize::new(0),
+            delay: Duration::ZERO,
+            endpoint: origin,
+        });
+        let guard = test_destination_guard(proxy, resolver.clone());
+        let authority = format!("provider-pipeline.test:{}", origin.port());
+        let policy = format!(
+            r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[authorization.providers.pipeline]
+kind = "process"
+command = "/usr/bin/python3"
+args = ["-u", "-c", '''
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if request["url"].endswith("/deny"):
+        decision = "deny"
+    elif request["url"].endswith("/pass"):
+        decision = "pass"
+    else:
+        decision = "invalid"
+    print(json.dumps({{"id": request["id"], "type": "response", "decision": decision}}, separators=(",", ":")), flush=True)
+''']
+timeout = "2s"
+retire_timeout = "6s"
+on_failure = "deny"
+inherit_environment = false
+environment = {{ PATH = "/usr/bin:/bin" }}
+include_request_body = false
+max_request_body_bytes = 1024
+max_decoded_request_body_bytes = 1024
+max_stdout_line_bytes = 4096
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "provider-first"
+decision = "delegate"
+urls = ["http://{authority}/deny", "http://{authority}/failure", "http://{authority}/pass"]
+methods = ["POST"]
+authorization_provider = "pipeline"
+
+[[policy.rules]]
+id = "deny-after-pass"
+decision = "deny"
+urls = ["http://{authority}/pass"]
+methods = ["POST"]
+
+[[policy.rules]]
+id = "queued-second"
+decision = "allow"
+urls = ["http://{authority}/two"]
+methods = ["GET"]
+"#,
+        );
+        let (_directory, product) = listener_product_with_destination_guard(
+            base_config(proxy, "explicit_http", &policy),
+            listeners,
+            guard,
+        )
+        .await;
+
+        for path in ["deny", "failure", "pass"] {
+            let pipelined = format!(
+                "POST http://{authority}/{path} HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 4\r\n\r\nbodyGET http://{authority}/two HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+            );
+            let response = send_raw_http(proxy, pipelined.as_bytes()).await;
+            assert!(
+                response.starts_with(b"HTTP/1.1 403"),
+                "unexpected {path} response: {}",
+                String::from_utf8_lossy(&response)
+            );
+            assert_eq!(
+                response
+                    .windows(b"HTTP/1.1 ".len())
+                    .filter(|window| *window == b"HTTP/1.1 ")
+                    .count(),
+                1,
+                "the queued request produced a second response after {path}"
+            );
+        }
+        assert_eq!(
+            resolver.calls.load(Ordering::Acquire),
+            3,
+            "only each provider-owned first request may resolve"
         );
 
         product.shutdown().await;
@@ -4667,10 +5246,11 @@ replace = "xx"
             r#"#!/bin/sh
 while IFS= read -r line; do
   id=$(printf "%s" "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-  if [ -n "$id" ]; then
-    case "$line" in
-      *complete-denied*) printf '{"id":"%s","type":"response","decision":"deny"}\n' "$id" ;;
-      *) printf '{"id":"%s","type":"response","decision":"allow","values":{"token":"secret-marker"},"requestBody":{"encoding":"base64","contentType":"text/plain","data":"cmVwbGFjZW1lbnQgc2VjcmV0"}}\n' "$id" ;;
+	  if [ -n "$id" ]; then
+	    case "$line" in
+	      *complete-denied*) printf '{"id":"%s","type":"response","decision":"deny"}\n' "$id" ;;
+	      *replacement-provider-limit*) printf '{"id":"%s","type":"response","decision":"allow","values":{"token":"secret-marker"},"requestBody":{"encoding":"base64","contentType":"text/plain","data":"eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4"}}\n' "$id" ;;
+	      *) printf '{"id":"%s","type":"response","decision":"allow","values":{"token":"secret-marker"},"requestBody":{"encoding":"base64","contentType":"text/plain","data":"cmVwbGFjZW1lbnQgc2VjcmV0"}}\n' "$id" ;;
     esac
   fi
 done
@@ -4739,6 +5319,12 @@ max_body_bytes = 128
 max_decoded_body_bytes = 128
 rules = [{{ literals = ["secret"], payloads = "text" }}]
 
+[redaction.profiles.strict_wire]
+replacement = "[MASKED]"
+max_body_bytes = 4
+max_decoded_body_bytes = 4
+rules = [{{ literals = ["secret"], payloads = "text" }}]
+
 [policy]
 default = "deny"
 
@@ -4749,6 +5335,22 @@ urls = ["http://{origin}/replacement", "http://{origin}/loop"]
 methods = ["POST"]
 authorization_provider = "replacing"
 redaction_profile = "wire"
+
+[[policy.rules]]
+id = "replacement-provider-limit"
+decision = "delegate"
+urls = ["http://{origin}/replacement-provider-limit"]
+methods = ["POST"]
+authorization_provider = "replacing"
+redaction_profile = "wire"
+
+[[policy.rules]]
+id = "replacement-redaction-limit"
+decision = "delegate"
+urls = ["http://{origin}/replacement-redaction-limit"]
+methods = ["POST"]
+authorization_provider = "replacing"
+redaction_profile = "strict_wire"
 
 [[policy.rules]]
 id = "complete-denied"
@@ -4816,6 +5418,23 @@ redaction_profile = "wire"
         .await;
         assert_eq!(loop_denied.status(), StatusCode::FORBIDDEN);
 
+        for (path, expected_status) in [
+            ("replacement-provider-limit", StatusCode::PAYLOAD_TOO_LARGE),
+            ("replacement-redaction-limit", StatusCode::PAYLOAD_TOO_LARGE),
+        ] {
+            let response = send_request(
+                proxy,
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri(format!("http://{origin}/{path}"))
+                    .header("x-visible", "retained")
+                    .body(Body::from("x"))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), expected_status, "{path}");
+        }
+
         let limit_denied = send_request(
             proxy,
             Request::builder()
@@ -4882,6 +5501,26 @@ redaction_profile = "wire"
             .as_ref()
             .unwrap()
             .contains_key("authorization"));
+        for (path, expected_size) in [
+            ("/replacement-provider-limit", 147),
+            ("/replacement-redaction-limit", b"replacement secret".len()),
+        ] {
+            let failed = records
+                .iter()
+                .find(|record| record.kind == CaptureKind::Request && record.url.ends_with(path))
+                .unwrap_or_else(|| panic!("missing replacement failure capture for {path}"));
+            assert_eq!(failed.decision, CaptureDecision::Deny, "{path}");
+            assert_eq!(failed.provider_replacement_omitted, Some(true), "{path}");
+            assert_eq!(
+                failed.provider_replacement_size,
+                Some(expected_size),
+                "{path}"
+            );
+            assert!(failed.body.is_none(), "{path}");
+            let headers = failed.headers.as_ref().unwrap();
+            assert_eq!(headers["x-visible"], "retained", "{path}");
+            assert!(!headers.contains_key("authorization"), "{path}");
+        }
         let denied = records
             .iter()
             .find(|record| {
@@ -6932,7 +7571,11 @@ rules = [{{ literals = ["password"], payloads = "text" }}]
             .await
             .unwrap();
         let response = read_http_head(&mut stream).await;
-        assert!(response.starts_with(b"HTTP/1.1 101 "));
+        assert!(
+            response.starts_with(b"HTTP/1.1 101 "),
+            "unexpected WebSocket handshake response: {}",
+            String::from_utf8_lossy(&response)
+        );
         stream
             .write_all(&websocket_frame(true, 0x1, b"client password", true))
             .await

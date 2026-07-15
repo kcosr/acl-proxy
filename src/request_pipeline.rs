@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "P06 C01 adds the pipeline before the mandatory C04 listener cutover"
-)]
-
 use http_access_runtime::{
     prepare_standalone_exchange, BoxFuture, DecisionProvider, ProviderOutcome, RuntimeRequest,
     RuntimeResponse, StandaloneExchange,

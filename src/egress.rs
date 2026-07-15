@@ -2,20 +2,18 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-use http::header::HeaderMap;
 use http::Uri;
 use rustls::{ClientConfig, ServerName};
 
 #[cfg(test)]
 use crate::config::compiler::CompiledParentProxyKind;
 use crate::config::compiler::{
-    CompiledEgressRoute, CompiledHttpVersion, CompiledTlsTrust, EgressPlan, HeaderEffectPlan,
-    ParentProxyPlan, ParentProxyTlsPlan, TransportTlsPlan,
+    CompiledEgressRoute, CompiledHttpVersion, CompiledTlsTrust, EgressPlan, ParentProxyPlan,
+    ParentProxyTlsPlan, TransportTlsPlan,
 };
 use crate::credentials::{
     resolve_credential_action, CredentialBindingError, ResolvedCredentialAction,
 };
-use crate::policy::{apply_header_effects, HeaderEffectError};
 use crate::runtime::CredentialSourceRegistry;
 use crate::tls::{
     build_client_config, load_client_trust, ClientAlpn, ClientTrust, TlsActivationError,
@@ -26,13 +24,12 @@ use http_access_url::{canonicalize_http_authority, canonicalize_tls_server_name}
 /// Generation-owned outbound transport policy and material.
 ///
 /// Activation consumes every path and logical credential name from the pure
-/// plan. Requests receive only clients, canonical parent metadata, compiled
-/// header effects, and runtime credential indices.
+/// plan. The standalone generation binds runtime credential indices during
+/// activation; requests receive only the resulting neutral forwarding plan.
 pub(crate) struct EgressSnapshot {
     identity: Arc<()>,
     route: EgressRoute,
     origin_tls: OriginTls,
-    request_headers: Box<[HeaderEffectPlan]>,
     credential_actions: Box<[ResolvedCredentialAction]>,
 }
 
@@ -147,7 +144,7 @@ impl EgressSnapshot {
             route,
             origin_tls,
             parent_proxy,
-            request_headers,
+            request_headers: _,
             credential_actions,
         } = plan;
         let origin_tls = OriginTls::activate(origin_tls, &mut is_cancelled)?;
@@ -168,7 +165,6 @@ impl EgressSnapshot {
             identity: Arc::new(()),
             route,
             origin_tls,
-            request_headers: request_headers.into_boxed_slice(),
             credential_actions,
         })
     }
@@ -195,13 +191,6 @@ impl EgressSnapshot {
         tls.custom_roots.clone()
     }
 
-    pub(crate) fn apply_request_headers(
-        &self,
-        headers: &mut HeaderMap,
-    ) -> Result<(), HeaderEffectError> {
-        apply_header_effects(&self.request_headers, headers)
-    }
-
     pub(crate) fn credential_actions(&self) -> &[ResolvedCredentialAction] {
         &self.credential_actions
     }
@@ -218,14 +207,6 @@ impl crate::runtime::EgressSnapshot for EgressSnapshot {
 
     fn origin_tls(&self) -> &OriginTls {
         EgressSnapshot::origin_tls(self)
-    }
-
-    fn apply_request_headers(&self, headers: &mut HeaderMap) -> Result<(), HeaderEffectError> {
-        EgressSnapshot::apply_request_headers(self, headers)
-    }
-
-    fn credential_actions(&self) -> &[ResolvedCredentialAction] {
-        EgressSnapshot::credential_actions(self)
     }
 }
 
@@ -551,7 +532,6 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, Once};
 
-    use http::header::AUTHORIZATION;
     use rcgen::generate_simple_self_signed;
     use tempfile::TempDir;
     use tracing_subscriber::fmt::MakeWriter;
@@ -1182,47 +1162,6 @@ default = "deny"
     }
 
     #[test]
-    fn compiled_global_header_effects_apply_in_authored_order() {
-        let directory = TempDir::new().unwrap();
-        let plan = compile_egress(
-            directory.path(),
-            r#"
-[egress]
-
-[[egress.request_headers]]
-operation = "set"
-when = "always"
-name = "x-chain"
-value = "one"
-
-[[egress.request_headers]]
-operation = "append"
-when = "always"
-name = "x-chain"
-value = "two"
-
-[[egress.request_headers]]
-operation = "replace"
-when = "always"
-name = "x-chain"
-search = "one"
-replace = "three"
-"#,
-        );
-        let snapshot = activate(plan);
-        let mut headers = HeaderMap::new();
-        snapshot.apply_request_headers(&mut headers).unwrap();
-        assert_eq!(
-            headers
-                .get_all("x-chain")
-                .iter()
-                .map(|value| value.to_str().unwrap())
-                .collect::<Vec<_>>(),
-            vec!["three", "two"]
-        );
-    }
-
-    #[test]
     fn credential_actions_resolve_to_indices_and_unknown_names_fail() {
         let directory = TempDir::new().unwrap();
         let plan = compile_egress(
@@ -1279,7 +1218,7 @@ credential = "api"
     }
 
     #[test]
-    fn candidate_activations_do_not_share_owned_material() {
+    fn candidate_activations_do_not_share_bound_credentials() {
         let directory = TempDir::new().unwrap();
         let plan = compile_egress(
             directory.path(),
@@ -1289,12 +1228,6 @@ source = "environment"
 variable = "TEST_TOKEN"
 
 [egress]
-
-[[egress.request_headers]]
-operation = "set"
-when = "always"
-name = "x-generation"
-value = "candidate"
 
 [[egress.credential_actions]]
 kind = "bearer"
@@ -1306,20 +1239,10 @@ credential = "token"
         let second = EgressSnapshot::activate(plan, &sources, || false).unwrap();
 
         assert_ne!(
-            first.request_headers.as_ptr(),
-            second.request_headers.as_ptr()
-        );
-        assert_ne!(
             first.credential_actions.as_ptr(),
             second.credential_actions.as_ptr()
         );
-        let mut first_headers = HeaderMap::new();
-        let mut second_headers = HeaderMap::new();
-        first.apply_request_headers(&mut first_headers).unwrap();
-        second.apply_request_headers(&mut second_headers).unwrap();
-        assert_eq!(first_headers, second_headers);
         assert_eq!(first.credential_actions(), second.credential_actions());
-        assert!(first_headers.get(AUTHORIZATION).is_none());
     }
 
     #[test]

@@ -171,13 +171,6 @@ pub(crate) trait EgressSnapshot: Send + Sync {
     fn route(&self) -> &crate::egress::EgressRoute;
 
     fn origin_tls(&self) -> &crate::egress::OriginTls;
-
-    fn apply_request_headers(
-        &self,
-        headers: &mut HeaderMap,
-    ) -> Result<(), crate::policy::HeaderEffectError>;
-
-    fn credential_actions(&self) -> &[crate::credentials::ResolvedCredentialAction];
 }
 
 pub(crate) trait CredentialResolver: Send + Sync {
@@ -191,10 +184,6 @@ pub(crate) trait CredentialResolver: Send + Sync {
         &self,
         headers: &mut HeaderMap,
     ) -> Result<crate::credentials::InboundCredentials, crate::credentials::CredentialError>;
-}
-
-pub(crate) trait RedactionSnapshot: Send + Sync {
-    fn profile(&self, index: RedactionProfileIndex) -> Option<crate::redaction::ProfileHandle>;
 }
 
 pub(crate) trait ObservationSnapshot: Send + Sync {
@@ -331,7 +320,6 @@ pub(crate) struct ActivatedGeneration {
     pub(crate) egress: Arc<dyn EgressSnapshot>,
     pub(crate) authorization: Arc<dyn AuthorizationSnapshot>,
     pub(crate) credentials: Arc<dyn CredentialResolver>,
-    pub(crate) redaction: Arc<dyn RedactionSnapshot>,
     pub(crate) observation: Arc<dyn ObservationSnapshot>,
     pub(crate) safety: Arc<dyn SafetySnapshot>,
     pub(crate) owner: Arc<dyn GenerationOwner>,
@@ -339,7 +327,6 @@ pub(crate) struct ActivatedGeneration {
 
 pub(crate) struct Generation {
     id: GenerationId,
-    #[allow(dead_code)]
     standalone: StandaloneGenerationPlan,
     request_timeout: Duration,
     max_content_decoding_expansion_ratio: usize,
@@ -349,7 +336,6 @@ pub(crate) struct Generation {
     egress: Arc<dyn EgressSnapshot>,
     authorization: Arc<dyn AuthorizationSnapshot>,
     credentials: Arc<dyn CredentialResolver>,
-    redaction: Arc<dyn RedactionSnapshot>,
     observation: Arc<dyn ObservationSnapshot>,
     safety: Arc<dyn SafetySnapshot>,
     pub(super) owner: Arc<dyn GenerationOwner>,
@@ -385,7 +371,6 @@ impl Generation {
             egress: value.egress,
             authorization: value.authorization,
             credentials: value.credentials,
-            redaction: value.redaction,
             observation: value.observation,
             safety: value.safety,
             owner: value.owner,
@@ -398,7 +383,7 @@ impl Generation {
         self.id
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn standalone(&self) -> &StandaloneGenerationPlan {
         &self.standalone
     }
@@ -434,10 +419,6 @@ impl Generation {
 
     pub(crate) fn credentials(&self) -> &dyn CredentialResolver {
         self.credentials.as_ref()
-    }
-
-    pub(crate) fn redaction(&self) -> &dyn RedactionSnapshot {
-        self.redaction.as_ref()
     }
 
     pub(crate) fn observation(&self) -> &dyn ObservationSnapshot {
@@ -523,6 +504,10 @@ pub(crate) struct GenerationLease {
 }
 
 impl GenerationLease {
+    pub(crate) fn standalone(&self) -> &StandaloneGenerationPlan {
+        &self.generation.standalone
+    }
+
     /// Retains this exact generation for an operation admitted by the current
     /// request. Retirement may already have started; the live request lease is
     /// the authority to extend only its captured generation.

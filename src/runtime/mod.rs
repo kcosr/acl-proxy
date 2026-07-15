@@ -18,8 +18,8 @@ pub(crate) use generation::{
     CredentialResolver, CredentialSourceIndex, CredentialSourceRegistry, EgressSnapshot,
     GenerationId, GenerationLease, GenerationOwner, GenerationRetention, GenerationRetentionError,
     ObservationSnapshot, PolicySnapshot, ProviderIndex, ProviderRegistry, PublicationGuard,
-    RedactionProfileIndex, RedactionProfileRegistry, RedactionSnapshot, ResolvedBindings,
-    ResolvedRuleBindings, SafetySnapshot,
+    RedactionProfileIndex, RedactionProfileRegistry, ResolvedBindings, ResolvedRuleBindings,
+    SafetySnapshot,
 };
 pub(crate) use readiness::ServiceReadiness;
 

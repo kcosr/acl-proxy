@@ -30,7 +30,6 @@ use crate::destination::{
     DestinationFacts, DestinationGuard, DestinationResolver, LocalAddressSnapshot,
     LocalAddressSource, ResolveFuture,
 };
-use crate::redaction::RedactionSnapshot as ProductRedactionSnapshot;
 use crate::safety::{WireBodyPool, WireBodyQuotaKey};
 use crate::upgrade::{
     UpgradeAllocation, UpgradeEntryPlan, UpgradeRelayPair, UpgradeRuntime, UpgradeRuntimeLimits,
@@ -89,17 +88,6 @@ impl EgressSnapshot for EmptySnapshot {
 
     fn origin_tls(&self) -> &crate::egress::OriginTls {
         panic!("empty test egress has no origin TLS policy")
-    }
-
-    fn apply_request_headers(
-        &self,
-        _headers: &mut http::HeaderMap,
-    ) -> Result<(), crate::policy::HeaderEffectError> {
-        Ok(())
-    }
-
-    fn credential_actions(&self) -> &[crate::credentials::ResolvedCredentialAction] {
-        &[]
     }
 }
 impl AuthorizationSnapshot for EmptySnapshot {
@@ -177,11 +165,6 @@ impl CredentialResolver for EmptySnapshot {
         _headers: &mut http::HeaderMap,
     ) -> Result<crate::credentials::InboundCredentials, crate::credentials::CredentialError> {
         panic!("empty test credentials cannot extract inbound values")
-    }
-}
-impl RedactionSnapshot for EmptySnapshot {
-    fn profile(&self, _index: RedactionProfileIndex) -> Option<crate::redaction::ProfileHandle> {
-        None
     }
 }
 impl ObservationSnapshot for EmptySnapshot {
@@ -711,10 +694,6 @@ impl CandidateActivator for FakeActivator {
             let standalone = crate::standalone::UnboundStandaloneGenerationPlan::compile(&plan, id)
                 .map_err(|error| RuntimeError::CandidateActivation(error.to_string()))?
                 .into_bound_for_runtime_test();
-            let redaction = ProductRedactionSnapshot::activate(plan.redaction, || false)
-                .map_err(|error| RuntimeError::CandidateActivation(error.to_string()))?;
-            let (redaction, _) = redaction.into_parts();
-            let redaction = Arc::new(redaction);
             let snapshot = Arc::new(EmptySnapshot);
             Ok(ActivatedGeneration {
                 standalone,
@@ -726,7 +705,6 @@ impl CandidateActivator for FakeActivator {
                 egress: snapshot.clone(),
                 authorization: snapshot.clone(),
                 credentials: snapshot.clone(),
-                redaction,
                 observation: snapshot.clone(),
                 safety: snapshot,
                 owner,
@@ -897,13 +875,15 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
             egress: empty.clone(),
             authorization: Arc::new(authorization),
             credentials: empty.clone(),
-            redaction: empty.clone(),
             observation: empty.clone(),
             safety: empty,
             owner: Arc::new(FakeOwner::default()),
         },
     ));
-    assert_eq!(generation.standalone().generation().get(), 1);
+    assert_eq!(
+        generation.standalone().snapshot_lease().generation().get(),
+        1
+    );
     assert!(generation
         .standalone()
         .snapshot_lease()
@@ -1513,22 +1493,12 @@ async fn old_lease_delays_retirement_cleanup_and_releases_it_once() {
 
 #[tokio::test]
 async fn upgraded_stream_does_not_pin_retiring_generation() {
-    let profile_config = |timeout: &str| {
-        format!(
-            "{}\n[redaction.profiles.wire]\nrules = [{{ literals = [\"secret\"] }}]\n",
-            config(timeout, "127.0.0.1:8881", 1)
-        )
-    };
-    let initial_text = profile_config("30s");
+    let initial_text = config("30s", "127.0.0.1:8881", 1);
     let (runtime, initial, source, activator, _static_resources) =
         runtime_fixture(&initial_text).await;
     runtime.start(initial).await.unwrap();
 
     let old_lease = runtime.lease().await.unwrap();
-    let profile_index = RedactionProfileRegistry::from_names(["wire".to_owned()])
-        .get("wire")
-        .unwrap();
-    let old_profile = old_lease.redaction().profile(profile_index).unwrap();
     let old_owner = activator.owner(0);
     let upgrades =
         UpgradeRuntime::try_new(UpgradeRuntimeLimits::new(1, 8, 2, Duration::from_secs(60)))
@@ -1540,16 +1510,13 @@ async fn upgraded_stream_does_not_pin_retiring_generation() {
             move |handshake| async move {
                 let entry = handshake
                     .commit(
-                        Some(old_profile),
+                        None,
                         UpgradeEntryPlan::new(
                             UpgradeTerminalControl::new(std::future::pending::<()>, |_| async {}),
                             |snapshot| async move {
-                                let profile = snapshot.wire_redaction().cloned().unwrap();
+                                assert!(snapshot.wire_redaction().is_none());
                                 Ok(UpgradeRelayPair::new(
-                                    async move {
-                                        let _profile = profile;
-                                        std::future::pending::<UpgradeTerminalCause>().await
-                                    },
+                                    std::future::pending::<UpgradeTerminalCause>(),
                                     std::future::pending::<UpgradeTerminalCause>(),
                                 ))
                             },
@@ -1564,7 +1531,7 @@ async fn upgraded_stream_does_not_pin_retiring_generation() {
     drop(old_lease);
 
     for timeout in ["31s", "32s", "33s"] {
-        source.push(profile_config(timeout));
+        source.push(config(timeout, "127.0.0.1:8881", 1));
         runtime.trigger_reload().await.unwrap();
         wait_for_retiring(&runtime, 0).await;
     }

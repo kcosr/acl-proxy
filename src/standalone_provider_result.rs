@@ -1,8 +1,8 @@
 use http_access_runtime::{RuntimeRequest, StandalonePlan, StandaloneTrusted};
 use http_access_types::{
-    BodyRepresentation, CredentialMutation, CredentialRef, ForwardingPlan, ForwardingPlanInput,
-    HeaderMutation, HeaderMutationBatch, HeaderMutationCondition, HeaderName, HeaderValue,
-    PlanBinding, UpgradeIntent, UpgradePolicy,
+    BodyRepresentation, CredentialMutation, CredentialMutationKind, CredentialRef, ForwardingPlan,
+    ForwardingPlanInput, HeaderMutation, HeaderMutationBatch, HeaderMutationCondition, HeaderName,
+    HeaderValue, PlanBinding, UpgradeIntent, UpgradePolicy,
 };
 
 use crate::authorization::protocol::{
@@ -10,12 +10,19 @@ use crate::authorization::protocol::{
     StagedProviderCredentialMutation,
 };
 use crate::authorization::AuthorizationAllowOutput;
+use crate::credentials::ResolvedCredentialAction;
 use crate::runtime::{CredentialSourceIndex, GenerationLease, ProviderIndex};
 use crate::safety::{GuardedBody, HttpWireBodyGuard, RuntimeReplayLease};
 use crate::standalone::{
     BoundCredentialSource, ProviderCredentialTemplates, StandaloneCaptureEvent,
     StandaloneGenerationPlan, StandaloneRuleDecision,
 };
+use crate::upgrade::UpgradeAllocation;
+
+pub(crate) struct StandaloneUpgradeBinding {
+    pub(crate) allocation: UpgradeAllocation,
+    pub(crate) wire_redaction: Option<crate::redaction::ProfileHandle>,
+}
 
 pub(crate) struct StandaloneProviderAllow {
     pub(crate) plan: StandalonePlan,
@@ -35,9 +42,16 @@ pub(crate) struct StandaloneRequestSidecar {
     rule_credential_sources: Option<Box<[StandaloneCredentialSourceBinding]>>,
     global_credential_sources: Option<Box<[StandaloneCredentialSourceBinding]>>,
     provider_credentials: Option<StagedProviderCredentialMutation>,
+    provider_credential_mutations: Option<Box<[CredentialMutation]>>,
     credential_program_taken: bool,
-    capture_events: Box<[StandaloneCaptureEvent]>,
-    capture_epoch: Option<std::sync::Arc<crate::observation::CaptureEpoch>>,
+    capture_body: StandaloneCaptureBody,
+    upgrade: Option<StandaloneUpgradeBinding>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StandaloneCaptureBody {
+    Stream { canonical_identity: bool },
+    ProviderReplacement { size: usize },
 }
 
 pub(crate) struct StandaloneCredentialSourceBinding {
@@ -51,8 +65,10 @@ struct StandaloneCredentialSourceStages {
 }
 
 pub(crate) struct StandaloneCredentialProgram {
+    plan_binding: PlanBinding,
     rule_sources: Box<[StandaloneCredentialSourceBinding]>,
     provider_credentials: Option<StagedProviderCredentialMutation>,
+    provider_mutations: Box<[CredentialMutation]>,
     global_sources: Box<[StandaloneCredentialSourceBinding]>,
 }
 
@@ -62,6 +78,8 @@ pub(crate) enum StandaloneProviderAllowError {
     Binding,
     #[error("provider credential output could not be staged")]
     ProviderCredential(#[source] ProviderCredentialInjectionError),
+    #[error("credential source resolution or injection failed")]
+    Credential(#[source] crate::credentials::CredentialError),
     #[error("provider body replacement could not be decoded")]
     ProviderReplacement(#[source] ProviderBodyReplacementDecodeError),
     #[error("provider body replacement could not be redacted")]
@@ -76,19 +94,41 @@ pub(crate) enum StandaloneProviderAllowError {
     CredentialProgramConsumed,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("provider allow adaptation failed")]
+pub(crate) struct StandaloneProviderAllowFailure {
+    #[source]
+    error: StandaloneProviderAllowError,
+    provider_replacement_size: Option<usize>,
+}
+
+impl StandaloneProviderAllowFailure {
+    pub(crate) fn into_error(self) -> StandaloneProviderAllowError {
+        self.error
+    }
+
+    pub(crate) fn provider_replacement_size(&self) -> Option<usize> {
+        self.provider_replacement_size
+    }
+}
+
 impl StandaloneRequestSidecar {
     pub(crate) fn plan_binding(&self) -> PlanBinding {
         self.plan_binding
     }
 
-    pub(crate) fn capture_events(&self) -> &[StandaloneCaptureEvent] {
-        &self.capture_events
+    pub(crate) fn capture_body(&self) -> StandaloneCaptureBody {
+        self.capture_body
     }
 
-    pub(crate) fn capture_epoch(
-        &self,
-    ) -> Option<&std::sync::Arc<crate::observation::CaptureEpoch>> {
-        self.capture_epoch.as_ref()
+    pub(crate) fn take_upgrade_binding(
+        &mut self,
+        plan_binding: PlanBinding,
+    ) -> Result<Option<StandaloneUpgradeBinding>, StandaloneProviderAllowError> {
+        if plan_binding != self.plan_binding {
+            return Err(StandaloneProviderAllowError::Binding);
+        }
+        Ok(self.upgrade.take())
     }
 
     pub(crate) fn take_credential_program(
@@ -103,11 +143,16 @@ impl StandaloneRequestSidecar {
         }
         self.credential_program_taken = true;
         Ok(StandaloneCredentialProgram {
+            plan_binding: self.plan_binding,
             rule_sources: self
                 .rule_credential_sources
                 .take()
                 .expect("an unconsumed sidecar owns its rule credential source bindings"),
             provider_credentials: self.provider_credentials.take(),
+            provider_mutations: self
+                .provider_credential_mutations
+                .take()
+                .expect("an unconsumed sidecar owns its provider credential mutations"),
             global_sources: self
                 .global_credential_sources
                 .take()
@@ -127,27 +172,109 @@ impl StandaloneCredentialSourceBinding {
 }
 
 impl StandaloneCredentialProgram {
-    pub(crate) fn rule_sources(&self) -> &[StandaloneCredentialSourceBinding] {
-        &self.rule_sources
-    }
-
-    pub(crate) fn global_sources(&self) -> &[StandaloneCredentialSourceBinding] {
-        &self.global_sources
-    }
-
-    pub(crate) fn into_parts(
+    pub(crate) fn apply(
         self,
-    ) -> (
-        Box<[StandaloneCredentialSourceBinding]>,
-        Option<StagedProviderCredentialMutation>,
-        Box<[StandaloneCredentialSourceBinding]>,
-    ) {
-        (
-            self.rule_sources,
-            self.provider_credentials,
-            self.global_sources,
-        )
+        plan: &ForwardingPlan,
+        credentials: &dyn crate::runtime::CredentialResolver,
+        headers: &mut http::HeaderMap,
+    ) -> Result<(), StandaloneProviderAllowError> {
+        if plan.binding() != self.plan_binding {
+            return Err(StandaloneProviderAllowError::Binding);
+        }
+        let mutations = plan.credential_mutations();
+        let rule_end = self.rule_sources.len();
+        let provider_end = rule_end
+            .checked_add(self.provider_mutations.len())
+            .ok_or(StandaloneProviderAllowError::Binding)?;
+        let total = provider_end
+            .checked_add(self.global_sources.len())
+            .ok_or(StandaloneProviderAllowError::Binding)?;
+        if mutations.len() != total
+            || mutations.get(rule_end..provider_end) != Some(&self.provider_mutations)
+            || !provider_shape_matches(self.provider_credentials.as_ref(), &self.provider_mutations)
+        {
+            return Err(StandaloneProviderAllowError::Binding);
+        }
+
+        let rule = resolved_credential_actions(&mutations[..rule_end], &self.rule_sources)?;
+        let global = resolved_credential_actions(&mutations[provider_end..], &self.global_sources)?;
+
+        let mut staged = http::HeaderMap::new();
+        staged.try_reserve(total).map_err(|_| {
+            StandaloneProviderAllowError::Credential(crate::credentials::CredentialError::Capacity)
+        })?;
+        credentials
+            .inject(&rule, &mut staged)
+            .map_err(StandaloneProviderAllowError::Credential)?;
+        if let Some(provider) = self.provider_credentials {
+            provider
+                .apply(&mut staged)
+                .map_err(StandaloneProviderAllowError::ProviderCredential)?;
+        }
+        credentials
+            .inject(&global, &mut staged)
+            .map_err(StandaloneProviderAllowError::Credential)?;
+
+        let additional = staged
+            .keys()
+            .filter(|name| !headers.contains_key(*name))
+            .count();
+        headers.try_reserve(additional).map_err(|_| {
+            StandaloneProviderAllowError::Credential(crate::credentials::CredentialError::Capacity)
+        })?;
+        for (name, value) in staged.drain() {
+            headers.insert(
+                name.expect("a checked credential plan has unique destinations"),
+                value,
+            );
+        }
+        Ok(())
     }
+}
+
+fn provider_shape_matches(
+    staged: Option<&StagedProviderCredentialMutation>,
+    mutations: &[CredentialMutation],
+) -> bool {
+    match staged {
+        Some(staged) => staged.matches_mutations(mutations),
+        None => mutations.is_empty(),
+    }
+}
+
+fn resolved_credential_actions(
+    mutations: &[CredentialMutation],
+    bindings: &[StandaloneCredentialSourceBinding],
+) -> Result<Vec<ResolvedCredentialAction>, StandaloneProviderAllowError> {
+    if mutations.len() != bindings.len() {
+        return Err(StandaloneProviderAllowError::Binding);
+    }
+    let mut actions = Vec::new();
+    actions.try_reserve_exact(bindings.len()).map_err(|_| {
+        StandaloneProviderAllowError::Credential(crate::credentials::CredentialError::Capacity)
+    })?;
+    for (mutation, binding) in mutations.iter().zip(bindings) {
+        if mutation.credential() != binding.reference() {
+            return Err(StandaloneProviderAllowError::Binding);
+        }
+        actions.push(match mutation.kind() {
+            CredentialMutationKind::Bearer(_) => ResolvedCredentialAction::Bearer {
+                source: binding.source(),
+            },
+            CredentialMutationKind::Basic { username, .. } => ResolvedCredentialAction::Basic {
+                username: username.clone(),
+                source: binding.source(),
+            },
+            CredentialMutationKind::CustomHeader { name, .. } => {
+                ResolvedCredentialAction::CustomHeader {
+                    header: http::HeaderName::from_bytes(name.as_str().as_bytes())
+                        .map_err(|_| StandaloneProviderAllowError::Binding)?,
+                    source: binding.source(),
+                }
+            }
+        });
+    }
+    Ok(actions)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -159,7 +286,37 @@ pub(crate) fn adapt_provider_allow(
     inspected_body: Option<GuardedBody>,
     guard: HttpWireBodyGuard,
     replay_lease: RuntimeReplayLease,
+    request: RuntimeRequest,
+) -> Result<StandaloneProviderAllow, StandaloneProviderAllowFailure> {
+    let mut provider_replacement_size = None;
+    adapt_provider_allow_inner(
+        lease,
+        rule_ordinal,
+        provider,
+        output,
+        inspected_body,
+        guard,
+        replay_lease,
+        request,
+        &mut provider_replacement_size,
+    )
+    .map_err(|error| StandaloneProviderAllowFailure {
+        error,
+        provider_replacement_size,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn adapt_provider_allow_inner(
+    lease: &GenerationLease,
+    rule_ordinal: usize,
+    provider: ProviderIndex,
+    output: AuthorizationAllowOutput,
+    inspected_body: Option<GuardedBody>,
+    guard: HttpWireBodyGuard,
+    replay_lease: RuntimeReplayLease,
     mut request: RuntimeRequest,
+    failure_replacement_size: &mut Option<usize>,
 ) -> Result<StandaloneProviderAllow, StandaloneProviderAllowError> {
     let generation = lease.standalone();
     let authorization = lease.authorization();
@@ -177,6 +334,10 @@ pub(crate) fn adapt_provider_allow(
     let (credentials, replacement) = authorization
         .consume_allow_output(provider, output)
         .ok_or(StandaloneProviderAllowError::Binding)?;
+    let provider_replacement_size = replacement
+        .as_ref()
+        .map(|replacement| replacement.decoded_size());
+    *failure_replacement_size = provider_replacement_size;
     let metadata = authorization
         .provider_metadata(provider)
         .ok_or(StandaloneProviderAllowError::Binding)?;
@@ -185,6 +346,7 @@ pub(crate) fn adapt_provider_allow(
         .get(provider.get())
         .filter(|templates| templates.ordinal() == provider.get())
         .ok_or(StandaloneProviderAllowError::Binding)?;
+    let upgrade_binding = compile_upgrade_binding(lease, Some(rule_ordinal), &request)?;
 
     let provider_credential_mutations = collect_provider_credential_mutations(
         generation,
@@ -258,6 +420,8 @@ pub(crate) fn adapt_provider_allow(
         provider_credential_mutations,
         staged_provider_credentials,
         provider_content_type,
+        provider_replacement_size,
+        upgrade_binding,
         guard,
         replay_lease,
         request,
@@ -298,6 +462,7 @@ pub(crate) fn adapt_local_allow(
     let provenance = rule
         .map(|(_, rule)| rule.local_provenance())
         .unwrap_or_else(|| generation.default_provenance());
+    let upgrade_binding = compile_upgrade_binding(lease, rule_ordinal, &request)?;
     finish_allow(
         generation,
         rule,
@@ -305,6 +470,8 @@ pub(crate) fn adapt_local_allow(
         Vec::new(),
         None,
         None,
+        None,
+        upgrade_binding,
         guard,
         replay_lease,
         request,
@@ -343,6 +510,8 @@ fn finish_allow(
     provider_credential_mutations: Vec<CredentialMutation>,
     staged_provider_credentials: Option<StagedProviderCredentialMutation>,
     provider_content_type: Option<HeaderMutationBatch>,
+    provider_replacement_size: Option<usize>,
+    upgrade_binding: Option<StandaloneUpgradeBinding>,
     guard: HttpWireBodyGuard,
     replay_lease: RuntimeReplayLease,
     request: RuntimeRequest,
@@ -369,7 +538,7 @@ fn finish_allow(
     let mut credential_mutations = rule_template
         .map(|rule| rule.credentials().to_vec())
         .unwrap_or_default();
-    credential_mutations.extend(provider_credential_mutations);
+    credential_mutations.extend_from_slice(&provider_credential_mutations);
     credential_mutations.extend_from_slice(generation.global_credentials());
 
     let upgrade = compile_upgrade(
@@ -386,10 +555,13 @@ fn finish_allow(
     let request_binding = request
         .binding()
         .map_err(StandaloneProviderAllowError::Runtime)?;
-    let capture_events = generation
-        .capture()
-        .map(|capture| capture.events().to_vec().into_boxed_slice())
-        .unwrap_or_default();
+    let capture_body = match provider_replacement_size {
+        Some(size) => StandaloneCaptureBody::ProviderReplacement { size },
+        None => StandaloneCaptureBody::Stream {
+            canonical_identity: request.body_representation()
+                == BodyRepresentation::CanonicalIdentity,
+        },
+    };
     let capture = generation.capture().and_then(|capture| {
         capture
             .events()
@@ -403,17 +575,6 @@ fn finish_allow(
             })
             .then(|| capture.intent().clone())
     });
-    let capture_epoch = if generation.capture().is_some() {
-        Some(
-            generation
-                .activated()
-                .capture_epoch()
-                .cloned()
-                .ok_or(StandaloneProviderAllowError::Binding)?,
-        )
-    } else {
-        None
-    };
     let plan = ForwardingPlan::new(ForwardingPlanInput {
         snapshot_identity: generation.identity().clone(),
         request_binding,
@@ -442,9 +603,10 @@ fn finish_allow(
         rule_credential_sources: Some(credential_sources.rule),
         global_credential_sources: Some(credential_sources.global),
         provider_credentials: staged_provider_credentials,
+        provider_credential_mutations: Some(provider_credential_mutations.into_boxed_slice()),
         credential_program_taken: false,
-        capture_events,
-        capture_epoch,
+        capture_body,
+        upgrade: upgrade_binding,
     };
     Ok(StandaloneProviderAllow {
         plan,
@@ -567,6 +729,34 @@ fn compile_upgrade(
         Some(UpgradeIntent::WebSocket) => Ok(UpgradePolicy::WebSocket),
         Some(UpgradeIntent::Other(protocol)) => Ok(UpgradePolicy::Opaque(protocol.clone())),
     }
+}
+
+fn compile_upgrade_binding(
+    lease: &GenerationLease,
+    rule_ordinal: Option<usize>,
+    request: &RuntimeRequest,
+) -> Result<Option<StandaloneUpgradeBinding>, StandaloneProviderAllowError> {
+    if request.facts().upgrade().is_none() {
+        return Ok(None);
+    }
+    let ordinal = rule_ordinal.ok_or(StandaloneProviderAllowError::Binding)?;
+    let compiled_wire_bytes = lease
+        .resource_plan()
+        .upgrade_wire_working_set_bytes_by_rule
+        .get(ordinal)
+        .copied()
+        .flatten();
+    let allocation = UpgradeAllocation::from_compiled_rule(ordinal, compiled_wire_bytes)
+        .map_err(|_| StandaloneProviderAllowError::Binding)?;
+    let wire_redaction = lease
+        .standalone()
+        .activated()
+        .rule_redaction(ordinal)
+        .map(|binding| binding.handle().clone());
+    Ok(Some(StandaloneUpgradeBinding {
+        allocation,
+        wire_redaction,
+    }))
 }
 
 #[cfg(all(test, unix))]
@@ -1058,6 +1248,9 @@ header = "x-test-loop"
 
     #[tokio::test]
     async fn content_type_preserve_remove_set_and_sidecar_use_are_exact() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        std::env::set_var("P06_RULE_TOKEN", "rule-secret");
+        std::env::set_var("P06_GLOBAL_TOKEN", "global-secret");
         let mut foreign_binding = None;
         for (replacement_type, expected, operation) in [
             (None, Some("application/global"), None),
@@ -1124,12 +1317,18 @@ header = "x-test-loop"
                 ));
             }
             let program = result.sidecar.take_credential_program(binding).unwrap();
-            assert_eq!(program.rule_sources().len(), 1);
-            assert_eq!(program.global_sources().len(), 1);
-            let (_rule_sources, credentials, _global_sources) = program.into_parts();
-            let credentials = credentials.unwrap();
-            credentials.apply(&mut headers).unwrap();
+            assert_eq!(program.rule_sources.len(), 1);
+            assert_eq!(program.global_sources.len(), 1);
+            program
+                .apply(
+                    result.plan.forwarding_plan(),
+                    lease.credentials(),
+                    &mut headers,
+                )
+                .unwrap();
+            assert_eq!(headers["x-rule-token"], "rule-secret");
             assert_eq!(headers["x-provider-token"], "secret-token");
+            assert_eq!(headers["x-global-token"], "global-secret");
             assert!(matches!(
                 result.sidecar.take_credential_program(binding),
                 Err(StandaloneProviderAllowError::CredentialProgramConsumed)
@@ -1139,6 +1338,166 @@ header = "x-test-loop"
             drop(lease);
             runtime.shutdown().await;
         }
+        std::env::remove_var("P06_RULE_TOKEN");
+        std::env::remove_var("P06_GLOBAL_TOKEN");
+    }
+
+    #[tokio::test]
+    async fn credential_program_applies_exact_rule_provider_global_order_once() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        std::env::set_var("P06_RULE_TOKEN", "rule-secret");
+        std::env::set_var("P06_GLOBAL_TOKEN", "global-secret");
+
+        let (primary_runtime, lease, _pool) = runtime().await;
+        let generation = lease.standalone();
+        let (guard, replay, provider) = admission(&lease);
+        let mut result = adapt_provider_allow(
+            &lease,
+            0,
+            provider,
+            output(&lease, provider, true, None),
+            None,
+            guard,
+            replay,
+            request(generation, vec![b"original".to_vec()]),
+        )
+        .unwrap();
+        let binding = result.plan.binding();
+        let program = result.sidecar.take_credential_program(binding).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-visible", http::HeaderValue::from_static("retained"));
+        headers.insert("x-rule-token", http::HeaderValue::from_static("replaced"));
+        program
+            .apply(
+                result.plan.forwarding_plan(),
+                lease.credentials(),
+                &mut headers,
+            )
+            .unwrap();
+
+        assert_eq!(headers["x-visible"], "retained");
+        assert_eq!(headers["x-rule-token"], "rule-secret");
+        assert_eq!(headers["x-provider-token"], "secret-token");
+        assert_eq!(headers["x-global-token"], "global-secret");
+        for name in ["x-rule-token", "x-provider-token", "x-global-token"] {
+            assert!(headers[name].is_sensitive());
+        }
+        assert!(matches!(
+            result.sidecar.take_credential_program(binding),
+            Err(StandaloneProviderAllowError::CredentialProgramConsumed)
+        ));
+
+        drop(result);
+        drop(lease);
+        primary_runtime.shutdown().await;
+        std::env::remove_var("P06_RULE_TOKEN");
+        std::env::remove_var("P06_GLOBAL_TOKEN");
+    }
+
+    #[tokio::test]
+    async fn credential_program_rejects_foreign_plan_before_header_mutation() {
+        let (primary_runtime, lease, _pool) = runtime().await;
+        let generation = lease.standalone();
+        let (guard, replay, provider) = admission(&lease);
+        let mut result = adapt_provider_allow(
+            &lease,
+            0,
+            provider,
+            output(&lease, provider, true, None),
+            None,
+            guard,
+            replay,
+            request(generation, vec![b"original".to_vec()]),
+        )
+        .unwrap();
+        let program = result
+            .sidecar
+            .take_credential_program(result.plan.binding())
+            .unwrap();
+
+        let (foreign_runtime, foreign_lease, _foreign_pool) = runtime().await;
+        let foreign_generation = foreign_lease.standalone();
+        let (foreign_guard, foreign_replay, foreign_provider) = admission(&foreign_lease);
+        let foreign = adapt_provider_allow(
+            &foreign_lease,
+            0,
+            foreign_provider,
+            output(&foreign_lease, foreign_provider, true, None),
+            None,
+            foreign_guard,
+            foreign_replay,
+            request(foreign_generation, vec![b"original".to_vec()]),
+        )
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-visible", http::HeaderValue::from_static("unchanged"));
+        assert!(matches!(
+            program.apply(
+                foreign.plan.forwarding_plan(),
+                lease.credentials(),
+                &mut headers,
+            ),
+            Err(StandaloneProviderAllowError::Binding)
+        ));
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers["x-visible"], "unchanged");
+
+        drop(foreign);
+        drop(foreign_lease);
+        foreign_runtime.shutdown().await;
+        drop(result);
+        drop(lease);
+        primary_runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn late_credential_source_failure_rolls_back_all_header_mutations() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        std::env::set_var("P06_RULE_TOKEN", "rule-secret");
+        std::env::remove_var("P06_GLOBAL_TOKEN");
+
+        let (runtime, lease, _pool) = runtime().await;
+        let generation = lease.standalone();
+        let (guard, replay, provider) = admission(&lease);
+        let mut result = adapt_provider_allow(
+            &lease,
+            0,
+            provider,
+            output(&lease, provider, true, None),
+            None,
+            guard,
+            replay,
+            request(generation, vec![b"original".to_vec()]),
+        )
+        .unwrap();
+        let program = result
+            .sidecar
+            .take_credential_program(result.plan.binding())
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-visible", http::HeaderValue::from_static("unchanged"));
+        headers.insert("x-rule-token", http::HeaderValue::from_static("original"));
+        assert!(matches!(
+            program.apply(
+                result.plan.forwarding_plan(),
+                lease.credentials(),
+                &mut headers,
+            ),
+            Err(StandaloneProviderAllowError::Credential(
+                crate::credentials::CredentialError::SourceUnavailable
+            ))
+        ));
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers["x-visible"], "unchanged");
+        assert_eq!(headers["x-rule-token"], "original");
+        assert!(!headers.contains_key("x-provider-token"));
+        assert!(!headers.contains_key("x-global-token"));
+
+        drop(result);
+        drop(lease);
+        runtime.shutdown().await;
+        std::env::remove_var("P06_RULE_TOKEN");
+        std::env::remove_var("P06_GLOBAL_TOKEN");
     }
 
     #[tokio::test]
@@ -1292,24 +1651,22 @@ header = "x-test-loop"
         .err()
         .expect("a foreign provider-output registry must fail closed");
 
-        assert!(matches!(error, StandaloneProviderAllowError::Binding));
+        assert!(matches!(error.error, StandaloneProviderAllowError::Binding));
         assert_eq!(pool.global_charge(), 0);
 
         let (guard, replay, provider) = admission(&lease);
         let foreign_plain_allow = output(&foreign_lease, foreign_provider, false, None);
-        assert!(matches!(
-            adapt_provider_allow(
-                &lease,
-                0,
-                provider,
-                foreign_plain_allow,
-                None,
-                guard,
-                replay,
-                request(generation, vec![b"original".to_vec()]),
-            ),
-            Err(StandaloneProviderAllowError::Binding)
-        ));
+        assert!(adapt_provider_allow(
+            &lease,
+            0,
+            provider,
+            foreign_plain_allow,
+            None,
+            guard,
+            replay,
+            request(generation, vec![b"original".to_vec()]),
+        )
+        .is_err_and(|failure| matches!(failure.error, StandaloneProviderAllowError::Binding)));
         assert_eq!(pool.global_charge(), 0);
 
         let (foreign_guard, foreign_replay, _) = admission(&foreign_lease);
@@ -1327,19 +1684,17 @@ header = "x-test-loop"
             Some(foreign_replacement),
         );
         let (guard, replay, provider) = admission(&lease);
-        assert!(matches!(
-            adapt_provider_allow(
-                &lease,
-                0,
-                provider,
-                foreign_replacement_allow,
-                None,
-                guard,
-                replay,
-                request(generation, vec![b"original".to_vec()]),
-            ),
-            Err(StandaloneProviderAllowError::Binding)
-        ));
+        assert!(adapt_provider_allow(
+            &lease,
+            0,
+            provider,
+            foreign_replacement_allow,
+            None,
+            guard,
+            replay,
+            request(generation, vec![b"original".to_vec()]),
+        )
+        .is_err_and(|failure| matches!(failure.error, StandaloneProviderAllowError::Binding)));
         assert_eq!(pool.global_charge(), 0);
         assert_eq!(foreign_pool.global_charge(), 0);
         drop(foreign_lease);
@@ -1369,8 +1724,12 @@ header = "x-test-loop"
         .err()
         .expect("a non-identity provider replacement must fail closed");
 
+        assert_eq!(
+            error.provider_replacement_size(),
+            Some(b"replacement".len())
+        );
         assert!(matches!(
-            error,
+            error.error,
             StandaloneProviderAllowError::ProviderReplacement(
                 ProviderBodyReplacementDecodeError::InvalidBody
             )
@@ -1406,7 +1765,14 @@ header = "x-test-loop"
         )
         .err()
         .expect("invalid Content-Type must fail before request replacement");
-        assert!(matches!(error, StandaloneProviderAllowError::ContentType));
+        assert_eq!(
+            error.provider_replacement_size(),
+            Some(b"replacement".len())
+        );
+        assert!(matches!(
+            error.error,
+            StandaloneProviderAllowError::ContentType
+        ));
         assert_eq!(pool.global_charge(), 0);
         drop(lease);
         runtime.shutdown().await;

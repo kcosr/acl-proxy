@@ -17,11 +17,11 @@ use crate::authorization::{ActivatedProviderOutputBinding, ProductAuthorizationS
 use crate::config::compiler::{
     AuthorizationProviderPlan, CompiledCaptureEvent, CompiledEgressRoute, CompiledHeaderEffectWhen,
     CompiledRuleDecision, CompiledTlsTrust, CredentialActionPlan, ForwardingPlan, HeaderEffectPlan,
-    HttpBodyReadPlan, PolicyRulePlan, ProviderOutputPlan, ReloadableProductPlan, TransportTlsPlan,
+    PolicyRulePlan, ProviderOutputPlan, ReloadableProductPlan, TransportTlsPlan,
 };
 use crate::credentials::ResolvedCredentialAction;
-use crate::egress::{ActivatedTlsRoots, EgressSnapshot};
-use crate::observation::{CaptureEpoch, CaptureEvent, ProductObservationSnapshot};
+use crate::egress::EgressSnapshot;
+use crate::observation::{CaptureEvent, ProductObservationSnapshot};
 use crate::redaction::{ProfileHandle, RedactionSnapshot};
 use crate::runtime::{
     CredentialSourceIndex, CredentialSourceRegistry, GenerationId, ProviderIndex, ProviderRegistry,
@@ -44,7 +44,6 @@ pub(crate) struct StandaloneGenerationPlan {
 
 pub(crate) struct StandaloneGenerationCore {
     identity: SnapshotIdentity,
-    generation: PolicyGeneration,
     timeouts: StageTimeouts,
     ordinary_request_body: RequestBodyPolicy,
     normalized_request_body: RequestBodyPolicy,
@@ -56,12 +55,9 @@ pub(crate) struct StandaloneGenerationCore {
     sensitive_headers: Box<[HeaderName]>,
     rules: Box<[StandaloneRuleTemplate]>,
     default_provenance: DecisionProvenance,
-    body_reads_by_cursor: Box<[StandaloneBodyReadPlan]>,
     global_request_headers: Option<HeaderMutationBatch>,
     global_credentials: Box<[CredentialMutation]>,
     provider_credentials: Box<[ProviderCredentialTemplates]>,
-    resource_projections: StandaloneResourceProjections,
-    resource_limits: RuntimeResourceLimits,
     snapshot_lease: SnapshotLease,
 }
 
@@ -69,7 +65,6 @@ struct StandaloneBindingManifest {
     global_credentials: Box<[StandaloneCredentialBindingManifest]>,
     rules: Box<[StandaloneRuleBindingManifest]>,
     provider_outputs: Box<[StandaloneProviderOutputManifest]>,
-    redactions: Box<[StandaloneRedactionBindingManifest]>,
     capture_redaction: Option<String>,
     tls: Box<[StandaloneTlsBindingManifest]>,
     resources: StandaloneResourceProof,
@@ -78,11 +73,6 @@ struct StandaloneBindingManifest {
 struct StandaloneCredentialBindingManifest {
     source: String,
     reference: CredentialRef,
-}
-
-struct StandaloneRedactionBindingManifest {
-    profile: String,
-    reference: RedactionRef,
 }
 
 struct StandaloneRuleBindingManifest {
@@ -122,7 +112,6 @@ enum StandaloneTlsRole {
 struct StandaloneTlsBindingManifest {
     role: StandaloneTlsRole,
     trust: CompiledTlsTrust,
-    reference: TlsRootsRef,
 }
 
 pub(crate) struct StandaloneActivatedBindings {
@@ -131,20 +120,16 @@ pub(crate) struct StandaloneActivatedBindings {
     rule_providers: Box<[Option<ProviderIndex>]>,
     rule_redactions: Box<[Option<BoundRedaction>]>,
     provider_outputs: Box<[BoundProviderOutput]>,
-    redactions: Box<[BoundRedaction]>,
-    capture_epoch: Option<std::sync::Arc<CaptureEpoch>>,
-    tls_roots: Box<[BoundTlsRoots]>,
-    resources: StandaloneResourceProof,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct StandaloneResourceProof {
+struct StandaloneResourceProof {
     cursors: Box<[StandaloneCursorResourceProof]>,
     max_reachable_combined_peak_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct StandaloneCursorResourceProof {
+struct StandaloneCursorResourceProof {
     product_incremental_peak_bytes: usize,
     runtime_replay_capacity_bytes: usize,
     combined_peak_bytes: usize,
@@ -162,31 +147,13 @@ pub(crate) struct BoundProviderOutput {
 }
 
 pub(crate) struct BoundRedaction {
-    reference: RedactionRef,
     profile: RedactionProfileIndex,
     handle: ProfileHandle,
 }
 
-pub(crate) struct BoundTlsRoots {
-    reference: TlsRootsRef,
-    role: StandaloneTlsRole,
-    roots: ActivatedTlsRoots,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StandaloneBodyReadPlan {
-    Disabled,
-    Mandatory {
-        max_encoded_bytes: usize,
-        max_decoded_bytes: usize,
-    },
-}
-
 pub(crate) struct StandaloneRuleTemplate {
-    id: StableId,
     ordinal: u32,
     decision: StandaloneRuleDecision,
-    request_timeout: Option<Duration>,
     allow_upgrades: bool,
     request_headers: Option<HeaderMutationBatch>,
     response_headers: Option<HeaderMutationBatch>,
@@ -216,7 +183,6 @@ pub(crate) enum StandaloneRuleDecision {
 
 pub(crate) struct StandaloneCaptureIntent {
     intent: CaptureIntent,
-    redaction: RedactionRef,
     events: Box<[StandaloneCaptureEvent]>,
 }
 
@@ -229,7 +195,7 @@ pub(crate) enum StandaloneCaptureEvent {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct StandaloneResourceProjections {
+struct StandaloneResourceProjections {
     request_peak_bytes: u64,
     response_peak_bytes: u64,
     capture_peak_bytes: u64,
@@ -290,7 +256,7 @@ impl UnboundStandaloneGenerationPlan {
             })
             .collect::<Result<BTreeMap<_, _>, StandaloneCompileError>>()?;
 
-        let capture = compile_capture(plan, &identity, version, &redactions)?;
+        let capture = compile_capture(plan, &identity, version)?;
         let sensitive_headers = compile_sensitive_headers(plan)?;
         let global_request_headers = compile_header_batch(&plan.egress.request_headers)?;
 
@@ -325,7 +291,6 @@ impl UnboundStandaloneGenerationPlan {
 
         let provider_credentials =
             compile_provider_credentials(plan, &identity, version, &mut credential_refs)?;
-        let body_reads_by_cursor = compile_body_reads(plan)?;
         let default_provenance = DecisionProvenance::new(
             generation,
             EffectivePolicy::Default,
@@ -373,7 +338,6 @@ impl UnboundStandaloneGenerationPlan {
 
         let core = StandaloneGenerationCore {
             identity,
-            generation,
             timeouts,
             ordinary_request_body,
             normalized_request_body,
@@ -385,12 +349,9 @@ impl UnboundStandaloneGenerationPlan {
             sensitive_headers,
             rules: rules.into_boxed_slice(),
             default_provenance,
-            body_reads_by_cursor,
             global_request_headers,
             global_credentials,
             provider_credentials,
-            resource_projections,
-            resource_limits,
             snapshot_lease,
         };
         let manifest = compile_binding_manifest(plan, &core, &redactions)?;
@@ -445,10 +406,6 @@ impl UnboundStandaloneGenerationPlan {
                 rule_providers: Box::new([]),
                 rule_redactions: Box::new([]),
                 provider_outputs: Box::new([]),
-                redactions: Box::new([]),
-                capture_epoch: None,
-                tls_roots: Box::new([]),
-                resources: self.manifest.resources.clone(),
             },
             core: self.core,
         }
@@ -458,10 +415,6 @@ impl UnboundStandaloneGenerationPlan {
 impl StandaloneGenerationCore {
     pub(crate) fn identity(&self) -> &SnapshotIdentity {
         &self.identity
-    }
-
-    pub(crate) fn generation(&self) -> PolicyGeneration {
-        self.generation
     }
 
     pub(crate) fn timeouts(&self) -> StageTimeouts {
@@ -511,10 +464,6 @@ impl StandaloneGenerationCore {
         &self.default_provenance
     }
 
-    pub(crate) fn body_reads_by_cursor(&self) -> &[StandaloneBodyReadPlan] {
-        &self.body_reads_by_cursor
-    }
-
     pub(crate) fn global_request_headers(&self) -> Option<&HeaderMutationBatch> {
         self.global_request_headers.as_ref()
     }
@@ -525,14 +474,6 @@ impl StandaloneGenerationCore {
 
     pub(crate) fn provider_credentials(&self) -> &[ProviderCredentialTemplates] {
         &self.provider_credentials
-    }
-
-    pub(crate) fn resource_projections(&self) -> StandaloneResourceProjections {
-        self.resource_projections
-    }
-
-    pub(crate) fn resource_limits(&self) -> RuntimeResourceLimits {
-        self.resource_limits
     }
 
     pub(crate) fn snapshot_lease(&self) -> &SnapshotLease {
@@ -582,33 +523,9 @@ impl StandaloneActivatedBindings {
     pub(crate) fn provider_outputs(&self) -> &[BoundProviderOutput] {
         &self.provider_outputs
     }
-
-    pub(crate) fn redactions(&self) -> &[BoundRedaction] {
-        &self.redactions
-    }
-
-    pub(crate) fn capture_epoch(&self) -> Option<&std::sync::Arc<CaptureEpoch>> {
-        self.capture_epoch.as_ref()
-    }
-
-    pub(crate) fn tls_roots(&self) -> &[BoundTlsRoots] {
-        &self.tls_roots
-    }
-
-    pub(crate) fn resources(&self) -> &StandaloneResourceProof {
-        &self.resources
-    }
 }
 
 impl StandaloneResourceProof {
-    pub(crate) fn cursors(&self) -> &[StandaloneCursorResourceProof] {
-        &self.cursors
-    }
-
-    pub(crate) fn max_reachable_combined_peak_bytes(&self) -> usize {
-        self.max_reachable_combined_peak_bytes
-    }
-
     fn is_valid(&self) -> bool {
         self.cursors.iter().all(|record| {
             record
@@ -622,20 +539,6 @@ impl StandaloneResourceProof {
             .max()
             .unwrap_or(0)
             == self.max_reachable_combined_peak_bytes
-    }
-}
-
-impl StandaloneCursorResourceProof {
-    pub(crate) fn product_incremental_peak_bytes(self) -> usize {
-        self.product_incremental_peak_bytes
-    }
-
-    pub(crate) fn runtime_replay_capacity_bytes(self) -> usize {
-        self.runtime_replay_capacity_bytes
-    }
-
-    pub(crate) fn combined_peak_bytes(self) -> usize {
-        self.combined_peak_bytes
     }
 }
 
@@ -664,26 +567,12 @@ impl BoundProviderOutput {
 }
 
 impl BoundRedaction {
-    pub(crate) fn reference(&self) -> &RedactionRef {
-        &self.reference
-    }
-
     pub(crate) fn profile(&self) -> RedactionProfileIndex {
         self.profile
     }
 
     pub(crate) fn handle(&self) -> &ProfileHandle {
         &self.handle
-    }
-}
-
-impl BoundTlsRoots {
-    pub(crate) fn reference(&self) -> &TlsRootsRef {
-        &self.reference
-    }
-
-    pub(crate) fn roots(&self) -> &ActivatedTlsRoots {
-        &self.roots
     }
 }
 
@@ -791,23 +680,9 @@ fn compile_binding_manifest(
         )
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    let redactions = plan
-        .redaction
-        .profiles
-        .keys()
-        .map(|profile| {
-            Ok(StandaloneRedactionBindingManifest {
-                profile: profile.clone(),
-                reference: redaction_refs.get(profile).cloned().ok_or(
-                    StandaloneCompileError::Inconsistent("redaction binding manifest"),
-                )?,
-            })
-        })
-        .collect::<Result<Vec<_>, StandaloneCompileError>>()?
-        .into_boxed_slice();
     let mut tls = Vec::new();
     if custom_trust(plan.egress.origin_tls.trust) {
-        let TlsIntent::CustomRoots(reference) = &core.origin_https_tls else {
+        let TlsIntent::CustomRoots(_) = &core.origin_https_tls else {
             return Err(StandaloneCompileError::Inconsistent(
                 "origin TLS binding manifest",
             ));
@@ -815,14 +690,13 @@ fn compile_binding_manifest(
         tls.push(StandaloneTlsBindingManifest {
             role: StandaloneTlsRole::Origin,
             trust: plan.egress.origin_tls.trust,
-            reference: reference.clone(),
         });
     }
     if let Some(parent) = plan.egress.parent_proxy.as_ref() {
         if let Some(parent_tls) = parent.tls.as_ref() {
             if custom_trust(parent_tls.trust) {
                 let Route::Parent {
-                    tls: TlsIntent::CustomRoots(reference),
+                    tls: TlsIntent::CustomRoots(_),
                     ..
                 } = &core.route
                 else {
@@ -833,7 +707,6 @@ fn compile_binding_manifest(
                 tls.push(StandaloneTlsBindingManifest {
                     role: StandaloneTlsRole::Parent,
                     trust: parent_tls.trust,
-                    reference: reference.clone(),
                 });
             }
         }
@@ -842,7 +715,6 @@ fn compile_binding_manifest(
         global_credentials,
         rules,
         provider_outputs,
-        redactions,
         capture_redaction: plan
             .observation
             .capture
@@ -1100,33 +972,11 @@ fn bind_activated(
         .collect::<Result<Vec<_>, _>>()?
         .into_boxed_slice();
 
-    let redaction_bindings = manifest
-        .redactions
-        .iter()
-        .map(|binding| {
-            let profile = redactions
-                .get(&binding.profile)
-                .ok_or(StandaloneBindError::Missing("redaction profile"))?;
-            let handle = redaction_snapshot
-                .profile(profile)
-                .ok_or(StandaloneBindError::Missing("redaction profile handle"))?;
-            Ok(BoundRedaction {
-                reference: binding.reference.clone(),
-                profile,
-                handle,
-            })
-        })
-        .collect::<Result<Vec<_>, StandaloneBindError>>()?
-        .into_boxed_slice();
+    bind_capture(core, manifest, redaction_snapshot, redactions, observation)?;
 
-    let capture_epoch = bind_capture(core, manifest, redaction_snapshot, redactions, observation)?;
-
-    let tls_roots = manifest
-        .tls
-        .iter()
-        .map(|binding| bind_tls_roots(binding, egress))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_boxed_slice();
+    for binding in &manifest.tls {
+        bind_tls_roots(binding, egress)?;
+    }
     if egress.origin_custom_roots().is_some()
         != manifest
             .tls
@@ -1147,10 +997,6 @@ fn bind_activated(
         rule_providers: rule_providers.into_boxed_slice(),
         rule_redactions: rule_redactions.into_boxed_slice(),
         provider_outputs,
-        redactions: redaction_bindings,
-        capture_epoch,
-        tls_roots,
-        resources: manifest.resources.clone(),
     })
 }
 
@@ -1171,7 +1017,7 @@ fn bind_credential_source(
 fn bind_tls_roots(
     binding: &StandaloneTlsBindingManifest,
     egress: &EgressSnapshot,
-) -> Result<BoundTlsRoots, StandaloneBindError> {
+) -> Result<(), StandaloneBindError> {
     let roots = match binding.role {
         StandaloneTlsRole::Origin => egress.origin_custom_roots(),
         StandaloneTlsRole::Parent => egress.parent_custom_roots(),
@@ -1180,11 +1026,7 @@ fn bind_tls_roots(
     if roots.trust() != binding.trust {
         return Err(StandaloneBindError::Inconsistent("TLS roots role"));
     }
-    Ok(BoundTlsRoots {
-        reference: binding.reference.clone(),
-        role: binding.role,
-        roots,
-    })
+    Ok(())
 }
 
 fn bind_provider_output(
@@ -1207,20 +1049,14 @@ fn bind_redaction(
     redaction_snapshot: &RedactionSnapshot,
     redactions: &RedactionProfileRegistry,
 ) -> Result<BoundRedaction, StandaloneBindError> {
-    let reference = reference
-        .cloned()
-        .ok_or(StandaloneBindError::Inconsistent("redaction reference"))?;
+    reference.ok_or(StandaloneBindError::Inconsistent("redaction reference"))?;
     let profile = redactions
         .get(name)
         .ok_or(StandaloneBindError::Missing("redaction profile"))?;
     let handle = redaction_snapshot
         .profile(profile)
         .ok_or(StandaloneBindError::Missing("redaction profile handle"))?;
-    Ok(BoundRedaction {
-        reference,
-        profile,
-        handle,
-    })
+    Ok(BoundRedaction { profile, handle })
 }
 
 fn bind_capture(
@@ -1229,13 +1065,13 @@ fn bind_capture(
     redaction_snapshot: &RedactionSnapshot,
     redactions: &RedactionProfileRegistry,
     observation: &ProductObservationSnapshot,
-) -> Result<Option<std::sync::Arc<CaptureEpoch>>, StandaloneBindError> {
+) -> Result<(), StandaloneBindError> {
     match (
         core.capture.as_ref(),
         manifest.capture_redaction.as_deref(),
         observation.capture_epoch().capture(),
     ) {
-        (None, None, None) => Ok(None),
+        (None, None, None) => Ok(()),
         (Some(neutral), Some(profile_name), Some(activated)) => {
             let profile_index = redactions
                 .get(profile_name)
@@ -1251,7 +1087,7 @@ fn bind_capture(
             {
                 return Err(StandaloneBindError::Inconsistent("capture binding"));
             }
-            Ok(Some(observation.capture_epoch().clone()))
+            Ok(())
         }
         _ => Err(StandaloneBindError::Inconsistent("capture shape")),
     }
@@ -1313,20 +1149,12 @@ fn credential_action_matches(
 }
 
 impl StandaloneRuleTemplate {
-    pub(crate) fn id(&self) -> &StableId {
-        &self.id
-    }
-
     pub(crate) fn ordinal(&self) -> u32 {
         self.ordinal
     }
 
     pub(crate) fn decision(&self) -> StandaloneRuleDecision {
         self.decision
-    }
-
-    pub(crate) fn request_timeout(&self) -> Option<Duration> {
-        self.request_timeout
     }
 
     pub(crate) fn allow_upgrades(&self) -> bool {
@@ -1387,26 +1215,8 @@ impl StandaloneCaptureIntent {
         &self.intent
     }
 
-    pub(crate) fn redaction(&self) -> &RedactionRef {
-        &self.redaction
-    }
-
     pub(crate) fn events(&self) -> &[StandaloneCaptureEvent] {
         &self.events
-    }
-}
-
-impl StandaloneResourceProjections {
-    pub(crate) fn request_peak_bytes(self) -> u64 {
-        self.request_peak_bytes
-    }
-
-    pub(crate) fn response_peak_bytes(self) -> u64 {
-        self.response_peak_bytes
-    }
-
-    pub(crate) fn capture_peak_bytes(self) -> u64 {
-        self.capture_peak_bytes
     }
 }
 
@@ -1607,7 +1417,6 @@ fn compile_capture(
     plan: &ReloadableProductPlan,
     identity: &SnapshotIdentity,
     version: u64,
-    redactions: &BTreeMap<String, RedactionRef>,
 ) -> Result<Option<StandaloneCaptureIntent>, StandaloneCompileError> {
     let Some(capture) = &plan.observation.capture else {
         return Ok(None);
@@ -1645,9 +1454,6 @@ fn compile_capture(
             "capture resource projection",
         ));
     }
-    let redaction = redactions.get(&capture.redaction_profile).cloned().ok_or(
-        StandaloneCompileError::Inconsistent("capture redaction reference"),
-    )?;
     let events = capture
         .events
         .iter()
@@ -1659,11 +1465,7 @@ fn compile_capture(
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    Ok(Some(StandaloneCaptureIntent {
-        intent,
-        redaction,
-        events,
-    }))
+    Ok(Some(StandaloneCaptureIntent { intent, events }))
 }
 
 fn compile_sensitive_headers(
@@ -1751,14 +1553,12 @@ fn compile_rule_template(
         })
         .transpose()?;
     Ok(StandaloneRuleTemplate {
-        id,
         ordinal: checked_ordinal,
         decision: match rule.decision {
             CompiledRuleDecision::Allow => StandaloneRuleDecision::Allow,
             CompiledRuleDecision::Deny => StandaloneRuleDecision::Deny,
             CompiledRuleDecision::Delegate => StandaloneRuleDecision::Delegate,
         },
-        request_timeout: rule.request_timeout,
         allow_upgrades: rule.allow_upgrades,
         request_headers: compile_header_batch(&rule.request_headers)?,
         response_headers: compile_header_batch(&rule.response_headers)?,
@@ -1861,27 +1661,6 @@ fn credential_ref(
 ) -> Result<CredentialRef, StandaloneCompileError> {
     CredentialRef::new(identity.clone(), stable_id(id)?, version)
         .map_err(|_| StandaloneCompileError::Checked("credential reference"))
-}
-
-fn compile_body_reads(
-    plan: &ReloadableProductPlan,
-) -> Result<Box<[StandaloneBodyReadPlan]>, StandaloneCompileError> {
-    if plan.policy.http_body_read_plans_by_cursor.len() != plan.policy.rules.len() + 1 {
-        return Err(StandaloneCompileError::Inconsistent("body-read cursors"));
-    }
-    Ok(plan
-        .policy
-        .http_body_read_plans_by_cursor
-        .iter()
-        .map(|read| match read {
-            HttpBodyReadPlan::Disabled => StandaloneBodyReadPlan::Disabled,
-            HttpBodyReadPlan::Mandatory(limits) => StandaloneBodyReadPlan::Mandatory {
-                max_encoded_bytes: limits.max_encoded_bytes(),
-                max_decoded_bytes: limits.max_decoded_bytes(),
-            },
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice())
 }
 
 fn compile_resource_projections(
@@ -2145,9 +1924,8 @@ header = "x-acl-proxy-request-id"
         )
         .unwrap();
 
-        assert_eq!(plan.generation().get(), 17);
         assert!(plan.snapshot_lease().owns(plan.identity()));
-        assert_eq!(plan.snapshot_lease().generation(), plan.generation());
+        assert_eq!(plan.snapshot_lease().generation().get(), 17);
         assert_eq!(plan.timeouts().connect_ms(), 3_000);
         assert_eq!(plan.timeouts().response_head_ms(), 4_000);
         assert_eq!(plan.timeouts().body_idle_ms(), 5_000);
@@ -2211,7 +1989,6 @@ header = "x-acl-proxy-request-id"
 
         let capture = plan.capture().expect("capture intent is retained");
         assert!(capture.intent().reference().belongs_to(plan.identity()));
-        assert!(capture.redaction().belongs_to(plan.identity()));
         assert_eq!(
             capture.events(),
             [
@@ -2221,10 +1998,8 @@ header = "x-acl-proxy-request-id"
         );
         assert_eq!(plan.rules().len(), 1);
         let rule = &plan.rules()[0];
-        assert_eq!(rule.id().as_str(), "delegate");
         assert_eq!(rule.ordinal(), 0);
         assert_eq!(rule.decision(), StandaloneRuleDecision::Delegate);
-        assert_eq!(rule.request_timeout(), None);
         assert!(rule.allow_upgrades());
         assert!(rule.request_headers().is_some());
         assert!(rule.response_headers().is_some());
@@ -2272,46 +2047,6 @@ header = "x-acl-proxy-request-id"
             .mutation()
             .credential()
             .belongs_to(plan.identity()));
-        assert_eq!(
-            plan.body_reads_by_cursor().len(),
-            compiled.reloadable_plan.policy.rules.len() + 1
-        );
-
-        let projections = plan.resource_projections();
-        assert_eq!(
-            projections.request_peak_bytes(),
-            [
-                plan.ordinary_request_body()
-                    .projection()
-                    .simultaneous_peak_bytes(),
-                plan.normalized_request_body()
-                    .projection()
-                    .simultaneous_peak_bytes(),
-                plan.upgrade_request_body()
-                    .projection()
-                    .simultaneous_peak_bytes(),
-            ]
-            .into_iter()
-            .max()
-            .unwrap()
-        );
-        assert_eq!(
-            projections.response_peak_bytes(),
-            plan.response().projection().simultaneous_peak_bytes()
-        );
-        assert_eq!(
-            projections.capture_peak_bytes(),
-            capture.intent().projection().simultaneous_peak_bytes()
-        );
-        assert_eq!(
-            plan.resource_limits(),
-            RuntimeResourceLimits::new(
-                projections.request_peak_bytes(),
-                projections.response_peak_bytes(),
-                projections.capture_peak_bytes(),
-            )
-            .unwrap()
-        );
     }
 
     #[test]
