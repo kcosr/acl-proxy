@@ -61,9 +61,9 @@ impl LocalAddressSource for EmptyLocalAddressSource {
 impl PolicySnapshot for EmptySnapshot {
     fn evaluate<'snapshot>(
         &'snapshot self,
-        _url: &crate::url::CanonicalUrl,
+        _url: &http_access_url::CanonicalUrl,
         _peer_ip: std::net::IpAddr,
-        _method: &http::Method,
+        _method: &http_access_types::HttpMethod,
         _headers: &http::HeaderMap,
         _extra_presence: &dyn Fn(&http::HeaderName) -> bool,
     ) -> crate::policy::PolicyEvaluation<'snapshot> {

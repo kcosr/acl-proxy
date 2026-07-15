@@ -1,4 +1,4 @@
-use crate::url::CanonicalUrl;
+use http_access_types::CanonicalUrl;
 
 const CONTENT_LENGTH_DIGITS: usize = 20;
 
@@ -15,13 +15,13 @@ pub(crate) fn encode_request_head(
 ) -> Result<usize, WebhookRequestHeadError> {
     let mut writer = HeadWriter::new(output);
     writer.push(b"POST ")?;
-    writer.push(url.path.as_bytes())?;
-    if let Some(query) = &url.query {
+    writer.push(url.path().as_bytes())?;
+    if let Some(query) = url.query() {
         writer.push(b"?")?;
         writer.push(query.as_bytes())?;
     }
     writer.push(b" HTTP/1.1\r\nHost: ")?;
-    writer.push(url.authority.as_bytes())?;
+    writer.push(url.authority().as_str().as_bytes())?;
     writer.push(b"\r\nContent-Type: application/json\r\nContent-Length: ")?;
     writer.push_decimal(content_length)?;
     writer.push(b"\r\nConnection: close\r\n\r\n")?;
@@ -71,7 +71,7 @@ impl<'a> HeadWriter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::url::canonicalize_http_url;
+    use http_access_url::canonicalize_http_url;
 
     #[test]
     fn webhook_request_head_is_canonical_and_exactly_bounded() {

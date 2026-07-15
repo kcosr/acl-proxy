@@ -11,7 +11,10 @@ use std::sync::Arc;
 
 use crate::config::StaticProductConfig;
 use crate::network::socket_binds_overlap;
-use crate::url::{canonicalize_http_url, CanonicalAuthority, CanonicalUrl};
+#[cfg(test)]
+use http_access_types::HttpScheme;
+use http_access_types::{CanonicalAuthority, CanonicalUrl};
+use http_access_url::canonicalize_http_url;
 
 pub(crate) use connector::{DestinationConnector, TcpDestinationConnector};
 pub(crate) use local::{LocalAddressSnapshot, LocalAddressSource, SystemLocalAddressSource};
@@ -91,10 +94,10 @@ impl DestinationTarget {
     pub(crate) fn parent(parent_hop: &CanonicalAuthority, origin: &CanonicalUrl) -> Self {
         Self {
             route: DestinationRoute::Parent,
-            resolution_host: parent_hop.host.clone(),
-            resolution_port: parent_hop.port,
-            semantic_authority: origin.authority.clone(),
-            semantic_path: origin.path.clone(),
+            resolution_host: parent_hop.host().as_str().to_owned(),
+            resolution_port: parent_hop.effective_port(),
+            semantic_authority: origin.authority().as_str().to_owned(),
+            semantic_path: origin.path().to_owned(),
             literal_origin: literal_endpoint(origin),
         }
     }
@@ -102,10 +105,10 @@ impl DestinationTarget {
     fn from_url(route: DestinationRoute, url: &CanonicalUrl) -> Self {
         Self {
             route,
-            resolution_host: url.host.clone(),
-            resolution_port: url.port,
-            semantic_authority: url.authority.clone(),
-            semantic_path: url.path.clone(),
+            resolution_host: url.authority().host().as_str().to_owned(),
+            resolution_port: url.authority().effective_port(),
+            semantic_authority: url.authority().as_str().to_owned(),
+            semantic_path: url.path().to_owned(),
             literal_origin: literal_endpoint(url),
         }
     }
@@ -130,10 +133,12 @@ impl DestinationTarget {
 }
 
 fn literal_endpoint(url: &CanonicalUrl) -> Option<SocketAddr> {
-    url.host
+    url.authority()
+        .host()
+        .as_str()
         .parse()
         .ok()
-        .map(|ip| normalize_endpoint(SocketAddr::new(ip, url.port)))
+        .map(|ip| normalize_endpoint(SocketAddr::new(ip, url.authority().effective_port())))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -145,7 +150,7 @@ pub(crate) struct ReservedControlSubtree {
 impl ReservedControlSubtree {
     pub(crate) fn new(public_url: &CanonicalUrl, canonical_base_path: impl Into<String>) -> Self {
         Self {
-            canonical_authority: public_url.authority.clone(),
+            canonical_authority: public_url.authority().as_str().to_owned(),
             canonical_base_path: canonical_base_path.into(),
         }
     }
@@ -238,7 +243,7 @@ impl DestinationFacts {
                     "{}/external-auth/callback",
                     control.base_path.trim_end_matches('/')
                 );
-                if public_url.path != expected_path || public_url.query.is_some() {
+                if public_url.path() != expected_path || public_url.query().is_some() {
                     return Err(DestinationGuardError::InconsistentStaticFacts(
                         "callback public URL does not identify the control callback route",
                     ));
@@ -947,7 +952,7 @@ mod tests {
     }
 
     fn target(route: DestinationRoute, port: u16) -> DestinationTarget {
-        let url = crate::url::canonicalize_http_url(&format!(
+        let url = http_access_url::canonicalize_http_url(&format!(
             "https://destination.example:{port}/resource"
         ))
         .expect("canonical destination URL");
@@ -955,8 +960,8 @@ mod tests {
             DestinationRoute::Direct => DestinationTarget::direct(&url),
             DestinationRoute::Webhook => DestinationTarget::webhook(&url),
             DestinationRoute::Parent => {
-                let parent = crate::url::canonicalize_http_authority(
-                    "https",
+                let parent = http_access_url::canonicalize_http_authority(
+                    HttpScheme::Https,
                     &format!("parent.example:{port}"),
                 )
                 .expect("canonical parent authority");
@@ -1079,7 +1084,7 @@ mod tests {
             assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
         }
 
-        let callback_url = crate::url::canonicalize_http_url(
+        let callback_url = http_access_url::canonicalize_http_url(
             "https://control.example/_acl/external-auth/callback",
         )
         .expect("canonical callback URL");
@@ -1380,7 +1385,7 @@ mod tests {
     #[tokio::test]
     async fn reserved_control_subtree_denies_before_dns() {
         let resolver = Arc::new(FixedResolver::new([endpoint("192.0.2.60:443")]));
-        let callback_url = crate::url::canonicalize_http_url(
+        let callback_url = http_access_url::canonicalize_http_url(
             "https://control.example/_acl/external-auth/callback",
         )
         .expect("canonical callback URL");
@@ -1409,7 +1414,7 @@ mod tests {
             Arc::clone(&resolver),
             [LocalStep::Addresses(vec![])],
         );
-        let url = crate::url::canonicalize_http_url("http://127.0.0.1:8443/resource")
+        let url = http_access_url::canonicalize_http_url("http://127.0.0.1:8443/resource")
             .expect("literal canonical URL");
 
         assert!(matches!(
@@ -1430,7 +1435,7 @@ mod tests {
             Arc::clone(&resolver),
             [LocalStep::Addresses(vec![])],
         );
-        let url = crate::url::canonicalize_http_url("http://0.0.0.0:8080/resource")
+        let url = http_access_url::canonicalize_http_url("http://0.0.0.0:8080/resource")
             .expect("literal canonical URL");
 
         assert!(matches!(
@@ -1451,9 +1456,10 @@ mod tests {
             Arc::clone(&resolver),
             [LocalStep::Addresses(vec![])],
         );
-        let parent = crate::url::canonicalize_http_authority("http", "127.0.0.2:3128")
-            .expect("literal parent authority");
-        let origin = crate::url::canonicalize_http_url("https://origin.example/private")
+        let parent =
+            http_access_url::canonicalize_http_authority(HttpScheme::Http, "127.0.0.2:3128")
+                .expect("literal parent authority");
+        let origin = http_access_url::canonicalize_http_url("https://origin.example/private")
             .expect("canonical origin URL");
 
         assert!(matches!(
@@ -1474,9 +1480,10 @@ mod tests {
             Arc::clone(&resolver),
             [LocalStep::Addresses(vec![])],
         );
-        let parent = crate::url::canonicalize_http_authority("http", "parent.example:3128")
-            .expect("canonical parent authority");
-        let origin = crate::url::canonicalize_http_url("https://origin.example:8443/private")
+        let parent =
+            http_access_url::canonicalize_http_authority(HttpScheme::Http, "parent.example:3128")
+                .expect("canonical parent authority");
+        let origin = http_access_url::canonicalize_http_url("https://origin.example:8443/private")
             .expect("canonical origin URL");
 
         let prepared = guard
@@ -1503,9 +1510,10 @@ mod tests {
             Arc::clone(&resolver),
             [LocalStep::Addresses(vec![])],
         );
-        let parent = crate::url::canonicalize_http_authority("http", "parent.example:3128")
-            .expect("canonical parent authority");
-        let origin = crate::url::canonicalize_http_url("http://127.0.0.1:8898/ready")
+        let parent =
+            http_access_url::canonicalize_http_authority(HttpScheme::Http, "parent.example:3128")
+                .expect("canonical parent authority");
+        let origin = http_access_url::canonicalize_http_url("http://127.0.0.1:8898/ready")
             .expect("canonical origin URL");
         let target = DestinationTarget::parent(&parent, &origin);
 
@@ -1654,9 +1662,10 @@ mod tests {
             [LocalStep::Addresses(vec![])],
         );
 
-        let direct_url =
-            crate::url::canonicalize_http_url("https://direct.example:8443/direct/path?mode=one")
-                .expect("direct URL");
+        let direct_url = http_access_url::canonicalize_http_url(
+            "https://direct.example:8443/direct/path?mode=one",
+        )
+        .expect("direct URL");
         let direct = resolve(&guard, DestinationTarget::direct(&direct_url))
             .await
             .expect("direct resolution");
@@ -1673,9 +1682,10 @@ mod tests {
         assert_eq!(direct.semantic_path(), "/direct/path");
         assert_eq!(direct.stream().peer, candidate);
 
-        let webhook_url =
-            crate::url::canonicalize_http_url("https://webhook.example:9443/provider/decision")
-                .expect("webhook URL");
+        let webhook_url = http_access_url::canonicalize_http_url(
+            "https://webhook.example:9443/provider/decision",
+        )
+        .expect("webhook URL");
         let webhook = resolve(&guard, DestinationTarget::webhook(&webhook_url))
             .await
             .expect("webhook resolution");
@@ -1692,10 +1702,11 @@ mod tests {
         assert_eq!(webhook.semantic_path(), "/provider/decision");
         assert_eq!(webhook.stream_mut().peer, candidate);
 
-        let parent_hop = crate::url::canonicalize_http_authority("https", "parent.example:3128")
-            .expect("parent authority");
+        let parent_hop =
+            http_access_url::canonicalize_http_authority(HttpScheme::Https, "parent.example:3128")
+                .expect("parent authority");
         let origin =
-            crate::url::canonicalize_http_url("https://origin.example:10443/parent/origin")
+            http_access_url::canonicalize_http_url("https://origin.example:10443/parent/origin")
                 .expect("parent origin");
         let parent = resolve(&guard, DestinationTarget::parent(&parent_hop, &origin))
             .await
@@ -1736,7 +1747,7 @@ mod tests {
         );
         assert_eq!(facts.control_bind, Some(endpoint("127.0.0.1:8898")));
         assert_eq!(facts.max_resolved_addresses, MAX_RESOLVED_ADDRESSES);
-        let callback = crate::url::canonicalize_http_url(
+        let callback = http_access_url::canonicalize_http_url(
             "https://control.example/_acl-proxy/external-auth/callback",
         )
         .expect("callback URL");

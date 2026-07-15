@@ -116,6 +116,12 @@ max_cached_certificates = 1024
 persist_leaf_certificates = false
 ```
 
+Each admitted connection on an HTTP/1-capable listener owns one fallibly
+allocated, zeroizing 64 KiB validation buffer. The allocation is bounded by
+that listener's `max_connections`; HTTP/2-only connections do not allocate it.
+The validator checks request framing before Hyper can dispatch policy,
+credential, or destination work.
+
 Generated CA material is private process state. Distribute only the generated
 `ca-cert.pem` to clients. File-backed mode uses explicit `ca_certificate` and
 `ca_private_key` paths. The certificate file may contain an ordered PEM CA
@@ -315,6 +321,9 @@ max_pending_records = 1024
 max_files = 10000
 max_total_bytes = 1073741824
 ```
+
+All HTTP ingress paths, including requests decrypted inside CONNECT MITM,
+serialize capture `mode` as `http_proxy`.
 
 ## Operations
 

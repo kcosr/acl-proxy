@@ -88,6 +88,19 @@ pub(crate) struct ResponseHead {
     pub(crate) framing: BodyFraming,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum IngressRequestKind {
+    Ordinary,
+    Upgrade,
+    Connect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct IngressRequestHead {
+    pub(crate) framing: BodyFraming,
+    pub(crate) kind: IngressRequestKind,
+}
+
 pub(crate) fn parse_request_head(
     store: &mut ParserStore,
 ) -> Result<HeadParse<RequestHead>, HeadError> {
@@ -297,7 +310,7 @@ fn summarize_headers(
     })
 }
 
-fn parse_content_length(value: &[u8]) -> Result<u64, HeadError> {
+pub(super) fn parse_content_length(value: &[u8]) -> Result<u64, HeadError> {
     let value = trim_ows(value);
     if value.is_empty()
         || !value.iter().all(u8::is_ascii_digit)
@@ -313,7 +326,7 @@ fn parse_content_length(value: &[u8]) -> Result<u64, HeadError> {
     })
 }
 
-fn trim_ows(mut value: &[u8]) -> &[u8] {
+pub(super) fn trim_ows(mut value: &[u8]) -> &[u8] {
     while value
         .first()
         .is_some_and(|byte| matches!(byte, b' ' | b'\t'))

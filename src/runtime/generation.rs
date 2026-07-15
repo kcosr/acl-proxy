@@ -146,9 +146,9 @@ pub(crate) struct ResolvedBindings {
 pub(crate) trait PolicySnapshot: Send + Sync {
     fn evaluate<'snapshot>(
         &'snapshot self,
-        url: &crate::url::CanonicalUrl,
+        url: &http_access_types::CanonicalUrl,
         peer_ip: std::net::IpAddr,
-        method: &http::Method,
+        method: &http_access_types::HttpMethod,
         headers: &HeaderMap,
         extra_presence: &dyn Fn(&http::HeaderName) -> bool,
     ) -> crate::policy::PolicyEvaluation<'snapshot>;

@@ -321,7 +321,7 @@ impl BodyFramer {
     }
 }
 
-fn parse_chunk_line(line: &[u8]) -> Result<u64, FramingError> {
+pub(super) fn parse_chunk_line(line: &[u8]) -> Result<u64, FramingError> {
     let (size, extensions) = match line.iter().position(|byte| *byte == b';') {
         Some(index) => (&line[..index], &line[index..]),
         None => (line, &[][..]),

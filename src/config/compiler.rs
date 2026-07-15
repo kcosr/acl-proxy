@@ -27,7 +27,7 @@ use crate::http1::store::PARSER_STORE_BYTES;
 use crate::http_body::{http_decoder_workspace_sizes, HTTP_DECODER_OUTPUT_STAGING_BYTES};
 use crate::network::{canonical_socket_addr, socket_binds_overlap};
 use crate::safety::wire_body::{guarded_body_allocation_bytes, guarded_workspace_allocation_bytes};
-use crate::url::{canonicalize_http_url, CompiledUrlPattern};
+use http_access_url::{canonicalize_http_url, CompiledUrlPattern};
 
 use super::authoring::{
     AuthorizationConfig, AuthorizationProviderConfig, CredentialActionConfig,
@@ -1050,7 +1050,7 @@ fn normalize_endpoint_urls(
 
 fn canonical_endpoint_url(value: &str, path: &str) -> Result<String, ConfigCompileError> {
     canonicalize_http_url(value)
-        .map(|url| url.url)
+        .map(|url| url.as_str().to_owned())
         .map_err(|error| ConfigCompileError::at(path, error.to_string()))
 }
 
@@ -1997,13 +1997,14 @@ fn validate_callback_matrix(
         };
         let provider_url = canonicalize_http_url(&provider.url)
             .expect("provider URL was canonicalized before validation");
-        let provider_in_control_subtree = provider_url.path == control.base_path
+        let provider_in_control_subtree = provider_url.path() == control.base_path
             || provider_url
-                .path
+                .path()
                 .strip_prefix(&control.base_path)
                 .is_some_and(|suffix| suffix.starts_with('/'));
-        if provider_url.host == callback_url.host
-            && provider_url.port == callback_url.port
+        if provider_url.authority().host() == callback_url.authority().host()
+            && provider_url.authority().effective_port()
+                == callback_url.authority().effective_port()
             && provider_in_control_subtree
         {
             return Err(ConfigCompileError::at(
@@ -4400,16 +4401,16 @@ fn compile_parent_proxy_plan(
             ParentProxyKind::AclProxy => CompiledParentProxyKind::AclProxy,
             ParentProxyKind::Generic => CompiledParentProxyKind::Generic,
         },
-        url: canonical.url,
-        host: canonical.host.clone(),
-        port: canonical.port,
+        url: canonical.as_str().to_owned(),
+        host: canonical.authority().host().as_str().to_owned(),
+        port: canonical.authority().effective_port(),
         tls: value.tls.as_ref().map(|tls| ParentProxyTlsPlan {
             trust: compile_tls_trust(tls.trust),
             ca_certificate: tls.ca_certificate.clone(),
             server_name: tls
                 .server_name
                 .clone()
-                .unwrap_or_else(|| canonical.host.clone()),
+                .unwrap_or_else(|| canonical.authority().host().as_str().to_owned()),
         }),
     })
 }
@@ -9050,7 +9051,7 @@ client_cidrs = ["::ffff:192.0.2.0/120"]
             let decision = snapshot.evaluate(
                 &url,
                 peer.parse().unwrap(),
-                &Method::GET,
+                &http_access_types::HttpMethod::new("GET").unwrap(),
                 &http::HeaderMap::new(),
                 |_| false,
             );
@@ -9059,7 +9060,7 @@ client_cidrs = ["::ffff:192.0.2.0/120"]
         let outside = snapshot.evaluate(
             &url,
             "198.51.100.44".parse().unwrap(),
-            &Method::GET,
+            &http_access_types::HttpMethod::new("GET").unwrap(),
             &http::HeaderMap::new(),
             |_| false,
         );
@@ -9085,7 +9086,7 @@ client_cidrs = ["::ffff:192.0.2.0/120"]
             let decision = snapshot.evaluate(
                 &url,
                 peer.parse().unwrap(),
-                &Method::GET,
+                &http_access_types::HttpMethod::new("GET").unwrap(),
                 &http::HeaderMap::new(),
                 |_| false,
             );
@@ -9095,7 +9096,7 @@ client_cidrs = ["::ffff:192.0.2.0/120"]
         let outside = snapshot.evaluate(
             &url,
             "198.51.100.44".parse().unwrap(),
-            &Method::GET,
+            &http_access_types::HttpMethod::new("GET").unwrap(),
             &http::HeaderMap::new(),
             |_| false,
         );

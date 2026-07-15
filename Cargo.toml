@@ -56,6 +56,8 @@ rustls-pemfile = "1"
 lru = "0.12"
 fs2 = "0.4"
 humantime = "2.1"
+http-access-types = { path = "../access-runtime/crates/http-access-types", version = "=0.1.0" }
+http-access-url = { path = "../access-runtime/crates/http-access-url", version = "=0.1.0" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -68,8 +70,6 @@ assert_cmd = "2.0"
 predicates = "3.1"
 tempfile = "3.10"
 h2 = "0.3"
-http-access-types = { path = "../access-runtime/crates/http-access-types", version = "=0.1.0" }
-http-access-url = { path = "../access-runtime/crates/http-access-url", version = "=0.1.0" }
 http-access-conformance = { path = "../access-runtime/crates/http-access-conformance", version = "=0.1.0" }
 
 [profile.release]

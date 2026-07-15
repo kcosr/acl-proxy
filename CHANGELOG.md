@@ -31,6 +31,11 @@
 
 - Established one strict URL contract for policy evaluation and forwarding: DNS hosts use IDNA/STD3 validation, fragments and ambiguous double encoding are rejected, encoded delimiters remain opaque, and the exact canonical URL authorized by policy is forwarded upstream.
 - Decoupled ingress HTTP versions from selected outbound protocols, normalizing request targets, authority, Host, TE, and ALPN across direct and parent routes.
+- Validate HTTP/1 request heads in a fixed zeroizing 64 KiB per-connection
+  buffer before dispatch, rejecting duplicate Content-Length and mixed
+  Content-Length/Transfer-Encoding fields regardless of wire order.
+- Kept the capture `mode` contract at `http_proxy` across all five HTTP ingress
+  modes, including requests decrypted inside CONNECT MITM.
 - Listener, control, MITM, logging, and shared resource capacities are static;
   policy, providers, redaction, capture selection, and egress effects publish as
   atomic generation snapshots.

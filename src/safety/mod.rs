@@ -117,14 +117,13 @@ mod tests {
     use std::path::Path;
 
     use http::header::{HeaderName, HeaderValue};
-    use http::Method;
 
     use super::*;
     use crate::config::compiler::{Capacity, CompiledResourcePlan, LoopDetectionPlan, SafetyPlan};
     use crate::config::{compile_config_text, ConfigTextInput};
     use crate::policy::CompiledPolicySnapshot;
     use crate::runtime::{CredentialSourceRegistry, ProviderRegistry, RedactionProfileRegistry};
-    use crate::url::canonicalize_http_url;
+    use http_access_url::canonicalize_http_url;
 
     fn snapshot(inject: bool) -> ProductSafetySnapshot {
         let (brand, _) = HttpWireBodyPlanIndex::test_pair(2, 0);
@@ -331,7 +330,7 @@ authorization_provider = "approval"
         let first = policy.evaluate(
             &url,
             Ipv4Addr::new(192, 0, 2, 1).into(),
-            &Method::GET,
+            &http_access_types::HttpMethod::new("GET").unwrap(),
             &HeaderMap::new(),
             |_| false,
         );
@@ -339,7 +338,7 @@ authorization_provider = "approval"
         let terminal = first.matched.unwrap().resume_cursor().resume(
             &url,
             Ipv4Addr::new(192, 0, 2, 1).into(),
-            &Method::GET,
+            &http_access_types::HttpMethod::new("GET").unwrap(),
             &HeaderMap::new(),
             |_| false,
         );

@@ -2,10 +2,10 @@ use std::collections::HashSet;
 
 use http::header::{HeaderMap, HeaderName, HeaderValue, CONNECTION, HOST, TE, UPGRADE};
 use http::{Request, StatusCode, Uri, Version};
+use http_access_types::CanonicalUrl;
 use hyper::Body;
 
 use crate::egress::OriginProtocol;
-use crate::url::CanonicalUrl;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestTargetForm {
@@ -51,13 +51,24 @@ impl UpgradeIntent {
 }
 
 impl<B> SanitizedRequest<B> {
-    #[cfg(test)]
     pub(crate) fn headers_mut(&mut self) -> &mut HeaderMap {
         self.request.headers_mut()
     }
 
     pub(crate) fn protocol(&self) -> OriginProtocol {
         self.protocol
+    }
+
+    pub(crate) fn version(&self) -> Version {
+        self.request.version()
+    }
+
+    pub(crate) fn method(&self) -> &http::Method {
+        self.request.method()
+    }
+
+    pub(crate) fn headers(&self) -> &HeaderMap {
+        self.request.headers()
     }
 
     pub(crate) fn upgrade_intent(&self) -> Option<&UpgradeIntent> {
@@ -284,17 +295,17 @@ fn prepare_origin_request_head<B>(
     request.headers_mut().remove(HOST);
 
     if use_http2 {
-        *request.uri_mut() = parse_uri(&canonical.url)?;
+        *request.uri_mut() = parse_uri(canonical.as_str())?;
         *request.version_mut() = Version::HTTP_2;
     } else {
         *request.uri_mut() = match target_form {
             RequestTargetForm::Origin => parse_uri(&canonical_path_and_query(canonical))?,
-            RequestTargetForm::Absolute => parse_uri(&canonical.url)?,
+            RequestTargetForm::Absolute => parse_uri(canonical.as_str())?,
         };
         *request.version_mut() = Version::HTTP_11;
         request.headers_mut().insert(
             HOST,
-            HeaderValue::from_str(&canonical.authority)
+            HeaderValue::from_str(canonical.authority().as_str())
                 .map_err(|_| HeaderPreparationError::Authority)?,
         );
     }
@@ -376,9 +387,9 @@ fn te_is_trailers_only(headers: &HeaderMap) -> bool {
 }
 
 fn canonical_path_and_query(canonical: &CanonicalUrl) -> String {
-    match &canonical.query {
-        Some(query) => format!("{}?{query}", canonical.path),
-        None => canonical.path.clone(),
+    match canonical.query() {
+        Some(query) => format!("{}?{query}", canonical.path()),
+        None => canonical.path().to_owned(),
     }
 }
 
@@ -416,7 +427,7 @@ mod tests {
     use http::header::{AUTHORIZATION, CONNECTION, HOST};
 
     use super::*;
-    use crate::url::canonicalize_http_url;
+    use http_access_url::canonicalize_http_url;
 
     fn request(uri: &str) -> Request<Body> {
         Request::builder()
@@ -468,8 +479,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(prepared.uri().to_string(), canonical.url);
-        assert_eq!(prepared.headers()[HOST], canonical.authority);
+        assert_eq!(prepared.uri().to_string(), canonical.as_str());
+        assert_eq!(prepared.headers()[HOST], canonical.authority().as_str());
     }
 
     #[test]
@@ -486,7 +497,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(prepared.uri().to_string(), canonical.url);
+        assert_eq!(prepared.uri().to_string(), canonical.as_str());
         assert_eq!(prepared.version(), Version::HTTP_2);
         assert!(!prepared.headers().contains_key(HOST));
     }
@@ -650,7 +661,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(prepared.version(), Version::HTTP_2);
-        assert_eq!(prepared.uri().to_string(), canonical.url);
+        assert_eq!(prepared.uri().to_string(), canonical.as_str());
         assert!(!prepared.headers().contains_key(HOST));
         assert_eq!(prepared.headers()[TE], "trailers");
     }

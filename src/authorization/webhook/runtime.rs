@@ -1,6 +1,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use http_access_types::CanonicalUrl;
+use http_access_url::{canonicalize_http_url, UrlError};
 use tokio::sync::{oneshot, Notify};
 
 #[cfg(test)]
@@ -25,7 +27,6 @@ use crate::destination::{DestinationGuard, DestinationGuardError};
 use crate::runtime::{AuthorizationDispatchContext, GenerationRetention, GenerationRetentionError};
 use crate::safety::wire_body::ProviderResponseCharge;
 use crate::safety::HttpWireBodyGuard;
-use crate::url::{canonicalize_http_url, CanonicalUrl, UrlError};
 
 pub(crate) struct WebhookAuthorizationRuntime {
     transport: WebhookTransportArena,
@@ -219,7 +220,7 @@ impl WebhookAuthorizationRuntime {
             let (rule_id, request, retention) = context.into_webhook_parts()?;
             let request = WebhookRequest::from_provider(rule_id, request);
             let prepared =
-                request.prepare(&callback_url.url, provider.max_request_bytes(), guard)?;
+                request.prepare(callback_url.as_str(), provider.max_request_bytes(), guard)?;
             let deadline = PendingDeadline::earliest(
                 dispatch_start,
                 request_deadline,

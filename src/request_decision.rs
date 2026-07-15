@@ -1,6 +1,7 @@
 use std::net::IpAddr;
 
-use http::{HeaderMap, HeaderName, HeaderValue, Method};
+use http::{HeaderMap, HeaderName, HeaderValue};
+use http_access_types::InterceptedRequestFacts;
 use tokio::time::Instant;
 
 use crate::authorization::protocol::{
@@ -12,24 +13,51 @@ use crate::authorization::{AuthorizationDecision, AuthorizationDispatchError};
 use crate::config::compiler::{CompiledProviderFailureMode, HeaderEffectPlan, HttpBodyReadPlan};
 use crate::credentials::{CredentialError, InboundCredentials, ResolvedCredentialAction};
 use crate::policy::{PolicyEvaluation, PolicyOutcome, PolicyRuleMatch};
+use crate::proxy::facts::{product_headers, FactsError, ValidatedRequestFactShape};
 use crate::redaction::ProfileHandle;
 use crate::runtime::{GenerationLease, ProviderIndex};
 use crate::safety::wire_body::WireBodyBufferError;
 use crate::safety::{GuardedBody, HttpWireBodyGuard, UnknownHttpWireBodyPlan, WireBodyQuotaKey};
 use crate::upgrade::UpgradeAllocation;
-use crate::url::CanonicalUrl;
 
 /// Strict request head. Body-bearing ingress prepares this first, then decodes
 /// only through the selected guard before completing the decision.
-pub(crate) struct RequestInput<'request> {
+pub(crate) struct RequestInput<'generation, 'request> {
     pub(crate) request_id: &'request str,
-    pub(crate) url: &'request CanonicalUrl,
-    pub(crate) method: &'request Method,
+    pub(crate) facts: InterceptedRequestFacts,
     pub(crate) peer_ip: IpAddr,
-    pub(crate) headers: HeaderMap,
     pub(crate) quota_key: WireBodyQuotaKey,
     pub(crate) started_at: Instant,
-    pub(crate) upgrade_intent: bool,
+    inbound: InboundCredentials<'generation>,
+    internal_context: HeaderMap,
+}
+
+impl<'generation, 'request> RequestInput<'generation, 'request> {
+    pub(crate) fn from_validated_shape(
+        lease: &'generation GenerationLease,
+        request_id: &'request str,
+        shape: ValidatedRequestFactShape,
+        sanitized_headers: &mut HeaderMap,
+        peer_ip: IpAddr,
+        quota_key: WireBodyQuotaKey,
+        started_at: Instant,
+    ) -> Result<Self, RequestDecisionError> {
+        let inbound = lease.credentials().extract_inbound(sanitized_headers)?;
+        let internal_context = strip_internal_context(
+            sanitized_headers,
+            lease.authorization().internal_context_headers(),
+        );
+        let facts = shape.into_facts(sanitized_headers)?;
+        Ok(Self {
+            request_id,
+            facts,
+            peer_ip,
+            quota_key,
+            started_at,
+            inbound,
+            internal_context,
+        })
+    }
 }
 
 pub(crate) enum RequestDecision<'generation> {
@@ -112,6 +140,8 @@ pub(crate) enum RequestDecisionError {
     },
     #[error("the effective request deadline exceeds the monotonic clock range")]
     RequestDeadlineOverflow,
+    #[error("checked request facts cannot be materialized")]
+    Facts(#[from] FactsError),
 }
 
 impl RequestDecisionError {
@@ -160,7 +190,7 @@ impl DeniedRequest<'_> {
 #[cfg(test)]
 pub(crate) async fn decide_request<'generation>(
     lease: &'generation GenerationLease,
-    input: RequestInput<'_>,
+    input: RequestInput<'generation, '_>,
 ) -> Result<RequestDecision<'generation>, RequestDecisionError> {
     prepare_request(lease, input)?.decide(None).await
 }
@@ -198,7 +228,7 @@ impl<'generation, 'request> PreparedRequest<'generation, 'request> {
 
     pub(crate) fn body_read_plan(&self) -> HttpBodyReadPlan {
         if self.early_deny.is_some()
-            || upgrade_is_disallowed(self.identity.upgrade_intent, &self.evaluation)
+            || upgrade_is_disallowed(self.identity.facts.upgrade().is_some(), &self.evaluation)
         {
             HttpBodyReadPlan::Disabled
         } else {
@@ -209,7 +239,7 @@ impl<'generation, 'request> PreparedRequest<'generation, 'request> {
     pub(crate) fn denies_without_resolution(&self) -> bool {
         self.early_deny.is_some()
             || self.evaluation.outcome == PolicyOutcome::Deny
-            || upgrade_is_disallowed(self.identity.upgrade_intent, &self.evaluation)
+            || upgrade_is_disallowed(self.identity.facts.upgrade().is_some(), &self.evaluation)
     }
 
     pub(crate) async fn decide(
@@ -263,20 +293,16 @@ impl<'generation, 'request> PreparedRequest<'generation, 'request> {
 
 pub(crate) fn prepare_request<'generation, 'request>(
     lease: &'generation GenerationLease,
-    mut input: RequestInput<'request>,
+    input: RequestInput<'generation, 'request>,
 ) -> Result<PreparedRequest<'generation, 'request>, RequestDecisionError> {
-    let inbound = lease.credentials().extract_inbound(&mut input.headers)?;
-    let internal_context = strip_internal_context(
-        &mut input.headers,
-        lease.authorization().internal_context_headers(),
-    );
+    let headers = product_headers(input.facts.headers())?;
 
     let evaluation = lease.policy().evaluate(
-        input.url,
+        input.facts.url(),
         input.peer_ip,
-        input.method,
-        &input.headers,
-        &|name| inbound.is_present(name),
+        input.facts.method(),
+        &headers,
+        &|name| input.inbound.is_present(name),
     );
     let request_timeout = evaluation
         .matched
@@ -291,22 +317,22 @@ pub(crate) fn prepare_request<'generation, 'request>(
         .safety()
         .begin_http_body(evaluation.wire_body_plan(), input.quota_key)?;
 
-    if lease.safety().contains_loop_marker(&input.headers) {
+    let identity = RequestIdentity {
+        request_id: input.request_id,
+        facts: input.facts,
+        peer_ip: input.peer_ip,
+        deadline,
+    };
+
+    if lease.safety().contains_loop_marker(&headers) {
         // Loop denial is completed through the same prepared request path so
         // the selected guard remains the sole body authority.
         return Ok(PreparedRequest {
             lease,
-            identity: RequestIdentity {
-                request_id: input.request_id,
-                url: input.url,
-                method: input.method,
-                peer_ip: input.peer_ip,
-                deadline,
-                upgrade_intent: input.upgrade_intent,
-            },
-            headers: input.headers,
-            inbound,
-            internal_context,
+            identity,
+            headers,
+            inbound: input.inbound,
+            internal_context: input.internal_context,
             evaluation,
             guard,
             early_deny: Some(DenyReason::LoopDetected),
@@ -315,31 +341,21 @@ pub(crate) fn prepare_request<'generation, 'request>(
 
     Ok(PreparedRequest {
         lease,
-        identity: RequestIdentity {
-            request_id: input.request_id,
-            url: input.url,
-            method: input.method,
-            peer_ip: input.peer_ip,
-            deadline,
-            upgrade_intent: input.upgrade_intent,
-        },
-        headers: input.headers,
-        inbound,
-        internal_context,
+        identity,
+        headers,
+        inbound: input.inbound,
+        internal_context: input.internal_context,
         evaluation,
         guard,
         early_deny: None,
     })
 }
 
-#[derive(Clone, Copy)]
 struct RequestIdentity<'request> {
     request_id: &'request str,
-    url: &'request CanonicalUrl,
-    method: &'request Method,
+    facts: InterceptedRequestFacts,
     peer_ip: IpAddr,
     deadline: Instant,
-    upgrade_intent: bool,
 }
 
 struct DecisionState<'generation, 'request> {
@@ -368,7 +384,7 @@ async fn evaluate_to_terminal<'generation>(
         mut body_provenance,
     } = state;
     loop {
-        if upgrade_is_disallowed(input.upgrade_intent, &evaluation) {
+        if upgrade_is_disallowed(input.facts.upgrade().is_some(), &evaluation) {
             let body = denied_observation_body(body, body_provenance);
             return Ok(RequestDecision::Deny(Box::new(DeniedRequest {
                 common: DecidedRequest {
@@ -384,7 +400,8 @@ async fn evaluate_to_terminal<'generation>(
         match evaluation.outcome {
             PolicyOutcome::Allow => {
                 let matched = evaluation.matched;
-                let upgrade = bind_upgrade(lease, input.upgrade_intent, matched.as_ref())?;
+                let upgrade =
+                    bind_upgrade(lease, input.facts.upgrade().is_some(), matched.as_ref())?;
                 let local_failure = match matched.as_ref() {
                     Some(matched) => {
                         validate_local_body_limits(lease, matched, None, body.as_ref())?
@@ -472,7 +489,7 @@ async fn evaluate_to_terminal<'generation>(
             .matched
             .take()
             .expect("delegate policy outcomes always identify their rule");
-        let upgrade = bind_upgrade(lease, input.upgrade_intent, Some(&matched))?;
+        let upgrade = bind_upgrade(lease, input.facts.upgrade().is_some(), Some(&matched))?;
         let provider = matched
             .authorization_provider()
             .expect("activated delegate rules always bind an authorization provider");
@@ -531,8 +548,8 @@ async fn evaluate_to_terminal<'generation>(
         });
         let provider_request = ProviderRequest {
             request_id: input.request_id,
-            url: &input.url.url,
-            method: input.method.as_str(),
+            url: input.facts.url().as_str(),
+            method: input.facts.method().as_str(),
             client_ip: &peer_ip,
             headers: (!included_headers.is_empty()).then_some(&provider_headers),
             body: provider_body,
@@ -673,9 +690,9 @@ async fn evaluate_to_terminal<'generation>(
             }
             AuthorizationDecision::Pass => {
                 evaluation = matched.resume_cursor().resume(
-                    input.url,
+                    input.facts.url(),
                     input.peer_ip,
-                    input.method,
+                    input.facts.method(),
                     &headers,
                     |name| inbound.is_present(name),
                 );
@@ -946,6 +963,8 @@ mod tests {
     use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use base64::Engine as _;
     use http::header::HeaderValue;
+    use http::Method;
+    use http_access_types::{BodyFraming, BodyMetadata, HttpMethod, IngressMode, UpgradeIntent};
 
     use super::*;
     use crate::activation::static_resources::ProductStaticResources;
@@ -956,7 +975,7 @@ mod tests {
         ActivationCancellation, BoxFuture, CandidateSource, ReloadTriggerResult, Runtime,
         RuntimeError, StaticOwnership,
     };
-    use crate::url::canonicalize_http_url;
+    use http_access_url::{canonicalize_http_url, CanonicalUrl};
 
     struct QueueSource(Mutex<VecDeque<CompiledConfig>>);
 
@@ -1046,33 +1065,53 @@ header = "x-test-loop"
         (runtime, source, generation, pool)
     }
 
-    fn input<'a>(
-        request_id: &'a str,
-        url: &'a CanonicalUrl,
-        headers: HeaderMap,
-    ) -> RequestInput<'a> {
+    fn input<'generation, 'request>(
+        lease: &'generation GenerationLease,
+        request_id: &'request str,
+        url: &CanonicalUrl,
+        mut headers: HeaderMap,
+    ) -> RequestInput<'generation, 'request> {
         let peer_ip = "192.0.2.10".parse().unwrap();
-        RequestInput {
+        let shape = crate::proxy::facts::validate_request_fact_shape(
+            IngressMode::ExplicitHttps,
+            http::Version::HTTP_11,
+            &Method::GET,
+            url.clone(),
+            &headers,
+            BodyMetadata::new(BodyFraming::None),
+            None,
+        )
+        .unwrap();
+        RequestInput::from_validated_shape(
+            lease,
             request_id,
-            url,
-            method: &Method::GET,
+            shape,
+            &mut headers,
             peer_ip,
-            headers,
-            quota_key: WireBodyQuotaKey::from_peer(peer_ip, |_| false),
-            started_at: Instant::now(),
-            upgrade_intent: false,
-        }
+            WireBodyQuotaKey::from_peer(peer_ip, |_| false),
+            Instant::now(),
+        )
+        .unwrap()
     }
 
-    fn upgrade_input<'a>(
-        request_id: &'a str,
-        url: &'a CanonicalUrl,
+    fn upgrade_input<'generation, 'request>(
+        lease: &'generation GenerationLease,
+        request_id: &'request str,
+        url: &CanonicalUrl,
         headers: HeaderMap,
-    ) -> RequestInput<'a> {
-        RequestInput {
-            upgrade_intent: true,
-            ..input(request_id, url, headers)
-        }
+    ) -> RequestInput<'generation, 'request> {
+        let mut input = input(lease, request_id, url, headers);
+        input.facts = InterceptedRequestFacts::new(
+            input.facts.ingress_mode(),
+            input.facts.version(),
+            input.facts.method().clone(),
+            input.facts.url().clone(),
+            input.facts.headers().to_vec(),
+            input.facts.body(),
+            Some(UpgradeIntent::WebSocket),
+        )
+        .unwrap();
+        input
     }
 
     #[test]
@@ -1220,9 +1259,23 @@ process_providers = ["identity_sink"]"#,
         headers.insert("x-test-identity", HeaderValue::from_static("secret"));
         headers.insert("x-internal-context", HeaderValue::from_static("untrusted"));
 
-        let RequestDecision::Allow(allowed) = decide_request(&old, input("before", &url, headers))
-            .await
+        let request_input = input(&old, "before", &url, headers);
+        assert!(request_input
+            .facts
+            .headers()
+            .iter()
+            .all(|field| field.name().as_str() != "x-test-identity"));
+        assert!(!serde_json::to_string(&request_input.facts)
             .unwrap()
+            .contains("secret"));
+        assert!(request_input
+            .inbound
+            .is_present(&HeaderName::from_static("x-test-identity")));
+        assert!(request_input
+            .internal_context
+            .contains_key("x-internal-context"));
+
+        let RequestDecision::Allow(allowed) = decide_request(&old, request_input).await.unwrap()
         else {
             panic!("the captured inbound credential should satisfy policy");
         };
@@ -1245,11 +1298,12 @@ process_providers = ["identity_sink"]"#,
         };
         assert_ne!(first_id, second_id);
 
-        let RequestDecision::Deny(old_decision) =
-            decide_request(&old, input("old-after-reload", &url, HeaderMap::new()))
-                .await
-                .unwrap()
-        else {
+        let RequestDecision::Deny(old_decision) = decide_request(
+            &old,
+            input(&old, "old-after-reload", &url, HeaderMap::new()),
+        )
+        .await
+        .unwrap() else {
             panic!("the retained generation still has its deny default");
         };
         assert_eq!(old_decision._reason, DenyReason::Policy);
@@ -1262,7 +1316,7 @@ process_providers = ["identity_sink"]"#,
         let current = runtime.lease().await.unwrap();
         let RequestDecision::Allow(current_decision) = decide_request(
             &current,
-            input("current-after-reload", &url, HeaderMap::new()),
+            input(&current, "current-after-reload", &url, HeaderMap::new()),
         )
         .await
         .unwrap() else {
@@ -1299,7 +1353,8 @@ rules = [{ literals = ["secret"], payloads = "text" }]"#,
         let lease = runtime.lease().await.unwrap();
         let url = canonicalize_http_url("https://example.test/body").unwrap();
 
-        let prepared = prepare_request(&lease, input("ordinary", &url, HeaderMap::new())).unwrap();
+        let prepared =
+            prepare_request(&lease, input(&lease, "ordinary", &url, HeaderMap::new())).unwrap();
         assert!(!prepared.denies_without_resolution());
         assert_eq!(
             prepared
@@ -1312,7 +1367,8 @@ rules = [{ literals = ["secret"], payloads = "text" }]"#,
 
         let mut looped_headers = HeaderMap::new();
         looped_headers.insert("x-test-loop", HeaderValue::from_static("already-seen"));
-        let looped = prepare_request(&lease, input("looped", &url, looped_headers)).unwrap();
+        let looped =
+            prepare_request(&lease, input(&lease, "looped", &url, looped_headers)).unwrap();
         assert!(looped.denies_without_resolution());
         assert_eq!(looped.body_read_plan(), HttpBodyReadPlan::Disabled);
         let RequestDecision::Deny(denied) = looped.decide(None).await.unwrap() else {
@@ -1342,7 +1398,7 @@ default = "allow""#,
 
         let prepared = prepare_request(
             &lease,
-            upgrade_input("default-allow-upgrade", &url, HeaderMap::new()),
+            upgrade_input(&lease, "default-allow-upgrade", &url, HeaderMap::new()),
         )
         .unwrap();
         assert!(prepared.denies_without_resolution());
@@ -1381,7 +1437,7 @@ rules = [{ literals = ["secret"] }]"#,
 
         let RequestDecision::Allow(allowed) = decide_request(
             &lease,
-            upgrade_input("bound-upgrade", &url, HeaderMap::new()),
+            upgrade_input(&lease, "bound-upgrade", &url, HeaderMap::new()),
         )
         .await
         .unwrap() else {
@@ -1446,7 +1502,7 @@ retire_timeout = "6s""#,
 
         let RequestDecision::Deny(denied) = decide_request(
             &lease,
-            upgrade_input("delegate-upgrade", &url, HeaderMap::new()),
+            upgrade_input(&lease, "delegate-upgrade", &url, HeaderMap::new()),
         )
         .await
         .unwrap() else {
@@ -1530,8 +1586,11 @@ rules = [{{ literals = ["x"] }}]"#,
         let (runtime, _source, _, pool) = runtime(initial).await;
         let lease = runtime.lease().await.unwrap();
         let url = canonicalize_http_url("https://example.test/profile-limit").unwrap();
-        let prepared = prepare_request(&lease, input("profile-limit", &url, HeaderMap::new()))
-            .expect("the suffix cursor prepares");
+        let prepared = prepare_request(
+            &lease,
+            input(&lease, "profile-limit", &url, HeaderMap::new()),
+        )
+        .expect("the suffix cursor prepares");
         assert_eq!(
             prepared
                 .body_read_plan()
@@ -1656,8 +1715,11 @@ max_decoded_request_body_bytes = 16"#,
         let (runtime, _source, _, pool) = runtime(initial).await;
         let lease = runtime.lease().await.unwrap();
         let url = canonicalize_http_url("https://example.test/resumed-limit").unwrap();
-        let prepared = prepare_request(&lease, input("resumed-limit", &url, HeaderMap::new()))
-            .expect("the suffix cursor prepares");
+        let prepared = prepare_request(
+            &lease,
+            input(&lease, "resumed-limit", &url, HeaderMap::new()),
+        )
+        .expect("the suffix cursor prepares");
         assert_eq!(
             prepared
                 .body_read_plan()
@@ -1732,8 +1794,11 @@ rules = [{ literals = ["x"] }]"#,
         let (runtime, _source, _, pool) = runtime(initial).await;
         let lease = runtime.lease().await.unwrap();
         let url = canonicalize_http_url("https://example.test/terminal-limit").unwrap();
-        let prepared = prepare_request(&lease, input("terminal-limit", &url, HeaderMap::new()))
-            .expect("the suffix cursor prepares");
+        let prepared = prepare_request(
+            &lease,
+            input(&lease, "terminal-limit", &url, HeaderMap::new()),
+        )
+        .expect("the suffix cursor prepares");
         assert_eq!(
             prepared
                 .body_read_plan()
@@ -1771,7 +1836,7 @@ rules = [{ literals = ["x"] }]"#,
 
         let prepared = prepare_request(
             &lease,
-            input("terminal-within-limit", &url, HeaderMap::new()),
+            input(&lease, "terminal-within-limit", &url, HeaderMap::new()),
         )
         .unwrap();
         let mut decoded = prepared.body_guard().buffer();
@@ -1828,7 +1893,7 @@ retire_timeout = "10s""#,
         let lease = runtime.lease().await.unwrap();
         let url = canonicalize_http_url("https://example.test/deadline").unwrap();
         let started_at = Instant::now();
-        let mut request = input("deadline", &url, HeaderMap::new());
+        let mut request = input(&lease, "deadline", &url, HeaderMap::new());
         request.started_at = started_at;
 
         let prepared = prepare_request(&lease, request).unwrap();
@@ -1838,8 +1903,17 @@ retire_timeout = "10s""#,
         drop(prepared);
 
         let default_started_at = Instant::now();
-        let mut unmatched = input("default-deadline", &url, HeaderMap::new());
-        unmatched.method = &Method::POST;
+        let mut unmatched = input(&lease, "default-deadline", &url, HeaderMap::new());
+        unmatched.facts = InterceptedRequestFacts::new(
+            unmatched.facts.ingress_mode(),
+            unmatched.facts.version(),
+            HttpMethod::new(Method::POST.as_str()).unwrap(),
+            unmatched.facts.url().clone(),
+            unmatched.facts.headers().to_vec(),
+            unmatched.facts.body(),
+            unmatched.facts.upgrade(),
+        )
+        .unwrap();
         unmatched.started_at = default_started_at;
         let prepared = prepare_request(&lease, unmatched).unwrap();
         assert_eq!(
@@ -1943,7 +2017,7 @@ authorization_provider = "terminal""#;
 
         for (path, expected_allow) in [("allow", true), ("deny", false)] {
             let url = canonicalize_http_url(&format!("https://example.test/{path}")).unwrap();
-            let decision = decide_request(&lease, input(path, &url, HeaderMap::new()))
+            let decision = decide_request(&lease, input(&lease, path, &url, HeaderMap::new()))
                 .await
                 .unwrap();
             match (decision, expected_allow) {
@@ -1972,7 +2046,7 @@ authorization_provider = "terminal""#;
 
         let url = canonicalize_http_url("https://example.test/exact-body").unwrap();
         let prepared =
-            prepare_request(&lease, input("exact-body", &url, HeaderMap::new())).unwrap();
+            prepare_request(&lease, input(&lease, "exact-body", &url, HeaderMap::new())).unwrap();
         let mut decoded = prepared.body_guard().buffer();
         decoded.try_extend_from_slice(b"exact-body").unwrap();
         let RequestDecision::Allow(allowed) = prepared
@@ -2006,11 +2080,12 @@ authorization_provider = "terminal""#;
         assert_eq!(pool.global_charge(), 0);
 
         let url = canonicalize_http_url("https://example.test/default-deny").unwrap();
-        let RequestDecision::Deny(mut default) =
-            decide_request(&lease, input("default-deny", &url, HeaderMap::new()))
-                .await
-                .unwrap()
-        else {
+        let RequestDecision::Deny(mut default) = decide_request(
+            &lease,
+            input(&lease, "default-deny", &url, HeaderMap::new()),
+        )
+        .await
+        .unwrap() else {
             panic!("provider pass must resume through the deny default");
         };
         assert!(default._rule.is_none());
@@ -2074,8 +2149,11 @@ max_decoded_request_body_bytes = 128"#,
         let (runtime, _source, _, pool) = runtime(initial).await;
         let lease = runtime.lease().await.unwrap();
         let url = canonicalize_http_url("https://example.test/provider-failure").unwrap();
-        let prepared =
-            prepare_request(&lease, input("provider-failure", &url, HeaderMap::new())).unwrap();
+        let prepared = prepare_request(
+            &lease,
+            input(&lease, "provider-failure", &url, HeaderMap::new()),
+        )
+        .unwrap();
         let mut decoded = prepared.body_guard().buffer();
         decoded.try_extend_from_slice(b"failure-body").unwrap();
 
@@ -2177,7 +2255,8 @@ authorization_provider = "replacing"
             let lease = runtime.lease().await.unwrap();
             let url = canonicalize_http_url("https://example.test/replacement").unwrap();
             let prepared =
-                prepare_request(&lease, input("replacement", &url, HeaderMap::new())).unwrap();
+                prepare_request(&lease, input(&lease, "replacement", &url, HeaderMap::new()))
+                    .unwrap();
             let one_guarded_chunk =
                 crate::safety::wire_body::guarded_body_allocation_bytes(1).unwrap();
             assert_eq!(
@@ -2321,9 +2400,10 @@ redaction_profile = "wire""#;
             let lease = runtime.lease().await.unwrap();
             let url = canonicalize_http_url("https://example.test/replacement").unwrap();
 
-            let decision = decide_request(&lease, input("replacement", &url, HeaderMap::new()))
-                .await
-                .expect("a replacement limit is a terminal denial, not a provider failure");
+            let decision =
+                decide_request(&lease, input(&lease, "replacement", &url, HeaderMap::new()))
+                    .await
+                    .expect("a replacement limit is a terminal denial, not a provider failure");
             let RequestDecision::Deny(mut denied) = decision else {
                 panic!("the over-limit replacement must deny");
             };

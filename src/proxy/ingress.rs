@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use bytes::Buf;
 use chrono::Utc;
-use http::header::{CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRAILER};
+use http::header::{CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRAILER, UPGRADE};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Version};
 use hyper::body::{Bytes, HttpBody, SizeHint};
 use hyper::server::conn::Http;
@@ -41,13 +41,13 @@ use crate::config::compiler::{
     StaticCleartextListener, StaticExplicitHttpsListener, StaticTransparentHttpsListener,
 };
 use crate::destination::DestinationTarget;
+use crate::http1::head::IngressRequestKind;
+use crate::http1::ingress::{RequestDisposition, ValidatedIngressIo};
 use crate::http_body::{read_mandatory_request_body, HttpBodyReadError};
 use crate::observation::{CaptureEpoch, CaptureEvent, ProductObservationRuntime};
 use crate::policy::apply_header_effects;
-use crate::proxy::authority::{
-    reconcile_connect_inner_request, reconcile_connect_outer_request, reconcile_connect_sni,
-    reconcile_explicit_request, reconcile_transparent_http_request, CanonicalConnectTarget,
-};
+use crate::proxy::authority::{reconcile_connect_outer_request, reconcile_request};
+use crate::proxy::facts::{body_metadata, validate_request_fact_shape};
 use crate::proxy::forward::{
     forward_request, forward_upgrade_request, preflight_forwarding_target,
     resolve_forwarding_target, ForwardBody, ForwardBodyError, ForwardUpgradeResult,
@@ -72,7 +72,10 @@ use crate::sensitive::{is_sensitive_header_name, REDACTED};
 use crate::upgrade::{
     UpgradeEntryPlan, UpgradeRuntime, UpgradeTerminalCause, UpgradeTerminalControl,
 };
-use crate::url::canonicalize_tls_server_name;
+use http_access_types::{CanonicalHost, IngressMode};
+use http_access_url::{
+    canonicalize_tls_server_name, reconcile_connect_sni, CanonicalConnectTarget,
+};
 
 /// Concrete process-runtime starter for the prebound product listener bundle.
 pub(crate) struct ProductProxySupervisorStarter {
@@ -126,7 +129,7 @@ impl ProxySupervisorStarter for ProductProxySupervisorStarter {
                 ProductIngressSupervisor::start(
                     IngressListenerConfig::cleartext(
                         kind,
-                        ConfiguredRequestAuthority::Explicit,
+                        ConfiguredRequestAuthority::ExplicitHttp,
                         *config,
                     ),
                     listener.listener,
@@ -220,20 +223,52 @@ fn require_connect_mitm_asset(
 
 #[derive(Clone)]
 enum RequestAuthority {
-    Explicit,
+    ExplicitHttp,
+    ExplicitHttps,
     TransparentHttp,
-    ConnectInner(Box<CanonicalConnectTarget>),
+    ConnectInner {
+        target: Box<CanonicalConnectTarget>,
+        sni: Option<CanonicalHost>,
+    },
     TransparentHttps {
         destination_port: u16,
-        sni: Arc<str>,
+        sni: CanonicalHost,
     },
+}
+
+impl RequestAuthority {
+    fn ingress_mode(&self) -> IngressMode {
+        match self {
+            Self::ExplicitHttp => IngressMode::ExplicitHttp,
+            Self::ExplicitHttps => IngressMode::ExplicitHttps,
+            Self::TransparentHttp => IngressMode::TransparentHttp,
+            Self::ConnectInner { .. } => IngressMode::ConnectMitmInner,
+            Self::TransparentHttps { .. } => IngressMode::TransparentHttps,
+        }
+    }
+
+    fn is_explicit(&self) -> bool {
+        matches!(self, Self::ExplicitHttp | Self::ExplicitHttps)
+    }
 }
 
 #[derive(Clone, Copy)]
 enum ConfiguredRequestAuthority {
-    Explicit,
+    ExplicitHttp,
+    ExplicitHttps,
     TransparentHttp,
     DynamicTransparentHttps,
+}
+
+impl ConfiguredRequestAuthority {
+    fn ingress_mode(self) -> Option<IngressMode> {
+        match self {
+            Self::ExplicitHttp => Some(IngressMode::ExplicitHttp),
+            Self::ExplicitHttps => Some(IngressMode::ExplicitHttps),
+            Self::TransparentHttp => Some(IngressMode::TransparentHttp),
+            Self::DynamicTransparentHttps => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -288,7 +323,7 @@ impl IngressListenerConfig {
     ) -> Self {
         Self {
             kind,
-            authority: ConfiguredRequestAuthority::Explicit,
+            authority: ConfiguredRequestAuthority::ExplicitHttps,
             transport: IngressTransport::StaticTls {
                 acceptor,
                 handshake_timeout: config.handshake_timeout,
@@ -859,7 +894,7 @@ async fn serve_http_connection(connection: HttpConnection) {
     let HttpConnection {
         kind,
         config,
-        stream,
+        mut stream,
         versions,
         authority,
         peer,
@@ -875,10 +910,27 @@ async fn serve_http_connection(connection: HttpConnection) {
         tunnel_tx,
         admission,
     } = connection;
+    let http1 = versions.contains(&CompiledHttpVersion::Http1);
+    let http2 = versions.contains(&CompiledHttpVersion::Http2);
+    let validation = if http1 {
+        let (validated, control) = match ValidatedIngressIo::try_new(stream, http2) {
+            Ok(validated) => validated,
+            Err(error) => {
+                tracing::warn!(listener = %kind, %peer, %error, "HTTP/1 ingress validation allocation failed");
+                return;
+            }
+        };
+        stream = Box::new(validated);
+        Some(control)
+    } else {
+        None
+    };
+
     let close = Arc::new(ConnectionClose::default());
     let service_close = close.clone();
     let service_config = config.clone();
     let service_stop = supervisor_stop.clone();
+    let service_validation = validation.clone();
     let service = service_fn(move |mut request| {
         let runtime = runtime.clone();
         let observation_runtime = observation_runtime.clone();
@@ -891,12 +943,30 @@ async fn serve_http_connection(connection: HttpConnection) {
         let tunnel_tx = tunnel_tx.clone();
         let admission = admission.clone();
         let tunnel_stop = service_stop.clone();
+        let validation_ticket = match &service_validation {
+            Some(control) => control.claim(observed_ingress_request_kind(&request)),
+            None => Ok(None),
+        };
         async move {
+            let validation_ticket = match validation_ticket {
+                Ok(ticket) => ticket,
+                Err(_) => {
+                    let mut rejected = HandledResponse::fixed(
+                        StatusCode::BAD_REQUEST,
+                        "invalid request framing\n",
+                        true,
+                    );
+                    rejected
+                        .response
+                        .headers_mut()
+                        .insert(CONNECTION, HeaderValue::from_static("close"));
+                    close.close();
+                    return Ok::<_, Infallible>(rejected.response);
+                }
+            };
             let close_entire_connection = request.version() != http::Version::HTTP_2;
             let downstream_upgrade = hyper::upgrade::on(&mut request);
-            let handled = if request.method() == Method::CONNECT
-                && matches!(&authority, RequestAuthority::Explicit)
-            {
+            let handled = if request.method() == Method::CONNECT && authority.is_explicit() {
                 execute_connect_request(
                     ConnectRequestExecution {
                         config,
@@ -940,6 +1010,20 @@ async fn serve_http_connection(connection: HttpConnection) {
                     .insert(CONNECTION, HeaderValue::from_static("close"));
                 close.close();
             }
+            if let Some(ticket) = validation_ticket {
+                if ticket.resolve(handled.request_disposition).is_err() {
+                    handled = HandledResponse::fixed(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "request failed\n",
+                        true,
+                    );
+                    handled
+                        .response
+                        .headers_mut()
+                        .insert(CONNECTION, HeaderValue::from_static("close"));
+                    close.close();
+                }
+            }
             Ok::<_, Infallible>(handled.response)
         }
     });
@@ -948,8 +1032,6 @@ async fn serve_http_connection(connection: HttpConnection) {
     http.http1_keep_alive(true);
     http.http1_header_read_timeout(config.request_header_timeout);
     http.http2_max_concurrent_streams(config.max_concurrent_streams);
-    let http1 = versions.contains(&CompiledHttpVersion::Http1);
-    let http2 = versions.contains(&CompiledHttpVersion::Http2);
     if http2 {
         http.http2_keep_alive_interval(config.request_header_timeout);
         http.http2_keep_alive_timeout(config.request_header_timeout);
@@ -981,6 +1063,38 @@ async fn serve_http_connection(connection: HttpConnection) {
     if let Err(error) = result {
         tracing::debug!(listener = %kind, %peer, %error, "HTTP ingress connection ended");
     }
+}
+
+fn observed_ingress_request_kind(request: &Request<Body>) -> Option<IngressRequestKind> {
+    if request.version() == Version::HTTP_2 {
+        return None;
+    }
+    if request.method() == Method::CONNECT {
+        return Some(IngressRequestKind::Connect);
+    }
+    let connection_upgrade = request.headers().get_all(CONNECTION).iter().any(|value| {
+        value
+            .as_bytes()
+            .split(|byte| *byte == b',')
+            .any(|token| trim_ascii_whitespace(token).eq_ignore_ascii_case(b"upgrade"))
+    });
+    Some(
+        if connection_upgrade && request.headers().contains_key(UPGRADE) {
+            IngressRequestKind::Upgrade
+        } else {
+            IngressRequestKind::Ordinary
+        },
+    )
+}
+
+fn trim_ascii_whitespace(mut value: &[u8]) -> &[u8] {
+    while value.first().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[1..];
+    }
+    while value.last().is_some_and(u8::is_ascii_whitespace) {
+        value = &value[..value.len() - 1];
+    }
+    value
 }
 
 trait IngressIo: AsyncRead + AsyncWrite {}
@@ -1041,7 +1155,8 @@ async fn prepare_ingress_transport(
             };
             let sni = canonicalize_tls_server_name(start.client_hello().server_name()?).ok()?;
             let server_config = {
-                let config_activation = manager.server_config_for_host(&sni, alpn_protocols);
+                let config_activation =
+                    manager.server_config_for_host(sni.as_str(), alpn_protocols);
                 tokio::pin!(config_activation);
                 tokio::select! {
                     biased;
@@ -1065,7 +1180,7 @@ async fn prepare_ingress_transport(
                 vec![selected],
                 RequestAuthority::TransparentHttps {
                     destination_port: destination.port(),
-                    sni: sni.into(),
+                    sni,
                 },
             ))
         }
@@ -1076,7 +1191,8 @@ fn establish_configured_authority(
     authority: ConfiguredRequestAuthority,
 ) -> Option<RequestAuthority> {
     match authority {
-        ConfiguredRequestAuthority::Explicit => Some(RequestAuthority::Explicit),
+        ConfiguredRequestAuthority::ExplicitHttp => Some(RequestAuthority::ExplicitHttp),
+        ConfiguredRequestAuthority::ExplicitHttps => Some(RequestAuthority::ExplicitHttps),
         ConfiguredRequestAuthority::TransparentHttp => Some(RequestAuthority::TransparentHttp),
         ConfiguredRequestAuthority::DynamicTransparentHttps => None,
     }
@@ -1131,6 +1247,7 @@ impl ConnectionClose {
 struct HandledResponse {
     response: Response<ProxyResponseBody>,
     close_connection: bool,
+    request_disposition: RequestDisposition,
 }
 
 enum UpgradeHandshakeResponse {
@@ -1150,6 +1267,11 @@ impl HandledResponse {
         Self {
             response,
             close_connection,
+            request_disposition: if close_connection {
+                RequestDisposition::Close
+            } else {
+                RequestDisposition::ContinueHttp
+            },
         }
     }
 }
@@ -1197,7 +1319,16 @@ impl ConnectTunnelPlan {
                 Err(_) => return,
             },
         };
-        if reconcile_connect_sni(&self.target, start.client_hello().server_name()).is_err() {
+        let sni = match start
+            .client_hello()
+            .server_name()
+            .map(canonicalize_tls_server_name)
+            .transpose()
+        {
+            Ok(sni) => sni,
+            Err(_) => return,
+        };
+        if reconcile_connect_sni(&self.target, sni.as_ref()).is_err() {
             return;
         }
         let handshake = start.into_stream(self.server_config);
@@ -1222,7 +1353,10 @@ impl ConnectTunnelPlan {
             config: self.config,
             stream: Box::new(tls),
             versions: vec![selected],
-            authority: RequestAuthority::ConnectInner(Box::new(self.target)),
+            authority: RequestAuthority::ConnectInner {
+                target: Box::new(self.target),
+                sni,
+            },
             peer: self.peer,
             quota_key: self.quota_key,
             ingress: IngressRuntime {
@@ -1269,24 +1403,20 @@ async fn execute_connect_request(
         admission,
         tunnel_stop,
     } = execution;
-    let policy = match request.version() {
-        Version::HTTP_10 | Version::HTTP_11 => {
-            config.connect.as_ref().and_then(|connect| connect.http1)
+    let ingress_mode = config
+        .authority
+        .ingress_mode()
+        .expect("outer CONNECT is only dispatched on an explicit listener");
+    let body_metadata = match body_metadata(request.version(), request.headers()) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            return HandledResponse::fixed(
+                StatusCode::BAD_REQUEST,
+                "invalid CONNECT framing\n",
+                true,
+            )
         }
-        Version::HTTP_2 => {
-            return HandledResponse::fixed(StatusCode::FORBIDDEN, "CONNECT denied\n", true)
-        }
-        _ => None,
     };
-    match policy {
-        Some(CompiledHttp1ConnectPolicy::Deny) => {
-            return HandledResponse::fixed(StatusCode::FORBIDDEN, "CONNECT denied\n", true)
-        }
-        Some(CompiledHttp1ConnectPolicy::Mitm) => {}
-        None => {
-            return HandledResponse::fixed(StatusCode::BAD_REQUEST, "CONNECT unsupported\n", true)
-        }
-    }
     if !request.body().is_end_stream() {
         return HandledResponse::fixed(
             StatusCode::BAD_REQUEST,
@@ -1305,16 +1435,7 @@ async fn execute_connect_request(
             )
         }
     };
-    let prepared_destination = match assets
-        .destination_guard()
-        .preflight(DestinationTarget::direct(&target.url))
-    {
-        Ok(destination) => destination,
-        Err(_) => {
-            return HandledResponse::fixed(StatusCode::FORBIDDEN, "destination denied\n", true)
-        }
-    };
-    let sanitized = match sanitize_untrusted_connect_request(request) {
+    let mut sanitized = match sanitize_untrusted_connect_request(request) {
         Ok(request) => request,
         Err(_) => {
             return HandledResponse::fixed(
@@ -1324,7 +1445,47 @@ async fn execute_connect_request(
             )
         }
     };
-    let (parts, _body, _protocol) = sanitized.into_parts();
+    let shape = match validate_request_fact_shape(
+        ingress_mode,
+        sanitized.version(),
+        sanitized.method(),
+        target.url().clone(),
+        sanitized.headers(),
+        body_metadata,
+        None,
+    ) {
+        Ok(shape) => shape,
+        Err(_) => {
+            return HandledResponse::fixed(StatusCode::BAD_REQUEST, "invalid CONNECT facts\n", true)
+        }
+    };
+    let policy = match sanitized.version() {
+        Version::HTTP_10 | Version::HTTP_11 => {
+            config.connect.as_ref().and_then(|connect| connect.http1)
+        }
+        Version::HTTP_2 => {
+            return HandledResponse::fixed(StatusCode::FORBIDDEN, "CONNECT denied\n", true)
+        }
+        _ => None,
+    };
+    match policy {
+        Some(CompiledHttp1ConnectPolicy::Deny) => {
+            return HandledResponse::fixed(StatusCode::FORBIDDEN, "CONNECT denied\n", true)
+        }
+        Some(CompiledHttp1ConnectPolicy::Mitm) => {}
+        None => {
+            return HandledResponse::fixed(StatusCode::BAD_REQUEST, "CONNECT unsupported\n", true)
+        }
+    }
+    let prepared_destination = match assets
+        .destination_guard()
+        .preflight(DestinationTarget::direct(target.url()))
+    {
+        Ok(destination) => destination,
+        Err(_) => {
+            return HandledResponse::fixed(StatusCode::FORBIDDEN, "destination denied\n", true)
+        }
+    };
     let Some(lease) = runtime.lease().await else {
         return HandledResponse::fixed(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1334,19 +1495,26 @@ async fn execute_connect_request(
     };
     let request_id = request_id();
     let started_at = Instant::now();
-    let prepared = match prepare_request(
+    let input = match RequestInput::from_validated_shape(
         &lease,
-        RequestInput {
-            request_id: &request_id,
-            url: &target.url,
-            method: &parts.method,
-            peer_ip: peer.ip(),
-            headers: parts.headers,
-            quota_key: quota_key.clone(),
-            started_at,
-            upgrade_intent: false,
-        },
+        &request_id,
+        shape,
+        sanitized.headers_mut(),
+        peer.ip(),
+        quota_key.clone(),
+        started_at,
     ) {
+        Ok(input) => input,
+        Err(_) => {
+            return HandledResponse::fixed(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request failed\n",
+                true,
+            )
+        }
+    };
+    let (_parts, _body, _protocol) = sanitized.into_parts();
+    let prepared = match prepare_request(&lease, input) {
         Ok(prepared) => prepared,
         Err(_) => {
             return HandledResponse::fixed(
@@ -1411,7 +1579,7 @@ async fn execute_connect_request(
     let alpn_protocols = connect_alpn_protocols(&config.http_versions);
     let server_config = match tokio::time::timeout_at(
         deadline,
-        manager.server_config_for_host(&target.authority.host, &alpn_protocols),
+        manager.server_config_for_host(target.authority().host().as_str(), &alpn_protocols),
     )
     .await
     {
@@ -1468,6 +1636,7 @@ async fn execute_connect_request(
             .body(ProxyResponseBody::Local(Body::empty()))
             .expect("CONNECT response is valid"),
         close_connection: false,
+        request_disposition: RequestDisposition::SwitchProtocol,
     }
 }
 
@@ -1489,18 +1658,19 @@ struct HttpCaptureContext {
     method: Method,
     client: SocketAddr,
     target: Option<CaptureEndpoint>,
+    ingress_mode: IngressMode,
     request_version: Version,
     max_expansion_ratio: usize,
 }
 
 impl HttpCaptureContext {
-    fn new(
+    fn new<B>(
         runtime: Arc<ProductObservationRuntime>,
         epoch: Arc<CaptureEpoch>,
         request_id: String,
         peer: SocketAddr,
-        method: Method,
-        request_version: Version,
+        request: &Request<B>,
+        ingress_mode: IngressMode,
         max_expansion_ratio: usize,
     ) -> Self {
         Self {
@@ -1508,31 +1678,35 @@ impl HttpCaptureContext {
             epoch,
             request_id,
             url: String::new(),
-            method,
+            method: request.method().clone(),
             client: peer,
             target: None,
-            request_version,
+            ingress_mode,
+            request_version: request.version(),
             max_expansion_ratio,
         }
     }
 
-    fn bind_target(&mut self, target: &crate::url::CanonicalUrl) {
+    fn bind_target(&mut self, target: &http_access_url::CanonicalUrl) {
         if !self.epoch.is_enabled() {
             return;
         }
-        self.url.clone_from(&target.url);
+        self.url = target.as_str().to_owned();
         self.target = Some(CaptureEndpoint {
-            address: Some(target.host_for_capture.clone()),
-            port: Some(target.port),
+            address: Some(target.authority().host().authority_form()),
+            port: Some(target.authority().effective_port()),
         });
     }
 
-    fn upgrade_capture_context(&self, target: &crate::url::CanonicalUrl) -> UpgradeCaptureContext {
+    fn upgrade_capture_context(
+        &self,
+        target: &http_access_url::CanonicalUrl,
+    ) -> UpgradeCaptureContext {
         let mut base = self.request_record(CaptureDecision::Allow, None);
-        base.url.clone_from(&target.url);
+        base.url = target.as_str().to_owned();
         base.target = Some(CaptureEndpoint {
-            address: Some(target.host_for_capture.clone()),
-            port: Some(target.port),
+            address: Some(target.authority().host().authority_form()),
+            port: Some(target.authority().effective_port()),
         });
         UpgradeCaptureContext::new(self.runtime.clone(), base, self.max_expansion_ratio)
     }
@@ -1612,7 +1786,7 @@ impl HttpCaptureContext {
             request_id: self.request_id.clone(),
             kind,
             decision,
-            mode: CaptureMode::HttpProxy,
+            mode: CaptureMode::for_ingress(self.ingress_mode),
             url: self.url.clone(),
             method: self.method.to_string(),
             status_code: status.map(|status| status.as_u16()),
@@ -1863,7 +2037,7 @@ struct AuthorizedUpgradeExecution {
     capture: UpgradeCaptureContext,
     binding: UpgradeBinding,
     request: SanitizedRequest<OriginRequestBody>,
-    canonical: crate::url::CanonicalUrl,
+    canonical: http_access_url::CanonicalUrl,
     resolved: ResolvedForwardingTarget,
     destinations: Arc<crate::destination::DestinationGuard>,
     retention: GenerationRetention,
@@ -2016,8 +2190,18 @@ async fn execute_request(
     } = execution;
     let started_at = Instant::now();
     let request_id = request_id();
-    let request_method = request.method().clone();
     let request_version = request.version();
+    let ingress_mode = authority.ingress_mode();
+    let body_metadata = match body_metadata(request_version, request.headers()) {
+        Ok(metadata) => metadata,
+        Err(_) => {
+            return HandledResponse::fixed(
+                StatusCode::BAD_REQUEST,
+                "invalid request framing\n",
+                true,
+            )
+        }
+    };
     let Some(lease) = runtime.lease().await else {
         return HandledResponse::fixed(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2030,25 +2214,29 @@ async fn execute_request(
         lease.observation().capture_epoch().clone(),
         request_id.clone(),
         peer,
-        request_method,
-        request_version,
+        &request,
+        ingress_mode,
         lease.max_content_decoding_expansion_ratio(),
     );
-    let target = match authority {
-        RequestAuthority::Explicit => reconcile_explicit_request(&mut request),
-        RequestAuthority::TransparentHttp => reconcile_transparent_http_request(&mut request),
-        RequestAuthority::ConnectInner(target) => {
-            reconcile_connect_inner_request(&mut request, &target)
+    let (connect_target, sni, destination_port) = match &authority {
+        RequestAuthority::ExplicitHttp
+        | RequestAuthority::ExplicitHttps
+        | RequestAuthority::TransparentHttp => (None, None, None),
+        RequestAuthority::ConnectInner { target, sni } => {
+            (Some(target.as_ref()), sni.as_ref(), None)
         }
         RequestAuthority::TransparentHttps {
             destination_port,
             sni,
-        } => crate::proxy::authority::reconcile_transparent_https_request(
-            &mut request,
-            destination_port,
-            Some(&sni),
-        ),
+        } => (None, Some(sni), Some(*destination_port)),
     };
+    let target = reconcile_request(
+        &mut request,
+        ingress_mode,
+        connect_target,
+        sni,
+        destination_port,
+    );
     let target = match target {
         Ok(target) => target,
         Err(_) => {
@@ -2059,8 +2247,8 @@ async fn execute_request(
             )
         }
     };
-    capture.bind_target(&target.url);
-    let sanitized = match sanitize_untrusted_request(request) {
+    capture.bind_target(target.url());
+    let mut sanitized = match sanitize_untrusted_request(request) {
         Ok(request) => request,
         Err(error) => {
             let status = match error {
@@ -2071,8 +2259,26 @@ async fn execute_request(
             return capture.deny_metadata_only(status, "invalid request\n", true);
         }
     };
+    let shape = match validate_request_fact_shape(
+        ingress_mode,
+        sanitized.version(),
+        sanitized.method(),
+        target.url().clone(),
+        sanitized.headers(),
+        body_metadata,
+        sanitized.upgrade_intent(),
+    ) {
+        Ok(shape) => shape,
+        Err(_) => {
+            return capture.deny_metadata_only(
+                StatusCode::BAD_REQUEST,
+                "invalid request facts\n",
+                true,
+            )
+        }
+    };
     let prepared_target = match preflight_forwarding_target(
-        &target.url,
+        target.url(),
         &sanitized,
         lease.egress(),
         assets.destination_guard(),
@@ -2086,7 +2292,24 @@ async fn execute_request(
     let upgrade_protocol = sanitized
         .upgrade_intent()
         .map(|intent| intent.protocol().clone());
-    let upgrade_intent = upgrade_protocol.is_some();
+    let input = match RequestInput::from_validated_shape(
+        &lease,
+        &request_id,
+        shape,
+        sanitized.headers_mut(),
+        peer.ip(),
+        quota_key,
+        started_at,
+    ) {
+        Ok(input) => input,
+        Err(_) => {
+            return capture.deny_metadata_only(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request failed\n",
+                true,
+            )
+        }
+    };
     let (mut parts, ingress_body, protocol) = sanitized.into_parts();
     let ingress_was_complete = ingress_body.is_end_stream();
     let mut body_headers = body_headers(&parts.headers);
@@ -2098,20 +2321,8 @@ async fn execute_request(
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    let headers = std::mem::take(&mut parts.headers);
-    let prepared = match prepare_request(
-        &lease,
-        RequestInput {
-            request_id: &request_id,
-            url: &target.url,
-            method: &parts.method,
-            peer_ip: peer.ip(),
-            headers,
-            quota_key,
-            started_at,
-            upgrade_intent,
-        },
-    ) {
+    parts.headers.clear();
+    let prepared = match prepare_request(&lease, input) {
         Ok(prepared) => prepared,
         Err(_) => {
             return capture.deny_metadata_only(
@@ -2325,7 +2536,7 @@ async fn execute_request(
             }
         };
         let response_effects = allowed.response_header_effects().to_vec();
-        let upgrade_capture = capture.upgrade_capture_context(&target.url);
+        let upgrade_capture = capture.upgrade_capture_context(target.url());
         drop(allowed);
         drop(lease);
         let outcome = execute_authorized_upgrade(AuthorizedUpgradeExecution {
@@ -2333,7 +2544,7 @@ async fn execute_request(
             capture: upgrade_capture,
             binding,
             request,
-            canonical: target.url.clone(),
+            canonical: target.url().clone(),
             resolved,
             destinations: assets.destination_guard().clone(),
             retention,
@@ -2382,6 +2593,7 @@ async fn execute_request(
                     response: response
                         .map(|body| ProxyResponseBody::forwarded(body, response_capture)),
                     close_connection: false,
+                    request_disposition: RequestDisposition::ContinueHttp,
                 }
             }
             UpgradeHandshakeResponse::SwitchingProtocols(response) => {
@@ -2403,6 +2615,7 @@ async fn execute_request(
                 HandledResponse {
                     response: response.map(ProxyResponseBody::Local),
                     close_connection: false,
+                    request_disposition: RequestDisposition::SwitchProtocol,
                 }
             }
             UpgradeHandshakeResponse::Failed(status) => {
@@ -2414,7 +2627,7 @@ async fn execute_request(
         deadline,
         forward_request(
             request,
-            &target.url,
+            target.url(),
             lease.egress(),
             assets.destination_guard(),
             resolved,
@@ -2479,6 +2692,7 @@ async fn execute_request(
     HandledResponse {
         response: response.map(|body| ProxyResponseBody::forwarded(body, response_capture)),
         close_connection: false,
+        request_disposition: RequestDisposition::ContinueHttp,
     }
 }
 
@@ -3138,6 +3352,43 @@ mod tests {
         (addresses, listeners)
     }
 
+    #[test]
+    fn request_authority_variants_map_to_exact_ingress_modes() {
+        let mut connect = Request::builder()
+            .method(Method::CONNECT)
+            .uri("example.test:443")
+            .header(http::header::HOST, "example.test:443")
+            .body(())
+            .unwrap();
+        let target = reconcile_connect_outer_request(&mut connect).unwrap();
+        let sni = canonicalize_tls_server_name("example.test").unwrap();
+        let cases = [
+            (RequestAuthority::ExplicitHttp, IngressMode::ExplicitHttp),
+            (RequestAuthority::ExplicitHttps, IngressMode::ExplicitHttps),
+            (
+                RequestAuthority::TransparentHttp,
+                IngressMode::TransparentHttp,
+            ),
+            (
+                RequestAuthority::ConnectInner {
+                    target: Box::new(target),
+                    sni: Some(sni.clone()),
+                },
+                IngressMode::ConnectMitmInner,
+            ),
+            (
+                RequestAuthority::TransparentHttps {
+                    destination_port: 8443,
+                    sni,
+                },
+                IngressMode::TransparentHttps,
+            ),
+        ];
+        for (authority, expected) in cases {
+            assert_eq!(authority.ingress_mode(), expected);
+        }
+    }
+
     async fn product(
         text: String,
         listeners: Vec<StdTcpListener>,
@@ -3205,6 +3456,52 @@ mod tests {
             .unwrap();
         product.activate_initial().await.unwrap();
         (directory, product, assets)
+    }
+
+    struct OverrideIngressAssetsStarter {
+        inner: ProductProxySupervisorStarter,
+        assets: Arc<ProductIngressAssets>,
+    }
+
+    impl ProxySupervisorStarter for OverrideIngressAssetsStarter {
+        fn start(
+            &mut self,
+            listener: PreparedProxyListener,
+            _assets: &Arc<ProductIngressAssets>,
+            failure_observer: Arc<dyn ProxySupervisorFailureObserver>,
+        ) -> Result<Arc<dyn ProxySupervisor>, ProxySupervisorStartError> {
+            self.inner.start(listener, &self.assets, failure_observer)
+        }
+    }
+
+    async fn listener_product_with_destination_guard(
+        text: String,
+        listeners: Vec<StdTcpListener>,
+        destination_guard: Arc<DestinationGuard>,
+    ) -> (tempfile::TempDir, Arc<ProductRuntime>) {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("acl-proxy.toml");
+        fs::write(&path, text).unwrap();
+        let loaded = load_and_compile_exact_config(&path).unwrap();
+        let assets = ProductIngressAssets::with_destination_guard(
+            &loaded.compiled.static_config,
+            destination_guard,
+        )
+        .unwrap();
+        let product = ProductRuntime::prepare_from_prebound(loaded, listeners)
+            .await
+            .unwrap();
+        product.activate_initial().await.unwrap();
+        let mut starter = OverrideIngressAssetsStarter {
+            inner: ProductProxySupervisorStarter::new(
+                product.runtime().clone(),
+                product.observation_runtime().clone(),
+                product.upgrade_runtime(),
+            ),
+            assets,
+        };
+        product.start_proxy_supervisors(&mut starter).await.unwrap();
+        (directory, product)
     }
 
     #[derive(Default)]
@@ -3292,7 +3589,7 @@ mod tests {
         let downstream_upgrade = hyper::upgrade::on(&mut request);
         execute_request(
             RequestExecution {
-                authority: RequestAuthority::Explicit,
+                authority: RequestAuthority::ExplicitHttp,
                 peer,
                 quota_key: WireBodyQuotaKey::from_peer(peer.ip(), |_| false),
                 runtime: product.runtime().clone(),
@@ -3364,6 +3661,173 @@ header = "x-test-loop"
             assert!(head.len() <= 32 * 1024, "HTTP head exceeded the test bound");
         }
         head
+    }
+
+    async fn send_raw_http(address: SocketAddr, wire: &[u8]) -> Vec<u8> {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream.write_all(wire).await.unwrap();
+        read_raw_http_response(stream).await
+    }
+
+    async fn read_raw_http_response(mut stream: impl AsyncRead + AsyncWrite + Unpin) -> Vec<u8> {
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .expect("raw HTTP response timed out")
+            .unwrap();
+        response
+    }
+
+    fn assert_forbidden_http10(response: &[u8], mode: &str) {
+        assert!(
+            response.starts_with(b"HTTP/1.0 403 ") || response.starts_with(b"HTTP/1.1 403 "),
+            "unexpected {mode} HTTP/1.0 response: {}",
+            String::from_utf8_lossy(response)
+        );
+        assert!(
+            response.ends_with(b"request denied\n"),
+            "{mode} HTTP/1.0 request did not reach policy: {}",
+            String::from_utf8_lossy(response)
+        );
+    }
+
+    #[tokio::test]
+    async fn http10_requests_reach_policy_in_all_five_ingress_modes() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let deny_policy = r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+"#;
+
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let (_directory, runtime) =
+            product(base_config(proxy, "explicit_http", deny_policy), listeners).await;
+        let response = send_raw_http(
+            proxy,
+            b"GET http://explicit.test/denied HTTP/1.0\r\nHost: explicit.test\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_forbidden_http10(&response, "explicit HTTP");
+        runtime.shutdown().await;
+
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let transparent_policy = r#"[policy]
+default = "deny"
+"#;
+        let (_directory, runtime) = product_with_original_destination(
+            base_config(proxy, "transparent_http", transparent_policy),
+            listeners,
+            Arc::new(FixedOriginalDestination(SocketAddr::from((
+                [198, 51, 100, 17],
+                8080,
+            )))),
+        )
+        .await;
+        let response = send_raw_http(
+            proxy,
+            b"GET /denied HTTP/1.0\r\nHost: transparent.test:8080\r\nConnection: close\r\n\r\n",
+        )
+        .await;
+        assert_forbidden_http10(&response, "transparent HTTP");
+        runtime.shutdown().await;
+
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let (identity, certificate) = test_tls_identity();
+        let explicit_https_policy = format!(
+            r#"[listeners.explicit_https.connect]
+http1 = "deny"
+
+[listeners.explicit_https.tls]
+certificate_chain = "{}"
+private_key = "{}"
+
+[policy]
+default = "deny"
+"#,
+            identity.path().join("server.pem").display(),
+            identity.path().join("server-key.pem").display(),
+        );
+        let (_directory, runtime) = product(
+            base_config(proxy, "explicit_https", &explicit_https_policy),
+            listeners,
+        )
+        .await;
+        let connector = test_tls_connector(certificate, vec![b"http/1.1".to_vec()]);
+        let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let mut stream = connector
+            .connect(ServerName::try_from("localhost").unwrap(), stream)
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET https://explicit.test/denied HTTP/1.0\r\nHost: explicit.test\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let response = read_raw_http_response(stream).await;
+        assert_forbidden_http10(&response, "explicit HTTPS");
+        runtime.shutdown().await;
+
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let transparent_https_policy = r#"[mitm]
+mode = "generated"
+directory = "mitm"
+
+[policy]
+default = "deny"
+"#;
+        let (directory, runtime) = product_with_original_destination(
+            base_config(proxy, "transparent_https", transparent_https_policy),
+            listeners,
+            Arc::new(FixedOriginalDestination(SocketAddr::from((
+                [198, 51, 100, 17],
+                8443,
+            )))),
+        )
+        .await;
+        let certificate = read_first_pem_certificate(&directory.path().join("mitm/ca-cert.pem"));
+        let connector = test_tls_connector(certificate, vec![b"http/1.1".to_vec()]);
+        let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let mut stream = connector
+            .connect(ServerName::try_from("transparent.test").unwrap(), stream)
+            .await
+            .unwrap();
+        stream
+            .write_all(
+                b"GET /denied HTTP/1.0\r\nHost: transparent.test:8443\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let response = read_raw_http_response(stream).await;
+        assert_forbidden_http10(&response, "transparent HTTPS");
+        runtime.shutdown().await;
+
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let target = "192.0.2.10:443";
+        let connect_policy = connect_mitm_policy(target).replacen(
+            &format!("urls = [\"https://{target}/**\"]"),
+            &format!("urls = [\"https://{target}/**\"]\nmethods = [\"CONNECT\"]"),
+            1,
+        );
+        let (directory, runtime) = product(
+            base_config(proxy, "explicit_http", &connect_policy),
+            listeners,
+        )
+        .await;
+        let outer = open_connect(proxy, target).await;
+        let certificate = read_first_pem_certificate(&directory.path().join("mitm/ca-cert.pem"));
+        let connector = test_tls_connector(certificate, vec![b"http/1.1".to_vec()]);
+        let mut inner = connector
+            .connect(ServerName::try_from("192.0.2.10").unwrap(), outer)
+            .await
+            .unwrap();
+        inner
+            .write_all(b"GET /denied HTTP/1.0\r\nHost: 192.0.2.10\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let response = read_raw_http_response(inner).await;
+        assert_forbidden_http10(&response, "CONNECT MITM inner");
+        runtime.shutdown().await;
     }
 
     #[derive(Debug)]
@@ -3519,6 +3983,194 @@ default = "deny"
         assert_eq!(handled.response.status(), StatusCode::FORBIDDEN);
         assert_eq!(resolver.calls.load(Ordering::Acquire), 0);
         assert!(!dropped.load(Ordering::Acquire));
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn raw_h1_framing_is_validated_before_resolution_and_valid_bodies_pass() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            loop {
+                let (stream, _) = origin_listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    Http::new()
+                        .http1_only(true)
+                        .serve_connection(
+                            stream,
+                            service_fn(|request| async move {
+                                let body = to_bytes(request.into_body()).await.unwrap();
+                                Ok::<_, Infallible>(Response::new(Body::from(format!(
+                                    "body-bytes={}",
+                                    body.len()
+                                ))))
+                            }),
+                        )
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        let resolver = Arc::new(DelayedResolver {
+            calls: AtomicUsize::new(0),
+            delay: Duration::ZERO,
+            endpoint: origin,
+        });
+        let guard = test_destination_guard(proxy, resolver.clone());
+        let policy = r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "allow"
+"#;
+        let (_directory, product) = listener_product_with_destination_guard(
+            base_config(proxy, "explicit_http", policy),
+            listeners,
+            guard,
+        )
+        .await;
+        let authority = format!("wire.test:{}", origin.port());
+        let target = format!("http://{authority}/body");
+        let malformed = [
+            format!(
+                "POST {target} HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\n\r\n"
+            ),
+            format!(
+                "POST {target} HTTP/1.1\r\nHost: {authority}\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\nConnection: close\r\n\r\n0\r\n\r\n"
+            ),
+            format!(
+                "POST {target} HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+            format!(
+                "POST {target} HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 0\r\nContent-Length: 1\r\nConnection: close\r\n\r\n"
+            ),
+        ];
+        for wire in malformed {
+            let response = send_raw_http(proxy, wire.as_bytes()).await;
+            assert!(
+                response.is_empty(),
+                "invalid framing reached Hyper: {}",
+                String::from_utf8_lossy(&response)
+            );
+            assert_eq!(
+                resolver.calls.load(Ordering::Acquire),
+                0,
+                "invalid framing reached destination resolution"
+            );
+        }
+
+        let content_length_zero = format!(
+            "POST {target} HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let response = send_raw_http(proxy, content_length_zero.as_bytes()).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "unexpected CL0 response (resolver calls={}): {}",
+            resolver.calls.load(Ordering::Acquire),
+            String::from_utf8_lossy(&response),
+        );
+        assert!(response.ends_with(b"body-bytes=0"));
+
+        let chunked = format!(
+            "POST {target} HTTP/1.1\r\nHost: {authority}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n4;safe=yes\r\ntest\r\n0\r\n\r\n"
+        );
+        let response = send_raw_http(proxy, chunked.as_bytes()).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "unexpected chunked response: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert!(response.ends_with(b"body-bytes=4"));
+
+        let mut large_trailers = format!(
+            "POST {target} HTTP/1.1\r\nHost: {authority}\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n1\r\nx\r\n0\r\n"
+        )
+        .into_bytes();
+        for index in 0..8 {
+            large_trailers.extend_from_slice(format!("X-Trailer-{index}: ").as_bytes());
+            large_trailers.extend(std::iter::repeat_n(b't', 12 * 1024));
+            large_trailers.extend_from_slice(b"\r\n");
+        }
+        large_trailers.extend_from_slice(b"\r\n");
+        assert!(large_trailers.len() > crate::http1::store::PARSER_STORE_BYTES);
+        let response = send_raw_http(proxy, &large_trailers).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "unexpected large-trailer response: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert!(response.ends_with(b"body-bytes=1"));
+        assert_eq!(resolver.calls.load(Ordering::Acquire), 3);
+
+        product.shutdown().await;
+        origin_task.abort();
+        let _ = origin_task.await;
+    }
+
+    #[tokio::test]
+    async fn close_disposition_interrupts_missing_body_and_blocks_pipelined_resolution() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let unused_origin = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let origin = unused_origin.local_addr().unwrap();
+        let resolver = Arc::new(DelayedResolver {
+            calls: AtomicUsize::new(0),
+            delay: Duration::ZERO,
+            endpoint: origin,
+        });
+        let guard = test_destination_guard(proxy, resolver.clone());
+        let authority = format!("pipeline.test:{}", origin.port());
+        let policy = format!(
+            r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "allow-second-only"
+decision = "allow"
+urls = ["http://{authority}/two"]
+methods = ["GET"]
+"#
+        );
+        let (_directory, product) = listener_product_with_destination_guard(
+            base_config(proxy, "explicit_http", &policy),
+            listeners,
+            guard,
+        )
+        .await;
+
+        let missing_body = format!(
+            "POST http://{authority}/one HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 32\r\n\r\n"
+        );
+        let response = send_raw_http(proxy, missing_body.as_bytes()).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 403"),
+            "declared body prevented close response: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(resolver.calls.load(Ordering::Acquire), 0);
+
+        let pipelined = format!(
+            "POST http://{authority}/one HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 4\r\n\r\nbodyGET http://{authority}/two HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+        );
+        let response = send_raw_http(proxy, pipelined.as_bytes()).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 403"),
+            "unexpected first pipeline response: {}",
+            String::from_utf8_lossy(&response)
+        );
+        assert_eq!(
+            resolver.calls.load(Ordering::Acquire),
+            0,
+            "the second pipelined request reached destination resolution"
+        );
+
         product.shutdown().await;
     }
 
@@ -5135,6 +5787,97 @@ redaction_profile = "wire"
     }
 
     #[tokio::test]
+    async fn transparent_http_h2_prior_knowledge_forwards_canonical_origin_request() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let (captured_tx, captured_rx) = oneshot::channel();
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin_listener.accept().await.unwrap();
+            let captured_tx = Arc::new(StdMutex::new(Some(captured_tx)));
+            Http::new()
+                .http1_only(true)
+                .serve_connection(
+                    stream,
+                    service_fn(move |request: Request<Body>| {
+                        let captured_tx = captured_tx.clone();
+                        async move {
+                            let host = request
+                                .headers()
+                                .get(http::header::HOST)
+                                .unwrap()
+                                .to_str()
+                                .unwrap()
+                                .to_owned();
+                            captured_tx
+                                .lock()
+                                .unwrap()
+                                .take()
+                                .unwrap()
+                                .send((request.version(), request.uri().to_string(), host))
+                                .ok();
+                            Ok::<_, Infallible>(Response::new(Body::from(
+                                "transparent h2 accepted",
+                            )))
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let policy = format!(
+            r#"[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "transparent-h2"
+decision = "allow"
+urls = ["http://{origin}/transparent-h2?mode=one"]
+methods = ["GET"]
+"#
+        );
+        let config = base_config(proxy, "transparent_http", &policy).replacen(
+            "http_versions = [\"http1\"]",
+            "http_versions = [\"http2\"]",
+            1,
+        );
+        let (_directory, product) = product(config, listeners).await;
+        let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let mut builder = conn::Builder::new();
+        builder.http2_only(true);
+        let (mut sender, connection) = builder.handshake(stream).await.unwrap();
+        let driver = tokio::spawn(connection);
+
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .uri(format!("http://{origin}/transparent-h2?mode=one"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.version(), Version::HTTP_2);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body()).await.unwrap(),
+            "transparent h2 accepted"
+        );
+        let (version, uri, host) = captured_rx.await.unwrap();
+        assert_eq!(version, Version::HTTP_11);
+        assert_eq!(uri, "/transparent-h2?mode=one");
+        assert_eq!(host, origin.to_string());
+
+        drop(sender);
+        product.shutdown().await;
+        driver.await.unwrap().unwrap();
+        origin_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn unbounded_shutdown_finishes_at_the_finite_request_deadline() {
         let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
         let ([proxy], listeners) = prebound_listeners::<1>();
@@ -5840,7 +6583,7 @@ default = "allow"
     }
 
     #[tokio::test]
-    async fn denied_connect_with_body_closes_before_pipelined_request() {
+    async fn connect_body_rejection_closes_before_pipelined_request() {
         let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
         let ([proxy], listeners) = prebound_listeners::<1>();
         let policy = r#"[listeners.explicit_http.connect]
@@ -5869,11 +6612,11 @@ Connection: close\r\n\
         let mut response = Vec::new();
         tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
             .await
-            .expect("denied CONNECT did not close the connection")
+            .expect("invalid CONNECT did not close the connection")
             .unwrap();
         let response_text = String::from_utf8(response).unwrap();
         assert!(
-            response_text.starts_with("HTTP/1.1 403 "),
+            response_text.starts_with("HTTP/1.1 400 "),
             "{response_text}"
         );
         assert!(
@@ -5888,7 +6631,7 @@ Connection: close\r\n\
             "{response_text}"
         );
         assert!(
-            response_text.ends_with("CONNECT denied\n"),
+            response_text.ends_with("CONNECT body is not allowed\n"),
             "{response_text}"
         );
 
@@ -6005,6 +6748,111 @@ urls = ["https://{target}/**"]
             .unwrap();
         assert_eq!(nested.status(), StatusCode::BAD_REQUEST);
         to_bytes(nested.into_body()).await.unwrap();
+        drop(sender);
+        driver.await.unwrap().unwrap();
+        origin_task.await.unwrap();
+        product.shutdown().await;
+        assert!(StdTcpListener::bind(proxy).is_ok());
+    }
+
+    #[tokio::test]
+    async fn connect_mitm_inner_h2_alpn_forwards_canonical_origin_request() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let (origin_identity, _) = test_tls_identity();
+        let origin_acceptor = crate::tls_identity::load_static_tls_acceptor(
+            &origin_identity.path().join("server.pem"),
+            &origin_identity.path().join("server-key.pem"),
+            vec![b"http/1.1".to_vec()],
+        )
+        .unwrap();
+        let (captured_tx, captured_rx) = oneshot::channel();
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin_listener.accept().await.unwrap();
+            let tls = origin_acceptor.accept(stream).await.unwrap();
+            let captured_tx = Arc::new(StdMutex::new(Some(captured_tx)));
+            Http::new()
+                .http1_only(true)
+                .serve_connection(
+                    tls,
+                    service_fn(move |request: Request<Body>| {
+                        let captured_tx = captured_tx.clone();
+                        let host = request
+                            .headers()
+                            .get(http::header::HOST)
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .to_owned();
+                        let captured = (request.version(), request.uri().to_string(), host);
+                        captured_tx
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .unwrap()
+                            .send(captured)
+                            .ok();
+                        async {
+                            Ok::<_, Infallible>(Response::new(Body::from(
+                                "connect inner h2 accepted",
+                            )))
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let target = origin.to_string();
+        let policy = connect_mitm_policy(&target).replacen(
+            "http1 = \"mitm\"",
+            "http1 = \"mitm\"\nhttp2 = \"deny\"",
+            1,
+        );
+        let config = base_config(proxy, "explicit_http", &policy)
+            .replacen(
+                "http_versions = [\"http1\"]",
+                "http_versions = [\"http1\", \"http2\"]",
+                1,
+            )
+            .replacen("trust = \"system\"", "trust = \"insecure\"", 1);
+        let (directory, product) = product(config, listeners).await;
+
+        let stream = open_connect(proxy, &target).await;
+        let certificate = read_first_pem_certificate(&directory.path().join("mitm/ca-cert.pem"));
+        let connector = test_tls_connector(certificate, vec![b"h2".to_vec()]);
+        let tls = connector
+            .connect(ServerName::try_from("127.0.0.1").unwrap(), stream)
+            .await
+            .unwrap();
+        assert_eq!(tls.get_ref().1.alpn_protocol(), Some(b"h2".as_slice()));
+        let mut builder = conn::Builder::new();
+        builder.http2_only(true);
+        let (mut sender, connection) = builder.handshake(tls).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .uri(format!("https://{target}/inner-h2?mode=one"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.version(), Version::HTTP_2);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body()).await.unwrap(),
+            "connect inner h2 accepted"
+        );
+        let (version, uri, host) = captured_rx.await.unwrap();
+        assert_eq!(version, Version::HTTP_11);
+        assert_eq!(uri, "/inner-h2?mode=one");
+        assert_eq!(host, target);
+
         drop(sender);
         driver.await.unwrap().unwrap();
         origin_task.await.unwrap();

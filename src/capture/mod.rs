@@ -8,6 +8,7 @@ use std::time::SystemTime;
 
 use base64::{encoded_len as base64_encoded_len, engine::general_purpose, Engine as _};
 use fs2::FileExt;
+use http_access_types::IngressMode;
 use once_cell::sync::Lazy;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -59,6 +60,18 @@ pub enum CaptureKind {
 #[serde(rename_all = "snake_case")]
 pub enum CaptureMode {
     HttpProxy,
+}
+
+impl CaptureMode {
+    pub(crate) const fn for_ingress(mode: IngressMode) -> Self {
+        match mode {
+            IngressMode::ExplicitHttp
+            | IngressMode::ExplicitHttps
+            | IngressMode::TransparentHttp
+            | IngressMode::ConnectMitmInner
+            | IngressMode::TransparentHttps => Self::HttpProxy,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -1274,6 +1287,24 @@ mod tests {
     use crate::runtime::GenerationOwner;
     use flate2::write::GzEncoder;
     use flate2::{Compress, Compression, FlushCompress, Status};
+
+    #[test]
+    fn every_http_ingress_mode_preserves_the_http_proxy_capture_wire_value() {
+        for ingress_mode in [
+            IngressMode::ExplicitHttp,
+            IngressMode::ExplicitHttps,
+            IngressMode::TransparentHttp,
+            IngressMode::ConnectMitmInner,
+            IngressMode::TransparentHttps,
+        ] {
+            let capture_mode = CaptureMode::for_ingress(ingress_mode);
+            assert_eq!(capture_mode, CaptureMode::HttpProxy);
+            assert_eq!(
+                serde_json::to_string(&capture_mode).unwrap(),
+                r#""http_proxy""#
+            );
+        }
+    }
 
     fn capture_sink(directory: PathBuf) -> CaptureSinkSpec {
         CaptureSinkSpec::new(

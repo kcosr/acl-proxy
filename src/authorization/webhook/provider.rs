@@ -2,6 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http::HeaderName;
+use http_access_types::{CanonicalUrl, HttpScheme};
+use http_access_url::{canonicalize_http_url, UrlError};
 use rustls::ClientConfig;
 
 use crate::authorization::protocol::ProviderOutputRegistry;
@@ -9,7 +11,6 @@ use crate::config::compiler::{
     CompiledProviderFailureMode, CompiledTlsTrust, WebhookProviderPlan, WebhookTlsPlan,
 };
 use crate::tls::{build_client_config, load_client_trust, ClientAlpn, TlsActivationError};
-use crate::url::{canonicalize_http_url, CanonicalUrl, UrlError};
 
 pub(crate) struct WebhookProvider {
     url: CanonicalUrl,
@@ -41,7 +42,7 @@ impl WebhookProvider {
             return Err(WebhookActivationError::Cancelled);
         }
         let url = canonicalize_http_url(&plan.url).map_err(WebhookActivationError::InvalidUrl)?;
-        let tls = if url.scheme == "https" {
+        let tls = if url.scheme() == HttpScheme::Https {
             let WebhookTlsPlan {
                 trust,
                 ca_certificate,
@@ -146,7 +147,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            provider.url().url,
+            provider.url().as_str(),
             "http://localhost:8080/authorize?mode=one"
         );
         assert_eq!(provider.timeout(), Duration::from_secs(3));

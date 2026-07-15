@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http::Method;
+use http_access_types::CanonicalUrl;
+use http_access_types::HttpMethod;
 use memchr::memmem::Finder;
 
 #[cfg(test)]
@@ -21,7 +23,6 @@ use crate::runtime::{
     CredentialSourceIndex, CredentialSourceRegistry, ProviderIndex, ProviderRegistry,
     RedactionProfileIndex, RedactionProfileRegistry, ResolvedBindings, ResolvedRuleBindings,
 };
-use crate::url::CanonicalUrl;
 
 const MAX_HEADER_FIELD_BYTES: usize = 64 * 1024;
 const MAX_HEADER_VALUE_BYTES: usize = 1024 * 1024;
@@ -109,7 +110,7 @@ impl fmt::Debug for PolicyActivation {
 struct ActivatedPolicyRule {
     id: String,
     decision: CompiledRuleDecision,
-    urls: Vec<crate::url::CompiledUrlPattern>,
+    urls: Vec<http_access_url::CompiledUrlPattern>,
     methods: Vec<Method>,
     client_cidrs: Vec<ipnet::IpNet>,
     headers: HeaderPredicatesPlan,
@@ -267,7 +268,7 @@ impl CompiledPolicySnapshot {
         &'snapshot self,
         url: &CanonicalUrl,
         peer_ip: IpAddr,
-        method: &Method,
+        method: &HttpMethod,
         headers: &HeaderMap,
         extra_presence: ExtraPresence,
     ) -> PolicyEvaluation<'snapshot>
@@ -282,7 +283,7 @@ impl CompiledPolicySnapshot {
         start_index: usize,
         url: &CanonicalUrl,
         peer_ip: IpAddr,
-        method: &Method,
+        method: &HttpMethod,
         headers: &HeaderMap,
         extra_presence: ExtraPresence,
     ) -> PolicyEvaluation<'snapshot>
@@ -388,7 +389,7 @@ impl crate::runtime::PolicySnapshot for CompiledPolicySnapshot {
         &'snapshot self,
         url: &CanonicalUrl,
         peer_ip: IpAddr,
-        method: &Method,
+        method: &HttpMethod,
         headers: &HeaderMap,
         extra_presence: &dyn Fn(&HeaderName) -> bool,
     ) -> PolicyEvaluation<'snapshot> {
@@ -491,7 +492,7 @@ impl<'snapshot> PolicyCursor<'snapshot> {
         self,
         url: &CanonicalUrl,
         peer_ip: IpAddr,
-        method: &Method,
+        method: &HttpMethod,
         headers: &HeaderMap,
         extra_presence: ExtraPresence,
     ) -> PolicyEvaluation<'snapshot>
@@ -523,7 +524,7 @@ fn rule_matches<ExtraPresence>(
     rule: &ActivatedPolicyRule,
     url: &CanonicalUrl,
     peer_ip: IpAddr,
-    method: &Method,
+    method: &HttpMethod,
     headers: &HeaderMap,
     extra_presence: &ExtraPresence,
 ) -> bool
@@ -839,7 +840,7 @@ mod tests {
 
     use super::*;
     use crate::config::compiler::{HeaderValuePredicatePlan, PolicyRulePlan};
-    use crate::url::{canonicalize_http_url, CompiledUrlPattern};
+    use http_access_url::{canonicalize_http_url, CompiledUrlPattern};
 
     fn provider_index(index: usize) -> ProviderIndex {
         let name = format!("index-{index:08}");
@@ -919,7 +920,7 @@ mod tests {
         snapshot.evaluate(
             &canonicalize_http_url(url).unwrap(),
             "192.0.2.10".parse().unwrap(),
-            &Method::GET,
+            &HttpMethod::new("GET").unwrap(),
             headers,
             |_| false,
         )
@@ -928,7 +929,7 @@ mod tests {
     fn evaluate_single_rule(
         rule: PolicyRulePlan,
         peer: &str,
-        method: &Method,
+        method: &HttpMethod,
         headers: &HeaderMap,
     ) -> PolicyOutcome {
         snapshot(CompiledDefaultDecision::Deny, vec![rule])
@@ -977,7 +978,7 @@ mod tests {
         let result = snapshot.evaluate(
             &canonicalize_http_url("https://example.com/path").unwrap(),
             "198.51.100.4".parse().unwrap(),
-            &Method::GET,
+            &HttpMethod::new("GET").unwrap(),
             &headers,
             |_| false,
         );
@@ -996,7 +997,7 @@ mod tests {
         let result = snapshot.evaluate(
             &canonicalize_http_url("https://example.com/").unwrap(),
             "::ffff:192.0.2.44".parse().unwrap(),
-            &Method::GET,
+            &HttpMethod::new("GET").unwrap(),
             &HeaderMap::new(),
             |_| false,
         );
@@ -1015,7 +1016,7 @@ mod tests {
         let result = snapshot.evaluate(
             &canonicalize_http_url("https://example.com/").unwrap(),
             "::ffff:192.0.2.44".parse().unwrap(),
-            &Method::GET,
+            &HttpMethod::new("GET").unwrap(),
             &HeaderMap::new(),
             |_| false,
         );
@@ -1038,7 +1039,12 @@ mod tests {
             ("::ffff:192.0.2.44", PolicyOutcome::Deny),
         ] {
             assert_eq!(
-                evaluate_single_rule(allow.clone(), peer, &Method::GET, &HeaderMap::new()),
+                evaluate_single_rule(
+                    allow.clone(),
+                    peer,
+                    &HttpMethod::new("GET").unwrap(),
+                    &HeaderMap::new()
+                ),
                 expected,
                 "peer {peer}"
             );
@@ -1085,7 +1091,7 @@ mod tests {
         let result = snapshot.evaluate(
             &url,
             "192.0.2.10".parse().unwrap(),
-            &Method::GET,
+            &HttpMethod::new("GET").unwrap(),
             &HeaderMap::new(),
             |name| name == inbound,
         );
@@ -1110,7 +1116,7 @@ mod tests {
             evaluate_single_rule(
                 absent_any.clone(),
                 "192.0.2.10",
-                &Method::GET,
+                &HttpMethod::new("GET").unwrap(),
                 &both_headers
             ),
             PolicyOutcome::Deny
@@ -1118,7 +1124,12 @@ mod tests {
         let mut one_absent = both_headers.clone();
         one_absent.remove(&second);
         assert_eq!(
-            evaluate_single_rule(absent_any, "192.0.2.10", &Method::GET, &one_absent),
+            evaluate_single_rule(
+                absent_any,
+                "192.0.2.10",
+                &HttpMethod::new("GET").unwrap(),
+                &one_absent
+            ),
             PolicyOutcome::Allow
         );
 
@@ -1129,11 +1140,21 @@ mod tests {
         );
         present_all.headers.present_all = vec![first.clone(), second.clone()];
         assert_eq!(
-            evaluate_single_rule(present_all.clone(), "192.0.2.10", &Method::GET, &one_absent,),
+            evaluate_single_rule(
+                present_all.clone(),
+                "192.0.2.10",
+                &HttpMethod::new("GET").unwrap(),
+                &one_absent,
+            ),
             PolicyOutcome::Deny
         );
         assert_eq!(
-            evaluate_single_rule(present_all, "192.0.2.10", &Method::GET, &both_headers),
+            evaluate_single_rule(
+                present_all,
+                "192.0.2.10",
+                &HttpMethod::new("GET").unwrap(),
+                &both_headers
+            ),
             PolicyOutcome::Allow
         );
 
@@ -1144,11 +1165,21 @@ mod tests {
         let mut all = rule("all", CompiledRuleDecision::Allow, "https://example.com/**");
         all.headers.all.push(value_predicate.clone());
         assert_eq!(
-            evaluate_single_rule(all.clone(), "192.0.2.10", &Method::GET, &HeaderMap::new()),
+            evaluate_single_rule(
+                all.clone(),
+                "192.0.2.10",
+                &HttpMethod::new("GET").unwrap(),
+                &HeaderMap::new()
+            ),
             PolicyOutcome::Deny
         );
         assert_eq!(
-            evaluate_single_rule(all, "192.0.2.10", &Method::GET, &both_headers),
+            evaluate_single_rule(
+                all,
+                "192.0.2.10",
+                &HttpMethod::new("GET").unwrap(),
+                &both_headers
+            ),
             PolicyOutcome::Allow
         );
 
@@ -1159,11 +1190,21 @@ mod tests {
         );
         none.headers.none.push(value_predicate);
         assert_eq!(
-            evaluate_single_rule(none.clone(), "192.0.2.10", &Method::GET, &both_headers),
+            evaluate_single_rule(
+                none.clone(),
+                "192.0.2.10",
+                &HttpMethod::new("GET").unwrap(),
+                &both_headers
+            ),
             PolicyOutcome::Deny
         );
         assert_eq!(
-            evaluate_single_rule(none, "192.0.2.10", &Method::GET, &HeaderMap::new()),
+            evaluate_single_rule(
+                none,
+                "192.0.2.10",
+                &HttpMethod::new("GET").unwrap(),
+                &HeaderMap::new()
+            ),
             PolicyOutcome::Allow
         );
 
@@ -1178,25 +1219,17 @@ mod tests {
             evaluate_single_rule(
                 method_and_header.clone(),
                 "192.0.2.10",
-                &Method::GET,
+                &HttpMethod::new("GET").unwrap(),
                 &both_headers,
             ),
             PolicyOutcome::Allow
         );
+        assert!(HttpMethod::new("get").is_err());
         assert_eq!(
             evaluate_single_rule(
                 method_and_header.clone(),
                 "192.0.2.10",
-                &Method::from_bytes(b"get").unwrap(),
-                &both_headers,
-            ),
-            PolicyOutcome::Allow
-        );
-        assert_eq!(
-            evaluate_single_rule(
-                method_and_header.clone(),
-                "192.0.2.10",
-                &Method::POST,
+                &HttpMethod::new("POST").unwrap(),
                 &both_headers,
             ),
             PolicyOutcome::Deny
@@ -1205,7 +1238,7 @@ mod tests {
             evaluate_single_rule(
                 method_and_header,
                 "192.0.2.10",
-                &Method::GET,
+                &HttpMethod::new("GET").unwrap(),
                 &HeaderMap::new(),
             ),
             PolicyOutcome::Deny
@@ -1230,7 +1263,7 @@ mod tests {
         let first = snapshot.evaluate(
             &url,
             "192.0.2.10".parse().unwrap(),
-            &Method::GET,
+            &HttpMethod::new("GET").unwrap(),
             &HeaderMap::new(),
             |_| false,
         );
@@ -1240,7 +1273,7 @@ mod tests {
         let resumed = matched.resume_cursor().resume(
             &url,
             "192.0.2.10".parse().unwrap(),
-            &Method::GET,
+            &HttpMethod::new("GET").unwrap(),
             &HeaderMap::new(),
             |_| false,
         );
@@ -1249,7 +1282,7 @@ mod tests {
         let default = resumed.matched.unwrap().resume_cursor().resume(
             &url,
             "192.0.2.10".parse().unwrap(),
-            &Method::GET,
+            &HttpMethod::new("GET").unwrap(),
             &HeaderMap::new(),
             |_| false,
         );
@@ -1306,7 +1339,7 @@ mod tests {
         let first = active.evaluate(
             &url,
             "192.0.2.10".parse().unwrap(),
-            &Method::GET,
+            &HttpMethod::new("GET").unwrap(),
             &HeaderMap::new(),
             |_| false,
         );
@@ -1319,7 +1352,7 @@ mod tests {
         let resumed = first.matched.unwrap().resume_cursor().resume(
             &url,
             "192.0.2.10".parse().unwrap(),
-            &Method::GET,
+            &HttpMethod::new("GET").unwrap(),
             &HeaderMap::new(),
             |_| false,
         );
@@ -1378,7 +1411,7 @@ mod tests {
         let first = active.evaluate(
             &url,
             "192.0.2.10".parse().unwrap(),
-            &Method::GET,
+            &HttpMethod::new("GET").unwrap(),
             &HeaderMap::new(),
             |_| false,
         );
@@ -1401,7 +1434,7 @@ mod tests {
         let resumed = first.matched.unwrap().resume_cursor().resume(
             &url,
             "192.0.2.10".parse().unwrap(),
-            &Method::GET,
+            &HttpMethod::new("GET").unwrap(),
             &HeaderMap::new(),
             |_| false,
         );
@@ -1455,7 +1488,7 @@ mod tests {
             .evaluate(
                 &url,
                 "192.0.2.10".parse().unwrap(),
-                &Method::GET,
+                &HttpMethod::new("GET").unwrap(),
                 &HeaderMap::new(),
                 |_| false,
             )
@@ -1476,7 +1509,7 @@ mod tests {
                 .evaluate(
                     &url,
                     "192.0.2.10".parse().unwrap(),
-                    &Method::GET,
+                    &HttpMethod::new("GET").unwrap(),
                     &HeaderMap::new(),
                     |_| false,
                 )
@@ -1487,7 +1520,7 @@ mod tests {
         let resumed = old_continuation.resume(
             &url,
             "192.0.2.10".parse().unwrap(),
-            &Method::GET,
+            &HttpMethod::new("GET").unwrap(),
             &HeaderMap::new(),
             |_| false,
         );

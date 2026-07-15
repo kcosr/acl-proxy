@@ -715,11 +715,11 @@ redaction_profile = "environment"
 
         assert_eq!(activated.bindings.provider_count, 0);
         assert_eq!(activated.bindings.redaction_profile_count, 1);
-        let url = crate::url::canonicalize_http_url("https://example.test/resource").unwrap();
+        let url = http_access_url::canonicalize_http_url("https://example.test/resource").unwrap();
         let policy = activated.policy.evaluate(
             &url,
             "192.0.2.10".parse().unwrap(),
-            &http::Method::GET,
+            &http_access_types::HttpMethod::new("GET").unwrap(),
             &http::HeaderMap::new(),
             &|_| false,
         );

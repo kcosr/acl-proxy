@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use http::header::{HeaderValue, HOST};
 use http::{Method, Request, Response, StatusCode, Version};
+use http_access_types::{CanonicalUrl, HttpScheme};
 use hyper::body::{Bytes, HttpBody, SizeHint};
 use hyper::client::conn;
 use hyper::Body;
@@ -23,7 +24,6 @@ use crate::egress::{
     ParentTransport,
 };
 use crate::runtime::{EgressSnapshot, GenerationRetention};
-use crate::url::CanonicalUrl;
 
 use super::headers::{
     prepare_downstream_upgrade_response, prepare_origin_request, prepare_origin_upgrade_request,
@@ -555,7 +555,7 @@ pub(crate) fn preflight_forwarding_target(
         },
     };
     Ok(PreparedForwardingTarget {
-        canonical_url: canonical.url.clone(),
+        canonical_url: canonical.as_str().to_owned(),
         ingress_protocol,
         origin_protocol,
         egress_identity,
@@ -638,7 +638,7 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let selected_origin_protocol = egress.origin_tls().select_protocol(request.protocol());
-    if target.canonical_url != canonical.url
+    if target.canonical_url != canonical.as_str()
         || target.ingress_protocol != request.protocol()
         || target.origin_protocol != selected_origin_protocol
         || target.egress_identity != egress.route() as *const EgressRoute as usize
@@ -730,7 +730,7 @@ where
     if selected_origin_protocol.is_http2() {
         return Err(ForwardError::UpgradeRequiresHttp1);
     }
-    if target.canonical_url != canonical.url
+    if target.canonical_url != canonical.as_str()
         || target.ingress_protocol != request.protocol()
         || target.origin_protocol != selected_origin_protocol
         || target.egress_identity != egress.route() as *const EgressRoute as usize
@@ -776,7 +776,7 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    if canonical.scheme == "https" {
+    if canonical.scheme() == HttpScheme::Https {
         let stream = connect_origin_tls(stream, canonical, egress, OriginProtocol::Http1).await?;
         let request = prepare_origin_upgrade_request(
             request,
@@ -810,7 +810,7 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    if canonical.scheme == "https" {
+    if canonical.scheme() == HttpScheme::Https {
         match parent.transport() {
             ParentTransport::Http => {
                 let tunnel = connect_parent_tunnel(stream, canonical).await?;
@@ -868,7 +868,7 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    if canonical.scheme == "https" {
+    if canonical.scheme() == HttpScheme::Https {
         let stream = connect_origin_tls(stream, canonical, egress, protocol).await?;
         let request =
             prepare_origin_request(request, canonical, RequestTargetForm::Origin, protocol)?;
@@ -894,7 +894,7 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    if canonical.scheme == "https" {
+    if canonical.scheme() == HttpScheme::Https {
         // CONNECT is deliberately HTTP/1.1 and contains no logical-origin
         // headers. The selected origin protocol applies inside the tunnel.
         match parent.transport() {
@@ -944,8 +944,8 @@ async fn connect_origin_tls<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let name =
-        ServerName::try_from(canonical.host.as_str()).map_err(|_| ForwardError::TlsServerName)?;
+    let name = ServerName::try_from(canonical.authority().host().as_str())
+        .map_err(|_| ForwardError::TlsServerName)?;
     let connector = TlsConnector::from(egress.origin_tls().client_config(protocol)?);
     let stream = connector
         .connect(name, stream)
@@ -982,11 +982,11 @@ async fn connect_parent_tunnel<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let authority = format!("{}:{}", canonical.host_for_capture, canonical.port);
+    let authority = canonical.authority().connect_authority();
     let uri: http::Uri = authority
         .parse()
         .map_err(|_| HeaderPreparationError::Target)?;
-    let host = HeaderValue::from_str(&authority).map_err(|_| HeaderPreparationError::Authority)?;
+    let host = HeaderValue::from_str(authority).map_err(|_| HeaderPreparationError::Authority)?;
     let request = Request::builder()
         .method(Method::CONNECT)
         .version(Version::HTTP_11)
@@ -1202,7 +1202,7 @@ mod tests {
     use crate::egress::EgressSnapshot as ProductEgressSnapshot;
     use crate::runtime::CredentialSourceRegistry;
     use crate::safety::{GuardedBody, WireBodyPool, WireBodyQuotaKey};
-    use crate::url::canonicalize_http_url;
+    use http_access_url::canonicalize_http_url;
 
     const CANDIDATE: &str = "192.0.2.20:8443";
 
@@ -1677,7 +1677,7 @@ mod tests {
             TranslationRoute::HttpParentClearOrigin | TranslationRoute::HttpsParentClearOrigin
         );
         let expected_uri = if expected_origin.is_http2() || ordinary_parent {
-            canonical.url.as_str()
+            canonical.as_str()
         } else {
             "/translate?q=1"
         };
@@ -1688,7 +1688,7 @@ mod tests {
                 assert_eq!(headers[TE], "trailers", "{route:?}");
             }
         } else {
-            assert_eq!(headers[HOST], canonical.authority, "{route:?}");
+            assert_eq!(headers[HOST], canonical.authority().as_str(), "{route:?}");
             assert!(!headers.contains_key(TE), "{route:?}");
         }
         assert_eq!(headers["authorization"], "Bearer origin-secret");
@@ -2283,7 +2283,7 @@ mod tests {
                 .unwrap();
         finish_response(response).await;
         let (uri, headers, body) = captured_rx.await.unwrap();
-        assert_eq!(uri, canonical.url);
+        assert_eq!(uri, canonical.as_str());
         assert!(!headers.contains_key(HOST));
         assert_eq!(headers["authorization"], "Bearer origin-secret");
         assert_eq!(body, b"request-body");
@@ -2494,8 +2494,8 @@ mod tests {
                 .unwrap();
         finish_response(response).await;
         let (uri, headers, _) = captured_rx.await.unwrap();
-        assert_eq!(uri, canonical.url);
-        assert_eq!(headers[HOST], canonical.authority);
+        assert_eq!(uri, canonical.as_str());
+        assert_eq!(headers[HOST], canonical.authority().as_str());
         assert_eq!(headers["authorization"], "Bearer origin-secret");
         assert!(!headers.contains_key("proxy-authorization"));
         server.await.unwrap();
@@ -2524,8 +2524,8 @@ mod tests {
                 .unwrap();
         finish_response(response).await;
         let (uri, headers, _) = captured_rx.await.unwrap();
-        assert_eq!(uri, canonical.url);
-        assert_eq!(headers[HOST], canonical.authority);
+        assert_eq!(uri, canonical.as_str());
+        assert_eq!(headers[HOST], canonical.authority().as_str());
         server.await.unwrap();
     }
 

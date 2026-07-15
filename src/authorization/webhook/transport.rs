@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::io;
 
+use http_access_types::CanonicalUrl;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::watch;
 use tokio_rustls::TlsConnector;
@@ -14,7 +15,6 @@ use super::wire::{encode_request_head, WebhookRequestHeadError};
 use crate::destination::{DestinationGuard, DestinationGuardError, DestinationTarget};
 use crate::http1::store::ParserStoreError;
 use crate::safety::GuardedBody;
-use crate::url::CanonicalUrl;
 
 pub(crate) async fn connect_and_deliver<C>(
     destination_guard: &DestinationGuard,
@@ -392,7 +392,7 @@ mod tests {
         ResolveFuture,
     };
     use crate::safety::{HttpWireBodyGuard, WireBodyPool, WireBodyQuotaKey};
-    use crate::url::canonicalize_http_url;
+    use http_access_url::canonicalize_http_url;
 
     fn guard() -> HttpWireBodyGuard {
         WireBodyPool::new(1024 * 1024, 1024 * 1024).begin_for_test(

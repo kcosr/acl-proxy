@@ -20,7 +20,8 @@ use crate::runtime::CredentialSourceRegistry;
 use crate::tls::{
     build_client_config, load_client_trust, ClientAlpn, ClientTrust, TlsActivationError,
 };
-use crate::url::{canonicalize_http_authority, canonicalize_tls_server_name, CanonicalAuthority};
+use http_access_types::{CanonicalAuthority, HttpScheme};
+use http_access_url::{canonicalize_http_authority, canonicalize_tls_server_name};
 
 /// Generation-owned outbound transport policy and material.
 ///
@@ -217,10 +218,16 @@ impl ParentEndpoint {
         let uri = url
             .parse::<Uri>()
             .map_err(|_| EgressActivationError::ParentUrl)?;
-        let scheme = uri.scheme_str().ok_or(EgressActivationError::ParentUrl)?;
+        let scheme = match uri.scheme_str() {
+            Some("http") => HttpScheme::Http,
+            Some("https") => HttpScheme::Https,
+            _ => return Err(EgressActivationError::ParentUrl),
+        };
         let transport = match (scheme, tls) {
-            ("http", None) => ParentTransport::Http,
-            ("https", Some(tls)) => ParentTransport::Https(ParentTls::activate(tls, is_cancelled)?),
+            (HttpScheme::Http, None) => ParentTransport::Http,
+            (HttpScheme::Https, Some(tls)) => {
+                ParentTransport::Https(ParentTls::activate(tls, is_cancelled)?)
+            }
             _ => return Err(EgressActivationError::Route),
         };
         let authority = canonicalize_http_authority(
@@ -230,7 +237,7 @@ impl ParentEndpoint {
                 .as_str(),
         )
         .map_err(|_| EgressActivationError::ParentUrl)?;
-        if authority.host != host || authority.port != port {
+        if authority.host().as_str() != host || authority.effective_port() != port {
             return Err(EgressActivationError::Route);
         }
         Ok(Self {
@@ -260,12 +267,12 @@ impl ParentEndpoint {
 
     #[cfg(test)]
     pub(crate) fn host(&self) -> &str {
-        &self.authority.host
+        self.authority.host().as_str()
     }
 
     #[cfg(test)]
     pub(crate) fn port(&self) -> u16 {
-        self.authority.port
+        self.authority.effective_port()
     }
 
     pub(crate) fn authority(&self) -> &CanonicalAuthority {
@@ -298,7 +305,7 @@ impl ParentTls {
             .map_err(|_| EgressActivationError::ParentServerName)?;
         ServerName::try_from(server_name.as_str())
             .map_err(|_| EgressActivationError::ParentServerName)?;
-        let enable_sni = server_name.parse::<IpAddr>().is_err();
+        let enable_sni = server_name.as_str().parse::<IpAddr>().is_err();
         let loaded_trust = load(plan.trust, plan.ca_certificate.as_deref())?;
         warn_if_insecure("parent", plan.trust);
         let http1_config = Arc::new(build_client_config(
@@ -314,7 +321,7 @@ impl ParentTls {
         Ok(Self {
             #[cfg(test)]
             trust: plan.trust,
-            server_name,
+            server_name: server_name.into(),
             http1_config,
             http2_config,
         })
