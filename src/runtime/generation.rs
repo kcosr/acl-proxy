@@ -158,9 +158,16 @@ pub(crate) trait PolicySnapshot: Send + Sync {
         headers: &HeaderMap,
         extra_presence: &dyn Fn(&http::HeaderName) -> bool,
     ) -> crate::policy::PolicyEvaluation<'snapshot>;
+
+    fn resolve_prepared<'snapshot>(
+        &'snapshot self,
+        prepared: crate::policy::PreparedPolicyEvaluation,
+    ) -> Option<crate::policy::PolicyEvaluation<'snapshot>>;
 }
 
 pub(crate) trait EgressSnapshot: Send + Sync {
+    fn identity(&self) -> &Arc<()>;
+
     fn route(&self) -> &crate::egress::EgressRoute;
 
     fn origin_tls(&self) -> &crate::egress::OriginTls;
@@ -180,13 +187,10 @@ pub(crate) trait CredentialResolver: Send + Sync {
         headers: &mut HeaderMap,
     ) -> Result<(), crate::credentials::CredentialError>;
 
-    fn extract_inbound<'resolver>(
-        &'resolver self,
+    fn extract_inbound(
+        &self,
         headers: &mut HeaderMap,
-    ) -> Result<
-        crate::credentials::InboundCredentials<'resolver>,
-        crate::credentials::CredentialError,
-    >;
+    ) -> Result<crate::credentials::InboundCredentials, crate::credentials::CredentialError>;
 }
 
 pub(crate) trait RedactionSnapshot: Send + Sync {

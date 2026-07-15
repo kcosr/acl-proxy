@@ -159,11 +159,50 @@ pub(crate) struct PolicyEvaluation<'snapshot> {
     wire_body_plan: HttpWireBodyPlanIndex,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PreparedPolicyEvaluation {
+    outcome: PolicyOutcome,
+    matched_index: Option<usize>,
+    body_read_plan: HttpBodyReadPlan,
+    wire_body_plan: HttpWireBodyPlanIndex,
+}
+
 impl PolicyEvaluation<'_> {
     pub(crate) fn body_read_plan(&self) -> HttpBodyReadPlan {
         self.body_read_plan
     }
 
+    pub(crate) fn wire_body_plan(&self) -> HttpWireBodyPlanIndex {
+        self.wire_body_plan
+    }
+
+    pub(crate) fn into_prepared(self) -> PreparedPolicyEvaluation {
+        PreparedPolicyEvaluation {
+            outcome: self.outcome,
+            matched_index: self.matched.as_ref().map(PolicyRuleMatch::index),
+            body_read_plan: self.body_read_plan,
+            wire_body_plan: self.wire_body_plan,
+        }
+    }
+}
+
+impl PreparedPolicyEvaluation {
+    #[cfg(test)]
+    pub(crate) fn outcome(&self) -> PolicyOutcome {
+        self.outcome
+    }
+
+    #[cfg(test)]
+    pub(crate) fn matched_index(&self) -> Option<usize> {
+        self.matched_index
+    }
+
+    #[cfg(test)]
+    pub(crate) fn body_read_plan(&self) -> HttpBodyReadPlan {
+        self.body_read_plan
+    }
+
+    #[cfg(test)]
     pub(crate) fn wire_body_plan(&self) -> HttpWireBodyPlanIndex {
         self.wire_body_plan
     }
@@ -276,6 +315,49 @@ impl CompiledPolicySnapshot {
         ExtraPresence: Fn(&HeaderName) -> bool,
     {
         self.evaluate_at(0, url, peer_ip, method, headers, extra_presence)
+    }
+
+    pub(crate) fn resolve_prepared(
+        &self,
+        prepared: PreparedPolicyEvaluation,
+    ) -> Option<PolicyEvaluation<'_>> {
+        let cursor = prepared.matched_index.unwrap_or(self.rules.len());
+        if prepared.wire_body_plan != HttpWireBodyPlanIndex::new(self.wire_body_plan_brand, cursor)
+            || self.http_body_read_plans_by_cursor.get(cursor).copied()
+                != Some(prepared.body_read_plan)
+        {
+            return None;
+        }
+
+        let matched = match prepared.matched_index {
+            Some(index) => {
+                let rule = self.rules.get(index)?;
+                if outcome(rule.decision) != prepared.outcome {
+                    return None;
+                }
+                Some(PolicyRuleMatch {
+                    snapshot: self,
+                    index,
+                    rule,
+                })
+            }
+            None => {
+                let default = match self.default {
+                    CompiledDefaultDecision::Allow => PolicyOutcome::Allow,
+                    CompiledDefaultDecision::Deny => PolicyOutcome::Deny,
+                };
+                if prepared.outcome != default {
+                    return None;
+                }
+                None
+            }
+        };
+        Some(PolicyEvaluation {
+            outcome: prepared.outcome,
+            matched,
+            body_read_plan: prepared.body_read_plan,
+            wire_body_plan: prepared.wire_body_plan,
+        })
     }
 
     fn evaluate_at<'snapshot, ExtraPresence>(
@@ -391,6 +473,13 @@ impl crate::runtime::PolicySnapshot for CompiledPolicySnapshot {
         extra_presence: &dyn Fn(&HeaderName) -> bool,
     ) -> PolicyEvaluation<'snapshot> {
         CompiledPolicySnapshot::evaluate(self, url, peer_ip, method, headers, extra_presence)
+    }
+
+    fn resolve_prepared<'snapshot>(
+        &'snapshot self,
+        prepared: PreparedPolicyEvaluation,
+    ) -> Option<PolicyEvaluation<'snapshot>> {
+        CompiledPolicySnapshot::resolve_prepared(self, prepared)
     }
 }
 
@@ -1285,6 +1374,40 @@ mod tests {
         );
         assert_eq!(default.outcome, PolicyOutcome::Deny);
         assert!(default.matched.is_none());
+    }
+
+    #[test]
+    fn prepared_evaluation_rebinds_only_to_its_exact_snapshot_cursor() {
+        let matched_rule = rule(
+            "prepared",
+            CompiledRuleDecision::Allow,
+            "https://example.com/**",
+        );
+        let active = snapshot(CompiledDefaultDecision::Deny, vec![matched_rule.clone()]);
+        let foreign = snapshot(CompiledDefaultDecision::Deny, vec![matched_rule]);
+        let prepared =
+            evaluate(&active, "https://example.com/path", &HeaderMap::new()).into_prepared();
+        let foreign_attempt =
+            evaluate(&active, "https://example.com/path", &HeaderMap::new()).into_prepared();
+
+        assert_eq!(prepared.outcome(), PolicyOutcome::Allow);
+        assert_eq!(prepared.matched_index(), Some(0));
+        assert_eq!(
+            prepared.body_read_plan(),
+            active.http_body_read_plans_by_cursor[0]
+        );
+        assert_eq!(
+            prepared
+                .wire_body_plan()
+                .resolve(active.wire_body_plan_brand, &[11, 0]),
+            Some(11)
+        );
+        let active_snapshot: &dyn crate::runtime::PolicySnapshot = &active;
+        let rebound = active_snapshot.resolve_prepared(prepared).unwrap();
+        assert_eq!(rebound.outcome, PolicyOutcome::Allow);
+        assert_eq!(rebound.matched.unwrap().id(), "prepared");
+        let foreign_snapshot: &dyn crate::runtime::PolicySnapshot = &foreign;
+        assert!(foreign_snapshot.resolve_prepared(foreign_attempt).is_none());
     }
 
     #[test]

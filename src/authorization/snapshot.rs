@@ -91,6 +91,26 @@ pub(crate) enum AuthorizationDispatchError {
     Webhook(#[source] WebhookDispatchError),
 }
 
+impl AuthorizationDispatchError {
+    pub(crate) fn is_timeout(&self) -> bool {
+        use crate::authorization::callback::PendingTerminalCause;
+
+        match self {
+            Self::Process(ProcessRequestError::Timeout) => true,
+            Self::Webhook(WebhookDispatchError::Terminal(cause))
+            | Self::Webhook(WebhookDispatchError::Callback(
+                super::webhook::runtime::WebhookCompletionError::Terminal(cause),
+            )) => matches!(
+                cause,
+                PendingTerminalCause::RequestDeadline
+                    | PendingTerminalCause::ProviderDeadline
+                    | PendingTerminalCause::ResumeTokenDeadline
+            ),
+            Self::UnknownProvider | Self::Process(_) | Self::Webhook(_) => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum AuthorizationActivationError {
     #[error("authorization activation was cancelled")]

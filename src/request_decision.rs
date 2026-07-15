@@ -24,19 +24,19 @@ use crate::upgrade::UpgradeAllocation;
 
 /// Strict request head. Body-bearing ingress prepares this first, then decodes
 /// only through the selected guard before completing the decision.
-pub(crate) struct RequestInput<'generation, 'request> {
+pub(crate) struct RequestInput<'request> {
     pub(crate) request_id: &'request str,
     pub(crate) facts: InterceptedRequestFacts,
     pub(crate) peer_ip: IpAddr,
     pub(crate) quota_key: WireBodyQuotaKey,
     pub(crate) started_at: Instant,
-    inbound: InboundCredentials<'generation>,
+    inbound: InboundCredentials,
     internal_context: HeaderMap,
 }
 
-impl<'generation, 'request> RequestInput<'generation, 'request> {
+impl<'request> RequestInput<'request> {
     pub(crate) fn from_validated_shape(
-        lease: &'generation GenerationLease,
+        lease: &GenerationLease,
         request_id: &'request str,
         shape: ValidatedRequestFactShape,
         sanitized_headers: &mut HeaderMap,
@@ -195,7 +195,7 @@ impl DeniedRequest<'_> {
 #[cfg(test)]
 pub(crate) async fn decide_request<'generation>(
     lease: &'generation GenerationLease,
-    input: RequestInput<'generation, '_>,
+    input: RequestInput<'_>,
 ) -> Result<RequestDecision<'generation>, RequestDecisionError> {
     prepare_request(lease, input)?.decide(None).await
 }
@@ -211,7 +211,7 @@ pub(crate) struct PreparedRequest<'generation, 'request> {
     lease: &'generation GenerationLease,
     identity: RequestIdentity<'request>,
     headers: HeaderMap,
-    inbound: InboundCredentials<'generation>,
+    inbound: InboundCredentials,
     internal_context: HeaderMap,
     evaluation: PolicyEvaluation<'generation>,
     guard: HttpWireBodyGuard,
@@ -301,7 +301,7 @@ impl<'generation, 'request> PreparedRequest<'generation, 'request> {
 
 pub(crate) fn prepare_request<'generation, 'request>(
     lease: &'generation GenerationLease,
-    input: RequestInput<'generation, 'request>,
+    input: RequestInput<'request>,
 ) -> Result<PreparedRequest<'generation, 'request>, RequestDecisionError> {
     let headers = product_headers(input.facts.headers())?;
 
@@ -372,7 +372,7 @@ struct RequestIdentity<'request> {
 struct DecisionState<'generation, 'request> {
     identity: RequestIdentity<'request>,
     headers: HeaderMap,
-    inbound: InboundCredentials<'generation>,
+    inbound: InboundCredentials,
     internal_context: HeaderMap,
     evaluation: PolicyEvaluation<'generation>,
     guard: HttpWireBodyGuard,
@@ -942,7 +942,7 @@ fn provider_header_values(
     include_headers: &[HeaderName],
     request_headers: &HeaderMap,
     internal_context: &HeaderMap,
-    inbound: &InboundCredentials<'_>,
+    inbound: &InboundCredentials,
     provider: ProviderIndex,
 ) -> Result<Vec<(HeaderName, Vec<HeaderValue>)>, RequestDecisionError> {
     let mut selected = HeaderMap::new();
@@ -1091,12 +1091,12 @@ header = "x-test-loop"
         (runtime, source, generation, pool)
     }
 
-    fn input<'generation, 'request>(
-        lease: &'generation GenerationLease,
+    fn input<'request>(
+        lease: &GenerationLease,
         request_id: &'request str,
         url: &CanonicalUrl,
         mut headers: HeaderMap,
-    ) -> RequestInput<'generation, 'request> {
+    ) -> RequestInput<'request> {
         let peer_ip = "192.0.2.10".parse().unwrap();
         let shape = crate::proxy::facts::validate_request_fact_shape(
             IngressMode::ExplicitHttps,
@@ -1120,12 +1120,12 @@ header = "x-test-loop"
         .unwrap()
     }
 
-    fn upgrade_input<'generation, 'request>(
-        lease: &'generation GenerationLease,
+    fn upgrade_input<'request>(
+        lease: &GenerationLease,
         request_id: &'request str,
         url: &CanonicalUrl,
         headers: HeaderMap,
-    ) -> RequestInput<'generation, 'request> {
+    ) -> RequestInput<'request> {
         let mut input = input(lease, request_id, url, headers);
         input.facts = InterceptedRequestFacts::new(
             input.facts.ingress_mode(),

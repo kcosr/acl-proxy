@@ -2294,6 +2294,17 @@ async fn execute_request(
             return capture.deny_metadata_only(StatusCode::FORBIDDEN, "destination denied\n", true)
         }
     };
+    let prepared_target = match prepared_target.bind_for_request(
+        target.url(),
+        sanitized.protocol(),
+        lease.egress(),
+        assets.destination_guard(),
+    ) {
+        Ok(target) => target,
+        Err(_) => {
+            return capture.deny_metadata_only(StatusCode::FORBIDDEN, "destination denied\n", true)
+        }
+    };
 
     let upgrade_protocol = sanitized
         .upgrade_intent()

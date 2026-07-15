@@ -69,8 +69,20 @@ impl PolicySnapshot for EmptySnapshot {
     ) -> crate::policy::PolicyEvaluation<'snapshot> {
         panic!("empty test policy cannot evaluate requests")
     }
+
+    fn resolve_prepared<'snapshot>(
+        &'snapshot self,
+        _prepared: crate::policy::PreparedPolicyEvaluation,
+    ) -> Option<crate::policy::PolicyEvaluation<'snapshot>> {
+        panic!("empty test policy cannot resolve prepared evaluations")
+    }
 }
 impl EgressSnapshot for EmptySnapshot {
+    fn identity(&self) -> &Arc<()> {
+        static IDENTITY: std::sync::OnceLock<Arc<()>> = std::sync::OnceLock::new();
+        IDENTITY.get_or_init(|| Arc::new(()))
+    }
+
     fn route(&self) -> &crate::egress::EgressRoute {
         panic!("empty test egress has no route")
     }
@@ -160,13 +172,10 @@ impl CredentialResolver for EmptySnapshot {
         Ok(())
     }
 
-    fn extract_inbound<'resolver>(
-        &'resolver self,
+    fn extract_inbound(
+        &self,
         _headers: &mut http::HeaderMap,
-    ) -> Result<
-        crate::credentials::InboundCredentials<'resolver>,
-        crate::credentials::CredentialError,
-    > {
+    ) -> Result<crate::credentials::InboundCredentials, crate::credentials::CredentialError> {
         panic!("empty test credentials cannot extract inbound values")
     }
 }

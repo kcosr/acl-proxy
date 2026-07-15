@@ -576,6 +576,12 @@ pub(crate) struct PreparedDestination {
     target: DestinationTarget,
 }
 
+impl PreparedDestination {
+    pub(crate) fn belongs_to(&self, guard: &DestinationGuard) -> bool {
+        Arc::ptr_eq(&self.brand, &guard.brand)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ResolvedDestination {
     brand: Arc<()>,

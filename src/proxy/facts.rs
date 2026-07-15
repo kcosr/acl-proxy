@@ -2,14 +2,19 @@ use http::header::{
     HeaderMap, HeaderName as ProductHeaderName, HeaderValue as ProductHeaderValue, CONTENT_LENGTH,
     TRANSFER_ENCODING,
 };
-use http::{Method, Version};
+use http::{Method, Request, Version};
 use http_access_types::{
     BodyFraming, BodyMetadata, CanonicalUrl, HeaderField, HeaderName, HeaderValue, HttpMethod,
     HttpVersion, IngressMode, InterceptedRequestFacts, UpgradeIntent as NeutralUpgradeIntent,
     UpgradeProtocol, ValueError,
 };
 
-use crate::proxy::headers::UpgradeIntent as ProductUpgradeIntent;
+use hyper::Body;
+
+use crate::proxy::headers::{
+    sanitize_untrusted_ingress_request, HeaderPreparationError, SanitizedIngressRequest,
+    UpgradeIntent as ProductUpgradeIntent,
+};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum FactsError {
@@ -45,6 +50,58 @@ pub(crate) struct ValidatedRequestFactShape {
     url: CanonicalUrl,
     body: BodyMetadata,
     upgrade: Option<NeutralUpgradeIntent>,
+}
+
+/// One fact shape and transport owner derived atomically from the same ingress
+/// request before product credential extraction.
+pub(crate) struct ValidatedStandaloneIngress {
+    shape: ValidatedRequestFactShape,
+    ingress: SanitizedIngressRequest,
+}
+
+impl ValidatedStandaloneIngress {
+    #[allow(
+        dead_code,
+        reason = "P06 C03 preflights this owner only in focused tests before C04 listener cutover"
+    )]
+    pub(crate) fn ingress(&self) -> &SanitizedIngressRequest {
+        &self.ingress
+    }
+
+    pub(crate) fn into_parts(self) -> (ValidatedRequestFactShape, SanitizedIngressRequest) {
+        (self.shape, self.ingress)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ValidatedStandaloneIngressError {
+    #[error("request framing or facts are invalid")]
+    Facts(#[from] FactsError),
+    #[error("request headers are invalid")]
+    Headers(#[from] HeaderPreparationError),
+}
+
+#[allow(
+    dead_code,
+    reason = "P06 C03 lands the atomic ingress validator before the mandatory C04 listener cutover"
+)]
+pub(crate) fn validate_standalone_ingress_request(
+    ingress_mode: IngressMode,
+    canonical: CanonicalUrl,
+    request: Request<Body>,
+) -> Result<ValidatedStandaloneIngress, ValidatedStandaloneIngressError> {
+    let framing = body_metadata(request.version(), request.headers())?;
+    let ingress = sanitize_untrusted_ingress_request(request)?;
+    let shape = validate_request_fact_shape(
+        ingress_mode,
+        ingress.version(),
+        ingress.method(),
+        canonical,
+        ingress.headers(),
+        framing,
+        ingress.upgrade_intent(),
+    )?;
+    Ok(ValidatedStandaloneIngress { shape, ingress })
 }
 
 pub(crate) fn http_version(version: Version) -> Result<HttpVersion, FactsError> {
@@ -334,6 +391,42 @@ mod tests {
             ),
             Err(FactsError::InvalidTransferEncoding)
         );
+    }
+
+    #[test]
+    fn standalone_ingress_atomically_binds_method_version_framing_and_upgrade_transport() {
+        let request = Request::builder()
+            .method(Method::POST)
+            .version(Version::HTTP_11)
+            .uri("/resource")
+            .header("host", "example.test")
+            .header("content-length", "3")
+            .header(CONNECTION, "upgrade")
+            .header(UPGRADE, "chat/1")
+            .body(Body::from("abc"))
+            .unwrap();
+        let canonical = canonicalize_http_url("http://example.test/resource").unwrap();
+
+        let validated =
+            validate_standalone_ingress_request(IngressMode::ExplicitHttp, canonical, request)
+                .unwrap();
+        let (shape, ingress) = validated.into_parts();
+        let (mut parts, _body, protocol, downstream_upgrade) = ingress.into_parts();
+        let headers = std::mem::take(&mut parts.headers);
+        let facts = shape.into_facts(&headers).unwrap();
+
+        assert_eq!(facts.method().as_str(), "POST");
+        assert_eq!(facts.version(), HttpVersion::Http11);
+        assert_eq!(facts.body().framing(), BodyFraming::ContentLength(3));
+        assert!(matches!(
+            facts.upgrade(),
+            Some(NeutralUpgradeIntent::Other(protocol)) if protocol.as_str() == "chat/1"
+        ));
+        assert_eq!(parts.method, Method::POST);
+        assert_eq!(parts.version, Version::HTTP_11);
+        assert_eq!(protocol, crate::egress::OriginProtocol::Http1);
+        assert!(parts.extensions.get::<ProductUpgradeIntent>().is_some());
+        assert!(downstream_upgrade.is_some());
     }
 
     #[test]

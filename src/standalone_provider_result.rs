@@ -11,7 +11,7 @@ use crate::authorization::protocol::{
 };
 use crate::authorization::AuthorizationAllowOutput;
 use crate::runtime::{CredentialSourceIndex, GenerationLease, ProviderIndex};
-use crate::safety::{HttpWireBodyGuard, RuntimeReplayLease};
+use crate::safety::{GuardedBody, HttpWireBodyGuard, RuntimeReplayLease};
 use crate::standalone::{
     BoundCredentialSource, ProviderCredentialTemplates, StandaloneCaptureEvent,
     StandaloneGenerationPlan, StandaloneRuleDecision,
@@ -156,6 +156,7 @@ pub(crate) fn adapt_provider_allow(
     rule_ordinal: usize,
     provider: ProviderIndex,
     output: AuthorizationAllowOutput,
+    inspected_body: Option<GuardedBody>,
     guard: HttpWireBodyGuard,
     replay_lease: RuntimeReplayLease,
     mut request: RuntimeRequest,
@@ -199,6 +200,7 @@ pub(crate) fn adapt_provider_allow(
     drop(credentials);
 
     let provider_content_type = if let Some(replacement) = replacement {
+        drop(inspected_body);
         let redaction = generation.activated().rule_redaction(rule_ordinal);
         let redaction_limit = redaction
             .map(|binding| binding.handle().limits().max_decoded_body_bytes)
@@ -236,11 +238,119 @@ pub(crate) fn adapt_provider_allow(
             .map_err(StandaloneProviderAllowError::Runtime)?;
         Some(content_type)
     } else {
+        if let Some(inspected_body) = inspected_body {
+            redact_and_rehome(
+                generation,
+                Some(rule_ordinal),
+                &guard,
+                &mut request,
+                inspected_body,
+            )?;
+        }
         None
     };
 
+    finish_allow(
+        generation,
+        Some((rule_ordinal, rule)),
+        rule.provider_provenance()
+            .ok_or(StandaloneProviderAllowError::Binding)?,
+        provider_credential_mutations,
+        staged_provider_credentials,
+        provider_content_type,
+        guard,
+        replay_lease,
+        request,
+    )
+}
+
+pub(crate) fn adapt_local_allow(
+    lease: &GenerationLease,
+    rule_ordinal: Option<usize>,
+    inspected_body: Option<GuardedBody>,
+    guard: HttpWireBodyGuard,
+    replay_lease: RuntimeReplayLease,
+    mut request: RuntimeRequest,
+) -> Result<StandaloneProviderAllow, StandaloneProviderAllowError> {
+    let generation = lease.standalone();
+    let rule = rule_ordinal
+        .map(|ordinal| {
+            generation
+                .rules()
+                .get(ordinal)
+                .filter(|rule| {
+                    rule.ordinal() as usize == ordinal
+                        && rule.decision() == StandaloneRuleDecision::Allow
+                })
+                .map(|rule| (ordinal, rule))
+                .ok_or(StandaloneProviderAllowError::Binding)
+        })
+        .transpose()?;
+    if let Some(inspected_body) = inspected_body {
+        redact_and_rehome(
+            generation,
+            rule_ordinal,
+            &guard,
+            &mut request,
+            inspected_body,
+        )?;
+    }
+    let provenance = rule
+        .map(|(_, rule)| rule.local_provenance())
+        .unwrap_or_else(|| generation.default_provenance());
+    finish_allow(
+        generation,
+        rule,
+        provenance,
+        Vec::new(),
+        None,
+        None,
+        guard,
+        replay_lease,
+        request,
+    )
+}
+
+fn redact_and_rehome(
+    generation: &StandaloneGenerationPlan,
+    rule_ordinal: Option<usize>,
+    guard: &HttpWireBodyGuard,
+    request: &mut RuntimeRequest,
+    body: GuardedBody,
+) -> Result<(), StandaloneProviderAllowError> {
+    let body = match rule_ordinal.and_then(|ordinal| generation.activated().rule_redaction(ordinal))
+    {
+        Some(binding) => {
+            binding
+                .handle()
+                .redact_guarded_decoded_http_body(guard, body)
+                .map_err(|_| StandaloneProviderAllowError::Redaction)?
+                .body
+        }
+        None => body,
+    };
+    let length = u64::try_from(body.len()).map_err(|_| StandaloneProviderAllowError::Binding)?;
+    request
+        .replace_body_fragments(length, body.segments())
+        .map_err(StandaloneProviderAllowError::Runtime)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_allow(
+    generation: &StandaloneGenerationPlan,
+    rule: Option<(usize, &crate::standalone::StandaloneRuleTemplate)>,
+    provenance: &http_access_types::DecisionProvenance,
+    provider_credential_mutations: Vec<CredentialMutation>,
+    staged_provider_credentials: Option<StagedProviderCredentialMutation>,
+    provider_content_type: Option<HeaderMutationBatch>,
+    guard: HttpWireBodyGuard,
+    replay_lease: RuntimeReplayLease,
+    request: RuntimeRequest,
+) -> Result<StandaloneProviderAllow, StandaloneProviderAllowError> {
+    let rule_template = rule.map(|(_, rule)| rule);
+
     let mut request_mutation_batches = Vec::new();
-    if let Some(batch) = rule.request_headers() {
+    if let Some(batch) = rule_template.and_then(|rule| rule.request_headers()) {
         request_mutation_batches.push(batch.clone());
     }
     if let Some(batch) = generation.global_request_headers() {
@@ -251,16 +361,21 @@ pub(crate) fn adapt_provider_allow(
     }
 
     let mut response_mutation_batches = Vec::new();
-    if let Some(batch) = rule.response_headers() {
+    if let Some(batch) = rule_template.and_then(|rule| rule.response_headers()) {
         response_mutation_batches.push(batch.clone());
     }
 
-    let credential_sources = collect_credential_sources(generation, rule_ordinal, rule)?;
-    let mut credential_mutations = rule.credentials().to_vec();
+    let credential_sources = collect_credential_sources(generation, rule)?;
+    let mut credential_mutations = rule_template
+        .map(|rule| rule.credentials().to_vec())
+        .unwrap_or_default();
     credential_mutations.extend(provider_credential_mutations);
     credential_mutations.extend_from_slice(generation.global_credentials());
 
-    let upgrade = compile_upgrade(&request, rule.allow_upgrades())?;
+    let upgrade = compile_upgrade(
+        &request,
+        rule_template.is_some_and(|rule| rule.allow_upgrades()),
+    )?;
     let request_body = match request.body_representation() {
         BodyRepresentation::CanonicalIdentity => generation.normalized_request_body(),
         BodyRepresentation::PreservedContentCoded if request.facts().upgrade().is_some() => {
@@ -310,13 +425,10 @@ pub(crate) fn adapt_provider_allow(
         response: generation.response(),
         request_mutation_batches,
         response_mutation_batches,
-        redaction: rule.redaction().cloned(),
+        redaction: rule_template.and_then(|rule| rule.redaction().cloned()),
         capture,
         upgrade,
-        provenance: rule
-            .provider_provenance()
-            .cloned()
-            .ok_or(StandaloneProviderAllowError::Binding)?,
+        provenance: provenance.clone(),
         credential_mutations,
     })
     .map_err(StandaloneProviderAllowError::Plan)?;
@@ -378,22 +490,24 @@ fn collect_provider_credential_mutations(
 
 fn collect_credential_sources(
     generation: &StandaloneGenerationPlan,
-    rule_ordinal: usize,
-    rule: &crate::standalone::StandaloneRuleTemplate,
+    rule: Option<(usize, &crate::standalone::StandaloneRuleTemplate)>,
 ) -> Result<StandaloneCredentialSourceStages, StandaloneProviderAllowError> {
-    let rule_bindings = generation
-        .activated()
-        .rule_credentials(rule_ordinal)
-        .ok_or(StandaloneProviderAllowError::Binding)?;
-    if rule_bindings.len() != rule.credentials().len()
-        || generation.activated().global_credentials().len()
-            != generation.global_credentials().len()
-    {
-        return Err(StandaloneProviderAllowError::Binding);
+    let mut rule_sources = Vec::new();
+    if let Some((rule_ordinal, rule)) = rule {
+        let rule_bindings = generation
+            .activated()
+            .rule_credentials(rule_ordinal)
+            .ok_or(StandaloneProviderAllowError::Binding)?;
+        if rule_bindings.len() != rule.credentials().len() {
+            return Err(StandaloneProviderAllowError::Binding);
+        }
+        rule_sources = Vec::with_capacity(rule_bindings.len());
+        for (binding, mutation) in rule_bindings.iter().zip(rule.credentials()) {
+            push_credential_source(&mut rule_sources, binding, mutation)?;
+        }
     }
-    let mut rule_sources = Vec::with_capacity(rule_bindings.len());
-    for (binding, mutation) in rule_bindings.iter().zip(rule.credentials()) {
-        push_credential_source(&mut rule_sources, binding, mutation)?;
+    if generation.activated().global_credentials().len() != generation.global_credentials().len() {
+        return Err(StandaloneProviderAllowError::Binding);
     }
     let mut global_sources = Vec::with_capacity(generation.activated().global_credentials().len());
     for (binding, mutation) in generation
@@ -621,10 +735,10 @@ header = "x-test-loop"
         }
     }
 
-    fn compiled() -> CompiledConfig {
+    fn compiled_text(text: &str) -> CompiledConfig {
         std::fs::create_dir_all("/tmp/p06-provider-result").unwrap();
         compile_config_text(ConfigTextInput {
-            text: CONFIG,
+            text,
             source_path: Path::new("/tmp/p06-provider-result/acl-proxy.toml"),
             config_root: Path::new("/tmp/p06-provider-result"),
         })
@@ -636,7 +750,17 @@ header = "x-test-loop"
         GenerationLease,
         Arc<crate::safety::WireBodyPool>,
     ) {
-        let initial = compiled();
+        runtime_from_config(CONFIG).await
+    }
+
+    async fn runtime_from_config(
+        text: &str,
+    ) -> (
+        Arc<Runtime>,
+        GenerationLease,
+        Arc<crate::safety::WireBodyPool>,
+    ) {
+        let initial = compiled_text(text);
         let resources = ProductStaticResources::try_new(&initial.static_config).unwrap();
         let pool = resources.wire_body_pool();
         let activator = resources.activator();
@@ -746,13 +870,18 @@ header = "x-test-loop"
     fn admission(
         lease: &GenerationLease,
     ) -> (HttpWireBodyGuard, RuntimeReplayLease, ProviderIndex) {
+        let (guard, replay) = local_admission(lease);
+        let provider = lease.standalone().activated().rule_provider(0).unwrap();
+        (guard, replay, provider)
+    }
+
+    fn local_admission(lease: &GenerationLease) -> (HttpWireBodyGuard, RuntimeReplayLease) {
         let url = http_access_url::canonicalize_http_url("https://example.test/resource").unwrap();
         let peer: IpAddr = "192.0.2.10".parse().unwrap();
         let method = HttpMethod::new("POST").unwrap();
         let evaluation = lease
             .policy()
             .evaluate(&url, peer, &method, &HeaderMap::new(), &|_| false);
-        let provider = lease.standalone().activated().rule_provider(0).unwrap();
         let admission = lease
             .safety()
             .begin_http_body(
@@ -762,7 +891,7 @@ header = "x-test-loop"
             .unwrap();
         let (guard, replay, staging) = admission.into_parts();
         drop(staging);
-        (guard, replay, provider)
+        (guard, replay)
     }
 
     fn replacement(
@@ -834,6 +963,7 @@ header = "x-test-loop"
                 0,
                 provider,
                 output(&lease, provider, true, Some(replacement)),
+                None,
                 guard,
                 replay,
                 before,
@@ -948,6 +1078,7 @@ header = "x-test-loop"
                 0,
                 provider,
                 output(&lease, provider, true, replacement),
+                None,
                 guard,
                 replay,
                 request(generation, vec![b"original".to_vec()]),
@@ -1024,6 +1155,7 @@ header = "x-test-loop"
             0,
             provider,
             output(&lease, provider, false, Some(replacement)),
+            None,
             guard,
             replay,
             request,
@@ -1050,6 +1182,91 @@ header = "x-test-loop"
     }
 
     #[tokio::test]
+    async fn provider_allow_without_replacement_rehomes_and_redacts_the_inspected_body_once() {
+        let (runtime, lease, pool) = runtime().await;
+        let generation = lease.standalone();
+        let (guard, replay, provider) = admission(&lease);
+        let mut inspected = guard.buffer();
+        inspected
+            .try_extend_from_slice(b"before secret after")
+            .unwrap();
+        let request = request(generation, vec![b"before secret after".to_vec()]);
+        let original_revision = request.revision();
+        let lineage = request.begin_provider_invocation();
+
+        let result = adapt_provider_allow(
+            &lease,
+            0,
+            provider,
+            output(&lease, provider, true, None),
+            Some(inspected.finish()),
+            guard,
+            replay,
+            request,
+        )
+        .unwrap();
+
+        assert_eq!(result.request.revision(), original_revision + 1);
+        assert_eq!(
+            result.request.body_representation(),
+            BodyRepresentation::CanonicalIdentity
+        );
+        let StandaloneProviderAllow {
+            plan,
+            request,
+            sidecar,
+        } = result;
+        let mut exchange = prepare_standalone_exchange(lineage, plan, request).unwrap();
+        assert_eq!(replay_exchange(&mut exchange), b"before [MASKED] after");
+        drop((exchange, sidecar, lease));
+        assert_eq!(pool.global_charge(), 0);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn local_allow_rehomes_and_redacts_with_local_rule_provenance() {
+        let local_config = CONFIG
+            .replace("decision = \"delegate\"", "decision = \"allow\"")
+            .replace("authorization_provider = \"approval\"\n", "");
+        let (runtime, lease, pool) = runtime_from_config(&local_config).await;
+        let generation = lease.standalone();
+        let (guard, replay) = local_admission(&lease);
+        let mut inspected = guard.buffer();
+        inspected
+            .try_extend_from_slice(b"local secret body")
+            .unwrap();
+        let request = request(generation, vec![b"local secret body".to_vec()]);
+        let original_revision = request.revision();
+        let lineage = request.begin_provider_invocation();
+
+        let result = adapt_local_allow(
+            &lease,
+            Some(0),
+            Some(inspected.finish()),
+            guard,
+            replay,
+            request,
+        )
+        .unwrap();
+
+        assert_eq!(result.request.revision(), original_revision + 1);
+        assert_eq!(
+            result.plan.forwarding_plan().provenance(),
+            generation.rules()[0].local_provenance()
+        );
+        let StandaloneProviderAllow {
+            plan,
+            request,
+            sidecar,
+        } = result;
+        let mut exchange = prepare_standalone_exchange(lineage, plan, request).unwrap();
+        assert_eq!(replay_exchange(&mut exchange), b"local [MASKED] body");
+        drop((exchange, sidecar, lease));
+        assert_eq!(pool.global_charge(), 0);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn foreign_generation_allow_outputs_fail_before_interpretation_or_staging() {
         let (primary_runtime, lease, pool) = runtime().await;
         let (foreign_runtime, foreign_lease, foreign_pool) = runtime().await;
@@ -1067,6 +1284,7 @@ header = "x-test-loop"
             0,
             provider,
             foreign_output,
+            None,
             guard,
             replay,
             request(generation, vec![b"original".to_vec()]),
@@ -1085,6 +1303,7 @@ header = "x-test-loop"
                 0,
                 provider,
                 foreign_plain_allow,
+                None,
                 guard,
                 replay,
                 request(generation, vec![b"original".to_vec()]),
@@ -1114,6 +1333,7 @@ header = "x-test-loop"
                 0,
                 provider,
                 foreign_replacement_allow,
+                None,
                 guard,
                 replay,
                 request(generation, vec![b"original".to_vec()]),
@@ -1141,6 +1361,7 @@ header = "x-test-loop"
             0,
             provider,
             output(&lease, provider, true, Some(replacement)),
+            None,
             guard,
             replay,
             request,
@@ -1178,6 +1399,7 @@ header = "x-test-loop"
             0,
             provider,
             output(&lease, provider, true, Some(replacement)),
+            None,
             guard,
             replay,
             request(generation, vec![b"original".to_vec()]),

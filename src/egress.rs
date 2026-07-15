@@ -29,6 +29,7 @@ use http_access_url::{canonicalize_http_authority, canonicalize_tls_server_name}
 /// plan. Requests receive only clients, canonical parent metadata, compiled
 /// header effects, and runtime credential indices.
 pub(crate) struct EgressSnapshot {
+    identity: Arc<()>,
     route: EgressRoute,
     origin_tls: OriginTls,
     request_headers: Box<[HeaderEffectPlan]>,
@@ -164,6 +165,7 @@ impl EgressSnapshot {
             .into_boxed_slice();
 
         Ok(Self {
+            identity: Arc::new(()),
             route,
             origin_tls,
             request_headers: request_headers.into_boxed_slice(),
@@ -206,6 +208,10 @@ impl EgressSnapshot {
 }
 
 impl crate::runtime::EgressSnapshot for EgressSnapshot {
+    fn identity(&self) -> &Arc<()> {
+        &self.identity
+    }
+
     fn route(&self) -> &EgressRoute {
         EgressSnapshot::route(self)
     }

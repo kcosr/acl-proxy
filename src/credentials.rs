@@ -4,6 +4,7 @@ use std::env;
 use std::fs::File;
 use std::io::{ErrorKind, Read};
 use std::path::Path;
+use std::sync::Arc;
 
 #[cfg(unix)]
 use std::fs::OpenOptions;
@@ -45,6 +46,8 @@ pub(crate) enum CredentialError {
     InvalidHeaderValue,
     #[error("inbound credential header is duplicated")]
     DuplicateInboundHeader,
+    #[error("credential processing capacity is exhausted")]
+    Capacity,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -117,7 +120,7 @@ struct InboundCredential {
 /// implementation because its source adapters retain secret locators.
 pub(crate) struct CredentialResolverSnapshot {
     sources: Box<[CredentialSourcePlan]>,
-    inbound: Box<[InboundCredential]>,
+    inbound: Arc<[InboundCredential]>,
 }
 
 pub(crate) struct CredentialActivation {
@@ -133,11 +136,13 @@ impl CredentialResolverSnapshot {
         let CredentialsPlan { inbound, sources } = plan;
         let source_registry = CredentialSourceRegistry::from_names(sources.keys().cloned());
         let sources = sources.into_values().collect::<Vec<_>>().into_boxed_slice();
-        let inbound = inbound
-            .into_values()
-            .map(|inbound| activate_inbound(inbound, provider_registry))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_boxed_slice();
+        let inbound = Arc::from(
+            inbound
+                .into_values()
+                .map(|inbound| activate_inbound(inbound, provider_registry))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_boxed_slice(),
+        );
         Ok(CredentialActivation {
             source_registry,
             snapshot: Self { sources, inbound },
@@ -218,10 +223,10 @@ impl CredentialResolverSnapshot {
         }
     }
 
-    pub(crate) fn extract_inbound<'resolver>(
-        &'resolver self,
+    pub(crate) fn extract_inbound(
+        &self,
         headers: &mut HeaderMap,
-    ) -> Result<InboundCredentials<'resolver>, CredentialError> {
+    ) -> Result<InboundCredentials, CredentialError> {
         InboundCredentials::extract(self, headers)
     }
 }
@@ -235,10 +240,10 @@ impl crate::runtime::CredentialResolver for CredentialResolverSnapshot {
         CredentialResolverSnapshot::inject(self, actions, headers)
     }
 
-    fn extract_inbound<'resolver>(
-        &'resolver self,
+    fn extract_inbound(
+        &self,
         headers: &mut HeaderMap,
-    ) -> Result<InboundCredentials<'resolver>, CredentialError> {
+    ) -> Result<InboundCredentials, CredentialError> {
         CredentialResolverSnapshot::extract_inbound(self, headers)
     }
 }
@@ -408,43 +413,57 @@ fn valid_header_value_bytes(bytes: &[u8]) -> bool {
 /// Request-scoped inbound values removed from the ordinary request headers.
 ///
 /// Only the process-provider copy method can materialize captured values again.
-pub(crate) struct InboundCredentials<'resolver> {
-    resolver: &'resolver CredentialResolverSnapshot,
-    captured: Box<[Option<SecretBytes>]>,
+pub(crate) struct InboundCredentials {
+    metadata: Arc<[InboundCredential]>,
+    captured: Box<[CapturedInboundCredential]>,
 }
 
-impl<'resolver> InboundCredentials<'resolver> {
+struct CapturedInboundCredential {
+    metadata_index: usize,
+    secret: SecretBytes,
+}
+
+impl InboundCredentials {
     fn extract(
-        resolver: &'resolver CredentialResolverSnapshot,
+        resolver: &CredentialResolverSnapshot,
         headers: &mut HeaderMap,
     ) -> Result<Self, CredentialError> {
-        let mut captured = Vec::with_capacity(resolver.inbound.len());
+        let mut captured = Vec::new();
         let mut duplicated = false;
         let mut invalid = None;
 
-        for inbound in &resolver.inbound {
-            let mut values: Vec<_> = headers
-                .get_all(&inbound.header)
-                .iter()
-                .map(|value| SecretBytes::new(value.as_bytes().to_vec()))
-                .collect();
+        for (metadata_index, inbound) in resolver.inbound.iter().enumerate() {
+            let mut values = headers.get_all(&inbound.header).iter();
+            let first = values.next().map(|value| value.as_bytes());
+            let duplicate = values.next().is_some();
+            let secret = if duplicate {
+                None
+            } else {
+                first.map(SecretBytes::copy_from_slice)
+            };
             headers.remove(&inbound.header);
 
-            let captured_value = match values.len() {
-                0 => None,
-                1 => match values.pop().expect("one captured value") {
-                    Ok(value) => Some(value),
-                    Err(error) => {
-                        invalid.get_or_insert(error);
-                        None
-                    }
-                },
-                _ => {
-                    duplicated = true;
-                    None
+            if duplicate {
+                duplicated = true;
+                continue;
+            }
+            let Some(secret) = secret else {
+                continue;
+            };
+            let secret = match secret {
+                Ok(secret) => secret,
+                Err(error) => {
+                    invalid.get_or_insert(error);
+                    continue;
                 }
             };
-            captured.push(captured_value);
+            captured
+                .try_reserve(1)
+                .map_err(|_| CredentialError::Capacity)?;
+            captured.push(CapturedInboundCredential {
+                metadata_index,
+                secret,
+            });
         }
 
         if duplicated {
@@ -454,17 +473,15 @@ impl<'resolver> InboundCredentials<'resolver> {
             return Err(error);
         }
         Ok(Self {
-            resolver,
+            metadata: Arc::clone(&resolver.inbound),
             captured: captured.into_boxed_slice(),
         })
     }
 
     pub(crate) fn is_present(&self, header: &HeaderName) -> bool {
-        self.resolver
-            .inbound
+        self.captured
             .iter()
-            .zip(self.captured.iter())
-            .any(|(inbound, value)| inbound.header == *header && value.is_some())
+            .any(|captured| self.metadata[captured.metadata_index].header == *header)
     }
 
     /// Replaces authorized inbound headers in a process-only dispatch map.
@@ -473,19 +490,20 @@ impl<'resolver> InboundCredentials<'resolver> {
         provider: ProviderIndex,
         destination: &mut HeaderMap,
     ) -> Result<usize, CredentialError> {
-        for inbound in &self.resolver.inbound {
+        for inbound in self.metadata.iter() {
             destination.remove(&inbound.header);
         }
 
         let mut staged = Vec::new();
-        for (inbound, secret) in self.resolver.inbound.iter().zip(self.captured.iter()) {
+        for captured in &self.captured {
+            let inbound = &self.metadata[captured.metadata_index];
             if provider_is_authorized(inbound, provider) {
-                let Some(secret) = secret else {
-                    continue;
-                };
+                staged
+                    .try_reserve(1)
+                    .map_err(|_| CredentialError::Capacity)?;
                 staged.push(ResolvedHeader::new(
                     inbound.header.clone(),
-                    SecretBytes::from_owned(secret.as_bytes().to_vec()),
+                    SecretBytes::copy_from_slice(captured.secret.as_bytes())?,
                 )?);
             }
         }
@@ -504,6 +522,15 @@ fn provider_is_authorized(inbound: &InboundCredential, provider: ProviderIndex) 
 struct SecretBytes(Vec<u8>);
 
 impl SecretBytes {
+    fn copy_from_slice(bytes: &[u8]) -> Result<Self, CredentialError> {
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(bytes.len())
+            .map_err(|_| CredentialError::Capacity)?;
+        owned.extend_from_slice(bytes);
+        Self::new(owned)
+    }
+
     fn new(bytes: Vec<u8>) -> Result<Self, CredentialError> {
         Self(bytes).validate()
     }
@@ -1165,6 +1192,7 @@ mod tests {
         );
 
         let inbound = resolver.extract_inbound(&mut request_headers).unwrap();
+        drop(resolver);
         // Policy evaluates presence through this typed handle after extraction;
         // the origin-facing request map no longer contains the secret.
         assert!(!request_headers.contains_key("x-identity-token"));

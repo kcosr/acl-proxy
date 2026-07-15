@@ -30,6 +30,7 @@ mod sensitive;
 #[allow(dead_code)]
 mod standalone;
 // Adopted by StandalonePolicyProvider in C03; C02 establishes the owned return boundary.
+mod standalone_policy_provider;
 #[allow(dead_code)]
 mod standalone_provider_result;
 mod tls;

@@ -41,6 +41,17 @@ pub(crate) struct SanitizedRequest<B = Body> {
     upgrade_intent: Option<UpgradeIntent>,
 }
 
+/// One sanitized Hyper request whose upgrade capability was captured from the
+/// same original request before ownership was split.
+#[allow(
+    dead_code,
+    reason = "P06 C03 lands the bound ingress owner before the mandatory C04 listener cutover"
+)]
+pub(crate) struct SanitizedIngressRequest {
+    request: SanitizedRequest<Body>,
+    downstream_upgrade: Option<hyper::upgrade::OnUpgrade>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct UpgradeIntent {
     protocol: HeaderValue,
@@ -97,6 +108,64 @@ impl<B> SanitizedRequest<B> {
             upgrade_intent,
         }
     }
+}
+
+#[allow(
+    dead_code,
+    reason = "P06 C03 lands the bound ingress owner before the mandatory C04 listener cutover"
+)]
+impl SanitizedIngressRequest {
+    pub(crate) fn sanitized(&self) -> &SanitizedRequest<Body> {
+        &self.request
+    }
+
+    pub(crate) fn version(&self) -> Version {
+        self.request.version()
+    }
+
+    pub(crate) fn method(&self) -> &http::Method {
+        self.request.method()
+    }
+
+    pub(crate) fn headers(&self) -> &HeaderMap {
+        self.request.headers()
+    }
+
+    pub(crate) fn upgrade_intent(&self) -> Option<&UpgradeIntent> {
+        self.request.upgrade_intent()
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        http::request::Parts,
+        Body,
+        OriginProtocol,
+        Option<hyper::upgrade::OnUpgrade>,
+    ) {
+        let (parts, body, protocol) = self.request.into_parts();
+        (parts, body, protocol, self.downstream_upgrade)
+    }
+}
+
+/// Sanitizes one ingress request while retaining only its own upgrade handle.
+#[allow(
+    dead_code,
+    reason = "P06 C03 lands the bound ingress owner before the mandatory C04 listener cutover"
+)]
+pub(crate) fn sanitize_untrusted_ingress_request(
+    mut request: Request<Body>,
+) -> Result<SanitizedIngressRequest, HeaderPreparationError> {
+    let downstream_upgrade = hyper::upgrade::on(&mut request);
+    let request = sanitize_untrusted_request(request)?;
+    let downstream_upgrade = request
+        .upgrade_intent()
+        .is_some()
+        .then_some(downstream_upgrade);
+    Ok(SanitizedIngressRequest {
+        request,
+        downstream_upgrade,
+    })
 }
 
 /// Removes attacker-controlled hop-by-hop headers before any trusted request

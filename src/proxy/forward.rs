@@ -67,6 +67,8 @@ pub(crate) enum ForwardError {
 pub(crate) enum ResolveForwardingError {
     #[error(transparent)]
     Destination(#[from] DestinationGuardError),
+    #[error("the forwarding preflight does not belong to this request and egress route")]
+    Binding,
 }
 
 #[derive(Clone, Debug, thiserror::Error)]
@@ -502,13 +504,15 @@ impl PendingUpstreamUpgrade {
     }
 }
 
-pub(crate) struct PreparedForwardingTarget {
+pub(crate) struct PreflightForwardingTarget {
     canonical_url: String,
     ingress_protocol: OriginProtocol,
     origin_protocol: OriginProtocol,
-    egress_identity: usize,
+    egress_identity: std::sync::Arc<()>,
     route: PreparedForwardingRoute,
 }
+
+pub(crate) struct PreparedForwardingTarget(PreflightForwardingTarget);
 
 enum PreparedForwardingRoute {
     Direct(PreparedDestination),
@@ -522,7 +526,7 @@ pub(crate) struct ResolvedForwardingTarget {
     canonical_url: String,
     ingress_protocol: OriginProtocol,
     origin_protocol: OriginProtocol,
-    egress_identity: usize,
+    egress_identity: std::sync::Arc<()>,
     route: ResolvedForwardingRoute,
 }
 
@@ -540,10 +544,10 @@ pub(crate) fn preflight_forwarding_target(
     request: &SanitizedRequest<impl Sized>,
     egress: &dyn EgressSnapshot,
     destinations: &DestinationGuard,
-) -> Result<PreparedForwardingTarget, ResolveForwardingError> {
+) -> Result<PreflightForwardingTarget, ResolveForwardingError> {
     let ingress_protocol = request.protocol();
     let origin_protocol = egress.origin_tls().select_protocol(ingress_protocol);
-    let egress_identity = egress.route() as *const EgressRoute as usize;
+    let egress_identity = egress.identity().clone();
     let route = match egress.route() {
         EgressRoute::Direct => PreparedForwardingRoute::Direct(
             destinations.preflight(DestinationTarget::direct(canonical))?,
@@ -554,7 +558,7 @@ pub(crate) fn preflight_forwarding_target(
                 .preflight(DestinationTarget::parent(parent.authority(), canonical))?,
         },
     };
-    Ok(PreparedForwardingTarget {
+    Ok(PreflightForwardingTarget {
         canonical_url: canonical.as_str().to_owned(),
         ingress_protocol,
         origin_protocol,
@@ -563,18 +567,54 @@ pub(crate) fn preflight_forwarding_target(
     })
 }
 
+impl PreflightForwardingTarget {
+    /// Binds semantic preflight to the exact request, egress snapshot, and
+    /// destination guard before DNS or provider work can begin.
+    pub(crate) fn bind_for_request(
+        self,
+        canonical: &CanonicalUrl,
+        ingress_protocol: OriginProtocol,
+        egress: &dyn EgressSnapshot,
+        destinations: &DestinationGuard,
+    ) -> Result<PreparedForwardingTarget, ResolveForwardingError> {
+        let origin_protocol = egress.origin_tls().select_protocol(ingress_protocol);
+        let route_matches = match (&self.route, egress.route()) {
+            (PreparedForwardingRoute::Direct(destination), EgressRoute::Direct) => {
+                destination.belongs_to(destinations)
+            }
+            (
+                PreparedForwardingRoute::Parent {
+                    parent_url,
+                    destination,
+                },
+                EgressRoute::Parent(parent),
+            ) => parent_url == parent.canonical_url() && destination.belongs_to(destinations),
+            _ => false,
+        };
+        if self.canonical_url != canonical.as_str()
+            || self.ingress_protocol != ingress_protocol
+            || self.origin_protocol != origin_protocol
+            || !std::sync::Arc::ptr_eq(&self.egress_identity, egress.identity())
+            || !route_matches
+        {
+            return Err(ResolveForwardingError::Binding);
+        }
+        Ok(PreparedForwardingTarget(self))
+    }
+}
+
 /// Completes one pinned destination resolution under the request deadline.
 pub(crate) async fn resolve_forwarding_target(
     prepared: PreparedForwardingTarget,
     destinations: &DestinationGuard,
 ) -> Result<ResolvedForwardingTarget, ResolveForwardingError> {
-    let PreparedForwardingTarget {
+    let PreparedForwardingTarget(PreflightForwardingTarget {
         canonical_url,
         ingress_protocol,
         origin_protocol,
         egress_identity,
         route,
-    } = prepared;
+    }) = prepared;
     let route = match route {
         PreparedForwardingRoute::Direct(destination) => {
             ResolvedForwardingRoute::Direct(destinations.complete_resolution(destination).await?)
@@ -641,7 +681,7 @@ where
     if target.canonical_url != canonical.as_str()
         || target.ingress_protocol != request.protocol()
         || target.origin_protocol != selected_origin_protocol
-        || target.egress_identity != egress.route() as *const EgressRoute as usize
+        || !std::sync::Arc::ptr_eq(&target.egress_identity, egress.identity())
     {
         return Err(ForwardError::ResolvedTargetMismatch);
     }
@@ -733,7 +773,7 @@ where
     if target.canonical_url != canonical.as_str()
         || target.ingress_protocol != request.protocol()
         || target.origin_protocol != selected_origin_protocol
-        || target.egress_identity != egress.route() as *const EgressRoute as usize
+        || !std::sync::Arc::ptr_eq(&target.egress_identity, egress.identity())
     {
         return Err(ForwardError::ResolvedTargetMismatch);
     }
@@ -1284,6 +1324,8 @@ mod tests {
         destinations: &DestinationGuard,
     ) -> Result<ResolvedForwardingTarget, ResolveForwardingError> {
         let prepared = preflight_forwarding_target(canonical, request, egress, destinations)?;
+        let prepared =
+            prepared.bind_for_request(canonical, request.protocol(), egress, destinations)?;
         resolve_forwarding_target(prepared, destinations).await
     }
 
@@ -2290,6 +2332,49 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[test]
+    fn preflight_binding_rejects_foreign_request_protocol_and_egress_before_resolution() {
+        let canonical = canonicalize_http_url("http://origin.example:8080/resource").unwrap();
+        let foreign_canonical =
+            canonicalize_http_url("http://foreign.example:8080/resource").unwrap();
+        let egress = activate(None);
+        let foreign_egress = activate(None);
+        let (guard, resolver) = guard();
+        let request = request();
+
+        let foreign_request =
+            preflight_forwarding_target(&canonical, &request, &egress, &guard).unwrap();
+        assert!(matches!(
+            foreign_request.bind_for_request(
+                &foreign_canonical,
+                request.protocol(),
+                &egress,
+                &guard,
+            ),
+            Err(ResolveForwardingError::Binding)
+        ));
+
+        let foreign_protocol =
+            preflight_forwarding_target(&canonical, &request, &egress, &guard).unwrap();
+        assert!(matches!(
+            foreign_protocol.bind_for_request(&canonical, OriginProtocol::Http2, &egress, &guard,),
+            Err(ResolveForwardingError::Binding)
+        ));
+
+        let foreign_snapshot =
+            preflight_forwarding_target(&canonical, &request, &egress, &guard).unwrap();
+        assert!(matches!(
+            foreign_snapshot.bind_for_request(
+                &canonical,
+                request.protocol(),
+                &foreign_egress,
+                &guard,
+            ),
+            Err(ResolveForwardingError::Binding)
+        ));
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn direct_https_rejects_incompatible_origin_alpn_before_http() {
         let canonical = canonicalize_http_url("https://origin.example/alpn").unwrap();
@@ -2453,6 +2538,9 @@ mod tests {
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
         assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
 
+        let prepared = prepared
+            .bind_for_request(&canonical, request.protocol(), &egress, &guard)
+            .unwrap();
         let target = resolve_forwarding_target(prepared, &guard).await.unwrap();
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
         assert_eq!(connector.calls.load(Ordering::SeqCst), 0);

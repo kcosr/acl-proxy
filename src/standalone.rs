@@ -1674,11 +1674,17 @@ fn compile_sensitive_headers(
         .inbound
         .values()
         .map(|inbound| neutral_header_name(&inbound.header))
+        .chain(
+            plan.authorization
+                .internal_context_headers
+                .iter()
+                .map(neutral_header_name),
+        )
         .collect::<Result<Vec<_>, _>>()?;
     headers.sort();
     if headers.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(StandaloneCompileError::Inconsistent(
-            "inbound sensitive headers",
+            "standalone sensitive headers",
         ));
     }
     Ok(headers.into_boxed_slice())
@@ -1984,7 +1990,10 @@ fn stable_id(value: &str) -> Result<StableId, StandaloneCompileError> {
 mod tests {
     use std::path::Path;
 
-    use http_access_types::{CredentialMutationKind, DecisionReasonCategory, EffectivePolicy};
+    use http_access_types::{
+        CredentialMutationKind, DecisionReasonCategory, EffectivePolicy, HeaderField,
+        PolicyHeaderFacts,
+    };
 
     use super::*;
     use crate::config::compiler::{CompiledParentProxyKind, ParentProxyPlan, ParentProxyTlsPlan};
@@ -2035,10 +2044,13 @@ variable = "RULE_TOKEN"
 source = "environment"
 variable = "GLOBAL_TOKEN"
 
+[authorization]
+internal_context_headers = ["x-internal-context"]
+
 [authorization.providers.approval]
 kind = "process"
 command = "/bin/true"
-include_headers = ["x-zeta-secret", "x-alpha-secret"]
+include_headers = ["x-zeta-secret", "x-alpha-secret", "x-internal-context"]
 
 [authorization.providers.approval.outputs.token]
 kind = "custom_header"
@@ -2057,6 +2069,11 @@ operation = "set"
 when = "always"
 name = "x-global"
 value = "global"
+
+[[egress.request_headers]]
+operation = "remove"
+when = "always"
+name = "x-internal-context"
 
 [[egress.credential_actions]]
 kind = "custom_header"
@@ -2180,7 +2197,7 @@ header = "x-acl-proxy-request-id"
                 .iter()
                 .map(HeaderName::as_str)
                 .collect::<Vec<_>>(),
-            ["x-alpha-secret", "x-zeta-secret"]
+            ["x-alpha-secret", "x-internal-context", "x-zeta-secret"]
         );
         assert!(matches!(plan.route(), Route::Direct));
         assert!(matches!(
@@ -2314,6 +2331,88 @@ header = "x-acl-proxy-request-id"
         assert!(!first.identity().same_snapshot(second.identity()));
         assert!(!first.snapshot_lease().owns(second.identity()));
         assert!(!second.snapshot_lease().owns(first.identity()));
+    }
+
+    #[test]
+    fn complete_headers_partition_inbound_and_internal_context_before_extraction() {
+        let compiled = compiled();
+        let plan = UnboundStandaloneGenerationPlan::compile(
+            &compiled.reloadable_plan,
+            GenerationId::for_test(22),
+        )
+        .unwrap();
+        let complete_headers = [
+            ("x-alpha-secret", b"alpha".as_slice()),
+            ("x-internal-context", b"context".as_slice()),
+            ("x-ordinary", b"ordinary".as_slice()),
+            ("x-zeta-secret", b"zeta".as_slice()),
+        ]
+        .into_iter()
+        .map(|(name, value)| {
+            HeaderField::new(
+                HeaderName::new(name.to_owned()).unwrap(),
+                HeaderValue::new(value.to_vec()).unwrap(),
+            )
+        })
+        .collect();
+
+        let partition =
+            PolicyHeaderFacts::new(complete_headers, plan.sensitive_headers().to_vec()).unwrap();
+
+        assert_eq!(
+            partition
+                .sensitive_headers()
+                .iter()
+                .map(HeaderName::as_str)
+                .collect::<Vec<_>>(),
+            ["x-alpha-secret", "x-internal-context", "x-zeta-secret"]
+        );
+        assert_eq!(
+            partition
+                .sensitive_header_presence()
+                .iter()
+                .map(HeaderName::as_str)
+                .collect::<Vec<_>>(),
+            ["x-alpha-secret", "x-internal-context", "x-zeta-secret"]
+        );
+        assert_eq!(partition.ordinary_headers().len(), 1);
+        assert_eq!(
+            partition.ordinary_headers()[0].name().as_str(),
+            "x-ordinary"
+        );
+        assert_eq!(
+            partition.ordinary_headers()[0].value().as_bytes(),
+            b"ordinary"
+        );
+    }
+
+    #[test]
+    fn compile_rejects_overlap_between_inbound_and_internal_context_headers() {
+        let mut compiled = compiled();
+        let inbound = compiled
+            .reloadable_plan
+            .credentials
+            .inbound
+            .values()
+            .next()
+            .unwrap()
+            .header
+            .clone();
+        compiled
+            .reloadable_plan
+            .authorization
+            .internal_context_headers
+            .push(inbound);
+
+        assert!(matches!(
+            UnboundStandaloneGenerationPlan::compile(
+                &compiled.reloadable_plan,
+                GenerationId::for_test(23),
+            ),
+            Err(StandaloneCompileError::Inconsistent(
+                "standalone sensitive headers"
+            ))
+        ));
     }
 
     #[test]

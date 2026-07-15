@@ -390,7 +390,6 @@ impl RuntimeReplayLease {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn capacity_bytes(&self) -> usize {
         self.capacity_bytes
     }

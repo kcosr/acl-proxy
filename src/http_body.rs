@@ -7,6 +7,8 @@ use std::task::{Context, Poll};
 
 use bytes::Buf;
 use http::header::{HeaderMap, CONTENT_ENCODING, TRAILER};
+use http_access_runtime::{RuntimeError, RuntimeRequest};
+use http_access_types::BodyObservationState;
 use hyper::body::HttpBody;
 use miniz_oxide::inflate::stream::{inflate, InflateState};
 use miniz_oxide::{DataFormat, MZFlush, MZStatus};
@@ -450,6 +452,99 @@ where
         encoded_len,
         body: decoded,
     })
+}
+
+pub(crate) async fn read_mandatory_runtime_request_body(
+    request: &mut RuntimeRequest,
+    limits: HttpBodyReadLimits,
+    max_expansion_ratio: usize,
+    deadline: Instant,
+    guard: &HttpWireBodyGuard,
+) -> Result<GuardedRequestBody, HttpBodyReadError> {
+    if request
+        .body_observation()
+        .map_err(map_runtime_body_error)?
+        .state()
+        != BodyObservationState::Unobserved
+    {
+        return Err(HttpBodyReadError::ReadFailed);
+    }
+    let headers = crate::proxy::facts::product_headers(request.facts().headers())
+        .map_err(|_| HttpBodyReadError::ReadFailed)?;
+    let encoding = parse_content_encoding(&headers)?;
+    if headers.contains_key(TRAILER) {
+        return Err(HttpBodyReadError::RequestTrailersUnsupported);
+    }
+
+    let mut encoded = guard.buffer();
+    loop {
+        check_deadline(deadline)?;
+        let next = tokio::time::timeout_at(
+            deadline,
+            std::future::poll_fn(|context| request.poll_body_chunk(context)),
+        )
+        .await
+        .map_err(|_| HttpBodyReadError::TimedOut)?
+        .map_err(map_runtime_body_error)?;
+        let Some(chunk) = next else {
+            break;
+        };
+        for bytes in chunk.as_bytes().chunks(MAX_BUFFER_GROWTH_BYTES) {
+            check_deadline(deadline)?;
+            let next_len = encoded
+                .len()
+                .checked_add(bytes.len())
+                .ok_or(HttpBodyReadError::EncodedLimitExceeded)?;
+            if next_len > limits.max_encoded_bytes() {
+                return Err(HttpBodyReadError::EncodedLimitExceeded);
+            }
+            encoded.try_extend_from_slice(bytes)?;
+            cooperative_checkpoint(deadline).await?;
+        }
+    }
+
+    let trailers = tokio::time::timeout_at(
+        deadline,
+        std::future::poll_fn(|context| request.poll_trailers(context)),
+    )
+    .await
+    .map_err(|_| HttpBodyReadError::TimedOut)?
+    .map_err(map_runtime_trailer_error)?;
+    if trailers.is_some_and(|trailers| trailers.iter().next().is_some()) {
+        return Err(HttpBodyReadError::RequestTrailersUnsupported);
+    }
+
+    let encoded = encoded.finish();
+    let encoded_len = encoded.len();
+    let decoded = decode_complete_http_body(
+        encoding,
+        encoded,
+        guard,
+        limits.max_decoded_bytes(),
+        max_expansion_ratio,
+        DecodeControl::wire(deadline),
+    )
+    .await?;
+    Ok(GuardedRequestBody {
+        encoded_len,
+        body: decoded,
+    })
+}
+
+fn map_runtime_body_error(error: RuntimeError) -> HttpBodyReadError {
+    match error {
+        RuntimeError::DeadlineExceeded => HttpBodyReadError::TimedOut,
+        RuntimeError::LimitExceeded => HttpBodyReadError::EncodedLimitExceeded,
+        _ => HttpBodyReadError::ReadFailed,
+    }
+}
+
+fn map_runtime_trailer_error(error: RuntimeError) -> HttpBodyReadError {
+    match error {
+        RuntimeError::DeadlineExceeded => HttpBodyReadError::TimedOut,
+        RuntimeError::LimitExceeded => HttpBodyReadError::RequestTrailersUnsupported,
+        _ => HttpBodyReadError::ReadFailed,
+    }
 }
 
 pub(crate) fn decode_capture_http_body(
@@ -1670,13 +1765,25 @@ mod tests {
     use std::io::Write;
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::PathBuf;
+    use std::pin::Pin;
     use std::sync::Arc;
+    use std::task::{Context, Poll};
     use std::time::Duration;
 
     use bytes::Bytes;
     use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
     use flate2::{Compress, Compression, FlushCompress, Status};
     use http::HeaderValue;
+    use http_access_runtime::{
+        BodyBounds, BodyBudget, BodySource, BodySourceEvent, BodyTrailerCopy, BoxFuture, Clock,
+        RuntimeBody, RuntimeTrailers,
+    };
+    use http_access_types::{
+        BodyFraming, BodyMetadata, BodyRepresentation, HeaderField,
+        HeaderName as NeutralHeaderName, HeaderValue as NeutralHeaderValue, HttpMethod,
+        HttpVersion, IngressMode, InterceptedRequestFacts, PolicyHeaderFacts,
+    };
+    use http_access_url::canonicalize_http_url;
     use hyper::Body;
     use tokio_stream::StreamExt;
 
@@ -1738,6 +1845,196 @@ mod tests {
         )
         .await;
         (result, guard, pool)
+    }
+
+    struct RuntimeTestClock;
+
+    impl Clock for RuntimeTestClock {
+        fn monotonic_millis(&self) -> u64 {
+            1
+        }
+
+        fn unix_millis(&self) -> u64 {
+            1
+        }
+
+        fn sleep_until(&self, _deadline_millis: u64) -> BoxFuture<'static, ()> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    fn runtime_request(source: impl BodySource + 'static, bounds: BodyBounds) -> RuntimeRequest {
+        runtime_request_with_headers(source, bounds, Vec::new())
+    }
+
+    fn runtime_request_with_headers(
+        source: impl BodySource + 'static,
+        bounds: BodyBounds,
+        headers: Vec<HeaderField>,
+    ) -> RuntimeRequest {
+        let body = RuntimeBody::new(
+            Box::pin(source),
+            bounds,
+            Arc::new(RuntimeTestClock),
+            BodyBudget::new(1024 * 1024).unwrap(),
+            1_000,
+        )
+        .unwrap();
+        let facts = InterceptedRequestFacts::new(
+            IngressMode::ExplicitHttp,
+            HttpVersion::Http11,
+            HttpMethod::new("POST").unwrap(),
+            canonicalize_http_url("http://example.test/resource").unwrap(),
+            headers,
+            BodyMetadata::new(BodyFraming::ContentLength(0)),
+            None,
+        )
+        .unwrap();
+        RuntimeRequest::new(
+            facts.clone(),
+            IpAddr::V4(Ipv4Addr::new(192, 0, 2, 8)),
+            PolicyHeaderFacts::new(facts.headers().to_vec(), Vec::new()).unwrap(),
+            BodyRepresentation::PreservedContentCoded,
+            body,
+            1_000,
+        )
+        .unwrap()
+    }
+
+    fn runtime_request_from_chunks(chunks: Vec<Vec<u8>>, body_bytes: u64) -> RuntimeRequest {
+        runtime_request_from_chunks_with_headers(chunks, body_bytes, Vec::new())
+    }
+
+    fn runtime_request_from_chunks_with_headers(
+        chunks: Vec<Vec<u8>>,
+        body_bytes: u64,
+        headers: Vec<HeaderField>,
+    ) -> RuntimeRequest {
+        struct Chunks {
+            chunks: std::collections::VecDeque<Vec<u8>>,
+            pending: Option<http_access_runtime::BodyChunkCopy>,
+        }
+
+        impl BodySource for Chunks {
+            fn poll_next(
+                mut self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+                budget: &BodyBudget,
+            ) -> Poll<Result<BodySourceEvent, RuntimeError>> {
+                let Some(bytes) = self.chunks.pop_front() else {
+                    return Poll::Ready(Ok(BodySourceEvent::End));
+                };
+                let mut copy = budget.begin_chunk_copy(bytes.len() as u64)?;
+                copy.push_fragment(&bytes)?;
+                self.pending = Some(copy);
+                Poll::Ready(
+                    self.pending
+                        .take()
+                        .expect("pending runtime chunk copy")
+                        .finish()
+                        .map(BodySourceEvent::Chunk),
+                )
+            }
+
+            fn poll_trailers(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+                _budget: &BodyBudget,
+            ) -> Poll<Result<Option<RuntimeTrailers>, RuntimeError>> {
+                Poll::Ready(Ok(None))
+            }
+        }
+
+        runtime_request_with_headers(
+            Chunks {
+                chunks: chunks.into(),
+                pending: None,
+            },
+            BodyBounds::new(body_bytes, body_bytes, body_bytes.max(1), 0, 0, 100).unwrap(),
+            headers,
+        )
+    }
+
+    struct TrailerSource {
+        ended: bool,
+        copy: Option<BodyTrailerCopy>,
+    }
+
+    impl BodySource for TrailerSource {
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _budget: &BodyBudget,
+        ) -> Poll<Result<BodySourceEvent, RuntimeError>> {
+            if self.ended {
+                return Poll::Ready(Err(RuntimeError::InvalidInput));
+            }
+            self.ended = true;
+            Poll::Ready(Ok(BodySourceEvent::End))
+        }
+
+        fn poll_trailers(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            budget: &BodyBudget,
+        ) -> Poll<Result<Option<RuntimeTrailers>, RuntimeError>> {
+            if self.copy.is_none() {
+                let mut copy = budget.begin_trailer_copy(1, 32)?;
+                copy.start_field("x-checksum", 7)?;
+                copy.push_value_fragment(b"private")?;
+                copy.finish_field()?;
+                self.copy = Some(copy);
+            }
+            match self
+                .copy
+                .as_mut()
+                .expect("runtime trailer copy")
+                .poll_finish(context)
+            {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(result) => Poll::Ready(result.map(Some)),
+            }
+        }
+    }
+
+    struct ErrorSource;
+
+    impl BodySource for ErrorSource {
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _budget: &BodyBudget,
+        ) -> Poll<Result<BodySourceEvent, RuntimeError>> {
+            Poll::Ready(Err(RuntimeError::ServiceFailure))
+        }
+
+        fn poll_trailers(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _budget: &BodyBudget,
+        ) -> Poll<Result<Option<RuntimeTrailers>, RuntimeError>> {
+            Poll::Ready(Ok(None))
+        }
+    }
+
+    struct PendingSource;
+
+    impl BodySource for PendingSource {
+        fn poll_next(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _budget: &BodyBudget,
+        ) -> Poll<Result<BodySourceEvent, RuntimeError>> {
+            Poll::Pending
+        }
+
+        fn poll_trailers(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _budget: &BodyBudget,
+        ) -> Poll<Result<Option<RuntimeTrailers>, RuntimeError>> {
+            Poll::Pending
+        }
     }
 
     fn body_bytes(body: &GuardedRequestBody) -> Vec<u8> {
@@ -2096,6 +2393,220 @@ mod tests {
             assert_eq!(guard.live_bytes(), 0);
             assert_eq!(pool.global_charge(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_request_identity_body_uses_guarded_decode_pipeline() {
+        let expected = b"runtime request body".to_vec();
+        let peak = compiled_peak(expected.len(), expected.len());
+        let pool = WireBodyPool::new(peak, peak);
+        let guard = pool.begin_for_test(peak, key());
+        let mut request = runtime_request_from_chunks(
+            vec![b"runtime ".to_vec(), b"request body".to_vec()],
+            expected.len() as u64,
+        );
+
+        let body = read_mandatory_runtime_request_body(
+            &mut request,
+            limits(expected.len(), expected.len()),
+            1,
+            Instant::now() + Duration::from_secs(1),
+            &guard,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(body.encoded_len(), expected.len());
+        assert_eq!(body.content_encoding(), CanonicalContentEncoding::Identity);
+        assert_eq!(body_bytes(&body), expected);
+        drop(body);
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_request_reader_uses_authoritative_content_encoding() {
+        let expected = b"authoritative compressed request".repeat(64);
+        let encoded = gzip(&expected);
+        let peak = compiled_peak(encoded.len(), expected.len());
+        let pool = WireBodyPool::new(peak, peak);
+        let guard = pool.begin_for_test(peak, key());
+        let header = HeaderField::new(
+            NeutralHeaderName::new("content-encoding").unwrap(),
+            NeutralHeaderValue::new(b"gzip".to_vec()).unwrap(),
+        );
+        let mut request = runtime_request_from_chunks_with_headers(
+            vec![encoded.clone()],
+            encoded.len().max(expected.len()) as u64,
+            vec![header],
+        );
+
+        let body = read_mandatory_runtime_request_body(
+            &mut request,
+            limits(encoded.len(), expected.len()),
+            128,
+            Instant::now() + Duration::from_secs(1),
+            &guard,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(body_bytes(&body), expected);
+    }
+
+    #[tokio::test]
+    async fn runtime_request_reader_rejects_partial_and_complete_reentry() {
+        let peak = compiled_peak(4, 4);
+        let pool = WireBodyPool::new(peak * 2, peak * 2);
+
+        let partial_guard = pool.begin_for_test(peak, key());
+        let mut partial = runtime_request_from_chunks(vec![b"ab".to_vec(), b"cd".to_vec()], 4);
+        let first = std::future::poll_fn(|context| partial.poll_body_chunk(context))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.as_bytes(), b"ab");
+        assert_eq!(
+            read_mandatory_runtime_request_body(
+                &mut partial,
+                limits(4, 4),
+                1,
+                Instant::now() + Duration::from_secs(1),
+                &partial_guard,
+            )
+            .await
+            .unwrap_err(),
+            HttpBodyReadError::ReadFailed
+        );
+
+        let complete_guard = pool.begin_for_test(peak, key());
+        let mut complete = runtime_request_from_chunks(vec![b"body".to_vec()], 4);
+        let observed = read_mandatory_runtime_request_body(
+            &mut complete,
+            limits(4, 4),
+            1,
+            Instant::now() + Duration::from_secs(1),
+            &complete_guard,
+        )
+        .await
+        .unwrap();
+        drop(observed);
+        assert_eq!(
+            read_mandatory_runtime_request_body(
+                &mut complete,
+                limits(4, 4),
+                1,
+                Instant::now() + Duration::from_secs(1),
+                &complete_guard,
+            )
+            .await
+            .unwrap_err(),
+            HttpBodyReadError::ReadFailed
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_request_reader_enforces_encoded_limit_incrementally() {
+        let peak = compiled_peak(3, 4);
+        let pool = WireBodyPool::new(peak, peak);
+        let guard = pool.begin_for_test(peak, key());
+        let mut request = runtime_request_from_chunks(vec![b"ab".to_vec(), b"cd".to_vec()], 4);
+
+        let error = read_mandatory_runtime_request_body(
+            &mut request,
+            limits(3, 4),
+            1,
+            Instant::now() + Duration::from_secs(1),
+            &guard,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, HttpBodyReadError::EncodedLimitExceeded);
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_request_reader_rejects_delivered_trailers() {
+        let max = 64;
+        let peak = compiled_peak(max, max);
+        let pool = WireBodyPool::new(peak, peak);
+        let guard = pool.begin_for_test(peak, key());
+        let mut request = runtime_request(
+            TrailerSource {
+                ended: false,
+                copy: None,
+            },
+            BodyBounds::new(1, 1, 1, 1, 32, 100).unwrap(),
+        );
+
+        let error = read_mandatory_runtime_request_body(
+            &mut request,
+            limits(max, max),
+            1,
+            Instant::now() + Duration::from_secs(1),
+            &guard,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, HttpBodyReadError::RequestTrailersUnsupported);
+        assert!(!error.to_string().contains("private"));
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_request_reader_sanitizes_runtime_source_errors() {
+        let max = 64;
+        let peak = compiled_peak(max, max);
+        let pool = WireBodyPool::new(peak, peak);
+        let guard = pool.begin_for_test(peak, key());
+        let mut request = runtime_request(
+            ErrorSource,
+            BodyBounds::new(max as u64, max as u64, max as u64, 0, 0, 100).unwrap(),
+        );
+
+        let error = read_mandatory_runtime_request_body(
+            &mut request,
+            limits(max, max),
+            1,
+            Instant::now() + Duration::from_secs(1),
+            &guard,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, HttpBodyReadError::ReadFailed);
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_request_reader_enforces_product_deadline() {
+        let max = 64;
+        let peak = compiled_peak(max, max);
+        let pool = WireBodyPool::new(peak, peak);
+        let guard = pool.begin_for_test(peak, key());
+        let mut request = runtime_request(
+            PendingSource,
+            BodyBounds::new(max as u64, max as u64, max as u64, 0, 0, 100).unwrap(),
+        );
+
+        let error = read_mandatory_runtime_request_body(
+            &mut request,
+            limits(max, max),
+            1,
+            Instant::now() + Duration::from_millis(10),
+            &guard,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error, HttpBodyReadError::TimedOut);
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
     }
 
     #[tokio::test]
