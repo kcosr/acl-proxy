@@ -7315,6 +7315,53 @@ default = "allow"
     }
 
     #[tokio::test]
+    async fn large_connection_and_upgrade_lines_reach_policy_with_exact_classification() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let policy = r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+"#;
+        let (_directory, product) =
+            product(base_config(proxy, "explicit_http", policy), listeners).await;
+
+        let request = |connection_token: &str| {
+            let mut wire = b"GET http://large-relevant.test/socket HTTP/1.1\r\nHost: large-relevant.test\r\nConnection: "
+                .to_vec();
+            wire.extend(std::iter::repeat_n(
+                b' ',
+                crate::http1::store::PARSER_STORE_BYTES + 17,
+            ));
+            wire.extend_from_slice(connection_token.as_bytes());
+            wire.extend_from_slice(b"\r\nUpgrade: test-");
+            wire.extend(std::iter::repeat_n(
+                b'x',
+                crate::http1::store::PARSER_STORE_BYTES + 19,
+            ));
+            wire.extend_from_slice(b"\r\n\r\n");
+            wire
+        };
+
+        let response = send_raw_http(proxy, &request("UpGrAdE \t, close")).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 403") && response.ends_with(b"request denied\n"),
+            "large upgrade request did not reach policy: {}",
+            String::from_utf8_lossy(&response)
+        );
+
+        let response = send_raw_http(proxy, &request("upgrade-x, close")).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 400") && response.ends_with(b"invalid request\n"),
+            "near-match Connection token was misclassified: {}",
+            String::from_utf8_lossy(&response)
+        );
+
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn opted_in_opaque_upgrade_relays_both_directions_and_releases_runtime() {
         let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
         let ([proxy], listeners) = prebound_listeners::<1>();

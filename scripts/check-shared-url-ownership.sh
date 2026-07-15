@@ -36,8 +36,16 @@ while IFS= read -r source; do
     fi
 done < <(rg -l 'InterceptedRequestFacts::new|neutral_headers\(' src --glob '*.rs')
 
+if [[ $(sed -n '1p' src/proxy/raw_h2_conformance.rs) != '#![cfg(test)]' ]]; then
+    printf 'the raw HTTP/2 conformance adapter must remain test-only\n' >&2
+    exit 1
+fi
+
 mapfile -t fact_materializers < <(
-    rg -n '\.into_facts\(' src --glob '*.rs' --glob '!src/proxy/facts.rs'
+    rg -n 'into_facts[[:space:]]*\(' src \
+        --glob '*.rs' \
+        --glob '!src/proxy/facts.rs' \
+        --glob '!src/proxy/raw_h2_conformance.rs'
 )
 if [[ ${#fact_materializers[@]} -ne 1 ]] \
     || [[ ${fact_materializers[0]} != src/request_decision.rs:*'let facts = shape.into_facts(sanitized_headers)?;' ]]; then

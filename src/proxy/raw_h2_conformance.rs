@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use std::collections::HashSet;
 
 use http::header::{HeaderName, HeaderValue};

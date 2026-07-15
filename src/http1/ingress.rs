@@ -272,6 +272,7 @@ enum Http1State {
 struct IngressHeadTracker {
     line: HeadLine,
     line_scanner: HeadLineScanner,
+    connection_scanner: ConnectionValueScanner,
     header_name_inspected: usize,
     fields: usize,
     content_length: Option<u64>,
@@ -297,6 +298,7 @@ enum HeadLine {
         name: RelevantHeader,
         value_start: usize,
     },
+    Connection,
     Irrelevant,
 }
 
@@ -304,8 +306,21 @@ enum HeadLine {
 enum RelevantHeader {
     ContentLength,
     TransferEncoding,
-    Connection,
-    Upgrade,
+}
+
+#[derive(Default)]
+struct ConnectionValueScanner {
+    inspected: usize,
+    token_match: usize,
+    token_mismatch: bool,
+    trailing_ows: bool,
+    found_upgrade: bool,
+}
+
+enum ConnectionProgress {
+    NeedInput,
+    Release(usize),
+    Complete(usize, bool),
 }
 
 enum HeadProgress {
@@ -720,15 +735,14 @@ impl IngressHeadTracker {
                             value_start: colon + 1,
                         }
                     } else if name.eq_ignore_ascii_case(b"connection") {
-                        HeadLine::Relevant {
-                            name: RelevantHeader::Connection,
-                            value_start: colon + 1,
-                        }
+                        self.connection_scanner = ConnectionValueScanner {
+                            inspected: colon + 1,
+                            ..ConnectionValueScanner::default()
+                        };
+                        HeadLine::Connection
                     } else if name.eq_ignore_ascii_case(b"upgrade") {
-                        HeadLine::Relevant {
-                            name: RelevantHeader::Upgrade,
-                            value_start: colon + 1,
-                        }
+                        self.upgrade = true;
+                        HeadLine::Irrelevant
                     } else {
                         HeadLine::Irrelevant
                     };
@@ -761,18 +775,26 @@ impl IngressHeadTracker {
                             }
                             self.transfer_encoding = true;
                         }
-                        RelevantHeader::Connection => {
-                            self.connection_upgrade |= value
-                                .split(|byte| *byte == b',')
-                                .any(|token| trim_ows(token).eq_ignore_ascii_case(b"upgrade"));
-                        }
-                        RelevantHeader::Upgrade => self.upgrade = true,
                     }
                     self.line = HeadLine::HeaderName;
                     self.line_scanner = HeadLineScanner::default();
                     self.header_name_inspected = 0;
                     return Ok(HeadProgress::Release(length));
                 }
+                HeadLine::Connection => match self.connection_scanner.scan(input)? {
+                    ConnectionProgress::NeedInput => return Ok(HeadProgress::NeedInput),
+                    ConnectionProgress::Release(length) => {
+                        return Ok(HeadProgress::Release(length));
+                    }
+                    ConnectionProgress::Complete(length, found_upgrade) => {
+                        self.connection_upgrade |= found_upgrade;
+                        self.line = HeadLine::HeaderName;
+                        self.line_scanner = HeadLineScanner::default();
+                        self.connection_scanner = ConnectionValueScanner::default();
+                        self.header_name_inspected = 0;
+                        return Ok(HeadProgress::Release(length));
+                    }
+                },
                 HeadLine::Irrelevant => {
                     for (index, byte) in input.iter().copied().enumerate() {
                         match byte {
@@ -804,6 +826,68 @@ impl IngressHeadTracker {
                 }
             }
         }
+    }
+}
+
+impl ConnectionValueScanner {
+    fn scan(&mut self, input: &[u8]) -> Result<ConnectionProgress, io::Error> {
+        while self.inspected < input.len() {
+            let index = self.inspected;
+            match input[index] {
+                b'\r' => {
+                    if index + 1 == input.len() {
+                        if index == 0 {
+                            return Ok(ConnectionProgress::NeedInput);
+                        }
+                        self.inspected = 0;
+                        return Ok(ConnectionProgress::Release(index));
+                    }
+                    if input[index + 1] != b'\n' {
+                        return Err(invalid_data("HTTP/1 head requires CRLF"));
+                    }
+                    self.finish_token();
+                    return Ok(ConnectionProgress::Complete(index + 2, self.found_upgrade));
+                }
+                b'\n' => return Err(invalid_data("HTTP/1 head requires CRLF")),
+                b',' => self.finish_token(),
+                byte => self.consume_token_byte(byte),
+            }
+            self.inspected += 1;
+        }
+        if input.is_empty() {
+            Ok(ConnectionProgress::NeedInput)
+        } else {
+            self.inspected = 0;
+            Ok(ConnectionProgress::Release(input.len()))
+        }
+    }
+
+    fn consume_token_byte(&mut self, byte: u8) {
+        const UPGRADE: &[u8] = b"upgrade";
+        if matches!(byte, b' ' | b'\t') {
+            if self.token_match == UPGRADE.len() && !self.token_mismatch {
+                self.trailing_ows = true;
+            } else if self.token_match != 0 {
+                self.token_mismatch = true;
+            }
+            return;
+        }
+        if self.trailing_ows
+            || self.token_mismatch
+            || self.token_match == UPGRADE.len()
+            || !byte.eq_ignore_ascii_case(&UPGRADE[self.token_match])
+        {
+            self.token_mismatch = true;
+            return;
+        }
+        self.token_match += 1;
+    }
+
+    fn finish_token(&mut self) {
+        self.found_upgrade |= self.token_match == b"upgrade".len() && !self.token_mismatch;
+        self.token_match = 0;
+        self.token_mismatch = false;
+        self.trailing_ows = false;
     }
 }
 
@@ -1293,6 +1377,79 @@ mod tests {
             .resolve(RequestDisposition::ContinueHttp)
             .unwrap();
         writer.await.unwrap();
+    }
+
+    #[test]
+    fn connection_token_match_survives_stream_and_cr_boundaries() {
+        let prefix = b"Connection:";
+        let mut scanner = ConnectionValueScanner {
+            inspected: prefix.len(),
+            ..ConnectionValueScanner::default()
+        };
+        let mut first = prefix.to_vec();
+        first.extend_from_slice(b" keep-alive,\tup");
+        assert!(matches!(
+            scanner.scan(&first).unwrap(),
+            ConnectionProgress::Release(length) if length == first.len()
+        ));
+        assert!(matches!(
+            scanner.scan(b"GRade \t, close\r").unwrap(),
+            ConnectionProgress::Release(length) if length == b"GRade \t, close".len()
+        ));
+        assert!(matches!(
+            scanner.scan(b"\r").unwrap(),
+            ConnectionProgress::NeedInput
+        ));
+        assert!(matches!(
+            scanner.scan(b"\r\n").unwrap(),
+            ConnectionProgress::Complete(2, true)
+        ));
+
+        let mut scanner = ConnectionValueScanner::default();
+        assert!(matches!(
+            scanner.scan(b"up").unwrap(),
+            ConnectionProgress::Release(2)
+        ));
+        assert!(matches!(
+            scanner.scan(b"grade-x\r\n").unwrap(),
+            ConnectionProgress::Complete(_, false)
+        ));
+    }
+
+    #[tokio::test]
+    async fn large_connection_and_upgrade_fields_stream_with_exact_classification() {
+        for (connection_token, expected_kind) in [
+            ("UpGrAdE \t, close", IngressRequestKind::Upgrade),
+            ("upgrade-x, close", IngressRequestKind::Ordinary),
+        ] {
+            let mut wire =
+                b"GET /large-relevant HTTP/1.1\r\nHost: example.test\r\nConnection: ".to_vec();
+            wire.extend(std::iter::repeat_n(b' ', PARSER_STORE_BYTES + 17));
+            wire.extend_from_slice(connection_token.as_bytes());
+            wire.extend_from_slice(b"\r\nUpgrade: test-");
+            wire.extend(std::iter::repeat_n(b'x', PARSER_STORE_BYTES + 19));
+            wire.extend_from_slice(b"\r\n\r\n");
+            let expected = wire.clone();
+
+            let (mut client, server) = tokio::io::duplex(PARSER_STORE_BYTES);
+            let (mut validated, control) = ValidatedIngressIo::try_new(server, false).unwrap();
+            let writer = tokio::spawn(async move {
+                client.write_all(&wire).await.unwrap();
+            });
+            let mut replayed = vec![0; expected.len()];
+            tokio::time::timeout(Duration::from_secs(1), validated.read_exact(&mut replayed))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(replayed, expected);
+            control
+                .claim(Some(expected_kind))
+                .unwrap()
+                .unwrap()
+                .resolve(RequestDisposition::Close)
+                .unwrap();
+            writer.await.unwrap();
+        }
     }
 
     #[tokio::test]
