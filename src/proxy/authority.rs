@@ -986,3 +986,327 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod conformance_adapter {
+    use super::*;
+    use http_access_conformance::{
+        load_authority_suite, AuthorityErrorCode, AuthorityEvidence, AuthorityOutcome,
+        FixtureHttpVersion, FixtureIngressMode, FixtureRequestMethod, OuterConnectEvidence,
+        ReconciledAuthority,
+    };
+    use http_access_types::{HttpVersion as SharedHttpVersion, IngressMode as SharedIngressMode};
+    use http_access_url::{
+        canonicalize_tls_server_name as shared_canonicalize_tls_server_name,
+        reconcile_connect_target as shared_reconcile_connect_target,
+        reconcile_request_target as shared_reconcile_request_target,
+        AuthorityError as SharedAuthorityError, ConnectTargetEvidence, RequestAuthorityEvidence,
+        RequestMethod, RequestTargetEvidence,
+    };
+
+    const INTENTIONAL_AUTHORITY_DIFFERENCES: &[&str] = &[];
+
+    // Hyper's Request cannot represent duplicate pseudo-fields, so the adapter
+    // rejects their ordered fixture evidence before either reconciler runs.
+    fn prevalidate_pseudo_fields(
+        input: &AuthorityEvidence,
+    ) -> Result<Option<(&str, &str)>, AuthorityErrorCode> {
+        if input.http_version != FixtureHttpVersion::Http2 {
+            return Ok(None);
+        }
+        let authority = match input.authority_fields.as_slice() {
+            [] => return Err(AuthorityErrorCode::MissingAuthority),
+            [authority] => authority.as_str(),
+            [_, _, ..] => return Err(AuthorityErrorCode::DuplicateAuthority),
+        };
+        let scheme = match input.scheme_fields.as_slice() {
+            [] => return Err(AuthorityErrorCode::MissingAuthority),
+            [scheme] => scheme.as_str(),
+            [_, _, ..] => return Err(AuthorityErrorCode::DuplicateAuthority),
+        };
+        Ok(Some((scheme, authority)))
+    }
+
+    fn shared_version(version: FixtureHttpVersion) -> SharedHttpVersion {
+        match version {
+            FixtureHttpVersion::Http10 => SharedHttpVersion::Http10,
+            FixtureHttpVersion::Http11 => SharedHttpVersion::Http11,
+            FixtureHttpVersion::Http2 => SharedHttpVersion::Http2,
+        }
+    }
+
+    fn shared_ingress(mode: FixtureIngressMode) -> SharedIngressMode {
+        match mode {
+            FixtureIngressMode::ExplicitHttp => SharedIngressMode::ExplicitHttp,
+            FixtureIngressMode::ExplicitHttps => SharedIngressMode::ExplicitHttps,
+            FixtureIngressMode::TransparentHttp => SharedIngressMode::TransparentHttp,
+            FixtureIngressMode::ConnectMitmInner => SharedIngressMode::ConnectMitmInner,
+            FixtureIngressMode::TransparentHttps => SharedIngressMode::TransparentHttps,
+        }
+    }
+
+    fn shared_method(method: FixtureRequestMethod) -> RequestMethod {
+        match method {
+            FixtureRequestMethod::Connect => RequestMethod::Connect,
+            FixtureRequestMethod::Other => RequestMethod::Other,
+        }
+    }
+
+    fn shared_target<'a>(
+        input: &'a AuthorityEvidence,
+        pseudo: Option<(&'a str, &'a str)>,
+    ) -> RequestTargetEvidence<'a> {
+        if let Some((scheme, authority)) = pseudo {
+            return RequestTargetEvidence::Http2 {
+                scheme,
+                authority,
+                path_and_query: &input.request_target,
+            };
+        }
+        match input.ingress_mode {
+            FixtureIngressMode::ExplicitHttp | FixtureIngressMode::ExplicitHttps => {
+                RequestTargetEvidence::Http1Absolute {
+                    url: &input.request_target,
+                }
+            }
+            FixtureIngressMode::TransparentHttp | FixtureIngressMode::TransparentHttps => {
+                RequestTargetEvidence::Http1Origin {
+                    path_and_query: &input.request_target,
+                }
+            }
+            FixtureIngressMode::ConnectMitmInner
+                if input.request_target.starts_with("http://")
+                    || input.request_target.starts_with("https://") =>
+            {
+                RequestTargetEvidence::Http1Absolute {
+                    url: &input.request_target,
+                }
+            }
+            FixtureIngressMode::ConnectMitmInner => RequestTargetEvidence::Http1Origin {
+                path_and_query: &input.request_target,
+            },
+        }
+    }
+
+    fn shared_outer(
+        outer: &OuterConnectEvidence,
+    ) -> Result<http_access_url::CanonicalConnectTarget, SharedAuthorityError> {
+        let hosts: Vec<&str> = outer.host_fields.iter().map(String::as_str).collect();
+        shared_reconcile_connect_target(ConnectTargetEvidence {
+            version: shared_version(outer.http_version),
+            method: RequestMethod::Connect,
+            target: RequestTargetEvidence::Http1Authority {
+                authority: &outer.target,
+            },
+            hosts: &hosts,
+        })
+    }
+
+    fn shared_result(input: &AuthorityEvidence) -> Result<ReconciledAuthority, AuthorityErrorCode> {
+        let pseudo = prevalidate_pseudo_fields(input)?;
+        let hosts: Vec<&str> = input.host_fields.iter().map(String::as_str).collect();
+        let sni = input.tls_server_name.as_deref().map(|raw| {
+            shared_canonicalize_tls_server_name(raw)
+                .expect("authority fixture SNI must pass shared prevalidation")
+        });
+        let outer = input
+            .outer_connect
+            .as_ref()
+            .map(shared_outer)
+            .transpose()
+            .map_err(shared_error_code)?;
+        let target = shared_reconcile_request_target(RequestAuthorityEvidence {
+            ingress_mode: shared_ingress(input.ingress_mode),
+            version: shared_version(input.http_version),
+            method: shared_method(input.method),
+            target: shared_target(input, pseudo),
+            hosts: &hosts,
+            connect_authority: outer.as_ref().map(|target| target.authority()),
+            sni: sni.as_ref(),
+            destination_port: input.destination_port,
+        })
+        .map_err(shared_error_code)?;
+        let url = target.url();
+        Ok(ReconciledAuthority {
+            scheme: url.scheme().as_str().to_owned(),
+            authority: url.authority().as_str().to_owned(),
+            host: url.authority().host().as_str().to_owned(),
+            port: url.authority().effective_port(),
+        })
+    }
+
+    fn shared_error_code(error: SharedAuthorityError) -> AuthorityErrorCode {
+        match error {
+            SharedAuthorityError::MissingAuthority | SharedAuthorityError::MissingHost => {
+                AuthorityErrorCode::MissingAuthority
+            }
+            SharedAuthorityError::DuplicateHost => AuthorityErrorCode::DuplicateAuthority,
+            SharedAuthorityError::AuthorityMismatch => AuthorityErrorCode::AuthorityMismatch,
+            SharedAuthorityError::TlsServerNameMismatch => {
+                AuthorityErrorCode::TlsServerNameMismatch
+            }
+            SharedAuthorityError::OuterConnectMismatch => AuthorityErrorCode::OuterConnectMismatch,
+            SharedAuthorityError::DestinationPortMismatch => {
+                AuthorityErrorCode::DestinationPortMismatch
+            }
+            SharedAuthorityError::ConnectMethod => AuthorityErrorCode::ConnectMethod,
+            SharedAuthorityError::UnsupportedConnectVersion => {
+                AuthorityErrorCode::UnsupportedConnectVersion
+            }
+            other => panic!("authority corpus produced unsupported shared error {other:?}"),
+        }
+    }
+
+    fn old_version(version: FixtureHttpVersion) -> Version {
+        match version {
+            FixtureHttpVersion::Http10 => Version::HTTP_10,
+            FixtureHttpVersion::Http11 => Version::HTTP_11,
+            FixtureHttpVersion::Http2 => Version::HTTP_2,
+        }
+    }
+
+    fn old_request(input: &AuthorityEvidence, pseudo: Option<(&str, &str)>) -> Request<()> {
+        let uri = match pseudo {
+            Some((scheme, authority)) => {
+                format!("{scheme}://{authority}{}", input.request_target)
+            }
+            None => input.request_target.clone(),
+        };
+        let mut request = Request::builder()
+            .method(match input.method {
+                FixtureRequestMethod::Connect => Method::CONNECT,
+                FixtureRequestMethod::Other => Method::GET,
+            })
+            .version(old_version(input.http_version))
+            .uri(uri)
+            .body(())
+            .expect("prevalidated authority fixture request");
+        for host in &input.host_fields {
+            request.headers_mut().append(
+                HOST,
+                HeaderValue::from_str(host).expect("prevalidated fixture Host"),
+            );
+        }
+        request
+    }
+
+    fn old_outer(outer: &OuterConnectEvidence) -> Result<CanonicalConnectTarget, AuthorityError> {
+        let mut request = Request::builder()
+            .method(Method::CONNECT)
+            .version(old_version(outer.http_version))
+            .uri(&outer.target)
+            .body(())
+            .expect("prevalidated outer CONNECT fixture");
+        for host in &outer.host_fields {
+            request.headers_mut().append(
+                HOST,
+                HeaderValue::from_str(host).expect("prevalidated outer Host"),
+            );
+        }
+        reconcile_connect_outer_request(&mut request)
+    }
+
+    fn old_result(input: &AuthorityEvidence) -> Result<ReconciledAuthority, AuthorityErrorCode> {
+        let pseudo = prevalidate_pseudo_fields(input)?;
+        let outer = input
+            .outer_connect
+            .as_ref()
+            .map(old_outer)
+            .transpose()
+            .map_err(|error| old_error_code(error, input))?;
+        if let Some(outer) = outer.as_ref() {
+            reconcile_connect_sni(outer, input.tls_server_name.as_deref())
+                .map_err(|error| old_error_code(error, input))?;
+        }
+        let mut request = old_request(input, pseudo);
+        let target = match input.ingress_mode {
+            FixtureIngressMode::ExplicitHttp | FixtureIngressMode::ExplicitHttps => {
+                reconcile_explicit_request(&mut request)
+            }
+            FixtureIngressMode::TransparentHttp => reconcile_transparent_http_request(&mut request),
+            FixtureIngressMode::ConnectMitmInner => reconcile_connect_inner_request(
+                &mut request,
+                outer
+                    .as_ref()
+                    .expect("connect fixture must carry outer evidence"),
+            ),
+            FixtureIngressMode::TransparentHttps => reconcile_transparent_https_request(
+                &mut request,
+                input.destination_port.unwrap_or(0),
+                input.tls_server_name.as_deref(),
+            ),
+        }
+        .map_err(|error| old_error_code(error, input))?;
+        Ok(ReconciledAuthority {
+            scheme: target.url.scheme,
+            authority: target.url.authority,
+            host: target.url.host,
+            port: target.url.port,
+        })
+    }
+
+    fn old_error_code(error: AuthorityError, input: &AuthorityEvidence) -> AuthorityErrorCode {
+        match error {
+            AuthorityError::MissingAuthority | AuthorityError::MissingHost => {
+                AuthorityErrorCode::MissingAuthority
+            }
+            AuthorityError::DuplicateHost => AuthorityErrorCode::DuplicateAuthority,
+            AuthorityError::ConnectMethod => AuthorityErrorCode::ConnectMethod,
+            AuthorityError::UnsupportedConnectVersion => {
+                AuthorityErrorCode::UnsupportedConnectVersion
+            }
+            AuthorityError::ConflictingAuthority => match input.ingress_mode {
+                FixtureIngressMode::ConnectMitmInner => AuthorityErrorCode::OuterConnectMismatch,
+                FixtureIngressMode::TransparentHttps => transparent_https_conflict(input),
+                _ => AuthorityErrorCode::AuthorityMismatch,
+            },
+            other => panic!("authority corpus produced unsupported old error {other:?}"),
+        }
+    }
+
+    fn transparent_https_conflict(input: &AuthorityEvidence) -> AuthorityErrorCode {
+        let raw_authority = if input.http_version == FixtureHttpVersion::Http2 {
+            input.authority_fields.first()
+        } else {
+            input.host_fields.first()
+        }
+        .expect("prevalidated transparent HTTPS authority");
+        let request = canonicalize_http_authority("https", raw_authority)
+            .expect("prevalidated transparent HTTPS authority");
+        let sni = canonicalize_tls_server_name(
+            input
+                .tls_server_name
+                .as_deref()
+                .expect("prevalidated transparent HTTPS SNI"),
+        )
+        .expect("prevalidated transparent HTTPS SNI");
+        if request.host == sni {
+            AuthorityErrorCode::DestinationPortMismatch
+        } else {
+            AuthorityErrorCode::TlsServerNameMismatch
+        }
+    }
+
+    #[test]
+    fn shared_authority_reconciliation_is_exactly_compatible_with_the_committed_corpus() {
+        assert!(
+            INTENTIONAL_AUTHORITY_DIFFERENCES.is_empty(),
+            "P03 requires an empty intentional-change list"
+        );
+        let suite = load_authority_suite().expect("committed authority suite must prevalidate");
+
+        for case in suite.into_cases() {
+            let old = old_result(&case.input);
+            let shared = shared_result(&case.input);
+            assert_eq!(old, shared, "{}: old/shared parity", case.id);
+            match case.expected {
+                AuthorityOutcome::Accepted { value } => {
+                    assert_eq!(old, Ok(value), "{}: fixture result", case.id);
+                }
+                AuthorityOutcome::Rejected { error } => {
+                    assert_eq!(old, Err(error), "{}: fixture error", case.id);
+                }
+            }
+        }
+    }
+}

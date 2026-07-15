@@ -839,7 +839,89 @@ fn is_unreserved(byte: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_access_conformance::{
+        load_matching_suite, load_url_suite, CanonicalUrlValue, MatchOutcome, UrlErrorCode,
+        UrlInput, UrlOutcome,
+    };
+    use http_access_types::HttpScheme;
+    use http_access_url::{
+        canonicalize_http_url as shared_canonicalize_http_url,
+        canonicalize_http_url_from_parts as shared_canonicalize_http_url_from_parts,
+        CompiledUrlPattern as SharedCompiledUrlPattern, UrlError as SharedUrlError,
+    };
     use serde::Deserialize;
+
+    const INTENTIONAL_URL_DIFFERENCES: &[&str] = &[];
+
+    fn old_error_code(error: &UrlError) -> UrlErrorCode {
+        match error {
+            UrlError::Parse => UrlErrorCode::Parse,
+            UrlError::Scheme => UrlErrorCode::Scheme,
+            UrlError::UserInfo => UrlErrorCode::UserInfo,
+            UrlError::Fragment => UrlErrorCode::Fragment,
+            UrlError::Host => UrlErrorCode::Host,
+            UrlError::Port => UrlErrorCode::Port,
+            UrlError::PercentEscape => UrlErrorCode::PercentEscape,
+            UrlError::ComponentByte => UrlErrorCode::ComponentByte,
+            UrlError::AmbiguousDoubleEncoding => UrlErrorCode::AmbiguousDoubleEncoding,
+            UrlError::Glob(_) => UrlErrorCode::Pattern,
+        }
+    }
+
+    fn shared_error_code(error: SharedUrlError) -> UrlErrorCode {
+        match error {
+            SharedUrlError::Parse => UrlErrorCode::Parse,
+            SharedUrlError::Scheme => UrlErrorCode::Scheme,
+            SharedUrlError::UserInfo => UrlErrorCode::UserInfo,
+            SharedUrlError::Fragment => UrlErrorCode::Fragment,
+            SharedUrlError::Host => UrlErrorCode::Host,
+            SharedUrlError::Port => UrlErrorCode::Port,
+            SharedUrlError::PercentEscape => UrlErrorCode::PercentEscape,
+            SharedUrlError::ComponentByte => UrlErrorCode::ComponentByte,
+            SharedUrlError::AmbiguousDoubleEncoding => UrlErrorCode::AmbiguousDoubleEncoding,
+            SharedUrlError::Pattern => UrlErrorCode::Pattern,
+        }
+    }
+
+    fn old_url_value(url: CanonicalUrl) -> CanonicalUrlValue {
+        CanonicalUrlValue {
+            url: url.url,
+            scheme: url.scheme,
+            authority: url.authority,
+            host: url.host,
+            host_for_authority: url.host_for_capture,
+            port: url.port,
+            path: url.path,
+            query: url.query,
+        }
+    }
+
+    fn shared_url_value(url: http_access_url::CanonicalUrl) -> CanonicalUrlValue {
+        let authority = url.authority();
+        let host = authority.host().as_str();
+        CanonicalUrlValue {
+            url: url.as_str().to_owned(),
+            scheme: url.scheme().as_str().to_owned(),
+            authority: authority.as_str().to_owned(),
+            host: host.to_owned(),
+            host_for_authority: if host.contains(':') {
+                format!("[{host}]")
+            } else {
+                host.to_owned()
+            },
+            port: authority.effective_port(),
+            path: url.path().to_owned(),
+            query: url.query().map(str::to_owned),
+        }
+    }
+
+    fn scheme(raw: &str) -> Result<HttpScheme, UrlErrorCode> {
+        match raw.to_ascii_lowercase().as_str() {
+            "http" => Ok(HttpScheme::Http),
+            "https" => Ok(HttpScheme::Https),
+            _ => Err(UrlErrorCode::Scheme),
+        }
+    }
 
     #[derive(Debug, Deserialize)]
     struct GoldenCase {
@@ -1379,5 +1461,88 @@ mod tests {
             "https://example.com/path?key=two&Key=One&Key=Three",
             "https://example.com/path?Key=One&key=two&Key=Three"
         ));
+    }
+
+    #[test]
+    fn shared_url_normalizer_is_exactly_compatible_with_the_committed_corpus() {
+        assert!(
+            INTENTIONAL_URL_DIFFERENCES.is_empty(),
+            "P03 requires an empty intentional-change list"
+        );
+        let suite = load_url_suite().expect("committed URL suite must prevalidate");
+
+        for case in suite.into_cases() {
+            let old = match &case.input {
+                UrlInput::Absolute { url } => canonicalize_http_url(url),
+                UrlInput::Origin {
+                    scheme,
+                    authority,
+                    target,
+                } => canonicalize_http_url_from_parts(scheme, authority, target),
+            }
+            .map(old_url_value)
+            .map_err(|error| old_error_code(&error));
+
+            let shared = match &case.input {
+                UrlInput::Absolute { url } => shared_canonicalize_http_url(url)
+                    .map(shared_url_value)
+                    .map_err(shared_error_code),
+                UrlInput::Origin {
+                    scheme: raw_scheme,
+                    authority,
+                    target,
+                } => scheme(raw_scheme).and_then(|scheme| {
+                    shared_canonicalize_http_url_from_parts(scheme, authority, target)
+                        .map(shared_url_value)
+                        .map_err(shared_error_code)
+                }),
+            };
+
+            assert_eq!(old, shared, "{}: old/shared parity", case.id);
+            match case.expected {
+                UrlOutcome::Accepted { value } => {
+                    assert_eq!(old, Ok(value), "{}: fixture result", case.id);
+                }
+                UrlOutcome::Rejected { error } => {
+                    assert_eq!(old, Err(error), "{}: fixture error", case.id);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shared_url_pattern_matcher_is_exactly_compatible_with_the_committed_corpus() {
+        assert!(
+            INTENTIONAL_URL_DIFFERENCES.is_empty(),
+            "P03 requires an empty intentional-change list"
+        );
+        let suite = load_matching_suite().expect("committed matching suite must prevalidate");
+
+        for case in suite.into_cases() {
+            let old = CompiledUrlPattern::compile(&case.input.pattern)
+                .map_err(|error| old_error_code(&error))
+                .and_then(|pattern| {
+                    canonicalize_http_url(&case.input.url)
+                        .map_err(|error| old_error_code(&error))
+                        .map(|url| pattern.is_match(&url))
+                });
+            let shared = SharedCompiledUrlPattern::compile(&case.input.pattern)
+                .map_err(shared_error_code)
+                .and_then(|pattern| {
+                    shared_canonicalize_http_url(&case.input.url)
+                        .map_err(shared_error_code)
+                        .map(|url| pattern.is_match(&url))
+                });
+
+            assert_eq!(old, shared, "{}: old/shared parity", case.id);
+            match case.expected {
+                MatchOutcome::Accepted { matches } => {
+                    assert_eq!(old, Ok(matches), "{}: fixture result", case.id);
+                }
+                MatchOutcome::Rejected { error } => {
+                    assert_eq!(old, Err(error), "{}: fixture error", case.id);
+                }
+            }
+        }
     }
 }

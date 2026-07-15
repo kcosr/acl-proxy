@@ -20,6 +20,9 @@ dependencies = [
  "fs2",
  "h2",
  "http",
+ "http-access-conformance",
+ "http-access-types",
+ "http-access-url",
  "httparse",
  "humantime",
  "hyper",
@@ -680,6 +683,34 @@ dependencies = [
  "bytes",
  "fnv",
  "itoa",
+]
+
+[[package]]
+name = "http-access-conformance"
+version = "0.1.0"
+dependencies = [
+ "http-access-types",
+ "http-access-url",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "http-access-types"
+version = "0.1.0"
+dependencies = [
+ "idna",
+ "serde",
+]
+
+[[package]]
+name = "http-access-url"
+version = "0.1.0"
+dependencies = [
+ "http-access-types",
+ "idna",
+ "regex",
+ "thiserror",
 ]
 
 [[package]]
