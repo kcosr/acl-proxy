@@ -6,18 +6,19 @@ use std::sync::Arc;
 
 use http::header::{HeaderMap, HeaderValue};
 
-use crate::config::compiler::{CompiledResourcePlan, SafetyPlan};
+use crate::config::compiler::{CompiledResourcePlan, HttpBodyResourcePlan, SafetyPlan};
 use crate::policy::{HttpWireBodyPlanBrand, HttpWireBodyPlanIndex};
 use crate::runtime::SafetySnapshot;
 
 pub(crate) use wire_body::{
-    GuardedBody, HttpWireBodyGuard, ProviderResponseCharge, WireBodyPool, WireBodyQuotaKey,
+    GuardedBody, HttpBodyAdmission, HttpWireBodyGuard, ProviderResponseCharge,
+    RequestStagingAuthority, RuntimeReplayLease, WireBodyPool, WireBodyQuotaKey,
 };
 
 pub(crate) struct ProductSafetySnapshot {
     loop_detection: LoopDetection,
     wire_body_pool: Arc<WireBodyPool>,
-    http_wire_body_peaks: Box<[usize]>,
+    http_body_resources: Box<[HttpBodyResourcePlan]>,
     http_wire_body_plan_brand: HttpWireBodyPlanBrand,
 }
 
@@ -47,8 +48,24 @@ impl ProductSafetySnapshot {
             .len()
             .checked_add(1)
             .ok_or(SafetyActivationError::InvalidHttpWireBodyPlans)?;
-        if resources.http_wire_body_peak_bytes_by_cursor.len() != expected_cursor_count
+        if resources.http_body_resources_by_cursor.len() != expected_cursor_count
             || http_wire_body_plan_brand.cursor_count() != expected_cursor_count
+            || resources
+                .http_body_resources_by_cursor
+                .iter()
+                .any(|resource| {
+                    resource
+                        .product_incremental_peak_bytes
+                        .checked_add(resource.runtime_replay_capacity_bytes)
+                        != Some(resource.combined_peak_bytes)
+                })
+            || resources
+                .http_body_resources_by_cursor
+                .iter()
+                .map(|resource| resource.combined_peak_bytes)
+                .max()
+                .unwrap_or(0)
+                != resources.max_reachable_http_body_combined_peak_bytes
         {
             return Err(SafetyActivationError::InvalidHttpWireBodyPlans);
         }
@@ -58,8 +75,8 @@ impl ProductSafetySnapshot {
                 header: plan.loop_detection.header,
             },
             wire_body_pool,
-            http_wire_body_peaks: resources
-                .http_wire_body_peak_bytes_by_cursor
+            http_body_resources: resources
+                .http_body_resources_by_cursor
                 .clone()
                 .into_boxed_slice(),
             http_wire_body_plan_brand,
@@ -95,11 +112,17 @@ impl SafetySnapshot for ProductSafetySnapshot {
         &self,
         plan: HttpWireBodyPlanIndex,
         quota_key: WireBodyQuotaKey,
-    ) -> Result<HttpWireBodyGuard, UnknownHttpWireBodyPlan> {
-        let peak = plan
-            .resolve(self.http_wire_body_plan_brand, &self.http_wire_body_peaks)
-            .ok_or(UnknownHttpWireBodyPlan)?;
-        Ok(self.wire_body_pool.begin(peak, quota_key))
+    ) -> Result<HttpBodyAdmission, HttpBodyAdmissionError> {
+        let resource = plan
+            .resolve(self.http_wire_body_plan_brand, &self.http_body_resources)
+            .ok_or(HttpBodyAdmissionError::UnknownPlan)?;
+        self.wire_body_pool
+            .begin_admission(
+                resource.product_incremental_peak_bytes,
+                resource.runtime_replay_capacity_bytes,
+                quota_key,
+            )
+            .map_err(HttpBodyAdmissionError::Resource)
     }
 }
 
@@ -108,8 +131,12 @@ impl SafetySnapshot for ProductSafetySnapshot {
 pub(crate) struct InvalidLoopMarker;
 
 #[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
-#[error("HTTP wire-body plan does not belong to the active policy snapshot")]
-pub(crate) struct UnknownHttpWireBodyPlan;
+pub(crate) enum HttpBodyAdmissionError {
+    #[error("HTTP wire-body plan does not belong to the active policy snapshot")]
+    UnknownPlan,
+    #[error(transparent)]
+    Resource(#[from] wire_body::WireBodyBufferError),
+}
 
 #[cfg(test)]
 mod tests {
@@ -136,8 +163,8 @@ mod tests {
                 },
             },
             &CompiledResourcePlan {
-                http_wire_body_peak_bytes_by_cursor: vec![peak, 0],
-                max_reachable_http_wire_body_peak_bytes: peak,
+                http_body_resources_by_cursor: vec![resource(peak, 0), resource(0, 0)],
+                max_reachable_http_body_combined_peak_bytes: peak,
                 wire_body_full_peak_capacity: Capacity::Finite(8),
                 wire_body_quota_key_full_peak_capacity: Capacity::Finite(4),
                 webhook_request_allocation_bytes_by_rule: vec![None],
@@ -150,6 +177,14 @@ mod tests {
             WireBodyPool::new(peak * 8, peak * 4),
         )
         .expect("test safety plan is consistent")
+    }
+
+    fn resource(product: usize, replay: usize) -> HttpBodyResourcePlan {
+        HttpBodyResourcePlan {
+            product_incremental_peak_bytes: product,
+            runtime_replay_capacity_bytes: replay,
+            combined_peak_bytes: product.checked_add(replay).unwrap(),
+        }
     }
 
     fn key() -> WireBodyQuotaKey {
@@ -205,15 +240,17 @@ mod tests {
     #[test]
     fn snapshot_starts_a_guard_against_the_shared_pool() {
         let snapshot = snapshot(true);
-        let guard = snapshot
+        let admission = snapshot
             .begin_http_body(
                 HttpWireBodyPlanIndex::test_for_brand(snapshot.http_wire_body_plan_brand, 0),
                 key(),
             )
             .expect("known plan");
+        let (guard, replay, _staging) = admission.into_parts();
         let mut body = guard.buffer();
         body.try_extend_from_slice(&[1; 128]).expect("within peak");
         assert_eq!(guard.live_bytes(), body.charged_bytes());
+        assert_eq!(replay.capacity_bytes(), 0);
     }
 
     #[test]
@@ -224,7 +261,7 @@ mod tests {
                 HttpWireBodyPlanIndex::test_for_brand(snapshot.http_wire_body_plan_brand, 2),
                 key(),
             ),
-            Err(UnknownHttpWireBodyPlan)
+            Err(HttpBodyAdmissionError::UnknownPlan)
         ));
         assert_eq!(snapshot.wire_body_pool.global_charge(), 0);
     }
@@ -235,7 +272,7 @@ mod tests {
         let (_, foreign) = HttpWireBodyPlanIndex::test_pair(2, 0);
         assert!(matches!(
             snapshot.begin_http_body(foreign, key()),
-            Err(UnknownHttpWireBodyPlan)
+            Err(HttpBodyAdmissionError::UnknownPlan)
         ));
         assert_eq!(snapshot.wire_body_pool.global_charge(), 0);
     }
@@ -252,8 +289,8 @@ mod tests {
                 },
             },
             &CompiledResourcePlan {
-                http_wire_body_peak_bytes_by_cursor: vec![peak],
-                max_reachable_http_wire_body_peak_bytes: peak,
+                http_body_resources_by_cursor: vec![resource(peak, 0)],
+                max_reachable_http_body_combined_peak_bytes: peak,
                 wire_body_full_peak_capacity: Capacity::Finite(8),
                 wire_body_quota_key_full_peak_capacity: Capacity::Finite(4),
                 webhook_request_allocation_bytes_by_rule: vec![None],
@@ -304,11 +341,11 @@ authorization_provider = "approval"
         .expect("test config compiles");
         let plan = compiled.reloadable_plan;
         assert_eq!(
-            plan.resource_plan.http_wire_body_peak_bytes_by_cursor.len(),
+            plan.resource_plan.combined_http_body_peaks_for_test().len(),
             2
         );
-        assert!(plan.resource_plan.http_wire_body_peak_bytes_by_cursor[0] > 0);
-        assert_eq!(plan.resource_plan.http_wire_body_peak_bytes_by_cursor[1], 0);
+        assert!(plan.resource_plan.combined_http_body_peaks_for_test()[0] > 0);
+        assert_eq!(plan.resource_plan.combined_http_body_peaks_for_test()[1], 0);
 
         let providers = ProviderRegistry::from_names(plan.authorization.providers.into_keys());
         let policy_activation = CompiledPolicySnapshot::activate(
@@ -343,9 +380,11 @@ authorization_provider = "approval"
             |_| false,
         );
         assert!(terminal.matched.is_none());
-        let guard = safety
+        let admission = safety
             .begin_http_body(terminal.wire_body_plan(), key())
             .expect("terminal cursor has a compiler-produced safety plan");
+        let (guard, replay, _staging) = admission.into_parts();
         assert_eq!(guard.cursor_peak_bytes(), 0);
+        assert_eq!(replay.capacity_bytes(), 0);
     }
 }

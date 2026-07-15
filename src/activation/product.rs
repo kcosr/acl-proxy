@@ -14,6 +14,7 @@ use crate::runtime::{
     GenerationId, GenerationOwner, ProviderRegistry, RuntimeError,
 };
 use crate::safety::ProductSafetySnapshot;
+use crate::standalone::UnboundStandaloneGenerationPlan;
 
 use super::owner::ProductGenerationOwner;
 use super::static_resources::ProductStaticResources;
@@ -45,36 +46,80 @@ impl ProductActivator {
         self.static_resources.authorization_runtime()
     }
 
+    #[cfg(test)]
     async fn activate_generation(
         &self,
         plan: ReloadableProductPlan,
         cancellation: ActivationCancellation,
     ) -> Result<ActivatedGeneration, RuntimeError> {
-        self.activate_generation_inner(plan, cancellation, |_| {})
-            .await
+        self.activate_generation_inner(
+            GenerationId::for_test(1),
+            plan,
+            cancellation,
+            |_| {},
+            |_| {},
+        )
+        .await
     }
 
     #[cfg(test)]
     async fn activate_generation_with_authorization_hook(
         &self,
+        id: GenerationId,
         plan: ReloadableProductPlan,
         cancellation: ActivationCancellation,
         after_authorization_activation: impl FnMut(&AuthorizationActivation),
     ) -> Result<ActivatedGeneration, RuntimeError> {
-        self.activate_generation_inner(plan, cancellation, after_authorization_activation)
-            .await
+        self.activate_generation_inner(
+            id,
+            plan,
+            cancellation,
+            after_authorization_activation,
+            |_| {},
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    async fn activate_generation_with_failed_standalone_bind(
+        &self,
+        id: GenerationId,
+        plan: ReloadableProductPlan,
+        cancellation: ActivationCancellation,
+        after_authorization_activation: impl FnMut(&AuthorizationActivation),
+    ) -> Result<ActivatedGeneration, RuntimeError> {
+        self.activate_generation_inner(
+            id,
+            plan,
+            cancellation,
+            after_authorization_activation,
+            |standalone| standalone.invalidate_first_provider_output_for_test(),
+        )
+        .await
     }
 
     async fn activate_generation_inner(
         &self,
+        id: GenerationId,
         plan: ReloadableProductPlan,
         cancellation: ActivationCancellation,
         mut after_authorization_activation: impl FnMut(&AuthorizationActivation),
+        mut before_standalone_bind: impl FnMut(&mut UnboundStandaloneGenerationPlan),
     ) -> Result<ActivatedGeneration, RuntimeError> {
+        cancellation.check()?;
+        let mut standalone =
+            UnboundStandaloneGenerationPlan::compile(&plan, id).map_err(|error| {
+                candidate_error(
+                    &cancellation,
+                    "standalone generation plan",
+                    error.to_string(),
+                )
+            })?;
         cancellation.check()?;
         let ReloadableProductPlan {
             request_timeout,
             max_content_decoding_expansion_ratio,
+            forwarding: _,
             egress,
             policy,
             authorization,
@@ -145,11 +190,13 @@ impl ProductActivator {
         .map_err(|error| map_authorization_error(error, &cancellation))?;
         after_authorization_activation(&authorization);
 
-        let (authorization, _provider_registry, provider_owners) = authorization.into_parts();
+        before_standalone_bind(&mut standalone);
+
+        let (authorization, provider_registry, provider_owners) = authorization.into_parts();
         let (observation, observation_owner) = observation.into_parts();
         let (policy, bindings) = policy.into_parts();
-        let (credentials, _credential_registry) = credentials.into_parts();
-        let (redaction, _redaction_registry) = redaction.into_parts();
+        let (credentials, credential_registry) = credentials.into_parts();
+        let (redaction, redaction_registry) = redaction.into_parts();
 
         let owners = provider_owners
             .into_vec()
@@ -157,12 +204,34 @@ impl ProductActivator {
             .chain(std::iter::once(observation_owner));
         let owner: Arc<dyn GenerationOwner> = Arc::new(ProductGenerationOwner::new(owners));
 
+        let standalone = match standalone.bind(
+            &credential_registry,
+            &redaction,
+            &redaction_registry,
+            &authorization,
+            &provider_registry,
+            &egress,
+            &observation,
+            &bindings,
+        ) {
+            Ok(standalone) => standalone,
+            Err(error) => {
+                owner.cleanup(CleanupReason::CandidateRejected).await;
+                return Err(candidate_error(
+                    &cancellation,
+                    "standalone generation binding",
+                    error.to_string(),
+                ));
+            }
+        };
+
         if cancellation.is_cancelled() {
             owner.cleanup(CleanupReason::CandidateRejected).await;
             return Err(RuntimeError::ActivationCancelled);
         }
 
         Ok(ActivatedGeneration {
+            standalone,
             request_timeout,
             max_content_decoding_expansion_ratio,
             resource_plan,
@@ -190,11 +259,11 @@ impl CandidateActivator for ProductActivator {
 
     fn activate(
         &self,
-        _id: GenerationId,
+        id: GenerationId,
         plan: ReloadableProductPlan,
         cancellation: ActivationCancellation,
     ) -> BoxFuture<'_, Result<ActivatedGeneration, RuntimeError>> {
-        Box::pin(self.activate_generation(plan, cancellation))
+        Box::pin(self.activate_generation_inner(id, plan, cancellation, |_| {}, |_| {}))
     }
 }
 
@@ -272,7 +341,7 @@ max_active_upgrades = 256
 upgrade_relay_buffer_bytes = 65536
 max_upgrade_buffer_bytes = 2147483648
 max_upgrade_lifetime = "8h"
-max_inflight_wire_body_bytes = 8589934592
+max_inflight_wire_body_bytes = 17179869184
 max_inflight_wire_body_bytes_per_quota_key = 1073741824
 min_wire_body_concurrency = 64
 max_content_decoding_expansion_ratio = 128
@@ -713,6 +782,35 @@ redaction_profile = "environment"
             .await
             .expect("candidate activation succeeds");
 
+        assert_eq!(activated.standalone.generation().get(), 1);
+        assert!(activated
+            .standalone
+            .snapshot_lease()
+            .owns(activated.standalone.identity()));
+        let standalone_bindings = activated.standalone.activated();
+        assert!(Arc::ptr_eq(
+            standalone_bindings
+                .capture_epoch()
+                .expect("standalone capture is bound"),
+            activated.observation.capture_epoch(),
+        ));
+        let bound_redaction = &standalone_bindings.redactions()[0];
+        let activated_redaction = activated
+            .redaction
+            .profile(bound_redaction.profile())
+            .expect("standalone redaction index resolves in the product snapshot");
+        assert!(bound_redaction.handle().same_profile(&activated_redaction));
+        let resource_proof = standalone_bindings.resources();
+        assert_eq!(resource_proof.cursors().len(), 1);
+        assert_eq!(
+            resource_proof.cursors()[0].combined_peak_bytes(),
+            resource_proof.cursors()[0].product_incremental_peak_bytes()
+                + resource_proof.cursors()[0].runtime_replay_capacity_bytes(),
+        );
+        assert_eq!(
+            resource_proof.max_reachable_combined_peak_bytes(),
+            resource_proof.cursors()[0].combined_peak_bytes(),
+        );
         assert_eq!(activated.bindings.provider_count, 0);
         assert_eq!(activated.bindings.redaction_profile_count, 1);
         let url = http_access_url::canonicalize_http_url("https://example.test/resource").unwrap();
@@ -856,6 +954,18 @@ command = "/usr/bin/python3"
 args = ["{}"]
 retire_timeout = "1s"
 
+[authorization.providers.local.outputs.token]
+kind = "bearer"
+required = true
+
+[credentials.sources.global]
+source = "environment"
+variable = "ACL_PROXY_TEST_GLOBAL_TOKEN"
+
+[[egress.credential_actions]]
+kind = "bearer"
+credential = "global"
+
 [policy]
 default = "deny""#,
                 script.display()
@@ -879,6 +989,20 @@ default = "deny""#,
             .expect("process provider candidate activates");
 
         assert_eq!(activated.bindings.provider_count, 1);
+        let standalone_bindings = activated.standalone.activated();
+        assert_eq!(standalone_bindings.global_credentials().len(), 1);
+        assert!(standalone_bindings.global_credentials()[0]
+            .reference()
+            .belongs_to(activated.standalone.identity()));
+        assert_eq!(standalone_bindings.provider_outputs().len(), 1);
+        assert_eq!(
+            standalone_bindings.provider_outputs()[0].provider().get(),
+            0
+        );
+        assert_eq!(standalone_bindings.provider_outputs()[0].output().get(), 0);
+        assert!(standalone_bindings.provider_outputs()[0]
+            .reference()
+            .belongs_to(activated.standalone.identity()));
         let mut publication = activated.owner.publication_guard().unwrap();
         publication.commit();
         drop(publication);
@@ -921,6 +1045,7 @@ default = "deny""#,
         let result = tokio::time::timeout(
             Duration::from_secs(2),
             activator.activate_generation_with_authorization_hook(
+                GenerationId::for_test(1),
                 compiled.reloadable_plan,
                 cancellation,
                 move |authorization| {
@@ -937,6 +1062,82 @@ default = "deny""#,
         .expect("product cancellation cleanup completes");
 
         assert!(matches!(result, Err(RuntimeError::ActivationCancelled)));
+        let (provider, pid) = observed
+            .lock()
+            .unwrap()
+            .take()
+            .expect("post-authorization hook ran");
+        assert_eq!(provider.cleanup_starts(), 1);
+        assert_eq!(
+            provider.cleanup_reasons(),
+            [CleanupReason::CandidateRejected]
+        );
+        // SAFETY: signal zero only checks whether the child PID still exists.
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_standalone_bind_rejects_and_reaps_activated_provider_once() {
+        let directory = TempDir::new().unwrap();
+        let script = directory.path().join("idle-until-bind-rejected.py");
+        fs::write(&script, "import time\nwhile True:\n    time.sleep(1)\n").unwrap();
+        let text = MINIMAL.replace(
+            "[policy]\ndefault = \"deny\"",
+            &format!(
+                r#"[authorization.providers.local]
+kind = "process"
+command = "/usr/bin/python3"
+args = ["{}"]
+retire_timeout = "1s"
+
+[authorization.providers.local.outputs.token]
+kind = "bearer"
+required = true
+
+[policy]
+default = "deny""#,
+                script.display()
+            ),
+        );
+        let source_path = directory.path().join("acl-proxy.toml");
+        let compiled = compile_config_text(ConfigTextInput {
+            text: &text,
+            source_path: &source_path,
+            config_root: directory.path(),
+        })
+        .unwrap();
+        let activator = product_activator(&compiled.static_config);
+        let observed = Arc::new(Mutex::new(None));
+        let hook_observed = observed.clone();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            activator.activate_generation_with_failed_standalone_bind(
+                GenerationId::for_test(1),
+                compiled.reloadable_plan,
+                ActivationCancellation::new_for_test(),
+                move |authorization| {
+                    let provider = authorization
+                        .process_provider_for_test(0)
+                        .expect("authorization activation owns the process provider");
+                    let pid = provider.child_id().expect("activated provider has a child");
+                    *hook_observed.lock().unwrap() = Some((provider, pid));
+                },
+            ),
+        )
+        .await
+        .expect("standalone bind cleanup completes");
+
+        assert!(matches!(
+            result,
+            Err(RuntimeError::CandidateActivation(message))
+                if message.contains("standalone generation binding")
+        ));
         let (provider, pid) = observed
             .lock()
             .unwrap()

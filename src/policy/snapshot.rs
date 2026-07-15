@@ -45,13 +45,13 @@ impl HttpWireBodyPlanIndex {
         Self { brand, ordinal }
     }
 
-    pub(crate) fn resolve(
+    pub(crate) fn resolve<T: Copy>(
         self,
         expected_brand: HttpWireBodyPlanBrand,
-        peaks: &[usize],
-    ) -> Option<usize> {
+        values: &[T],
+    ) -> Option<T> {
         (self.brand == expected_brand)
-            .then(|| peaks.get(self.ordinal).copied())
+            .then(|| values.get(self.ordinal).copied())
             .flatten()
     }
 
@@ -300,11 +300,8 @@ impl CompiledPolicySnapshot {
                         index,
                         rule,
                     }),
-                    body_read_plan: self.http_body_read_plans_by_cursor[start_index],
-                    wire_body_plan: HttpWireBodyPlanIndex::new(
-                        self.wire_body_plan_brand,
-                        start_index,
-                    ),
+                    body_read_plan: self.http_body_read_plans_by_cursor[index],
+                    wire_body_plan: HttpWireBodyPlanIndex::new(self.wire_body_plan_brand, index),
                 };
             }
         }
@@ -315,8 +312,8 @@ impl CompiledPolicySnapshot {
                 CompiledDefaultDecision::Deny => PolicyOutcome::Deny,
             },
             matched: None,
-            body_read_plan: self.http_body_read_plans_by_cursor[start_index],
-            wire_body_plan: HttpWireBodyPlanIndex::new(self.wire_body_plan_brand, start_index),
+            body_read_plan: self.http_body_read_plans_by_cursor[self.rules.len()],
+            wire_body_plan: HttpWireBodyPlanIndex::new(self.wire_body_plan_brand, self.rules.len()),
         }
     }
 }
@@ -1291,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn skipped_rules_keep_the_evaluation_plan_at_the_starting_cursor() {
+    fn skipped_rules_select_the_first_matching_resource_cursor() {
         let skipped = rule(
             "skipped",
             CompiledRuleDecision::Deny,
@@ -1309,13 +1306,13 @@ mod tests {
         assert_eq!(
             evaluation
                 .wire_body_plan()
-                .resolve(snapshot.wire_body_plan_brand, &[101, 202, 303]),
-            Some(101)
+                .resolve(snapshot.wire_body_plan_brand, &[10_000_000, 1_024, 0]),
+            Some(1_024)
         );
     }
 
     #[test]
-    fn resumed_cursor_owns_its_branded_plan_independent_of_later_match() {
+    fn resumed_evaluation_reports_the_later_matching_cursor() {
         let delegate = rule(
             "delegate",
             CompiledRuleDecision::Delegate,
@@ -1361,7 +1358,7 @@ mod tests {
             resumed
                 .wire_body_plan()
                 .resolve(active.wire_body_plan_brand, &[11, 22, 33, 44]),
-            Some(22)
+            Some(33)
         );
 
         let foreign = snapshot(
@@ -1422,13 +1419,13 @@ mod tests {
                 .body_read_plan()
                 .limits()
                 .map(|limits| (limits.max_encoded_bytes(), limits.max_decoded_bytes(),)),
-            Some((16, 32))
+            Some((8, 32))
         );
         assert_eq!(
             first
                 .wire_body_plan()
                 .resolve(active.wire_body_plan_brand, &[101, 202, 303, 0]),
-            Some(101)
+            Some(202)
         );
 
         let resumed = first.matched.unwrap().resume_cursor().resume(

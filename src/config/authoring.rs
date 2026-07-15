@@ -78,6 +78,9 @@ pub(super) struct ServiceConfig {
     #[serde(default = "default_request_timeout")]
     pub request_timeout: PositiveDuration,
 
+    #[serde(default)]
+    pub forwarding: ForwardingConfig,
+
     #[serde(default = "default_shutdown_drain_timeout")]
     pub shutdown_drain_timeout: DrainTimeout,
 
@@ -122,6 +125,7 @@ impl Default for ServiceConfig {
     fn default() -> Self {
         Self {
             request_timeout: default_request_timeout(),
+            forwarding: ForwardingConfig::default(),
             shutdown_drain_timeout: default_shutdown_drain_timeout(),
             max_retiring_generations: default_max_retiring_generations(),
             max_active_upgrades: default_max_active_upgrades(),
@@ -142,6 +146,82 @@ impl Default for ServiceConfig {
 
 fn default_request_timeout() -> PositiveDuration {
     seconds(30)
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ForwardingConfig {
+    #[serde(default = "default_forwarding_timeout")]
+    pub connect_timeout: PositiveDuration,
+    #[serde(default = "default_forwarding_timeout")]
+    pub response_head_timeout: PositiveDuration,
+    #[serde(default = "default_forwarding_timeout")]
+    pub body_idle_timeout: PositiveDuration,
+    #[serde(default = "default_forwarding_timeout")]
+    pub upgrade_idle_timeout: PositiveDuration,
+    #[serde(default = "default_forwarding_max_request_bytes")]
+    pub max_request_wire_bytes: usize,
+    #[serde(default = "default_forwarding_max_request_bytes")]
+    pub max_request_decoded_bytes: usize,
+    #[serde(default = "default_forwarding_max_response_bytes")]
+    pub max_response_wire_bytes: usize,
+    #[serde(default = "default_forwarding_max_response_bytes")]
+    pub max_response_decoded_bytes: usize,
+    #[serde(default = "default_forwarding_chunk_bytes")]
+    pub chunk_bytes: usize,
+    #[serde(default = "default_forwarding_preserve_request_trailers")]
+    pub preserve_request_trailers: bool,
+    #[serde(default = "default_forwarding_max_trailer_count")]
+    pub max_trailer_count: usize,
+    #[serde(default = "default_forwarding_max_trailer_bytes")]
+    pub max_trailer_bytes: usize,
+}
+
+impl Default for ForwardingConfig {
+    fn default() -> Self {
+        Self {
+            connect_timeout: default_forwarding_timeout(),
+            response_head_timeout: default_forwarding_timeout(),
+            body_idle_timeout: default_forwarding_timeout(),
+            upgrade_idle_timeout: default_forwarding_timeout(),
+            max_request_wire_bytes: default_forwarding_max_request_bytes(),
+            max_request_decoded_bytes: default_forwarding_max_request_bytes(),
+            max_response_wire_bytes: default_forwarding_max_response_bytes(),
+            max_response_decoded_bytes: default_forwarding_max_response_bytes(),
+            chunk_bytes: default_forwarding_chunk_bytes(),
+            preserve_request_trailers: default_forwarding_preserve_request_trailers(),
+            max_trailer_count: default_forwarding_max_trailer_count(),
+            max_trailer_bytes: default_forwarding_max_trailer_bytes(),
+        }
+    }
+}
+
+fn default_forwarding_timeout() -> PositiveDuration {
+    seconds(30)
+}
+
+fn default_forwarding_max_request_bytes() -> usize {
+    50 * 1024 * 1024
+}
+
+fn default_forwarding_max_response_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+fn default_forwarding_chunk_bytes() -> usize {
+    64 * 1024
+}
+
+fn default_forwarding_preserve_request_trailers() -> bool {
+    true
+}
+
+fn default_forwarding_max_trailer_count() -> usize {
+    4_096
+}
+
+fn default_forwarding_max_trailer_bytes() -> usize {
+    1024 * 1024
 }
 
 fn default_shutdown_drain_timeout() -> DrainTimeout {
@@ -181,11 +261,11 @@ fn default_max_upgrade_lifetime() -> PositiveDuration {
 }
 
 fn default_max_inflight_wire_body_bytes() -> usize {
-    8 * 1024 * 1024 * 1024
+    16 * 1024 * 1024 * 1024
 }
 
 fn default_max_inflight_wire_body_bytes_per_quota_key() -> usize {
-    1024 * 1024 * 1024
+    2 * 1024 * 1024 * 1024
 }
 
 fn default_min_wire_body_concurrency() -> usize {
@@ -1223,14 +1303,33 @@ header = "x-acl-proxy-request-id"
         );
         assert_eq!(
             config.service.max_inflight_wire_body_bytes,
-            8 * 1024 * 1024 * 1024
+            16 * 1024 * 1024 * 1024
         );
         assert_eq!(
             config.service.max_inflight_wire_body_bytes_per_quota_key,
-            1024 * 1024 * 1024
+            2 * 1024 * 1024 * 1024
         );
         assert_eq!(config.service.min_wire_body_concurrency, 64);
         assert_eq!(config.service.max_content_decoding_expansion_ratio, 128);
+        let forwarding = &config.service.forwarding;
+        assert_eq!(forwarding.connect_timeout.get(), Duration::from_secs(30));
+        assert_eq!(
+            forwarding.response_head_timeout.get(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(forwarding.body_idle_timeout.get(), Duration::from_secs(30));
+        assert_eq!(
+            forwarding.upgrade_idle_timeout.get(),
+            Duration::from_secs(30)
+        );
+        assert_eq!(forwarding.max_request_wire_bytes, 50 * 1024 * 1024);
+        assert_eq!(forwarding.max_request_decoded_bytes, 50 * 1024 * 1024);
+        assert_eq!(forwarding.max_response_wire_bytes, 64 * 1024 * 1024);
+        assert_eq!(forwarding.max_response_decoded_bytes, 64 * 1024 * 1024);
+        assert_eq!(forwarding.chunk_bytes, 64 * 1024);
+        assert!(forwarding.preserve_request_trailers);
+        assert_eq!(forwarding.max_trailer_count, 4_096);
+        assert_eq!(forwarding.max_trailer_bytes, 1024 * 1024);
         assert_eq!(config.policy.default, PolicyDefaultDecision::Deny);
         assert!(config.policy.rules.is_empty());
         assert!(config.safety.loop_detection.inject);
@@ -1295,6 +1394,49 @@ max_content_decoding_expansion_ratio = 96"#,
         );
         assert_eq!(parsed.service.min_wire_body_concurrency, 128);
         assert_eq!(parsed.service.max_content_decoding_expansion_ratio, 96);
+    }
+
+    #[test]
+    fn forwarding_fields_are_authored_with_exact_names() {
+        let authored = MINIMAL.replace(
+            "[listeners.explicit_http]",
+            r#"[service.forwarding]
+connect_timeout = "1s"
+response_head_timeout = "2s"
+body_idle_timeout = "3s"
+upgrade_idle_timeout = "4s"
+max_request_wire_bytes = 5
+max_request_decoded_bytes = 6
+max_response_wire_bytes = 7
+max_response_decoded_bytes = 8
+chunk_bytes = 9
+preserve_request_trailers = false
+max_trailer_count = 10
+max_trailer_bytes = 11
+
+[listeners.explicit_http]"#,
+        );
+
+        let parsed: AuthoringConfig = toml::from_str(&authored).unwrap();
+        let forwarding = parsed.service.forwarding;
+        assert_eq!(forwarding.connect_timeout.get(), Duration::from_secs(1));
+        assert_eq!(
+            forwarding.response_head_timeout.get(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(forwarding.body_idle_timeout.get(), Duration::from_secs(3));
+        assert_eq!(
+            forwarding.upgrade_idle_timeout.get(),
+            Duration::from_secs(4)
+        );
+        assert_eq!(forwarding.max_request_wire_bytes, 5);
+        assert_eq!(forwarding.max_request_decoded_bytes, 6);
+        assert_eq!(forwarding.max_response_wire_bytes, 7);
+        assert_eq!(forwarding.max_response_decoded_bytes, 8);
+        assert_eq!(forwarding.chunk_bytes, 9);
+        assert!(!forwarding.preserve_request_trailers);
+        assert_eq!(forwarding.max_trailer_count, 10);
+        assert_eq!(forwarding.max_trailer_bytes, 11);
     }
 
     #[test]

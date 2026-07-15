@@ -116,6 +116,20 @@ impl WireBodyPool {
         }
     }
 
+    pub(super) fn begin_admission(
+        self: &Arc<Self>,
+        product_peak_bytes: usize,
+        runtime_replay_capacity_bytes: usize,
+        quota_key: WireBodyQuotaKey,
+    ) -> Result<HttpBodyAdmission, WireBodyBufferError> {
+        let replay_lease =
+            RuntimeReplayLease::acquire(self, quota_key.clone(), runtime_replay_capacity_bytes)?;
+        Ok(HttpBodyAdmission {
+            guard: self.begin(product_peak_bytes, quota_key),
+            replay_lease,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn begin_for_test(
         self: &Arc<Self>,
@@ -123,6 +137,16 @@ impl WireBodyPool {
         quota_key: WireBodyQuotaKey,
     ) -> HttpWireBodyGuard {
         self.begin(cursor_peak_bytes, quota_key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn begin_admission_for_test(
+        self: &Arc<Self>,
+        product_peak_bytes: usize,
+        runtime_replay_capacity_bytes: usize,
+        quota_key: WireBodyQuotaKey,
+    ) -> Result<HttpBodyAdmission, WireBodyBufferError> {
+        self.begin_admission(product_peak_bytes, runtime_replay_capacity_bytes, quota_key)
     }
 
     #[cfg(test)]
@@ -267,6 +291,117 @@ impl Drop for QuotaLease {
 
 pub(crate) struct HttpWireBodyGuard {
     inner: Arc<GuardInner>,
+}
+
+pub(crate) struct HttpBodyAdmission {
+    guard: HttpWireBodyGuard,
+    replay_lease: RuntimeReplayLease,
+}
+
+impl HttpBodyAdmission {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        HttpWireBodyGuard,
+        RuntimeReplayLease,
+        RequestStagingAuthority,
+    ) {
+        let staging = RequestStagingAuthority {
+            inner: Arc::clone(&self.guard.inner),
+        };
+        (self.guard, self.replay_lease, staging)
+    }
+}
+
+pub(crate) struct RequestStagingAuthority {
+    inner: Arc<GuardInner>,
+}
+
+impl RequestStagingAuthority {
+    #[cfg(test)]
+    pub(crate) fn for_test(guard: &HttpWireBodyGuard) -> Self {
+        Self {
+            inner: Arc::clone(&guard.inner),
+        }
+    }
+
+    pub(crate) fn validate_guard(
+        &self,
+        guard: &HttpWireBodyGuard,
+    ) -> Result<(), WireBodyBufferError> {
+        if Arc::ptr_eq(&self.inner, &guard.inner) {
+            Ok(())
+        } else {
+            Err(WireBodyBufferError::ForeignGuard)
+        }
+    }
+
+    pub(crate) fn buffer(&self) -> RequestStagingBodyBuilder {
+        RequestStagingBodyBuilder(GuardedBodyBuilder::new(WireAllocationAuthority(
+            Arc::clone(&self.inner),
+        )))
+    }
+}
+
+pub(crate) struct RequestStagingBodyBuilder(GuardedBodyBuilder);
+
+impl RequestStagingBodyBuilder {
+    pub(crate) fn try_extend_from_slice(
+        &mut self,
+        bytes: &[u8],
+    ) -> Result<(), WireBodyBufferError> {
+        self.0.try_extend_from_slice(bytes)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn finish(self) -> GuardedBody {
+        self.0.finish()
+    }
+}
+
+pub(crate) struct RuntimeReplayLease {
+    pool: Arc<WireBodyPool>,
+    quota_lease: Option<QuotaLease>,
+    capacity_bytes: usize,
+}
+
+impl RuntimeReplayLease {
+    fn acquire(
+        pool: &Arc<WireBodyPool>,
+        quota_key: WireBodyQuotaKey,
+        capacity_bytes: usize,
+    ) -> Result<Self, WireBodyBufferError> {
+        if capacity_bytes == 0 {
+            return Ok(Self {
+                pool: Arc::clone(pool),
+                quota_lease: None,
+                capacity_bytes: 0,
+            });
+        }
+        let quota_lease = pool.lease_quota(&quota_key);
+        pool.try_charge(&quota_lease, capacity_bytes)?;
+        Ok(Self {
+            pool: Arc::clone(pool),
+            quota_lease: Some(quota_lease),
+            capacity_bytes,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity_bytes(&self) -> usize {
+        self.capacity_bytes
+    }
+}
+
+impl Drop for RuntimeReplayLease {
+    fn drop(&mut self) {
+        if let Some(quota_lease) = &self.quota_lease {
+            self.pool.release(quota_lease, self.capacity_bytes);
+        }
+    }
 }
 
 /// Cloneable allocation authority for a provider response. It deliberately
@@ -564,6 +699,57 @@ mod linked_tests {
 
     fn allocation(chunks: usize) -> usize {
         guarded_body_allocation_bytes(chunks * MAX_BUFFER_GROWTH_BYTES).unwrap()
+    }
+
+    #[test]
+    fn composite_admission_retains_exact_replay_charge_for_request_lifetime() {
+        let product = allocation(1);
+        let replay = 3 * product;
+        let pool = WireBodyPool::new(product + replay, product + replay);
+        let admission = pool
+            .begin_admission_for_test(product, replay, key())
+            .expect("combined request fits");
+        assert_eq!(pool.global_charge(), replay);
+
+        let (guard, replay_lease, staging) = admission.into_parts();
+        assert_eq!(replay_lease.capacity_bytes(), replay);
+        staging.validate_guard(&guard).unwrap();
+        let mut body = guard.buffer();
+        body.try_extend_from_slice(b"product body").unwrap();
+        assert_eq!(pool.global_charge(), product + replay);
+
+        drop(body);
+        drop(guard);
+        drop(staging);
+        assert_eq!(pool.global_charge(), replay);
+        drop(replay_lease);
+        assert_eq!(pool.global_charge(), 0);
+    }
+
+    #[test]
+    fn failed_replay_admission_rolls_back_quota_and_process_charge() {
+        let pool = WireBodyPool::new(10, 10);
+        let quota_key = key();
+        assert!(matches!(
+            pool.begin_admission_for_test(0, 11, quota_key.clone()),
+            Err(WireBodyBufferError::QuotaExhausted)
+        ));
+        assert_eq!(pool.global_charge(), 0);
+        assert_eq!(pool.quota_charge(&quota_key), 0);
+    }
+
+    #[test]
+    fn staging_authority_rejects_a_foreign_request_guard() {
+        let one = allocation(1);
+        let pool = WireBodyPool::new(2 * one, 2 * one);
+        let first = pool.begin(one, key());
+        let second = pool.begin(one, key());
+        let staging = RequestStagingAuthority::for_test(&first);
+
+        assert_eq!(
+            staging.validate_guard(&second),
+            Err(WireBodyBufferError::ForeignGuard)
+        );
     }
 
     fn body_bytes(body: &GuardedBody) -> Vec<u8> {

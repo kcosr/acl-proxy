@@ -6,8 +6,8 @@ shutdown_drain_timeout = "30s"
 max_active_webhook_deliveries = 256
 webhook_transport_buffer_bytes = 65536
 max_webhook_transport_bytes = 67108864
-max_inflight_wire_body_bytes = 8589934592
-max_inflight_wire_body_bytes_per_quota_key = 1073741824
+max_inflight_wire_body_bytes = 17179869184
+max_inflight_wire_body_bytes_per_quota_key = 2147483648
 min_wire_body_concurrency = 64
 max_content_decoding_expansion_ratio = 128
 

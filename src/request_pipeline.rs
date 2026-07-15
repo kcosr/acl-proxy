@@ -67,9 +67,10 @@ mod tests {
     use std::task::{Context, Poll};
 
     use http_access_runtime::{
-        BodyBudget, BodyChunk, BodySource, BoxFuture, Clock, DecisionProvider, ProviderOutcome,
-        RuntimeBody, RuntimeError, RuntimeRequest, RuntimeResourceLimits, RuntimeResponse,
-        RuntimeTrailers, SnapshotLease, SnapshotRegistries, StandaloneExchange, StandaloneTrusted,
+        BodyBudget, BodySource, BodySourceEvent, BoxFuture, Clock, DecisionProvider,
+        ProviderOutcome, RuntimeBody, RuntimeError, RuntimeRequest, RuntimeResourceLimits,
+        RuntimeResponse, RuntimeTrailers, SnapshotLease, SnapshotRegistries, StandaloneExchange,
+        StandaloneTrusted,
     };
     use http_access_types::{
         BodyFraming, BodyLimits, BodyMetadata, BodyRepresentation, CanonicalAuthority,
@@ -141,7 +142,7 @@ mod tests {
             self: Pin<&mut Self>,
             _context: &mut Context<'_>,
             _budget: &BodyBudget,
-        ) -> Poll<Result<Option<BodyChunk>, RuntimeError>> {
+        ) -> Poll<Result<BodySourceEvent, RuntimeError>> {
             Poll::Pending
         }
 
@@ -706,7 +707,7 @@ mod tests {
     }
 
     fn body_bounds() -> http_access_runtime::BodyBounds {
-        http_access_runtime::BodyBounds::new(1_024, 512, 0, 0, 100).unwrap()
+        http_access_runtime::BodyBounds::new(1_024, 1_024, 512, 0, 0, 100).unwrap()
     }
 
     fn facts() -> http_access_types::InterceptedRequestFacts {

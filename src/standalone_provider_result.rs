@@ -1,0 +1,1192 @@
+use http_access_runtime::{RuntimeRequest, StandalonePlan, StandaloneTrusted};
+use http_access_types::{
+    BodyRepresentation, CredentialMutation, CredentialRef, ForwardingPlan, ForwardingPlanInput,
+    HeaderMutation, HeaderMutationBatch, HeaderMutationCondition, HeaderName, HeaderValue,
+    PlanBinding, UpgradeIntent, UpgradePolicy,
+};
+
+use crate::authorization::protocol::{
+    ProviderBodyReplacementDecodeError, ProviderCredentialInjectionError,
+    StagedProviderCredentialMutation,
+};
+use crate::authorization::AuthorizationAllowOutput;
+use crate::runtime::{CredentialSourceIndex, GenerationLease, ProviderIndex};
+use crate::safety::{HttpWireBodyGuard, RuntimeReplayLease};
+use crate::standalone::{
+    BoundCredentialSource, ProviderCredentialTemplates, StandaloneCaptureEvent,
+    StandaloneGenerationPlan, StandaloneRuleDecision,
+};
+
+pub(crate) struct StandaloneProviderAllow {
+    pub(crate) plan: StandalonePlan,
+    pub(crate) request: RuntimeRequest,
+    pub(crate) sidecar: StandaloneRequestSidecar,
+}
+
+/// Product-only resources and secret bindings for one validated forwarding pair.
+///
+/// The shared plan contains only opaque credential references. Provider values
+/// stay guarded here until the terminal dispatcher consumes them for the exact
+/// plan binding.
+pub(crate) struct StandaloneRequestSidecar {
+    plan_binding: PlanBinding,
+    _guard: HttpWireBodyGuard,
+    _replay_lease: RuntimeReplayLease,
+    rule_credential_sources: Option<Box<[StandaloneCredentialSourceBinding]>>,
+    global_credential_sources: Option<Box<[StandaloneCredentialSourceBinding]>>,
+    provider_credentials: Option<StagedProviderCredentialMutation>,
+    credential_program_taken: bool,
+    capture_events: Box<[StandaloneCaptureEvent]>,
+    capture_epoch: Option<std::sync::Arc<crate::observation::CaptureEpoch>>,
+}
+
+pub(crate) struct StandaloneCredentialSourceBinding {
+    reference: CredentialRef,
+    source: CredentialSourceIndex,
+}
+
+struct StandaloneCredentialSourceStages {
+    rule: Box<[StandaloneCredentialSourceBinding]>,
+    global: Box<[StandaloneCredentialSourceBinding]>,
+}
+
+pub(crate) struct StandaloneCredentialProgram {
+    rule_sources: Box<[StandaloneCredentialSourceBinding]>,
+    provider_credentials: Option<StagedProviderCredentialMutation>,
+    global_sources: Box<[StandaloneCredentialSourceBinding]>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum StandaloneProviderAllowError {
+    #[error("provider allow result does not match the activated standalone binding")]
+    Binding,
+    #[error("provider credential output could not be staged")]
+    ProviderCredential(#[source] ProviderCredentialInjectionError),
+    #[error("provider body replacement could not be decoded")]
+    ProviderReplacement(#[source] ProviderBodyReplacementDecodeError),
+    #[error("provider body replacement could not be redacted")]
+    Redaction,
+    #[error("provider Content-Type is invalid")]
+    ContentType,
+    #[error("provider allow request rebuilding failed")]
+    Runtime(#[source] http_access_runtime::RuntimeError),
+    #[error("provider allow forwarding intent is invalid")]
+    Plan(#[source] http_access_types::ContractError),
+    #[error("the standalone credential program has already been consumed")]
+    CredentialProgramConsumed,
+}
+
+impl StandaloneRequestSidecar {
+    pub(crate) fn plan_binding(&self) -> PlanBinding {
+        self.plan_binding
+    }
+
+    pub(crate) fn capture_events(&self) -> &[StandaloneCaptureEvent] {
+        &self.capture_events
+    }
+
+    pub(crate) fn capture_epoch(
+        &self,
+    ) -> Option<&std::sync::Arc<crate::observation::CaptureEpoch>> {
+        self.capture_epoch.as_ref()
+    }
+
+    pub(crate) fn take_credential_program(
+        &mut self,
+        plan_binding: PlanBinding,
+    ) -> Result<StandaloneCredentialProgram, StandaloneProviderAllowError> {
+        if plan_binding != self.plan_binding {
+            return Err(StandaloneProviderAllowError::Binding);
+        }
+        if self.credential_program_taken {
+            return Err(StandaloneProviderAllowError::CredentialProgramConsumed);
+        }
+        self.credential_program_taken = true;
+        Ok(StandaloneCredentialProgram {
+            rule_sources: self
+                .rule_credential_sources
+                .take()
+                .expect("an unconsumed sidecar owns its rule credential source bindings"),
+            provider_credentials: self.provider_credentials.take(),
+            global_sources: self
+                .global_credential_sources
+                .take()
+                .expect("an unconsumed sidecar owns its global credential source bindings"),
+        })
+    }
+}
+
+impl StandaloneCredentialSourceBinding {
+    pub(crate) fn reference(&self) -> &CredentialRef {
+        &self.reference
+    }
+
+    pub(crate) fn source(&self) -> CredentialSourceIndex {
+        self.source
+    }
+}
+
+impl StandaloneCredentialProgram {
+    pub(crate) fn rule_sources(&self) -> &[StandaloneCredentialSourceBinding] {
+        &self.rule_sources
+    }
+
+    pub(crate) fn global_sources(&self) -> &[StandaloneCredentialSourceBinding] {
+        &self.global_sources
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Box<[StandaloneCredentialSourceBinding]>,
+        Option<StagedProviderCredentialMutation>,
+        Box<[StandaloneCredentialSourceBinding]>,
+    ) {
+        (
+            self.rule_sources,
+            self.provider_credentials,
+            self.global_sources,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn adapt_provider_allow(
+    lease: &GenerationLease,
+    rule_ordinal: usize,
+    provider: ProviderIndex,
+    output: AuthorizationAllowOutput,
+    guard: HttpWireBodyGuard,
+    replay_lease: RuntimeReplayLease,
+    mut request: RuntimeRequest,
+) -> Result<StandaloneProviderAllow, StandaloneProviderAllowError> {
+    let generation = lease.standalone();
+    let authorization = lease.authorization();
+    let rule = generation
+        .rules()
+        .get(rule_ordinal)
+        .filter(|rule| {
+            rule.ordinal() as usize == rule_ordinal
+                && rule.decision() == StandaloneRuleDecision::Delegate
+        })
+        .ok_or(StandaloneProviderAllowError::Binding)?;
+    if generation.activated().rule_provider(rule_ordinal) != Some(provider) {
+        return Err(StandaloneProviderAllowError::Binding);
+    }
+    let (credentials, replacement) = authorization
+        .consume_allow_output(provider, output)
+        .ok_or(StandaloneProviderAllowError::Binding)?;
+    let metadata = authorization
+        .provider_metadata(provider)
+        .ok_or(StandaloneProviderAllowError::Binding)?;
+    let provider_templates = generation
+        .provider_credentials()
+        .get(provider.get())
+        .filter(|templates| templates.ordinal() == provider.get())
+        .ok_or(StandaloneProviderAllowError::Binding)?;
+
+    let provider_credential_mutations = collect_provider_credential_mutations(
+        generation,
+        provider,
+        provider_templates,
+        credentials.as_ref(),
+    )?;
+    let staged_provider_credentials = credentials
+        .as_ref()
+        .map(|credentials| authorization.stage_provider_credentials(provider, credentials, &guard))
+        .transpose()
+        .map_err(StandaloneProviderAllowError::ProviderCredential)?;
+    drop(credentials);
+
+    let provider_content_type = if let Some(replacement) = replacement {
+        let redaction = generation.activated().rule_redaction(rule_ordinal);
+        let redaction_limit = redaction
+            .map(|binding| binding.handle().limits().max_decoded_body_bytes)
+            .unwrap_or(usize::MAX);
+        let (content_type, content_encoding, decoded) = replacement
+            .decode_with_limits(
+                &guard,
+                metadata.max_decoded_request_body_bytes,
+                redaction_limit,
+            )
+            .map_err(StandaloneProviderAllowError::ProviderReplacement)?;
+        if content_encoding
+            .as_deref()
+            .is_some_and(|value| value != "identity")
+        {
+            return Err(StandaloneProviderAllowError::ProviderReplacement(
+                ProviderBodyReplacementDecodeError::InvalidBody,
+            ));
+        }
+        let content_type = content_type_batch(content_type)?;
+        let replacement = match redaction {
+            Some(binding) => {
+                binding
+                    .handle()
+                    .redact_guarded_decoded_http_body(&guard, decoded)
+                    .map_err(|_| StandaloneProviderAllowError::Redaction)?
+                    .body
+            }
+            None => decoded,
+        };
+        let replacement_length =
+            u64::try_from(replacement.len()).map_err(|_| StandaloneProviderAllowError::Binding)?;
+        request
+            .replace_body_fragments(replacement_length, replacement.segments())
+            .map_err(StandaloneProviderAllowError::Runtime)?;
+        Some(content_type)
+    } else {
+        None
+    };
+
+    let mut request_mutation_batches = Vec::new();
+    if let Some(batch) = rule.request_headers() {
+        request_mutation_batches.push(batch.clone());
+    }
+    if let Some(batch) = generation.global_request_headers() {
+        request_mutation_batches.push(batch.clone());
+    }
+    if let Some(batch) = provider_content_type {
+        request_mutation_batches.push(batch);
+    }
+
+    let mut response_mutation_batches = Vec::new();
+    if let Some(batch) = rule.response_headers() {
+        response_mutation_batches.push(batch.clone());
+    }
+
+    let credential_sources = collect_credential_sources(generation, rule_ordinal, rule)?;
+    let mut credential_mutations = rule.credentials().to_vec();
+    credential_mutations.extend(provider_credential_mutations);
+    credential_mutations.extend_from_slice(generation.global_credentials());
+
+    let upgrade = compile_upgrade(&request, rule.allow_upgrades())?;
+    let request_body = match request.body_representation() {
+        BodyRepresentation::CanonicalIdentity => generation.normalized_request_body(),
+        BodyRepresentation::PreservedContentCoded if request.facts().upgrade().is_some() => {
+            generation.upgrade_request_body()
+        }
+        BodyRepresentation::PreservedContentCoded => generation.ordinary_request_body(),
+    };
+    let request_binding = request
+        .binding()
+        .map_err(StandaloneProviderAllowError::Runtime)?;
+    let capture_events = generation
+        .capture()
+        .map(|capture| capture.events().to_vec().into_boxed_slice())
+        .unwrap_or_default();
+    let capture = generation.capture().and_then(|capture| {
+        capture
+            .events()
+            .iter()
+            .any(|event| {
+                matches!(
+                    event,
+                    StandaloneCaptureEvent::RequestAllowed
+                        | StandaloneCaptureEvent::ResponseAllowed
+                )
+            })
+            .then(|| capture.intent().clone())
+    });
+    let capture_epoch = if generation.capture().is_some() {
+        Some(
+            generation
+                .activated()
+                .capture_epoch()
+                .cloned()
+                .ok_or(StandaloneProviderAllowError::Binding)?,
+        )
+    } else {
+        None
+    };
+    let plan = ForwardingPlan::new(ForwardingPlanInput {
+        snapshot_identity: generation.identity().clone(),
+        request_binding,
+        origin: request.facts().url().clone(),
+        route: generation.route().clone(),
+        origin_tls: generation.origin_tls(request.facts().url().scheme()),
+        timeouts: generation.timeouts(),
+        request_body,
+        response: generation.response(),
+        request_mutation_batches,
+        response_mutation_batches,
+        redaction: rule.redaction().cloned(),
+        capture,
+        upgrade,
+        provenance: rule
+            .provider_provenance()
+            .cloned()
+            .ok_or(StandaloneProviderAllowError::Binding)?,
+        credential_mutations,
+    })
+    .map_err(StandaloneProviderAllowError::Plan)?;
+    let plan_binding = plan.binding();
+    let plan = StandaloneTrusted::validate(plan, &request, generation.snapshot_lease())
+        .map_err(StandaloneProviderAllowError::Runtime)?;
+    let sidecar = StandaloneRequestSidecar {
+        plan_binding,
+        _guard: guard,
+        _replay_lease: replay_lease,
+        rule_credential_sources: Some(credential_sources.rule),
+        global_credential_sources: Some(credential_sources.global),
+        provider_credentials: staged_provider_credentials,
+        credential_program_taken: false,
+        capture_events,
+        capture_epoch,
+    };
+    Ok(StandaloneProviderAllow {
+        plan,
+        request,
+        sidecar,
+    })
+}
+
+fn collect_provider_credential_mutations(
+    generation: &StandaloneGenerationPlan,
+    provider: ProviderIndex,
+    templates: &ProviderCredentialTemplates,
+    credentials: Option<&crate::authorization::protocol::ProviderCredentialSet>,
+) -> Result<Vec<CredentialMutation>, StandaloneProviderAllowError> {
+    let bindings = generation
+        .activated()
+        .provider_outputs()
+        .iter()
+        .filter(|binding| binding.provider() == provider)
+        .collect::<Vec<_>>();
+    if bindings.len() != templates.outputs().len() {
+        return Err(StandaloneProviderAllowError::Binding);
+    }
+    let mut mutations = Vec::new();
+    for template in templates.outputs() {
+        let binding = bindings
+            .iter()
+            .copied()
+            .find(|binding| binding.output().get() == template.ordinal())
+            .filter(|binding| binding.reference() == template.mutation().credential())
+            .ok_or(StandaloneProviderAllowError::Binding)?;
+        let present =
+            credentials.is_some_and(|credentials| credentials.contains_output(binding.output()));
+        if template.required() && !present {
+            return Err(StandaloneProviderAllowError::Binding);
+        }
+        if present {
+            mutations.push(template.mutation().clone());
+        }
+    }
+    Ok(mutations)
+}
+
+fn collect_credential_sources(
+    generation: &StandaloneGenerationPlan,
+    rule_ordinal: usize,
+    rule: &crate::standalone::StandaloneRuleTemplate,
+) -> Result<StandaloneCredentialSourceStages, StandaloneProviderAllowError> {
+    let rule_bindings = generation
+        .activated()
+        .rule_credentials(rule_ordinal)
+        .ok_or(StandaloneProviderAllowError::Binding)?;
+    if rule_bindings.len() != rule.credentials().len()
+        || generation.activated().global_credentials().len()
+            != generation.global_credentials().len()
+    {
+        return Err(StandaloneProviderAllowError::Binding);
+    }
+    let mut rule_sources = Vec::with_capacity(rule_bindings.len());
+    for (binding, mutation) in rule_bindings.iter().zip(rule.credentials()) {
+        push_credential_source(&mut rule_sources, binding, mutation)?;
+    }
+    let mut global_sources = Vec::with_capacity(generation.activated().global_credentials().len());
+    for (binding, mutation) in generation
+        .activated()
+        .global_credentials()
+        .iter()
+        .zip(generation.global_credentials())
+    {
+        push_credential_source(&mut global_sources, binding, mutation)?;
+    }
+    Ok(StandaloneCredentialSourceStages {
+        rule: rule_sources.into_boxed_slice(),
+        global: global_sources.into_boxed_slice(),
+    })
+}
+
+fn push_credential_source(
+    result: &mut Vec<StandaloneCredentialSourceBinding>,
+    binding: &BoundCredentialSource,
+    mutation: &CredentialMutation,
+) -> Result<(), StandaloneProviderAllowError> {
+    if binding.reference() != mutation.credential() {
+        return Err(StandaloneProviderAllowError::Binding);
+    }
+    result.push(StandaloneCredentialSourceBinding {
+        reference: binding.reference().clone(),
+        source: binding.source(),
+    });
+    Ok(())
+}
+
+fn content_type_batch(
+    content_type: Option<String>,
+) -> Result<HeaderMutationBatch, StandaloneProviderAllowError> {
+    let name = HeaderName::new("content-type".to_owned())
+        .map_err(|_| StandaloneProviderAllowError::ContentType)?;
+    let mutation = match content_type {
+        Some(value) => HeaderMutation::set(
+            HeaderMutationCondition::Always,
+            name,
+            vec![HeaderValue::new(value.into_bytes())
+                .map_err(|_| StandaloneProviderAllowError::ContentType)?],
+        ),
+        None => HeaderMutation::remove(HeaderMutationCondition::Always, name),
+    }
+    .map_err(|_| StandaloneProviderAllowError::ContentType)?;
+    HeaderMutationBatch::new(vec![mutation]).map_err(|_| StandaloneProviderAllowError::ContentType)
+}
+
+fn compile_upgrade(
+    request: &RuntimeRequest,
+    allow: bool,
+) -> Result<UpgradePolicy, StandaloneProviderAllowError> {
+    match request.facts().upgrade() {
+        None => Ok(UpgradePolicy::Deny),
+        Some(_) if !allow => Err(StandaloneProviderAllowError::Binding),
+        Some(UpgradeIntent::WebSocket) => Ok(UpgradePolicy::WebSocket),
+        Some(UpgradeIntent::Other(protocol)) => Ok(UpgradePolicy::Opaque(protocol.clone())),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::future;
+    use std::net::IpAddr;
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+
+    use http::HeaderMap;
+    use http_access_runtime::{
+        prepare_standalone_exchange, BodyBounds, BodyBudget, BoxFuture, Clock, RuntimeBody,
+        StandaloneExchange,
+    };
+    use http_access_types::{
+        BodyFraming, BodyMetadata, HeaderField, HeaderMutationOperation, HttpMethod, HttpVersion,
+        IngressMode, PolicyHeaderFacts,
+    };
+
+    use super::*;
+    use crate::activation::static_resources::ProductStaticResources;
+    use crate::authorization::protocol::{ProviderBodyReplacement, ProviderCredentialSet};
+    use crate::config::{compile_config_text, CompiledConfig, ConfigTextInput};
+    use crate::runtime::{
+        ActivationCancellation, CandidateSource, GenerationLease, Runtime, RuntimeError,
+        StaticOwnership,
+    };
+    use crate::safety::WireBodyQuotaKey;
+
+    const CONFIG: &str = r#"schema_version = 3
+
+[service]
+request_timeout = "30s"
+max_retiring_generations = 2
+
+[service.forwarding]
+connect_timeout = "1s"
+response_head_timeout = "1s"
+body_idle_timeout = "1s"
+upgrade_idle_timeout = "1s"
+max_request_wire_bytes = 4096
+max_request_decoded_bytes = 4096
+max_response_wire_bytes = 4096
+max_response_decoded_bytes = 4096
+chunk_bytes = 1024
+preserve_request_trailers = false
+max_trailer_count = 8
+max_trailer_bytes = 1024
+
+[listeners.explicit_http]
+bind = "127.0.0.1:8881"
+http_versions = ["http1"]
+
+[listeners.explicit_http.connect]
+http1 = "deny"
+
+[credentials]
+allowed_custom_headers = ["x-provider-token", "x-rule-token", "x-global-token"]
+
+[credentials.sources.rule]
+source = "environment"
+variable = "P06_RULE_TOKEN"
+
+[credentials.sources.global]
+source = "environment"
+variable = "P06_GLOBAL_TOKEN"
+
+[authorization.providers.approval]
+kind = "process"
+command = "/bin/cat"
+retire_timeout = "31s"
+include_request_body = true
+allow_request_body_replacement = true
+max_request_body_bytes = 4096
+max_decoded_request_body_bytes = 4096
+
+[authorization.providers.approval.outputs.token]
+kind = "custom_header"
+header = "x-provider-token"
+required = false
+
+[egress]
+route = "direct"
+
+[egress.origin_tls]
+trust = "system"
+
+[redaction.profiles.wire]
+replacement = "[MASKED]"
+max_body_bytes = 4096
+max_decoded_body_bytes = 4096
+rules = [{ literals = ["secret"], payloads = "text" }]
+
+[[egress.request_headers]]
+operation = "set"
+when = "always"
+name = "content-type"
+value = "application/global"
+
+[[egress.credential_actions]]
+kind = "custom_header"
+header = "x-global-token"
+credential = "global"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "delegate"
+decision = "delegate"
+methods = ["POST"]
+urls = ["https://example.test/**"]
+authorization_provider = "approval"
+redaction_profile = "wire"
+
+[[policy.rules.request_headers]]
+operation = "set"
+when = "always"
+name = "content-type"
+value = "application/rule"
+
+[[policy.rules.response_headers]]
+operation = "remove"
+when = "always"
+name = "x-private"
+
+[[policy.rules.credential_actions]]
+kind = "custom_header"
+header = "x-rule-token"
+credential = "rule"
+
+[observation.logging]
+level = "info"
+console = true
+
+[safety.loop_detection]
+inject = true
+header = "x-test-loop"
+"#;
+
+    struct EmptySource;
+
+    impl CandidateSource for EmptySource {
+        fn load_latest(
+            &self,
+            _cancellation: ActivationCancellation,
+        ) -> BoxFuture<'_, Result<CompiledConfig, RuntimeError>> {
+            Box::pin(async { Err(RuntimeError::CandidateSource("unused".into())) })
+        }
+    }
+
+    struct TestClock;
+
+    impl Clock for TestClock {
+        fn monotonic_millis(&self) -> u64 {
+            1
+        }
+
+        fn unix_millis(&self) -> u64 {
+            1
+        }
+
+        fn sleep_until(&self, _deadline_millis: u64) -> BoxFuture<'static, ()> {
+            Box::pin(future::pending())
+        }
+    }
+
+    fn compiled() -> CompiledConfig {
+        std::fs::create_dir_all("/tmp/p06-provider-result").unwrap();
+        compile_config_text(ConfigTextInput {
+            text: CONFIG,
+            source_path: Path::new("/tmp/p06-provider-result/acl-proxy.toml"),
+            config_root: Path::new("/tmp/p06-provider-result"),
+        })
+        .unwrap()
+    }
+
+    async fn runtime() -> (
+        Arc<Runtime>,
+        GenerationLease,
+        Arc<crate::safety::WireBodyPool>,
+    ) {
+        let initial = compiled();
+        let resources = ProductStaticResources::try_new(&initial.static_config).unwrap();
+        let pool = resources.wire_body_pool();
+        let activator = resources.activator();
+        let ownership = StaticOwnership::new(
+            initial.static_config.clone(),
+            initial.static_fingerprint.clone(),
+            resources,
+        );
+        let runtime = Runtime::new(ownership, Arc::new(EmptySource), activator)
+            .await
+            .unwrap();
+        runtime.start(initial).await.unwrap();
+        let lease = runtime.lease().await.unwrap();
+        (runtime, lease, pool)
+    }
+
+    fn body_bounds(generation: &StandaloneGenerationPlan) -> BodyBounds {
+        let limits = generation.ordinary_request_body().limits();
+        BodyBounds::new(
+            limits.wire_bytes(),
+            limits.decoded_bytes(),
+            limits.chunk_bytes(),
+            limits.trailer_count(),
+            limits.trailer_bytes(),
+            generation.timeouts().body_idle_ms(),
+        )
+        .unwrap()
+    }
+
+    fn request(generation: &StandaloneGenerationPlan, chunks: Vec<Vec<u8>>) -> RuntimeRequest {
+        let length = chunks.iter().map(Vec::len).sum::<usize>();
+        let content_type = HeaderField::new(
+            HeaderName::new("content-type".to_owned()).unwrap(),
+            HeaderValue::new(b"application/original".to_vec()).unwrap(),
+        );
+        let facts = http_access_types::InterceptedRequestFacts::new(
+            IngressMode::ExplicitHttps,
+            HttpVersion::Http11,
+            HttpMethod::new("POST").unwrap(),
+            http_access_url::canonicalize_http_url("https://example.test/resource").unwrap(),
+            vec![content_type],
+            BodyMetadata::new(BodyFraming::ContentLength(length as u64)),
+            None,
+        )
+        .unwrap();
+        let body = RuntimeBody::from_chunks(
+            chunks,
+            body_bounds(generation),
+            Arc::new(TestClock),
+            BodyBudget::new(32 * 1024 * 1024).unwrap(),
+            30_001,
+        )
+        .unwrap();
+        let mut request = RuntimeRequest::new(
+            facts.clone(),
+            "192.0.2.10".parse().unwrap(),
+            PolicyHeaderFacts::new(facts.headers().to_vec(), Vec::new()).unwrap(),
+            BodyRepresentation::PreservedContentCoded,
+            body,
+            30_001,
+        )
+        .unwrap();
+        observe_body(&mut request);
+        request
+    }
+
+    fn observe_body(request: &mut RuntimeRequest) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        loop {
+            match request.poll_body_chunk(&mut Context::from_waker(std::task::Waker::noop())) {
+                Poll::Ready(Ok(Some(chunk))) => bytes.extend_from_slice(chunk.as_bytes()),
+                Poll::Ready(Ok(None)) => break,
+                Poll::Ready(Err(error)) => panic!("body observation failed: {error}"),
+                Poll::Pending => {}
+            }
+        }
+        loop {
+            match request.poll_trailers(&mut Context::from_waker(std::task::Waker::noop())) {
+                Poll::Ready(Ok(_)) => break,
+                Poll::Ready(Err(error)) => panic!("trailer observation failed: {error}"),
+                Poll::Pending => {}
+            }
+        }
+        bytes
+    }
+
+    fn replay_exchange(exchange: &mut StandaloneExchange) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        loop {
+            match exchange.poll_body_chunk(&mut Context::from_waker(std::task::Waker::noop())) {
+                Poll::Ready(Ok(Some(chunk))) => bytes.extend_from_slice(chunk.as_bytes()),
+                Poll::Ready(Ok(None)) => break,
+                Poll::Ready(Err(error)) => panic!("body replay failed: {error}"),
+                Poll::Pending => {}
+            }
+        }
+        loop {
+            match exchange.poll_trailers(&mut Context::from_waker(std::task::Waker::noop())) {
+                Poll::Ready(Ok(_)) => break,
+                Poll::Ready(Err(error)) => panic!("trailer replay failed: {error}"),
+                Poll::Pending => {}
+            }
+        }
+        bytes
+    }
+
+    fn admission(
+        lease: &GenerationLease,
+    ) -> (HttpWireBodyGuard, RuntimeReplayLease, ProviderIndex) {
+        let url = http_access_url::canonicalize_http_url("https://example.test/resource").unwrap();
+        let peer: IpAddr = "192.0.2.10".parse().unwrap();
+        let method = HttpMethod::new("POST").unwrap();
+        let evaluation = lease
+            .policy()
+            .evaluate(&url, peer, &method, &HeaderMap::new(), &|_| false);
+        let provider = lease.standalone().activated().rule_provider(0).unwrap();
+        let admission = lease
+            .safety()
+            .begin_http_body(
+                evaluation.wire_body_plan(),
+                WireBodyQuotaKey::from_peer(peer, |_| false),
+            )
+            .unwrap();
+        let (guard, replay, staging) = admission.into_parts();
+        drop(staging);
+        (guard, replay, provider)
+    }
+
+    fn replacement(
+        guard: &HttpWireBodyGuard,
+        fragments: &[&[u8]],
+        content_type: Option<&str>,
+    ) -> ProviderBodyReplacement {
+        let mut body = guard.buffer();
+        for fragment in fragments {
+            body.try_extend_from_slice(fragment).unwrap();
+        }
+        ProviderBodyReplacement::from_decoded_with_metadata_for_test(
+            body.finish(),
+            content_type.map(str::to_owned),
+            Some("identity".to_owned()),
+        )
+    }
+
+    fn replacement_with_encoding(
+        guard: &HttpWireBodyGuard,
+        body: &[u8],
+        content_encoding: &str,
+    ) -> ProviderBodyReplacement {
+        let mut staged = guard.buffer();
+        staged.try_extend_from_slice(body).unwrap();
+        ProviderBodyReplacement::from_decoded_with_metadata_for_test(
+            staged.finish(),
+            Some("application/provider".to_owned()),
+            Some(content_encoding.to_owned()),
+        )
+    }
+
+    fn output(
+        lease: &GenerationLease,
+        provider: ProviderIndex,
+        credentials: bool,
+        replacement: Option<ProviderBodyReplacement>,
+    ) -> AuthorizationAllowOutput {
+        let generation = lease.standalone();
+        let binding = &generation.activated().provider_outputs()[0];
+        let credentials = credentials.then(|| {
+            ProviderCredentialSet::single_value_for_test(binding.output(), 1, b"secret-token")
+        });
+        lease
+            .authorization()
+            .bind_allow_output_for_test(provider, credentials, replacement)
+    }
+
+    #[tokio::test]
+    async fn replacement_shapes_rehome_once_and_bind_the_exact_result() {
+        let cases: Vec<Vec<&[u8]>> = vec![
+            Vec::new(),
+            vec![b"one"],
+            vec![b"multi", b"-segment"],
+            vec![b"", b"empty", b"", b"-interleaved", b""],
+            std::iter::repeat_n(&b"x"[..], 512).collect(),
+        ];
+        for fragments in cases {
+            let (runtime, lease, pool) = runtime().await;
+            let generation = lease.standalone();
+            let (guard, replay, provider) = admission(&lease);
+            let replacement = replacement(&guard, &fragments, Some("application/provider"));
+            let expected = fragments.concat();
+            let before = request(generation, vec![b"original".to_vec()]);
+            let before_revision = before.revision();
+            let lineage = before.begin_provider_invocation();
+            let result = adapt_provider_allow(
+                &lease,
+                0,
+                provider,
+                output(&lease, provider, true, Some(replacement)),
+                guard,
+                replay,
+                before,
+            )
+            .unwrap();
+
+            assert_eq!(result.request.revision(), before_revision + 1);
+            assert_eq!(
+                result.request.body_representation(),
+                BodyRepresentation::CanonicalIdentity
+            );
+            result.plan.validate_request(&result.request).unwrap();
+            assert_eq!(result.sidecar.plan_binding(), result.plan.binding());
+            assert_eq!(
+                result
+                    .sidecar
+                    .rule_credential_sources
+                    .as_ref()
+                    .expect("rule credential program is unconsumed")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                result
+                    .sidecar
+                    .global_credential_sources
+                    .as_ref()
+                    .expect("global credential program is unconsumed")
+                    .len(),
+                1
+            );
+            let credential_mutations = result.plan.forwarding_plan().credential_mutations();
+            assert_eq!(credential_mutations.len(), 3);
+            assert_eq!(
+                credential_mutations[0].credential(),
+                generation.rules()[0].credentials()[0].credential()
+            );
+            assert_eq!(
+                credential_mutations[1].credential(),
+                generation.provider_credentials()[provider.get()].outputs()[0]
+                    .mutation()
+                    .credential()
+            );
+            assert_eq!(
+                credential_mutations[2].credential(),
+                generation.global_credentials()[0].credential()
+            );
+            assert_eq!(
+                result
+                    .plan
+                    .forwarding_plan()
+                    .request_mutation_batches()
+                    .len(),
+                3
+            );
+            assert_eq!(
+                result.plan.forwarding_plan().request_mutation_batches()[2].mutations()[0]
+                    .operation(),
+                HeaderMutationOperation::Set
+            );
+            let forwarding = result.plan.forwarding_plan();
+            assert_eq!(forwarding.route(), generation.route());
+            assert_eq!(
+                forwarding.origin_tls(),
+                &generation.origin_tls(result.request.facts().url().scheme())
+            );
+            assert_eq!(
+                forwarding.request_body(),
+                generation.normalized_request_body()
+            );
+            assert_eq!(forwarding.response(), generation.response());
+            assert_eq!(forwarding.capture(), None);
+            assert_eq!(forwarding.upgrade(), &UpgradePolicy::Deny);
+            assert_eq!(
+                forwarding.provenance(),
+                generation.rules()[0].provider_provenance().unwrap()
+            );
+            let StandaloneProviderAllow {
+                plan,
+                request,
+                sidecar,
+            } = result;
+            let mut exchange = prepare_standalone_exchange(lineage, plan, request).unwrap();
+            assert_eq!(replay_exchange(&mut exchange), expected);
+            drop(exchange);
+            drop(sidecar);
+            assert_eq!(pool.global_charge(), 0);
+            drop(lease);
+            runtime.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn content_type_preserve_remove_set_and_sidecar_use_are_exact() {
+        let mut foreign_binding = None;
+        for (replacement_type, expected, operation) in [
+            (None, Some("application/global"), None),
+            (Some(None), None, Some(HeaderMutationOperation::Remove)),
+            (
+                Some(Some("application/provider")),
+                Some("application/provider"),
+                Some(HeaderMutationOperation::Set),
+            ),
+        ] {
+            let (runtime, lease, _pool) = runtime().await;
+            let generation = lease.standalone();
+            let (guard, replay, provider) = admission(&lease);
+            let replacement =
+                replacement_type.map(|content_type| replacement(&guard, &[b"body"], content_type));
+            let mut result = adapt_provider_allow(
+                &lease,
+                0,
+                provider,
+                output(&lease, provider, true, replacement),
+                guard,
+                replay,
+                request(generation, vec![b"original".to_vec()]),
+            )
+            .unwrap();
+            let batches = result.plan.forwarding_plan().request_mutation_batches();
+            assert_eq!(batches.len(), if operation.is_some() { 3 } else { 2 });
+            if let Some(operation) = operation {
+                assert_eq!(
+                    batches.last().unwrap().mutations()[0].operation(),
+                    operation
+                );
+            }
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "content-type",
+                http::HeaderValue::from_static("application/original"),
+            );
+            let neutral = headers
+                .iter()
+                .map(|(name, value)| {
+                    HeaderField::new(
+                        HeaderName::new(name.as_str().to_owned()).unwrap(),
+                        HeaderValue::new(value.as_bytes().to_vec()).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let applied =
+                http_access_types::apply_header_mutation_batches(&neutral, batches).unwrap();
+            assert_eq!(
+                applied
+                    .iter()
+                    .find(|field| field.name().as_str() == "content-type")
+                    .map(|field| std::str::from_utf8(field.value().as_bytes()).unwrap()),
+                expected
+            );
+
+            let binding = result.plan.binding();
+            if let Some(foreign_binding) = foreign_binding {
+                assert!(matches!(
+                    result.sidecar.take_credential_program(foreign_binding),
+                    Err(StandaloneProviderAllowError::Binding)
+                ));
+            }
+            let program = result.sidecar.take_credential_program(binding).unwrap();
+            assert_eq!(program.rule_sources().len(), 1);
+            assert_eq!(program.global_sources().len(), 1);
+            let (_rule_sources, credentials, _global_sources) = program.into_parts();
+            let credentials = credentials.unwrap();
+            credentials.apply(&mut headers).unwrap();
+            assert_eq!(headers["x-provider-token"], "secret-token");
+            assert!(matches!(
+                result.sidecar.take_credential_program(binding),
+                Err(StandaloneProviderAllowError::CredentialProgramConsumed)
+            ));
+            foreign_binding = Some(binding);
+            drop(result);
+            drop(lease);
+            runtime.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_replacement_is_redacted_before_the_single_runtime_commit() {
+        let (runtime, lease, _pool) = runtime().await;
+        let generation = lease.standalone();
+        let (guard, replay, provider) = admission(&lease);
+        let replacement = replacement(&guard, &[b"before secret after"], Some("text/plain"));
+        let request = request(generation, vec![b"original".to_vec()]);
+        let original_revision = request.revision();
+        let lineage = request.begin_provider_invocation();
+        let result = adapt_provider_allow(
+            &lease,
+            0,
+            provider,
+            output(&lease, provider, false, Some(replacement)),
+            guard,
+            replay,
+            request,
+        )
+        .unwrap();
+
+        assert_eq!(result.request.revision(), original_revision + 1);
+        assert_eq!(
+            result.request.body_representation(),
+            BodyRepresentation::CanonicalIdentity
+        );
+        result.plan.validate_request(&result.request).unwrap();
+        let StandaloneProviderAllow {
+            plan,
+            request,
+            sidecar,
+        } = result;
+        let mut exchange = prepare_standalone_exchange(lineage, plan, request).unwrap();
+        assert_eq!(replay_exchange(&mut exchange), b"before [MASKED] after");
+        drop(exchange);
+        drop(sidecar);
+        drop(lease);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn foreign_generation_allow_outputs_fail_before_interpretation_or_staging() {
+        let (primary_runtime, lease, pool) = runtime().await;
+        let (foreign_runtime, foreign_lease, foreign_pool) = runtime().await;
+        let generation = lease.standalone();
+        let foreign_provider = foreign_lease
+            .standalone()
+            .activated()
+            .rule_provider(0)
+            .unwrap();
+        let foreign_output = output(&foreign_lease, foreign_provider, true, None);
+        let (guard, replay, provider) = admission(&lease);
+
+        let error = adapt_provider_allow(
+            &lease,
+            0,
+            provider,
+            foreign_output,
+            guard,
+            replay,
+            request(generation, vec![b"original".to_vec()]),
+        )
+        .err()
+        .expect("a foreign provider-output registry must fail closed");
+
+        assert!(matches!(error, StandaloneProviderAllowError::Binding));
+        assert_eq!(pool.global_charge(), 0);
+
+        let (guard, replay, provider) = admission(&lease);
+        let foreign_plain_allow = output(&foreign_lease, foreign_provider, false, None);
+        assert!(matches!(
+            adapt_provider_allow(
+                &lease,
+                0,
+                provider,
+                foreign_plain_allow,
+                guard,
+                replay,
+                request(generation, vec![b"original".to_vec()]),
+            ),
+            Err(StandaloneProviderAllowError::Binding)
+        ));
+        assert_eq!(pool.global_charge(), 0);
+
+        let (foreign_guard, foreign_replay, _) = admission(&foreign_lease);
+        let foreign_replacement = replacement(
+            &foreign_guard,
+            &[b"foreign replacement"],
+            Some("application/foreign"),
+        );
+        drop(foreign_guard);
+        drop(foreign_replay);
+        let foreign_replacement_allow = output(
+            &foreign_lease,
+            foreign_provider,
+            false,
+            Some(foreign_replacement),
+        );
+        let (guard, replay, provider) = admission(&lease);
+        assert!(matches!(
+            adapt_provider_allow(
+                &lease,
+                0,
+                provider,
+                foreign_replacement_allow,
+                guard,
+                replay,
+                request(generation, vec![b"original".to_vec()]),
+            ),
+            Err(StandaloneProviderAllowError::Binding)
+        ));
+        assert_eq!(pool.global_charge(), 0);
+        assert_eq!(foreign_pool.global_charge(), 0);
+        drop(foreign_lease);
+        foreign_runtime.shutdown().await;
+        drop(lease);
+        primary_runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn non_identity_provider_replacement_fails_before_commit_and_releases_charges() {
+        let (runtime, lease, pool) = runtime().await;
+        let generation = lease.standalone();
+        let (guard, replay, provider) = admission(&lease);
+        let replacement = replacement_with_encoding(&guard, b"replacement", "gzip");
+        let request = request(generation, vec![b"original".to_vec()]);
+
+        let error = adapt_provider_allow(
+            &lease,
+            0,
+            provider,
+            output(&lease, provider, true, Some(replacement)),
+            guard,
+            replay,
+            request,
+        )
+        .err()
+        .expect("a non-identity provider replacement must fail closed");
+
+        assert!(matches!(
+            error,
+            StandaloneProviderAllowError::ProviderReplacement(
+                ProviderBodyReplacementDecodeError::InvalidBody
+            )
+        ));
+        assert_eq!(pool.global_charge(), 0);
+        drop(lease);
+        runtime.shutdown().await;
+    }
+
+    #[test]
+    fn invalid_content_type_is_rejected_by_pure_precommit_preparation() {
+        assert!(matches!(
+            content_type_batch(Some("invalid\nvalue".to_owned())),
+            Err(StandaloneProviderAllowError::ContentType)
+        ));
+    }
+
+    #[tokio::test]
+    async fn invalid_content_type_releases_all_product_charges() {
+        let (runtime, lease, pool) = runtime().await;
+        let generation = lease.standalone();
+        let (guard, replay, provider) = admission(&lease);
+        let replacement = replacement(&guard, &[b"replacement"], Some("invalid\nvalue"));
+        let error = adapt_provider_allow(
+            &lease,
+            0,
+            provider,
+            output(&lease, provider, true, Some(replacement)),
+            guard,
+            replay,
+            request(generation, vec![b"original".to_vec()]),
+        )
+        .err()
+        .expect("invalid Content-Type must fail before request replacement");
+        assert!(matches!(error, StandaloneProviderAllowError::ContentType));
+        assert_eq!(pool.global_charge(), 0);
+        drop(lease);
+        runtime.shutdown().await;
+    }
+}

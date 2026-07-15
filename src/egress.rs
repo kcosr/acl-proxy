@@ -61,6 +61,7 @@ pub(crate) struct OriginTls {
     http_versions: Box<[CompiledHttpVersion]>,
     http1_config: Option<Arc<ClientConfig>>,
     http2_config: Option<Arc<ClientConfig>>,
+    custom_roots: Option<ActivatedTlsRoots>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -88,6 +89,13 @@ pub(crate) struct ParentTls {
     server_name: String,
     http1_config: Arc<ClientConfig>,
     http2_config: Arc<ClientConfig>,
+    custom_roots: Option<ActivatedTlsRoots>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ActivatedTlsRoots {
+    trust: CompiledTlsTrust,
+    _store: Arc<ClientTrust>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -169,6 +177,20 @@ impl EgressSnapshot {
 
     pub(crate) fn origin_tls(&self) -> &OriginTls {
         &self.origin_tls
+    }
+
+    pub(crate) fn origin_custom_roots(&self) -> Option<ActivatedTlsRoots> {
+        self.origin_tls.custom_roots.clone()
+    }
+
+    pub(crate) fn parent_custom_roots(&self) -> Option<ActivatedTlsRoots> {
+        let EgressRoute::Parent(parent) = &self.route else {
+            return None;
+        };
+        let ParentTransport::Https(tls) = parent.transport() else {
+            return None;
+        };
+        tls.custom_roots.clone()
     }
 
     pub(crate) fn apply_request_headers(
@@ -306,15 +328,23 @@ impl ParentTls {
         ServerName::try_from(server_name.as_str())
             .map_err(|_| EgressActivationError::ParentServerName)?;
         let enable_sni = server_name.as_str().parse::<IpAddr>().is_err();
-        let loaded_trust = load(plan.trust, plan.ca_certificate.as_deref())?;
+        let loaded_trust = Arc::new(load(plan.trust, plan.ca_certificate.as_deref())?);
+        let custom_roots = matches!(
+            plan.trust,
+            CompiledTlsTrust::Custom | CompiledTlsTrust::SystemPlusCustom
+        )
+        .then(|| ActivatedTlsRoots {
+            trust: plan.trust,
+            _store: loaded_trust.clone(),
+        });
         warn_if_insecure("parent", plan.trust);
         let http1_config = Arc::new(build_client_config(
-            &loaded_trust,
+            loaded_trust.as_ref(),
             ClientAlpn::Http1,
             enable_sni,
         ));
         let http2_config = Arc::new(build_client_config(
-            &loaded_trust,
+            loaded_trust.as_ref(),
             ClientAlpn::Http2,
             enable_sni,
         ));
@@ -324,6 +354,7 @@ impl ParentTls {
             server_name: server_name.into(),
             http1_config,
             http2_config,
+            custom_roots,
         })
     }
 
@@ -389,16 +420,35 @@ impl OriginTls {
             return Err(EgressActivationError::Route);
         }
 
-        let loaded_trust = load(trust, ca_certificate.as_deref())?;
+        let loaded_trust = Arc::new(load(trust, ca_certificate.as_deref())?);
+        let custom_roots = matches!(
+            trust,
+            CompiledTlsTrust::Custom | CompiledTlsTrust::SystemPlusCustom
+        )
+        .then(|| ActivatedTlsRoots {
+            trust,
+            _store: loaded_trust.clone(),
+        });
         warn_if_insecure("origin", trust);
         Ok(Self {
             #[cfg(test)]
             trust,
             http_versions: http_versions.into_boxed_slice(),
-            http1_config: http1
-                .then(|| Arc::new(build_client_config(&loaded_trust, ClientAlpn::Http1, true))),
-            http2_config: http2
-                .then(|| Arc::new(build_client_config(&loaded_trust, ClientAlpn::Http2, true))),
+            http1_config: http1.then(|| {
+                Arc::new(build_client_config(
+                    loaded_trust.as_ref(),
+                    ClientAlpn::Http1,
+                    true,
+                ))
+            }),
+            http2_config: http2.then(|| {
+                Arc::new(build_client_config(
+                    loaded_trust.as_ref(),
+                    ClientAlpn::Http2,
+                    true,
+                ))
+            }),
+            custom_roots,
         })
     }
 
@@ -456,6 +506,12 @@ impl OriginTls {
         compatible
             .then_some(())
             .ok_or(OriginProtocolError::IncompatibleAlpn)
+    }
+}
+
+impl ActivatedTlsRoots {
+    pub(crate) fn trust(&self) -> CompiledTlsTrust {
+        self.trust
     }
 }
 

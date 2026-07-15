@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use http::HeaderName;
@@ -10,7 +11,8 @@ use super::process::{
 use super::protocol::ProviderRequest;
 use super::protocol::{
     ProviderBodyReplacement, ProviderCredentialInjectionError, ProviderCredentialSet,
-    ProviderDecision, StagedProviderCredentialMutation,
+    ProviderDecision, ProviderOutputDefinition, ProviderOutputIndex, ProviderOutputRegistry,
+    StagedProviderCredentialMutation,
 };
 use super::webhook::provider::{WebhookActivationError, WebhookProvider};
 use super::webhook::runtime::{WebhookAuthorizationRuntime, WebhookDispatchError};
@@ -25,6 +27,7 @@ use crate::runtime::{
 use crate::safety::HttpWireBodyGuard;
 
 pub(crate) struct ProductAuthorizationSnapshot {
+    id: u64,
     internal_context_headers: Box<[HeaderName]>,
     providers: Box<[ActiveProvider]>,
     callback: Option<AuthorizationCallbackPlan>,
@@ -51,13 +54,31 @@ pub(crate) struct AuthorizationProviderMetadata<'snapshot> {
     pub(crate) failure_mode: CompiledProviderFailureMode,
 }
 
+pub(crate) struct ActivatedProviderOutputBinding<'snapshot> {
+    provider: ProviderIndex,
+    output: ProviderOutputIndex,
+    definition: &'snapshot ProviderOutputDefinition,
+}
+
 pub(crate) enum AuthorizationDecision {
-    Allow {
-        credentials: Option<ProviderCredentialSet>,
-        replacement: Option<ProviderBodyReplacement>,
-    },
+    Allow(AuthorizationAllowOutput),
     Deny,
     Pass,
+}
+
+pub(crate) struct AuthorizationAllowOutput {
+    snapshot_id: u64,
+    provider: ProviderIndex,
+    credentials: Option<ProviderCredentialSet>,
+    replacement: Option<ProviderBodyReplacement>,
+}
+
+static NEXT_AUTHORIZATION_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_authorization_snapshot_id() -> u64 {
+    let id = NEXT_AUTHORIZATION_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed);
+    assert!(id != 0, "authorization snapshot ID overflow");
+    id
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -196,6 +217,7 @@ impl ProductAuthorizationSnapshot {
         Ok(AuthorizationActivation {
             provider_registry,
             snapshot: Self {
+                id: next_authorization_snapshot_id(),
                 internal_context_headers: plan.internal_context_headers.into_boxed_slice(),
                 providers: providers.into_boxed_slice(),
                 callback: plan.callback,
@@ -207,6 +229,39 @@ impl ProductAuthorizationSnapshot {
 
     pub(crate) fn internal_context_headers(&self) -> &[HeaderName] {
         &self.internal_context_headers
+    }
+
+    fn bind_allow_output(
+        &self,
+        provider: ProviderIndex,
+        credentials: Option<ProviderCredentialSet>,
+        replacement: Option<ProviderBodyReplacement>,
+    ) -> AuthorizationAllowOutput {
+        AuthorizationAllowOutput {
+            snapshot_id: self.id,
+            provider,
+            credentials,
+            replacement,
+        }
+    }
+
+    fn consume_allow_output(
+        &self,
+        provider: ProviderIndex,
+        output: AuthorizationAllowOutput,
+    ) -> Option<(
+        Option<ProviderCredentialSet>,
+        Option<ProviderBodyReplacement>,
+    )> {
+        (output.snapshot_id == self.id && output.provider == provider)
+            .then_some((output.credentials, output.replacement))
+    }
+
+    fn outputs(&self, provider: ProviderIndex) -> Option<&ProviderOutputRegistry> {
+        match self.providers.get(provider.get())? {
+            ActiveProvider::Process(process) => process.outputs(),
+            ActiveProvider::Webhook(webhook) => Some(webhook.outputs()),
+        }
     }
 
     pub(crate) fn provider_metadata(
@@ -250,6 +305,47 @@ impl ProductAuthorizationSnapshot {
         outputs.stage_credentials(credentials, guard)
     }
 
+    fn bind_process_decision(
+        &self,
+        provider: ProviderIndex,
+        decision: ProcessDecision,
+    ) -> AuthorizationDecision {
+        match decision {
+            ProcessDecision::Allow => {
+                AuthorizationDecision::Allow(self.bind_allow_output(provider, None, None))
+            }
+            ProcessDecision::AllowWithOutputs {
+                credentials,
+                replacement,
+            } => AuthorizationDecision::Allow(self.bind_allow_output(
+                provider,
+                credentials,
+                replacement,
+            )),
+            ProcessDecision::Deny => AuthorizationDecision::Deny,
+            ProcessDecision::Pass => AuthorizationDecision::Pass,
+        }
+    }
+
+    fn bind_webhook_decision(
+        &self,
+        provider: ProviderIndex,
+        decision: ProviderDecision,
+    ) -> AuthorizationDecision {
+        match decision {
+            ProviderDecision::Allow {
+                credentials,
+                replacement,
+            } => AuthorizationDecision::Allow(self.bind_allow_output(
+                provider,
+                Some(credentials),
+                replacement,
+            )),
+            ProviderDecision::Deny => AuthorizationDecision::Deny,
+            ProviderDecision::Pass => AuthorizationDecision::Pass,
+        }
+    }
+
     #[cfg(test)]
     fn dispatch_process_for_test<'a>(
         &'a self,
@@ -259,20 +355,53 @@ impl ProductAuthorizationSnapshot {
         request_deadline: Instant,
     ) -> BoxFuture<'a, Result<AuthorizationDecision, AuthorizationDispatchError>> {
         Box::pin(async move {
-            let provider = self
+            let active = self
                 .providers
                 .get(provider.get())
                 .ok_or(AuthorizationDispatchError::UnknownProvider)?;
-            match provider {
+            match active {
                 ActiveProvider::Process(process) => process
                     .decide(request, guard, request_deadline)
                     .await
-                    .map(AuthorizationDecision::from)
+                    .map(|decision| self.bind_process_decision(provider, decision))
                     .map_err(AuthorizationDispatchError::Process),
                 ActiveProvider::Webhook(_) => {
                     unreachable!("process-only test dispatch selected a webhook provider")
                 }
             }
+        })
+    }
+}
+
+impl ActivatedProviderOutputBinding<'_> {
+    pub(crate) fn provider(&self) -> ProviderIndex {
+        self.provider
+    }
+
+    pub(crate) fn output(&self) -> ProviderOutputIndex {
+        self.output
+    }
+
+    pub(crate) fn definition(&self) -> &ProviderOutputDefinition {
+        self.definition
+    }
+}
+
+impl ProductAuthorizationSnapshot {
+    pub(crate) fn provider_output_binding(
+        &self,
+        provider_registry: &ProviderRegistry,
+        provider_name: &str,
+        output_name: &str,
+    ) -> Option<ActivatedProviderOutputBinding<'_>> {
+        let provider = provider_registry.get(provider_name)?;
+        let outputs = self.outputs(provider)?;
+        let output = outputs.index(output_name)?;
+        let definition = outputs.definitions().get(output.get())?;
+        Some(ActivatedProviderOutputBinding {
+            provider,
+            output,
+            definition,
         })
     }
 }
@@ -298,6 +427,27 @@ impl AuthorizationSnapshot for ProductAuthorizationSnapshot {
         ProductAuthorizationSnapshot::stage_provider_credentials(self, provider, credentials, guard)
     }
 
+    fn consume_allow_output(
+        &self,
+        provider: ProviderIndex,
+        output: AuthorizationAllowOutput,
+    ) -> Option<(
+        Option<ProviderCredentialSet>,
+        Option<ProviderBodyReplacement>,
+    )> {
+        ProductAuthorizationSnapshot::consume_allow_output(self, provider, output)
+    }
+
+    #[cfg(test)]
+    fn bind_allow_output_for_test(
+        &self,
+        provider: ProviderIndex,
+        credentials: Option<ProviderCredentialSet>,
+        replacement: Option<ProviderBodyReplacement>,
+    ) -> AuthorizationAllowOutput {
+        self.bind_allow_output(provider, credentials, replacement)
+    }
+
     fn dispatch<'a>(
         &'a self,
         provider: ProviderIndex,
@@ -306,15 +456,15 @@ impl AuthorizationSnapshot for ProductAuthorizationSnapshot {
         request_deadline: Instant,
     ) -> BoxFuture<'a, Result<AuthorizationDecision, AuthorizationDispatchError>> {
         Box::pin(async move {
-            let provider = self
+            let active = self
                 .providers
                 .get(provider.get())
                 .ok_or(AuthorizationDispatchError::UnknownProvider)?;
-            match provider {
+            match active {
                 ActiveProvider::Process(process) => process
                     .decide(context.into_request(), guard, request_deadline)
                     .await
-                    .map(AuthorizationDecision::from)
+                    .map(|decision| self.bind_process_decision(provider, decision))
                     .map_err(AuthorizationDispatchError::Process),
                 ActiveProvider::Webhook(webhook) => self
                     .webhook_runtime
@@ -328,46 +478,10 @@ impl AuthorizationSnapshot for ProductAuthorizationSnapshot {
                         request_deadline,
                     )
                     .await
-                    .map(AuthorizationDecision::from)
+                    .map(|decision| self.bind_webhook_decision(provider, decision))
                     .map_err(AuthorizationDispatchError::Webhook),
             }
         })
-    }
-}
-
-impl From<ProcessDecision> for AuthorizationDecision {
-    fn from(decision: ProcessDecision) -> Self {
-        match decision {
-            ProcessDecision::Allow => Self::Allow {
-                credentials: None,
-                replacement: None,
-            },
-            ProcessDecision::AllowWithOutputs {
-                credentials,
-                replacement,
-            } => Self::Allow {
-                credentials,
-                replacement,
-            },
-            ProcessDecision::Deny => Self::Deny,
-            ProcessDecision::Pass => Self::Pass,
-        }
-    }
-}
-
-impl From<ProviderDecision> for AuthorizationDecision {
-    fn from(decision: ProviderDecision) -> Self {
-        match decision {
-            ProviderDecision::Allow {
-                credentials,
-                replacement,
-            } => Self::Allow {
-                credentials: Some(credentials),
-                replacement,
-            },
-            ProviderDecision::Deny => Self::Deny,
-            ProviderDecision::Pass => Self::Pass,
-        }
     }
 }
 
@@ -758,22 +872,42 @@ for line in sys.stdin:
         }
 
         let _: &dyn AuthorizationSnapshot = &snapshot;
-        assert!(matches!(
-            snapshot
-                .dispatch_process_for_test(
-                    provider,
-                    request("request-1"),
-                    &body_guard(),
-                    Instant::now() + Duration::from_secs(5),
-                )
-                .await
-                .unwrap(),
-            AuthorizationDecision::Allow { .. }
-        ));
+        let decision = snapshot
+            .dispatch_process_for_test(
+                provider,
+                request("request-1"),
+                &body_guard(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let AuthorizationDecision::Allow(output) = decision else {
+            panic!("expected the process provider to allow the request");
+        };
+        let (credentials, replacement) = snapshot
+            .consume_allow_output(provider, output)
+            .expect("the dispatch output is bound to its snapshot and provider");
+        assert!(credentials.is_none());
+        assert!(replacement.is_none());
         let foreign =
             ProviderRegistry::from_names(["unused-a".to_string(), "unused-z".to_string()])
                 .get("unused-z")
                 .unwrap();
+        let foreign_provider_output = snapshot
+            .dispatch_process_for_test(
+                provider,
+                request("request-provider-binding"),
+                &body_guard(),
+                Instant::now() + Duration::from_secs(5),
+            )
+            .await
+            .unwrap();
+        let AuthorizationDecision::Allow(foreign_provider_output) = foreign_provider_output else {
+            panic!("expected the process provider to allow the request");
+        };
+        assert!(snapshot
+            .consume_allow_output(foreign, foreign_provider_output)
+            .is_none());
         assert!(matches!(
             snapshot
                 .dispatch_process_for_test(
@@ -786,6 +920,39 @@ for line in sys.stdin:
             Err(AuthorizationDispatchError::UnknownProvider)
         ));
         cleanup(&owners).await;
+    }
+
+    #[test]
+    fn allow_output_transfers_and_releases_owned_replacement() {
+        let (pool, quota_key, guard) = body_guard_with_pool();
+        let mut body = guard.buffer();
+        body.try_extend_from_slice(b"owned replacement").unwrap();
+        let body = body.finish();
+        let charge = body.charged_bytes();
+        let provider = ProviderRegistry::from_names(["test".to_owned()])
+            .get("test")
+            .unwrap();
+        let output = AuthorizationAllowOutput {
+            snapshot_id: 1,
+            provider,
+            credentials: None,
+            replacement: Some(ProviderBodyReplacement::from_decoded_for_test(body)),
+        };
+
+        assert_eq!(pool.global_charge(), charge);
+        assert_eq!(pool.quota_charge(&quota_key), charge);
+
+        let AuthorizationAllowOutput {
+            credentials,
+            replacement,
+            ..
+        } = output;
+        assert!(credentials.is_none());
+        assert_eq!(pool.global_charge(), charge);
+
+        drop(replacement);
+        assert_eq!(pool.global_charge(), 0);
+        assert_eq!(pool.quota_charge(&quota_key), 0);
     }
 
     #[tokio::test]

@@ -114,6 +114,26 @@ impl AuthorizationSnapshot for EmptySnapshot {
         Err(crate::authorization::protocol::ProviderCredentialInjectionError::UnknownProvider)
     }
 
+    fn consume_allow_output(
+        &self,
+        _provider: ProviderIndex,
+        _output: crate::authorization::AuthorizationAllowOutput,
+    ) -> Option<(
+        Option<crate::authorization::protocol::ProviderCredentialSet>,
+        Option<crate::authorization::protocol::ProviderBodyReplacement>,
+    )> {
+        None
+    }
+
+    fn bind_allow_output_for_test(
+        &self,
+        _provider: ProviderIndex,
+        _credentials: Option<crate::authorization::protocol::ProviderCredentialSet>,
+        _replacement: Option<crate::authorization::protocol::ProviderBodyReplacement>,
+    ) -> crate::authorization::AuthorizationAllowOutput {
+        panic!("the empty authorization snapshot cannot bind allow output")
+    }
+
     fn dispatch<'a>(
         &'a self,
         _provider: ProviderIndex,
@@ -179,8 +199,10 @@ impl SafetySnapshot for EmptySnapshot {
         &self,
         _plan: crate::policy::HttpWireBodyPlanIndex,
         quota_key: crate::safety::WireBodyQuotaKey,
-    ) -> Result<crate::safety::HttpWireBodyGuard, crate::safety::UnknownHttpWireBodyPlan> {
-        Ok(crate::safety::WireBodyPool::new(1, 1).begin_for_test(0, quota_key))
+    ) -> Result<crate::safety::HttpBodyAdmission, crate::safety::HttpBodyAdmissionError> {
+        crate::safety::WireBodyPool::new(1, 1)
+            .begin_admission_for_test(0, 0, quota_key)
+            .map_err(crate::safety::HttpBodyAdmissionError::Resource)
     }
 }
 
@@ -630,7 +652,7 @@ impl CandidateActivator for FakeActivator {
 
     fn activate(
         &self,
-        _id: GenerationId,
+        id: GenerationId,
         plan: crate::config::ReloadableProductPlan,
         cancellation: ActivationCancellation,
     ) -> BoxFuture<'_, Result<ActivatedGeneration, RuntimeError>> {
@@ -677,12 +699,16 @@ impl CandidateActivator for FakeActivator {
                 )));
             }
 
+            let standalone = crate::standalone::UnboundStandaloneGenerationPlan::compile(&plan, id)
+                .map_err(|error| RuntimeError::CandidateActivation(error.to_string()))?
+                .into_bound_for_runtime_test();
             let redaction = ProductRedactionSnapshot::activate(plan.redaction, || false)
                 .map_err(|error| RuntimeError::CandidateActivation(error.to_string()))?;
             let (redaction, _) = redaction.into_parts();
             let redaction = Arc::new(redaction);
             let snapshot = Arc::new(EmptySnapshot);
             Ok(ActivatedGeneration {
+                standalone,
                 request_timeout: plan.request_timeout,
                 max_content_decoding_expansion_ratio: plan.max_content_decoding_expansion_ratio,
                 resource_plan: plan.resource_plan,
@@ -843,10 +869,17 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
     assert!(owners.is_empty());
 
     let compiled = compile(&config("30s", "127.0.0.1:8881", 2)).unwrap();
+    let standalone = crate::standalone::UnboundStandaloneGenerationPlan::compile(
+        &compiled.reloadable_plan,
+        GenerationId::new(1),
+    )
+    .unwrap()
+    .into_bound_for_runtime_test();
     let empty = Arc::new(EmptySnapshot);
     let generation = Arc::new(Generation::from_activated(
         GenerationId::new(1),
         ActivatedGeneration {
+            standalone,
             request_timeout: Duration::from_secs(30),
             max_content_decoding_expansion_ratio: 128,
             resource_plan: compiled.reloadable_plan.resource_plan.clone(),
@@ -861,6 +894,11 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
             owner: Arc::new(FakeOwner::default()),
         },
     ));
+    assert_eq!(generation.standalone().generation().get(), 1);
+    assert!(generation
+        .standalone()
+        .snapshot_lease()
+        .owns(generation.standalone().identity()));
     let lease = generation.try_lease().unwrap();
     let body_guard = WireBodyPool::new(2 * 1024 * 1024, 2 * 1024 * 1024).begin_for_test(
         512 * 1024,

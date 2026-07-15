@@ -7,6 +7,7 @@ mod snapshot;
 pub(crate) mod webhook;
 
 pub(crate) use snapshot::{
-    AuthorizationActivation, AuthorizationActivationError, AuthorizationDecision,
-    AuthorizationDispatchError, AuthorizationProviderMetadata, ProductAuthorizationSnapshot,
+    ActivatedProviderOutputBinding, AuthorizationActivation, AuthorizationActivationError,
+    AuthorizationAllowOutput, AuthorizationDecision, AuthorizationDispatchError,
+    AuthorizationProviderMetadata, ProductAuthorizationSnapshot,
 };

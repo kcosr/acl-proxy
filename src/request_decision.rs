@@ -17,7 +17,9 @@ use crate::proxy::facts::{product_headers, FactsError, ValidatedRequestFactShape
 use crate::redaction::ProfileHandle;
 use crate::runtime::{GenerationLease, ProviderIndex};
 use crate::safety::wire_body::WireBodyBufferError;
-use crate::safety::{GuardedBody, HttpWireBodyGuard, UnknownHttpWireBodyPlan, WireBodyQuotaKey};
+use crate::safety::{
+    GuardedBody, HttpBodyAdmissionError, HttpWireBodyGuard, RuntimeReplayLease, WireBodyQuotaKey,
+};
 use crate::upgrade::UpgradeAllocation;
 
 /// Strict request head. Body-bearing ingress prepares this first, then decodes
@@ -98,6 +100,7 @@ pub(crate) enum TerminalRequestBodyProvenance {
 pub(crate) struct DecidedRequest {
     pub(crate) headers: HeaderMap,
     pub(crate) _body_guard: HttpWireBodyGuard,
+    pub(crate) _runtime_replay_lease: RuntimeReplayLease,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,12 +117,14 @@ pub(crate) enum DenyReason {
 pub(crate) enum RequestDecisionError {
     #[error("inbound credential processing failed")]
     Credential(#[from] CredentialError),
-    #[error("the policy wire-body plan does not belong to this generation")]
-    BodyPlan(#[from] UnknownHttpWireBodyPlan),
+    #[error("HTTP body admission failed")]
+    BodyAdmission(#[from] HttpBodyAdmissionError),
     #[error("request body was not allocated by the selected policy guard")]
     BodyGuard(#[from] WireBodyBufferError),
     #[error("authorization provider metadata is missing")]
     MissingProvider,
+    #[error("authorization allow output does not belong to the selected provider generation")]
+    ProviderOutputBinding,
     #[error("the policy redaction profile is missing from this generation")]
     MissingRedactionProfile,
     #[error("the matched upgrade rule has no compiled upgrade allocation")]
@@ -210,6 +215,7 @@ pub(crate) struct PreparedRequest<'generation, 'request> {
     internal_context: HeaderMap,
     evaluation: PolicyEvaluation<'generation>,
     guard: HttpWireBodyGuard,
+    replay_lease: RuntimeReplayLease,
     early_deny: Option<DenyReason>,
 }
 
@@ -267,6 +273,7 @@ impl<'generation, 'request> PreparedRequest<'generation, 'request> {
                 common: DecidedRequest {
                     headers: self.headers,
                     _body_guard: self.guard,
+                    _runtime_replay_lease: self.replay_lease,
                 },
                 _rule: None,
                 _reason: reason,
@@ -283,6 +290,7 @@ impl<'generation, 'request> PreparedRequest<'generation, 'request> {
                 internal_context: self.internal_context,
                 evaluation: self.evaluation,
                 guard: self.guard,
+                replay_lease: self.replay_lease,
                 body,
                 body_provenance,
             },
@@ -313,9 +321,10 @@ pub(crate) fn prepare_request<'generation, 'request>(
         .started_at
         .checked_add(request_timeout)
         .ok_or(RequestDecisionError::RequestDeadlineOverflow)?;
-    let guard = lease
+    let admission = lease
         .safety()
         .begin_http_body(evaluation.wire_body_plan(), input.quota_key)?;
+    let (guard, replay_lease, _staging_authority) = admission.into_parts();
 
     let identity = RequestIdentity {
         request_id: input.request_id,
@@ -335,6 +344,7 @@ pub(crate) fn prepare_request<'generation, 'request>(
             internal_context: input.internal_context,
             evaluation,
             guard,
+            replay_lease,
             early_deny: Some(DenyReason::LoopDetected),
         });
     }
@@ -347,6 +357,7 @@ pub(crate) fn prepare_request<'generation, 'request>(
         internal_context: input.internal_context,
         evaluation,
         guard,
+        replay_lease,
         early_deny: None,
     })
 }
@@ -365,6 +376,7 @@ struct DecisionState<'generation, 'request> {
     internal_context: HeaderMap,
     evaluation: PolicyEvaluation<'generation>,
     guard: HttpWireBodyGuard,
+    replay_lease: RuntimeReplayLease,
     body: Option<GuardedRequestBody>,
     body_provenance: TerminalRequestBodyProvenance,
 }
@@ -380,6 +392,7 @@ async fn evaluate_to_terminal<'generation>(
         internal_context,
         mut evaluation,
         guard,
+        replay_lease,
         mut body,
         mut body_provenance,
     } = state;
@@ -390,6 +403,7 @@ async fn evaluate_to_terminal<'generation>(
                 common: DecidedRequest {
                     headers,
                     _body_guard: guard,
+                    _runtime_replay_lease: replay_lease,
                 },
                 _rule: evaluation.matched,
                 _reason: DenyReason::Policy,
@@ -414,6 +428,7 @@ async fn evaluate_to_terminal<'generation>(
                         common: DecidedRequest {
                             headers,
                             _body_guard: guard,
+                            _runtime_replay_lease: replay_lease,
                         },
                         _rule: matched,
                         _reason: reason,
@@ -449,6 +464,7 @@ async fn evaluate_to_terminal<'generation>(
                             common: DecidedRequest {
                                 headers,
                                 _body_guard: guard,
+                                _runtime_replay_lease: replay_lease,
                             },
                             _rule: matched,
                             _reason: DenyReason::RedactionFailure,
@@ -461,6 +477,7 @@ async fn evaluate_to_terminal<'generation>(
                     common: DecidedRequest {
                         headers,
                         _body_guard: guard,
+                        _runtime_replay_lease: replay_lease,
                     },
                     rule: matched,
                     provider_credentials: None,
@@ -475,6 +492,7 @@ async fn evaluate_to_terminal<'generation>(
                     common: DecidedRequest {
                         headers,
                         _body_guard: guard,
+                        _runtime_replay_lease: replay_lease,
                     },
                     _rule: evaluation.matched,
                     _reason: DenyReason::Policy,
@@ -515,6 +533,7 @@ async fn evaluate_to_terminal<'generation>(
                 common: DecidedRequest {
                     headers,
                     _body_guard: guard,
+                    _runtime_replay_lease: replay_lease,
                 },
                 _rule: Some(matched),
                 _reason: reason,
@@ -572,6 +591,7 @@ async fn evaluate_to_terminal<'generation>(
                     common: DecidedRequest {
                         headers,
                         _body_guard: guard,
+                        _runtime_replay_lease: replay_lease,
                     },
                     _rule: Some(matched),
                     _reason: DenyReason::ProviderFailure,
@@ -583,10 +603,11 @@ async fn evaluate_to_terminal<'generation>(
         };
 
         match decision {
-            AuthorizationDecision::Allow {
-                credentials,
-                replacement,
-            } => {
+            AuthorizationDecision::Allow(output) => {
+                let (credentials, replacement) = lease
+                    .authorization()
+                    .consume_allow_output(provider, output)
+                    .ok_or(RequestDecisionError::ProviderOutputBinding)?;
                 let replacement_limits = terminal_decoded_body_limits(
                     lease,
                     Some(&matched),
@@ -605,6 +626,7 @@ async fn evaluate_to_terminal<'generation>(
                             common: DecidedRequest {
                                 headers,
                                 _body_guard: guard,
+                                _runtime_replay_lease: replay_lease,
                             },
                             _rule: Some(matched),
                             _reason: DenyReason::ProviderBodyLimit,
@@ -617,6 +639,7 @@ async fn evaluate_to_terminal<'generation>(
                             common: DecidedRequest {
                                 headers,
                                 _body_guard: guard,
+                                _runtime_replay_lease: replay_lease,
                             },
                             _rule: Some(matched),
                             _reason: DenyReason::RedactionFailure,
@@ -655,6 +678,7 @@ async fn evaluate_to_terminal<'generation>(
                             common: DecidedRequest {
                                 headers,
                                 _body_guard: guard,
+                                _runtime_replay_lease: replay_lease,
                             },
                             _rule: Some(matched),
                             _reason: DenyReason::RedactionFailure,
@@ -667,6 +691,7 @@ async fn evaluate_to_terminal<'generation>(
                     common: DecidedRequest {
                         headers,
                         _body_guard: guard,
+                        _runtime_replay_lease: replay_lease,
                     },
                     rule: Some(matched),
                     provider_credentials,
@@ -681,6 +706,7 @@ async fn evaluate_to_terminal<'generation>(
                     common: DecidedRequest {
                         headers,
                         _body_guard: guard,
+                        _runtime_replay_lease: replay_lease,
                     },
                     _rule: Some(matched),
                     _reason: DenyReason::Provider,
@@ -1802,7 +1828,8 @@ rules = [{ literals = ["x"] }]"#,
                 .body_read_plan()
                 .limits()
                 .map(|limits| (limits.max_encoded_bytes(), limits.max_decoded_bytes())),
-            Some((16, 16))
+            Some((1, 16)),
+            "the GET cursor must exclude the disjoint POST suffix"
         );
         let mut decoded = prepared.body_guard().buffer();
         decoded.try_extend_from_slice(b"x").unwrap();
@@ -2245,10 +2272,10 @@ methods = ["GET"]
 authorization_provider = "replacing"
             redaction_profile = "wire""#;
             let initial = compile(&config(policy, &extra));
-            let expected_cursor_peak = initial
+            let expected_cursor_resources = initial
                 .reloadable_plan
                 .resource_plan
-                .http_wire_body_peak_bytes_by_cursor[0];
+                .http_body_resources_by_cursor[0];
             let (runtime, _source, _, pool) = runtime(initial).await;
             let lease = runtime.lease().await.unwrap();
             let url = canonicalize_http_url("https://example.test/replacement").unwrap();
@@ -2259,11 +2286,21 @@ authorization_provider = "replacing"
                 crate::safety::wire_body::guarded_body_allocation_bytes(1).unwrap();
             assert_eq!(
                 prepared.body_guard().cursor_peak_bytes(),
-                expected_cursor_peak,
-                "the runtime guard must preserve the compiler's exact terminal peak"
+                expected_cursor_resources.product_incremental_peak_bytes,
+                "the runtime guard must preserve the compiler's exact product peak"
+            );
+            assert_eq!(
+                prepared.replay_lease.capacity_bytes(),
+                expected_cursor_resources.runtime_replay_capacity_bytes,
+                "the replay lease must preserve the compiler's exact replay capacity"
+            );
+            assert_eq!(
+                prepared.body_guard().cursor_peak_bytes() + prepared.replay_lease.capacity_bytes(),
+                expected_cursor_resources.combined_peak_bytes,
+                "admission must preserve the compiler's exact combined peak"
             );
             assert!(
-                expected_cursor_peak >= 4 * one_guarded_chunk,
+                expected_cursor_resources.product_incremental_peak_bytes >= 4 * one_guarded_chunk,
                 "the compiled terminal peak must retain compact guarded credentials beside decoded input, matcher scratch, and redacted output"
             );
             let mut original = prepared.body_guard().buffer();

@@ -8,6 +8,7 @@ use std::time::Duration;
 use base64::encoded_len as base64_encoded_len;
 use http::header::{HeaderName, HeaderValue};
 use http::Method;
+use http_access_runtime::BodyBudget;
 use regex_automata::{
     dfa::{dense, regex::Regex as DfaRegex, StartKind},
     nfa::thompson::{self, WhichCaptures, NFA},
@@ -26,6 +27,8 @@ use crate::capture::CaptureSinkSpec;
 use crate::http1::store::PARSER_STORE_BYTES;
 use crate::http_body::{http_decoder_workspace_sizes, HTTP_DECODER_OUTPUT_STAGING_BYTES};
 use crate::network::{canonical_socket_addr, socket_binds_overlap};
+#[cfg(test)]
+use crate::safety::wire_body::MAX_BUFFER_GROWTH_BYTES;
 use crate::safety::wire_body::{guarded_body_allocation_bytes, guarded_workspace_allocation_bytes};
 use http_access_url::{canonicalize_http_url, CompiledUrlPattern};
 
@@ -67,6 +70,10 @@ const MAX_PROCESS_PROVIDERS: usize = 64;
 const MAX_PROCESS_BODY_BYTES: usize = GIB;
 const MAX_PROCESS_STDOUT_LINE_BYTES: usize = 16 * MIB;
 const MAX_PROCESS_PENDING_REQUESTS: usize = 4_096;
+const MAX_FORWARDING_BODY_BYTES: usize = GIB;
+const MAX_FORWARDING_TRAILER_COUNT: usize = 65_536;
+const MAX_RUNTIME_BODY_CHUNKS: usize = 65_536;
+const MAX_FORWARDING_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_POLICY_RULES: usize = 100_000;
 const MAX_URLS_PER_RULE: usize = 1_024;
 const MAX_EFFECTS_PER_SCOPE: usize = 1_024;
@@ -260,6 +267,7 @@ pub(crate) struct StaticCaptureConfig {
 pub(crate) struct ReloadableProductPlan {
     pub(crate) request_timeout: Duration,
     pub(crate) max_content_decoding_expansion_ratio: usize,
+    pub(crate) forwarding: ForwardingPlan,
     pub(crate) egress: EgressPlan,
     pub(crate) policy: PolicyPlan,
     pub(crate) authorization: AuthorizationPlan,
@@ -268,6 +276,22 @@ pub(crate) struct ReloadableProductPlan {
     pub(crate) observation: ObservationPlan,
     pub(crate) safety: SafetyPlan,
     pub(crate) resource_plan: CompiledResourcePlan,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ForwardingPlan {
+    pub(crate) connect_timeout: Duration,
+    pub(crate) response_head_timeout: Duration,
+    pub(crate) body_idle_timeout: Duration,
+    pub(crate) upgrade_idle_timeout: Duration,
+    pub(crate) max_request_wire_bytes: usize,
+    pub(crate) max_request_decoded_bytes: usize,
+    pub(crate) max_response_wire_bytes: usize,
+    pub(crate) max_response_decoded_bytes: usize,
+    pub(crate) chunk_bytes: usize,
+    pub(crate) preserve_request_trailers: bool,
+    pub(crate) max_trailer_count: usize,
+    pub(crate) max_trailer_bytes: usize,
 }
 
 impl fmt::Debug for ReloadableProductPlan {
@@ -279,6 +303,7 @@ impl fmt::Debug for ReloadableProductPlan {
                 "max_content_decoding_expansion_ratio",
                 &self.max_content_decoding_expansion_ratio,
             )
+            .field("forwarding", &self.forwarding)
             .field("policy_rule_count", &self.policy.rules.len())
             .field(
                 "authorization_provider_count",
@@ -921,8 +946,8 @@ pub(crate) struct LoopDetectionPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CompiledResourcePlan {
-    pub(crate) http_wire_body_peak_bytes_by_cursor: Vec<usize>,
-    pub(crate) max_reachable_http_wire_body_peak_bytes: usize,
+    pub(crate) http_body_resources_by_cursor: Vec<HttpBodyResourcePlan>,
+    pub(crate) max_reachable_http_body_combined_peak_bytes: usize,
     pub(crate) wire_body_full_peak_capacity: Capacity,
     pub(crate) wire_body_quota_key_full_peak_capacity: Capacity,
     pub(crate) webhook_request_allocation_bytes_by_rule: Vec<Option<usize>>,
@@ -930,6 +955,30 @@ pub(crate) struct CompiledResourcePlan {
     pub(crate) upgrade_wire_working_set_bytes_by_rule: Vec<Option<usize>>,
     pub(crate) max_upgrade_allocation_per_stream: usize,
     pub(crate) max_upgrade_allocation_all_streams: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HttpBodyResourcePlan {
+    pub(crate) product_incremental_peak_bytes: usize,
+    pub(crate) runtime_replay_capacity_bytes: usize,
+    pub(crate) combined_peak_bytes: usize,
+}
+
+#[cfg(test)]
+impl CompiledResourcePlan {
+    pub(crate) fn combined_http_body_peaks_for_test(&self) -> Vec<usize> {
+        self.http_body_resources_by_cursor
+            .iter()
+            .map(|resource| resource.combined_peak_bytes)
+            .collect()
+    }
+
+    pub(crate) fn runtime_replay_capacities_for_test(&self) -> Vec<usize> {
+        self.http_body_resources_by_cursor
+            .iter()
+            .map(|resource| resource.runtime_replay_capacity_bytes)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1320,6 +1369,7 @@ fn validate_positive_limits(
         config.service.max_content_decoding_expansion_ratio,
         MAX_CONTENT_DECODING_RATIO,
     )?;
+    validate_forwarding_limits(&config.service.forwarding)?;
     let four_quota = config
         .service
         .max_inflight_wire_body_bytes_per_quota_key
@@ -1372,6 +1422,111 @@ fn validate_positive_limits(
     validate_logging_capture_limits(config)?;
     validate_provider_limits(config)?;
     validate_redaction_limits(config)?;
+    Ok(())
+}
+
+fn validate_forwarding_limits(
+    forwarding: &super::authoring::ForwardingConfig,
+) -> Result<(), ConfigCompileError> {
+    for (field, timeout) in [
+        ("connect_timeout", forwarding.connect_timeout.get()),
+        (
+            "response_head_timeout",
+            forwarding.response_head_timeout.get(),
+        ),
+        ("body_idle_timeout", forwarding.body_idle_timeout.get()),
+        (
+            "upgrade_idle_timeout",
+            forwarding.upgrade_idle_timeout.get(),
+        ),
+    ] {
+        if timeout > MAX_FORWARDING_TIMEOUT {
+            return Err(ConfigCompileError::at(
+                format!("service.forwarding.{field}"),
+                "must not exceed 10 minutes",
+            ));
+        }
+    }
+    for (field, bytes) in [
+        ("max_request_wire_bytes", forwarding.max_request_wire_bytes),
+        (
+            "max_request_decoded_bytes",
+            forwarding.max_request_decoded_bytes,
+        ),
+        (
+            "max_response_wire_bytes",
+            forwarding.max_response_wire_bytes,
+        ),
+        (
+            "max_response_decoded_bytes",
+            forwarding.max_response_decoded_bytes,
+        ),
+        ("chunk_bytes", forwarding.chunk_bytes),
+        ("max_trailer_bytes", forwarding.max_trailer_bytes),
+    ] {
+        check_range(
+            &format!("service.forwarding.{field}"),
+            bytes,
+            MAX_FORWARDING_BODY_BYTES,
+        )?;
+    }
+    check_range(
+        "service.forwarding.max_trailer_count",
+        forwarding.max_trailer_count,
+        MAX_FORWARDING_TRAILER_COUNT,
+    )?;
+    let smallest_body_limit = forwarding
+        .max_request_wire_bytes
+        .min(forwarding.max_request_decoded_bytes)
+        .min(forwarding.max_response_wire_bytes)
+        .min(forwarding.max_response_decoded_bytes);
+    if forwarding.chunk_bytes > smallest_body_limit {
+        return Err(ConfigCompileError::at(
+            "service.forwarding.chunk_bytes",
+            "must not exceed any forwarding body byte limit",
+        ));
+    }
+    for (field, maximum_source_bytes) in [
+        ("max_request_wire_bytes", forwarding.max_request_wire_bytes),
+        (
+            "max_request_decoded_bytes",
+            forwarding.max_request_decoded_bytes,
+        ),
+        (
+            "max_response_wire_bytes",
+            forwarding.max_response_wire_bytes,
+        ),
+        (
+            "max_response_decoded_bytes",
+            forwarding.max_response_decoded_bytes,
+        ),
+    ] {
+        validate_runtime_chunk_quotient(
+            &format!("service.forwarding.{field}"),
+            maximum_source_bytes,
+            forwarding.chunk_bytes,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_runtime_chunk_quotient(
+    path: &str,
+    maximum_source_bytes: usize,
+    chunk_bytes: usize,
+) -> Result<(), ConfigCompileError> {
+    let allocation_count = maximum_source_bytes
+        .checked_add(chunk_bytes - 1)
+        .ok_or_else(|| ConfigCompileError::at(path, "runtime chunk quotient overflow"))?
+        / chunk_bytes;
+    if allocation_count > MAX_RUNTIME_BODY_CHUNKS {
+        return Err(ConfigCompileError::at(
+            path,
+            format!(
+                "requires more than {MAX_RUNTIME_BODY_CHUNKS} runtime body chunks at the configured service.forwarding.chunk_bytes"
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -3377,6 +3532,19 @@ fn validate_logging_capture_limits(
                 "in-flight and total limits must each hold at least one maximum capture body",
             ));
         }
+        if let Some(profile) = config.redaction.profiles.get(&capture.redaction_profile) {
+            let maximum_source_bytes = profile.max_body_bytes.max(profile.max_decoded_body_bytes);
+            let chunk_bytes = config
+                .service
+                .forwarding
+                .chunk_bytes
+                .min(maximum_source_bytes);
+            validate_runtime_chunk_quotient(
+                "observation.capture.redaction_profile",
+                maximum_source_bytes,
+                chunk_bytes,
+            )?;
+        }
     }
     Ok(())
 }
@@ -3411,26 +3579,15 @@ fn configured_profile_literal_scratch_bytes(
 fn compile_resource_plan(
     config: &super::authoring::AuthoringConfig,
 ) -> Result<CompiledResourcePlan, ConfigCompileError> {
-    let body_read_plans = compile_http_body_read_plans(config)?;
+    let body_read_compilation = compile_http_body_read_plans(config)?;
+    let body_read_plans = &body_read_compilation.published_by_cursor;
     let rule_schedules = config
         .policy
         .rules
         .iter()
         .map(|rule| compile_http_rule_schedule(config, rule))
         .collect::<Result<Vec<_>, _>>()?;
-    // Mandatory decoding happens from the starting cursor before a rule is
-    // selected. A body-free rule can therefore retain that cursor's merged
-    // decoded body while any body-free suffix stage runs. Locally bounded
-    // rules are excluded because runtime enforces their smaller limit first.
-    let mut body_free_stage_bytes_by_cursor = vec![0usize; rule_schedules.len() + 1];
-    for index in (0..rule_schedules.len()).rev() {
-        body_free_stage_bytes_by_cursor[index] = body_free_stage_bytes_by_cursor[index + 1];
-        let schedule = &rule_schedules[index];
-        if schedule.local_body_allocation.is_none() {
-            body_free_stage_bytes_by_cursor[index] = body_free_stage_bytes_by_cursor[index]
-                .max(schedule.max_incoming_additional_bytes());
-        }
-    }
+    validate_forwarding_request_bounds(config, body_read_plans, &rule_schedules)?;
     let webhook_request_allocation_bytes_by_rule = rule_schedules
         .iter()
         .map(|schedule| schedule.webhook_request_allocation)
@@ -3439,94 +3596,104 @@ fn compile_resource_plan(
         .iter()
         .map(|schedule| schedule.webhook_callback_allocation)
         .collect();
-    // Rule-local schedules describe live allocations, not cumulative work.
-    // A provider pass retains only the decoded original. A later compatible
-    // rule reuses that allocation and adds only its simultaneously live stage.
-    // The reverse indexes hold the largest later stage reachable by any
-    // request method. This covers an arbitrary number of delegate passes in
-    // O(rules + total method entries), without weakening the policy-rule cap.
-    let mut path_peaks = vec![0usize; rule_schedules.len()];
-    let mut all_later_stage_bytes = 0usize;
-    let mut wildcard_later_stage_bytes = 0usize;
-    let mut later_stage_bytes_by_method = BTreeMap::<String, usize>::new();
+
+    let forwarding = &config.service.forwarding;
+    let staging_bytes = project_guarded_body_allocation(
+        forwarding.chunk_bytes,
+        "service.forwarding.chunk_bytes",
+        "request coalescing staging arithmetic overflow",
+    )?;
+    let terminal_requires_runtime = matches!(
+        config.policy.default,
+        super::authoring::PolicyDefaultDecision::Allow
+    );
+    let terminal_replay = if terminal_requires_runtime {
+        runtime_replay_capacity(config, None, "policy.default")?
+    } else {
+        0
+    };
+    let terminal_product_peak = if terminal_requires_runtime {
+        staging_bytes
+    } else {
+        0
+    };
+    let terminal_combined = checked_add(
+        terminal_product_peak,
+        terminal_replay,
+        "policy.default",
+        "HTTP body combined peak arithmetic overflow",
+    )?;
+    let terminal_path = ReachableHttpPath {
+        product_peak_bytes: terminal_product_peak,
+        requires_runtime_body: terminal_requires_runtime,
+        ..ReachableHttpPath::default()
+    };
+    let mut resources_by_cursor = vec![
+        HttpBodyResourcePlan {
+            product_incremental_peak_bytes: 0,
+            runtime_replay_capacity_bytes: 0,
+            combined_peak_bytes: 0,
+        };
+        rule_schedules.len() + 1
+    ];
+    resources_by_cursor[rule_schedules.len()] = HttpBodyResourcePlan {
+        product_incremental_peak_bytes: terminal_product_peak,
+        runtime_replay_capacity_bytes: terminal_replay,
+        combined_peak_bytes: terminal_combined,
+    };
+    let method_domain = policy_method_domain(config);
+    let mut later = MethodSuffix::new(&method_domain, terminal_path);
+
     for index in (0..rule_schedules.len()).rev() {
         let schedule = &rule_schedules[index];
-        path_peaks[index] = schedule.initial_peak;
-        if let Some(retained) = schedule.retained_original_after_pass {
-            let compatible_later_stage_bytes = if config.policy.rules[index].methods.is_empty() {
-                all_later_stage_bytes
-            } else {
-                config.policy.rules[index].methods.iter().fold(
-                    wildcard_later_stage_bytes,
-                    |peak, method| {
-                        peak.max(
-                            later_stage_bytes_by_method
-                                .get(&method.to_ascii_uppercase())
-                                .copied()
-                                .unwrap_or(0),
-                        )
-                    },
-                )
-            };
-            path_peaks[index] = path_peaks[index].max(checked_add(
-                retained,
-                compatible_later_stage_bytes,
-                &format!("policy.rules[{index}]"),
-                "delegate-pass body retention arithmetic overflow",
-            )?);
-        }
-
-        let stage_bytes = schedule.max_incoming_additional_bytes();
-        all_later_stage_bytes = all_later_stage_bytes.max(stage_bytes);
-        if config.policy.rules[index].methods.is_empty() {
-            wildcard_later_stage_bytes = wildcard_later_stage_bytes.max(stage_bytes);
-        } else {
-            for method in &config.policy.rules[index].methods {
-                later_stage_bytes_by_method
-                    .entry(method.to_ascii_uppercase())
-                    .and_modify(|peak| *peak = (*peak).max(stage_bytes))
-                    .or_insert(stage_bytes);
-            }
-        }
-    }
-
-    let mut cursor_peaks = vec![0usize; config.policy.rules.len() + 1];
-    for index in (0..config.policy.rules.len()).rev() {
-        cursor_peaks[index] = cursor_peaks[index + 1].max(path_peaks[index]);
-    }
-    for (index, (cursor_peak, read_plan)) in
-        cursor_peaks.iter_mut().zip(body_read_plans).enumerate()
-    {
-        if let Some(limits) = read_plan.limits() {
-            *cursor_peak = (*cursor_peak).max(decode_peak(
-                limits.max_encoded_bytes(),
-                limits.max_decoded_bytes(),
-            )?);
-            let merged_original = project_guarded_body_allocation(
-                limits.max_decoded_bytes(),
-                "policy.rules",
-                "post-decode merged body allocation arithmetic overflow",
+        let rule = &config.policy.rules[index];
+        let variants = rule_method_variants(rule, &method_domain);
+        let mut specialized_paths = RuleMethodValues::default();
+        for variant in &variants {
+            let path = compile_reachable_http_path(
+                config,
+                schedule,
+                rule,
+                later.get(variant.as_deref()),
+                body_read_compilation.specialized_by_rule[index].get(variant.as_deref()),
+                staging_bytes,
+                index,
             )?;
-            *cursor_peak = (*cursor_peak).max(checked_add(
-                merged_original,
-                body_free_stage_bytes_by_cursor[index],
-                "policy.rules",
-                "post-decode body-free rule arithmetic overflow",
-            )?);
+            specialized_paths.insert(variant.as_deref(), path);
+        }
+
+        let published_path = specialized_paths.merged(ReachableHttpPath::merge);
+        resources_by_cursor[index] = finalize_http_body_resource(
+            config,
+            published_path,
+            body_read_plans[index],
+            staging_bytes,
+            index,
+        )?
+        .1;
+
+        for variant in &variants {
+            let path = specialized_paths.get(variant.as_deref());
+            later.merge_at(variant.as_deref(), path, ReachableHttpPath::merge);
         }
     }
-    let max_wire_peak = cursor_peaks.iter().copied().max().unwrap_or(0);
 
-    let wire_body_full_peak_capacity = if max_wire_peak == 0 {
+    let max_combined_peak = resources_by_cursor
+        .iter()
+        .map(|resource| resource.combined_peak_bytes)
+        .max()
+        .unwrap_or(0);
+
+    let wire_body_full_peak_capacity = if max_combined_peak == 0 {
         Capacity::Unbounded
     } else {
-        if max_wire_peak > config.service.max_inflight_wire_body_bytes_per_quota_key {
+        if max_combined_peak > config.service.max_inflight_wire_body_bytes_per_quota_key {
             return Err(ConfigCompileError::at(
                 "service.max_inflight_wire_body_bytes_per_quota_key",
                 "must hold the largest pass-reachable mandatory body working set",
             ));
         }
-        let required = max_wire_peak
+        let required = max_combined_peak
             .checked_mul(config.service.min_wire_body_concurrency)
             .ok_or_else(|| {
                 ConfigCompileError::at("service", "wire-body capacity arithmetic overflow")
@@ -3537,12 +3704,12 @@ fn compile_resource_plan(
                 "the requested minimum concurrency does not fit the global wire-body pool",
             ));
         }
-        Capacity::Finite(config.service.max_inflight_wire_body_bytes / max_wire_peak)
+        Capacity::Finite(config.service.max_inflight_wire_body_bytes / max_combined_peak)
     };
     let wire_body_quota_key_full_peak_capacity = config
         .service
         .max_inflight_wire_body_bytes_per_quota_key
-        .checked_div(max_wire_peak)
+        .checked_div(max_combined_peak)
         .map_or(Capacity::Unbounded, Capacity::Finite);
 
     let transport = config
@@ -3608,8 +3775,8 @@ fn compile_resource_plan(
     }
 
     Ok(CompiledResourcePlan {
-        http_wire_body_peak_bytes_by_cursor: cursor_peaks,
-        max_reachable_http_wire_body_peak_bytes: max_wire_peak,
+        http_body_resources_by_cursor: resources_by_cursor,
+        max_reachable_http_body_combined_peak_bytes: max_combined_peak,
         wire_body_full_peak_capacity,
         wire_body_quota_key_full_peak_capacity,
         webhook_request_allocation_bytes_by_rule,
@@ -3620,11 +3787,181 @@ fn compile_resource_plan(
     })
 }
 
+#[derive(Clone, Copy, Default)]
+struct ReachableHttpPath {
+    product_peak_bytes: usize,
+    incoming_stage_peak_bytes: usize,
+    body_free_stage_peak_bytes: usize,
+    canonical_output_or_replacement_limit: usize,
+    requires_runtime_body: bool,
+}
+
+impl ReachableHttpPath {
+    fn merge(self, other: Self) -> Self {
+        Self {
+            product_peak_bytes: self.product_peak_bytes.max(other.product_peak_bytes),
+            incoming_stage_peak_bytes: self
+                .incoming_stage_peak_bytes
+                .max(other.incoming_stage_peak_bytes),
+            body_free_stage_peak_bytes: self
+                .body_free_stage_peak_bytes
+                .max(other.body_free_stage_peak_bytes),
+            canonical_output_or_replacement_limit: self
+                .canonical_output_or_replacement_limit
+                .max(other.canonical_output_or_replacement_limit),
+            requires_runtime_body: self.requires_runtime_body || other.requires_runtime_body,
+        }
+    }
+}
+
+fn compile_reachable_http_path(
+    config: &super::authoring::AuthoringConfig,
+    schedule: &HttpRuleAllocationSchedule,
+    rule: &PolicyRuleConfig,
+    compatible_later: ReachableHttpPath,
+    body_read_plan: HttpBodyReadPlan,
+    staging_bytes: usize,
+    index: usize,
+) -> Result<ReachableHttpPath, ConfigCompileError> {
+    let local_stage = schedule.max_incoming_additional_bytes();
+    let mut path = ReachableHttpPath {
+        product_peak_bytes: schedule.initial_peak,
+        incoming_stage_peak_bytes: local_stage,
+        body_free_stage_peak_bytes: if schedule.local_body_allocation.is_none() {
+            local_stage
+        } else {
+            0
+        },
+        canonical_output_or_replacement_limit: schedule.replacement_decoded_limit.unwrap_or(0),
+        // A delegate provider can terminally allow even when it does not inspect
+        // the body, so every non-deny rule has an opaque forward-allow path.
+        requires_runtime_body: !matches!(rule.decision, RuleDecision::Deny),
+    };
+    if matches!(rule.decision, RuleDecision::Delegate) {
+        path.incoming_stage_peak_bytes = path
+            .incoming_stage_peak_bytes
+            .max(compatible_later.incoming_stage_peak_bytes);
+        path.body_free_stage_peak_bytes = path
+            .body_free_stage_peak_bytes
+            .max(compatible_later.body_free_stage_peak_bytes);
+        path.canonical_output_or_replacement_limit = path
+            .canonical_output_or_replacement_limit
+            .max(compatible_later.canonical_output_or_replacement_limit);
+        path.requires_runtime_body |= compatible_later.requires_runtime_body;
+        path.product_peak_bytes = if let Some(retained) = schedule.retained_original_after_pass {
+            path.product_peak_bytes.max(checked_add(
+                retained,
+                compatible_later.incoming_stage_peak_bytes,
+                &format!("policy.rules[{index}]"),
+                "delegate-pass body retention arithmetic overflow",
+            )?)
+        } else {
+            path.product_peak_bytes
+                .max(compatible_later.product_peak_bytes)
+        };
+    }
+    finalize_http_body_resource(config, path, body_read_plan, staging_bytes, index)
+        .map(|(path, _)| path)
+}
+
+fn finalize_http_body_resource(
+    config: &super::authoring::AuthoringConfig,
+    mut path: ReachableHttpPath,
+    body_read_plan: HttpBodyReadPlan,
+    staging_bytes: usize,
+    index: usize,
+) -> Result<(ReachableHttpPath, HttpBodyResourcePlan), ConfigCompileError> {
+    if let Some(limits) = body_read_plan.limits() {
+        path.canonical_output_or_replacement_limit = path
+            .canonical_output_or_replacement_limit
+            .max(limits.max_decoded_bytes());
+        path.product_peak_bytes = path.product_peak_bytes.max(decode_peak(
+            limits.max_encoded_bytes(),
+            limits.max_decoded_bytes(),
+        )?);
+        let merged_original = project_guarded_body_allocation(
+            limits.max_decoded_bytes(),
+            &format!("policy.rules[{index}]"),
+            "post-decode merged body allocation arithmetic overflow",
+        )?;
+        path.product_peak_bytes = path.product_peak_bytes.max(checked_add(
+            merged_original,
+            path.body_free_stage_peak_bytes,
+            &format!("policy.rules[{index}]"),
+            "post-decode body-free rule arithmetic overflow",
+        )?);
+    }
+    if path.requires_runtime_body {
+        path.product_peak_bytes = path.product_peak_bytes.max(staging_bytes);
+    }
+    let replay_capacity = if path.requires_runtime_body {
+        runtime_replay_capacity(
+            config,
+            NonZeroUsize::new(path.canonical_output_or_replacement_limit),
+            &format!("policy.rules[{index}]"),
+        )?
+    } else {
+        0
+    };
+    let combined_peak = checked_add(
+        path.product_peak_bytes,
+        replay_capacity,
+        &format!("policy.rules[{index}]"),
+        "HTTP body combined peak arithmetic overflow",
+    )?;
+    Ok((
+        path,
+        HttpBodyResourcePlan {
+            product_incremental_peak_bytes: path.product_peak_bytes,
+            runtime_replay_capacity_bytes: replay_capacity,
+            combined_peak_bytes: combined_peak,
+        },
+    ))
+}
+
+fn runtime_replay_capacity(
+    config: &super::authoring::AuthoringConfig,
+    canonical_output_or_replacement_limit: Option<NonZeroUsize>,
+    path: &str,
+) -> Result<usize, ConfigCompileError> {
+    let forwarding = &config.service.forwarding;
+    let source_payload_bytes = forwarding.max_request_wire_bytes;
+    let (trailer_count, trailer_bytes) = if canonical_output_or_replacement_limit.is_none()
+        && forwarding.preserve_request_trailers
+    {
+        (forwarding.max_trailer_count, forwarding.max_trailer_bytes)
+    } else {
+        (0, 0)
+    };
+    let required = BodyBudget::required_replay_storage_bytes(
+        u64::try_from(source_payload_bytes).map_err(|_| {
+            ConfigCompileError::at(path, "runtime replay source conversion overflow")
+        })?,
+        u64::try_from(forwarding.chunk_bytes).map_err(|_| {
+            ConfigCompileError::at(path, "runtime replay chunk conversion overflow")
+        })?,
+        u64::try_from(trailer_count).map_err(|_| {
+            ConfigCompileError::at(path, "runtime replay trailer conversion overflow")
+        })?,
+        u64::try_from(trailer_bytes).map_err(|_| {
+            ConfigCompileError::at(path, "runtime replay trailer conversion overflow")
+        })?,
+        canonical_output_or_replacement_limit
+            .map(|limit| u64::try_from(limit.get()))
+            .transpose()
+            .map_err(|_| ConfigCompileError::at(path, "runtime replacement conversion overflow"))?,
+    )
+    .map_err(|_| ConfigCompileError::at(path, "runtime replay projection is invalid"))?;
+    usize::try_from(required)
+        .map_err(|_| ConfigCompileError::at(path, "runtime replay projection overflow"))
+}
+
 #[derive(Debug)]
 struct HttpRuleAllocationSchedule {
     initial_peak: usize,
     local_body_allocation: Option<usize>,
     retained_original_after_pass: Option<usize>,
+    replacement_decoded_limit: Option<usize>,
     incoming_stages: Vec<IncomingBodyStage>,
     webhook_request_allocation: Option<usize>,
     webhook_callback_allocation: Option<usize>,
@@ -3638,6 +3975,39 @@ impl HttpRuleAllocationSchedule {
             .max()
             .unwrap_or(0)
     }
+}
+
+fn validate_forwarding_request_bounds(
+    config: &super::authoring::AuthoringConfig,
+    body_read_plans: &[HttpBodyReadPlan],
+    rule_schedules: &[HttpRuleAllocationSchedule],
+) -> Result<(), ConfigCompileError> {
+    let forwarding = &config.service.forwarding;
+    for limits in body_read_plans.iter().filter_map(|plan| plan.limits()) {
+        if limits.max_encoded_bytes() > forwarding.max_request_wire_bytes {
+            return Err(ConfigCompileError::at(
+                "service.forwarding.max_request_wire_bytes",
+                "must cover every reachable mandatory request wire-body limit",
+            ));
+        }
+        if limits.max_decoded_bytes() > forwarding.max_request_decoded_bytes {
+            return Err(ConfigCompileError::at(
+                "service.forwarding.max_request_decoded_bytes",
+                "must cover every reachable mandatory decoded request-body limit",
+            ));
+        }
+    }
+    if rule_schedules
+        .iter()
+        .filter_map(|schedule| schedule.replacement_decoded_limit)
+        .any(|limit| limit > forwarding.max_request_decoded_bytes)
+    {
+        return Err(ConfigCompileError::at(
+            "service.forwarding.max_request_decoded_bytes",
+            "must cover every reachable provider replacement limit",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -3678,6 +4048,13 @@ fn compile_http_rule_schedule(
         })
         .transpose()?;
     let effective_body_limits = effective_http_body_limits(process_body, profile);
+    let replacement_decoded_limit = process_body
+        .filter(|provider| provider.allow_request_body_replacement)
+        .map(|_| {
+            effective_body_limits
+                .expect("request-body replacement has effective body limits")
+                .1
+        });
     let local_body_allocation = effective_body_limits
         .map(|(_, original_limit)| {
             project_guarded_body_allocation(
@@ -4014,6 +4391,7 @@ fn compile_http_rule_schedule(
         } else {
             None
         },
+        replacement_decoded_limit,
         incoming_stages,
         webhook_request_allocation,
         webhook_callback_allocation,
@@ -4040,13 +4418,125 @@ fn effective_http_body_limits(
     }
 }
 
+#[derive(Clone)]
+struct MethodSuffix<T: Copy> {
+    fallback: T,
+    by_method: BTreeMap<String, T>,
+}
+
+impl<T: Copy> MethodSuffix<T> {
+    fn new(methods: &BTreeSet<String>, fallback: T) -> Self {
+        Self {
+            fallback,
+            by_method: methods
+                .iter()
+                .map(|method| (method.clone(), fallback))
+                .collect(),
+        }
+    }
+
+    fn get(&self, method: Option<&str>) -> T {
+        method
+            .and_then(|method| self.by_method.get(method).copied())
+            .unwrap_or(self.fallback)
+    }
+
+    fn merge_at(&mut self, method: Option<&str>, value: T, merge: impl FnOnce(T, T) -> T) {
+        match method {
+            Some(method) => {
+                let current = self
+                    .by_method
+                    .get_mut(method)
+                    .expect("policy method domain contains every authored method");
+                *current = merge(*current, value);
+            }
+            None => self.fallback = merge(self.fallback, value),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RuleMethodValues<T: Copy> {
+    fallback: Option<T>,
+    by_method: BTreeMap<String, T>,
+}
+
+impl<T: Copy> Default for RuleMethodValues<T> {
+    fn default() -> Self {
+        Self {
+            fallback: None,
+            by_method: BTreeMap::new(),
+        }
+    }
+}
+
+impl<T: Copy> RuleMethodValues<T> {
+    fn insert(&mut self, method: Option<&str>, value: T) {
+        match method {
+            Some(method) => {
+                self.by_method.insert(method.to_string(), value);
+            }
+            None => self.fallback = Some(value),
+        }
+    }
+
+    fn get(&self, method: Option<&str>) -> T {
+        method
+            .and_then(|method| self.by_method.get(method).copied())
+            .or(self.fallback)
+            .expect("rule method specialization covers every matched method")
+    }
+
+    fn merged(&self, merge: impl Fn(T, T) -> T + Copy) -> T {
+        self.fallback
+            .into_iter()
+            .chain(self.by_method.values().copied())
+            .reduce(merge)
+            .expect("every policy rule matches at least one method category")
+    }
+}
+
+fn policy_method_domain(config: &super::authoring::AuthoringConfig) -> BTreeSet<String> {
+    config
+        .policy
+        .rules
+        .iter()
+        .flat_map(|rule| rule.methods.iter())
+        .map(|method| method.to_ascii_uppercase())
+        .collect()
+}
+
+fn rule_method_variants(
+    rule: &PolicyRuleConfig,
+    method_domain: &BTreeSet<String>,
+) -> Vec<Option<String>> {
+    if rule.methods.is_empty() {
+        std::iter::once(None)
+            .chain(method_domain.iter().cloned().map(Some))
+            .collect()
+    } else {
+        rule.methods
+            .iter()
+            .map(|method| Some(method.to_ascii_uppercase()))
+            .collect()
+    }
+}
+
+struct CompiledHttpBodyReadPlans {
+    published_by_cursor: Vec<HttpBodyReadPlan>,
+    specialized_by_rule: Vec<RuleMethodValues<HttpBodyReadPlan>>,
+}
+
 fn compile_http_body_read_plans(
     config: &super::authoring::AuthoringConfig,
-) -> Result<Vec<HttpBodyReadPlan>, ConfigCompileError> {
+) -> Result<CompiledHttpBodyReadPlans, ConfigCompileError> {
     let cursor_count = config.policy.rules.len().checked_add(1).ok_or_else(|| {
         ConfigCompileError::at("policy.rules", "HTTP body read cursor count overflow")
     })?;
     let mut plans = vec![HttpBodyReadPlan::Disabled; cursor_count];
+    let mut specialized = vec![RuleMethodValues::default(); config.policy.rules.len()];
+    let method_domain = policy_method_domain(config);
+    let mut later = MethodSuffix::new(&method_domain, HttpBodyReadPlan::Disabled);
 
     for index in (0..config.policy.rules.len()).rev() {
         let rule = &config.policy.rules[index];
@@ -4080,10 +4570,26 @@ fn compile_http_body_read_plans(
             })
             .transpose()?
             .unwrap_or(HttpBodyReadPlan::Disabled);
-        plans[index] = exact.merge(plans[index + 1]);
+        let variants = rule_method_variants(rule, &method_domain);
+        for variant in &variants {
+            let path = if matches!(rule.decision, RuleDecision::Delegate) {
+                exact.merge(later.get(variant.as_deref()))
+            } else {
+                exact
+            };
+            specialized[index].insert(variant.as_deref(), path);
+        }
+        plans[index] = specialized[index].merged(HttpBodyReadPlan::merge);
+        for variant in &variants {
+            let path = specialized[index].get(variant.as_deref());
+            later.merge_at(variant.as_deref(), path, HttpBodyReadPlan::merge);
+        }
     }
 
-    Ok(plans)
+    Ok(CompiledHttpBodyReadPlans {
+        published_by_cursor: plans,
+        specialized_by_rule: specialized,
+    })
 }
 
 fn provider_response_guarded_suffix_bytes(
@@ -4332,11 +4838,12 @@ fn compile_reloadable_plan(
     compiled_urls_by_rule: Vec<Vec<CompiledUrlPattern>>,
     resource_plan: CompiledResourcePlan,
 ) -> Result<ReloadableProductPlan, ConfigCompileError> {
-    let http_body_read_plans_by_cursor = compile_http_body_read_plans(config)?;
+    let http_body_read_plans_by_cursor = compile_http_body_read_plans(config)?.published_by_cursor;
     let capture_working_set = compile_capture_working_set(config)?;
     Ok(ReloadableProductPlan {
         request_timeout: config.service.request_timeout.get(),
         max_content_decoding_expansion_ratio: config.service.max_content_decoding_expansion_ratio,
+        forwarding: compile_forwarding_plan(&config.service.forwarding),
         egress: compile_egress_plan(&config.egress)?,
         policy: compile_policy_plan(
             &config.policy,
@@ -4350,6 +4857,23 @@ fn compile_reloadable_plan(
         safety: compile_safety_plan(&config.safety)?,
         resource_plan,
     })
+}
+
+fn compile_forwarding_plan(value: &super::authoring::ForwardingConfig) -> ForwardingPlan {
+    ForwardingPlan {
+        connect_timeout: value.connect_timeout.get(),
+        response_head_timeout: value.response_head_timeout.get(),
+        body_idle_timeout: value.body_idle_timeout.get(),
+        upgrade_idle_timeout: value.upgrade_idle_timeout.get(),
+        max_request_wire_bytes: value.max_request_wire_bytes,
+        max_request_decoded_bytes: value.max_request_decoded_bytes,
+        max_response_wire_bytes: value.max_response_wire_bytes,
+        max_response_decoded_bytes: value.max_response_decoded_bytes,
+        chunk_bytes: value.chunk_bytes,
+        preserve_request_trailers: value.preserve_request_trailers,
+        max_trailer_count: value.max_trailer_count,
+        max_trailer_bytes: value.max_trailer_bytes,
+    }
 }
 
 fn compile_egress_plan(value: &EgressConfig) -> Result<EgressPlan, ConfigCompileError> {
@@ -5593,9 +6117,266 @@ default = "deny"
             .expect("test payload must have a guarded allocation projection")
     }
 
+    fn default_runtime_replay_storage() -> usize {
+        usize::try_from(
+            BodyBudget::required_replay_storage_bytes(
+                u64::try_from(50 * MIB).unwrap(),
+                u64::try_from(64 * 1024).unwrap(),
+                4_096,
+                u64::try_from(MIB).unwrap(),
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn canonical_runtime_replay_storage(decoded_bytes: usize) -> usize {
+        canonical_runtime_replay_storage_for(50 * MIB, 64 * 1024, decoded_bytes)
+    }
+
+    fn canonical_runtime_replay_storage_for(
+        source_bytes: usize,
+        chunk_bytes: usize,
+        decoded_bytes: usize,
+    ) -> usize {
+        usize::try_from(
+            BodyBudget::required_replay_storage_bytes(
+                u64::try_from(source_bytes).unwrap(),
+                u64::try_from(chunk_bytes).unwrap(),
+                0,
+                0,
+                Some(u64::try_from(decoded_bytes).unwrap()),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
     fn body_read_limits(plan: HttpBodyReadPlan) -> Option<(usize, usize)> {
         plan.limits()
             .map(|limits| (limits.max_encoded_bytes(), limits.max_decoded_bytes()))
+    }
+
+    #[test]
+    fn forwarding_plan_compiles_exact_reloadable_fields() {
+        let compiled = compile(&resource_config(
+            r#"
+[service.forwarding]
+connect_timeout = "1s"
+response_head_timeout = "2s"
+body_idle_timeout = "3s"
+upgrade_idle_timeout = "4s"
+max_request_wire_bytes = 1048576
+max_request_decoded_bytes = 2097152
+max_response_wire_bytes = 3145728
+max_response_decoded_bytes = 4194304
+chunk_bytes = 65536
+preserve_request_trailers = false
+max_trailer_count = 128
+max_trailer_bytes = 131072
+"#,
+            "",
+            "",
+        ))
+        .unwrap();
+
+        assert_eq!(
+            compiled.reloadable_plan.forwarding,
+            ForwardingPlan {
+                connect_timeout: Duration::from_secs(1),
+                response_head_timeout: Duration::from_secs(2),
+                body_idle_timeout: Duration::from_secs(3),
+                upgrade_idle_timeout: Duration::from_secs(4),
+                max_request_wire_bytes: MIB,
+                max_request_decoded_bytes: 2 * MIB,
+                max_response_wire_bytes: 3 * MIB,
+                max_response_decoded_bytes: 4 * MIB,
+                chunk_bytes: 64 * 1024,
+                preserve_request_trailers: false,
+                max_trailer_count: 128,
+                max_trailer_bytes: 128 * 1024,
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_replay_budget_exists_only_for_forwarding_or_observing_paths() {
+        let allow = compile(&resource_config(
+            "",
+            "",
+            r#"
+[[policy.rules]]
+id = "allow"
+decision = "allow"
+methods = ["GET"]
+"#,
+        ))
+        .unwrap();
+        let replay = default_runtime_replay_storage();
+        assert_eq!(
+            allow
+                .reloadable_plan
+                .resource_plan
+                .runtime_replay_capacities_for_test(),
+            [replay, 0]
+        );
+
+        let default_allow = compile(
+            &resource_config("", "", "").replace("default = \"deny\"", "default = \"allow\""),
+        )
+        .unwrap();
+        assert_eq!(
+            default_allow
+                .reloadable_plan
+                .resource_plan
+                .runtime_replay_capacities_for_test(),
+            [replay]
+        );
+
+        let deny = compile(&resource_config("", "", "")).unwrap();
+        assert_eq!(
+            deny.reloadable_plan
+                .resource_plan
+                .runtime_replay_capacities_for_test(),
+            [0]
+        );
+        assert_eq!(
+            deny.reloadable_plan
+                .resource_plan
+                .wire_body_full_peak_capacity,
+            Capacity::Unbounded
+        );
+    }
+
+    #[test]
+    fn forwarding_limits_and_mandatory_request_bounds_fail_closed() {
+        for (assignment, expected) in [
+            ("connect_timeout = \"601s\"", "must not exceed 10 minutes"),
+            (
+                "max_response_wire_bytes = 1073741825",
+                "must be between 1 and 1073741824",
+            ),
+        ] {
+            let input = resource_config(&format!("[service.forwarding]\n{assignment}"), "", "");
+            let error = compile(&input).expect_err("forwarding ceiling must be enforced");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+
+        let definitions = r#"
+[authorization.providers.body]
+kind = "process"
+command = "/bin/body-provider"
+include_request_body = true
+max_request_body_bytes = 2
+max_decoded_request_body_bytes = 3
+retire_timeout = "1s"
+"#;
+        let rules = r#"
+[[policy.rules]]
+id = "body"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "body"
+"#;
+        for (field, expected) in [
+            (
+                "max_request_wire_bytes",
+                "must cover every reachable mandatory request wire-body limit",
+            ),
+            (
+                "max_request_decoded_bytes",
+                "must cover every reachable mandatory decoded request-body limit",
+            ),
+        ] {
+            let wire = if field == "max_request_wire_bytes" {
+                1
+            } else {
+                3
+            };
+            let decoded = if field == "max_request_decoded_bytes" {
+                1
+            } else {
+                3
+            };
+            let service = format!(
+                "[service.forwarding]\nmax_request_wire_bytes = {wire}\nmax_request_decoded_bytes = {decoded}\nmax_response_wire_bytes = 3\nmax_response_decoded_bytes = 3\nchunk_bytes = 1"
+            );
+            let error = compile(&resource_config(&service, definitions, rules))
+                .expect_err("undersized forwarding request bound must fail");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn runtime_chunk_quotient_accepts_equality_and_rejects_excess_and_overflow() {
+        let equality = resource_config(
+            r#"
+[service.forwarding]
+max_request_wire_bytes = 65536
+max_request_decoded_bytes = 65536
+max_response_wire_bytes = 65536
+max_response_decoded_bytes = 65536
+chunk_bytes = 1
+"#,
+            "",
+            "",
+        );
+        compile(&equality).expect("exactly 65,536 runtime chunks are representable");
+
+        for (field, replacement) in [
+            (
+                "max_request_wire_bytes = 65536",
+                "max_request_wire_bytes = 65537",
+            ),
+            (
+                "max_response_decoded_bytes = 65536",
+                "max_response_decoded_bytes = 65537",
+            ),
+        ] {
+            let excess = equality.replace(field, replacement);
+            let error = compile(&excess).expect_err("a 65,537th runtime chunk must be rejected");
+            assert!(error
+                .to_string()
+                .contains("more than 65536 runtime body chunks"));
+        }
+
+        let overflow = validate_runtime_chunk_quotient("test.body", usize::MAX, 2)
+            .expect_err("chunk quotient arithmetic must be checked");
+        assert!(overflow
+            .to_string()
+            .contains("runtime chunk quotient overflow"));
+    }
+
+    #[test]
+    fn capture_runtime_chunk_quotient_is_validated_independently() {
+        let input = resource_config(
+            r#"
+[service.forwarding]
+max_request_wire_bytes = 1
+max_request_decoded_bytes = 1
+max_response_wire_bytes = 1
+max_response_decoded_bytes = 1
+chunk_bytes = 1
+"#,
+            r#"
+[redaction.profiles.capture]
+max_body_bytes = 65537
+max_decoded_body_bytes = 65537
+rules = [{ literals = ["secret"] }]
+
+[observation.capture]
+events = ["request.allowed"]
+redaction_profile = "capture"
+directory = "captures"
+max_inflight_body_bytes = 134217728
+"#,
+            "",
+        );
+        let error = compile(&input).expect_err("capture must obey the runtime chunk ceiling");
+        assert!(error
+            .to_string()
+            .contains("more than 65536 runtime body chunks"));
     }
 
     #[test]
@@ -5751,13 +6532,15 @@ methods = ["POST"]
         let peaks = &compiled
             .reloadable_plan
             .resource_plan
-            .http_wire_body_peak_bytes_by_cursor;
+            .combined_http_body_peaks_for_test();
         let merged = decode_peak(first_encoded, later_decoded).unwrap();
+        let replay = canonical_runtime_replay_storage(later_decoded);
 
-        assert_eq!(peaks[0], merged);
-        assert_eq!(peaks[1], decode_peak(later_encoded, later_decoded).unwrap());
+        assert!(peaks[0] >= merged);
+        assert!(peaks[0] >= replay);
+        assert!(peaks[1] >= decode_peak(later_encoded, later_decoded).unwrap());
         assert!(merged > decode_peak(first_encoded, first_decoded).unwrap());
-        assert!(merged > peaks[1]);
+        assert!(peaks[0] >= peaks[1]);
     }
 
     #[test]
@@ -5822,20 +6605,22 @@ methods = ["POST"]
         let merged_original = guarded(MIB);
         let first_provider_stage = first.max_incoming_additional_bytes();
         let decode = decode_peak(MIB, MIB).unwrap();
+        let replay = default_runtime_replay_storage();
 
         assert_eq!(first.local_body_allocation, None);
         assert!(merged_original + first_provider_stage > decode);
-        assert_eq!(
-            compiled
-                .reloadable_plan
-                .resource_plan
-                .http_wire_body_peak_bytes_by_cursor,
-            [merged_original + first_provider_stage, decode, 0]
-        );
+        let peaks = &compiled
+            .reloadable_plan
+            .resource_plan
+            .combined_http_body_peaks_for_test();
+        assert!(peaks[0] >= merged_original + first_provider_stage);
+        assert!(peaks[0] >= replay);
+        assert!(peaks[1] >= decode);
+        assert_eq!(peaks[2], 0);
     }
 
     #[test]
-    fn skipped_predicate_keeps_later_mandatory_body_read_reachable() {
+    fn method_incompatible_skipped_rule_does_not_inherit_later_body_read() {
         let compiled = compile(&resource_config(
             "",
             r#"
@@ -5866,7 +6651,7 @@ methods = ["POST"]
             .policy
             .http_body_read_plans_by_cursor;
 
-        assert_eq!(body_read_limits(plans[0]), Some((12, 36)));
+        assert_eq!(plans[0], HttpBodyReadPlan::Disabled);
         assert_eq!(body_read_limits(plans[1]), Some((12, 36)));
         assert_eq!(plans[2], HttpBodyReadPlan::Disabled);
     }
@@ -5958,12 +6743,12 @@ methods = ["POST"]
             [Some(callback_allocation)]
         );
         assert_eq!(
-            resources.http_wire_body_peak_bytes_by_cursor,
-            [request_allocation, 0]
+            resources.combined_http_body_peaks_for_test(),
+            [request_allocation + default_runtime_replay_storage(), 0]
         );
         assert_eq!(
-            resources.max_reachable_http_wire_body_peak_bytes,
-            request_allocation
+            resources.max_reachable_http_body_combined_peak_bytes,
+            request_allocation + default_runtime_replay_storage()
         );
     }
 
@@ -6301,9 +7086,11 @@ authorization_provider = "later"
         assert_eq!(compact_credentials, 2 * guarded(1));
         let initial_peak = (retained + rehome).max(decode_peak(1, 1).unwrap());
         assert_eq!(initial_peak, decode_peak(1, 1).unwrap());
+        let first_replay = canonical_runtime_replay_storage(1);
+        let later_replay = default_runtime_replay_storage();
         assert_eq!(
-            plan.http_wire_body_peak_bytes_by_cursor,
-            [initial_peak, rehome, 0]
+            plan.combined_http_body_peaks_for_test(),
+            [initial_peak + first_replay, rehome + later_replay, 0]
         );
     }
 
@@ -6368,8 +7155,8 @@ redaction_profile = "small"
         );
         assert_eq!(retained, 2 * guarded(1));
         assert_eq!(incoming_redaction, 3 * guarded(1));
-        assert!(plan.http_wire_body_peak_bytes_by_cursor[0] >= retained + incoming_redaction);
-        assert_eq!(plan.http_wire_body_peak_bytes_by_cursor[2], 0);
+        assert!(plan.combined_http_body_peaks_for_test()[0] >= retained + incoming_redaction);
+        assert_eq!(plan.combined_http_body_peaks_for_test()[2], 0);
     }
 
     #[test]
@@ -6465,13 +7252,19 @@ authorization_provider = "later"
         let retained = guarded(1);
         let response = guarded(response_bytes);
         let decoder_peak = decode_peak(1, 1).unwrap();
+        let first_replay = canonical_runtime_replay_storage(1);
+        let later_replay = default_runtime_replay_storage();
 
         assert_eq!(first.retained_original_after_pass, Some(retained));
         assert_eq!(second.initial_peak, response);
         assert_eq!(second.max_incoming_additional_bytes(), response);
         assert_eq!(
-            resources.http_wire_body_peak_bytes_by_cursor,
-            [decoder_peak.max(retained + response), response, 0]
+            resources.combined_http_body_peaks_for_test(),
+            [
+                decoder_peak.max(retained + response) + first_replay,
+                response + later_replay,
+                0
+            ]
         );
     }
 
@@ -6553,10 +7346,10 @@ authorization_provider = "later"
         let request_scratch = guarded(PROVIDER_REQUEST_STREAM_SCRATCH_BYTES);
 
         assert_eq!(second.max_incoming_additional_bytes(), request_scratch);
-        assert!(resources.http_wire_body_peak_bytes_by_cursor[0] >= retained + request_scratch);
+        assert!(resources.combined_http_body_peaks_for_test()[0] >= retained + request_scratch);
         assert_eq!(
-            resources.http_wire_body_peak_bytes_by_cursor[1],
-            request_scratch
+            resources.combined_http_body_peaks_for_test()[1],
+            request_scratch + default_runtime_replay_storage()
         );
     }
 
@@ -6600,14 +7393,12 @@ authorization_provider = "decision"
 "#,
             );
             let resources = compile(&input).unwrap().reloadable_plan.resource_plan;
+            let combined = guarded(continuation_bytes) + default_runtime_replay_storage();
 
+            assert_eq!(resources.combined_http_body_peaks_for_test(), [combined, 0]);
             assert_eq!(
-                resources.http_wire_body_peak_bytes_by_cursor,
-                [guarded(continuation_bytes), 0]
-            );
-            assert_eq!(
-                resources.max_reachable_http_wire_body_peak_bytes,
-                guarded(continuation_bytes)
+                resources.max_reachable_http_body_combined_peak_bytes,
+                combined
             );
         }
         assert_eq!(guarded(64 * 1024), guarded(1));
@@ -6681,13 +7472,15 @@ authorization_provider = "later"
         let retained_original = guarded(1);
         let later_continuation = guarded(later_continuation_bytes);
         let decoder_peak = decode_peak(1, 1).unwrap();
+        let first_replay = canonical_runtime_replay_storage(1);
+        let later_replay = default_runtime_replay_storage();
 
         assert_eq!(later_continuation, 3 * guarded(1));
         assert_eq!(
-            resources.http_wire_body_peak_bytes_by_cursor,
+            resources.combined_http_body_peaks_for_test(),
             [
-                decoder_peak.max(retained_original + later_continuation),
-                later_continuation,
+                decoder_peak.max(retained_original + later_continuation) + first_replay,
+                later_continuation + later_replay,
                 0,
             ]
         );
@@ -6716,16 +7509,20 @@ authorization_provider = "decision"
             provider_response_guarded_suffix_bytes(MIB, "test.provider.max_stdout_line_bytes")
                 .unwrap(),
         );
+        let combined = peak + default_runtime_replay_storage();
 
-        assert_eq!(resources.http_wire_body_peak_bytes_by_cursor, [peak, 0]);
-        assert_eq!(resources.max_reachable_http_wire_body_peak_bytes, peak);
+        assert_eq!(resources.combined_http_body_peaks_for_test(), [combined, 0]);
+        assert_eq!(
+            resources.max_reachable_http_body_combined_peak_bytes,
+            combined
+        );
         assert_eq!(
             resources.wire_body_full_peak_capacity,
-            Capacity::Finite(8 * GIB / peak)
+            Capacity::Finite(16 * GIB / combined)
         );
         assert_eq!(
             resources.wire_body_quota_key_full_peak_capacity,
-            Capacity::Finite(GIB / peak)
+            Capacity::Finite(2 * GIB / combined)
         );
     }
 
@@ -6776,8 +7573,8 @@ redaction_profile = "terminal"
             compiled
                 .reloadable_plan
                 .resource_plan
-                .http_wire_body_peak_bytes_by_cursor[0],
-            decoder_peak.max(retained + later_additional)
+                .combined_http_body_peaks_for_test()[0],
+            decoder_peak.max(retained + later_additional) + canonical_runtime_replay_storage(1)
         );
     }
 
@@ -6789,7 +7586,7 @@ redaction_profile = "terminal"
         let peak = baseline
             .reloadable_plan
             .resource_plan
-            .max_reachable_http_wire_body_peak_bytes;
+            .max_reachable_http_body_combined_peak_bytes;
         let exact_service = format!(
             "max_inflight_wire_body_bytes = {}\nmax_inflight_wire_body_bytes_per_quota_key = {peak}\nmin_wire_body_concurrency = 5",
             5 * peak
@@ -6838,13 +7635,14 @@ redaction_profile = "terminal"
         use crate::safety::{WireBodyPool, WireBodyQuotaKey};
 
         let compiled = compile(&one_byte_body_provider_config("")).unwrap();
-        let peak = compiled
+        let guarded_peak = compiled
             .reloadable_plan
             .resource_plan
-            .max_reachable_http_wire_body_peak_bytes;
-        let pool = WireBodyPool::new(peak, peak);
+            .http_body_resources_by_cursor[0]
+            .product_incremental_peak_bytes;
+        let pool = WireBodyPool::new(guarded_peak, guarded_peak);
         let guard = pool.begin_for_test(
-            peak,
+            guarded_peak,
             WireBodyQuotaKey::from_peer(
                 std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
                 |_| false,
@@ -6860,8 +7658,8 @@ redaction_profile = "terminal"
         encoded.try_extend_from_slice(&[1]).unwrap();
         decoded.try_extend_from_slice(&[2]).unwrap();
 
-        assert_eq!(guard.live_bytes(), peak);
-        assert_eq!(pool.global_charge(), peak);
+        assert_eq!(guard.live_bytes(), guarded_peak);
+        assert_eq!(pool.global_charge(), guarded_peak);
         assert_eq!(
             decoder_workspace.len(),
             guarded_workspace_allocation_bytes(decoder_sizes.maximum()).unwrap()
@@ -7235,7 +8033,8 @@ filename = "{{requestId}}-{{suffix}}.json"
             ),
             format!(
                 "resources={}:{}",
-                plan.resource_plan.max_reachable_http_wire_body_peak_bytes,
+                plan.resource_plan
+                    .max_reachable_http_body_combined_peak_bytes,
                 plan.resource_plan.max_upgrade_allocation_all_streams
             ),
         ]
@@ -8193,8 +8992,8 @@ x-aw-identity-token = ["secret"]"#,
                 compiled
                     .reloadable_plan
                     .resource_plan
-                    .max_reachable_http_wire_body_peak_bytes
-                    <= 128 * MIB,
+                    .max_reachable_http_body_combined_peak_bytes
+                    <= 231 * MIB,
                 "{name} fixture exceeds the production HTTP body-plan ceiling"
             );
         }
@@ -8234,9 +9033,109 @@ redaction_profile = "large"
         );
         let compiled = compile(&input).unwrap();
         let plan = &compiled.reloadable_plan.resource_plan;
+        let get_peak = decode_peak(MIB, MIB).unwrap();
         let redaction_peak = decode_peak(8 * MIB, 8 * MIB).unwrap();
-        assert_eq!(plan.http_wire_body_peak_bytes_by_cursor[0], redaction_peak);
-        assert_eq!(plan.http_wire_body_peak_bytes_by_cursor[1], redaction_peak);
+        assert_eq!(
+            plan.combined_http_body_peaks_for_test()[0],
+            get_peak + canonical_runtime_replay_storage(MIB)
+        );
+        assert_eq!(
+            plan.combined_http_body_peaks_for_test()[1],
+            redaction_peak + canonical_runtime_replay_storage(8 * MIB)
+        );
+    }
+
+    #[test]
+    fn multi_method_delegate_preserves_method_specialized_successor_resources() {
+        let definitions = r#"
+[authorization.providers.first]
+kind = "process"
+command = "/bin/first-provider"
+include_request_body = true
+allow_request_body_replacement = true
+max_request_body_bytes = 2097152
+max_decoded_request_body_bytes = 2097152
+max_stdout_line_bytes = 3145728
+retire_timeout = "1s"
+
+[authorization.providers.middle]
+kind = "process"
+command = "/bin/middle-provider"
+include_request_body = true
+allow_request_body_replacement = true
+max_request_body_bytes = 1048576
+max_decoded_request_body_bytes = 1048576
+max_stdout_line_bytes = 2097152
+retire_timeout = "1s"
+
+[authorization.providers.large-post]
+kind = "process"
+command = "/bin/large-post-provider"
+include_request_body = true
+allow_request_body_replacement = true
+max_request_body_bytes = 33554432
+max_decoded_request_body_bytes = 33554432
+max_stdout_line_bytes = 16777216
+retire_timeout = "1s"
+"#;
+        let rules = r#"
+[[policy.rules]]
+id = "first-get"
+decision = "delegate"
+methods = ["GET"]
+authorization_provider = "first"
+
+[[policy.rules]]
+id = "middle-get-post"
+decision = "delegate"
+methods = ["GET", "POST"]
+authorization_provider = "middle"
+
+[[policy.rules]]
+id = "large-post"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "large-post"
+"#;
+        let input = resource_config("", definitions, rules);
+        let authored: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
+        let compiled = compile(&input).unwrap();
+        let body_reads = &compiled
+            .reloadable_plan
+            .policy
+            .http_body_read_plans_by_cursor;
+        let resources = &compiled.reloadable_plan.resource_plan;
+
+        assert_eq!(body_read_limits(body_reads[0]), Some((2 * MIB, 2 * MIB)));
+        assert_eq!(body_read_limits(body_reads[1]), Some((32 * MIB, 32 * MIB)));
+
+        let first = compile_http_rule_schedule(&authored, &authored.policy.rules[0]).unwrap();
+        let middle = compile_http_rule_schedule(&authored, &authored.policy.rules[1]).unwrap();
+        let expected_product_peak = first
+            .initial_peak
+            .max(
+                first.retained_original_after_pass.unwrap()
+                    + middle.max_incoming_additional_bytes(),
+            )
+            .max(decode_peak(2 * MIB, 2 * MIB).unwrap())
+            .max(guarded(64 * 1024));
+        assert_eq!(
+            resources.http_body_resources_by_cursor[0],
+            HttpBodyResourcePlan {
+                product_incremental_peak_bytes: expected_product_peak,
+                runtime_replay_capacity_bytes: canonical_runtime_replay_storage(2 * MIB),
+                combined_peak_bytes: expected_product_peak
+                    + canonical_runtime_replay_storage(2 * MIB),
+            }
+        );
+        assert_eq!(
+            resources.http_body_resources_by_cursor[1].runtime_replay_capacity_bytes,
+            canonical_runtime_replay_storage(32 * MIB)
+        );
+        assert!(
+            resources.http_body_resources_by_cursor[0].combined_peak_bytes
+                < resources.http_body_resources_by_cursor[1].combined_peak_bytes
+        );
     }
 
     #[test]
@@ -8277,14 +9176,16 @@ redaction_profile = "terminal"
         let terminal_decode = decode_peak(MIB, 8 * MIB).unwrap();
         let first_retained_terminal = guarded(16 * MIB) + guarded(8 * MIB) + guarded(scratch);
         let terminal_stage = 2 * guarded(8 * MIB) + guarded(scratch);
+        let first_replay = canonical_runtime_replay_storage(16 * MIB);
+        let terminal_replay = canonical_runtime_replay_storage(8 * MIB);
         assert_eq!(
             compiled
                 .reloadable_plan
                 .resource_plan
-                .http_wire_body_peak_bytes_by_cursor,
+                .combined_http_body_peaks_for_test(),
             vec![
-                first_decode.max(first_retained_terminal),
-                terminal_decode.max(terminal_stage),
+                first_decode.max(first_retained_terminal) + first_replay,
+                terminal_decode.max(terminal_stage) + terminal_replay,
                 0,
             ]
         );
@@ -8342,15 +9243,17 @@ redaction_profile = "terminal"
         let terminal_decode = decode_peak(MIB, 8 * MIB).unwrap();
         let first_retained_terminal = guarded(16 * MIB) + guarded(8 * MIB) + guarded(scratch);
         let terminal_stage = 2 * guarded(8 * MIB) + guarded(scratch);
+        let first_replay = canonical_runtime_replay_storage(16 * MIB);
+        let terminal_replay = canonical_runtime_replay_storage(8 * MIB);
         assert_eq!(
             compiled
                 .reloadable_plan
                 .resource_plan
-                .http_wire_body_peak_bytes_by_cursor,
+                .combined_http_body_peaks_for_test(),
             vec![
-                first_decode.max(first_retained_terminal),
-                terminal_decode.max(terminal_stage),
-                terminal_decode.max(terminal_stage),
+                first_decode.max(first_retained_terminal) + first_replay,
+                terminal_decode.max(terminal_stage) + terminal_replay,
+                terminal_decode.max(terminal_stage) + terminal_replay,
                 0,
             ]
         );
@@ -8382,22 +9285,239 @@ authorization_provider = "replacing"
         let compiled = compile(&input).unwrap();
         let mandatory_decode = decode_peak(MIB, 16 * MIB).unwrap();
         let replacement_decode = replacement_decode_peak(16 * MIB, 16 * MIB).unwrap();
+        let runtime_budget = canonical_runtime_replay_storage(16 * MIB);
         assert_eq!(
             compiled
                 .reloadable_plan
                 .resource_plan
-                .max_reachable_http_wire_body_peak_bytes,
-            mandatory_decode.max(replacement_decode)
+                .max_reachable_http_body_combined_peak_bytes,
+            mandatory_decode.max(replacement_decode) + runtime_budget
+        );
+    }
+
+    #[test]
+    fn process_replacement_projects_exact_runtime_budget_without_webhook_resources() {
+        let decoded_limit = MAX_BUFFER_GROWTH_BYTES + 1;
+        let input = resource_config(
+            "",
+            &format!(
+                r#"
+[authorization.providers.replacing]
+kind = "process"
+command = "/bin/replacing-provider"
+include_request_body = true
+allow_request_body_replacement = true
+max_request_body_bytes = {decoded_limit}
+max_decoded_request_body_bytes = {decoded_limit}
+max_stdout_line_bytes = 1048576
+retire_timeout = "1s"
+"#
+            ),
+            r#"
+[[policy.rules]]
+id = "replacement"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "replacing"
+"#,
+        );
+        let authored: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
+        let schedule = compile_http_rule_schedule(&authored, &authored.policy.rules[0]).unwrap();
+        let compiled = compile(&input).unwrap();
+        let resources = &compiled.reloadable_plan.resource_plan;
+        let runtime_budget = canonical_runtime_replay_storage(decoded_limit);
+        let guarded_peak = schedule
+            .initial_peak
+            .max(decode_peak(decoded_limit, decoded_limit).unwrap());
+
+        assert_eq!(
+            resources.runtime_replay_capacities_for_test(),
+            [runtime_budget, 0]
+        );
+        assert_eq!(
+            resources.combined_http_body_peaks_for_test(),
+            [guarded_peak + runtime_budget, 0]
+        );
+        assert_eq!(resources.webhook_request_allocation_bytes_by_rule, [None]);
+        assert_eq!(resources.webhook_callback_allocation_bytes_by_rule, [None]);
+    }
+
+    #[test]
+    fn delegate_pass_keeps_later_replacement_budget_reachable() {
+        let first_limit = 2 * MAX_BUFFER_GROWTH_BYTES;
+        let replacement_limit = MAX_BUFFER_GROWTH_BYTES + 1;
+        let input = resource_config(
+            "",
+            &format!(
+                r#"
+[authorization.providers.first]
+kind = "process"
+command = "/bin/first-provider"
+include_request_body = true
+max_request_body_bytes = {first_limit}
+max_decoded_request_body_bytes = {first_limit}
+max_stdout_line_bytes = 1048576
+retire_timeout = "1s"
+
+[authorization.providers.replacing]
+kind = "process"
+command = "/bin/replacing-provider"
+include_request_body = true
+allow_request_body_replacement = true
+max_request_body_bytes = {replacement_limit}
+max_decoded_request_body_bytes = {replacement_limit}
+max_stdout_line_bytes = 1048576
+retire_timeout = "1s"
+"#
+            ),
+            r#"
+[[policy.rules]]
+id = "first"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "first"
+
+[[policy.rules]]
+id = "replacement"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "replacing"
+"#,
+        );
+        let compiled = compile(&input).unwrap();
+        let first_cursor_budget = canonical_runtime_replay_storage(first_limit);
+        let later_cursor_budget = canonical_runtime_replay_storage(replacement_limit);
+
+        assert_eq!(
+            compiled
+                .reloadable_plan
+                .resource_plan
+                .runtime_replay_capacities_for_test(),
+            [first_cursor_budget, later_cursor_budget, 0]
+        );
+    }
+
+    #[test]
+    fn disjoint_method_path_does_not_combine_replacement_reserve_with_larger_stage() {
+        let input = resource_config(
+            "",
+            r#"
+[authorization.providers.get-replacement]
+kind = "process"
+command = "/bin/get-provider"
+include_request_body = true
+allow_request_body_replacement = true
+max_request_body_bytes = 1048576
+max_decoded_request_body_bytes = 1048576
+max_stdout_line_bytes = 2097152
+retire_timeout = "1s"
+
+[redaction.profiles.post-stage]
+max_body_bytes = 33554432
+max_decoded_body_bytes = 33554432
+rules = [{ literals = ["post-stage"] }]
+"#,
+            r#"
+[[policy.rules]]
+id = "get-replacement"
+decision = "delegate"
+methods = ["GET"]
+authorization_provider = "get-replacement"
+
+[[policy.rules]]
+id = "post-stage"
+decision = "allow"
+methods = ["POST"]
+redaction_profile = "post-stage"
+"#,
+        );
+        let authored: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
+        let post_schedule =
+            compile_http_rule_schedule(&authored, &authored.policy.rules[1]).unwrap();
+        let replacement_budget = canonical_runtime_replay_storage(MIB);
+        let post_replay = canonical_runtime_replay_storage(32 * MIB);
+        let post_decode_peak = decode_peak(32 * MIB, 32 * MIB).unwrap();
+        let post_path_peak = post_schedule.initial_peak.max(post_decode_peak);
+        let compiled = compile(&input).unwrap();
+        let resources = &compiled.reloadable_plan.resource_plan;
+
+        assert_eq!(
+            resources.runtime_replay_capacities_for_test(),
+            [replacement_budget, post_replay, 0]
+        );
+        let combined_post_path = post_path_peak + post_replay;
+        assert_eq!(
+            resources.max_reachable_http_body_combined_peak_bytes,
+            combined_post_path
+        );
+        assert!(
+            resources.http_body_resources_by_cursor[0].combined_peak_bytes < combined_post_path
+        );
+
+        let exact_service = format!(
+            "max_inflight_wire_body_bytes = {}\nmax_inflight_wire_body_bytes_per_quota_key = {}\nmin_wire_body_concurrency = 1",
+            4 * combined_post_path,
+            combined_post_path
+        );
+        let exact = input.replacen(
+            "request_timeout = \"1s\"",
+            &format!("request_timeout = \"1s\"\n{exact_service}"),
+            1,
+        );
+        compile(&exact).expect("disjoint methods fit the exact compatible-path capacity");
+    }
+
+    #[test]
+    fn runtime_replacement_reserve_participates_in_quota_capacity_rejection() {
+        let definitions = r#"
+[authorization.providers.replacing]
+kind = "process"
+command = "/bin/replacing-provider"
+include_request_body = true
+allow_request_body_replacement = true
+max_request_body_bytes = 1
+max_decoded_request_body_bytes = 1
+max_stdout_line_bytes = 65536
+retire_timeout = "1s"
+"#;
+        let rules = r#"
+[[policy.rules]]
+id = "replacement"
+decision = "delegate"
+methods = ["POST"]
+authorization_provider = "replacing"
+"#;
+        let compiled = compile(&resource_config("", definitions, rules)).unwrap();
+        let combined_peak = compiled
+            .reloadable_plan
+            .resource_plan
+            .max_reachable_http_body_combined_peak_bytes;
+        let service = format!(
+            "max_inflight_wire_body_bytes = {}\nmax_inflight_wire_body_bytes_per_quota_key = {}\nmin_wire_body_concurrency = 1",
+            4 * combined_peak,
+            combined_peak - 1
+        );
+
+        let error = compile(&resource_config(&service, definitions, rules))
+            .expect_err("the quota must hold the guarded peak plus runtime admission reserve");
+
+        assert!(
+            error
+                .to_string()
+                .contains("largest pass-reachable mandatory body working set"),
+            "{error}"
         );
     }
 
     #[test]
     fn stricter_profile_limits_every_combined_provider_body_stage() {
-        let peak = decode_peak(1, 1).unwrap();
+        let guarded_peak = decode_peak(1, 1).unwrap();
+        let runtime_budget = canonical_runtime_replay_storage(1);
+        let combined_peak = guarded_peak + runtime_budget;
         let input = resource_config(
             &format!(
-                "max_inflight_wire_body_bytes = {}\nmax_inflight_wire_body_bytes_per_quota_key = {peak}\nmin_wire_body_concurrency = 5",
-                5 * peak
+                "max_inflight_wire_body_bytes = {}\nmax_inflight_wire_body_bytes_per_quota_key = {combined_peak}\nmin_wire_body_concurrency = 5",
+                5 * combined_peak
             ),
             r#"
 [authorization.providers.large]
@@ -8428,8 +9548,18 @@ redaction_profile = "small"
             .expect("the exact pool holds every stage reachable through the stricter profile");
         let resources = &compiled.reloadable_plan.resource_plan;
 
-        assert_eq!(resources.max_reachable_http_wire_body_peak_bytes, peak);
-        assert_eq!(resources.http_wire_body_peak_bytes_by_cursor, [peak, 0]);
+        assert_eq!(
+            resources.runtime_replay_capacities_for_test(),
+            [runtime_budget, 0]
+        );
+        assert_eq!(
+            resources.max_reachable_http_body_combined_peak_bytes,
+            combined_peak
+        );
+        assert_eq!(
+            resources.combined_http_body_peaks_for_test(),
+            [combined_peak, 0]
+        );
         assert_eq!(resources.wire_body_full_peak_capacity, Capacity::Finite(5));
         assert_eq!(
             resources.wire_body_quota_key_full_peak_capacity,
@@ -8487,7 +9617,11 @@ rules = [{{ literals = ["x"] }}]
             64 * MIB,
         );
         let input = resource_config(
-            "",
+            r#"
+[service.forwarding]
+max_request_wire_bytes = 67108864
+max_request_decoded_bytes = 67108864
+"#,
             &definitions,
             r#"
 [[policy.rules]]
@@ -8515,12 +9649,13 @@ authorization_provider = "larger"
         );
 
         let compiled = compile(&input).unwrap();
+        let replay = canonical_runtime_replay_storage_for(64 * MIB, 64 * 1024, 64 * MIB);
         assert_eq!(
             compiled
                 .reloadable_plan
                 .resource_plan
-                .http_wire_body_peak_bytes_by_cursor,
-            [merged_decode, merged_decode, 0]
+                .combined_http_body_peaks_for_test(),
+            [merged_decode + replay, merged_decode + replay, 0]
         );
     }
 
@@ -8562,13 +9697,18 @@ redaction_profile = "expanding"
         );
         let compiled = compile(&input).unwrap();
         let merged_decode_peak = decode_peak(MIB, MIB).unwrap();
+        let runtime_budget = canonical_runtime_replay_storage(MIB);
 
         assert_eq!(
             compiled
                 .reloadable_plan
                 .resource_plan
-                .http_wire_body_peak_bytes_by_cursor,
-            vec![merged_decode_peak, merged_decode_peak, 0]
+                .combined_http_body_peaks_for_test(),
+            vec![
+                merged_decode_peak + runtime_budget,
+                merged_decode_peak + runtime_budget,
+                0,
+            ]
         );
         assert!(merged_decode_peak > 2 * guarded(8 * MIB));
     }

@@ -431,6 +431,10 @@ impl ProviderCredentialSet {
         }
     }
 
+    pub(crate) fn contains_output(&self, index: ProviderOutputIndex) -> bool {
+        self.value_segments(index).is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn contiguous(&self, index: ProviderOutputIndex) -> Option<&[u8]> {
         let Self::Contiguous(credentials) = self else {
@@ -467,6 +471,23 @@ impl ProviderCredentialSet {
 
     pub(super) fn from_process_segmented(credentials: ProcessProviderCredentials) -> Self {
         Self::ProcessSegmented(credentials)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn single_value_for_test(
+        index: ProviderOutputIndex,
+        output_count: usize,
+        value: &[u8],
+    ) -> Self {
+        assert!(index.get() < output_count);
+        let mut values = std::iter::repeat_with(|| None)
+            .take(output_count)
+            .collect::<Vec<_>>();
+        values[index.get()] = Some(SecretBytes(value.to_vec()));
+        Self::Contiguous(ContiguousProviderCredentials {
+            registry_id: index.registry_id(),
+            values: values.into_boxed_slice(),
+        })
     }
 
     fn value_segments(&self, index: ProviderOutputIndex) -> Option<ProviderCredentialSegments<'_>> {
@@ -621,6 +642,19 @@ impl ProviderBodyReplacement {
         Self {
             content_type: None,
             content_encoding: None,
+            storage: ProviderBodyReplacementStorage::Decoded(decoded),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_decoded_with_metadata_for_test(
+        decoded: GuardedBody,
+        content_type: Option<String>,
+        content_encoding: Option<String>,
+    ) -> Self {
+        Self {
+            content_type,
+            content_encoding,
             storage: ProviderBodyReplacementStorage::Decoded(decoded),
         }
     }

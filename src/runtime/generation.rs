@@ -10,6 +10,7 @@ use http::header::HeaderMap;
 use tokio::sync::Notify;
 
 use crate::config::compiler::CompiledResourcePlan;
+use crate::standalone::StandaloneGenerationPlan;
 
 use super::activation::{BoxFuture, RuntimeError};
 
@@ -25,6 +26,11 @@ impl GenerationId {
     }
 
     pub(super) fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(value: u64) -> Self {
         Self(value)
     }
 }
@@ -208,6 +214,23 @@ pub(crate) trait AuthorizationSnapshot: Send + Sync {
         crate::authorization::protocol::ProviderCredentialInjectionError,
     >;
 
+    fn consume_allow_output(
+        &self,
+        provider: ProviderIndex,
+        output: crate::authorization::AuthorizationAllowOutput,
+    ) -> Option<(
+        Option<crate::authorization::protocol::ProviderCredentialSet>,
+        Option<crate::authorization::protocol::ProviderBodyReplacement>,
+    )>;
+
+    #[cfg(test)]
+    fn bind_allow_output_for_test(
+        &self,
+        provider: ProviderIndex,
+        credentials: Option<crate::authorization::protocol::ProviderCredentialSet>,
+        replacement: Option<crate::authorization::protocol::ProviderBodyReplacement>,
+    ) -> crate::authorization::AuthorizationAllowOutput;
+
     fn dispatch<'a>(
         &'a self,
         provider: ProviderIndex,
@@ -261,7 +284,7 @@ pub(crate) trait SafetySnapshot: Send + Sync {
         &self,
         plan: crate::policy::HttpWireBodyPlanIndex,
         quota_key: crate::safety::WireBodyQuotaKey,
-    ) -> Result<crate::safety::HttpWireBodyGuard, crate::safety::UnknownHttpWireBodyPlan>;
+    ) -> Result<crate::safety::HttpBodyAdmission, crate::safety::HttpBodyAdmissionError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -295,6 +318,7 @@ pub(crate) trait GenerationOwner: Send + Sync {
 }
 
 pub(crate) struct ActivatedGeneration {
+    pub(crate) standalone: StandaloneGenerationPlan,
     pub(crate) request_timeout: Duration,
     pub(crate) max_content_decoding_expansion_ratio: usize,
     pub(crate) resource_plan: CompiledResourcePlan,
@@ -311,6 +335,8 @@ pub(crate) struct ActivatedGeneration {
 
 pub(crate) struct Generation {
     id: GenerationId,
+    #[allow(dead_code)]
+    standalone: StandaloneGenerationPlan,
     request_timeout: Duration,
     max_content_decoding_expansion_ratio: usize,
     resource_plan: CompiledResourcePlan,
@@ -346,6 +372,7 @@ impl Generation {
     pub(super) fn from_activated(id: GenerationId, value: ActivatedGeneration) -> Self {
         Self {
             id,
+            standalone: value.standalone,
             request_timeout: value.request_timeout,
             max_content_decoding_expansion_ratio: value.max_content_decoding_expansion_ratio,
             resource_plan: value.resource_plan,
@@ -365,6 +392,11 @@ impl Generation {
 
     pub(crate) fn id(&self) -> GenerationId {
         self.id
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn standalone(&self) -> &StandaloneGenerationPlan {
+        &self.standalone
     }
 
     pub(crate) fn request_timeout(&self) -> Duration {
