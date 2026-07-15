@@ -66,14 +66,12 @@ impl ProductRuntime {
 
     async fn prepare_inner(
         loaded: LoadedCompiledConfig,
-        #[cfg_attr(not(test), allow(unused_variables))] prebound: Option<
-            Vec<std::net::TcpListener>,
-        >,
-        #[cfg_attr(not(test), allow(unused_variables))] destination_guard: Option<
-            Arc<crate::destination::DestinationGuard>,
-        >,
+        prebound: Option<Vec<std::net::TcpListener>>,
+        destination_guard: Option<Arc<crate::destination::DestinationGuard>>,
     ) -> Result<Arc<Self>, ProductRuntimeError> {
         let LoadedCompiledConfig { metadata, compiled } = loaded;
+        #[cfg(not(test))]
+        let _ = (prebound, destination_guard);
         #[cfg(test)]
         let static_resources = match destination_guard {
             Some(destination_guard) => ProductStaticResources::try_new_with_destination_guard(
@@ -125,6 +123,11 @@ impl ProductRuntime {
 
     pub(crate) fn upgrade_runtime(&self) -> Arc<UpgradeRuntime> {
         self.static_resources.upgrade_runtime()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wire_body_pool(&self) -> Arc<crate::safety::WireBodyPool> {
+        self.static_resources.wire_body_pool()
     }
 
     /// Transfers the atomically prepared proxy socket bundle to the future

@@ -13,8 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::network::canonical_ip;
 use crate::safety::allocation::{
     self, AllocationAuthority, ExactAllocationLease, ReservedStableBodyBuilder, StableBody,
-    StableBodyBuilder, StableBodySegments, StableScratch, StableWorkspace,
-    StableWorkspaceAllocation,
+    StableBodyBuilder, StableBodySegments, StableScratch, StableWorkspaceAllocation,
 };
 
 const QUOTA_SHARD_COUNT: usize = 16;
@@ -126,6 +125,7 @@ impl WireBodyPool {
         self.begin(cursor_peak_bytes, quota_key)
     }
 
+    #[cfg(test)]
     pub(crate) fn global_charge(&self) -> usize {
         self.global_charge.load(Ordering::Acquire)
     }
@@ -326,6 +326,7 @@ impl HttpWireBodyGuard {
         self.inner.live_bytes.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
     pub(crate) fn cursor_peak_bytes(&self) -> usize {
         self.inner.cursor_peak_bytes
     }
@@ -366,7 +367,6 @@ pub(crate) type ReservedGuardedBodyBuilder = ReservedStableBodyBuilder<WireAlloc
 pub(crate) type GuardedBody = StableBody<WireAllocationAuthority>;
 pub(crate) type GuardedBodySegments<'a> = StableBodySegments<'a>;
 pub(crate) type GuardedScratch = StableScratch<WireAllocationAuthority>;
-pub(crate) type GuardedWorkspace = StableWorkspace<WireAllocationAuthority>;
 pub(crate) type GuardedWorkspaceAllocation = StableWorkspaceAllocation<WireAllocationAuthority>;
 
 struct GuardInner {

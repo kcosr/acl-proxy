@@ -58,6 +58,7 @@ impl fmt::Debug for LoadedCompiledConfig {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy)]
 pub(crate) struct ConfigTextInput<'a> {
     pub(crate) text: &'a str,
@@ -139,6 +140,7 @@ pub(crate) fn load_and_compile_exact_config(
     Ok(LoadedCompiledConfig { metadata, compiled })
 }
 
+#[cfg(test)]
 pub(crate) fn compile_config_text(
     input: ConfigTextInput<'_>,
 ) -> Result<CompiledConfig, ConfigFacadeError> {

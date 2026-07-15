@@ -13,6 +13,7 @@ COMMON_NS=""
 INTERNAL_NS=""
 ORIGIN_NS=""
 PIDS=()
+FORWARD_RULE=0
 
 fail() {
     printf 'production topology smoke failed: %s\n' "$*" >&2
@@ -20,7 +21,8 @@ fail() {
 }
 
 cleanup() {
-    local pid namespace
+    local status=$?
+    local pid namespace role
     for pid in "${PIDS[@]:-}"; do
         if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
             kill -TERM "$pid" 2>/dev/null || true
@@ -29,6 +31,22 @@ cleanup() {
     for pid in "${PIDS[@]:-}"; do
         [[ -z "$pid" ]] || wait "$pid" 2>/dev/null || true
     done
+    if (( status != 0 )) && [[ -n "$TMP_DIR" ]]; then
+        for role in host common internal origin; do
+            if [[ -s "$TMP_DIR/$role/stderr.log" ]]; then
+                printf '%s\n' "--- $role stderr ---" >&2
+                tail -n 40 "$TMP_DIR/$role/stderr.log" >&2
+            fi
+        done
+        while IFS= read -r log; do
+            printf '%s\n' "--- ${log#"$TMP_DIR/"} ---" >&2
+            tail -n 40 "$log" >&2
+        done < <(find "$TMP_DIR" -type f -path '*/runtime/logs/*' -size +0c -print)
+    fi
+    if (( FORWARD_RULE == 1 )); then
+        iptables -D FORWARD -s 198.18.0.0/15 -d 198.18.0.0/15 -j ACCEPT \
+            2>/dev/null || true
+    fi
     for namespace in "$HOST_NS" "$COMMON_NS" "$INTERNAL_NS" "$ORIGIN_NS"; do
         if [[ -n "$namespace" ]]; then
             ip netns del "$namespace" 2>/dev/null || true
@@ -39,6 +57,7 @@ cleanup() {
         ip link del "$BRIDGE" 2>/dev/null || true
     fi
     [[ -z "$TMP_DIR" ]] || rm -rf "$TMP_DIR"
+    return "$status"
 }
 trap cleanup EXIT
 
@@ -123,6 +142,8 @@ ORIGIN_NS="apo$SUFFIX"
 
 ip link add "$BRIDGE" type bridge
 ip link set "$BRIDGE" up
+iptables -I FORWARD -s 198.18.0.0/15 -d 198.18.0.0/15 -j ACCEPT
+FORWARD_RULE=1
 
 add_namespace() {
     local namespace=$1
@@ -219,13 +240,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-http = http.server.ThreadingHTTPServer(("0.0.0.0", 80), Handler)
-https = http.server.ThreadingHTTPServer(("0.0.0.0", 443), Handler)
+http_server = http.server.ThreadingHTTPServer(("0.0.0.0", 80), Handler)
+https_server = http.server.ThreadingHTTPServer(("0.0.0.0", 443), Handler)
 context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 context.load_cert_chain(sys.argv[1], sys.argv[2])
-https.socket = context.wrap_socket(https.socket, server_side=True)
-threading.Thread(target=http.serve_forever, daemon=True).start()
-https.serve_forever()
+https_server.socket = context.wrap_socket(https_server.socket, server_side=True)
+threading.Thread(target=http_server.serve_forever, daemon=True).start()
+https_server.serve_forever()
 PY
 
 ip netns exec "$ORIGIN_NS" python3 "$TMP_DIR/origin/origin.py" \
@@ -273,6 +294,13 @@ wait_ready() {
 run_proxy "$HOST_NS" host fixture-host-unused
 wait_ready "$HOST_NS" host
 
+origin_body=$(ip netns exec "$HOST_NS" curl --fail --silent --show-error \
+    --connect-timeout 3 --max-time 10 --noproxy '*' \
+    --cacert "$TMP_DIR/origin/ca-cert.pem" \
+    https://gitlab.example.test/topology-origin-preflight)
+[[ "$origin_body" == *'origin-ok:/topology-origin-preflight:'* ]] \
+    || fail "host namespace could not reach the HTTPS origin"
+
 readonly HOST_CA="$TMP_DIR/host/runtime/certs/ca-cert.pem"
 readonly HOST_CA_KEY="$TMP_DIR/host/runtime/certs/ca-key.pem"
 for attempt in {1..200}; do
@@ -311,28 +339,64 @@ for namespace in "$HOST_NS" "$COMMON_NS" "$INTERNAL_NS"; do
     [[ "$status" != 200 ]] || fail "data listener exposed readiness in $namespace"
 done
 
-common_body=$(ip netns exec "$COMMON_NS" curl --fail --silent --show-error \
-    --proxy http://127.0.0.1:8881 --cacert "$HOST_CA" \
-    -H 'x-aw-identity-token: spoofed-client-value' \
-    https://gitlab.example.test/group/public.git/custom)
-[[ "$common_body" == *'identity=absent:context=absent' ]] \
-    || fail "common identity/context reached the origin or request failed"
+spoofed_policy_context_is_replaced_before_provider_dispatch() {
+    local common_body common_status internal_body internal_status
+    common_status=$(ip netns exec "$COMMON_NS" curl --silent --show-error \
+        --connect-timeout 3 --max-time 10 \
+        --proxy http://127.0.0.1:8881 --cacert "$HOST_CA" \
+        -H 'x-aw-identity-token: spoofed-client-value' \
+        -H 'x-aw-policy-context: fixture-internal' \
+        --output "$TMP_DIR/common/provider.body" --write-out '%{http_code}' \
+        https://gitlab.example.test/group/public.git/custom)
+    common_body=$(<"$TMP_DIR/common/provider.body")
+    [[ "$common_status" == 200 ]] \
+        || fail "common provider path returned HTTP $common_status: $common_body"
+    [[ "$common_body" == *'identity=absent:context=absent' ]] \
+        || fail "common identity/context reached the origin or request failed"
 
-internal_body=$(ip netns exec "$INTERNAL_NS" curl --fail --silent --show-error \
-    --proxy http://127.0.0.1:8881 --cacert "$HOST_CA" \
-    -H 'x-aw-identity-token: spoofed-client-value' \
-    https://gitlab.example.test/group/internal.git/custom)
-[[ "$internal_body" == *'identity=absent:context=absent' ]] \
-    || fail "internal identity/context reached the origin or request failed"
+    internal_status=$(ip netns exec "$INTERNAL_NS" curl --silent --show-error \
+        --connect-timeout 3 --max-time 10 \
+        --proxy http://127.0.0.1:8881 --cacert "$HOST_CA" \
+        -H 'x-aw-identity-token: spoofed-client-value' \
+        -H 'x-aw-policy-context: workload-spoof' \
+        --output "$TMP_DIR/internal/provider.body" --write-out '%{http_code}' \
+        https://gitlab.example.test/group/internal.git/custom)
+    internal_body=$(<"$TMP_DIR/internal/provider.body")
+    [[ "$internal_status" == 200 ]] \
+        || fail "internal provider path returned HTTP $internal_status: $internal_body"
+    [[ "$internal_body" == *'identity=absent:context=absent' ]] \
+        || fail "internal identity/context reached the origin or request failed"
+}
 
-deny_status=$(ip netns exec "$INTERNAL_NS" curl --silent --show-error \
+spoofed_policy_context_is_replaced_before_provider_dispatch
+
+direct_host_context_must_match_identity_authorization() {
+    local status
+    status=$(ip netns exec "$COMMON_NS" curl --silent --show-error \
+        --connect-timeout 3 --max-time 10 \
+        --proxy http://198.18.0.10:8881 --cacert "$HOST_CA" \
+        -H 'x-aw-identity-token: fixture-common-identity' \
+        -H 'x-aw-policy-context: fixture-internal' \
+        --output "$TMP_DIR/common/direct-host-denied.body" --write-out '%{http_code}' \
+        https://gitlab.example.test/group/public.git/custom)
+    [[ "$status" == 403 ]] \
+        || fail "direct host identity/context mismatch returned HTTP $status"
+}
+
+direct_host_context_must_match_identity_authorization
+
+deny_status=$(ip netns exec "$COMMON_NS" curl --silent --show-error \
+    --connect-timeout 3 --max-time 10 \
     --proxy http://127.0.0.1:8881 --cacert "$HOST_CA" \
-    --output "$TMP_DIR/internal/denied.body" --write-out '%{http_code}' \
+    --output "$TMP_DIR/common/denied.body" --write-out '%{http_code}' \
     https://gitlab.example.test/group/not-authorized/custom)
 [[ "$deny_status" == 403 ]] || fail "provider denial returned HTTP $deny_status"
 
 http_body=$(ip netns exec "$INTERNAL_NS" curl --fail --silent --show-error \
+    --connect-timeout 3 --max-time 10 \
     --proxy http://198.18.0.10:8881 \
+    -H 'x-aw-identity-token: fixture-internal-identity' \
+    -H 'x-aw-policy-context: fixture-internal' \
     http://git.private-a.example.test/topology-http)
 [[ "$http_body" == *'identity=absent:context=absent' ]] \
     || fail "host HTTP proxy path failed or leaked internal headers"
@@ -340,6 +404,7 @@ http_body=$(ip netns exec "$INTERNAL_NS" curl --fail --silent --show-error \
 ip netns exec "$INTERNAL_NS" iptables -t nat -A OUTPUT -p tcp --dport 443 \
     -j REDIRECT --to-ports 8889
 transparent_body=$(ip netns exec "$INTERNAL_NS" curl --fail --silent --show-error \
+    --connect-timeout 3 --max-time 10 \
     --noproxy '*' --cacert "$HOST_CA" \
     -H 'x-aw-identity-token: spoofed-client-value' \
     https://gitlab.example.test/group/internal.git/custom)

@@ -118,11 +118,13 @@ impl DestinationTarget {
         self.resolution_port
     }
 
-    pub(crate) fn semantic_authority(&self) -> &str {
+    #[cfg(test)]
+    fn semantic_authority(&self) -> &str {
         &self.semantic_authority
     }
 
-    pub(crate) fn semantic_path(&self) -> &str {
+    #[cfg(test)]
+    fn semantic_path(&self) -> &str {
         &self.semantic_path
     }
 }
@@ -587,22 +589,27 @@ impl<S> ConnectedDestination<S> {
         self.target.resolution_host()
     }
 
+    #[cfg(test)]
     pub(crate) fn resolution_port(&self) -> u16 {
         self.target.resolution_port()
     }
 
+    #[cfg(test)]
     pub(crate) fn semantic_authority(&self) -> &str {
         self.target.semantic_authority()
     }
 
+    #[cfg(test)]
     pub(crate) fn semantic_path(&self) -> &str {
         self.target.semantic_path()
     }
 
+    #[cfg(test)]
     pub(crate) fn stream(&self) -> &S {
         &self.stream
     }
 
+    #[cfg(test)]
     pub(crate) fn stream_mut(&mut self) -> &mut S {
         &mut self.stream
     }
@@ -611,6 +618,7 @@ impl<S> ConnectedDestination<S> {
         self.stream
     }
 
+    #[cfg(test)]
     pub(crate) fn map_stream<T>(self, map: impl FnOnce(S) -> T) -> ConnectedDestination<T> {
         ConnectedDestination {
             target: self.target,
@@ -632,7 +640,9 @@ pub(crate) enum ProtectedReason {
 #[derive(Debug)]
 pub(crate) enum DestinationGuardError {
     InconsistentStaticFacts(&'static str),
+    #[cfg(test)]
     InvalidResolutionLimit,
+    #[cfg(test)]
     ResolutionLimitTooLarge {
         limit: usize,
         maximum: usize,
@@ -670,7 +680,9 @@ impl fmt::Display for DestinationGuardError {
                     "inconsistent compiled destination facts: {reason}"
                 )
             }
+            #[cfg(test)]
             Self::InvalidResolutionLimit => write!(formatter, "resolution limit must be nonzero"),
+            #[cfg(test)]
             Self::ResolutionLimitTooLarge { limit, maximum } => write!(
                 formatter,
                 "resolution limit {limit} exceeds the internal maximum {maximum}"

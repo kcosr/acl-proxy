@@ -50,7 +50,6 @@ pub(crate) struct CanonicalRequestTarget {
 pub(crate) struct CanonicalConnectTarget {
     pub(crate) authority: CanonicalAuthority,
     pub(crate) url: CanonicalUrl,
-    pub(crate) uri: Uri,
 }
 
 pub(crate) fn reconcile_explicit_request<B>(
@@ -136,7 +135,6 @@ pub(crate) fn reconcile_connect_outer_request<B>(
     Ok(CanonicalConnectTarget {
         authority,
         url: canonical_url,
-        uri,
     })
 }
 
@@ -631,7 +629,6 @@ mod tests {
         assert_eq!(target.authority.authority, "example.com");
         assert_eq!(target.authority.port, 443);
         assert_eq!(target.url.url, "https://example.com/");
-        assert_eq!(target.uri.to_string(), "example.com:443");
         assert_eq!(valid.uri().to_string(), "example.com:443");
         assert_eq!(host(&valid), "example.com:443");
 
@@ -698,7 +695,6 @@ mod tests {
         let target = reconcile_connect_outer_request(&mut request).unwrap();
         assert_eq!(target.authority.host, "2001:db8::1");
         assert_eq!(target.authority.authority, "[2001:db8::1]:8443");
-        assert_eq!(target.uri.to_string(), "[2001:db8::1]:8443");
         assert_eq!(host(&request), "[2001:db8::1]:8443");
     }
 

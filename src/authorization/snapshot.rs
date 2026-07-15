@@ -372,6 +372,7 @@ impl From<ProviderDecision> for AuthorizationDecision {
 }
 
 impl AuthorizationActivation {
+    #[cfg(test)]
     pub(crate) fn provider_registry(&self) -> &ProviderRegistry {
         &self.provider_registry
     }
@@ -605,10 +606,14 @@ mod tests {
     }
 
     fn body_guard() -> HttpWireBodyGuard {
-        WireBodyPool::new(8 * 1024 * 1024, 8 * 1024 * 1024).begin_for_test(
-            2 * 1024 * 1024,
-            WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::LOCALHOST), |_| false),
-        )
+        body_guard_with_pool().2
+    }
+
+    fn body_guard_with_pool() -> (Arc<WireBodyPool>, WireBodyQuotaKey, HttpWireBodyGuard) {
+        let pool = WireBodyPool::new(8 * 1024 * 1024, 8 * 1024 * 1024);
+        let quota_key = WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::LOCALHOST), |_| false);
+        let guard = pool.begin_for_test(2 * 1024 * 1024, quota_key.clone());
+        (pool, quota_key, guard)
     }
 
     async fn cleanup(owners: &[Arc<dyn GenerationOwner>]) {
@@ -784,7 +789,7 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn pass_dispatch_borrows_guard_and_preserves_request_body_ownership() {
+    async fn http_wire_body_pool_is_global_and_pass_safe() {
         let directory = TempDir::new().unwrap();
         let script = write_python(
             &directory,
@@ -811,13 +816,15 @@ for line in sys.stdin:
             publication.commit();
         }
 
-        let guard = body_guard();
+        let (pool, quota_key, guard) = body_guard_with_pool();
         let mut body = guard.buffer();
         body.try_extend_from_slice(b"retained request body")
             .unwrap();
         let body = body.finish();
         let body_charge = body.charged_bytes();
         assert_eq!(guard.live_bytes(), body_charge);
+        assert_eq!(pool.global_charge(), body_charge);
+        assert_eq!(pool.quota_charge(&quota_key), body_charge);
 
         let _: &dyn AuthorizationSnapshot = &snapshot;
         assert!(matches!(
@@ -833,11 +840,50 @@ for line in sys.stdin:
             AuthorizationDecision::Pass
         ));
         assert_eq!(guard.live_bytes(), body_charge);
+        assert_eq!(pool.global_charge(), body_charge);
+        assert_eq!(pool.quota_charge(&quota_key), body_charge);
+
+        let mut successor = guard.buffer();
+        successor
+            .try_extend_from_slice(b"pass-reachable successor work")
+            .unwrap();
+        let successor = successor.finish();
+        let successor_charge = successor.charged_bytes();
+        assert_eq!(guard.live_bytes(), body_charge + successor_charge);
+        assert_eq!(pool.global_charge(), body_charge + successor_charge);
+        assert_eq!(
+            pool.quota_charge(&quota_key),
+            body_charge + successor_charge
+        );
+
+        let peer_key =
+            WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 55)), |_| false);
+        let peer_guard = pool.begin_for_test(2 * 1024 * 1024, peer_key.clone());
+        let mut concurrent = peer_guard.buffer();
+        concurrent
+            .try_extend_from_slice(b"concurrent request")
+            .unwrap();
+        let concurrent = concurrent.finish();
+        let concurrent_charge = concurrent.charged_bytes();
+        assert_eq!(peer_guard.live_bytes(), concurrent_charge);
+        assert_eq!(pool.quota_charge(&peer_key), concurrent_charge);
+        assert_eq!(
+            pool.global_charge(),
+            body_charge + successor_charge + concurrent_charge
+        );
 
         let body = guard.transfer_body(body).unwrap();
         assert_eq!(body.len(), b"retained request body".len());
         drop(body);
+        assert_eq!(guard.live_bytes(), successor_charge);
+        assert_eq!(pool.global_charge(), successor_charge + concurrent_charge);
+        drop(successor);
+        drop(concurrent);
         assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(peer_guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+        assert_eq!(pool.quota_charge(&quota_key), 0);
+        assert_eq!(pool.quota_charge(&peer_key), 0);
         cleanup(&owners).await;
     }
 

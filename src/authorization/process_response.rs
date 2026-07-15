@@ -78,7 +78,7 @@ pub(super) enum DecisionOnlyResponse {
 pub(super) enum ProcessResponse {
     DecisionOnly(DecisionOnlyProviderDecision),
     Expanded(ProviderDecision),
-    AssignedFailure(AssignedResponseError),
+    AssignedFailure,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -122,9 +122,7 @@ pub(super) async fn read_process_response(
                 DecisionOnlyResponse::Decision(decision) => {
                     Ok(ProcessResponse::DecisionOnly(decision))
                 }
-                DecisionOnlyResponse::AssignedFailure(error) => {
-                    Ok(ProcessResponse::AssignedFailure(error))
-                }
+                DecisionOnlyResponse::AssignedFailure(_) => Ok(ProcessResponse::AssignedFailure),
             }
         }
         ProcessResponseSchema::Expanded {
@@ -182,8 +180,8 @@ where
             syntax
                 .finish()
                 .map_err(|_| FatalProcessResponseError::MalformedJson)?;
-            if let Some(error) = assigned_error {
-                return Ok(ProcessResponse::AssignedFailure(error));
+            if assigned_error.is_some() {
+                return Ok(ProcessResponse::AssignedFailure);
             }
             return match parser
                 .take()
@@ -191,12 +189,8 @@ where
                 .finish()
             {
                 Ok(decision) => Ok(ProcessResponse::Expanded(decision)),
-                Err(ProcessEffectsParseError::Assigned(error)) => {
-                    Ok(ProcessResponse::AssignedFailure(error))
-                }
-                Err(ProcessEffectsParseError::Malformed) => Ok(ProcessResponse::AssignedFailure(
-                    AssignedResponseError::InvalidShape,
-                )),
+                Err(ProcessEffectsParseError::Assigned(_))
+                | Err(ProcessEffectsParseError::Malformed) => Ok(ProcessResponse::AssignedFailure),
                 Err(ProcessEffectsParseError::DuplicateId) => {
                     Err(FatalProcessResponseError::DuplicateId)
                 }

@@ -117,6 +117,7 @@ impl CallbackCredentialSet {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn charged_bytes(&self) -> usize {
         self.storage.charged_bytes()
     }

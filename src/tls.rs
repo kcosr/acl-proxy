@@ -32,6 +32,7 @@ pub(crate) enum ClientTrust {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClientAlpn {
+    #[cfg(test)]
     None,
     Http1,
     Http2,
@@ -40,6 +41,7 @@ pub(crate) enum ClientAlpn {
 impl ClientAlpn {
     fn protocols(self) -> Vec<Vec<u8>> {
         match self {
+            #[cfg(test)]
             Self::None => Vec::new(),
             Self::Http1 => vec![b"http/1.1".to_vec()],
             Self::Http2 => vec![b"h2".to_vec()],

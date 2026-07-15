@@ -35,6 +35,7 @@ pub(crate) enum PayloadClass {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PayloadLimit {
+    #[cfg(test)]
     EncodedHttpBody,
     DecodedHttpBody,
     WebSocketFrame,
@@ -322,6 +323,7 @@ impl StableRedactionContext for CaptureOperation {
 
 pub(crate) struct RedactionSnapshot {
     profiles: Box<[ProfileHandle]>,
+    #[cfg(test)]
     compiled_matcher_resident_bytes: usize,
 }
 
@@ -365,6 +367,7 @@ impl RedactionSnapshot {
             profile_registry,
             snapshot: Self {
                 profiles: profiles.into_boxed_slice(),
+                #[cfg(test)]
                 compiled_matcher_resident_bytes,
             },
         })
@@ -374,14 +377,7 @@ impl RedactionSnapshot {
         self.profiles.get(index.get()).cloned()
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.profiles.len()
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.profiles.is_empty()
-    }
-
+    #[cfg(test)]
     pub(crate) fn compiled_matcher_resident_bytes(&self) -> usize {
         self.compiled_matcher_resident_bytes
     }
@@ -391,18 +387,6 @@ impl crate::runtime::RedactionSnapshot for RedactionSnapshot {
     fn profile(&self, index: RedactionProfileIndex) -> Option<ProfileHandle> {
         RedactionSnapshot::profile(self, index)
     }
-
-    fn len(&self) -> usize {
-        RedactionSnapshot::len(self)
-    }
-
-    fn is_empty(&self) -> bool {
-        RedactionSnapshot::is_empty(self)
-    }
-
-    fn compiled_matcher_resident_bytes(&self) -> usize {
-        RedactionSnapshot::compiled_matcher_resident_bytes(self)
-    }
 }
 
 impl RedactionActivation {
@@ -410,6 +394,7 @@ impl RedactionActivation {
         self.profile_registry.get(name)
     }
 
+    #[cfg(test)]
     pub(crate) fn profile(&self, name: &str) -> Option<ProfileHandle> {
         self.profile_index(name)
             .and_then(|index| self.snapshot.profile(index))
@@ -444,6 +429,11 @@ impl fmt::Debug for ProfileHandle {
 }
 
 impl ProfileHandle {
+    #[cfg(test)]
+    pub(crate) fn strong_count(&self) -> usize {
+        Arc::strong_count(&self.0)
+    }
+
     fn activate(
         plan: RedactionProfilePlan,
         profile_index: usize,
@@ -462,6 +452,7 @@ impl ProfileHandle {
         self.0.limits
     }
 
+    #[cfg(test)]
     pub(crate) fn validate_encoded_http_body_size(
         &self,
         bytes: usize,
@@ -492,6 +483,7 @@ impl ProfileHandle {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn redact_decoded_http_body(
         &self,
         payload: Vec<u8>,
@@ -1469,6 +1461,7 @@ impl ZeroizingAhoCorasick {
         Ok(())
     }
 
+    #[cfg(test)]
     fn for_each_match(&self, input: &[u8], mut callback: impl FnMut(usize, usize) -> bool) {
         for interval in self.matches(input) {
             if !callback(interval.start, interval.end) {
@@ -1688,6 +1681,7 @@ impl<T: ZeroValid> ZeroizingBox<T> {
         })
     }
 
+    #[cfg(test)]
     fn layout_bytes(&self) -> usize {
         self.layout.size()
     }
@@ -2183,8 +2177,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::config::compiler::{
-        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledLogLevel,
-        ObservationPlan, PolicyDecisionLoggingPlan, ReloadableLoggingPlan,
+        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, ObservationPlan,
         MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE,
         MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT,
     };
@@ -2326,15 +2319,6 @@ mod tests {
         let pool = CapturePool::new();
         let activation = ProductObservationSnapshot::activate(
             ObservationPlan {
-                logging: ReloadableLoggingPlan {
-                    level: CompiledLogLevel::Info,
-                    policy_decisions: PolicyDecisionLoggingPlan {
-                        allows: false,
-                        denies: false,
-                        allow_level: CompiledLogLevel::Info,
-                        deny_level: CompiledLogLevel::Warn,
-                    },
-                },
                 capture: Some(CapturePlan {
                     events: vec![CompiledCaptureEvent::RequestAllowed],
                     redaction_profile: "main".to_owned(),

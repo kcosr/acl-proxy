@@ -42,6 +42,7 @@ pub(crate) struct ControlServer {
     stop_gate: Arc<StdMutex<ControlStop>>,
     task: AsyncMutex<ControlTaskState>,
     arena: ControlParserArena,
+    #[cfg(test)]
     local_addr: SocketAddr,
     #[cfg(test)]
     spawned_connections: Arc<AtomicUsize>,
@@ -53,6 +54,7 @@ struct ControlTaskState {
 }
 
 impl ControlServer {
+    #[cfg(test)]
     pub(crate) fn bind(
         config: &StaticControlConfig,
         authorization: Arc<WebhookAuthorizationRuntime>,
@@ -85,6 +87,7 @@ impl ControlServer {
         prepared: PreparedControlServer,
         listener: StdTcpListener,
     ) -> Result<Arc<Self>, ControlServerError> {
+        #[cfg(test)]
         let local_addr = listener
             .local_addr()
             .map_err(ControlServerError::ListenerAddress)?;
@@ -93,7 +96,12 @@ impl ControlServer {
             .map_err(ControlServerError::ListenerNonblocking)?;
         let listener =
             TcpListener::from_std(listener).map_err(ControlServerError::ListenerAdopt)?;
-        Self::start_listener(prepared, ControlListener::new(listener), local_addr)
+        Self::start_listener(
+            prepared,
+            ControlListener::new(listener),
+            #[cfg(test)]
+            local_addr,
+        )
     }
 
     #[cfg(test)]
@@ -142,7 +150,7 @@ impl ControlServer {
     fn start_listener(
         prepared: PreparedControlServer,
         listener: ControlListener,
-        local_addr: SocketAddr,
+        #[cfg(test)] local_addr: SocketAddr,
     ) -> Result<Arc<Self>, ControlServerError> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| ControlServerError::RuntimeUnavailable)?;
@@ -169,12 +177,14 @@ impl ControlServer {
                 terminal: None,
             }),
             arena,
+            #[cfg(test)]
             local_addr,
             #[cfg(test)]
             spawned_connections,
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
@@ -791,6 +801,7 @@ pub(crate) enum ControlServerError {
         #[source]
         source: std::io::Error,
     },
+    #[cfg(test)]
     #[error("failed to read the control listener address: {0}")]
     ListenerAddress(std::io::Error),
     #[error("failed to make the control listener nonblocking: {0}")]
@@ -819,9 +830,10 @@ pub(crate) enum ControlServerShutdownError {
 
 impl fmt::Debug for ControlServer {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ControlServer")
-            .field("local_addr", &self.local_addr)
+        let mut debug = formatter.debug_struct("ControlServer");
+        #[cfg(test)]
+        debug.field("local_addr", &self.local_addr);
+        debug
             .field("arena_counts", &self.arena_counts())
             .finish_non_exhaustive()
     }

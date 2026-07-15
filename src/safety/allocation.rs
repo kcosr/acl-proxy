@@ -73,10 +73,12 @@ impl<A: AllocationAuthority> StableExactBytes<A> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.charged_bytes
     }
 
+    #[cfg(test)]
     pub(crate) fn is_empty(&self) -> bool {
         self.charged_bytes == 0
     }
@@ -91,6 +93,7 @@ impl<A: AllocationAuthority> StableExactBytes<A> {
             .expect("exact byte storage exists")
     }
 
+    #[cfg(test)]
     pub(crate) fn belongs_to(&self, authority: &A) -> bool {
         self.authority.is_same(authority)
     }
@@ -120,10 +123,6 @@ impl<A: AllocationAuthority> ExactAllocationLease<A> {
     pub(crate) fn try_new(authority: A, bytes: usize) -> Result<Self, A::Error> {
         authority.try_charge(bytes)?;
         Ok(Self { authority, bytes })
-    }
-
-    pub(crate) fn bytes(&self) -> usize {
-        self.bytes
     }
 
     fn commit(&mut self) -> usize {
@@ -195,10 +194,7 @@ impl<A: AllocationAuthority> StableBodyBuilder<A> {
         self.len
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
+    #[cfg(test)]
     pub(crate) fn charged_bytes(&self) -> usize {
         self.charged_bytes
     }
@@ -304,6 +300,7 @@ impl<A: AllocationAuthority> ReservedStableBodyBuilder<A> {
         self.inner.len
     }
 
+    #[cfg(test)]
     pub(crate) fn charged_bytes(&self) -> usize {
         self.inner.charged_bytes
     }
@@ -639,6 +636,7 @@ impl<A: AllocationAuthority> StableWorkspaceAllocation<A> {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.charged_bytes
     }

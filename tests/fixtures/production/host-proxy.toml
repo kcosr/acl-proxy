@@ -47,6 +47,14 @@ name = "x-aw-policy-context"
 default = "deny"
 
 [[policy.rules]]
+id = "prod-host-parent-connect"
+description = "Parent CONNECT bootstrap for the sanitized container network"
+decision = "allow"
+urls = ["**"]
+methods = ["CONNECT"]
+client_cidrs = ["198.18.0.0/15"]
+
+[[policy.rules]]
 id = "prod-host-r00-require-identity"
 description = "Sanitized source rule 00: deny when workload identity is absent"
 decision = "deny"
@@ -196,6 +204,7 @@ urls = [
   "https://**.sentry.io/**",
   "https://**.datadoghq.com/**",
 ]
+redaction_profile = "sensitive_strings"
 
 [[policy.rules]]
 id = "prod-host-r14-raw-source-get"

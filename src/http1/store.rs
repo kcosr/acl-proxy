@@ -52,6 +52,7 @@ impl ParserStore {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
         self.bytes.len()
     }
@@ -80,6 +81,7 @@ impl ParserStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn append(&mut self, input: &[u8]) -> Result<(), ParserStoreError> {
         if input.len() > self.bytes.len() - self.end && self.start != 0 {
             self.compact();

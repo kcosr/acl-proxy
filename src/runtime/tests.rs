@@ -30,7 +30,12 @@ use crate::destination::{
     DestinationFacts, DestinationGuard, DestinationResolver, LocalAddressSnapshot,
     LocalAddressSource, ResolveFuture,
 };
+use crate::redaction::RedactionSnapshot as ProductRedactionSnapshot;
 use crate::safety::{WireBodyPool, WireBodyQuotaKey};
+use crate::upgrade::{
+    UpgradeAllocation, UpgradeEntryPlan, UpgradeRelayPair, UpgradeRuntime, UpgradeRuntimeLimits,
+    UpgradeTerminalCause, UpgradeTerminalControl,
+};
 
 use super::*;
 
@@ -126,10 +131,6 @@ impl AuthorizationSnapshot for EmptySnapshot {
     }
 }
 impl CredentialResolver for EmptySnapshot {
-    fn source_count(&self) -> usize {
-        0
-    }
-
     fn inject(
         &self,
         actions: &[crate::credentials::ResolvedCredentialAction],
@@ -153,24 +154,8 @@ impl RedactionSnapshot for EmptySnapshot {
     fn profile(&self, _index: RedactionProfileIndex) -> Option<crate::redaction::ProfileHandle> {
         None
     }
-
-    fn len(&self) -> usize {
-        0
-    }
-
-    fn is_empty(&self) -> bool {
-        true
-    }
-
-    fn compiled_matcher_resident_bytes(&self) -> usize {
-        0
-    }
 }
 impl ObservationSnapshot for EmptySnapshot {
-    fn logging(&self) -> &crate::observation::ObservationLoggingPolicy {
-        panic!("empty test observation has no logging policy")
-    }
-
     fn capture_epoch(&self) -> &Arc<crate::observation::CaptureEpoch> {
         static DISABLED: std::sync::LazyLock<Arc<crate::observation::CaptureEpoch>> =
             std::sync::LazyLock::new(|| Arc::new(crate::observation::CaptureEpoch::disabled()));
@@ -692,6 +677,10 @@ impl CandidateActivator for FakeActivator {
                 )));
             }
 
+            let redaction = ProductRedactionSnapshot::activate(plan.redaction, || false)
+                .map_err(|error| RuntimeError::CandidateActivation(error.to_string()))?;
+            let (redaction, _) = redaction.into_parts();
+            let redaction = Arc::new(redaction);
             let snapshot = Arc::new(EmptySnapshot);
             Ok(ActivatedGeneration {
                 request_timeout: plan.request_timeout,
@@ -702,7 +691,7 @@ impl CandidateActivator for FakeActivator {
                 egress: snapshot.clone(),
                 authorization: snapshot.clone(),
                 credentials: snapshot.clone(),
-                redaction: snapshot.clone(),
+                redaction,
                 observation: snapshot.clone(),
                 safety: snapshot,
                 owner,
@@ -1473,6 +1462,75 @@ async fn old_lease_delays_retirement_cleanup_and_releases_it_once() {
     tokio::task::yield_now().await;
     assert_eq!(old_owner.retirements.load(Ordering::Acquire), 1);
     assert_eq!(old_owner.events().len(), 2);
+}
+
+#[tokio::test]
+async fn upgraded_stream_does_not_pin_retiring_generation() {
+    let profile_config = |timeout: &str| {
+        format!(
+            "{}\n[redaction.profiles.wire]\nrules = [{{ literals = [\"secret\"] }}]\n",
+            config(timeout, "127.0.0.1:8881", 1)
+        )
+    };
+    let initial_text = profile_config("30s");
+    let (runtime, initial, source, activator, _static_resources) =
+        runtime_fixture(&initial_text).await;
+    runtime.start(initial).await.unwrap();
+
+    let old_lease = runtime.lease().await.unwrap();
+    let profile_index = RedactionProfileRegistry::from_names(["wire".to_owned()])
+        .get("wire")
+        .unwrap();
+    let old_profile = old_lease.redaction().profile(profile_index).unwrap();
+    let old_owner = activator.owner(0);
+    let upgrades =
+        UpgradeRuntime::try_new(UpgradeRuntimeLimits::new(1, 8, 2, Duration::from_secs(60)))
+            .unwrap();
+    let (committed_tx, committed_rx) = oneshot::channel();
+    upgrades
+        .try_spawn_handshake(
+            UpgradeAllocation::from_compiled_rule(0, Some(0)).unwrap(),
+            move |handshake| async move {
+                let entry = handshake
+                    .commit(
+                        Some(old_profile),
+                        UpgradeEntryPlan::new(
+                            UpgradeTerminalControl::new(std::future::pending::<()>, |_| async {}),
+                            |snapshot| async move {
+                                let profile = snapshot.wire_redaction().cloned().unwrap();
+                                Ok(UpgradeRelayPair::new(
+                                    async move {
+                                        let _profile = profile;
+                                        std::future::pending::<UpgradeTerminalCause>().await
+                                    },
+                                    std::future::pending::<UpgradeTerminalCause>(),
+                                ))
+                            },
+                        ),
+                    )
+                    .unwrap();
+                committed_tx.send(entry).unwrap();
+            },
+        )
+        .unwrap();
+    let entry = committed_rx.await.unwrap();
+    drop(old_lease);
+
+    for timeout in ["31s", "32s", "33s"] {
+        source.push(profile_config(timeout));
+        runtime.trigger_reload().await.unwrap();
+        wait_for_retiring(&runtime, 0).await;
+    }
+
+    assert_eq!(runtime.active_generation_id().unwrap().get(), 4);
+    assert_eq!(old_owner.retirements.load(Ordering::Acquire), 1);
+    assert_eq!(upgrades.counts().committed, 1);
+
+    upgrades
+        .shutdown_and_wait(Some(tokio::time::Instant::now()))
+        .await;
+    entry.wait_closed().await;
+    assert_eq!(upgrades.counts().committed, 0);
 }
 
 #[tokio::test]

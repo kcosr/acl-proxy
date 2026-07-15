@@ -20,6 +20,7 @@ impl OriginalDestinationResolver for SystemOriginalDestinationResolver {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OriginalDestinationError {
+    #[cfg(not(target_os = "linux"))]
     #[error("original-destination lookup is unsupported on {platform}")]
     UnsupportedPlatform { platform: &'static str },
     #[error("failed to inspect the accepted socket address: {0}")]
@@ -144,6 +145,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn unsupported_platform_error_is_explicit() {
         let error = OriginalDestinationError::UnsupportedPlatform {

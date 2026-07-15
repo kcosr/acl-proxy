@@ -130,11 +130,7 @@ impl CredentialResolverSnapshot {
         plan: CredentialsPlan,
         provider_registry: &ProviderRegistry,
     ) -> Result<CredentialActivation, CredentialActivationError> {
-        let CredentialsPlan {
-            allowed_custom_headers: _,
-            inbound,
-            sources,
-        } = plan;
+        let CredentialsPlan { inbound, sources } = plan;
         let source_registry = CredentialSourceRegistry::from_names(sources.keys().cloned());
         let sources = sources.into_values().collect::<Vec<_>>().into_boxed_slice();
         let inbound = inbound
@@ -148,6 +144,7 @@ impl CredentialResolverSnapshot {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn source_count(&self) -> usize {
         self.sources.len()
     }
@@ -230,10 +227,6 @@ impl CredentialResolverSnapshot {
 }
 
 impl crate::runtime::CredentialResolver for CredentialResolverSnapshot {
-    fn source_count(&self) -> usize {
-        CredentialResolverSnapshot::source_count(self)
-    }
-
     fn inject(
         &self,
         actions: &[ResolvedCredentialAction],
@@ -612,7 +605,6 @@ mod tests {
 
     fn plan_with_sources(sources: BTreeMap<String, CredentialSourcePlan>) -> CredentialsPlan {
         CredentialsPlan {
-            allowed_custom_headers: vec![HeaderName::from_static("x-api-key")],
             inbound: BTreeMap::new(),
             sources,
         }
@@ -1151,7 +1143,6 @@ mod tests {
 
     fn inbound_plan() -> CredentialsPlan {
         CredentialsPlan {
-            allowed_custom_headers: Vec::new(),
             inbound: BTreeMap::from([(
                 "identity".to_string(),
                 InboundCredentialPlan {

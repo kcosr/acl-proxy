@@ -315,10 +315,6 @@ impl ProcessProvider {
         &self.inner.include_headers
     }
 
-    pub(crate) fn timeout(&self) -> Duration {
-        self.inner.timeout
-    }
-
     pub(crate) fn failure_mode(&self) -> CompiledProviderFailureMode {
         self.inner.failure_mode
     }
@@ -876,7 +872,7 @@ async fn run_reader(inner: Arc<Inner>, epoch: u64, stdout: ChildStdout) {
                     ProcessResponse::Expanded(decision) => {
                         let _ = pending.response.send(Ok(ProcessDecision::from(decision)));
                     }
-                    ProcessResponse::AssignedFailure(_) => {
+                    ProcessResponse::AssignedFailure => {
                         let _ = pending
                             .response
                             .send(Err(ProcessRequestError::InvalidResponse));
@@ -2222,8 +2218,8 @@ for line in sys.stdin:
                 1024,
             ),
             (
-                "compressed-replacement",
-                r#"{"type":"response","decision":"allow","values":{"token":"present"},"requestBody":{"encoding":"base64","contentEncoding":"zstd","data":"e30="}}"#,
+                "wrong-content-encoding-shape",
+                r#"{"type":"response","decision":"allow","values":{"token":"present"},"requestBody":{"encoding":"base64","contentEncoding":[],"data":"e30="}}"#,
                 1024,
             ),
         ] {
@@ -2253,6 +2249,54 @@ for line in sys.stdin:
                 Err(ProcessRequestError::InvalidResponse),
                 "{name} must terminate as an invalid provider response"
             );
+            assert_eq!(pool.global_charge(), 0, "{name} leaked guarded bytes");
+            cleanup(&provider).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_replacement_content_encoding_is_identity_only() {
+        for (name, content_encoding, accepted) in [
+            ("absent", None, true),
+            ("identity", Some("identity"), true),
+            ("gzip", Some("gzip"), false),
+            ("mixed-case-identity", Some("Identity"), false),
+        ] {
+            let directory = TempDir::new().unwrap();
+            let content_encoding_field = content_encoding
+                .map(|value| format!(r#", "contentEncoding": {value:?}"#))
+                .unwrap_or_default();
+            let source = format!(
+                r#"import json, sys
+for line in sys.stdin:
+ request=json.loads(line)
+ print(json.dumps({{"id":request["id"],"type":"response","decision":"allow","requestBody":{{"encoding":"base64"{content_encoding_field},"data":"e30="}}}}, separators=(',', ':')), flush=True)
+"#
+            );
+            let script = write_python(&directory, &source);
+            let mut provider_plan = plan(&directory, &script);
+            provider_plan.allow_request_body_replacement = true;
+            let provider = ProcessProvider::activate(provider_plan, || false)
+                .await
+                .unwrap();
+            commit(&provider);
+
+            let (pool, guard) = body_guard_with_pool();
+            let actual = provider
+                .decide(request(name), &guard, request_deadline())
+                .await;
+            if accepted {
+                let ProcessDecision::AllowWithOutputs {
+                    replacement: Some(replacement),
+                    ..
+                } = actual.expect("identity-coded replacement must be accepted")
+                else {
+                    panic!("{name} did not return its replacement");
+                };
+                assert_eq!(replacement.content_encoding(), content_encoding);
+            } else {
+                assert_eq!(actual, Err(ProcessRequestError::InvalidResponse), "{name}");
+            }
             assert_eq!(pool.global_charge(), 0, "{name} leaked guarded bytes");
             cleanup(&provider).await;
         }

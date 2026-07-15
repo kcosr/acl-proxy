@@ -22,17 +22,20 @@ negative tests. They are not production byte copies.
 
 ## Structural Inventory
 
-| Role | Source rules | Source patterns | Actions | Scheme intent |
+| Role | V3 rules | V3 patterns | Actions | Scheme intent |
 | --- | ---: | ---: | --- | --- |
-| host | 44 | 133 | 36 allow, 7 deny, 1 delegate | 118 HTTPS, 13 HTTP, 2 catchall |
+| host | 45 | 134 | 37 allow, 7 deny, 1 delegate | 118 HTTPS, 13 HTTP, 3 catchall |
 | common container | 1 | 1 | 1 allow | catchall |
 | internal container | 8 | 12 | 8 allow | 11 HTTPS, 1 HTTP |
 
-The host source has 21 method-constrained rules, 8 header-predicate rules, and
-3 wire-redaction rules. The v3 fixture preserves rule order, action count,
-pattern count, HTTP-versus-HTTPS intent, method boundaries, provider placement,
-and redaction placement. Context-header predicates are the reviewed exception
-described below.
+The host fixture has 22 method-constrained rules, 8 header-predicate rules, and
+4 wire-redaction rules. The v3 fixture preserves source-rule order,
+HTTP-versus-HTTPS intent, method boundaries, and provider placement. The host
+adds one CONNECT-only bootstrap rule because parent CONNECT control requests
+intentionally carry no origin identity or context. It also applies mandatory
+wire redaction to content-coded telemetry under the reviewed R7 normalization
+contract. Context-header predicates are the other reviewed exception described
+below.
 
 ## Authoring And Ownership Changes
 
@@ -53,6 +56,7 @@ described below.
 | legacy plugin profiles | generation-owned process providers with config-rooted command/arguments, no environment inheritance, and a minimal explicit PATH |
 | implicit provider retirement | explicit two-hour retirement windows cover the host role's greatest effective request timeout |
 | exact environment placeholders in redaction literals | five typed `literal_environment_variables` plus one ordinary synthetic literal and one expression |
+| content-coded telemetry forwarded without mandatory normalization | the Sentry/Datadog telemetry rule selects `sensitive_strings`, producing bounded identity-coded upstream bytes under the R7 contract |
 | all capture events disabled | capture table absent |
 | relative runtime paths with legacy ownership | config-rooted fixture paths |
 
@@ -87,6 +91,7 @@ destinations and paths are replaced, but the stated counts apply to each row.
 
 | Source | V3 ID | Decision | Patterns | Preserved intent |
 | --- | --- | --- | ---: | --- |
+| bootstrap | `prod-host-parent-connect` | allow | 1 | credential-free parent CONNECT from the sanitized container network; inner requests remain fully authorized |
 | 00 | `prod-host-r00-require-identity` | deny | 1 | catchall missing-identity gate |
 | 01 | `prod-host-r01-ai-redaction-a` | allow | 4 | AI service group with wire redaction |
 | 02 | `prod-host-r02-editor-redaction` | allow | 2 | editor group, one-label wildcard, wire redaction |
@@ -100,7 +105,7 @@ destinations and paths are replaced, but the stated counts apply to each row.
 | 10 | `prod-host-r10-development-host` | allow | 1 | development host |
 | 11 | `prod-host-r11-agent-service` | allow | 1 | internal agent service |
 | 12 | `prod-host-r12-agent-chat` | allow | 1 | internal agent chat API |
-| 13 | `prod-host-r13-telemetry` | allow | 3 | telemetry and recursive Sentry/Datadog wildcards |
+| 13 | `prod-host-r13-telemetry` | allow | 3 | telemetry and recursive Sentry/Datadog wildcards with reviewed wire redaction |
 | 14 | `prod-host-r14-raw-source-get` | allow | 1 | GET raw source content |
 | 15 | `prod-host-r15-storage-get` | allow | 2 | GET storage/download pair |
 | 16 | `prod-host-r16-context-c-model-a-deny` | deny | 1 | context-C model-A gate |

@@ -93,10 +93,12 @@ impl UpgradeAllocation {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn rule_index(self) -> usize {
         self.rule_index
     }
 
+    #[cfg(test)]
     pub(crate) fn wire_bytes(self) -> usize {
         self.wire_bytes
     }
@@ -121,10 +123,6 @@ impl UpgradedStreamSnapshot {
             relay_buffer_bytes,
             wire_redaction,
         }
-    }
-
-    pub(crate) fn relay_buffer_bytes(&self) -> usize {
-        self.relay_buffer_bytes
     }
 
     pub(crate) fn wire_redaction(&self) -> Option<&ProfileHandle> {
@@ -249,6 +247,7 @@ pub(crate) struct UpgradeRelayPair {
 }
 
 impl UpgradeRelayPair {
+    #[cfg(test)]
     pub(crate) fn new<First, Second>(first: First, second: Second) -> Self
     where
         First: Future<Output = UpgradeTerminalCause> + Send + 'static,
@@ -318,6 +317,7 @@ pub(crate) enum UpgradeTerminalCause {
     RelayError,
     LifetimeExpired,
     Shutdown,
+    #[cfg(test)]
     Cancelled,
     SetupFailed,
     DownstreamWriteFailed,
@@ -779,6 +779,7 @@ impl UpgradeRuntime {
         self.wait_until_drained().await;
     }
 
+    #[cfg(test)]
     pub(crate) fn counts(&self) -> UpgradeRuntimeCounts {
         let state = lock(&self.inner.state);
         UpgradeRuntimeCounts {
@@ -1076,10 +1077,12 @@ impl fmt::Debug for UpgradeHandshake {
 }
 
 impl UpgradeHandshake {
+    #[cfg(test)]
     pub(crate) fn allocation(&self) -> UpgradeAllocation {
         self.reservation.allocation
     }
 
+    #[cfg(test)]
     pub(crate) fn reserved_bytes(&self) -> usize {
         self.reservation.bytes
     }
@@ -1094,6 +1097,7 @@ impl UpgradeHandshake {
         self.commit_inner(wire_redaction, plan, || {}, RuntimeInner::track_owned_task)
     }
 
+    #[cfg(test)]
     fn commit_with_start_hook<Hook>(
         &mut self,
         wire_redaction: Option<ProfileHandle>,
@@ -1223,11 +1227,13 @@ impl fmt::Debug for CommittedUpgrade {
 }
 
 impl CommittedUpgrade {
+    #[cfg(test)]
     pub(crate) fn submit_terminal(&self, cause: UpgradeTerminalCause) {
         self.shared
             .begin_closing(cause, Instant::now(), self.shared.cleanup_grace);
     }
 
+    #[cfg(test)]
     pub(crate) async fn wait_closed(&self) {
         loop {
             let notified = self.shared.closed.notified();
@@ -1242,6 +1248,7 @@ impl CommittedUpgrade {
         *lock(&self.shared.winning_cause)
     }
 
+    #[cfg(test)]
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
@@ -1358,11 +1365,9 @@ async fn run_task_supervisor(mut receiver: mpsc::UnboundedReceiver<SupervisorCom
                 };
                 aborts.remove(&tracked_id.unwrap_or(id));
                 if let Some(waiter) = join_waiters.remove(&id) {
-                    if let Err(result) = waiter.send(result) {
-                        if let Err(error) = result {
-                            if !error.is_cancelled() {
-                                tracing::error!(%error, "unobserved upgrade raw teardown task failure");
-                            }
+                    if let Err(Err(error)) = waiter.send(result) {
+                        if !error.is_cancelled() {
+                            tracing::error!(%error, "unobserved upgrade raw teardown task failure");
                         }
                     }
                 } else if let Err(error) = result {
@@ -1698,6 +1703,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct UpgradeRuntimeCounts {
     pub(crate) maximum_slots: usize,
@@ -1766,6 +1772,7 @@ pub(crate) enum UpgradeCommitError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc as std_mpsc;
     use std::thread;
@@ -1773,6 +1780,10 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+    use crate::config::compiler::{
+        CompiledRedactionPayloads, RedactionPlan, RedactionProfilePlan, RedactionRulePlan,
+    };
+    use crate::redaction::{PayloadClass, RedactionSnapshot};
 
     fn limits(slots: usize, bytes: usize) -> UpgradeRuntimeLimits {
         UpgradeRuntimeLimits::new(slots, bytes, 2, Duration::from_secs(60))
@@ -1806,6 +1817,37 @@ mod tests {
         plan(|_| async {
             std::future::pending::<Result<UpgradeRelayPair, UpgradeTerminalCause>>().await
         })
+    }
+
+    fn wire_profile(replacement: &[u8], literal: &[u8]) -> ProfileHandle {
+        RedactionSnapshot::activate(
+            RedactionPlan {
+                profiles: BTreeMap::from([(
+                    "wire".to_owned(),
+                    RedactionProfilePlan {
+                        replacement: replacement.to_vec(),
+                        max_body_bytes: 1024,
+                        max_decoded_body_bytes: 1024,
+                        max_frame_bytes: 1024,
+                        max_message_bytes: 1024,
+                        allow_permessage_deflate: false,
+                        max_environment_literal_sources: 0,
+                        max_environment_literal_bytes: 1,
+                        max_environment_literal_total_bytes: 1,
+                        rules: vec![RedactionRulePlan {
+                            literals: vec![literal.to_vec()],
+                            literal_environment_variables: Vec::new(),
+                            expressions: Vec::new(),
+                            payloads: CompiledRedactionPayloads::Both,
+                        }],
+                    },
+                )]),
+            },
+            || false,
+        )
+        .unwrap()
+        .profile("wire")
+        .unwrap()
     }
 
     async fn wait_for_counts(
@@ -2533,6 +2575,132 @@ mod tests {
         assert_eq!(raw_polls.load(Ordering::SeqCst), 0);
         runtime.wait_until_drained().await;
         assert_eq!(setup_effects.load(Ordering::SeqCst), 0);
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn upgrade_admission_shutdown_race_linearizes_registry_snapshot() {
+        let runtime = UpgradeRuntime::try_new(limits(1, 8)).unwrap();
+        let (admission_entered_tx, admission_entered_rx) = std_mpsc::channel();
+        let (release_admission_tx, release_admission_rx) = std_mpsc::channel();
+        let admission_runtime = runtime.clone();
+        let admission = thread::spawn(move || {
+            admission_runtime.try_spawn_handshake_with_hook(
+                allocation(0, 0),
+                |_| std::future::pending::<()>(),
+                || {
+                    admission_entered_tx.send(()).unwrap();
+                    release_admission_rx.recv().unwrap();
+                },
+            )
+        });
+
+        admission_entered_rx.recv().unwrap();
+        let (shutdown_done_tx, mut shutdown_done_rx) = oneshot::channel();
+        let shutdown_runtime = runtime.clone();
+        tokio::spawn(async move {
+            shutdown_runtime.begin_shutdown(Some(Instant::now()));
+            let _ = shutdown_done_tx.send(());
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut shutdown_done_rx)
+                .await
+                .is_err(),
+            "shutdown must serialize behind the admission registry lock"
+        );
+        release_admission_tx.send(()).unwrap();
+        assert_eq!(admission.join().unwrap(), Ok(()));
+        shutdown_done_rx.await.unwrap();
+        runtime.wait_until_drained().await;
+
+        assert_eq!(
+            runtime.counts(),
+            UpgradeRuntimeCounts {
+                maximum_slots: 1,
+                maximum_bytes: 8,
+                reserved_slots: 0,
+                reserved_bytes: 0,
+                uncommitted: 0,
+                committed: 0,
+                tracked_tasks: 0,
+                accepting: false,
+            }
+        );
+        runtime.shutdown_and_wait(Some(Instant::now())).await;
+    }
+
+    #[tokio::test]
+    async fn upgraded_stream_wire_rotation_is_lifetime_bounded() {
+        let lifetime = Duration::from_millis(40);
+        let cleanup = Duration::from_millis(30);
+        let runtime = UpgradeRuntime::try_new(short_limits(lifetime, cleanup)).unwrap();
+        let old_profile = wire_profile(b"[OLD]", b"secret");
+        let new_profile = wire_profile(b"[NEW]", b"secret");
+        let (observed_tx, observed_rx) = oneshot::channel();
+        let (committed_tx, committed_rx) = oneshot::channel();
+
+        runtime
+            .try_spawn_handshake(allocation(0, 0), {
+                let retained_profile = old_profile.clone();
+                move |handshake| async move {
+                    let entry = handshake
+                        .commit(
+                            Some(retained_profile),
+                            plan(move |snapshot| async move {
+                                let profile = snapshot
+                                    .wire_redaction()
+                                    .cloned()
+                                    .expect("wire profile remains in the stream snapshot");
+                                let redacted = profile
+                                    .redact_websocket_message(
+                                        b"secret".to_vec(),
+                                        PayloadClass::Text,
+                                    )
+                                    .unwrap();
+                                observed_tx.send(redacted.bytes.clone()).unwrap();
+                                Ok(UpgradeRelayPair::new(
+                                    async move {
+                                        let _profile = profile;
+                                        std::future::pending::<UpgradeTerminalCause>().await
+                                    },
+                                    std::future::pending::<UpgradeTerminalCause>(),
+                                ))
+                            }),
+                        )
+                        .unwrap();
+                    committed_tx.send(entry).unwrap();
+                }
+            })
+            .unwrap();
+
+        let entry = committed_rx.await.unwrap();
+        assert_eq!(observed_rx.await.unwrap(), b"[OLD]");
+        assert_eq!(
+            new_profile
+                .redact_websocket_message(b"secret".to_vec(), PayloadClass::Text)
+                .unwrap()
+                .bytes,
+            b"[NEW]"
+        );
+        wait_for_counts(&runtime, |counts| counts.committed == 1).await;
+        assert_eq!(old_profile.strong_count(), 2);
+
+        tokio::time::timeout(
+            lifetime + cleanup + Duration::from_millis(250),
+            entry.wait_closed(),
+        )
+        .await
+        .expect("wire-profile lifetime is bounded by stream cleanup");
+        wait_for_counts(&runtime, |counts| {
+            counts.committed == 0 && counts.tracked_tasks == 0
+        })
+        .await;
+        assert_eq!(old_profile.strong_count(), 1);
+        assert_eq!(
+            entry.terminal_cause(),
+            Some(UpgradeTerminalCause::LifetimeExpired)
+        );
         runtime.shutdown_and_wait(Some(Instant::now())).await;
     }
 

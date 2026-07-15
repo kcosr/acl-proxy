@@ -116,9 +116,8 @@ mod tests {
         CaptureSinkSpec,
     };
     use crate::config::compiler::{
-        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledLogLevel,
-        CompiledRedactionPayloads, ObservationPlan, PolicyDecisionLoggingPlan, RedactionPlan,
-        RedactionProfilePlan, RedactionRulePlan, ReloadableLoggingPlan,
+        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledRedactionPayloads,
+        ObservationPlan, RedactionPlan, RedactionProfilePlan, RedactionRulePlan,
     };
     use crate::observation::{CapturePool, ProductObservationSnapshot};
     use crate::redaction::RedactionSnapshot;
@@ -158,15 +157,6 @@ mod tests {
         let pool = CapturePool::new();
         let activation = ProductObservationSnapshot::activate(
             ObservationPlan {
-                logging: ReloadableLoggingPlan {
-                    level: CompiledLogLevel::Info,
-                    policy_decisions: PolicyDecisionLoggingPlan {
-                        allows: false,
-                        denies: false,
-                        allow_level: CompiledLogLevel::Info,
-                        deny_level: CompiledLogLevel::Warn,
-                    },
-                },
                 capture: Some(CapturePlan {
                     events: vec![CompiledCaptureEvent::RequestAllowed],
                     redaction_profile: "capture".to_owned(),

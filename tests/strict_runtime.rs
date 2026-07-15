@@ -499,7 +499,7 @@ value = "{generation}"
 
 [safety.loop_detection]
 inject = true
-header = "x-strict-v3-request-id"
+header = "x-strict-request-id"
 "#,
         python.display(),
         provider.display()
@@ -588,7 +588,7 @@ fn wait_for_records(capture_dir: &Path, url: &str, count: usize) -> Vec<Value> {
 }
 
 #[test]
-fn strict_v3_runtime_provider_webhook_capture_and_reload_are_live() {
+fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
     let directory = TempDir::new().expect("create runtime fixture");
     let python = python3_path();
     write_file(&directory.path().join("provider.py"), provider_script());

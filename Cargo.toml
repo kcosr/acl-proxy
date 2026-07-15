@@ -28,7 +28,6 @@ memchr = "2.7"
 zeroize = "1.9"
 allocator-api2 = "0.2"
 url = "2.5"
-urlencoding = "2.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 base64 = "0.22"
@@ -44,18 +43,15 @@ rand = "0.8"
 tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal", "process"] }
 hyper = { version = "0.14", features = ["full"] }
 httparse = "1.10.1"
-hyper-tls = "0.5"
 tokio-stream = "0.1"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 http = "0.2"
-hyper-rustls = { version = "0.24", features = ["rustls-native-certs", "webpki-roots", "http1", "http2", "tokio-runtime"] }
 rustls = { version = "0.21", features = ["dangerous_configuration"] }
 rustls-native-certs = "0.6"
 webpki = { package = "rustls-webpki", version = "0.101" }
 tokio-rustls = "0.24"
 rcgen = { version = "0.13", features = ["pem", "x509-parser"] }
 rustls-pemfile = "1"
-dashmap = "5"
 lru = "0.12"
 fs2 = "0.4"
 humantime = "2.1"

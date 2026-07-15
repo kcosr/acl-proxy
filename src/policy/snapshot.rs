@@ -108,7 +108,6 @@ impl fmt::Debug for PolicyActivation {
 
 struct ActivatedPolicyRule {
     id: String,
-    description: Option<String>,
     decision: CompiledRuleDecision,
     urls: Vec<crate::url::CompiledUrlPattern>,
     methods: Vec<Method>,
@@ -348,10 +347,6 @@ impl<'snapshot> PolicyRuleMatch<'snapshot> {
         &self.rule.id
     }
 
-    pub(crate) fn description(&self) -> Option<&'snapshot str> {
-        self.rule.description.as_deref()
-    }
-
     pub(crate) fn resume_cursor(self) -> PolicyCursor<'snapshot> {
         PolicyCursor {
             snapshot: self.snapshot,
@@ -476,7 +471,6 @@ fn activate_rule(
         .into_boxed_slice();
     Ok(ActivatedPolicyRule {
         id: rule.id,
-        description: rule.description,
         decision: rule.decision,
         urls: rule.urls,
         methods: rule.methods,
@@ -1226,7 +1220,6 @@ mod tests {
             "https://example.com/**",
         );
         delegate.authorization_provider = Some("provider".to_string());
-        delegate.description = Some("approval step".to_string());
         let allow = rule(
             "fallback",
             CompiledRuleDecision::Allow,
@@ -1243,10 +1236,7 @@ mod tests {
         );
         assert_eq!(first.outcome, PolicyOutcome::Delegate);
         let matched = first.matched.unwrap();
-        assert_eq!(
-            (matched.index(), matched.id(), matched.description()),
-            (0, "approval", Some("approval step"))
-        );
+        assert_eq!((matched.index(), matched.id()), (0, "approval"));
         let resumed = matched.resume_cursor().resume(
             &url,
             "192.0.2.10".parse().unwrap(),

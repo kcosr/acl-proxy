@@ -230,10 +230,20 @@ pub(crate) enum StaticMitmConfig {
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct StaticLoggingConfig {
+    pub(crate) level: CompiledLogLevel,
     pub(crate) directory: Option<PathBuf>,
     pub(crate) max_bytes: u64,
     pub(crate) max_files: usize,
     pub(crate) console: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub(crate) enum CompiledLogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
@@ -314,6 +324,7 @@ pub(crate) enum CompiledTlsTrust {
 
 #[derive(Clone)]
 pub(crate) struct ParentProxyPlan {
+    #[cfg(test)]
     pub(crate) kind: CompiledParentProxyKind,
     pub(crate) url: String,
     pub(crate) host: String,
@@ -321,6 +332,7 @@ pub(crate) struct ParentProxyPlan {
     pub(crate) tls: Option<ParentProxyTlsPlan>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompiledParentProxyKind {
     AclProxy,
@@ -354,6 +366,7 @@ pub(crate) struct HttpBodyReadLimits {
 }
 
 impl HttpBodyReadPlan {
+    #[cfg(test)]
     pub(crate) fn requires_mandatory_read(self) -> bool {
         matches!(self, Self::Mandatory(_))
     }
@@ -576,7 +589,6 @@ pub(crate) enum ProviderOutputPlan {
 
 #[derive(Clone)]
 pub(crate) struct CredentialsPlan {
-    pub(crate) allowed_custom_headers: Vec<HeaderName>,
     pub(crate) inbound: BTreeMap<String, InboundCredentialPlan>,
     pub(crate) sources: BTreeMap<String, CredentialSourcePlan>,
 }
@@ -726,6 +738,7 @@ pub(crate) struct RedactionLiteralProjection {
     pub(crate) edge_count: usize,
     pub(crate) max_pattern_len: usize,
     pub(crate) resident_bytes: usize,
+    #[cfg(test)]
     pub(crate) reference_build_bytes: usize,
     pub(crate) trie_build_bytes: usize,
     pub(crate) failure_build_bytes: usize,
@@ -757,6 +770,7 @@ pub(crate) fn redaction_literal_projection(
             edge_count: 0,
             max_pattern_len: 0,
             resident_bytes: 0,
+            #[cfg(test)]
             reference_build_bytes: 0,
             trie_build_bytes: 0,
             failure_build_bytes: 0,
@@ -808,6 +822,7 @@ pub(crate) fn redaction_literal_projection(
         edge_count,
         max_pattern_len,
         resident_bytes,
+        #[cfg(test)]
         reference_build_bytes: pattern_reference_construction_bytes,
         trie_build_bytes,
         failure_build_bytes,
@@ -862,31 +877,7 @@ pub(crate) enum CompiledRedactionPayloads {
 
 #[derive(Clone)]
 pub(crate) struct ObservationPlan {
-    pub(crate) logging: ReloadableLoggingPlan,
     pub(crate) capture: Option<CapturePlan>,
-}
-
-#[derive(Clone)]
-pub(crate) struct ReloadableLoggingPlan {
-    pub(crate) level: CompiledLogLevel,
-    pub(crate) policy_decisions: PolicyDecisionLoggingPlan,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CompiledLogLevel {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
-}
-
-#[derive(Clone)]
-pub(crate) struct PolicyDecisionLoggingPlan {
-    pub(crate) allows: bool,
-    pub(crate) denies: bool,
-    pub(crate) allow_level: CompiledLogLevel,
-    pub(crate) deny_level: CompiledLogLevel,
 }
 
 #[derive(Clone)]
@@ -896,29 +887,17 @@ pub(crate) struct CapturePlan {
     pub(crate) sink: CaptureSinkSpec,
     pub(crate) max_body_bytes: usize,
     pub(crate) max_inflight_body_bytes: usize,
+    #[cfg(test)]
     pub(crate) working_set: CaptureWorkingSetPlan,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CaptureWorkingSetPlan {
     pub(crate) decode_peak_bytes: usize,
     pub(crate) literal_redaction_peak_bytes: usize,
     pub(crate) expression_successor_peak_bytes: usize,
     pub(crate) serialization_peak_bytes: usize,
     pub(crate) maximum_peak_bytes: usize,
-}
-
-#[cfg(test)]
-impl Default for CaptureWorkingSetPlan {
-    fn default() -> Self {
-        Self {
-            decode_peak_bytes: 0,
-            literal_redaction_peak_bytes: 0,
-            expression_successor_peak_bytes: 0,
-            serialization_peak_bytes: 0,
-            maximum_peak_bytes: 0,
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3361,24 +3340,7 @@ fn validate_logging_capture_limits(
         logging.max_files,
         MAX_LOG_FILES,
     )?;
-    for (path, level) in [
-        ("observation.logging.level", logging.level.as_str()),
-        (
-            "observation.logging.policy_decisions.allow_level",
-            logging.policy_decisions.allow_level.as_str(),
-        ),
-        (
-            "observation.logging.policy_decisions.deny_level",
-            logging.policy_decisions.deny_level.as_str(),
-        ),
-    ] {
-        if !matches!(level, "trace" | "debug" | "info" | "warn" | "error") {
-            return Err(ConfigCompileError::at(
-                path,
-                "must be trace, debug, info, warn, or error",
-            ));
-        }
-    }
+    compile_log_level(&logging.level, "observation.logging.level")?;
     if let Some(capture) = &config.observation.capture {
         check_range(
             "observation.capture.max_body_bytes",
@@ -4433,6 +4395,7 @@ fn compile_parent_proxy_plan(
         ConfigCompileError::at("egress.parent_proxy.url", format!("invalid URL: {error}"))
     })?;
     Ok(ParentProxyPlan {
+        #[cfg(test)]
         kind: match value.kind {
             ParentProxyKind::AclProxy => CompiledParentProxyKind::AclProxy,
             ParentProxyKind::Generic => CompiledParentProxyKind::Generic,
@@ -4863,14 +4826,7 @@ fn compile_credentials_plan(
             (name.clone(), source)
         })
         .collect();
-    Ok(CredentialsPlan {
-        allowed_custom_headers: compile_header_names(
-            &value.allowed_custom_headers,
-            "credentials.allowed_custom_headers",
-        )?,
-        inbound,
-        sources,
-    })
+    Ok(CredentialsPlan { inbound, sources })
 }
 
 enum AuthoredLiteralProjectionError {
@@ -5098,21 +5054,6 @@ fn compile_observation_plan(
     capture_working_set: Option<CaptureWorkingSetPlan>,
 ) -> Result<ObservationPlan, ConfigCompileError> {
     Ok(ObservationPlan {
-        logging: ReloadableLoggingPlan {
-            level: compile_log_level(&value.logging.level, "observation.logging.level")?,
-            policy_decisions: PolicyDecisionLoggingPlan {
-                allows: value.logging.policy_decisions.allows,
-                denies: value.logging.policy_decisions.denies,
-                allow_level: compile_log_level(
-                    &value.logging.policy_decisions.allow_level,
-                    "observation.logging.policy_decisions.allow_level",
-                )?,
-                deny_level: compile_log_level(
-                    &value.logging.policy_decisions.deny_level,
-                    "observation.logging.policy_decisions.deny_level",
-                )?,
-            },
-        },
         capture: value.capture.as_ref().map(|capture| {
             compile_capture_plan(
                 capture,
@@ -5131,7 +5072,7 @@ fn compile_log_level(value: &str, path: &str) -> Result<CompiledLogLevel, Config
         "error" => Ok(CompiledLogLevel::Error),
         _ => Err(ConfigCompileError::at(
             path,
-            "invalid log level after validation",
+            "must be trace, debug, info, warn, or error",
         )),
     }
 }
@@ -5140,6 +5081,8 @@ fn compile_capture_plan(
     value: &super::authoring::AuthoringCaptureConfig,
     working_set: CaptureWorkingSetPlan,
 ) -> CapturePlan {
+    #[cfg(not(test))]
+    let _ = working_set;
     CapturePlan {
         events: value
             .events
@@ -5169,6 +5112,7 @@ fn compile_capture_plan(
         .expect("validated observation capture sink"),
         max_body_bytes: value.max_body_bytes,
         max_inflight_body_bytes: value.max_inflight_body_bytes,
+        #[cfg(test)]
         working_set,
     }
 }
@@ -5238,6 +5182,10 @@ fn compile_static_config(
             .as_ref()
             .map(|callback| callback.public_url.clone()),
         logging: StaticLoggingConfig {
+            level: compile_log_level(
+                &config.observation.logging.level,
+                "observation.logging.level",
+            )?,
             directory: config.observation.logging.directory.clone(),
             max_bytes: config.observation.logging.max_bytes,
             max_files: config.observation.logging.max_files,
@@ -6833,7 +6781,9 @@ redaction_profile = "terminal"
     }
 
     #[test]
-    fn minimum_concurrency_uses_the_projected_allocation_peak() {
+    fn http_wire_body_incremental_permits_preserve_minimum_concurrency() {
+        use crate::safety::{WireBodyPool, WireBodyQuotaKey};
+
         let baseline = compile(&one_byte_body_provider_config("")).unwrap();
         let peak = baseline
             .reloadable_plan
@@ -6859,6 +6809,27 @@ redaction_profile = "terminal"
         let error = compile(&one_byte_body_provider_config(&insufficient_service))
             .expect_err("one byte below the projected product must fail");
         assert_eq!(error.path, "service.min_wire_body_concurrency");
+
+        let pool = WireBodyPool::new(5 * peak, peak);
+        let small_charge = guarded(1);
+        let mut live = Vec::new();
+        for peer_suffix in 1..=6 {
+            let guard = pool.begin_for_test(
+                peak,
+                WireBodyQuotaKey::from_peer(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, peer_suffix)),
+                    |_| false,
+                ),
+            );
+            let mut body = guard.buffer();
+            body.try_extend_from_slice(b"x").unwrap();
+            live.push((guard, body.finish()));
+        }
+        assert!(small_charge < peak);
+        assert_eq!(pool.global_charge(), 6 * small_charge);
+        assert!(pool.global_charge() < 5 * peak);
+        drop(live);
+        assert_eq!(pool.global_charge(), 0);
     }
 
     #[test]
@@ -7201,13 +7172,6 @@ filename = "{{requestId}}-{{suffix}}.json"
             CompiledDefaultDecision::Allow => "allow",
             CompiledDefaultDecision::Deny => "deny",
         };
-        let log_level = match plan.observation.logging.level {
-            CompiledLogLevel::Trace => "trace",
-            CompiledLogLevel::Debug => "debug",
-            CompiledLogLevel::Info => "info",
-            CompiledLogLevel::Warn => "warn",
-            CompiledLogLevel::Error => "error",
-        };
         let providers = plan
             .authorization
             .providers
@@ -7250,16 +7214,13 @@ filename = "{{requestId}}-{{suffix}}.json"
                     .unwrap_or_default()
             ),
             format!(
-                "credentials={}:{}:{}",
-                plan.credentials.allowed_custom_headers.len(),
+                "credentials={}:{}",
                 plan.credentials.inbound.len(),
                 plan.credentials.sources.len()
             ),
             format!("redaction={}", plan.redaction.profiles.len()),
             format!(
-                "observation={log_level}:{}:{}:{}:{}",
-                plan.observation.logging.policy_decisions.allows,
-                plan.observation.logging.policy_decisions.denies,
+                "observation={}:{}",
                 plan.observation.capture.is_some(),
                 plan.observation
                     .capture
@@ -7474,14 +7435,14 @@ console = false
 
         let log_level_changed =
             compile(&callback.replace("level = \"info\"", "level = \"debug\"")).unwrap();
-        assert_eq!(
+        assert_ne!(
             baseline.static_fingerprint,
             log_level_changed.static_fingerprint
         );
-        assert!(matches!(
-            log_level_changed.reloadable_plan.observation.logging.level,
+        assert_eq!(
+            log_level_changed.static_config.logging.level,
             CompiledLogLevel::Debug
-        ));
+        );
     }
 
     #[test]
@@ -7551,12 +7512,6 @@ max_bytes = 104857600
 max_files = 5
 console = true
 
-[observation.logging.policy_decisions]
-allows = false
-denies = true
-allow_level = "info"
-deny_level = "warn"
-
 [safety.loop_detection]
 inject = true
 header = "x-acl-proxy-request-id"
@@ -7600,6 +7555,7 @@ header = "x-acl-proxy-request-id"
             ("logging rotation bytes", baseline.replace("max_bytes = 104857600", "max_bytes = 104857601")),
             ("logging rotation files", baseline.replace("max_files = 5", "max_files = 6")),
             ("logging console", baseline.replace("console = true", "console = false")),
+            ("logging level", baseline.replace("level = \"info\"", "level = \"debug\"")),
         ];
         for (name, mutation) in static_mutations {
             let compiled = compile(&mutation)
@@ -7619,8 +7575,6 @@ header = "x-acl-proxy-request-id"
             ("callback admission", baseline.replace("max_pending_operations = 32", "max_pending_operations = 33")),
             ("webhook request limit", baseline.replace("max_request_bytes = 65536", "max_request_bytes = 65535")),
             ("webhook response limit", baseline.replace("max_response_bytes = 65536", "max_response_bytes = 65535")),
-            ("logging level", baseline.replace("level = \"info\"", "level = \"debug\"")),
-            ("decision logging", baseline.replace("allows = false", "allows = true")),
             ("loop header", baseline.replace("x-acl-proxy-request-id", "x-acl-proxy-next-id")),
             ("policy rules", baseline.replace(
                 "[observation.logging]",

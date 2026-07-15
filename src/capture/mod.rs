@@ -13,15 +13,16 @@ use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
 
-use crate::config::{CaptureConfig, Config};
 use crate::filesystem::create_private_dir_all;
 use crate::http_body::{
     decode_capture_http_body, decode_capture_websocket_permessage_deflate, CaptureContentEncoding,
     CaptureHttpDecodeError,
 };
+#[cfg(test)]
+use crate::observation::CaptureEvent;
 use crate::observation::{
-    CaptureAllocationError, CaptureBody as OwnedCaptureBody, CaptureEpoch, CaptureEvent,
-    CaptureExactBytes, CaptureOperation,
+    CaptureAllocationError, CaptureBody as OwnedCaptureBody, CaptureEpoch, CaptureExactBytes,
+    CaptureOperation,
 };
 use crate::redaction::{PayloadClass, SnapshotError as RedactionSnapshotError};
 use crate::sensitive::{is_sensitive_header_name, redact_url_for_sink, REDACTED};
@@ -39,13 +40,6 @@ use std::os::unix::fs::OpenOptionsExt;
 static CAPTURE_DIRECTORY_LOCKS: Lazy<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static CAPTURE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-/// Maximum number of body bytes to buffer per request/response for capture.
-///
-/// The legacy Node.js implementation captured full bodies. The Rust
-/// implementation intentionally limits in-memory buffering to this value
-/// while still recording the full logical length separately.
-pub const DEFAULT_MAX_BODY_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -65,8 +59,6 @@ pub enum CaptureKind {
 #[serde(rename_all = "snake_case")]
 pub enum CaptureMode {
     HttpProxy,
-    HttpsConnect,
-    HttpsTransparent,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -289,6 +281,7 @@ pub(crate) enum CaptureArtifactSubmitError {
 }
 
 impl CaptureArtifactJob {
+    #[cfg(test)]
     pub(crate) fn try_begin(
         epoch: Arc<CaptureEpoch>,
         event: CaptureEvent,
@@ -533,6 +526,7 @@ impl CaptureArtifactBody {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn total_len(&self) -> usize {
         self.total_len
     }
@@ -682,7 +676,7 @@ impl CaptureRecord {
 
 fn canonical_base64_decoded_len(encoded: &str) -> Option<usize> {
     let bytes = encoded.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return None;
     }
     if bytes.is_empty() {
@@ -827,75 +821,6 @@ pub enum CaptureBodyDecodeError {
     InvalidBase64(#[source] base64::DecodeError),
 }
 
-#[derive(Debug, Clone)]
-pub struct CaptureRecordOptions {
-    pub timestamp: String,
-    pub request_id: String,
-    pub kind: CaptureKind,
-    pub decision: CaptureDecision,
-    pub mode: CaptureMode,
-    pub url: String,
-    pub method: Option<String>,
-    pub client: CaptureEndpoint,
-    pub target: Option<CaptureEndpoint>,
-    pub http_version: Option<String>,
-    pub headers: Option<HeaderMap>,
-    pub status_code: Option<u16>,
-    pub status_message: Option<String>,
-    pub body: Option<BodyCaptureResult>,
-}
-
-#[derive(Debug, Clone)]
-pub struct BodyCaptureResult {
-    pub captured: Vec<u8>,
-    pub total_len: usize,
-}
-
-#[derive(Debug, Clone)]
-pub struct BodyCaptureBuffer {
-    max_bytes: usize,
-    captured: Vec<u8>,
-    total_len: usize,
-}
-
-impl BodyCaptureBuffer {
-    /// Create a new bounded body capture buffer.
-    ///
-    /// The buffer will record at most `max_bytes` of body data while
-    /// still tracking the full logical length of the stream.
-    pub fn new(max_bytes: usize) -> Self {
-        BodyCaptureBuffer {
-            max_bytes,
-            captured: Vec::new(),
-            total_len: 0,
-        }
-    }
-
-    /// Append a chunk of body bytes to the buffer.
-    ///
-    /// All bytes contribute to `total_len`, but only the first
-    /// `max_bytes` bytes across all calls are retained in `captured`.
-    pub fn push(&mut self, chunk: &[u8]) {
-        self.total_len = self.total_len.saturating_add(chunk.len());
-        if self.captured.len() >= self.max_bytes {
-            return;
-        }
-
-        let remaining = self.max_bytes - self.captured.len();
-        let to_take = remaining.min(chunk.len());
-        if to_take > 0 {
-            self.captured.extend_from_slice(&chunk[..to_take]);
-        }
-    }
-
-    pub fn finish(self) -> BodyCaptureResult {
-        BodyCaptureResult {
-            captured: self.captured,
-            total_len: self.total_len,
-        }
-    }
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum CaptureError {
     #[error("failed to create capture directory {path}: {source}")]
@@ -951,63 +876,6 @@ pub enum CaptureError {
     Serialize(#[from] serde_json::Error),
 }
 
-/// Determine whether a given request/response should be captured based on
-/// the `[capture]` configuration flags.
-pub fn should_capture(cfg: &Config, decision: CaptureDecision, kind: CaptureKind) -> bool {
-    let capture_cfg: &CaptureConfig = &cfg.capture;
-    match (decision, kind) {
-        (CaptureDecision::Allow, CaptureKind::Request) => capture_cfg.allowed_request,
-        (CaptureDecision::Allow, CaptureKind::Response) => capture_cfg.allowed_response,
-        (CaptureDecision::Deny, CaptureKind::Request) => capture_cfg.denied_request,
-        (CaptureDecision::Deny, CaptureKind::Response) => capture_cfg.denied_response,
-    }
-}
-
-pub fn build_capture_record(opts: CaptureRecordOptions) -> CaptureRecord {
-    let CaptureRecordOptions {
-        timestamp,
-        request_id,
-        kind,
-        decision,
-        mode,
-        url,
-        method,
-        client,
-        target,
-        http_version,
-        headers,
-        status_code,
-        status_message,
-        body,
-    } = opts;
-
-    let body_info = body.and_then(|b| build_body(headers.as_ref(), &b));
-    let body_truncated = body_info
-        .as_ref()
-        .and_then(|(_, truncated)| truncated.then_some(true));
-    let body = body_info.map(|(body, _)| body);
-
-    CaptureRecord {
-        timestamp,
-        request_id,
-        kind,
-        decision,
-        mode,
-        url: redact_url_for_sink(&url),
-        method: method.unwrap_or_default(),
-        status_code,
-        status_message,
-        client,
-        target,
-        http_version,
-        headers,
-        body,
-        body_truncated,
-        provider_replacement_omitted: None,
-        provider_replacement_size: None,
-    }
-}
-
 impl CaptureRecord {
     /// Decode the captured body bytes from this record.
     ///
@@ -1031,48 +899,6 @@ impl CaptureRecord {
             .decode(&body.data)
             .map_err(CaptureBodyDecodeError::InvalidBase64)
     }
-}
-
-fn build_body(
-    headers: Option<&HeaderMap>,
-    body: &BodyCaptureResult,
-) -> Option<(CaptureBody, bool)> {
-    if body.total_len == 0 {
-        return None;
-    }
-
-    let content_type = headers.and_then(|map| first_header_string(map, "content-type"));
-    let content_encoding = headers.and_then(|map| first_header_string(map, "content-encoding"));
-
-    let data = general_purpose::STANDARD.encode(&body.captured);
-
-    Some((
-        CaptureBody {
-            encoding: "base64".to_string(),
-            length: body.total_len,
-            data,
-            content_type,
-            content_encoding,
-        },
-        body.captured.len() < body.total_len,
-    ))
-}
-
-fn first_header_string(headers: &HeaderMap, name: &str) -> Option<String> {
-    headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(name))
-        .and_then(|(_, v)| match v {
-            JsonValue::String(s) => Some(s.clone()),
-            JsonValue::Array(arr) => arr.iter().find_map(|v| {
-                if let JsonValue::String(s) = v {
-                    Some(s.clone())
-                } else {
-                    None
-                }
-            }),
-            _ => None,
-        })
 }
 
 fn sanitize_path_component(input: &str) -> String {
@@ -1440,9 +1266,8 @@ mod tests {
 
     use super::*;
     use crate::config::compiler::{
-        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledLogLevel,
-        CompiledRedactionPayloads, ObservationPlan, PolicyDecisionLoggingPlan, RedactionPlan,
-        RedactionProfilePlan, RedactionRulePlan, ReloadableLoggingPlan,
+        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledRedactionPayloads,
+        ObservationPlan, RedactionPlan, RedactionProfilePlan, RedactionRulePlan,
     };
     use crate::observation::{CapturePool, ProductObservationSnapshot};
     use crate::redaction::RedactionSnapshot;
@@ -1516,15 +1341,6 @@ mod tests {
         let pool = CapturePool::new();
         let activation = ProductObservationSnapshot::activate(
             ObservationPlan {
-                logging: ReloadableLoggingPlan {
-                    level: CompiledLogLevel::Info,
-                    policy_decisions: PolicyDecisionLoggingPlan {
-                        allows: false,
-                        denies: false,
-                        allow_level: CompiledLogLevel::Info,
-                        deny_level: CompiledLogLevel::Warn,
-                    },
-                },
                 capture: Some(CapturePlan {
                     events: vec![
                         CompiledCaptureEvent::RequestAllowed,

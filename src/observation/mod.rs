@@ -1,7 +1,6 @@
 mod capture;
 
 use std::fmt;
-use std::path::Path;
 #[cfg(test)]
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
@@ -10,12 +9,9 @@ use crate::capture::{
     CaptureArtifactJob, CaptureArtifactSubmitError, CaptureArtifactWorker, CaptureSinkSpec,
     CaptureWorkerStartError,
 };
-use crate::config::compiler::{
-    CapturePlan, CompiledCaptureEvent, CompiledLogLevel, ObservationPlan,
-    PolicyDecisionLoggingPlan, ReloadableLoggingPlan,
-};
+use crate::config::compiler::{CapturePlan, CompiledCaptureEvent, ObservationPlan};
 use crate::redaction::{ProfileHandle, RedactionActivation, RedactionSnapshot};
-use crate::runtime::{GenerationOwner, ObservationSnapshot, RedactionProfileIndex};
+use crate::runtime::{GenerationOwner, ObservationSnapshot};
 
 use capture::CaptureEpochUpdate;
 pub(crate) use capture::{
@@ -122,7 +118,6 @@ impl fmt::Debug for CaptureEpoch {
 }
 
 pub(crate) struct ProductObservationSnapshot {
-    logging: ObservationLoggingPolicy,
     capture_epoch: Arc<CaptureEpoch>,
 }
 
@@ -130,7 +125,6 @@ impl fmt::Debug for ProductObservationSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ProductObservationSnapshot")
-            .field("logging_level", &log_level_name(self.logging.level))
             .field("capture_enabled", &self.capture_epoch.is_enabled())
             .field(
                 "capture_event_count",
@@ -149,8 +143,7 @@ impl ProductObservationSnapshot {
         redaction: &RedactionActivation,
         capture_pool: Arc<CapturePool>,
     ) -> Result<ObservationActivation, ObservationActivationError> {
-        let ObservationPlan { logging, capture } = plan;
-        let logging = ObservationLoggingPolicy::from_plan(logging);
+        let capture = plan.capture;
         let (capture_epoch, proposed_limit) = match capture {
             None => (Arc::new(CaptureEpoch::disabled()), 0),
             Some(plan) => {
@@ -164,7 +157,6 @@ impl ProductObservationSnapshot {
                 (
                     Arc::new(CaptureEpoch::enabled(CapturePolicy::activate(
                         plan,
-                        profile_index,
                         profile,
                         Arc::downgrade(&capture_pool),
                     ))),
@@ -178,32 +170,22 @@ impl ProductObservationSnapshot {
             proposed_limit,
         ));
         Ok(ObservationActivation {
-            snapshot: Self {
-                logging,
-                capture_epoch,
-            },
+            snapshot: Self { capture_epoch },
             owner,
         })
-    }
-
-    pub(crate) fn logging(&self) -> &ObservationLoggingPolicy {
-        &self.logging
     }
 
     pub(crate) fn capture_epoch(&self) -> &Arc<CaptureEpoch> {
         &self.capture_epoch
     }
 
+    #[cfg(test)]
     pub(crate) fn capture(&self) -> Option<&CapturePolicy> {
         self.capture_epoch.capture()
     }
 }
 
 impl ObservationSnapshot for ProductObservationSnapshot {
-    fn logging(&self) -> &ObservationLoggingPolicy {
-        ProductObservationSnapshot::logging(self)
-    }
-
     fn capture_epoch(&self) -> &Arc<CaptureEpoch> {
         ProductObservationSnapshot::capture_epoch(self)
     }
@@ -225,6 +207,7 @@ impl fmt::Debug for ObservationActivation {
 }
 
 impl ObservationActivation {
+    #[cfg(test)]
     pub(crate) fn snapshot(&self) -> &ProductObservationSnapshot {
         &self.snapshot
     }
@@ -240,75 +223,11 @@ pub(crate) enum ObservationActivationError {
     MissingCaptureProfile,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct ObservationLoggingPolicy {
-    level: CompiledLogLevel,
-    decisions: DecisionLoggingPolicy,
-}
-
-impl ObservationLoggingPolicy {
-    fn from_plan(plan: ReloadableLoggingPlan) -> Self {
-        Self {
-            level: plan.level,
-            decisions: DecisionLoggingPolicy::from_plan(plan.policy_decisions),
-        }
-    }
-
-    pub(crate) fn level(&self) -> CompiledLogLevel {
-        self.level
-    }
-
-    pub(crate) fn decisions(&self) -> DecisionLoggingPolicy {
-        self.decisions
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct DecisionLoggingPolicy {
-    allows: bool,
-    denies: bool,
-    allow_level: CompiledLogLevel,
-    deny_level: CompiledLogLevel,
-}
-
-impl DecisionLoggingPolicy {
-    fn from_plan(plan: PolicyDecisionLoggingPlan) -> Self {
-        Self {
-            allows: plan.allows,
-            denies: plan.denies,
-            allow_level: plan.allow_level,
-            deny_level: plan.deny_level,
-        }
-    }
-
-    pub(crate) fn enabled(&self, decision: CaptureDecision) -> bool {
-        match decision {
-            CaptureDecision::Allow => self.allows,
-            CaptureDecision::Deny => self.denies,
-        }
-    }
-
-    pub(crate) fn level(&self, decision: CaptureDecision) -> CompiledLogLevel {
-        match decision {
-            CaptureDecision::Allow => self.allow_level,
-            CaptureDecision::Deny => self.deny_level,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CaptureDecision {
-    Allow,
-    Deny,
-}
-
 pub(crate) struct CapturePolicy {
     events: CaptureEventSet,
-    profile_index: RedactionProfileIndex,
     profile: ProfileHandle,
     sink: CaptureSinkSpec,
     max_body_bytes: usize,
-    working_set: crate::config::compiler::CaptureWorkingSetPlan,
     pool: Weak<CapturePool>,
 }
 
@@ -325,27 +244,20 @@ impl fmt::Debug for CapturePolicy {
 }
 
 impl CapturePolicy {
-    fn activate(
-        plan: CapturePlan,
-        profile_index: RedactionProfileIndex,
-        profile: ProfileHandle,
-        pool: Weak<CapturePool>,
-    ) -> Self {
+    fn activate(plan: CapturePlan, profile: ProfileHandle, pool: Weak<CapturePool>) -> Self {
         let CapturePlan {
             events,
             redaction_profile: _,
             sink,
             max_body_bytes,
             max_inflight_body_bytes: _,
-            working_set,
+            ..
         } = plan;
         Self {
             events: CaptureEventSet::from_compiled(events),
-            profile_index,
             profile,
             sink,
             max_body_bytes,
-            working_set,
             pool,
         }
     }
@@ -361,10 +273,6 @@ impl CapturePolicy {
         self.pool.upgrade()?.try_admit()
     }
 
-    pub(crate) fn profile_index(&self) -> RedactionProfileIndex {
-        self.profile_index
-    }
-
     pub(crate) fn profile(&self) -> &ProfileHandle {
         &self.profile
     }
@@ -373,28 +281,8 @@ impl CapturePolicy {
         &self.sink
     }
 
-    pub(crate) fn directory(&self) -> &Path {
-        self.sink.directory()
-    }
-
-    pub(crate) fn filename(&self) -> &str {
-        self.sink.filename_template()
-    }
-
     pub(crate) fn max_body_bytes(&self) -> usize {
         self.max_body_bytes
-    }
-
-    pub(crate) fn working_set(&self) -> crate::config::compiler::CaptureWorkingSetPlan {
-        self.working_set
-    }
-
-    pub(crate) fn max_files(&self) -> usize {
-        self.sink.max_files()
-    }
-
-    pub(crate) fn max_total_bytes(&self) -> u64 {
-        self.sink.max_total_bytes()
     }
 }
 
@@ -438,16 +326,6 @@ impl CaptureEventSet {
     }
 }
 
-fn log_level_name(level: CompiledLogLevel) -> &'static str {
-    match level {
-        CompiledLogLevel::Trace => "trace",
-        CompiledLogLevel::Debug => "debug",
-        CompiledLogLevel::Info => "info",
-        CompiledLogLevel::Warn => "warn",
-        CompiledLogLevel::Error => "error",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -460,25 +338,12 @@ mod tests {
     use crate::redaction::RedactionSnapshot;
     use crate::runtime::{CleanupReason, RuntimeError};
 
-    fn logging() -> ReloadableLoggingPlan {
-        ReloadableLoggingPlan {
-            level: CompiledLogLevel::Info,
-            policy_decisions: PolicyDecisionLoggingPlan {
-                allows: false,
-                denies: true,
-                allow_level: CompiledLogLevel::Info,
-                deny_level: CompiledLogLevel::Warn,
-            },
-        }
-    }
-
     fn plan(
         profile_name: &str,
         events: Vec<CompiledCaptureEvent>,
         limit: usize,
     ) -> ObservationPlan {
         ObservationPlan {
-            logging: logging(),
             capture: Some(CapturePlan {
                 events,
                 redaction_profile: profile_name.to_owned(),
@@ -497,10 +362,7 @@ mod tests {
     }
 
     fn disabled_plan() -> ObservationPlan {
-        ObservationPlan {
-            logging: logging(),
-            capture: None,
-        }
+        ObservationPlan { capture: None }
     }
 
     fn profile_plan(max_body_bytes: usize) -> RedactionProfilePlan {
@@ -581,18 +443,12 @@ mod tests {
         .expect("observation activation");
         let capture = activation.snapshot().capture().expect("capture");
 
-        assert_eq!(
-            capture.profile_index(),
-            redaction
-                .profile_index("private-profile-name")
-                .expect("profile index")
-        );
         assert_eq!(capture.profile().limits().max_body_bytes, 73);
         assert!(!format!("{activation:?}").contains("private-profile-name"));
     }
 
     #[test]
-    fn event_set_and_decision_logging_are_immutable_typed_policy() {
+    fn event_set_is_immutable_typed_policy() {
         let pool = CapturePool::new();
         let activation = activate(
             pool,
@@ -610,18 +466,6 @@ mod tests {
         assert!(capture.captures(CaptureEvent::RequestAllowed));
         assert!(capture.captures(CaptureEvent::ResponseDenied));
         assert!(!capture.captures(CaptureEvent::ResponseAllowed));
-        assert!(!snapshot
-            .logging()
-            .decisions()
-            .enabled(CaptureDecision::Allow));
-        assert!(snapshot
-            .logging()
-            .decisions()
-            .enabled(CaptureDecision::Deny));
-        assert!(matches!(
-            snapshot.logging().decisions().level(CaptureDecision::Deny),
-            CompiledLogLevel::Warn
-        ));
     }
 
     #[test]

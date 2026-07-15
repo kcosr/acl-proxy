@@ -167,6 +167,7 @@ pub(crate) struct WebhookTransportLease {
 }
 
 impl WebhookTransportLease {
+    #[cfg(test)]
     pub(crate) fn outbound(&self) -> &[u8] {
         self.buffers().outbound.as_ref()
     }
@@ -175,10 +176,12 @@ impl WebhookTransportLease {
         self.buffers_mut().outbound.as_mut()
     }
 
+    #[cfg(test)]
     pub(crate) fn inbound(&self) -> &ParserStore {
         &self.buffers().inbound
     }
 
+    #[cfg(test)]
     pub(crate) fn inbound_mut(&mut self) -> &mut ParserStore {
         &mut self.buffers_mut().inbound
     }
@@ -204,6 +207,7 @@ impl WebhookTransportLease {
         )
     }
 
+    #[cfg(test)]
     fn buffers(&self) -> &TransportBuffers {
         self.buffers
             .as_ref()
@@ -275,6 +279,7 @@ pub(crate) struct WebhookInboundBuffer {
 }
 
 impl WebhookInboundBuffer {
+    #[cfg(test)]
     pub(crate) fn parser_store(&self) -> &ParserStore {
         self.parser_store
             .as_ref()

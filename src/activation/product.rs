@@ -31,12 +31,14 @@ impl ProductActivator {
         Self { static_resources }
     }
 
+    #[cfg(test)]
     pub(crate) fn observation_runtime_handle(
         &self,
     ) -> Arc<crate::observation::ProductObservationRuntime> {
         self.static_resources.observation_runtime()
     }
 
+    #[cfg(test)]
     pub(crate) fn authorization_runtime_handle(
         &self,
     ) -> Arc<crate::authorization::webhook::runtime::WebhookAuthorizationRuntime> {
@@ -737,7 +739,6 @@ redaction_profile = "environment"
             .unwrap();
         let _origin_trust = activated.egress.origin_tls().trust();
 
-        assert_eq!(activated.credentials.source_count(), 0);
         activated
             .credentials
             .inject(&[], &mut request_headers)
@@ -753,22 +754,14 @@ redaction_profile = "environment"
             .internal_context_headers()
             .is_empty());
 
-        assert_eq!(activated.redaction.len(), 1);
-        assert!(!activated.redaction.is_empty());
-        assert!(activated.redaction.compiled_matcher_resident_bytes() > 0);
         let capture = activated
             .observation
             .capture_epoch()
             .capture()
             .expect("capture policy is generation-owned");
-        assert!(activated
-            .redaction
-            .profile(capture.profile_index())
-            .is_some());
-        assert!(matches!(
-            activated.observation.logging().level(),
-            crate::config::compiler::CompiledLogLevel::Info
-        ));
+        assert_eq!(capture.max_body_bytes(), 1024);
+        let capture_profile_limits = capture.profile().limits();
+        assert!(capture_profile_limits.compiled_matcher_resident_bytes > 0);
         assert_eq!(observation_runtime.committed_capture_limit(), 0);
         let mut publication = activated.owner.publication_guard().unwrap();
         publication.commit();

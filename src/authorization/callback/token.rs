@@ -21,6 +21,7 @@ impl ResumeToken {
         &self.encoded
     }
 
+    #[cfg(test)]
     pub(crate) fn as_str(&self) -> &str {
         std::str::from_utf8(self.as_bytes()).expect("base64url output is ASCII")
     }

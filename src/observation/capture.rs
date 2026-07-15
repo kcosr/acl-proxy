@@ -307,6 +307,7 @@ impl CaptureOperation {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn validate_exact_bytes(
         &self,
         bytes: &CaptureExactBytes,
@@ -502,9 +503,8 @@ mod tests {
 
     use super::*;
     use crate::config::compiler::{
-        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledLogLevel,
-        CompiledRedactionPayloads, ObservationPlan, PolicyDecisionLoggingPlan, RedactionPlan,
-        RedactionProfilePlan, RedactionRulePlan, ReloadableLoggingPlan,
+        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledRedactionPayloads,
+        ObservationPlan, RedactionPlan, RedactionProfilePlan, RedactionRulePlan,
     };
     use crate::observation::{CaptureEvent, ObservationActivation, ProductObservationSnapshot};
     use crate::redaction::RedactionSnapshot;
@@ -542,15 +542,6 @@ mod tests {
             RedactionSnapshot::activate(RedactionPlan { profiles }, || false).expect("redaction");
         ProductObservationSnapshot::activate(
             ObservationPlan {
-                logging: ReloadableLoggingPlan {
-                    level: CompiledLogLevel::Info,
-                    policy_decisions: PolicyDecisionLoggingPlan {
-                        allows: false,
-                        denies: true,
-                        allow_level: CompiledLogLevel::Info,
-                        deny_level: CompiledLogLevel::Warn,
-                    },
-                },
                 capture: Some(CapturePlan {
                     events: vec![CompiledCaptureEvent::RequestAllowed],
                     redaction_profile: "accounting".to_owned(),

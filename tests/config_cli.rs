@@ -96,6 +96,21 @@ fn config_validate_accepts_strict_schema_three() {
 }
 
 #[test]
+fn config_validate_rejects_invalid_observation_logging_level() {
+    let file = config_file(&format!(
+        "{MINIMAL}\n[observation.logging]\nlevel = \"notalevel\"\n"
+    ));
+
+    command()
+        .args(["config", "validate", "--config"])
+        .arg(file.path())
+        .assert()
+        .failure()
+        .stderr(contains("observation.logging.level"))
+        .stderr(contains("must be trace, debug, info, warn, or error"));
+}
+
+#[test]
 fn config_validate_rejects_old_missing_and_future_schema_versions() {
     for (name, contents) in [
         (

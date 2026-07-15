@@ -6,9 +6,11 @@ use http::header::HeaderMap;
 use http::Uri;
 use rustls::{ClientConfig, ServerName};
 
+#[cfg(test)]
+use crate::config::compiler::CompiledParentProxyKind;
 use crate::config::compiler::{
-    CompiledEgressRoute, CompiledHttpVersion, CompiledParentProxyKind, CompiledTlsTrust,
-    EgressPlan, HeaderEffectPlan, ParentProxyPlan, ParentProxyTlsPlan, TransportTlsPlan,
+    CompiledEgressRoute, CompiledHttpVersion, CompiledTlsTrust, EgressPlan, HeaderEffectPlan,
+    ParentProxyPlan, ParentProxyTlsPlan, TransportTlsPlan,
 };
 use crate::credentials::{
     resolve_credential_action, CredentialBindingError, ResolvedCredentialAction,
@@ -38,8 +40,10 @@ pub(crate) enum EgressRoute {
 }
 
 pub(crate) struct ParentEndpoint {
+    #[cfg(test)]
     kind: CompiledParentProxyKind,
     canonical_url: String,
+    #[cfg(test)]
     uri: Uri,
     authority: CanonicalAuthority,
     transport: ParentTransport,
@@ -51,6 +55,7 @@ pub(crate) enum ParentTransport {
 }
 
 pub(crate) struct OriginTls {
+    #[cfg(test)]
     trust: CompiledTlsTrust,
     http_versions: Box<[CompiledHttpVersion]>,
     http1_config: Option<Arc<ClientConfig>>,
@@ -77,6 +82,7 @@ impl OriginProtocol {
 }
 
 pub(crate) struct ParentTls {
+    #[cfg(test)]
     trust: CompiledTlsTrust,
     server_name: String,
     http1_config: Arc<ClientConfig>,
@@ -199,12 +205,14 @@ impl ParentEndpoint {
         plan: ParentProxyPlan,
         is_cancelled: &mut dyn FnMut() -> bool,
     ) -> Result<Self, EgressActivationError> {
+        #[cfg(test)]
+        let kind = plan.kind;
         let ParentProxyPlan {
-            kind,
             url,
             host,
             port,
             tls,
+            ..
         } = plan;
         let uri = url
             .parse::<Uri>()
@@ -226,14 +234,17 @@ impl ParentEndpoint {
             return Err(EgressActivationError::Route);
         }
         Ok(Self {
+            #[cfg(test)]
             kind,
             canonical_url: url,
+            #[cfg(test)]
             uri,
             authority,
             transport,
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn kind(&self) -> CompiledParentProxyKind {
         self.kind
     }
@@ -242,14 +253,17 @@ impl ParentEndpoint {
         &self.canonical_url
     }
 
+    #[cfg(test)]
     pub(crate) fn uri(&self) -> &Uri {
         &self.uri
     }
 
+    #[cfg(test)]
     pub(crate) fn host(&self) -> &str {
         &self.authority.host
     }
 
+    #[cfg(test)]
     pub(crate) fn port(&self) -> u16 {
         self.authority.port
     }
@@ -298,6 +312,7 @@ impl ParentTls {
             enable_sni,
         ));
         Ok(Self {
+            #[cfg(test)]
             trust: plan.trust,
             server_name,
             http1_config,
@@ -305,6 +320,7 @@ impl ParentTls {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn trust(&self) -> CompiledTlsTrust {
         self.trust
     }
@@ -369,6 +385,7 @@ impl OriginTls {
         let loaded_trust = load(trust, ca_certificate.as_deref())?;
         warn_if_insecure("origin", trust);
         Ok(Self {
+            #[cfg(test)]
             trust,
             http_versions: http_versions.into_boxed_slice(),
             http1_config: http1
@@ -378,10 +395,12 @@ impl OriginTls {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn trust(&self) -> CompiledTlsTrust {
         self.trust
     }
 
+    #[cfg(test)]
     pub(crate) fn http_versions(&self) -> &[CompiledHttpVersion] {
         &self.http_versions
     }

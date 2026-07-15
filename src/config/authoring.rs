@@ -1041,9 +1041,6 @@ pub(super) struct AuthoringLoggingConfig {
 
     #[serde(default = "default_logging_console")]
     pub console: bool,
-
-    #[serde(default)]
-    pub policy_decisions: PolicyDecisionLoggingConfig,
 }
 
 impl Default for AuthoringLoggingConfig {
@@ -1054,7 +1051,6 @@ impl Default for AuthoringLoggingConfig {
             max_bytes: default_logging_max_bytes(),
             max_files: default_logging_max_files(),
             console: default_logging_console(),
-            policy_decisions: PolicyDecisionLoggingConfig::default(),
         }
     }
 }
@@ -1073,45 +1069,6 @@ fn default_logging_max_files() -> usize {
 
 fn default_logging_console() -> bool {
     true
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct PolicyDecisionLoggingConfig {
-    #[serde(default)]
-    pub allows: bool,
-
-    #[serde(default = "default_log_denies")]
-    pub denies: bool,
-
-    #[serde(default = "default_allow_log_level")]
-    pub allow_level: String,
-
-    #[serde(default = "default_deny_log_level")]
-    pub deny_level: String,
-}
-
-impl Default for PolicyDecisionLoggingConfig {
-    fn default() -> Self {
-        Self {
-            allows: false,
-            denies: default_log_denies(),
-            allow_level: default_allow_log_level(),
-            deny_level: default_deny_log_level(),
-        }
-    }
-}
-
-fn default_log_denies() -> bool {
-    true
-}
-
-fn default_allow_log_level() -> String {
-    "info".to_string()
-}
-
-fn default_deny_log_level() -> String {
-    "warn".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]

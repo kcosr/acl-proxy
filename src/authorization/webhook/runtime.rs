@@ -3,9 +3,11 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{oneshot, Notify};
 
+#[cfg(test)]
+use super::pool::WebhookTransportArenaCounts;
 use super::pool::{
-    WebhookTransportAdmissionError, WebhookTransportArena, WebhookTransportArenaCounts,
-    WebhookTransportArenaError, WebhookTransportLease,
+    WebhookTransportAdmissionError, WebhookTransportArena, WebhookTransportArenaError,
+    WebhookTransportLease,
 };
 use super::provider::WebhookProvider;
 use super::request::{WebhookRequest, WebhookRequestError};
@@ -34,7 +36,7 @@ pub(crate) struct WebhookAuthorizationRuntime {
 }
 
 pub(crate) struct PendingWebhookOperation {
-    retention: GenerationRetention,
+    _retention: GenerationRetention,
     provider: Arc<WebhookProvider>,
     response_charge: ProviderResponseCharge,
     delivery_teardown: DeliveryTeardown,
@@ -95,8 +97,6 @@ pub(crate) enum WebhookDispatchError {
     Callback(#[from] WebhookCompletionError),
     #[error("webhook callback completion channel closed")]
     CompletionClosed,
-    #[error("webhook pending operation store failed")]
-    StorePoisoned,
     #[error("webhook authorization admission is closed")]
     AdmissionClosed,
     #[error("webhook authorization admission gate failed")]
@@ -154,6 +154,7 @@ impl WebhookAuthorizationRuntime {
         self.transport.try_acquire()
     }
 
+    #[cfg(test)]
     pub(crate) fn transport_counts(&self) -> WebhookTransportArenaCounts {
         self.transport.counts()
     }
@@ -181,6 +182,7 @@ impl WebhookAuthorizationRuntime {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn destination_guard(&self) -> &Arc<DestinationGuard> {
         &self.destination
     }
@@ -319,7 +321,6 @@ async fn terminal_delivery_result(
         }
         PendingTerminalResult::ClaimOwns { .. } => await_callback(operation, receiver).await,
         PendingTerminalResult::AlreadyTerminal => await_callback(operation, receiver).await,
-        PendingTerminalResult::Poisoned => Err(WebhookDispatchError::StorePoisoned),
     }
 }
 
@@ -347,7 +348,6 @@ async fn await_callback(
                     .await
                     .map_err(|_| WebhookDispatchError::CompletionClosed)?
                     .map_err(map_completion_error),
-                PendingTerminalResult::Poisoned => Err(WebhookDispatchError::StorePoisoned),
             }
         }
     }
@@ -369,16 +369,12 @@ impl PendingWebhookOperation {
         completion: oneshot::Sender<Result<ProviderDecision, WebhookCompletionError>>,
     ) -> Self {
         Self {
-            retention,
+            _retention: retention,
             provider,
             response_charge,
             delivery_teardown,
             completion,
         }
-    }
-
-    pub(crate) fn generation(&self) -> crate::runtime::GenerationId {
-        self.retention.id()
     }
 
     pub(crate) fn provider(&self) -> &Arc<WebhookProvider> {

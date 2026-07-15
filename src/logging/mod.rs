@@ -1,6 +1,3 @@
-#![allow(clippy::too_many_arguments)]
-
-use std::fmt;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -12,28 +9,16 @@ use std::thread;
 use tracing::Level;
 use tracing_subscriber::fmt::SubscriberBuilder;
 
-use crate::config::compiler::StaticLoggingConfig;
-use crate::config::{LoggingConfig, LoggingPolicyDecisionsConfig, PolicyRuleAction};
+use crate::config::compiler::{CompiledLogLevel, StaticLoggingConfig};
 use crate::filesystem::{
     create_private_dir_all, open_private_file_for_append, open_private_file_for_write,
 };
-use crate::policy::PolicyDecision;
-use crate::sensitive::redact_url_for_sink;
 
 const LOG_FILENAME: &str = "acl-proxy.log";
 const LOG_QUEUE_CAPACITY: usize = 8192;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoggingError {
-    #[error("invalid log level for {field}: {value}")]
-    InvalidLevel { field: &'static str, value: String },
-
-    #[error("logging.max_bytes must be greater than zero when logging.directory is set")]
-    InvalidMaxBytes { value: u64 },
-
-    #[error("logging.max_files must be greater than zero when logging.directory is set")]
-    InvalidMaxFiles { value: usize },
-
     #[error("failed to create logging directory {path}: {source}")]
     CreateDir {
         path: PathBuf,
@@ -53,40 +38,23 @@ pub enum LoggingError {
 }
 
 #[derive(Debug, Clone)]
-pub struct PolicyDecisionLogging {
-    pub log_allows: bool,
-    pub log_denies: bool,
-    pub level_allows: Level,
-    pub level_denies: Level,
+pub(crate) struct LoggingSettings {
+    level: Level,
+    directory: Option<PathBuf>,
+    max_bytes: u64,
+    max_files: usize,
+    console: bool,
 }
 
-#[derive(Debug, Clone)]
-pub struct LoggingSettings {
-    pub level: Level,
-    pub policy_decisions: PolicyDecisionLogging,
-    pub directory: Option<PathBuf>,
-    pub max_bytes: u64,
-    pub max_files: usize,
-    pub console: bool,
-}
-
-pub struct LoggingGuards {
+pub(crate) struct LoggingGuards {
     _worker: Option<WorkerGuard>,
 }
 
 impl LoggingSettings {
     /// Builds the process-lifetime sink from strict compiled configuration.
-    /// Generation-owned observation policy performs event filtering, so the
-    /// static subscriber must admit every level across reloads.
     pub(crate) fn from_static_config(cfg: &StaticLoggingConfig) -> Self {
         Self {
-            level: Level::TRACE,
-            policy_decisions: PolicyDecisionLogging {
-                log_allows: true,
-                log_denies: true,
-                level_allows: Level::TRACE,
-                level_denies: Level::TRACE,
-            },
+            level: tracing_level(cfg.level),
             directory: cfg.directory.clone(),
             max_bytes: cfg.max_bytes,
             max_files: cfg.max_files,
@@ -94,42 +62,11 @@ impl LoggingSettings {
         }
     }
 
-    pub fn from_config(cfg: &LoggingConfig) -> Result<Self, LoggingError> {
-        let level = parse_level(&cfg.level).map_err(|value| LoggingError::InvalidLevel {
-            field: "logging.level",
-            value,
-        })?;
-
-        if cfg.directory.is_some() {
-            if cfg.max_bytes == 0 {
-                return Err(LoggingError::InvalidMaxBytes {
-                    value: cfg.max_bytes,
-                });
-            }
-            if cfg.max_files == 0 {
-                return Err(LoggingError::InvalidMaxFiles {
-                    value: cfg.max_files,
-                });
-            }
-        }
-
-        let policy_decisions = PolicyDecisionLogging::from_config(&cfg.policy_decisions)?;
-
-        Ok(LoggingSettings {
-            level,
-            policy_decisions,
-            directory: cfg.directory.clone(),
-            max_bytes: cfg.max_bytes,
-            max_files: cfg.max_files,
-            console: cfg.console,
-        })
-    }
-
-    /// Configure a global tracing subscriber using the configured log level.
+    /// Configure a global tracing subscriber for the process-lifetime sinks.
     ///
     /// This is kept separate from the pure configuration parsing so that
     /// higher-level code can manage when the global subscriber is installed.
-    pub fn init_tracing(&self) -> Result<LoggingGuards, LoggingError> {
+    pub(crate) fn init_tracing(&self) -> Result<LoggingGuards, LoggingError> {
         let builder: SubscriberBuilder = tracing_subscriber::fmt()
             .with_max_level(self.level)
             .with_target(true)
@@ -183,85 +120,15 @@ impl LoggingSettings {
             Ok(LoggingGuards { _worker: None })
         }
     }
+}
 
-    /// Log a policy decision in a structured, configurable way.
-    ///
-    /// This helper does not assume where the subscriber sends events; it only
-    /// emits structured fields that downstream subscribers can consume.
-    pub fn log_policy_decision<'a>(&self, ctx: PolicyDecisionLogContext<'a>) {
-        let allowed = ctx.decision.allowed;
-
-        if allowed && !self.policy_decisions.log_allows {
-            return;
-        }
-        if !allowed && !self.policy_decisions.log_denies {
-            return;
-        }
-
-        let level = if allowed {
-            self.policy_decisions.level_allows
-        } else {
-            self.policy_decisions.level_denies
-        };
-        let (rule_action, rule_pattern, rule_description) = match ctx.decision.matched.as_ref() {
-            Some(m) => {
-                let action = match m.action {
-                    PolicyRuleAction::Allow => "allow",
-                    PolicyRuleAction::Deny => "deny",
-                    PolicyRuleAction::Delegate => "delegate",
-                };
-                (Some(action), m.pattern.as_deref(), m.description.as_deref())
-            }
-            None => (None, None, None),
-        };
-
-        let method = ctx.method.unwrap_or_default();
-        let client_ip = ctx.client_ip.unwrap_or_default();
-        emit_policy_event(
-            level,
-            ctx.request_id,
-            allowed,
-            ctx.url,
-            method,
-            client_ip,
-            rule_action,
-            rule_pattern,
-            rule_description,
-            None,
-        );
-    }
-
-    pub fn log_policy_upgrade_denied<'a>(&self, ctx: PolicyDecisionLogContext<'a>) {
-        if !self.policy_decisions.log_denies {
-            return;
-        }
-
-        let (rule_action, rule_pattern, rule_description) = match ctx.decision.matched.as_ref() {
-            Some(m) => {
-                let action = match m.action {
-                    PolicyRuleAction::Allow => "allow",
-                    PolicyRuleAction::Deny => "deny",
-                    PolicyRuleAction::Delegate => "delegate",
-                };
-                (Some(action), m.pattern.as_deref(), m.description.as_deref())
-            }
-            None => (None, None, None),
-        };
-
-        let method = ctx.method.unwrap_or_default();
-        let client_ip = ctx.client_ip.unwrap_or_default();
-        emit_policy_event(
-            self.policy_decisions.level_denies,
-            ctx.request_id,
-            false,
-            ctx.url,
-            method,
-            client_ip,
-            rule_action,
-            rule_pattern,
-            rule_description,
-            Some("http_upgrade_blocked"),
-        );
+fn tracing_level(level: CompiledLogLevel) -> Level {
+    match level {
+        CompiledLogLevel::Trace => Level::TRACE,
+        CompiledLogLevel::Debug => Level::DEBUG,
+        CompiledLogLevel::Info => Level::INFO,
+        CompiledLogLevel::Warn => Level::WARN,
+        CompiledLogLevel::Error => Level::ERROR,
     }
 }
 
@@ -472,147 +339,11 @@ impl Write for RotatingFileWriter {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct PolicyDecisionLogContext<'a> {
-    pub request_id: &'a str,
-    pub url: &'a str,
-    pub method: Option<&'a str>,
-    pub client_ip: Option<&'a str>,
-    pub decision: &'a PolicyDecision,
-}
-
-impl PolicyDecisionLogging {
-    pub fn from_config(cfg: &LoggingPolicyDecisionsConfig) -> Result<Self, LoggingError> {
-        let level_allows =
-            parse_level(&cfg.level_allows).map_err(|value| LoggingError::InvalidLevel {
-                field: "logging.policy_decisions.level_allows",
-                value,
-            })?;
-
-        let level_denies =
-            parse_level(&cfg.level_denies).map_err(|value| LoggingError::InvalidLevel {
-                field: "logging.policy_decisions.level_denies",
-                value,
-            })?;
-
-        Ok(PolicyDecisionLogging {
-            log_allows: cfg.log_allows,
-            log_denies: cfg.log_denies,
-            level_allows,
-            level_denies,
-        })
-    }
-}
-
-fn parse_level(value: &str) -> Result<Level, String> {
-    let upper = value.trim().to_ascii_uppercase();
-    upper.parse::<Level>().map_err(|_| value.to_string())
-}
-
-fn emit_policy_event(
-    level: Level,
-    request_id: &str,
-    allowed: bool,
-    url: &str,
-    method: &str,
-    client_ip: &str,
-    rule_action: Option<&str>,
-    rule_pattern: Option<&str>,
-    rule_description: Option<&str>,
-    reason: Option<&str>,
-) {
-    let safe_url = redact_url_for_sink(url);
-    let url = safe_url.as_str();
-
-    match level {
-        Level::TRACE => tracing::event!(
-            target: "acl_proxy::policy",
-            Level::TRACE,
-            request_id,
-            allowed,
-            url,
-            method,
-            client_ip,
-            rule_action,
-            rule_pattern,
-            rule_description,
-            reason,
-            "policy decision"
-        ),
-        Level::DEBUG => tracing::event!(
-            target: "acl_proxy::policy",
-            Level::DEBUG,
-            request_id,
-            allowed,
-            url,
-            method,
-            client_ip,
-            rule_action,
-            rule_pattern,
-            rule_description,
-            reason,
-            "policy decision"
-        ),
-        Level::INFO => tracing::event!(
-            target: "acl_proxy::policy",
-            Level::INFO,
-            request_id,
-            allowed,
-            url,
-            method,
-            client_ip,
-            rule_action,
-            rule_pattern,
-            rule_description,
-            reason,
-            "policy decision"
-        ),
-        Level::WARN => tracing::event!(
-            target: "acl_proxy::policy",
-            Level::WARN,
-            request_id,
-            allowed,
-            url,
-            method,
-            client_ip,
-            rule_action,
-            rule_pattern,
-            rule_description,
-            reason,
-            "policy decision"
-        ),
-        Level::ERROR => tracing::event!(
-            target: "acl_proxy::policy",
-            Level::ERROR,
-            request_id,
-            allowed,
-            url,
-            method,
-            client_ip,
-            rule_action,
-            rule_pattern,
-            rule_description,
-            reason,
-            "policy decision"
-        ),
-    }
-}
-
-impl fmt::Display for PolicyDecisionLogging {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "allows={}, denies={}, level_allows={:?}, level_denies={:?}",
-            self.log_allows, self.log_denies, self.level_allows, self.level_denies
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::LoggingPolicyDecisionsConfig;
     use std::io::Write;
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
     #[cfg(unix)]
@@ -627,30 +358,9 @@ mod tests {
     }
 
     #[test]
-    fn logging_settings_parses_levels() {
-        let cfg = LoggingConfig {
-            directory: Some(PathBuf::from("logs")),
-            level: "debug".to_string(),
-            max_bytes: 104_857_600,
-            max_files: 5,
-            console: true,
-            policy_decisions: LoggingPolicyDecisionsConfig {
-                log_allows: true,
-                log_denies: true,
-                level_allows: "info".to_string(),
-                level_denies: "warn".to_string(),
-            },
-        };
-
-        let settings = LoggingSettings::from_config(&cfg).expect("parse logging config");
-        assert_eq!(settings.level, Level::DEBUG);
-        assert_eq!(settings.policy_decisions.level_allows, Level::INFO);
-        assert_eq!(settings.policy_decisions.level_denies, Level::WARN);
-    }
-
-    #[test]
-    fn strict_static_logging_admits_reloadable_observation_levels() {
+    fn strict_static_logging_copies_process_lifetime_sink_settings() {
         let cfg = StaticLoggingConfig {
+            level: CompiledLogLevel::Warn,
             directory: Some(PathBuf::from("strict-logs")),
             max_bytes: 4096,
             max_files: 3,
@@ -658,59 +368,49 @@ mod tests {
         };
 
         let settings = LoggingSettings::from_static_config(&cfg);
-        assert_eq!(settings.level, Level::TRACE);
+        assert_eq!(settings.level, Level::WARN);
         assert_eq!(settings.directory, cfg.directory);
         assert_eq!(settings.max_bytes, 4096);
         assert_eq!(settings.max_files, 3);
         assert!(!settings.console);
     }
 
-    #[test]
-    fn invalid_base_level_fails() {
-        let cfg = LoggingConfig {
-            directory: Some(PathBuf::from("logs")),
-            level: "notalevel".to_string(),
-            max_bytes: 104_857_600,
-            max_files: 5,
-            console: true,
-            policy_decisions: LoggingPolicyDecisionsConfig::default(),
-        };
+    struct RecordingSink {
+        bytes: Arc<Mutex<Vec<u8>>>,
+        flushed: Arc<AtomicBool>,
+    }
 
-        let err = LoggingSettings::from_config(&cfg).expect_err("should fail");
-        let msg = format!("{err}");
-        assert!(msg.contains("invalid log level"), "unexpected error: {msg}");
+    impl Write for RecordingSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.bytes.lock().expect("lock recording sink").extend(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flushed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
     }
 
     #[test]
-    fn invalid_max_bytes_fails_when_directory_set() {
-        let cfg = LoggingConfig {
-            directory: Some(PathBuf::from("logs")),
-            level: "info".to_string(),
-            max_bytes: 0,
-            max_files: 5,
-            console: true,
-            policy_decisions: LoggingPolicyDecisionsConfig::default(),
+    fn non_blocking_guard_drains_accepted_lines_and_flushes() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let flushed = Arc::new(AtomicBool::new(false));
+        let sink = RecordingSink {
+            bytes: Arc::clone(&bytes),
+            flushed: Arc::clone(&flushed),
         };
+        let (mut writer, guard) = NonBlockingWriter::new(Box::new(sink));
 
-        let err = LoggingSettings::from_config(&cfg).expect_err("should fail");
-        let msg = format!("{err}");
-        assert!(msg.contains("logging.max_bytes"), "unexpected error: {msg}");
-    }
+        writer.write_all(b"first\n").expect("enqueue first line");
+        writer.write_all(b"second\n").expect("enqueue second line");
+        drop(guard);
 
-    #[test]
-    fn invalid_max_files_fails_when_directory_set() {
-        let cfg = LoggingConfig {
-            directory: Some(PathBuf::from("logs")),
-            level: "info".to_string(),
-            max_bytes: 1024,
-            max_files: 0,
-            console: true,
-            policy_decisions: LoggingPolicyDecisionsConfig::default(),
-        };
-
-        let err = LoggingSettings::from_config(&cfg).expect_err("should fail");
-        let msg = format!("{err}");
-        assert!(msg.contains("logging.max_files"), "unexpected error: {msg}");
+        assert_eq!(
+            bytes.lock().expect("lock recorded bytes").as_slice(),
+            b"first\nsecond\n"
+        );
+        assert!(flushed.load(Ordering::SeqCst));
     }
 
     #[test]

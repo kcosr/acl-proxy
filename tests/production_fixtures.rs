@@ -55,7 +55,7 @@ fn strings<'a>(value: &'a TomlValue, key: &str) -> Vec<&'a str> {
 #[test]
 fn sanitized_production_role_structure_matches_difference_record() {
     let expectations = [
-        ("host-proxy.toml", 44, 133, 21, 2, 3),
+        ("host-proxy.toml", 45, 134, 22, 2, 4),
         ("common-container-proxy.toml", 1, 1, 0, 0, 0),
         ("internal-container-proxy.toml", 8, 12, 1, 0, 0),
     ];
@@ -141,7 +141,7 @@ fn sanitized_production_role_structure_matches_difference_record() {
             *counts.entry(decision).or_insert(0usize) += 1;
             counts
         });
-    assert_eq!(decisions.get("allow"), Some(&36));
+    assert_eq!(decisions.get("allow"), Some(&37));
     assert_eq!(decisions.get("deny"), Some(&7));
     assert_eq!(decisions.get("delegate"), Some(&1));
 

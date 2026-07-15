@@ -30,6 +30,7 @@ use crate::config::compiler::{ProviderOutputPlan, MAX_PROVIDER_CREDENTIAL_BYTES}
 use crate::safety::wire_body::GuardedScratch;
 use crate::safety::{GuardedBody, HttpWireBodyGuard};
 
+#[cfg(test)]
 const PROVIDER_STREAM_SCRATCH_BYTES: usize = 64 * 1024;
 static NEXT_OUTPUT_REGISTRY_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -131,6 +132,7 @@ impl ProviderOutputRegistry {
         self.by_wire_name.get(wire_name).copied()
     }
 
+    #[cfg(test)]
     pub(crate) fn definition(
         &self,
         index: ProviderOutputIndex,
@@ -429,27 +431,22 @@ impl ProviderCredentialSet {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn contiguous(&self, index: ProviderOutputIndex) -> Option<&[u8]> {
-        #[cfg(not(test))]
-        let _ = index;
-        #[cfg(test)]
-        {
-            let Self::Contiguous(credentials) = self else {
-                return None;
-            };
-            if index.registry_id != credentials.registry_id {
-                return None;
-            }
-            credentials
-                .values
-                .get(index.get())
-                .and_then(Option::as_ref)
-                .map(SecretBytes::as_bytes)
+        let Self::Contiguous(credentials) = self else {
+            return None;
+        };
+        if index.registry_id != credentials.registry_id {
+            return None;
         }
-        #[cfg(not(test))]
-        None
+        credentials
+            .values
+            .get(index.get())
+            .and_then(Option::as_ref)
+            .map(SecretBytes::as_bytes)
     }
 
+    #[cfg(test)]
     pub(crate) fn segmented(
         &self,
         index: ProviderOutputIndex,
@@ -628,10 +625,12 @@ impl ProviderBodyReplacement {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn content_type(&self) -> Option<&str> {
         self.content_type.as_deref()
     }
 
+    #[cfg(test)]
     pub(crate) fn content_encoding(&self) -> Option<&str> {
         self.content_encoding.as_deref()
     }
@@ -841,6 +840,7 @@ pub(crate) enum AssignedResponseError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) enum UnassignableResponseError {
     MalformedJson,
     MissingId,
@@ -1323,6 +1323,7 @@ impl ProviderResponseContinuation {
         &self.id
     }
 
+    #[cfg(test)]
     pub(crate) fn consumed_bytes(&self) -> usize {
         self.consumed_bytes
     }

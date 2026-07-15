@@ -222,7 +222,7 @@ fn require_connect_mitm_asset(
 enum RequestAuthority {
     Explicit,
     TransparentHttp,
-    ConnectInner(CanonicalConnectTarget),
+    ConnectInner(Box<CanonicalConnectTarget>),
     TransparentHttps {
         destination_port: u16,
         sni: Arc<str>,
@@ -345,6 +345,14 @@ struct SupervisorTaskState {
     terminal: Option<Result<(), Arc<ProxySupervisorFailure>>>,
 }
 
+#[derive(Clone)]
+struct IngressRuntime {
+    runtime: Arc<Runtime>,
+    observation: Arc<ProductObservationRuntime>,
+    upgrade: Arc<UpgradeRuntime>,
+    assets: Arc<ProductIngressAssets>,
+}
+
 impl ProductIngressSupervisor {
     fn start(
         config: IngressListenerConfig,
@@ -378,10 +386,12 @@ impl ProductIngressSupervisor {
         let listener_task = executor.spawn(run_listener(
             config,
             listener,
-            runtime,
-            observation_runtime,
-            upgrade_runtime,
-            assets,
+            IngressRuntime {
+                runtime,
+                observation: observation_runtime,
+                upgrade: upgrade_runtime,
+                assets,
+            },
             quota_classifier,
             stop_rx,
         ));
@@ -484,13 +494,16 @@ fn start_error(
 async fn run_listener(
     config: IngressListenerConfig,
     listener: TcpListener,
-    runtime: Arc<Runtime>,
-    observation_runtime: Arc<ProductObservationRuntime>,
-    upgrade_runtime: Arc<UpgradeRuntime>,
-    assets: Arc<ProductIngressAssets>,
+    ingress: IngressRuntime,
     quota_classifier: LocalQuotaClassifier,
     mut stop: watch::Receiver<SupervisorStop>,
 ) -> Result<(), Arc<ProxySupervisorFailure>> {
+    let IngressRuntime {
+        runtime,
+        observation: observation_runtime,
+        upgrade: upgrade_runtime,
+        assets,
+    } = ingress;
     let kind = config.kind;
     let connection_slots = Arc::new(Semaphore::new(config.max_connections));
     let (refresh_stop, refresh_stop_rx) = watch::channel(false);
@@ -614,20 +627,22 @@ async fn run_listener(
         let connection_stop = stop.clone();
         let connection_tunnels = tunnel_tx.clone();
         connections.spawn(async move {
-            serve_connection(
+            serve_connection(AcceptedConnection {
                 kind,
-                connection_config,
+                config: connection_config,
                 stream,
                 peer,
                 quota_key,
-                runtime,
-                observation_runtime,
-                upgrade_runtime,
-                assets,
-                connection_stop,
-                connection_tunnels,
-                permit,
-            )
+                ingress: IngressRuntime {
+                    runtime,
+                    observation: observation_runtime,
+                    upgrade: upgrade_runtime,
+                    assets,
+                },
+                supervisor_stop: connection_stop,
+                tunnel_tx: connection_tunnels,
+                admission: permit,
+            })
             .await;
         });
     }
@@ -774,21 +789,30 @@ fn classify_accept_error(error: &io::Error) -> AcceptErrorAction {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn serve_connection(
+struct AcceptedConnection {
     kind: ProxyListenerKind,
     config: IngressListenerConfig,
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
     quota_key: WireBodyQuotaKey,
-    runtime: Arc<Runtime>,
-    observation_runtime: Arc<ProductObservationRuntime>,
-    upgrade_runtime: Arc<UpgradeRuntime>,
-    assets: Arc<ProductIngressAssets>,
-    mut supervisor_stop: watch::Receiver<SupervisorStop>,
+    ingress: IngressRuntime,
+    supervisor_stop: watch::Receiver<SupervisorStop>,
     tunnel_tx: mpsc::Sender<ConnectTunnelPlan>,
     admission: OwnedSemaphorePermit,
-) {
+}
+
+async fn serve_connection(connection: AcceptedConnection) {
+    let AcceptedConnection {
+        kind,
+        config,
+        stream,
+        peer,
+        quota_key,
+        ingress,
+        mut supervisor_stop,
+        tunnel_tx,
+        admission,
+    } = connection;
     let Some((stream, versions, authority)) = prepare_ingress_transport(
         &config.transport,
         config.authority,
@@ -801,42 +825,56 @@ async fn serve_connection(
         return;
     };
     let admission = Arc::new(StdMutex::new(Some(admission)));
-    serve_http_connection(
+    serve_http_connection(HttpConnection {
         kind,
-        &config,
+        config,
         stream,
         versions,
         authority,
         peer,
         quota_key,
-        runtime,
-        observation_runtime,
-        upgrade_runtime,
-        assets,
-        &mut supervisor_stop,
+        ingress,
+        supervisor_stop,
         tunnel_tx,
-        Some(admission),
-    )
+        admission: Some(admission),
+    })
     .await;
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn serve_http_connection(
+struct HttpConnection {
     kind: ProxyListenerKind,
-    config: &IngressListenerConfig,
+    config: IngressListenerConfig,
     stream: BoxedIngressIo,
     versions: Vec<CompiledHttpVersion>,
     authority: RequestAuthority,
     peer: SocketAddr,
     quota_key: WireBodyQuotaKey,
-    runtime: Arc<Runtime>,
-    observation_runtime: Arc<ProductObservationRuntime>,
-    upgrade_runtime: Arc<UpgradeRuntime>,
-    assets: Arc<ProductIngressAssets>,
-    supervisor_stop: &mut watch::Receiver<SupervisorStop>,
+    ingress: IngressRuntime,
+    supervisor_stop: watch::Receiver<SupervisorStop>,
     tunnel_tx: mpsc::Sender<ConnectTunnelPlan>,
     admission: Option<Arc<StdMutex<Option<OwnedSemaphorePermit>>>>,
-) {
+}
+
+async fn serve_http_connection(connection: HttpConnection) {
+    let HttpConnection {
+        kind,
+        config,
+        stream,
+        versions,
+        authority,
+        peer,
+        quota_key,
+        ingress:
+            IngressRuntime {
+                runtime,
+                observation: observation_runtime,
+                upgrade: upgrade_runtime,
+                assets,
+            },
+        mut supervisor_stop,
+        tunnel_tx,
+        admission,
+    } = connection;
     let close = Arc::new(ConnectionClose::default());
     let service_close = close.clone();
     let service_config = config.clone();
@@ -860,29 +898,35 @@ async fn serve_http_connection(
                 && matches!(&authority, RequestAuthority::Explicit)
             {
                 execute_connect_request(
-                    config,
-                    peer,
-                    quota_key,
-                    runtime,
-                    observation_runtime,
-                    upgrade_runtime,
-                    assets,
+                    ConnectRequestExecution {
+                        config,
+                        peer,
+                        quota_key,
+                        ingress: IngressRuntime {
+                            runtime,
+                            observation: observation_runtime,
+                            upgrade: upgrade_runtime,
+                            assets,
+                        },
+                        tunnel_tx,
+                        admission: admission.expect("an outer explicit connection owns admission"),
+                        tunnel_stop,
+                    },
                     request,
                     downstream_upgrade,
-                    tunnel_tx,
-                    admission.expect("an outer explicit connection owns admission"),
-                    tunnel_stop,
                 )
                 .await
             } else {
                 execute_request(
-                    authority,
-                    peer,
-                    quota_key,
-                    runtime,
-                    observation_runtime,
-                    upgrade_runtime,
-                    assets,
+                    RequestExecution {
+                        authority,
+                        peer,
+                        quota_key,
+                        runtime,
+                        observation_runtime,
+                        upgrade_runtime,
+                        assets,
+                    },
                     request,
                     downstream_upgrade,
                 )
@@ -929,7 +973,7 @@ async fn serve_http_connection(
             connection.as_mut().graceful_shutdown();
             connection.await
         }
-        _ = wait_for_supervisor_stop(supervisor_stop) => {
+        _ = wait_for_supervisor_stop(&mut supervisor_stop) => {
             connection.as_mut().graceful_shutdown();
             connection.await
         }
@@ -1173,41 +1217,58 @@ impl ConnectTunnelPlan {
             return;
         };
         self.config.connect = None;
-        serve_http_connection(
-            self.kind,
-            &self.config,
-            Box::new(tls),
-            vec![selected],
-            RequestAuthority::ConnectInner(self.target),
-            self.peer,
-            self.quota_key,
-            self.runtime,
-            self.observation_runtime,
-            self.upgrade_runtime,
-            self.assets,
-            &mut self.stop,
-            self.tunnel_tx,
-            None,
-        )
+        serve_http_connection(HttpConnection {
+            kind: self.kind,
+            config: self.config,
+            stream: Box::new(tls),
+            versions: vec![selected],
+            authority: RequestAuthority::ConnectInner(Box::new(self.target)),
+            peer: self.peer,
+            quota_key: self.quota_key,
+            ingress: IngressRuntime {
+                runtime: self.runtime,
+                observation: self.observation_runtime,
+                upgrade: self.upgrade_runtime,
+                assets: self.assets,
+            },
+            supervisor_stop: self.stop,
+            tunnel_tx: self.tunnel_tx,
+            admission: None,
+        })
         .await;
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn execute_connect_request(
+struct ConnectRequestExecution {
     config: IngressListenerConfig,
     peer: SocketAddr,
     quota_key: WireBodyQuotaKey,
-    runtime: Arc<Runtime>,
-    observation_runtime: Arc<ProductObservationRuntime>,
-    upgrade_runtime: Arc<UpgradeRuntime>,
-    assets: Arc<ProductIngressAssets>,
-    mut request: Request<Body>,
-    downstream_upgrade: hyper::upgrade::OnUpgrade,
+    ingress: IngressRuntime,
     tunnel_tx: mpsc::Sender<ConnectTunnelPlan>,
     admission: Arc<StdMutex<Option<OwnedSemaphorePermit>>>,
     tunnel_stop: watch::Receiver<SupervisorStop>,
+}
+
+async fn execute_connect_request(
+    execution: ConnectRequestExecution,
+    mut request: Request<Body>,
+    downstream_upgrade: hyper::upgrade::OnUpgrade,
 ) -> HandledResponse {
+    let ConnectRequestExecution {
+        config,
+        peer,
+        quota_key,
+        ingress:
+            IngressRuntime {
+                runtime,
+                observation: observation_runtime,
+                upgrade: upgrade_runtime,
+                assets,
+            },
+        tunnel_tx,
+        admission,
+        tunnel_stop,
+    } = execution;
     let policy = match request.version() {
         Version::HTTP_10 | Version::HTTP_11 => {
             config.connect.as_ref().and_then(|connect| connect.http1)
@@ -1797,10 +1858,9 @@ fn http_version(version: Version) -> &'static str {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn execute_authorized_upgrade(
-    upgrade_runtime: Arc<UpgradeRuntime>,
-    upgrade_capture: UpgradeCaptureContext,
+struct AuthorizedUpgradeExecution {
+    runtime: Arc<UpgradeRuntime>,
+    capture: UpgradeCaptureContext,
     binding: UpgradeBinding,
     request: SanitizedRequest<OriginRequestBody>,
     canonical: crate::url::CanonicalUrl,
@@ -1812,7 +1872,26 @@ async fn execute_authorized_upgrade(
     response_effects: Vec<HeaderEffectPlan>,
     request_headers: HeaderMap,
     protocol: HeaderValue,
+}
+
+async fn execute_authorized_upgrade(
+    execution: AuthorizedUpgradeExecution,
 ) -> Result<UpgradeHandshakeResponse, StatusCode> {
+    let AuthorizedUpgradeExecution {
+        runtime: upgrade_runtime,
+        capture: upgrade_capture,
+        binding,
+        request,
+        canonical,
+        resolved,
+        destinations,
+        retention,
+        downstream_upgrade,
+        deadline,
+        response_effects,
+        request_headers,
+        protocol,
+    } = execution;
     let (response_tx, response_rx) = oneshot::channel();
     let allocation = binding.allocation;
     let wire_redaction = binding.wire_redaction;
@@ -1872,7 +1951,7 @@ async fn execute_authorized_upgrade(
                         }
                     };
                     let terminal_control =
-                        UpgradeTerminalControl::new(|| std::future::pending::<()>(), |_| async {});
+                        UpgradeTerminalControl::new(std::future::pending::<()>, |_| async {});
                     let entry_plan =
                         UpgradeEntryPlan::new(terminal_control, move |snapshot| async move {
                             response_tx
@@ -1911,7 +1990,7 @@ async fn execute_authorized_upgrade(
     }
 }
 
-async fn execute_request(
+struct RequestExecution {
     authority: RequestAuthority,
     peer: SocketAddr,
     quota_key: WireBodyQuotaKey,
@@ -1919,9 +1998,22 @@ async fn execute_request(
     observation_runtime: Arc<ProductObservationRuntime>,
     upgrade_runtime: Arc<UpgradeRuntime>,
     assets: Arc<ProductIngressAssets>,
+}
+
+async fn execute_request(
+    execution: RequestExecution,
     mut request: Request<Body>,
     downstream_upgrade: hyper::upgrade::OnUpgrade,
 ) -> HandledResponse {
+    let RequestExecution {
+        authority,
+        peer,
+        quota_key,
+        runtime,
+        observation_runtime,
+        upgrade_runtime,
+        assets,
+    } = execution;
     let started_at = Instant::now();
     let request_id = request_id();
     let request_method = request.method().clone();
@@ -2236,21 +2328,21 @@ async fn execute_request(
         let upgrade_capture = capture.upgrade_capture_context(&target.url);
         drop(allowed);
         drop(lease);
-        let outcome = execute_authorized_upgrade(
-            upgrade_runtime,
-            upgrade_capture,
+        let outcome = execute_authorized_upgrade(AuthorizedUpgradeExecution {
+            runtime: upgrade_runtime,
+            capture: upgrade_capture,
             binding,
             request,
-            target.url.clone(),
+            canonical: target.url.clone(),
             resolved,
-            assets.destination_guard().clone(),
+            destinations: assets.destination_guard().clone(),
             retention,
             downstream_upgrade,
             deadline,
             response_effects,
             request_headers,
-            upgrade_protocol,
-        )
+            protocol: upgrade_protocol,
+        })
         .await;
         let outcome = match outcome {
             Ok(outcome) => outcome,
@@ -2331,13 +2423,14 @@ async fn execute_request(
     .await
     {
         Ok(Ok(response)) => response,
-        Ok(Err(_)) => {
+        Ok(Err(error)) => {
+            tracing::error!(error = ?error, "upstream request failed");
             return capture.fixed_response(
                 CaptureDecision::Allow,
                 StatusCode::BAD_GATEWAY,
                 "upstream failed\n",
                 true,
-            )
+            );
         }
         Err(_) => {
             return capture.fixed_response(
@@ -2702,13 +2795,16 @@ enum ProxyResponseBody {
     Local(Body),
     Forwarded {
         body: ForwardBody,
-        capture: Option<CaptureSubmission>,
+        capture: Option<Box<CaptureSubmission>>,
     },
 }
 
 impl ProxyResponseBody {
     fn forwarded(body: ForwardBody, capture: Option<CaptureSubmission>) -> Self {
-        Self::Forwarded { body, capture }
+        Self::Forwarded {
+            body,
+            capture: capture.map(Box::new),
+        }
     }
 }
 
@@ -2806,12 +2902,190 @@ impl HttpBody for ProxyResponseBody {
 
 #[cfg(test)]
 // Full parent-hop topology tests live separately from the focused ingress unit suite.
-#[path = "ingress_parent_tests.rs"]
-mod parent_tests;
+mod parent_tests {
+    include!("ingress_parent_tests.rs");
+
+    #[tokio::test]
+    async fn unprotected_websocket_relays_through_https_acl_proxy_parent() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let root = tempdir().unwrap();
+        let origin_directory = root.path().join("origin");
+        let parent_directory = root.path().join("parent");
+        let child_directory = root.path().join("child");
+        fs::create_dir_all(&origin_directory).unwrap();
+        fs::create_dir_all(&parent_directory).unwrap();
+        fs::create_dir_all(&child_directory).unwrap();
+
+        let origin_identity = write_identity(&origin_directory, "origin", ORIGIN_HOST);
+        let parent_identity = write_identity(&parent_directory, "parent", PARENT_HOST);
+        let (origin, websocket_origin) = spawn_websocket_origin(&origin_identity).await;
+        let (parent, parent_listener) = prebound_listener();
+        let parent_product = start_product(
+            &parent_directory,
+            parent_config(
+                parent,
+                &parent_identity,
+                origin,
+                &origin_identity.certificate_path,
+            ),
+            parent_listener,
+        )
+        .await;
+        let parent_mitm_ca = parent_directory.join("mitm/ca-cert.pem");
+        let (child, child_listener) = prebound_listener();
+        let child_configuration = child_config(
+            child,
+            parent,
+            &parent_identity,
+            &parent_mitm_ca,
+            origin,
+            false,
+        )
+        .replace("allow_upgrades = false", "allow_upgrades = true");
+        let child_product = start_child_product(
+            &child_directory,
+            child_configuration,
+            child_listener,
+            parent,
+            origin,
+        )
+        .await;
+
+        let connector = tls_connector(&child_directory.join("mitm/ca-cert.pem"));
+        let stream = tokio::net::TcpStream::connect(child).await.unwrap();
+        let mut stream = connector
+            .connect(ServerName::try_from(ORIGIN_HOST).unwrap(), stream)
+            .await
+            .unwrap();
+        stream
+            .write_all(
+                format!(
+                    "GET /socket HTTP/1.1\r\nHost: {ORIGIN_HOST}:{}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGVzdC13ZWJzb2NrZXQta2V5\r\n\r\n",
+                    origin.port()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response = read_http_head(&mut stream).await;
+        assert!(
+            response.starts_with(b"HTTP/1.1 101 "),
+            "{}",
+            String::from_utf8_lossy(&response)
+        );
+        write_websocket_frame(&mut stream, 0x1, b"client password", true)
+            .await
+            .unwrap();
+        let reply = read_websocket_frame(&mut stream).await.unwrap();
+        let seen = websocket_origin.await.unwrap();
+        drop(stream);
+
+        child_product.shutdown().await;
+        parent_product.shutdown().await;
+        assert_eq!(seen.opcode, 0x1);
+        assert_eq!(seen.payload, b"client password");
+        assert_eq!(reply.opcode, 0x1);
+        assert_eq!(reply.payload, b"server password");
+        assert!(child_product.shutdown_diagnostic().is_none());
+        assert!(parent_product.shutdown_diagnostic().is_none());
+    }
+}
 
 #[cfg(test)]
-#[path = "ingress_explicit_https_tests.rs"]
-mod explicit_https_tests;
+mod explicit_https_tests {
+    include!("ingress_explicit_https_tests.rs");
+
+    #[tokio::test]
+    async fn explicit_https_shutdown_closes_idle_keep_alive_connection() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let (listener_address, listener) = prebound_listener();
+        let origin = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin.accept().await.unwrap();
+            hyper::server::conn::Http::new()
+                .http1_only(true)
+                .serve_connection(
+                    stream,
+                    hyper::service::service_fn(|_request| async {
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(Body::from(
+                            "keep-alive response",
+                        )))
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let (identity, certificate) = test_tls_identity();
+        let config = strict_config(listener_address, "http1", origin_address, &identity);
+        let (_directory, product) = start_product(config, listener).await;
+        let connector = test_tls_connector(certificate, b"http/1.1");
+        let stream = tokio::net::TcpStream::connect(listener_address)
+            .await
+            .unwrap();
+        let mut stream = connector
+            .connect(ServerName::try_from("localhost").unwrap(), stream)
+            .await
+            .unwrap();
+        stream
+            .write_all(
+                format!(
+                    "GET http://{origin_address}/keep-alive HTTP/1.1\r\nHost: {origin_address}\r\nConnection: keep-alive\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let head = read_http_head(&mut stream).await;
+        assert!(head.starts_with(b"HTTP/1.1 200 "));
+        let content_length = String::from_utf8_lossy(&head)
+            .lines()
+            .find_map(|line| {
+                line.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+            })
+            .unwrap();
+        let mut body = vec![0; content_length];
+        stream.read_exact(&mut body).await.unwrap();
+        assert_eq!(body, b"keep-alive response");
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), product.shutdown())
+            .await
+            .expect("explicit HTTPS shutdown must join an idle keep-alive connection");
+        let mut byte = [0_u8; 1];
+        assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+        origin_task.await.unwrap();
+        assert!(StdTcpListener::bind(listener_address).is_ok());
+    }
+
+    #[tokio::test]
+    async fn explicit_https_shutdown_interrupts_stalled_client_hello() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let (listener_address, listener) = prebound_listener();
+        let origin_address = SocketAddr::from(([192, 0, 2, 10], 80));
+        let (identity, _certificate) = test_tls_identity();
+        let config = strict_config(listener_address, "http1", origin_address, &identity).replacen(
+            "http_versions = [\"http1\"]",
+            "http_versions = [\"http1\"]\nhandshake_timeout = \"1h\"",
+            1,
+        );
+        let (_directory, product) = start_product(config, listener).await;
+        let mut stalled = tokio::net::TcpStream::connect(listener_address)
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), product.shutdown())
+            .await
+            .expect("explicit HTTPS shutdown must interrupt a stalled ClientHello");
+        let mut byte = [0_u8; 1];
+        assert_eq!(stalled.read(&mut byte).await.unwrap(), 0);
+        assert!(StdTcpListener::bind(listener_address).is_ok());
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -3017,13 +3291,15 @@ mod tests {
         let peer = SocketAddr::from(([192, 0, 2, 44], 41_000));
         let downstream_upgrade = hyper::upgrade::on(&mut request);
         execute_request(
-            RequestAuthority::Explicit,
-            peer,
-            WireBodyQuotaKey::from_peer(peer.ip(), |_| false),
-            product.runtime().clone(),
-            product.observation_runtime().clone(),
-            product.upgrade_runtime(),
-            assets,
+            RequestExecution {
+                authority: RequestAuthority::Explicit,
+                peer,
+                quota_key: WireBodyQuotaKey::from_peer(peer.ip(), |_| false),
+                runtime: product.runtime().clone(),
+                observation_runtime: product.observation_runtime().clone(),
+                upgrade_runtime: product.upgrade_runtime(),
+                assets,
+            },
             request,
             downstream_upgrade,
         )
@@ -3088,6 +3364,65 @@ header = "x-test-loop"
             assert!(head.len() <= 32 * 1024, "HTTP head exceeded the test bound");
         }
         head
+    }
+
+    #[derive(Debug)]
+    struct TestWebSocketFrame {
+        fin: bool,
+        opcode: u8,
+        payload: Vec<u8>,
+    }
+
+    fn websocket_frame(fin: bool, opcode: u8, payload: &[u8], masked: bool) -> Vec<u8> {
+        assert!(payload.len() < 126, "test WebSocket payload is too large");
+        let mut frame = vec![(u8::from(fin) << 7) | opcode];
+        frame.push((u8::from(masked) << 7) | payload.len() as u8);
+        if masked {
+            let mask = [0x11, 0x22, 0x33, 0x44];
+            frame.extend_from_slice(&mask);
+            frame.extend(
+                payload
+                    .iter()
+                    .enumerate()
+                    .map(|(index, byte)| byte ^ mask[index % mask.len()]),
+            );
+        } else {
+            frame.extend_from_slice(payload);
+        }
+        frame
+    }
+
+    async fn read_websocket_frame(
+        stream: &mut (impl AsyncRead + Unpin),
+    ) -> io::Result<TestWebSocketFrame> {
+        let mut header = [0_u8; 2];
+        stream.read_exact(&mut header).await?;
+        let fin = header[0] & 0x80 != 0;
+        let opcode = header[0] & 0x0f;
+        let masked = header[1] & 0x80 != 0;
+        let length = usize::from(header[1] & 0x7f);
+        if length >= 126 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "extended WebSocket payload is unsupported in this test",
+            ));
+        }
+        let mut mask = [0_u8; 4];
+        if masked {
+            stream.read_exact(&mut mask).await?;
+        }
+        let mut payload = vec![0_u8; length];
+        stream.read_exact(&mut payload).await?;
+        if masked {
+            for (index, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask[index % mask.len()];
+            }
+        }
+        Ok(TestWebSocketFrame {
+            fin,
+            opcode,
+            payload,
+        })
     }
 
     fn test_tls_identity() -> (tempfile::TempDir, Vec<u8>) {
@@ -3600,7 +3935,7 @@ replace = "xx"
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn active_executor_capture_omits_provider_replacement_bytes() {
+    async fn capture_profile_redacts_all_denial_paths() {
         use std::os::unix::fs::PermissionsExt;
 
         let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
@@ -3689,7 +4024,7 @@ default = "deny"
 [[policy.rules]]
 id = "replacement"
 decision = "delegate"
-urls = ["http://{origin}/replacement"]
+urls = ["http://{origin}/replacement", "http://{origin}/loop"]
 methods = ["POST"]
 authorization_provider = "replacing"
 redaction_profile = "wire"
@@ -3697,14 +4032,17 @@ redaction_profile = "wire"
 [[policy.rules]]
 id = "complete-denied"
 decision = "delegate"
-urls = ["http://{origin}/complete-denied"]
+urls = ["http://{origin}/complete-denied", "http://{origin}/too-large"]
 methods = ["POST"]
 authorization_provider = "replacing"
 redaction_profile = "wire"
 
 {}"#,
             provider_path.display(),
-            capture_config(),
+            capture_config().replace(
+                "literals = [\"capture-redaction-sentinel\"]",
+                "literals = [\"capture-redaction-sentinel\", \"denied\", \"invalid\"]",
+            ),
         );
         let (directory, product) =
             product(base_config(proxy, "explicit_http", &policy), listeners).await;
@@ -3726,11 +4064,82 @@ redaction_profile = "wire"
             Request::builder()
                 .method(http::Method::POST)
                 .uri(format!("http://{origin}/complete-denied"))
-                .body(Body::from("denied complete body"))
+                .body(Body::from(
+                    "capture-redaction-sentinel complete original body",
+                ))
                 .unwrap(),
         )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        let default_denied = send_request(
+            proxy,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri(format!("http://{origin}/default-denied"))
+                .body(Body::from("capture-redaction-sentinel unread default body"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(default_denied.status(), StatusCode::FORBIDDEN);
+
+        let loop_denied = send_request(
+            proxy,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri(format!("http://{origin}/loop"))
+                .header("x-test-loop", "already-seen")
+                .body(Body::from("capture-redaction-sentinel unread loop body"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(loop_denied.status(), StatusCode::FORBIDDEN);
+
+        let limit_denied = send_request(
+            proxy,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri(format!("http://{origin}/too-large"))
+                .body(Body::from(vec![b'x'; 256]))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(limit_denied.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let destination_denied = send_request(
+            proxy,
+            Request::builder()
+                .uri(format!("http://{proxy}/destination-denied"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(destination_denied.status(), StatusCode::FORBIDDEN);
+
+        let authority_denied = send_request(
+            proxy,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri(format!("http://{origin}/authority-denied"))
+                .header(http::header::HOST, "example.invalid")
+                .body(Body::from(
+                    "capture-redaction-sentinel unread authority body",
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(authority_denied.status(), StatusCode::BAD_REQUEST);
+
+        let invalid_url_denied = send_request(
+            proxy,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri(format!("http://user@{origin}/invalid-url"))
+                .body(Body::from("capture-redaction-sentinel unread URL body"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(invalid_url_denied.status(), StatusCode::BAD_REQUEST);
         product.shutdown().await;
         origin_task.await.unwrap();
 
@@ -3759,11 +4168,258 @@ redaction_profile = "wire"
             })
             .unwrap();
         assert_eq!(denied.decision, CaptureDecision::Deny);
-        assert_eq!(denied.decode_body_bytes().unwrap(), b"denied complete body");
+        assert_eq!(
+            denied.decode_body_bytes().unwrap(),
+            b"[MASKED] complete original body"
+        );
+        assert!(!denied
+            .decode_body_bytes()
+            .unwrap()
+            .windows(b"capture-redaction-sentinel".len())
+            .any(|window| window == b"capture-redaction-sentinel"));
+
+        for path in [
+            "/default-denied",
+            "/loop",
+            "/too-large",
+            "/destination-denied",
+        ] {
+            let request = records
+                .iter()
+                .find(|record| record.kind == CaptureKind::Request && record.url.ends_with(path))
+                .unwrap_or_else(|| panic!("missing request capture for {path}"));
+            assert_eq!(request.decision, CaptureDecision::Deny);
+            assert!(
+                request.body.is_none(),
+                "an unread denial body must not be drained for capture: {path}"
+            );
+
+            let response = records
+                .iter()
+                .find(|record| record.kind == CaptureKind::Response && record.url.ends_with(path))
+                .unwrap_or_else(|| panic!("missing response capture for {path}"));
+            assert_eq!(response.decision, CaptureDecision::Deny);
+            let response_body = response.decode_body_bytes().unwrap();
+            assert!(response_body
+                .windows(b"[MASKED]".len())
+                .any(|window| window == b"[MASKED]"));
+            assert!(!response_body
+                .windows(b"denied".len())
+                .any(|window| window == b"denied"));
+        }
+
+        let pre_policy_records = records
+            .iter()
+            .filter(|record| record.url.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            pre_policy_records.len(),
+            4,
+            "URL and authority denials must each capture request and response metadata"
+        );
+        for record in pre_policy_records {
+            assert_eq!(record.decision, CaptureDecision::Deny);
+            match record.kind {
+                CaptureKind::Request => assert!(record.body.is_none()),
+                CaptureKind::Response => {
+                    assert_eq!(record.status_code, Some(StatusCode::BAD_REQUEST.as_u16()));
+                    assert_eq!(
+                        record.decode_body_bytes().unwrap(),
+                        b"[MASKED] request target\n"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
-    async fn proxy_egress_cannot_target_self_or_control_plane() {
+    async fn capture_only_decoding_preserves_upstream_content_coding() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let (captured_tx, captured_rx) = oneshot::channel();
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin_listener.accept().await.unwrap();
+            let captured_tx = Arc::new(StdMutex::new(Some(captured_tx)));
+            Http::new()
+                .http1_only(true)
+                .serve_connection(
+                    stream,
+                    service_fn(move |request: Request<Body>| {
+                        let captured_tx = captured_tx.clone();
+                        async move {
+                            let (parts, body) = request.into_parts();
+                            let body = to_bytes(body).await.unwrap();
+                            captured_tx
+                                .lock()
+                                .unwrap()
+                                .take()
+                                .unwrap()
+                                .send((parts.headers, body))
+                                .ok();
+                            Ok::<_, Infallible>(Response::new(Body::from("accepted")))
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let policy = format!(
+            r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "capture-only"
+decision = "allow"
+urls = ["http://{origin}/compressed"]
+methods = ["POST"]
+
+{}"#,
+            capture_config()
+        );
+        let (directory, product) =
+            product(base_config(proxy, "explicit_http", &policy), listeners).await;
+        let plain = b"opaque capture-redaction-sentinel payload";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(plain).unwrap();
+        let encoded = encoder.finish().unwrap();
+        let response = send_request(
+            proxy,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri(format!("http://{origin}/compressed"))
+                .header(CONTENT_TYPE, "application/json")
+                .header(CONTENT_ENCODING, "gzip")
+                .header(CONTENT_LENGTH, encoded.len().to_string())
+                .body(Body::from(encoded.clone()))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(to_bytes(response.into_body()).await.unwrap(), "accepted");
+        let (origin_headers, origin_body) = captured_rx.await.unwrap();
+        assert_eq!(origin_body, encoded);
+        assert_eq!(origin_headers[CONTENT_ENCODING], "gzip");
+        assert_eq!(
+            origin_headers[CONTENT_LENGTH],
+            origin_body.len().to_string()
+        );
+
+        product.shutdown().await;
+        origin_task.await.unwrap();
+        let records = read_capture_records(directory.path());
+        let request = records
+            .iter()
+            .find(|record| record.kind == CaptureKind::Request)
+            .unwrap();
+        assert_eq!(
+            request.decode_body_bytes().unwrap(),
+            b"opaque [MASKED] payload"
+        );
+        assert_eq!(
+            request.body.as_ref().unwrap().content_encoding.as_deref(),
+            Some("identity")
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_redaction_failure_is_observation_only() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let (captured_tx, captured_rx) = oneshot::channel();
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin_listener.accept().await.unwrap();
+            let captured_tx = Arc::new(StdMutex::new(Some(captured_tx)));
+            Http::new()
+                .http1_only(true)
+                .serve_connection(
+                    stream,
+                    service_fn(move |request: Request<Body>| {
+                        let captured_tx = captured_tx.clone();
+                        async move {
+                            let body = to_bytes(request.into_body()).await.unwrap();
+                            captured_tx.lock().unwrap().take().unwrap().send(body).ok();
+                            Ok::<_, Infallible>(Response::new(Body::from("accepted")))
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let policy = format!(
+            r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[redaction.profiles.capture_failure]
+replacement = "replacement-exceeds-limit"
+max_body_bytes = 8
+max_decoded_body_bytes = 8
+rules = [{{ literals = ["secret"], payloads = "text" }}]
+
+[observation.capture]
+events = ["request.allowed", "response.allowed"]
+redaction_profile = "capture_failure"
+directory = "captures"
+max_body_bytes = 8
+max_inflight_body_bytes = 134217728
+max_pending_records = 8
+max_files = 8
+max_total_bytes = 1048576
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "capture-failure"
+decision = "allow"
+urls = ["http://{origin}/capture-failure"]
+methods = ["POST"]
+"#
+        );
+        let (directory, product) =
+            product(base_config(proxy, "explicit_http", &policy), listeners).await;
+        let response = send_request(
+            proxy,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri(format!("http://{origin}/capture-failure"))
+                .body(Body::from("secret"))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(to_bytes(response.into_body()).await.unwrap(), "accepted");
+        assert_eq!(captured_rx.await.unwrap(), "secret");
+
+        product.shutdown().await;
+        origin_task.await.unwrap();
+        let records = read_capture_records(directory.path());
+        let request = records
+            .iter()
+            .find(|record| record.kind == CaptureKind::Request)
+            .unwrap();
+        assert_eq!(request.decision, CaptureDecision::Allow);
+        assert!(request.body.is_none());
+        assert!(request.body_truncated.is_none());
+        let response = records
+            .iter()
+            .find(|record| record.kind == CaptureKind::Response)
+            .unwrap();
+        assert_eq!(response.decode_body_bytes().unwrap(), b"accepted");
+    }
+
+    #[tokio::test]
+    async fn proxy_listener_cannot_reach_control_callback() {
         let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
         let ([proxy, control], listeners) = prebound_listeners::<2>();
         let config = format!(
@@ -3813,6 +4469,23 @@ default = "allow"
         .await;
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        product.shutdown().await;
+        assert!(StdTcpListener::bind(proxy).is_ok());
+        assert!(StdTcpListener::bind(control).is_ok());
+    }
+
+    #[tokio::test]
+    async fn proxy_listener_cannot_reach_itself() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let policy = r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "allow"
+"#;
+        let (_directory, product) =
+            product(base_config(proxy, "explicit_http", policy), listeners).await;
         let response = send_request(
             proxy,
             Request::builder()
@@ -3821,10 +4494,10 @@ default = "allow"
                 .unwrap(),
         )
         .await;
+
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         product.shutdown().await;
         assert!(StdTcpListener::bind(proxy).is_ok());
-        assert!(StdTcpListener::bind(control).is_ok());
     }
 
     struct CapturedRoundTrip {
@@ -4014,6 +4687,210 @@ value = "policy"
             b"canonical decoded request bytes".len().to_string()
         );
         assert_eq!(captured.headers[CONTENT_TYPE], "application/octet-stream");
+    }
+
+    fn deterministic_telemetry_body(entropy_bytes: usize, repeated_bytes: usize) -> Vec<u8> {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut state = 0x0123_4567_89ab_cdef_u64;
+        let entropy = (0..entropy_bytes).map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            ALPHABET[(state & 63) as usize]
+        });
+        b"{\"entropy\":\""
+            .iter()
+            .copied()
+            .chain(entropy)
+            .chain(b"\",\"telemetry\":\"".iter().copied())
+            .chain(std::iter::repeat_n(b'a', repeated_bytes))
+            .chain(b"\",\"secret\":\"synthetic-safe-literal\"}".iter().copied())
+            .collect()
+    }
+
+    fn gzip_body(body: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(body).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    #[tokio::test]
+    async fn production_compressed_telemetry_body_compatibility() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let production_fixture: toml::Value = toml::from_str(include_str!(
+            "../../tests/fixtures/production/host-proxy.toml"
+        ))
+        .unwrap();
+        let production_rules = production_fixture["policy"]["rules"].as_array().unwrap();
+        let production_telemetry = production_rules
+            .iter()
+            .find(|rule| rule["id"].as_str() == Some("prod-host-r13-telemetry"))
+            .unwrap();
+        assert_eq!(
+            production_telemetry["redaction_profile"].as_str(),
+            Some("sensitive_strings")
+        );
+        assert_eq!(
+            production_telemetry["urls"].as_array().unwrap(),
+            &[
+                toml::Value::String("https://statsig.anthropic.com/**".to_owned()),
+                toml::Value::String("https://**.sentry.io/**".to_owned()),
+                toml::Value::String("https://**.datadoghq.com/**".to_owned()),
+            ]
+        );
+        let production_profile = &production_fixture["redaction"]["profiles"]["sensitive_strings"];
+        assert_eq!(
+            production_profile["max_body_bytes"].as_integer(),
+            Some(10_485_760)
+        );
+        assert_eq!(
+            production_profile["max_decoded_body_bytes"].as_integer(),
+            Some(52_428_800)
+        );
+
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let (origin_identity, _) = test_tls_identity();
+        let origin_acceptor = crate::tls_identity::load_static_tls_acceptor(
+            &origin_identity.path().join("server.pem"),
+            &origin_identity.path().join("server-key.pem"),
+            vec![b"http/1.1".to_vec()],
+        )
+        .unwrap();
+        let (captured_tx, captured_rx) = oneshot::channel();
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin_listener.accept().await.unwrap();
+            let stream = origin_acceptor.accept(stream).await.unwrap();
+            let captured_tx = Arc::new(StdMutex::new(Some(captured_tx)));
+            Http::new()
+                .http1_only(true)
+                .serve_connection(
+                    stream,
+                    service_fn(move |request: Request<Body>| {
+                        let captured_tx = captured_tx.clone();
+                        async move {
+                            let (parts, body) = request.into_parts();
+                            let body = to_bytes(body).await.unwrap();
+                            captured_tx
+                                .lock()
+                                .unwrap()
+                                .take()
+                                .unwrap()
+                                .send((parts.headers, body))
+                                .ok();
+                            Ok::<_, Infallible>(Response::new(Body::from("accepted telemetry")))
+                        }
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let resolver = Arc::new(DelayedResolver {
+            calls: AtomicUsize::new(0),
+            delay: Duration::ZERO,
+            endpoint: origin,
+        });
+        let destination_guard = test_destination_guard(proxy, resolver.clone());
+        let policy = r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[authorization.providers.telemetry]
+kind = "process"
+command = "/usr/bin/python3"
+args = ["-u", "-c", '''
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    body = request.get("body")
+    allowed = body is not None and body.get("encoding") == "base64" and len(body.get("data", "")) > 1000000
+    print(json.dumps({"id": request["id"], "type": "response", "decision": "allow" if allowed else "deny"}, separators=(",", ":")), flush=True)
+''']
+timeout = "2s"
+retire_timeout = "6s"
+inherit_environment = false
+environment = { PATH = "/usr/bin:/bin" }
+include_request_body = true
+max_request_body_bytes = 10485760
+max_decoded_request_body_bytes = 52428800
+max_stdout_line_bytes = 4096
+
+[redaction.profiles.sensitive_strings]
+replacement = "[REDACTED]"
+max_body_bytes = 10485760
+max_decoded_body_bytes = 52428800
+max_frame_bytes = 262144
+max_message_bytes = 1048576
+allow_permessage_deflate = false
+max_environment_literal_sources = 64
+max_environment_literal_bytes = 65536
+max_environment_literal_total_bytes = 1048576
+rules = [{ literals = ["synthetic-safe-literal"], payloads = "text" }]
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "prod-host-r13-telemetry"
+decision = "delegate"
+urls = ["https://**.sentry.io/**", "https://**.datadoghq.com/**"]
+methods = ["POST"]
+authorization_provider = "telemetry"
+redaction_profile = "sensitive_strings"
+"#;
+        let config = base_config(proxy, "explicit_http", policy)
+            .replacen("trust = \"system\"", "trust = \"insecure\"", 1)
+            .replacen(
+                "shutdown_drain_timeout = \"1s\"",
+                "shutdown_drain_timeout = \"1s\"\nmax_content_decoding_expansion_ratio = 128",
+                1,
+            );
+        let (_directory, product, assets) =
+            product_with_destination_guard(config, listeners, destination_guard).await;
+        let wire_body_pool = product.wire_body_pool();
+
+        let telemetry = deterministic_telemetry_body(16_000, 1_200_000);
+        let encoded = gzip_body(&telemetry);
+        assert!(telemetry.len() > 1024 * 1024);
+        assert!(telemetry.len() > 64 * encoded.len());
+        assert!(telemetry.len() <= 128 * encoded.len());
+        let handled = execute_direct(
+            &product,
+            assets,
+            Request::builder()
+                .method(http::Method::POST)
+                .uri("https://ingest.sentry.io/api/telemetry")
+                .header(CONTENT_TYPE, "application/json")
+                .header(CONTENT_ENCODING, "gzip")
+                .header(CONTENT_LENGTH, encoded.len().to_string())
+                .body(Body::from(encoded))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(handled.response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(handled.response.into_body()).await.unwrap(),
+            "accepted telemetry"
+        );
+        let (origin_headers, origin_body) = captured_rx.await.unwrap();
+        let expected = String::from_utf8(telemetry)
+            .unwrap()
+            .replace("synthetic-safe-literal", "[REDACTED]");
+        assert_eq!(origin_body, expected.as_bytes());
+        assert!(!origin_headers.contains_key(CONTENT_ENCODING));
+        assert_eq!(
+            origin_headers[CONTENT_LENGTH],
+            origin_body.len().to_string()
+        );
+        assert_eq!(origin_headers[CONTENT_TYPE], "application/json");
+        assert_eq!(resolver.calls.load(Ordering::Acquire), 1);
+        assert_eq!(wire_body_pool.global_charge(), 0);
+
+        product.shutdown().await;
+        origin_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -4691,6 +5568,113 @@ default = "deny"
     }
 
     #[tokio::test]
+    async fn concurrent_http2_streams_keep_mixed_allow_and_deny_decisions_isolated() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let (origin_identity, _) = test_tls_identity();
+        let origin_acceptor = crate::tls_identity::load_static_tls_acceptor(
+            &origin_identity.path().join("server.pem"),
+            &origin_identity.path().join("server-key.pem"),
+            vec![b"http/1.1".to_vec()],
+        )
+        .unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin_listener.accept().await.unwrap();
+            let stream = origin_acceptor.accept(stream).await.unwrap();
+            Http::new()
+                .http1_only(true)
+                .serve_connection(
+                    stream,
+                    service_fn(|request: Request<Body>| async move {
+                        assert_eq!(request.uri().path(), "/ok");
+                        Ok::<_, Infallible>(Response::new(Body::from("allowed stream")))
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let policy = format!(
+            r#"[mitm]
+mode = "generated"
+directory = "mitm"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "allowed-stream"
+decision = "allow"
+urls = ["https://localhost:{}/ok"]
+"#,
+            origin.port()
+        );
+        let config = base_config(proxy, "transparent_https", &policy)
+            .replacen("trust = \"system\"", "trust = \"insecure\"", 1)
+            .replacen(
+                "http_versions = [\"http1\"]",
+                "http_versions = [\"http2\"]\nhandshake_timeout = \"1s\"\nmax_concurrent_streams = 8",
+                1,
+            );
+        let (directory, product) = product_with_original_destination(
+            config,
+            listeners,
+            Arc::new(FixedOriginalDestination(origin)),
+        )
+        .await;
+        let certificate = read_first_pem_certificate(&directory.path().join("mitm/ca-cert.pem"));
+        let connector = test_tls_connector(certificate, vec![b"h2".to_vec()]);
+        let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let stream = connector
+            .connect(ServerName::try_from("localhost").unwrap(), stream)
+            .await
+            .unwrap();
+        let mut builder = conn::Builder::new();
+        builder.http2_only(true);
+        let (mut sender, connection) = builder.handshake(stream).await.unwrap();
+        let driver = tokio::spawn(connection);
+        std::future::poll_fn(|context| sender.poll_ready(context))
+            .await
+            .unwrap();
+        let allowed = sender.send_request(
+            Request::builder()
+                .uri(format!("https://localhost:{}/ok", origin.port()))
+                .body(Body::empty())
+                .unwrap(),
+        );
+        std::future::poll_fn(|context| sender.poll_ready(context))
+            .await
+            .unwrap();
+        let denied = sender.send_request(
+            Request::builder()
+                .uri(format!("https://localhost:{}/denied", origin.port()))
+                .body(Body::empty())
+                .unwrap(),
+        );
+        let (allowed, denied) = tokio::join!(allowed, denied);
+        let allowed = allowed.unwrap();
+        let denied = denied.unwrap();
+
+        assert_eq!(allowed.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(allowed.into_body()).await.unwrap(),
+            "allowed stream"
+        );
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            to_bytes(denied.into_body()).await.unwrap(),
+            "request denied\n"
+        );
+
+        product.shutdown().await;
+        driver.await.unwrap().ok();
+        origin_task.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn terminal_supervisor_panic_is_observed_promptly() {
         let (failure_tx, failure_rx) = oneshot::channel();
         let observer = Arc::new(ChannelFailureObserver(StdMutex::new(Some(failure_tx))));
@@ -4974,6 +5958,97 @@ urls = ["https://{target}/**"]
         origin_task.await.unwrap();
         product.shutdown().await;
         assert!(StdTcpListener::bind(proxy).is_ok());
+    }
+
+    #[tokio::test]
+    async fn connect_mitm_websocket_applies_wire_redaction() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let (origin_identity, _) = test_tls_identity();
+        let origin_acceptor = crate::tls_identity::load_static_tls_acceptor(
+            &origin_identity.path().join("server.pem"),
+            &origin_identity.path().join("server-key.pem"),
+            vec![b"http/1.1".to_vec()],
+        )
+        .unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin_listener.accept().await.unwrap();
+            let mut stream = origin_acceptor.accept(stream).await.unwrap();
+            let request = read_http_head(&mut stream).await;
+            let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            assert!(request.contains("\r\nupgrade: websocket\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let frame = read_websocket_frame(&mut stream).await.unwrap();
+            stream
+                .write_all(&websocket_frame(true, 0x1, b"server response", false))
+                .await
+                .unwrap();
+            frame
+        });
+        let target = origin.to_string();
+        let policy = connect_mitm_policy(&target).replace(
+            &format!("urls = [\"https://{target}/**\"]"),
+            &format!(
+                "urls = [\"https://{target}/**\"]\nallow_upgrades = true\nredaction_profile = \"wire\""
+            ),
+        );
+        let policy = format!(
+            r#"{policy}
+
+[redaction.profiles.wire]
+replacement = "[REDACTED]"
+max_frame_bytes = 1024
+max_message_bytes = 1024
+rules = [{{ literals = ["password"], payloads = "text" }}]
+"#
+        );
+        let config = base_config(proxy, "explicit_http", &policy).replacen(
+            "trust = \"system\"",
+            "trust = \"insecure\"",
+            1,
+        );
+        let (directory, product) = product(config, listeners).await;
+        let stream = open_connect(proxy, &target).await;
+        let certificate = read_first_pem_certificate(&directory.path().join("mitm/ca-cert.pem"));
+        let connector = test_tls_connector(certificate, vec![b"http/1.1".to_vec()]);
+        let mut stream = connector
+            .connect(ServerName::try_from("127.0.0.1").unwrap(), stream)
+            .await
+            .unwrap();
+        stream
+            .write_all(
+                format!(
+                    "GET /socket HTTP/1.1\r\nHost: {target}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGVzdC13ZWJzb2NrZXQta2V5\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response = read_http_head(&mut stream).await;
+        assert!(response.starts_with(b"HTTP/1.1 101 "));
+        stream
+            .write_all(&websocket_frame(true, 0x1, b"client password", true))
+            .await
+            .unwrap();
+        let response = read_websocket_frame(&mut stream).await.unwrap();
+        let seen = origin_task.await.unwrap();
+
+        assert!(seen.fin);
+        assert_eq!(seen.opcode, 0x1);
+        assert_eq!(seen.payload, b"client [REDACTED]");
+        assert_eq!(response.opcode, 0x1);
+        assert_eq!(response.payload, b"server response");
+        drop(stream);
+        product.shutdown().await;
     }
 
     #[tokio::test]
@@ -5421,6 +6496,93 @@ allow_upgrades = true
         })
         .await
         .expect("the completed upgrade retained runtime resources");
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn fragmented_websocket_message_is_buffered_and_redacted_before_forwarding() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin_listener.accept().await.unwrap();
+            let request = read_http_head(&mut stream).await;
+            let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            assert!(request.contains("\r\nupgrade: websocket\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let frame = read_websocket_frame(&mut stream).await.unwrap();
+            seen_tx.send(frame).unwrap();
+        });
+        let policy = format!(
+            r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[redaction.profiles.wire]
+replacement = "[REDACTED]"
+max_frame_bytes = 1024
+max_message_bytes = 1024
+rules = [{{ literals = ["password"], payloads = "text" }}]
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "fragmented-websocket"
+decision = "allow"
+methods = ["GET"]
+urls = ["http://{origin}/socket"]
+allow_upgrades = true
+redaction_profile = "wire"
+"#
+        );
+        let (_directory, product) =
+            product(base_config(proxy, "explicit_http", &policy), listeners).await;
+        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET http://{origin}/socket HTTP/1.1\r\nHost: {origin}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGVzdC13ZWJzb2NrZXQta2V5\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response = read_http_head(&mut client).await;
+        assert!(response.starts_with(b"HTTP/1.1 101 "));
+
+        client
+            .write_all(&websocket_frame(false, 0x1, b"client pass", true))
+            .await
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(75), seen_rx.recv())
+                .await
+                .is_err(),
+            "a partial WebSocket message reached the origin"
+        );
+        client
+            .write_all(&websocket_frame(true, 0x0, b"word", true))
+            .await
+            .unwrap();
+        let seen = tokio::time::timeout(Duration::from_secs(2), seen_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(seen.fin);
+        assert_eq!(seen.opcode, 0x1);
+        assert_eq!(seen.payload, b"client [REDACTED]");
+
+        drop(client);
+        origin_task.await.unwrap();
         product.shutdown().await;
     }
 

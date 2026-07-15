@@ -45,6 +45,7 @@ pub(crate) struct LocalAddressSnapshot {
 }
 
 impl LocalAddressSnapshot {
+    #[cfg(test)]
     pub(crate) fn new(addresses: impl IntoIterator<Item = LocalAddress>) -> Self {
         Self {
             addresses: addresses.into_iter().collect(),

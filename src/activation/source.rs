@@ -6,7 +6,7 @@ use crate::runtime::{ActivationCancellation, BoxFuture, CandidateSource, Runtime
 
 /// Reloads the exact configuration file selected during process startup.
 ///
-/// File reads and strict-v3 compilation are bounded and side-effect free. They
+/// File reads and strict configuration compilation are bounded and side-effect free. They
 /// run off the async executor, while cancellation checks bracket the complete
 /// blocking operation so a cancelled result can never enter activation.
 pub(crate) struct FileCandidateSource {

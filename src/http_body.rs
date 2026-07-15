@@ -3,8 +3,7 @@ use std::future::Future;
 use std::mem::{size_of, MaybeUninit};
 use std::pin::pin;
 use std::ptr;
-use std::sync::Arc;
-use std::task::{Context, Poll, Wake, Waker};
+use std::task::{Context, Poll};
 
 use bytes::Buf;
 use http::header::{HeaderMap, CONTENT_ENCODING, TRAILER};
@@ -36,21 +35,34 @@ const MIB: usize = 1024 * KIB;
 const BROTLI_MAX_WINDOW_BYTES: usize = 16 * MIB;
 const BROTLI_RING_WRITE_AHEAD_SLACK_BYTES: usize = 542;
 const BROTLI_FIXED_WORKSPACE_BYTES: usize = 4 * MIB;
+#[cfg(test)]
 const BROTLI_MAX_TREE_COUNT: usize = 256;
+#[cfg(test)]
 const BROTLI_HUFFMAN_CODE_BYTES: usize = 4;
+#[cfg(test)]
 const BROTLI_HUFFMAN_POINTER_BYTES: usize = size_of::<usize>();
+#[cfg(test)]
 const BROTLI_HUFFMAN_ALLOCATOR_OVERHEAD_ENTRIES: usize = 376;
+#[cfg(test)]
 const BROTLI_LITERAL_HUFFMAN_ALLOCATED_ENTRIES: usize =
     256 + BROTLI_HUFFMAN_ALLOCATOR_OVERHEAD_ENTRIES;
+#[cfg(test)]
 const BROTLI_COMMAND_HUFFMAN_ALLOCATED_ENTRIES: usize =
     704 + BROTLI_HUFFMAN_ALLOCATOR_OVERHEAD_ENTRIES;
+#[cfg(test)]
 const BROTLI_DISTANCE_HUFFMAN_ALLOCATED_ENTRIES: usize =
     520 + BROTLI_HUFFMAN_ALLOCATOR_OVERHEAD_ENTRIES;
+#[cfg(test)]
 const BROTLI_DISTANCE_HUFFMAN_BUDGET_ENTRIES: usize = 920;
+#[cfg(test)]
 const BROTLI_DECODER_STATE_BUDGET_BYTES: usize = 8 * KIB;
+#[cfg(test)]
 const BROTLI_SHARED_DICTIONARY_BUDGET_BYTES: usize = 2 * KIB;
+#[cfg(test)]
 const BROTLI_BLOCK_TREE_BUDGET_BYTES: usize = 16 * KIB;
+#[cfg(test)]
 const BROTLI_CONTEXT_BUDGET_BYTES: usize = 18 * KIB;
+#[cfg(test)]
 const BROTLI_ARENA_ALLOCATION_COUNT: usize = 10;
 const ZSTD_STANDARD_WINDOW_BYTES: usize = 8 * MIB;
 const ZSTD_LIBRARY_WINDOW_LOG_MAX: u32 = if usize::BITS == 32 {
@@ -96,11 +108,13 @@ pub(crate) fn http_decoder_workspace_sizes() -> Option<HttpDecoderWorkspaceSizes
     })
 }
 
+#[cfg(test)]
 const fn brotli_huffman_group_budget(maximum_table_entries: usize) -> usize {
     BROTLI_MAX_TREE_COUNT * maximum_table_entries * BROTLI_HUFFMAN_CODE_BYTES
         + BROTLI_MAX_TREE_COUNT * BROTLI_HUFFMAN_POINTER_BYTES
 }
 
+#[cfg(test)]
 const fn brotli_fixed_workspace_required_bytes() -> usize {
     size_of::<BrotliArenaState>()
         + size_of::<BrotliArenaBlock>()
@@ -202,10 +216,12 @@ pub(crate) struct GuardedRequestBody {
 }
 
 impl GuardedRequestBody {
+    #[cfg(test)]
     pub(crate) fn content_encoding(&self) -> CanonicalContentEncoding {
         CanonicalContentEncoding::Identity
     }
 
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.body.len()
     }
@@ -546,14 +562,7 @@ async fn decode_capture_websocket_permessage_deflate_inner(
 }
 
 fn poll_capture_decode<F: Future>(future: F) -> F::Output {
-    struct CaptureDecodeWake;
-
-    impl Wake for CaptureDecodeWake {
-        fn wake(self: Arc<Self>) {}
-    }
-
-    let waker = Waker::from(Arc::new(CaptureDecodeWake));
-    let mut context = Context::from_waker(&waker);
+    let mut context = Context::from_waker(std::task::Waker::noop());
     let mut future = pin!(future);
     loop {
         match future.as_mut().poll(&mut context) {
@@ -1673,9 +1682,8 @@ mod tests {
 
     use crate::capture::CaptureSinkSpec;
     use crate::config::compiler::{
-        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledLogLevel,
-        CompiledRedactionPayloads, ObservationPlan, PolicyDecisionLoggingPlan, RedactionPlan,
-        RedactionProfilePlan, RedactionRulePlan, ReloadableLoggingPlan,
+        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledRedactionPayloads,
+        ObservationPlan, RedactionPlan, RedactionProfilePlan, RedactionRulePlan,
     };
     use crate::observation::{CapturePool, ProductObservationSnapshot};
     use crate::redaction::RedactionSnapshot;
@@ -1771,15 +1779,6 @@ mod tests {
         let pool = CapturePool::new();
         let activation = ProductObservationSnapshot::activate(
             ObservationPlan {
-                logging: ReloadableLoggingPlan {
-                    level: CompiledLogLevel::Info,
-                    policy_decisions: PolicyDecisionLoggingPlan {
-                        allows: false,
-                        denies: true,
-                        allow_level: CompiledLogLevel::Info,
-                        deny_level: CompiledLogLevel::Warn,
-                    },
-                },
                 capture: Some(CapturePlan {
                     events: vec![CompiledCaptureEvent::RequestDenied],
                     redaction_profile: "capture".to_owned(),
@@ -2063,9 +2062,11 @@ mod tests {
         assert_eq!(BROTLI_LITERAL_HUFFMAN_ALLOCATED_ENTRIES, 632);
         assert_eq!(BROTLI_COMMAND_HUFFMAN_ALLOCATED_ENTRIES, 1080);
         assert_eq!(BROTLI_DISTANCE_HUFFMAN_ALLOCATED_ENTRIES, 896);
-        assert!(
-            BROTLI_DISTANCE_HUFFMAN_BUDGET_ENTRIES >= BROTLI_DISTANCE_HUFFMAN_ALLOCATED_ENTRIES
-        );
+        const {
+            assert!(
+                BROTLI_DISTANCE_HUFFMAN_BUDGET_ENTRIES >= BROTLI_DISTANCE_HUFFMAN_ALLOCATED_ENTRIES
+            );
+        }
         assert!(required <= BROTLI_FIXED_WORKSPACE_BYTES);
         assert!(BROTLI_FIXED_WORKSPACE_BYTES - required >= MIB);
     }

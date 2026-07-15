@@ -45,42 +45,6 @@ pub(crate) enum StaticTlsIdentityError {
     InvalidIdentity(String),
 }
 
-impl StaticTlsIdentityError {
-    pub(crate) fn describe_with_fields(
-        &self,
-        certificate_chain_field: &str,
-        private_key_field: &str,
-    ) -> String {
-        match self {
-            Self::ReadCertificateChain { path, source } => format!(
-                "failed to read {certificate_chain_field} {}: {source}",
-                path.display()
-            ),
-            Self::InvalidCertificateChain { path, source } => format!(
-                "{certificate_chain_field} {} must contain valid PEM certificates: {source}",
-                path.display()
-            ),
-            Self::EmptyCertificateChain { path } => format!(
-                "{certificate_chain_field} {} must contain at least one PEM certificate",
-                path.display()
-            ),
-            Self::ReadPrivateKey { path, source } => format!(
-                "failed to read {private_key_field} {}: {source}",
-                path.display()
-            ),
-            Self::InvalidPrivateKey { path, source } => format!(
-                "{private_key_field} {} must contain a valid PEM private key: {source}",
-                path.display()
-            ),
-            Self::UnsupportedPrivateKey { path } => format!(
-                "{private_key_field} {} must contain a supported PEM private key",
-                path.display()
-            ),
-            Self::InvalidIdentity(message) => message.clone(),
-        }
-    }
-}
-
 pub(crate) fn load_static_server_config(
     certificate_chain_path: &Path,
     private_key_path: &Path,

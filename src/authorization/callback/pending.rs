@@ -386,29 +386,16 @@ impl<P> PendingCapabilityStore<P> {
     }
 
     pub(crate) fn final_cancel_all(&self, cause: PendingTerminalCause) -> FinalCancellation<P> {
-        self.final_cancel_all_inner(cause, None)
+        self.final_cancel_all_inner(cause)
     }
 
-    #[cfg(test)]
-    fn final_cancel_all_at(
-        &self,
-        cause: PendingTerminalCause,
-        occurred_at: Instant,
-    ) -> FinalCancellation<P> {
-        self.final_cancel_all_inner(cause, Some(occurred_at))
-    }
-
-    fn final_cancel_all_inner(
-        &self,
-        cause: PendingTerminalCause,
-        fixed_now: Option<Instant>,
-    ) -> FinalCancellation<P> {
+    fn final_cancel_all_inner(&self, cause: PendingTerminalCause) -> FinalCancellation<P> {
         let mut state = self
             .inner
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let occurred_at = fixed_now.unwrap_or_else(Instant::now);
+        let occurred_at = Instant::now();
         state.accepting = false;
         let shutdown_deadline = state.shutdown_deadline;
         let pending = std::mem::take(&mut state.pending);
@@ -563,15 +550,6 @@ impl<P> PendingOperationGuard<P> {
         self.signal_handle().finish_pending(cause)
     }
 
-    #[cfg(test)]
-    fn finish_pending_at(
-        &self,
-        cause: PendingTerminalCause,
-        occurred_at: Instant,
-    ) -> PendingTerminalResult<P> {
-        self.signal_handle().finish_pending_at(cause, occurred_at)
-    }
-
     pub(crate) async fn expire_at_deadline(&self) -> PendingTerminalResult<P> {
         loop {
             let changed = self.store.inner.changed.notified();
@@ -659,37 +637,24 @@ impl<P> PendingOperationSignal<P> {
     }
 
     pub(crate) fn finish_pending(&self, cause: PendingTerminalCause) -> PendingTerminalResult<P> {
-        self.finish_pending_inner(cause, None, true)
-    }
-
-    #[cfg(test)]
-    fn finish_pending_at(
-        &self,
-        cause: PendingTerminalCause,
-        occurred_at: Instant,
-    ) -> PendingTerminalResult<P> {
-        self.finish_pending_inner(cause, Some(occurred_at), false)
+        self.finish_pending_inner(cause)
     }
 
     fn finish_pending_after_owner_drop(
         &self,
         cause: PendingTerminalCause,
     ) -> PendingTerminalResult<P> {
-        self.finish_pending_inner(cause, None, true)
+        self.finish_pending_inner(cause)
     }
 
-    fn finish_pending_inner(
-        &self,
-        cause: PendingTerminalCause,
-        fixed_now: Option<Instant>,
-        recover_poison: bool,
-    ) -> PendingTerminalResult<P> {
-        let mut state = match self.store.inner.state.lock() {
-            Ok(state) => state,
-            Err(poisoned) if recover_poison => poisoned.into_inner(),
-            Err(_) => return PendingTerminalResult::Poisoned,
-        };
-        let occurred_at = fixed_now.unwrap_or_else(Instant::now);
+    fn finish_pending_inner(&self, cause: PendingTerminalCause) -> PendingTerminalResult<P> {
+        let mut state = self
+            .store
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let occurred_at = Instant::now();
         let shutdown_deadline = state.shutdown_deadline;
         if let Some(entry) = state.pending.remove(&self.operation) {
             assert_eq!(state.lookup.remove(&entry.digest), Some(self.operation));
@@ -741,12 +706,6 @@ impl<P> CallbackClaim<P> {
     pub(crate) fn payload(&self) -> &P {
         self.payload
             .as_ref()
-            .expect("an active callback claim owns its payload")
-    }
-
-    pub(crate) fn payload_mut(&mut self) -> &mut P {
-        self.payload
-            .as_mut()
             .expect("an active callback claim owns its payload")
     }
 
@@ -848,7 +807,6 @@ pub(crate) enum PendingTerminalResult<P> {
     Won(TerminalOperation<P>),
     ClaimOwns { signal_recorded: bool },
     AlreadyTerminal,
-    Poisoned,
 }
 
 pub(crate) enum CallbackClaimResult<P> {
@@ -874,7 +832,6 @@ impl<P> fmt::Debug for PendingTerminalResult<P> {
                 .field("signal_recorded", signal_recorded)
                 .finish(),
             Self::AlreadyTerminal => formatter.write_str("AlreadyTerminal"),
-            Self::Poisoned => formatter.write_str("Poisoned"),
         }
     }
 }
@@ -952,20 +909,25 @@ pub(crate) struct CapabilityStoreCounts {
 
 pub(crate) struct PendingAdmissionError<P> {
     kind: PendingAdmissionErrorKind,
-    payload: P,
+    _payload: P,
 }
 
 impl<P> PendingAdmissionError<P> {
     fn new(kind: PendingAdmissionErrorKind, payload: P) -> Self {
-        Self { kind, payload }
+        Self {
+            kind,
+            _payload: payload,
+        }
     }
 
+    #[cfg(test)]
     pub(crate) fn kind(&self) -> PendingAdmissionErrorKind {
         self.kind
     }
 
+    #[cfg(test)]
     pub(crate) fn into_payload(self) -> P {
-        self.payload
+        self._payload
     }
 }
 

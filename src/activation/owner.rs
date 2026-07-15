@@ -37,6 +37,7 @@ impl ProductGenerationOwner {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn empty() -> Self {
         Self::new([])
     }

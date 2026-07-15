@@ -290,14 +290,17 @@ impl Runtime {
         LifecycleState::from_raw(self.lifecycle.load(Ordering::Acquire))
     }
 
+    #[cfg(test)]
     pub(crate) fn is_ready(&self) -> bool {
         self.static_ownership.readiness.is_ready()
     }
 
+    #[cfg(test)]
     pub(crate) fn active_generation_id(&self) -> Option<GenerationId> {
         self.active.load_full().map(|generation| generation.id())
     }
 
+    #[cfg(test)]
     pub(crate) fn retiring_generations(&self) -> usize {
         self.retiring_count.load(Ordering::Acquire)
     }

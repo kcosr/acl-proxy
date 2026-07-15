@@ -10,7 +10,6 @@ use crate::tls_identity::{load_static_tls_acceptor, StaticTlsIdentityError};
 pub(crate) struct ProductIngressAssets {
     destination_guard: Arc<DestinationGuard>,
     explicit_https_tls: Option<TlsAcceptor>,
-    explicit_https_alpn: Box<[Vec<u8>]>,
     transparent_https_alpn: Box<[Vec<u8>]>,
     mitm: Option<Arc<MitmCertificateManager>>,
 }
@@ -66,7 +65,6 @@ impl ProductIngressAssets {
         Ok(Arc::new(Self {
             destination_guard,
             explicit_https_tls,
-            explicit_https_alpn: explicit_https_alpn.into_boxed_slice(),
             transparent_https_alpn: transparent_https_alpn.into_boxed_slice(),
             mitm,
         }))
@@ -86,10 +84,6 @@ impl ProductIngressAssets {
 
     pub(crate) fn explicit_https_tls(&self) -> Option<&TlsAcceptor> {
         self.explicit_https_tls.as_ref()
-    }
-
-    pub(crate) fn explicit_https_alpn(&self) -> &[Vec<u8>] {
-        &self.explicit_https_alpn
     }
 
     pub(crate) fn transparent_https_alpn(&self) -> &[Vec<u8>] {
@@ -180,10 +174,6 @@ default = "deny"
         let assets = ProductIngressAssets::from_static(&compiled.static_config).unwrap();
 
         assert!(assets.explicit_https_tls().is_some());
-        assert_eq!(
-            assets.explicit_https_alpn(),
-            [b"h2".to_vec(), b"http/1.1".to_vec()]
-        );
         assert_eq!(assets.transparent_https_alpn(), [b"http/1.1".to_vec()]);
         assert!(assets.mitm().is_some());
         let dynamic_certificates = directory.path().join("mitm/dynamic");

@@ -17,18 +17,15 @@
 
 - `src/main.rs` — Entry point, delegates to CLI.
 - `src/cli/mod.rs` — CLI parsing, config validate/init, policy dump.
-- `src/config/mod.rs` — Configuration structs, TOML loading, validation, env overrides.
-- `src/policy/mod.rs` — Policy engine: rule compilation, pattern matching, macro/ruleset expansion.
-- `src/app.rs` — `AppState` and shared state management (`ArcSwap`).
-- `src/proxy/http.rs` — HTTP listener (explicit proxy + transparent HTTP interception).
-- `src/proxy/https_connect.rs` — HTTPS CONNECT MITM handler.
-- `src/proxy/https_transparent.rs` — Transparent HTTPS listener (HTTP/1.1 + HTTP/2).
-- `src/external_auth.rs` — External auth webhooks, callbacks, approval lifecycle.
-- `src/auth_plugin.rs` — Stdio plugin lifecycle management.
+- `src/config/` — Strict schema-3 authoring, loading, compilation, and templates.
+- `src/policy/snapshot.rs` — Generation-bound compiled policy evaluation.
+- `src/activation/` and `src/runtime/` — Product activation, reload, ownership, and shutdown.
+- `src/proxy/ingress.rs` — Common explicit, transparent, CONNECT MITM, TLS, and upgrade ingress.
+- `src/proxy/forward.rs` — Direct and parent request/response forwarding.
+- `src/authorization/` — Process and webhook authorization lifecycles.
 - `src/capture/mod.rs` — Request/response capture to JSON files.
 - `src/certs/mod.rs` — CA and per-host certificate generation and caching.
 - `src/logging/mod.rs` — Structured logging with file rotation.
-- `src/loop_protection/mod.rs` — Loop detection and header injection.
 - `src/bin/extract-capture-body.rs` — Helper CLI to decode captured bodies.
 
 ## Working Rules

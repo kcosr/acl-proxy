@@ -118,7 +118,10 @@ persist_leaf_certificates = false
 
 Generated CA material is private process state. Distribute only the generated
 `ca-cert.pem` to clients. File-backed mode uses explicit `ca_certificate` and
-`ca_private_key` paths; private keys must not grant group or other access.
+`ca_private_key` paths. The certificate file may contain an ordered PEM CA
+chain: its first certificate must match the private key and be CA-capable, and
+the complete chain is served with generated leaf certificates. Private keys
+must not grant group or other access.
 
 ### Egress
 

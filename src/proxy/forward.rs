@@ -108,6 +108,7 @@ impl DriverTask {
         }
     }
 
+    #[cfg(test)]
     fn from_handle(handle: tokio::task::JoinHandle<Result<(), hyper::Error>>) -> Self {
         Self {
             handle: Some(handle),
@@ -598,10 +599,10 @@ pub(crate) async fn resolve_forwarding_target(
 /// Sends one already-authorized logical origin request without connection reuse.
 /// The resolved token carries the only DNS result; connect performs synchronous
 /// pre- and post-connect validation before any outbound bytes.
-pub(crate) async fn forward_request<'egress, B>(
+pub(crate) async fn forward_request<B>(
     request: SanitizedRequest<B>,
     canonical: &CanonicalUrl,
-    egress: &'egress dyn EgressSnapshot,
+    egress: &dyn EgressSnapshot,
     destinations: &DestinationGuard,
     target: ResolvedForwardingTarget,
 ) -> Result<ForwardedResponse, ForwardError>
@@ -621,10 +622,10 @@ where
     .await
 }
 
-async fn forward_with_connector<'egress, C, B>(
+async fn forward_with_connector<C, B>(
     request: SanitizedRequest<B>,
     canonical: &CanonicalUrl,
-    egress: &'egress dyn EgressSnapshot,
+    egress: &dyn EgressSnapshot,
     destinations: &DestinationGuard,
     target: ResolvedForwardingTarget,
     connector: &C,
@@ -706,10 +707,10 @@ where
     .await
 }
 
-async fn forward_upgrade_with_connector<'egress, C, B>(
+async fn forward_upgrade_with_connector<C, B>(
     request: SanitizedRequest<B>,
     canonical: &CanonicalUrl,
-    egress: &'egress dyn EgressSnapshot,
+    egress: &dyn EgressSnapshot,
     destinations: &DestinationGuard,
     target: ResolvedForwardingTarget,
     connector: &C,
@@ -1175,6 +1176,7 @@ mod tests {
     use std::future::Future;
     use std::io;
     use std::net::SocketAddr;
+    use std::net::{IpAddr, Ipv4Addr};
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1199,6 +1201,7 @@ mod tests {
     };
     use crate::egress::EgressSnapshot as ProductEgressSnapshot;
     use crate::runtime::CredentialSourceRegistry;
+    use crate::safety::{GuardedBody, WireBodyPool, WireBodyQuotaKey};
     use crate::url::canonicalize_http_url;
 
     const CANDIDATE: &str = "192.0.2.20:8443";
@@ -1887,8 +1890,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn early_101_is_rejected_until_the_request_body_signals_completion() {
-        struct PendingTrailersBody;
+    async fn upgrade_early_101_and_shutdown_restore_body_budget() {
+        struct PendingTrailersBody {
+            _charged_body: GuardedBody,
+        }
 
         impl HttpBody for PendingTrailersBody {
             type Data = Bytes;
@@ -1909,6 +1914,20 @@ mod tests {
             }
         }
 
+        let pool = WireBodyPool::new(1024 * 1024, 1024 * 1024);
+        let guard = pool.begin_for_test(
+            1024 * 1024,
+            WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::LOCALHOST), |_| false),
+        );
+        let mut charged_body = guard.buffer();
+        charged_body
+            .try_extend_from_slice(b"budget-owned-upgrade-body")
+            .unwrap();
+        let charged_body = charged_body.finish();
+        let charged_bytes = charged_body.charged_bytes();
+        assert!(charged_bytes > 0);
+        assert_eq!(pool.global_charge(), charged_bytes);
+
         let request = Request::builder()
             .method(Method::GET)
             .version(Version::HTTP_11)
@@ -1916,7 +1935,9 @@ mod tests {
             .header(HOST, "origin.example")
             .header(CONNECTION, "upgrade")
             .header(UPGRADE, "WebSocket")
-            .body(PendingTrailersBody)
+            .body(PendingTrailersBody {
+                _charged_body: charged_body,
+            })
             .unwrap();
         let sanitized = crate::proxy::headers::sanitize_untrusted_request(request).unwrap();
         let intent = sanitized.upgrade_intent().unwrap().clone();
@@ -1947,6 +1968,8 @@ mod tests {
             .expect("an early 101 cannot establish an upgrade");
         assert!(matches!(error, ForwardError::UpgradeRequestBodyIncomplete));
         server.await.unwrap();
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
     }
 
     #[tokio::test]

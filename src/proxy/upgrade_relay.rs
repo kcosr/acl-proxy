@@ -1531,9 +1531,8 @@ mod tests {
     use super::*;
     use crate::capture::{CaptureDecision, CaptureEndpoint, CaptureMode, CaptureSinkSpec};
     use crate::config::compiler::{
-        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledLogLevel,
-        CompiledRedactionPayloads, ObservationPlan, PolicyDecisionLoggingPlan, RedactionPlan,
-        RedactionProfilePlan, RedactionRulePlan, ReloadableLoggingPlan,
+        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledRedactionPayloads,
+        ObservationPlan, RedactionPlan, RedactionProfilePlan, RedactionRulePlan,
     };
     use crate::observation::ProductObservationRuntime;
     use crate::redaction::{RedactionActivation, RedactionSnapshot};
@@ -1611,15 +1610,6 @@ mod tests {
         let activation = runtime
             .activate(
                 ObservationPlan {
-                    logging: ReloadableLoggingPlan {
-                        level: CompiledLogLevel::Info,
-                        policy_decisions: PolicyDecisionLoggingPlan {
-                            allows: false,
-                            denies: false,
-                            allow_level: CompiledLogLevel::Info,
-                            deny_level: CompiledLogLevel::Warn,
-                        },
-                    },
                     capture: Some(CapturePlan {
                         events: vec![
                             CompiledCaptureEvent::RequestAllowed,

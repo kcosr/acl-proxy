@@ -2,18 +2,14 @@ mod pending;
 mod response;
 mod token;
 
-#[allow(unused_imports)]
 pub(crate) use pending::{
-    CallbackClaim, CallbackClaimError, CallbackClaimResult, CapabilityStoreCounts,
-    FinalCancellation, PendingAdmission, PendingAdmissionError, PendingAdmissionErrorKind,
-    PendingCapabilityStore, PendingDeadline, PendingOperationGuard, PendingOperationSignal,
-    PendingTerminalCause, PendingTerminalResult, TerminalOperation,
+    CallbackClaim, CallbackClaimError, CallbackClaimResult, PendingCapabilityStore,
+    PendingDeadline, PendingOperationGuard, PendingTerminalCause, PendingTerminalResult,
 };
-#[allow(unused_imports)]
 pub(crate) use response::{
     AssignedCallbackResponseParser, CallbackCredentialSegments, CallbackCredentialSet,
-    CallbackDecisionKind, CallbackPrefixError, CallbackResponseDecision, CallbackResponseError,
-    CallbackResponsePrefix,
+    CallbackResponseDecision, CallbackResponseError, CallbackResponsePrefix,
 };
-#[allow(unused_imports)]
-pub(crate) use token::{ResumeToken, ResumeTokenDigest};
+pub(crate) use token::ResumeToken;
+#[cfg(test)]
+pub(crate) use token::ResumeTokenDigest;

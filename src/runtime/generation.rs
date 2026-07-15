@@ -168,8 +168,6 @@ pub(crate) trait EgressSnapshot: Send + Sync {
 }
 
 pub(crate) trait CredentialResolver: Send + Sync {
-    fn source_count(&self) -> usize;
-
     fn inject(
         &self,
         actions: &[crate::credentials::ResolvedCredentialAction],
@@ -187,17 +185,9 @@ pub(crate) trait CredentialResolver: Send + Sync {
 
 pub(crate) trait RedactionSnapshot: Send + Sync {
     fn profile(&self, index: RedactionProfileIndex) -> Option<crate::redaction::ProfileHandle>;
-
-    fn len(&self) -> usize;
-
-    fn is_empty(&self) -> bool;
-
-    fn compiled_matcher_resident_bytes(&self) -> usize;
 }
 
 pub(crate) trait ObservationSnapshot: Send + Sync {
-    fn logging(&self) -> &crate::observation::ObservationLoggingPolicy;
-
     fn capture_epoch(&self) -> &Arc<crate::observation::CaptureEpoch>;
 }
 pub(crate) trait AuthorizationSnapshot: Send + Sync {
@@ -389,6 +379,7 @@ impl Generation {
         &self.resource_plan
     }
 
+    #[cfg(test)]
     pub(crate) fn bindings(&self) -> &ResolvedBindings {
         &self.bindings
     }
