@@ -315,6 +315,7 @@ async fn await_graceful_peer(
 pub(crate) enum UpgradeTerminalCause {
     PeerClosed,
     RelayError,
+    IdleTimeout,
     LifetimeExpired,
     Shutdown,
     #[cfg(test)]

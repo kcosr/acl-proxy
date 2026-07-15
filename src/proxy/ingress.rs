@@ -19,9 +19,7 @@ use hyper::Body;
 use rustls::server::Acceptor as RustlsAcceptor;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::{
-    mpsc, oneshot, watch, Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore,
-};
+use tokio::sync::{mpsc, watch, Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor};
@@ -47,18 +45,14 @@ use crate::proxy::authority::{reconcile_connect_outer_request, reconcile_request
 use crate::proxy::facts::{
     validate_standalone_connect_ingress_request, validate_standalone_ingress_request,
 };
-use crate::proxy::forward::{
-    forward_request, forward_upgrade_request, preflight_forwarding_target, ForwardBody,
-    ForwardBodyError, ForwardUpgradeResult, ForwardedResponse, ResolvedForwardingTarget,
-};
-use crate::proxy::headers::SanitizedRequest;
+use crate::proxy::forward::{preflight_forwarding_target, ForwardBody, ForwardBodyError};
+use crate::proxy::forwarding_executor::ForwardingExecutor;
 use crate::proxy::original_destination::{
     OriginalDestinationResolver, SystemOriginalDestinationResolver,
 };
-use crate::proxy::standalone_body::StandaloneExchangeBody;
-use crate::proxy::upgrade_relay::{EstablishedUpgradeKind, UpgradeCaptureContext};
+use crate::proxy::upgrade_relay::UpgradeCaptureContext;
 use crate::request_pipeline::{RequestPipeline, RequestPipelineError};
-use crate::runtime::{BoxFuture, GenerationRetention, Runtime};
+use crate::runtime::{BoxFuture, Runtime};
 use crate::safety::{GuardedBody, WireBodyQuotaKey};
 use crate::sensitive::{is_sensitive_header_name, REDACTED};
 use crate::standalone_policy_provider::{
@@ -66,11 +60,8 @@ use crate::standalone_policy_provider::{
     StandaloneProviderInput, StandaloneResponseBodyProvenance, StandaloneResponseDispatch,
     StandaloneTerminalService, TokioRuntimeClock,
 };
-use crate::standalone_provider_result::{StandaloneCaptureBody, StandaloneUpgradeBinding};
-use crate::upgrade::{
-    UpgradeEntryPlan, UpgradeRuntime, UpgradeTerminalCause, UpgradeTerminalControl,
-};
-use http_access_types::{apply_header_mutation_batches, CanonicalHost, IngressMode, UpgradePolicy};
+use crate::upgrade::UpgradeRuntime;
+use http_access_types::{CanonicalHost, IngressMode, UpgradePolicy};
 use http_access_url::{
     canonicalize_tls_server_name, reconcile_connect_sni, CanonicalConnectTarget,
 };
@@ -1256,16 +1247,10 @@ impl ConnectionClose {
     }
 }
 
-struct HandledResponse {
-    response: Response<ProxyResponseBody>,
-    close_connection: bool,
-    request_disposition: RequestDisposition,
-}
-
-enum UpgradeHandshakeResponse {
-    Ordinary(ForwardedResponse),
-    SwitchingProtocols(Response<Body>),
-    Failed(StatusCode),
+pub(super) struct HandledResponse {
+    pub(super) response: Response<ProxyResponseBody>,
+    pub(super) close_connection: bool,
+    pub(super) request_disposition: RequestDisposition,
 }
 
 impl HandledResponse {
@@ -1445,8 +1430,9 @@ async fn execute_connect_terminal(
 ) -> HandledResponse {
     let StandaloneForwardDispatch {
         exchange,
-        generation,
+        services,
         request_id: _,
+        quota_key: _,
         retention,
         deadline,
         destinations: _,
@@ -1468,7 +1454,7 @@ async fn execute_connect_terminal(
     {
         return HandledResponse::fixed(StatusCode::INTERNAL_SERVER_ERROR, "request failed\n", true);
     }
-    drop((exchange, sidecar, retention, generation));
+    drop((exchange, sidecar, retention, services));
 
     let Some(manager) = terminal.assets.mitm().cloned() else {
         return HandledResponse::fixed(
@@ -1668,7 +1654,7 @@ fn connect_alpn_protocols(versions: &[CompiledHttpVersion]) -> Vec<Vec<u8>> {
         .collect()
 }
 
-struct HttpCaptureContext {
+pub(super) struct HttpCaptureContext {
     runtime: Arc<ProductObservationRuntime>,
     epoch: Arc<CaptureEpoch>,
     request_id: String,
@@ -1682,7 +1668,7 @@ struct HttpCaptureContext {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TerminalRequestBodyProvenance {
+pub(super) enum TerminalRequestBodyProvenance {
     Unconsumed,
     CompleteOriginal,
     CompleteWireRedacted,
@@ -1729,7 +1715,7 @@ impl HttpCaptureContext {
         });
     }
 
-    fn upgrade_capture_context(
+    pub(super) fn upgrade_capture_context(
         &self,
         target: &http_access_url::CanonicalUrl,
     ) -> UpgradeCaptureContext {
@@ -1742,7 +1728,7 @@ impl HttpCaptureContext {
         UpgradeCaptureContext::new(self.runtime.clone(), base, self.max_expansion_ratio)
     }
 
-    fn begin(
+    pub(super) fn begin(
         &self,
         event: CaptureEvent,
         record: impl FnOnce() -> CaptureRecord,
@@ -1779,7 +1765,7 @@ impl HttpCaptureContext {
         )
     }
 
-    fn response_record(
+    pub(super) fn response_record(
         &self,
         decision: CaptureDecision,
         version: Version,
@@ -1836,7 +1822,7 @@ impl HttpCaptureContext {
         }
     }
 
-    fn begin_allowed_request(
+    pub(super) fn begin_allowed_request(
         &self,
         headers: &HeaderMap,
         body_headers: &HeaderMap,
@@ -1901,7 +1887,7 @@ impl HttpCaptureContext {
         }
     }
 
-    fn fixed_response(
+    pub(super) fn fixed_response(
         &self,
         decision: CaptureDecision,
         status: StatusCode,
@@ -2041,156 +2027,6 @@ fn http_version(version: Version) -> &'static str {
     }
 }
 
-struct StandaloneUpgradeExecution {
-    runtime: Arc<UpgradeRuntime>,
-    capture: UpgradeCaptureContext,
-    binding: StandaloneUpgradeBinding,
-    request: SanitizedRequest<StandaloneExchangeBody>,
-    canonical: http_access_url::CanonicalUrl,
-    resolved: ResolvedForwardingTarget,
-    destinations: Arc<crate::destination::DestinationGuard>,
-    retention: GenerationRetention,
-    downstream_upgrade: hyper::upgrade::OnUpgrade,
-    deadline: Instant,
-    response_mutations: Vec<http_access_types::HeaderMutationBatch>,
-    request_headers: HeaderMap,
-    protocol: HeaderValue,
-}
-
-async fn execute_standalone_upgrade(
-    execution: StandaloneUpgradeExecution,
-) -> Result<UpgradeHandshakeResponse, StatusCode> {
-    let StandaloneUpgradeExecution {
-        runtime: upgrade_runtime,
-        capture: upgrade_capture,
-        binding,
-        request,
-        canonical,
-        resolved,
-        destinations,
-        retention,
-        downstream_upgrade,
-        deadline,
-        response_mutations,
-        request_headers,
-        protocol,
-    } = execution;
-    let (response_tx, response_rx) = oneshot::channel();
-    let allocation = binding.allocation;
-    let wire_redaction = binding.wire_redaction;
-    let task_profile = wire_redaction.clone();
-    let runtime_for_task = upgrade_runtime.clone();
-    upgrade_runtime
-        .try_spawn_handshake(allocation, move |handshake| async move {
-            let forwarded = tokio::time::timeout_at(
-                deadline,
-                forward_upgrade_request(request, &canonical, &retention, destinations, resolved),
-            )
-            .await;
-            match forwarded {
-                Ok(Ok(ForwardUpgradeResult::Response(mut response))) => {
-                    if apply_standalone_response_mutations(
-                        &response_mutations,
-                        response.headers_mut(),
-                    )
-                    .is_err()
-                    {
-                        let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                        ));
-                        return;
-                    }
-                    response
-                        .body_mut()
-                        .bind_request_lifetime(deadline, retention);
-                    let _ = response_tx.send(UpgradeHandshakeResponse::Ordinary(response));
-                }
-                Ok(Ok(ForwardUpgradeResult::SwitchingProtocols(upgrade))) => {
-                    let (mut response, upstream_upgrade) = upgrade.into_parts();
-                    if apply_standalone_response_mutations(
-                        &response_mutations,
-                        response.headers_mut(),
-                    )
-                    .is_err()
-                    {
-                        let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                        ));
-                        return;
-                    }
-                    let kind = match EstablishedUpgradeKind::from_handshake(
-                        &protocol,
-                        &request_headers,
-                        response.headers(),
-                        task_profile.as_ref(),
-                    ) {
-                        Ok(kind) => kind,
-                        Err(_) => {
-                            let _ = response_tx
-                                .send(UpgradeHandshakeResponse::Failed(StatusCode::BAD_GATEWAY));
-                            return;
-                        }
-                    };
-                    let prepared_relay = match kind.prepare(
-                        runtime_for_task.limits().relay_buffer_bytes(),
-                        Some(upgrade_capture),
-                    ) {
-                        Ok(prepared_relay) => prepared_relay,
-                        Err(_) => {
-                            let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                            ));
-                            return;
-                        }
-                    };
-                    let terminal_control =
-                        UpgradeTerminalControl::new(std::future::pending::<()>, |_| async {});
-                    let entry_plan =
-                        UpgradeEntryPlan::new(terminal_control, move |snapshot| async move {
-                            response_tx
-                                .send(UpgradeHandshakeResponse::SwitchingProtocols(response))
-                                .map_err(|_| UpgradeTerminalCause::DownstreamWriteFailed)?;
-                            let (downstream, upstream) =
-                                tokio::join!(downstream_upgrade, upstream_upgrade.complete());
-                            let downstream = downstream
-                                .map_err(|_| UpgradeTerminalCause::DownstreamWriteFailed)?;
-                            let upstream =
-                                upstream.map_err(|_| UpgradeTerminalCause::SetupFailed)?;
-                            Ok(prepared_relay.establish(downstream, upstream, snapshot))
-                        });
-                    if handshake.commit(wire_redaction, entry_plan).is_err() {
-                        return;
-                    }
-                    drop(retention);
-                }
-                Ok(Err(_)) => {
-                    let _ =
-                        response_tx.send(UpgradeHandshakeResponse::Failed(StatusCode::BAD_GATEWAY));
-                }
-                Err(_) => {
-                    let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
-                        StatusCode::GATEWAY_TIMEOUT,
-                    ));
-                }
-            }
-        })
-        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-
-    match tokio::time::timeout_at(deadline, response_rx).await {
-        Ok(Ok(response)) => Ok(response),
-        Ok(Err(_)) => Err(StatusCode::SERVICE_UNAVAILABLE),
-        Err(_) => Err(StatusCode::GATEWAY_TIMEOUT),
-    }
-}
-
-fn apply_standalone_response_mutations(
-    batches: &[http_access_types::HeaderMutationBatch],
-    headers: &mut HeaderMap,
-) -> Result<(), ()> {
-    *headers = crate::proxy::facts::apply_response_mutations(headers, batches).map_err(|_| ())?;
-    Ok(())
-}
-
 struct RequestExecution {
     authority: RequestAuthority,
     peer: SocketAddr,
@@ -2201,9 +2037,9 @@ struct RequestExecution {
     assets: Arc<ProductIngressAssets>,
 }
 
-struct StandaloneHttpTerminal {
-    capture: HttpCaptureContext,
-    upgrade_runtime: Arc<UpgradeRuntime>,
+pub(super) struct StandaloneHttpTerminal {
+    pub(super) capture: HttpCaptureContext,
+    pub(super) upgrade_runtime: Arc<UpgradeRuntime>,
 }
 
 impl StandaloneTerminalService for StandaloneHttpTerminal {
@@ -2314,287 +2150,7 @@ impl StandaloneTerminalService for StandaloneHttpTerminal {
     }
 
     fn forward(self, dispatch: StandaloneForwardDispatch) -> BoxFuture<'static, Self::Output> {
-        Box::pin(execute_standalone_forward(self, dispatch))
-    }
-}
-
-async fn execute_standalone_forward(
-    terminal: StandaloneHttpTerminal,
-    mut dispatch: StandaloneForwardDispatch,
-) -> HandledResponse {
-    let StandaloneIngressTransport::Ordinary {
-        mut parts,
-        protocol,
-        downstream_upgrade,
-    } = dispatch.transport
-    else {
-        return terminal.capture.fixed_response(
-            CaptureDecision::Allow,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "request failed\n",
-            true,
-        );
-    };
-    let plan = dispatch.exchange.plan();
-    let origin = plan.origin().clone();
-    let plan_binding = plan.binding();
-    let response_mutations = plan.response_mutation_batches().to_vec();
-    let upgrade = plan.upgrade().clone();
-    let upgrade_binding = match dispatch.sidecar.take_upgrade_binding(plan_binding) {
-        Ok(binding) => binding,
-        Err(_) => {
-            return terminal.capture.fixed_response(
-                CaptureDecision::Allow,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "request failed\n",
-                true,
-            )
-        }
-    };
-    let neutral_headers = match apply_header_mutation_batches(
-        dispatch.exchange.facts().headers(),
-        plan.request_mutation_batches(),
-    ) {
-        Ok(headers) => headers,
-        Err(_) => {
-            if let Ok(headers) =
-                crate::proxy::facts::product_headers(dispatch.exchange.facts().headers())
-            {
-                let body_headers = body_headers(&headers);
-                if let Some(mut submission) = terminal.capture.begin_allowed_request(
-                    &headers,
-                    &body_headers,
-                    TerminalRequestBodyProvenance::Unconsumed,
-                ) {
-                    submission.abandon();
-                }
-            }
-            return terminal.capture.fixed_response(
-                CaptureDecision::Allow,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "request failed\n",
-                true,
-            );
-        }
-    };
-    let mut headers = match crate::proxy::facts::product_headers(&neutral_headers) {
-        Ok(headers) => headers,
-        Err(_) => {
-            return terminal.capture.fixed_response(
-                CaptureDecision::Allow,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "request failed\n",
-                true,
-            )
-        }
-    };
-    let capture_headers = headers.clone();
-    let mut capture_body_headers = body_headers(&headers);
-    let provenance = match dispatch.sidecar.capture_body() {
-        StandaloneCaptureBody::ProviderReplacement { size } => {
-            TerminalRequestBodyProvenance::ProviderReplacement { size }
-        }
-        StandaloneCaptureBody::Stream { canonical_identity } => {
-            if canonical_identity {
-                capture_body_headers.insert(CONTENT_ENCODING, HeaderValue::from_static("identity"));
-            }
-            if plan.redaction().is_some() {
-                TerminalRequestBodyProvenance::CompleteWireRedacted
-            } else {
-                TerminalRequestBodyProvenance::CompleteOriginal
-            }
-        }
-    };
-    let request_capture =
-        terminal
-            .capture
-            .begin_allowed_request(&capture_headers, &capture_body_headers, provenance);
-
-    let program = match dispatch.sidecar.take_credential_program(plan_binding) {
-        Ok(program) => program,
-        Err(_) => {
-            return terminal.capture.fixed_response(
-                CaptureDecision::Allow,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "request failed\n",
-                true,
-            )
-        }
-    };
-    if program
-        .apply(
-            dispatch.exchange.plan(),
-            dispatch.generation.credentials(),
-            &mut headers,
-        )
-        .is_err()
-        || dispatch
-            .generation
-            .safety()
-            .inject_loop_marker(&mut headers, &dispatch.request_id)
-            .is_err()
-    {
-        return terminal.capture.fixed_response(
-            CaptureDecision::Allow,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "request failed\n",
-            true,
-        );
-    }
-    parts.headers = headers;
-    let request_headers = capture_headers;
-    let mut body = StandaloneExchangeBody::new(dispatch.exchange, dispatch.sidecar);
-    body.set_capture(request_capture);
-    let request = SanitizedRequest::from_parts(*parts, body, protocol);
-
-    if !matches!(upgrade, UpgradePolicy::Deny) {
-        let (Some(binding), Some(downstream_upgrade), Some(upgrade_protocol)) = (
-            upgrade_binding,
-            downstream_upgrade,
-            request
-                .upgrade_intent()
-                .map(|intent| intent.protocol().clone()),
-        ) else {
-            return terminal.capture.fixed_response(
-                CaptureDecision::Allow,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "upgrade failed\n",
-                true,
-            );
-        };
-        let upgrade_capture = terminal.capture.upgrade_capture_context(&origin);
-        let outcome = execute_standalone_upgrade(StandaloneUpgradeExecution {
-            runtime: terminal.upgrade_runtime,
-            capture: upgrade_capture,
-            binding,
-            request,
-            canonical: origin,
-            resolved: dispatch.resolved,
-            destinations: dispatch.destinations,
-            retention: dispatch.retention,
-            downstream_upgrade,
-            deadline: dispatch.deadline,
-            response_mutations,
-            request_headers,
-            protocol: upgrade_protocol,
-        })
-        .await;
-        return match outcome {
-            Ok(UpgradeHandshakeResponse::Ordinary(response)) => {
-                let response_capture = terminal.capture.begin(
-                    CaptureEvent::ResponseAllowed,
-                    || {
-                        terminal.capture.response_record(
-                            CaptureDecision::Allow,
-                            response.version(),
-                            Some(response.headers()),
-                            response.status(),
-                            false,
-                        )
-                    },
-                    response.headers(),
-                );
-                HandledResponse {
-                    response: response
-                        .map(|body| ProxyResponseBody::forwarded(body, response_capture)),
-                    close_connection: false,
-                    request_disposition: RequestDisposition::ContinueHttp,
-                }
-            }
-            Ok(UpgradeHandshakeResponse::SwitchingProtocols(response)) => {
-                if let Some(mut submission) = terminal.capture.begin(
-                    CaptureEvent::ResponseAllowed,
-                    || {
-                        terminal.capture.response_record(
-                            CaptureDecision::Allow,
-                            response.version(),
-                            Some(response.headers()),
-                            response.status(),
-                            false,
-                        )
-                    },
-                    response.headers(),
-                ) {
-                    submission.finish();
-                }
-                HandledResponse {
-                    response: response.map(ProxyResponseBody::Local),
-                    close_connection: false,
-                    request_disposition: RequestDisposition::SwitchProtocol,
-                }
-            }
-            Ok(UpgradeHandshakeResponse::Failed(status)) | Err(status) => terminal
-                .capture
-                .fixed_response(CaptureDecision::Allow, status, "upgrade failed\n", true),
-        };
-    }
-    if upgrade_binding.is_some() || downstream_upgrade.is_some() {
-        return terminal.capture.fixed_response(
-            CaptureDecision::Allow,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "request failed\n",
-            true,
-        );
-    }
-    let mut response = match tokio::time::timeout_at(
-        dispatch.deadline,
-        forward_request(
-            request,
-            &origin,
-            dispatch.generation.egress(),
-            &dispatch.destinations,
-            dispatch.resolved,
-        ),
-    )
-    .await
-    {
-        Ok(Ok(response)) => response,
-        Ok(Err(error)) => {
-            tracing::error!(error = ?error, "upstream request failed");
-            return terminal.capture.fixed_response(
-                CaptureDecision::Allow,
-                StatusCode::BAD_GATEWAY,
-                "upstream failed\n",
-                true,
-            );
-        }
-        Err(_) => {
-            return terminal.capture.fixed_response(
-                CaptureDecision::Allow,
-                StatusCode::GATEWAY_TIMEOUT,
-                "request timed out\n",
-                true,
-            )
-        }
-    };
-    response
-        .body_mut()
-        .bind_request_lifetime(dispatch.deadline, dispatch.retention);
-    if apply_standalone_response_mutations(&response_mutations, response.headers_mut()).is_err() {
-        return terminal.capture.fixed_response(
-            CaptureDecision::Allow,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "response failed\n",
-            true,
-        );
-    }
-    let response_capture = terminal.capture.begin(
-        CaptureEvent::ResponseAllowed,
-        || {
-            terminal.capture.response_record(
-                CaptureDecision::Allow,
-                response.version(),
-                Some(response.headers()),
-                response.status(),
-                false,
-            )
-        },
-        response.headers(),
-    );
-    HandledResponse {
-        response: response.map(|body| ProxyResponseBody::forwarded(body, response_capture)),
-        close_connection: false,
-        request_disposition: RequestDisposition::ContinueHttp,
+        Box::pin(ForwardingExecutor::execute(self, dispatch))
     }
 }
 
@@ -2709,16 +2265,6 @@ async fn execute_request_via_pipeline(
     RequestPipeline::new().execute(provider, request).await
 }
 
-fn body_headers(headers: &HeaderMap) -> HeaderMap {
-    let mut selected = HeaderMap::new();
-    for name in [CONTENT_ENCODING, TRAILER] {
-        for value in headers.get_all(&name).iter() {
-            selected.append(name.clone(), value.clone());
-        }
-    }
-    selected
-}
-
 fn request_id() -> String {
     use rand::RngCore;
     use std::fmt::Write;
@@ -2733,25 +2279,25 @@ fn request_id() -> String {
     id
 }
 
-enum ProxyResponseBody {
+pub(super) enum ProxyResponseBody {
     Local(Body),
     Forwarded {
-        body: ForwardBody,
+        body: Box<ForwardBody>,
         capture: Option<Box<CaptureSubmission>>,
     },
 }
 
 impl ProxyResponseBody {
-    fn forwarded(body: ForwardBody, capture: Option<CaptureSubmission>) -> Self {
+    pub(super) fn forwarded(body: ForwardBody, capture: Option<CaptureSubmission>) -> Self {
         Self::Forwarded {
-            body,
+            body: Box::new(body),
             capture: capture.map(Box::new),
         }
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-enum ProxyResponseBodyError {
+pub(super) enum ProxyResponseBodyError {
     #[error(transparent)]
     Local(#[from] hyper::Error),
     #[error(transparent)]
@@ -2772,7 +2318,7 @@ impl HttpBody for ProxyResponseBody {
                 .map(|item| item.map(|item| item.map_err(ProxyResponseBodyError::Local))),
             Self::Forwarded { body, capture } => {
                 let exact_remaining = body.size_hint().exact();
-                match Pin::new(&mut *body).poll_data(context) {
+                match Pin::new(&mut **body).poll_data(context) {
                     Poll::Pending => Poll::Pending,
                     Poll::Ready(Some(Ok(data))) => {
                         let data_len = data.remaining();
@@ -2809,7 +2355,8 @@ impl HttpBody for ProxyResponseBody {
             Self::Local(body) => Pin::new(body)
                 .poll_trailers(context)
                 .map_err(ProxyResponseBodyError::Local),
-            Self::Forwarded { body, capture } => match Pin::new(body).poll_trailers(context) {
+            Self::Forwarded { body, capture } => match Pin::new(&mut **body).poll_trailers(context)
+            {
                 Poll::Pending => Poll::Pending,
                 Poll::Ready(Ok(trailers)) => {
                     if let Some(capture) = capture.as_mut() {

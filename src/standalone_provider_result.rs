@@ -72,6 +72,37 @@ pub(crate) struct StandaloneCredentialProgram {
     global_sources: Box<[StandaloneCredentialSourceBinding]>,
 }
 
+pub(crate) trait StandaloneCredentialInjector {
+    fn inject(
+        &self,
+        actions: &[ResolvedCredentialAction],
+        headers: &mut http::HeaderMap,
+    ) -> Result<(), crate::credentials::CredentialError>;
+}
+
+impl<T> StandaloneCredentialInjector for T
+where
+    T: crate::runtime::CredentialResolver + ?Sized,
+{
+    fn inject(
+        &self,
+        actions: &[ResolvedCredentialAction],
+        headers: &mut http::HeaderMap,
+    ) -> Result<(), crate::credentials::CredentialError> {
+        crate::runtime::CredentialResolver::inject(self, actions, headers)
+    }
+}
+
+impl StandaloneCredentialInjector for crate::runtime::ForwardingGenerationServices {
+    fn inject(
+        &self,
+        actions: &[ResolvedCredentialAction],
+        headers: &mut http::HeaderMap,
+    ) -> Result<(), crate::credentials::CredentialError> {
+        self.inject_credentials(actions, headers)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StandaloneProviderAllowError {
     #[error("provider allow result does not match the activated standalone binding")]
@@ -172,12 +203,15 @@ impl StandaloneCredentialSourceBinding {
 }
 
 impl StandaloneCredentialProgram {
-    pub(crate) fn apply(
+    pub(crate) fn apply<Credentials>(
         self,
         plan: &ForwardingPlan,
-        credentials: &dyn crate::runtime::CredentialResolver,
+        credentials: &Credentials,
         headers: &mut http::HeaderMap,
-    ) -> Result<(), StandaloneProviderAllowError> {
+    ) -> Result<(), StandaloneProviderAllowError>
+    where
+        Credentials: StandaloneCredentialInjector + ?Sized,
+    {
         if plan.binding() != self.plan_binding {
             return Err(StandaloneProviderAllowError::Binding);
         }

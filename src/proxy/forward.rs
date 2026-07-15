@@ -24,6 +24,7 @@ use crate::egress::{
     ParentTransport,
 };
 use crate::runtime::{EgressSnapshot, GenerationRetention};
+use crate::safety::ForwardResponseAdmission;
 
 use super::headers::{
     prepare_downstream_upgrade_response, prepare_origin_request, prepare_origin_upgrade_request,
@@ -32,6 +33,8 @@ use super::headers::{
 };
 
 const TERMINAL_DRIVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_EMPTY_RESPONSE_FRAMES: u64 = 65_536;
+const MAX_INTERNAL_RESPONSE_EVENTS_PER_POLL: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ForwardError {
@@ -61,6 +64,62 @@ pub(crate) enum ForwardError {
     UpgradeRequiresHttp1,
     #[error("the upstream switched protocols before the request body completed")]
     UpgradeRequestBodyIncomplete,
+    #[error("upstream connection setup timed out")]
+    ConnectTimeout,
+    #[error("upstream response head timed out")]
+    ResponseHeadTimeout,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ForwardingDeadlines {
+    connect: Instant,
+    response_head_timeout: Duration,
+    absolute: Instant,
+}
+
+impl ForwardingDeadlines {
+    pub(crate) fn new(
+        absolute: Instant,
+        connect_timeout: Duration,
+        response_head_timeout: Duration,
+    ) -> Self {
+        let now = Instant::now();
+        Self {
+            connect: now
+                .checked_add(connect_timeout)
+                .unwrap_or(absolute)
+                .min(absolute),
+            response_head_timeout,
+            absolute,
+        }
+    }
+
+    fn response_head(self) -> Instant {
+        Instant::now()
+            .checked_add(self.response_head_timeout)
+            .unwrap_or(self.absolute)
+            .min(self.absolute)
+    }
+
+    #[cfg(test)]
+    fn for_test() -> Self {
+        let timeout = Duration::from_secs(3_600);
+        Self::new(Instant::now() + timeout, timeout, timeout)
+    }
+}
+
+async fn connect_stage<F, T, E>(
+    deadlines: ForwardingDeadlines,
+    future: F,
+) -> Result<T, ForwardError>
+where
+    F: Future<Output = Result<T, E>>,
+    ForwardError: From<E>,
+{
+    match tokio::time::timeout_at(deadlines.connect, future).await {
+        Ok(result) => result.map_err(ForwardError::from),
+        Err(_) => Err(ForwardError::ConnectTimeout),
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -81,6 +140,17 @@ pub(crate) enum ForwardBodyError {
     Task(#[source] std::sync::Arc<tokio::task::JoinError>),
     #[error("upstream connection did not finish before the terminal drain deadline")]
     Timeout,
+    #[error("upstream response body exceeded configured limits")]
+    Limit,
+}
+
+#[derive(Clone, Copy)]
+struct ForwardResponseLimits {
+    wire_bytes: u64,
+    chunk_bytes: usize,
+    trailer_count: u64,
+    trailer_bytes: u64,
+    idle: Duration,
 }
 
 pub(crate) struct ForwardBody {
@@ -94,6 +164,12 @@ pub(crate) struct ForwardBody {
     driver: DriverTask,
     request_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     generation: Option<GenerationRetention>,
+    response_admission: Option<ForwardResponseAdmission>,
+    response_limits: Option<ForwardResponseLimits>,
+    response_idle_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    pending_data: Option<Bytes>,
+    observed_wire_bytes: u64,
+    empty_frames: u64,
 }
 
 struct DriverTask {
@@ -172,18 +248,50 @@ impl ForwardBody {
             driver,
             request_deadline: None,
             generation: None,
+            response_admission: None,
+            response_limits: None,
+            response_idle_deadline: None,
+            pending_data: None,
+            observed_wire_bytes: 0,
+            empty_frames: 0,
         }
     }
 
-    pub(crate) fn bind_request_lifetime(
+    pub(crate) fn bind_response_lifetime(
         &mut self,
         deadline: Instant,
         generation: GenerationRetention,
+        response_admission: ForwardResponseAdmission,
+        policy: http_access_types::ResponsePolicy,
     ) {
         debug_assert!(self.request_deadline.is_none());
         debug_assert!(self.generation.is_none());
+        debug_assert!(self.response_admission.is_none());
         self.request_deadline = Some(Box::pin(tokio::time::sleep_until(deadline)));
         self.generation = Some(generation);
+        self.response_admission = Some(response_admission);
+        self.configure_response_policy(policy);
+    }
+
+    fn configure_response_policy(&mut self, policy: http_access_types::ResponsePolicy) {
+        debug_assert!(self.response_limits.is_none());
+        let limits = policy.limits();
+        let response_limits = ForwardResponseLimits {
+            wire_bytes: limits.wire_bytes(),
+            chunk_bytes: usize::try_from(limits.chunk_bytes())
+                .expect("checked response chunk limit fits the product target"),
+            trailer_count: limits.trailer_count(),
+            trailer_bytes: limits.trailer_bytes(),
+            idle: Duration::from_millis(policy.idle_ms()),
+        };
+        self.response_idle_deadline = Some(Box::pin(tokio::time::sleep(response_limits.idle)));
+        self.response_limits = Some(response_limits);
+    }
+
+    #[cfg(test)]
+    fn with_response_policy(mut self, policy: http_access_types::ResponsePolicy) -> Self {
+        self.configure_response_policy(policy);
+        self
     }
 
     #[cfg(test)]
@@ -205,6 +313,104 @@ impl ForwardBody {
         }
     }
 
+    fn release_response_lifetime(&mut self) {
+        self.request_deadline.take();
+        self.response_idle_deadline.take();
+        self.response_admission.take();
+        self.generation.take();
+    }
+
+    fn reset_response_idle_deadline(&mut self) {
+        let Some(limits) = self.response_limits else {
+            return;
+        };
+        if let Some(deadline) = self.response_idle_deadline.as_mut() {
+            deadline.as_mut().reset(Instant::now() + limits.idle);
+        }
+    }
+
+    fn poll_response_idle_deadline(&mut self, context: &mut Context<'_>) -> Poll<ForwardBodyError> {
+        let Some(deadline) = self.response_idle_deadline.as_mut() else {
+            return Poll::Pending;
+        };
+        if deadline.as_mut().poll(context).is_pending() {
+            return Poll::Pending;
+        }
+
+        self.body.take();
+        self.pending_data.take();
+        self.trailers.take();
+        self.terminal_error.get_or_insert(ForwardBodyError::Timeout);
+        self.poll_terminal_error_join(context)
+    }
+
+    fn fail_body(
+        &mut self,
+        context: &mut Context<'_>,
+        error: ForwardBodyError,
+    ) -> Poll<ForwardBodyError> {
+        self.body.take();
+        self.pending_data.take();
+        self.trailers.take();
+        self.terminal_error.get_or_insert(error);
+        self.poll_terminal_error_join(context)
+    }
+
+    fn next_data_slice(&mut self) -> Option<Bytes> {
+        let Some(limits) = self.response_limits else {
+            return self.pending_data.take();
+        };
+        let pending = self.pending_data.as_mut()?;
+        if pending.len() > limits.chunk_bytes {
+            return Some(pending.split_to(limits.chunk_bytes));
+        }
+        self.pending_data.take()
+    }
+
+    fn admit_response_data(&mut self, bytes: Bytes) -> Result<(), ForwardBodyError> {
+        let Some(limits) = self.response_limits else {
+            self.pending_data = Some(bytes);
+            return Ok(());
+        };
+        let frame_bytes = u64::try_from(bytes.len()).map_err(|_| ForwardBodyError::Limit)?;
+        self.observed_wire_bytes = self
+            .observed_wire_bytes
+            .checked_add(frame_bytes)
+            .ok_or(ForwardBodyError::Limit)?;
+        if self.observed_wire_bytes > limits.wire_bytes {
+            return Err(ForwardBodyError::Limit);
+        }
+        self.reset_response_idle_deadline();
+        self.pending_data = Some(bytes);
+        Ok(())
+    }
+
+    fn admit_response_trailers(
+        &mut self,
+        trailers: &http::HeaderMap,
+    ) -> Result<(), ForwardBodyError> {
+        let Some(limits) = self.response_limits else {
+            return Ok(());
+        };
+        let count = u64::try_from(trailers.len()).map_err(|_| ForwardBodyError::Limit)?;
+        let bytes = trailers.iter().try_fold(0_u64, |total, (name, value)| {
+            let entry = name
+                .as_str()
+                .len()
+                .checked_add(value.as_bytes().len())
+                .and_then(|size| u64::try_from(size).ok())
+                .ok_or(ForwardBodyError::Limit)?;
+            total.checked_add(entry).ok_or(ForwardBodyError::Limit)
+        })?;
+        if count > limits.trailer_count || bytes > limits.trailer_bytes {
+            return Err(ForwardBodyError::Limit);
+        }
+        if count != 0 {
+            self.reset_response_idle_deadline();
+        }
+        Ok(())
+    }
+
     fn poll_request_deadline(&mut self, context: &mut Context<'_>) -> Poll<ForwardBodyError> {
         let Some(deadline) = self.request_deadline.as_mut() else {
             return Poll::Pending;
@@ -214,6 +420,7 @@ impl ForwardBody {
         }
 
         self.body.take();
+        self.pending_data.take();
         self.trailers.take();
         self.terminal_error.get_or_insert(ForwardBodyError::Timeout);
         self.poll_terminal_error_join(context)
@@ -231,6 +438,7 @@ impl ForwardBody {
         }
 
         self.body.take();
+        self.pending_data.take();
         self.trailers.take();
         self.terminal_error.get_or_insert(ForwardBodyError::Timeout);
         self.poll_terminal_error_join(context)
@@ -243,8 +451,7 @@ impl ForwardBody {
         match self.driver.poll(context) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(_) => {
-                self.request_deadline.take();
-                self.generation.take();
+                self.release_response_lifetime();
                 Poll::Ready(Ok(()))
             }
         }
@@ -290,10 +497,19 @@ impl ForwardBody {
             None => None,
         };
         self.body.take();
-        self.trailers = Some(trailers.map(|mut headers| {
-            strip_response_hop_by_hop(&mut headers);
-            headers
-        }));
+        let trailers = match trailers {
+            Some(mut headers) => {
+                if let Err(error) = self.admit_response_trailers(&headers) {
+                    self.terminal_error = Some(error.clone());
+                    return Poll::Ready(Err(error));
+                }
+                strip_response_hop_by_hop(&mut headers);
+                Some(headers)
+            }
+            None => None,
+        };
+        self.response_idle_deadline.take();
+        self.trailers = Some(trailers);
         Poll::Ready(Ok(()))
     }
 
@@ -302,8 +518,7 @@ impl ForwardBody {
         match self.driver.poll(context) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(_) => {
-                self.request_deadline.take();
-                self.generation.take();
+                self.release_response_lifetime();
                 Poll::Ready(
                     self.terminal_error
                         .as_ref()
@@ -327,22 +542,19 @@ impl ForwardBody {
         match self.driver.poll(context) {
             Poll::Pending => self.poll_driver_drain_timeout(context),
             Poll::Ready(Ok(Ok(()))) => {
-                self.request_deadline.take();
-                self.generation.take();
+                self.release_response_lifetime();
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Ok(Err(error))) => {
                 let error = ForwardBodyError::Connection(std::sync::Arc::new(error));
                 self.terminal_error = Some(error.clone());
-                self.request_deadline.take();
-                self.generation.take();
+                self.release_response_lifetime();
                 Poll::Ready(Err(error))
             }
             Poll::Ready(Err(error)) => {
                 let error = ForwardBodyError::Task(std::sync::Arc::new(error));
                 self.terminal_error = Some(error.clone());
-                self.request_deadline.take();
-                self.generation.take();
+                self.release_response_lifetime();
                 Poll::Ready(Err(error))
             }
         }
@@ -366,17 +578,45 @@ impl HttpBody for ForwardBody {
         if let Poll::Ready(error) = self.poll_request_deadline(context) {
             return Poll::Ready(Some(Err(error)));
         }
+        if let Poll::Ready(error) = self.poll_response_idle_deadline(context) {
+            return Poll::Ready(Some(Err(error)));
+        }
+        if let Some(bytes) = self.next_data_slice() {
+            return Poll::Ready(Some(Ok(bytes)));
+        }
         if !self.data_done {
-            if let Some(body) = self.body.as_mut() {
+            for _ in 0..MAX_INTERNAL_RESPONSE_EVENTS_PER_POLL {
+                let Some(body) = self.body.as_mut() else {
+                    self.data_done = true;
+                    self.begin_terminal_drain();
+                    break;
+                };
                 match Pin::new(body).poll_data(context) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Some(Ok(bytes))) => return Poll::Ready(Some(Ok(bytes))),
+                    Poll::Ready(Some(Ok(bytes))) if bytes.is_empty() => {
+                        self.empty_frames = self.empty_frames.saturating_add(1);
+                        if self.empty_frames > MAX_EMPTY_RESPONSE_FRAMES {
+                            return match self.fail_body(context, ForwardBodyError::Limit) {
+                                Poll::Pending => Poll::Pending,
+                                Poll::Ready(error) => Poll::Ready(Some(Err(error))),
+                            };
+                        }
+                    }
+                    Poll::Ready(Some(Ok(bytes))) => {
+                        if let Err(error) = self.admit_response_data(bytes) {
+                            return match self.fail_body(context, error) {
+                                Poll::Pending => Poll::Pending,
+                                Poll::Ready(error) => Poll::Ready(Some(Err(error))),
+                            };
+                        }
+                        return Poll::Ready(Some(Ok(self
+                            .next_data_slice()
+                            .expect("admitted response data is pending"))));
+                    }
                     Poll::Ready(Some(Err(error))) => {
-                        self.body.take();
-                        self.trailers.take();
-                        self.terminal_error =
-                            Some(ForwardBodyError::Body(std::sync::Arc::new(error)));
-                        return match self.poll_terminal_error_join(context) {
+                        return match self
+                            .fail_body(context, ForwardBodyError::Body(std::sync::Arc::new(error)))
+                        {
                             Poll::Pending => Poll::Pending,
                             Poll::Ready(error) => Poll::Ready(Some(Err(error))),
                         };
@@ -384,11 +624,13 @@ impl HttpBody for ForwardBody {
                     Poll::Ready(None) => {
                         self.data_done = true;
                         self.begin_terminal_drain();
+                        break;
                     }
                 }
-            } else {
-                self.data_done = true;
-                self.begin_terminal_drain();
+            }
+            if !self.data_done {
+                context.waker().wake_by_ref();
+                return Poll::Pending;
             }
         }
         match self.poll_response_trailers(context) {
@@ -419,6 +661,9 @@ impl HttpBody for ForwardBody {
             };
         }
         if let Poll::Ready(error) = self.poll_request_deadline(context) {
+            return Poll::Ready(Err(error));
+        }
+        if let Poll::Ready(error) = self.poll_response_idle_deadline(context) {
             return Poll::Ready(Err(error));
         }
         match self.poll_response_trailers(context) {
@@ -467,7 +712,7 @@ impl HttpBody for ForwardBody {
 pub(crate) type ForwardedResponse = Response<ForwardBody>;
 
 pub(crate) enum ForwardUpgradeResult {
-    Response(ForwardedResponse),
+    Response(Box<ForwardedResponse>),
     SwitchingProtocols(ForwardedUpgrade),
 }
 
@@ -645,30 +890,33 @@ pub(crate) async fn forward_request<B>(
     egress: &dyn EgressSnapshot,
     destinations: &DestinationGuard,
     target: ResolvedForwardingTarget,
+    deadlines: ForwardingDeadlines,
 ) -> Result<ForwardedResponse, ForwardError>
 where
     B: HttpBody + Send + 'static,
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    forward_with_connector(
+    forward_with_connector_timed(
         request,
         canonical,
         egress,
         destinations,
         target,
         &TcpDestinationConnector,
+        deadlines,
     )
     .await
 }
 
-async fn forward_with_connector<C, B>(
+async fn forward_with_connector_timed<C, B>(
     request: SanitizedRequest<B>,
     canonical: &CanonicalUrl,
     egress: &dyn EgressSnapshot,
     destinations: &DestinationGuard,
     target: ResolvedForwardingTarget,
     connector: &C,
+    deadlines: ForwardingDeadlines,
 ) -> Result<ForwardedResponse, ForwardError>
 where
     C: DestinationConnector,
@@ -688,11 +936,18 @@ where
 
     match (egress.route(), target.route) {
         (EgressRoute::Direct, ResolvedForwardingRoute::Direct(resolved)) => {
-            let stream = destinations
-                .connect(resolved, connector)
+            let stream = connect_stage(deadlines, destinations.connect(resolved, connector))
                 .await?
                 .into_stream();
-            forward_direct(request, canonical, egress, selected_origin_protocol, stream).await
+            forward_direct(
+                request,
+                canonical,
+                egress,
+                selected_origin_protocol,
+                stream,
+                deadlines,
+            )
+            .await
         }
         (
             EgressRoute::Parent(parent),
@@ -701,8 +956,7 @@ where
                 destination: resolved,
             },
         ) if parent_url == parent.canonical_url() => {
-            let stream = destinations
-                .connect(resolved, connector)
+            let stream = connect_stage(deadlines, destinations.connect(resolved, connector))
                 .await?
                 .into_stream();
             forward_via_parent(
@@ -712,11 +966,40 @@ where
                 parent,
                 selected_origin_protocol,
                 stream,
+                deadlines,
             )
             .await
         }
         _ => Err(ForwardError::ResolvedTargetMismatch),
     }
+}
+
+#[cfg(test)]
+async fn forward_with_connector<C, B>(
+    request: SanitizedRequest<B>,
+    canonical: &CanonicalUrl,
+    egress: &dyn EgressSnapshot,
+    destinations: &DestinationGuard,
+    target: ResolvedForwardingTarget,
+    connector: &C,
+) -> Result<ForwardedResponse, ForwardError>
+where
+    C: DestinationConnector,
+    C::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    forward_with_connector_timed(
+        request,
+        canonical,
+        egress,
+        destinations,
+        target,
+        connector,
+        ForwardingDeadlines::for_test(),
+    )
+    .await
 }
 
 /// Sends one already-authorized HTTP/1 upgrade request without connection
@@ -729,6 +1012,7 @@ pub(crate) async fn forward_upgrade_request<B>(
     generation: &GenerationRetention,
     destinations: std::sync::Arc<DestinationGuard>,
     target: ResolvedForwardingTarget,
+    deadlines: ForwardingDeadlines,
 ) -> Result<ForwardUpgradeResult, ForwardError>
 where
     B: HttpBody + Send + 'static,
@@ -736,24 +1020,26 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let egress = generation.egress();
-    forward_upgrade_with_connector(
+    forward_upgrade_with_connector_timed(
         request,
         canonical,
         egress,
         &destinations,
         target,
         &TcpDestinationConnector,
+        deadlines,
     )
     .await
 }
 
-async fn forward_upgrade_with_connector<C, B>(
+async fn forward_upgrade_with_connector_timed<C, B>(
     request: SanitizedRequest<B>,
     canonical: &CanonicalUrl,
     egress: &dyn EgressSnapshot,
     destinations: &DestinationGuard,
     target: ResolvedForwardingTarget,
     connector: &C,
+    deadlines: ForwardingDeadlines,
 ) -> Result<ForwardUpgradeResult, ForwardError>
 where
     C: DestinationConnector,
@@ -780,11 +1066,10 @@ where
 
     match (egress.route(), target.route) {
         (EgressRoute::Direct, ResolvedForwardingRoute::Direct(resolved)) => {
-            let stream = destinations
-                .connect(resolved, connector)
+            let stream = connect_stage(deadlines, destinations.connect(resolved, connector))
                 .await?
                 .into_stream();
-            forward_upgrade_direct(request, canonical, egress, stream, intent).await
+            forward_upgrade_direct(request, canonical, egress, stream, intent, deadlines).await
         }
         (
             EgressRoute::Parent(parent),
@@ -793,14 +1078,44 @@ where
                 destination: resolved,
             },
         ) if parent_url == parent.canonical_url() => {
-            let stream = destinations
-                .connect(resolved, connector)
+            let stream = connect_stage(deadlines, destinations.connect(resolved, connector))
                 .await?
                 .into_stream();
-            forward_upgrade_via_parent(request, canonical, egress, parent, stream, intent).await
+            forward_upgrade_via_parent(
+                request, canonical, egress, parent, stream, intent, deadlines,
+            )
+            .await
         }
         _ => Err(ForwardError::ResolvedTargetMismatch),
     }
+}
+
+#[cfg(test)]
+async fn forward_upgrade_with_connector<C, B>(
+    request: SanitizedRequest<B>,
+    canonical: &CanonicalUrl,
+    egress: &dyn EgressSnapshot,
+    destinations: &DestinationGuard,
+    target: ResolvedForwardingTarget,
+    connector: &C,
+) -> Result<ForwardUpgradeResult, ForwardError>
+where
+    C: DestinationConnector,
+    C::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    forward_upgrade_with_connector_timed(
+        request,
+        canonical,
+        egress,
+        destinations,
+        target,
+        connector,
+        ForwardingDeadlines::for_test(),
+    )
+    .await
 }
 
 async fn forward_upgrade_direct<S, B>(
@@ -809,6 +1124,7 @@ async fn forward_upgrade_direct<S, B>(
     egress: &dyn EgressSnapshot,
     stream: S,
     intent: UpgradeIntent,
+    deadlines: ForwardingDeadlines,
 ) -> Result<ForwardUpgradeResult, ForwardError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -817,14 +1133,18 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     if canonical.scheme() == HttpScheme::Https {
-        let stream = connect_origin_tls(stream, canonical, egress, OriginProtocol::Http1).await?;
+        let stream = connect_stage(
+            deadlines,
+            connect_origin_tls(stream, canonical, egress, OriginProtocol::Http1),
+        )
+        .await?;
         let request = prepare_origin_upgrade_request(
             request,
             canonical,
             RequestTargetForm::Origin,
             OriginProtocol::Http1,
         )?;
-        send_upgrade_request(stream, request, intent).await
+        send_upgrade_request(stream, request, intent, deadlines).await
     } else {
         let request = prepare_origin_upgrade_request(
             request,
@@ -832,7 +1152,7 @@ where
             RequestTargetForm::Origin,
             OriginProtocol::Http1,
         )?;
-        send_upgrade_request(stream, request, intent).await
+        send_upgrade_request(stream, request, intent, deadlines).await
     }
 }
 
@@ -843,6 +1163,7 @@ async fn forward_upgrade_via_parent<S, B>(
     parent: &ParentEndpoint,
     stream: S,
     intent: UpgradeIntent,
+    deadlines: ForwardingDeadlines,
 ) -> Result<ForwardUpgradeResult, ForwardError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -853,29 +1174,39 @@ where
     if canonical.scheme() == HttpScheme::Https {
         match parent.transport() {
             ParentTransport::Http => {
-                let tunnel = connect_parent_tunnel(stream, canonical).await?;
-                let origin =
-                    connect_origin_tls(tunnel, canonical, egress, OriginProtocol::Http1).await?;
+                let tunnel =
+                    connect_stage(deadlines, connect_parent_tunnel(stream, canonical)).await?;
+                let origin = connect_stage(
+                    deadlines,
+                    connect_origin_tls(tunnel, canonical, egress, OriginProtocol::Http1),
+                )
+                .await?;
                 let request = prepare_origin_upgrade_request(
                     request,
                     canonical,
                     RequestTargetForm::Origin,
                     OriginProtocol::Http1,
                 )?;
-                send_upgrade_request(origin, request, intent).await
+                send_upgrade_request(origin, request, intent, deadlines).await
             }
             ParentTransport::Https(tls) => {
-                let parent_stream = connect_parent_tls(stream, tls, false).await?;
-                let tunnel = connect_parent_tunnel(parent_stream, canonical).await?;
-                let origin =
-                    connect_origin_tls(tunnel, canonical, egress, OriginProtocol::Http1).await?;
+                let parent_stream =
+                    connect_stage(deadlines, connect_parent_tls(stream, tls, false)).await?;
+                let tunnel =
+                    connect_stage(deadlines, connect_parent_tunnel(parent_stream, canonical))
+                        .await?;
+                let origin = connect_stage(
+                    deadlines,
+                    connect_origin_tls(tunnel, canonical, egress, OriginProtocol::Http1),
+                )
+                .await?;
                 let request = prepare_origin_upgrade_request(
                     request,
                     canonical,
                     RequestTargetForm::Origin,
                     OriginProtocol::Http1,
                 )?;
-                send_upgrade_request(origin, request, intent).await
+                send_upgrade_request(origin, request, intent, deadlines).await
             }
         }
     } else {
@@ -886,10 +1217,11 @@ where
             OriginProtocol::Http1,
         )?;
         match parent.transport() {
-            ParentTransport::Http => send_upgrade_request(stream, request, intent).await,
+            ParentTransport::Http => send_upgrade_request(stream, request, intent, deadlines).await,
             ParentTransport::Https(tls) => {
-                let stream = connect_parent_tls(stream, tls, false).await?;
-                send_upgrade_request(stream, request, intent).await
+                let stream =
+                    connect_stage(deadlines, connect_parent_tls(stream, tls, false)).await?;
+                send_upgrade_request(stream, request, intent, deadlines).await
             }
         }
     }
@@ -901,6 +1233,7 @@ async fn forward_direct<S, B>(
     egress: &dyn EgressSnapshot,
     protocol: OriginProtocol,
     stream: S,
+    deadlines: ForwardingDeadlines,
 ) -> Result<ForwardedResponse, ForwardError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -909,14 +1242,18 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     if canonical.scheme() == HttpScheme::Https {
-        let stream = connect_origin_tls(stream, canonical, egress, protocol).await?;
+        let stream = connect_stage(
+            deadlines,
+            connect_origin_tls(stream, canonical, egress, protocol),
+        )
+        .await?;
         let request =
             prepare_origin_request(request, canonical, RequestTargetForm::Origin, protocol)?;
-        send_request(stream, request, protocol).await
+        send_request(stream, request, protocol, deadlines).await
     } else {
         let request =
             prepare_origin_request(request, canonical, RequestTargetForm::Origin, protocol)?;
-        send_request(stream, request, protocol).await
+        send_request(stream, request, protocol, deadlines).await
     }
 }
 
@@ -927,6 +1264,7 @@ async fn forward_via_parent<S, B>(
     parent: &ParentEndpoint,
     protocol: OriginProtocol,
     stream: S,
+    deadlines: ForwardingDeadlines,
 ) -> Result<ForwardedResponse, ForwardError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -939,37 +1277,53 @@ where
         // headers. The selected origin protocol applies inside the tunnel.
         match parent.transport() {
             ParentTransport::Http => {
-                let tunnel = connect_parent_tunnel(stream, canonical).await?;
-                let origin = connect_origin_tls(tunnel, canonical, egress, protocol).await?;
+                let tunnel =
+                    connect_stage(deadlines, connect_parent_tunnel(stream, canonical)).await?;
+                let origin = connect_stage(
+                    deadlines,
+                    connect_origin_tls(tunnel, canonical, egress, protocol),
+                )
+                .await?;
                 let request = prepare_origin_request(
                     request,
                     canonical,
                     RequestTargetForm::Origin,
                     protocol,
                 )?;
-                send_request(origin, request, protocol).await
+                send_request(origin, request, protocol, deadlines).await
             }
             ParentTransport::Https(tls) => {
-                let parent_stream = connect_parent_tls(stream, tls, false).await?;
-                let tunnel = connect_parent_tunnel(parent_stream, canonical).await?;
-                let origin = connect_origin_tls(tunnel, canonical, egress, protocol).await?;
+                let parent_stream =
+                    connect_stage(deadlines, connect_parent_tls(stream, tls, false)).await?;
+                let tunnel =
+                    connect_stage(deadlines, connect_parent_tunnel(parent_stream, canonical))
+                        .await?;
+                let origin = connect_stage(
+                    deadlines,
+                    connect_origin_tls(tunnel, canonical, egress, protocol),
+                )
+                .await?;
                 let request = prepare_origin_request(
                     request,
                     canonical,
                     RequestTargetForm::Origin,
                     protocol,
                 )?;
-                send_request(origin, request, protocol).await
+                send_request(origin, request, protocol, deadlines).await
             }
         }
     } else {
         let request =
             prepare_origin_request(request, canonical, RequestTargetForm::Absolute, protocol)?;
         match parent.transport() {
-            ParentTransport::Http => send_request(stream, request, protocol).await,
+            ParentTransport::Http => send_request(stream, request, protocol, deadlines).await,
             ParentTransport::Https(tls) => {
-                let stream = connect_parent_tls(stream, tls, protocol.is_http2()).await?;
-                send_request(stream, request, protocol).await
+                let stream = connect_stage(
+                    deadlines,
+                    connect_parent_tls(stream, tls, protocol.is_http2()),
+                )
+                .await?;
+                send_request(stream, request, protocol, deadlines).await
             }
         }
     }
@@ -1070,6 +1424,7 @@ async fn send_upgrade_request<S, B>(
     stream: S,
     request: Request<B>,
     intent: UpgradeIntent,
+    deadlines: ForwardingDeadlines,
 ) -> Result<ForwardUpgradeResult, ForwardError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1080,25 +1435,36 @@ where
     let (parts, body) = request.into_parts();
     let (body, body_complete) = UpgradeRequestBody::new(body);
     let request = Request::from_parts(parts, body);
-    let (mut sender, connection) = conn::Builder::new()
-        .handshake(stream)
-        .await
-        .map_err(ForwardError::Http)?;
+    let (mut sender, connection) = connect_stage(deadlines, async {
+        conn::Builder::new()
+            .handshake(stream)
+            .await
+            .map_err(ForwardError::Http)
+    })
+    .await?;
     let driver = DriverTask::spawn(connection);
-    let mut response = match sender.send_request(request).await {
-        Ok(response) => response,
-        Err(error) => {
+    let mut response = match tokio::time::timeout_at(
+        deadlines.response_head(),
+        sender.send_request(request),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
             driver.abort_and_join().await;
             return Err(ForwardError::Http(error));
+        }
+        Err(_) => {
+            driver.abort_and_join().await;
+            return Err(ForwardError::ResponseHeadTimeout);
         }
     };
 
     if response.status() != StatusCode::SWITCHING_PROTOCOLS {
         let (mut parts, body) = response.into_parts();
         strip_response_hop_by_hop(&mut parts.headers);
-        return Ok(ForwardUpgradeResult::Response(Response::from_parts(
-            parts,
-            ForwardBody::new(body, driver),
+        return Ok(ForwardUpgradeResult::Response(Box::new(
+            Response::from_parts(parts, ForwardBody::new(body, driver)),
         )));
     }
 
@@ -1177,6 +1543,7 @@ async fn send_request<S, B>(
     stream: S,
     request: Request<B>,
     protocol: OriginProtocol,
+    deadlines: ForwardingDeadlines,
 ) -> Result<ForwardedResponse, ForwardError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1188,16 +1555,25 @@ where
     if protocol.is_http2() {
         builder.http2_only(true);
     }
-    let (mut sender, connection) = builder
-        .handshake(stream)
-        .await
-        .map_err(ForwardError::Http)?;
+    let (mut sender, connection) = connect_stage(deadlines, async {
+        builder.handshake(stream).await.map_err(ForwardError::Http)
+    })
+    .await?;
     let driver = DriverTask::spawn(connection);
-    let response = match sender.send_request(request).await {
-        Ok(response) => response,
-        Err(error) => {
+    let response = match tokio::time::timeout_at(
+        deadlines.response_head(),
+        sender.send_request(request),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
             driver.abort_and_join().await;
             return Err(ForwardError::Http(error));
+        }
+        Err(_) => {
+            driver.abort_and_join().await;
+            return Err(ForwardError::ResponseHeadTimeout);
         }
     };
     if response.status().is_informational() {
@@ -1762,6 +2138,31 @@ mod tests {
         }
     }
 
+    fn response_policy(
+        wire_bytes: u64,
+        chunk_bytes: u64,
+        trailer_count: u64,
+        trailer_bytes: u64,
+        idle_ms: u64,
+    ) -> http_access_types::ResponsePolicy {
+        let limits = http_access_types::BodyLimits::new(
+            wire_bytes,
+            wire_bytes,
+            1,
+            1,
+            chunk_bytes,
+            trailer_count,
+            trailer_bytes,
+        )
+        .unwrap();
+        http_access_types::ResponsePolicy::new(
+            limits,
+            idle_ms,
+            http_access_types::RedirectPolicy::ReturnToCaller,
+        )
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn ordinary_forwarding_rejects_unsolicited_switching_protocols() {
         let canonical = canonicalize_http_url("http://origin.example/ordinary").unwrap();
@@ -1890,7 +2291,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         assert!(!response.headers().contains_key(CONNECTION));
         assert!(!response.headers().contains_key("x-private"));
-        let body = hyper::body::to_bytes(response.into_body()).await.unwrap();
+        let body = hyper::body::to_bytes((*response).into_body())
+            .await
+            .unwrap();
         assert_eq!(body, "denied");
         server.await.unwrap();
     }
@@ -2004,7 +2407,7 @@ mod tests {
             assert_eq!(server.read(&mut byte).await.unwrap(), 0);
         });
 
-        let error = send_upgrade_request(client, request, intent)
+        let error = send_upgrade_request(client, request, intent, ForwardingDeadlines::for_test())
             .await
             .err()
             .expect("an early 101 cannot establish an upgrade");
@@ -2030,6 +2433,123 @@ mod tests {
         assert!(body.data().await.is_none());
         assert!(body.trailers().await.unwrap().is_none());
         assert_eq!(completed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn response_body_slices_wire_frames_without_copying_or_recounting() {
+        let driver = tokio::spawn(async { Ok(()) });
+        let mut body = ForwardBody::new(
+            Body::from(Bytes::from_static(b"abcdef")),
+            DriverTask::from_handle(driver),
+        )
+        .with_response_policy(response_policy(6, 2, 4, 128, 1_000));
+
+        assert_eq!(body.data().await.unwrap().unwrap(), "ab");
+        assert_eq!(body.data().await.unwrap().unwrap(), "cd");
+        assert_eq!(body.data().await.unwrap().unwrap(), "ef");
+        assert!(body.data().await.is_none());
+        assert_eq!(body.observed_wire_bytes, 6);
+    }
+
+    #[tokio::test]
+    async fn response_body_rejects_wire_bytes_above_the_checked_limit() {
+        let driver = tokio::spawn(async { Ok(()) });
+        let mut body = ForwardBody::new(
+            Body::from(Bytes::from_static(b"abcdef")),
+            DriverTask::from_handle(driver),
+        )
+        .with_response_policy(response_policy(5, 5, 4, 128, 1_000));
+
+        let error = body.data().await.unwrap().unwrap_err();
+        assert!(matches!(error, ForwardBodyError::Limit));
+    }
+
+    #[tokio::test]
+    async fn response_body_idle_timeout_does_not_require_origin_eof() {
+        let driver =
+            tokio::spawn(async { std::future::pending::<Result<(), hyper::Error>>().await });
+        let (_sender, pending_body) = Body::channel();
+        let mut body = ForwardBody::new(pending_body, DriverTask::from_handle(driver))
+            .with_response_policy(response_policy(8, 4, 4, 128, 20));
+
+        let error = body.data().await.unwrap().unwrap_err();
+        assert!(matches!(error, ForwardBodyError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn response_trailers_are_bounded_before_hop_header_cleanup() {
+        let (mut sender, upstream_body) = Body::channel();
+        tokio::spawn(async move {
+            let mut trailers = http::HeaderMap::new();
+            trailers.append("x-one", HeaderValue::from_static("a"));
+            trailers.append("x-one", HeaderValue::from_static("b"));
+            sender.send_trailers(trailers).await.unwrap();
+        });
+        let driver = tokio::spawn(async { Ok(()) });
+        let mut body = ForwardBody::new(upstream_body, DriverTask::from_handle(driver))
+            .with_response_policy(response_policy(8, 4, 1, 128, 1_000));
+
+        let error = body.data().await.unwrap().unwrap_err();
+        assert!(matches!(error, ForwardBodyError::Limit));
+    }
+
+    #[tokio::test]
+    async fn response_body_caps_empty_frames_with_cooperative_polling() {
+        let frames = tokio_stream::iter(
+            (0..=MAX_EMPTY_RESPONSE_FRAMES).map(|_| Ok::<Bytes, io::Error>(Bytes::new())),
+        );
+        let driver = tokio::spawn(async { Ok(()) });
+        let mut body = ForwardBody::new(Body::wrap_stream(frames), DriverTask::from_handle(driver))
+            .with_response_policy(response_policy(8, 4, 4, 128, 600_000));
+
+        let error = body.data().await.unwrap().unwrap_err();
+        assert!(matches!(error, ForwardBodyError::Limit));
+    }
+
+    #[tokio::test]
+    async fn connect_stage_reports_its_own_timeout() {
+        let deadlines = ForwardingDeadlines::new(
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_millis(1),
+            Duration::from_secs(1),
+        );
+        let error = connect_stage(
+            deadlines,
+            std::future::pending::<Result<(), ForwardError>>(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(error, ForwardError::ConnectTimeout));
+    }
+
+    #[tokio::test]
+    async fn response_head_timeout_aborts_the_started_connection_driver() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let head = read_http_head(&mut server).await;
+            assert!(head.starts_with("GET /wait HTTP/1.1\r\n"));
+            let mut byte = [0_u8; 1];
+            assert_eq!(server.read(&mut byte).await.unwrap(), 0);
+        });
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/wait")
+            .header(HOST, "origin.example")
+            .body(Body::empty())
+            .unwrap();
+        let deadlines = ForwardingDeadlines::new(
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_millis(20),
+        );
+
+        let error = match send_request(client, request, OriginProtocol::Http1, deadlines).await {
+            Ok(_) => panic!("a missing upstream response head must time out"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, ForwardError::ResponseHeadTimeout));
+        server.await.unwrap();
     }
 
     #[tokio::test]

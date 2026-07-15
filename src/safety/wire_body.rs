@@ -127,6 +127,16 @@ impl WireBodyPool {
         })
     }
 
+    pub(super) fn begin_forward_response(
+        self: &Arc<Self>,
+        response_peak_bytes: usize,
+        quota_key: WireBodyQuotaKey,
+    ) -> Result<ForwardResponseAdmission, WireBodyBufferError> {
+        Ok(ForwardResponseAdmission {
+            _reservation: RuntimeReplayLease::acquire(self, quota_key, response_peak_bytes)?,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn begin_for_test(
         self: &Arc<Self>,
@@ -363,6 +373,18 @@ pub(crate) struct RuntimeReplayLease {
     pool: Arc<WireBodyPool>,
     quota_lease: Option<QuotaLease>,
     capacity_bytes: usize,
+}
+
+/// Non-cloneable aggregate reservation retained by one forwarded response.
+pub(crate) struct ForwardResponseAdmission {
+    _reservation: RuntimeReplayLease,
+}
+
+impl ForwardResponseAdmission {
+    #[cfg(test)]
+    pub(crate) fn capacity_bytes(&self) -> usize {
+        self._reservation.capacity_bytes()
+    }
 }
 
 impl RuntimeReplayLease {

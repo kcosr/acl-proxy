@@ -32,7 +32,9 @@ use crate::proxy::forward::{
     ResolvedForwardingTarget,
 };
 use crate::request_pipeline::{RequestPipelineError, StandaloneDispatch};
-use crate::runtime::{GenerationLease, GenerationRetention, ProviderIndex};
+use crate::runtime::{
+    ForwardingGenerationServices, GenerationLease, GenerationRetention, ProviderIndex,
+};
 use crate::runtime_body_source::{ProductBodySource, ProductBodySourceActivation};
 use crate::safety::{GuardedBody, WireBodyQuotaKey};
 use crate::standalone_provider_result::{
@@ -167,14 +169,16 @@ struct PreparedDecision {
 struct PreparedTerminalState {
     generation: GenerationLease,
     request_id: String,
+    quota_key: WireBodyQuotaKey,
     deadline: Instant,
     destinations: Arc<DestinationGuard>,
     transport: StandaloneIngressTransport,
 }
 
 struct PreparedDispatch {
-    generation: GenerationLease,
+    services: ForwardingGenerationServices,
     request_id: String,
+    quota_key: WireBodyQuotaKey,
     retention: GenerationRetention,
     deadline: Instant,
     destinations: Arc<DestinationGuard>,
@@ -218,8 +222,9 @@ impl StandaloneIngressTransport {
 
 pub(crate) struct StandaloneForwardDispatch {
     pub(crate) exchange: StandaloneExchange,
-    pub(crate) generation: GenerationLease,
+    pub(crate) services: ForwardingGenerationServices,
     pub(crate) request_id: String,
+    pub(crate) quota_key: WireBodyQuotaKey,
     pub(crate) retention: GenerationRetention,
     pub(crate) deadline: Instant,
     pub(crate) destinations: Arc<DestinationGuard>,
@@ -411,6 +416,7 @@ where
             terminal: Some(PreparedTerminalState {
                 generation: lease,
                 request_id: input.request_id.clone(),
+                quota_key: input.quota_key.clone(),
                 deadline,
                 destinations: input.destinations,
                 transport,
@@ -762,9 +768,11 @@ where
             .generation
             .retain_for_operation()
             .map_err(|_| 503_u16)?;
+        let services = terminal.generation.into_forwarding_services();
         *dispatch = Some(PreparedDispatch {
-            generation: terminal.generation,
+            services,
             request_id: terminal.request_id,
+            quota_key: terminal.quota_key,
             retention,
             deadline: terminal.deadline,
             destinations: terminal.destinations,
@@ -943,8 +951,9 @@ where
         }
         terminal.forward(StandaloneForwardDispatch {
             exchange,
-            generation: dispatch.generation,
+            services: dispatch.services,
             request_id: dispatch.request_id,
+            quota_key: dispatch.quota_key,
             retention: dispatch.retention,
             deadline: dispatch.deadline,
             destinations: dispatch.destinations,
@@ -1345,7 +1354,6 @@ header = "x-test-loop"
 
         fn forward(self, dispatch: StandaloneForwardDispatch) -> BoxFuture<'static, Self::Output> {
             Box::pin(async move {
-                assert_eq!(dispatch.generation.id(), dispatch.retention.id());
                 assert_eq!(
                     dispatch.exchange.plan().request_body().trailer_policy(),
                     TrailerPolicy::Deny

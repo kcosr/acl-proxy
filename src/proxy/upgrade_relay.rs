@@ -3,6 +3,7 @@ use std::io::Read;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use allocator_api2::boxed::Box as FallibleBox;
@@ -12,7 +13,9 @@ use flate2::{Compress, Compression, FlushCompress};
 use http::header::{HeaderName, HeaderValue};
 use http::HeaderMap;
 use hyper::upgrade::Upgraded;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use crate::capture::{CaptureArtifactJob, CaptureKind, CaptureRecord};
 use crate::observation::{CaptureBodyBuilder, CaptureEvent, ProductObservationRuntime};
@@ -287,6 +290,92 @@ pub(crate) struct PreparedUpgradeRelay {
     kind: PreparedUpgradeKind,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct UpgradeRelayDeadlines {
+    idle: Duration,
+    absolute: Instant,
+}
+
+impl UpgradeRelayDeadlines {
+    pub(crate) fn new(idle: Duration, absolute: Instant) -> Self {
+        Self { idle, absolute }
+    }
+}
+
+struct RelayActivity {
+    sequence: AtomicU64,
+    changed: Notify,
+}
+
+impl RelayActivity {
+    fn record(&self) {
+        self.sequence.fetch_add(1, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+}
+
+struct ActivityIo<T> {
+    inner: T,
+    activity: Option<Arc<RelayActivity>>,
+}
+
+impl<T> ActivityIo<T> {
+    fn new(inner: T, activity: Option<Arc<RelayActivity>>) -> Self {
+        Self { inner, activity }
+    }
+
+    fn record(&self, bytes: usize) {
+        if bytes != 0 {
+            if let Some(activity) = self.activity.as_ref() {
+                activity.record();
+            }
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for ActivityIo<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buffer.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(context, buffer);
+        if matches!(result, Poll::Ready(Ok(()))) {
+            self.record(buffer.filled().len().saturating_sub(before));
+        }
+        result
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for ActivityIo<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(context, buffer);
+        if let Poll::Ready(Ok(bytes)) = result {
+            self.record(bytes);
+        }
+        result
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(context)
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(context)
+    }
+}
+
 enum PreparedUpgradeKind {
     Opaque {
         client_to_upstream: RelayBuffer,
@@ -314,12 +403,14 @@ impl PreparedUpgradeRelay {
         downstream: Upgraded,
         upstream: Upgraded,
         snapshot: UpgradedStreamSnapshot,
+        deadlines: UpgradeRelayDeadlines,
     ) -> UpgradeRelayPair {
         debug_assert!(
             !matches!(&self.kind, PreparedUpgradeKind::WebSocket { .. })
                 || snapshot.wire_redaction().is_some()
         );
-        build_relay_tasks(downstream, upstream, self.kind).into_pair()
+        build_relay_tasks_with_deadlines(downstream, upstream, self.kind, Some(deadlines))
+            .into_pair()
     }
 }
 
@@ -339,8 +430,29 @@ impl RelayTasks {
             self.graceful_drain_timeout,
         )
     }
+
+    fn with_deadlines(
+        self,
+        deadlines: UpgradeRelayDeadlines,
+        activity: Arc<RelayActivity>,
+    ) -> Self {
+        Self {
+            client_to_upstream: Box::pin(relay_with_deadlines(
+                self.client_to_upstream,
+                deadlines,
+                activity.clone(),
+            )),
+            upstream_to_client: Box::pin(relay_with_deadlines(
+                self.upstream_to_client,
+                deadlines,
+                activity,
+            )),
+            graceful_drain_timeout: self.graceful_drain_timeout,
+        }
+    }
 }
 
+#[cfg(test)]
 fn build_relay_tasks<Downstream, Upstream>(
     downstream: Downstream,
     upstream: Upstream,
@@ -350,7 +462,65 @@ where
     Downstream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     Upstream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    match kind {
+    build_relay_tasks_with_deadlines(downstream, upstream, kind, None)
+}
+
+async fn relay_with_deadlines(
+    relay: RelayFuture,
+    deadlines: UpgradeRelayDeadlines,
+    activity: Arc<RelayActivity>,
+) -> UpgradeTerminalCause {
+    let mut relay = relay;
+    let absolute = tokio::time::sleep_until(deadlines.absolute);
+    tokio::pin!(absolute);
+    let mut observed = activity.sequence.load(Ordering::Acquire);
+    let idle = tokio::time::sleep(deadlines.idle);
+    tokio::pin!(idle);
+
+    loop {
+        let changed = activity.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let current = activity.sequence.load(Ordering::Acquire);
+        if current != observed {
+            observed = current;
+            idle.as_mut().reset(Instant::now() + deadlines.idle);
+            continue;
+        }
+        tokio::select! {
+            cause = relay.as_mut() => return cause,
+            () = absolute.as_mut() => return UpgradeTerminalCause::LifetimeExpired,
+            () = idle.as_mut() => return UpgradeTerminalCause::IdleTimeout,
+            () = changed.as_mut() => {
+                let current = activity.sequence.load(Ordering::Acquire);
+                if current != observed {
+                    observed = current;
+                    idle.as_mut().reset(Instant::now() + deadlines.idle);
+                }
+            }
+        }
+    }
+}
+
+fn build_relay_tasks_with_deadlines<Downstream, Upstream>(
+    downstream: Downstream,
+    upstream: Upstream,
+    kind: PreparedUpgradeKind,
+    deadlines: Option<UpgradeRelayDeadlines>,
+) -> RelayTasks
+where
+    Downstream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    Upstream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let activity = deadlines.map(|_| {
+        Arc::new(RelayActivity {
+            sequence: AtomicU64::new(0),
+            changed: Notify::new(),
+        })
+    });
+    let downstream = ActivityIo::new(downstream, activity.clone());
+    let upstream = ActivityIo::new(upstream, activity.clone());
+    let tasks = match kind {
         PreparedUpgradeKind::Opaque {
             client_to_upstream,
             upstream_to_client,
@@ -428,6 +598,10 @@ where
                 graceful_drain_timeout: Some(WEBSOCKET_CLOSE_DRAIN_TIMEOUT),
             }
         }
+    };
+    match (deadlines, activity) {
+        (Some(deadlines), Some(activity)) => tasks.with_deadlines(deadlines, activity),
+        _ => tasks,
     }
 }
 
@@ -1742,6 +1916,21 @@ mod tests {
         (downstream_peer, upstream_peer, tasks)
     }
 
+    fn establish_timed_opaque_streams(
+        deadlines: UpgradeRelayDeadlines,
+    ) -> (DuplexStream, DuplexStream, RelayTasks) {
+        let prepared = EstablishedUpgradeKind::Opaque.prepare(8, None).unwrap();
+        let (downstream_peer, downstream_relay) = duplex(4096);
+        let (upstream_peer, upstream_relay) = duplex(4096);
+        let tasks = build_relay_tasks_with_deadlines(
+            downstream_relay,
+            upstream_relay,
+            prepared.kind,
+            Some(deadlines),
+        );
+        (downstream_peer, upstream_peer, tasks)
+    }
+
     fn wire_frame(
         fin: bool,
         compressed: bool,
@@ -1834,6 +2023,84 @@ mod tests {
             UpgradeTerminalCause::PeerClosed
         );
         drop((downstream, upstream));
+    }
+
+    #[tokio::test]
+    async fn upgrade_idle_is_shared_across_both_relay_directions() {
+        let deadlines = UpgradeRelayDeadlines::new(
+            Duration::from_millis(40),
+            Instant::now() + Duration::from_secs(2),
+        );
+        let (mut downstream, mut upstream, tasks) = establish_timed_opaque_streams(deadlines);
+        let mut client_to_upstream = tokio::spawn(tasks.client_to_upstream);
+        let mut upstream_to_client = tokio::spawn(tasks.upstream_to_client);
+
+        for byte in 0_u8..5 {
+            downstream.write_all(&[byte]).await.unwrap();
+            let mut relayed = [0_u8; 1];
+            upstream.read_exact(&mut relayed).await.unwrap();
+            assert_eq!(relayed, [byte]);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(!client_to_upstream.is_finished());
+            assert!(!upstream_to_client.is_finished());
+        }
+
+        let (first, client_finished) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                cause = &mut client_to_upstream => (cause.unwrap(), true),
+                cause = &mut upstream_to_client => (cause.unwrap(), false),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(first, UpgradeTerminalCause::IdleTimeout);
+        if client_finished {
+            upstream_to_client.abort();
+            let _ = upstream_to_client.await;
+        } else {
+            client_to_upstream.abort();
+            let _ = client_to_upstream.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn upgrade_absolute_deadline_is_not_reset_by_activity() {
+        let absolute = Instant::now() + Duration::from_millis(120);
+        let deadlines = UpgradeRelayDeadlines::new(Duration::from_secs(1), absolute);
+        let (mut downstream, mut upstream, tasks) = establish_timed_opaque_streams(deadlines);
+        let mut client_to_upstream = tokio::spawn(tasks.client_to_upstream);
+        let mut upstream_to_client = tokio::spawn(tasks.upstream_to_client);
+        let traffic = tokio::spawn(async move {
+            loop {
+                if downstream.write_all(b"x").await.is_err() {
+                    break;
+                }
+                let mut relayed = [0_u8; 1];
+                if upstream.read_exact(&mut relayed).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let (first, client_finished) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                cause = &mut client_to_upstream => (cause.unwrap(), true),
+                cause = &mut upstream_to_client => (cause.unwrap(), false),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(first, UpgradeTerminalCause::LifetimeExpired);
+        if client_finished {
+            upstream_to_client.abort();
+            let _ = upstream_to_client.await;
+        } else {
+            client_to_upstream.abort();
+            let _ = client_to_upstream.await;
+        }
+        traffic.abort();
+        let _ = traffic.await;
     }
 
     #[tokio::test]

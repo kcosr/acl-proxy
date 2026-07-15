@@ -196,6 +196,14 @@ impl SafetySnapshot for EmptySnapshot {
             .begin_admission_for_test(0, 0, quota_key)
             .map_err(crate::safety::HttpBodyAdmissionError::Resource)
     }
+
+    fn begin_forward_response(
+        &self,
+        _quota_key: crate::safety::WireBodyQuotaKey,
+    ) -> Result<crate::safety::ForwardResponseAdmission, crate::safety::ForwardResponseAdmissionError>
+    {
+        unreachable!("the empty runtime snapshot cannot forward a response")
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

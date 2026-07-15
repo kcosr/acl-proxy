@@ -11,14 +11,16 @@ use crate::policy::{HttpWireBodyPlanBrand, HttpWireBodyPlanIndex};
 use crate::runtime::SafetySnapshot;
 
 pub(crate) use wire_body::{
-    GuardedBody, HttpBodyAdmission, HttpWireBodyGuard, ProviderResponseCharge,
-    RequestStagingAuthority, RuntimeReplayLease, WireBodyPool, WireBodyQuotaKey,
+    ForwardResponseAdmission, GuardedBody, HttpBodyAdmission, HttpWireBodyGuard,
+    ProviderResponseCharge, RequestStagingAuthority, RuntimeReplayLease, WireBodyPool,
+    WireBodyQuotaKey,
 };
 
 pub(crate) struct ProductSafetySnapshot {
     loop_detection: LoopDetection,
     wire_body_pool: Arc<WireBodyPool>,
     http_body_resources: Box<[HttpBodyResourcePlan]>,
+    forward_response_peak_bytes: usize,
     http_wire_body_plan_brand: HttpWireBodyPlanBrand,
 }
 
@@ -66,6 +68,18 @@ impl ProductSafetySnapshot {
                 .max()
                 .unwrap_or(0)
                 != resources.max_reachable_http_body_combined_peak_bytes
+            || resources.forward_response_peak_bytes == 0
+            || resources
+                .http_body_resources_by_cursor
+                .iter()
+                .filter(|resource| resource.combined_peak_bytes != 0)
+                .try_fold(0_usize, |maximum, resource| {
+                    resource
+                        .combined_peak_bytes
+                        .checked_add(resources.forward_response_peak_bytes)
+                        .map(|peak| maximum.max(peak))
+                })
+                != Some(resources.max_reachable_http_exchange_peak_bytes)
         {
             return Err(SafetyActivationError::InvalidHttpWireBodyPlans);
         }
@@ -79,6 +93,7 @@ impl ProductSafetySnapshot {
                 .http_body_resources_by_cursor
                 .clone()
                 .into_boxed_slice(),
+            forward_response_peak_bytes: resources.forward_response_peak_bytes,
             http_wire_body_plan_brand,
         })
     }
@@ -124,6 +139,15 @@ impl SafetySnapshot for ProductSafetySnapshot {
             )
             .map_err(HttpBodyAdmissionError::Resource)
     }
+
+    fn begin_forward_response(
+        &self,
+        quota_key: WireBodyQuotaKey,
+    ) -> Result<ForwardResponseAdmission, ForwardResponseAdmissionError> {
+        self.wire_body_pool
+            .begin_forward_response(self.forward_response_peak_bytes, quota_key)
+            .map_err(ForwardResponseAdmissionError::Resource)
+    }
 }
 
 #[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
@@ -136,6 +160,12 @@ pub(crate) enum HttpBodyAdmissionError {
     UnknownPlan,
     #[error(transparent)]
     Resource(#[from] wire_body::WireBodyBufferError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ForwardResponseAdmissionError {
+    #[error("forward response resources are unavailable")]
+    Resource(#[source] wire_body::WireBodyBufferError),
 }
 
 #[cfg(test)]
@@ -165,8 +195,10 @@ mod tests {
             &CompiledResourcePlan {
                 http_body_resources_by_cursor: vec![resource(peak, 0), resource(0, 0)],
                 max_reachable_http_body_combined_peak_bytes: peak,
-                wire_body_full_peak_capacity: Capacity::Finite(8),
-                wire_body_quota_key_full_peak_capacity: Capacity::Finite(4),
+                forward_response_peak_bytes: peak,
+                max_reachable_http_exchange_peak_bytes: 2 * peak,
+                wire_body_full_peak_capacity: Capacity::Finite(4),
+                wire_body_quota_key_full_peak_capacity: Capacity::Finite(2),
                 webhook_request_allocation_bytes_by_rule: vec![None],
                 webhook_callback_allocation_bytes_by_rule: vec![None],
                 upgrade_wire_working_set_bytes_by_rule: vec![None],
@@ -254,6 +286,20 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_response_reservation_is_held_until_admission_drops() {
+        let snapshot = snapshot(true);
+        let expected = snapshot.forward_response_peak_bytes;
+        let admission = snapshot
+            .begin_forward_response(key())
+            .expect("forward response capacity is available");
+
+        assert_eq!(admission.capacity_bytes(), expected);
+        assert_eq!(snapshot.wire_body_pool.global_charge(), expected);
+        drop(admission);
+        assert_eq!(snapshot.wire_body_pool.global_charge(), 0);
+    }
+
+    #[test]
     fn snapshot_rejects_unknown_plan_without_granting_a_guard() {
         let snapshot = snapshot(true);
         assert!(matches!(
@@ -291,8 +337,10 @@ mod tests {
             &CompiledResourcePlan {
                 http_body_resources_by_cursor: vec![resource(peak, 0)],
                 max_reachable_http_body_combined_peak_bytes: peak,
-                wire_body_full_peak_capacity: Capacity::Finite(8),
-                wire_body_quota_key_full_peak_capacity: Capacity::Finite(4),
+                forward_response_peak_bytes: peak,
+                max_reachable_http_exchange_peak_bytes: 2 * peak,
+                wire_body_full_peak_capacity: Capacity::Finite(4),
+                wire_body_quota_key_full_peak_capacity: Capacity::Finite(2),
                 webhook_request_allocation_bytes_by_rule: vec![None],
                 webhook_callback_allocation_bytes_by_rule: vec![None],
                 upgrade_wire_working_set_bytes_by_rule: vec![None],

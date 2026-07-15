@@ -278,6 +278,11 @@ pub(crate) trait SafetySnapshot: Send + Sync {
         plan: crate::policy::HttpWireBodyPlanIndex,
         quota_key: crate::safety::WireBodyQuotaKey,
     ) -> Result<crate::safety::HttpBodyAdmission, crate::safety::HttpBodyAdmissionError>;
+
+    fn begin_forward_response(
+        &self,
+        quota_key: crate::safety::WireBodyQuotaKey,
+    ) -> Result<crate::safety::ForwardResponseAdmission, crate::safety::ForwardResponseAdmissionError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -503,6 +508,42 @@ pub(crate) struct GenerationLease {
     generation: Arc<Generation>,
 }
 
+pub(crate) struct ForwardingGenerationServices {
+    egress: Arc<dyn EgressSnapshot>,
+    credentials: Arc<dyn CredentialResolver>,
+    safety: Arc<dyn SafetySnapshot>,
+}
+
+impl ForwardingGenerationServices {
+    pub(crate) fn egress(&self) -> &dyn EgressSnapshot {
+        self.egress.as_ref()
+    }
+
+    pub(crate) fn inject_credentials(
+        &self,
+        actions: &[crate::credentials::ResolvedCredentialAction],
+        headers: &mut HeaderMap,
+    ) -> Result<(), crate::credentials::CredentialError> {
+        self.credentials.inject(actions, headers)
+    }
+
+    pub(crate) fn inject_loop_marker(
+        &self,
+        headers: &mut HeaderMap,
+        request_id: &str,
+    ) -> Result<(), crate::safety::InvalidLoopMarker> {
+        self.safety.inject_loop_marker(headers, request_id)
+    }
+
+    pub(crate) fn begin_response(
+        &self,
+        quota_key: crate::safety::WireBodyQuotaKey,
+    ) -> Result<crate::safety::ForwardResponseAdmission, crate::safety::ForwardResponseAdmissionError>
+    {
+        self.safety.begin_forward_response(quota_key)
+    }
+}
+
 impl GenerationLease {
     pub(crate) fn standalone(&self) -> &StandaloneGenerationPlan {
         &self.generation.standalone
@@ -515,6 +556,14 @@ impl GenerationLease {
         &self,
     ) -> Result<GenerationRetention, GenerationRetentionError> {
         self.generation.retain_existing()
+    }
+
+    pub(crate) fn into_forwarding_services(self) -> ForwardingGenerationServices {
+        ForwardingGenerationServices {
+            egress: Arc::clone(&self.generation.egress),
+            credentials: Arc::clone(&self.generation.credentials),
+            safety: Arc::clone(&self.generation.safety),
+        }
     }
 
     pub(crate) fn dispatch_authorization<'a>(

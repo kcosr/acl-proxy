@@ -9,6 +9,7 @@ use base64::encoded_len as base64_encoded_len;
 use http::header::{HeaderName, HeaderValue};
 use http::Method;
 use http_access_runtime::BodyBudget;
+use http_access_types::{BodyLimits, RedirectPolicy, ResponsePolicy};
 use regex_automata::{
     dfa::{dense, regex::Regex as DfaRegex, StartKind},
     nfa::thompson::{self, WhichCaptures, NFA},
@@ -957,6 +958,8 @@ pub(crate) struct LoopDetectionPlan {
 pub(crate) struct CompiledResourcePlan {
     pub(crate) http_body_resources_by_cursor: Vec<HttpBodyResourcePlan>,
     pub(crate) max_reachable_http_body_combined_peak_bytes: usize,
+    pub(crate) forward_response_peak_bytes: usize,
+    pub(crate) max_reachable_http_exchange_peak_bytes: usize,
     pub(crate) wire_body_full_peak_capacity: Capacity,
     pub(crate) wire_body_quota_key_full_peak_capacity: Capacity,
     pub(crate) webhook_request_allocation_bytes_by_rule: Vec<Option<usize>>,
@@ -3692,17 +3695,33 @@ fn compile_resource_plan(
         .map(|resource| resource.combined_peak_bytes)
         .max()
         .unwrap_or(0);
+    let forward_response_peak = compile_forward_response_peak(config)?;
+    let max_exchange_peak = resources_by_cursor
+        .iter()
+        .filter(|resource| resource.combined_peak_bytes != 0)
+        .try_fold(0_usize, |maximum, resource| {
+            let peak = resource
+                .combined_peak_bytes
+                .checked_add(forward_response_peak)
+                .ok_or_else(|| {
+                    ConfigCompileError::at(
+                        "service.forwarding",
+                        "request/response admission arithmetic overflow",
+                    )
+                })?;
+            Ok::<_, ConfigCompileError>(maximum.max(peak))
+        })?;
 
-    let wire_body_full_peak_capacity = if max_combined_peak == 0 {
+    let wire_body_full_peak_capacity = if max_exchange_peak == 0 {
         Capacity::Unbounded
     } else {
-        if max_combined_peak > config.service.max_inflight_wire_body_bytes_per_quota_key {
+        if max_exchange_peak > config.service.max_inflight_wire_body_bytes_per_quota_key {
             return Err(ConfigCompileError::at(
                 "service.max_inflight_wire_body_bytes_per_quota_key",
-                "must hold the largest pass-reachable mandatory body working set",
+                "must hold the largest pass-reachable request/response working set",
             ));
         }
-        let required = max_combined_peak
+        let required = max_exchange_peak
             .checked_mul(config.service.min_wire_body_concurrency)
             .ok_or_else(|| {
                 ConfigCompileError::at("service", "wire-body capacity arithmetic overflow")
@@ -3713,12 +3732,12 @@ fn compile_resource_plan(
                 "the requested minimum concurrency does not fit the global wire-body pool",
             ));
         }
-        Capacity::Finite(config.service.max_inflight_wire_body_bytes / max_combined_peak)
+        Capacity::Finite(config.service.max_inflight_wire_body_bytes / max_exchange_peak)
     };
     let wire_body_quota_key_full_peak_capacity = config
         .service
         .max_inflight_wire_body_bytes_per_quota_key
-        .checked_div(max_combined_peak)
+        .checked_div(max_exchange_peak)
         .map_or(Capacity::Unbounded, Capacity::Finite);
 
     let transport = config
@@ -3786,6 +3805,8 @@ fn compile_resource_plan(
     Ok(CompiledResourcePlan {
         http_body_resources_by_cursor: resources_by_cursor,
         max_reachable_http_body_combined_peak_bytes: max_combined_peak,
+        forward_response_peak_bytes: forward_response_peak,
+        max_reachable_http_exchange_peak_bytes: max_exchange_peak,
         wire_body_full_peak_capacity,
         wire_body_quota_key_full_peak_capacity,
         webhook_request_allocation_bytes_by_rule,
@@ -3793,6 +3814,78 @@ fn compile_resource_plan(
         upgrade_wire_working_set_bytes_by_rule,
         max_upgrade_allocation_per_stream: per_stream,
         max_upgrade_allocation_all_streams: all_streams,
+    })
+}
+
+fn compile_forward_response_peak(
+    config: &super::authoring::AuthoringConfig,
+) -> Result<usize, ConfigCompileError> {
+    let forwarding = &config.service.forwarding;
+    let ratio =
+        u64::try_from(config.service.max_content_decoding_expansion_ratio).map_err(|_| {
+            ConfigCompileError::at(
+                "service.max_content_decoding_expansion_ratio",
+                "forward response ratio cannot be represented",
+            )
+        })?;
+    let limits = BodyLimits::new(
+        u64::try_from(forwarding.max_response_wire_bytes).map_err(|_| {
+            ConfigCompileError::at(
+                "service.forwarding.max_response_wire_bytes",
+                "forward response limit cannot be represented",
+            )
+        })?,
+        u64::try_from(forwarding.max_response_decoded_bytes).map_err(|_| {
+            ConfigCompileError::at(
+                "service.forwarding.max_response_decoded_bytes",
+                "forward response limit cannot be represented",
+            )
+        })?,
+        ratio,
+        1,
+        u64::try_from(forwarding.chunk_bytes).map_err(|_| {
+            ConfigCompileError::at(
+                "service.forwarding.chunk_bytes",
+                "forward response chunk limit cannot be represented",
+            )
+        })?,
+        u64::try_from(forwarding.max_trailer_count).map_err(|_| {
+            ConfigCompileError::at(
+                "service.forwarding.max_trailer_count",
+                "forward response trailer limit cannot be represented",
+            )
+        })?,
+        u64::try_from(forwarding.max_trailer_bytes).map_err(|_| {
+            ConfigCompileError::at(
+                "service.forwarding.max_trailer_bytes",
+                "forward response trailer limit cannot be represented",
+            )
+        })?,
+    )
+    .map_err(|_| {
+        ConfigCompileError::at(
+            "service.forwarding",
+            "forward response limits are inconsistent",
+        )
+    })?;
+    let idle_ms = u64::try_from(forwarding.body_idle_timeout.get().as_millis()).map_err(|_| {
+        ConfigCompileError::at(
+            "service.forwarding.body_idle_timeout",
+            "forward response idle timeout cannot be represented",
+        )
+    })?;
+    let policy =
+        ResponsePolicy::new(limits, idle_ms, RedirectPolicy::ReturnToCaller).map_err(|_| {
+            ConfigCompileError::at(
+                "service.forwarding",
+                "forward response policy is inconsistent",
+            )
+        })?;
+    usize::try_from(policy.projection().simultaneous_peak_bytes()).map_err(|_| {
+        ConfigCompileError::at(
+            "service.forwarding",
+            "forward response projection cannot be represented",
+        )
     })
 }
 
@@ -7519,19 +7612,21 @@ authorization_provider = "decision"
                 .unwrap(),
         );
         let combined = peak + default_runtime_replay_storage();
+        let exchange = combined + resources.forward_response_peak_bytes;
 
         assert_eq!(resources.combined_http_body_peaks_for_test(), [combined, 0]);
         assert_eq!(
             resources.max_reachable_http_body_combined_peak_bytes,
             combined
         );
+        assert_eq!(resources.max_reachable_http_exchange_peak_bytes, exchange);
         assert_eq!(
             resources.wire_body_full_peak_capacity,
-            Capacity::Finite(16 * GIB / combined)
+            Capacity::Finite(16 * GIB / exchange)
         );
         assert_eq!(
             resources.wire_body_quota_key_full_peak_capacity,
-            Capacity::Finite(2 * GIB / combined)
+            Capacity::Finite(2 * GIB / exchange)
         );
     }
 
@@ -7592,10 +7687,14 @@ redaction_profile = "terminal"
         use crate::safety::{WireBodyPool, WireBodyQuotaKey};
 
         let baseline = compile(&one_byte_body_provider_config("")).unwrap();
-        let peak = baseline
+        let request_peak = baseline
             .reloadable_plan
             .resource_plan
             .max_reachable_http_body_combined_peak_bytes;
+        let peak = baseline
+            .reloadable_plan
+            .resource_plan
+            .max_reachable_http_exchange_peak_bytes;
         let exact_service = format!(
             "max_inflight_wire_body_bytes = {}\nmax_inflight_wire_body_bytes_per_quota_key = {peak}\nmin_wire_body_concurrency = 5",
             5 * peak
@@ -7617,12 +7716,12 @@ redaction_profile = "terminal"
             .expect_err("one byte below the projected product must fail");
         assert_eq!(error.path, "service.min_wire_body_concurrency");
 
-        let pool = WireBodyPool::new(5 * peak, peak);
+        let pool = WireBodyPool::new(5 * request_peak, request_peak);
         let small_charge = guarded(1);
         let mut live = Vec::new();
         for peer_suffix in 1..=6 {
             let guard = pool.begin_for_test(
-                peak,
+                request_peak,
                 WireBodyQuotaKey::from_peer(
                     std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, peer_suffix)),
                     |_| false,
@@ -7632,7 +7731,7 @@ redaction_profile = "terminal"
             body.try_extend_from_slice(b"x").unwrap();
             live.push((guard, body.finish()));
         }
-        assert!(small_charge < peak);
+        assert!(small_charge < request_peak);
         assert_eq!(pool.global_charge(), 6 * small_charge);
         assert!(pool.global_charge() < 5 * peak);
         drop(live);
@@ -9455,6 +9554,7 @@ redaction_profile = "post-stage"
             [replacement_budget, post_replay, 0]
         );
         let combined_post_path = post_path_peak + post_replay;
+        let exchange_peak = resources.max_reachable_http_exchange_peak_bytes;
         assert_eq!(
             resources.max_reachable_http_body_combined_peak_bytes,
             combined_post_path
@@ -9465,8 +9565,8 @@ redaction_profile = "post-stage"
 
         let exact_service = format!(
             "max_inflight_wire_body_bytes = {}\nmax_inflight_wire_body_bytes_per_quota_key = {}\nmin_wire_body_concurrency = 1",
-            4 * combined_post_path,
-            combined_post_path
+            4 * exchange_peak,
+            exchange_peak
         );
         let exact = input.replacen(
             "request_timeout = \"1s\"",
@@ -9497,14 +9597,17 @@ methods = ["POST"]
 authorization_provider = "replacing"
 "#;
         let compiled = compile(&resource_config("", definitions, rules)).unwrap();
-        let combined_peak = compiled
-            .reloadable_plan
-            .resource_plan
-            .max_reachable_http_body_combined_peak_bytes;
+        let resources = &compiled.reloadable_plan.resource_plan;
+        let combined_peak = resources.max_reachable_http_body_combined_peak_bytes;
+        let exchange_peak = resources.max_reachable_http_exchange_peak_bytes;
+        assert_eq!(
+            exchange_peak,
+            combined_peak + resources.forward_response_peak_bytes
+        );
         let service = format!(
             "max_inflight_wire_body_bytes = {}\nmax_inflight_wire_body_bytes_per_quota_key = {}\nmin_wire_body_concurrency = 1",
-            4 * combined_peak,
-            combined_peak - 1
+            4 * exchange_peak,
+            exchange_peak - 1
         );
 
         let error = compile(&resource_config(&service, definitions, rules))
@@ -9513,7 +9616,7 @@ authorization_provider = "replacing"
         assert!(
             error
                 .to_string()
-                .contains("largest pass-reachable mandatory body working set"),
+                .contains("largest pass-reachable request/response working set"),
             "{error}"
         );
     }
@@ -9523,10 +9626,16 @@ authorization_provider = "replacing"
         let guarded_peak = decode_peak(1, 1).unwrap();
         let runtime_budget = canonical_runtime_replay_storage(1);
         let combined_peak = guarded_peak + runtime_budget;
+        let response_peak = compile(&resource_config("", "", ""))
+            .unwrap()
+            .reloadable_plan
+            .resource_plan
+            .forward_response_peak_bytes;
+        let exchange_peak = combined_peak + response_peak;
         let input = resource_config(
             &format!(
-                "max_inflight_wire_body_bytes = {}\nmax_inflight_wire_body_bytes_per_quota_key = {combined_peak}\nmin_wire_body_concurrency = 5",
-                5 * combined_peak
+                "max_inflight_wire_body_bytes = {}\nmax_inflight_wire_body_bytes_per_quota_key = {exchange_peak}\nmin_wire_body_concurrency = 5",
+                5 * exchange_peak
             ),
             r#"
 [authorization.providers.large]
@@ -9564,6 +9673,10 @@ redaction_profile = "small"
         assert_eq!(
             resources.max_reachable_http_body_combined_peak_bytes,
             combined_peak
+        );
+        assert_eq!(
+            resources.max_reachable_http_exchange_peak_bytes,
+            exchange_peak
         );
         assert_eq!(
             resources.combined_http_body_peaks_for_test(),

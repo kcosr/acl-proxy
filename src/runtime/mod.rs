@@ -16,10 +16,10 @@ pub(crate) use generation::Generation;
 pub(crate) use generation::{
     ActivatedGeneration, AuthorizationDispatchContext, AuthorizationSnapshot, CleanupReason,
     CredentialResolver, CredentialSourceIndex, CredentialSourceRegistry, EgressSnapshot,
-    GenerationId, GenerationLease, GenerationOwner, GenerationRetention, GenerationRetentionError,
-    ObservationSnapshot, PolicySnapshot, ProviderIndex, ProviderRegistry, PublicationGuard,
-    RedactionProfileIndex, RedactionProfileRegistry, ResolvedBindings, ResolvedRuleBindings,
-    SafetySnapshot,
+    ForwardingGenerationServices, GenerationId, GenerationLease, GenerationOwner,
+    GenerationRetention, GenerationRetentionError, ObservationSnapshot, PolicySnapshot,
+    ProviderIndex, ProviderRegistry, PublicationGuard, RedactionProfileIndex,
+    RedactionProfileRegistry, ResolvedBindings, ResolvedRuleBindings, SafetySnapshot,
 };
 pub(crate) use readiness::ServiceReadiness;
 
