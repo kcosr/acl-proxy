@@ -303,14 +303,32 @@ impl CredentialIoRuntime {
         &self,
         deadline: Option<tokio::time::Instant>,
     ) -> CredentialIoShutdownOutcome {
+        self.wait_for_detached_operations_with_hook(deadline, std::future::ready(()))
+            .await
+    }
+
+    async fn wait_for_detached_operations_with_hook<Hook>(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+        before_first_await: Hook,
+    ) -> CredentialIoShutdownOutcome
+    where
+        Hook: Future<Output = ()>,
+    {
+        let mut before_first_await = Some(before_first_await);
         loop {
             let active = self.active_operations();
             if active == 0 {
                 return CredentialIoShutdownOutcome::Drained;
             }
             let changed = self.inner.state_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             if self.active_operations() == 0 {
                 continue;
+            }
+            if let Some(before_first_await) = before_first_await.take() {
+                before_first_await.await;
             }
             match deadline {
                 Some(deadline) => {
@@ -319,7 +337,7 @@ impl CredentialIoRuntime {
                         _ = tokio::time::sleep_until(deadline) => {
                             return self.deadline_outcome();
                         }
-                        () = changed => {}
+                        () = &mut changed => {}
                     }
                 }
                 None => changed.await,
@@ -984,6 +1002,63 @@ mod tests {
             CredentialIoShutdownOutcome::Drained
         );
         assert_eq!(runtime.counts().active, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn detached_completion_between_recheck_and_await_wakes_retry() {
+        let runtime = CredentialIoRuntime::for_test(1);
+        let gate = Arc::new(BlockingGate::default());
+        let gate_for_job = Arc::clone(&gate);
+        let (started_tx, started_rx) = std_mpsc::channel();
+        let operation = runtime
+            .submit(Box::new(move |_| {
+                started_tx.send(()).unwrap();
+                gate_for_job.wait();
+                Err(CredentialError::UnknownReference)
+            }))
+            .unwrap();
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            runtime
+                .shutdown_and_wait(Some(
+                    tokio::time::Instant::now() + std::time::Duration::from_millis(20),
+                ))
+                .await,
+            CredentialIoShutdownOutcome::DeadlineExceeded {
+                detached_operations: 1,
+            }
+        );
+        assert!(matches!(operation.await, Err(CredentialError::Cancelled)));
+
+        let retry_runtime = Arc::clone(&runtime);
+        let (waiter_enabled_tx, waiter_enabled_rx) = oneshot::channel();
+        let (await_tx, await_rx) = oneshot::channel();
+        let retry = tokio::spawn(async move {
+            retry_runtime
+                .wait_for_detached_operations_with_hook(None, async move {
+                    let _ = waiter_enabled_tx.send(());
+                    let _ = await_rx.await;
+                })
+                .await
+        });
+        waiter_enabled_rx.await.unwrap();
+
+        gate.open();
+        while runtime.counts().active != 0 {
+            tokio::task::yield_now().await;
+        }
+        let _ = await_tx.send(());
+
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), retry)
+                .await
+                .unwrap()
+                .unwrap(),
+            CredentialIoShutdownOutcome::Drained
+        );
     }
 
     #[test]
