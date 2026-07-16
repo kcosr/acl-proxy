@@ -7299,6 +7299,114 @@ urls = ["https://{target}/**"]
     }
 
     #[tokio::test]
+    async fn connect_mitm_outer_tunnel_omits_global_origin_credentials() {
+        const VARIABLE: &str = "ACL_PROXY_OUTER_CONNECT_IDENTITY";
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        std::env::remove_var(VARIABLE);
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let (origin_identity, _) = test_tls_identity();
+        let origin_acceptor = crate::tls_identity::load_static_tls_acceptor(
+            &origin_identity.path().join("server.pem"),
+            &origin_identity.path().join("server-key.pem"),
+            vec![b"http/1.1".to_vec()],
+        )
+        .unwrap();
+        let (identity_tx, identity_rx) = oneshot::channel();
+        let identity_tx = Arc::new(StdMutex::new(Some(identity_tx)));
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin_listener.accept().await.unwrap();
+            let tls = origin_acceptor.accept(stream).await.unwrap();
+            Http::new()
+                .http1_only(true)
+                .serve_connection(
+                    tls,
+                    service_fn(move |request| {
+                        let identity_tx = identity_tx.clone();
+                        let identity = request
+                            .headers()
+                            .get("x-aw-identity-token")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_owned);
+                        identity_tx
+                            .lock()
+                            .unwrap()
+                            .take()
+                            .unwrap()
+                            .send(identity)
+                            .ok();
+                        async { Ok::<_, Infallible>(Response::new(Body::from("credentialized"))) }
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let target = origin.to_string();
+        let credential_config = format!(
+            r#"
+[[egress.credential_actions]]
+kind = "custom_header"
+header = "x-aw-identity-token"
+credential = "outer_identity"
+
+[credentials]
+allowed_custom_headers = ["x-aw-identity-token"]
+
+[credentials.sources.outer_identity]
+source = "environment"
+variable = "{VARIABLE}"
+"#
+        );
+        let policy = format!("{}{}", connect_mitm_policy(&target), credential_config);
+        let config = base_config(proxy, "explicit_http", &policy).replacen(
+            "trust = \"system\"",
+            "trust = \"insecure\"",
+            1,
+        );
+        let (directory, product) = product(config, listeners).await;
+
+        let stream = open_connect(proxy, &target).await;
+        std::env::set_var(VARIABLE, "inner-identity");
+        let certificate = read_first_pem_certificate(&directory.path().join("mitm/ca-cert.pem"));
+        let connector = test_tls_connector(certificate, vec![b"http/1.1".to_vec()]);
+        let tls = connector
+            .connect(ServerName::try_from("127.0.0.1").unwrap(), stream)
+            .await
+            .unwrap();
+        let (mut sender, connection) = conn::handshake(tls).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .uri("/credentialized")
+                    .header(http::header::HOST, &target)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body()).await.unwrap(),
+            "credentialized"
+        );
+        assert_eq!(
+            identity_rx.await.unwrap().as_deref(),
+            Some("inner-identity")
+        );
+        drop(sender);
+        driver.await.unwrap().unwrap();
+        origin_task.await.unwrap();
+
+        product.shutdown().await;
+        assert!(StdTcpListener::bind(proxy).is_ok());
+        std::env::remove_var(VARIABLE);
+    }
+
+    #[tokio::test]
     async fn connect_mitm_inner_h2_alpn_forwards_canonical_origin_request() {
         let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
         let ([proxy], listeners) = prebound_listeners::<1>();

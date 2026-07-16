@@ -188,6 +188,7 @@ fn adapt_provider_allow_inner(
         .get(rule_ordinal)
         .filter(|rule| rule.ordinal() as usize == rule_ordinal)
         .ok_or(StandaloneProviderAllowError::Binding)?;
+    let outer_connect = request.facts().method().as_str() == "CONNECT";
     let (credentials, replacement) = authorization
         .consume_allow_output(provider, output)
         .ok_or(StandaloneProviderAllowError::Binding)?;
@@ -205,19 +206,24 @@ fn adapt_provider_allow_inner(
         .ok_or(StandaloneProviderAllowError::Binding)?;
     let upgrade_binding = compile_upgrade_binding(lease, Some(rule_ordinal), &request)?;
 
-    let provider_credentials = collect_provider_credentials(
-        generation,
-        provider,
-        provider_templates,
-        credentials.as_ref(),
-    )?;
-    let provider_wire = credentials
-        .as_ref()
-        .map(|credentials| {
-            authorization.compact_provider_credential_wire(provider, credentials, &guard)
-        })
-        .transpose()
-        .map_err(StandaloneProviderAllowError::ProviderCredential)?;
+    let (provider_credentials, provider_wire) = if outer_connect {
+        (Vec::new(), None)
+    } else {
+        let selected = collect_provider_credentials(
+            generation,
+            provider,
+            provider_templates,
+            credentials.as_ref(),
+        )?;
+        let wire = credentials
+            .as_ref()
+            .map(|credentials| {
+                authorization.compact_provider_credential_wire(provider, credentials, &guard)
+            })
+            .transpose()
+            .map_err(StandaloneProviderAllowError::ProviderCredential)?;
+        (selected, wire)
+    };
     drop(credentials);
 
     let provider_content_type = if let Some(replacement) = replacement {
@@ -373,6 +379,7 @@ fn finish_allow(
     credential_io_runtime: Arc<crate::credential_io_runtime::CredentialIoRuntime>,
 ) -> Result<StandaloneProviderAllow, StandaloneProviderAllowError> {
     let rule_template = rule.map(|(_, rule)| rule);
+    let outer_connect = request.facts().method().as_str() == "CONNECT";
 
     let mut request_mutation_batches = Vec::new();
     if let Some(batch) = rule_template.and_then(|rule| rule.request_headers()) {
@@ -390,26 +397,33 @@ fn finish_allow(
         response_mutation_batches.push(batch.clone());
     }
 
-    let credential_sources = collect_credential_sources(generation, rule)?;
-    let mut credential_mutations: Vec<CredentialMutation> = rule_template
-        .map(|rule| {
-            rule.credentials()
+    // Outer CONNECT is a credential-free tunnel bootstrap. The logical request
+    // inside the MITM tunnel receives its own plan and credential execution.
+    let mut credential_mutations: Vec<CredentialMutation> = if outer_connect {
+        Vec::new()
+    } else {
+        rule_template
+            .map(|rule| {
+                rule.credentials()
+                    .iter()
+                    .map(|template| template.mutation().clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    if !outer_connect {
+        credential_mutations.extend(
+            provider_credentials
                 .iter()
-                .map(|template| template.mutation().clone())
-                .collect()
-        })
-        .unwrap_or_default();
-    credential_mutations.extend(
-        provider_credentials
-            .iter()
-            .map(|credential| credential.mutation.clone()),
-    );
-    credential_mutations.extend(
-        generation
-            .global_credentials()
-            .iter()
-            .map(|template| template.mutation().clone()),
-    );
+                .map(|credential| credential.mutation.clone()),
+        );
+        credential_mutations.extend(
+            generation
+                .global_credentials()
+                .iter()
+                .map(|template| template.mutation().clone()),
+        );
+    }
 
     let upgrade = compile_upgrade(
         &request,
@@ -466,14 +480,18 @@ fn finish_allow(
     let plan_binding = plan.binding();
     let plan = StandaloneTrusted::validate(plan, &request, generation.snapshot_lease())
         .map_err(StandaloneProviderAllowError::Runtime)?;
-    let credential_preparation = prepare_credentials(
-        &plan,
-        credential_sources,
-        provider_credentials,
-        provider_wire,
-        &guard,
-        credential_io_runtime,
-    )?;
+    let credential_preparation = if outer_connect {
+        None
+    } else {
+        prepare_credentials(
+            &plan,
+            collect_credential_sources(generation, rule)?,
+            provider_credentials,
+            provider_wire,
+            &guard,
+            credential_io_runtime,
+        )?
+    };
     let sidecar = StandaloneRequestSidecar {
         plan_binding,
         _guard: guard,
@@ -996,6 +1014,38 @@ header = "x-test-loop"
         request
     }
 
+    fn connect_request(generation: &StandaloneGenerationPlan) -> RuntimeRequest {
+        let facts = http_access_types::InterceptedRequestFacts::new(
+            IngressMode::ExplicitHttp,
+            HttpVersion::Http11,
+            HttpMethod::new("CONNECT").unwrap(),
+            http_access_url::canonicalize_http_url("https://example.test/").unwrap(),
+            Vec::new(),
+            BodyMetadata::new(BodyFraming::None),
+            None,
+        )
+        .unwrap();
+        let body = RuntimeBody::from_chunks(
+            Vec::new(),
+            body_bounds(generation),
+            Arc::new(TestClock),
+            BodyBudget::new(32 * 1024 * 1024).unwrap(),
+            30_001,
+        )
+        .unwrap();
+        let mut request = RuntimeRequest::new(
+            facts.clone(),
+            "192.0.2.10".parse().unwrap(),
+            PolicyHeaderFacts::new(facts.headers().to_vec(), Vec::new()).unwrap(),
+            BodyRepresentation::PreservedContentCoded,
+            body,
+            30_001,
+        )
+        .unwrap();
+        observe_body(&mut request);
+        request
+    }
+
     fn observe_body(request: &mut RuntimeRequest) -> Vec<u8> {
         let mut bytes = Vec::new();
         loop {
@@ -1051,6 +1101,14 @@ header = "x-test-loop"
     fn local_admission(lease: &GenerationLease) -> (HttpWireBodyGuard, RuntimeReplayLease) {
         let peer: IpAddr = "192.0.2.10".parse().unwrap();
         let request = request(lease.standalone(), Vec::new());
+        admission_for_request(lease, &request, peer)
+    }
+
+    fn admission_for_request(
+        lease: &GenerationLease,
+        request: &RuntimeRequest,
+        peer: IpAddr,
+    ) -> (HttpWireBodyGuard, RuntimeReplayLease) {
         let input = EvaluationInput::new(
             request.facts(),
             peer,
@@ -1482,6 +1540,44 @@ header = "x-test-loop"
         primary_runtime.shutdown().await;
         std::env::remove_var("P06_RULE_TOKEN");
         std::env::remove_var("P06_GLOBAL_TOKEN");
+    }
+
+    #[tokio::test]
+    async fn delegated_outer_connect_skips_required_provider_origin_credentials() {
+        let config = CONFIG
+            .replace("methods = [\"POST\"]", "methods = [\"CONNECT\"]")
+            .replace("required = false", "required = true");
+        let (runtime, lease, _pool) = runtime_from_config(&config).await;
+        let request = connect_request(lease.standalone());
+        let peer = "192.0.2.10".parse().unwrap();
+        let (guard, replay) = admission_for_request(&lease, &request, peer);
+        let provider = lease
+            .standalone()
+            .activated()
+            .rule_provider_for_test(0)
+            .unwrap();
+        let lineage = request.begin_provider_invocation();
+
+        let result = adapt_provider_allow(
+            &lease,
+            0,
+            provider,
+            output(&lease, provider, false, None),
+            None,
+            guard,
+            replay,
+            request,
+        )
+        .expect("outer CONNECT must not require origin credential outputs");
+
+        assert!(result.credentials.is_none());
+        assert!(result
+            .plan
+            .forwarding_plan()
+            .credential_mutations()
+            .is_empty());
+        drop((result, lineage, lease));
+        runtime.shutdown().await;
     }
 
     #[tokio::test]
