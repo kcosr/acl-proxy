@@ -10,6 +10,7 @@ use super::protocol::{
     ProviderResponseContinuation,
 };
 use crate::config::compiler::ProcessProviderPlan;
+use crate::runtime::AuthorizationInvocationMode;
 use crate::safety::wire_body::{GuardedBodySegments, WireBodyBufferError};
 #[cfg(test)]
 use crate::safety::HttpWireBodyGuard;
@@ -59,6 +60,10 @@ impl DecisionOnlyResponseSchema {
     pub(super) fn activate(plan: &ProcessProviderPlan) -> Option<Self> {
         (plan.outputs.is_empty() && !plan.allow_request_body_replacement)
             .then_some(Self { _private: () })
+    }
+
+    fn for_invocation() -> Self {
+        Self { _private: () }
     }
 }
 
@@ -115,7 +120,21 @@ pub(super) async fn read_process_response(
     continuation: ProviderResponseContinuation,
     guard: &ProviderResponseCharge,
     schema: &ProcessResponseSchema,
+    invocation_mode: AuthorizationInvocationMode,
 ) -> Result<ProcessResponse, FatalProcessResponseError> {
+    if invocation_mode == AuthorizationInvocationMode::DecisionOnly {
+        return match read_decision_only_response(
+            reader,
+            continuation,
+            guard,
+            &DecisionOnlyResponseSchema::for_invocation(),
+        )
+        .await?
+        {
+            DecisionOnlyResponse::Decision(decision) => Ok(ProcessResponse::DecisionOnly(decision)),
+            DecisionOnlyResponse::AssignedFailure(_) => Ok(ProcessResponse::AssignedFailure),
+        };
+    }
     match schema {
         ProcessResponseSchema::DecisionOnly(schema) => {
             match read_decision_only_response(reader, continuation, guard, schema).await? {

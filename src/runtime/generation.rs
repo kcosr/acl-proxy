@@ -180,12 +180,18 @@ pub(crate) trait AuthorizationSnapshot: Send + Sync {
 pub(crate) struct AuthorizationDispatchContext<'a> {
     rule_id: &'a str,
     request: crate::authorization::protocol::ProviderRequest<'a>,
+    invocation_mode: AuthorizationInvocationMode,
     generation: &'a GenerationLease,
 }
 
 impl<'a> AuthorizationDispatchContext<'a> {
-    pub(crate) fn into_request(self) -> crate::authorization::protocol::ProviderRequest<'a> {
-        self.request
+    pub(crate) fn into_request_parts(
+        self,
+    ) -> (
+        crate::authorization::protocol::ProviderRequest<'a>,
+        AuthorizationInvocationMode,
+    ) {
+        (self.request, self.invocation_mode)
     }
 
     pub(crate) fn into_webhook_parts(
@@ -194,13 +200,20 @@ impl<'a> AuthorizationDispatchContext<'a> {
         (
             &'a str,
             crate::authorization::protocol::ProviderRequest<'a>,
+            AuthorizationInvocationMode,
             GenerationRetention,
         ),
         GenerationRetentionError,
     > {
         let retention = self.generation.retain_for_operation()?;
-        Ok((self.rule_id, self.request, retention))
+        Ok((self.rule_id, self.request, self.invocation_mode, retention))
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AuthorizationInvocationMode {
+    EffectsAllowed,
+    DecisionOnly,
 }
 pub(crate) trait SafetySnapshot: Send + Sync {
     fn contains_loop_marker(&self, headers: &HeaderMap) -> bool;
@@ -498,6 +511,7 @@ impl GenerationLease {
         provider: ProviderIndex,
         rule_id: &'a str,
         request: crate::authorization::protocol::ProviderRequest<'a>,
+        invocation_mode: AuthorizationInvocationMode,
         guard: &'a crate::safety::HttpWireBodyGuard,
         request_deadline: tokio::time::Instant,
     ) -> BoxFuture<
@@ -512,6 +526,7 @@ impl GenerationLease {
             AuthorizationDispatchContext {
                 rule_id,
                 request,
+                invocation_mode,
                 generation: self,
             },
             guard,

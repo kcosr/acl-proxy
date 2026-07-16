@@ -898,6 +898,7 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
         provider,
         "rule-1",
         request,
+        crate::runtime::AuthorizationInvocationMode::EffectsAllowed,
         &body_guard,
         tokio::time::Instant::now() + Duration::from_secs(5),
     );
@@ -957,6 +958,7 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
                 headers: None,
                 body: None,
             },
+            crate::runtime::AuthorizationInvocationMode::EffectsAllowed,
             &body_guard,
             tokio::time::Instant::now() + Duration::from_secs(5),
         )

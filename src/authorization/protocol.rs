@@ -761,6 +761,7 @@ pub(crate) enum ProviderDecision {
         credentials: ProviderCredentialSet,
         replacement: Option<ProviderBodyReplacement>,
     },
+    AllowWithoutEffects,
     Deny,
     Pass,
 }

@@ -361,6 +361,9 @@ impl ProductAuthorizationSnapshot {
                 Some(credentials),
                 replacement,
             )),
+            ProviderDecision::AllowWithoutEffects => {
+                AuthorizationDecision::Allow(self.bind_allow_output(provider, None, None))
+            }
             ProviderDecision::Deny => AuthorizationDecision::Deny,
             ProviderDecision::Pass => AuthorizationDecision::Pass,
         }
@@ -381,7 +384,12 @@ impl ProductAuthorizationSnapshot {
                 .ok_or(AuthorizationDispatchError::UnknownProvider)?;
             match active {
                 ActiveProvider::Process(process) => process
-                    .decide(request, guard, request_deadline)
+                    .decide(
+                        request,
+                        crate::runtime::AuthorizationInvocationMode::EffectsAllowed,
+                        guard,
+                        request_deadline,
+                    )
                     .await
                     .map(|decision| self.bind_process_decision(provider, decision))
                     .map_err(AuthorizationDispatchError::Process),
@@ -486,11 +494,14 @@ impl AuthorizationSnapshot for ProductAuthorizationSnapshot {
                 .get(provider.get())
                 .ok_or(AuthorizationDispatchError::UnknownProvider)?;
             match active {
-                ActiveProvider::Process(process) => process
-                    .decide(context.into_request(), guard, request_deadline)
-                    .await
-                    .map(|decision| self.bind_process_decision(provider, decision))
-                    .map_err(AuthorizationDispatchError::Process),
+                ActiveProvider::Process(process) => {
+                    let (request, invocation_mode) = context.into_request_parts();
+                    process
+                        .decide(request, invocation_mode, guard, request_deadline)
+                        .await
+                        .map(|decision| self.bind_process_decision(provider, decision))
+                        .map_err(AuthorizationDispatchError::Process)
+                }
                 ActiveProvider::Webhook(webhook) => self
                     .webhook_runtime
                     .dispatch(

@@ -23,7 +23,10 @@ use super::protocol::{
     RequestStreamError, PROCESS_PROVIDER_CORRELATION_ID_BYTES,
 };
 use crate::config::compiler::{CompiledProviderFailureMode, ProcessProviderPlan};
-use crate::runtime::{BoxFuture, CleanupReason, GenerationOwner, PublicationGuard, RuntimeError};
+use crate::runtime::{
+    AuthorizationInvocationMode, BoxFuture, CleanupReason, GenerationOwner, PublicationGuard,
+    RuntimeError,
+};
 use crate::safety::{HttpWireBodyGuard, ProviderResponseCharge};
 
 const CHILD_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -96,6 +99,7 @@ struct PendingRequest {
     response_charge: ProviderResponseCharge,
     completed: Arc<AtomicBool>,
     request_deadline: Instant,
+    invocation_mode: AuthorizationInvocationMode,
     epoch: u64,
     _admission: PendingAdmission,
 }
@@ -335,20 +339,43 @@ impl ProcessProvider {
         self.inner.response_schema.outputs()
     }
 
-    pub(crate) async fn decide(
+    #[cfg(test)]
+    async fn decide_effects_allowed_for_test(
         &self,
         request: ProviderRequest<'_>,
         guard: &HttpWireBodyGuard,
         request_deadline: Instant,
     ) -> Result<ProcessDecision, ProcessRequestError> {
-        if request.body.is_some() != self.inner.include_request_body {
+        self.decide(
+            request,
+            AuthorizationInvocationMode::EffectsAllowed,
+            guard,
+            request_deadline,
+        )
+        .await
+    }
+
+    pub(crate) async fn decide(
+        &self,
+        request: ProviderRequest<'_>,
+        invocation_mode: AuthorizationInvocationMode,
+        guard: &HttpWireBodyGuard,
+        request_deadline: Instant,
+    ) -> Result<ProcessDecision, ProcessRequestError> {
+        let valid_body_shape = match invocation_mode {
+            AuthorizationInvocationMode::EffectsAllowed => {
+                request.body.is_some() == self.inner.include_request_body
+            }
+            AuthorizationInvocationMode::DecisionOnly => request.body.is_none(),
+        };
+        if !valid_body_shape {
             return Err(ProcessRequestError::InvalidRequest);
         }
         let operation_deadline =
             operation_deadline(Instant::now(), request_deadline, self.inner.timeout);
         let (receiver, cancellation) = match time::timeout_at(
             operation_deadline,
-            self.dispatch_before_response(request, guard, request_deadline),
+            self.dispatch_before_response(request, invocation_mode, guard, request_deadline),
         )
         .await
         {
@@ -367,6 +394,7 @@ impl ProcessProvider {
     async fn dispatch_before_response(
         &self,
         request: ProviderRequest<'_>,
+        invocation_mode: AuthorizationInvocationMode,
         guard: &HttpWireBodyGuard,
         request_deadline: Instant,
     ) -> Result<
@@ -461,6 +489,7 @@ impl ProcessProvider {
                     response_charge,
                     completed: completed.clone(),
                     request_deadline,
+                    invocation_mode,
                     epoch,
                     _admission: admission,
                 },
@@ -852,6 +881,7 @@ async fn run_reader(inner: Arc<Inner>, epoch: u64, stdout: ChildStdout) {
             continuation,
             &pending.response_charge,
             &inner.response_schema,
+            pending.invocation_mode,
         )
         .await;
         match parsed {
@@ -916,6 +946,7 @@ impl From<ProviderDecision> for ProcessDecision {
                 credentials: Some(credentials),
                 replacement,
             },
+            ProviderDecision::AllowWithoutEffects => Self::Allow,
             ProviderDecision::Deny => Self::Deny,
             ProviderDecision::Pass => Self::Pass,
         }
@@ -1690,8 +1721,16 @@ for request, decision in ((second, "deny"), (first, "allow")):
 
         let first_guard = body_guard();
         let second_guard = body_guard();
-        let first = provider.decide(request("first"), &first_guard, request_deadline());
-        let second = provider.decide(request("second"), &second_guard, request_deadline());
+        let first = provider.decide_effects_allowed_for_test(
+            request("first"),
+            &first_guard,
+            request_deadline(),
+        );
+        let second = provider.decide_effects_allowed_for_test(
+            request("second"),
+            &second_guard,
+            request_deadline(),
+        );
         let (first, second) = tokio::join!(first, second);
         assert_eq!(first.unwrap(), ProcessDecision::Allow);
         assert_eq!(second.unwrap(), ProcessDecision::Deny);
@@ -1730,21 +1769,33 @@ print(json.dumps({"id": second["id"], "type": "response", "decision": "deny"}, s
         let first_provider = provider.clone();
         let first = tokio::spawn(async move {
             first_provider
-                .decide(request("first"), &body_guard(), request_deadline())
+                .decide_effects_allowed_for_test(
+                    request("first"),
+                    &body_guard(),
+                    request_deadline(),
+                )
                 .await
         });
         wait_for_file(&first_read).await;
         let second_provider = provider.clone();
         let second = tokio::spawn(async move {
             second_provider
-                .decide(request("second"), &body_guard(), request_deadline())
+                .decide_effects_allowed_for_test(
+                    request("second"),
+                    &body_guard(),
+                    request_deadline(),
+                )
                 .await
         });
         wait_for_file(&second_read).await;
         let third_provider = provider.clone();
         let third = tokio::spawn(async move {
             third_provider
-                .decide(request("third"), &body_guard(), request_deadline())
+                .decide_effects_allowed_for_test(
+                    request("third"),
+                    &body_guard(),
+                    request_deadline(),
+                )
                 .await
         });
         wait_for_file(&third_read).await;
@@ -1789,13 +1840,21 @@ print(json.dumps({"id": second["id"], "type": "response", "decision": "deny"}, s
 
             assert_eq!(
                 provider
-                    .decide(request(name), &body_guard(), request_deadline())
+                    .decide_effects_allowed_for_test(
+                        request(name),
+                        &body_guard(),
+                        request_deadline()
+                    )
                     .await,
                 Err(ProcessRequestError::Unavailable)
             );
             assert_eq!(
                 provider
-                    .decide(request("after-fatal"), &body_guard(), request_deadline())
+                    .decide_effects_allowed_for_test(
+                        request("after-fatal"),
+                        &body_guard(),
+                        request_deadline()
+                    )
                     .await,
                 Err(ProcessRequestError::Unavailable)
             );
@@ -1826,13 +1885,21 @@ time.sleep(30)
         let first_provider = provider.clone();
         let first = tokio::spawn(async move {
             first_provider
-                .decide(request("first"), &body_guard(), request_deadline())
+                .decide_effects_allowed_for_test(
+                    request("first"),
+                    &body_guard(),
+                    request_deadline(),
+                )
                 .await
         });
         wait_for_complete_json_frame(&observed).await;
         assert_eq!(
             provider
-                .decide(request("second"), &body_guard(), request_deadline())
+                .decide_effects_allowed_for_test(
+                    request("second"),
+                    &body_guard(),
+                    request_deadline()
+                )
                 .await,
             Err(ProcessRequestError::AtCapacity)
         );
@@ -1869,14 +1936,18 @@ for line in sys.stdin:
 
         assert_eq!(
             provider
-                .decide(request("failed-once"), &body_guard(), request_deadline())
+                .decide_effects_allowed_for_test(
+                    request("failed-once"),
+                    &body_guard(),
+                    request_deadline()
+                )
                 .await,
             Err(ProcessRequestError::Unavailable)
         );
         let mut restarted = None;
         for attempt in 0..100 {
             match provider
-                .decide(
+                .decide_effects_allowed_for_test(
                     request(&format!("restart-{attempt}")),
                     &body_guard(),
                     request_deadline(),
@@ -1923,13 +1994,21 @@ print(json.dumps({"id": second["id"], "type": "response", "decision": "allow"}, 
 
         assert_eq!(
             provider
-                .decide(request("logical-x"), &body_guard(), request_deadline())
+                .decide_effects_allowed_for_test(
+                    request("logical-x"),
+                    &body_guard(),
+                    request_deadline()
+                )
                 .await,
             Ok(ProcessDecision::Allow)
         );
         assert_eq!(
             provider
-                .decide(request("logical-x"), &body_guard(), request_deadline())
+                .decide_effects_allowed_for_test(
+                    request("logical-x"),
+                    &body_guard(),
+                    request_deadline()
+                )
                 .await,
             Err(ProcessRequestError::Unavailable)
         );
@@ -1963,14 +2042,22 @@ for line in sys.stdin:
 
         assert_eq!(
             provider
-                .decide(request("logical-x"), &body_guard(), request_deadline())
+                .decide_effects_allowed_for_test(
+                    request("logical-x"),
+                    &body_guard(),
+                    request_deadline()
+                )
                 .await,
             Err(ProcessRequestError::Unavailable)
         );
         let mut restarted = None;
         for _ in 0..100 {
             match provider
-                .decide(request("logical-x"), &body_guard(), request_deadline())
+                .decide_effects_allowed_for_test(
+                    request("logical-x"),
+                    &body_guard(),
+                    request_deadline(),
+                )
                 .await
             {
                 Ok(decision) => {
@@ -2025,7 +2112,11 @@ for line in sys.stdin:
         assert_eq!(
             time::timeout(
                 Duration::from_secs(2),
-                provider.decide(blocked, &body_guard(), request_deadline()),
+                provider.decide_effects_allowed_for_test(
+                    blocked,
+                    &body_guard(),
+                    request_deadline()
+                ),
             )
             .await
             .expect("fatal epoch must interrupt the inherited blocked pipe"),
@@ -2035,7 +2126,11 @@ for line in sys.stdin:
         let mut restarted = None;
         for _ in 0..100 {
             match provider
-                .decide(request("healthy"), &body_guard(), request_deadline())
+                .decide_effects_allowed_for_test(
+                    request("healthy"),
+                    &body_guard(),
+                    request_deadline(),
+                )
                 .await
             {
                 Ok(decision) => {
@@ -2089,7 +2184,11 @@ for line in sys.stdin:
 
         assert_eq!(
             provider
-                .decide(request("environment"), &body_guard(), request_deadline())
+                .decide_effects_allowed_for_test(
+                    request("environment"),
+                    &body_guard(),
+                    request_deadline()
+                )
                 .await,
             Ok(ProcessDecision::Allow)
         );
@@ -2168,7 +2267,7 @@ for line in sys.stdin:
 
         let (pool, guard) = body_guard_with_pool();
         let decision = provider
-            .decide(request("expanded"), &guard, request_deadline())
+            .decide_effects_allowed_for_test(request("expanded"), &guard, request_deadline())
             .await
             .unwrap();
         let ProcessDecision::AllowWithOutputs {
@@ -2191,6 +2290,173 @@ for line in sys.stdin:
         );
         drop(replacement);
         assert_eq!(pool.global_charge(), 0);
+        cleanup(&provider).await;
+    }
+
+    #[tokio::test]
+    async fn decision_only_invocation_ignores_expanded_requirements_and_accepts_plain_decisions() {
+        let directory = TempDir::new().unwrap();
+        let observed = directory.path().join("observed");
+        let script = write_python(
+            &directory,
+            r#"import json, pathlib, sys
+observed = []
+for line in sys.stdin:
+    request = json.loads(line)
+    observed.append({"requestId": request["requestId"], "hasBody": "body" in request})
+    pathlib.Path("observed").write_text(json.dumps(observed))
+    decision = request["requestId"].split("-")[-1]
+    print(json.dumps({"id": request["id"], "type": "response", "decision": decision}, separators=(",", ":")), flush=True)
+"#,
+        );
+        let mut provider_plan = plan(&directory, &script);
+        provider_plan.include_request_body = true;
+        provider_plan.allow_request_body_replacement = true;
+        provider_plan.outputs.insert(
+            "token".to_string(),
+            ProviderOutputPlan::Bearer { required: true },
+        );
+        let provider = ProcessProvider::activate(provider_plan, || false)
+            .await
+            .unwrap();
+        commit(&provider);
+
+        for (name, expected) in [
+            ("outer-allow", ProcessDecision::Allow),
+            ("outer-deny", ProcessDecision::Deny),
+            ("outer-pass", ProcessDecision::Pass),
+        ] {
+            let actual = provider
+                .decide(
+                    request(name),
+                    AuthorizationInvocationMode::DecisionOnly,
+                    &body_guard(),
+                    request_deadline(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
+
+        let observations: serde_json::Value =
+            serde_json::from_slice(&fs::read(observed).unwrap()).unwrap();
+        assert_eq!(observations.as_array().unwrap().len(), 3);
+        assert!(observations
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|observation| observation["hasBody"] == false));
+        cleanup(&provider).await;
+    }
+
+    #[tokio::test]
+    async fn decision_only_invocation_strictly_rejects_effect_bearing_responses() {
+        let directory = TempDir::new().unwrap();
+        let script = write_python(
+            &directory,
+            r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if request["requestId"] == "values":
+        effects = {"values": {"token": "must-not-be-retained"}}
+    else:
+        effects = {"requestBody": {"encoding": "base64", "data": "e30="}}
+    response = {"id": request["id"], "type": "response", "decision": "allow", **effects}
+    print(json.dumps(response, separators=(",", ":")), flush=True)
+"#,
+        );
+        let mut provider_plan = plan(&directory, &script);
+        provider_plan.allow_request_body_replacement = true;
+        provider_plan.outputs.insert(
+            "token".to_string(),
+            ProviderOutputPlan::Bearer { required: true },
+        );
+        let provider = ProcessProvider::activate(provider_plan, || false)
+            .await
+            .unwrap();
+        commit(&provider);
+
+        let (pool, guard) = body_guard_with_pool();
+        for name in ["values", "replacement"] {
+            assert_eq!(
+                provider
+                    .decide(
+                        request(name),
+                        AuthorizationInvocationMode::DecisionOnly,
+                        &guard,
+                        request_deadline(),
+                    )
+                    .await,
+                Err(ProcessRequestError::InvalidResponse)
+            );
+            assert_eq!(pool.global_charge(), 0, "{name} leaked guarded bytes");
+        }
+        cleanup(&provider).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_full_and_decision_only_invocations_use_their_own_response_schema() {
+        let directory = TempDir::new().unwrap();
+        let script = write_python(
+            &directory,
+            r#"import json, sys
+requests = [json.loads(sys.stdin.readline()), json.loads(sys.stdin.readline())]
+for request in reversed(requests):
+    if request["requestId"] == "full":
+        assert "body" in request
+        response = {"id": request["id"], "type": "response", "decision": "allow", "values": {"token": "full-secret"}}
+    else:
+        assert "body" not in request
+        response = {"id": request["id"], "type": "response", "decision": "allow"}
+    print(json.dumps(response, separators=(",", ":")), flush=True)
+"#,
+        );
+        let mut provider_plan = plan(&directory, &script);
+        provider_plan.include_request_body = true;
+        provider_plan.outputs.insert(
+            "token".to_string(),
+            ProviderOutputPlan::Bearer { required: true },
+        );
+        let provider = ProcessProvider::activate(provider_plan, || false)
+            .await
+            .unwrap();
+        commit(&provider);
+
+        let decoded_guard = body_guard();
+        let mut decoded = decoded_guard.buffer();
+        decoded.try_extend_from_slice(b"full-body").unwrap();
+        let decoded = decoded.finish();
+        let mut full_request = request("full");
+        full_request.body = Some(GuardedProviderBody {
+            content_type: Some("text/plain"),
+            content_encoding: Some("identity"),
+            decoded: &decoded,
+        });
+        let full_guard = body_guard();
+        let decision_guard = body_guard();
+        let (full, decision_only) = tokio::join!(
+            provider.decide(
+                full_request,
+                AuthorizationInvocationMode::EffectsAllowed,
+                &full_guard,
+                request_deadline(),
+            ),
+            provider.decide(
+                request("outer"),
+                AuthorizationInvocationMode::DecisionOnly,
+                &decision_guard,
+                request_deadline(),
+            ),
+        );
+
+        assert!(matches!(
+            full.unwrap(),
+            ProcessDecision::AllowWithOutputs {
+                credentials: Some(_),
+                replacement: None,
+            }
+        ));
+        assert_eq!(decision_only, Ok(ProcessDecision::Allow));
         cleanup(&provider).await;
     }
 
@@ -2244,7 +2510,7 @@ for line in sys.stdin:
             let (pool, guard) = body_guard_with_pool();
             assert_eq!(
                 provider
-                    .decide(request(name), &guard, request_deadline())
+                    .decide_effects_allowed_for_test(request(name), &guard, request_deadline())
                     .await,
                 Err(ProcessRequestError::InvalidResponse),
                 "{name} must terminate as an invalid provider response"
@@ -2283,7 +2549,7 @@ for line in sys.stdin:
 
             let (pool, guard) = body_guard_with_pool();
             let actual = provider
-                .decide(request(name), &guard, request_deadline())
+                .decide_effects_allowed_for_test(request(name), &guard, request_deadline())
                 .await;
             if accepted {
                 let ProcessDecision::AllowWithOutputs {
@@ -2329,7 +2595,11 @@ for line in sys.stdin:
 
         let (pool, guard) = body_guard_with_pool();
         let decision = provider
-            .decide(request("oversized-replacement"), &guard, request_deadline())
+            .decide_effects_allowed_for_test(
+                request("oversized-replacement"),
+                &guard,
+                request_deadline(),
+            )
             .await
             .unwrap();
         let ProcessDecision::AllowWithOutputs {
@@ -2377,12 +2647,16 @@ for line in sys.stdin:
 
         assert_eq!(
             provider
-                .decide(request("invalid-assigned"), &guard, request_deadline())
+                .decide_effects_allowed_for_test(
+                    request("invalid-assigned"),
+                    &guard,
+                    request_deadline()
+                )
                 .await,
             Err(ProcessRequestError::InvalidResponse)
         );
         let second = provider
-            .decide(request("same-child"), &guard, request_deadline())
+            .decide_effects_allowed_for_test(request("same-child"), &guard, request_deadline())
             .await
             .unwrap();
         assert!(matches!(second, ProcessDecision::AllowWithOutputs { .. }));
@@ -2417,7 +2691,7 @@ for line in sys.stdin:
             credentials,
             replacement: Some(replacement),
         } = provider
-            .decide(request("escaped"), &guard, request_deadline())
+            .decide_effects_allowed_for_test(request("escaped"), &guard, request_deadline())
             .await
             .unwrap()
         else {
@@ -2476,7 +2750,7 @@ time.sleep(30)
         body_request.body = Some(body);
         assert_eq!(
             provider
-                .decide(body_request, &body_guard(), request_deadline())
+                .decide_effects_allowed_for_test(body_request, &body_guard(), request_deadline())
                 .await,
             Err(ProcessRequestError::InvalidRequest)
         );
@@ -2515,14 +2789,22 @@ for line in sys.stdin:
         let first_provider = provider.clone();
         let first = tokio::spawn(async move {
             first_provider
-                .decide(request("slow-prefix"), &body_guard(), request_deadline())
+                .decide_effects_allowed_for_test(
+                    request("slow-prefix"),
+                    &body_guard(),
+                    request_deadline(),
+                )
                 .await
         });
         time::sleep(Duration::from_millis(20)).await;
         let second_provider = provider.clone();
         let second = tokio::spawn(async move {
             second_provider
-                .decide(request("queued"), &body_guard(), request_deadline())
+                .decide_effects_allowed_for_test(
+                    request("queued"),
+                    &body_guard(),
+                    request_deadline(),
+                )
                 .await
         });
         assert_eq!(first.await.unwrap(), Err(ProcessRequestError::Timeout));
@@ -2531,7 +2813,7 @@ for line in sys.stdin:
         let mut restarted = None;
         for attempt in 0..100 {
             match provider
-                .decide(
+                .decide_effects_allowed_for_test(
                     request(&format!("after-timeout-{attempt}")),
                     &body_guard(),
                     request_deadline(),
@@ -2582,7 +2864,7 @@ time.sleep(30)
         let first_provider = provider.clone();
         let first = tokio::spawn(async move {
             first_provider
-                .decide(
+                .decide_effects_allowed_for_test(
                     request("claimed"),
                     &body_guard(),
                     Instant::now() + Duration::from_secs(5),
@@ -2593,7 +2875,7 @@ time.sleep(30)
         let second_provider = provider.clone();
         let second = tokio::spawn(async move {
             second_provider
-                .decide(
+                .decide_effects_allowed_for_test(
                     request("short-deadline"),
                     &body_guard(),
                     Instant::now() + Duration::from_millis(100),
@@ -2636,7 +2918,11 @@ time.sleep(30)
         assert_eq!(
             time::timeout(
                 Duration::from_secs(2),
-                provider.decide(blocked, &body_guard(), request_deadline()),
+                provider.decide_effects_allowed_for_test(
+                    blocked,
+                    &body_guard(),
+                    request_deadline()
+                ),
             )
             .await
             .expect("provider deadline must interrupt a blocked pipe write"),
@@ -2668,7 +2954,11 @@ for line in sys.stdin:
         provider.retirement_started(CleanupReason::Retired);
         assert_eq!(
             provider
-                .decide(request("existing-lease"), &body_guard(), request_deadline(),)
+                .decide_effects_allowed_for_test(
+                    request("existing-lease"),
+                    &body_guard(),
+                    request_deadline(),
+                )
                 .await,
             Ok(ProcessDecision::Allow)
         );
@@ -2681,7 +2971,11 @@ for line in sys.stdin:
         assert!(!process_alive(pid));
         assert_eq!(
             provider
-                .decide(request("after-deadline"), &body_guard(), request_deadline(),)
+                .decide_effects_allowed_for_test(
+                    request("after-deadline"),
+                    &body_guard(),
+                    request_deadline(),
+                )
                 .await,
             Err(ProcessRequestError::Unavailable)
         );
@@ -2710,7 +3004,7 @@ for line in sys.stdin:
         }
         assert_eq!(
             provider
-                .decide(
+                .decide_effects_allowed_for_test(
                     request("past-retirement-deadline"),
                     &body_guard(),
                     request_deadline(),

@@ -14,10 +14,10 @@ pub(crate) use core::{
 #[cfg(test)]
 pub(crate) use generation::Generation;
 pub(crate) use generation::{
-    ActivatedGeneration, AuthorizationDispatchContext, AuthorizationSnapshot, CleanupReason,
-    EgressSnapshot, ForwardingGenerationServices, GenerationId, GenerationLease, GenerationOwner,
-    GenerationRetention, GenerationRetentionError, ObservationSnapshot, ProviderIndex,
-    ProviderRegistry, PublicationGuard, SafetySnapshot,
+    ActivatedGeneration, AuthorizationDispatchContext, AuthorizationInvocationMode,
+    AuthorizationSnapshot, CleanupReason, EgressSnapshot, ForwardingGenerationServices,
+    GenerationId, GenerationLease, GenerationOwner, GenerationRetention, GenerationRetentionError,
+    ObservationSnapshot, ProviderIndex, ProviderRegistry, PublicationGuard, SafetySnapshot,
 };
 pub(crate) use readiness::ServiceReadiness;
 
