@@ -2,10 +2,8 @@ use std::collections::HashSet;
 
 use http::header::{HeaderMap, HeaderName, HeaderValue, CONNECTION, HOST, TE, UPGRADE};
 use http::{Request, StatusCode, Uri, Version};
-use http_access_types::CanonicalUrl;
+use http_access_types::{CanonicalUrl, HttpProtocol};
 use hyper::Body;
-
-use crate::egress::OriginProtocol;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RequestTargetForm {
@@ -37,7 +35,7 @@ pub(crate) enum HeaderPreparationError {
 
 pub(crate) struct SanitizedRequest<B = Body> {
     request: Request<B>,
-    protocol: OriginProtocol,
+    protocol: HttpProtocol,
     upgrade_intent: Option<UpgradeIntent>,
 }
 
@@ -71,7 +69,7 @@ impl<B> SanitizedRequest<B> {
         self.request.headers_mut()
     }
 
-    pub(crate) fn protocol(&self) -> OriginProtocol {
+    pub(crate) fn protocol(&self) -> HttpProtocol {
         self.protocol
     }
 
@@ -91,7 +89,7 @@ impl<B> SanitizedRequest<B> {
         self.upgrade_intent.as_ref()
     }
 
-    pub(crate) fn into_parts(self) -> (http::request::Parts, B, OriginProtocol) {
+    pub(crate) fn into_parts(self) -> (http::request::Parts, B, HttpProtocol) {
         let (mut parts, body) = self.request.into_parts();
         if let Some(intent) = self.upgrade_intent {
             parts.extensions.insert(intent);
@@ -102,7 +100,7 @@ impl<B> SanitizedRequest<B> {
     pub(crate) fn from_parts(
         mut parts: http::request::Parts,
         body: B,
-        protocol: OriginProtocol,
+        protocol: HttpProtocol,
     ) -> Self {
         let upgrade_intent = parts.extensions.remove::<UpgradeIntent>();
         Self {
@@ -139,7 +137,7 @@ impl SanitizedIngressRequest {
     ) -> (
         http::request::Parts,
         Body,
-        OriginProtocol,
+        HttpProtocol,
         Option<hyper::upgrade::OnUpgrade>,
     ) {
         let (parts, body, protocol) = self.request.into_parts();
@@ -169,7 +167,7 @@ impl SanitizedConnectIngressRequest {
     ) -> (
         http::request::Parts,
         Body,
-        OriginProtocol,
+        HttpProtocol,
         hyper::upgrade::OnUpgrade,
     ) {
         let (parts, body, protocol) = self.request.into_parts();
@@ -215,17 +213,17 @@ pub(crate) fn sanitize_untrusted_request<B>(
         return Err(HeaderPreparationError::ConnectUnsupported);
     }
     let protocol = match request.version() {
-        Version::HTTP_10 | Version::HTTP_11 => OriginProtocol::Http1,
-        Version::HTTP_2 => OriginProtocol::Http2,
+        Version::HTTP_10 | Version::HTTP_11 => HttpProtocol::Http1,
+        Version::HTTP_2 => HttpProtocol::Http2,
         _ => return Err(HeaderPreparationError::UnsupportedVersion),
     };
-    if protocol.is_http2() {
+    if protocol == HttpProtocol::Http2 {
         validate_h2_te(request.headers())?;
     }
     let connection_tokens = strict_connection_header_tokens(request.headers())?;
     let upgrade_intent =
         extract_upgrade_intent(request.version(), request.headers(), &connection_tokens)?;
-    strip_request_hop_by_hop(request.headers_mut(), protocol.is_http2());
+    strip_request_hop_by_hop(request.headers_mut(), protocol == HttpProtocol::Http2);
     Ok(SanitizedRequest {
         request,
         protocol,
@@ -252,7 +250,7 @@ pub(crate) fn sanitize_untrusted_connect_request<B>(
     strip_request_hop_by_hop(request.headers_mut(), false);
     Ok(SanitizedRequest {
         request,
-        protocol: OriginProtocol::Http1,
+        protocol: HttpProtocol::Http1,
         upgrade_intent: None,
     })
 }
@@ -353,7 +351,7 @@ pub(crate) fn prepare_origin_request<B>(
     sanitized: SanitizedRequest<B>,
     canonical: &CanonicalUrl,
     target_form: RequestTargetForm,
-    protocol: OriginProtocol,
+    protocol: HttpProtocol,
 ) -> Result<Request<B>, HeaderPreparationError> {
     if sanitized.upgrade_intent.is_some() {
         return Err(HeaderPreparationError::UpgradeUnsupported);
@@ -365,9 +363,9 @@ pub(crate) fn prepare_origin_upgrade_request<B>(
     sanitized: SanitizedRequest<B>,
     canonical: &CanonicalUrl,
     target_form: RequestTargetForm,
-    protocol: OriginProtocol,
+    protocol: HttpProtocol,
 ) -> Result<Request<B>, HeaderPreparationError> {
-    if protocol.is_http2() {
+    if protocol == HttpProtocol::Http2 {
         return Err(HeaderPreparationError::InvalidUpgrade);
     }
     let intent = sanitized
@@ -388,9 +386,9 @@ fn prepare_origin_request_head<B>(
     mut sanitized: SanitizedRequest<B>,
     canonical: &CanonicalUrl,
     target_form: RequestTargetForm,
-    protocol: OriginProtocol,
+    protocol: HttpProtocol,
 ) -> Result<Request<B>, HeaderPreparationError> {
-    let use_http2 = protocol.is_http2();
+    let use_http2 = protocol == HttpProtocol::Http2;
     if use_http2 {
         validate_h2_te(sanitized.request.headers())?;
         if sanitized.request.headers().contains_key(TE) {
@@ -600,7 +598,7 @@ mod tests {
             sanitized,
             &canonical,
             RequestTargetForm::Origin,
-            OriginProtocol::Http1,
+            HttpProtocol::Http1,
         )
         .unwrap();
 
@@ -622,7 +620,7 @@ mod tests {
             sanitized,
             &canonical,
             RequestTargetForm::Absolute,
-            OriginProtocol::Http1,
+            HttpProtocol::Http1,
         )
         .unwrap();
 
@@ -640,7 +638,7 @@ mod tests {
             sanitized,
             &canonical,
             RequestTargetForm::Origin,
-            OriginProtocol::Http2,
+            HttpProtocol::Http2,
         )
         .unwrap();
 
@@ -681,7 +679,7 @@ mod tests {
             sanitized,
             &canonical,
             RequestTargetForm::Origin,
-            OriginProtocol::Http1,
+            HttpProtocol::Http1,
         )
         .unwrap();
 
@@ -701,7 +699,7 @@ mod tests {
             trailers,
             &canonical,
             RequestTargetForm::Origin,
-            OriginProtocol::Http2,
+            HttpProtocol::Http2,
         )
         .unwrap();
         assert_eq!(trailers.headers()[TE], "trailers");
@@ -725,7 +723,7 @@ mod tests {
                 trusted_invalid,
                 &canonical,
                 RequestTargetForm::Origin,
-                OriginProtocol::Http2,
+                HttpProtocol::Http2,
             ),
             Err(HeaderPreparationError::InvalidTe)
         ));
@@ -738,7 +736,7 @@ mod tests {
             trusted_ows,
             &canonical,
             RequestTargetForm::Origin,
-            OriginProtocol::Http2,
+            HttpProtocol::Http2,
         )
         .unwrap();
         assert_eq!(trusted_ows.headers()[TE], "trailers");
@@ -755,7 +753,7 @@ mod tests {
             trusted_duplicates,
             &canonical,
             RequestTargetForm::Origin,
-            OriginProtocol::Http2,
+            HttpProtocol::Http2,
         )
         .unwrap();
         assert_eq!(trusted_duplicates.headers()[TE], "trailers");
@@ -776,10 +774,10 @@ mod tests {
         }
     }
 
-    fn fixture_protocol(version: FixtureHttpVersion) -> OriginProtocol {
+    fn fixture_protocol(version: FixtureHttpVersion) -> HttpProtocol {
         match version {
-            FixtureHttpVersion::Http10 | FixtureHttpVersion::Http11 => OriginProtocol::Http1,
-            FixtureHttpVersion::Http2 => OriginProtocol::Http2,
+            FixtureHttpVersion::Http10 | FixtureHttpVersion::Http11 => HttpProtocol::Http1,
+            FixtureHttpVersion::Http2 => HttpProtocol::Http2,
         }
     }
 
@@ -920,7 +918,7 @@ mod tests {
             sanitized,
             &canonical,
             RequestTargetForm::Origin,
-            OriginProtocol::Http1,
+            HttpProtocol::Http1,
         )
         .unwrap();
         assert_eq!(prepared.headers()["x-injected"], "trusted");
@@ -939,7 +937,7 @@ mod tests {
                 sanitized,
                 &canonical,
                 RequestTargetForm::Origin,
-                OriginProtocol::Http1,
+                HttpProtocol::Http1,
             ),
             Err(HeaderPreparationError::Unsanitized)
         ));
@@ -959,7 +957,7 @@ mod tests {
             sanitized,
             &canonical,
             RequestTargetForm::Origin,
-            OriginProtocol::Http1,
+            HttpProtocol::Http1,
         )
         .unwrap();
 
@@ -981,7 +979,7 @@ mod tests {
             sanitized,
             &canonical,
             RequestTargetForm::Origin,
-            OriginProtocol::Http2,
+            HttpProtocol::Http2,
         )
         .unwrap();
 
@@ -1003,7 +1001,7 @@ mod tests {
             sanitized,
             &canonical,
             RequestTargetForm::Origin,
-            OriginProtocol::Http1,
+            HttpProtocol::Http1,
         )
         .unwrap();
 
@@ -1089,7 +1087,7 @@ mod tests {
             sanitized,
             &canonical,
             RequestTargetForm::Origin,
-            OriginProtocol::Http1,
+            HttpProtocol::Http1,
         )
         .unwrap();
 
@@ -1162,7 +1160,7 @@ mod tests {
         let ingress = sanitize_untrusted_connect_ingress_request(request).unwrap();
         assert_eq!(ingress.method(), http::Method::CONNECT);
         assert_eq!(ingress.version(), Version::HTTP_11);
-        assert_eq!(ingress.sanitized().protocol(), OriginProtocol::Http1);
+        assert_eq!(ingress.sanitized().protocol(), HttpProtocol::Http1);
         assert!(!ingress.headers().contains_key(CONNECTION));
         assert!(!ingress.headers().contains_key("x-private"));
 
@@ -1170,7 +1168,7 @@ mod tests {
         assert_eq!(parts.method, http::Method::CONNECT);
         assert_eq!(parts.version, Version::HTTP_11);
         assert!(body.is_end_stream());
-        assert_eq!(protocol, OriginProtocol::Http1);
+        assert_eq!(protocol, HttpProtocol::Http1);
         drop(downstream_upgrade);
     }
 

@@ -7,23 +7,23 @@ use credential_core::{
 use http_access_policy_acl::ProductActionRef;
 use http_access_runtime::{RuntimeResourceLimits, SnapshotLease, SnapshotRegistries};
 use http_access_types::{
-    BodyLimits, BodyRepresentation, CaptureIntent, CaptureRef, CredentialMutation,
-    CredentialMutationKind, CredentialRef, HeaderMutation, HeaderMutationBatch,
-    HeaderMutationCondition, HeaderName, HeaderValue, HttpScheme, PolicyGeneration, RedactionRef,
-    RedirectPolicy, RequestBodyPolicy, Route, SensitiveHeaderPolicy, SnapshotIdentity, StableId,
-    StageTimeouts, TlsIntent, TlsRootsRef, TrailerPolicy,
+    BodyLimits, BodyRepresentation, CanonicalHost, CaptureIntent, CaptureRef, ClientTlsIntent,
+    CredentialMutation, CredentialMutationKind, CredentialRef, HeaderMutation, HeaderMutationBatch,
+    HeaderMutationCondition, HeaderName, HeaderValue, HttpProtocol, HttpProtocolSet, HttpScheme,
+    HttpVersion, PolicyGeneration, RedactionRef, RedirectPolicy, RequestBodyPolicy, Route,
+    SensitiveHeaderPolicy, SnapshotIdentity, StableId, StageTimeouts, TlsTrust, TrailerPolicy,
+    TransportSecurity,
 };
-use http_access_url::canonicalize_http_url;
 
 use crate::authorization::protocol::{ProviderOutputDefinition, ProviderOutputIndex};
 use crate::authorization::{ActivatedProviderOutputBinding, ProductAuthorizationSnapshot};
 use crate::config::compiler::{
-    AuthorizationProviderPlan, CompiledCaptureEvent, CompiledEgressRoute, CompiledHeaderEffectWhen,
-    CompiledTlsTrust, CredentialActionPlan, ForwardingPlan, HeaderEffectPlan, PolicyRulePlan,
-    ProviderOutputPlan, ReloadableProductPlan, TransportTlsPlan,
+    AuthorizationProviderPlan, CompiledCaptureEvent, CompiledHeaderEffectWhen,
+    CredentialActionPlan, ForwardingPlan, HeaderEffectPlan, PolicyRulePlan, ProviderOutputPlan,
+    ReloadableProductPlan,
 };
 use crate::credentials::OutboundCredentialSource;
-use crate::egress::EgressSnapshot;
+use crate::egress::NeutralEgressBindings;
 use crate::observation::{CaptureEvent, ProductObservationSnapshot};
 use crate::policy::{ProductAclCompileError, ProductAclSnapshot};
 use crate::runtime::{GenerationId, ProviderIndex, ProviderRegistry};
@@ -45,13 +45,15 @@ pub(crate) struct StandaloneGenerationPlan {
 
 pub(crate) struct StandaloneGenerationCore {
     identity: SnapshotIdentity,
+    generation: PolicyGeneration,
     timeouts: StageTimeouts,
     ordinary_request_body: RequestBodyPolicy,
     normalized_request_body: RequestBodyPolicy,
     upgrade_request_body: RequestBodyPolicy,
     response: http_access_types::ResponsePolicy,
-    route: Route,
-    origin_https_tls: TlsIntent,
+    route: Option<Route>,
+    origin_protocols: Option<HttpProtocolSet>,
+    origin_https_trust: Option<TlsTrust>,
     capture: Option<StandaloneCaptureIntent>,
     sensitive_headers: Box<[HeaderName]>,
     sensitive_header_policy: SensitiveHeaderPolicy,
@@ -60,13 +62,14 @@ pub(crate) struct StandaloneGenerationCore {
     global_request_headers: Option<HeaderMutationBatch>,
     global_credentials: Box<[StandaloneCredentialTemplate]>,
     provider_credentials: Box<[ProviderCredentialTemplates]>,
-    snapshot_lease: SnapshotLease,
+    snapshot_lease: Option<SnapshotLease>,
+    pending_registries: Option<SnapshotRegistries>,
+    resource_limits: RuntimeResourceLimits,
 }
 
 struct StandaloneBindingManifest {
     provider_outputs: Box<[StandaloneProviderOutputManifest]>,
     capture_redaction: Option<RedactionRef>,
-    tls: Box<[StandaloneTlsBindingManifest]>,
     resources: StandaloneResourceProof,
 }
 
@@ -95,17 +98,6 @@ enum StandaloneProviderOutputShape {
         header: http::HeaderName,
         required: bool,
     },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum StandaloneTlsRole {
-    Origin,
-    Parent,
-}
-
-struct StandaloneTlsBindingManifest {
-    role: StandaloneTlsRole,
-    trust: CompiledTlsTrust,
 }
 
 pub(crate) struct StandaloneActivatedBindings {
@@ -225,16 +217,6 @@ impl UnboundStandaloneGenerationPlan {
         let (ordinary_request_body, normalized_request_body, upgrade_request_body, response) =
             compile_body_policies(&plan.forwarding, plan.max_content_decoding_expansion_ratio)?;
 
-        let mut tls_roots = Vec::new();
-        let origin_https_tls = compile_tls_intent(
-            &plan.egress.origin_tls,
-            "egress.origin_tls",
-            &identity,
-            version,
-            &mut tls_roots,
-        )?;
-        let route = compile_route(plan, &identity, version, &mut tls_roots)?;
-
         let redactions = plan
             .redaction
             .profiles
@@ -312,35 +294,20 @@ impl UnboundStandaloneGenerationPlan {
             .iter()
             .map(|capture| capture.intent.reference().clone())
             .collect::<Vec<_>>();
-        let registries = SnapshotRegistries::new(
-            &identity,
-            &credential_refs,
-            &redaction_refs,
-            &capture_refs,
-            &tls_roots,
-        )
-        .map_err(|_| StandaloneCompileError::Checked("snapshot registries"))?;
-        let snapshot_lease = SnapshotLease::new(http_access_runtime::SnapshotLeaseInput {
-            identity: identity.clone(),
-            generation,
-            sensitive_headers: sensitive_headers.to_vec(),
-            registries,
-            managed_network_policies: Vec::new(),
-            resource_limits,
-            templates: Vec::new(),
-            handles: Vec::new(),
-        })
-        .map_err(|_| StandaloneCompileError::Checked("snapshot lease"))?;
-
+        let registries =
+            SnapshotRegistries::new(&identity, &credential_refs, &redaction_refs, &capture_refs)
+                .map_err(|_| StandaloneCompileError::Checked("snapshot registries"))?;
         let core = StandaloneGenerationCore {
             identity,
+            generation,
             timeouts,
             ordinary_request_body,
             normalized_request_body,
             upgrade_request_body,
             response,
-            route,
-            origin_https_tls,
+            route: None,
+            origin_protocols: None,
+            origin_https_trust: None,
             capture,
             sensitive_headers,
             sensitive_header_policy,
@@ -349,10 +316,43 @@ impl UnboundStandaloneGenerationPlan {
             global_request_headers,
             global_credentials,
             provider_credentials,
-            snapshot_lease,
+            snapshot_lease: None,
+            pending_registries: Some(registries),
+            resource_limits,
         };
         let manifest = compile_binding_manifest(plan, &core, &redactions)?;
         Ok(Self { core, manifest })
+    }
+
+    pub(crate) fn finalize(
+        mut self,
+        neutral_egress: NeutralEgressBindings,
+    ) -> Result<Self, StandaloneCompileError> {
+        let (origin_protocols, origin_https_trust, route, tls_roots) = neutral_egress.into_parts();
+        let registries =
+            self.core
+                .pending_registries
+                .take()
+                .ok_or(StandaloneCompileError::Inconsistent(
+                    "standalone generation finalization",
+                ))?;
+        let snapshot_lease = SnapshotLease::new(http_access_runtime::SnapshotLeaseInput {
+            identity: self.core.identity.clone(),
+            generation: self.core.generation,
+            sensitive_headers: self.core.sensitive_headers.to_vec(),
+            registries,
+            managed_network_policies: Vec::new(),
+            tls_roots,
+            resource_limits: self.core.resource_limits,
+            templates: Vec::new(),
+            handles: Vec::new(),
+        })
+        .map_err(|_| StandaloneCompileError::Checked("snapshot lease"))?;
+        self.core.route = Some(route);
+        self.core.origin_protocols = Some(origin_protocols);
+        self.core.origin_https_trust = Some(origin_https_trust);
+        self.core.snapshot_lease = Some(snapshot_lease);
+        Ok(self)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -362,9 +362,18 @@ impl UnboundStandaloneGenerationPlan {
         redaction_snapshot: &RedactionSnapshot,
         authorization: &ProductAuthorizationSnapshot,
         providers: &ProviderRegistry,
-        egress: &EgressSnapshot,
         observation: &ProductObservationSnapshot,
     ) -> Result<StandaloneGenerationPlan, StandaloneBindError> {
+        if self.core.snapshot_lease.is_none()
+            || self.core.pending_registries.is_some()
+            || self.core.route.is_none()
+            || self.core.origin_protocols.is_none()
+            || self.core.origin_https_trust.is_none()
+        {
+            return Err(StandaloneBindError::Inconsistent(
+                "standalone generation finalization",
+            ));
+        }
         let activated = bind_activated(
             &self.core,
             &self.manifest,
@@ -372,7 +381,6 @@ impl UnboundStandaloneGenerationPlan {
             redaction_snapshot,
             authorization,
             providers,
-            egress,
             observation,
         )?;
         Ok(StandaloneGenerationPlan {
@@ -386,7 +394,7 @@ impl UnboundStandaloneGenerationPlan {
     }
 
     pub(crate) fn version(&self) -> u64 {
-        self.core.snapshot_lease.generation().get()
+        self.core.generation.get()
     }
 
     pub(crate) fn capture_redaction(&self) -> Option<&RedactionRef> {
@@ -404,6 +412,9 @@ impl UnboundStandaloneGenerationPlan {
 
     #[cfg(test)]
     pub(crate) fn into_bound_for_runtime_test(self) -> StandaloneGenerationPlan {
+        let finalized = self
+            .finalize(crate::egress::NeutralEgressBindings::direct_system_for_test())
+            .expect("runtime test standalone generation finalizes");
         StandaloneGenerationPlan {
             activated: StandaloneActivatedBindings {
                 global_credentials: Box::new([]),
@@ -412,7 +423,7 @@ impl UnboundStandaloneGenerationPlan {
                 rule_redactions: Box::new([]),
                 provider_outputs: Box::new([]),
             },
-            core: self.core,
+            core: finalized.core,
         }
     }
 }
@@ -443,13 +454,32 @@ impl StandaloneGenerationCore {
     }
 
     pub(crate) fn route(&self) -> &Route {
-        &self.route
+        self.route
+            .as_ref()
+            .expect("standalone generation route is finalized before publication")
     }
 
-    pub(crate) fn origin_tls(&self, scheme: HttpScheme) -> TlsIntent {
+    pub(crate) fn origin_protocol(&self, ingress: HttpVersion) -> HttpProtocol {
+        self.origin_protocols
+            .as_ref()
+            .expect("standalone generation protocols are finalized before publication")
+            .select(ingress)
+    }
+
+    pub(crate) fn origin_security(
+        &self,
+        scheme: HttpScheme,
+        authenticated_name: CanonicalHost,
+    ) -> TransportSecurity {
         match scheme {
-            HttpScheme::Http => TlsIntent::Disabled,
-            HttpScheme::Https => self.origin_https_tls.clone(),
+            HttpScheme::Http => TransportSecurity::Cleartext,
+            HttpScheme::Https => TransportSecurity::Tls(ClientTlsIntent::new(
+                authenticated_name,
+                self.origin_https_trust
+                    .as_ref()
+                    .expect("standalone generation trust is finalized before publication")
+                    .clone(),
+            )),
         }
     }
 
@@ -486,7 +516,9 @@ impl StandaloneGenerationCore {
     }
 
     pub(crate) fn snapshot_lease(&self) -> &SnapshotLease {
-        &self.snapshot_lease
+        self.snapshot_lease
+            .as_ref()
+            .expect("standalone generation lease is finalized before publication")
     }
 }
 
@@ -669,37 +701,6 @@ fn compile_binding_manifest(
         )
         .collect::<Vec<_>>()
         .into_boxed_slice();
-    let mut tls = Vec::new();
-    if custom_trust(plan.egress.origin_tls.trust) {
-        let TlsIntent::CustomRoots(_) = &core.origin_https_tls else {
-            return Err(StandaloneCompileError::Inconsistent(
-                "origin TLS binding manifest",
-            ));
-        };
-        tls.push(StandaloneTlsBindingManifest {
-            role: StandaloneTlsRole::Origin,
-            trust: plan.egress.origin_tls.trust,
-        });
-    }
-    if let Some(parent) = plan.egress.parent_proxy.as_ref() {
-        if let Some(parent_tls) = parent.tls.as_ref() {
-            if custom_trust(parent_tls.trust) {
-                let Route::Parent {
-                    tls: TlsIntent::CustomRoots(_),
-                    ..
-                } = &core.route
-                else {
-                    return Err(StandaloneCompileError::Inconsistent(
-                        "parent TLS binding manifest",
-                    ));
-                };
-                tls.push(StandaloneTlsBindingManifest {
-                    role: StandaloneTlsRole::Parent,
-                    trust: parent_tls.trust,
-                });
-            }
-        }
-    }
     Ok(StandaloneBindingManifest {
         provider_outputs,
         capture_redaction: plan
@@ -707,7 +708,6 @@ fn compile_binding_manifest(
             .capture
             .as_ref()
             .and_then(|capture| redaction_refs.get(&capture.redaction_profile).cloned()),
-        tls: tls.into_boxed_slice(),
         resources: compile_resource_proof(plan)?,
     })
 }
@@ -820,13 +820,6 @@ impl StandaloneProviderOutputShape {
     }
 }
 
-const fn custom_trust(trust: CompiledTlsTrust) -> bool {
-    matches!(
-        trust,
-        CompiledTlsTrust::Custom | CompiledTlsTrust::SystemPlusCustom
-    )
-}
-
 #[allow(clippy::too_many_arguments)]
 fn bind_activated(
     core: &StandaloneGenerationCore,
@@ -835,7 +828,6 @@ fn bind_activated(
     redaction_snapshot: &RedactionSnapshot,
     authorization: &ProductAuthorizationSnapshot,
     providers: &ProviderRegistry,
-    egress: &EgressSnapshot,
     observation: &ProductObservationSnapshot,
 ) -> Result<StandaloneActivatedBindings, StandaloneBindError> {
     if !manifest.resources.is_valid() {
@@ -903,23 +895,6 @@ fn bind_activated(
 
     bind_capture(core, manifest, redaction_snapshot, observation)?;
 
-    for binding in &manifest.tls {
-        bind_tls_roots(binding, egress)?;
-    }
-    if egress.origin_custom_roots().is_some()
-        != manifest
-            .tls
-            .iter()
-            .any(|binding| binding.role == StandaloneTlsRole::Origin)
-        || egress.parent_custom_roots().is_some()
-            != manifest
-                .tls
-                .iter()
-                .any(|binding| binding.role == StandaloneTlsRole::Parent)
-    {
-        return Err(StandaloneBindError::Inconsistent("TLS roots shape"));
-    }
-
     Ok(StandaloneActivatedBindings {
         global_credentials,
         rule_credentials: rule_credentials.into_boxed_slice(),
@@ -959,21 +934,6 @@ fn bind_credential_source(
     )
     .map_err(|_| StandaloneBindError::Inconsistent("credential descriptor"))?;
     Ok(BoundCredentialSource { descriptor, source })
-}
-
-fn bind_tls_roots(
-    binding: &StandaloneTlsBindingManifest,
-    egress: &EgressSnapshot,
-) -> Result<(), StandaloneBindError> {
-    let roots = match binding.role {
-        StandaloneTlsRole::Origin => egress.origin_custom_roots(),
-        StandaloneTlsRole::Parent => egress.parent_custom_roots(),
-    }
-    .ok_or(StandaloneBindError::Missing("TLS roots"))?;
-    if roots.trust() != binding.trust {
-        return Err(StandaloneBindError::Inconsistent("TLS roots role"));
-    }
-    Ok(())
 }
 
 fn bind_provider_output(
@@ -1245,72 +1205,6 @@ fn body_limits(
             .map_err(|_| StandaloneCompileError::Checked("trailer byte limit"))?,
     )
     .map_err(|_| StandaloneCompileError::Checked("body limits"))
-}
-
-fn compile_route(
-    plan: &ReloadableProductPlan,
-    identity: &SnapshotIdentity,
-    version: u64,
-    tls_roots: &mut Vec<TlsRootsRef>,
-) -> Result<Route, StandaloneCompileError> {
-    match (&plan.egress.route, &plan.egress.parent_proxy) {
-        (CompiledEgressRoute::Direct, None) => Ok(Route::Direct),
-        (CompiledEgressRoute::ParentProxy, Some(parent)) => {
-            let target = canonicalize_http_url(&parent.url)
-                .map_err(|_| StandaloneCompileError::Checked("parent route URL"))?;
-            let tls = match (target.scheme(), parent.tls.as_ref()) {
-                (HttpScheme::Http, None) => TlsIntent::Disabled,
-                (HttpScheme::Https, Some(tls)) => compile_tls_intent_parts(
-                    tls.trust,
-                    "egress.parent_proxy.tls",
-                    identity,
-                    version,
-                    tls_roots,
-                )?,
-                _ => return Err(StandaloneCompileError::Inconsistent("parent route")),
-            };
-            Ok(Route::Parent { target, tls })
-        }
-        _ => Err(StandaloneCompileError::Inconsistent("egress route")),
-    }
-}
-
-fn compile_tls_intent(
-    plan: &TransportTlsPlan,
-    role: &'static str,
-    identity: &SnapshotIdentity,
-    version: u64,
-    tls_roots: &mut Vec<TlsRootsRef>,
-) -> Result<TlsIntent, StandaloneCompileError> {
-    compile_tls_intent_parts(plan.trust, role, identity, version, tls_roots)
-}
-
-fn compile_tls_intent_parts(
-    trust: CompiledTlsTrust,
-    role: &'static str,
-    identity: &SnapshotIdentity,
-    version: u64,
-    tls_roots: &mut Vec<TlsRootsRef>,
-) -> Result<TlsIntent, StandaloneCompileError> {
-    match trust {
-        CompiledTlsTrust::System => Ok(TlsIntent::SystemRoots),
-        CompiledTlsTrust::Insecure => Ok(TlsIntent::Insecure),
-        CompiledTlsTrust::Custom | CompiledTlsTrust::SystemPlusCustom => {
-            let suffix = match trust {
-                CompiledTlsTrust::Custom => "custom",
-                CompiledTlsTrust::SystemPlusCustom => "system-plus-custom",
-                _ => unreachable!(),
-            };
-            let reference = TlsRootsRef::new(
-                identity.clone(),
-                stable_id(&format!("{role}/{suffix}"))?,
-                version,
-            )
-            .map_err(|_| StandaloneCompileError::Checked("TLS roots reference"))?;
-            tls_roots.push(reference.clone());
-            Ok(TlsIntent::CustomRoots(reference))
-        }
-    }
 }
 
 fn compile_capture(
@@ -1719,10 +1613,16 @@ mod tests {
     use std::path::Path;
 
     use http_access_types::{CredentialMutationKind, HeaderField, PolicyHeaderFacts};
+    use rcgen::generate_simple_self_signed;
+    use tempfile::TempDir;
 
     use super::*;
-    use crate::config::compiler::{CompiledParentProxyKind, ParentProxyPlan, ParentProxyTlsPlan};
+    use crate::config::compiler::{
+        CompiledEgressRoute, CompiledParentProxyKind, CompiledTlsTrust, ParentProxyPlan,
+        ParentProxyTlsPlan,
+    };
     use crate::config::{compile_config_text, ConfigTextInput};
+    use crate::egress::EgressSnapshot;
 
     const PLAN: &str = r#"schema_version = 3
 
@@ -1861,6 +1761,46 @@ header = "x-acl-proxy-request-id"
         .expect("standalone generation fixture compiles")
     }
 
+    fn finalized(
+        plan: &ReloadableProductPlan,
+        id: GenerationId,
+    ) -> UnboundStandaloneGenerationPlan {
+        let directory = TempDir::new().unwrap();
+        let certificate =
+            generate_simple_self_signed(vec!["standalone-root.example".to_owned()]).unwrap();
+        let ca = directory.path().join("root.pem");
+        std::fs::write(&ca, certificate.cert.pem()).unwrap();
+        let mut egress = plan.egress.clone();
+        if matches!(
+            egress.origin_tls.trust,
+            CompiledTlsTrust::Custom | CompiledTlsTrust::SystemPlusCustom
+        ) {
+            egress.origin_tls.ca_certificate = Some(ca.clone());
+        }
+        if let Some(parent_tls) = egress
+            .parent_proxy
+            .as_mut()
+            .and_then(|parent| parent.tls.as_mut())
+        {
+            if matches!(
+                parent_tls.trust,
+                CompiledTlsTrust::Custom | CompiledTlsTrust::SystemPlusCustom
+            ) {
+                parent_tls.ca_certificate = Some(ca);
+            }
+        }
+        let draft = UnboundStandaloneGenerationPlan::compile(plan, id).unwrap();
+        let activation = EgressSnapshot::activate(
+            egress,
+            draft.identity(),
+            PolicyGeneration::new(draft.version()).unwrap(),
+            || false,
+        )
+        .unwrap();
+        let (_, neutral) = activation.into_parts();
+        draft.finalize(neutral).unwrap()
+    }
+
     fn outbound_sources(
         plan: &ReloadableProductPlan,
     ) -> BTreeMap<String, OutboundCredentialSource> {
@@ -1877,11 +1817,7 @@ header = "x-acl-proxy-request-id"
     #[test]
     fn compile_retains_exact_checked_generation_intent() {
         let compiled = compiled();
-        let plan = UnboundStandaloneGenerationPlan::compile(
-            &compiled.reloadable_plan,
-            GenerationId::for_test(17),
-        )
-        .unwrap();
+        let plan = finalized(&compiled.reloadable_plan, GenerationId::for_test(17));
 
         assert!(plan.snapshot_lease().owns(plan.identity()));
         assert_eq!(plan.snapshot_lease().generation().get(), 17);
@@ -1957,12 +1893,22 @@ header = "x-acl-proxy-request-id"
         );
         assert!(matches!(plan.route(), Route::Direct));
         assert!(matches!(
-            plan.origin_tls(HttpScheme::Http),
-            TlsIntent::Disabled
+            plan.origin_security(
+                HttpScheme::Http,
+                CanonicalHost::new("origin.example").unwrap()
+            ),
+            TransportSecurity::Cleartext
         ));
-        let TlsIntent::CustomRoots(roots) = plan.origin_tls(HttpScheme::Https) else {
+        let TransportSecurity::Tls(intent) = plan.origin_security(
+            HttpScheme::Https,
+            CanonicalHost::new("origin.example").unwrap(),
+        ) else {
+            panic!("HTTPS origin retains TLS security")
+        };
+        let TlsTrust::SystemAndCustomRoots(roots) = intent.trust() else {
             panic!("system-plus-custom HTTPS trust uses the merged roots reference")
         };
+        assert_eq!(intent.authenticated_name().as_str(), "origin.example");
         assert!(roots.belongs_to(plan.identity()));
 
         let capture = plan.capture().expect("capture intent is retained");
@@ -2041,16 +1987,8 @@ header = "x-acl-proxy-request-id"
     #[test]
     fn each_compile_creates_a_fresh_snapshot_identity() {
         let compiled = compiled();
-        let first = UnboundStandaloneGenerationPlan::compile(
-            &compiled.reloadable_plan,
-            GenerationId::for_test(21),
-        )
-        .unwrap();
-        let second = UnboundStandaloneGenerationPlan::compile(
-            &compiled.reloadable_plan,
-            GenerationId::for_test(21),
-        )
-        .unwrap();
+        let first = finalized(&compiled.reloadable_plan, GenerationId::for_test(21));
+        let second = finalized(&compiled.reloadable_plan, GenerationId::for_test(21));
 
         assert!(!first.identity().same_snapshot(second.identity()));
         assert!(!first.snapshot_lease().owns(second.identity()));
@@ -2155,18 +2093,18 @@ header = "x-acl-proxy-request-id"
             }),
         });
 
-        let plan = UnboundStandaloneGenerationPlan::compile(
-            &compiled.reloadable_plan,
-            GenerationId::for_test(31),
-        )
-        .unwrap();
-        let Route::Parent { target, tls } = plan.route() else {
+        let plan = finalized(&compiled.reloadable_plan, GenerationId::for_test(31));
+        let Route::Parent { target, security } = plan.route() else {
             panic!("parent route intent is retained")
         };
         assert_eq!(target.as_str(), "https://parent.example.test:8443/");
-        let TlsIntent::CustomRoots(roots) = tls else {
-            panic!("custom parent trust is represented by an opaque roots reference")
+        let TransportSecurity::Tls(intent) = security else {
+            panic!("custom parent route retains TLS security")
         };
+        let TlsTrust::CustomRoots(roots) = intent.trust() else {
+            panic!("custom parent trust retains exact root material")
+        };
+        assert_eq!(intent.authenticated_name().as_str(), "parent.example.test");
         assert!(roots.belongs_to(plan.identity()));
         assert!(plan.snapshot_lease().owns(plan.identity()));
     }
@@ -2269,24 +2207,6 @@ header = "x-acl-proxy-request-id"
             header: http::HeaderName::from_static("x-provider-token"),
             required: false,
         }));
-    }
-
-    #[test]
-    fn custom_root_binding_rejects_an_activation_with_different_trust() {
-        let mut compiled = compiled();
-        let plan = UnboundStandaloneGenerationPlan::compile(
-            &compiled.reloadable_plan,
-            GenerationId::for_test(42),
-        )
-        .unwrap();
-        compiled.reloadable_plan.egress.origin_tls.trust = CompiledTlsTrust::Insecure;
-        compiled.reloadable_plan.egress.origin_tls.ca_certificate = None;
-        let egress = EgressSnapshot::activate(compiled.reloadable_plan.egress, || false).unwrap();
-
-        assert_eq!(
-            bind_tls_roots(&plan.manifest.tls[0], &egress).err(),
-            Some(StandaloneBindError::Missing("TLS roots"))
-        );
     }
 
     #[test]

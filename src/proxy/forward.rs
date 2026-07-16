@@ -24,11 +24,11 @@ use crate::destination::{
     PreparedDestination, ResolvedDestination, TcpDestinationConnector,
 };
 use crate::egress::{
-    EgressRoute, OriginProtocol, OriginProtocolError, ParentAlpnError, ParentEndpoint,
-    ParentTransport,
+    EgressRoute, OriginProtocolError, ParentAlpnError, ParentEndpoint, ParentTransport,
 };
 use crate::runtime::{EgressSnapshot, GenerationRetention};
 use crate::safety::ForwardResponseAdmission;
+use http_access_types::HttpProtocol;
 
 use super::h2_stream_cancellation::H2StreamCancellation;
 use super::headers::{
@@ -52,7 +52,7 @@ pub(crate) enum ForwardError {
     #[error("TLS connection failed")]
     Tls(#[source] std::io::Error),
     #[error(transparent)]
-    OriginProtocol(#[from] OriginProtocolError),
+    HttpProtocol(#[from] OriginProtocolError),
     #[error(transparent)]
     ParentProtocol(#[from] ParentAlpnError),
     #[error("HTTP forwarding failed")]
@@ -1087,8 +1087,8 @@ impl PendingUpstreamUpgrade {
 
 pub(crate) struct PreflightForwardingTarget {
     canonical_url: String,
-    ingress_protocol: OriginProtocol,
-    origin_protocol: OriginProtocol,
+    ingress_protocol: HttpProtocol,
+    origin_protocol: HttpProtocol,
     egress_identity: std::sync::Arc<()>,
     route: PreparedForwardingRoute,
 }
@@ -1105,8 +1105,8 @@ enum PreparedForwardingRoute {
 
 pub(crate) struct ResolvedForwardingTarget {
     canonical_url: String,
-    ingress_protocol: OriginProtocol,
-    origin_protocol: OriginProtocol,
+    ingress_protocol: HttpProtocol,
+    origin_protocol: HttpProtocol,
     egress_identity: std::sync::Arc<()>,
     route: ResolvedForwardingRoute,
 }
@@ -1154,7 +1154,7 @@ impl PreflightForwardingTarget {
     pub(crate) fn bind_for_request(
         self,
         canonical: &CanonicalUrl,
-        ingress_protocol: OriginProtocol,
+        ingress_protocol: HttpProtocol,
         egress: &dyn EgressSnapshot,
         destinations: &DestinationGuard,
     ) -> Result<PreparedForwardingTarget, ResolveForwardingError> {
@@ -1393,7 +1393,7 @@ where
         .cloned()
         .ok_or(HeaderPreparationError::InvalidUpgrade)?;
     let selected_origin_protocol = egress.origin_tls().select_protocol(request.protocol());
-    if selected_origin_protocol.is_http2() {
+    if selected_origin_protocol == HttpProtocol::Http2 {
         return Err(ForwardError::UpgradeRequiresHttp1);
     }
     if target.canonical_url != canonical.as_str()
@@ -1481,14 +1481,14 @@ where
     if canonical.scheme() == HttpScheme::Https {
         let stream = connect_stage(
             deadlines,
-            connect_origin_tls(stream, canonical, egress, OriginProtocol::Http1),
+            connect_origin_tls(stream, canonical, egress, HttpProtocol::Http1),
         )
         .await?;
         let request = prepare_origin_upgrade_request(
             request,
             canonical,
             RequestTargetForm::Origin,
-            OriginProtocol::Http1,
+            HttpProtocol::Http1,
         )?;
         send_upgrade_request(stream, request, intent, deadlines, credentials).await
     } else {
@@ -1496,7 +1496,7 @@ where
             request,
             canonical,
             RequestTargetForm::Origin,
-            OriginProtocol::Http1,
+            HttpProtocol::Http1,
         )?;
         send_upgrade_request(stream, request, intent, deadlines, credentials).await
     }
@@ -1528,14 +1528,14 @@ where
                     connect_stage(deadlines, connect_parent_tunnel(stream, canonical)).await?;
                 let origin = connect_stage(
                     deadlines,
-                    connect_origin_tls(tunnel, canonical, egress, OriginProtocol::Http1),
+                    connect_origin_tls(tunnel, canonical, egress, HttpProtocol::Http1),
                 )
                 .await?;
                 let request = prepare_origin_upgrade_request(
                     request,
                     canonical,
                     RequestTargetForm::Origin,
-                    OriginProtocol::Http1,
+                    HttpProtocol::Http1,
                 )?;
                 send_upgrade_request(origin, request, intent, deadlines, credentials).await
             }
@@ -1547,14 +1547,14 @@ where
                         .await?;
                 let origin = connect_stage(
                     deadlines,
-                    connect_origin_tls(tunnel, canonical, egress, OriginProtocol::Http1),
+                    connect_origin_tls(tunnel, canonical, egress, HttpProtocol::Http1),
                 )
                 .await?;
                 let request = prepare_origin_upgrade_request(
                     request,
                     canonical,
                     RequestTargetForm::Origin,
-                    OriginProtocol::Http1,
+                    HttpProtocol::Http1,
                 )?;
                 send_upgrade_request(origin, request, intent, deadlines, credentials).await
             }
@@ -1564,7 +1564,7 @@ where
             request,
             canonical,
             RequestTargetForm::Absolute,
-            OriginProtocol::Http1,
+            HttpProtocol::Http1,
         )?;
         match parent.transport() {
             ParentTransport::Http => {
@@ -1583,7 +1583,7 @@ async fn forward_direct<S, B>(
     request: SanitizedRequest<B>,
     canonical: &CanonicalUrl,
     egress: &dyn EgressSnapshot,
-    protocol: OriginProtocol,
+    protocol: HttpProtocol,
     stream: S,
     execution: EstablishedForwardExecution,
 ) -> Result<ForwardedResponse, ForwardError>
@@ -1618,7 +1618,7 @@ async fn forward_via_parent<S, B>(
     canonical: &CanonicalUrl,
     egress: &dyn EgressSnapshot,
     parent: &ParentEndpoint,
-    protocol: OriginProtocol,
+    protocol: HttpProtocol,
     stream: S,
     execution: EstablishedForwardExecution,
 ) -> Result<ForwardedResponse, ForwardError>
@@ -1682,7 +1682,7 @@ where
             ParentTransport::Https(tls) => {
                 let stream = connect_stage(
                     deadlines,
-                    connect_parent_tls(stream, tls, protocol.is_http2()),
+                    connect_parent_tls(stream, tls, protocol == HttpProtocol::Http2),
                 )
                 .await?;
                 send_request(stream, request, protocol, deadlines, credentials).await
@@ -1695,7 +1695,7 @@ async fn connect_origin_tls<S>(
     stream: S,
     canonical: &CanonicalUrl,
     egress: &dyn EgressSnapshot,
-    protocol: OriginProtocol,
+    protocol: HttpProtocol,
 ) -> Result<TlsStream<S>, ForwardError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -2051,7 +2051,7 @@ impl<B: HttpBody> HttpBody for UpgradeRequestBody<B> {
 async fn send_request<S, B>(
     stream: S,
     request: Request<B>,
-    protocol: OriginProtocol,
+    protocol: HttpProtocol,
     deadlines: ForwardingDeadlines,
     credentials: Option<ProductCredentialExecution>,
 ) -> Result<ForwardedResponse, ForwardError>
@@ -2062,7 +2062,7 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let mut builder = conn::Builder::new();
-    if protocol.is_http2() {
+    if protocol == HttpProtocol::Http2 {
         builder.http2_only(true);
     }
     let (mut sender, connection) = connect_stage(deadlines, async {
@@ -2281,6 +2281,7 @@ mod tests {
                 server_name: "parent.example".to_owned(),
             }),
         });
+        let identity = http_access_types::SnapshotIdentity::new();
         ProductEgressSnapshot::activate(
             EgressPlan {
                 route: if parent_proxy.is_some() {
@@ -2297,9 +2298,13 @@ mod tests {
                 request_headers: vec![],
                 credential_actions: vec![],
             },
+            &identity,
+            http_access_types::PolicyGeneration::new(1).unwrap(),
             || false,
         )
         .unwrap()
+        .into_parts()
+        .0
     }
 
     fn request() -> SanitizedRequest {
@@ -2607,14 +2612,14 @@ mod tests {
                 .insert(TE, HeaderValue::from_static("trailers"));
         }
         let expected_ingress = if ingress_version == Version::HTTP_2 {
-            OriginProtocol::Http2
+            HttpProtocol::Http2
         } else {
-            OriginProtocol::Http1
+            HttpProtocol::Http1
         };
         let expected_origin = if selected_version == CompiledHttpVersion::Http2 {
-            OriginProtocol::Http2
+            HttpProtocol::Http2
         } else {
-            OriginProtocol::Http1
+            HttpProtocol::Http1
         };
         let (guard, _) = guard();
         let (client, server) = tokio::io::duplex(256 * 1024);
@@ -2680,13 +2685,13 @@ mod tests {
             route,
             TranslationRoute::HttpParentClearOrigin | TranslationRoute::HttpsParentClearOrigin
         );
-        let expected_uri = if expected_origin.is_http2() || ordinary_parent {
+        let expected_uri = if expected_origin == HttpProtocol::Http2 || ordinary_parent {
             canonical.as_str()
         } else {
             "/translate?q=1"
         };
         assert_eq!(uri, expected_uri, "{route:?}");
-        if expected_origin.is_http2() {
+        if expected_origin == HttpProtocol::Http2 {
             assert!(!headers.contains_key(HOST), "{route:?}");
             if ingress_version == Version::HTTP_2 {
                 assert_eq!(headers[TE], "trailers", "{route:?}");
@@ -2937,7 +2942,7 @@ mod tests {
                 request,
                 &canonical,
                 RequestTargetForm::Origin,
-                OriginProtocol::Http1,
+                HttpProtocol::Http1,
             )
             .unwrap();
             let (client, mut server) = tokio::io::duplex(64 * 1024);
@@ -3059,7 +3064,7 @@ mod tests {
             request,
             &canonical,
             RequestTargetForm::Origin,
-            OriginProtocol::Http1,
+            HttpProtocol::Http1,
         )
         .unwrap();
         let (client, mut server) = tokio::io::duplex(64 * 1024);
@@ -3243,7 +3248,7 @@ mod tests {
             sanitized,
             &canonical,
             RequestTargetForm::Origin,
-            OriginProtocol::Http1,
+            HttpProtocol::Http1,
         )
         .unwrap();
         let (client, mut server) = tokio::io::duplex(64 * 1024);
@@ -3455,11 +3460,11 @@ mod tests {
         )
         .begin_connect();
 
-        let error =
-            match send_request(client, request, OriginProtocol::Http1, deadlines, None).await {
-                Ok(_) => panic!("a missing upstream response head must time out"),
-                Err(error) => error,
-            };
+        let error = match send_request(client, request, HttpProtocol::Http1, deadlines, None).await
+        {
+            Ok(_) => panic!("a missing upstream response head must time out"),
+            Err(error) => error,
+        };
         assert!(matches!(error, ForwardError::ResponseHeadTimeout));
         server.await.unwrap();
     }
@@ -3882,7 +3887,7 @@ mod tests {
         let foreign_protocol =
             preflight_forwarding_target(&canonical, &request, &egress, &guard).unwrap();
         assert!(matches!(
-            foreign_protocol.bind_for_request(&canonical, OriginProtocol::Http2, &egress, &guard,),
+            foreign_protocol.bind_for_request(&canonical, HttpProtocol::Http2, &egress, &guard,),
             Err(ResolveForwardingError::Binding)
         ));
 
@@ -3920,7 +3925,7 @@ mod tests {
 
         assert!(matches!(
             forward_with_connector(request, &canonical, &egress, &guard, target, &connector).await,
-            Err(ForwardError::OriginProtocol(
+            Err(ForwardError::HttpProtocol(
                 OriginProtocolError::IncompatibleAlpn
             ))
         ));
@@ -3977,7 +3982,7 @@ mod tests {
         let mut target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
             .await
             .unwrap();
-        target.origin_protocol = OriginProtocol::Http2;
+        target.origin_protocol = HttpProtocol::Http2;
         let (client, _server) = tokio::io::duplex(1024);
         let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
         assert!(matches!(

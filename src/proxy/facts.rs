@@ -502,7 +502,7 @@ mod tests {
         ));
         assert_eq!(parts.method, Method::POST);
         assert_eq!(parts.version, Version::HTTP_11);
-        assert_eq!(protocol, crate::egress::OriginProtocol::Http1);
+        assert_eq!(protocol, http_access_types::HttpProtocol::Http1);
         assert!(parts.extensions.get::<ProductUpgradeIntent>().is_some());
         assert!(downstream_upgrade.is_some());
     }
@@ -540,7 +540,7 @@ mod tests {
             assert_eq!(parts.method, Method::CONNECT);
             assert_eq!(parts.version, Version::HTTP_11);
             assert!(body.is_end_stream());
-            assert_eq!(protocol, crate::egress::OriginProtocol::Http1);
+            assert_eq!(protocol, http_access_types::HttpProtocol::Http1);
             drop(downstream_upgrade);
         }
     }

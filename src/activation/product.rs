@@ -172,8 +172,22 @@ impl ProductActivator {
             .map_err(|error| candidate_error(&cancellation, "observation", error.to_string()))?;
         cancellation.check()?;
 
-        let egress = EgressSnapshot::activate(egress, || cancellation.is_cancelled())
-            .map_err(|error| map_egress_error(error, &cancellation))?;
+        let egress = EgressSnapshot::activate(
+            egress,
+            standalone.identity(),
+            http_access_types::PolicyGeneration::new(standalone.version())
+                .map_err(|_| RuntimeError::CandidateActivation("invalid generation".to_owned()))?,
+            || cancellation.is_cancelled(),
+        )
+        .map_err(|error| map_egress_error(error, &cancellation))?;
+        let (egress, neutral_egress) = egress.into_parts();
+        standalone = standalone.finalize(neutral_egress).map_err(|error| {
+            candidate_error(
+                &cancellation,
+                "standalone generation finalization",
+                error.to_string(),
+            )
+        })?;
         cancellation.check()?;
 
         // Process providers start only after the other generation-owned
@@ -206,7 +220,6 @@ impl ProductActivator {
             &redaction,
             &authorization,
             &provider_registry,
-            &egress,
             &observation,
         ) {
             Ok(standalone) => standalone,
@@ -427,6 +440,38 @@ redaction_profile = "environment"
             .await
             .unwrap();
         (runtime, source)
+    }
+
+    #[tokio::test]
+    async fn invalid_standalone_candidate_fails_before_egress_ca_io() {
+        let mut compiled = compile(MINIMAL);
+        compiled
+            .reloadable_plan
+            .resource_plan
+            .http_body_resources_by_cursor[0]
+            .combined_peak_bytes += 1;
+        compiled.reloadable_plan.egress.origin_tls.trust =
+            crate::config::compiler::CompiledTlsTrust::Custom;
+        compiled.reloadable_plan.egress.origin_tls.ca_certificate =
+            Some("/sensitive/missing/ca.pem".into());
+        let activator = product_activator(&compiled.static_config);
+
+        let error = activator
+            .activate_generation(
+                compiled.reloadable_plan,
+                ActivationCancellation::new_for_test(),
+            )
+            .await
+            .err()
+            .expect("invalid standalone candidate must fail");
+
+        assert!(matches!(
+            error,
+            RuntimeError::CandidateActivation(message)
+                if message.contains("standalone generation plan")
+                    && !message.contains("custom CA")
+                    && !message.contains("/sensitive/")
+        ));
     }
 
     fn redact_environment_secret(lease: &crate::runtime::GenerationLease, input: &[u8]) -> Vec<u8> {
@@ -825,7 +870,10 @@ redaction_profile = "environment"
             activated.egress.route(),
             crate::egress::EgressRoute::Direct
         ));
-        assert_eq!(activated.egress.origin_tls().http_versions().len(), 2);
+        assert_eq!(
+            activated.egress.origin_tls().protocols().protocols().len(),
+            2
+        );
         assert!(standalone_bindings.global_credentials().is_empty());
         let mut request_headers = http::HeaderMap::new();
         let _origin_trust = activated.egress.origin_tls().trust();

@@ -1551,7 +1551,7 @@ async fn execute_connect_terminal(
     else {
         return HandledResponse::fixed(StatusCode::INTERNAL_SERVER_ERROR, "request failed\n", true);
     };
-    if protocol != crate::egress::OriginProtocol::Http1
+    if protocol != http_access_types::HttpProtocol::Http1
         || exchange.facts().method().as_str() != "CONNECT"
         || exchange.plan().origin() != terminal.target.url()
         || !matches!(exchange.plan().upgrade(), UpgradePolicy::Deny)

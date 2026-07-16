@@ -32,7 +32,6 @@ use crate::config::compiler::{
 use crate::credential_resolver::ProductCredentialPreparation;
 use crate::credentials::InboundCredentials;
 use crate::destination::DestinationGuard;
-use crate::egress::OriginProtocol;
 use crate::http_body::{read_mandatory_runtime_request_body, HttpBodyReadError};
 use crate::observation::{DecisionSubmissionTarget, PendingDecisionSubmission};
 use crate::policy::{HttpWireBodyPlanIndex, ProductRuleEffectsRef};
@@ -51,6 +50,7 @@ use crate::standalone_provider_result::{
     adapt_local_allow, adapt_provider_allow, StandaloneAllowMode, StandaloneProviderAllowError,
     StandaloneRequestSidecar,
 };
+use http_access_types::HttpProtocol;
 
 pub(crate) struct TokioRuntimeClock {
     epoch: Instant,
@@ -210,17 +210,17 @@ struct PreparedDispatch {
 pub(crate) enum StandaloneIngressTransport {
     Ordinary {
         parts: Box<http::request::Parts>,
-        protocol: OriginProtocol,
+        protocol: HttpProtocol,
         downstream_upgrade: Option<hyper::upgrade::OnUpgrade>,
     },
     OuterConnect {
-        protocol: OriginProtocol,
+        protocol: HttpProtocol,
         downstream_upgrade: hyper::upgrade::OnUpgrade,
     },
 }
 
 impl StandaloneIngressTransport {
-    fn protocol(&self) -> OriginProtocol {
+    fn protocol(&self) -> HttpProtocol {
         match self {
             Self::Ordinary { protocol, .. } | Self::OuterConnect { protocol, .. } => *protocol,
         }
@@ -232,7 +232,7 @@ impl StandaloneIngressTransport {
                 downstream_upgrade, ..
             } => downstream_upgrade.is_some() == facts.upgrade().is_some(),
             Self::OuterConnect { protocol, .. } => {
-                *protocol == OriginProtocol::Http1
+                *protocol == HttpProtocol::Http1
                     && facts.method().as_str() == "CONNECT"
                     && facts.upgrade().is_none()
             }
@@ -1400,10 +1400,10 @@ fn take_internal_context(
     Ok(internal)
 }
 
-fn ingress_protocol(version: HttpVersion) -> OriginProtocol {
+fn ingress_protocol(version: HttpVersion) -> HttpProtocol {
     match version {
-        HttpVersion::Http10 | HttpVersion::Http11 => OriginProtocol::Http1,
-        HttpVersion::Http2 => OriginProtocol::Http2,
+        HttpVersion::Http10 | HttpVersion::Http11 => HttpProtocol::Http1,
+        HttpVersion::Http2 => HttpProtocol::Http2,
     }
 }
 
@@ -1752,7 +1752,7 @@ header = "x-test-loop"
                 assert!(matches!(
                     &dispatch.transport,
                     StandaloneIngressTransport::OuterConnect {
-                        protocol: OriginProtocol::Http1,
+                        protocol: HttpProtocol::Http1,
                         ..
                     }
                 ));

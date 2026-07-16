@@ -1,7 +1,8 @@
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(test)]
 use http::Uri;
 use rustls::{ClientConfig, ServerName};
 
@@ -11,11 +12,18 @@ use crate::config::compiler::{
     CompiledEgressRoute, CompiledHttpVersion, CompiledTlsTrust, EgressPlan, ParentProxyPlan,
     ParentProxyTlsPlan, TransportTlsPlan,
 };
+#[cfg(test)]
+use crate::tls::ClientTrust;
 use crate::tls::{
-    build_client_config, load_client_trust, ClientAlpn, ClientTrust, TlsActivationError,
+    build_client_config, load_client_trust_with_cached_material, ClientAlpn, LoadedClientTrust,
+    TlsActivationError,
 };
-use http_access_types::{CanonicalAuthority, HttpScheme};
-use http_access_url::{canonicalize_http_authority, canonicalize_tls_server_name};
+use http_access_runtime::{TlsRootCertificate, TlsRootSet, TlsRootsRegistration};
+use http_access_types::{
+    CanonicalAuthority, ClientTlsIntent, HttpProtocol, HttpProtocolSet, HttpScheme, HttpVersion,
+    PolicyGeneration, Route, SnapshotIdentity, StableId, TlsRootsRef, TlsTrust, TransportSecurity,
+};
+use http_access_url::{canonicalize_http_url, canonicalize_tls_server_name};
 
 /// Generation-owned outbound transport policy and material.
 ///
@@ -24,6 +32,27 @@ pub(crate) struct EgressSnapshot {
     identity: Arc<()>,
     route: EgressRoute,
     origin_tls: OriginTls,
+}
+
+pub(crate) struct EgressActivation {
+    snapshot: EgressSnapshot,
+    neutral: NeutralEgressBindings,
+    #[cfg(test)]
+    custom_ca_file_reads: usize,
+}
+
+pub(crate) struct NeutralEgressBindings {
+    protocols: HttpProtocolSet,
+    origin_https_trust: TlsTrust,
+    route: Route,
+    tls_roots: Vec<TlsRootsRegistration>,
+}
+
+struct EgressTrustLoader<'a> {
+    custom_ca_der: Vec<(PathBuf, Vec<Vec<u8>>)>,
+    is_cancelled: &'a mut dyn FnMut() -> bool,
+    #[cfg(test)]
+    custom_ca_file_reads: usize,
 }
 
 pub(crate) enum EgressRoute {
@@ -49,29 +78,9 @@ pub(crate) enum ParentTransport {
 pub(crate) struct OriginTls {
     #[cfg(test)]
     trust: CompiledTlsTrust,
-    http_versions: Box<[CompiledHttpVersion]>,
+    protocols: HttpProtocolSet,
     http1_config: Option<Arc<ClientConfig>>,
     http2_config: Option<Arc<ClientConfig>>,
-    custom_roots: Option<ActivatedTlsRoots>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum OriginProtocol {
-    Http1,
-    Http2,
-}
-
-impl OriginProtocol {
-    pub(crate) fn is_http2(self) -> bool {
-        self == Self::Http2
-    }
-
-    fn from_compiled(version: CompiledHttpVersion) -> Self {
-        match version {
-            CompiledHttpVersion::Http1 => Self::Http1,
-            CompiledHttpVersion::Http2 => Self::Http2,
-        }
-    }
 }
 
 pub(crate) struct ParentTls {
@@ -80,13 +89,6 @@ pub(crate) struct ParentTls {
     server_name: String,
     http1_config: Arc<ClientConfig>,
     http2_config: Arc<ClientConfig>,
-    custom_roots: Option<ActivatedTlsRoots>,
-}
-
-#[derive(Clone)]
-pub(crate) struct ActivatedTlsRoots {
-    trust: CompiledTlsTrust,
-    _store: Arc<ClientTrust>,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -109,6 +111,8 @@ pub(crate) enum EgressActivationError {
     CaEmpty,
     #[error("custom CA certificate bundle contains an unusable certificate")]
     CaUnusable,
+    #[error("egress neutral TLS bindings are invalid")]
+    NeutralTls,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -128,26 +132,52 @@ pub(crate) enum OriginProtocolError {
 impl EgressSnapshot {
     pub(crate) fn activate(
         plan: EgressPlan,
+        identity: &SnapshotIdentity,
+        generation: PolicyGeneration,
         mut is_cancelled: impl FnMut() -> bool,
-    ) -> Result<Self, EgressActivationError> {
+    ) -> Result<EgressActivation, EgressActivationError> {
         let EgressPlan {
             route,
             origin_tls,
             parent_proxy,
             ..
         } = plan;
-        let origin_tls = OriginTls::activate(origin_tls, &mut is_cancelled)?;
-        let route = match (route, parent_proxy) {
-            (CompiledEgressRoute::Direct, None) => EgressRoute::Direct,
-            (CompiledEgressRoute::ParentProxy, Some(parent)) => EgressRoute::Parent(Box::new(
-                ParentEndpoint::activate(parent, &mut is_cancelled)?,
-            )),
+        let mut trust_loader = EgressTrustLoader {
+            custom_ca_der: Vec::new(),
+            is_cancelled: &mut is_cancelled,
+            #[cfg(test)]
+            custom_ca_file_reads: 0,
+        };
+        let (origin_tls, protocols, origin_https_trust, origin_roots) =
+            OriginTls::activate(origin_tls, identity, generation, &mut trust_loader)?;
+        let (route, neutral_route, parent_roots) = match (route, parent_proxy) {
+            (CompiledEgressRoute::Direct, None) => (EgressRoute::Direct, Route::Direct, None),
+            (CompiledEgressRoute::ParentProxy, Some(parent)) => {
+                let (endpoint, neutral_route, roots) =
+                    ParentEndpoint::activate(parent, identity, generation, &mut trust_loader)?;
+                (
+                    EgressRoute::Parent(Box::new(endpoint)),
+                    neutral_route,
+                    roots,
+                )
+            }
             _ => return Err(EgressActivationError::Route),
         };
-        Ok(Self {
-            identity: Arc::new(()),
-            route,
-            origin_tls,
+        let tls_roots = origin_roots.into_iter().chain(parent_roots).collect();
+        Ok(EgressActivation {
+            snapshot: Self {
+                identity: Arc::new(()),
+                route,
+                origin_tls,
+            },
+            neutral: NeutralEgressBindings {
+                protocols,
+                origin_https_trust,
+                route: neutral_route,
+                tls_roots,
+            },
+            #[cfg(test)]
+            custom_ca_file_reads: trust_loader.custom_ca_file_reads,
         })
     }
 
@@ -158,19 +188,82 @@ impl EgressSnapshot {
     pub(crate) fn origin_tls(&self) -> &OriginTls {
         &self.origin_tls
     }
+}
 
-    pub(crate) fn origin_custom_roots(&self) -> Option<ActivatedTlsRoots> {
-        self.origin_tls.custom_roots.clone()
+impl EgressActivation {
+    pub(crate) fn into_parts(self) -> (EgressSnapshot, NeutralEgressBindings) {
+        (self.snapshot, self.neutral)
     }
 
-    pub(crate) fn parent_custom_roots(&self) -> Option<ActivatedTlsRoots> {
-        let EgressRoute::Parent(parent) = &self.route else {
-            return None;
-        };
-        let ParentTransport::Https(tls) = parent.transport() else {
-            return None;
-        };
-        tls.custom_roots.clone()
+    #[cfg(test)]
+    fn custom_ca_file_reads(&self) -> usize {
+        self.custom_ca_file_reads
+    }
+}
+
+impl EgressTrustLoader<'_> {
+    fn load(
+        &mut self,
+        trust: CompiledTlsTrust,
+        ca_certificate: Option<&Path>,
+    ) -> Result<LoadedClientTrust, EgressActivationError> {
+        let cached = ca_certificate.and_then(|path| {
+            self.custom_ca_der
+                .iter()
+                .find(|(candidate, _)| candidate == path)
+                .map(|(_, certificates)| certificates.clone())
+        });
+        #[cfg(test)]
+        if ca_certificate.is_some()
+            && cached.is_none()
+            && matches!(
+                trust,
+                CompiledTlsTrust::Custom | CompiledTlsTrust::SystemPlusCustom
+            )
+        {
+            self.custom_ca_file_reads += 1;
+        }
+        let loaded = load_client_trust_with_cached_material(
+            trust,
+            ca_certificate,
+            cached,
+            self.is_cancelled,
+        )?;
+        if let (Some(path), Some(certificates)) = (ca_certificate, loaded.custom_ca_der()) {
+            if !self
+                .custom_ca_der
+                .iter()
+                .any(|(candidate, _)| candidate == path)
+            {
+                self.custom_ca_der
+                    .push((path.to_path_buf(), certificates.to_vec()));
+            }
+        }
+        Ok(loaded)
+    }
+}
+
+impl NeutralEgressBindings {
+    pub(crate) fn into_parts(
+        self,
+    ) -> (HttpProtocolSet, TlsTrust, Route, Vec<TlsRootsRegistration>) {
+        (
+            self.protocols,
+            self.origin_https_trust,
+            self.route,
+            self.tls_roots,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn direct_system_for_test() -> Self {
+        Self {
+            protocols: HttpProtocolSet::new(vec![HttpProtocol::Http1, HttpProtocol::Http2])
+                .unwrap(),
+            origin_https_trust: TlsTrust::SystemRoots,
+            route: Route::Direct,
+            tls_roots: Vec::new(),
+        }
     }
 }
 
@@ -191,8 +284,10 @@ impl crate::runtime::EgressSnapshot for EgressSnapshot {
 impl ParentEndpoint {
     fn activate(
         plan: ParentProxyPlan,
-        is_cancelled: &mut dyn FnMut() -> bool,
-    ) -> Result<Self, EgressActivationError> {
+        identity: &SnapshotIdentity,
+        generation: PolicyGeneration,
+        trust_loader: &mut EgressTrustLoader<'_>,
+    ) -> Result<(Self, Route, Option<TlsRootsRegistration>), EgressActivationError> {
         #[cfg(test)]
         let kind = plan.kind;
         let ParentProxyPlan {
@@ -202,40 +297,45 @@ impl ParentEndpoint {
             tls,
             ..
         } = plan;
-        let uri = url
-            .parse::<Uri>()
-            .map_err(|_| EgressActivationError::ParentUrl)?;
-        let scheme = match uri.scheme_str() {
-            Some("http") => HttpScheme::Http,
-            Some("https") => HttpScheme::Https,
-            _ => return Err(EgressActivationError::ParentUrl),
-        };
-        let transport = match (scheme, tls) {
-            (HttpScheme::Http, None) => ParentTransport::Http,
+        let target = canonicalize_http_url(&url).map_err(|_| EgressActivationError::ParentUrl)?;
+        if target.path() != "/" || target.query().is_some() {
+            return Err(EgressActivationError::ParentUrl);
+        }
+        let scheme = target.scheme();
+        let (transport, security, roots) = match (scheme, tls) {
+            (HttpScheme::Http, None) => (ParentTransport::Http, TransportSecurity::Cleartext, None),
             (HttpScheme::Https, Some(tls)) => {
-                ParentTransport::Https(ParentTls::activate(tls, is_cancelled)?)
+                let (tls, intent, roots) =
+                    ParentTls::activate(tls, identity, generation, trust_loader)?;
+                (
+                    ParentTransport::Https(tls),
+                    TransportSecurity::Tls(intent),
+                    roots,
+                )
             }
             _ => return Err(EgressActivationError::Route),
         };
-        let authority = canonicalize_http_authority(
-            scheme,
-            uri.authority()
-                .ok_or(EgressActivationError::ParentUrl)?
-                .as_str(),
-        )
-        .map_err(|_| EgressActivationError::ParentUrl)?;
+        let authority = target.authority().clone();
         if authority.host().as_str() != host || authority.effective_port() != port {
             return Err(EgressActivationError::Route);
         }
-        Ok(Self {
-            #[cfg(test)]
-            kind,
-            canonical_url: url,
-            #[cfg(test)]
-            uri,
-            authority,
-            transport,
-        })
+        #[cfg(test)]
+        let uri = url
+            .parse::<Uri>()
+            .map_err(|_| EgressActivationError::ParentUrl)?;
+        Ok((
+            Self {
+                #[cfg(test)]
+                kind,
+                canonical_url: url,
+                #[cfg(test)]
+                uri,
+                authority,
+                transport,
+            },
+            Route::Parent { target, security },
+            roots,
+        ))
     }
 
     #[cfg(test)]
@@ -274,34 +374,45 @@ impl ParentEndpoint {
 impl ParentTls {
     fn activate(
         plan: ParentProxyTlsPlan,
-        is_cancelled: &mut dyn FnMut() -> bool,
-    ) -> Result<Self, EgressActivationError> {
-        Self::activate_with_loader(plan, |trust, ca_certificate| {
-            load_client_trust(trust, ca_certificate, is_cancelled).map_err(Into::into)
-        })
+        identity: &SnapshotIdentity,
+        generation: PolicyGeneration,
+        trust_loader: &mut EgressTrustLoader<'_>,
+    ) -> Result<(Self, ClientTlsIntent, Option<TlsRootsRegistration>), EgressActivationError> {
+        Self::activate_with_loader(
+            plan,
+            |trust, ca_certificate| trust_loader.load(trust, ca_certificate),
+            identity,
+            generation,
+        )
     }
 
     fn activate_with_loader<F>(
         plan: ParentProxyTlsPlan,
         load: F,
-    ) -> Result<Self, EgressActivationError>
+        identity: &SnapshotIdentity,
+        generation: PolicyGeneration,
+    ) -> Result<(Self, ClientTlsIntent, Option<TlsRootsRegistration>), EgressActivationError>
     where
-        F: FnOnce(CompiledTlsTrust, Option<&Path>) -> Result<ClientTrust, EgressActivationError>,
+        F: FnOnce(
+            CompiledTlsTrust,
+            Option<&Path>,
+        ) -> Result<LoadedClientTrust, EgressActivationError>,
     {
         let server_name = canonicalize_tls_server_name(&plan.server_name)
             .map_err(|_| EgressActivationError::ParentServerName)?;
         ServerName::try_from(server_name.as_str())
             .map_err(|_| EgressActivationError::ParentServerName)?;
         let enable_sni = server_name.as_str().parse::<IpAddr>().is_err();
-        let loaded_trust = Arc::new(load(plan.trust, plan.ca_certificate.as_deref())?);
-        let custom_roots = matches!(
+        let loaded = load(plan.trust, plan.ca_certificate.as_deref())?;
+        let (loaded_trust, custom_ca_der) = loaded.into_parts();
+        let (neutral_trust, roots) = neutral_tls_trust(
             plan.trust,
-            CompiledTlsTrust::Custom | CompiledTlsTrust::SystemPlusCustom
-        )
-        .then(|| ActivatedTlsRoots {
-            trust: plan.trust,
-            _store: loaded_trust.clone(),
-        });
+            identity,
+            generation,
+            "egress-parent-roots",
+            custom_ca_der,
+        )?;
+        let loaded_trust = Arc::new(loaded_trust);
         warn_if_insecure("parent", plan.trust);
         let http1_config = Arc::new(build_client_config(
             loaded_trust.as_ref(),
@@ -313,14 +424,18 @@ impl ParentTls {
             ClientAlpn::Http2,
             enable_sni,
         ));
-        Ok(Self {
-            #[cfg(test)]
-            trust: plan.trust,
-            server_name: server_name.into(),
-            http1_config,
-            http2_config,
-            custom_roots,
-        })
+        let intent = ClientTlsIntent::new(server_name.clone(), neutral_trust);
+        Ok((
+            Self {
+                #[cfg(test)]
+                trust: plan.trust,
+                server_name: server_name.into(),
+                http1_config,
+                http2_config,
+            },
+            intent,
+            roots,
+        ))
     }
 
     #[cfg(test)]
@@ -360,61 +475,98 @@ impl ParentTls {
 impl OriginTls {
     fn activate(
         plan: TransportTlsPlan,
-        is_cancelled: &mut dyn FnMut() -> bool,
-    ) -> Result<Self, EgressActivationError> {
-        Self::activate_with_loader(plan, |trust, ca_certificate| {
-            load_client_trust(trust, ca_certificate, is_cancelled).map_err(Into::into)
-        })
+        identity: &SnapshotIdentity,
+        generation: PolicyGeneration,
+        trust_loader: &mut EgressTrustLoader<'_>,
+    ) -> Result<
+        (
+            Self,
+            HttpProtocolSet,
+            TlsTrust,
+            Option<TlsRootsRegistration>,
+        ),
+        EgressActivationError,
+    > {
+        Self::activate_with_loader(
+            plan,
+            |trust, ca_certificate| trust_loader.load(trust, ca_certificate),
+            identity,
+            generation,
+        )
     }
 
     fn activate_with_loader<F>(
         plan: TransportTlsPlan,
         load: F,
-    ) -> Result<Self, EgressActivationError>
+        identity: &SnapshotIdentity,
+        generation: PolicyGeneration,
+    ) -> Result<
+        (
+            Self,
+            HttpProtocolSet,
+            TlsTrust,
+            Option<TlsRootsRegistration>,
+        ),
+        EgressActivationError,
+    >
     where
-        F: FnOnce(CompiledTlsTrust, Option<&Path>) -> Result<ClientTrust, EgressActivationError>,
+        F: FnOnce(
+            CompiledTlsTrust,
+            Option<&Path>,
+        ) -> Result<LoadedClientTrust, EgressActivationError>,
     {
         let TransportTlsPlan {
             trust,
             ca_certificate,
             http_versions,
         } = plan;
-        let http1 = http_versions.contains(&CompiledHttpVersion::Http1);
-        let http2 = http_versions.contains(&CompiledHttpVersion::Http2);
-        if !http1 && !http2 {
-            return Err(EgressActivationError::Route);
-        }
-
-        let loaded_trust = Arc::new(load(trust, ca_certificate.as_deref())?);
-        let custom_roots = matches!(
-            trust,
-            CompiledTlsTrust::Custom | CompiledTlsTrust::SystemPlusCustom
+        let protocols = HttpProtocolSet::new(
+            http_versions
+                .into_iter()
+                .map(|version| match version {
+                    CompiledHttpVersion::Http1 => HttpProtocol::Http1,
+                    CompiledHttpVersion::Http2 => HttpProtocol::Http2,
+                })
+                .collect(),
         )
-        .then(|| ActivatedTlsRoots {
+        .map_err(|_| EgressActivationError::Route)?;
+        let http1 = protocols.protocols().contains(&HttpProtocol::Http1);
+        let http2 = protocols.protocols().contains(&HttpProtocol::Http2);
+        let loaded = load(trust, ca_certificate.as_deref())?;
+        let (loaded_trust, custom_ca_der) = loaded.into_parts();
+        let (neutral_trust, roots) = neutral_tls_trust(
             trust,
-            _store: loaded_trust.clone(),
-        });
+            identity,
+            generation,
+            "egress-origin-roots",
+            custom_ca_der,
+        )?;
+        let loaded_trust = Arc::new(loaded_trust);
         warn_if_insecure("origin", trust);
-        Ok(Self {
-            #[cfg(test)]
-            trust,
-            http_versions: http_versions.into_boxed_slice(),
-            http1_config: http1.then(|| {
-                Arc::new(build_client_config(
-                    loaded_trust.as_ref(),
-                    ClientAlpn::Http1,
-                    true,
-                ))
-            }),
-            http2_config: http2.then(|| {
-                Arc::new(build_client_config(
-                    loaded_trust.as_ref(),
-                    ClientAlpn::Http2,
-                    true,
-                ))
-            }),
-            custom_roots,
-        })
+        Ok((
+            Self {
+                #[cfg(test)]
+                trust,
+                protocols: protocols.clone(),
+                http1_config: http1.then(|| {
+                    Arc::new(build_client_config(
+                        loaded_trust.as_ref(),
+                        ClientAlpn::Http1,
+                        true,
+                    ))
+                }),
+                http2_config: http2.then(|| {
+                    Arc::new(build_client_config(
+                        loaded_trust.as_ref(),
+                        ClientAlpn::Http2,
+                        true,
+                    ))
+                }),
+            },
+            protocols,
+            neutral_trust,
+            roots,
+        ))
     }
 
     #[cfg(test)]
@@ -423,33 +575,23 @@ impl OriginTls {
     }
 
     #[cfg(test)]
-    pub(crate) fn http_versions(&self) -> &[CompiledHttpVersion] {
-        &self.http_versions
+    pub(crate) fn protocols(&self) -> &HttpProtocolSet {
+        &self.protocols
     }
 
-    pub(crate) fn select_protocol(&self, ingress: OriginProtocol) -> OriginProtocol {
-        let ingress_enabled = if ingress.is_http2() {
-            self.http2_config.is_some()
-        } else {
-            self.http1_config.is_some()
+    pub(crate) fn select_protocol(&self, ingress: HttpProtocol) -> HttpProtocol {
+        let version = match ingress {
+            HttpProtocol::Http1 => HttpVersion::Http11,
+            HttpProtocol::Http2 => HttpVersion::Http2,
         };
-        if ingress_enabled {
-            return ingress;
-        }
-
-        OriginProtocol::from_compiled(
-            *self
-                .http_versions
-                .first()
-                .expect("activated origin TLS has an enabled HTTP protocol"),
-        )
+        self.protocols.select(version)
     }
 
     pub(crate) fn client_config(
         &self,
-        protocol: OriginProtocol,
+        protocol: HttpProtocol,
     ) -> Result<Arc<ClientConfig>, OriginProtocolError> {
-        let config = if protocol.is_http2() {
+        let config = if protocol == HttpProtocol::Http2 {
             &self.http2_config
         } else {
             &self.http1_config
@@ -459,11 +601,11 @@ impl OriginTls {
 
     pub(crate) fn validate_negotiated_alpn(
         &self,
-        protocol: OriginProtocol,
+        protocol: HttpProtocol,
         negotiated: Option<&[u8]>,
     ) -> Result<(), OriginProtocolError> {
         self.client_config(protocol)?;
-        let compatible = if protocol.is_http2() {
+        let compatible = if protocol == HttpProtocol::Http2 {
             negotiated == Some(b"h2")
         } else {
             negotiated.is_none() || negotiated == Some(b"http/1.1")
@@ -474,9 +616,43 @@ impl OriginTls {
     }
 }
 
-impl ActivatedTlsRoots {
-    pub(crate) fn trust(&self) -> CompiledTlsTrust {
-        self.trust
+fn neutral_tls_trust(
+    trust: CompiledTlsTrust,
+    identity: &SnapshotIdentity,
+    generation: PolicyGeneration,
+    id: &'static str,
+    custom_ca_der: Option<Vec<Vec<u8>>>,
+) -> Result<(TlsTrust, Option<TlsRootsRegistration>), EgressActivationError> {
+    match (trust, custom_ca_der) {
+        (CompiledTlsTrust::System, None) => Ok((TlsTrust::SystemRoots, None)),
+        (CompiledTlsTrust::Insecure, None) => Ok((TlsTrust::Insecure, None)),
+        (CompiledTlsTrust::Custom | CompiledTlsTrust::SystemPlusCustom, Some(certificates)) => {
+            let certificates = certificates
+                .into_iter()
+                .map(TlsRootCertificate::new)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| EgressActivationError::NeutralTls)?;
+            let roots = TlsRootSet::new(generation, certificates)
+                .map_err(|_| EgressActivationError::NeutralTls)?;
+            let reference = TlsRootsRef::new(
+                identity.clone(),
+                StableId::new(id.to_owned()).map_err(|_| EgressActivationError::NeutralTls)?,
+                generation.get(),
+                roots.binding(),
+            )
+            .map_err(|_| EgressActivationError::NeutralTls)?;
+            let neutral_trust = match trust {
+                CompiledTlsTrust::Custom => TlsTrust::CustomRoots(reference.clone()),
+                CompiledTlsTrust::SystemPlusCustom => {
+                    TlsTrust::SystemAndCustomRoots(reference.clone())
+                }
+                _ => unreachable!(),
+            };
+            let registration = TlsRootsRegistration::new(reference, roots)
+                .map_err(|_| EgressActivationError::NeutralTls)?;
+            Ok((neutral_trust, Some(registration)))
+        }
+        _ => Err(EgressActivationError::NeutralTls),
     }
 }
 
@@ -633,8 +809,21 @@ mod tests {
         path
     }
 
+    fn test_identity() -> SnapshotIdentity {
+        SnapshotIdentity::new()
+    }
+
+    fn test_generation() -> PolicyGeneration {
+        PolicyGeneration::new(7).unwrap()
+    }
+
+    fn activate_bundle(plan: EgressPlan) -> EgressActivation {
+        let identity = test_identity();
+        EgressSnapshot::activate(plan, &identity, test_generation(), || false).unwrap()
+    }
+
     fn activate(plan: EgressPlan) -> EgressSnapshot {
-        EgressSnapshot::activate(plan, || false).unwrap()
+        activate_bundle(plan).into_parts().0
     }
 
     fn activation_error(plan: EgressPlan) -> EgressActivationError {
@@ -645,7 +834,8 @@ mod tests {
         plan: EgressPlan,
         is_cancelled: impl FnMut() -> bool,
     ) -> EgressActivationError {
-        match EgressSnapshot::activate(plan, is_cancelled) {
+        let identity = test_identity();
+        match EgressSnapshot::activate(plan, &identity, test_generation(), is_cancelled) {
             Ok(_) => panic!("egress activation unexpectedly succeeded"),
             Err(error) => error,
         }
@@ -671,13 +861,13 @@ mod tests {
             assert!(matches!(snapshot.route(), EgressRoute::Direct));
             assert!(snapshot.origin_tls().trust() == trust);
             assert_eq!(
-                snapshot.origin_tls().http_versions(),
-                [CompiledHttpVersion::Http1, CompiledHttpVersion::Http2]
+                snapshot.origin_tls().protocols().protocols(),
+                [HttpProtocol::Http1, HttpProtocol::Http2]
             );
             assert_eq!(
                 snapshot
                     .origin_tls()
-                    .client_config(OriginProtocol::Http1)
+                    .client_config(HttpProtocol::Http1)
                     .unwrap()
                     .alpn_protocols,
                 [b"http/1.1".to_vec()]
@@ -685,7 +875,7 @@ mod tests {
             assert_eq!(
                 snapshot
                     .origin_tls()
-                    .client_config(OriginProtocol::Http2)
+                    .client_config(HttpProtocol::Http2)
                     .unwrap()
                     .alpn_protocols,
                 [b"h2".to_vec()]
@@ -697,12 +887,12 @@ mod tests {
     fn direct_route_honors_single_origin_protocols() {
         for version in [CompiledHttpVersion::Http1, CompiledHttpVersion::Http2] {
             let snapshot = activate(direct_plan(CompiledTlsTrust::Insecure, None, vec![version]));
-            assert_eq!(snapshot.origin_tls().http_versions(), [version]);
             let expected = if version == CompiledHttpVersion::Http2 {
-                OriginProtocol::Http2
+                HttpProtocol::Http2
             } else {
-                OriginProtocol::Http1
+                HttpProtocol::Http1
             };
+            assert_eq!(snapshot.origin_tls().protocols().protocols(), [expected]);
             let expected_alpn: &[u8] = if version == CompiledHttpVersion::Http2 {
                 b"h2"
             } else {
@@ -719,18 +909,18 @@ mod tests {
             assert_eq!(
                 snapshot
                     .origin_tls()
-                    .client_config(if expected.is_http2() {
-                        OriginProtocol::Http1
+                    .client_config(if expected == HttpProtocol::Http2 {
+                        HttpProtocol::Http1
                     } else {
-                        OriginProtocol::Http2
+                        HttpProtocol::Http2
                     })
                     .err(),
                 Some(OriginProtocolError::Disabled)
             );
-            let ingress = if expected.is_http2() {
-                OriginProtocol::Http1
+            let ingress = if expected == HttpProtocol::Http2 {
+                HttpProtocol::Http1
             } else {
-                OriginProtocol::Http2
+                HttpProtocol::Http2
             };
             assert_eq!(snapshot.origin_tls().select_protocol(ingress), expected);
             assert_eq!(snapshot.origin_tls().select_protocol(expected), expected);
@@ -762,24 +952,24 @@ mod tests {
             vec![CompiledHttpVersion::Http1, CompiledHttpVersion::Http2],
         ));
         assert_eq!(
-            snapshot.origin_tls().select_protocol(OriginProtocol::Http1),
-            OriginProtocol::Http1
+            snapshot.origin_tls().select_protocol(HttpProtocol::Http1),
+            HttpProtocol::Http1
         );
         assert_eq!(
-            snapshot.origin_tls().select_protocol(OriginProtocol::Http2),
-            OriginProtocol::Http2
+            snapshot.origin_tls().select_protocol(HttpProtocol::Http2),
+            HttpProtocol::Http2
         );
 
         for (versions, ingress, expected) in [
             (
                 vec![CompiledHttpVersion::Http1],
-                OriginProtocol::Http2,
-                OriginProtocol::Http1,
+                HttpProtocol::Http2,
+                HttpProtocol::Http1,
             ),
             (
                 vec![CompiledHttpVersion::Http2],
-                OriginProtocol::Http1,
-                OriginProtocol::Http2,
+                HttpProtocol::Http1,
+                HttpProtocol::Http2,
             ),
         ] {
             let snapshot = activate(direct_plan(CompiledTlsTrust::Insecure, None, versions));
@@ -788,9 +978,113 @@ mod tests {
     }
 
     #[test]
+    fn neutral_root_bindings_change_for_content_and_generation_and_preserve_trust_mode() {
+        let first_directory = TempDir::new().unwrap();
+        let second_directory = TempDir::new().unwrap();
+        let first_ca = write_ca(&first_directory);
+        let second_ca = write_ca(&second_directory);
+        let identity = test_identity();
+        let activate_trust = |trust, ca: PathBuf, generation| {
+            EgressSnapshot::activate(
+                direct_plan(trust, Some(ca), vec![CompiledHttpVersion::Http1]),
+                &identity,
+                generation,
+                || false,
+            )
+            .unwrap()
+            .neutral
+        };
+
+        let custom = activate_trust(
+            CompiledTlsTrust::Custom,
+            first_ca.clone(),
+            test_generation(),
+        );
+        let TlsTrust::CustomRoots(custom_ref) = &custom.origin_https_trust else {
+            panic!("custom trust must remain custom-only")
+        };
+        assert_eq!(custom.tls_roots.len(), 1);
+
+        let combined = activate_trust(
+            CompiledTlsTrust::SystemPlusCustom,
+            first_ca.clone(),
+            test_generation(),
+        );
+        let TlsTrust::SystemAndCustomRoots(combined_ref) = &combined.origin_https_trust else {
+            panic!("combined trust must retain system roots")
+        };
+        assert_eq!(custom_ref.binding(), combined_ref.binding());
+
+        let substituted = activate_trust(CompiledTlsTrust::Custom, second_ca, test_generation());
+        let TlsTrust::CustomRoots(substituted_ref) = &substituted.origin_https_trust else {
+            panic!("substituted trust remains custom-only")
+        };
+        assert_ne!(custom_ref.binding(), substituted_ref.binding());
+
+        let rotated_generation = PolicyGeneration::new(8).unwrap();
+        let rotated = activate_trust(CompiledTlsTrust::Custom, first_ca, rotated_generation);
+        let TlsTrust::CustomRoots(rotated_ref) = &rotated.origin_https_trust else {
+            panic!("rotated trust remains custom-only")
+        };
+        assert_eq!(custom_ref.version(), 7);
+        assert_eq!(rotated_ref.version(), 8);
+        assert_ne!(custom_ref.binding(), rotated_ref.binding());
+    }
+
+    #[test]
+    fn one_custom_ca_read_feeds_origin_parent_and_exact_registrations() {
+        let directory = TempDir::new().unwrap();
+        let ca = write_ca(&directory);
+        let plan = EgressPlan {
+            route: CompiledEgressRoute::ParentProxy,
+            origin_tls: TransportTlsPlan {
+                trust: CompiledTlsTrust::Custom,
+                ca_certificate: Some(ca.clone()),
+                http_versions: vec![CompiledHttpVersion::Http2, CompiledHttpVersion::Http1],
+            },
+            parent_proxy: Some(ParentProxyPlan {
+                kind: CompiledParentProxyKind::Generic,
+                url: "https://parent.example:8443/".to_owned(),
+                host: "parent.example".to_owned(),
+                port: 8443,
+                tls: Some(ParentProxyTlsPlan {
+                    trust: CompiledTlsTrust::Custom,
+                    ca_certificate: Some(ca),
+                    server_name: "authenticated-parent.example".to_owned(),
+                }),
+            }),
+            request_headers: Vec::new(),
+            credential_actions: Vec::new(),
+        };
+        let identity = test_identity();
+        let activation =
+            EgressSnapshot::activate(plan, &identity, test_generation(), || false).unwrap();
+
+        assert_eq!(activation.custom_ca_file_reads(), 1);
+        assert_eq!(activation.neutral.tls_roots.len(), 2);
+        assert_eq!(
+            activation.neutral.protocols.protocols(),
+            [HttpProtocol::Http2, HttpProtocol::Http1]
+        );
+        let Route::Parent { target, security } = &activation.neutral.route else {
+            panic!("neutral route must retain parent")
+        };
+        assert_eq!(target.as_str(), "https://parent.example:8443/");
+        let TransportSecurity::Tls(intent) = security else {
+            panic!("HTTPS parent must retain TLS intent")
+        };
+        assert_eq!(
+            intent.authenticated_name().as_str(),
+            "authenticated-parent.example"
+        );
+        assert!(matches!(intent.trust(), TlsTrust::CustomRoots(_)));
+    }
+
+    #[test]
     fn origin_tls_loads_trust_once_and_validates_exact_protocol() {
         let load_count = Cell::new(0);
-        let tls = OriginTls::activate_with_loader(
+        let identity = test_identity();
+        let (tls, _, _, _) = OriginTls::activate_with_loader(
             direct_plan(
                 CompiledTlsTrust::Insecure,
                 None,
@@ -799,38 +1093,40 @@ mod tests {
             .origin_tls,
             |_trust, _ca_certificate| {
                 load_count.set(load_count.get() + 1);
-                Ok(ClientTrust::Insecure)
+                Ok(LoadedClientTrust::new(ClientTrust::Insecure, None))
             },
+            &identity,
+            test_generation(),
         )
         .unwrap();
 
         assert_eq!(load_count.get(), 1);
         assert_eq!(
-            tls.client_config(OriginProtocol::Http1)
+            tls.client_config(HttpProtocol::Http1)
                 .unwrap()
                 .alpn_protocols,
             [b"http/1.1".to_vec()]
         );
         assert_eq!(
-            tls.client_config(OriginProtocol::Http2)
+            tls.client_config(HttpProtocol::Http2)
                 .unwrap()
                 .alpn_protocols,
             [b"h2".to_vec()]
         );
         assert_eq!(
-            tls.validate_negotiated_alpn(OriginProtocol::Http1, None),
+            tls.validate_negotiated_alpn(HttpProtocol::Http1, None),
             Ok(())
         );
         assert_eq!(
-            tls.validate_negotiated_alpn(OriginProtocol::Http1, Some(b"h2")),
+            tls.validate_negotiated_alpn(HttpProtocol::Http1, Some(b"h2")),
             Err(OriginProtocolError::IncompatibleAlpn)
         );
         assert_eq!(
-            tls.validate_negotiated_alpn(OriginProtocol::Http2, Some(b"h2")),
+            tls.validate_negotiated_alpn(HttpProtocol::Http2, Some(b"h2")),
             Ok(())
         );
         assert_eq!(
-            tls.validate_negotiated_alpn(OriginProtocol::Http2, None),
+            tls.validate_negotiated_alpn(HttpProtocol::Http2, None),
             Err(OriginProtocolError::IncompatibleAlpn)
         );
     }
@@ -914,7 +1210,8 @@ mod tests {
     fn parent_tls_loads_trust_once_for_both_protocol_configs() {
         let directory = TempDir::new().unwrap();
         let load_count = Cell::new(0);
-        let tls = ParentTls::activate_with_loader(
+        let identity = test_identity();
+        let (tls, _, _) = ParentTls::activate_with_loader(
             ParentProxyTlsPlan {
                 trust: CompiledTlsTrust::Custom,
                 ca_certificate: Some(write_ca(&directory)),
@@ -922,8 +1219,11 @@ mod tests {
             },
             |trust, ca_certificate| {
                 load_count.set(load_count.get() + 1);
-                load_client_trust(trust, ca_certificate, &mut || false).map_err(Into::into)
+                load_client_trust_with_cached_material(trust, ca_certificate, None, &mut || false)
+                    .map_err(Into::into)
             },
+            &identity,
+            test_generation(),
         )
         .unwrap();
 
@@ -937,15 +1237,23 @@ mod tests {
 
     #[test]
     fn parent_alpn_validation_enforces_exact_h2_without_downgrading_h1() {
-        let tls = ParentTls::activate(
-            ParentProxyTlsPlan {
+        let snapshot = activate(parent_plan(ParentProxyPlan {
+            kind: CompiledParentProxyKind::Generic,
+            url: "https://parent.example/".to_owned(),
+            host: "parent.example".to_owned(),
+            port: 443,
+            tls: Some(ParentProxyTlsPlan {
                 trust: CompiledTlsTrust::Insecure,
                 ca_certificate: None,
                 server_name: "parent.example".to_string(),
-            },
-            &mut || false,
-        )
-        .unwrap();
+            }),
+        }));
+        let EgressRoute::Parent(parent) = snapshot.route() else {
+            panic!("expected parent route");
+        };
+        let ParentTransport::Https(tls) = parent.transport() else {
+            panic!("expected parent TLS");
+        };
 
         assert_eq!(tls.validate_negotiated_alpn(false, None), Ok(()));
         assert_eq!(
@@ -985,22 +1293,25 @@ mod tests {
         assert!(origin_logs.contains("tls_scope=\"origin\""));
 
         let parent_logs = capture_logs(|| {
-            ParentTls::activate(
-                ParentProxyTlsPlan {
+            activate(parent_plan(ParentProxyPlan {
+                kind: CompiledParentProxyKind::Generic,
+                url: "https://parent.example/".to_owned(),
+                host: "parent.example".to_owned(),
+                port: 443,
+                tls: Some(ParentProxyTlsPlan {
                     trust: CompiledTlsTrust::Insecure,
                     ca_certificate: None,
                     server_name: "sensitive-parent-name.example".to_string(),
-                },
-                &mut || false,
-            )
-            .unwrap();
+                }),
+            }));
         });
         assert_eq!(
             parent_logs
                 .matches("TLS certificate verification is disabled")
                 .count(),
-            1
+            2
         );
+        assert!(parent_logs.contains("tls_scope=\"origin\""));
         assert!(parent_logs.contains("tls_scope=\"parent\""));
         assert!(!parent_logs.contains("sensitive-parent-name.example"));
     }
@@ -1059,7 +1370,8 @@ mod tests {
             vec![CompiledHttpVersion::Http1],
         );
         let checks = Cell::new(0usize);
-        let error = match EgressSnapshot::activate(plan, || {
+        let identity = test_identity();
+        let error = match EgressSnapshot::activate(plan, &identity, test_generation(), || {
             let next = checks.get() + 1;
             checks.set(next);
             next == 4
@@ -1135,5 +1447,21 @@ mod tests {
             activation_error(parent_without_metadata),
             EgressActivationError::Route
         );
+
+        for url in [
+            "http://parent.example:8080/not-root",
+            "http://parent.example:8080/?mode=unsafe",
+        ] {
+            assert_eq!(
+                activation_error(parent_plan(ParentProxyPlan {
+                    kind: CompiledParentProxyKind::Generic,
+                    url: url.to_owned(),
+                    host: "parent.example".to_owned(),
+                    port: 8080,
+                    tls: None,
+                })),
+                EgressActivationError::ParentUrl
+            );
+        }
     }
 }

@@ -480,8 +480,12 @@ fn finish_allow(
         snapshot_identity: generation.identity().clone(),
         request_binding,
         origin: request.facts().url().clone(),
+        origin_protocol: generation.origin_protocol(request.facts().version()),
         route: generation.route().clone(),
-        origin_tls: generation.origin_tls(request.facts().url().scheme()),
+        origin_security: generation.origin_security(
+            request.facts().url().scheme(),
+            request.facts().url().authority().host().clone(),
+        ),
         managed_network_policy: None,
         timeouts: generation.timeouts(),
         request_body,
@@ -1420,8 +1424,15 @@ header = "x-test-loop"
             let forwarding = result.plan.forwarding_plan();
             assert_eq!(forwarding.route(), generation.route());
             assert_eq!(
-                forwarding.origin_tls(),
-                &generation.origin_tls(result.request.facts().url().scheme())
+                forwarding.origin_protocol(),
+                generation.origin_protocol(result.request.facts().version())
+            );
+            assert_eq!(
+                forwarding.origin_security(),
+                &generation.origin_security(
+                    result.request.facts().url().scheme(),
+                    result.request.facts().url().authority().host().clone(),
+                )
             );
             assert_eq!(
                 forwarding.request_body(),

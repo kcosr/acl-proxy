@@ -565,8 +565,14 @@ fn execution_for_test(
             snapshot_identity: identity,
             request_binding: http_access_types::RequestBinding::from_bytes([7; 32]),
             origin,
+            origin_protocol: http_access_types::HttpProtocol::Http1,
             route: http_access_types::Route::Direct,
-            origin_tls: http_access_types::TlsIntent::SystemRoots,
+            origin_security: http_access_types::TransportSecurity::Tls(
+                http_access_types::ClientTlsIntent::new(
+                    http_access_types::CanonicalHost::new("origin.example").unwrap(),
+                    http_access_types::TlsTrust::SystemRoots,
+                ),
+            ),
             managed_network_policy: None,
             timeouts: http_access_types::StageTimeouts::new(1000, 1000, 1000, 1000).unwrap(),
             request_body: http_access_types::RequestBodyPolicy::new(

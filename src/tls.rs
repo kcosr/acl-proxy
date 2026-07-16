@@ -30,6 +30,30 @@ pub(crate) enum ClientTrust {
     Insecure,
 }
 
+#[derive(Clone)]
+pub(crate) struct LoadedClientTrust {
+    trust: ClientTrust,
+    custom_ca_der: Option<Vec<Vec<u8>>>,
+}
+
+impl LoadedClientTrust {
+    #[cfg(test)]
+    pub(crate) fn new(trust: ClientTrust, custom_ca_der: Option<Vec<Vec<u8>>>) -> Self {
+        Self {
+            trust,
+            custom_ca_der,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (ClientTrust, Option<Vec<Vec<u8>>>) {
+        (self.trust, self.custom_ca_der)
+    }
+
+    pub(crate) fn custom_ca_der(&self) -> Option<&[Vec<u8>]> {
+        self.custom_ca_der.as_deref()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClientAlpn {
     #[cfg(test)]
@@ -54,24 +78,69 @@ pub(crate) fn load_client_trust(
     ca_certificate: Option<&Path>,
     is_cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<ClientTrust, TlsActivationError> {
-    match trust {
-        CompiledTlsTrust::System => Ok(ClientTrust::Roots(root_store_with_native_roots(
-            is_cancelled,
-        )?)),
-        CompiledTlsTrust::Custom => Ok(ClientTrust::Roots(root_store_from_custom_ca(
-            ca_certificate.ok_or(TlsActivationError::CaUnavailable)?,
-            is_cancelled,
-        )?)),
-        CompiledTlsTrust::SystemPlusCustom => {
-            let mut roots = root_store_with_native_roots(is_cancelled)?;
-            add_custom_ca(
-                &mut roots,
+    load_client_trust_with_material(trust, ca_certificate, is_cancelled).map(|loaded| loaded.trust)
+}
+
+pub(crate) fn load_client_trust_with_material(
+    trust: CompiledTlsTrust,
+    ca_certificate: Option<&Path>,
+    is_cancelled: &mut dyn FnMut() -> bool,
+) -> Result<LoadedClientTrust, TlsActivationError> {
+    load_client_trust_with_cached_material(trust, ca_certificate, None, is_cancelled)
+}
+
+pub(crate) fn load_client_trust_with_cached_material(
+    trust: CompiledTlsTrust,
+    ca_certificate: Option<&Path>,
+    cached_custom_ca_der: Option<Vec<Vec<u8>>>,
+    is_cancelled: &mut dyn FnMut() -> bool,
+) -> Result<LoadedClientTrust, TlsActivationError> {
+    load_client_trust_from_loaders(
+        trust,
+        is_cancelled,
+        root_store_with_native_roots,
+        |is_cancelled| match cached_custom_ca_der {
+            Some(certificates) => Ok(certificates),
+            None => load_custom_ca_der(
                 ca_certificate.ok_or(TlsActivationError::CaUnavailable)?,
                 is_cancelled,
-            )?;
-            Ok(ClientTrust::Roots(roots))
+            ),
+        },
+    )
+}
+
+fn load_client_trust_from_loaders(
+    trust: CompiledTlsTrust,
+    is_cancelled: &mut dyn FnMut() -> bool,
+    load_native: impl FnOnce(&mut dyn FnMut() -> bool) -> Result<RootCertStore, TlsActivationError>,
+    load_custom: impl FnOnce(&mut dyn FnMut() -> bool) -> Result<Vec<Vec<u8>>, TlsActivationError>,
+) -> Result<LoadedClientTrust, TlsActivationError> {
+    match trust {
+        CompiledTlsTrust::System => Ok(LoadedClientTrust {
+            trust: ClientTrust::Roots(load_native(is_cancelled)?),
+            custom_ca_der: None,
+        }),
+        CompiledTlsTrust::Custom => {
+            let custom_ca_der = load_custom(is_cancelled)?;
+            let roots = root_store_from_custom_ca(&custom_ca_der)?;
+            Ok(LoadedClientTrust {
+                trust: ClientTrust::Roots(roots),
+                custom_ca_der: Some(custom_ca_der),
+            })
         }
-        CompiledTlsTrust::Insecure => Ok(ClientTrust::Insecure),
+        CompiledTlsTrust::SystemPlusCustom => {
+            let mut roots = load_native(is_cancelled)?;
+            let custom_ca_der = load_custom(is_cancelled)?;
+            add_custom_ca(&mut roots, &custom_ca_der)?;
+            Ok(LoadedClientTrust {
+                trust: ClientTrust::Roots(roots),
+                custom_ca_der: Some(custom_ca_der),
+            })
+        }
+        CompiledTlsTrust::Insecure => Ok(LoadedClientTrust {
+            trust: ClientTrust::Insecure,
+            custom_ca_der: None,
+        }),
     }
 }
 
@@ -126,19 +195,29 @@ fn validate_native_root_store(roots: RootCertStore) -> Result<RootCertStore, Tls
 }
 
 fn root_store_from_custom_ca(
-    path: &Path,
-    is_cancelled: &mut dyn FnMut() -> bool,
+    certificates: &[Vec<u8>],
 ) -> Result<RootCertStore, TlsActivationError> {
     let mut roots = RootCertStore::empty();
-    add_custom_ca(&mut roots, path, is_cancelled)?;
+    add_custom_ca(&mut roots, certificates)?;
     Ok(roots)
 }
 
 fn add_custom_ca(
     roots: &mut RootCertStore,
+    certificates: &[Vec<u8>],
+) -> Result<(), TlsActivationError> {
+    for certificate in certificates {
+        roots
+            .add(&Certificate(certificate.clone()))
+            .map_err(|_| TlsActivationError::CaUnusable)?;
+    }
+    Ok(())
+}
+
+fn load_custom_ca_der(
     path: &Path,
     is_cancelled: &mut dyn FnMut() -> bool,
-) -> Result<(), TlsActivationError> {
+) -> Result<Vec<Vec<u8>>, TlsActivationError> {
     check_activation_cancellation(is_cancelled)?;
     let file = File::open(path);
     check_activation_cancellation(is_cancelled)?;
@@ -150,12 +229,7 @@ fn add_custom_ca(
     if certificates.is_empty() {
         return Err(TlsActivationError::CaEmpty);
     }
-    for certificate in certificates {
-        roots
-            .add(&Certificate(certificate))
-            .map_err(|_| TlsActivationError::CaUnusable)?;
-    }
-    Ok(())
+    Ok(certificates)
 }
 
 fn check_activation_cancellation(
@@ -186,6 +260,8 @@ impl ServerCertVerifier for NoVerifyServerCert {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
 
     #[test]
@@ -208,5 +284,27 @@ mod tests {
             validate_native_root_store(RootCertStore::empty()).unwrap_err(),
             TlsActivationError::NativeRoots
         );
+    }
+
+    #[test]
+    fn system_plus_custom_preserves_native_failure_precedence() {
+        let order = RefCell::new(Vec::new());
+        let error = load_client_trust_from_loaders(
+            CompiledTlsTrust::SystemPlusCustom,
+            &mut || false,
+            |_| {
+                order.borrow_mut().push("native");
+                Err(TlsActivationError::NativeRoots)
+            },
+            |_| {
+                order.borrow_mut().push("custom");
+                Err(TlsActivationError::CaUnavailable)
+            },
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(error, TlsActivationError::NativeRoots);
+        assert_eq!(&*order.borrow(), &["native"]);
     }
 }
