@@ -9,6 +9,7 @@ pub(crate) use pending::{
 pub(crate) use response::{
     AssignedCallbackResponseParser, CallbackCredentialSegments, CallbackCredentialSet,
     CallbackResponseDecision, CallbackResponseError, CallbackResponsePrefix,
+    DecisionOnlyCallbackResponseParser,
 };
 pub(crate) use token::ResumeToken;
 #[cfg(test)]

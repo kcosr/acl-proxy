@@ -24,7 +24,10 @@ use crate::config::StaticProductConfig;
 #[cfg(test)]
 use crate::destination::DestinationFacts;
 use crate::destination::{DestinationGuard, DestinationGuardError};
-use crate::runtime::{AuthorizationDispatchContext, GenerationRetention, GenerationRetentionError};
+use crate::runtime::{
+    AuthorizationDispatchContext, AuthorizationInvocationMode, GenerationRetention,
+    GenerationRetentionError,
+};
 use crate::safety::wire_body::ProviderResponseCharge;
 use crate::safety::HttpWireBodyGuard;
 
@@ -39,6 +42,7 @@ pub(crate) struct WebhookAuthorizationRuntime {
 pub(crate) struct PendingWebhookOperation {
     _retention: GenerationRetention,
     provider: Arc<WebhookProvider>,
+    invocation_mode: AuthorizationInvocationMode,
     response_charge: ProviderResponseCharge,
     delivery_teardown: DeliveryTeardown,
     completion: oneshot::Sender<Result<ProviderDecision, WebhookCompletionError>>,
@@ -217,7 +221,7 @@ impl WebhookAuthorizationRuntime {
             let callback_url = self
                 .callback_url()
                 .ok_or(WebhookDispatchError::CallbackUnavailable)?;
-            let (rule_id, request, retention) = context.into_webhook_parts()?;
+            let (rule_id, request, invocation_mode, retention) = context.into_webhook_parts()?;
             let request = WebhookRequest::from_provider(rule_id, request);
             let prepared =
                 request.prepare(callback_url.as_str(), provider.max_request_bytes(), guard)?;
@@ -233,6 +237,7 @@ impl WebhookAuthorizationRuntime {
             let payload = PendingWebhookOperation::new(
                 retention,
                 provider.clone(),
+                invocation_mode,
                 guard.provider_response_charge(),
                 teardown,
                 completion,
@@ -365,6 +370,7 @@ impl PendingWebhookOperation {
     pub(crate) fn new(
         retention: GenerationRetention,
         provider: Arc<WebhookProvider>,
+        invocation_mode: AuthorizationInvocationMode,
         response_charge: ProviderResponseCharge,
         delivery_teardown: DeliveryTeardown,
         completion: oneshot::Sender<Result<ProviderDecision, WebhookCompletionError>>,
@@ -372,6 +378,7 @@ impl PendingWebhookOperation {
         Self {
             _retention: retention,
             provider,
+            invocation_mode,
             response_charge,
             delivery_teardown,
             completion,
@@ -380,6 +387,10 @@ impl PendingWebhookOperation {
 
     pub(crate) fn provider(&self) -> &Arc<WebhookProvider> {
         &self.provider
+    }
+
+    pub(crate) fn invocation_mode(&self) -> AuthorizationInvocationMode {
+        self.invocation_mode
     }
 
     pub(crate) fn response_charge(&self) -> &ProviderResponseCharge {
@@ -400,6 +411,7 @@ impl PendingWebhookOperation {
                 credentials: ProviderCredentialSet::from_segmented(credentials),
                 replacement: None,
             },
+            CallbackResponseDecision::AllowWithoutEffects => ProviderDecision::AllowWithoutEffects,
             CallbackResponseDecision::Deny => ProviderDecision::Deny,
             CallbackResponseDecision::Pass => ProviderDecision::Pass,
         };

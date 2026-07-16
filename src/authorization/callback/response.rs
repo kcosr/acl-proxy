@@ -73,6 +73,7 @@ pub(crate) enum CallbackDecisionKind {
 
 pub(crate) enum CallbackResponseDecision {
     Allow(CallbackCredentialSet),
+    AllowWithoutEffects,
     Deny,
     Pass,
 }
@@ -81,6 +82,7 @@ impl fmt::Debug for CallbackResponseDecision {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Allow(credentials) => formatter.debug_tuple("Allow").field(credentials).finish(),
+            Self::AllowWithoutEffects => formatter.write_str("AllowWithoutEffects"),
             Self::Deny => formatter.write_str("Deny"),
             Self::Pass => formatter.write_str("Pass"),
         }
@@ -204,6 +206,21 @@ enum Phase {
     OutputValue,
     AfterOutputValue,
     AfterValues,
+    Trailing,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DecisionOnlyPhase {
+    TypeKey(usize),
+    TypeColon,
+    TypeValue(usize),
+    TypeComma,
+    DecisionKey(usize),
+    DecisionColon,
+    DecisionValueStart,
+    DecisionValue,
+    AfterDecision,
     Trailing,
     Failed,
 }
@@ -684,6 +701,202 @@ impl<'a> AssignedCallbackResponseParser<'a> {
     }
 }
 
+/// Incremental parser for callbacks whose invocation may authorize a request
+/// but may not return provider effects. It deliberately owns no output
+/// registry, response charge, or credential storage.
+pub(crate) struct DecisionOnlyCallbackResponseParser {
+    max_entity_bytes: usize,
+    entity_bytes: usize,
+    phase: DecisionOnlyPhase,
+    decision: Option<CallbackDecisionKind>,
+    scalar: Zeroizing<[u8; 8]>,
+    scalar_len: usize,
+}
+
+impl DecisionOnlyCallbackResponseParser {
+    pub(crate) fn new(
+        provider_max_response_bytes: usize,
+        control_max_request_body_bytes: usize,
+    ) -> Result<Self, CallbackResponseError> {
+        let max_entity_bytes = provider_max_response_bytes.min(control_max_request_body_bytes);
+        if max_entity_bytes < MIN_CALLBACK_RESPONSE_BYTES {
+            return Err(CallbackResponseError::LimitExceeded);
+        }
+        Ok(Self {
+            max_entity_bytes,
+            entity_bytes: CALLBACK_RESPONSE_PREFIX_BYTES,
+            phase: DecisionOnlyPhase::TypeKey(0),
+            decision: None,
+            scalar: Zeroizing::new([0; 8]),
+            scalar_len: 0,
+        })
+    }
+
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<(), CallbackResponseError> {
+        if self.phase == DecisionOnlyPhase::Failed {
+            return Err(CallbackResponseError::Malformed);
+        }
+        for byte in bytes {
+            self.entity_bytes = self
+                .entity_bytes
+                .checked_add(1)
+                .ok_or(CallbackResponseError::LimitExceeded)?;
+            if self.entity_bytes > self.max_entity_bytes {
+                self.fail();
+                return Err(CallbackResponseError::LimitExceeded);
+            }
+            if let Err(error) = self.consume(*byte) {
+                self.fail();
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> Result<CallbackResponseDecision, CallbackResponseError> {
+        if self.phase != DecisionOnlyPhase::Trailing {
+            self.fail();
+            return Err(CallbackResponseError::Malformed);
+        }
+        match self.decision.expect("a complete response has a decision") {
+            CallbackDecisionKind::Allow => Ok(CallbackResponseDecision::AllowWithoutEffects),
+            CallbackDecisionKind::Deny => Ok(CallbackResponseDecision::Deny),
+            CallbackDecisionKind::Pass => Ok(CallbackResponseDecision::Pass),
+        }
+    }
+
+    fn consume(&mut self, byte: u8) -> Result<(), CallbackResponseError> {
+        let phase = self.phase;
+        self.phase = match phase {
+            DecisionOnlyPhase::TypeKey(position) => decision_only_match_fixed(
+                byte,
+                position,
+                b"\"type\"",
+                DecisionOnlyPhase::TypeColon,
+            )?,
+            DecisionOnlyPhase::TypeColon => decision_only_expect_punctuation(
+                byte,
+                b':',
+                DecisionOnlyPhase::TypeValue(0),
+                DecisionOnlyPhase::TypeColon,
+            )?,
+            DecisionOnlyPhase::TypeValue(position) => decision_only_match_fixed(
+                byte,
+                position,
+                b"\"response\"",
+                DecisionOnlyPhase::TypeComma,
+            )?,
+            DecisionOnlyPhase::TypeComma => decision_only_expect_punctuation(
+                byte,
+                b',',
+                DecisionOnlyPhase::DecisionKey(0),
+                DecisionOnlyPhase::TypeComma,
+            )?,
+            DecisionOnlyPhase::DecisionKey(position) => decision_only_match_fixed(
+                byte,
+                position,
+                b"\"decision\"",
+                DecisionOnlyPhase::DecisionColon,
+            )?,
+            DecisionOnlyPhase::DecisionColon => decision_only_expect_punctuation(
+                byte,
+                b':',
+                DecisionOnlyPhase::DecisionValueStart,
+                DecisionOnlyPhase::DecisionColon,
+            )?,
+            DecisionOnlyPhase::DecisionValueStart if is_json_whitespace(byte) => {
+                DecisionOnlyPhase::DecisionValueStart
+            }
+            DecisionOnlyPhase::DecisionValueStart if byte == b'"' => {
+                self.scalar.zeroize();
+                self.scalar_len = 0;
+                DecisionOnlyPhase::DecisionValue
+            }
+            DecisionOnlyPhase::DecisionValueStart => {
+                return Err(CallbackResponseError::InvalidShape)
+            }
+            DecisionOnlyPhase::DecisionValue if byte == b'"' => {
+                self.decision = match &self.scalar[..self.scalar_len] {
+                    b"allow" => Some(CallbackDecisionKind::Allow),
+                    b"deny" => Some(CallbackDecisionKind::Deny),
+                    b"pass" => Some(CallbackDecisionKind::Pass),
+                    _ => return Err(CallbackResponseError::InvalidShape),
+                };
+                DecisionOnlyPhase::AfterDecision
+            }
+            DecisionOnlyPhase::DecisionValue
+                if byte.is_ascii() && !matches!(byte, b'\\' | 0..=31) =>
+            {
+                if self.scalar_len == self.scalar.len() {
+                    return Err(CallbackResponseError::InvalidShape);
+                }
+                self.scalar[self.scalar_len] = byte;
+                self.scalar_len += 1;
+                DecisionOnlyPhase::DecisionValue
+            }
+            DecisionOnlyPhase::DecisionValue => return Err(CallbackResponseError::InvalidShape),
+            DecisionOnlyPhase::AfterDecision if is_json_whitespace(byte) => {
+                DecisionOnlyPhase::AfterDecision
+            }
+            DecisionOnlyPhase::AfterDecision if byte == b'}' => DecisionOnlyPhase::Trailing,
+            DecisionOnlyPhase::AfterDecision => return Err(CallbackResponseError::InvalidShape),
+            DecisionOnlyPhase::Trailing if is_json_whitespace(byte) => DecisionOnlyPhase::Trailing,
+            DecisionOnlyPhase::Trailing => return Err(CallbackResponseError::Malformed),
+            DecisionOnlyPhase::Failed => return Err(CallbackResponseError::Malformed),
+        };
+        Ok(())
+    }
+
+    fn fail(&mut self) {
+        self.phase = DecisionOnlyPhase::Failed;
+        self.scalar.zeroize();
+    }
+}
+
+fn decision_only_match_fixed(
+    byte: u8,
+    position: usize,
+    literal: &[u8],
+    complete: DecisionOnlyPhase,
+) -> Result<DecisionOnlyPhase, CallbackResponseError> {
+    if position == 0 && is_json_whitespace(byte) {
+        return Ok(match complete {
+            DecisionOnlyPhase::TypeColon => DecisionOnlyPhase::TypeKey(0),
+            DecisionOnlyPhase::TypeComma => DecisionOnlyPhase::TypeValue(0),
+            DecisionOnlyPhase::DecisionColon => DecisionOnlyPhase::DecisionKey(0),
+            _ => return Err(CallbackResponseError::Malformed),
+        });
+    }
+    if literal.get(position) != Some(&byte) {
+        return Err(CallbackResponseError::InvalidShape);
+    }
+    Ok(if position + 1 == literal.len() {
+        complete
+    } else {
+        match complete {
+            DecisionOnlyPhase::TypeColon => DecisionOnlyPhase::TypeKey(position + 1),
+            DecisionOnlyPhase::TypeComma => DecisionOnlyPhase::TypeValue(position + 1),
+            DecisionOnlyPhase::DecisionColon => DecisionOnlyPhase::DecisionKey(position + 1),
+            _ => return Err(CallbackResponseError::Malformed),
+        }
+    })
+}
+
+fn decision_only_expect_punctuation(
+    byte: u8,
+    expected: u8,
+    complete: DecisionOnlyPhase,
+    waiting: DecisionOnlyPhase,
+) -> Result<DecisionOnlyPhase, CallbackResponseError> {
+    if is_json_whitespace(byte) {
+        Ok(waiting)
+    } else if byte == expected {
+        Ok(complete)
+    } else {
+        Err(CallbackResponseError::Malformed)
+    }
+}
+
 fn match_fixed(
     byte: u8,
     position: usize,
@@ -819,6 +1032,24 @@ mod tests {
         parser.finish()
     }
 
+    fn parse_decision_only(
+        body: &[u8],
+        provider_limit: usize,
+        control_limit: usize,
+    ) -> Result<CallbackResponseDecision, CallbackResponseError> {
+        let prefix: [u8; CALLBACK_RESPONSE_PREFIX_BYTES] = body
+            .get(..CALLBACK_RESPONSE_PREFIX_BYTES)
+            .unwrap_or(&[])
+            .try_into()
+            .map_err(|_| CallbackResponseError::Malformed)?;
+        CallbackResponsePrefix::parse(&prefix).map_err(|_| CallbackResponseError::Malformed)?;
+        let mut parser = DecisionOnlyCallbackResponseParser::new(provider_limit, control_limit)?;
+        for chunk in body[CALLBACK_RESPONSE_PREFIX_BYTES..].chunks(2) {
+            parser.push(chunk)?;
+        }
+        parser.finish()
+    }
+
     fn body(suffix: &str) -> Vec<u8> {
         let mut body = PREFIX.to_vec();
         body.extend_from_slice(suffix.as_bytes());
@@ -895,6 +1126,62 @@ mod tests {
                 response.len(),
                 response.len() - 1
             ),
+            Err(CallbackResponseError::LimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn decision_only_callback_accepts_only_effect_free_decisions() {
+        for (wire, expected) in [
+            (
+                body("\"type\":\"response\",\"decision\":\"allow\"}"),
+                CallbackDecisionKind::Allow,
+            ),
+            (
+                body(" \"type\" : \"response\" , \"decision\" : \"deny\" } \r\n"),
+                CallbackDecisionKind::Deny,
+            ),
+            (
+                body("\"type\":\"response\",\"decision\":\"pass\"}"),
+                CallbackDecisionKind::Pass,
+            ),
+        ] {
+            let decision = parse_decision_only(&wire, wire.len(), wire.len()).unwrap();
+            assert!(matches!(
+                (expected, decision),
+                (
+                    CallbackDecisionKind::Allow,
+                    CallbackResponseDecision::AllowWithoutEffects
+                ) | (CallbackDecisionKind::Deny, CallbackResponseDecision::Deny)
+                    | (CallbackDecisionKind::Pass, CallbackResponseDecision::Pass)
+            ));
+        }
+
+        for wire in [
+            body("\"type\":\"response\",\"decision\":\"allow\",\"values\":{}}"),
+            body("\"type\":\"response\",\"decision\":\"deny\",\"replacement\":\"x\"}"),
+            body("\"type\":\"response\",\"decision\":\"pass\",\"extra\":null}"),
+        ] {
+            assert!(matches!(
+                parse_decision_only(&wire, wire.len(), wire.len()),
+                Err(CallbackResponseError::InvalidShape) | Err(CallbackResponseError::Malformed)
+            ));
+        }
+    }
+
+    #[test]
+    fn decision_only_callback_enforces_entity_bounds_without_a_response_charge() {
+        let response = body("\"type\":\"response\",\"decision\":\"allow\"}");
+        assert!(matches!(
+            parse_decision_only(&response, response.len(), response.len()),
+            Ok(CallbackResponseDecision::AllowWithoutEffects)
+        ));
+        assert!(matches!(
+            parse_decision_only(&response, response.len() - 1, response.len()),
+            Err(CallbackResponseError::LimitExceeded)
+        ));
+        assert!(matches!(
+            parse_decision_only(&response, response.len(), response.len() - 1),
             Err(CallbackResponseError::LimitExceeded)
         ));
     }

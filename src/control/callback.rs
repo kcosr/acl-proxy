@@ -7,7 +7,7 @@ use zeroize::{Zeroize, Zeroizing};
 use crate::authorization::callback::{
     AssignedCallbackResponseParser, CallbackClaim, CallbackClaimError, CallbackClaimResult,
     CallbackResponseDecision, CallbackResponseError, CallbackResponsePrefix,
-    PendingCapabilityStore, PendingTerminalCause,
+    DecisionOnlyCallbackResponseParser, PendingCapabilityStore, PendingTerminalCause,
 };
 use crate::authorization::protocol::CALLBACK_RESPONSE_PREFIX_BYTES;
 use crate::authorization::webhook::provider::WebhookProvider;
@@ -16,6 +16,7 @@ use crate::authorization::webhook::runtime::{
 };
 use crate::http1::framing::{BodyFramer, BodyFraming, BodyProgress, FramingProcessError};
 use crate::http1::store::ParserStore;
+use crate::runtime::AuthorizationInvocationMode;
 use crate::safety::ProviderResponseCharge;
 
 use super::response::{ControlResponse, EmptyResponseStatus};
@@ -271,9 +272,8 @@ where
     let payload = claim.payload();
     let provider_limit = payload.provider().max_response_bytes();
     let entity_limit = provider_limit.min(control_max_request_body_bytes);
-    let mut parser = match AssignedCallbackResponseParser::new(
-        payload.provider().outputs(),
-        payload.response_charge(),
+    let mut parser = match CallbackResponseParser::new(
+        payload,
         provider_limit,
         control_max_request_body_bytes,
     ) {
@@ -349,6 +349,47 @@ where
                 return ClaimedEntityResult::Rejected(EmptyResponseStatus::BadRequest)
             }
             Err(_) => return ClaimedEntityResult::Failed,
+        }
+    }
+}
+
+enum CallbackResponseParser<'a> {
+    Effects(AssignedCallbackResponseParser<'a>),
+    DecisionOnly(DecisionOnlyCallbackResponseParser),
+}
+
+impl<'a> CallbackResponseParser<'a> {
+    fn new<P: CallbackPayload>(
+        payload: &'a P,
+        provider_limit: usize,
+        control_limit: usize,
+    ) -> Result<Self, CallbackResponseError> {
+        match payload.invocation_mode() {
+            AuthorizationInvocationMode::EffectsAllowed => AssignedCallbackResponseParser::new(
+                payload.provider().outputs(),
+                payload.response_charge(),
+                provider_limit,
+                control_limit,
+            )
+            .map(Self::Effects),
+            AuthorizationInvocationMode::DecisionOnly => {
+                DecisionOnlyCallbackResponseParser::new(provider_limit, control_limit)
+                    .map(Self::DecisionOnly)
+            }
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Result<(), CallbackResponseError> {
+        match self {
+            Self::Effects(parser) => parser.push(bytes),
+            Self::DecisionOnly(parser) => parser.push(bytes),
+        }
+    }
+
+    fn finish(self) -> Result<CallbackResponseDecision, CallbackResponseError> {
+        match self {
+            Self::Effects(parser) => parser.finish(),
+            Self::DecisionOnly(parser) => parser.finish(),
         }
     }
 }
@@ -463,6 +504,7 @@ enum PreParseResult {
 
 trait CallbackPayload: Sized {
     fn provider(&self) -> &WebhookProvider;
+    fn invocation_mode(&self) -> AuthorizationInvocationMode;
     fn response_charge(&self) -> &ProviderResponseCharge;
     fn wait_for_delivery_teardown(&self) -> impl Future<Output = ()> + Send;
     fn complete_callback(self, decision: CallbackResponseDecision) -> bool;
@@ -473,6 +515,10 @@ trait CallbackPayload: Sized {
 impl CallbackPayload for PendingWebhookOperation {
     fn provider(&self) -> &WebhookProvider {
         self.provider()
+    }
+
+    fn invocation_mode(&self) -> AuthorizationInvocationMode {
+        self.invocation_mode()
     }
 
     fn response_charge(&self) -> &ProviderResponseCharge {
@@ -524,6 +570,7 @@ mod tests {
 
     struct FakePayload {
         provider: Arc<WebhookProvider>,
+        invocation_mode: AuthorizationInvocationMode,
         response_charge: ProviderResponseCharge,
         teardown: DeliveryTeardown,
         completion: oneshot::Sender<RecordedCompletion>,
@@ -532,6 +579,10 @@ mod tests {
     impl CallbackPayload for FakePayload {
         fn provider(&self) -> &WebhookProvider {
             &self.provider
+        }
+
+        fn invocation_mode(&self) -> AuthorizationInvocationMode {
+            self.invocation_mode
         }
 
         fn response_charge(&self) -> &ProviderResponseCharge {
@@ -544,7 +595,8 @@ mod tests {
 
         fn complete_callback(self, decision: CallbackResponseDecision) -> bool {
             let completion = match decision {
-                CallbackResponseDecision::Allow(_) => RecordedCompletion::Allow,
+                CallbackResponseDecision::Allow(_)
+                | CallbackResponseDecision::AllowWithoutEffects => RecordedCompletion::Allow,
                 CallbackResponseDecision::Deny => RecordedCompletion::Deny,
                 CallbackResponseDecision::Pass => RecordedCompletion::Pass,
             };
@@ -594,6 +646,18 @@ mod tests {
     }
 
     fn admit(max_response_bytes: usize, cursor_peak_bytes: usize) -> AdmittedCallback {
+        admit_with_mode(
+            max_response_bytes,
+            cursor_peak_bytes,
+            AuthorizationInvocationMode::EffectsAllowed,
+        )
+    }
+
+    fn admit_with_mode(
+        max_response_bytes: usize,
+        cursor_peak_bytes: usize,
+        invocation_mode: AuthorizationInvocationMode,
+    ) -> AdmittedCallback {
         let store = PendingCapabilityStore::new();
         let pool = WireBodyPool::new(cursor_peak_bytes, cursor_peak_bytes);
         let guard = pool.begin_for_test(
@@ -605,6 +669,7 @@ mod tests {
         let now = Instant::now();
         let payload = FakePayload {
             provider: provider(max_response_bytes),
+            invocation_mode,
             response_charge: guard.provider_response_charge(),
             teardown: teardown.clone(),
             completion: completion_tx,
@@ -637,6 +702,42 @@ mod tests {
             "{{\"resumeToken\":\"{token}\",\"type\":\"response\",\"decision\":\"allow\",\"values\":{{\"api_token\":\"secret\"}}}}"
         )
         .into_bytes()
+    }
+
+    fn admit_on_store(
+        store: &PendingCapabilityStore<FakePayload>,
+        provider: Arc<WebhookProvider>,
+        guard: &HttpWireBodyGuard,
+        invocation_mode: AuthorizationInvocationMode,
+    ) -> (
+        String,
+        PendingOperationGuard<FakePayload>,
+        oneshot::Receiver<RecordedCompletion>,
+        DeliveryTeardown,
+    ) {
+        let teardown = DeliveryTeardown::new();
+        let (completion_tx, completion) = oneshot::channel();
+        let now = Instant::now();
+        let admission = store
+            .try_admit(
+                PendingOperationLimit::try_new(4).unwrap(),
+                PendingDeadline::earliest(
+                    now,
+                    now + Duration::from_secs(30),
+                    Duration::from_secs(30),
+                    Duration::from_secs(30),
+                ),
+                FakePayload {
+                    provider,
+                    invocation_mode,
+                    response_charge: guard.provider_response_charge(),
+                    teardown: teardown.clone(),
+                    completion: completion_tx,
+                },
+            )
+            .unwrap();
+        let (token, operation) = admission.into_parts();
+        (token.as_str().to_string(), operation, completion, teardown)
     }
 
     fn deny_body(token: &str) -> Vec<u8> {
@@ -705,6 +806,135 @@ mod tests {
         assert_eq!(replay.response().unwrap().status(), 404);
         assert_store_wiped(&replay_store);
         drop(admitted.operation);
+    }
+
+    #[tokio::test]
+    async fn decision_only_callback_accepts_plain_allow_without_response_charge() {
+        let admitted = admit_with_mode(4096, 1, AuthorizationInvocationMode::DecisionOnly);
+        admitted.teardown.complete();
+        let body = format!(
+            "{{\"resumeToken\":\"{}\",\"type\":\"response\",\"decision\":\"allow\"}}",
+            admitted.token
+        )
+        .into_bytes();
+        let mut store = ParserStore::try_new().unwrap();
+        store.append(&body).unwrap();
+        let mut reader = tokio::io::empty();
+
+        let outcome = handle_callback_entity_with_store(
+            &mut reader,
+            &mut store,
+            BodyFraming::ContentLength(body.len() as u64),
+            &admitted.store,
+            4096,
+            deadline(),
+        )
+        .await;
+
+        assert_eq!(outcome.response().unwrap().status(), 204);
+        assert_eq!(
+            admitted.completion.await.unwrap(),
+            RecordedCompletion::Allow
+        );
+        assert_eq!(admitted.guard.live_bytes(), 0);
+        assert_store_wiped(&store);
+        drop(admitted.operation);
+    }
+
+    #[tokio::test]
+    async fn decision_only_callback_rejects_effect_fields_without_response_charge() {
+        let admitted = admit_with_mode(4096, 1, AuthorizationInvocationMode::DecisionOnly);
+        admitted.teardown.complete();
+        let body = allow_body(&admitted.token);
+        let mut store = ParserStore::try_new().unwrap();
+        store.append(&body).unwrap();
+        let mut reader = tokio::io::empty();
+
+        let outcome = handle_callback_entity_with_store(
+            &mut reader,
+            &mut store,
+            BodyFraming::ContentLength(body.len() as u64),
+            &admitted.store,
+            4096,
+            deadline(),
+        )
+        .await;
+
+        assert_eq!(outcome.response().unwrap().status(), 400);
+        assert_eq!(
+            admitted.completion.await.unwrap(),
+            RecordedCompletion::Invalid
+        );
+        assert_eq!(admitted.guard.live_bytes(), 0);
+        assert_store_wiped(&store);
+        drop(admitted.operation);
+    }
+
+    #[tokio::test]
+    async fn callback_tokens_preserve_per_operation_invocation_modes() {
+        let store = PendingCapabilityStore::new();
+        let effects_pool = WireBodyPool::new(128 * 1024, 128 * 1024);
+        let effects_guard = effects_pool.begin_for_test(
+            128 * 1024,
+            WireBodyQuotaKey::Peer(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        );
+        let decision_pool = WireBodyPool::new(1, 1);
+        let decision_guard = decision_pool
+            .begin_for_test(1, WireBodyQuotaKey::Peer(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        let provider = provider(4096);
+        let (effects_token, effects_operation, effects_completion, effects_teardown) =
+            admit_on_store(
+                &store,
+                provider.clone(),
+                &effects_guard,
+                AuthorizationInvocationMode::EffectsAllowed,
+            );
+        let (decision_token, decision_operation, decision_completion, decision_teardown) =
+            admit_on_store(
+                &store,
+                provider,
+                &decision_guard,
+                AuthorizationInvocationMode::DecisionOnly,
+            );
+        effects_teardown.complete();
+        decision_teardown.complete();
+
+        let effects_body = allow_body(&effects_token);
+        let mut effects_store = ParserStore::try_new().unwrap();
+        effects_store.append(&effects_body).unwrap();
+        let mut reader = tokio::io::empty();
+        let effects_outcome = handle_callback_entity_with_store(
+            &mut reader,
+            &mut effects_store,
+            BodyFraming::ContentLength(effects_body.len() as u64),
+            &store,
+            4096,
+            deadline(),
+        )
+        .await;
+        assert_eq!(effects_outcome.response().unwrap().status(), 204);
+        assert_eq!(effects_completion.await.unwrap(), RecordedCompletion::Allow);
+
+        let decision_body = allow_body(&decision_token);
+        let mut decision_store = ParserStore::try_new().unwrap();
+        decision_store.append(&decision_body).unwrap();
+        let decision_outcome = handle_callback_entity_with_store(
+            &mut reader,
+            &mut decision_store,
+            BodyFraming::ContentLength(decision_body.len() as u64),
+            &store,
+            4096,
+            deadline(),
+        )
+        .await;
+        assert_eq!(decision_outcome.response().unwrap().status(), 400);
+        assert_eq!(
+            decision_completion.await.unwrap(),
+            RecordedCompletion::Invalid
+        );
+        assert_eq!(decision_guard.live_bytes(), 0);
+        drop(effects_operation);
+        drop(decision_operation);
     }
 
     #[tokio::test]
