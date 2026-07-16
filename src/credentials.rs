@@ -478,6 +478,7 @@ impl InboundCredentials {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn is_present(&self, header: &HeaderName) -> bool {
         self.captured
             .iter()

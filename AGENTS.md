@@ -18,7 +18,7 @@
 - `src/main.rs` — Entry point, delegates to CLI.
 - `src/cli/mod.rs` — CLI parsing, config validate/init, policy dump.
 - `src/config/` — Strict schema-3 authoring, loading, compilation, and templates.
-- `src/policy/snapshot.rs` — Generation-bound compiled policy evaluation.
+- `src/policy/adapter.rs` — Product compilation and resources for the shared ACL evaluator.
 - `src/activation/` and `src/runtime/` — Product activation, reload, ownership, and shutdown.
 - `src/proxy/ingress.rs` — Common explicit, transparent, CONNECT MITM, TLS, and upgrade ingress.
 - `src/proxy/forward.rs` — Direct and parent request/response forwarding.

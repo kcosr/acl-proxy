@@ -178,8 +178,7 @@ mod tests {
     use super::*;
     use crate::config::compiler::{Capacity, CompiledResourcePlan, LoopDetectionPlan, SafetyPlan};
     use crate::config::{compile_config_text, ConfigTextInput};
-    use crate::policy::CompiledPolicySnapshot;
-    use crate::runtime::{CredentialSourceRegistry, ProviderRegistry, RedactionProfileRegistry};
+    use crate::policy::ProductAclSnapshot;
     use http_access_url::canonicalize_http_url;
 
     fn snapshot(inject: bool) -> ProductSafetySnapshot {
@@ -395,41 +394,71 @@ authorization_provider = "approval"
         assert!(plan.resource_plan.combined_http_body_peaks_for_test()[0] > 0);
         assert_eq!(plan.resource_plan.combined_http_body_peaks_for_test()[1], 0);
 
-        let providers = ProviderRegistry::from_names(plan.authorization.providers.into_keys());
-        let policy_activation = CompiledPolicySnapshot::activate(
-            plan.policy,
-            &providers,
-            &RedactionProfileRegistry::from_names([]),
-            &CredentialSourceRegistry::from_names([]),
+        let policy = ProductAclSnapshot::compile(
+            &plan.policy,
+            http_access_types::PolicyGeneration::new(1).unwrap(),
+            http_access_types::SnapshotIdentity::new(),
+            &[],
         )
         .expect("compiled policy activates");
         let safety = ProductSafetySnapshot::activate(
             plan.safety,
             &plan.resource_plan,
-            policy_activation.wire_body_plan_brand(),
+            policy.resources().wire_body_plan_brand(),
             WireBodyPool::new(1, 1),
         )
         .expect("compiler and policy cursor domains agree");
-        let (policy, _) = policy_activation.into_parts();
         let url = canonicalize_http_url("https://example.test/path").unwrap();
-        let first = policy.evaluate(
-            &url,
+        let facts = http_access_types::InterceptedRequestFacts::new(
+            http_access_types::IngressMode::ExplicitHttps,
+            http_access_types::HttpVersion::Http11,
+            http_access_types::HttpMethod::new("GET").unwrap(),
+            url,
+            Vec::new(),
+            http_access_types::BodyMetadata::new(http_access_types::BodyFraming::None),
+            None,
+        )
+        .unwrap();
+        let header_facts =
+            http_access_types::PolicyHeaderFacts::new(Vec::new(), Vec::new()).unwrap();
+        let input = http_access_policy_acl::EvaluationInput::new(
+            &facts,
             Ipv4Addr::new(192, 0, 2, 1).into(),
-            &http_access_types::HttpMethod::new("GET").unwrap(),
-            &HeaderMap::new(),
-            |_| false,
-        );
-        assert_eq!(first.matched.as_ref().unwrap().id(), "final-delegate");
-        let terminal = first.matched.unwrap().resume_cursor().resume(
-            &url,
-            Ipv4Addr::new(192, 0, 2, 1).into(),
-            &http_access_types::HttpMethod::new("GET").unwrap(),
-            &HeaderMap::new(),
-            |_| false,
-        );
-        assert!(terminal.matched.is_none());
+            &header_facts,
+            1,
+            http_access_types::BodyRepresentation::PreservedContentCoded,
+            http_access_types::BodyObservation::unobserved(),
+        )
+        .unwrap();
+        let first = policy.snapshot().evaluate(&input).unwrap();
+        let http_access_policy_acl::PolicyEvaluation::Delegate(delegated) = first else {
+            panic!("final rule should delegate")
+        };
+        let http_access_types::EffectivePolicy::Rule { id, .. } =
+            delegated.provenance().effective_policy()
+        else {
+            panic!("delegate should retain rule provenance")
+        };
+        assert_eq!(id.as_str(), "final-delegate");
+        let terminal = policy
+            .snapshot()
+            .resolve_delegate(
+                delegated,
+                http_access_policy_acl::ProviderDisposition::Pass,
+                &input,
+            )
+            .unwrap();
+        let http_access_policy_acl::PolicyEvaluation::Deny { provenance } = terminal else {
+            panic!("passing the final delegate should reach the deny default")
+        };
+        let terminal_cursor = policy.resource_cursor(&provenance).unwrap();
+        let terminal_wire_body_plan = policy.resources().wire_body_plan(terminal_cursor).unwrap();
+        assert!(matches!(
+            provenance.effective_policy(),
+            http_access_types::EffectivePolicy::Default
+        ));
         let admission = safety
-            .begin_http_body(terminal.wire_body_plan(), key())
+            .begin_http_body(terminal_wire_body_plan, key())
             .expect("terminal cursor has a compiler-produced safety plan");
         let (guard, replay, _staging) = admission.into_parts();
         assert_eq!(guard.cursor_peak_bytes(), 0);

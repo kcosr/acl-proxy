@@ -57,25 +57,6 @@ impl LocalAddressSource for EmptyLocalAddressSource {
     }
 }
 
-impl PolicySnapshot for EmptySnapshot {
-    fn evaluate<'snapshot>(
-        &'snapshot self,
-        _url: &http_access_url::CanonicalUrl,
-        _peer_ip: std::net::IpAddr,
-        _method: &http_access_types::HttpMethod,
-        _headers: &http::HeaderMap,
-        _extra_presence: &dyn Fn(&http::HeaderName) -> bool,
-    ) -> crate::policy::PolicyEvaluation<'snapshot> {
-        panic!("empty test policy cannot evaluate requests")
-    }
-
-    fn resolve_prepared<'snapshot>(
-        &'snapshot self,
-        _prepared: crate::policy::PreparedPolicyEvaluation,
-    ) -> Option<crate::policy::PolicyEvaluation<'snapshot>> {
-        panic!("empty test policy cannot resolve prepared evaluations")
-    }
-}
 impl EgressSnapshot for EmptySnapshot {
     fn identity(&self) -> &Arc<()> {
         static IDENTITY: std::sync::OnceLock<Arc<()>> = std::sync::OnceLock::new();
@@ -708,8 +689,6 @@ impl CandidateActivator for FakeActivator {
                 request_timeout: plan.request_timeout,
                 max_content_decoding_expansion_ratio: plan.max_content_decoding_expansion_ratio,
                 resource_plan: plan.resource_plan,
-                bindings: ResolvedBindings::default(),
-                policy: snapshot.clone(),
                 egress: snapshot.clone(),
                 authorization: snapshot.clone(),
                 credentials: snapshot.clone(),
@@ -878,8 +857,6 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
             request_timeout: Duration::from_secs(30),
             max_content_decoding_expansion_ratio: 128,
             resource_plan: compiled.reloadable_plan.resource_plan.clone(),
-            bindings: ResolvedBindings::default(),
-            policy: empty.clone(),
             egress: empty.clone(),
             authorization: Arc::new(authorization),
             credentials: empty.clone(),

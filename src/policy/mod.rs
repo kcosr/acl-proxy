@@ -1,6 +1,6 @@
-mod snapshot;
+mod adapter;
 
-pub(crate) use snapshot::{
-    CompiledPolicySnapshot, HttpWireBodyPlanBrand, HttpWireBodyPlanIndex, PolicyEvaluation,
-    PolicyOutcome, PolicyRuleMatch, PreparedPolicyEvaluation,
+pub(crate) use adapter::{
+    HttpWireBodyPlanBrand, HttpWireBodyPlanIndex, ProductAclCompileError, ProductAclSnapshot,
+    ProductRuleEffectsRef,
 };

@@ -14,8 +14,6 @@ mod http_body;
 mod logging;
 mod network;
 mod observation;
-#[cfg(test)]
-mod p05_contract_adapter_tests;
 mod policy;
 mod proxy;
 mod redaction;

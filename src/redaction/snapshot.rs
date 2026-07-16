@@ -394,10 +394,6 @@ impl RedactionActivation {
             .and_then(|index| self.snapshot.profile(index))
     }
 
-    pub(crate) fn profile_registry(&self) -> &RedactionProfileRegistry {
-        &self.profile_registry
-    }
-
     pub(crate) fn into_parts(self) -> (RedactionSnapshot, RedactionProfileRegistry) {
         (self.snapshot, self.profile_registry)
     }

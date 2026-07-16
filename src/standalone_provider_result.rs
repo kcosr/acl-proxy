@@ -1,8 +1,13 @@
+use http_access_policy_acl::MatchedEffects;
+#[cfg(all(test, unix))]
+use http_access_policy_acl::{EvaluationInput, PolicyEvaluation, ProviderDisposition};
 use http_access_runtime::{RuntimeRequest, StandalonePlan, StandaloneTrusted};
+#[cfg(all(test, unix))]
+use http_access_types::BodyObservation;
 use http_access_types::{
-    BodyRepresentation, CredentialMutation, CredentialMutationKind, CredentialRef, ForwardingPlan,
-    ForwardingPlanInput, HeaderMutation, HeaderMutationBatch, HeaderMutationCondition, HeaderName,
-    HeaderValue, PlanBinding, UpgradeIntent, UpgradePolicy,
+    BodyRepresentation, CredentialMutation, CredentialMutationKind, CredentialRef,
+    DecisionProvenance, ForwardingPlan, ForwardingPlanInput, HeaderMutation, HeaderMutationBatch,
+    HeaderMutationCondition, HeaderName, HeaderValue, PlanBinding, UpgradeIntent, UpgradePolicy,
 };
 
 use crate::authorization::protocol::{
@@ -11,11 +16,12 @@ use crate::authorization::protocol::{
 };
 use crate::authorization::AuthorizationAllowOutput;
 use crate::credentials::ResolvedCredentialAction;
+use crate::policy::ProductRuleEffectsRef;
 use crate::runtime::{CredentialSourceIndex, GenerationLease, ProviderIndex};
 use crate::safety::{GuardedBody, HttpWireBodyGuard, RuntimeReplayLease};
 use crate::standalone::{
     BoundCredentialSource, ProviderCredentialTemplates, StandaloneCaptureEvent,
-    StandaloneGenerationPlan, StandaloneRuleDecision,
+    StandaloneGenerationPlan,
 };
 use crate::upgrade::UpgradeAllocation;
 
@@ -314,7 +320,8 @@ fn resolved_credential_actions(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn adapt_provider_allow(
     lease: &GenerationLease,
-    rule_ordinal: usize,
+    effects: ProductRuleEffectsRef,
+    provenance: &DecisionProvenance,
     provider: ProviderIndex,
     output: AuthorizationAllowOutput,
     inspected_body: Option<GuardedBody>,
@@ -325,7 +332,8 @@ pub(crate) fn adapt_provider_allow(
     let mut provider_replacement_size = None;
     adapt_provider_allow_inner(
         lease,
-        rule_ordinal,
+        effects,
+        provenance,
         provider,
         output,
         inspected_body,
@@ -343,7 +351,8 @@ pub(crate) fn adapt_provider_allow(
 #[allow(clippy::too_many_arguments)]
 fn adapt_provider_allow_inner(
     lease: &GenerationLease,
-    rule_ordinal: usize,
+    effects: ProductRuleEffectsRef,
+    provenance: &DecisionProvenance,
     provider: ProviderIndex,
     output: AuthorizationAllowOutput,
     inspected_body: Option<GuardedBody>,
@@ -354,17 +363,12 @@ fn adapt_provider_allow_inner(
 ) -> Result<StandaloneProviderAllow, StandaloneProviderAllowError> {
     let generation = lease.standalone();
     let authorization = lease.authorization();
+    let rule_ordinal = effects.ordinal();
     let rule = generation
         .rules()
         .get(rule_ordinal)
-        .filter(|rule| {
-            rule.ordinal() as usize == rule_ordinal
-                && rule.decision() == StandaloneRuleDecision::Delegate
-        })
+        .filter(|rule| rule.ordinal() as usize == rule_ordinal)
         .ok_or(StandaloneProviderAllowError::Binding)?;
-    if generation.activated().rule_provider(rule_ordinal) != Some(provider) {
-        return Err(StandaloneProviderAllowError::Binding);
-    }
     let (credentials, replacement) = authorization
         .consume_allow_output(provider, output)
         .ok_or(StandaloneProviderAllowError::Binding)?;
@@ -449,8 +453,7 @@ fn adapt_provider_allow_inner(
     finish_allow(
         generation,
         Some((rule_ordinal, rule)),
-        rule.provider_provenance()
-            .ok_or(StandaloneProviderAllowError::Binding)?,
+        provenance,
         provider_credential_mutations,
         staged_provider_credentials,
         provider_content_type,
@@ -464,22 +467,24 @@ fn adapt_provider_allow_inner(
 
 pub(crate) fn adapt_local_allow(
     lease: &GenerationLease,
-    rule_ordinal: Option<usize>,
+    effects: MatchedEffects<ProductRuleEffectsRef>,
+    provenance: &DecisionProvenance,
     inspected_body: Option<GuardedBody>,
     guard: HttpWireBodyGuard,
     replay_lease: RuntimeReplayLease,
     mut request: RuntimeRequest,
 ) -> Result<StandaloneProviderAllow, StandaloneProviderAllowError> {
     let generation = lease.standalone();
+    let rule_ordinal = match effects {
+        MatchedEffects::Empty => None,
+        MatchedEffects::Rule(effects) => Some(effects.ordinal()),
+    };
     let rule = rule_ordinal
         .map(|ordinal| {
             generation
                 .rules()
                 .get(ordinal)
-                .filter(|rule| {
-                    rule.ordinal() as usize == ordinal
-                        && rule.decision() == StandaloneRuleDecision::Allow
-                })
+                .filter(|rule| rule.ordinal() as usize == ordinal)
                 .map(|rule| (ordinal, rule))
                 .ok_or(StandaloneProviderAllowError::Binding)
         })
@@ -493,9 +498,6 @@ pub(crate) fn adapt_local_allow(
             inspected_body,
         )?;
     }
-    let provenance = rule
-        .map(|(_, rule)| rule.local_provenance())
-        .unwrap_or_else(|| generation.default_provenance());
     let upgrade_binding = compile_upgrade_binding(lease, rule_ordinal, &request)?;
     finish_allow(
         generation,
@@ -1095,23 +1097,50 @@ header = "x-test-loop"
         lease: &GenerationLease,
     ) -> (HttpWireBodyGuard, RuntimeReplayLease, ProviderIndex) {
         let (guard, replay) = local_admission(lease);
-        let provider = lease.standalone().activated().rule_provider(0).unwrap();
+        let provider = lease
+            .standalone()
+            .activated()
+            .rule_provider_for_test(0)
+            .unwrap();
         (guard, replay, provider)
     }
 
     fn local_admission(lease: &GenerationLease) -> (HttpWireBodyGuard, RuntimeReplayLease) {
-        let url = http_access_url::canonicalize_http_url("https://example.test/resource").unwrap();
         let peer: IpAddr = "192.0.2.10".parse().unwrap();
-        let method = HttpMethod::new("POST").unwrap();
+        let request = request(lease.standalone(), Vec::new());
+        let input = EvaluationInput::new(
+            request.facts(),
+            peer,
+            request.policy_header_facts(),
+            RuntimeRequest::INITIAL_REVISION,
+            BodyRepresentation::PreservedContentCoded,
+            BodyObservation::unobserved(),
+        )
+        .unwrap();
         let evaluation = lease
-            .policy()
-            .evaluate(&url, peer, &method, &HeaderMap::new(), &|_| false);
+            .standalone()
+            .product_acl()
+            .snapshot()
+            .evaluate(&input)
+            .unwrap();
+        let cursor = lease
+            .standalone()
+            .product_acl()
+            .resource_cursor(match &evaluation {
+                PolicyEvaluation::Allow { provenance, .. }
+                | PolicyEvaluation::Deny { provenance } => provenance,
+                PolicyEvaluation::Delegate(delegated) => delegated.provenance(),
+            })
+            .unwrap();
+        let wire_body_plan = lease
+            .standalone()
+            .product_acl()
+            .resources()
+            .wire_body_plan(cursor)
+            .unwrap();
         let admission = lease
             .safety()
-            .begin_http_body(
-                evaluation.wire_body_plan(),
-                WireBodyQuotaKey::from_peer(peer, |_| false),
-            )
+            .begin_http_body(wire_body_plan, WireBodyQuotaKey::from_peer(peer, |_| false))
             .unwrap();
         let (guard, replay, staging) = admission.into_parts();
         drop(staging);
@@ -1162,6 +1191,115 @@ header = "x-test-loop"
         lease
             .authorization()
             .bind_allow_output_for_test(provider, credentials, replacement)
+    }
+
+    fn test_policy_rule_ordinal(provenance: &DecisionProvenance) -> Option<usize> {
+        match provenance.effective_policy() {
+            http_access_types::EffectivePolicy::Default => None,
+            http_access_types::EffectivePolicy::Rule { ordinal, .. } => {
+                usize::try_from(*ordinal).ok()
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn adapt_provider_allow(
+        lease: &GenerationLease,
+        rule_ordinal: usize,
+        provider: ProviderIndex,
+        output: AuthorizationAllowOutput,
+        inspected_body: Option<GuardedBody>,
+        guard: HttpWireBodyGuard,
+        replay_lease: RuntimeReplayLease,
+        request: RuntimeRequest,
+    ) -> Result<StandaloneProviderAllow, StandaloneProviderAllowFailure> {
+        let input = EvaluationInput::new(
+            request.facts(),
+            "192.0.2.10".parse().unwrap(),
+            request.policy_header_facts(),
+            RuntimeRequest::INITIAL_REVISION,
+            BodyRepresentation::PreservedContentCoded,
+            BodyObservation::unobserved(),
+        )
+        .unwrap();
+        let PolicyEvaluation::Delegate(delegated) = lease
+            .standalone()
+            .product_acl()
+            .snapshot()
+            .evaluate(&input)
+            .unwrap()
+        else {
+            panic!("test request must select a delegated rule");
+        };
+        assert_eq!(
+            test_policy_rule_ordinal(delegated.provenance()),
+            Some(rule_ordinal)
+        );
+        let resolved = lease
+            .standalone()
+            .product_acl()
+            .snapshot()
+            .resolve_delegate(delegated, ProviderDisposition::Allow, &input)
+            .unwrap();
+        let PolicyEvaluation::Allow {
+            provenance,
+            effects: MatchedEffects::Rule(effects),
+        } = resolved
+        else {
+            panic!("provider allow must release the delegated effects");
+        };
+        super::adapt_provider_allow(
+            lease,
+            effects,
+            &provenance,
+            provider,
+            output,
+            inspected_body,
+            guard,
+            replay_lease,
+            request,
+        )
+    }
+
+    fn adapt_local_allow(
+        lease: &GenerationLease,
+        rule_ordinal: Option<usize>,
+        inspected_body: Option<GuardedBody>,
+        guard: HttpWireBodyGuard,
+        replay_lease: RuntimeReplayLease,
+        request: RuntimeRequest,
+    ) -> Result<StandaloneProviderAllow, StandaloneProviderAllowError> {
+        let input = EvaluationInput::new(
+            request.facts(),
+            "192.0.2.10".parse().unwrap(),
+            request.policy_header_facts(),
+            RuntimeRequest::INITIAL_REVISION,
+            BodyRepresentation::PreservedContentCoded,
+            BodyObservation::unobserved(),
+        )
+        .unwrap();
+        let PolicyEvaluation::Allow {
+            provenance,
+            effects,
+        } = lease
+            .standalone()
+            .product_acl()
+            .snapshot()
+            .evaluate(&input)
+            .unwrap()
+        else {
+            panic!("test request must select a local allow");
+        };
+        assert_eq!(test_policy_rule_ordinal(&provenance), rule_ordinal);
+        super::adapt_local_allow(
+            lease,
+            effects,
+            &provenance,
+            inspected_body,
+            guard,
+            replay_lease,
+            request,
+        )
     }
 
     #[tokio::test]
@@ -1262,8 +1400,8 @@ header = "x-test-loop"
             assert_eq!(forwarding.capture(), None);
             assert_eq!(forwarding.upgrade(), &UpgradePolicy::Deny);
             assert_eq!(
-                forwarding.provenance(),
-                generation.rules()[0].provider_provenance().unwrap()
+                forwarding.provenance().reason().category(),
+                http_access_types::DecisionReasonCategory::Provider
             );
             let StandaloneProviderAllow {
                 plan,
@@ -1644,8 +1782,13 @@ header = "x-test-loop"
 
         assert_eq!(result.request.revision(), original_revision + 1);
         assert_eq!(
-            result.plan.forwarding_plan().provenance(),
-            generation.rules()[0].local_provenance()
+            result
+                .plan
+                .forwarding_plan()
+                .provenance()
+                .reason()
+                .category(),
+            http_access_types::DecisionReasonCategory::Policy
         );
         let StandaloneProviderAllow {
             plan,
@@ -1667,7 +1810,7 @@ header = "x-test-loop"
         let foreign_provider = foreign_lease
             .standalone()
             .activated()
-            .rule_provider(0)
+            .rule_provider_for_test(0)
             .unwrap();
         let foreign_output = output(&foreign_lease, foreign_provider, true, None);
         let (guard, replay, provider) = admission(&lease);

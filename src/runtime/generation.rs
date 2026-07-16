@@ -64,10 +64,6 @@ macro_rules! index_registry {
             pub(crate) fn get(&self, name: &str) -> Option<$index> {
                 self.indices.get(name).copied()
             }
-
-            pub(crate) fn len(&self) -> usize {
-                self.indices.len()
-            }
         }
 
         impl fmt::Debug for $registry {
@@ -88,11 +84,24 @@ macro_rules! index_registry {
 }
 
 index_registry!(ProviderRegistry, ProviderIndex, "ProviderRegistry");
+
+impl ProviderRegistry {
+    pub(crate) fn len(&self) -> usize {
+        self.indices.len()
+    }
+}
 index_registry!(
     RedactionProfileRegistry,
     RedactionProfileIndex,
     "RedactionProfileRegistry"
 );
+
+#[cfg(test)]
+impl RedactionProfileRegistry {
+    pub(crate) fn len(&self) -> usize {
+        self.indices.len()
+    }
+}
 index_registry!(
     CredentialSourceRegistry,
     CredentialSourceIndex,
@@ -132,37 +141,6 @@ mod index_registry_tests {
         assert_eq!(credentials.get("shared").unwrap().get(), 0);
         assert_eq!(profiles.get("shared").unwrap().get(), 0);
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ResolvedRuleBindings {
-    pub(crate) authorization_provider: Option<ProviderIndex>,
-    pub(crate) redaction_profile: Option<RedactionProfileIndex>,
-    pub(crate) credentials: Box<[CredentialSourceIndex]>,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ResolvedBindings {
-    pub(crate) provider_count: usize,
-    pub(crate) redaction_profile_count: usize,
-    pub(crate) credential_count: usize,
-    pub(crate) rules: Box<[ResolvedRuleBindings]>,
-}
-
-pub(crate) trait PolicySnapshot: Send + Sync {
-    fn evaluate<'snapshot>(
-        &'snapshot self,
-        url: &http_access_types::CanonicalUrl,
-        peer_ip: std::net::IpAddr,
-        method: &http_access_types::HttpMethod,
-        headers: &HeaderMap,
-        extra_presence: &dyn Fn(&http::HeaderName) -> bool,
-    ) -> crate::policy::PolicyEvaluation<'snapshot>;
-
-    fn resolve_prepared<'snapshot>(
-        &'snapshot self,
-        prepared: crate::policy::PreparedPolicyEvaluation,
-    ) -> Option<crate::policy::PolicyEvaluation<'snapshot>>;
 }
 
 pub(crate) trait EgressSnapshot: Send + Sync {
@@ -320,8 +298,6 @@ pub(crate) struct ActivatedGeneration {
     pub(crate) request_timeout: Duration,
     pub(crate) max_content_decoding_expansion_ratio: usize,
     pub(crate) resource_plan: CompiledResourcePlan,
-    pub(crate) bindings: ResolvedBindings,
-    pub(crate) policy: Arc<dyn PolicySnapshot>,
     pub(crate) egress: Arc<dyn EgressSnapshot>,
     pub(crate) authorization: Arc<dyn AuthorizationSnapshot>,
     pub(crate) credentials: Arc<dyn CredentialResolver>,
@@ -336,8 +312,6 @@ pub(crate) struct Generation {
     request_timeout: Duration,
     max_content_decoding_expansion_ratio: usize,
     resource_plan: CompiledResourcePlan,
-    bindings: ResolvedBindings,
-    policy: Arc<dyn PolicySnapshot>,
     egress: Arc<dyn EgressSnapshot>,
     authorization: Arc<dyn AuthorizationSnapshot>,
     credentials: Arc<dyn CredentialResolver>,
@@ -358,7 +332,6 @@ impl fmt::Debug for Generation {
                 "max_content_decoding_expansion_ratio",
                 &self.max_content_decoding_expansion_ratio,
             )
-            .field("bindings", &self.bindings)
             .finish_non_exhaustive()
     }
 }
@@ -371,8 +344,6 @@ impl Generation {
             request_timeout: value.request_timeout,
             max_content_decoding_expansion_ratio: value.max_content_decoding_expansion_ratio,
             resource_plan: value.resource_plan,
-            bindings: value.bindings,
-            policy: value.policy,
             egress: value.egress,
             authorization: value.authorization,
             credentials: value.credentials,
@@ -403,15 +374,6 @@ impl Generation {
 
     pub(crate) fn resource_plan(&self) -> &CompiledResourcePlan {
         &self.resource_plan
-    }
-
-    #[cfg(test)]
-    pub(crate) fn bindings(&self) -> &ResolvedBindings {
-        &self.bindings
-    }
-
-    pub(crate) fn policy(&self) -> &dyn PolicySnapshot {
-        self.policy.as_ref()
     }
 
     pub(crate) fn egress(&self) -> &dyn EgressSnapshot {

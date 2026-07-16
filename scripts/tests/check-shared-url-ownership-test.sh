@@ -21,11 +21,11 @@ import sys
 root = pathlib.Path(sys.argv[1]).resolve()
 mode = sys.argv[2]
 runtime = root.parent / "access-runtime" / "crates"
-policy_kind = "dev"
+policy_kind = None
 policy_path = runtime / "http-access-policy-acl"
 policy_version = "=0.1.0"
-if mode == "production-policy":
-    policy_kind = None
+if mode == "dev-policy":
+    policy_kind = "dev"
 elif mode == "wrong-policy-path":
     policy_path = runtime / "http-access-conformance"
 elif mode == "wrong-policy-version":
@@ -84,8 +84,8 @@ expect_failure() {
     fi
 }
 
-expect_failure production-policy 'production policy dependency' \
-    "http-access-policy-acl has kind None, expected 'dev'"
+expect_failure dev-policy 'development-only policy dependency' \
+    "http-access-policy-acl has kind 'dev', expected None"
 expect_failure wrong-policy-path 'wrong policy dependency path' \
     'http-access-policy-acl must use the exact sibling path'
 expect_failure wrong-policy-version 'loose policy dependency version' \

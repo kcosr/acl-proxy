@@ -6009,6 +6009,35 @@ fn valid_environment_name(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn evaluate_test_policy(
+        snapshot: &crate::policy::ProductAclSnapshot,
+        url: &http_access_types::CanonicalUrl,
+        peer_ip: IpAddr,
+    ) -> http_access_policy_acl::PolicyEvaluation<crate::policy::ProductRuleEffectsRef> {
+        let facts = http_access_types::InterceptedRequestFacts::new(
+            http_access_types::IngressMode::ExplicitHttps,
+            http_access_types::HttpVersion::Http11,
+            http_access_types::HttpMethod::new("GET").unwrap(),
+            url.clone(),
+            Vec::new(),
+            http_access_types::BodyMetadata::new(http_access_types::BodyFraming::None),
+            None,
+        )
+        .unwrap();
+        let header_facts =
+            http_access_types::PolicyHeaderFacts::new(Vec::new(), Vec::new()).unwrap();
+        let input = http_access_policy_acl::EvaluationInput::new(
+            &facts,
+            peer_ip,
+            &header_facts,
+            1,
+            http_access_types::BodyRepresentation::PreservedContentCoded,
+            http_access_types::BodyObservation::unobserved(),
+        )
+        .unwrap();
+        snapshot.snapshot().evaluate(&input).unwrap()
+    }
+
     const MINIMAL: &str = r#"
 schema_version = 3
 
@@ -10306,27 +10335,26 @@ client_cidrs = ["::ffff:192.0.2.0/120"]
             compiled.reloadable_plan.policy.rules[0].client_cidrs,
             vec!["192.0.2.0/24".parse::<ipnet::IpNet>().unwrap()]
         );
-        let snapshot =
-            crate::policy::CompiledPolicySnapshot::from_plan(compiled.reloadable_plan.policy);
+        let snapshot = crate::policy::ProductAclSnapshot::compile(
+            &compiled.reloadable_plan.policy,
+            http_access_types::PolicyGeneration::new(1).unwrap(),
+            http_access_types::SnapshotIdentity::new(),
+            &[],
+        )
+        .unwrap();
         let url = canonicalize_http_url("https://example.com/").unwrap();
         for peer in ["192.0.2.44", "::ffff:192.0.2.44"] {
-            let decision = snapshot.evaluate(
-                &url,
-                peer.parse().unwrap(),
-                &http_access_types::HttpMethod::new("GET").unwrap(),
-                &http::HeaderMap::new(),
-                |_| false,
-            );
-            assert_eq!(decision.outcome, crate::policy::PolicyOutcome::Allow);
+            let decision = evaluate_test_policy(&snapshot, &url, peer.parse().unwrap());
+            assert!(matches!(
+                decision,
+                http_access_policy_acl::PolicyEvaluation::Allow { .. }
+            ));
         }
-        let outside = snapshot.evaluate(
-            &url,
-            "198.51.100.44".parse().unwrap(),
-            &http_access_types::HttpMethod::new("GET").unwrap(),
-            &http::HeaderMap::new(),
-            |_| false,
-        );
-        assert_eq!(outside.outcome, crate::policy::PolicyOutcome::Deny);
+        let outside = evaluate_test_policy(&snapshot, &url, "198.51.100.44".parse().unwrap());
+        assert!(matches!(
+            outside,
+            http_access_policy_acl::PolicyEvaluation::Deny { .. }
+        ));
     }
 
     #[test]
@@ -10341,29 +10369,33 @@ client_cidrs = ["::ffff:192.0.2.0/120"]
 "#
         );
         let compiled = compile(&input).expect("mapped CIDR should compile");
-        let snapshot =
-            crate::policy::CompiledPolicySnapshot::from_plan(compiled.reloadable_plan.policy);
+        let snapshot = crate::policy::ProductAclSnapshot::compile(
+            &compiled.reloadable_plan.policy,
+            http_access_types::PolicyGeneration::new(1).unwrap(),
+            http_access_types::SnapshotIdentity::new(),
+            &[],
+        )
+        .unwrap();
         let url = canonicalize_http_url("https://example.com/").unwrap();
         for peer in ["192.0.2.44", "::ffff:192.0.2.44"] {
-            let decision = snapshot.evaluate(
-                &url,
-                peer.parse().unwrap(),
-                &http_access_types::HttpMethod::new("GET").unwrap(),
-                &http::HeaderMap::new(),
-                |_| false,
-            );
-            assert_eq!(decision.outcome, crate::policy::PolicyOutcome::Deny);
-            assert_eq!(decision.matched.as_ref().unwrap().id(), "mapped-deny");
+            let decision = evaluate_test_policy(&snapshot, &url, peer.parse().unwrap());
+            let http_access_policy_acl::PolicyEvaluation::Deny { provenance } = decision else {
+                panic!("mapped peer should be denied")
+            };
+            let http_access_types::EffectivePolicy::Rule { id, .. } = provenance.effective_policy()
+            else {
+                panic!("mapped peer should match the deny rule")
+            };
+            assert_eq!(id.as_str(), "mapped-deny");
         }
-        let outside = snapshot.evaluate(
-            &url,
-            "198.51.100.44".parse().unwrap(),
-            &http_access_types::HttpMethod::new("GET").unwrap(),
-            &http::HeaderMap::new(),
-            |_| false,
-        );
-        assert_eq!(outside.outcome, crate::policy::PolicyOutcome::Allow);
-        assert!(outside.matched.is_none());
+        let outside = evaluate_test_policy(&snapshot, &url, "198.51.100.44".parse().unwrap());
+        let http_access_policy_acl::PolicyEvaluation::Allow { provenance, .. } = outside else {
+            panic!("outside peer should be allowed by the default")
+        };
+        assert!(matches!(
+            provenance.effective_policy(),
+            http_access_types::EffectivePolicy::Default
+        ));
     }
 
     #[test]

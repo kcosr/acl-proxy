@@ -7,7 +7,6 @@ use crate::config::compiler::ReloadableProductPlan;
 use crate::config::StaticFingerprint;
 use crate::credentials::CredentialResolverSnapshot;
 use crate::egress::{EgressActivationError, EgressSnapshot};
-use crate::policy::CompiledPolicySnapshot;
 use crate::redaction::{RedactionSnapshot, SnapshotError};
 use crate::runtime::{
     ActivatedGeneration, ActivationCancellation, BoxFuture, CandidateActivator, CleanupReason,
@@ -121,7 +120,7 @@ impl ProductActivator {
             max_content_decoding_expansion_ratio,
             forwarding: _,
             egress,
-            policy,
+            policy: _,
             authorization,
             credentials,
             redaction,
@@ -146,19 +145,10 @@ impl ProductActivator {
             })?;
         cancellation.check()?;
 
-        let policy = CompiledPolicySnapshot::activate(
-            policy,
-            &provider_registry,
-            redaction.profile_registry(),
-            credentials.source_registry(),
-        )
-        .map_err(|error| candidate_error(&cancellation, "policy", error.to_string()))?;
-        cancellation.check()?;
-
         let safety = ProductSafetySnapshot::activate(
             safety,
             &resource_plan,
-            policy.wire_body_plan_brand(),
+            standalone.product_acl().resources().wire_body_plan_brand(),
             self.static_resources.wire_body_pool(),
         )
         .map_err(|error| candidate_error(&cancellation, "safety", error.to_string()))?;
@@ -194,7 +184,6 @@ impl ProductActivator {
 
         let (authorization, provider_registry, provider_owners) = authorization.into_parts();
         let (observation, observation_owner) = observation.into_parts();
-        let (policy, bindings) = policy.into_parts();
         let (credentials, credential_registry) = credentials.into_parts();
         let (redaction, redaction_registry) = redaction.into_parts();
 
@@ -212,7 +201,6 @@ impl ProductActivator {
             &provider_registry,
             &egress,
             &observation,
-            &bindings,
         ) {
             Ok(standalone) => standalone,
             Err(error) => {
@@ -235,8 +223,6 @@ impl ProductActivator {
             request_timeout,
             max_content_decoding_expansion_ratio,
             resource_plan,
-            bindings,
-            policy: Arc::new(policy),
             egress: Arc::new(egress),
             authorization: Arc::new(authorization),
             credentials: Arc::new(credentials),
@@ -436,15 +422,11 @@ redaction_profile = "environment"
     }
 
     fn redact_environment_secret(lease: &crate::runtime::GenerationLease, input: &[u8]) -> Vec<u8> {
-        let profile = lease.bindings().rules[0]
-            .redaction_profile
-            .expect("policy rule binds the environment redaction profile");
         let binding = lease
             .standalone()
             .activated()
             .rule_redaction(0)
             .expect("standalone generation binds the rule redaction profile");
-        assert_eq!(binding.profile(), profile);
         let redacted = binding
             .handle()
             .redact_decoded_http_body(input.to_vec())
@@ -791,18 +773,46 @@ redaction_profile = "environment"
             .snapshot_lease()
             .owns(activated.standalone.identity()));
         let standalone_bindings = activated.standalone.activated();
-        assert_eq!(activated.bindings.provider_count, 0);
-        assert_eq!(activated.bindings.redaction_profile_count, 1);
+        assert!(standalone_bindings.provider_outputs().is_empty());
+        assert!(activated.standalone.capture().is_some());
         let url = http_access_url::canonicalize_http_url("https://example.test/resource").unwrap();
-        let policy = activated.policy.evaluate(
-            &url,
+        let facts = http_access_types::InterceptedRequestFacts::new(
+            http_access_types::IngressMode::ExplicitHttps,
+            http_access_types::HttpVersion::Http11,
+            http_access_types::HttpMethod::new("GET").unwrap(),
+            url,
+            Vec::new(),
+            http_access_types::BodyMetadata::new(http_access_types::BodyFraming::None),
+            None,
+        )
+        .unwrap();
+        let header_facts = http_access_types::PolicyHeaderFacts::new(
+            Vec::new(),
+            activated.standalone.sensitive_headers().to_vec(),
+        )
+        .unwrap();
+        let input = http_access_policy_acl::EvaluationInput::new(
+            &facts,
             "192.0.2.10".parse().unwrap(),
-            &http_access_types::HttpMethod::new("GET").unwrap(),
-            &http::HeaderMap::new(),
-            &|_| false,
-        );
-        assert_eq!(policy.outcome, crate::policy::PolicyOutcome::Deny);
-        assert!(policy.matched.is_none());
+            &header_facts,
+            1,
+            http_access_types::BodyRepresentation::PreservedContentCoded,
+            http_access_types::BodyObservation::unobserved(),
+        )
+        .unwrap();
+        let policy = activated
+            .standalone
+            .product_acl()
+            .snapshot()
+            .evaluate(&input)
+            .unwrap();
+        let http_access_policy_acl::PolicyEvaluation::Deny { provenance } = policy else {
+            panic!("the minimal policy should deny by default")
+        };
+        assert!(matches!(
+            provenance.effective_policy(),
+            http_access_types::EffectivePolicy::Default
+        ));
 
         assert!(matches!(
             activated.egress.route(),
@@ -817,11 +827,11 @@ redaction_profile = "environment"
             .credentials
             .inject(&[], &mut request_headers)
             .unwrap();
-        let inbound = activated
+        let _inbound = activated
             .credentials
             .extract_inbound(&mut request_headers)
             .unwrap();
-        assert!(!inbound.is_present(&http::header::AUTHORIZATION));
+        assert!(!request_headers.contains_key(http::header::AUTHORIZATION));
 
         assert!(activated
             .authorization
@@ -964,7 +974,6 @@ default = "deny""#,
             .await
             .expect("process provider candidate activates");
 
-        assert_eq!(activated.bindings.provider_count, 1);
         let standalone_bindings = activated.standalone.activated();
         assert_eq!(standalone_bindings.global_credentials().len(), 1);
         assert!(standalone_bindings.global_credentials()[0]

@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use http_access_policy_acl::ProductActionRef;
 use http_access_runtime::{RuntimeResourceLimits, SnapshotLease, SnapshotRegistries};
 use http_access_types::{
     BodyLimits, BodyRepresentation, CaptureIntent, CaptureRef, CredentialMutation,
-    CredentialMutationKind, CredentialRef, DecisionProvenance, DecisionReason,
-    DecisionReasonCategory, EffectivePolicy, HeaderMutation, HeaderMutationBatch,
+    CredentialMutationKind, CredentialRef, HeaderMutation, HeaderMutationBatch,
     HeaderMutationCondition, HeaderName, HeaderValue, HttpScheme, PolicyGeneration, RedactionRef,
     RedirectPolicy, RequestBodyPolicy, Route, SnapshotIdentity, StableId, StageTimeouts, TlsIntent,
     TlsRootsRef, TrailerPolicy,
@@ -16,16 +16,17 @@ use crate::authorization::protocol::{ProviderOutputDefinition, ProviderOutputInd
 use crate::authorization::{ActivatedProviderOutputBinding, ProductAuthorizationSnapshot};
 use crate::config::compiler::{
     AuthorizationProviderPlan, CompiledCaptureEvent, CompiledEgressRoute, CompiledHeaderEffectWhen,
-    CompiledRuleDecision, CompiledTlsTrust, CredentialActionPlan, ForwardingPlan, HeaderEffectPlan,
-    PolicyRulePlan, ProviderOutputPlan, ReloadableProductPlan, TransportTlsPlan,
+    CompiledTlsTrust, CredentialActionPlan, ForwardingPlan, HeaderEffectPlan, PolicyRulePlan,
+    ProviderOutputPlan, ReloadableProductPlan, TransportTlsPlan,
 };
 use crate::credentials::ResolvedCredentialAction;
 use crate::egress::EgressSnapshot;
 use crate::observation::{CaptureEvent, ProductObservationSnapshot};
+use crate::policy::{ProductAclCompileError, ProductAclSnapshot};
 use crate::redaction::{ProfileHandle, RedactionSnapshot};
 use crate::runtime::{
     CredentialSourceIndex, CredentialSourceRegistry, GenerationId, ProviderIndex, ProviderRegistry,
-    RedactionProfileIndex, RedactionProfileRegistry, ResolvedBindings,
+    RedactionProfileRegistry,
 };
 
 /// Snapshot-local immutable inputs needed by the standalone request adapter.
@@ -53,8 +54,8 @@ pub(crate) struct StandaloneGenerationCore {
     origin_https_tls: TlsIntent,
     capture: Option<StandaloneCaptureIntent>,
     sensitive_headers: Box<[HeaderName]>,
+    product_acl: ProductAclSnapshot,
     rules: Box<[StandaloneRuleTemplate]>,
-    default_provenance: DecisionProvenance,
     global_request_headers: Option<HeaderMutationBatch>,
     global_credentials: Box<[CredentialMutation]>,
     provider_credentials: Box<[ProviderCredentialTemplates]>,
@@ -63,7 +64,6 @@ pub(crate) struct StandaloneGenerationCore {
 
 struct StandaloneBindingManifest {
     global_credentials: Box<[StandaloneCredentialBindingManifest]>,
-    rules: Box<[StandaloneRuleBindingManifest]>,
     provider_outputs: Box<[StandaloneProviderOutputManifest]>,
     capture_redaction: Option<String>,
     tls: Box<[StandaloneTlsBindingManifest]>,
@@ -73,12 +73,6 @@ struct StandaloneBindingManifest {
 struct StandaloneCredentialBindingManifest {
     source: String,
     reference: CredentialRef,
-}
-
-struct StandaloneRuleBindingManifest {
-    provider: Option<String>,
-    redaction: Option<String>,
-    credentials: Box<[StandaloneCredentialBindingManifest]>,
 }
 
 struct StandaloneProviderOutputManifest {
@@ -117,7 +111,7 @@ struct StandaloneTlsBindingManifest {
 pub(crate) struct StandaloneActivatedBindings {
     global_credentials: Box<[BoundCredentialSource]>,
     rule_credentials: Box<[Box<[BoundCredentialSource]>]>,
-    rule_providers: Box<[Option<ProviderIndex>]>,
+    rule_providers: Box<[Option<BoundRuleProvider>]>,
     rule_redactions: Box<[Option<BoundRedaction>]>,
     provider_outputs: Box<[BoundProviderOutput]>,
 }
@@ -140,6 +134,11 @@ pub(crate) struct BoundCredentialSource {
     source: CredentialSourceIndex,
 }
 
+struct BoundRuleProvider {
+    action_id: StableId,
+    provider: ProviderIndex,
+}
+
 pub(crate) struct BoundProviderOutput {
     reference: CredentialRef,
     provider: ProviderIndex,
@@ -147,20 +146,19 @@ pub(crate) struct BoundProviderOutput {
 }
 
 pub(crate) struct BoundRedaction {
-    profile: RedactionProfileIndex,
     handle: ProfileHandle,
 }
 
 pub(crate) struct StandaloneRuleTemplate {
     ordinal: u32,
-    decision: StandaloneRuleDecision,
+    request_timeout: Option<Duration>,
     allow_upgrades: bool,
     request_headers: Option<HeaderMutationBatch>,
     response_headers: Option<HeaderMutationBatch>,
     credentials: Box<[CredentialMutation]>,
+    credential_sources: Box<[String]>,
     redaction: Option<RedactionRef>,
-    local_provenance: DecisionProvenance,
-    provider_provenance: Option<DecisionProvenance>,
+    redaction_profile: Option<String>,
 }
 
 pub(crate) struct ProviderCredentialTemplates {
@@ -172,13 +170,6 @@ pub(crate) struct ProviderCredentialTemplate {
     ordinal: usize,
     required: bool,
     mutation: CredentialMutation,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum StandaloneRuleDecision {
-    Allow,
-    Deny,
-    Delegate,
 }
 
 pub(crate) struct StandaloneCaptureIntent {
@@ -209,6 +200,8 @@ pub(crate) enum StandaloneCompileError {
     Checked(&'static str),
     #[error("inconsistent standalone {0}")]
     Inconsistent(&'static str),
+    #[error("invalid compiled ACL")]
+    Policy(#[from] ProductAclCompileError),
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -258,6 +251,12 @@ impl UnboundStandaloneGenerationPlan {
 
         let capture = compile_capture(plan, &identity, version)?;
         let sensitive_headers = compile_sensitive_headers(plan)?;
+        let product_acl = ProductAclSnapshot::compile(
+            &plan.policy,
+            generation,
+            identity.clone(),
+            &sensitive_headers,
+        )?;
         let global_request_headers = compile_header_batch(&plan.egress.request_headers)?;
 
         let mut credential_refs = Vec::new();
@@ -281,7 +280,6 @@ impl UnboundStandaloneGenerationPlan {
             rules.push(compile_rule_template(
                 rule,
                 ordinal,
-                generation,
                 &identity,
                 version,
                 &redactions,
@@ -291,13 +289,6 @@ impl UnboundStandaloneGenerationPlan {
 
         let provider_credentials =
             compile_provider_credentials(plan, &identity, version, &mut credential_refs)?;
-        let default_provenance = DecisionProvenance::new(
-            generation,
-            EffectivePolicy::Default,
-            DecisionReason::new(DecisionReasonCategory::Policy, 0),
-            None,
-        );
-
         let resource_projections = compile_resource_projections(
             ordinary_request_body,
             normalized_request_body,
@@ -347,8 +338,8 @@ impl UnboundStandaloneGenerationPlan {
             origin_https_tls,
             capture,
             sensitive_headers,
+            product_acl,
             rules: rules.into_boxed_slice(),
-            default_provenance,
             global_request_headers,
             global_credentials,
             provider_credentials,
@@ -368,7 +359,6 @@ impl UnboundStandaloneGenerationPlan {
         providers: &ProviderRegistry,
         egress: &EgressSnapshot,
         observation: &ProductObservationSnapshot,
-        policy_bindings: &ResolvedBindings,
     ) -> Result<StandaloneGenerationPlan, StandaloneBindError> {
         let activated = bind_activated(
             &self.core,
@@ -380,7 +370,6 @@ impl UnboundStandaloneGenerationPlan {
             providers,
             egress,
             observation,
-            policy_bindings,
         )?;
         Ok(StandaloneGenerationPlan {
             core: self.core,
@@ -460,8 +449,8 @@ impl StandaloneGenerationCore {
         &self.rules
     }
 
-    pub(crate) fn default_provenance(&self) -> &DecisionProvenance {
-        &self.default_provenance
+    pub(crate) const fn product_acl(&self) -> &ProductAclSnapshot {
+        &self.product_acl
     }
 
     pub(crate) fn global_request_headers(&self) -> Option<&HeaderMutationBatch> {
@@ -512,8 +501,21 @@ impl StandaloneActivatedBindings {
         self.rule_credentials.get(ordinal).map(AsRef::as_ref)
     }
 
-    pub(crate) fn rule_provider(&self, ordinal: usize) -> Option<ProviderIndex> {
-        self.rule_providers.get(ordinal).copied().flatten()
+    pub(crate) fn provider_for_action(
+        &self,
+        ordinal: usize,
+        action: &ProductActionRef,
+    ) -> Option<ProviderIndex> {
+        let bound = self.rule_providers.get(ordinal)?.as_ref()?;
+        (action.id() == &bound.action_id).then_some(bound.provider)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rule_provider_for_test(&self, ordinal: usize) -> Option<ProviderIndex> {
+        self.rule_providers
+            .get(ordinal)?
+            .as_ref()
+            .map(|bound| bound.provider)
     }
 
     pub(crate) fn rule_redaction(&self, ordinal: usize) -> Option<&BoundRedaction> {
@@ -567,10 +569,6 @@ impl BoundProviderOutput {
 }
 
 impl BoundRedaction {
-    pub(crate) fn profile(&self) -> RedactionProfileIndex {
-        self.profile
-    }
-
     pub(crate) fn handle(&self) -> &ProfileHandle {
         &self.handle
     }
@@ -589,17 +587,6 @@ fn compile_binding_manifest(
             "standalone binding manifest shape",
         ));
     }
-    if plan
-        .policy
-        .rules
-        .iter()
-        .zip(core.rules.iter())
-        .any(|(rule, core_rule)| rule.credential_actions.len() != core_rule.credentials.len())
-    {
-        return Err(StandaloneCompileError::Inconsistent(
-            "standalone rule credential manifest shape",
-        ));
-    }
     let global_credentials = plan
         .egress
         .credential_actions
@@ -608,27 +595,6 @@ fn compile_binding_manifest(
         .map(|(action, mutation)| StandaloneCredentialBindingManifest {
             source: credential_source_name(action).to_owned(),
             reference: mutation.credential().clone(),
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    let rules = plan
-        .policy
-        .rules
-        .iter()
-        .enumerate()
-        .map(|(ordinal, rule)| StandaloneRuleBindingManifest {
-            provider: rule.authorization_provider.clone(),
-            redaction: rule.redaction_profile.clone(),
-            credentials: rule
-                .credential_actions
-                .iter()
-                .zip(core.rules[ordinal].credentials.iter())
-                .map(|(action, mutation)| StandaloneCredentialBindingManifest {
-                    source: credential_source_name(action).to_owned(),
-                    reference: mutation.credential().clone(),
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
         })
         .collect::<Vec<_>>()
         .into_boxed_slice();
@@ -713,7 +679,6 @@ fn compile_binding_manifest(
     }
     Ok(StandaloneBindingManifest {
         global_credentials,
-        rules,
         provider_outputs,
         capture_redaction: plan
             .observation
@@ -851,22 +816,12 @@ fn bind_activated(
     providers: &ProviderRegistry,
     egress: &EgressSnapshot,
     observation: &ProductObservationSnapshot,
-    policy_bindings: &ResolvedBindings,
 ) -> Result<StandaloneActivatedBindings, StandaloneBindError> {
     if !manifest.resources.is_valid() {
         return Err(StandaloneBindError::Inconsistent(
             "standalone resource proof",
         ));
     }
-    if policy_bindings.rules.len() != manifest.rules.len()
-        || core.rules.len() != manifest.rules.len()
-        || policy_bindings.provider_count != providers.len()
-        || policy_bindings.redaction_profile_count != redactions.len()
-        || policy_bindings.credential_count != credentials.len()
-    {
-        return Err(StandaloneBindError::Inconsistent("policy registry shape"));
-    }
-
     if manifest.global_credentials.len() != core.global_credentials.len()
         || manifest.global_credentials.len() != egress.credential_actions().len()
     {
@@ -891,55 +846,46 @@ fn bind_activated(
         .collect::<Result<Vec<_>, _>>()?
         .into_boxed_slice();
 
-    let mut rule_credentials = Vec::with_capacity(manifest.rules.len());
-    let mut rule_providers = Vec::with_capacity(manifest.rules.len());
-    let mut rule_redactions = Vec::with_capacity(manifest.rules.len());
-    for (ordinal, ((binding, core_rule), policy_rule)) in manifest
-        .rules
-        .iter()
-        .zip(core.rules.iter())
-        .zip(policy_bindings.rules.iter())
-        .enumerate()
-    {
-        if binding.credentials.len() != core_rule.credentials.len()
-            || binding.credentials.len() != policy_rule.credentials.len()
-        {
+    let mut rule_credentials = Vec::with_capacity(core.rules.len());
+    let mut rule_providers = Vec::with_capacity(core.rules.len());
+    let mut rule_redactions = Vec::with_capacity(core.rules.len());
+    for (ordinal, core_rule) in core.rules.iter().enumerate() {
+        if core_rule.credential_sources.len() != core_rule.credentials.len() {
             return Err(StandaloneBindError::Inconsistent("rule credential shape"));
         }
-        let credentials_for_rule = binding
-            .credentials
+        let credentials_for_rule = core_rule
+            .credential_sources
             .iter()
             .zip(core_rule.credentials.iter())
-            .zip(policy_rule.credentials.iter())
-            .map(|((binding, mutation), activated)| {
-                let bound = bind_credential_source(binding, credentials, "rule credential source")?;
-                if mutation.credential() != &binding.reference || bound.source != *activated {
-                    return Err(StandaloneBindError::Inconsistent("rule credential binding"));
-                }
-                Ok(bound)
+            .map(|(source, mutation)| {
+                bind_credential_source_parts(
+                    source,
+                    mutation.credential(),
+                    credentials,
+                    "rule credential source",
+                )
             })
             .collect::<Result<Vec<_>, _>>()?
             .into_boxed_slice();
         rule_credentials.push(credentials_for_rule);
 
-        let provider = binding
-            .provider
-            .as_deref()
-            .map(|name| {
-                providers
-                    .get(name)
-                    .ok_or(StandaloneBindError::Missing("rule provider"))
+        let provider = core
+            .product_acl
+            .provider_action_id(ordinal)
+            .map(|action_id| {
+                let provider = providers
+                    .get(action_id.as_str())
+                    .ok_or(StandaloneBindError::Missing("rule provider"))?;
+                Ok(BoundRuleProvider {
+                    action_id: action_id.clone(),
+                    provider,
+                })
             })
             .transpose()?;
-        if provider != policy_rule.authorization_provider
-            || (core_rule.decision == StandaloneRuleDecision::Delegate) != provider.is_some()
-        {
-            return Err(StandaloneBindError::Inconsistent("rule provider binding"));
-        }
         rule_providers.push(provider);
 
-        let redaction = binding
-            .redaction
+        let redaction = core_rule
+            .redaction_profile
             .as_deref()
             .map(|name| {
                 bind_redaction(
@@ -950,9 +896,6 @@ fn bind_activated(
                 )
             })
             .transpose()?;
-        if redaction.as_ref().map(BoundRedaction::profile) != policy_rule.redaction_profile {
-            return Err(StandaloneBindError::Inconsistent("rule redaction binding"));
-        }
         rule_redactions.push(redaction);
 
         if usize::try_from(core_rule.ordinal).ok() != Some(ordinal) {
@@ -1005,11 +948,20 @@ fn bind_credential_source(
     credentials: &CredentialSourceRegistry,
     missing: &'static str,
 ) -> Result<BoundCredentialSource, StandaloneBindError> {
+    bind_credential_source_parts(&binding.source, &binding.reference, credentials, missing)
+}
+
+fn bind_credential_source_parts(
+    source_name: &str,
+    reference: &CredentialRef,
+    credentials: &CredentialSourceRegistry,
+    missing: &'static str,
+) -> Result<BoundCredentialSource, StandaloneBindError> {
     let source = credentials
-        .get(&binding.source)
+        .get(source_name)
         .ok_or(StandaloneBindError::Missing(missing))?;
     Ok(BoundCredentialSource {
-        reference: binding.reference.clone(),
+        reference: reference.clone(),
         source,
     })
 }
@@ -1056,7 +1008,7 @@ fn bind_redaction(
     let handle = redaction_snapshot
         .profile(profile)
         .ok_or(StandaloneBindError::Missing("redaction profile handle"))?;
-    Ok(BoundRedaction { profile, handle })
+    Ok(BoundRedaction { handle })
 }
 
 fn bind_capture(
@@ -1153,8 +1105,8 @@ impl StandaloneRuleTemplate {
         self.ordinal
     }
 
-    pub(crate) fn decision(&self) -> StandaloneRuleDecision {
-        self.decision
+    pub(crate) const fn request_timeout(&self) -> Option<Duration> {
+        self.request_timeout
     }
 
     pub(crate) fn allow_upgrades(&self) -> bool {
@@ -1175,14 +1127,6 @@ impl StandaloneRuleTemplate {
 
     pub(crate) fn redaction(&self) -> Option<&RedactionRef> {
         self.redaction.as_ref()
-    }
-
-    pub(crate) fn local_provenance(&self) -> &DecisionProvenance {
-        &self.local_provenance
-    }
-
-    pub(crate) fn provider_provenance(&self) -> Option<&DecisionProvenance> {
-        self.provider_provenance.as_ref()
     }
 }
 
@@ -1496,33 +1440,13 @@ fn compile_sensitive_headers(
 fn compile_rule_template(
     rule: &PolicyRulePlan,
     ordinal: usize,
-    generation: PolicyGeneration,
     identity: &SnapshotIdentity,
     version: u64,
     redactions: &BTreeMap<String, RedactionRef>,
     credential_refs: &mut Vec<CredentialRef>,
 ) -> Result<StandaloneRuleTemplate, StandaloneCompileError> {
-    let id = stable_id(&rule.id)?;
     let checked_ordinal =
         u32::try_from(ordinal).map_err(|_| StandaloneCompileError::Checked("rule ordinal"))?;
-    let effective_policy = EffectivePolicy::Rule {
-        id: id.clone(),
-        ordinal: checked_ordinal,
-    };
-    let local_provenance = DecisionProvenance::new(
-        generation,
-        effective_policy.clone(),
-        DecisionReason::new(DecisionReasonCategory::Policy, 0),
-        None,
-    );
-    let provider_provenance = matches!(rule.decision, CompiledRuleDecision::Delegate).then(|| {
-        DecisionProvenance::new(
-            generation,
-            effective_policy,
-            DecisionReason::new(DecisionReasonCategory::Provider, 0),
-            None,
-        )
-    });
     let credentials = rule
         .credential_actions
         .iter()
@@ -1554,18 +1478,20 @@ fn compile_rule_template(
         .transpose()?;
     Ok(StandaloneRuleTemplate {
         ordinal: checked_ordinal,
-        decision: match rule.decision {
-            CompiledRuleDecision::Allow => StandaloneRuleDecision::Allow,
-            CompiledRuleDecision::Deny => StandaloneRuleDecision::Deny,
-            CompiledRuleDecision::Delegate => StandaloneRuleDecision::Delegate,
-        },
+        request_timeout: rule.request_timeout,
         allow_upgrades: rule.allow_upgrades,
         request_headers: compile_header_batch(&rule.request_headers)?,
         response_headers: compile_header_batch(&rule.response_headers)?,
+        credential_sources: rule
+            .credential_actions
+            .iter()
+            .map(credential_source_name)
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
         credentials,
         redaction,
-        local_provenance,
-        provider_provenance,
+        redaction_profile: rule.redaction_profile.clone(),
     })
 }
 
@@ -1769,10 +1695,7 @@ fn stable_id(value: &str) -> Result<StableId, StandaloneCompileError> {
 mod tests {
     use std::path::Path;
 
-    use http_access_types::{
-        CredentialMutationKind, DecisionReasonCategory, EffectivePolicy, HeaderField,
-        PolicyHeaderFacts,
-    };
+    use http_access_types::{CredentialMutationKind, HeaderField, PolicyHeaderFacts};
 
     use super::*;
     use crate::config::compiler::{CompiledParentProxyKind, ParentProxyPlan, ParentProxyTlsPlan};
@@ -1999,39 +1922,23 @@ header = "x-acl-proxy-request-id"
         assert_eq!(plan.rules().len(), 1);
         let rule = &plan.rules()[0];
         assert_eq!(rule.ordinal(), 0);
-        assert_eq!(rule.decision(), StandaloneRuleDecision::Delegate);
+        assert_eq!(rule.request_timeout(), None);
         assert!(rule.allow_upgrades());
         assert!(rule.request_headers().is_some());
         assert!(rule.response_headers().is_some());
         assert!(rule.redaction().unwrap().belongs_to(plan.identity()));
+        assert_eq!(rule.redaction_profile.as_deref(), Some("capture"));
         assert_eq!(rule.credentials().len(), 1);
+        assert_eq!(rule.credential_sources.as_ref(), ["rule"]);
         assert!(rule.credentials()[0]
             .credential()
             .belongs_to(plan.identity()));
-        assert!(matches!(
-            rule.local_provenance().effective_policy(),
-            EffectivePolicy::Rule { ordinal: 0, .. }
-        ));
         assert_eq!(
-            rule.local_provenance().reason().category(),
-            DecisionReasonCategory::Policy
+            plan.product_acl()
+                .provider_action_id(0)
+                .map(StableId::as_str),
+            Some("approval")
         );
-        assert_eq!(rule.local_provenance().reason().code(), 0);
-        assert!(rule.local_provenance().trace_id().is_none());
-        assert_eq!(
-            rule.provider_provenance().unwrap().reason().category(),
-            DecisionReasonCategory::Provider
-        );
-        assert!(matches!(
-            plan.default_provenance().effective_policy(),
-            EffectivePolicy::Default
-        ));
-        assert_eq!(
-            plan.default_provenance().reason().category(),
-            DecisionReasonCategory::Policy
-        );
-        assert_eq!(plan.default_provenance().reason().code(), 0);
-        assert!(plan.default_provenance().trace_id().is_none());
         assert_eq!(plan.global_credentials().len(), 1);
         assert!(matches!(
             plan.global_credentials()[0].kind(),
@@ -2047,6 +1954,32 @@ header = "x-acl-proxy-request-id"
             .mutation()
             .credential()
             .belongs_to(plan.identity()));
+    }
+
+    #[test]
+    fn bound_provider_requires_the_exact_acl_action_id() {
+        let identity = SnapshotIdentity::new();
+        let providers = ProviderRegistry::from_names(["alpha".to_owned(), "beta".to_owned()]);
+        let bindings = StandaloneActivatedBindings {
+            global_credentials: Box::new([]),
+            rule_credentials: Box::new([]),
+            rule_providers: vec![Some(BoundRuleProvider {
+                action_id: stable_id("alpha").unwrap(),
+                provider: providers.get("alpha").unwrap(),
+            })]
+            .into_boxed_slice(),
+            rule_redactions: Box::new([]),
+            provider_outputs: Box::new([]),
+        };
+        let alpha = ProductActionRef::new(&identity, stable_id("alpha").unwrap());
+        let beta = ProductActionRef::new(&identity, stable_id("beta").unwrap());
+
+        assert_eq!(
+            bindings.provider_for_action(0, &alpha),
+            providers.get("alpha")
+        );
+        assert_eq!(bindings.provider_for_action(0, &beta), None);
+        assert_eq!(bindings.provider_for_action(1, &alpha), None);
     }
 
     #[test]

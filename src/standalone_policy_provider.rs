@@ -4,13 +4,16 @@ use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use http::header::{HeaderMap, HeaderName, CONTENT_TYPE};
+use http_access_policy_acl::{
+    EvaluationInput, MatchedEffects, PolicyEvaluation, ProviderDisposition,
+};
 use http_access_runtime::{
     BodyBounds, BodyBudget, BodyBudgetActivation, BoxFuture, Clock, DecisionProvider,
     ProviderOutcome, RuntimeBody, RuntimeRequest, RuntimeResponse, StandaloneExchange,
 };
 use http_access_types::{
-    BodyFraming, BodyObservationState, BodyRepresentation, HttpVersion, PolicyHeaderFacts,
-    RequestBinding, TrailerPolicy,
+    BodyFraming, BodyObservation, BodyObservationState, BodyRepresentation, DecisionProvenance,
+    EffectivePolicy, HttpVersion, PolicyHeaderFacts, RequestBinding, TrailerPolicy,
 };
 use hyper::body::HttpBody;
 use tokio::time::Instant;
@@ -25,7 +28,7 @@ use crate::credentials::InboundCredentials;
 use crate::destination::DestinationGuard;
 use crate::egress::OriginProtocol;
 use crate::http_body::{read_mandatory_runtime_request_body, HttpBodyReadError};
-use crate::policy::{PolicyOutcome, PreparedPolicyEvaluation};
+use crate::policy::{HttpWireBodyPlanIndex, ProductRuleEffectsRef};
 use crate::proxy::facts::{FactsError, SanitizedStandaloneIngress, ValidatedStandaloneIngress};
 use crate::proxy::forward::{
     resolve_forwarding_target, PreflightForwardingTarget, PreparedForwardingTarget,
@@ -151,7 +154,9 @@ pub(crate) enum StandaloneResponseBodyProvenance {
 struct PreparedDecision {
     terminal: Option<PreparedTerminalState>,
     initial_binding: RequestBinding,
-    evaluation: PreparedPolicyEvaluation,
+    evaluation: PolicyEvaluation<ProductRuleEffectsRef>,
+    body_read_plan: HttpBodyReadPlan,
+    wire_body_plan: HttpWireBodyPlanIndex,
     request_id: String,
     headers: HeaderMap,
     inbound: InboundCredentials,
@@ -254,6 +259,8 @@ pub(crate) enum StandaloneProviderPrepareError {
     Deadline,
     #[error("request body contract is invalid")]
     Body(#[from] http_access_runtime::RuntimeError),
+    #[error("request policy evaluation failed")]
+    Policy,
 }
 
 impl<T> StandalonePolicyProvider<T>
@@ -338,17 +345,42 @@ where
             )
             .map_err(|_| StandaloneProviderPrepareError::Target)?;
 
-        let evaluation = lease.policy().evaluate(
-            facts.url(),
+        let evaluation_input = EvaluationInput::new(
+            &facts,
             input.peer_ip,
-            facts.method(),
-            &headers,
-            &|name| inbound.is_present(name) || internal_context.contains_key(name),
-        );
-        let request_timeout = evaluation
-            .matched
-            .as_ref()
-            .and_then(crate::policy::PolicyRuleMatch::request_timeout)
+            &header_facts,
+            RuntimeRequest::INITIAL_REVISION,
+            BodyRepresentation::PreservedContentCoded,
+            BodyObservation::unobserved(),
+        )
+        .map_err(|_| StandaloneProviderPrepareError::Policy)?;
+        let initial_binding = evaluation_input.request_binding();
+        let evaluation = lease
+            .standalone()
+            .product_acl()
+            .snapshot()
+            .evaluate(&evaluation_input)
+            .map_err(|_| StandaloneProviderPrepareError::Policy)?;
+        let resource_cursor = lease
+            .standalone()
+            .product_acl()
+            .resource_cursor(policy_provenance(&evaluation))
+            .map_err(|_| StandaloneProviderPrepareError::Policy)?;
+        let body_read_plan = lease
+            .standalone()
+            .product_acl()
+            .resources()
+            .body_read_plan(resource_cursor)
+            .ok_or(StandaloneProviderPrepareError::Policy)?;
+        let wire_body_plan = lease
+            .standalone()
+            .product_acl()
+            .resources()
+            .wire_body_plan(resource_cursor)
+            .ok_or(StandaloneProviderPrepareError::Policy)?;
+        let request_timeout = policy_rule_ordinal(policy_provenance(&evaluation))
+            .and_then(|ordinal| lease.standalone().rules().get(ordinal))
+            .and_then(crate::standalone::StandaloneRuleTemplate::request_timeout)
             .unwrap_or_else(|| lease.request_timeout());
         let deadline = input
             .started_at
@@ -360,8 +392,8 @@ where
             .ok_or(StandaloneProviderPrepareError::Deadline)?;
         let early_deny = input.listener_denied
             || lease.safety().contains_loop_marker(&headers)
-            || evaluation.outcome == PolicyOutcome::Deny
-            || upgrade_is_disallowed(facts.upgrade().is_some(), &evaluation);
+            || matches!(evaluation, PolicyEvaluation::Deny { .. })
+            || upgrade_is_disallowed(lease.standalone(), facts.upgrade().is_some(), &evaluation);
 
         let body_policy = if facts.upgrade().is_some() {
             lease.standalone().upgrade_request_body()
@@ -404,14 +436,14 @@ where
             body,
             absolute_deadline_millis,
         )?;
-        let initial_binding = request.binding()?;
-        if request.body_observation()?.state() != BodyObservationState::Unobserved {
+        if request.binding()? != initial_binding
+            || request.body_observation()?.state() != BodyObservationState::Unobserved
+        {
             return Err(StandaloneProviderPrepareError::Body(
                 http_access_runtime::RuntimeError::InvalidInput,
             ));
         }
         let responses = PreparedResponses::new(&request, input.clock.clone())?;
-        let evaluation = evaluation.into_prepared();
         let prepared = PreparedDecision {
             terminal: Some(PreparedTerminalState {
                 generation: lease,
@@ -423,6 +455,8 @@ where
             }),
             initial_binding,
             evaluation,
+            body_read_plan,
+            wire_body_plan,
             request_id: input.request_id,
             headers,
             inbound,
@@ -464,13 +498,14 @@ where
         {
             return Err(500);
         }
-        let mut evaluation = generation
-            .policy()
-            .resolve_prepared(state.evaluation)
-            .ok_or(500_u16)?;
+        let mut evaluation = state.evaluation;
         if state.early_deny
-            || evaluation.outcome == PolicyOutcome::Deny
-            || upgrade_is_disallowed(request.facts().upgrade().is_some(), &evaluation)
+            || matches!(evaluation, PolicyEvaluation::Deny { .. })
+            || upgrade_is_disallowed(
+                generation.standalone(),
+                request.facts().upgrade().is_some(),
+                &evaluation,
+            )
         {
             let close_connection = !state.ingress_body_complete;
             self.record_denial(
@@ -501,7 +536,7 @@ where
 
         let admission = generation
             .safety()
-            .begin_http_body(evaluation.wire_body_plan(), state.quota_key)
+            .begin_http_body(state.wire_body_plan, state.quota_key)
             .map_err(|error| match error {
                 crate::safety::HttpBodyAdmissionError::Resource(_) => 503_u16,
                 crate::safety::HttpBodyAdmissionError::UnknownPlan => 500_u16,
@@ -528,7 +563,7 @@ where
         let body_read_plan = if request.facts().upgrade().is_some() {
             HttpBodyReadPlan::Disabled
         } else {
-            evaluation.body_read_plan()
+            state.body_read_plan
         };
         let mut inspected = match body_read_plan {
             HttpBodyReadPlan::Disabled => None,
@@ -554,15 +589,19 @@ where
             if Instant::now() >= deadline {
                 return Err(504);
             }
-            if upgrade_is_disallowed(request.facts().upgrade().is_some(), &evaluation) {
+            if upgrade_is_disallowed(
+                generation.standalone(),
+                request.facts().upgrade().is_some(),
+                &evaluation,
+            ) {
                 return Err(403);
             }
-            match evaluation.outcome {
-                PolicyOutcome::Allow => {
-                    let ordinal = evaluation
-                        .matched
-                        .as_ref()
-                        .map(crate::policy::PolicyRuleMatch::index);
+            match evaluation {
+                PolicyEvaluation::Allow {
+                    provenance,
+                    effects,
+                } => {
+                    let ordinal = policy_rule_ordinal(&provenance);
                     validate_redaction_limits(generation, ordinal, inspected.as_ref())?;
                     let inspected_body = if request.facts().upgrade().is_some() {
                         drop(inspected.take());
@@ -572,7 +611,8 @@ where
                     };
                     let allowed = adapt_local_allow(
                         generation,
-                        ordinal,
+                        effects,
+                        &provenance,
                         inspected_body,
                         guard,
                         replay_lease,
@@ -582,11 +622,8 @@ where
                     let terminal = state.terminal.take().ok_or(500_u16)?;
                     return self.finish_forward(resolved, allowed, terminal);
                 }
-                PolicyOutcome::Deny => {
-                    let ordinal = evaluation
-                        .matched
-                        .as_ref()
-                        .map(crate::policy::PolicyRuleMatch::index);
+                PolicyEvaluation::Deny { provenance } => {
+                    let ordinal = policy_rule_ordinal(&provenance);
                     self.record_inspected_denial(
                         &mut state.headers,
                         generation,
@@ -597,153 +634,205 @@ where
                     );
                     return Err(403);
                 }
-                PolicyOutcome::Delegate => {}
-            }
-
-            let matched = evaluation
-                .matched
-                .take()
-                .expect("delegate policy outcomes identify one rule");
-            let ordinal = matched.index();
-            let provider = matched.authorization_provider().ok_or(500_u16)?;
-            let metadata = generation
-                .authorization()
-                .provider_metadata(provider)
-                .ok_or(500_u16)?;
-            if metadata.include_request_body && inspected.is_none() {
-                if request.facts().upgrade().is_some()
-                    && matches!(
-                        request.facts().body().framing(),
-                        BodyFraming::None | BodyFraming::ContentLength(0)
-                    )
-                {
-                    inspected = Some(InspectedBody {
-                        content_type: content_type.clone(),
-                        encoded_len: 0,
-                        decoded: guard.buffer().finish(),
-                    });
-                } else {
-                    return Err(500);
-                }
-            }
-            validate_provider_limits(generation, ordinal, metadata, inspected.as_ref())?;
-            let selected = provider_header_values(
-                metadata.include_headers,
-                &state.headers,
-                &state.internal_context,
-                &state.inbound,
-                provider,
-            )
-            .map_err(|_| 500_u16)?;
-            let included = selected
-                .iter()
-                .map(|(name, values)| IncludedHeader::new(name, values))
-                .collect::<Vec<_>>();
-            let provider_headers = ProviderRequestHeaders::new(&included).map_err(|_| 500_u16)?;
-            let peer_ip = state.peer_ip.to_string();
-            let provider_body = metadata.include_request_body.then(|| {
-                let body = inspected
-                    .as_ref()
-                    .expect("body-including providers require mandatory inspection");
-                GuardedProviderBody {
-                    content_type: body.content_type.as_deref(),
-                    content_encoding: Some("identity"),
-                    decoded: &body.decoded,
-                }
-            });
-            let provider_request = ProviderRequest {
-                request_id: &state.request_id,
-                url: request.facts().url().as_str(),
-                method: request.facts().method().as_str(),
-                client_ip: &peer_ip,
-                headers: (!included.is_empty()).then_some(&provider_headers),
-                body: provider_body,
-            };
-            let decision = generation
-                .dispatch_authorization(provider, matched.id(), provider_request, &guard, deadline)
-                .await;
-            if Instant::now() >= deadline {
-                return Err(504);
-            }
-            let decision = match decision {
-                Ok(decision) => decision,
-                Err(_) if metadata.failure_mode == CompiledProviderFailureMode::Deny => {
-                    self.record_inspected_denial(
-                        &mut state.headers,
-                        generation,
-                        Some(ordinal),
-                        &guard,
-                        inspected.take(),
-                        !state.ingress_body_complete,
-                    );
-                    return Err(403);
-                }
-                Err(error) if error.is_timeout() || Instant::now() >= deadline => return Err(504),
-                Err(_) => return Err(500),
-            };
-
-            match decision {
-                AuthorizationDecision::Allow(output) => {
-                    let original_body_consumed = inspected.is_some() || state.ingress_body_complete;
-                    let inspected_body = if request.facts().upgrade().is_some() {
-                        drop(inspected.take());
-                        None
-                    } else {
-                        inspected.take().map(|body| body.decoded)
+                PolicyEvaluation::Delegate(delegated) => {
+                    let ordinal = policy_rule_ordinal(delegated.provenance()).ok_or(500_u16)?;
+                    let action = generation
+                        .standalone()
+                        .product_acl()
+                        .delegated_action(&delegated)
+                        .map_err(|_| 500_u16)?;
+                    let rule_id = match delegated.provenance().effective_policy() {
+                        EffectivePolicy::Rule { id, .. } => id.as_str(),
+                        EffectivePolicy::Default => return Err(500),
                     };
-                    let allowed = match adapt_provider_allow(
-                        generation,
-                        ordinal,
+                    let provider = generation
+                        .standalone()
+                        .activated()
+                        .provider_for_action(ordinal, action)
+                        .ok_or(500_u16)?;
+                    let metadata = generation
+                        .authorization()
+                        .provider_metadata(provider)
+                        .ok_or(500_u16)?;
+                    if metadata.include_request_body && inspected.is_none() {
+                        if request.facts().upgrade().is_some()
+                            && matches!(
+                                request.facts().body().framing(),
+                                BodyFraming::None | BodyFraming::ContentLength(0)
+                            )
+                        {
+                            inspected = Some(InspectedBody {
+                                content_type: content_type.clone(),
+                                encoded_len: 0,
+                                decoded: guard.buffer().finish(),
+                            });
+                        } else {
+                            return Err(500);
+                        }
+                    }
+                    validate_provider_limits(generation, ordinal, metadata, inspected.as_ref())?;
+                    let selected = provider_header_values(
+                        metadata.include_headers,
+                        &state.headers,
+                        &state.internal_context,
+                        &state.inbound,
                         provider,
-                        output,
-                        inspected_body,
-                        guard,
-                        replay_lease,
-                        request,
-                    ) {
-                        Ok(allowed) => allowed,
-                        Err(failure) => {
-                            let provenance = failure.provider_replacement_size().map_or(
+                    )
+                    .map_err(|_| 500_u16)?;
+                    let included = selected
+                        .iter()
+                        .map(|(name, values)| IncludedHeader::new(name, values))
+                        .collect::<Vec<_>>();
+                    let provider_headers =
+                        ProviderRequestHeaders::new(&included).map_err(|_| 500_u16)?;
+                    let peer_ip = state.peer_ip.to_string();
+                    let provider_body = metadata.include_request_body.then(|| {
+                        let body = inspected
+                            .as_ref()
+                            .expect("body-including providers require mandatory inspection");
+                        GuardedProviderBody {
+                            content_type: body.content_type.as_deref(),
+                            content_encoding: Some("identity"),
+                            decoded: &body.decoded,
+                        }
+                    });
+                    let provider_request = ProviderRequest {
+                        request_id: &state.request_id,
+                        url: request.facts().url().as_str(),
+                        method: request.facts().method().as_str(),
+                        client_ip: &peer_ip,
+                        headers: (!included.is_empty()).then_some(&provider_headers),
+                        body: provider_body,
+                    };
+                    let decision = generation
+                        .dispatch_authorization(
+                            provider,
+                            rule_id,
+                            provider_request,
+                            &guard,
+                            deadline,
+                        )
+                        .await;
+                    if Instant::now() >= deadline {
+                        return Err(504);
+                    }
+                    let decision = match decision {
+                        Ok(decision) => decision,
+                        Err(_) if metadata.failure_mode == CompiledProviderFailureMode::Deny => {
+                            let policy_result = resolve_delegate(
+                                generation,
+                                delegated,
+                                ProviderDisposition::Deny,
+                                &request,
+                                state.peer_ip,
+                            )?;
+                            if !matches!(policy_result, PolicyEvaluation::Deny { .. }) {
+                                return Err(500);
+                            }
+                            self.record_inspected_denial(
+                                &mut state.headers,
+                                generation,
+                                Some(ordinal),
+                                &guard,
+                                inspected.take(),
+                                !state.ingress_body_complete,
+                            );
+                            return Err(403);
+                        }
+                        Err(error) if error.is_timeout() || Instant::now() >= deadline => {
+                            return Err(504)
+                        }
+                        Err(_) => return Err(500),
+                    };
+
+                    match decision {
+                        AuthorizationDecision::Allow(output) => {
+                            let policy_result = resolve_delegate(
+                                generation,
+                                delegated,
+                                ProviderDisposition::Allow,
+                                &request,
+                                state.peer_ip,
+                            )?;
+                            let PolicyEvaluation::Allow {
+                                provenance,
+                                effects: MatchedEffects::Rule(effects),
+                            } = policy_result
+                            else {
+                                return Err(500);
+                            };
+                            let original_body_consumed =
+                                inspected.is_some() || state.ingress_body_complete;
+                            let inspected_body = if request.facts().upgrade().is_some() {
+                                drop(inspected.take());
+                                None
+                            } else {
+                                inspected.take().map(|body| body.decoded)
+                            };
+                            let allowed =
+                                match adapt_provider_allow(
+                                    generation,
+                                    effects,
+                                    &provenance,
+                                    provider,
+                                    output,
+                                    inspected_body,
+                                    guard,
+                                    replay_lease,
+                                    request,
+                                ) {
+                                    Ok(allowed) => allowed,
+                                    Err(failure) => {
+                                        let provenance = failure.provider_replacement_size().map_or(
                                 StandaloneResponseBodyProvenance::Unconsumed,
                                 |size| StandaloneResponseBodyProvenance::ProviderReplacement {
                                     size,
                                 },
                             );
-                            let status = adapter_error_status(failure.into_error());
-                            self.record_denial(
-                                &mut state.headers,
-                                None,
-                                provenance,
-                                !original_body_consumed,
-                            );
-                            return Err(status);
+                                        let status = adapter_error_status(failure.into_error());
+                                        self.record_denial(
+                                            &mut state.headers,
+                                            None,
+                                            provenance,
+                                            !original_body_consumed,
+                                        );
+                                        return Err(status);
+                                    }
+                                };
+                            let terminal = state.terminal.take().ok_or(500_u16)?;
+                            return self.finish_forward(resolved, allowed, terminal);
                         }
-                    };
-                    let terminal = state.terminal.take().ok_or(500_u16)?;
-                    return self.finish_forward(resolved, allowed, terminal);
-                }
-                AuthorizationDecision::Deny => {
-                    self.record_inspected_denial(
-                        &mut state.headers,
-                        generation,
-                        Some(ordinal),
-                        &guard,
-                        inspected.take(),
-                        !state.ingress_body_complete,
-                    );
-                    return Err(403);
-                }
-                AuthorizationDecision::Pass => {
-                    evaluation = matched.resume_cursor().resume(
-                        request.facts().url(),
-                        state.peer_ip,
-                        request.facts().method(),
-                        &state.headers,
-                        |name| {
-                            state.inbound.is_present(name)
-                                || state.internal_context.contains_key(name)
-                        },
-                    );
+                        AuthorizationDecision::Deny => {
+                            let policy_result = resolve_delegate(
+                                generation,
+                                delegated,
+                                ProviderDisposition::Deny,
+                                &request,
+                                state.peer_ip,
+                            )?;
+                            if !matches!(policy_result, PolicyEvaluation::Deny { .. }) {
+                                return Err(500);
+                            }
+                            self.record_inspected_denial(
+                                &mut state.headers,
+                                generation,
+                                Some(ordinal),
+                                &guard,
+                                inspected.take(),
+                                !state.ingress_body_complete,
+                            );
+                            return Err(403);
+                        }
+                        AuthorizationDecision::Pass => {
+                            evaluation = resolve_delegate(
+                                generation,
+                                delegated,
+                                ProviderDisposition::Pass,
+                                &request,
+                                state.peer_ip,
+                            )?;
+                        }
+                    }
                 }
             }
         }
@@ -1122,16 +1211,56 @@ fn ingress_protocol(version: HttpVersion) -> OriginProtocol {
     }
 }
 
+fn policy_provenance(evaluation: &PolicyEvaluation<ProductRuleEffectsRef>) -> &DecisionProvenance {
+    match evaluation {
+        PolicyEvaluation::Allow { provenance, .. } | PolicyEvaluation::Deny { provenance } => {
+            provenance
+        }
+        PolicyEvaluation::Delegate(delegated) => delegated.provenance(),
+    }
+}
+
+fn policy_rule_ordinal(provenance: &DecisionProvenance) -> Option<usize> {
+    match provenance.effective_policy() {
+        EffectivePolicy::Default => None,
+        EffectivePolicy::Rule { ordinal, .. } => usize::try_from(*ordinal).ok(),
+    }
+}
+
+fn resolve_delegate(
+    generation: &GenerationLease,
+    delegated: http_access_policy_acl::DelegateMatch<ProductRuleEffectsRef>,
+    disposition: ProviderDisposition,
+    request: &RuntimeRequest,
+    peer_ip: IpAddr,
+) -> Result<PolicyEvaluation<ProductRuleEffectsRef>, u16> {
+    let input = EvaluationInput::new(
+        request.facts(),
+        peer_ip,
+        request.policy_header_facts(),
+        RuntimeRequest::INITIAL_REVISION,
+        BodyRepresentation::PreservedContentCoded,
+        BodyObservation::unobserved(),
+    )
+    .map_err(|_| 500_u16)?;
+    generation
+        .standalone()
+        .product_acl()
+        .snapshot()
+        .resolve_delegate(delegated, disposition, &input)
+        .map_err(|_| 500_u16)
+}
+
 fn upgrade_is_disallowed(
+    generation: &crate::standalone::StandaloneGenerationPlan,
     upgrade_intent: bool,
-    evaluation: &crate::policy::PolicyEvaluation<'_>,
+    evaluation: &PolicyEvaluation<ProductRuleEffectsRef>,
 ) -> bool {
     upgrade_intent
-        && evaluation.outcome != PolicyOutcome::Deny
-        && !evaluation
-            .matched
-            .as_ref()
-            .is_some_and(crate::policy::PolicyRuleMatch::allows_upgrades)
+        && !matches!(evaluation, PolicyEvaluation::Deny { .. })
+        && !policy_rule_ordinal(policy_provenance(evaluation))
+            .and_then(|ordinal| generation.rules().get(ordinal))
+            .is_some_and(crate::standalone::StandaloneRuleTemplate::allow_upgrades)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
