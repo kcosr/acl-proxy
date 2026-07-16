@@ -21,7 +21,6 @@ use crate::observation::{
     CaptureBody, CaptureBodyBuilder, CaptureOperation, CaptureScratch, CaptureWorkspace,
     CaptureWorkspaceAllocation,
 };
-use crate::redaction::ProfileHandle;
 use crate::safety::allocation::{
     AllocationAuthority, StableBody, StableBodyBuilder, StableScratch, StableWorkspace,
     StableWorkspaceAllocation,
@@ -31,6 +30,7 @@ use crate::safety::wire_body::{
     WireAllocationAuthority, WireBodyBufferError, MAX_BUFFER_GROWTH_BYTES,
 };
 use crate::safety::{GuardedBody, HttpWireBodyGuard};
+use http_access_redaction::RedactionProfile;
 
 pub(crate) const HTTP_DECODER_OUTPUT_STAGING_BYTES: usize = 64 * 1024;
 
@@ -559,7 +559,7 @@ pub(crate) fn decode_capture_http_body(
     encoding: CaptureContentEncoding,
     encoded: CaptureBody,
     operation: &CaptureOperation,
-    profile: &ProfileHandle,
+    profile: &RedactionProfile,
     max_expansion_ratio: usize,
 ) -> Result<CaptureBody, CaptureHttpDecodeError> {
     poll_capture_decode(decode_capture_http_body_inner(
@@ -575,21 +575,21 @@ async fn decode_capture_http_body_inner(
     encoding: CaptureContentEncoding,
     encoded: CaptureBody,
     operation: &CaptureOperation,
-    profile: &ProfileHandle,
+    profile: &RedactionProfile,
     max_expansion_ratio: usize,
 ) -> Result<CaptureBody, CaptureHttpDecodeError> {
     operation
         .validate_body(&encoded)
         .map_err(|_| CaptureHttpDecodeError::ResourceExhausted)?;
     let limits = profile.limits();
-    if encoded.len() > limits.max_body_bytes {
+    if encoded.len() > limits.max_body_bytes() {
         return Err(CaptureHttpDecodeError::EncodedLimitExceeded);
     }
     decode_complete_http_body(
         encoding,
         encoded,
         operation,
-        limits.max_decoded_body_bytes,
+        limits.max_decoded_body_bytes(),
         max_expansion_ratio,
         DecodeControl::capture(),
     )
@@ -1769,7 +1769,6 @@ fn validate_zstd_frame_window(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::io::Write;
     use std::net::{IpAddr, Ipv4Addr};
     use std::path::PathBuf;
@@ -1797,11 +1796,10 @@ mod tests {
 
     use crate::capture::CaptureSinkSpec;
     use crate::config::compiler::{
-        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledRedactionPayloads,
-        ObservationPlan, RedactionPlan, RedactionProfilePlan, RedactionRulePlan,
+        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, ObservationPlan,
     };
     use crate::observation::{CapturePool, ProductObservationSnapshot};
-    use crate::redaction::RedactionSnapshot;
+    use crate::redaction::{test_snapshot, TestProfile};
     use crate::safety::wire_body::{
         guarded_body_allocation_bytes, guarded_workspace_allocation_bytes, WireBodyPool,
         WireBodyQuotaKey,
@@ -2071,30 +2069,19 @@ mod tests {
         limit: usize,
         max_encoded: usize,
         max_decoded: usize,
-    ) -> (CaptureOperation, ProfileHandle, Arc<CapturePool>) {
-        let mut profiles = BTreeMap::new();
-        profiles.insert(
-            "capture".to_owned(),
-            RedactionProfilePlan {
-                replacement: b"[REDACTED]".to_vec(),
-                max_body_bytes: max_encoded,
-                max_decoded_body_bytes: max_decoded,
-                max_frame_bytes: max_encoded,
-                max_message_bytes: max_decoded,
-                allow_permessage_deflate: false,
-                max_environment_literal_sources: 1,
-                max_environment_literal_bytes: 64,
-                max_environment_literal_total_bytes: 64,
-                rules: vec![RedactionRulePlan {
-                    literals: vec![b"secret".to_vec()],
-                    literal_environment_variables: Vec::new(),
-                    expressions: Vec::new(),
-                    payloads: CompiledRedactionPayloads::Both,
-                }],
-            },
-        );
-        let redaction = RedactionSnapshot::activate(RedactionPlan { profiles }, || false).unwrap();
-        let profile = redaction.profile("capture").unwrap();
+    ) -> (CaptureOperation, RedactionProfile, Arc<CapturePool>) {
+        let (redaction, references) = test_snapshot(vec![TestProfile {
+            name: "capture".to_owned(),
+            replacement: b"[REDACTED]".to_vec(),
+            max_body_bytes: max_encoded,
+            max_decoded_body_bytes: max_decoded,
+            max_frame_bytes: max_encoded,
+            max_message_bytes: max_decoded,
+            allow_permessage_deflate: false,
+            literals: vec![b"secret".to_vec()],
+        }]);
+        let reference = references.get("capture").unwrap();
+        let profile = redaction.profile(reference).unwrap();
         let pool = CapturePool::new();
         let activation = ProductObservationSnapshot::activate(
             ObservationPlan {
@@ -2115,6 +2102,7 @@ mod tests {
                 ..ObservationPlan::default()
             },
             &redaction,
+            Some(reference),
             pool.clone(),
         )
         .unwrap();

@@ -27,7 +27,7 @@ use crate::upgrade::UpgradeAllocation;
 
 pub(crate) struct StandaloneUpgradeBinding {
     pub(crate) allocation: UpgradeAllocation,
-    pub(crate) wire_redaction: Option<crate::redaction::ProfileHandle>,
+    pub(crate) wire_redaction: Option<http_access_redaction::RedactionProfile>,
 }
 
 pub(crate) struct StandaloneProviderAllow {
@@ -403,7 +403,7 @@ fn adapt_provider_allow_inner(
         drop(inspected_body);
         let redaction = generation.activated().rule_redaction(rule_ordinal);
         let redaction_limit = redaction
-            .map(|binding| binding.handle().limits().max_decoded_body_bytes)
+            .map(|binding| binding.handle().limits().max_decoded_body_bytes())
             .unwrap_or(usize::MAX);
         let (content_type, content_encoding, decoded) = replacement
             .decode_with_limits(
@@ -422,13 +422,11 @@ fn adapt_provider_allow_inner(
         }
         let content_type = content_type_batch(content_type)?;
         let replacement = match redaction {
-            Some(binding) => {
-                binding
-                    .handle()
-                    .redact_guarded_decoded_http_body(&guard, decoded)
-                    .map_err(|_| StandaloneProviderAllowError::Redaction)?
-                    .body
-            }
+            Some(binding) => binding
+                .handle()
+                .redact_http_body(&guard, decoded)
+                .map_err(|_| StandaloneProviderAllowError::Redaction)?
+                .into_body(),
             None => decoded,
         };
         let replacement_length =
@@ -523,13 +521,11 @@ fn redact_and_rehome(
 ) -> Result<(), StandaloneProviderAllowError> {
     let body = match rule_ordinal.and_then(|ordinal| generation.activated().rule_redaction(ordinal))
     {
-        Some(binding) => {
-            binding
-                .handle()
-                .redact_guarded_decoded_http_body(guard, body)
-                .map_err(|_| StandaloneProviderAllowError::Redaction)?
-                .body
-        }
+        Some(binding) => binding
+            .handle()
+            .redact_http_body(guard, body)
+            .map_err(|_| StandaloneProviderAllowError::Redaction)?
+            .into_body(),
         None => body,
     };
     let length = u64::try_from(body.len()).map_err(|_| StandaloneProviderAllowError::Binding)?;

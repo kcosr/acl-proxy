@@ -39,9 +39,6 @@ impl GenerationId {
 pub(crate) struct ProviderIndex(usize);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct RedactionProfileIndex(usize);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct CredentialSourceIndex(usize);
 
 macro_rules! index_registry {
@@ -91,18 +88,6 @@ impl ProviderRegistry {
     }
 }
 index_registry!(
-    RedactionProfileRegistry,
-    RedactionProfileIndex,
-    "RedactionProfileRegistry"
-);
-
-#[cfg(test)]
-impl RedactionProfileRegistry {
-    pub(crate) fn len(&self) -> usize {
-        self.indices.len()
-    }
-}
-index_registry!(
     CredentialSourceRegistry,
     CredentialSourceIndex,
     "CredentialSourceRegistry"
@@ -131,15 +116,6 @@ mod index_registry_tests {
         assert_eq!(forward.get("alpha-provider").unwrap().get(), 0);
         assert_eq!(forward.get("omega-provider").unwrap().get(), 1);
         assert!(!format!("{forward:?}").contains("alpha-provider"));
-    }
-
-    #[test]
-    fn registry_domains_assign_their_own_non_forgeable_indices() {
-        let credentials = CredentialSourceRegistry::from_names(["shared".to_string()]);
-        let profiles = RedactionProfileRegistry::from_names(["shared".to_string()]);
-
-        assert_eq!(credentials.get("shared").unwrap().get(), 0);
-        assert_eq!(profiles.get("shared").unwrap().get(), 0);
     }
 }
 

@@ -25,7 +25,7 @@ use crate::observation::{
     CaptureAllocationError, CaptureBody as OwnedCaptureBody, CaptureEpoch, CaptureExactBytes,
     CaptureOperation,
 };
-use crate::redaction::{PayloadClass, SnapshotError as RedactionSnapshotError};
+use http_access_redaction::{PayloadClass, RedactionError};
 
 mod tap;
 mod worker;
@@ -381,7 +381,7 @@ enum CaptureArtifactProcessError {
     #[error("capture HTTP decode omitted the payload")]
     HttpDecode(#[from] CaptureHttpDecodeError),
     #[error("capture redaction omitted the payload")]
-    Redaction(#[from] RedactionSnapshotError),
+    Redaction(#[from] RedactionError),
     #[error("capture artifact encoding omitted the payload")]
     Artifact(#[from] CaptureArtifactBodyError),
     #[error("capture WebSocket compression is not enabled by the selected profile")]
@@ -530,13 +530,14 @@ impl CaptureArtifactJob {
                 )?;
                 let redacted = policy
                     .profile()
-                    .redact_capture_decoded_http_body(&self.operation, decoded)?;
-                if redacted.body.is_empty() {
+                    .redact_http_body(&self.operation, decoded)?
+                    .into_body();
+                if redacted.is_empty() {
                     return Ok(None);
                 }
                 let body = CaptureArtifactBody::encode(
                     &self.operation,
-                    redacted.body,
+                    redacted,
                     policy.max_body_bytes(),
                     content_type,
                     content_encoding_present.then(|| "identity".to_owned()),
@@ -550,28 +551,28 @@ impl CaptureArtifactJob {
             } => {
                 let limits = policy.profile().limits();
                 let decoded = if compressed {
-                    if !limits.allow_permessage_deflate {
+                    if !limits.allow_permessage_deflate() {
                         return Err(CaptureArtifactProcessError::UnsupportedWebSocketCompression);
                     }
                     decode_capture_websocket_permessage_deflate(
                         encoded,
                         &self.operation,
-                        limits.max_message_bytes,
+                        limits.max_message_bytes(),
                     )?
                 } else {
                     encoded
                 };
-                let redacted = policy.profile().redact_capture_websocket_message(
-                    &self.operation,
-                    decoded,
-                    class,
-                )?;
-                if redacted.body.is_empty() {
+                let redacted =
+                    policy
+                        .profile()
+                        .redact_websocket_message(&self.operation, decoded, class)?;
+                let redacted = redacted.into_body();
+                if redacted.is_empty() {
                     return Ok(None);
                 }
                 let body = CaptureArtifactBody::encode(
                     &self.operation,
-                    redacted.body,
+                    redacted,
                     policy.max_body_bytes(),
                     None,
                     None,
@@ -1379,16 +1380,14 @@ fn sync_capture_file(file: &File) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::io::Write as _;
 
     use super::*;
     use crate::config::compiler::{
-        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledRedactionPayloads,
-        ObservationPlan, RedactionPlan, RedactionProfilePlan, RedactionRulePlan,
+        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, ObservationPlan,
     };
     use crate::observation::{CapturePool, ProductObservationSnapshot};
-    use crate::redaction::RedactionSnapshot;
+    use crate::redaction::{test_snapshot, TestProfile};
     use crate::runtime::GenerationOwner;
     use flate2::write::GzEncoder;
     use flate2::{Compress, Compression, FlushCompress, Status};
@@ -1451,29 +1450,16 @@ mod tests {
         Arc<crate::observation::CaptureEpoch>,
         Arc<dyn GenerationOwner>,
     ) {
-        let mut profiles = BTreeMap::new();
-        profiles.insert(
-            "capture".to_owned(),
-            RedactionProfilePlan {
-                replacement: b"REDACTED".to_vec(),
-                max_body_bytes: 1024,
-                max_decoded_body_bytes: 1024,
-                max_frame_bytes: 1024,
-                max_message_bytes: 1024,
-                allow_permessage_deflate,
-                max_environment_literal_sources: 0,
-                max_environment_literal_bytes: 0,
-                max_environment_literal_total_bytes: 0,
-                rules: vec![RedactionRulePlan {
-                    literals: vec![b"secret".to_vec()],
-                    literal_environment_variables: Vec::new(),
-                    expressions: Vec::new(),
-                    payloads: CompiledRedactionPayloads::Both,
-                }],
-            },
-        );
-        let redaction = RedactionSnapshot::activate(RedactionPlan { profiles }, || false)
-            .expect("redaction activation");
+        let (redaction, references) = test_snapshot(vec![TestProfile {
+            name: "capture".to_owned(),
+            replacement: b"REDACTED".to_vec(),
+            max_body_bytes: 1024,
+            max_decoded_body_bytes: 1024,
+            max_frame_bytes: 1024,
+            max_message_bytes: 1024,
+            allow_permessage_deflate,
+            literals: vec![b"secret".to_vec()],
+        }]);
         let pool = CapturePool::new();
         let activation = ProductObservationSnapshot::activate(
             ObservationPlan {
@@ -1497,6 +1483,7 @@ mod tests {
                 ..ObservationPlan::default()
             },
             &redaction,
+            references.get("capture"),
             pool.clone(),
         )
         .expect("observation activation");

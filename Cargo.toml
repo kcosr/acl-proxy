@@ -23,7 +23,6 @@ ipnet = { version = "2.9", features = ["serde"] }
 if-addrs = { version = "0.15.0", features = ["link-local"] }
 idna = "1.1"
 regex = "1.11"
-regex-automata = { version = "0.4.13", default-features = false, features = ["std", "syntax", "dfa-build", "dfa-search", "unicode"] }
 memchr = "2.7"
 zeroize = "1.9"
 allocator-api2 = "0.2"
@@ -60,6 +59,7 @@ http-access-types = { path = "../access-runtime/crates/http-access-types", versi
 http-access-url = { path = "../access-runtime/crates/http-access-url", version = "=0.1.0" }
 http-access-runtime = { path = "../access-runtime/crates/http-access-runtime", version = "=0.1.0" }
 http-access-policy-acl = { path = "../access-runtime/crates/http-access-policy-acl", version = "=0.1.0" }
+http-access-redaction = { path = "../access-runtime/crates/http-access-redaction", version = "=0.1.0" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

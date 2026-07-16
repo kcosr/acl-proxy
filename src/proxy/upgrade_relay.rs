@@ -12,6 +12,7 @@ use flate2::read::DeflateDecoder;
 use flate2::{Compress, Compression, FlushCompress};
 use http::header::{HeaderName, HeaderValue};
 use http::HeaderMap;
+use http_access_redaction::{PayloadClass, RedactionProfile};
 use hyper::upgrade::Upgraded;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::Notify;
@@ -19,7 +20,7 @@ use tokio::time::Instant;
 
 use crate::capture::{CaptureArtifactJob, CaptureKind, SanitizedCaptureMetadata};
 use crate::observation::{CaptureBodyBuilder, CaptureEvent, ProductObservationRuntime};
-use crate::redaction::{PayloadClass, ProfileHandle};
+use crate::redaction::{UpgradeRedactionBody, UpgradeRedactionContext};
 use crate::upgrade::{UpgradeRelayPair, UpgradeTerminalCause, UpgradedStreamSnapshot};
 
 const SEC_WEBSOCKET_EXTENSIONS: &str = "sec-websocket-extensions";
@@ -36,7 +37,7 @@ pub(crate) enum EstablishedUpgradeKind {
     },
     WebSocket {
         negotiation: WebSocketNegotiation,
-        profile: ProfileHandle,
+        profile: RedactionProfile,
     },
 }
 
@@ -45,7 +46,7 @@ impl EstablishedUpgradeKind {
         protocol: &HeaderValue,
         request: &HeaderMap,
         switching_protocols: &HeaderMap,
-        profile: Option<&ProfileHandle>,
+        profile: Option<&RedactionProfile>,
     ) -> Result<Self, UpgradeRelayBuildError> {
         let is_websocket = protocol
             .to_str()
@@ -59,7 +60,7 @@ impl EstablishedUpgradeKind {
             });
         };
         let negotiation = WebSocketNegotiation::from_headers(request, switching_protocols)?;
-        if negotiation.permessage_deflate && !profile.limits().allow_permessage_deflate {
+        if negotiation.permessage_deflate && !profile.limits().allow_permessage_deflate() {
             return Err(UpgradeRelayBuildError::CompressionNotAllowed);
         }
         Ok(Self::WebSocket {
@@ -184,8 +185,8 @@ impl UpgradeCaptureContext {
             body,
             compressed,
             class,
-            max_frame_bytes: limits.max_frame_bytes,
-            max_message_bytes: limits.max_message_bytes,
+            max_frame_bytes: limits.max_frame_bytes(),
+            max_message_bytes: limits.max_message_bytes(),
             encoded_bytes: 0,
             omitted: false,
         })
@@ -381,7 +382,7 @@ enum PreparedUpgradeKind {
     },
     WebSocket {
         negotiation: WebSocketNegotiation,
-        profile: ProfileHandle,
+        profile: RedactionProfile,
         capture: Option<UpgradeCaptureContext>,
     },
 }
@@ -925,7 +926,7 @@ enum RelayProtocolError {
 async fn relay_websocket_direction<Reader, Writer>(
     reader: Reader,
     writer: Writer,
-    profile: ProfileHandle,
+    profile: RedactionProfile,
     extensions: WebSocketNegotiation,
     direction: WebSocketDirection,
     capture_context: Option<UpgradeCaptureContext>,
@@ -949,7 +950,7 @@ where
 async fn relay_websocket_direction_with_boundary<Reader, Writer, Boundary>(
     mut reader: Reader,
     mut writer: Writer,
-    profile: ProfileHandle,
+    profile: RedactionProfile,
     extensions: WebSocketNegotiation,
     direction: WebSocketDirection,
     capture_context: Option<UpgradeCaptureContext>,
@@ -1033,7 +1034,7 @@ where
                 return UpgradeTerminalCause::RelayError;
             }
             if profile
-                .validate_encoded_websocket_message_size(header.payload_len)
+                .validate_encoded_websocket_message(header.payload_len)
                 .is_err()
             {
                 let _ = write_close(
@@ -1120,7 +1121,7 @@ where
             return UpgradeTerminalCause::RelayError;
         };
         if profile
-            .validate_encoded_websocket_message_size(message_len)
+            .validate_encoded_websocket_message(message_len)
             .is_err()
         {
             let _ = write_close(
@@ -1189,7 +1190,7 @@ where
 
 fn redact_client_control_frame(
     mut frame: Frame,
-    profile: &ProfileHandle,
+    profile: &RedactionProfile,
 ) -> Result<Frame, RelayProtocolError> {
     let payload = std::mem::take(&mut frame.payload);
     frame.payload = match frame.opcode {
@@ -1217,14 +1218,20 @@ fn redact_client_control_frame(
 }
 
 fn redact_control_payload(
-    profile: &ProfileHandle,
+    profile: &RedactionProfile,
     payload: Vec<u8>,
     class: PayloadClass,
 ) -> Result<Vec<u8>, RelayProtocolError> {
-    let mut redacted = profile
-        .redact_websocket_message(payload, class)
+    let context = UpgradeRedactionContext::for_profile(profile);
+    let payload =
+        UpgradeRedactionBody::new(payload).map_err(|_| RelayProtocolError::MessageTooLarge)?;
+    let redacted = profile
+        .redact_websocket_message(&context, payload, class)
         .map_err(|_| RelayProtocolError::MessageTooLarge)?;
-    Ok(std::mem::take(&mut redacted.bytes))
+    redacted
+        .into_body()
+        .into_vec()
+        .map_err(|_| RelayProtocolError::MessageTooLarge)
 }
 
 async fn forward_websocket_message<Writer>(
@@ -1232,7 +1239,7 @@ async fn forward_websocket_message<Writer>(
     opcode: OpCode,
     compressed: bool,
     encoded: Vec<u8>,
-    profile: &ProfileHandle,
+    profile: &RedactionProfile,
     extensions: WebSocketNegotiation,
     direction: WebSocketDirection,
 ) -> Result<(), RelayProtocolError>
@@ -1243,12 +1250,12 @@ where
         if !extensions.permessage_deflate {
             return Err(RelayProtocolError::Protocol);
         }
-        decompress_message(&encoded, profile.limits().max_message_bytes)?
+        decompress_message(&encoded, profile.limits().max_message_bytes())?
     } else {
         encoded.clone()
     };
     profile
-        .validate_encoded_websocket_message_size(decoded.len())
+        .validate_encoded_websocket_message(decoded.len())
         .map_err(|_| RelayProtocolError::MessageTooLarge)?;
     let class = match opcode {
         OpCode::Text => {
@@ -1260,10 +1267,16 @@ where
     };
 
     let output = if direction == WebSocketDirection::ClientToUpstream {
-        let mut redacted = profile
-            .redact_websocket_message(decoded, class)
+        let context = UpgradeRedactionContext::for_profile(profile);
+        let decoded =
+            UpgradeRedactionBody::new(decoded).map_err(|_| RelayProtocolError::MessageTooLarge)?;
+        let redacted = profile
+            .redact_websocket_message(&context, decoded, class)
             .map_err(|_| RelayProtocolError::MessageTooLarge)?;
-        let redacted_bytes = std::mem::take(&mut redacted.bytes);
+        let redacted_bytes = redacted
+            .into_body()
+            .into_vec()
+            .map_err(|_| RelayProtocolError::MessageTooLarge)?;
         if compressed {
             compress_message(&redacted_bytes)?
         } else {
@@ -1301,7 +1314,7 @@ struct FrameHeader {
 async fn read_frame_header<Reader>(
     reader: &mut Reader,
     expect_masked: bool,
-    profile: &ProfileHandle,
+    profile: &RedactionProfile,
 ) -> Result<Option<FrameHeader>, RelayProtocolError>
 where
     Reader: AsyncRead + Unpin,
@@ -1352,7 +1365,7 @@ where
     }
     let payload_len = usize::try_from(len).map_err(|_| RelayProtocolError::FrameTooLarge)?;
     profile
-        .validate_websocket_frame_size(payload_len)
+        .validate_websocket_frame(payload_len)
         .map_err(|_| RelayProtocolError::FrameTooLarge)?;
 
     let mask = if masked {
@@ -1692,6 +1705,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
+    use http_access_redaction::RedactionSnapshot;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     use super::*;
@@ -1699,73 +1713,127 @@ mod tests {
         CaptureDecision, CaptureEndpoint, CaptureMode, CaptureRecord, CaptureSinkSpec,
     };
     use crate::config::compiler::{
-        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledRedactionPayloads,
-        ObservationPlan, RedactionPlan, RedactionProfilePlan, RedactionRulePlan,
+        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, ObservationPlan,
     };
     use crate::observation::ProductObservationRuntime;
-    use crate::redaction::{RedactionActivation, RedactionSnapshot};
+    use crate::redaction::{test_snapshot, TestProfile};
     use crate::runtime::GenerationOwner;
 
     fn profile(
         max_frame_bytes: usize,
         max_message_bytes: usize,
         allow_permessage_deflate: bool,
-    ) -> ProfileHandle {
-        let plan = RedactionPlan {
-            profiles: BTreeMap::from([(
-                "wire".to_owned(),
-                RedactionProfilePlan {
-                    replacement: b"[MASKED]".to_vec(),
-                    max_body_bytes: max_message_bytes,
-                    max_decoded_body_bytes: max_message_bytes,
-                    max_frame_bytes,
-                    max_message_bytes,
-                    allow_permessage_deflate,
-                    max_environment_literal_sources: 0,
-                    max_environment_literal_bytes: 1,
-                    max_environment_literal_total_bytes: 1,
-                    rules: vec![RedactionRulePlan {
-                        literals: vec![b"secret".to_vec()],
-                        literal_environment_variables: Vec::new(),
-                        expressions: Vec::new(),
-                        payloads: CompiledRedactionPayloads::Both,
-                    }],
-                },
-            )]),
-        };
-        RedactionSnapshot::activate(plan, || false)
-            .unwrap()
-            .profile("wire")
-            .unwrap()
+    ) -> RedactionProfile {
+        let (snapshot, references) = test_snapshot(vec![TestProfile {
+            name: "wire".to_owned(),
+            replacement: b"[MASKED]".to_vec(),
+            max_body_bytes: max_message_bytes,
+            max_decoded_body_bytes: max_message_bytes,
+            max_frame_bytes,
+            max_message_bytes,
+            allow_permessage_deflate,
+            literals: vec![b"secret".to_vec()],
+        }]);
+        snapshot.profile(references.get("wire").unwrap()).unwrap()
     }
 
-    fn redaction_activation(name: &str, replacement: &[u8], literal: &[u8]) -> RedactionActivation {
-        RedactionSnapshot::activate(
-            RedactionPlan {
-                profiles: BTreeMap::from([(
-                    name.to_owned(),
-                    RedactionProfilePlan {
-                        replacement: replacement.to_vec(),
-                        max_body_bytes: 1024,
-                        max_decoded_body_bytes: 1024,
-                        max_frame_bytes: 1024,
-                        max_message_bytes: 1024,
-                        allow_permessage_deflate: true,
-                        max_environment_literal_sources: 0,
-                        max_environment_literal_bytes: 1,
-                        max_environment_literal_total_bytes: 1,
-                        rules: vec![RedactionRulePlan {
-                            literals: vec![literal.to_vec()],
-                            literal_environment_variables: Vec::new(),
-                            expressions: Vec::new(),
-                            payloads: CompiledRedactionPayloads::Both,
-                        }],
-                    },
-                )]),
-            },
+    #[test]
+    fn upgrade_scratch_projection_is_independent_of_message_limit() {
+        let (snapshot, references) = test_snapshot(vec![TestProfile {
+            name: "wire".to_owned(),
+            replacement: b"[MASKED]".to_vec(),
+            max_body_bytes: 64,
+            max_decoded_body_bytes: 64,
+            max_frame_bytes: 64,
+            max_message_bytes: 64,
+            allow_permessage_deflate: false,
+            literals: vec![vec![b'x'; 512]],
+        }]);
+        let profile = snapshot.profile(references.get("wire").unwrap()).unwrap();
+        assert!(profile.metrics().matcher_scratch_bytes() > profile.limits().max_message_bytes());
+
+        let output = profile
+            .redact_websocket_message(
+                &UpgradeRedactionContext::for_profile(&profile),
+                UpgradeRedactionBody::new(b"short message".to_vec()).unwrap(),
+                PayloadClass::Text,
+            )
+            .unwrap()
+            .into_body()
+            .into_vec()
+            .unwrap();
+        assert_eq!(output, b"short message");
+    }
+
+    #[test]
+    fn upgrade_context_accepts_class_specific_scratch_below_profile_maximum() {
+        use http_access_redaction::{
+            PreparedRedactionSnapshot, RedactionLimits, RedactionProfileSpec, RedactionRuleSpec,
+            RedactionSnapshotSpec, RulePayloads,
+        };
+        use http_access_types::{RedactionRef, SnapshotIdentity, StableId};
+
+        let identity = SnapshotIdentity::new();
+        let id = StableId::new("wire").unwrap();
+        let reference = RedactionRef::new(identity.clone(), id.clone(), 1).unwrap();
+        let prepared = PreparedRedactionSnapshot::prepare(
+            RedactionSnapshotSpec::new(vec![RedactionProfileSpec::new(
+                id,
+                b"[MASKED]".to_vec(),
+                RedactionLimits::new(1024, 1024, 1024, 1024, false, 1, 1, 1).unwrap(),
+                vec![
+                    RedactionRuleSpec::new(
+                        vec![vec![b'x'; 512]],
+                        Vec::new(),
+                        Vec::new(),
+                        RulePayloads::Text,
+                    ),
+                    RedactionRuleSpec::new(
+                        vec![b"bin".to_vec()],
+                        Vec::new(),
+                        Vec::new(),
+                        RulePayloads::Binary,
+                    ),
+                ],
+            )]),
             || false,
         )
-        .unwrap()
+        .unwrap();
+        let snapshot =
+            RedactionSnapshot::activate(identity, 1, prepared, Vec::new(), || false).unwrap();
+        let profile = snapshot.profile(&reference).unwrap();
+
+        let output = profile
+            .redact_websocket_message(
+                &UpgradeRedactionContext::for_profile(&profile),
+                UpgradeRedactionBody::new(b"bin payload".to_vec()).unwrap(),
+                PayloadClass::Binary,
+            )
+            .unwrap()
+            .into_body()
+            .into_vec()
+            .unwrap();
+        assert_eq!(output, b"[MASKED] payload");
+    }
+
+    fn redaction_activation(
+        name: &str,
+        replacement: &[u8],
+        literal: &[u8],
+    ) -> (
+        RedactionSnapshot,
+        BTreeMap<String, http_access_types::RedactionRef>,
+    ) {
+        test_snapshot(vec![TestProfile {
+            name: name.to_owned(),
+            replacement: replacement.to_vec(),
+            max_body_bytes: 1024,
+            max_decoded_body_bytes: 1024,
+            max_frame_bytes: 1024,
+            max_message_bytes: 1024,
+            allow_permessage_deflate: true,
+            literals: vec![literal.to_vec()],
+        }])
     }
 
     fn publish_capture_epoch(
@@ -1773,8 +1841,8 @@ mod tests {
         directory: &Path,
         limit: usize,
         replacement: &[u8],
-    ) -> (RedactionActivation, Arc<dyn GenerationOwner>) {
-        let redaction = redaction_activation("capture", replacement, b"secret");
+    ) -> (RedactionSnapshot, Arc<dyn GenerationOwner>) {
+        let (redaction, references) = redaction_activation("capture", replacement, b"secret");
         let activation = runtime
             .activate(
                 ObservationPlan {
@@ -1798,6 +1866,7 @@ mod tests {
                     ..ObservationPlan::default()
                 },
                 &redaction,
+                references.get("capture"),
             )
             .unwrap();
         let (_snapshot, owner) = activation.into_parts();
@@ -1865,7 +1934,7 @@ mod tests {
         headers
     }
 
-    fn websocket_kind(profile: &ProfileHandle, compressed: bool) -> EstablishedUpgradeKind {
+    fn websocket_kind(profile: &RedactionProfile, compressed: bool) -> EstablishedUpgradeKind {
         let request = headers(compressed.then_some("permessage-deflate"));
         let response = headers(compressed.then_some(
             "permessage-deflate; client_no_context_takeover; server_no_context_takeover",

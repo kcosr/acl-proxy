@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::network::canonical_ip;
 use crate::safety::allocation::{
     self, AllocationAuthority, ExactAllocationLease, ReservedStableBodyBuilder, StableBody,
-    StableBodyBuilder, StableBodySegments, StableScratch, StableWorkspaceAllocation,
+    StableBodyBuilder, StableBodySegments, StableExactBytes, StableScratch,
+    StableWorkspaceAllocation,
 };
 
 const QUOTA_SHARD_COUNT: usize = 16;
@@ -469,6 +470,13 @@ impl HttpWireBodyGuard {
         GuardedAllocationCharge::try_new(self.authority(), bytes)
     }
 
+    pub(crate) fn exact_bytes(
+        &self,
+        bytes: usize,
+    ) -> Result<GuardedExactBytes, WireBodyBufferError> {
+        GuardedExactBytes::try_zeroed(self.authority(), bytes)
+    }
+
     pub(crate) fn provider_response_charge(&self) -> ProviderResponseCharge {
         ProviderResponseCharge {
             inner: self.inner.clone(),
@@ -519,6 +527,7 @@ pub(crate) type GuardedAllocationCharge = ExactAllocationLease<WireAllocationAut
 pub(crate) type GuardedBodyBuilder = StableBodyBuilder<WireAllocationAuthority>;
 pub(crate) type ReservedGuardedBodyBuilder = ReservedStableBodyBuilder<WireAllocationAuthority>;
 pub(crate) type GuardedBody = StableBody<WireAllocationAuthority>;
+pub(crate) type GuardedExactBytes = StableExactBytes<WireAllocationAuthority>;
 pub(crate) type GuardedBodySegments<'a> = StableBodySegments<'a>;
 pub(crate) type GuardedScratch = StableScratch<WireAllocationAuthority>;
 pub(crate) type GuardedWorkspaceAllocation = StableWorkspaceAllocation<WireAllocationAuthority>;

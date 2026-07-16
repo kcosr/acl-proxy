@@ -420,7 +420,7 @@ rules = [{{ expressions = ["{REGEX_SECRET}("] }}]
         assert_secret_absent(&compile_error, REGEX_SECRET);
         assert!(compile_error
             .to_string()
-            .contains("invalid regular expression"));
+            .contains("invalid bounded redaction expression"));
     }
 
     #[test]
@@ -440,7 +440,9 @@ rules = [{{ expressions = ['\b{SECRET}\b'], literal_environment_variables = ["MI
         .expect_err("validation must reject cache-requiring regex syntax");
         assert_secret_absent(&error, SECRET);
         assert!(error.to_string().contains("expressions[0]"));
-        assert!(error.to_string().contains("bounded matcher"));
+        assert!(error
+            .to_string()
+            .contains("invalid bounded redaction expression"));
     }
 
     #[test]

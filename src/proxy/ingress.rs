@@ -2733,7 +2733,7 @@ mod tests {
     use rustls::{Certificate, ClientConfig, RootCertStore, ServerName};
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::sync::oneshot;
+    use tokio::sync::{mpsc, oneshot};
     use tokio_rustls::TlsConnector;
 
     use super::*;
@@ -5343,40 +5343,48 @@ redaction_profile = "wire"
     #[tokio::test]
     async fn capture_only_decoding_preserves_upstream_content_coding() {
         let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
-        let ([proxy], listeners) = prebound_listeners::<1>();
         let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
         let origin = origin_listener.local_addr().unwrap();
-        let (captured_tx, captured_rx) = oneshot::channel();
+        let (captured_tx, mut captured_rx) = mpsc::unbounded_channel();
         let origin_task = tokio::spawn(async move {
-            let (stream, _) = origin_listener.accept().await.unwrap();
-            let captured_tx = Arc::new(StdMutex::new(Some(captured_tx)));
-            Http::new()
-                .http1_only(true)
-                .serve_connection(
-                    stream,
-                    service_fn(move |request: Request<Body>| {
-                        let captured_tx = captured_tx.clone();
-                        async move {
-                            let (parts, body) = request.into_parts();
-                            let body = to_bytes(body).await.unwrap();
-                            captured_tx
-                                .lock()
-                                .unwrap()
-                                .take()
-                                .unwrap()
-                                .send((parts.headers, body))
-                                .ok();
-                            Ok::<_, Infallible>(Response::new(Body::from("accepted")))
-                        }
-                    }),
-                )
-                .await
-                .unwrap();
+            for _ in 0..2 {
+                let (stream, _) = origin_listener.accept().await.unwrap();
+                let captured_tx = captured_tx.clone();
+                Http::new()
+                    .http1_only(true)
+                    .serve_connection(
+                        stream,
+                        service_fn(move |request: Request<Body>| {
+                            let captured_tx = captured_tx.clone();
+                            async move {
+                                let (parts, body) = request.into_parts();
+                                let body = to_bytes(body).await.unwrap();
+                                captured_tx.send((parts.headers, body)).unwrap();
+                                Ok::<_, Infallible>(Response::new(Body::from("accepted")))
+                            }
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            }
         });
-        let policy = format!(
-            r#"[listeners.explicit_http.connect]
+        let plain = b"opaque capture-redaction-sentinel payload";
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(plain).unwrap();
+        let encoded = encoder.finish().unwrap();
+        let mut upstream = Vec::new();
+        let mut capture_records = Vec::new();
+        for capture_enabled in [false, true] {
+            let ([proxy], listeners) = prebound_listeners::<1>();
+            let capture = if capture_enabled {
+                capture_config()
+            } else {
+                ""
+            };
+            let policy = format!(
+                r#"[listeners.explicit_http.connect]
 http1 = "deny"
 
 [policy]
@@ -5388,41 +5396,48 @@ decision = "allow"
 urls = ["http://{origin}/compressed"]
 methods = ["POST"]
 
-{}"#,
-            capture_config()
-        );
-        let (directory, product) =
-            product(base_config(proxy, "explicit_http", &policy), listeners).await;
-        let plain = b"opaque capture-redaction-sentinel payload";
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(plain).unwrap();
-        let encoded = encoder.finish().unwrap();
-        let response = send_request(
-            proxy,
-            Request::builder()
-                .method(http::Method::POST)
-                .uri(format!("http://{origin}/compressed"))
-                .header(CONTENT_TYPE, "application/json")
-                .header(CONTENT_ENCODING, "gzip")
-                .header(CONTENT_LENGTH, encoded.len().to_string())
-                .body(Body::from(encoded.clone()))
-                .unwrap(),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(to_bytes(response.into_body()).await.unwrap(), "accepted");
-        let (origin_headers, origin_body) = captured_rx.await.unwrap();
-        assert_eq!(origin_body, encoded);
+{capture}"#,
+            );
+            let (directory, product) =
+                product(base_config(proxy, "explicit_http", &policy), listeners).await;
+            let response = send_request(
+                proxy,
+                Request::builder()
+                    .method(http::Method::POST)
+                    .uri(format!("http://{origin}/compressed"))
+                    .header(CONTENT_TYPE, "application/json")
+                    .header(CONTENT_ENCODING, "gzip")
+                    .header(CONTENT_LENGTH, encoded.len().to_string())
+                    .body(Body::from(encoded.clone()))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(to_bytes(response.into_body()).await.unwrap(), "accepted");
+            upstream.push(captured_rx.recv().await.unwrap());
+            product.shutdown().await;
+            if capture_enabled {
+                capture_records = read_capture_records(directory.path());
+            } else {
+                assert!(!directory.path().join("captures").exists());
+            }
+        }
+        origin_task.await.unwrap();
+
+        for (headers, _) in &mut upstream {
+            headers.remove("x-test-loop");
+        }
+        assert_eq!(upstream[0], upstream[1]);
+        let (origin_headers, origin_body) = &upstream[1];
+        assert_eq!(origin_body, &encoded);
         assert_eq!(origin_headers[CONTENT_ENCODING], "gzip");
         assert_eq!(
             origin_headers[CONTENT_LENGTH],
             origin_body.len().to_string()
         );
+        assert!(!origin_headers.contains_key(http::header::TRANSFER_ENCODING));
 
-        product.shutdown().await;
-        origin_task.await.unwrap();
-        let records = read_capture_records(directory.path());
-        let request = records
+        let request = capture_records
             .iter()
             .find(|record| record.kind == CaptureKind::Request)
             .unwrap();

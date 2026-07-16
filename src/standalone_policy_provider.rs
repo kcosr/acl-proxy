@@ -1017,7 +1017,7 @@ where
                 match redaction {
                     Some(binding) => binding
                         .handle()
-                        .redact_guarded_decoded_http_body(guard, body.decoded)
+                        .redact_http_body(guard, body.decoded)
                         .ok()
                         .map_or(
                             (None, StandaloneResponseBodyProvenance::CompleteOriginal),
@@ -1025,7 +1025,7 @@ where
                                 (
                                     Some(StandaloneDeniedBody {
                                         content_type: body.content_type,
-                                        decoded: redacted.body,
+                                        decoded: redacted.into_body(),
                                     }),
                                     StandaloneResponseBodyProvenance::CompleteWireRedacted,
                                 )
@@ -1230,8 +1230,8 @@ fn validate_redaction_limits(
         return Ok(());
     };
     let limits = redaction.handle().limits();
-    if body.encoded_len > limits.max_body_bytes
-        || body.decoded.len() > limits.max_decoded_body_bytes
+    if body.encoded_len > limits.max_body_bytes()
+        || body.decoded.len() > limits.max_decoded_body_bytes()
     {
         return Err(413);
     }

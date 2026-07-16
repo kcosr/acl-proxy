@@ -8,13 +8,19 @@ use std::time::Duration;
 use base64::encoded_len as base64_encoded_len;
 use http::header::{HeaderName, HeaderValue};
 use http::Method;
-use http_access_runtime::BodyBudget;
-use http_access_types::{BodyLimits, RedirectPolicy, ResponsePolicy};
-use regex_automata::{
-    dfa::{dense, regex::Regex as DfaRegex, StartKind},
-    nfa::thompson::{self, WhichCaptures, NFA},
-    MatchKind as RegexMatchKind,
+#[cfg(test)]
+use http_access_redaction::MAX_MATCHER_SCRATCH_BYTES;
+use http_access_redaction::{
+    ExternalLiteralSlot, PreparedRedactionSnapshot, RedactionLimits, RedactionProfileSpec,
+    RedactionRuleSpec, RedactionSnapshotSpec, RulePayloads, MAX_AUTHORED_LITERALS_PER_PROFILE,
+    MAX_AUTHORED_LITERAL_BYTES_PER_PROFILE, MAX_EXPRESSIONS_PER_PROFILE,
+    MAX_EXPRESSION_BYTES_PER_PROFILE, MAX_EXTERNAL_LITERAL_BYTES,
+    MAX_EXTERNAL_LITERAL_BYTES_PER_PROFILE, MAX_EXTERNAL_LITERAL_BYTES_PER_SNAPSHOT,
+    MAX_EXTERNAL_SLOTS_PER_PROFILE, MAX_EXTERNAL_SLOTS_PER_SNAPSHOT, MAX_PROFILES,
+    MAX_RULES_PER_PROFILE,
 };
+use http_access_runtime::BodyBudget;
+use http_access_types::{BodyLimits, RedirectPolicy, ResponsePolicy, StableId};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
@@ -28,6 +34,9 @@ use crate::capture::CaptureSinkSpec;
 use crate::http1::store::PARSER_STORE_BYTES;
 use crate::http_body::{http_decoder_workspace_sizes, HTTP_DECODER_OUTPUT_STAGING_BYTES};
 use crate::network::{canonical_socket_addr, socket_binds_overlap};
+use crate::redaction::{
+    ProductExternalLiteralSource, ProductRedactionPlan, ProductRedactionProfile,
+};
 #[cfg(test)]
 use crate::safety::wire_body::MAX_BUFFER_GROWTH_BYTES;
 use crate::safety::wire_body::{guarded_body_allocation_bytes, guarded_workspace_allocation_bytes};
@@ -81,23 +90,20 @@ const MAX_EFFECTS_PER_SCOPE: usize = 1_024;
 const MAX_HEADER_PREDICATES_PER_RULE: usize = 4_096;
 const MAX_HEADER_FIELD_BYTES: usize = 64 * 1024;
 const MAX_PROVIDER_ITEMS: usize = 256;
-const MAX_REDACTION_PROFILES: usize = 256;
-const MAX_REDACTION_RULES: usize = 1_024;
-const MAX_REDACTION_EXPRESSIONS: usize = 1_024;
-const MAX_REDACTION_EXPRESSION_BYTES_PER_PROFILE: usize = MAX_CONFIG_BYTES;
+const MAX_REDACTION_PROFILES: usize = MAX_PROFILES;
+const MAX_REDACTION_RULES: usize = MAX_RULES_PER_PROFILE;
+const MAX_REDACTION_EXPRESSIONS: usize = MAX_EXPRESSIONS_PER_PROFILE;
+const MAX_REDACTION_EXPRESSION_BYTES_PER_PROFILE: usize = MAX_EXPRESSION_BYTES_PER_PROFILE;
 const MAX_REDACTION_BODY_BYTES: usize = GIB;
 const MAX_REDACTION_FRAME_BYTES: usize = 16 * MIB;
 const MAX_REDACTION_MESSAGE_BYTES: usize = 256 * MIB;
-const MAX_REDACTION_ENV_SOURCES_PER_PROFILE: usize = 1_024;
-const MAX_REDACTION_ENV_BYTES: usize = MIB;
-const MAX_REDACTION_ENV_TOTAL_BYTES_PER_PROFILE: usize = 16 * MIB;
-const MAX_REDACTION_ENV_SOURCES_PER_SNAPSHOT: usize = 4_096;
-const MAX_REDACTION_ENV_BYTES_PER_SNAPSHOT: usize = 64 * MIB;
-pub(crate) const MAX_REDACTION_REGEX_DFA_BYTES: usize = MIB;
-pub(crate) const MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE: usize = 16 * MIB;
-pub(crate) const MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT: usize = 64 * MIB;
-const MAX_TOML_REDACTION_LITERALS_PER_PROFILE: usize = 4_096;
-const MAX_TOML_REDACTION_LITERAL_BYTES_PER_PROFILE: usize = 16 * MIB;
+const MAX_REDACTION_ENV_SOURCES_PER_PROFILE: usize = MAX_EXTERNAL_SLOTS_PER_PROFILE;
+const MAX_REDACTION_ENV_BYTES: usize = MAX_EXTERNAL_LITERAL_BYTES;
+const MAX_REDACTION_ENV_TOTAL_BYTES_PER_PROFILE: usize = MAX_EXTERNAL_LITERAL_BYTES_PER_PROFILE;
+const MAX_REDACTION_ENV_SOURCES_PER_SNAPSHOT: usize = MAX_EXTERNAL_SLOTS_PER_SNAPSHOT;
+const MAX_REDACTION_ENV_BYTES_PER_SNAPSHOT: usize = MAX_EXTERNAL_LITERAL_BYTES_PER_SNAPSHOT;
+const MAX_TOML_REDACTION_LITERALS_PER_PROFILE: usize = MAX_AUTHORED_LITERALS_PER_PROFILE;
+const MAX_TOML_REDACTION_LITERAL_BYTES_PER_PROFILE: usize = MAX_AUTHORED_LITERAL_BYTES_PER_PROFILE;
 const MAX_LOG_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const MAX_LOG_FILES: usize = 1_000_000;
 const MAX_CAPTURE_BODY_BYTES: usize = GIB;
@@ -107,7 +113,6 @@ const MAX_CAPTURE_FILES: usize = 10_000_000;
 const MAX_CAPTURE_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024 * 1024;
 pub(crate) const MAX_PROVIDER_CREDENTIAL_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_PROVIDER_OUTPUT_NAME_BYTES: usize = 4 * 1024;
-pub(crate) const MAX_REDACTION_MATCHER_SCRATCH_BYTES: usize = MIB;
 const PROVIDER_REPLACEMENT_STAGING_BYTES: usize = 64 * 1024;
 const WEBSOCKET_DEFLATE_SCRATCH_BYTES: usize = 64 * 1024;
 const PROVIDER_REQUEST_STREAM_SCRATCH_BYTES: usize = 64 * 1024;
@@ -282,7 +287,7 @@ pub(crate) struct ReloadableProductPlan {
     pub(crate) policy: PolicyPlan,
     pub(crate) authorization: AuthorizationPlan,
     pub(crate) credentials: CredentialsPlan,
-    pub(crate) redaction: RedactionPlan,
+    pub(crate) redaction: ProductRedactionPlan,
     pub(crate) observation: ObservationPlan,
     pub(crate) safety: SafetyPlan,
     pub(crate) resource_plan: CompiledResourcePlan,
@@ -640,276 +645,6 @@ pub(crate) enum CredentialSourcePlan {
     File { path: PathBuf },
 }
 
-#[derive(Clone)]
-pub(crate) struct RedactionPlan {
-    pub(crate) profiles: BTreeMap<String, RedactionProfilePlan>,
-}
-
-#[derive(Clone)]
-pub(crate) struct RedactionProfilePlan {
-    pub(crate) replacement: Vec<u8>,
-    pub(crate) max_body_bytes: usize,
-    pub(crate) max_decoded_body_bytes: usize,
-    pub(crate) max_frame_bytes: usize,
-    pub(crate) max_message_bytes: usize,
-    pub(crate) allow_permessage_deflate: bool,
-    pub(crate) max_environment_literal_sources: usize,
-    pub(crate) max_environment_literal_bytes: usize,
-    pub(crate) max_environment_literal_total_bytes: usize,
-    pub(crate) rules: Vec<RedactionRulePlan>,
-}
-
-#[derive(Clone)]
-pub(crate) struct RedactionRulePlan {
-    pub(crate) literals: Vec<Vec<u8>>,
-    pub(crate) literal_environment_variables: Vec<String>,
-    pub(crate) expressions: Vec<String>,
-    pub(crate) payloads: CompiledRedactionPayloads,
-}
-
-pub(crate) fn build_redaction_regex(
-    expression: &str,
-    remaining_matcher_budget: usize,
-) -> Result<DfaRegex, ()> {
-    // This ceiling covers the compiler's accounted NFA, DFA, and determinizer
-    // state. Parser/finalization auxiliaries, Vec capacity, and allocator
-    // metadata are outside regex-automata's public size accounting.
-    let forward_limit = MAX_REDACTION_REGEX_DFA_BYTES.min(remaining_matcher_budget / 3);
-    if forward_limit == 0 {
-        return Err(());
-    }
-    let forward_nfa = build_redaction_nfa(expression, false, forward_limit)?;
-    let forward = build_redaction_dfa(&forward_nfa, false, forward_limit)?;
-    drop(forward_nfa);
-
-    let forward_bytes = forward.memory_usage();
-    let reverse_budget = remaining_matcher_budget
-        .checked_sub(forward_bytes)
-        .ok_or(())?;
-    let reverse_limit = MAX_REDACTION_REGEX_DFA_BYTES.min(reverse_budget / 3);
-    if reverse_limit == 0 {
-        return Err(());
-    }
-    let reverse_nfa = build_redaction_nfa(expression, true, reverse_limit)?;
-    let reverse = build_redaction_dfa(&reverse_nfa, true, reverse_limit)?;
-    drop(reverse_nfa);
-
-    let resident_bytes = forward_bytes
-        .checked_add(reverse.memory_usage())
-        .ok_or(())?;
-    if resident_bytes > remaining_matcher_budget {
-        return Err(());
-    }
-    Ok(DfaRegex::builder().build_from_dfas(forward, reverse))
-}
-
-fn build_redaction_nfa(expression: &str, reverse: bool, limit: usize) -> Result<NFA, ()> {
-    let mut compiler = NFA::compiler();
-    compiler.configure(
-        thompson::Config::new()
-            .utf8(true)
-            .reverse(reverse)
-            .shrink(false)
-            .which_captures(WhichCaptures::None)
-            .nfa_size_limit(Some(limit)),
-    );
-    compiler.build(expression).map_err(|_| ())
-}
-
-fn build_redaction_dfa(nfa: &NFA, reverse: bool, limit: usize) -> Result<dense::DFA<Vec<u32>>, ()> {
-    let config = dense::Config::new()
-        .accelerate(false)
-        .minimize(false)
-        .prefilter(None)
-        .dfa_size_limit(Some(limit))
-        .determinize_size_limit(Some(limit));
-    let config = if reverse {
-        config
-            .specialize_start_states(false)
-            .start_kind(StartKind::Anchored)
-            .match_kind(RegexMatchKind::All)
-    } else {
-        config
-            .specialize_start_states(true)
-            .start_kind(StartKind::Both)
-            .match_kind(RegexMatchKind::LeftmostFirst)
-    };
-    dense::Builder::new()
-        .configure(config)
-        .build_from_nfa(nfa)
-        .map_err(|_| ())
-}
-
-pub(crate) fn redaction_regex_resident_bytes(expression: &DfaRegex) -> Option<usize> {
-    expression
-        .forward()
-        .memory_usage()
-        .checked_add(expression.reverse().memory_usage())
-}
-
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct RedactionLiteralEdge {
-    pub(crate) source: usize,
-    pub(crate) byte: u8,
-    pub(crate) target: usize,
-}
-
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct RedactionLiteralNode {
-    pub(crate) edge_start: usize,
-    pub(crate) edge_len: usize,
-    pub(crate) failure: usize,
-    pub(crate) output_len: usize,
-}
-
-#[derive(Clone, Copy, Default)]
-pub(crate) struct RedactionLiteralInterval {
-    pub(crate) start: usize,
-    pub(crate) end: usize,
-}
-
-pub(crate) struct RedactionLiteralProjection {
-    pub(crate) state_count: usize,
-    pub(crate) edge_count: usize,
-    pub(crate) max_pattern_len: usize,
-    pub(crate) resident_bytes: usize,
-    #[cfg(test)]
-    pub(crate) reference_build_bytes: usize,
-    pub(crate) trie_build_bytes: usize,
-    pub(crate) failure_build_bytes: usize,
-    pub(crate) build_bytes: usize,
-}
-
-pub(crate) fn redaction_literal_reference_bytes(
-    staging_capacity: usize,
-    final_len: usize,
-) -> Option<(usize, usize)> {
-    let element_bytes = std::mem::size_of::<&[u8]>();
-    let staging_bytes = staging_capacity.checked_mul(element_bytes)?;
-    let final_bytes = final_len.checked_mul(element_bytes)?;
-    let construction_bytes = staging_bytes.checked_add(final_bytes)?;
-    Some((final_bytes, construction_bytes))
-}
-
-pub(crate) fn redaction_literal_projection(
-    patterns: &mut [&[u8]],
-    pattern_reference_bytes: usize,
-    pattern_reference_construction_bytes: usize,
-) -> Option<RedactionLiteralProjection> {
-    if patterns.is_empty() {
-        if pattern_reference_bytes != 0 || pattern_reference_construction_bytes != 0 {
-            return None;
-        }
-        return Some(RedactionLiteralProjection {
-            state_count: 0,
-            edge_count: 0,
-            max_pattern_len: 0,
-            resident_bytes: 0,
-            #[cfg(test)]
-            reference_build_bytes: 0,
-            trie_build_bytes: 0,
-            failure_build_bytes: 0,
-            build_bytes: 0,
-        });
-    }
-    let minimum_reference_bytes = patterns.len().checked_mul(std::mem::size_of::<&[u8]>())?;
-    if pattern_reference_bytes != minimum_reference_bytes
-        || pattern_reference_construction_bytes < pattern_reference_bytes
-    {
-        return None;
-    }
-    patterns.sort_unstable();
-
-    let mut state_count = 1usize;
-    let mut max_pattern_len = 0usize;
-    for index in 0..patterns.len() {
-        let pattern = patterns[index];
-        let previous = index
-            .checked_sub(1)
-            .map(|previous| patterns[previous])
-            .unwrap_or(&[]);
-        if index != 0 && pattern == previous {
-            continue;
-        }
-        let shared = pattern_common_prefix_len(previous, pattern);
-        state_count = state_count.checked_add(pattern.len() - shared)?;
-        max_pattern_len = max_pattern_len.max(pattern.len());
-    }
-    let edge_count = state_count.checked_sub(1)?;
-    let resident_bytes = state_count
-        .checked_mul(std::mem::size_of::<RedactionLiteralNode>())?
-        .checked_add(edge_count.checked_mul(std::mem::size_of::<RedactionLiteralEdge>())?)?;
-    let terminal_and_path_bytes = state_count
-        .checked_mul(std::mem::size_of::<usize>())?
-        .checked_add(
-            max_pattern_len
-                .checked_add(1)?
-                .checked_mul(std::mem::size_of::<usize>())?,
-        )?;
-    let shared_build_bytes = resident_bytes.checked_add(terminal_and_path_bytes)?;
-    // Reference-array conversion, trie construction, and failure-link BFS are
-    // distinct peaks. The reference box is wiped before the BFS queue exists.
-    let trie_build_bytes = shared_build_bytes.checked_add(pattern_reference_bytes)?;
-    let failure_build_bytes =
-        shared_build_bytes.checked_add(state_count.checked_mul(std::mem::size_of::<usize>())?)?;
-    Some(RedactionLiteralProjection {
-        state_count,
-        edge_count,
-        max_pattern_len,
-        resident_bytes,
-        #[cfg(test)]
-        reference_build_bytes: pattern_reference_construction_bytes,
-        trie_build_bytes,
-        failure_build_bytes,
-        build_bytes: pattern_reference_construction_bytes
-            .max(trie_build_bytes)
-            .max(failure_build_bytes),
-    })
-}
-
-pub(crate) fn redaction_literal_scratch_bytes(max_pattern_len: usize) -> Option<usize> {
-    max_pattern_len
-        .checked_mul(std::mem::size_of::<RedactionLiteralInterval>())
-        .filter(|bytes| *bytes <= MAX_REDACTION_MATCHER_SCRATCH_BYTES)
-}
-
-fn pattern_common_prefix_len(left: &[u8], right: &[u8]) -> usize {
-    left.iter()
-        .zip(right)
-        .take_while(|(left, right)| left == right)
-        .count()
-}
-
-pub(crate) fn checked_redaction_matcher_resident_bytes(
-    profile_bytes: usize,
-    snapshot_bytes: usize,
-    additional_bytes: usize,
-) -> Option<(usize, usize)> {
-    let profile_bytes = profile_bytes.checked_add(additional_bytes)?;
-    let snapshot_bytes = snapshot_bytes.checked_add(additional_bytes)?;
-    (profile_bytes <= MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE
-        && snapshot_bytes <= MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT)
-        .then_some((profile_bytes, snapshot_bytes))
-}
-
-pub(crate) fn remaining_redaction_matcher_resident_bytes(
-    profile_bytes: usize,
-    snapshot_bytes: usize,
-) -> Option<usize> {
-    let profile_remaining =
-        MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE.checked_sub(profile_bytes)?;
-    let snapshot_remaining =
-        MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT.checked_sub(snapshot_bytes)?;
-    Some(profile_remaining.min(snapshot_remaining))
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CompiledRedactionPayloads {
-    Text,
-    Binary,
-    Both,
-}
-
 #[derive(Clone, Default)]
 pub(crate) struct ObservationPlan {
     pub(crate) logging: ReloadableLoggingPlan,
@@ -1110,7 +845,8 @@ pub(super) fn compile_config(
     let listener_facts = validate_listener_control_mitm_matrix(&config)?;
     validate_tls_and_parent_matrix(&config, &listener_facts)?;
     let validation = validate_references_and_security_boundaries(&config)?;
-    let resource_plan = compile_resource_plan(&config)?;
+    let redaction = compile_redaction_plan(&config.redaction)?;
+    let resource_plan = compile_resource_plan(&config, &redaction)?;
 
     let static_config = compile_static_config(&config, config_root.clone())?;
     let reloadable_plan = compile_reloadable_plan(
@@ -1118,6 +854,7 @@ pub(super) fn compile_config(
         &config_root,
         validation.compiled_urls_by_rule,
         resource_plan,
+        redaction,
     )?;
     let static_fingerprint = StaticFingerprint::from_config(&static_config)
         .map_err(|error| ConfigCompileError::at("schema_version", error.to_string()))?;
@@ -3371,7 +3108,6 @@ fn validate_redaction_limits(
             profile.max_environment_literal_total_bytes,
             MAX_REDACTION_ENV_TOTAL_BYTES_PER_PROFILE,
         )?;
-        configured_profile_literal_scratch_bytes(profile, &prefix)?;
         if profile.max_decoded_body_bytes < profile.max_body_bytes {
             return Err(ConfigCompileError::at(
                 &prefix,
@@ -3610,35 +3346,9 @@ fn validate_logging_capture_limits(
     Ok(())
 }
 
-fn configured_profile_literal_scratch_bytes(
-    profile: &super::authoring::RedactionProfileConfig,
-    path: &str,
-) -> Result<usize, ConfigCompileError> {
-    let mut max_pattern_len = 0usize;
-    let mut has_environment_source = false;
-    for rule in &profile.rules {
-        max_pattern_len = max_pattern_len.max(
-            rule.literals
-                .iter()
-                .map(|literal| literal.len())
-                .max()
-                .unwrap_or(0),
-        );
-        has_environment_source |= !rule.literal_environment_variables.is_empty();
-    }
-    if has_environment_source {
-        max_pattern_len = max_pattern_len.max(profile.max_environment_literal_bytes);
-    }
-    redaction_literal_scratch_bytes(max_pattern_len).ok_or_else(|| {
-        ConfigCompileError::at(
-            path,
-            "configured literal horizon exceeds the matcher scratch ceiling",
-        )
-    })
-}
-
 fn compile_resource_plan(
     config: &super::authoring::AuthoringConfig,
+    redaction: &ProductRedactionPlan,
 ) -> Result<CompiledResourcePlan, ConfigCompileError> {
     let body_read_compilation = compile_http_body_read_plans(config)?;
     let body_read_plans = &body_read_compilation.published_by_cursor;
@@ -3646,7 +3356,7 @@ fn compile_resource_plan(
         .policy
         .rules
         .iter()
-        .map(|rule| compile_http_rule_schedule(config, rule))
+        .map(|rule| compile_http_rule_schedule_with_redaction(config, redaction, rule))
         .collect::<Result<Vec<_>, _>>()?;
     validate_forwarding_request_bounds(config, body_read_plans, &rule_schedules)?;
     let webhook_request_allocation_bytes_by_rule = rule_schedules
@@ -3806,19 +3516,14 @@ fn compile_resource_plan(
                 .redaction_profile
                 .as_ref()
                 .map(|name| {
-                    let profile = config
-                        .redaction
+                    let profile = redaction
                         .profiles
                         .get(name)
                         .expect("profile references validated before resource compilation");
-                    let scratch_bytes = configured_profile_literal_scratch_bytes(
-                        profile,
-                        &format!("redaction.profiles.{name}"),
-                    )?;
                     upgrade_wire_peak(
-                        profile.max_message_bytes,
-                        profile.allow_permessage_deflate,
-                        scratch_bytes,
+                        profile.limits.max_message_bytes(),
+                        profile.limits.allow_permessage_deflate(),
+                        profile.projection.matcher_scratch_bytes(),
                     )
                 })
                 .transpose()?
@@ -4166,8 +3871,9 @@ struct IncomingBodyStage {
     additional_bytes: usize,
 }
 
-fn compile_http_rule_schedule(
+fn compile_http_rule_schedule_with_redaction(
     config: &super::authoring::AuthoringConfig,
+    redaction: &ProductRedactionPlan,
     rule: &PolicyRuleConfig,
 ) -> Result<HttpRuleAllocationSchedule, ConfigCompileError> {
     let process_provider = rule.authorization_provider.as_ref().and_then(|name| {
@@ -4190,14 +3896,14 @@ fn compile_http_rule_schedule(
             .get(name)
             .expect("profile references validated before resource compilation")
     });
-    let profile_scratch_bytes = rule
-        .redaction_profile
-        .as_ref()
-        .zip(profile)
-        .map(|(name, profile)| {
-            configured_profile_literal_scratch_bytes(profile, &format!("redaction.profiles.{name}"))
-        })
-        .transpose()?;
+    let profile_scratch_bytes = rule.redaction_profile.as_ref().map(|name| {
+        redaction
+            .profiles
+            .get(name)
+            .expect("profile references validated before resource compilation")
+            .projection
+            .matcher_scratch_bytes()
+    });
     let effective_body_limits = effective_http_body_limits(process_body, profile);
     let replacement_decoded_limit = process_body
         .filter(|provider| provider.allow_request_body_replacement)
@@ -4455,9 +4161,11 @@ fn compile_http_rule_schedule(
             "policy.rules",
             "HTTP redaction plan arithmetic overflow",
         )?;
-        let has_text_expressions = profile.rules.iter().any(|rule| {
-            !rule.expressions.is_empty() && !matches!(rule.payloads, RedactionPayloads::Binary)
-        });
+        let has_text_expressions = rule
+            .redaction_profile
+            .as_ref()
+            .and_then(|name| redaction.profiles.get(name))
+            .is_some_and(|profile| profile.has_text_expressions);
         let regex_peak = if has_text_expressions {
             guarded_body_stage_peak(
                 [
@@ -4547,6 +4255,40 @@ fn compile_http_rule_schedule(
         webhook_request_allocation,
         webhook_callback_allocation,
     })
+}
+
+#[cfg(test)]
+fn compile_http_rule_schedule(
+    config: &super::authoring::AuthoringConfig,
+    rule: &PolicyRuleConfig,
+) -> Result<HttpRuleAllocationSchedule, ConfigCompileError> {
+    let redaction = compile_redaction_plan(&config.redaction)?;
+    compile_http_rule_schedule_with_redaction(config, &redaction, rule)
+}
+
+#[cfg(test)]
+fn shared_matcher_scratch_bytes(horizon: usize) -> usize {
+    let id = StableId::new("scratch-projection").unwrap();
+    let limits = RedactionLimits::new(1, 1, 1, 1, false, 1, 1, 1).unwrap();
+    let prepared = PreparedRedactionSnapshot::prepare(
+        RedactionSnapshotSpec::new(vec![RedactionProfileSpec::new(
+            id.clone(),
+            b"x".to_vec(),
+            limits,
+            vec![RedactionRuleSpec::new(
+                vec![vec![b'x'; horizon]],
+                Vec::new(),
+                Vec::new(),
+                RulePayloads::Both,
+            )],
+        )]),
+        || false,
+    )
+    .unwrap();
+    prepared
+        .profile_projection(&id)
+        .unwrap()
+        .matcher_scratch_bytes()
 }
 
 fn effective_http_body_limits(
@@ -4810,29 +4552,22 @@ fn decode_peak(encoded: usize, decoded: usize) -> Result<usize, ConfigCompileErr
 
 fn compile_capture_working_set(
     config: &super::authoring::AuthoringConfig,
+    redaction: &ProductRedactionPlan,
 ) -> Result<Option<CaptureWorkingSetPlan>, ConfigCompileError> {
     let Some(capture) = &config.observation.capture else {
         return Ok(None);
     };
-    let profile = config
-        .redaction
+    let profile = redaction
         .profiles
         .get(&capture.redaction_profile)
         .expect("capture profile references validated before capture compilation");
-    let matcher_scratch_bytes = configured_profile_literal_scratch_bytes(
-        profile,
-        &format!("redaction.profiles.{}", capture.redaction_profile),
-    )?;
-    let has_text_expressions = profile.rules.iter().any(|rule| {
-        !rule.expressions.is_empty() && !matches!(rule.payloads, RedactionPayloads::Binary)
-    });
     let plan = capture_working_set_plan(
-        profile.max_body_bytes,
-        profile.max_decoded_body_bytes,
-        profile.max_message_bytes,
-        profile.allow_permessage_deflate,
-        matcher_scratch_bytes,
-        has_text_expressions,
+        profile.limits.max_body_bytes(),
+        profile.limits.max_decoded_body_bytes(),
+        profile.limits.max_message_bytes(),
+        profile.limits.allow_permessage_deflate(),
+        profile.projection.matcher_scratch_bytes(),
+        profile.has_text_expressions,
         capture.max_body_bytes,
     )?;
     if plan.maximum_peak_bytes > capture.max_inflight_body_bytes {
@@ -4988,9 +4723,10 @@ fn compile_reloadable_plan(
     working_directory: &Path,
     compiled_urls_by_rule: Vec<Vec<CompiledUrlPattern>>,
     resource_plan: CompiledResourcePlan,
+    redaction: ProductRedactionPlan,
 ) -> Result<ReloadableProductPlan, ConfigCompileError> {
     let http_body_read_plans_by_cursor = compile_http_body_read_plans(config)?.published_by_cursor;
-    let capture_working_set = compile_capture_working_set(config)?;
+    let capture_working_set = compile_capture_working_set(config, &redaction)?;
     Ok(ReloadableProductPlan {
         request_timeout: config.service.request_timeout.get(),
         max_content_decoding_expansion_ratio: config.service.max_content_decoding_expansion_ratio,
@@ -5003,7 +4739,7 @@ fn compile_reloadable_plan(
         )?,
         authorization: compile_authorization_plan(&config.authorization, working_directory)?,
         credentials: compile_credentials_plan(&config.credentials)?,
-        redaction: compile_redaction_plan(&config.redaction)?,
+        redaction,
         observation: compile_observation_plan(&config.observation, capture_working_set)?,
         safety: compile_safety_plan(&config.safety)?,
         resource_plan,
@@ -5505,224 +5241,133 @@ fn compile_credentials_plan(
     Ok(CredentialsPlan { inbound, sources })
 }
 
-enum AuthoredLiteralProjectionError {
-    Scratch,
-    Matcher,
-}
+fn compile_redaction_plan(
+    value: &RedactionConfig,
+) -> Result<ProductRedactionPlan, ConfigCompileError> {
+    let mut specs = Vec::new();
+    specs.try_reserve_exact(value.profiles.len()).map_err(|_| {
+        ConfigCompileError::at(
+            "redaction.profiles",
+            "redaction preparation allocation failed",
+        )
+    })?;
+    let mut profile_metadata = Vec::new();
+    let mut sources = Vec::new();
 
-fn authored_literal_resident_bytes(
-    value: &super::authoring::RedactionProfileConfig,
-    class: CompiledRedactionPayloads,
-    build_budget: usize,
-) -> Result<usize, AuthoredLiteralProjectionError> {
-    let pattern_count = value
-        .rules
-        .iter()
-        .filter(|rule| {
-            matches!(
-                (rule.payloads, class),
-                (RedactionPayloads::Text, CompiledRedactionPayloads::Text)
-                    | (RedactionPayloads::Binary, CompiledRedactionPayloads::Binary)
-                    | (RedactionPayloads::Both, _)
-            )
-        })
-        .map(|rule| rule.literals.len())
-        .try_fold(0usize, usize::checked_add)
-        .ok_or(AuthoredLiteralProjectionError::Matcher)?;
-    let mut patterns = Vec::new();
-    patterns
-        .try_reserve_exact(pattern_count)
-        .map_err(|_| AuthoredLiteralProjectionError::Matcher)?;
-    for rule in &value.rules {
-        let applies = matches!(
-            (rule.payloads, class),
-            (RedactionPayloads::Text, CompiledRedactionPayloads::Text)
-                | (RedactionPayloads::Binary, CompiledRedactionPayloads::Binary)
-                | (RedactionPayloads::Both, _)
-        );
-        if !applies {
-            continue;
-        }
-        for literal in &rule.literals {
-            patterns.push(literal.as_bytes());
-        }
-    }
-    debug_assert_eq!(patterns.len(), pattern_count);
-    let (pattern_reference_bytes, pattern_reference_construction_bytes) =
-        redaction_literal_reference_bytes(patterns.capacity(), patterns.len())
-            .ok_or(AuthoredLiteralProjectionError::Matcher)?;
-    let mut patterns = patterns.into_boxed_slice();
-    if std::mem::size_of_val(patterns.as_ref()) != pattern_reference_bytes {
-        return Err(AuthoredLiteralProjectionError::Matcher);
-    }
-    let projection = redaction_literal_projection(
-        &mut patterns,
-        pattern_reference_bytes,
-        pattern_reference_construction_bytes,
-    );
-    let projection = projection.ok_or(AuthoredLiteralProjectionError::Matcher)?;
-    redaction_literal_scratch_bytes(projection.max_pattern_len)
-        .ok_or(AuthoredLiteralProjectionError::Scratch)?;
-    (projection.build_bytes <= build_budget && projection.resident_bytes <= build_budget)
-        .then_some(projection.resident_bytes)
-        .ok_or(AuthoredLiteralProjectionError::Matcher)
-}
-
-fn compile_redaction_plan(value: &RedactionConfig) -> Result<RedactionPlan, ConfigCompileError> {
-    let mut snapshot_matcher_resident_bytes = 0usize;
-    let profiles = value
-        .profiles
-        .iter()
-        .map(|(name, value)| {
-            let prefix = format!("redaction.profiles.{name}");
-            let snapshot_remaining = MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT
-                .checked_sub(snapshot_matcher_resident_bytes)
-                .ok_or_else(|| {
-                    ConfigCompileError::at(&prefix, "compiled matcher snapshot memory ceiling exceeded")
+    for (profile_index, (name, profile)) in value.profiles.iter().enumerate() {
+        let prefix = format!("redaction.profiles.{name}");
+        let id = StableId::new(name.clone())
+            .map_err(|_| ConfigCompileError::at(&prefix, "invalid redaction profile name"))?;
+        let limits = RedactionLimits::new(
+            profile.max_body_bytes,
+            profile.max_decoded_body_bytes,
+            profile.max_frame_bytes,
+            profile.max_message_bytes,
+            profile.allow_permessage_deflate,
+            profile.max_environment_literal_sources,
+            profile.max_environment_literal_bytes,
+            profile.max_environment_literal_total_bytes,
+        )
+        .map_err(|error| ConfigCompileError::at(&prefix, error.to_string()))?;
+        let mut rules = Vec::new();
+        rules.try_reserve_exact(profile.rules.len()).map_err(|_| {
+            ConfigCompileError::at(&prefix, "redaction preparation allocation failed")
+        })?;
+        for (rule_index, rule) in profile.rules.iter().enumerate() {
+            let mut slots = Vec::new();
+            slots
+                .try_reserve_exact(rule.literal_environment_variables.len())
+                .map_err(|_| {
+                    ConfigCompileError::at(
+                        format!("{prefix}.rules[{rule_index}]"),
+                        "redaction preparation allocation failed",
+                    )
                 })?;
-            let text_literal_bytes = authored_literal_resident_bytes(
-                value,
-                CompiledRedactionPayloads::Text,
-                MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE.min(snapshot_remaining),
-            )
-            .map_err(|error| {
-                let message = match error {
-                    AuthoredLiteralProjectionError::Scratch => {
-                        "text literal exceeds the matcher scratch horizon"
-                    }
-                    AuthoredLiteralProjectionError::Matcher => {
-                        "bounded text literal matcher build ceiling exceeded"
-                    }
-                };
-                ConfigCompileError::at(&prefix, message)
-            })?;
-            let binary_literal_budget = MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE
-                .checked_sub(text_literal_bytes)
-                .map(|profile_remaining| {
-                    profile_remaining.min(snapshot_remaining.saturating_sub(text_literal_bytes))
-                })
-                .ok_or_else(|| {
-                    ConfigCompileError::at(&prefix, "compiled matcher profile memory ceiling exceeded")
-                })?;
-            let binary_literal_bytes = authored_literal_resident_bytes(
-                value,
-                CompiledRedactionPayloads::Binary,
-                binary_literal_budget,
-            )
-            .map_err(|error| {
-                let message = match error {
-                    AuthoredLiteralProjectionError::Scratch => {
-                        "binary literal exceeds the matcher scratch horizon"
-                    }
-                    AuthoredLiteralProjectionError::Matcher => {
-                        "bounded binary literal matcher build ceiling exceeded"
-                    }
-                };
-                ConfigCompileError::at(&prefix, message)
-            })?;
-            let literal_bytes = text_literal_bytes
-                .checked_add(binary_literal_bytes)
-                .ok_or_else(|| {
-                    ConfigCompileError::at(&prefix, "compiled matcher size accounting overflow")
-                })?;
-            let (mut profile_matcher_resident_bytes, new_snapshot_bytes) =
-                checked_redaction_matcher_resident_bytes(
-                    0,
-                    snapshot_matcher_resident_bytes,
-                    literal_bytes,
-                )
-                .ok_or_else(|| {
-                    ConfigCompileError::at(&prefix, "compiled matcher memory ceiling exceeded")
-                })?;
-            snapshot_matcher_resident_bytes = new_snapshot_bytes;
-            let rules = value
-                .rules
-                .iter()
-                .enumerate()
-                .map(|(index, rule)| {
-                    let path = format!("{prefix}.rules[{index}]");
-                    Ok(RedactionRulePlan {
-                        literals: rule
-                            .literals
-                            .iter()
-                            .map(|literal| literal.as_bytes().to_vec())
-                            .collect(),
-                        literal_environment_variables: rule.literal_environment_variables.clone(),
-                        expressions: rule
-                            .expressions
-                            .iter()
-                            .enumerate()
-                            .map(|(expression_index, expression)| {
-                                let expression_path =
-                                    format!("{path}.expressions[{expression_index}]");
-                                let remaining_budget =
-                                    remaining_redaction_matcher_resident_bytes(
-                                        profile_matcher_resident_bytes,
-                                        snapshot_matcher_resident_bytes,
-                                    )
-                                    .ok_or_else(|| {
-                                        ConfigCompileError::at(
-                                            &expression_path,
-                                            "compiled matcher memory ceiling exceeded",
-                                        )
-                                    })?;
-                                let matcher = build_redaction_regex(expression, remaining_budget)
-                                    .map_err(|_| {
-                                    ConfigCompileError::at(
-                                        &expression_path,
-                                        "invalid regular expression or unsupported by the bounded matcher",
-                                    )
-                                })?;
-                                let bytes = redaction_regex_resident_bytes(&matcher)
-                                    .ok_or_else(|| {
-                                        ConfigCompileError::at(
-                                            &expression_path,
-                                            "bounded regular-expression size accounting overflow",
-                                        )
-                                    })?;
-                                let (profile_bytes, snapshot_bytes) =
-                                    checked_redaction_matcher_resident_bytes(
-                                        profile_matcher_resident_bytes,
-                                        snapshot_matcher_resident_bytes,
-                                        bytes,
-                                    )
-                                    .ok_or_else(|| {
-                                        ConfigCompileError::at(
-                                            &expression_path,
-                                            "compiled matcher memory ceiling exceeded",
-                                        )
-                                    })?;
-                                profile_matcher_resident_bytes = profile_bytes;
-                                snapshot_matcher_resident_bytes = snapshot_bytes;
-                                Ok(expression.clone())
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
-                        payloads: match rule.payloads {
-                            RedactionPayloads::Text => CompiledRedactionPayloads::Text,
-                            RedactionPayloads::Binary => CompiledRedactionPayloads::Binary,
-                            RedactionPayloads::Both => CompiledRedactionPayloads::Both,
-                        },
-                    })
-                })
-                .collect::<Result<Vec<_>, ConfigCompileError>>()?;
-            Ok((
-                name.clone(),
-                RedactionProfilePlan {
-                    replacement: value.replacement.as_bytes().to_vec(),
-                    max_body_bytes: value.max_body_bytes,
-                    max_decoded_body_bytes: value.max_decoded_body_bytes,
-                    max_frame_bytes: value.max_frame_bytes,
-                    max_message_bytes: value.max_message_bytes,
-                    allow_permessage_deflate: value.allow_permessage_deflate,
-                    max_environment_literal_sources: value.max_environment_literal_sources,
-                    max_environment_literal_bytes: value.max_environment_literal_bytes,
-                    max_environment_literal_total_bytes: value.max_environment_literal_total_bytes,
-                    rules,
+            for (source_index, variable) in rule.literal_environment_variables.iter().enumerate() {
+                let slot = ExternalLiteralSlot::new();
+                slots.push(slot.clone());
+                sources.push(ProductExternalLiteralSource {
+                    slot,
+                    variable: variable.clone(),
+                    profile: profile_index,
+                    rule: rule_index,
+                    source_index,
+                    max_bytes: profile.max_environment_literal_bytes,
+                });
+            }
+            rules.push(RedactionRuleSpec::new(
+                rule.literals
+                    .iter()
+                    .map(|literal| literal.as_bytes().to_vec())
+                    .collect(),
+                slots,
+                rule.expressions.clone(),
+                match rule.payloads {
+                    RedactionPayloads::Text => RulePayloads::Text,
+                    RedactionPayloads::Binary => RulePayloads::Binary,
+                    RedactionPayloads::Both => RulePayloads::Both,
                 },
-            ))
+            ));
+        }
+        let has_text_expressions = profile.rules.iter().any(|rule| {
+            !rule.expressions.is_empty() && !matches!(rule.payloads, RedactionPayloads::Binary)
+        });
+        profile_metadata.push((name.clone(), id.clone(), limits, has_text_expressions));
+        specs.push(RedactionProfileSpec::new(
+            id,
+            profile.replacement.as_bytes().to_vec(),
+            limits,
+            rules,
+        ));
+    }
+
+    let prepared = PreparedRedactionSnapshot::prepare(RedactionSnapshotSpec::new(specs), || false)
+        .map_err(|error| {
+            let profile_name = value
+                .profiles
+                .keys()
+                .nth(error.profile)
+                .map(String::as_str)
+                .unwrap_or("<invalid>");
+            let mut path = format!("redaction.profiles.{profile_name}");
+            if let Some(rule) = error.rule {
+                path.push_str(&format!(".rules[{rule}]"));
+            }
+            if let Some(item) = error.item {
+                let collection = if matches!(
+                    error.kind,
+                    http_access_redaction::PrepareErrorKind::InvalidExpression
+                ) {
+                    "expressions"
+                } else {
+                    "literals"
+                };
+                path.push_str(&format!(".{collection}[{item}]"));
+            }
+            ConfigCompileError::at(path, error.kind.to_string())
+        })?;
+    let profiles = profile_metadata
+        .into_iter()
+        .map(|(name, id, limits, has_text_expressions)| {
+            let projection = prepared
+                .profile_projection(&id)
+                .expect("prepared metadata contains every authored profile");
+            (
+                name,
+                ProductRedactionProfile {
+                    limits,
+                    projection,
+                    has_text_expressions,
+                },
+            )
         })
-        .collect::<Result<BTreeMap<_, _>, ConfigCompileError>>()?;
-    Ok(RedactionPlan { profiles })
+        .collect();
+
+    Ok(ProductRedactionPlan {
+        profiles,
+        prepared,
+        sources,
+    })
 }
 
 fn compile_observation_plan(
@@ -6141,67 +5786,14 @@ rules = [{{ expressions = ['\bsecret-marker\b'] }}]
         let error = compile(&input).expect_err("Unicode word boundaries require runtime caches");
         let rendered = format!("{error:?} {error}");
         assert!(rendered.contains("redaction.profiles.secrets.rules[0].expressions[0]"));
-        assert!(rendered.contains("unsupported by the bounded matcher"));
+        assert!(rendered.contains("invalid bounded redaction expression"));
         assert!(!rendered.contains("secret-marker"));
     }
 
     #[test]
-    fn compiled_matcher_accounting_aggregates_across_profiles() {
-        let mut snapshot_bytes = 0usize;
-        for _ in 0..4 {
-            let (profile_bytes, next_snapshot_bytes) = checked_redaction_matcher_resident_bytes(
-                0,
-                snapshot_bytes,
-                MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE,
-            )
-            .expect("four full profile budgets fit the snapshot ceiling");
-            assert_eq!(
-                profile_bytes,
-                MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE
-            );
-            snapshot_bytes = next_snapshot_bytes;
-        }
-        assert_eq!(
-            snapshot_bytes,
-            MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT
-        );
-        assert!(checked_redaction_matcher_resident_bytes(0, snapshot_bytes, 1).is_none());
-        assert!(checked_redaction_matcher_resident_bytes(usize::MAX, 0, 1).is_none());
-    }
-
-    #[test]
-    fn regex_build_is_bounded_by_matcher_budget_remaining_after_prior_state() {
-        let after_earlier_profiles = remaining_redaction_matcher_resident_bytes(
-            0,
-            MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_SNAPSHOT - 2,
-        )
-        .unwrap();
-        assert_eq!(after_earlier_profiles, 2);
-        assert!(build_redaction_regex("token-[0-9]+", after_earlier_profiles).is_err());
-
-        let after_earlier_profile_matchers = remaining_redaction_matcher_resident_bytes(
-            MAX_REDACTION_COMPILED_MATCHER_BYTES_PER_PROFILE - 2,
-            0,
-        )
-        .unwrap();
-        assert_eq!(after_earlier_profile_matchers, 2);
-        assert!(build_redaction_regex("token-[0-9]+", after_earlier_profile_matchers).is_err());
-
-        let matcher = build_redaction_regex("token-[0-9]+", 3 * 1024 * 1024)
-            .expect("the absolute one-MiB direction cap remains usable");
-        assert!(redaction_regex_resident_bytes(&matcher).unwrap() <= 2 * 1024 * 1024);
-
-        assert!(build_redaction_regex(r"\w{100}", 96 * 1024).is_err());
-        let large_expression = "a".repeat(32 * 1024);
-        assert!(build_redaction_regex(&large_expression, 96 * 1024).is_err());
-    }
-
-    #[test]
     fn authored_literal_horizon_is_rejected_during_pure_compilation() {
-        let literal = "x".repeat(
-            MAX_REDACTION_MATCHER_SCRATCH_BYTES / std::mem::size_of::<RedactionLiteralInterval>()
-                + 1,
-        );
+        let literal =
+            "x".repeat(MAX_MATCHER_SCRATCH_BYTES / (std::mem::size_of::<usize>() * 2) + 1);
         let input = format!(
             r#"{MINIMAL}
 
@@ -6212,64 +5804,8 @@ rules = [{{ literals = ["{literal}"] }}]
         let error = compile(&input).expect_err("the literal horizon exceeds one MiB of scratch");
         let rendered = format!("{error:?} {error}");
         assert!(rendered.contains("redaction.profiles.secrets"));
-        assert!(rendered.contains("configured literal horizon exceeds"));
+        assert!(rendered.contains("invalid redaction limit"));
         assert!(!rendered.contains(&literal));
-    }
-
-    #[test]
-    fn sparse_literal_projection_is_exact_after_sorting_and_deduplication() {
-        let abc = b"abc".as_slice();
-        let abd = b"abd".as_slice();
-        let mut patterns = Vec::new();
-        patterns.try_reserve_exact(3).unwrap();
-        patterns.extend([abd, abc, abc]);
-        let (pattern_reference_bytes, pattern_reference_construction_bytes) =
-            redaction_literal_reference_bytes(patterns.capacity(), patterns.len()).unwrap();
-        assert_eq!(
-            pattern_reference_construction_bytes,
-            (patterns.capacity() + patterns.len()) * std::mem::size_of::<&[u8]>()
-        );
-        let mut patterns = patterns.into_boxed_slice();
-        let projection = redaction_literal_projection(
-            &mut patterns,
-            pattern_reference_bytes,
-            pattern_reference_construction_bytes,
-        )
-        .unwrap();
-
-        assert_eq!(patterns[0], abc);
-        assert_eq!(patterns[1], abc);
-        assert_eq!(patterns[2], abd);
-        assert_eq!(projection.state_count, 5);
-        assert_eq!(projection.edge_count, 4);
-        assert_eq!(projection.max_pattern_len, 3);
-        assert_eq!(
-            projection.resident_bytes,
-            5 * std::mem::size_of::<RedactionLiteralNode>()
-                + 4 * std::mem::size_of::<RedactionLiteralEdge>()
-        );
-        let shared_build_bytes = projection.resident_bytes
-            + 5 * std::mem::size_of::<usize>()
-            + 4 * std::mem::size_of::<usize>();
-        assert_eq!(
-            projection.reference_build_bytes,
-            pattern_reference_construction_bytes
-        );
-        assert_eq!(
-            projection.trie_build_bytes,
-            shared_build_bytes + pattern_reference_bytes
-        );
-        assert_eq!(
-            projection.failure_build_bytes,
-            shared_build_bytes + 5 * std::mem::size_of::<usize>()
-        );
-        assert_eq!(
-            projection.build_bytes,
-            projection
-                .reference_build_bytes
-                .max(projection.trie_build_bytes)
-                .max(projection.failure_build_bytes)
-        );
     }
 
     #[test]
@@ -6283,9 +5819,7 @@ rules = [{{ literal_environment_variables = ["TEST_REDACTION_SECRET"] }}]
 "#
         );
         let error = compile(&input).expect_err("the configured source horizon exceeds scratch");
-        assert!(error
-            .to_string()
-            .contains("configured literal horizon exceeds"));
+        assert!(error.to_string().contains("invalid redaction limit"));
     }
 
     fn resource_config(service: &str, definitions: &str, rules: &str) -> String {
@@ -7217,7 +6751,7 @@ redaction_profile = "small"
         );
         let config: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
         let schedule = compile_http_rule_schedule(&config, &config.policy.rules[0]).unwrap();
-        let literal_scratch = redaction_literal_scratch_bytes(1).unwrap();
+        let literal_scratch = shared_matcher_scratch_bytes(1);
         let continuation_bytes = provider_response_guarded_suffix_bytes(80, "test").unwrap();
         let compact_credential_bytes = continuation_bytes.min(MAX_PROVIDER_CREDENTIAL_BYTES);
         let terminal_redaction =
@@ -7345,7 +6879,7 @@ redaction_profile = "small"
             compile_http_rule_schedule(&authored, &authored.policy.rules[1]).unwrap();
         let plan = compile(&input).unwrap().reloadable_plan.resource_plan;
         let retained = guarded(65_537);
-        let literal_scratch = guarded(redaction_literal_scratch_bytes(1).unwrap());
+        let literal_scratch = guarded(shared_matcher_scratch_bytes(1));
         let redaction_output = guarded(1);
         let compact_credentials =
             guarded(provider_response_guarded_suffix_bytes(80, "test").unwrap());
@@ -7903,7 +7437,7 @@ redaction_profile = "terminal"
     fn capture_working_set_projects_each_required_peak_exactly() {
         let encoded_bytes = 3 * HTTP_DECODER_OUTPUT_STAGING_BYTES + 1;
         let decoded_bytes = 5 * HTTP_DECODER_OUTPUT_STAGING_BYTES + 1;
-        let matcher_scratch_bytes = 3 * std::mem::size_of::<RedactionLiteralInterval>();
+        let matcher_scratch_bytes = 3 * std::mem::size_of::<usize>() * 2;
         let stored_bytes = 2 * HTTP_DECODER_OUTPUT_STAGING_BYTES + 1;
         let encoded = guarded(encoded_bytes);
         let decoded = guarded(decoded_bytes);
@@ -7969,7 +7503,7 @@ redaction_profile = "terminal"
     fn capture_working_set_covers_maximum_websocket_decode_redaction_and_serialization() {
         let message_bytes = 256 * MIB;
         let stored_bytes = MIB;
-        let matcher_scratch = redaction_literal_scratch_bytes("secret".len()).unwrap();
+        let matcher_scratch = shared_matcher_scratch_bytes("secret".len());
         let expected = capture_working_set_plan(
             1,
             1,
@@ -8079,7 +7613,7 @@ max_total_bytes = 1
             1,
             MIB,
             false,
-            redaction_literal_scratch_bytes("secret".len()).unwrap(),
+            shared_matcher_scratch_bytes("secret".len()),
             false,
             1,
         )
@@ -8150,7 +7684,7 @@ filename = "{{requestId}}-{{suffix}}.json"
             profile.max_decoded_body_bytes,
             profile.max_message_bytes,
             profile.allow_permessage_deflate,
-            redaction_literal_scratch_bytes(profile.max_environment_literal_bytes).unwrap(),
+            shared_matcher_scratch_bytes(profile.max_environment_literal_bytes),
             false,
             authored_capture.max_body_bytes,
         )
@@ -9435,7 +8969,7 @@ redaction_profile = "terminal"
 "#,
         );
         let compiled = compile(&input).unwrap();
-        let scratch = redaction_literal_scratch_bytes("terminal-test-literal".len()).unwrap();
+        let scratch = shared_matcher_scratch_bytes("terminal-test-literal".len());
         let first_decode = decode_peak(MIB, 16 * MIB).unwrap();
         let terminal_decode = decode_peak(MIB, 8 * MIB).unwrap();
         let first_retained_terminal = guarded(16 * MIB) + guarded(8 * MIB) + guarded(scratch);
@@ -9502,7 +9036,7 @@ redaction_profile = "terminal"
 "#,
         );
         let compiled = compile(&input).unwrap();
-        let scratch = redaction_literal_scratch_bytes("terminal-test-literal".len()).unwrap();
+        let scratch = shared_matcher_scratch_bytes("terminal-test-literal".len());
         let first_decode = decode_peak(MIB, 16 * MIB).unwrap();
         let terminal_decode = decode_peak(MIB, 8 * MIB).unwrap();
         let first_retained_terminal = guarded(16 * MIB) + guarded(8 * MIB) + guarded(scratch);
@@ -10036,9 +9570,8 @@ methods = ["DELETE"]
         let compiled = compile(&input).unwrap();
         let plan = &compiled.reloadable_plan.resource_plan;
         let transport = 2 * 64 * 1024;
-        let plain_scratch = redaction_literal_scratch_bytes("plain-test-literal".len()).unwrap();
-        let deflate_scratch =
-            redaction_literal_scratch_bytes("deflate-test-literal".len()).unwrap();
+        let plain_scratch = shared_matcher_scratch_bytes("plain-test-literal".len());
+        let deflate_scratch = shared_matcher_scratch_bytes("deflate-test-literal".len());
         assert_eq!(
             plan.upgrade_wire_working_set_bytes_by_rule,
             vec![

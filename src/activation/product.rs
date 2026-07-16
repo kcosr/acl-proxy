@@ -7,7 +7,7 @@ use crate::config::compiler::ReloadableProductPlan;
 use crate::config::StaticFingerprint;
 use crate::credentials::CredentialResolverSnapshot;
 use crate::egress::{EgressActivationError, EgressSnapshot};
-use crate::redaction::{RedactionSnapshot, SnapshotError};
+use crate::redaction::ProductRedactionActivationError;
 use crate::runtime::{
     ActivatedGeneration, ActivationCancellation, BoxFuture, CandidateActivator, CleanupReason,
     GenerationId, GenerationOwner, ProviderRegistry, RuntimeError,
@@ -119,6 +119,7 @@ impl ProductActivator {
                     error.to_string(),
                 )
             })?;
+        let capture_redaction = standalone.capture_redaction().cloned();
         cancellation.check()?;
         let ReloadableProductPlan {
             request_timeout,
@@ -144,7 +145,10 @@ impl ProductActivator {
         let provider_registry =
             ProviderRegistry::from_names(authorization.providers.keys().cloned());
 
-        let redaction = RedactionSnapshot::activate(redaction, || cancellation.is_cancelled())
+        let redaction = redaction
+            .activate(standalone.identity().clone(), standalone.version(), || {
+                cancellation.is_cancelled()
+            })
             .map_err(|error| map_redaction_error(error, &cancellation))?;
         cancellation.check()?;
 
@@ -166,7 +170,7 @@ impl ProductActivator {
         let observation = self
             .static_resources
             .observation_runtime()
-            .activate(observation, &redaction)
+            .activate(observation, &redaction, capture_redaction.as_ref())
             .map_err(|error| candidate_error(&cancellation, "observation", error.to_string()))?;
         cancellation.check()?;
 
@@ -194,7 +198,6 @@ impl ProductActivator {
         let (authorization, provider_registry, provider_owners) = authorization.into_parts();
         let (observation, observation_owner) = observation.into_parts();
         let (credentials, credential_registry) = credentials.into_parts();
-        let (redaction, redaction_registry) = redaction.into_parts();
 
         let owners = provider_owners
             .into_vec()
@@ -205,7 +208,6 @@ impl ProductActivator {
         let standalone = match standalone.bind(
             &credential_registry,
             &redaction,
-            &redaction_registry,
             &authorization,
             &provider_registry,
             &egress,
@@ -274,10 +276,10 @@ fn candidate_error(
 }
 
 fn map_redaction_error(
-    error: SnapshotError,
+    error: ProductRedactionActivationError,
     cancellation: &ActivationCancellation,
 ) -> RuntimeError {
-    if error == SnapshotError::ActivationCancelled {
+    if error == ProductRedactionActivationError::Cancelled {
         RuntimeError::ActivationCancelled
     } else {
         candidate_error(cancellation, "redaction", error.to_string())
@@ -438,9 +440,13 @@ redaction_profile = "environment"
             .expect("standalone generation binds the rule redaction profile");
         let redacted = binding
             .handle()
-            .redact_decoded_http_body(input.to_vec())
+            .redact_websocket_message(
+                &crate::redaction::UpgradeRedactionContext::for_profile(binding.handle()),
+                crate::redaction::UpgradeRedactionBody::new(input.to_vec()).unwrap(),
+                http_access_redaction::PayloadClass::Text,
+            )
             .unwrap();
-        redacted.bytes.clone()
+        redacted.into_body().into_vec().unwrap()
     }
 
     #[tokio::test]
@@ -853,8 +859,13 @@ redaction_profile = "environment"
             .capture()
             .expect("capture policy is generation-owned");
         assert_eq!(capture.max_body_bytes(), 1024);
-        let capture_profile_limits = capture.profile().limits();
-        assert!(capture_profile_limits.compiled_matcher_resident_bytes > 0);
+        assert!(
+            capture
+                .profile()
+                .metrics()
+                .compiled_matcher_resident_bytes()
+                > 0
+        );
         assert_eq!(observation_runtime.committed_capture_limit(), 0);
         let mut publication = activated.owner.publication_guard().unwrap();
         publication.commit();

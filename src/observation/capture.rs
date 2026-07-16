@@ -496,18 +496,16 @@ impl PublicationGuard for CaptureEpochPublicationGuard<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use std::sync::Barrier;
     use std::thread;
 
     use super::*;
     use crate::config::compiler::{
-        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledRedactionPayloads,
-        ObservationPlan, RedactionPlan, RedactionProfilePlan, RedactionRulePlan,
+        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, ObservationPlan,
     };
     use crate::observation::{CaptureEvent, ObservationActivation, ProductObservationSnapshot};
-    use crate::redaction::RedactionSnapshot;
+    use crate::redaction::{test_snapshot, TestProfile};
     use crate::safety::allocation::{
         body_allocation_bytes, workspace_allocation_bytes, MAX_BUFFER_GROWTH_BYTES,
     };
@@ -517,29 +515,16 @@ mod tests {
         pool: Arc<CapturePool>,
         limit: usize,
     ) -> ObservationActivation {
-        let mut profiles = BTreeMap::new();
-        profiles.insert(
-            "accounting".to_owned(),
-            RedactionProfilePlan {
-                replacement: b"[REMOVED]".to_vec(),
-                max_body_bytes: 8,
-                max_decoded_body_bytes: 128,
-                max_frame_bytes: 64,
-                max_message_bytes: 128,
-                allow_permessage_deflate: false,
-                max_environment_literal_sources: 1,
-                max_environment_literal_bytes: 64,
-                max_environment_literal_total_bytes: 64,
-                rules: vec![RedactionRulePlan {
-                    literals: vec![b"secret".to_vec()],
-                    literal_environment_variables: Vec::new(),
-                    expressions: Vec::new(),
-                    payloads: CompiledRedactionPayloads::Both,
-                }],
-            },
-        );
-        let redaction =
-            RedactionSnapshot::activate(RedactionPlan { profiles }, || false).expect("redaction");
+        let (redaction, references) = test_snapshot(vec![TestProfile {
+            name: "accounting".to_owned(),
+            replacement: b"[REMOVED]".to_vec(),
+            max_body_bytes: 8,
+            max_decoded_body_bytes: 128,
+            max_frame_bytes: 64,
+            max_message_bytes: 128,
+            allow_permessage_deflate: false,
+            literals: vec![b"secret".to_vec()],
+        }]);
         ProductObservationSnapshot::activate(
             ObservationPlan {
                 capture: Some(CapturePlan {
@@ -559,6 +544,7 @@ mod tests {
                 ..ObservationPlan::default()
             },
             &redaction,
+            references.get("accounting"),
             pool,
         )
         .expect("capture activation")

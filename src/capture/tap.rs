@@ -105,7 +105,6 @@ impl HttpCaptureTap {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::path::Path;
 
     use http::HeaderValue;
@@ -116,11 +115,10 @@ mod tests {
         CaptureRecord, CaptureSinkSpec,
     };
     use crate::config::compiler::{
-        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledRedactionPayloads,
-        ObservationPlan, RedactionPlan, RedactionProfilePlan, RedactionRulePlan,
+        CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, ObservationPlan,
     };
     use crate::observation::{CapturePool, ProductObservationSnapshot};
-    use crate::redaction::RedactionSnapshot;
+    use crate::redaction::{test_snapshot, TestProfile};
     use crate::runtime::GenerationOwner;
 
     fn epoch_with_limit(
@@ -131,29 +129,16 @@ mod tests {
         Arc<CapturePool>,
         Arc<dyn GenerationOwner>,
     ) {
-        let mut profiles = BTreeMap::new();
-        profiles.insert(
-            "capture".to_owned(),
-            RedactionProfilePlan {
-                replacement: b"REDACTED".to_vec(),
-                max_body_bytes: 1024,
-                max_decoded_body_bytes: 1024,
-                max_frame_bytes: 1024,
-                max_message_bytes: 1024,
-                allow_permessage_deflate: false,
-                max_environment_literal_sources: 0,
-                max_environment_literal_bytes: 0,
-                max_environment_literal_total_bytes: 0,
-                rules: vec![RedactionRulePlan {
-                    literals: Vec::new(),
-                    literal_environment_variables: Vec::new(),
-                    expressions: Vec::new(),
-                    payloads: CompiledRedactionPayloads::Both,
-                }],
-            },
-        );
-        let redaction = RedactionSnapshot::activate(RedactionPlan { profiles }, || false)
-            .expect("redaction activation");
+        let (redaction, references) = test_snapshot(vec![TestProfile {
+            name: "capture".to_owned(),
+            replacement: b"REDACTED".to_vec(),
+            max_body_bytes: 1024,
+            max_decoded_body_bytes: 1024,
+            max_frame_bytes: 1024,
+            max_message_bytes: 1024,
+            allow_permessage_deflate: false,
+            literals: Vec::new(),
+        }]);
         let pool = CapturePool::new();
         let activation = ProductObservationSnapshot::activate(
             ObservationPlan {
@@ -174,6 +159,7 @@ mod tests {
                 ..ObservationPlan::default()
             },
             &redaction,
+            references.get("capture"),
             pool.clone(),
         )
         .expect("observation activation");

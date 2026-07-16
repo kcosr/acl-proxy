@@ -23,11 +23,10 @@ use crate::credentials::ResolvedCredentialAction;
 use crate::egress::EgressSnapshot;
 use crate::observation::{CaptureEvent, ProductObservationSnapshot};
 use crate::policy::{ProductAclCompileError, ProductAclSnapshot};
-use crate::redaction::{ProfileHandle, RedactionSnapshot};
 use crate::runtime::{
     CredentialSourceIndex, CredentialSourceRegistry, GenerationId, ProviderIndex, ProviderRegistry,
-    RedactionProfileRegistry,
 };
+use http_access_redaction::{RedactionProfile, RedactionSnapshot};
 
 /// Snapshot-local immutable inputs needed by the standalone request adapter.
 ///
@@ -66,7 +65,7 @@ pub(crate) struct StandaloneGenerationCore {
 struct StandaloneBindingManifest {
     global_credentials: Box<[StandaloneCredentialBindingManifest]>,
     provider_outputs: Box<[StandaloneProviderOutputManifest]>,
-    capture_redaction: Option<String>,
+    capture_redaction: Option<RedactionRef>,
     tls: Box<[StandaloneTlsBindingManifest]>,
     resources: StandaloneResourceProof,
 }
@@ -147,7 +146,7 @@ pub(crate) struct BoundProviderOutput {
 }
 
 pub(crate) struct BoundRedaction {
-    handle: ProfileHandle,
+    handle: RedactionProfile,
 }
 
 pub(crate) struct StandaloneRuleTemplate {
@@ -357,7 +356,6 @@ impl UnboundStandaloneGenerationPlan {
         self,
         credentials: &CredentialSourceRegistry,
         redaction_snapshot: &RedactionSnapshot,
-        redactions: &RedactionProfileRegistry,
         authorization: &ProductAuthorizationSnapshot,
         providers: &ProviderRegistry,
         egress: &EgressSnapshot,
@@ -368,7 +366,6 @@ impl UnboundStandaloneGenerationPlan {
             &self.manifest,
             credentials,
             redaction_snapshot,
-            redactions,
             authorization,
             providers,
             egress,
@@ -378,6 +375,18 @@ impl UnboundStandaloneGenerationPlan {
             core: self.core,
             activated,
         })
+    }
+
+    pub(crate) fn identity(&self) -> &SnapshotIdentity {
+        self.core.identity()
+    }
+
+    pub(crate) fn version(&self) -> u64 {
+        self.core.snapshot_lease.generation().get()
+    }
+
+    pub(crate) fn capture_redaction(&self) -> Option<&RedactionRef> {
+        self.manifest.capture_redaction.as_ref()
     }
 
     #[cfg(test)]
@@ -576,7 +585,7 @@ impl BoundProviderOutput {
 }
 
 impl BoundRedaction {
-    pub(crate) fn handle(&self) -> &ProfileHandle {
+    pub(crate) fn handle(&self) -> &RedactionProfile {
         &self.handle
     }
 }
@@ -691,7 +700,7 @@ fn compile_binding_manifest(
             .observation
             .capture
             .as_ref()
-            .map(|capture| capture.redaction_profile.clone()),
+            .and_then(|capture| redaction_refs.get(&capture.redaction_profile).cloned()),
         tls: tls.into_boxed_slice(),
         resources: compile_resource_proof(plan)?,
     })
@@ -818,7 +827,6 @@ fn bind_activated(
     manifest: &StandaloneBindingManifest,
     credentials: &CredentialSourceRegistry,
     redaction_snapshot: &RedactionSnapshot,
-    redactions: &RedactionProfileRegistry,
     authorization: &ProductAuthorizationSnapshot,
     providers: &ProviderRegistry,
     egress: &EgressSnapshot,
@@ -894,14 +902,7 @@ fn bind_activated(
         let redaction = core_rule
             .redaction_profile
             .as_deref()
-            .map(|name| {
-                bind_redaction(
-                    name,
-                    core_rule.redaction.as_ref(),
-                    redaction_snapshot,
-                    redactions,
-                )
-            })
+            .map(|name| bind_redaction(name, core_rule.redaction.as_ref(), redaction_snapshot))
             .transpose()?;
         rule_redactions.push(redaction);
 
@@ -922,7 +923,7 @@ fn bind_activated(
         .collect::<Result<Vec<_>, _>>()?
         .into_boxed_slice();
 
-    bind_capture(core, manifest, redaction_snapshot, redactions, observation)?;
+    bind_capture(core, manifest, redaction_snapshot, observation)?;
 
     for binding in &manifest.tls {
         bind_tls_roots(binding, egress)?;
@@ -1003,18 +1004,14 @@ fn bind_provider_output(
 }
 
 fn bind_redaction(
-    name: &str,
+    _name: &str,
     reference: Option<&RedactionRef>,
     redaction_snapshot: &RedactionSnapshot,
-    redactions: &RedactionProfileRegistry,
 ) -> Result<BoundRedaction, StandaloneBindError> {
-    reference.ok_or(StandaloneBindError::Inconsistent("redaction reference"))?;
-    let profile = redactions
-        .get(name)
-        .ok_or(StandaloneBindError::Missing("redaction profile"))?;
+    let reference = reference.ok_or(StandaloneBindError::Inconsistent("redaction reference"))?;
     let handle = redaction_snapshot
-        .profile(profile)
-        .ok_or(StandaloneBindError::Missing("redaction profile handle"))?;
+        .profile(reference)
+        .map_err(|_| StandaloneBindError::Missing("redaction profile handle"))?;
     Ok(BoundRedaction { handle })
 }
 
@@ -1022,25 +1019,18 @@ fn bind_capture(
     core: &StandaloneGenerationCore,
     manifest: &StandaloneBindingManifest,
     redaction_snapshot: &RedactionSnapshot,
-    redactions: &RedactionProfileRegistry,
     observation: &ProductObservationSnapshot,
 ) -> Result<(), StandaloneBindError> {
     match (
         core.capture.as_ref(),
-        manifest.capture_redaction.as_deref(),
+        manifest.capture_redaction.as_ref(),
         observation.capture_epoch().capture(),
     ) {
         (None, None, None) => Ok(()),
-        (Some(neutral), Some(profile_name), Some(activated)) => {
-            let profile_index = redactions
-                .get(profile_name)
-                .ok_or(StandaloneBindError::Missing("capture redaction profile"))?;
-            let profile =
-                redaction_snapshot
-                    .profile(profile_index)
-                    .ok_or(StandaloneBindError::Missing(
-                        "capture redaction profile handle",
-                    ))?;
+        (Some(neutral), Some(reference), Some(activated)) => {
+            let profile = redaction_snapshot
+                .profile(reference)
+                .map_err(|_| StandaloneBindError::Missing("capture redaction profile handle"))?;
             if !profile.same_profile(activated.profile())
                 || !capture_events_match(neutral.events(), activated)
             {
@@ -1381,13 +1371,15 @@ fn compile_capture(
         ))?;
     let ratio = u64::try_from(plan.max_content_decoding_expansion_ratio)
         .map_err(|_| StandaloneCompileError::Checked("capture expansion ratio"))?;
-    let chunk_bytes = plan
-        .forwarding
-        .chunk_bytes
-        .min(profile.max_body_bytes.max(profile.max_decoded_body_bytes));
+    let chunk_bytes = plan.forwarding.chunk_bytes.min(
+        profile
+            .limits
+            .max_body_bytes()
+            .max(profile.limits.max_decoded_body_bytes()),
+    );
     let limits = body_limits(
-        profile.max_body_bytes,
-        profile.max_decoded_body_bytes,
+        profile.limits.max_body_bytes(),
+        profile.limits.max_decoded_body_bytes(),
         ratio,
         chunk_bytes,
         0,

@@ -5,11 +5,14 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
+use http_access_redaction::{RedactionProfile, RedactionSnapshot};
 use http_access_runtime::BestEffortAdmission;
 #[cfg(not(test))]
 use http_access_runtime::ObservationQueue;
 pub(crate) use http_access_types::CaptureEvent;
-use http_access_types::{CaptureEventPolicy, DecisionAuditFacts, DecisionDisposition};
+use http_access_types::{
+    CaptureEventPolicy, DecisionAuditFacts, DecisionDisposition, RedactionRef,
+};
 
 use crate::capture::{
     CaptureArtifactJob, CaptureArtifactSubmitError, CaptureArtifactWorker, CaptureSinkSpec,
@@ -21,7 +24,6 @@ use crate::config::compiler::{
 };
 #[cfg(not(test))]
 use crate::logging::PolicyDecisionLogSink;
-use crate::redaction::{ProfileHandle, RedactionActivation, RedactionSnapshot};
 use crate::runtime::{GenerationOwner, ObservationSnapshot};
 
 use capture::CaptureEpochUpdate;
@@ -72,9 +74,15 @@ impl ProductObservationRuntime {
     pub(crate) fn activate(
         &self,
         plan: ObservationPlan,
-        redaction: &RedactionActivation,
+        redaction: &RedactionSnapshot,
+        capture_redaction: Option<&RedactionRef>,
     ) -> Result<ObservationActivation, ObservationActivationError> {
-        ProductObservationSnapshot::activate(plan, redaction, self.capture_pool.clone())
+        ProductObservationSnapshot::activate(
+            plan,
+            redaction,
+            capture_redaction,
+            self.capture_pool.clone(),
+        )
     }
 
     /// Leases the capture-only state currently published for established
@@ -300,7 +308,8 @@ impl fmt::Debug for ProductObservationSnapshot {
 impl ProductObservationSnapshot {
     pub(crate) fn activate(
         plan: ObservationPlan,
-        redaction: &RedactionActivation,
+        redaction: &RedactionSnapshot,
+        capture_redaction: Option<&RedactionRef>,
         capture_pool: Arc<CapturePool>,
     ) -> Result<ObservationActivation, ObservationActivationError> {
         let ObservationPlan { logging, capture } = plan;
@@ -308,12 +317,11 @@ impl ProductObservationSnapshot {
         let (capture_epoch, proposed_limit) = match capture {
             None => (Arc::new(CaptureEpoch::disabled()), 0),
             Some(plan) => {
-                let profile_name = &plan.redaction_profile;
-                let profile_index = redaction
-                    .profile_index(profile_name)
-                    .ok_or(ObservationActivationError::MissingCaptureProfile)?;
-                let profile = RedactionSnapshot::profile(redaction, profile_index)
-                    .ok_or(ObservationActivationError::MissingCaptureProfile)?;
+                let reference =
+                    capture_redaction.ok_or(ObservationActivationError::MissingCaptureProfile)?;
+                let profile = redaction
+                    .profile(reference)
+                    .map_err(|_| ObservationActivationError::MissingCaptureProfile)?;
                 let proposed_limit = plan.max_inflight_body_bytes;
                 (
                     Arc::new(CaptureEpoch::enabled(CapturePolicy::activate(
@@ -438,7 +446,7 @@ pub(crate) enum ObservationActivationError {
 
 pub(crate) struct CapturePolicy {
     events: CaptureEventPolicy,
-    profile: ProfileHandle,
+    profile: RedactionProfile,
     sink: CaptureSinkSpec,
     max_body_bytes: usize,
     pool: Weak<CapturePool>,
@@ -457,7 +465,7 @@ impl fmt::Debug for CapturePolicy {
 }
 
 impl CapturePolicy {
-    fn activate(plan: CapturePlan, profile: ProfileHandle, pool: Weak<CapturePool>) -> Self {
+    fn activate(plan: CapturePlan, profile: RedactionProfile, pool: Weak<CapturePool>) -> Self {
         let CapturePlan {
             events,
             redaction_profile: _,
@@ -492,7 +500,7 @@ impl CapturePolicy {
         self.pool.upgrade()?.try_admit()
     }
 
-    pub(crate) fn profile(&self) -> &ProfileHandle {
+    pub(crate) fn profile(&self) -> &RedactionProfile {
         &self.profile
     }
 
@@ -511,11 +519,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::config::compiler::{
-        CaptureWorkingSetPlan, CompiledRedactionPayloads, PolicyDecisionLoggingPlan, RedactionPlan,
-        RedactionProfilePlan, RedactionRulePlan,
-    };
-    use crate::redaction::RedactionSnapshot;
+    use crate::config::compiler::{CaptureWorkingSetPlan, PolicyDecisionLoggingPlan};
+    use crate::redaction::{test_snapshot, TestProfile};
     use crate::runtime::{CleanupReason, RuntimeError};
 
     fn decision_facts() -> DecisionAuditFacts {
@@ -619,32 +624,27 @@ mod tests {
         ObservationPlan::default()
     }
 
-    fn profile_plan(max_body_bytes: usize) -> RedactionProfilePlan {
-        RedactionProfilePlan {
-            replacement: b"[REMOVED]".to_vec(),
-            max_body_bytes,
-            max_decoded_body_bytes: 128,
-            max_frame_bytes: 64,
-            max_message_bytes: 128,
-            allow_permessage_deflate: false,
-            max_environment_literal_sources: 1,
-            max_environment_literal_bytes: 64,
-            max_environment_literal_total_bytes: 64,
-            rules: vec![RedactionRulePlan {
-                literals: vec![b"secret".to_vec()],
-                literal_environment_variables: Vec::new(),
-                expressions: Vec::new(),
-                payloads: CompiledRedactionPayloads::Both,
-            }],
-        }
-    }
-
-    fn redaction<'a>(entries: impl IntoIterator<Item = (&'a str, usize)>) -> RedactionActivation {
-        let mut profiles = BTreeMap::new();
-        for (name, max_body_bytes) in entries {
-            profiles.insert(name.to_owned(), profile_plan(max_body_bytes));
-        }
-        RedactionSnapshot::activate(RedactionPlan { profiles }, || false).expect("profiles")
+    fn redaction<'a>(
+        entries: impl IntoIterator<Item = (&'a str, usize)>,
+    ) -> (
+        RedactionSnapshot,
+        BTreeMap<String, http_access_types::RedactionRef>,
+    ) {
+        test_snapshot(
+            entries
+                .into_iter()
+                .map(|(name, max_body_bytes)| TestProfile {
+                    name: name.to_owned(),
+                    replacement: b"[REMOVED]".to_vec(),
+                    max_body_bytes,
+                    max_decoded_body_bytes: 128,
+                    max_frame_bytes: 64,
+                    max_message_bytes: 128,
+                    allow_permessage_deflate: false,
+                    literals: vec![b"secret".to_vec()],
+                })
+                .collect(),
+        )
     }
 
     fn activate(
@@ -654,9 +654,14 @@ mod tests {
         limit: usize,
         profile_body_limit: usize,
     ) -> ObservationActivation {
-        let redaction = redaction([(profile_name, profile_body_limit)]);
-        ProductObservationSnapshot::activate(plan(profile_name, events, limit), &redaction, pool)
-            .expect("observation activation")
+        let (redaction, references) = redaction([(profile_name, profile_body_limit)]);
+        ProductObservationSnapshot::activate(
+            plan(profile_name, events, limit),
+            &redaction,
+            references.get(profile_name),
+            pool,
+        )
+        .expect("observation activation")
     }
 
     fn commit(owner: &Arc<dyn GenerationOwner>) {
@@ -684,7 +689,8 @@ mod tests {
     #[test]
     fn activation_resolves_the_named_typed_profile_from_one_activation() {
         let pool = CapturePool::new();
-        let redaction = redaction([("first-profile", 17), ("private-profile-name", 73)]);
+        let (redaction, references) =
+            redaction([("first-profile", 17), ("private-profile-name", 73)]);
         let activation = ProductObservationSnapshot::activate(
             plan(
                 "private-profile-name",
@@ -692,12 +698,13 @@ mod tests {
                 16,
             ),
             &redaction,
+            references.get("private-profile-name"),
             pool,
         )
         .expect("observation activation");
         let capture = activation.snapshot().capture().expect("capture");
 
-        assert_eq!(capture.profile().limits().max_body_bytes, 73);
+        assert_eq!(capture.profile().limits().max_body_bytes(), 73);
         assert!(!format!("{activation:?}").contains("private-profile-name"));
     }
 
@@ -724,7 +731,7 @@ mod tests {
 
     #[test]
     fn generation_snapshot_filters_decisions_and_selects_static_severity_queue() {
-        let redaction = redaction(std::iter::empty());
+        let (redaction, _) = redaction(std::iter::empty());
         let snapshot = ProductObservationSnapshot::activate(
             ObservationPlan {
                 logging: ReloadableLoggingPlan {
@@ -739,6 +746,7 @@ mod tests {
                 capture: None,
             },
             &redaction,
+            None,
             CapturePool::new(),
         )
         .unwrap();
@@ -844,10 +852,11 @@ mod tests {
             enabled_snapshot.capture_epoch()
         ));
 
-        let disabled_redaction = redaction(std::iter::empty());
+        let (disabled_redaction, _) = redaction(std::iter::empty());
         let disabled = ProductObservationSnapshot::activate(
             disabled_plan(),
             &disabled_redaction,
+            None,
             pool.clone(),
         )
         .expect("disabled observation activation");
@@ -891,9 +900,9 @@ mod tests {
         commit(&owner);
         drop(epoch);
 
-        let disabled_redaction = redaction(std::iter::empty());
+        let (disabled_redaction, _) = redaction(std::iter::empty());
         let disabled =
-            ProductObservationSnapshot::activate(disabled_plan(), &disabled_redaction, pool)
+            ProductObservationSnapshot::activate(disabled_plan(), &disabled_redaction, None, pool)
                 .expect("disabled observation activation");
         let (disabled_snapshot, disabled_owner) = disabled.into_parts();
         commit(&disabled_owner);
@@ -911,11 +920,12 @@ mod tests {
     #[tokio::test]
     async fn shutdown_disables_new_epochs_without_invalidating_a_lease() {
         let runtime = ProductObservationRuntime::try_new(1).expect("capture worker");
-        let redaction = redaction([("profile", 8)]);
+        let (redaction, references) = redaction([("profile", 8)]);
         let activation = runtime
             .activate(
                 plan("profile", vec![CompiledCaptureEvent::RequestAllowed], 16),
                 &redaction,
+                references.get("profile"),
             )
             .expect("observation activation");
         let (_snapshot, owner) = activation.into_parts();
@@ -934,11 +944,12 @@ mod tests {
     #[tokio::test]
     async fn shutdown_closure_rejects_stale_candidate_and_old_epoch_zero_byte_admission() {
         let runtime = ProductObservationRuntime::try_new(1).expect("capture worker");
-        let redaction = redaction([("profile", 8)]);
+        let (redaction, references) = redaction([("profile", 8)]);
         let activation = runtime
             .activate(
                 plan("profile", vec![CompiledCaptureEvent::RequestAllowed], 16),
                 &redaction,
+                references.get("profile"),
             )
             .expect("observation activation");
         let (snapshot, owner) = activation.into_parts();
@@ -1041,7 +1052,7 @@ mod tests {
     #[test]
     fn missing_authored_profile_is_rejected() {
         let pool = CapturePool::new();
-        let redaction = redaction([("different-profile", 8)]);
+        let (redaction, _) = redaction([("different-profile", 8)]);
         assert_eq!(
             ProductObservationSnapshot::activate(
                 plan(
@@ -1050,6 +1061,7 @@ mod tests {
                     8,
                 ),
                 &redaction,
+                None,
                 pool,
             )
             .expect_err("missing binding"),

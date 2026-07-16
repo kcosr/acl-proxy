@@ -12,7 +12,7 @@ use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
 use tokio::task::{AbortHandle, Id as TaskId, JoinHandle, JoinSet};
 use tokio::time::Instant;
 
-use crate::redaction::ProfileHandle;
+use http_access_redaction::RedactionProfile;
 
 const ENTRY_OPEN: u8 = 0;
 const ENTRY_CLOSING: u8 = 1;
@@ -114,18 +114,18 @@ pub(crate) enum UpgradeAllocationError {
 /// contains no generation lease or generation-owned provider/callback handle.
 pub(crate) struct UpgradedStreamSnapshot {
     relay_buffer_bytes: usize,
-    wire_redaction: Option<ProfileHandle>,
+    wire_redaction: Option<RedactionProfile>,
 }
 
 impl UpgradedStreamSnapshot {
-    fn new(relay_buffer_bytes: usize, wire_redaction: Option<ProfileHandle>) -> Self {
+    fn new(relay_buffer_bytes: usize, wire_redaction: Option<RedactionProfile>) -> Self {
         Self {
             relay_buffer_bytes,
             wire_redaction,
         }
     }
 
-    pub(crate) fn wire_redaction(&self) -> Option<&ProfileHandle> {
+    pub(crate) fn wire_redaction(&self) -> Option<&RedactionProfile> {
         self.wire_redaction.as_ref()
     }
 }
@@ -1092,7 +1092,7 @@ impl UpgradeHandshake {
     /// deadline derivation both happen inside the same winning gate.
     pub(crate) fn commit(
         mut self,
-        wire_redaction: Option<ProfileHandle>,
+        wire_redaction: Option<RedactionProfile>,
         plan: UpgradeEntryPlan,
     ) -> Result<CommittedUpgrade, UpgradeCommitError> {
         self.commit_inner(wire_redaction, plan, || {}, RuntimeInner::track_owned_task)
@@ -1101,7 +1101,7 @@ impl UpgradeHandshake {
     #[cfg(test)]
     fn commit_with_start_hook<Hook>(
         &mut self,
-        wire_redaction: Option<ProfileHandle>,
+        wire_redaction: Option<RedactionProfile>,
         plan: UpgradeEntryPlan,
         after_registration_before_start: Hook,
     ) -> Result<CommittedUpgrade, UpgradeCommitError>
@@ -1118,7 +1118,7 @@ impl UpgradeHandshake {
 
     fn commit_inner<Hook, Register>(
         &mut self,
-        wire_redaction: Option<ProfileHandle>,
+        wire_redaction: Option<RedactionProfile>,
         plan: UpgradeEntryPlan,
         after_registration_before_start: Hook,
         register: Register,
@@ -1773,7 +1773,6 @@ pub(crate) enum UpgradeCommitError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc as std_mpsc;
     use std::thread;
@@ -1781,10 +1780,10 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
-    use crate::config::compiler::{
-        CompiledRedactionPayloads, RedactionPlan, RedactionProfilePlan, RedactionRulePlan,
+    use crate::redaction::{
+        test_snapshot, TestProfile, UpgradeRedactionBody, UpgradeRedactionContext,
     };
-    use crate::redaction::{PayloadClass, RedactionSnapshot};
+    use http_access_redaction::PayloadClass;
 
     fn limits(slots: usize, bytes: usize) -> UpgradeRuntimeLimits {
         UpgradeRuntimeLimits::new(slots, bytes, 2, Duration::from_secs(60))
@@ -1820,35 +1819,18 @@ mod tests {
         })
     }
 
-    fn wire_profile(replacement: &[u8], literal: &[u8]) -> ProfileHandle {
-        RedactionSnapshot::activate(
-            RedactionPlan {
-                profiles: BTreeMap::from([(
-                    "wire".to_owned(),
-                    RedactionProfilePlan {
-                        replacement: replacement.to_vec(),
-                        max_body_bytes: 1024,
-                        max_decoded_body_bytes: 1024,
-                        max_frame_bytes: 1024,
-                        max_message_bytes: 1024,
-                        allow_permessage_deflate: false,
-                        max_environment_literal_sources: 0,
-                        max_environment_literal_bytes: 1,
-                        max_environment_literal_total_bytes: 1,
-                        rules: vec![RedactionRulePlan {
-                            literals: vec![literal.to_vec()],
-                            literal_environment_variables: Vec::new(),
-                            expressions: Vec::new(),
-                            payloads: CompiledRedactionPayloads::Both,
-                        }],
-                    },
-                )]),
-            },
-            || false,
-        )
-        .unwrap()
-        .profile("wire")
-        .unwrap()
+    fn wire_profile(replacement: &[u8], literal: &[u8]) -> RedactionProfile {
+        let (snapshot, references) = test_snapshot(vec![TestProfile {
+            name: "wire".to_owned(),
+            replacement: replacement.to_vec(),
+            max_body_bytes: 1024,
+            max_decoded_body_bytes: 1024,
+            max_frame_bytes: 1024,
+            max_message_bytes: 1024,
+            allow_permessage_deflate: false,
+            literals: vec![literal.to_vec()],
+        }]);
+        snapshot.profile(references.get("wire").unwrap()).unwrap()
     }
 
     async fn wait_for_counts(
@@ -2655,11 +2637,14 @@ mod tests {
                                     .expect("wire profile remains in the stream snapshot");
                                 let redacted = profile
                                     .redact_websocket_message(
-                                        b"secret".to_vec(),
+                                        &UpgradeRedactionContext::for_profile(&profile),
+                                        UpgradeRedactionBody::new(b"secret".to_vec()).unwrap(),
                                         PayloadClass::Text,
                                     )
                                     .unwrap();
-                                observed_tx.send(redacted.bytes.clone()).unwrap();
+                                observed_tx
+                                    .send(redacted.into_body().into_vec().unwrap())
+                                    .unwrap();
                                 Ok(UpgradeRelayPair::new(
                                     async move {
                                         let _profile = profile;
@@ -2679,13 +2664,18 @@ mod tests {
         assert_eq!(observed_rx.await.unwrap(), b"[OLD]");
         assert_eq!(
             new_profile
-                .redact_websocket_message(b"secret".to_vec(), PayloadClass::Text)
+                .redact_websocket_message(
+                    &UpgradeRedactionContext::for_profile(&new_profile),
+                    UpgradeRedactionBody::new(b"secret".to_vec()).unwrap(),
+                    PayloadClass::Text,
+                )
                 .unwrap()
-                .bytes,
+                .into_body()
+                .into_vec()
+                .unwrap(),
             b"[NEW]"
         );
         wait_for_counts(&runtime, |counts| counts.committed == 1).await;
-        assert_eq!(old_profile.strong_count(), 2);
 
         tokio::time::timeout(
             lifetime + cleanup + Duration::from_millis(250),
@@ -2697,7 +2687,6 @@ mod tests {
             counts.committed == 0 && counts.tracked_tasks == 0
         })
         .await;
-        assert_eq!(old_profile.strong_count(), 1);
         assert_eq!(
             entry.terminal_cause(),
             Some(UpgradeTerminalCause::LifetimeExpired)

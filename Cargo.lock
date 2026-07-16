@@ -22,6 +22,7 @@ dependencies = [
  "http",
  "http-access-conformance",
  "http-access-policy-acl",
+ "http-access-redaction",
  "http-access-runtime",
  "http-access-types",
  "http-access-url",
@@ -40,7 +41,6 @@ dependencies = [
  "rand",
  "rcgen",
  "regex",
- "regex-automata",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",
@@ -724,6 +724,9 @@ name = "http-access-redaction"
 version = "0.1.0"
 dependencies = [
  "http-access-types",
+ "regex-automata",
+ "thiserror",
+ "zeroize",
 ]
 
 [[package]]
