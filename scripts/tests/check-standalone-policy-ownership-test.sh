@@ -11,6 +11,10 @@ trap cleanup EXIT INT TERM
 BASELINE="$TEST_ROOT/baseline"
 mkdir -p "$BASELINE/scripts" "$BASELINE/src/proxy" "$BASELINE/src/http1"
 cp "$SOURCE_ROOT/scripts/check-standalone-policy-ownership.sh" "$BASELINE/scripts/"
+printf '%s\n' 'mod proxy;' 'mod http1;' >"$BASELINE/src/lib.rs"
+printf '%s\n' 'mod ingress;' 'mod forward;' 'mod upgrade_relay;' \
+    >"$BASELINE/src/proxy/mod.rs"
+printf '%s\n' 'mod ingress;' >"$BASELINE/src/http1/mod.rs"
 
 for source in \
     src/proxy/ingress.rs \
@@ -38,6 +42,15 @@ runner() {
 
 runner "$BASELINE" >"$TEST_ROOT/pass.log"
 grep -Fq 'standalone policy ownership gate passed' "$TEST_ROOT/pass.log"
+
+test_only="$TEST_ROOT/test-only-module"
+cp -R "$BASELINE" "$test_only"
+printf '%s\n' 'mod proxy;' 'mod http1;' '#[cfg(test)]' 'mod hidden_tests;' \
+    >"$test_only/src/lib.rs"
+printf '%s\n' 'fn ignored(other: Context, facts: Facts, request: Request) { other.decide(&facts, request); }' \
+    >"$test_only/src/hidden_tests.rs"
+runner "$test_only" >"$TEST_ROOT/test-only-pass.log"
+grep -Fq 'standalone policy ownership gate passed' "$TEST_ROOT/test-only-pass.log"
 
 expect_failure() {
     local root=$1
@@ -188,6 +201,31 @@ printf '%s\n' 'use untrusted::info; fn bypass(other: Context, facts: Facts, requ
     >>"$case_root/src/proxy/ingress.rs"
 expect_failure "$case_root" 'safe-basename macro import shadow' \
     'production macro is not ownership-audited'
+
+case_index=$((case_index + 1))
+case_root="$TEST_ROOT/namespace-import-shadow-macro-decision"
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' 'use untrusted as tracing; fn bypass(other: Context, facts: Facts, request: Request) { tracing::info!(other, facts, request); }' \
+    >>"$case_root/src/proxy/ingress.rs"
+expect_failure "$case_root" 'trusted macro namespace import shadow' \
+    'production macro is not ownership-audited'
+
+case_index=$((case_index + 1))
+case_root="$TEST_ROOT/namespace-module-shadow-macro-decision"
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' 'mod tracing { pub use untrusted::info; } fn bypass(other: Context, facts: Facts, request: Request) { tracing::info!(other, facts, request); }' \
+    >>"$case_root/src/proxy/ingress.rs"
+expect_failure "$case_root" 'trusted macro namespace local-module shadow' \
+    'production macro is not ownership-audited'
+
+case_index=$((case_index + 1))
+case_root="$TEST_ROOT/production-test-looking-module"
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' 'mod proxy;' 'mod http1;' 'mod hidden_tests;' >"$case_root/src/lib.rs"
+printf '%s\n' 'fn bypass(other: Context, facts: Facts, request: Request) { other.decide(&facts, request); }' \
+    >"$case_root/src/hidden_tests.rs"
+expect_failure "$case_root" 'production module with test-looking filename' \
+    'DecisionProvider::decide must have no product production caller'
 
 case_index=$((case_index + 1))
 case_root="$TEST_ROOT/obsolete-pipeline"
