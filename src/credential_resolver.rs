@@ -567,6 +567,7 @@ fn execution_for_test(
             origin,
             route: http_access_types::Route::Direct,
             origin_tls: http_access_types::TlsIntent::SystemRoots,
+            managed_network_policy: None,
             timeouts: http_access_types::StageTimeouts::new(1000, 1000, 1000, 1000).unwrap(),
             request_body: http_access_types::RequestBodyPolicy::new(
                 http_access_types::BodyRepresentation::PreservedContentCoded,

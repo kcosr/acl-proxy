@@ -320,15 +320,16 @@ impl UnboundStandaloneGenerationPlan {
             &tls_roots,
         )
         .map_err(|_| StandaloneCompileError::Checked("snapshot registries"))?;
-        let snapshot_lease = SnapshotLease::new(
-            identity.clone(),
+        let snapshot_lease = SnapshotLease::new(http_access_runtime::SnapshotLeaseInput {
+            identity: identity.clone(),
             generation,
-            sensitive_headers.to_vec(),
+            sensitive_headers: sensitive_headers.to_vec(),
             registries,
+            managed_network_policies: Vec::new(),
             resource_limits,
-            Vec::new(),
-            Vec::new(),
-        )
+            templates: Vec::new(),
+            handles: Vec::new(),
+        })
         .map_err(|_| StandaloneCompileError::Checked("snapshot lease"))?;
 
         let core = StandaloneGenerationCore {

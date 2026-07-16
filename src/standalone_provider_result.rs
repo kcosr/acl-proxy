@@ -482,6 +482,7 @@ fn finish_allow(
         origin: request.facts().url().clone(),
         route: generation.route().clone(),
         origin_tls: generation.origin_tls(request.facts().url().scheme()),
+        managed_network_policy: None,
         timeouts: generation.timeouts(),
         request_body,
         response: generation.response(),
