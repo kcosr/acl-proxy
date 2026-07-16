@@ -228,6 +228,28 @@ expect_failure "$case_root" 'production module with test-looking filename' \
     'DecisionProvider::decide must have no product production caller'
 
 case_index=$((case_index + 1))
+case_root="$TEST_ROOT/production-path-override"
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' 'mod proxy;' 'mod http1;' '#[path = "hidden_tests.rs"]' 'mod harmless;' \
+    >"$case_root/src/lib.rs"
+printf '%s\n' 'fn clean() {}' >"$case_root/src/harmless.rs"
+printf '%s\n' 'fn bypass(other: Context, facts: Facts, request: Request) { other.decide(&facts, request); }' \
+    >"$case_root/src/hidden_tests.rs"
+expect_failure "$case_root" 'production module path override' \
+    'production module path override is not ownership-audited'
+
+case_index=$((case_index + 1))
+case_root="$TEST_ROOT/production-cfg-attr-path-override"
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' 'mod proxy;' 'mod http1;' '#[cfg_attr(unix, path = "hidden_tests.rs")]' 'mod harmless;' \
+    >"$case_root/src/lib.rs"
+printf '%s\n' 'fn clean() {}' >"$case_root/src/harmless.rs"
+printf '%s\n' 'fn bypass(other: Context, facts: Facts, request: Request) { other.decide(&facts, request); }' \
+    >"$case_root/src/hidden_tests.rs"
+expect_failure "$case_root" 'production cfg_attr module path override' \
+    'production module path override is not ownership-audited'
+
+case_index=$((case_index + 1))
 case_root="$TEST_ROOT/obsolete-pipeline"
 cp -R "$BASELINE" "$case_root"
 printf '%s\n' 'fn obsolete() {}' >"$case_root/src/request_pipeline.rs"
