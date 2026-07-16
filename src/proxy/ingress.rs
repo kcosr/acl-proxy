@@ -1540,6 +1540,7 @@ async fn execute_connect_terminal(
         destinations: _,
         resolved: _,
         sidecar,
+        credentials,
         transport,
         mut decision,
     } = dispatch;
@@ -1554,11 +1555,12 @@ async fn execute_connect_terminal(
         || exchange.facts().method().as_str() != "CONNECT"
         || exchange.plan().origin() != terminal.target.url()
         || !matches!(exchange.plan().upgrade(), UpgradePolicy::Deny)
+        || credentials.is_some()
     {
         return HandledResponse::fixed(StatusCode::INTERNAL_SERVER_ERROR, "request failed\n", true);
     }
     decision.submit_now();
-    drop((exchange, sidecar, retention, services));
+    drop((exchange, sidecar, credentials, retention, services));
 
     let Some(manager) = terminal.assets.mitm().cloned() else {
         return HandledResponse::fixed(

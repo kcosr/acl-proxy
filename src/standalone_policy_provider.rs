@@ -28,6 +28,7 @@ use crate::authorization::AuthorizationDecision;
 use crate::config::compiler::{
     CompiledDecisionLogLevel, CompiledProviderFailureMode, HttpBodyReadPlan,
 };
+use crate::credential_resolver::ProductCredentialPreparation;
 use crate::credentials::InboundCredentials;
 use crate::destination::DestinationGuard;
 use crate::egress::OriginProtocol;
@@ -199,6 +200,7 @@ struct PreparedDispatch {
     destinations: Arc<DestinationGuard>,
     resolved: ResolvedForwardingTarget,
     sidecar: StandaloneRequestSidecar,
+    credentials: Option<ProductCredentialPreparation>,
     transport: StandaloneIngressTransport,
     decision: PendingDecisionSubmission,
 }
@@ -246,6 +248,7 @@ pub(crate) struct StandaloneForwardDispatch {
     pub(crate) destinations: Arc<DestinationGuard>,
     pub(crate) resolved: ResolvedForwardingTarget,
     pub(crate) sidecar: StandaloneRequestSidecar,
+    pub(crate) credentials: Option<ProductCredentialPreparation>,
     pub(crate) transport: StandaloneIngressTransport,
     pub(crate) decision: PendingDecisionSubmission,
 }
@@ -373,7 +376,7 @@ where
                 sensitive_header_presence.push(name.clone());
             }
         }
-        let inbound = lease.credentials().extract_inbound(&mut headers)?;
+        let inbound = lease.credentials().extract(&mut headers)?;
         let internal_context = take_internal_context(
             &mut headers,
             lease.authorization().internal_context_headers(),
@@ -936,6 +939,7 @@ where
             plan,
             request,
             sidecar,
+            credentials,
         } = allowed;
         let mut dispatch = lock(&self.dispatch);
         if dispatch.is_some() {
@@ -959,6 +963,7 @@ where
             destinations: terminal.destinations,
             resolved,
             sidecar,
+            credentials,
             transport: terminal.transport,
             decision,
         });
@@ -1189,6 +1194,7 @@ where
             destinations: dispatch.destinations,
             resolved: dispatch.resolved,
             sidecar: dispatch.sidecar,
+            credentials: dispatch.credentials,
             transport: dispatch.transport,
             decision: dispatch.decision,
         })
@@ -1286,14 +1292,13 @@ fn adapter_error_status(error: StandaloneProviderAllowError) -> u16 {
             http_access_runtime::RuntimeError::DeadlineExceeded,
         ) => 504,
         StandaloneProviderAllowError::ProviderCredential(
-            crate::authorization::protocol::ProviderCredentialInjectionError::AllocationFailed,
+            crate::authorization::protocol::ProviderCredentialWireError::AllocationFailed,
         ) => 503,
         StandaloneProviderAllowError::Binding
         | StandaloneProviderAllowError::ProviderCredential(_)
         | StandaloneProviderAllowError::Credential(_)
         | StandaloneProviderAllowError::Runtime(_)
-        | StandaloneProviderAllowError::Plan(_)
-        | StandaloneProviderAllowError::CredentialProgramConsumed => 500,
+        | StandaloneProviderAllowError::Plan(_) => 500,
         StandaloneProviderAllowError::Redaction => 403,
     }
 }

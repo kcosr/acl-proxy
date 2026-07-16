@@ -67,7 +67,6 @@ impl UpgradeIntent {
 }
 
 impl<B> SanitizedRequest<B> {
-    #[cfg(test)]
     pub(crate) fn headers_mut(&mut self) -> &mut HeaderMap {
         self.request.headers_mut()
     }

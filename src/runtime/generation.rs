@@ -38,9 +38,6 @@ impl GenerationId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ProviderIndex(usize);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct CredentialSourceIndex(usize);
-
 macro_rules! index_registry {
     ($registry:ident, $index:ident, $label:literal) => {
         pub(crate) struct $registry {
@@ -87,18 +84,13 @@ impl ProviderRegistry {
         self.indices.len()
     }
 }
-index_registry!(
-    CredentialSourceRegistry,
-    CredentialSourceIndex,
-    "CredentialSourceRegistry"
-);
 
 #[cfg(test)]
 mod index_registry_tests {
     use super::*;
 
     #[test]
-    fn registries_assign_dense_indices_independent_of_input_order() {
+    fn provider_registry_assigns_dense_indices_independent_of_input_order() {
         let forward = ProviderRegistry::from_names([
             "alpha-provider".to_string(),
             "omega-provider".to_string(),
@@ -127,19 +119,6 @@ pub(crate) trait EgressSnapshot: Send + Sync {
     fn origin_tls(&self) -> &crate::egress::OriginTls;
 }
 
-pub(crate) trait CredentialResolver: Send + Sync {
-    fn inject(
-        &self,
-        actions: &[crate::credentials::ResolvedCredentialAction],
-        headers: &mut HeaderMap,
-    ) -> Result<(), crate::credentials::CredentialError>;
-
-    fn extract_inbound(
-        &self,
-        headers: &mut HeaderMap,
-    ) -> Result<crate::credentials::InboundCredentials, crate::credentials::CredentialError>;
-}
-
 pub(crate) trait ObservationSnapshot: Send + Sync {
     fn capture_epoch(&self) -> &Arc<crate::observation::CaptureEpoch>;
 
@@ -156,14 +135,14 @@ pub(crate) trait AuthorizationSnapshot: Send + Sync {
         provider: ProviderIndex,
     ) -> Option<crate::authorization::AuthorizationProviderMetadata<'_>>;
 
-    fn stage_provider_credentials(
+    fn compact_provider_credential_wire(
         &self,
         provider: ProviderIndex,
         credentials: &crate::authorization::protocol::ProviderCredentialSet,
         guard: &crate::safety::HttpWireBodyGuard,
     ) -> Result<
-        crate::authorization::protocol::StagedProviderCredentialMutation,
-        crate::authorization::protocol::ProviderCredentialInjectionError,
+        crate::authorization::protocol::ProviderCredentialWireStore,
+        crate::authorization::protocol::ProviderCredentialWireError,
     >;
 
     fn consume_allow_output(
@@ -281,7 +260,8 @@ pub(crate) struct ActivatedGeneration {
     pub(crate) resource_plan: CompiledResourcePlan,
     pub(crate) egress: Arc<dyn EgressSnapshot>,
     pub(crate) authorization: Arc<dyn AuthorizationSnapshot>,
-    pub(crate) credentials: Arc<dyn CredentialResolver>,
+    pub(crate) credentials: Arc<crate::credentials::InboundCredentialSnapshot>,
+    pub(crate) credential_io_runtime: Arc<crate::credential_io_runtime::CredentialIoRuntime>,
     pub(crate) observation: Arc<dyn ObservationSnapshot>,
     pub(crate) safety: Arc<dyn SafetySnapshot>,
     pub(crate) owner: Arc<dyn GenerationOwner>,
@@ -295,7 +275,8 @@ pub(crate) struct Generation {
     resource_plan: CompiledResourcePlan,
     egress: Arc<dyn EgressSnapshot>,
     authorization: Arc<dyn AuthorizationSnapshot>,
-    credentials: Arc<dyn CredentialResolver>,
+    credentials: Arc<crate::credentials::InboundCredentialSnapshot>,
+    credential_io_runtime: Arc<crate::credential_io_runtime::CredentialIoRuntime>,
     observation: Arc<dyn ObservationSnapshot>,
     safety: Arc<dyn SafetySnapshot>,
     pub(super) owner: Arc<dyn GenerationOwner>,
@@ -328,6 +309,7 @@ impl Generation {
             egress: value.egress,
             authorization: value.authorization,
             credentials: value.credentials,
+            credential_io_runtime: value.credential_io_runtime,
             observation: value.observation,
             safety: value.safety,
             owner: value.owner,
@@ -365,8 +347,14 @@ impl Generation {
         self.authorization.as_ref()
     }
 
-    pub(crate) fn credentials(&self) -> &dyn CredentialResolver {
+    pub(crate) fn credentials(&self) -> &crate::credentials::InboundCredentialSnapshot {
         self.credentials.as_ref()
+    }
+
+    pub(crate) fn credential_io_runtime(
+        &self,
+    ) -> Arc<crate::credential_io_runtime::CredentialIoRuntime> {
+        Arc::clone(&self.credential_io_runtime)
     }
 
     pub(crate) fn observation(&self) -> &dyn ObservationSnapshot {
@@ -453,21 +441,12 @@ pub(crate) struct GenerationLease {
 
 pub(crate) struct ForwardingGenerationServices {
     egress: Arc<dyn EgressSnapshot>,
-    credentials: Arc<dyn CredentialResolver>,
     safety: Arc<dyn SafetySnapshot>,
 }
 
 impl ForwardingGenerationServices {
     pub(crate) fn egress(&self) -> &dyn EgressSnapshot {
         self.egress.as_ref()
-    }
-
-    pub(crate) fn inject_credentials(
-        &self,
-        actions: &[crate::credentials::ResolvedCredentialAction],
-        headers: &mut HeaderMap,
-    ) -> Result<(), crate::credentials::CredentialError> {
-        self.credentials.inject(actions, headers)
     }
 
     pub(crate) fn inject_loop_marker(
@@ -492,6 +471,12 @@ impl GenerationLease {
         &self.generation.standalone
     }
 
+    pub(crate) fn credential_io_runtime(
+        &self,
+    ) -> Arc<crate::credential_io_runtime::CredentialIoRuntime> {
+        self.generation.credential_io_runtime()
+    }
+
     /// Retains this exact generation for an operation admitted by the current
     /// request. Retirement may already have started; the live request lease is
     /// the authority to extend only its captured generation.
@@ -504,7 +489,6 @@ impl GenerationLease {
     pub(crate) fn into_forwarding_services(self) -> ForwardingGenerationServices {
         ForwardingGenerationServices {
             egress: Arc::clone(&self.generation.egress),
-            credentials: Arc::clone(&self.generation.credentials),
             safety: Arc::clone(&self.generation.safety),
         }
     }

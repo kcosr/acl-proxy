@@ -767,6 +767,7 @@ mod tests {
     use tokio::io::{AsyncRead, ReadBuf};
 
     use super::*;
+    use crate::authorization::protocol::projected_provider_credential_wire_metadata_bytes;
     use crate::authorization::protocol::read_provider_response_prefix_for_test;
     use crate::config::compiler::{
         CompiledProviderFailureMode, ProviderOutputPlan, MAX_PROVIDER_OUTPUT_NAME_BYTES,
@@ -849,7 +850,17 @@ mod tests {
     }
 
     fn guard_for(payload_bytes: usize) -> (Arc<WireBodyPool>, HttpWireBodyGuard, usize) {
-        let allocation = guarded_body_allocation_bytes(payload_bytes.max(1)).unwrap();
+        guard_for_with_additional_charge(payload_bytes, 0)
+    }
+
+    fn guard_for_with_additional_charge(
+        payload_bytes: usize,
+        additional_charge: usize,
+    ) -> (Arc<WireBodyPool>, HttpWireBodyGuard, usize) {
+        let allocation = guarded_body_allocation_bytes(payload_bytes.max(1))
+            .unwrap()
+            .checked_add(additional_charge)
+            .unwrap();
         let pool = WireBodyPool::new(allocation, allocation);
         let guard = pool.begin_for_test(
             allocation,
@@ -1170,18 +1181,19 @@ mod tests {
         else {
             panic!("the exact-bound output name must be assigned");
         };
-        let (_, staging_guard, _) = guard_for(1);
+        let metadata = projected_provider_credential_wire_metadata_bytes(outputs.len()).unwrap();
+        let (_, staging_guard, _) = guard_for_with_additional_charge(1, metadata);
         let staged = outputs
-            .stage_credentials(&credentials, &staging_guard)
+            .compact_provider_credential_wire(&credentials, &staging_guard)
             .unwrap();
-        let mut headers = http::HeaderMap::new();
-        staged.apply(&mut headers).unwrap();
-        assert_eq!(
-            headers.get(http::header::AUTHORIZATION).unwrap(),
-            "Bearer secret"
-        );
+        let output = outputs.index(&output_name).unwrap();
+        let mut material = vec![0; staged.output_len(output).unwrap()];
+        staged.copy_output(output, &mut material).unwrap();
+        assert_eq!(material, b"secret");
+        drop(staged);
         drop(credentials);
         assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(staging_guard.live_bytes(), 0);
     }
 
     #[tokio::test]

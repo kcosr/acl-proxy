@@ -6,6 +6,10 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use base64::encoded_len as base64_encoded_len;
+use credential_core::{
+    project_credential_resources, CredentialDescriptor, CredentialLimits, CredentialProfile,
+    CredentialPurpose,
+};
 use http::header::{HeaderName, HeaderValue};
 use http::Method;
 #[cfg(test)]
@@ -20,17 +24,24 @@ use http_access_redaction::{
     MAX_RULES_PER_PROFILE,
 };
 use http_access_runtime::BodyBudget;
-use http_access_types::{BodyLimits, RedirectPolicy, ResponsePolicy, StableId};
+use http_access_types::{
+    BodyLimits, CredentialMutation, CredentialMutationKind, CredentialRef,
+    HeaderName as NeutralHeaderName, RedirectPolicy, ResponsePolicy, SnapshotIdentity, StableId,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use url::{Host, Url};
 
 use crate::authorization::protocol::{
-    CALLBACK_RESPONSE_PREFIX_BYTES, MIN_CALLBACK_RESPONSE_BYTES,
-    MIN_WEBHOOK_REQUEST_WITHOUT_CALLBACK_URL_BYTES, PROCESS_PROVIDER_MIN_DECISION_RESPONSE_BYTES,
-    PROCESS_PROVIDER_RESPONSE_PREFIX_BYTES, PROCESS_PROVIDER_RESPONSE_TERMINATOR_BYTES,
+    projected_provider_credential_wire_metadata_bytes, CALLBACK_RESPONSE_PREFIX_BYTES,
+    MIN_CALLBACK_RESPONSE_BYTES, MIN_WEBHOOK_REQUEST_WITHOUT_CALLBACK_URL_BYTES,
+    PROCESS_PROVIDER_MIN_DECISION_RESPONSE_BYTES, PROCESS_PROVIDER_RESPONSE_PREFIX_BYTES,
+    PROCESS_PROVIDER_RESPONSE_TERMINATOR_BYTES,
 };
 use crate::capture::CaptureSinkSpec;
+use crate::credential_buffers::ProductCredentialProjectionContext;
+use crate::credential_resolver::projected_product_adapter_bytes;
+use crate::credentials::{MAX_CREDENTIAL_BYTES, MAX_FILE_READ_BYTES};
 use crate::http1::store::PARSER_STORE_BYTES;
 use crate::http_body::{http_decoder_workspace_sizes, HTTP_DECODER_OUTPUT_STAGING_BYTES};
 use crate::network::{canonical_socket_addr, socket_binds_overlap};
@@ -113,6 +124,9 @@ const MAX_CAPTURE_FILES: usize = 10_000_000;
 const MAX_CAPTURE_TOTAL_BYTES: u64 = 64 * 1024 * 1024 * 1024 * 1024;
 pub(crate) const MAX_PROVIDER_CREDENTIAL_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_PROVIDER_OUTPUT_NAME_BYTES: usize = 4 * 1024;
+pub(crate) const MAX_ENVIRONMENT_CREDENTIAL_NAME_BYTES: usize = 255;
+pub(crate) const MAX_CREDENTIAL_FILE_PATH_BYTES: usize = 4096;
+pub(crate) const MAX_CREDENTIAL_FILE_COMPONENT_BYTES: usize = 255;
 const PROVIDER_REPLACEMENT_STAGING_BYTES: usize = 64 * 1024;
 const WEBSOCKET_DEFLATE_SCRATCH_BYTES: usize = 64 * 1024;
 const PROVIDER_REQUEST_STREAM_SCRATCH_BYTES: usize = 64 * 1024;
@@ -2081,12 +2095,33 @@ fn validate_credentials(
                         "must be a valid environment variable name",
                     ));
                 }
+                if value.variable.len() > MAX_ENVIRONMENT_CREDENTIAL_NAME_BYTES {
+                    return Err(ConfigCompileError::at(
+                        format!("credentials.sources.{name}.variable"),
+                        "exceeds the credential source locator limit",
+                    ));
+                }
             }
             CredentialSourceConfig::File(value) => {
                 if !value.path.is_absolute() {
                     return Err(ConfigCompileError::at(
                         format!("credentials.sources.{name}.path"),
                         "must be normalized by the config-root compiler",
+                    ));
+                }
+                if value.path.as_os_str().as_encoded_bytes().len() > MAX_CREDENTIAL_FILE_PATH_BYTES
+                {
+                    return Err(ConfigCompileError::at(
+                        format!("credentials.sources.{name}.path"),
+                        "exceeds the credential source locator limit",
+                    ));
+                }
+                if value.path.components().any(|component| {
+                    matches!(component, Component::Normal(name) if name.as_encoded_bytes().len() > MAX_CREDENTIAL_FILE_COMPONENT_BYTES)
+                }) {
+                    return Err(ConfigCompileError::at(
+                        format!("credentials.sources.{name}.path"),
+                        "contains a component over the credential path component limit",
                     ));
                 }
             }
@@ -3384,7 +3419,12 @@ fn compile_resource_plan(
         0
     };
     let terminal_product_peak = if terminal_requires_runtime {
-        staging_bytes
+        checked_add(
+            staging_bytes,
+            compile_credential_finalization_peak(config, None)?,
+            "policy.default",
+            "default credential finalization projection overflow",
+        )?
     } else {
         0
     };
@@ -3962,10 +4002,10 @@ fn compile_http_rule_schedule_with_redaction(
             )
         })
         .transpose()?;
-    let webhook_credential_bytes = webhook_provider
+    let webhook_credential_allocation = webhook_provider
         .zip(webhook_callback_bytes)
         .map(|(provider, callback_bytes)| {
-            compact_provider_credential_bytes(provider.outputs.len(), callback_bytes)
+            compact_provider_credential_allocation(provider.outputs.len(), callback_bytes)
         })
         .transpose()?;
     for allocation in [webhook_request_allocation, webhook_callback_allocation]
@@ -4013,22 +4053,13 @@ fn compile_http_rule_schedule_with_redaction(
             )
         })
         .transpose()?;
-    let process_credential_bytes = process_provider
+    let process_credential_allocation = process_provider
         .zip(response_continuation_bytes)
         .map(|(provider, continuation_bytes)| {
-            compact_provider_credential_bytes(provider.outputs.len(), continuation_bytes)
+            compact_provider_credential_allocation(provider.outputs.len(), continuation_bytes)
         })
         .transpose()?;
-    let credential_bytes = process_credential_bytes.or(webhook_credential_bytes);
-    let credential_allocation = credential_bytes
-        .map(|bytes| {
-            project_guarded_body_allocation(
-                bytes,
-                "policy.rules",
-                "provider credential rehome arithmetic overflow",
-            )
-        })
-        .transpose()?;
+    let credential_allocation = process_credential_allocation.or(webhook_credential_allocation);
     if let Some(response_continuation_allocation) = response_continuation_allocation {
         initial_peak = initial_peak.max(response_continuation_allocation);
     }
@@ -4110,10 +4141,16 @@ fn compile_http_rule_schedule_with_redaction(
                 "HTTP provider-response continuation arithmetic overflow",
             )?);
             if let (Some(continuation_bytes), Some(credentials)) =
-                (response_continuation_bytes, credential_bytes)
+                (response_continuation_bytes, credential_allocation)
             {
-                initial_peak = initial_peak.max(guarded_body_stage_peak(
-                    [original_limit, continuation_bytes, credentials],
+                let body_peak = guarded_body_stage_peak(
+                    [original_limit, continuation_bytes],
+                    "policy.rules",
+                    "process credential rehome arithmetic overflow",
+                )?;
+                initial_peak = initial_peak.max(checked_add(
+                    body_peak,
+                    credentials,
                     "policy.rules",
                     "process credential rehome arithmetic overflow",
                 )?);
@@ -4134,16 +4171,28 @@ fn compile_http_rule_schedule_with_redaction(
                 response_continuation_bytes,
                 original_limit,
             )?);
-            if let Some(credentials) = credential_bytes {
-                initial_peak = initial_peak.max(guarded_body_stage_peak(
-                    [response_continuation_bytes, original_limit, credentials],
+            if let Some(credentials) = credential_allocation {
+                let body_peak = guarded_body_stage_peak(
+                    [response_continuation_bytes, original_limit],
+                    "policy.rules",
+                    "process replacement credential rehome arithmetic overflow",
+                )?;
+                initial_peak = initial_peak.max(checked_add(
+                    body_peak,
+                    credentials,
                     "policy.rules",
                     "process replacement credential rehome arithmetic overflow",
                 )?);
             }
-        } else if let Some(credentials) = credential_bytes {
-            initial_peak = initial_peak.max(guarded_body_stage_peak(
-                [original_limit, response_continuation_bytes, credentials],
+        } else if let Some(credentials) = credential_allocation {
+            let body_peak = guarded_body_stage_peak(
+                [original_limit, response_continuation_bytes],
+                "policy.rules",
+                "process credential rehome arithmetic overflow",
+            )?;
+            initial_peak = initial_peak.max(checked_add(
+                body_peak,
+                credentials,
                 "policy.rules",
                 "process credential rehome arithmetic overflow",
             )?);
@@ -4239,6 +4288,30 @@ fn compile_http_rule_schedule_with_redaction(
                 "HTTP replacement credential-regex plan arithmetic overflow",
             )?);
             initial_peak = initial_peak.max(replacement_redaction_peak);
+        }
+    }
+
+    let credential_finalization_peak = compile_credential_finalization_peak(config, Some(rule))?;
+    if credential_finalization_peak != 0 {
+        initial_peak = checked_add(
+            initial_peak,
+            credential_finalization_peak,
+            "policy.rules",
+            "credential finalization projection overflow",
+        )?;
+        if incoming_stages.is_empty() {
+            incoming_stages.push(IncomingBodyStage {
+                additional_bytes: credential_finalization_peak,
+            });
+        } else {
+            for stage in &mut incoming_stages {
+                stage.additional_bytes = checked_add(
+                    stage.additional_bytes,
+                    credential_finalization_peak,
+                    "policy.rules",
+                    "incoming credential finalization projection overflow",
+                )?;
+            }
         }
     }
 
@@ -4501,11 +4574,11 @@ fn provider_response_guarded_suffix_bytes(
         })
 }
 
-fn compact_provider_credential_bytes(
+fn compact_provider_credential_allocation(
     output_count: usize,
     response_bytes: usize,
 ) -> Result<usize, ConfigCompileError> {
-    output_count
+    let payload = output_count
         .checked_mul(MAX_PROVIDER_CREDENTIAL_BYTES)
         .map(|declared_bytes| declared_bytes.min(response_bytes))
         .ok_or_else(|| {
@@ -4513,7 +4586,364 @@ fn compact_provider_credential_bytes(
                 "authorization.providers",
                 "provider credential storage arithmetic overflow",
             )
+        })?;
+    let payload = project_guarded_body_allocation(
+        payload,
+        "authorization.providers",
+        "provider credential storage arithmetic overflow",
+    )?;
+    let metadata =
+        projected_provider_credential_wire_metadata_bytes(output_count).ok_or_else(|| {
+            ConfigCompileError::at(
+                "authorization.providers",
+                "provider credential metadata arithmetic overflow",
+            )
+        })?;
+    payload.checked_add(metadata).ok_or_else(|| {
+        ConfigCompileError::at(
+            "authorization.providers",
+            "provider credential storage arithmetic overflow",
+        )
+    })
+}
+
+fn compile_credential_finalization_peak(
+    config: &super::authoring::AuthoringConfig,
+    rule: Option<&PolicyRuleConfig>,
+) -> Result<usize, ConfigCompileError> {
+    if rule.is_some_and(|rule| matches!(rule.decision, RuleDecision::Deny))
+        || rule.is_none()
+            && matches!(
+                config.policy.default,
+                super::authoring::PolicyDefaultDecision::Deny
+            )
+    {
+        return Ok(0);
+    }
+
+    let identity = SnapshotIdentity::new();
+    let rule_index = rule
+        .map(|rule| {
+            config
+                .policy
+                .rules
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, rule))
+                .or_else(|| {
+                    config
+                        .policy
+                        .rules
+                        .iter()
+                        .position(|candidate| candidate.id == rule.id)
+                })
+                .ok_or_else(|| {
+                    ConfigCompileError::at("policy.rules", "credential projection rule is missing")
+                })
         })
+        .transpose()?;
+    let provider = rule
+        .filter(|rule| matches!(rule.decision, RuleDecision::Delegate))
+        .and_then(|rule| rule.authorization_provider.as_ref())
+        .map(|name| {
+            let ordinal = config
+                .authorization
+                .providers
+                .keys()
+                .position(|candidate| candidate == name)
+                .ok_or_else(|| {
+                    ConfigCompileError::at(
+                        "policy.rules.authorization_provider",
+                        "credential projection provider is missing",
+                    )
+                })?;
+            let outputs = match config.authorization.providers.get(name) {
+                Some(AuthorizationProviderConfig::Webhook(provider)) => &provider.outputs,
+                Some(AuthorizationProviderConfig::Process(provider)) => &provider.outputs,
+                None => {
+                    return Err(ConfigCompileError::at(
+                        "policy.rules.authorization_provider",
+                        "credential projection provider is missing",
+                    ))
+                }
+            };
+            Ok((ordinal, outputs))
+        })
+        .transpose()?;
+
+    let rule_count = rule.map_or(0, |rule| rule.credential_actions.len());
+    let provider_count = provider.map_or(0, |(_, outputs)| outputs.len());
+    let total = rule_count
+        .checked_add(provider_count)
+        .and_then(|count| count.checked_add(config.egress.credential_actions.len()))
+        .ok_or_else(|| {
+            ConfigCompileError::at("credentials", "credential projection count overflow")
+        })?;
+    if total == 0 {
+        return Ok(0);
+    }
+
+    let mut descriptors = Vec::with_capacity(total);
+    let mut mutations = Vec::with_capacity(total);
+    let mut reference_literal_bytes = 0usize;
+    let mut maximum_environment_staging_bytes = 0usize;
+
+    if let (Some(rule), Some(rule_index)) = (rule, rule_index) {
+        for (action_index, action) in rule.credential_actions.iter().enumerate() {
+            let id = format!("rule/{rule_index}/credential/{action_index}");
+            push_source_projection(
+                config,
+                action,
+                &identity,
+                &id,
+                &mut descriptors,
+                &mut mutations,
+                &mut reference_literal_bytes,
+                &mut maximum_environment_staging_bytes,
+            )?;
+        }
+    }
+    if let Some((provider_ordinal, outputs)) = provider {
+        for (output_ordinal, output) in outputs.values().enumerate() {
+            let id = format!("provider/{provider_ordinal}/output/{output_ordinal}");
+            let reference = projection_credential_ref(&identity, &id)?;
+            let mutation = projection_provider_mutation(output, reference)?;
+            push_projection_descriptor(
+                &identity,
+                id.len(),
+                mutation,
+                credential_core::MAX_CREDENTIAL_MATERIAL_BYTES,
+                0,
+                &mut descriptors,
+                &mut mutations,
+                &mut reference_literal_bytes,
+            )?;
+        }
+    }
+    for (action_index, action) in config.egress.credential_actions.iter().enumerate() {
+        let id = format!("global/credential/{action_index}");
+        push_source_projection(
+            config,
+            action,
+            &identity,
+            &id,
+            &mut descriptors,
+            &mut mutations,
+            &mut reference_literal_bytes,
+            &mut maximum_environment_staging_bytes,
+        )?;
+    }
+
+    let shared = project_credential_resources(
+        &identity,
+        CredentialProfile::StandaloneTrusted,
+        &descriptors,
+        &mutations,
+        &ProductCredentialProjectionContext,
+    )
+    .map_err(|error| {
+        let message = if error == credential_core::CredentialError::ResourceLimit {
+            "shared credential resource limits are exceeded"
+        } else {
+            "shared credential projection is invalid"
+        };
+        ConfigCompileError::at("credentials", message)
+    })?;
+    let destination_literal_bytes =
+        mutations
+            .iter()
+            .try_fold(0usize, |total, mutation| match mutation.kind() {
+                CredentialMutationKind::CustomHeader { name, .. } => {
+                    total.checked_add(name.as_str().len()).ok_or_else(|| {
+                        ConfigCompileError::at(
+                            "credentials",
+                            "credential destination projection overflow",
+                        )
+                    })
+                }
+                CredentialMutationKind::Bearer(_) | CredentialMutationKind::Basic { .. } => {
+                    Ok(total)
+                }
+            })?;
+    let product = projected_product_adapter_bytes(
+        total,
+        reference_literal_bytes,
+        maximum_environment_staging_bytes,
+        total,
+        destination_literal_bytes,
+        rule_count != 0 || !config.egress.credential_actions.is_empty(),
+        provider_count != 0,
+    )
+    .map_err(|_| {
+        ConfigCompileError::at("credentials", "product credential projection is invalid")
+    })?;
+    let peak = shared
+        .simultaneous_peak_bytes()
+        .checked_add(product)
+        .ok_or_else(|| {
+            ConfigCompileError::at("credentials", "credential projection peak overflow")
+        })?;
+    usize::try_from(peak).map_err(|_| {
+        ConfigCompileError::at("credentials", "credential projection cannot be represented")
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_source_projection(
+    config: &super::authoring::AuthoringConfig,
+    action: &CredentialActionConfig,
+    identity: &SnapshotIdentity,
+    id: &str,
+    descriptors: &mut Vec<CredentialDescriptor>,
+    mutations: &mut Vec<CredentialMutation>,
+    reference_literal_bytes: &mut usize,
+    maximum_environment_staging_bytes: &mut usize,
+) -> Result<(), ConfigCompileError> {
+    let source_name = match action {
+        CredentialActionConfig::Bearer(action) => &action.credential,
+        CredentialActionConfig::Basic(action) => &action.password_credential,
+        CredentialActionConfig::CustomHeader(action) => &action.credential,
+    };
+    let staging = match config.credentials.sources.get(source_name) {
+        Some(CredentialSourceConfig::Environment(_)) => {
+            *maximum_environment_staging_bytes =
+                (*maximum_environment_staging_bytes).max(MAX_CREDENTIAL_BYTES);
+            MAX_CREDENTIAL_BYTES
+        }
+        Some(CredentialSourceConfig::File(_)) => MAX_FILE_READ_BYTES as usize,
+        None => {
+            return Err(ConfigCompileError::at(
+                "credentials.sources",
+                "credential projection source is missing",
+            ))
+        }
+    };
+    let reference = projection_credential_ref(identity, id)?;
+    let mutation = projection_source_mutation(action, reference)?;
+    push_projection_descriptor(
+        identity,
+        id.len(),
+        mutation,
+        MAX_CREDENTIAL_BYTES,
+        staging,
+        descriptors,
+        mutations,
+        reference_literal_bytes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_projection_descriptor(
+    identity: &SnapshotIdentity,
+    reference_literal_len: usize,
+    mutation: CredentialMutation,
+    maximum_material_bytes: usize,
+    maximum_staging_bytes: usize,
+    descriptors: &mut Vec<CredentialDescriptor>,
+    mutations: &mut Vec<CredentialMutation>,
+    reference_literal_bytes: &mut usize,
+) -> Result<(), ConfigCompileError> {
+    let purpose = match mutation.kind() {
+        CredentialMutationKind::Bearer(_) => CredentialPurpose::Bearer,
+        CredentialMutationKind::Basic { .. } => CredentialPurpose::BasicPassword,
+        CredentialMutationKind::CustomHeader { name, .. } => {
+            CredentialPurpose::CustomHeader(name.clone())
+        }
+    };
+    let limits =
+        CredentialLimits::new(maximum_material_bytes, maximum_staging_bytes).map_err(|_| {
+            ConfigCompileError::at("credentials", "credential projection limits are invalid")
+        })?;
+    let descriptor = CredentialDescriptor::new(
+        mutation.credential().clone(),
+        purpose,
+        CredentialProfile::StandaloneTrusted,
+        limits,
+    )
+    .map_err(|_| {
+        ConfigCompileError::at("credentials", "credential projection descriptor is invalid")
+    })?;
+    if !descriptor.reference().belongs_to(identity) {
+        return Err(ConfigCompileError::at(
+            "credentials",
+            "credential projection reference is foreign",
+        ));
+    }
+    *reference_literal_bytes = reference_literal_bytes
+        .checked_add(reference_literal_len)
+        .ok_or_else(|| {
+            ConfigCompileError::at("credentials", "credential reference projection overflow")
+        })?;
+    descriptors.push(descriptor);
+    mutations.push(mutation);
+    Ok(())
+}
+
+fn projection_credential_ref(
+    identity: &SnapshotIdentity,
+    id: &str,
+) -> Result<CredentialRef, ConfigCompileError> {
+    let id = StableId::new(id.to_owned()).map_err(|_| {
+        ConfigCompileError::at("credentials", "credential projection reference is invalid")
+    })?;
+    CredentialRef::new(identity.clone(), id, 1).map_err(|_| {
+        ConfigCompileError::at("credentials", "credential projection reference is invalid")
+    })
+}
+
+fn projection_source_mutation(
+    action: &CredentialActionConfig,
+    reference: CredentialRef,
+) -> Result<CredentialMutation, ConfigCompileError> {
+    match action {
+        CredentialActionConfig::Bearer(_) => Ok(CredentialMutation::bearer(reference)),
+        CredentialActionConfig::Basic(action) => {
+            CredentialMutation::basic(action.username.clone(), reference)
+                .map_err(|_| ConfigCompileError::at("credentials", "basic credential is invalid"))
+        }
+        CredentialActionConfig::CustomHeader(action) => CredentialMutation::custom_header(
+            NeutralHeaderName::new(action.header.clone()).map_err(|_| {
+                ConfigCompileError::at("credentials", "credential destination is invalid")
+            })?,
+            reference,
+        )
+        .map_err(|_| ConfigCompileError::at("credentials", "custom-header credential is invalid")),
+    }
+}
+
+fn projection_provider_mutation(
+    output: &super::authoring::ProviderOutputConfig,
+    reference: CredentialRef,
+) -> Result<CredentialMutation, ConfigCompileError> {
+    match output {
+        super::authoring::ProviderOutputConfig::Bearer(_) => {
+            Ok(CredentialMutation::bearer(reference))
+        }
+        super::authoring::ProviderOutputConfig::Basic(output) => {
+            CredentialMutation::basic(output.username.clone(), reference).map_err(|_| {
+                ConfigCompileError::at(
+                    "authorization.providers.outputs",
+                    "provider basic credential is invalid",
+                )
+            })
+        }
+        super::authoring::ProviderOutputConfig::CustomHeader(output) => {
+            CredentialMutation::custom_header(
+                NeutralHeaderName::new(output.header.clone()).map_err(|_| {
+                    ConfigCompileError::at(
+                        "authorization.providers.outputs",
+                        "provider credential destination is invalid",
+                    )
+                })?,
+                reference,
+            )
+            .map_err(|_| {
+                ConfigCompileError::at(
+                    "authorization.providers.outputs",
+                    "provider custom-header credential is invalid",
+                )
+            })
+        }
+    }
 }
 
 fn replacement_decode_peak(
@@ -5725,6 +6155,9 @@ fn valid_environment_name(value: &str) -> bool {
 mod tests {
     use super::*;
 
+    const MAX_TEST_PROVIDER_OUTPUTS_WITHIN_SHARED_RAW_BATCH: usize =
+        credential_core::MAX_CREDENTIAL_RAW_BATCH_BYTES / MAX_PROVIDER_CREDENTIAL_BYTES;
+
     fn evaluate_test_policy(
         snapshot: &crate::policy::ProductAclSnapshot,
         url: &http_access_types::CanonicalUrl,
@@ -5767,6 +6200,92 @@ http1 = "deny"
 [policy]
 default = "deny"
 "#;
+
+    #[test]
+    fn credential_source_locators_enforce_exact_authored_bounds() {
+        let exact_environment =
+            format!("A{}", "B".repeat(MAX_ENVIRONMENT_CREDENTIAL_NAME_BYTES - 1));
+        let exact_path = format!(
+            "/{}",
+            (0..16)
+                .map(|_| "p".repeat(MAX_CREDENTIAL_FILE_COMPONENT_BYTES))
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        assert_eq!(exact_path.len(), MAX_CREDENTIAL_FILE_PATH_BYTES);
+        let exact = MINIMAL.replace(
+            "[policy]",
+            &format!(
+                r#"[credentials.sources.environment]
+source = "environment"
+variable = "{exact_environment}"
+
+[credentials.sources.file]
+source = "file"
+path = "{exact_path}"
+
+[policy]"#,
+            ),
+        );
+        compile(&exact).unwrap();
+
+        let oversized_environment =
+            format!("A{}", "B".repeat(MAX_ENVIRONMENT_CREDENTIAL_NAME_BYTES));
+        let error = compile(&MINIMAL.replace(
+            "[policy]",
+            &format!(
+                r#"[credentials.sources.environment]
+source = "environment"
+variable = "{oversized_environment}"
+
+[policy]"#,
+            ),
+        ))
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("exceeds the credential source locator limit"));
+
+        let oversized_path = format!(
+            "/{}",
+            (0..17)
+                .map(|_| "p".repeat(240))
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        assert_eq!(oversized_path.len(), MAX_CREDENTIAL_FILE_PATH_BYTES + 1);
+        let error = compile(&MINIMAL.replace(
+            "[policy]",
+            &format!(
+                r#"[credentials.sources.file]
+source = "file"
+path = "{oversized_path}"
+
+[policy]"#,
+            ),
+        ))
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("exceeds the credential source locator limit"));
+
+        let oversized_component =
+            format!("/{}", "p".repeat(MAX_CREDENTIAL_FILE_COMPONENT_BYTES + 1));
+        let error = compile(&MINIMAL.replace(
+            "[policy]",
+            &format!(
+                r#"[credentials.sources.file]
+source = "file"
+path = "{oversized_component}"
+
+[policy]"#,
+            ),
+        ))
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("contains a component over the credential path component limit"));
+    }
 
     fn compile(toml: &str) -> Result<CompiledProductConfig, ConfigCompileError> {
         let config: super::super::authoring::AuthoringConfig =
@@ -6281,11 +6800,11 @@ methods = ["POST"]
 
     #[test]
     fn upstream_body_free_delegate_holds_merged_body_across_provider_stages() {
-        let output_headers = (0..128)
+        let output_headers = (0..MAX_TEST_PROVIDER_OUTPUTS_WITHIN_SHARED_RAW_BATCH)
             .map(|index| format!("\"x-output-{index}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        let outputs = (0..128)
+        let outputs = (0..MAX_TEST_PROVIDER_OUTPUTS_WITHIN_SHARED_RAW_BATCH)
             .map(|index| {
                 format!(
                     r#"
@@ -6353,6 +6872,57 @@ methods = ["POST"]
         assert!(peaks[0] >= replay);
         assert!(peaks[1] >= decode);
         assert_eq!(peaks[2], 0);
+    }
+
+    #[test]
+    fn provider_outputs_over_shared_raw_batch_limit_are_rejected() {
+        let output_count = MAX_TEST_PROVIDER_OUTPUTS_WITHIN_SHARED_RAW_BATCH + 1;
+        let output_headers = (0..output_count)
+            .map(|index| format!("\"x-output-{index}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let outputs = (0..output_count)
+            .map(|index| {
+                format!(
+                    r#"
+[authorization.providers.provider.outputs.value_{index}]
+kind = "custom_header"
+header = "x-output-{index}"
+"#,
+                )
+            })
+            .collect::<String>();
+        let definitions = format!(
+            r#"
+[credentials]
+allowed_custom_headers = [{output_headers}]
+
+[authorization.providers.provider]
+kind = "process"
+command = "/bin/provider"
+retire_timeout = "1s"
+{outputs}
+"#,
+        );
+        let input = resource_config(
+            "",
+            &definitions,
+            r#"
+[[policy.rules]]
+id = "provider"
+decision = "delegate"
+authorization_provider = "provider"
+methods = ["GET"]
+"#,
+        );
+
+        let error = compile(&input).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("shared credential resource limits are exceeded"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -6710,11 +7280,20 @@ authorization_provider = "decision"
         let config: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
         let schedule = compile_http_rule_schedule(&config, &config.policy.rules[0]).unwrap();
         let continuation = guarded(continuation_bytes);
-        let compact_credentials = guarded(MAX_PROVIDER_CREDENTIAL_BYTES);
+        let compact_credentials =
+            compact_provider_credential_allocation(1, MAX_PROVIDER_CREDENTIAL_BYTES).unwrap();
+        let finalization =
+            compile_credential_finalization_peak(&config, Some(&config.policy.rules[0])).unwrap();
 
         assert_eq!(continuation, 2 * guarded(1));
-        assert_eq!(compact_credentials, guarded(1));
-        assert_eq!(schedule.initial_peak, continuation + compact_credentials);
+        assert_eq!(
+            compact_credentials,
+            guarded(1) + projected_provider_credential_wire_metadata_bytes(1).unwrap()
+        );
+        assert_eq!(
+            schedule.initial_peak,
+            continuation + compact_credentials + finalization
+        );
     }
 
     #[test]
@@ -6753,12 +7332,18 @@ redaction_profile = "small"
         let schedule = compile_http_rule_schedule(&config, &config.policy.rules[0]).unwrap();
         let literal_scratch = shared_matcher_scratch_bytes(1);
         let continuation_bytes = provider_response_guarded_suffix_bytes(80, "test").unwrap();
-        let compact_credential_bytes = continuation_bytes.min(MAX_PROVIDER_CREDENTIAL_BYTES);
+        let compact_credentials =
+            compact_provider_credential_allocation(1, continuation_bytes).unwrap();
         let terminal_redaction =
-            guarded(1) + guarded(literal_scratch) + guarded(1) + guarded(compact_credential_bytes);
-        let expected = decode_peak(1, 1).unwrap().max(terminal_redaction);
+            guarded(1) + guarded(literal_scratch) + guarded(1) + compact_credentials;
+        let finalization =
+            compile_credential_finalization_peak(&config, Some(&config.policy.rules[0])).unwrap();
+        let expected = decode_peak(1, 1).unwrap().max(terminal_redaction) + finalization;
 
-        assert_eq!(terminal_redaction, 4 * guarded(1));
+        assert_eq!(
+            terminal_redaction,
+            4 * guarded(1) + projected_provider_credential_wire_metadata_bytes(1).unwrap()
+        );
         assert_eq!(schedule.initial_peak, expected);
     }
 
@@ -6815,18 +7400,29 @@ authorization_provider = "later"
         let plan = compile(&input).unwrap().reloadable_plan.resource_plan;
         let retained = guarded(1);
         let continuation = guarded(continuation_bytes);
-        let compact_credentials = guarded(2 * MAX_PROVIDER_CREDENTIAL_BYTES);
+        let compact_credentials =
+            compact_provider_credential_allocation(2, 2 * MAX_PROVIDER_CREDENTIAL_BYTES).unwrap();
         let rehome = continuation + compact_credentials;
+        let config: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
+        let later_finalization =
+            compile_credential_finalization_peak(&config, Some(&config.policy.rules[1])).unwrap();
 
         assert_eq!(continuation, 65 * guarded(1));
-        assert_eq!(compact_credentials, 2 * guarded(1));
+        assert_eq!(
+            compact_credentials,
+            2 * guarded(1) + projected_provider_credential_wire_metadata_bytes(2).unwrap()
+        );
         let initial_peak = (retained + rehome).max(decode_peak(1, 1).unwrap());
         assert_eq!(initial_peak, decode_peak(1, 1).unwrap());
         let first_replay = canonical_runtime_replay_storage(1);
         let later_replay = default_runtime_replay_storage();
         assert_eq!(
             plan.combined_http_body_peaks_for_test(),
-            [initial_peak + first_replay, rehome + later_replay, 0]
+            [
+                initial_peak.max(retained + rehome + later_finalization) + first_replay,
+                rehome + later_finalization + later_replay,
+                0
+            ]
         );
     }
 
@@ -6881,16 +7477,25 @@ redaction_profile = "small"
         let retained = guarded(65_537);
         let literal_scratch = guarded(shared_matcher_scratch_bytes(1));
         let redaction_output = guarded(1);
-        let compact_credentials =
-            guarded(provider_response_guarded_suffix_bytes(80, "test").unwrap());
+        let compact_credentials = compact_provider_credential_allocation(
+            1,
+            provider_response_guarded_suffix_bytes(80, "test").unwrap(),
+        )
+        .unwrap();
         let incoming_redaction = literal_scratch + redaction_output + compact_credentials;
+        let credential_finalization =
+            compile_credential_finalization_peak(&authored, Some(&authored.policy.rules[1]))
+                .unwrap();
 
         assert_eq!(
             later_schedule.max_incoming_additional_bytes(),
-            incoming_redaction
+            incoming_redaction + credential_finalization
         );
         assert_eq!(retained, 2 * guarded(1));
-        assert_eq!(incoming_redaction, 3 * guarded(1));
+        assert_eq!(
+            incoming_redaction,
+            3 * guarded(1) + projected_provider_credential_wire_metadata_bytes(1).unwrap()
+        );
         assert!(plan.combined_http_body_peaks_for_test()[0] >= retained + incoming_redaction);
         assert_eq!(plan.combined_http_body_peaks_for_test()[2], 0);
     }
@@ -9381,11 +9986,11 @@ redaction_profile = "small"
 
     #[test]
     fn runtime_enforced_local_minimum_excludes_merged_body_from_large_provider_rehome() {
-        let output_headers = (0..128)
+        let output_headers = (0..MAX_TEST_PROVIDER_OUTPUTS_WITHIN_SHARED_RAW_BATCH)
             .map(|index| format!("\"x-output-{index}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        let outputs = (0..128)
+        let outputs = (0..MAX_TEST_PROVIDER_OUTPUTS_WITHIN_SHARED_RAW_BATCH)
             .map(|index| {
                 format!(
                     r#"

@@ -11,10 +11,6 @@ use crate::config::compiler::{
     CompiledEgressRoute, CompiledHttpVersion, CompiledTlsTrust, EgressPlan, ParentProxyPlan,
     ParentProxyTlsPlan, TransportTlsPlan,
 };
-use crate::credentials::{
-    resolve_credential_action, CredentialBindingError, ResolvedCredentialAction,
-};
-use crate::runtime::CredentialSourceRegistry;
 use crate::tls::{
     build_client_config, load_client_trust, ClientAlpn, ClientTrust, TlsActivationError,
 };
@@ -23,14 +19,11 @@ use http_access_url::{canonicalize_http_authority, canonicalize_tls_server_name}
 
 /// Generation-owned outbound transport policy and material.
 ///
-/// Activation consumes every path and logical credential name from the pure
-/// plan. The standalone generation binds runtime credential indices during
-/// activation; requests receive only the resulting neutral forwarding plan.
+/// Credential policy never enters this transport snapshot.
 pub(crate) struct EgressSnapshot {
     identity: Arc<()>,
     route: EgressRoute,
     origin_tls: OriginTls,
-    credential_actions: Box<[ResolvedCredentialAction]>,
 }
 
 pub(crate) enum EgressRoute {
@@ -116,8 +109,6 @@ pub(crate) enum EgressActivationError {
     CaEmpty,
     #[error("custom CA certificate bundle contains an unusable certificate")]
     CaUnusable,
-    #[error("egress credential action is invalid: {0}")]
-    Credential(#[from] CredentialBindingError),
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -137,15 +128,13 @@ pub(crate) enum OriginProtocolError {
 impl EgressSnapshot {
     pub(crate) fn activate(
         plan: EgressPlan,
-        credential_sources: &CredentialSourceRegistry,
         mut is_cancelled: impl FnMut() -> bool,
     ) -> Result<Self, EgressActivationError> {
         let EgressPlan {
             route,
             origin_tls,
             parent_proxy,
-            request_headers: _,
-            credential_actions,
+            ..
         } = plan;
         let origin_tls = OriginTls::activate(origin_tls, &mut is_cancelled)?;
         let route = match (route, parent_proxy) {
@@ -155,17 +144,10 @@ impl EgressSnapshot {
             )),
             _ => return Err(EgressActivationError::Route),
         };
-        let credential_actions = credential_actions
-            .into_iter()
-            .map(|action| resolve_credential_action(action, credential_sources))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_boxed_slice();
-
         Ok(Self {
             identity: Arc::new(()),
             route,
             origin_tls,
-            credential_actions,
         })
     }
 
@@ -189,10 +171,6 @@ impl EgressSnapshot {
             return None;
         };
         tls.custom_roots.clone()
-    }
-
-    pub(crate) fn credential_actions(&self) -> &[ResolvedCredentialAction] {
-        &self.credential_actions
     }
 }
 
@@ -529,7 +507,7 @@ impl From<TlsActivationError> for EgressActivationError {
 mod tests {
     use std::cell::{Cell, RefCell};
     use std::io::{self, Write};
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::{Mutex, Once};
 
     use rcgen::generate_simple_self_signed;
@@ -537,8 +515,7 @@ mod tests {
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
-    use crate::config::compiler::{CredentialActionPlan, ParentProxyTlsPlan};
-    use crate::config::{compile_config_text, ConfigTextInput};
+    use crate::config::compiler::ParentProxyTlsPlan;
 
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
@@ -657,7 +634,7 @@ mod tests {
     }
 
     fn activate(plan: EgressPlan) -> EgressSnapshot {
-        EgressSnapshot::activate(plan, &CredentialSourceRegistry::from_names([]), || false).unwrap()
+        EgressSnapshot::activate(plan, || false).unwrap()
     }
 
     fn activation_error(plan: EgressPlan) -> EgressActivationError {
@@ -668,42 +645,10 @@ mod tests {
         plan: EgressPlan,
         is_cancelled: impl FnMut() -> bool,
     ) -> EgressActivationError {
-        match EgressSnapshot::activate(
-            plan,
-            &CredentialSourceRegistry::from_names([]),
-            is_cancelled,
-        ) {
+        match EgressSnapshot::activate(plan, is_cancelled) {
             Ok(_) => panic!("egress activation unexpectedly succeeded"),
             Err(error) => error,
         }
-    }
-
-    fn compile_egress(config_root: &Path, definitions: &str) -> EgressPlan {
-        let text = format!(
-            r#"
-schema_version = 3
-
-[listeners.explicit_http]
-bind = "127.0.0.1:8881"
-http_versions = ["http1"]
-
-[listeners.explicit_http.connect]
-http1 = "deny"
-
-{definitions}
-
-[policy]
-default = "deny"
-"#
-        );
-        compile_config_text(ConfigTextInput {
-            text: &text,
-            source_path: &config_root.join("acl-proxy.toml"),
-            config_root,
-        })
-        .unwrap()
-        .reloadable_plan
-        .egress
     }
 
     #[test]
@@ -1114,15 +1059,14 @@ default = "deny"
             vec![CompiledHttpVersion::Http1],
         );
         let checks = Cell::new(0usize);
-        let error =
-            match EgressSnapshot::activate(plan, &CredentialSourceRegistry::from_names([]), || {
-                let next = checks.get() + 1;
-                checks.set(next);
-                next == 4
-            }) {
-                Ok(_) => panic!("post-read cancellation unexpectedly activated egress"),
-                Err(error) => error,
-            };
+        let error = match EgressSnapshot::activate(plan, || {
+            let next = checks.get() + 1;
+            checks.set(next);
+            next == 4
+        }) {
+            Ok(_) => panic!("post-read cancellation unexpectedly activated egress"),
+            Err(error) => error,
+        };
 
         assert_eq!(error, EgressActivationError::ActivationCancelled);
         assert_eq!(checks.get(), 4);
@@ -1162,90 +1106,6 @@ default = "deny"
     }
 
     #[test]
-    fn credential_actions_resolve_to_indices_and_unknown_names_fail() {
-        let directory = TempDir::new().unwrap();
-        let plan = compile_egress(
-            directory.path(),
-            r#"
-[credentials]
-allowed_custom_headers = ["x-api-key"]
-
-[credentials.sources.token]
-source = "environment"
-variable = "TEST_TOKEN"
-
-[credentials.sources.api]
-source = "environment"
-variable = "TEST_API_KEY"
-
-[egress]
-
-[[egress.credential_actions]]
-kind = "bearer"
-credential = "token"
-
-[[egress.credential_actions]]
-kind = "custom_header"
-header = "x-api-key"
-credential = "api"
-"#,
-        );
-        let sources =
-            CredentialSourceRegistry::from_names(["token".to_string(), "api".to_string()]);
-        let token = sources.get("token").unwrap();
-        let api = sources.get("api").unwrap();
-        let snapshot = EgressSnapshot::activate(plan.clone(), &sources, || false).unwrap();
-        assert_eq!(
-            snapshot.credential_actions(),
-            [
-                ResolvedCredentialAction::Bearer { source: token },
-                ResolvedCredentialAction::CustomHeader {
-                    header: "x-api-key".parse().unwrap(),
-                    source: api
-                }
-            ]
-        );
-
-        let missing_api = CredentialSourceRegistry::from_names(["token".to_string()]);
-        let error = match EgressSnapshot::activate(plan, &missing_api, || false) {
-            Ok(_) => panic!("unknown credential name unexpectedly activated"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            error,
-            EgressActivationError::Credential(CredentialBindingError::UnknownSource)
-        );
-    }
-
-    #[test]
-    fn candidate_activations_do_not_share_bound_credentials() {
-        let directory = TempDir::new().unwrap();
-        let plan = compile_egress(
-            directory.path(),
-            r#"
-[credentials.sources.token]
-source = "environment"
-variable = "TEST_TOKEN"
-
-[egress]
-
-[[egress.credential_actions]]
-kind = "bearer"
-credential = "token"
-"#,
-        );
-        let sources = CredentialSourceRegistry::from_names(["token".to_string()]);
-        let first = EgressSnapshot::activate(plan.clone(), &sources, || false).unwrap();
-        let second = EgressSnapshot::activate(plan, &sources, || false).unwrap();
-
-        assert_ne!(
-            first.credential_actions.as_ptr(),
-            second.credential_actions.as_ptr()
-        );
-        assert_eq!(first.credential_actions(), second.credential_actions());
-    }
-
-    #[test]
     fn route_matrix_rejects_inconsistent_parent_metadata() {
         let mut direct_with_parent = parent_plan(ParentProxyPlan {
             kind: CompiledParentProxyKind::Generic,
@@ -1269,7 +1129,7 @@ credential = "token"
             },
             parent_proxy: None,
             request_headers: Vec::new(),
-            credential_actions: Vec::<CredentialActionPlan>::new(),
+            credential_actions: Vec::new(),
         };
         assert_eq!(
             activation_error(parent_without_metadata),

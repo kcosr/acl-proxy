@@ -30,9 +30,27 @@ use crate::standalone_provider_result::{StandaloneCaptureBody, StandaloneUpgrade
 use crate::upgrade::{
     UpgradeEntryPlan, UpgradeRuntime, UpgradeTerminalCause, UpgradeTerminalControl,
 };
+use credential_core::CredentialCancellation;
 use http_access_types::{apply_header_mutation_batches, UpgradePolicy};
 
+use crate::credential_resolver::ProductCredentialExecution;
+
 pub(super) struct ForwardingExecutor;
+
+struct ForwardingCredentialCancellation {
+    deadline: Instant,
+    h2_stream: Option<H2StreamCancellation>,
+}
+
+impl CredentialCancellation for ForwardingCredentialCancellation {
+    fn is_cancelled(&self) -> bool {
+        Instant::now() >= self.deadline
+            || self
+                .h2_stream
+                .as_ref()
+                .is_some_and(H2StreamCancellation::is_cancelled)
+    }
+}
 
 impl ForwardingExecutor {
     pub(super) async fn execute(
@@ -54,6 +72,7 @@ impl ForwardingExecutor {
         };
         let h2_stream = parts.extensions.remove::<H2StreamCancellation>();
         let plan = dispatch.exchange.plan();
+        let plan_arc = dispatch.exchange.plan_arc();
         let origin = plan.origin().clone();
         let plan_binding = plan.binding();
         let response_mutations = plan.response_mutation_batches().to_vec();
@@ -142,24 +161,11 @@ impl ForwardingExecutor {
         );
 
         dispatch.decision.submit_now();
-        let program = match dispatch.sidecar.take_credential_program(plan_binding) {
-            Ok(program) => program,
-            Err(_) => {
-                return terminal.capture.fixed_response(
-                    CaptureDecision::Allow,
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "request failed\n",
-                    true,
-                )
-            }
-        };
-        if program
-            .apply(dispatch.exchange.plan(), &dispatch.services, &mut headers)
+        let credential_preparation = dispatch.credentials;
+        if dispatch
+            .services
+            .inject_loop_marker(&mut headers, &dispatch.request_id)
             .is_err()
-            || dispatch
-                .services
-                .inject_loop_marker(&mut headers, &dispatch.request_id)
-                .is_err()
         {
             return terminal.capture.fixed_response(
                 CaptureDecision::Allow,
@@ -172,7 +178,7 @@ impl ForwardingExecutor {
         let request_headers = capture_headers;
         let mut body = StandaloneExchangeBody::new(dispatch.exchange, dispatch.sidecar);
         body.set_capture(request_capture);
-        let request = SanitizedRequest::from_parts(*parts, body, protocol);
+        let mut request = SanitizedRequest::from_parts(*parts, body, protocol);
         let response_admission = match dispatch.services.begin_response(dispatch.quota_key) {
             Ok(admission) => admission,
             Err(_) => {
@@ -183,6 +189,37 @@ impl ForwardingExecutor {
                     true,
                 )
             }
+        };
+        let credentials = match credential_preparation {
+            Some(preparation) => {
+                let credential_cancellation: Arc<dyn CredentialCancellation> =
+                    Arc::new(ForwardingCredentialCancellation {
+                        deadline: dispatch.deadline,
+                        h2_stream: h2_stream.clone(),
+                    });
+                match preparation.admit_for_plan(&plan_arc, credential_cancellation) {
+                    Ok(mut execution) => {
+                        if execution.reserve_transport(request.headers_mut()).is_err() {
+                            return terminal.capture.fixed_response(
+                                CaptureDecision::Allow,
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                "service unavailable\n",
+                                true,
+                            );
+                        }
+                        Some(execution)
+                    }
+                    Err(_) => {
+                        return terminal.capture.fixed_response(
+                            CaptureDecision::Allow,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "service unavailable\n",
+                            true,
+                        )
+                    }
+                }
+            }
+            None => None,
         };
 
         if !matches!(upgrade, UpgradePolicy::Deny) {
@@ -220,6 +257,7 @@ impl ForwardingExecutor {
                 h2_stream: h2_stream.clone(),
                 forwarding_timeouts,
                 upgrade_deadlines,
+                credentials,
             })
             .await;
             return match outcome {
@@ -289,6 +327,7 @@ impl ForwardingExecutor {
                 &dispatch.destinations,
                 dispatch.resolved,
                 forwarding_timeouts,
+                credentials,
             ),
         )
         .await
@@ -380,6 +419,7 @@ struct StandaloneUpgradeExecution {
     h2_stream: Option<H2StreamCancellation>,
     forwarding_timeouts: ForwardingTimeouts,
     upgrade_deadlines: UpgradeRelayDeadlines,
+    credentials: Option<ProductCredentialExecution>,
 }
 
 enum UpgradeHandshakeResponse {
@@ -453,6 +493,7 @@ async fn execute_standalone_upgrade(
         h2_stream,
         forwarding_timeouts,
         upgrade_deadlines,
+        credentials,
     } = execution;
     let (response_tx, response_rx) = oneshot::channel();
     let (cancel_tx, cancel_rx) = oneshot::channel();
@@ -473,6 +514,7 @@ async fn execute_standalone_upgrade(
                         destinations,
                         resolved,
                         forwarding_timeouts,
+                        credentials,
                     ),
                 )
                 .await;

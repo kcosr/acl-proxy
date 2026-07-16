@@ -5,7 +5,7 @@ use crate::authorization::{
 };
 use crate::config::compiler::ReloadableProductPlan;
 use crate::config::StaticFingerprint;
-use crate::credentials::CredentialResolverSnapshot;
+use crate::credentials::CredentialActivation;
 use crate::egress::{EgressActivationError, EgressSnapshot};
 use crate::redaction::ProductRedactionActivationError;
 use crate::runtime::{
@@ -152,10 +152,8 @@ impl ProductActivator {
             .map_err(|error| map_redaction_error(error, &cancellation))?;
         cancellation.check()?;
 
-        let credentials = CredentialResolverSnapshot::activate(credentials, &provider_registry)
-            .map_err(|error| {
-                candidate_error(&cancellation, "credential resolver", error.to_string())
-            })?;
+        let credentials = CredentialActivation::activate(credentials, &provider_registry)
+            .map_err(|error| candidate_error(&cancellation, "credentials", error.to_string()))?;
         cancellation.check()?;
 
         let safety = ProductSafetySnapshot::activate(
@@ -174,15 +172,13 @@ impl ProductActivator {
             .map_err(|error| candidate_error(&cancellation, "observation", error.to_string()))?;
         cancellation.check()?;
 
-        let egress = EgressSnapshot::activate(egress, credentials.source_registry(), || {
-            cancellation.is_cancelled()
-        })
-        .map_err(|error| map_egress_error(error, &cancellation))?;
+        let egress = EgressSnapshot::activate(egress, || cancellation.is_cancelled())
+            .map_err(|error| map_egress_error(error, &cancellation))?;
         cancellation.check()?;
 
-        // Process providers are deliberately last. Failures in secret
-        // resolution, binding, TLS construction, or resource validation cannot
-        // create a child that then needs product-level rollback.
+        // Process providers start only after the other generation-owned
+        // resources have activated. Final binding follows because it consumes
+        // the activated provider-output handles.
         let authorization = ProductAuthorizationSnapshot::activate(
             authorization,
             provider_registry,
@@ -197,7 +193,7 @@ impl ProductActivator {
 
         let (authorization, provider_registry, provider_owners) = authorization.into_parts();
         let (observation, observation_owner) = observation.into_parts();
-        let (credentials, credential_registry) = credentials.into_parts();
+        let (credentials, credential_sources) = credentials.into_parts();
 
         let owners = provider_owners
             .into_vec()
@@ -206,7 +202,7 @@ impl ProductActivator {
         let owner: Arc<dyn GenerationOwner> = Arc::new(ProductGenerationOwner::new(owners));
 
         let standalone = match standalone.bind(
-            &credential_registry,
+            &credential_sources,
             &redaction,
             &authorization,
             &provider_registry,
@@ -237,6 +233,7 @@ impl ProductActivator {
             egress: Arc::new(egress),
             authorization: Arc::new(authorization),
             credentials: Arc::new(credentials),
+            credential_io_runtime: self.static_resources.credential_io_runtime(),
             observation: Arc::new(observation),
             safety: Arc::new(safety),
             owner,
@@ -838,14 +835,7 @@ redaction_profile = "environment"
         let mut request_headers = http::HeaderMap::new();
         let _origin_trust = activated.egress.origin_tls().trust();
 
-        activated
-            .credentials
-            .inject(&[], &mut request_headers)
-            .unwrap();
-        let _inbound = activated
-            .credentials
-            .extract_inbound(&mut request_headers)
-            .unwrap();
+        let _inbound = activated.credentials.extract(&mut request_headers).unwrap();
         assert!(!request_headers.contains_key(http::header::AUTHORIZATION));
 
         assert!(activated

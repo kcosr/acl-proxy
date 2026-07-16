@@ -748,11 +748,12 @@ mod tests {
     use std::collections::BTreeMap;
     use std::net::{IpAddr, Ipv4Addr};
 
-    use http::header::AUTHORIZATION;
-    use http::{HeaderMap, HeaderName};
+    use http::HeaderName;
 
     use super::*;
-    use crate::authorization::protocol::ProviderCredentialSet;
+    use crate::authorization::protocol::{
+        projected_provider_credential_wire_metadata_bytes, ProviderCredentialSet,
+    };
     use crate::config::compiler::ProviderOutputPlan;
     use crate::safety::wire_body::guarded_body_allocation_bytes;
     use crate::safety::{HttpWireBodyGuard, WireBodyPool, WireBodyQuotaKey};
@@ -777,7 +778,18 @@ mod tests {
     }
 
     fn guard(limit: usize) -> (std::sync::Arc<WireBodyPool>, HttpWireBodyGuard) {
-        let allocation = guarded_body_allocation_bytes(limit).unwrap().max(1);
+        guard_with_additional_charge(limit, 0)
+    }
+
+    fn guard_with_additional_charge(
+        limit: usize,
+        additional_charge: usize,
+    ) -> (std::sync::Arc<WireBodyPool>, HttpWireBodyGuard) {
+        let allocation = guarded_body_allocation_bytes(limit)
+            .unwrap()
+            .max(1)
+            .checked_add(additional_charge)
+            .unwrap();
         let pool = WireBodyPool::new(allocation * 2, allocation * 2);
         let guard = pool.begin_for_test(
             allocation,
@@ -973,7 +985,8 @@ mod tests {
         let response = body(
             "\"type\":\"response\",\"decision\":\"allow\",\"values\":{\"api_token\":\"secret-marker\"}}",
         );
-        let (_, guard) = guard(64 * 1024 + 1);
+        let metadata = projected_provider_credential_wire_metadata_bytes(outputs.len()).unwrap();
+        let (_, guard) = guard_with_additional_charge(64 * 1024 + 1, metadata);
         let CallbackResponseDecision::Allow(credentials) = parse(
             &response,
             &outputs,
@@ -999,14 +1012,15 @@ mod tests {
         );
         assert!(!format!("{provider_credentials:?}").contains("secret-marker"));
 
-        let mut headers = HeaderMap::new();
-        outputs
-            .stage_credentials(&provider_credentials, &guard)
-            .unwrap()
-            .apply(&mut headers)
+        let staged = outputs
+            .compact_provider_credential_wire(&provider_credentials, &guard)
             .unwrap();
-        assert_eq!(headers.get(AUTHORIZATION).unwrap(), "Bearer secret-marker");
-        assert!(headers.get(AUTHORIZATION).unwrap().is_sensitive());
+        let mut material = vec![0; staged.output_len(index).unwrap()];
+        staged.copy_output(index, &mut material).unwrap();
+        assert_eq!(material, b"secret-marker");
+        drop(staged);
+        drop(provider_credentials);
+        assert_eq!(guard.live_bytes(), 0);
     }
 
     #[test]

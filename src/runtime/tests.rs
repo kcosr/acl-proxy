@@ -23,7 +23,7 @@ use crate::authorization::webhook::runtime::WebhookAuthorizationRuntime;
 use crate::authorization::ProductAuthorizationSnapshot;
 use crate::config::compiler::{
     AuthorizationCallbackPlan, AuthorizationPlan, AuthorizationProviderPlan,
-    CompiledProviderFailureMode, PendingOperationLimit, WebhookProviderPlan,
+    CompiledProviderFailureMode, CredentialsPlan, PendingOperationLimit, WebhookProviderPlan,
 };
 use crate::config::{compile_config_text, CompiledConfig, ConfigTextInput};
 use crate::destination::{
@@ -83,16 +83,16 @@ impl AuthorizationSnapshot for EmptySnapshot {
         None
     }
 
-    fn stage_provider_credentials(
+    fn compact_provider_credential_wire(
         &self,
         _provider: ProviderIndex,
         _credentials: &crate::authorization::protocol::ProviderCredentialSet,
         _guard: &crate::safety::HttpWireBodyGuard,
     ) -> Result<
-        crate::authorization::protocol::StagedProviderCredentialMutation,
-        crate::authorization::protocol::ProviderCredentialInjectionError,
+        crate::authorization::protocol::ProviderCredentialWireStore,
+        crate::authorization::protocol::ProviderCredentialWireError,
     > {
-        Err(crate::authorization::protocol::ProviderCredentialInjectionError::UnknownProvider)
+        Err(crate::authorization::protocol::ProviderCredentialWireError::UnknownProvider)
     }
 
     fn consume_allow_output(
@@ -131,23 +131,6 @@ impl AuthorizationSnapshot for EmptySnapshot {
         Box::pin(async { Err(crate::authorization::AuthorizationDispatchError::UnknownProvider) })
     }
 }
-impl CredentialResolver for EmptySnapshot {
-    fn inject(
-        &self,
-        actions: &[crate::credentials::ResolvedCredentialAction],
-        _headers: &mut http::HeaderMap,
-    ) -> Result<(), crate::credentials::CredentialError> {
-        assert!(actions.is_empty());
-        Ok(())
-    }
-
-    fn extract_inbound(
-        &self,
-        _headers: &mut http::HeaderMap,
-    ) -> Result<crate::credentials::InboundCredentials, crate::credentials::CredentialError> {
-        panic!("empty test credentials cannot extract inbound values")
-    }
-}
 impl ObservationSnapshot for EmptySnapshot {
     fn capture_epoch(&self) -> &Arc<crate::observation::CaptureEpoch> {
         static DISABLED: std::sync::LazyLock<Arc<crate::observation::CaptureEpoch>> =
@@ -161,6 +144,20 @@ impl ObservationSnapshot for EmptySnapshot {
     ) -> Option<crate::config::compiler::CompiledDecisionLogLevel> {
         None
     }
+}
+
+fn empty_inbound_credentials() -> Arc<crate::credentials::InboundCredentialSnapshot> {
+    let activation = crate::credentials::CredentialActivation::activate(
+        CredentialsPlan {
+            inbound: std::collections::BTreeMap::new(),
+            sources: std::collections::BTreeMap::new(),
+        },
+        &ProviderRegistry::from_names([]),
+    )
+    .expect("empty credentials activate");
+    let (snapshot, sources) = activation.into_parts();
+    assert!(sources.is_empty());
+    Arc::new(snapshot)
 }
 impl SafetySnapshot for EmptySnapshot {
     fn contains_loop_marker(&self, _headers: &http::HeaderMap) -> bool {
@@ -698,7 +695,9 @@ impl CandidateActivator for FakeActivator {
                 resource_plan: plan.resource_plan,
                 egress: snapshot.clone(),
                 authorization: snapshot.clone(),
-                credentials: snapshot.clone(),
+                credentials: empty_inbound_credentials(),
+                credential_io_runtime: crate::credential_io_runtime::CredentialIoRuntime::new()
+                    .unwrap(),
                 observation: snapshot.clone(),
                 safety: snapshot,
                 owner,
@@ -866,7 +865,9 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
             resource_plan: compiled.reloadable_plan.resource_plan.clone(),
             egress: empty.clone(),
             authorization: Arc::new(authorization),
-            credentials: empty.clone(),
+            credentials: empty_inbound_credentials(),
+            credential_io_runtime: crate::credential_io_runtime::CredentialIoRuntime::new()
+                .unwrap(),
             observation: empty.clone(),
             safety: empty,
             owner: Arc::new(FakeOwner::default()),

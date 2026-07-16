@@ -13,6 +13,7 @@ use crate::control::server::{
     ControlServer, ControlServerError, ControlServerFailureObserver, ControlServerRunError,
     ControlServerShutdownError,
 };
+use crate::credential_io_runtime::{CredentialIoRuntime, CredentialIoRuntimeError};
 use crate::logging::{process_logging_level_control, LoggingLevelControl};
 use crate::observation::{ProductObservationRuntime, ProductObservationRuntimeStartError};
 use crate::runtime::{BoxFuture, ServiceReadiness, StaticResourceBrand, StaticResources};
@@ -51,6 +52,7 @@ pub(crate) struct ProductStaticResources {
     wire_body_pool: Arc<WireBodyPool>,
     observation_runtime: Arc<ProductObservationRuntime>,
     logging_level: LoggingLevelControl,
+    credential_io_runtime: Arc<CredentialIoRuntime>,
     authorization_runtime: Arc<WebhookAuthorizationRuntime>,
     upgrade_runtime: Arc<UpgradeRuntime>,
 }
@@ -120,6 +122,7 @@ impl ProductStaticResources {
             static_config.service.upgrade_relay_buffer_bytes,
             static_config.service.max_upgrade_lifetime,
         ))?;
+        let credential_io_runtime = CredentialIoRuntime::new()?;
         let static_fingerprint = StaticFingerprint::from_config(static_config)?;
         let logging_level = process_logging_level_control();
         // Start the process-owned worker last so construction cannot return an
@@ -159,6 +162,7 @@ impl ProductStaticResources {
             ),
             observation_runtime,
             logging_level,
+            credential_io_runtime,
             authorization_runtime,
             upgrade_runtime,
         }))
@@ -186,6 +190,10 @@ impl ProductStaticResources {
 
     pub(crate) fn authorization_runtime(&self) -> Arc<WebhookAuthorizationRuntime> {
         self.authorization_runtime.clone()
+    }
+
+    pub(crate) fn credential_io_runtime(&self) -> Arc<CredentialIoRuntime> {
+        self.credential_io_runtime.clone()
     }
 
     pub(crate) fn upgrade_runtime(&self) -> Arc<UpgradeRuntime> {
@@ -588,6 +596,7 @@ impl StaticResources for ProductStaticResources {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = deadline;
         self.observation_runtime.begin_shutdown();
+        self.credential_io_runtime.begin_shutdown();
         self.authorization_runtime.begin_shutdown(deadline);
         self.upgrade_runtime.begin_shutdown(deadline);
         if let Some(mitm) = self.ingress_assets.mitm() {
@@ -643,6 +652,7 @@ impl StaticResources for ProductStaticResources {
                 }
             }
             self.authorization_runtime.wait_until_drained().await;
+            self.credential_io_runtime.shutdown_and_wait().await;
             self.upgrade_shutdown
                 .get_or_init(|| self.upgrade_runtime.shutdown_and_wait(deadline))
                 .await;
@@ -669,6 +679,8 @@ pub(crate) enum ProductStaticResourcesError {
     StaticFingerprint(#[from] StaticFingerprintError),
     #[error("static authorization runtime construction failed")]
     Authorization(#[from] WebhookAuthorizationRuntimeError),
+    #[error("static credential I/O runtime construction failed")]
+    CredentialIo(#[from] CredentialIoRuntimeError),
     #[error("static upgrade runtime construction failed")]
     Upgrade(#[from] UpgradeRuntimeError),
     #[error("static observation runtime construction failed")]

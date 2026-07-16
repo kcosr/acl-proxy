@@ -297,6 +297,7 @@ impl Drop for QuotaLease {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct HttpWireBodyGuard {
     inner: Arc<GuardInner>,
 }

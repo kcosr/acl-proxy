@@ -18,6 +18,7 @@ use tokio::time::Instant;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
+use crate::credential_resolver::ProductCredentialExecution;
 use crate::destination::{
     DestinationConnector, DestinationGuard, DestinationGuardError, DestinationTarget,
     PreparedDestination, ResolvedDestination, TcpDestinationConnector,
@@ -72,6 +73,8 @@ pub(crate) enum ForwardError {
     ConnectTimeout,
     #[error("upstream response head timed out")]
     ResponseHeadTimeout,
+    #[error("credential finalization failed")]
+    Credential(#[source] credential_core::CredentialError),
 }
 
 #[derive(Clone, Copy)]
@@ -110,6 +113,32 @@ impl ForwardingTimeouts {
         let timeout = Duration::from_secs(3_600);
         Self::new(Instant::now() + timeout, timeout, timeout)
     }
+}
+
+struct ForwardExecutionOptions {
+    timeouts: ForwardingTimeouts,
+    credentials: Option<ProductCredentialExecution>,
+}
+
+impl ForwardExecutionOptions {
+    fn new(timeouts: ForwardingTimeouts, credentials: Option<ProductCredentialExecution>) -> Self {
+        Self {
+            timeouts,
+            credentials,
+        }
+    }
+
+    fn begin_connect(self) -> EstablishedForwardExecution {
+        EstablishedForwardExecution {
+            deadlines: self.timeouts.begin_connect(),
+            credentials: self.credentials,
+        }
+    }
+}
+
+struct EstablishedForwardExecution {
+    deadlines: ForwardingDeadlines,
+    credentials: Option<ProductCredentialExecution>,
 }
 
 #[derive(Clone, Copy)]
@@ -1198,6 +1227,7 @@ pub(crate) async fn forward_request<B>(
     destinations: &DestinationGuard,
     target: ResolvedForwardingTarget,
     timeouts: ForwardingTimeouts,
+    credentials: Option<ProductCredentialExecution>,
 ) -> Result<ForwardedResponse, ForwardError>
 where
     B: HttpBody + Send + 'static,
@@ -1211,7 +1241,7 @@ where
         destinations,
         target,
         &TcpDestinationConnector,
-        timeouts,
+        ForwardExecutionOptions::new(timeouts, credentials),
     )
     .await
 }
@@ -1223,7 +1253,7 @@ async fn forward_with_connector_timed<C, B>(
     destinations: &DestinationGuard,
     target: ResolvedForwardingTarget,
     connector: &C,
-    timeouts: ForwardingTimeouts,
+    execution: ForwardExecutionOptions,
 ) -> Result<ForwardedResponse, ForwardError>
 where
     C: DestinationConnector,
@@ -1241,7 +1271,8 @@ where
         return Err(ForwardError::ResolvedTargetMismatch);
     }
 
-    let deadlines = timeouts.begin_connect();
+    let execution = execution.begin_connect();
+    let deadlines = execution.deadlines;
     match (egress.route(), target.route) {
         (EgressRoute::Direct, ResolvedForwardingRoute::Direct(resolved)) => {
             let stream = connect_stage(deadlines, destinations.connect(resolved, connector))
@@ -1253,7 +1284,7 @@ where
                 egress,
                 selected_origin_protocol,
                 stream,
-                deadlines,
+                execution,
             )
             .await
         }
@@ -1274,7 +1305,7 @@ where
                 parent,
                 selected_origin_protocol,
                 stream,
-                deadlines,
+                execution,
             )
             .await
         }
@@ -1305,7 +1336,7 @@ where
         destinations,
         target,
         connector,
-        ForwardingTimeouts::for_test(),
+        ForwardExecutionOptions::new(ForwardingTimeouts::for_test(), None),
     )
     .await
 }
@@ -1321,6 +1352,7 @@ pub(crate) async fn forward_upgrade_request<B>(
     destinations: std::sync::Arc<DestinationGuard>,
     target: ResolvedForwardingTarget,
     timeouts: ForwardingTimeouts,
+    credentials: Option<ProductCredentialExecution>,
 ) -> Result<ForwardUpgradeResult, ForwardError>
 where
     B: HttpBody + Send + 'static,
@@ -1335,7 +1367,7 @@ where
         &destinations,
         target,
         &TcpDestinationConnector,
-        timeouts,
+        ForwardExecutionOptions::new(timeouts, credentials),
     )
     .await
 }
@@ -1347,7 +1379,7 @@ async fn forward_upgrade_with_connector_timed<C, B>(
     destinations: &DestinationGuard,
     target: ResolvedForwardingTarget,
     connector: &C,
-    timeouts: ForwardingTimeouts,
+    execution: ForwardExecutionOptions,
 ) -> Result<ForwardUpgradeResult, ForwardError>
 where
     C: DestinationConnector,
@@ -1372,13 +1404,14 @@ where
         return Err(ForwardError::ResolvedTargetMismatch);
     }
 
-    let deadlines = timeouts.begin_connect();
+    let execution = execution.begin_connect();
+    let deadlines = execution.deadlines;
     match (egress.route(), target.route) {
         (EgressRoute::Direct, ResolvedForwardingRoute::Direct(resolved)) => {
             let stream = connect_stage(deadlines, destinations.connect(resolved, connector))
                 .await?
                 .into_stream();
-            forward_upgrade_direct(request, canonical, egress, stream, intent, deadlines).await
+            forward_upgrade_direct(request, canonical, egress, stream, intent, execution).await
         }
         (
             EgressRoute::Parent(parent),
@@ -1391,7 +1424,7 @@ where
                 .await?
                 .into_stream();
             forward_upgrade_via_parent(
-                request, canonical, egress, parent, stream, intent, deadlines,
+                request, canonical, egress, parent, stream, intent, execution,
             )
             .await
         }
@@ -1422,7 +1455,7 @@ where
         destinations,
         target,
         connector,
-        ForwardingTimeouts::for_test(),
+        ForwardExecutionOptions::new(ForwardingTimeouts::for_test(), None),
     )
     .await
 }
@@ -1433,7 +1466,7 @@ async fn forward_upgrade_direct<S, B>(
     egress: &dyn EgressSnapshot,
     stream: S,
     intent: UpgradeIntent,
-    deadlines: ForwardingDeadlines,
+    execution: EstablishedForwardExecution,
 ) -> Result<ForwardUpgradeResult, ForwardError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1441,6 +1474,10 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    let EstablishedForwardExecution {
+        deadlines,
+        credentials,
+    } = execution;
     if canonical.scheme() == HttpScheme::Https {
         let stream = connect_stage(
             deadlines,
@@ -1453,7 +1490,7 @@ where
             RequestTargetForm::Origin,
             OriginProtocol::Http1,
         )?;
-        send_upgrade_request(stream, request, intent, deadlines).await
+        send_upgrade_request(stream, request, intent, deadlines, credentials).await
     } else {
         let request = prepare_origin_upgrade_request(
             request,
@@ -1461,7 +1498,7 @@ where
             RequestTargetForm::Origin,
             OriginProtocol::Http1,
         )?;
-        send_upgrade_request(stream, request, intent, deadlines).await
+        send_upgrade_request(stream, request, intent, deadlines, credentials).await
     }
 }
 
@@ -1472,7 +1509,7 @@ async fn forward_upgrade_via_parent<S, B>(
     parent: &ParentEndpoint,
     stream: S,
     intent: UpgradeIntent,
-    deadlines: ForwardingDeadlines,
+    execution: EstablishedForwardExecution,
 ) -> Result<ForwardUpgradeResult, ForwardError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1480,6 +1517,10 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    let EstablishedForwardExecution {
+        deadlines,
+        credentials,
+    } = execution;
     if canonical.scheme() == HttpScheme::Https {
         match parent.transport() {
             ParentTransport::Http => {
@@ -1496,7 +1537,7 @@ where
                     RequestTargetForm::Origin,
                     OriginProtocol::Http1,
                 )?;
-                send_upgrade_request(origin, request, intent, deadlines).await
+                send_upgrade_request(origin, request, intent, deadlines, credentials).await
             }
             ParentTransport::Https(tls) => {
                 let parent_stream =
@@ -1515,7 +1556,7 @@ where
                     RequestTargetForm::Origin,
                     OriginProtocol::Http1,
                 )?;
-                send_upgrade_request(origin, request, intent, deadlines).await
+                send_upgrade_request(origin, request, intent, deadlines, credentials).await
             }
         }
     } else {
@@ -1526,11 +1567,13 @@ where
             OriginProtocol::Http1,
         )?;
         match parent.transport() {
-            ParentTransport::Http => send_upgrade_request(stream, request, intent, deadlines).await,
+            ParentTransport::Http => {
+                send_upgrade_request(stream, request, intent, deadlines, credentials).await
+            }
             ParentTransport::Https(tls) => {
                 let stream =
                     connect_stage(deadlines, connect_parent_tls(stream, tls, false)).await?;
-                send_upgrade_request(stream, request, intent, deadlines).await
+                send_upgrade_request(stream, request, intent, deadlines, credentials).await
             }
         }
     }
@@ -1542,7 +1585,7 @@ async fn forward_direct<S, B>(
     egress: &dyn EgressSnapshot,
     protocol: OriginProtocol,
     stream: S,
-    deadlines: ForwardingDeadlines,
+    execution: EstablishedForwardExecution,
 ) -> Result<ForwardedResponse, ForwardError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1550,6 +1593,10 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    let EstablishedForwardExecution {
+        deadlines,
+        credentials,
+    } = execution;
     if canonical.scheme() == HttpScheme::Https {
         let stream = connect_stage(
             deadlines,
@@ -1558,11 +1605,11 @@ where
         .await?;
         let request =
             prepare_origin_request(request, canonical, RequestTargetForm::Origin, protocol)?;
-        send_request(stream, request, protocol, deadlines).await
+        send_request(stream, request, protocol, deadlines, credentials).await
     } else {
         let request =
             prepare_origin_request(request, canonical, RequestTargetForm::Origin, protocol)?;
-        send_request(stream, request, protocol, deadlines).await
+        send_request(stream, request, protocol, deadlines, credentials).await
     }
 }
 
@@ -1573,7 +1620,7 @@ async fn forward_via_parent<S, B>(
     parent: &ParentEndpoint,
     protocol: OriginProtocol,
     stream: S,
-    deadlines: ForwardingDeadlines,
+    execution: EstablishedForwardExecution,
 ) -> Result<ForwardedResponse, ForwardError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1581,6 +1628,10 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    let EstablishedForwardExecution {
+        deadlines,
+        credentials,
+    } = execution;
     if canonical.scheme() == HttpScheme::Https {
         // CONNECT is deliberately HTTP/1.1 and contains no logical-origin
         // headers. The selected origin protocol applies inside the tunnel.
@@ -1599,7 +1650,7 @@ where
                     RequestTargetForm::Origin,
                     protocol,
                 )?;
-                send_request(origin, request, protocol, deadlines).await
+                send_request(origin, request, protocol, deadlines, credentials).await
             }
             ParentTransport::Https(tls) => {
                 let parent_stream =
@@ -1618,21 +1669,23 @@ where
                     RequestTargetForm::Origin,
                     protocol,
                 )?;
-                send_request(origin, request, protocol, deadlines).await
+                send_request(origin, request, protocol, deadlines, credentials).await
             }
         }
     } else {
         let request =
             prepare_origin_request(request, canonical, RequestTargetForm::Absolute, protocol)?;
         match parent.transport() {
-            ParentTransport::Http => send_request(stream, request, protocol, deadlines).await,
+            ParentTransport::Http => {
+                send_request(stream, request, protocol, deadlines, credentials).await
+            }
             ParentTransport::Https(tls) => {
                 let stream = connect_stage(
                     deadlines,
                     connect_parent_tls(stream, tls, protocol.is_http2()),
                 )
                 .await?;
-                send_request(stream, request, protocol, deadlines).await
+                send_request(stream, request, protocol, deadlines, credentials).await
             }
         }
     }
@@ -1843,6 +1896,7 @@ async fn send_upgrade_request<S, B>(
     request: Request<B>,
     intent: UpgradeIntent,
     deadlines: ForwardingDeadlines,
+    credentials: Option<ProductCredentialExecution>,
 ) -> Result<ForwardUpgradeResult, ForwardError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -1852,7 +1906,7 @@ where
 {
     let (parts, body) = request.into_parts();
     let (body, write_state) = UpgradeRequestBody::new(body);
-    let request = Request::from_parts(parts, body);
+    let mut request = Request::from_parts(parts, body);
     let stream = UpgradeFlushTrackedIo::new(stream, write_state.clone());
     let (mut sender, connection) = connect_stage(deadlines, async {
         conn::Builder::new()
@@ -1862,6 +1916,12 @@ where
     })
     .await?;
     let driver = DriverTask::spawn(connection);
+    if let Some(credentials) = credentials {
+        if let Err(error) = credentials.finalize(&mut request).await {
+            driver.abort_and_join().await;
+            return Err(ForwardError::Credential(error));
+        }
+    }
     let mut response = match tokio::time::timeout_at(
         deadlines.response_head(),
         sender.send_request(request),
@@ -1993,6 +2053,7 @@ async fn send_request<S, B>(
     request: Request<B>,
     protocol: OriginProtocol,
     deadlines: ForwardingDeadlines,
+    credentials: Option<ProductCredentialExecution>,
 ) -> Result<ForwardedResponse, ForwardError>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -2009,6 +2070,13 @@ where
     })
     .await?;
     let driver = DriverTask::spawn(connection);
+    let mut request = request;
+    if let Some(credentials) = credentials {
+        if let Err(error) = credentials.finalize(&mut request).await {
+            driver.abort_and_join().await;
+            return Err(ForwardError::Credential(error));
+        }
+    }
     let response = match tokio::time::timeout_at(
         deadlines.response_head(),
         sender.send_request(request),
@@ -2038,10 +2106,13 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::fs;
     use std::future::Future;
     use std::io;
     use std::net::SocketAddr;
     use std::net::{IpAddr, Ipv4Addr};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -2065,11 +2136,17 @@ mod tests {
         ResolveFuture,
     };
     use crate::egress::EgressSnapshot as ProductEgressSnapshot;
-    use crate::runtime::CredentialSourceRegistry;
     use crate::safety::{GuardedBody, WireBodyPool, WireBodyQuotaKey};
     use http_access_url::canonicalize_http_url;
 
     const CANDIDATE: &str = "192.0.2.20:8443";
+
+    fn expect_forward_error<T>(result: Result<T, ForwardError>, message: &str) -> ForwardError {
+        match result {
+            Ok(_) => panic!("{message}"),
+            Err(error) => error,
+        }
+    }
 
     struct FixedResolver {
         endpoint: SocketAddr,
@@ -2095,6 +2172,10 @@ mod tests {
     struct FakeConnector {
         peer: SocketAddr,
         streams: Mutex<VecDeque<DuplexStream>>,
+        calls: AtomicUsize,
+    }
+
+    struct FailingConnector {
         calls: AtomicUsize,
     }
 
@@ -2130,6 +2211,22 @@ mod tests {
         }
     }
 
+    impl DestinationConnector for FailingConnector {
+        type Stream = DuplexStream;
+
+        fn connect(
+            &self,
+            _endpoint: SocketAddr,
+        ) -> Pin<Box<dyn Future<Output = io::Result<Self::Stream>> + Send + '_>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err(io::Error::new(io::ErrorKind::ConnectionRefused, "rejected")) })
+        }
+
+        fn peer_addr(&self, _stream: &Self::Stream) -> io::Result<SocketAddr> {
+            unreachable!("a failed connector never returns a stream")
+        }
+    }
+
     fn guard() -> (DestinationGuard, Arc<FixedResolver>) {
         let endpoint = CANDIDATE.parse().unwrap();
         let resolver = Arc::new(FixedResolver {
@@ -2140,6 +2237,14 @@ mod tests {
         let guard =
             DestinationGuard::with_sources(facts, resolver.clone(), Arc::new(EmptyLocalAddresses));
         (guard, resolver)
+    }
+
+    fn credential_guard() -> crate::safety::HttpWireBodyGuard {
+        let peak = 8 * 1024 * 1024;
+        WireBodyPool::new(peak, peak).begin_for_test(
+            peak,
+            WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::LOCALHOST), |_| false),
+        )
     }
 
     async fn prepare_and_resolve_target<B>(
@@ -2192,7 +2297,6 @@ mod tests {
                 request_headers: vec![],
                 credential_actions: vec![],
             },
-            &CredentialSourceRegistry::from_names([]),
             || false,
         )
         .unwrap()
@@ -2671,11 +2775,10 @@ mod tests {
             assert_eq!(server.read(&mut byte).await.unwrap(), 0);
         });
 
-        let error =
-            forward_with_connector(request, &canonical, &egress, &guard, target, &connector)
-                .await
-                .err()
-                .expect("an ordinary request must reject an unsolicited 101");
+        let error = expect_forward_error(
+            forward_with_connector(request, &canonical, &egress, &guard, target, &connector).await,
+            "an ordinary request must reject an unsolicited 101",
+        );
         assert!(matches!(
             error,
             ForwardError::UnexpectedInformationalResponse(StatusCode::SWITCHING_PROTOCOLS)
@@ -2685,9 +2788,21 @@ mod tests {
 
     #[tokio::test]
     async fn upgrade_handshake_preserves_driver_and_returns_canonical_owned_parts() {
+        const VARIABLE: &str = "ACL_PROXY_UPGRADE_LATE_TOKEN";
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        std::env::set_var(VARIABLE, "upgrade-secret");
         let canonical = canonicalize_http_url("http://origin.example/socket?q=1").unwrap();
         let egress = activate(None);
-        let request = upgrade_request();
+        let mut request = upgrade_request();
+        let wire_guard = credential_guard();
+        let (mut credentials, io) = crate::credential_resolver::environment_execution_for_test(
+            &wire_guard,
+            VARIABLE,
+            "x-late-token",
+        );
+        credentials
+            .reserve_transport(request.headers_mut())
+            .unwrap();
         let (guard, _) = guard();
         let (client, mut server) = tokio::io::duplex(64 * 1024);
         let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
@@ -2709,8 +2824,14 @@ mod tests {
             head
         });
 
-        let result = forward_upgrade_with_connector(
-            request, &canonical, &egress, &guard, target, &connector,
+        let result = forward_upgrade_with_connector_timed(
+            request,
+            &canonical,
+            &egress,
+            &guard,
+            target,
+            &connector,
+            ForwardExecutionOptions::new(ForwardingTimeouts::for_test(), Some(credentials)),
         )
         .await
         .unwrap();
@@ -2738,7 +2859,13 @@ mod tests {
         assert!(head.contains("\r\nhost: origin.example\r\n"));
         assert!(head.contains("\r\nconnection: upgrade\r\n"));
         assert!(head.contains("\r\nupgrade: websocket\r\n"));
+        assert_eq!(
+            head.matches("\r\nx-late-token: upgrade-secret\r\n").count(),
+            1
+        );
         assert!(!head.contains("x-private"));
+        io.shutdown_and_wait().await;
+        std::env::remove_var(VARIABLE);
     }
 
     #[tokio::test]
@@ -2845,6 +2972,7 @@ mod tests {
                 request,
                 intent,
                 ForwardingTimeouts::for_test().begin_connect(),
+                None,
             )
             .await
             .unwrap_or_else(|error| panic!("chunked={chunked}: {error:?}"));
@@ -2954,15 +3082,17 @@ mod tests {
                 .unwrap();
         });
 
-        let error = send_upgrade_request(
-            FlushPendingIo { inner: client },
-            request,
-            intent,
-            ForwardingTimeouts::for_test().begin_connect(),
-        )
-        .await
-        .err()
-        .expect("a 101 received before request flush must fail");
+        let error = expect_forward_error(
+            send_upgrade_request(
+                FlushPendingIo { inner: client },
+                request,
+                intent,
+                ForwardingTimeouts::for_test().begin_connect(),
+                None,
+            )
+            .await,
+            "a 101 received before request flush must fail",
+        );
         assert!(matches!(error, ForwardError::UpgradeRequestBodyIncomplete));
         server.await.unwrap();
     }
@@ -3029,12 +3159,13 @@ mod tests {
             assert_eq!(server.read(&mut byte).await.unwrap(), 0);
         });
 
-        let error = forward_upgrade_with_connector(
-            request, &canonical, &egress, &guard, target, &connector,
-        )
-        .await
-        .err()
-        .expect("mismatched 101 protocol must fail");
+        let error = expect_forward_error(
+            forward_upgrade_with_connector(
+                request, &canonical, &egress, &guard, target, &connector,
+            )
+            .await,
+            "mismatched 101 protocol must fail",
+        );
         assert!(matches!(
             error,
             ForwardError::Header(HeaderPreparationError::InvalidUpgrade)
@@ -3142,15 +3273,17 @@ mod tests {
                 .unwrap();
         });
 
-        let error = send_upgrade_request(
-            client,
-            request,
-            intent,
-            ForwardingTimeouts::for_test().begin_connect(),
-        )
-        .await
-        .err()
-        .expect("an early 101 cannot establish an upgrade");
+        let error = expect_forward_error(
+            send_upgrade_request(
+                client,
+                request,
+                intent,
+                ForwardingTimeouts::for_test().begin_connect(),
+                None,
+            )
+            .await,
+            "an early 101 cannot establish an upgrade",
+        );
         assert!(matches!(error, ForwardError::UpgradeRequestBodyIncomplete));
         server.await.unwrap();
         assert_eq!(guard.live_bytes(), 0);
@@ -3271,12 +3404,14 @@ mod tests {
             Duration::from_secs(1),
         )
         .begin_connect();
-        let error = connect_stage(
-            deadlines,
-            std::future::pending::<Result<(), ForwardError>>(),
-        )
-        .await
-        .unwrap_err();
+        let error = expect_forward_error(
+            connect_stage(
+                deadlines,
+                std::future::pending::<Result<(), ForwardError>>(),
+            )
+            .await,
+            "connection failure must reject forwarding",
+        );
 
         assert!(matches!(error, ForwardError::ConnectTimeout));
     }
@@ -3320,10 +3455,11 @@ mod tests {
         )
         .begin_connect();
 
-        let error = match send_request(client, request, OriginProtocol::Http1, deadlines).await {
-            Ok(_) => panic!("a missing upstream response head must time out"),
-            Err(error) => error,
-        };
+        let error =
+            match send_request(client, request, OriginProtocol::Http1, deadlines, None).await {
+                Ok(_) => panic!("a missing upstream response head must time out"),
+                Err(error) => error,
+            };
         assert!(matches!(error, ForwardError::ResponseHeadTimeout));
         server.await.unwrap();
     }
@@ -3625,6 +3761,100 @@ mod tests {
         assert_eq!(headers["authorization"], "Bearer origin-secret");
         assert_eq!(body, b"request-body");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn h2_credentials_finalize_after_handshake_and_send_once() {
+        const VARIABLE: &str = "ACL_PROXY_H2_LATE_TOKEN";
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        std::env::set_var(VARIABLE, "h2-secret");
+        let canonical = canonicalize_http_url("http://origin.example:8080/h2-credential").unwrap();
+        let egress = activate_with_versions(None, vec![CompiledHttpVersion::Http2]);
+        let mut request = request_with_version(Version::HTTP_2);
+        let wire_guard = credential_guard();
+        let (mut credentials, io) = crate::credential_resolver::environment_execution_for_test(
+            &wire_guard,
+            VARIABLE,
+            "x-late-token",
+        );
+        credentials
+            .reserve_transport(request.headers_mut())
+            .unwrap();
+        let (guard, _) = guard();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        let (captured_tx, captured_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_h2(server, captured_tx));
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
+            .await
+            .unwrap();
+
+        let response = forward_with_connector_timed(
+            request,
+            &canonical,
+            &egress,
+            &guard,
+            target,
+            &connector,
+            ForwardExecutionOptions::new(ForwardingTimeouts::for_test(), Some(credentials)),
+        )
+        .await
+        .unwrap();
+        finish_response(response).await;
+        let (_, headers, _) = captured_rx.await.unwrap();
+        assert_eq!(headers.get_all("x-late-token").iter().count(), 1);
+        assert_eq!(headers["x-late-token"], "h2-secret");
+        server.await.unwrap();
+        io.shutdown_and_wait().await;
+        std::env::remove_var(VARIABLE);
+    }
+
+    #[tokio::test]
+    async fn h2_missing_credential_fails_after_handshake_without_request_stream() {
+        const VARIABLE: &str = "ACL_PROXY_H2_MISSING_TOKEN";
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        std::env::remove_var(VARIABLE);
+        let canonical = canonicalize_http_url("http://origin.example:8080/h2-missing").unwrap();
+        let egress = activate_with_versions(None, vec![CompiledHttpVersion::Http2]);
+        let mut request = request_with_version(Version::HTTP_2);
+        let wire_guard = credential_guard();
+        let (mut credentials, io) = crate::credential_resolver::environment_execution_for_test(
+            &wire_guard,
+            VARIABLE,
+            "x-late-token",
+        );
+        credentials
+            .reserve_transport(request.headers_mut())
+            .unwrap();
+        let (guard, _) = guard();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        let (captured_tx, captured_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_h2(server, captured_tx));
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
+            .await
+            .unwrap();
+
+        let error = expect_forward_error(
+            forward_with_connector_timed(
+                request,
+                &canonical,
+                &egress,
+                &guard,
+                target,
+                &connector,
+                ForwardExecutionOptions::new(ForwardingTimeouts::for_test(), Some(credentials)),
+            )
+            .await,
+            "missing H2 credential must reject forwarding",
+        );
+        assert!(matches!(
+            error,
+            ForwardError::Credential(credential_core::CredentialError::ServiceUnavailable)
+        ));
+        assert!(captured_rx.await.is_err());
+        server.await.unwrap();
+        io.shutdown_and_wait().await;
     }
 
     #[test]
@@ -3938,7 +4168,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_failure_precedes_environment_credential_resolution() {
+        const VARIABLE: &str = "ACL_PROXY_FORWARD_CONNECT_FAILURE_TOKEN";
+        std::env::remove_var(VARIABLE);
+        let canonical = canonicalize_http_url("http://origin.example/fail").unwrap();
+        let egress = activate(None);
+        let mut request = request();
+        let (destinations, _) = guard();
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &destinations)
+            .await
+            .unwrap();
+        let wire_guard = credential_guard();
+        let (mut credentials, io) = crate::credential_resolver::environment_execution_for_test(
+            &wire_guard,
+            VARIABLE,
+            "x-late-token",
+        );
+        credentials
+            .reserve_transport(request.headers_mut())
+            .unwrap();
+        let connector = FailingConnector {
+            calls: AtomicUsize::new(0),
+        };
+
+        let error = expect_forward_error(
+            forward_with_connector_timed(
+                request,
+                &canonical,
+                &egress,
+                &destinations,
+                target,
+                &connector,
+                ForwardExecutionOptions::new(ForwardingTimeouts::for_test(), Some(credentials)),
+            )
+            .await,
+            "missing credential source must reject forwarding",
+        );
+
+        assert!(matches!(error, ForwardError::Destination(_)));
+        assert_eq!(connector.calls.load(Ordering::SeqCst), 1);
+        io.shutdown_and_wait().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn credential_rotation_and_disappearance_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credential");
+        let mut prepared = Vec::new();
+        for _ in 0..3 {
+            let wire_guard = credential_guard();
+            let execution = crate::credential_resolver::file_execution_for_test(
+                &wire_guard,
+                path.clone(),
+                "x-late-token",
+            );
+            prepared.push((wire_guard, execution));
+        }
+
+        for expected in ["old-secret", "new-secret"] {
+            let replacement = directory.path().join(format!("replacement-{expected}"));
+            fs::write(&replacement, expected).unwrap();
+            fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::rename(&replacement, &path).unwrap();
+            let (_wire_guard, (mut credentials, io)) = prepared.remove(0);
+            let canonical = canonicalize_http_url("http://origin.example/rotated").unwrap();
+            let egress = activate(None);
+            let mut request = request();
+            credentials
+                .reserve_transport(request.headers_mut())
+                .unwrap();
+            let (destinations, _) = guard();
+            let target = prepare_and_resolve_target(&canonical, &request, &egress, &destinations)
+                .await
+                .unwrap();
+            let (client, mut server) = tokio::io::duplex(64 * 1024);
+            let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+            let expected = expected.to_owned();
+            let server = tokio::spawn(async move {
+                let head = read_http_head(&mut server).await.to_ascii_lowercase();
+                let field = format!("\r\nx-late-token: {expected}\r\n");
+                assert_eq!(head.matches(&field).count(), 1, "{head}");
+                server
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+            });
+
+            let response = forward_with_connector_timed(
+                request,
+                &canonical,
+                &egress,
+                &destinations,
+                target,
+                &connector,
+                ForwardExecutionOptions::new(ForwardingTimeouts::for_test(), Some(credentials)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let mut body = response.into_body();
+            assert!(body.data().await.is_none());
+            server.await.unwrap();
+            io.shutdown_and_wait().await;
+        }
+
+        fs::remove_file(&path).unwrap();
+        let (_wire_guard, (mut credentials, io)) = prepared.remove(0);
+        let canonical = canonicalize_http_url("http://origin.example/missing").unwrap();
+        let egress = activate(None);
+        let mut request = request();
+        credentials
+            .reserve_transport(request.headers_mut())
+            .unwrap();
+        let (destinations, _) = guard();
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &destinations)
+            .await
+            .unwrap();
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        let server = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            server.read_to_end(&mut bytes).await.unwrap();
+            assert!(bytes.is_empty(), "credential failure emitted request bytes");
+        });
+
+        let error = expect_forward_error(
+            forward_with_connector_timed(
+                request,
+                &canonical,
+                &egress,
+                &destinations,
+                target,
+                &connector,
+                ForwardExecutionOptions::new(ForwardingTimeouts::for_test(), Some(credentials)),
+            )
+            .await,
+            "missing credential source must reject forwarding",
+        );
+        assert!(matches!(
+            error,
+            ForwardError::Credential(credential_core::CredentialError::ServiceUnavailable)
+        ));
+        server.await.unwrap();
+        io.shutdown_and_wait().await;
+    }
+
+    #[tokio::test]
     async fn parent_connect_carries_no_origin_credentials() {
+        const VARIABLE: &str = "ACL_PROXY_PARENT_TUNNEL_TOKEN";
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        std::env::set_var(VARIABLE, "late-parent-secret");
         let canonical = canonicalize_http_url("https://origin.example/secure").unwrap();
         let egress = activate(Some(("http://parent.example:8443/", false)));
         let (guard, _) = guard();
@@ -3965,15 +4345,31 @@ mod tests {
             let tls = tls_acceptor(b"http/1.1").accept(server).await.unwrap();
             serve_h1(tls, origin_tx).await;
         });
-        let request = request();
+        let mut request = request();
+        let wire_guard = credential_guard();
+        let (mut credentials, io) = crate::credential_resolver::environment_execution_for_test(
+            &wire_guard,
+            VARIABLE,
+            "x-late-token",
+        );
+        credentials
+            .reserve_transport(request.headers_mut())
+            .unwrap();
         let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
             .await
             .unwrap();
 
-        let response =
-            forward_with_connector(request, &canonical, &egress, &guard, target, &connector)
-                .await
-                .unwrap();
+        let response = forward_with_connector_timed(
+            request,
+            &canonical,
+            &egress,
+            &guard,
+            target,
+            &connector,
+            ForwardExecutionOptions::new(ForwardingTimeouts::for_test(), Some(credentials)),
+        )
+        .await
+        .unwrap();
         finish_response(response).await;
 
         let connect = connect_rx.await.unwrap().to_ascii_lowercase();
@@ -3985,6 +4381,7 @@ mod tests {
             "cookie",
             "x-workload-identity",
             "x-loop-marker",
+            "x-late-token",
             "request-body",
             "/secure",
         ] {
@@ -3998,8 +4395,66 @@ mod tests {
         assert_eq!(headers["cookie"], "origin-session=secret");
         assert_eq!(headers["x-workload-identity"], "workload-42");
         assert_eq!(headers["x-loop-marker"], "request-42");
+        assert_eq!(headers["x-late-token"], "late-parent-secret");
         assert_eq!(body, b"request-body");
         server.await.unwrap();
+        io.shutdown_and_wait().await;
+        std::env::remove_var(VARIABLE);
+    }
+
+    #[tokio::test]
+    async fn parent_connect_rejection_precedes_environment_credential_resolution() {
+        const VARIABLE: &str = "ACL_PROXY_PARENT_REJECTION_TOKEN";
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        std::env::remove_var(VARIABLE);
+        let canonical = canonicalize_http_url("https://origin.example/rejected").unwrap();
+        let egress = activate(Some(("http://parent.example:8443/", false)));
+        let (guard, _) = guard();
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        let server = tokio::spawn(async move {
+            let head = read_http_head(&mut server).await.to_ascii_lowercase();
+            assert!(!head.contains("x-late-token"), "{head}");
+            server
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let mut request = request();
+        let wire_guard = credential_guard();
+        let (mut credentials, io) = crate::credential_resolver::environment_execution_for_test(
+            &wire_guard,
+            VARIABLE,
+            "x-late-token",
+        );
+        credentials
+            .reserve_transport(request.headers_mut())
+            .unwrap();
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
+            .await
+            .unwrap();
+
+        let error = expect_forward_error(
+            forward_with_connector_timed(
+                request,
+                &canonical,
+                &egress,
+                &guard,
+                target,
+                &connector,
+                ForwardExecutionOptions::new(ForwardingTimeouts::for_test(), Some(credentials)),
+            )
+            .await,
+            "parent rejection must fail forwarding",
+        );
+        assert!(matches!(
+            error,
+            ForwardError::ParentConnect(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+        ));
+        server.await.unwrap();
+        io.shutdown_and_wait().await;
     }
 
     #[tokio::test]

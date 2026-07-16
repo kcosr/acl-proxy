@@ -60,6 +60,7 @@ http-access-url = { path = "../access-runtime/crates/http-access-url", version =
 http-access-runtime = { path = "../access-runtime/crates/http-access-runtime", version = "=0.1.0" }
 http-access-policy-acl = { path = "../access-runtime/crates/http-access-policy-acl", version = "=0.1.0" }
 http-access-redaction = { path = "../access-runtime/crates/http-access-redaction", version = "=0.1.0" }
+credential-core = { path = "../access-runtime/crates/credential-core", version = "=0.1.0" }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

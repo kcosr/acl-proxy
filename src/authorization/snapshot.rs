@@ -10,9 +10,9 @@ use super::process::{
 #[cfg(test)]
 use super::protocol::ProviderRequest;
 use super::protocol::{
-    ProviderBodyReplacement, ProviderCredentialInjectionError, ProviderCredentialSet,
-    ProviderDecision, ProviderOutputDefinition, ProviderOutputIndex, ProviderOutputRegistry,
-    StagedProviderCredentialMutation,
+    ProviderBodyReplacement, ProviderCredentialSet, ProviderCredentialWireError,
+    ProviderCredentialWireStore, ProviderDecision, ProviderOutputDefinition, ProviderOutputIndex,
+    ProviderOutputRegistry,
 };
 use super::webhook::provider::{WebhookActivationError, WebhookProvider};
 use super::webhook::runtime::{WebhookAuthorizationRuntime, WebhookDispatchError};
@@ -306,23 +306,23 @@ impl ProductAuthorizationSnapshot {
         }
     }
 
-    pub(crate) fn stage_provider_credentials(
+    pub(crate) fn compact_provider_credential_wire(
         &self,
         provider: ProviderIndex,
         credentials: &ProviderCredentialSet,
         guard: &HttpWireBodyGuard,
-    ) -> Result<StagedProviderCredentialMutation, ProviderCredentialInjectionError> {
+    ) -> Result<ProviderCredentialWireStore, ProviderCredentialWireError> {
         let outputs = match self
             .providers
             .get(provider.get())
-            .ok_or(ProviderCredentialInjectionError::UnknownProvider)?
+            .ok_or(ProviderCredentialWireError::UnknownProvider)?
         {
             ActiveProvider::Process(process) => process
                 .outputs()
-                .ok_or(ProviderCredentialInjectionError::ForeignRegistry)?,
+                .ok_or(ProviderCredentialWireError::ForeignRegistry)?,
             ActiveProvider::Webhook(webhook) => webhook.outputs(),
         };
-        outputs.stage_credentials(credentials, guard)
+        outputs.compact_provider_credential_wire(credentials, guard)
     }
 
     fn bind_process_decision(
@@ -438,13 +438,18 @@ impl AuthorizationSnapshot for ProductAuthorizationSnapshot {
         ProductAuthorizationSnapshot::provider_metadata(self, provider)
     }
 
-    fn stage_provider_credentials(
+    fn compact_provider_credential_wire(
         &self,
         provider: ProviderIndex,
         credentials: &ProviderCredentialSet,
         guard: &HttpWireBodyGuard,
-    ) -> Result<StagedProviderCredentialMutation, ProviderCredentialInjectionError> {
-        ProductAuthorizationSnapshot::stage_provider_credentials(self, provider, credentials, guard)
+    ) -> Result<ProviderCredentialWireStore, ProviderCredentialWireError> {
+        ProductAuthorizationSnapshot::compact_provider_credential_wire(
+            self,
+            provider,
+            credentials,
+            guard,
+        )
     }
 
     fn consume_allow_output(
@@ -639,7 +644,7 @@ mod tests {
     use super::*;
     use crate::config::compiler::{
         AuthorizationCallbackPlan, CompiledProviderFailureMode, PendingOperationLimit,
-        ProcessProviderPlan, WebhookProviderPlan,
+        ProcessProviderPlan, ProviderOutputPlan, WebhookProviderPlan,
     };
     use crate::runtime::{PublicationGuard, RuntimeError};
     use crate::safety::{WireBodyPool, WireBodyQuotaKey};
@@ -859,6 +864,66 @@ mod tests {
                 .include_headers,
             ["x-context"]
         );
+        let (_, _, owners) = activation.into_parts();
+        assert!(owners.is_empty());
+    }
+
+    #[tokio::test]
+    async fn object_safe_snapshot_stages_exact_raw_provider_material() {
+        let plan = AuthorizationPlan {
+            internal_context_headers: vec![],
+            callback: Some(AuthorizationCallbackPlan {
+                resume_token_ttl: Duration::from_secs(30),
+                max_pending_operations: PendingOperationLimit::try_new(4).unwrap(),
+            }),
+            providers: BTreeMap::from([(
+                "webhook".to_string(),
+                AuthorizationProviderPlan::Webhook(WebhookProviderPlan {
+                    url: "http://127.0.0.1:9/authorize".to_string(),
+                    timeout: Duration::from_secs(2),
+                    on_failure: CompiledProviderFailureMode::Deny,
+                    include_headers: vec![],
+                    max_request_bytes: 8192,
+                    max_response_bytes: 4096,
+                    outputs: BTreeMap::from([(
+                        "token".to_string(),
+                        ProviderOutputPlan::Bearer { required: true },
+                    )]),
+                    tls: None,
+                }),
+            )]),
+        };
+        let registry = ProviderRegistry::from_names(plan.providers.keys().cloned());
+        let activation = ProductAuthorizationSnapshot::activate(
+            plan,
+            registry,
+            WebhookAuthorizationRuntime::for_test(Some(
+                "http://127.0.0.1:8888/_acl/external-auth/callback",
+            )),
+            cancellation(),
+        )
+        .await
+        .unwrap();
+        let provider = activation.provider_registry().get("webhook").unwrap();
+        let binding = activation
+            .provider_output_binding(activation.provider_registry(), "webhook", "token")
+            .unwrap();
+        let credentials = ProviderCredentialSet::single_value_for_test(
+            binding.output(),
+            1,
+            b"raw-provider-secret",
+        );
+        let snapshot: &dyn AuthorizationSnapshot = &*activation;
+        let material = snapshot
+            .compact_provider_credential_wire(provider, &credentials, &body_guard())
+            .unwrap();
+        assert_eq!(material.output_len(binding.output()), Some(19));
+        let mut destination = [0; 19];
+        material
+            .copy_output(binding.output(), &mut destination)
+            .unwrap();
+        assert_eq!(&destination, b"raw-provider-secret");
+
         let (_, _, owners) = activation.into_parts();
         assert!(owners.is_empty());
     }

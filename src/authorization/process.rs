@@ -2424,18 +2424,15 @@ for line in sys.stdin:
             panic!("escaped guarded effects must be accepted");
         };
         let credentials = credentials.unwrap();
-        let mut headers = http::HeaderMap::new();
-        provider
-            .outputs()
-            .unwrap()
-            .stage_credentials(&credentials, &guard)
-            .unwrap()
-            .apply(&mut headers)
+        let outputs = provider.outputs().unwrap();
+        let staged = outputs
+            .compact_provider_credential_wire(&credentials, &guard)
             .unwrap();
-        assert_eq!(
-            headers.get(http::header::AUTHORIZATION).unwrap(),
-            "Bearer secret"
-        );
+        let output = outputs.index("token").unwrap();
+        let mut material = vec![0; staged.output_len(output).unwrap()];
+        staged.copy_output(output, &mut material).unwrap();
+        assert_eq!(material, b"secret");
+        drop(staged);
         drop(credentials);
         assert_eq!(replacement.content_encoding(), Some("identity"));
         let (_, _, decoded) = replacement.decode(&guard).unwrap();

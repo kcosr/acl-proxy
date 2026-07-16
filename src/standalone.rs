@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use credential_core::{
+    CredentialDescriptor, CredentialLimits, CredentialProfile, CredentialPurpose,
+};
 use http_access_policy_acl::ProductActionRef;
 use http_access_runtime::{RuntimeResourceLimits, SnapshotLease, SnapshotRegistries};
 use http_access_types::{
@@ -19,13 +22,11 @@ use crate::config::compiler::{
     CompiledTlsTrust, CredentialActionPlan, ForwardingPlan, HeaderEffectPlan, PolicyRulePlan,
     ProviderOutputPlan, ReloadableProductPlan, TransportTlsPlan,
 };
-use crate::credentials::ResolvedCredentialAction;
+use crate::credentials::OutboundCredentialSource;
 use crate::egress::EgressSnapshot;
 use crate::observation::{CaptureEvent, ProductObservationSnapshot};
 use crate::policy::{ProductAclCompileError, ProductAclSnapshot};
-use crate::runtime::{
-    CredentialSourceIndex, CredentialSourceRegistry, GenerationId, ProviderIndex, ProviderRegistry,
-};
+use crate::runtime::{GenerationId, ProviderIndex, ProviderRegistry};
 use http_access_redaction::{RedactionProfile, RedactionSnapshot};
 
 /// Snapshot-local immutable inputs needed by the standalone request adapter.
@@ -57,22 +58,21 @@ pub(crate) struct StandaloneGenerationCore {
     product_acl: ProductAclSnapshot,
     rules: Box<[StandaloneRuleTemplate]>,
     global_request_headers: Option<HeaderMutationBatch>,
-    global_credentials: Box<[CredentialMutation]>,
+    global_credentials: Box<[StandaloneCredentialTemplate]>,
     provider_credentials: Box<[ProviderCredentialTemplates]>,
     snapshot_lease: SnapshotLease,
 }
 
 struct StandaloneBindingManifest {
-    global_credentials: Box<[StandaloneCredentialBindingManifest]>,
     provider_outputs: Box<[StandaloneProviderOutputManifest]>,
     capture_redaction: Option<RedactionRef>,
     tls: Box<[StandaloneTlsBindingManifest]>,
     resources: StandaloneResourceProof,
 }
 
-struct StandaloneCredentialBindingManifest {
+pub(crate) struct StandaloneCredentialTemplate {
     source: String,
-    reference: CredentialRef,
+    mutation: CredentialMutation,
 }
 
 struct StandaloneProviderOutputManifest {
@@ -130,8 +130,8 @@ struct StandaloneCursorResourceProof {
 }
 
 pub(crate) struct BoundCredentialSource {
-    reference: CredentialRef,
-    source: CredentialSourceIndex,
+    descriptor: CredentialDescriptor,
+    source: OutboundCredentialSource,
 }
 
 struct BoundRuleProvider {
@@ -155,8 +155,7 @@ pub(crate) struct StandaloneRuleTemplate {
     allow_upgrades: bool,
     request_headers: Option<HeaderMutationBatch>,
     response_headers: Option<HeaderMutationBatch>,
-    credentials: Box<[CredentialMutation]>,
-    credential_sources: Box<[String]>,
+    credentials: Box<[StandaloneCredentialTemplate]>,
     redaction: Option<RedactionRef>,
     redaction_profile: Option<String>,
 }
@@ -267,13 +266,17 @@ impl UnboundStandaloneGenerationPlan {
             .iter()
             .enumerate()
             .map(|(index, action)| {
-                compile_credential(
+                let mutation = compile_credential(
                     action,
                     credential_ref(&identity, version, &format!("global/credential/{index}"))?,
                     &mut credential_refs,
-                )
+                )?;
+                Ok(StandaloneCredentialTemplate {
+                    source: credential_source_name(action).to_owned(),
+                    mutation,
+                })
             })
-            .collect::<Result<Vec<_>, _>>()?
+            .collect::<Result<Vec<_>, StandaloneCompileError>>()?
             .into_boxed_slice();
 
         let mut rules = Vec::with_capacity(plan.policy.rules.len());
@@ -354,7 +357,7 @@ impl UnboundStandaloneGenerationPlan {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn bind(
         self,
-        credentials: &CredentialSourceRegistry,
+        credentials: &BTreeMap<String, OutboundCredentialSource>,
         redaction_snapshot: &RedactionSnapshot,
         authorization: &ProductAuthorizationSnapshot,
         providers: &ProviderRegistry,
@@ -473,7 +476,7 @@ impl StandaloneGenerationCore {
         self.global_request_headers.as_ref()
     }
 
-    pub(crate) fn global_credentials(&self) -> &[CredentialMutation] {
+    pub(crate) fn global_credentials(&self) -> &[StandaloneCredentialTemplate] {
         &self.global_credentials
     }
 
@@ -562,11 +565,25 @@ impl StandaloneResourceProof {
 
 impl BoundCredentialSource {
     pub(crate) fn reference(&self) -> &CredentialRef {
-        &self.reference
+        self.descriptor.reference()
     }
 
-    pub(crate) fn source(&self) -> CredentialSourceIndex {
-        self.source
+    pub(crate) fn descriptor(&self) -> &CredentialDescriptor {
+        &self.descriptor
+    }
+
+    pub(crate) fn source(&self) -> &OutboundCredentialSource {
+        &self.source
+    }
+}
+
+impl StandaloneCredentialTemplate {
+    pub(crate) fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub(crate) fn mutation(&self) -> &CredentialMutation {
+        &self.mutation
     }
 }
 
@@ -603,17 +620,6 @@ fn compile_binding_manifest(
             "standalone binding manifest shape",
         ));
     }
-    let global_credentials = plan
-        .egress
-        .credential_actions
-        .iter()
-        .zip(core.global_credentials.iter())
-        .map(|(action, mutation)| StandaloneCredentialBindingManifest {
-            source: credential_source_name(action).to_owned(),
-            reference: mutation.credential().clone(),
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
     let neutral_provider_outputs = core
         .provider_credentials
         .iter()
@@ -694,7 +700,6 @@ fn compile_binding_manifest(
         }
     }
     Ok(StandaloneBindingManifest {
-        global_credentials,
         provider_outputs,
         capture_redaction: plan
             .observation
@@ -825,7 +830,7 @@ const fn custom_trust(trust: CompiledTlsTrust) -> bool {
 fn bind_activated(
     core: &StandaloneGenerationCore,
     manifest: &StandaloneBindingManifest,
-    credentials: &CredentialSourceRegistry,
+    credentials: &BTreeMap<String, OutboundCredentialSource>,
     redaction_snapshot: &RedactionSnapshot,
     authorization: &ProductAuthorizationSnapshot,
     providers: &ProviderRegistry,
@@ -837,27 +842,10 @@ fn bind_activated(
             "standalone resource proof",
         ));
     }
-    if manifest.global_credentials.len() != core.global_credentials.len()
-        || manifest.global_credentials.len() != egress.credential_actions().len()
-    {
-        return Err(StandaloneBindError::Inconsistent("global credential shape"));
-    }
-    let global_credentials = manifest
+    let global_credentials = core
         .global_credentials
         .iter()
-        .zip(core.global_credentials.iter())
-        .zip(egress.credential_actions().iter())
-        .map(|((binding, mutation), activated)| {
-            let bound = bind_credential_source(binding, credentials, "credential source")?;
-            if mutation.credential() != &binding.reference
-                || !credential_action_matches(mutation, bound.source, activated)
-            {
-                return Err(StandaloneBindError::Inconsistent(
-                    "global credential binding",
-                ));
-            }
-            Ok(bound)
-        })
+        .map(|template| bind_credential_source(template, credentials, "credential source"))
         .collect::<Result<Vec<_>, _>>()?
         .into_boxed_slice();
 
@@ -865,21 +853,10 @@ fn bind_activated(
     let mut rule_providers = Vec::with_capacity(core.rules.len());
     let mut rule_redactions = Vec::with_capacity(core.rules.len());
     for (ordinal, core_rule) in core.rules.iter().enumerate() {
-        if core_rule.credential_sources.len() != core_rule.credentials.len() {
-            return Err(StandaloneBindError::Inconsistent("rule credential shape"));
-        }
         let credentials_for_rule = core_rule
-            .credential_sources
+            .credentials
             .iter()
-            .zip(core_rule.credentials.iter())
-            .map(|(source, mutation)| {
-                bind_credential_source_parts(
-                    source,
-                    mutation.credential(),
-                    credentials,
-                    "rule credential source",
-                )
-            })
+            .map(|template| bind_credential_source(template, credentials, "rule credential source"))
             .collect::<Result<Vec<_>, _>>()?
             .into_boxed_slice();
         rule_credentials.push(credentials_for_rule);
@@ -952,26 +929,35 @@ fn bind_activated(
 }
 
 fn bind_credential_source(
-    binding: &StandaloneCredentialBindingManifest,
-    credentials: &CredentialSourceRegistry,
-    missing: &'static str,
-) -> Result<BoundCredentialSource, StandaloneBindError> {
-    bind_credential_source_parts(&binding.source, &binding.reference, credentials, missing)
-}
-
-fn bind_credential_source_parts(
-    source_name: &str,
-    reference: &CredentialRef,
-    credentials: &CredentialSourceRegistry,
+    template: &StandaloneCredentialTemplate,
+    credentials: &BTreeMap<String, OutboundCredentialSource>,
     missing: &'static str,
 ) -> Result<BoundCredentialSource, StandaloneBindError> {
     let source = credentials
-        .get(source_name)
+        .get(template.source())
+        .cloned()
         .ok_or(StandaloneBindError::Missing(missing))?;
-    Ok(BoundCredentialSource {
-        reference: reference.clone(),
-        source,
-    })
+    let mutation = template.mutation();
+    let purpose = match mutation.kind() {
+        CredentialMutationKind::Bearer(_) => CredentialPurpose::Bearer,
+        CredentialMutationKind::Basic { .. } => CredentialPurpose::BasicPassword,
+        CredentialMutationKind::CustomHeader { name, .. } => {
+            CredentialPurpose::CustomHeader(name.clone())
+        }
+    };
+    let limits = CredentialLimits::new(
+        source.maximum_material_bytes(),
+        source.maximum_staging_bytes(),
+    )
+    .map_err(|_| StandaloneBindError::Inconsistent("credential source limits"))?;
+    let descriptor = CredentialDescriptor::new(
+        mutation.credential().clone(),
+        purpose,
+        CredentialProfile::StandaloneTrusted,
+        limits,
+    )
+    .map_err(|_| StandaloneBindError::Inconsistent("credential descriptor"))?;
+    Ok(BoundCredentialSource { descriptor, source })
 }
 
 fn bind_tls_roots(
@@ -1069,34 +1055,6 @@ fn capture_events_match(
     })
 }
 
-fn credential_action_matches(
-    mutation: &CredentialMutation,
-    source: CredentialSourceIndex,
-    activated: &ResolvedCredentialAction,
-) -> bool {
-    match (mutation.kind(), activated) {
-        (
-            CredentialMutationKind::Bearer(_),
-            ResolvedCredentialAction::Bearer { source: actual },
-        ) => source == *actual,
-        (
-            CredentialMutationKind::Basic { username, .. },
-            ResolvedCredentialAction::Basic {
-                username: actual_username,
-                source: actual,
-            },
-        ) => source == *actual && username == actual_username,
-        (
-            CredentialMutationKind::CustomHeader { name, .. },
-            ResolvedCredentialAction::CustomHeader {
-                header,
-                source: actual,
-            },
-        ) => source == *actual && name.as_str() == header.as_str(),
-        _ => false,
-    }
-}
-
 impl StandaloneRuleTemplate {
     pub(crate) fn ordinal(&self) -> u32 {
         self.ordinal
@@ -1118,7 +1076,7 @@ impl StandaloneRuleTemplate {
         self.response_headers.as_ref()
     }
 
-    pub(crate) fn credentials(&self) -> &[CredentialMutation] {
+    pub(crate) fn credentials(&self) -> &[StandaloneCredentialTemplate] {
         &self.credentials
     }
 
@@ -1519,7 +1477,7 @@ fn compile_rule_template(
         .iter()
         .enumerate()
         .map(|(action, value)| {
-            compile_credential(
+            let mutation = compile_credential(
                 value,
                 credential_ref(
                     identity,
@@ -1527,9 +1485,13 @@ fn compile_rule_template(
                     &format!("rule/{ordinal}/credential/{action}"),
                 )?,
                 credential_refs,
-            )
+            )?;
+            Ok(StandaloneCredentialTemplate {
+                source: credential_source_name(value).to_owned(),
+                mutation,
+            })
         })
-        .collect::<Result<Vec<_>, _>>()?
+        .collect::<Result<Vec<_>, StandaloneCompileError>>()?
         .into_boxed_slice();
     let redaction = rule
         .redaction_profile
@@ -1549,13 +1511,6 @@ fn compile_rule_template(
         allow_upgrades: rule.allow_upgrades,
         request_headers: compile_header_batch(&rule.request_headers)?,
         response_headers: compile_header_batch(&rule.response_headers)?,
-        credential_sources: rule
-            .credential_actions
-            .iter()
-            .map(credential_source_name)
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
         credentials,
         redaction,
         redaction_profile: rule.redaction_profile.clone(),
@@ -1905,6 +1860,19 @@ header = "x-acl-proxy-request-id"
         .expect("standalone generation fixture compiles")
     }
 
+    fn outbound_sources(
+        plan: &ReloadableProductPlan,
+    ) -> BTreeMap<String, OutboundCredentialSource> {
+        let providers = ProviderRegistry::from_names(plan.authorization.providers.keys().cloned());
+        let activation = crate::credentials::CredentialActivation::activate(
+            plan.credentials.clone(),
+            &providers,
+        )
+        .expect("credential sources activate");
+        let (_inbound, sources) = activation.into_parts();
+        sources
+    }
+
     #[test]
     fn compile_retains_exact_checked_generation_intent() {
         let compiled = compiled();
@@ -2015,8 +1983,9 @@ header = "x-acl-proxy-request-id"
         assert!(rule.redaction().unwrap().belongs_to(plan.identity()));
         assert_eq!(rule.redaction_profile.as_deref(), Some("capture"));
         assert_eq!(rule.credentials().len(), 1);
-        assert_eq!(rule.credential_sources.as_ref(), ["rule"]);
+        assert_eq!(rule.credentials()[0].source(), "rule");
         assert!(rule.credentials()[0]
+            .mutation()
             .credential()
             .belongs_to(plan.identity()));
         assert_eq!(
@@ -2027,7 +1996,7 @@ header = "x-acl-proxy-request-id"
         );
         assert_eq!(plan.global_credentials().len(), 1);
         assert!(matches!(
-            plan.global_credentials()[0].kind(),
+            plan.global_credentials()[0].mutation().kind(),
             CredentialMutationKind::CustomHeader { name, .. } if name.as_str() == "x-global-token"
         ));
         assert!(plan.global_request_headers().is_some());
@@ -2202,7 +2171,7 @@ header = "x-acl-proxy-request-id"
     }
 
     #[test]
-    fn missing_activated_credential_source_is_rejected_by_semantic_name() {
+    fn missing_activated_credential_source_is_rejected_by_template() {
         let compiled = compiled();
         let plan = UnboundStandaloneGenerationPlan::compile(
             &compiled.reloadable_plan,
@@ -2212,12 +2181,75 @@ header = "x-acl-proxy-request-id"
 
         assert_eq!(
             bind_credential_source(
-                &plan.manifest.global_credentials[0],
-                &CredentialSourceRegistry::from_names([]),
+                &plan.global_credentials()[0],
+                &BTreeMap::new(),
                 "credential source",
             )
             .err(),
             Some(StandaloneBindError::Missing("credential source"))
+        );
+    }
+
+    #[test]
+    fn direct_source_binding_retains_exact_descriptor_and_locator() {
+        let compiled = compiled();
+        let sources = outbound_sources(&compiled.reloadable_plan);
+        let plan = UnboundStandaloneGenerationPlan::compile(
+            &compiled.reloadable_plan,
+            GenerationId::for_test(42),
+        )
+        .unwrap();
+        let template = &plan.global_credentials()[0];
+        let mutation = template.mutation();
+        let bound = bind_credential_source(template, &sources, "credential source").unwrap();
+
+        assert_eq!(bound.reference(), mutation.credential());
+        assert_eq!(
+            bound.descriptor().profile(),
+            CredentialProfile::StandaloneTrusted
+        );
+        assert!(matches!(
+            bound.descriptor().purpose(),
+            CredentialPurpose::CustomHeader(name) if name.as_str() == "x-global-token"
+        ));
+        assert_eq!(
+            bound.descriptor().limits().maximum_material_bytes(),
+            bound.source().maximum_material_bytes()
+        );
+        assert_eq!(
+            bound.descriptor().limits().maximum_resolver_staging_bytes(),
+            bound.source().maximum_staging_bytes()
+        );
+    }
+
+    #[test]
+    fn direct_source_binding_uses_the_template_reference() {
+        let compiled = compiled();
+        let sources = outbound_sources(&compiled.reloadable_plan);
+        let plan = UnboundStandaloneGenerationPlan::compile(
+            &compiled.reloadable_plan,
+            GenerationId::for_test(43),
+        )
+        .unwrap();
+
+        let global =
+            bind_credential_source(&plan.global_credentials()[0], &sources, "credential source")
+                .unwrap();
+        let rule = bind_credential_source(
+            &plan.rules()[0].credentials()[0],
+            &sources,
+            "rule credential source",
+        )
+        .unwrap();
+
+        assert_ne!(global.reference(), rule.reference());
+        assert_eq!(
+            global.reference(),
+            plan.global_credentials()[0].mutation().credential()
+        );
+        assert_eq!(
+            rule.reference(),
+            plan.rules()[0].credentials()[0].mutation().credential()
         );
     }
 
@@ -2248,9 +2280,7 @@ header = "x-acl-proxy-request-id"
         .unwrap();
         compiled.reloadable_plan.egress.origin_tls.trust = CompiledTlsTrust::Insecure;
         compiled.reloadable_plan.egress.origin_tls.ca_certificate = None;
-        let sources = CredentialSourceRegistry::from_names(["global".to_owned()]);
-        let egress =
-            EgressSnapshot::activate(compiled.reloadable_plan.egress, &sources, || false).unwrap();
+        let egress = EgressSnapshot::activate(compiled.reloadable_plan.egress, || false).unwrap();
 
         assert_eq!(
             bind_tls_roots(&plan.manifest.tls[0], &egress).err(),

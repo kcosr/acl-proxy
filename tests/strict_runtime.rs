@@ -542,15 +542,16 @@ fn start_origin(directory: &Path, python: &Path) -> (ChildGuard, SocketAddr) {
         .expect("start fixture origin");
     let mut guard = ChildGuard::new(child, libc::SIGTERM);
     let deadline = Instant::now() + PROCESS_TIMEOUT;
-    while !port_file.is_file() {
+    let port = loop {
+        if let Ok(contents) = fs::read_to_string(&port_file) {
+            if let Ok(port) = contents.parse::<u16>() {
+                break port;
+            }
+        }
         assert!(guard.is_running(), "fixture origin exited during startup");
         assert!(Instant::now() < deadline, "fixture origin did not bind");
         std::thread::sleep(Duration::from_millis(20));
-    }
-    let port = fs::read_to_string(port_file)
-        .unwrap()
-        .parse::<u16>()
-        .unwrap();
+    };
     (guard, SocketAddr::from(([127, 0, 0, 1], port)))
 }
 

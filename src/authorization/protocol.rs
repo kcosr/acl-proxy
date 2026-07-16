@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 #[cfg(test)]
 use std::io::Write;
@@ -6,15 +6,14 @@ use std::io::{self, Read};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+use allocator_api2::boxed::Box as FallibleBox;
 use std::task::{Context, Poll};
 
-use base64::encoded_len as base64_encoded_len;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::read::DecoderReader;
 use base64::Engine as _;
-use http::header::AUTHORIZATION;
-use http::{HeaderMap, HeaderName, HeaderValue};
-use http_access_types::{CredentialMutation, CredentialMutationKind};
+use http::{HeaderName, HeaderValue};
 #[cfg(test)]
 use serde::de::{IgnoredAny, MapAccess, Visitor};
 use serde::ser::{SerializeMap, SerializeSeq};
@@ -28,7 +27,7 @@ use zeroize::Zeroize;
 use zeroize::Zeroizing;
 
 use crate::config::compiler::{ProviderOutputPlan, MAX_PROVIDER_CREDENTIAL_BYTES};
-use crate::safety::wire_body::GuardedScratch;
+use crate::safety::wire_body::{GuardedAllocationCharge, GuardedScratch};
 use crate::safety::{GuardedBody, HttpWireBodyGuard};
 
 #[cfg(test)]
@@ -147,228 +146,162 @@ impl ProviderOutputRegistry {
         &self.definitions
     }
 
-    pub(crate) fn stage_credentials(
+    pub(crate) fn compact_provider_credential_wire(
         &self,
         credentials: &ProviderCredentialSet,
         guard: &HttpWireBodyGuard,
-    ) -> Result<StagedProviderCredentialMutation, ProviderCredentialInjectionError> {
+    ) -> Result<ProviderCredentialWireStore, ProviderCredentialWireError> {
         if credentials.registry_id() != self.id {
-            return Err(ProviderCredentialInjectionError::ForeignRegistry);
+            return Err(ProviderCredentialWireError::ForeignRegistry);
         }
 
-        let mut destinations = HashSet::new();
-        destinations
-            .try_reserve(self.definitions.len())
-            .map_err(|_| ProviderCredentialInjectionError::AllocationFailed)?;
-        let mut staged = Vec::new();
-        staged
-            .try_reserve_exact(self.definitions.len())
-            .map_err(|_| ProviderCredentialInjectionError::AllocationFailed)?;
+        let range_bytes = projected_provider_credential_wire_metadata_bytes(self.definitions.len())
+            .ok_or(ProviderCredentialWireError::AllocationFailed)?;
+        let range_charge = guard
+            .charge_exact_allocation(range_bytes)
+            .map_err(|_| ProviderCredentialWireError::AllocationFailed)?;
+        let mut ranges = FallibleBox::<[Option<ProcessEffectRange>]>::try_new_uninit_slice(
+            self.definitions.len(),
+        )
+        .map_err(|_| ProviderCredentialWireError::AllocationFailed)?;
         let mut storage = guard.buffer();
-        for (ordinal, definition) in self.definitions.iter().enumerate() {
+        for ordinal in 0..self.definitions.len() {
             let index = ProviderOutputIndex {
                 registry_id: self.id,
                 ordinal,
             };
             let Some(segments) = credentials.value_segments(index) else {
+                ranges[ordinal].write(None);
                 continue;
             };
-            let (destination, rendering) = match definition {
-                ProviderOutputDefinition::Bearer { .. } => {
-                    (AUTHORIZATION, StagedProviderRendering::Bearer)
-                }
-                ProviderOutputDefinition::Basic { username, .. } => (
-                    AUTHORIZATION,
-                    StagedProviderRendering::Basic(username.clone()),
-                ),
-                ProviderOutputDefinition::CustomHeader { header, .. } => {
-                    (header.clone(), StagedProviderRendering::Custom)
-                }
-            };
-            if !destinations.insert(destination.clone()) {
-                return Err(ProviderCredentialInjectionError::DuplicateDestination);
-            }
             let start = storage.len();
             let mut length = 0usize;
             for segment in segments {
                 length = length
                     .checked_add(segment.len())
                     .filter(|length| *length <= MAX_PROVIDER_CREDENTIAL_BYTES)
-                    .ok_or(ProviderCredentialInjectionError::InvalidCredential)?;
-                if !valid_header_value_bytes(segment) {
-                    return Err(ProviderCredentialInjectionError::InvalidCredential);
-                }
+                    .ok_or(ProviderCredentialWireError::InvalidCredential)?;
                 storage
                     .try_extend_from_slice(segment)
-                    .map_err(|_| ProviderCredentialInjectionError::AllocationFailed)?;
+                    .map_err(|_| ProviderCredentialWireError::AllocationFailed)?;
             }
             if length == 0 {
-                return Err(ProviderCredentialInjectionError::InvalidCredential);
+                return Err(ProviderCredentialWireError::InvalidCredential);
             }
-            staged.push(StagedProviderHeader {
-                destination,
-                rendering,
-                range: ProcessEffectRange {
-                    start,
-                    end: storage.len(),
-                },
-            });
+            ranges[ordinal].write(Some(ProcessEffectRange {
+                start,
+                end: storage.len(),
+            }));
         }
 
-        Ok(StagedProviderCredentialMutation {
-            headers: staged,
+        // Every slot is initialized exactly once by the complete ordinal loop.
+        let ranges = unsafe { ranges.assume_init() };
+        Ok(ProviderCredentialWireStore {
+            registry_id: self.id,
+            ranges,
             storage: storage.finish(),
+            _range_charge: range_charge,
         })
     }
 }
 
-pub(crate) struct StagedProviderCredentialMutation {
-    headers: Vec<StagedProviderHeader>,
+pub(crate) fn projected_provider_credential_wire_metadata_bytes(
+    output_count: usize,
+) -> Option<usize> {
+    output_count.checked_mul(std::mem::size_of::<Option<ProcessEffectRange>>())
+}
+
+/// Bounded raw provider-response ranges retained by the product wire adapter.
+///
+/// These bytes are not resolved credential-core material: they remain on the
+/// request wire guard until the exact late resolver copies one selected range
+/// into a session-branded credential-core writer immediately before send.
+pub(crate) struct ProviderCredentialWireStore {
+    registry_id: u64,
+    ranges: FallibleBox<[Option<ProcessEffectRange>]>,
     storage: GuardedBody,
+    _range_charge: GuardedAllocationCharge,
 }
 
-struct StagedProviderHeader {
-    destination: HeaderName,
-    rendering: StagedProviderRendering,
-    range: ProcessEffectRange,
-}
-
-enum StagedProviderRendering {
-    Bearer,
-    Basic(String),
-    Custom,
-}
-
-impl StagedProviderCredentialMutation {
-    pub(crate) fn matches_mutations(&self, mutations: &[CredentialMutation]) -> bool {
-        self.headers.len() == mutations.len()
-            && self
-                .headers
-                .iter()
-                .zip(mutations)
-                .all(
-                    |(staged, mutation)| match (&staged.rendering, mutation.kind()) {
-                        (StagedProviderRendering::Bearer, CredentialMutationKind::Bearer(_)) => {
-                            staged.destination == AUTHORIZATION
-                        }
-                        (
-                            StagedProviderRendering::Basic(staged_username),
-                            CredentialMutationKind::Basic { username, .. },
-                        ) => staged.destination == AUTHORIZATION && staged_username == username,
-                        (
-                            StagedProviderRendering::Custom,
-                            CredentialMutationKind::CustomHeader { name, .. },
-                        ) => staged.destination.as_str() == name.as_str(),
-                        _ => false,
-                    },
-                )
+impl ProviderCredentialWireStore {
+    pub(crate) fn output_len(&self, output: ProviderOutputIndex) -> Option<usize> {
+        let range = self.output_range(output).ok()?;
+        range.end.checked_sub(range.start)
     }
 
-    pub(crate) fn apply(
-        self,
-        headers: &mut HeaderMap,
-    ) -> Result<(), ProviderCredentialInjectionError> {
-        let additional = self
-            .headers
-            .iter()
-            .filter(|header| !headers.contains_key(&header.destination))
-            .count();
-        headers
-            .try_reserve(additional)
-            .map_err(|_| ProviderCredentialInjectionError::AllocationFailed)?;
-        let mut mutations = Vec::new();
-        mutations
-            .try_reserve_exact(self.headers.len())
-            .map_err(|_| ProviderCredentialInjectionError::AllocationFailed)?;
-        for header in &self.headers {
-            let mut raw = Zeroizing::new(Vec::new());
-            raw.try_reserve_exact(header.range.end - header.range.start)
-                .map_err(|_| ProviderCredentialInjectionError::AllocationFailed)?;
-            for segment in ProcessEffectSegments::new(&self.storage, header.range) {
-                raw.extend_from_slice(segment);
-            }
-            let rendered = match &header.rendering {
-                StagedProviderRendering::Bearer => {
-                    let mut rendered = Zeroizing::new(Vec::new());
-                    let rendered_len = 7usize
-                        .checked_add(raw.len())
-                        .ok_or(ProviderCredentialInjectionError::AllocationFailed)?;
-                    rendered
-                        .try_reserve_exact(rendered_len)
-                        .map_err(|_| ProviderCredentialInjectionError::AllocationFailed)?;
-                    rendered.extend_from_slice(b"Bearer ");
-                    rendered.extend_from_slice(&raw);
-                    rendered
-                }
-                StagedProviderRendering::Basic(username) => {
-                    let mut plain = Zeroizing::new(Vec::new());
-                    let plain_len = username
-                        .len()
-                        .checked_add(1)
-                        .and_then(|len| len.checked_add(raw.len()))
-                        .ok_or(ProviderCredentialInjectionError::AllocationFailed)?;
-                    plain
-                        .try_reserve_exact(plain_len)
-                        .map_err(|_| ProviderCredentialInjectionError::AllocationFailed)?;
-                    plain.extend_from_slice(username.as_bytes());
-                    plain.push(b':');
-                    plain.extend_from_slice(&raw);
-                    let encoded_len = base64_encoded_len(plain.len(), true)
-                        .ok_or(ProviderCredentialInjectionError::AllocationFailed)?;
-                    let rendered_len = 6usize
-                        .checked_add(encoded_len)
-                        .ok_or(ProviderCredentialInjectionError::AllocationFailed)?;
-                    let mut rendered = Zeroizing::new(Vec::new());
-                    rendered
-                        .try_reserve_exact(rendered_len)
-                        .map_err(|_| ProviderCredentialInjectionError::AllocationFailed)?;
-                    rendered.resize(rendered_len, 0);
-                    rendered[..6].copy_from_slice(b"Basic ");
-                    BASE64_STANDARD
-                        .encode_slice(&plain, &mut rendered[6..])
-                        .map_err(|_| ProviderCredentialInjectionError::InvalidCredential)?;
-                    rendered
-                }
-                StagedProviderRendering::Custom => raw,
-            };
-            let mut value = HeaderValue::from_bytes(&rendered)
-                .map_err(|_| ProviderCredentialInjectionError::InvalidCredential)?;
-            value.set_sensitive(true);
-            mutations.push((header.destination.clone(), value));
+    pub(crate) fn copy_output(
+        &self,
+        output: ProviderOutputIndex,
+        destination: &mut [u8],
+    ) -> Result<(), ProviderCredentialWireError> {
+        let range = self.output_range(output)?;
+        let expected_len = range
+            .end
+            .checked_sub(range.start)
+            .ok_or(ProviderCredentialWireError::InvalidCredential)?;
+        if destination.len() != expected_len {
+            return Err(ProviderCredentialWireError::BufferLengthMismatch);
         }
-        for (destination, value) in mutations {
-            headers.insert(destination, value);
+        let mut copied = 0usize;
+        for segment in ProcessEffectSegments::new(&self.storage, range) {
+            let end = copied
+                .checked_add(segment.len())
+                .ok_or(ProviderCredentialWireError::InvalidCredential)?;
+            destination[copied..end].copy_from_slice(segment);
+            copied = end;
         }
-        Ok(())
+        (copied == destination.len())
+            .then_some(())
+            .ok_or(ProviderCredentialWireError::InvalidCredential)
     }
 
     #[cfg(test)]
-    pub(crate) fn len(&self) -> usize {
-        self.headers.len()
+    pub(crate) fn present_count(&self) -> usize {
+        self.ranges.iter().filter(|range| range.is_some()).count()
+    }
+
+    fn output_range(
+        &self,
+        output: ProviderOutputIndex,
+    ) -> Result<ProcessEffectRange, ProviderCredentialWireError> {
+        if output.registry_id() != self.registry_id {
+            return Err(ProviderCredentialWireError::ForeignRegistry);
+        }
+        self.ranges
+            .get(output.get())
+            .copied()
+            .flatten()
+            .ok_or(ProviderCredentialWireError::OutputUnavailable)
     }
 }
 
-impl fmt::Debug for StagedProviderCredentialMutation {
+impl fmt::Debug for ProviderCredentialWireStore {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("StagedProviderCredentialMutation")
-            .field("header_count", &self.headers.len())
+            .debug_struct("ProviderCredentialWireStore")
+            .field("output_count", &self.ranges.len())
+            .field(
+                "present_count",
+                &self.ranges.iter().filter(|range| range.is_some()).count(),
+            )
             .field("charged_bytes", &self.storage.charged_bytes())
             .finish()
     }
 }
 
 #[derive(Clone, Copy, Debug, thiserror::Error, PartialEq, Eq)]
-pub(crate) enum ProviderCredentialInjectionError {
+pub(crate) enum ProviderCredentialWireError {
     #[error("authorization provider is not active")]
     UnknownProvider,
     #[error("authorization credentials belong to another provider registry")]
     ForeignRegistry,
-    #[error("authorization provider outputs target the same header")]
-    DuplicateDestination,
+    #[error("authorization credential output is unavailable")]
+    OutputUnavailable,
     #[error("authorization provider returned invalid credential material")]
     InvalidCredential,
-    #[error("authorization credential injection allocation failed")]
+    #[error("authorization credential material destination length is invalid")]
+    BufferLengthMismatch,
+    #[error("authorization credential material allocation failed")]
     AllocationFailed,
 }
 
@@ -1648,6 +1581,7 @@ fn bind_output_values(
     ))
 }
 
+#[cfg(test)]
 fn valid_header_value_bytes(bytes: &[u8]) -> bool {
     bytes
         .iter()
@@ -2858,7 +2792,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_credentials_materialize_only_at_final_apply() {
+    fn provider_credentials_are_retained_as_raw_exact_material() {
         let outputs = ProviderOutputRegistry::activate(BTreeMap::from([
             (
                 "password".to_string(),
@@ -2884,39 +2818,50 @@ mod tests {
         else {
             panic!("expected allow");
         };
-        let mut headers = HeaderMap::new();
-        headers.insert("x-preserved", HeaderValue::from_static("original"));
         let credential_charge = crate::safety::wire_body::guarded_body_allocation_bytes(1).unwrap();
         let peak = 2 * credential_charge;
         let pool = WireBodyPool::new(peak, peak);
         let quota_key = WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::LOCALHOST), |_| false);
         let guard = pool.begin_for_test(peak, quota_key.clone());
-        let staged = outputs.stage_credentials(&credentials, &guard).unwrap();
+        let material = outputs
+            .compact_provider_credential_wire(&credentials, &guard)
+            .unwrap();
+        let range_charge = projected_provider_credential_wire_metadata_bytes(2).unwrap();
 
-        assert_eq!(staged.len(), 2);
-        assert!(headers.get(AUTHORIZATION).is_none());
-        assert_eq!(pool.global_charge(), credential_charge);
-        assert_eq!(pool.quota_charge(&quota_key), credential_charge);
-        let debug = format!("{staged:?}");
+        assert_eq!(material.present_count(), 2);
+        assert_eq!(pool.global_charge(), credential_charge + range_charge);
+        assert_eq!(
+            pool.quota_charge(&quota_key),
+            credential_charge + range_charge
+        );
+        let debug = format!("{material:?}");
         assert!(!debug.contains("secret-password"));
         assert!(!debug.contains("secret-trace"));
 
-        staged.apply(&mut headers).unwrap();
+        let password = outputs.index("password").unwrap();
+        let trace = outputs.index("trace").unwrap();
+        assert_eq!(material.output_len(password), Some(15));
+        assert_eq!(material.output_len(trace), Some(12));
+        let mut password_bytes = [0; 15];
+        material.copy_output(password, &mut password_bytes).unwrap();
+        let mut trace_bytes = [0; 12];
+        material.copy_output(trace, &mut trace_bytes).unwrap();
+        assert_eq!(&password_bytes, b"secret-password");
+        assert_eq!(&trace_bytes, b"secret-trace");
 
+        let mut wrong_length = [b'x'; 14];
         assert_eq!(
-            headers.get(AUTHORIZATION).unwrap(),
-            "Basic YWdlbnQ6c2VjcmV0LXBhc3N3b3Jk"
+            material.copy_output(password, &mut wrong_length),
+            Err(ProviderCredentialWireError::BufferLengthMismatch)
         );
-        assert_eq!(headers.get("x-trace-token").unwrap(), "secret-trace");
-        assert_eq!(headers.get("x-preserved").unwrap(), "original");
-        assert!(headers.get(AUTHORIZATION).unwrap().is_sensitive());
-        assert!(headers.get("x-trace-token").unwrap().is_sensitive());
+        assert_eq!(wrong_length, [b'x'; 14]);
+        drop(material);
         assert_eq!(pool.global_charge(), 0);
         assert_eq!(pool.quota_charge(&quota_key), 0);
     }
 
     #[test]
-    fn foreign_or_conflicting_credentials_leave_headers_unchanged_and_errors_secret_safe() {
+    fn material_store_rejects_foreign_or_absent_outputs_without_rendering_destinations() {
         let first = outputs(true);
         let second = outputs(true);
         let ProviderDecision::Allow { credentials, .. } = assigned_result(
@@ -2928,54 +2873,57 @@ mod tests {
         else {
             panic!("expected allow");
         };
-        let headers = HeaderMap::from_iter([(
-            HeaderName::from_static("x-preserved"),
-            HeaderValue::from_static("original"),
-        )]);
-        let before = headers.clone();
         let error = second
-            .stage_credentials(&credentials, &staging_guard())
+            .compact_provider_credential_wire(&credentials, &staging_guard())
             .unwrap_err();
-        assert_eq!(error, ProviderCredentialInjectionError::ForeignRegistry);
-        assert_eq!(headers, before);
+        assert_eq!(error, ProviderCredentialWireError::ForeignRegistry);
         assert!(!format!("{error:?} {error}").contains("secret-marker"));
 
-        let conflicting = ProviderOutputRegistry::activate(BTreeMap::from([
+        let shared_destination = ProviderOutputRegistry::activate(BTreeMap::from([
             (
                 "first".to_string(),
                 ProviderOutputPlan::CustomHeader {
                     header: HeaderName::from_static("x-conflict"),
-                    required: true,
+                    required: false,
                 },
             ),
             (
                 "second".to_string(),
                 ProviderOutputPlan::CustomHeader {
                     header: HeaderName::from_static("x-conflict"),
-                    required: true,
+                    required: false,
                 },
             ),
         ]));
         let ProviderDecision::Allow { credentials, .. } = assigned_result(
-            r#"{"id":"request-1","type":"response","decision":"allow","values":{"first":"secret-one","second":"secret-two"}}"#,
-            &conflicting,
+            r#"{"id":"request-1","type":"response","decision":"allow","values":{"first":"secret-one"}}"#,
+            &shared_destination,
             false,
         )
         .unwrap()
         else {
             panic!("expected allow");
         };
-        let error = conflicting
-            .stage_credentials(&credentials, &staging_guard())
-            .unwrap_err();
+        let material = shared_destination
+            .compact_provider_credential_wire(&credentials, &staging_guard())
+            .unwrap();
+        let first_output = shared_destination.index("first").unwrap();
+        let second_output = shared_destination.index("second").unwrap();
+        let mut first_bytes = [0; 10];
+        material
+            .copy_output(first_output, &mut first_bytes)
+            .unwrap();
+        assert_eq!(&first_bytes, b"secret-one");
+        assert_eq!(material.output_len(second_output), None);
         assert_eq!(
-            error,
-            ProviderCredentialInjectionError::DuplicateDestination
+            material.copy_output(second_output, &mut []),
+            Err(ProviderCredentialWireError::OutputUnavailable)
         );
-        assert_eq!(headers, before);
-        let rendered = format!("{error:?} {error}");
-        assert!(!rendered.contains("secret-one"));
-        assert!(!rendered.contains("secret-two"));
+        assert_eq!(
+            material.copy_output(first.index("token").unwrap(), &mut []),
+            Err(ProviderCredentialWireError::ForeignRegistry)
+        );
+        assert!(!format!("{material:?}").contains("secret-one"));
     }
 
     #[test]
