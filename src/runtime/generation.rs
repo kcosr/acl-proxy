@@ -166,6 +166,11 @@ pub(crate) trait CredentialResolver: Send + Sync {
 
 pub(crate) trait ObservationSnapshot: Send + Sync {
     fn capture_epoch(&self) -> &Arc<crate::observation::CaptureEpoch>;
+
+    fn decision_level(
+        &self,
+        disposition: http_access_types::DecisionDisposition,
+    ) -> Option<crate::config::compiler::CompiledDecisionLogLevel>;
 }
 pub(crate) trait AuthorizationSnapshot: Send + Sync {
     fn internal_context_headers(&self) -> &[http::HeaderName];

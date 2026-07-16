@@ -39,6 +39,11 @@ impl ProductActivator {
     }
 
     #[cfg(test)]
+    pub(crate) fn logging_level_handle(&self) -> crate::logging::LoggingLevelControl {
+        self.static_resources.logging_level()
+    }
+
+    #[cfg(test)]
     pub(crate) fn authorization_runtime_handle(
         &self,
     ) -> Arc<crate::authorization::webhook::runtime::WebhookAuthorizationRuntime> {
@@ -128,6 +133,10 @@ impl ProductActivator {
             safety,
             resource_plan,
         } = plan;
+        let logging_level_owner = self
+            .static_resources
+            .logging_level()
+            .stage(observation.logging.level);
 
         // Bind every logical provider reference before any provider process is
         // started. Authorization consumes this exact registry during its final
@@ -190,7 +199,7 @@ impl ProductActivator {
         let owners = provider_owners
             .into_vec()
             .into_iter()
-            .chain(std::iter::once(observation_owner));
+            .chain([observation_owner, logging_level_owner]);
         let owner: Arc<dyn GenerationOwner> = Arc::new(ProductGenerationOwner::new(owners));
 
         let standalone = match standalone.bind(
@@ -879,6 +888,68 @@ redaction_profile = "environment"
         drop(successor_publication);
 
         activated.owner.cleanup(CleanupReason::Shutdown).await;
+        successor.owner.cleanup(CleanupReason::Shutdown).await;
+    }
+
+    #[tokio::test]
+    async fn logging_level_changes_only_with_generation_publication() {
+        let initial = compile(&MINIMAL.replace("level = \"info\"", "level = \"warn\""));
+        let activator = product_activator(&initial.static_config);
+        let logging = activator.logging_level_handle();
+        assert_eq!(
+            logging.current(),
+            crate::config::compiler::CompiledLogLevel::Info
+        );
+
+        let initial = activator
+            .activate_generation(
+                initial.reloadable_plan,
+                ActivationCancellation::new_for_test(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            logging.current(),
+            crate::config::compiler::CompiledLogLevel::Info
+        );
+        initial.owner.publication_guard().unwrap().commit();
+        assert_eq!(
+            logging.current(),
+            crate::config::compiler::CompiledLogLevel::Warn
+        );
+
+        let rejected = compile(&MINIMAL.replace("level = \"info\"", "level = \"trace\""));
+        let rejected = activator
+            .activate_generation(
+                rejected.reloadable_plan,
+                ActivationCancellation::new_for_test(),
+            )
+            .await
+            .unwrap();
+        rejected
+            .owner
+            .cleanup(CleanupReason::CandidateRejected)
+            .await;
+        assert_eq!(
+            logging.current(),
+            crate::config::compiler::CompiledLogLevel::Warn
+        );
+
+        let successor = compile(&MINIMAL.replace("level = \"info\"", "level = \"debug\""));
+        let successor = activator
+            .activate_generation(
+                successor.reloadable_plan,
+                ActivationCancellation::new_for_test(),
+            )
+            .await
+            .unwrap();
+        successor.owner.publication_guard().unwrap().commit();
+        assert_eq!(
+            logging.current(),
+            crate::config::compiler::CompiledLogLevel::Debug
+        );
+
+        initial.owner.cleanup(CleanupReason::Shutdown).await;
         successor.owner.cleanup(CleanupReason::Shutdown).await;
     }
 

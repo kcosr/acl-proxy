@@ -555,6 +555,12 @@ max_bytes = 104857600
 max_files = 5
 console = false
 
+[observation.logging.policy_decisions]
+allows = false
+denies = true
+allow_level = "info"
+deny_level = "warn"
+
 [safety.loop_detection]
 inject = true
 header = "x-acl-proxy-request-id"

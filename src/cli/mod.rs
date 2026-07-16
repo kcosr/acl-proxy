@@ -109,8 +109,10 @@ pub fn run() -> Result<ExitCode, CliError> {
         Command::Run => {
             let loaded = load_and_compile_config(config_path)
                 .map_err(|error| CliError::Config(error.to_string()))?;
-            let logging =
-                LoggingSettings::from_static_config(&loaded.compiled.static_config.logging);
+            let logging = LoggingSettings::from_config(
+                &loaded.compiled.static_config.logging,
+                loaded.compiled.reloadable_plan.observation.logging.level,
+            );
             let _logging_guards = logging.init_tracing()?;
             log_startup(&loaded.compiled.static_config);
 

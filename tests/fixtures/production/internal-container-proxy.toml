@@ -128,6 +128,12 @@ level = "error"
 directory = "runtime/logs"
 console = false
 
+[observation.logging.policy_decisions]
+allows = false
+denies = true
+allow_level = "info"
+deny_level = "warn"
+
 [safety.loop_detection]
 inject = false
 header = "x-acl-proxy-request-id"

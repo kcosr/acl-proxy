@@ -141,6 +141,7 @@ impl ForwardingExecutor {
             provenance,
         );
 
+        dispatch.decision.submit_now();
         let program = match dispatch.sidecar.take_credential_program(plan_binding) {
             Ok(program) => program,
             Err(_) => {

@@ -12,8 +12,10 @@ use http_access_runtime::{
     ProviderOutcome, RuntimeBody, RuntimeRequest, RuntimeResponse, StandaloneExchange,
 };
 use http_access_types::{
-    BodyFraming, BodyObservation, BodyObservationState, BodyRepresentation, DecisionProvenance,
-    EffectivePolicy, HttpVersion, PolicyHeaderFacts, RequestBinding, TrailerPolicy,
+    BodyFraming, BodyObservation, BodyObservationState, BodyRepresentation, DecisionAuditFacts,
+    DecisionAuditFactsInput, DecisionAuditSource, DecisionDisposition, DecisionProvenance,
+    DecisionReason, DecisionReasonCategory, EffectivePolicy, HeaderName as NeutralHeaderName,
+    HttpMethod, HttpVersion, PolicyHeaderFacts, RequestBinding, StableId, TrailerPolicy,
 };
 use hyper::body::HttpBody;
 use tokio::time::Instant;
@@ -23,11 +25,14 @@ use crate::authorization::protocol::{
     ProviderRequestHeaders,
 };
 use crate::authorization::AuthorizationDecision;
-use crate::config::compiler::{CompiledProviderFailureMode, HttpBodyReadPlan};
+use crate::config::compiler::{
+    CompiledDecisionLogLevel, CompiledProviderFailureMode, HttpBodyReadPlan,
+};
 use crate::credentials::InboundCredentials;
 use crate::destination::DestinationGuard;
 use crate::egress::OriginProtocol;
 use crate::http_body::{read_mandatory_runtime_request_body, HttpBodyReadError};
+use crate::observation::{DecisionSubmissionTarget, PendingDecisionSubmission};
 use crate::policy::{HttpWireBodyPlanIndex, ProductRuleEffectsRef};
 use crate::proxy::facts::{FactsError, SanitizedStandaloneIngress, ValidatedStandaloneIngress};
 use crate::proxy::forward::{
@@ -106,6 +111,7 @@ pub(crate) struct StandaloneProviderInput {
     pub(crate) destinations: Arc<DestinationGuard>,
     pub(crate) clock: Arc<TokioRuntimeClock>,
     pub(crate) listener_denied: bool,
+    pub(crate) decision_target: DecisionSubmissionTarget,
 }
 
 pub(crate) trait StandaloneTerminalService: Send + 'static {
@@ -124,11 +130,15 @@ pub(crate) struct StandalonePolicyProvider<T> {
     dispatch: Mutex<Option<PreparedDispatch>>,
     responses: Mutex<PreparedResponses>,
     response_observation: Mutex<Option<StandaloneResponseObservation>>,
+    decision_source: Mutex<Option<DecisionAuditSource>>,
+    response_decision: Mutex<Option<PendingDecisionSubmission>>,
+    audit: DecisionAuditContext,
 }
 
 pub(crate) struct StandaloneResponseDispatch {
     pub(crate) response: RuntimeResponse,
     pub(crate) observation: Option<StandaloneResponseObservation>,
+    pub(crate) decision: PendingDecisionSubmission,
 }
 
 pub(crate) struct StandaloneResponseObservation {
@@ -167,7 +177,7 @@ struct PreparedDecision {
     body_budget_activation: BodyBudgetActivation,
     body_source_activation: ProductBodySourceActivation,
     prepared_target: PreparedForwardingTarget,
-    early_deny: bool,
+    early_deny_source: Option<DecisionAuditSource>,
     ingress_body_complete: bool,
 }
 
@@ -190,6 +200,7 @@ struct PreparedDispatch {
     resolved: ResolvedForwardingTarget,
     sidecar: StandaloneRequestSidecar,
     transport: StandaloneIngressTransport,
+    decision: PendingDecisionSubmission,
 }
 
 pub(crate) enum StandaloneIngressTransport {
@@ -236,6 +247,42 @@ pub(crate) struct StandaloneForwardDispatch {
     pub(crate) resolved: ResolvedForwardingTarget,
     pub(crate) sidecar: StandaloneRequestSidecar,
     pub(crate) transport: StandaloneIngressTransport,
+    pub(crate) decision: PendingDecisionSubmission,
+}
+
+struct DecisionAuditContext {
+    target: DecisionSubmissionTarget,
+    request_id: StableId,
+    method: HttpMethod,
+    url: http_access_types::CanonicalUrl,
+    peer_ip: IpAddr,
+    sensitive_header_presence: Box<[NeutralHeaderName]>,
+    allow_level: Option<CompiledDecisionLogLevel>,
+    deny_level: Option<CompiledDecisionLogLevel>,
+}
+
+impl DecisionAuditContext {
+    fn pending(
+        &self,
+        disposition: DecisionDisposition,
+        source: DecisionAuditSource,
+    ) -> PendingDecisionSubmission {
+        let facts = DecisionAuditFacts::new(DecisionAuditFactsInput {
+            request_id: &self.request_id,
+            disposition,
+            method: Some(&self.method),
+            url: Some(&self.url),
+            peer_ip: Some(self.peer_ip),
+            source: &source,
+            sensitive_header_presence: &self.sensitive_header_presence,
+        })
+        .expect("provider audit facts derive from checked request facts");
+        let level = match disposition {
+            DecisionDisposition::Allow => self.allow_level,
+            DecisionDisposition::Deny => self.deny_level,
+        };
+        PendingDecisionSubmission::new(self.target.clone(), level, facts)
+    }
 }
 
 struct PreparedResponses {
@@ -245,6 +292,8 @@ struct PreparedResponses {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum StandaloneProviderPrepareError {
+    #[error("request identifier is invalid")]
+    RequestId,
     #[error("request header facts are invalid")]
     HeaderFacts,
     #[error("request credential extraction failed")]
@@ -301,7 +350,17 @@ where
             }
         };
         let ingress_body_complete = ingress_body.is_end_stream();
+        let audit_request_id = StableId::new(input.request_id.clone())
+            .map_err(|_| StandaloneProviderPrepareError::RequestId)?;
         let transport_protocol = transport.protocol();
+        let audit_sensitive_header_presence = lease
+            .standalone()
+            .sensitive_header_policy()
+            .names()
+            .iter()
+            .filter(|name| headers.contains_key(name.as_str()))
+            .cloned()
+            .collect();
         let sensitive_headers = lease.standalone().sensitive_headers().to_vec();
         let mut sensitive_header_presence = Vec::new();
         sensitive_header_presence
@@ -324,6 +383,8 @@ where
             return Err(StandaloneProviderPrepareError::HeaderFacts);
         }
         let facts = shape.into_facts(&headers)?;
+        let audit_method = facts.method().clone();
+        let audit_url = facts.url().clone();
         if transport_protocol != ingress_protocol(facts.version())
             || !transport.matches_facts(&facts)
         {
@@ -390,10 +451,18 @@ where
             .clock
             .deadline_millis(deadline)
             .ok_or(StandaloneProviderPrepareError::Deadline)?;
-        let early_deny = input.listener_denied
-            || lease.safety().contains_loop_marker(&headers)
-            || matches!(evaluation, PolicyEvaluation::Deny { .. })
-            || upgrade_is_disallowed(lease.standalone(), facts.upgrade().is_some(), &evaluation);
+        let early_deny_source = if input.listener_denied {
+            Some(local_source(DecisionReasonCategory::Policy, 1))
+        } else if lease.safety().contains_loop_marker(&headers) {
+            Some(local_source(DecisionReasonCategory::Loop, 1))
+        } else if let PolicyEvaluation::Deny { provenance } = &evaluation {
+            Some(DecisionAuditSource::Policy(provenance.clone()))
+        } else if upgrade_is_disallowed(lease.standalone(), facts.upgrade().is_some(), &evaluation)
+        {
+            Some(local_source(DecisionReasonCategory::InvalidPlan, 2))
+        } else {
+            None
+        };
 
         let body_policy = if facts.upgrade().is_some() {
             lease.standalone().upgrade_request_body()
@@ -444,6 +513,20 @@ where
             ));
         }
         let responses = PreparedResponses::new(&request, input.clock.clone())?;
+        let audit = DecisionAuditContext {
+            target: input.decision_target,
+            request_id: audit_request_id,
+            method: audit_method,
+            url: audit_url,
+            peer_ip: input.peer_ip,
+            sensitive_header_presence: audit_sensitive_header_presence,
+            allow_level: lease
+                .observation()
+                .decision_level(DecisionDisposition::Allow),
+            deny_level: lease
+                .observation()
+                .decision_level(DecisionDisposition::Deny),
+        };
         let prepared = PreparedDecision {
             terminal: Some(PreparedTerminalState {
                 generation: lease,
@@ -467,7 +550,7 @@ where
             body_budget_activation,
             body_source_activation,
             prepared_target,
-            early_deny,
+            early_deny_source,
             ingress_body_complete,
         };
         Ok((
@@ -477,6 +560,9 @@ where
                 dispatch: Mutex::new(None),
                 responses: Mutex::new(responses),
                 response_observation: Mutex::new(None),
+                decision_source: Mutex::new(None),
+                response_decision: Mutex::new(None),
+                audit,
             },
             request,
         ))
@@ -499,14 +585,8 @@ where
             return Err(500);
         }
         let mut evaluation = state.evaluation;
-        if state.early_deny
-            || matches!(evaluation, PolicyEvaluation::Deny { .. })
-            || upgrade_is_disallowed(
-                generation.standalone(),
-                request.facts().upgrade().is_some(),
-                &evaluation,
-            )
-        {
+        if let Some(source) = state.early_deny_source.take() {
+            self.set_decision_source(source);
             let close_connection = !state.ingress_body_complete;
             self.record_denial(
                 &mut state.headers,
@@ -594,6 +674,7 @@ where
                 request.facts().upgrade().is_some(),
                 &evaluation,
             ) {
+                self.set_decision_source(local_source(DecisionReasonCategory::InvalidPlan, 2));
                 return Err(403);
             }
             match evaluation {
@@ -619,10 +700,12 @@ where
                         request,
                     )
                     .map_err(adapter_error_status)?;
+                    self.set_decision_source(DecisionAuditSource::Policy(provenance));
                     let terminal = state.terminal.take().ok_or(500_u16)?;
                     return self.finish_forward(resolved, allowed, terminal);
                 }
                 PolicyEvaluation::Deny { provenance } => {
+                    self.set_decision_source(DecisionAuditSource::Policy(provenance.clone()));
                     let ordinal = policy_rule_ordinal(&provenance);
                     self.record_inspected_denial(
                         &mut state.headers,
@@ -726,9 +809,10 @@ where
                                 &request,
                                 state.peer_ip,
                             )?;
-                            if !matches!(policy_result, PolicyEvaluation::Deny { .. }) {
+                            let PolicyEvaluation::Deny { provenance } = policy_result else {
                                 return Err(500);
-                            }
+                            };
+                            self.set_decision_source(DecisionAuditSource::Policy(provenance));
                             self.record_inspected_denial(
                                 &mut state.headers,
                                 generation,
@@ -800,6 +884,7 @@ where
                                     }
                                 };
                             let terminal = state.terminal.take().ok_or(500_u16)?;
+                            self.set_decision_source(DecisionAuditSource::Policy(provenance));
                             return self.finish_forward(resolved, allowed, terminal);
                         }
                         AuthorizationDecision::Deny => {
@@ -810,9 +895,10 @@ where
                                 &request,
                                 state.peer_ip,
                             )?;
-                            if !matches!(policy_result, PolicyEvaluation::Deny { .. }) {
+                            let PolicyEvaluation::Deny { provenance } = policy_result else {
                                 return Err(500);
-                            }
+                            };
+                            self.set_decision_source(DecisionAuditSource::Policy(provenance));
                             self.record_inspected_denial(
                                 &mut state.headers,
                                 generation,
@@ -858,6 +944,10 @@ where
             .retain_for_operation()
             .map_err(|_| 503_u16)?;
         let services = terminal.generation.into_forwarding_services();
+        let source = self
+            .take_decision_source()
+            .expect("forward outcome owns final policy provenance");
+        let decision = self.audit.pending(DecisionDisposition::Allow, source);
         *dispatch = Some(PreparedDispatch {
             services,
             request_id: terminal.request_id,
@@ -868,11 +958,21 @@ where
             resolved,
             sidecar,
             transport: terminal.transport,
+            decision,
         });
         Ok(ProviderOutcome::Forward { plan, request })
     }
 
     fn response(&self, status: u16) -> ProviderOutcome {
+        let source = self
+            .take_decision_source()
+            .unwrap_or_else(|| local_status_source(status));
+        let decision = self.audit.pending(DecisionDisposition::Deny, source);
+        let previous = lock(&self.response_decision).replace(decision);
+        debug_assert!(
+            previous.is_none(),
+            "one provider invocation has one response decision"
+        );
         ProviderOutcome::Respond(
             lock(&self.responses)
                 .build(status)
@@ -949,6 +1049,18 @@ where
             .take()
             .expect("the consumed request context owns one terminal service")
     }
+
+    fn set_decision_source(&self, source: DecisionAuditSource) {
+        let previous = lock(&self.decision_source).replace(source);
+        debug_assert!(
+            previous.is_none(),
+            "one provider invocation has one final source"
+        );
+    }
+
+    fn take_decision_source(&self) -> Option<DecisionAuditSource> {
+        lock(&self.decision_source).take()
+    }
 }
 
 impl PreparedResponses {
@@ -998,13 +1110,21 @@ where
     ) -> BoxFuture<'a, ProviderOutcome> {
         let state = lock(&self.decision).take();
         Box::pin(async move {
+            let cancelled = self.audit.pending(
+                DecisionDisposition::Deny,
+                local_source(DecisionReasonCategory::Transport, 1),
+            );
             let Some(state) = state else {
-                return self.response(500);
+                let outcome = self.response(500);
+                cancelled.discard();
+                return outcome;
             };
-            match self.decide_owned(state, facts, request).await {
+            let outcome = match self.decide_owned(state, facts, request).await {
                 Ok(outcome) => outcome,
                 Err(status) => self.response(status),
-            }
+            };
+            cancelled.discard();
+            outcome
         })
     }
 }
@@ -1016,28 +1136,47 @@ where
     type Output = T::Output;
 
     fn fail_closed(&self, error: RequestPipelineError) -> BoxFuture<'_, Self::Output> {
-        lock(&self.dispatch).take();
+        if let Some(dispatch) = lock(&self.dispatch).take() {
+            dispatch.decision.discard();
+        }
+        if let Some(decision) = lock(&self.response_decision).take() {
+            decision.discard();
+        }
+        let mut decision = self.audit.pending(
+            DecisionDisposition::Deny,
+            local_source(DecisionReasonCategory::InvalidPlan, 4),
+        );
+        decision.submit_now();
         self.take_terminal().fail_closed(error)
     }
 
     fn respond(&self, response: RuntimeResponse) -> BoxFuture<'_, Self::Output> {
-        lock(&self.dispatch).take();
+        if let Some(dispatch) = lock(&self.dispatch).take() {
+            dispatch.decision.discard();
+        }
         let observation = lock(&self.response_observation).take();
         self.take_terminal().respond(StandaloneResponseDispatch {
             response,
             observation,
+            decision: lock(&self.response_decision).take().unwrap_or_else(|| {
+                self.audit.pending(
+                    DecisionDisposition::Deny,
+                    local_source(DecisionReasonCategory::InvalidPlan, 5),
+                )
+            }),
         })
     }
 
     fn forward(&self, exchange: StandaloneExchange) -> BoxFuture<'_, Self::Output> {
         let dispatch = lock(&self.dispatch).take();
-        let terminal = self.take_terminal();
         let Some(dispatch) = dispatch else {
-            return terminal.fail_closed(RequestPipelineError::InvalidProviderOutput);
+            return self.fail_closed(RequestPipelineError::InvalidProviderOutput);
         };
         if dispatch.sidecar.plan_binding() != exchange.plan().binding() {
-            return terminal.fail_closed(RequestPipelineError::InvalidProviderOutput);
+            dispatch.decision.discard();
+            return self.fail_closed(RequestPipelineError::InvalidProviderOutput);
         }
+        let terminal = self.take_terminal();
         terminal.forward(StandaloneForwardDispatch {
             exchange,
             services: dispatch.services,
@@ -1049,6 +1188,7 @@ where
             resolved: dispatch.resolved,
             sidecar: dispatch.sidecar,
             transport: dispatch.transport,
+            decision: dispatch.decision,
         })
     }
 }
@@ -1111,6 +1251,20 @@ fn body_error_status(error: HttpBodyReadError) -> u16 {
         | HttpBodyReadError::DecoderWindowExceeded => 415,
         HttpBodyReadError::ResourceExhausted => 503,
     }
+}
+
+fn local_source(category: DecisionReasonCategory, code: u16) -> DecisionAuditSource {
+    DecisionAuditSource::Local(DecisionReason::new(category, code))
+}
+
+fn local_status_source(status: u16) -> DecisionAuditSource {
+    let category = match status {
+        408 | 504 => DecisionReasonCategory::Expired,
+        500 => DecisionReasonCategory::InvalidPlan,
+        502 | 503 => DecisionReasonCategory::Transport,
+        _ => DecisionReasonCategory::InvalidPlan,
+    };
+    local_source(category, status)
 }
 
 fn adapter_error_status(error: StandaloneProviderAllowError) -> u16 {
@@ -1388,6 +1542,54 @@ header = "x-test-loop"
         }
     }
 
+    #[derive(Debug)]
+    enum AuditedTerminal {
+        Response(u16, DecisionAuditSource, Box<[String]>),
+        Forward(DecisionAuditSource, Box<[String]>),
+        FailClosed,
+    }
+
+    struct AuditTerminal;
+
+    impl StandaloneTerminalService for AuditTerminal {
+        type Output = AuditedTerminal;
+
+        fn fail_closed(self, _error: RequestPipelineError) -> BoxFuture<'static, Self::Output> {
+            Box::pin(async { AuditedTerminal::FailClosed })
+        }
+
+        fn respond(self, dispatch: StandaloneResponseDispatch) -> BoxFuture<'static, Self::Output> {
+            let status = dispatch.response.status();
+            let facts = dispatch
+                .decision
+                .facts()
+                .expect("response carries one pending decision");
+            assert_eq!(facts.disposition(), DecisionDisposition::Deny);
+            let source = facts.source().clone();
+            let presence = facts
+                .sensitive_header_presence()
+                .iter()
+                .map(|name| name.as_str().to_owned())
+                .collect();
+            Box::pin(async move { AuditedTerminal::Response(status, source, presence) })
+        }
+
+        fn forward(self, dispatch: StandaloneForwardDispatch) -> BoxFuture<'static, Self::Output> {
+            let facts = dispatch
+                .decision
+                .facts()
+                .expect("forward carries one pending decision");
+            assert_eq!(facts.disposition(), DecisionDisposition::Allow);
+            let source = facts.source().clone();
+            let presence = facts
+                .sensitive_header_presence()
+                .iter()
+                .map(|name| name.as_str().to_owned())
+                .collect();
+            Box::pin(async move { AuditedTerminal::Forward(source, presence) })
+        }
+    }
+
     #[derive(Debug, Eq, PartialEq)]
     struct ObservedResponse {
         status: u16,
@@ -1507,7 +1709,7 @@ header = "x-test-loop"
     #[derive(Debug, Eq, PartialEq)]
     enum BodyTerminalOutcome {
         Response(u16),
-        Forward(Vec<u8>),
+        Forward(Vec<u8>, DecisionAuditSource),
         FailClosed,
     }
 
@@ -1529,6 +1731,12 @@ header = "x-test-loop"
             self,
             mut dispatch: StandaloneForwardDispatch,
         ) -> BoxFuture<'static, Self::Output> {
+            let facts = dispatch
+                .decision
+                .facts()
+                .expect("forward carries one pending decision");
+            assert_eq!(facts.disposition(), DecisionDisposition::Allow);
+            let source = facts.source().clone();
             Box::pin(async move {
                 let mut bytes = Vec::new();
                 while let Some(chunk) =
@@ -1539,7 +1747,7 @@ header = "x-test-loop"
                     bytes.extend_from_slice(chunk.as_bytes());
                 }
                 drop((self, dispatch));
-                BodyTerminalOutcome::Forward(bytes)
+                BodyTerminalOutcome::Forward(bytes, source)
             })
         }
     }
@@ -1565,6 +1773,19 @@ header = "x-test-loop"
         resolver_calls: Arc<AtomicUsize>,
     ) -> (Arc<Runtime>, Arc<DestinationGuard>) {
         runtime_from(compiled(default), resolver_calls).await
+    }
+
+    async fn runtime_with_allow_observation(
+        default: &str,
+        resolver_calls: Arc<AtomicUsize>,
+    ) -> (Arc<Runtime>, Arc<DestinationGuard>) {
+        runtime_from(
+            compiled_text(&format!(
+                "[policy]\ndefault = \"{default}\"\n\n[observation.logging.policy_decisions]\nallows = true\n"
+            )),
+            resolver_calls,
+        )
+        .await
     }
 
     async fn runtime_from(
@@ -1611,6 +1832,9 @@ max_decoded_request_body_bytes = 4096
 
 [policy]
 default = "deny"
+
+[observation.logging.policy_decisions]
+allows = true
 
 [[policy.rules]]
 id = "delegate"
@@ -1746,6 +1970,7 @@ done
             destinations,
             clock: TokioRuntimeClock::new(started_at),
             listener_denied: false,
+            decision_target: DecisionSubmissionTarget::Disabled,
         }
     }
 
@@ -1788,22 +2013,79 @@ done
             destinations,
             clock: TokioRuntimeClock::new(started_at),
             listener_denied: false,
+            decision_target: DecisionSubmissionTarget::Disabled,
         }
     }
 
     #[tokio::test]
     async fn default_allow_resolves_once_and_forwards_through_the_common_pipeline() {
         let resolver_calls = Arc::new(AtomicUsize::new(0));
-        let (runtime, destinations) = runtime("allow", resolver_calls.clone()).await;
+        let (runtime, destinations) =
+            runtime_with_allow_observation("allow", resolver_calls.clone()).await;
         let lease = runtime.lease().await.unwrap();
-        let input = prepared_input(&lease, destinations, Body::empty(), &[]);
+        let mut input = prepared_input(&lease, destinations, Body::empty(), &[]);
+        let submissions = Arc::new(AtomicUsize::new(0));
+        input.decision_target = DecisionSubmissionTarget::Probe(submissions.clone());
         let (provider, request) =
-            StandalonePolicyProvider::prepare(lease, TestTerminal, input).unwrap();
+            StandalonePolicyProvider::prepare(lease, AuditTerminal, input).unwrap();
 
         let terminal = RequestPipeline::new().execute(provider, request).await;
 
-        assert_eq!(terminal, Terminal::Forward);
+        let AuditedTerminal::Forward(DecisionAuditSource::Policy(provenance), presence) = terminal
+        else {
+            panic!("default allow must retain policy provenance");
+        };
+        assert_eq!(provenance.effective_policy(), &EffectivePolicy::Default);
+        assert!(presence.is_empty());
         assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fail_closed_replaces_pending_allow_with_one_deny_submission() {
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let (runtime, destinations) = runtime("allow", resolver_calls).await;
+        let lease = runtime.lease().await.unwrap();
+        let mut input = prepared_input(&lease, destinations, Body::empty(), &[]);
+        let submissions = Arc::new(AtomicUsize::new(0));
+        input.decision_target = DecisionSubmissionTarget::Probe(submissions.clone());
+        let (provider, request) =
+            StandalonePolicyProvider::prepare(lease, AuditTerminal, input).unwrap();
+        let facts = request.facts().clone();
+
+        let outcome = provider.decide(&facts, request).await;
+        assert!(matches!(outcome, ProviderOutcome::Forward { .. }));
+        let terminal = provider
+            .fail_closed(RequestPipelineError::InvalidProviderOutput)
+            .await;
+
+        assert!(matches!(terminal, AuditedTerminal::FailClosed));
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn decision_presence_uses_full_observation_sensitive_union() {
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let (runtime, destinations) = runtime("deny", resolver_calls).await;
+        let lease = runtime.lease().await.unwrap();
+        let input = prepared_input(
+            &lease,
+            destinations,
+            Body::empty(),
+            &[("authorization", "secret"), ("cookie", "session=secret")],
+        );
+        let (provider, request) =
+            StandalonePolicyProvider::prepare(lease, AuditTerminal, input).unwrap();
+
+        let terminal = RequestPipeline::new().execute(provider, request).await;
+
+        let AuditedTerminal::Response(403, _, presence) = terminal else {
+            panic!("default deny must retain full sensitive-name presence");
+        };
+        assert_eq!(
+            presence.as_ref(),
+            &["authorization".to_owned(), "cookie".to_owned()]
+        );
     }
 
     #[tokio::test]
@@ -1824,18 +2106,37 @@ done
 
     #[tokio::test]
     async fn policy_and_loop_denials_do_not_resolve_or_poll_the_body() {
-        for (default, headers) in [("deny", &[][..]), ("allow", &[("x-test-loop", "loop")][..])] {
+        for (default, headers, policy_source) in [
+            ("deny", &[][..], true),
+            ("allow", &[("x-test-loop", "loop")][..], false),
+        ] {
             let resolver_calls = Arc::new(AtomicUsize::new(0));
             let (runtime, destinations) = runtime(default, resolver_calls.clone()).await;
             let lease = runtime.lease().await.unwrap();
-            let input = prepared_input(&lease, destinations, Body::empty(), headers);
+            let mut input = prepared_input(&lease, destinations, Body::empty(), headers);
+            let submissions = Arc::new(AtomicUsize::new(0));
+            input.decision_target = DecisionSubmissionTarget::Probe(submissions.clone());
             let (provider, request) =
-                StandalonePolicyProvider::prepare(lease, TestTerminal, input).unwrap();
+                StandalonePolicyProvider::prepare(lease, AuditTerminal, input).unwrap();
 
             let terminal = RequestPipeline::new().execute(provider, request).await;
 
-            assert_eq!(terminal, Terminal::Response(403));
+            let AuditedTerminal::Response(403, source, _) = terminal else {
+                panic!("early denial must retain one audit source");
+            };
+            if policy_source {
+                let DecisionAuditSource::Policy(provenance) = source else {
+                    panic!("policy denial must retain policy provenance");
+                };
+                assert_eq!(provenance.effective_policy(), &EffectivePolicy::Default);
+            } else {
+                let DecisionAuditSource::Local(reason) = source else {
+                    panic!("loop denial must be identified as local");
+                };
+                assert_eq!(reason.category(), DecisionReasonCategory::Loop);
+            }
             assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(submissions.load(Ordering::SeqCst), 1);
         }
     }
 
@@ -1868,12 +2169,14 @@ done
             let (runtime, destinations) = runtime_from(config, resolver_calls.clone()).await;
             let lease = runtime.lease().await.unwrap();
             let (mut sender, body) = Body::channel();
-            let input = prepared_input(
+            let mut input = prepared_input(
                 &lease,
                 destinations,
                 body,
                 &[("content-length", "4"), ("content-type", "text/plain")],
             );
+            let submissions = Arc::new(AtomicUsize::new(0));
+            input.decision_target = DecisionSubmissionTarget::Probe(submissions.clone());
             let (provider, request) =
                 StandalonePolicyProvider::prepare(lease, ObservationTerminal, input).unwrap();
 
@@ -1893,6 +2196,7 @@ done
                 .await
                 .is_err());
             assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(submissions.load(Ordering::SeqCst), 1);
             runtime.shutdown().await;
         }
     }
@@ -2021,22 +2325,30 @@ request_timeout = "20ms"
         let config = process_provider_config(&provider_script, "allow");
         let (runtime, destinations) = runtime_from(config, resolver_calls.clone()).await;
         let lease = runtime.lease().await.unwrap();
-        let input = prepared_input(
+        let mut input = prepared_input(
             &lease,
             destinations,
             Body::from("inspected request body"),
             &[("content-length", "22"), ("content-type", "text/plain")],
         );
+        let submissions = Arc::new(AtomicUsize::new(0));
+        input.decision_target = DecisionSubmissionTarget::Probe(submissions.clone());
         let (provider, request) =
             StandalonePolicyProvider::prepare(lease, BodyTerminal, input).unwrap();
 
         let terminal = RequestPipeline::new().execute(provider, request).await;
 
-        assert_eq!(
-            terminal,
-            BodyTerminalOutcome::Forward(b"inspected request body".to_vec())
-        );
+        let BodyTerminalOutcome::Forward(body, DecisionAuditSource::Policy(provenance)) = terminal
+        else {
+            panic!("resumed allow must retain policy provenance");
+        };
+        assert_eq!(body, b"inspected request body");
+        let EffectivePolicy::Rule { id, .. } = provenance.effective_policy() else {
+            panic!("resumed allow must identify its matched rule");
+        };
+        assert_eq!(id.as_str(), "after-pass");
         assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
         runtime.shutdown().await;
     }
 
@@ -2049,22 +2361,34 @@ request_timeout = "20ms"
         let config = process_provider_config(&provider_script, "deny");
         let (runtime, destinations) = runtime_from(config, resolver_calls.clone()).await;
         let lease = runtime.lease().await.unwrap();
-        let input = prepared_input(
+        let mut input = prepared_input(
             &lease,
             destinations,
             Body::from("provider-visible"),
             &[("content-length", "16"), ("content-type", "text/plain")],
         );
+        let submissions = Arc::new(AtomicUsize::new(0));
+        input.decision_target = DecisionSubmissionTarget::Probe(submissions.clone());
         let (provider, request) =
             StandalonePolicyProvider::prepare(lease, BodyTerminal, input).unwrap();
 
         let terminal = RequestPipeline::new().execute(provider, request).await;
 
+        let BodyTerminalOutcome::Forward(body, DecisionAuditSource::Policy(provenance)) = terminal
+        else {
+            panic!("provider allow must retain policy provenance");
+        };
+        assert_eq!(body, b"provider-visible");
+        let EffectivePolicy::Rule { id, .. } = provenance.effective_policy() else {
+            panic!("provider allow must identify its delegated rule");
+        };
+        assert_eq!(id.as_str(), "delegate");
         assert_eq!(
-            terminal,
-            BodyTerminalOutcome::Forward(b"provider-visible".to_vec())
+            provenance.reason().category(),
+            DecisionReasonCategory::Provider
         );
         assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
         runtime.shutdown().await;
     }
 
@@ -2079,12 +2403,14 @@ request_timeout = "20ms"
         let (runtime, destinations) = runtime_from(config, resolver_calls.clone()).await;
         let lease = runtime.lease().await.unwrap();
         let (mut sender, body) = Body::channel();
-        let input = prepared_input(
+        let mut input = prepared_input(
             &lease,
             destinations,
             body,
             &[("content-length", "16"), ("content-type", "text/plain")],
         );
+        let submissions = Arc::new(AtomicUsize::new(0));
+        input.decision_target = DecisionSubmissionTarget::Probe(submissions.clone());
         let (provider, request) =
             StandalonePolicyProvider::prepare(lease, TestTerminal, input).unwrap();
         let facts = request.facts().clone();
@@ -2099,6 +2425,7 @@ request_timeout = "20ms"
             .is_err());
         assert!(!marker.exists());
         assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
         drop(provider);
         runtime.shutdown().await;
     }

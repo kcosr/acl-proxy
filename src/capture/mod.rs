@@ -8,7 +8,9 @@ use std::time::SystemTime;
 
 use base64::{encoded_len as base64_encoded_len, engine::general_purpose, Engine as _};
 use fs2::FileExt;
-use http_access_types::IngressMode;
+use http_access_types::{
+    CaptureEvent, CaptureFacts, HttpVersion, IngressMode, SanitizedHeaderValue,
+};
 use once_cell::sync::Lazy;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -19,14 +21,11 @@ use crate::http_body::{
     decode_capture_http_body, decode_capture_websocket_permessage_deflate, CaptureContentEncoding,
     CaptureHttpDecodeError,
 };
-#[cfg(test)]
-use crate::observation::CaptureEvent;
 use crate::observation::{
     CaptureAllocationError, CaptureBody as OwnedCaptureBody, CaptureEpoch, CaptureExactBytes,
     CaptureOperation,
 };
 use crate::redaction::{PayloadClass, SnapshotError as RedactionSnapshotError};
-use crate::sensitive::{is_sensitive_header_name, redact_url_for_sink, REDACTED};
 
 mod tap;
 mod worker;
@@ -41,6 +40,8 @@ use std::os::unix::fs::OpenOptionsExt;
 static CAPTURE_DIRECTORY_LOCKS: Lazy<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static CAPTURE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) const REDACTED: &str = "[REDACTED]";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -230,21 +231,125 @@ pub(crate) struct CaptureArtifactJob {
     max_expansion_ratio: usize,
 }
 
-struct SanitizedCaptureMetadata {
+#[derive(Clone)]
+pub(crate) struct SanitizedCaptureMetadata {
     record: CaptureRecord,
 }
 
 impl SanitizedCaptureMetadata {
-    fn from_record(mut record: CaptureRecord) -> Self {
-        record.url = redact_url_for_sink(&record.url);
-        if let Some(headers) = record.headers.as_mut() {
-            for (name, value) in headers {
-                if is_sensitive_header_name(name) {
-                    *value = JsonValue::String(REDACTED.to_owned());
-                }
-            }
+    pub(crate) fn from_facts(
+        facts: CaptureFacts,
+        timestamp: String,
+        client_port: Option<u16>,
+        include_headers: bool,
+        status_message: Option<String>,
+    ) -> Self {
+        let (kind, decision) = match facts.event() {
+            CaptureEvent::RequestAllowed => (CaptureKind::Request, CaptureDecision::Allow),
+            CaptureEvent::ResponseAllowed => (CaptureKind::Response, CaptureDecision::Allow),
+            CaptureEvent::RequestDenied => (CaptureKind::Request, CaptureDecision::Deny),
+            CaptureEvent::ResponseDenied => (CaptureKind::Response, CaptureDecision::Deny),
+        };
+        let headers = include_headers.then(|| capture_headers(facts.headers()));
+        Self {
+            record: CaptureRecord {
+                timestamp,
+                request_id: facts.request_id().as_str().to_owned(),
+                kind,
+                decision,
+                mode: CaptureMode::for_ingress(facts.ingress_mode()),
+                url: facts
+                    .url()
+                    .map_or_else(String::new, |url| url.as_str().to_owned()),
+                method: facts
+                    .method()
+                    .map_or_else(String::new, |method| method.as_str().to_owned()),
+                status_code: facts.status(),
+                status_message,
+                client: CaptureEndpoint {
+                    address: facts.client_ip().map(|ip| ip.to_string()),
+                    port: client_port,
+                },
+                target: facts.target().map(|target| CaptureEndpoint {
+                    address: Some(target.host().authority_form()),
+                    port: Some(target.effective_port()),
+                }),
+                http_version: facts.version().map(capture_http_version).map(str::to_owned),
+                headers,
+                body: None,
+                body_truncated: None,
+                provider_replacement_omitted: None,
+                provider_replacement_size: None,
+            },
         }
+    }
+
+    pub(crate) fn mark_provider_replacement_omitted(&mut self, size: usize) {
+        self.record.mark_provider_replacement_omitted(size);
+    }
+
+    pub(crate) fn without_headers(mut self) -> Self {
+        self.record.headers = None;
+        self
+    }
+
+    pub(crate) fn for_websocket_message(
+        &self,
+        timestamp: String,
+        label: &str,
+        sequence: u64,
+        kind: CaptureKind,
+    ) -> Self {
+        let mut metadata = self.clone();
+        metadata.record.timestamp = timestamp;
+        metadata.record.request_id = format!("{}-ws-{label}-{sequence}", self.record.request_id);
+        metadata.record.kind = kind;
+        metadata.record.status_code = None;
+        metadata.record.status_message = None;
+        metadata
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test_record(record: CaptureRecord) -> Self {
         Self { record }
+    }
+}
+
+fn capture_headers(fields: &[http_access_types::SanitizedHeaderField]) -> HeaderMap {
+    let mut captured = HeaderMap::new();
+    for field in fields {
+        let name = field.name().as_str().to_owned();
+        let value = match field.value() {
+            SanitizedHeaderValue::Redacted => JsonValue::String(REDACTED.to_owned()),
+            SanitizedHeaderValue::Visible(value) => {
+                let Ok(value) = std::str::from_utf8(value.as_bytes()) else {
+                    continue;
+                };
+                JsonValue::String(value.to_owned())
+            }
+        };
+        match captured.entry(name) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(value);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => match entry.get_mut() {
+                JsonValue::String(existing) => {
+                    *entry.get_mut() =
+                        JsonValue::Array(vec![JsonValue::String(existing.clone()), value]);
+                }
+                JsonValue::Array(values) => values.push(value),
+                _ => unreachable!("capture headers contain only strings and string arrays"),
+            },
+        }
+    }
+    captured
+}
+
+const fn capture_http_version(version: HttpVersion) -> &'static str {
+    match version {
+        HttpVersion::Http10 => "1.0",
+        HttpVersion::Http11 => "1.1",
+        HttpVersion::Http2 => "2",
     }
 }
 
@@ -310,7 +415,7 @@ impl CaptureArtifactJob {
         Ok(Some(Self {
             operation,
             epoch,
-            metadata: SanitizedCaptureMetadata::from_record(metadata),
+            metadata: SanitizedCaptureMetadata::from_test_record(metadata),
             payload: CaptureArtifactPayload::Unavailable,
             max_expansion_ratio,
         }))
@@ -319,16 +424,16 @@ impl CaptureArtifactJob {
     pub(crate) fn begin_admitted(
         epoch: Arc<CaptureEpoch>,
         operation: CaptureOperation,
-        metadata: CaptureRecord,
+        metadata: SanitizedCaptureMetadata,
         max_expansion_ratio: usize,
     ) -> Result<Self, CaptureArtifactJobError> {
-        if metadata.body.is_some() || metadata.body_truncated.is_some() {
+        if metadata.record.body.is_some() || metadata.record.body_truncated.is_some() {
             return Err(CaptureArtifactJobError::MetadataAlreadyHasBodyOutcome);
         }
         Ok(Self {
             operation,
             epoch,
-            metadata: SanitizedCaptureMetadata::from_record(metadata),
+            metadata,
             payload: CaptureArtifactPayload::Unavailable,
             max_expansion_ratio,
         })
@@ -1389,6 +1494,7 @@ mod tests {
                     max_inflight_body_bytes: 1024 * 1024,
                     working_set: CaptureWorkingSetPlan::default(),
                 }),
+                ..ObservationPlan::default()
             },
             &redaction,
             pool.clone(),
@@ -1586,35 +1692,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn artifact_worker_sanitizes_metadata_at_the_queue_boundary() {
+    async fn artifact_worker_accepts_only_pre_sanitized_typed_metadata() {
         let directory = tempfile::tempdir().unwrap();
         let (epoch, _owner) = capture_engine_epoch(directory.path(), 1024, false);
-        let mut metadata = sample_record_with_body(None);
-        metadata.request_id = "credential-metadata".to_owned();
-        metadata.url =
-            "https://alice:url-password@example.com/path?token=query-secret#fragment".to_owned();
-        metadata.headers = Some(HeaderMap::from([
-            (
-                "Authorization".to_owned(),
-                JsonValue::String("Bearer authorization-secret".to_owned()),
+        let event = CaptureEvent::RequestAllowed;
+        let operation = epoch
+            .capture()
+            .and_then(|policy| policy.try_admit(event))
+            .expect("capture admission");
+        let policy = http_access_types::SensitiveHeaderPolicy::new([], [], []).unwrap();
+        let headers = [
+            http_access_types::SanitizedHeaderField::redacted(
+                http_access_types::HeaderName::new("authorization").unwrap(),
             ),
-            (
-                "COOKIE".to_owned(),
-                JsonValue::Array(vec![JsonValue::String("session=cookie-secret".to_owned())]),
+            http_access_types::SanitizedHeaderField::redacted(
+                http_access_types::HeaderName::new("cookie").unwrap(),
             ),
-            (
-                "content-type".to_owned(),
-                JsonValue::String("text/plain".to_owned()),
-            ),
-        ]));
-        let job = CaptureArtifactJob::try_begin(
-            epoch,
-            crate::observation::CaptureEvent::RequestAllowed,
-            metadata,
-            16,
+            http_access_types::SanitizedHeaderField::visible(
+                &policy,
+                http_access_types::HeaderName::new("content-type").unwrap(),
+                http_access_types::HeaderValue::new(b"text/plain".to_vec()).unwrap(),
+            )
+            .unwrap(),
+        ];
+        let request_id = http_access_types::StableId::new("credential-metadata").unwrap();
+        let method = http_access_types::HttpMethod::new("GET").unwrap();
+        let url =
+            http_access_url::canonicalize_http_url("https://example.com/path?token=query-secret")
+                .unwrap();
+        let facts = CaptureFacts::new(
+            &policy,
+            http_access_types::CaptureFactsInput {
+                request_id: &request_id,
+                event,
+                ingress_mode: IngressMode::ExplicitHttp,
+                method: Some(&method),
+                url: Some(&url),
+                client_ip: None,
+                target: Some(url.authority()),
+                version: Some(HttpVersion::Http11),
+                status: None,
+                headers: &headers,
+            },
         )
-        .unwrap()
-        .expect("capture admission");
+        .unwrap();
+        let metadata = SanitizedCaptureMetadata::from_facts(
+            facts,
+            "2026-01-01T00:00:00Z".to_owned(),
+            None,
+            true,
+            None,
+        );
+        let job = CaptureArtifactJob::begin_admitted(epoch, operation, metadata, 16).unwrap();
 
         let worker = CaptureArtifactWorker::start(1).unwrap();
         worker.try_submit(job).unwrap();
@@ -1624,11 +1753,11 @@ mod tests {
         assert_eq!(record.url, "https://example.com/path?REDACTED");
         let headers = record.headers.as_ref().unwrap();
         assert_eq!(
-            headers.get("Authorization"),
+            headers.get("authorization"),
             Some(&JsonValue::String(REDACTED.to_owned()))
         );
         assert_eq!(
-            headers.get("COOKIE"),
+            headers.get("cookie"),
             Some(&JsonValue::String(REDACTED.to_owned()))
         );
         assert_eq!(
@@ -1645,16 +1774,10 @@ mod tests {
             })
             .and_then(|path| fs::read(path).ok())
             .expect("persisted capture artifact");
-        for secret in [
-            b"url-password".as_slice(),
-            b"query-secret".as_slice(),
-            b"authorization-secret".as_slice(),
-            b"cookie-secret".as_slice(),
-        ] {
-            assert!(!artifact
-                .windows(secret.len())
-                .any(|window| window == secret));
-        }
+        let secret = b"query-secret".as_slice();
+        assert!(!artifact
+            .windows(secret.len())
+            .any(|window| window == secret));
     }
 
     #[test]

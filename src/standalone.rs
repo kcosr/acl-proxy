@@ -7,8 +7,8 @@ use http_access_types::{
     BodyLimits, BodyRepresentation, CaptureIntent, CaptureRef, CredentialMutation,
     CredentialMutationKind, CredentialRef, HeaderMutation, HeaderMutationBatch,
     HeaderMutationCondition, HeaderName, HeaderValue, HttpScheme, PolicyGeneration, RedactionRef,
-    RedirectPolicy, RequestBodyPolicy, Route, SnapshotIdentity, StableId, StageTimeouts, TlsIntent,
-    TlsRootsRef, TrailerPolicy,
+    RedirectPolicy, RequestBodyPolicy, Route, SensitiveHeaderPolicy, SnapshotIdentity, StableId,
+    StageTimeouts, TlsIntent, TlsRootsRef, TrailerPolicy,
 };
 use http_access_url::canonicalize_http_url;
 
@@ -54,6 +54,7 @@ pub(crate) struct StandaloneGenerationCore {
     origin_https_tls: TlsIntent,
     capture: Option<StandaloneCaptureIntent>,
     sensitive_headers: Box<[HeaderName]>,
+    sensitive_header_policy: SensitiveHeaderPolicy,
     product_acl: ProductAclSnapshot,
     rules: Box<[StandaloneRuleTemplate]>,
     global_request_headers: Option<HeaderMutationBatch>,
@@ -251,6 +252,7 @@ impl UnboundStandaloneGenerationPlan {
 
         let capture = compile_capture(plan, &identity, version)?;
         let sensitive_headers = compile_sensitive_headers(plan)?;
+        let sensitive_header_policy = compile_observation_sensitive_header_policy(plan)?;
         let product_acl = ProductAclSnapshot::compile(
             &plan.policy,
             generation,
@@ -338,6 +340,7 @@ impl UnboundStandaloneGenerationPlan {
             origin_https_tls,
             capture,
             sensitive_headers,
+            sensitive_header_policy,
             product_acl,
             rules: rules.into_boxed_slice(),
             global_request_headers,
@@ -443,6 +446,10 @@ impl StandaloneGenerationCore {
 
     pub(crate) fn sensitive_headers(&self) -> &[HeaderName] {
         &self.sensitive_headers
+    }
+
+    pub(crate) const fn sensitive_header_policy(&self) -> &SensitiveHeaderPolicy {
+        &self.sensitive_header_policy
     }
 
     pub(crate) fn rules(&self) -> &[StandaloneRuleTemplate] {
@@ -1436,6 +1443,74 @@ fn compile_sensitive_headers(
     Ok(headers.into_boxed_slice())
 }
 
+fn compile_observation_sensitive_header_policy(
+    plan: &ReloadableProductPlan,
+) -> Result<SensitiveHeaderPolicy, StandaloneCompileError> {
+    let inbound = plan
+        .credentials
+        .inbound
+        .values()
+        .map(|inbound| neutral_header_name(&inbound.header))
+        .collect::<Result<Vec<_>, _>>()?;
+    let internal_context = plan
+        .authorization
+        .internal_context_headers
+        .iter()
+        .map(neutral_header_name)
+        .collect::<Result<Vec<_>, _>>()?;
+    let credential_destinations = plan
+        .egress
+        .credential_actions
+        .iter()
+        .chain(
+            plan.policy
+                .rules
+                .iter()
+                .flat_map(|rule| rule.credential_actions.iter()),
+        )
+        .map(credential_action_destination)
+        .chain(
+            plan.authorization
+                .providers
+                .values()
+                .flat_map(|provider| match provider {
+                    AuthorizationProviderPlan::Webhook(provider) => provider.outputs.values(),
+                    AuthorizationProviderPlan::Process(provider) => provider.outputs.values(),
+                })
+                .map(provider_output_destination),
+        )
+        .collect::<Result<Vec<_>, _>>()?;
+
+    SensitiveHeaderPolicy::new(inbound, internal_context, credential_destinations)
+        .map_err(|_| StandaloneCompileError::Checked("sensitive header policy"))
+}
+
+fn credential_action_destination(
+    action: &CredentialActionPlan,
+) -> Result<HeaderName, StandaloneCompileError> {
+    match action {
+        CredentialActionPlan::Bearer { .. } | CredentialActionPlan::Basic { .. } => {
+            HeaderName::new("authorization").map_err(|_| {
+                StandaloneCompileError::Checked("authorization credential destination")
+            })
+        }
+        CredentialActionPlan::CustomHeader { header, .. } => neutral_header_name(header),
+    }
+}
+
+fn provider_output_destination(
+    output: &ProviderOutputPlan,
+) -> Result<HeaderName, StandaloneCompileError> {
+    match output {
+        ProviderOutputPlan::Bearer { .. } | ProviderOutputPlan::Basic { .. } => {
+            HeaderName::new("authorization").map_err(|_| {
+                StandaloneCompileError::Checked("authorization provider output destination")
+            })
+        }
+        ProviderOutputPlan::CustomHeader { header, .. } => neutral_header_name(header),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compile_rule_template(
     rule: &PolicyRulePlan,
@@ -1899,6 +1974,25 @@ header = "x-acl-proxy-request-id"
                 .map(HeaderName::as_str)
                 .collect::<Vec<_>>(),
             ["x-alpha-secret", "x-internal-context", "x-zeta-secret"]
+        );
+        assert_eq!(
+            plan.sensitive_header_policy()
+                .names()
+                .iter()
+                .map(HeaderName::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "authorization",
+                "cookie",
+                "proxy-authorization",
+                "set-cookie",
+                "x-alpha-secret",
+                "x-global-token",
+                "x-internal-context",
+                "x-provider-token",
+                "x-rule-token",
+                "x-zeta-secret"
+            ]
         );
         assert!(matches!(plan.route(), Route::Direct));
         assert!(matches!(

@@ -1121,6 +1121,9 @@ pub(super) struct AuthoringLoggingConfig {
 
     #[serde(default = "default_logging_console")]
     pub console: bool,
+
+    #[serde(default)]
+    pub policy_decisions: PolicyDecisionLoggingConfig,
 }
 
 impl Default for AuthoringLoggingConfig {
@@ -1131,6 +1134,7 @@ impl Default for AuthoringLoggingConfig {
             max_bytes: default_logging_max_bytes(),
             max_files: default_logging_max_files(),
             console: default_logging_console(),
+            policy_decisions: PolicyDecisionLoggingConfig::default(),
         }
     }
 }
@@ -1149,6 +1153,45 @@ fn default_logging_max_files() -> usize {
 
 fn default_logging_console() -> bool {
     true
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct PolicyDecisionLoggingConfig {
+    #[serde(default)]
+    pub allows: bool,
+
+    #[serde(default = "default_log_denies")]
+    pub denies: bool,
+
+    #[serde(default = "default_allow_log_level")]
+    pub allow_level: String,
+
+    #[serde(default = "default_deny_log_level")]
+    pub deny_level: String,
+}
+
+impl Default for PolicyDecisionLoggingConfig {
+    fn default() -> Self {
+        Self {
+            allows: false,
+            denies: default_log_denies(),
+            allow_level: default_allow_log_level(),
+            deny_level: default_deny_log_level(),
+        }
+    }
+}
+
+fn default_log_denies() -> bool {
+    true
+}
+
+fn default_allow_log_level() -> String {
+    "info".to_owned()
+}
+
+fn default_deny_log_level() -> String {
+    "warn".to_owned()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1310,6 +1353,16 @@ header = "x-acl-proxy-request-id"
             2 * 1024 * 1024 * 1024
         );
         assert_eq!(config.service.min_wire_body_concurrency, 64);
+        assert!(!config.observation.logging.policy_decisions.allows);
+        assert!(config.observation.logging.policy_decisions.denies);
+        assert_eq!(
+            config.observation.logging.policy_decisions.allow_level,
+            "info"
+        );
+        assert_eq!(
+            config.observation.logging.policy_decisions.deny_level,
+            "warn"
+        );
         assert_eq!(config.service.max_content_decoding_expansion_ratio, 128);
         let forwarding = &config.service.forwarding;
         assert_eq!(forwarding.connect_timeout.get(), Duration::from_secs(30));
@@ -1344,6 +1397,26 @@ header = "x-acl-proxy-request-id"
         assert_eq!(listener.http_versions, vec![HttpVersion::Http1]);
         assert_eq!(listener.connect.http1, Some(Http1ConnectPolicy::Deny));
         assert_eq!(listener.connect.http2, None);
+    }
+
+    #[test]
+    fn policy_decision_logging_uses_one_strict_shape() {
+        let authored = format!(
+            "{MINIMAL}\n[observation.logging.policy_decisions]\nallows = true\ndenies = false\nallow_level = \"warn\"\ndeny_level = \"info\"\n"
+        );
+        let config: AuthoringConfig = toml::from_str(&authored).unwrap();
+        let decisions = config.observation.logging.policy_decisions;
+        assert!(decisions.allows);
+        assert!(!decisions.denies);
+        assert_eq!(decisions.allow_level, "warn");
+        assert_eq!(decisions.deny_level, "info");
+
+        for unknown in ["log_allows", "allow_severity", "enabled"] {
+            let authored =
+                format!("{MINIMAL}\n[observation.logging.policy_decisions]\n{unknown} = true\n");
+            let error = toml::from_str::<AuthoringConfig>(&authored).unwrap_err();
+            assert!(error.to_string().contains("unknown field"), "{error}");
+        }
     }
 
     #[test]

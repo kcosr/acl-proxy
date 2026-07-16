@@ -21,7 +21,6 @@ mod request_pipeline;
 mod runtime;
 mod runtime_body_source;
 mod safety;
-mod sensitive;
 mod standalone;
 mod standalone_policy_provider;
 mod standalone_provider_result;

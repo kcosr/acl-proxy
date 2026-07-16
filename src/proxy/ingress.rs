@@ -30,17 +30,20 @@ use crate::activation::listeners::{
     ProxySupervisorFailure, ProxySupervisorFailureObserver, ProxySupervisorStartError,
     ProxySupervisorStarter,
 };
-use crate::capture::{
-    CaptureDecision, CaptureEndpoint, CaptureKind, CaptureMode, CaptureRecord, HttpCaptureTap,
-};
+#[cfg(test)]
+use crate::capture::REDACTED;
+use crate::capture::{CaptureDecision, CaptureKind, HttpCaptureTap, SanitizedCaptureMetadata};
 use crate::certs::MitmCertificateManager;
 use crate::config::compiler::{
-    CompiledHttpVersion, StaticCleartextListener, StaticExplicitHttpsListener,
-    StaticTransparentHttpsListener,
+    CompiledDecisionLogLevel, CompiledHttpVersion, StaticCleartextListener,
+    StaticExplicitHttpsListener, StaticTransparentHttpsListener,
 };
 use crate::http1::head::IngressRequestKind;
 use crate::http1::ingress::{RequestDisposition, ValidatedIngressIo};
-use crate::observation::{CaptureEpoch, CaptureEvent, ProductObservationRuntime};
+use crate::observation::{
+    CaptureEpoch, CaptureEvent, DecisionSubmissionTarget, PendingDecisionSubmission,
+    ProductObservationRuntime,
+};
 use crate::proxy::authority::{reconcile_connect_outer_request, reconcile_request};
 use crate::proxy::facts::{
     validate_standalone_connect_ingress_request, validate_standalone_ingress_request,
@@ -53,16 +56,20 @@ use crate::proxy::original_destination::{
 };
 use crate::proxy::upgrade_relay::UpgradeCaptureContext;
 use crate::request_pipeline::{RequestPipeline, RequestPipelineError};
-use crate::runtime::{BoxFuture, Runtime};
+use crate::runtime::{BoxFuture, GenerationLease, Runtime};
 use crate::safety::{GuardedBody, WireBodyQuotaKey};
-use crate::sensitive::{is_sensitive_header_name, REDACTED};
 use crate::standalone_policy_provider::{
     StandaloneForwardDispatch, StandaloneIngressTransport, StandalonePolicyProvider,
     StandaloneProviderInput, StandaloneResponseBodyProvenance, StandaloneResponseDispatch,
     StandaloneTerminalService, TokioRuntimeClock,
 };
 use crate::upgrade::UpgradeRuntime;
-use http_access_types::{CanonicalHost, IngressMode, UpgradePolicy};
+use http_access_types::{
+    CanonicalHost, CaptureFacts, CaptureFactsInput, DecisionAuditFacts, DecisionAuditFactsInput,
+    DecisionAuditSource, DecisionDisposition, DecisionReason, DecisionReasonCategory,
+    HeaderName as NeutralHeaderName, HeaderValue as NeutralHeaderValue, HttpMethod, IngressMode,
+    SanitizedHeaderField, SensitiveHeaderPolicy, SinkSafeUrl, StableId, UpgradePolicy,
+};
 use http_access_url::{
     canonicalize_tls_server_name, reconcile_connect_sni, CanonicalConnectTarget,
 };
@@ -952,6 +959,16 @@ async fn serve_http_connection(connection: HttpConnection) {
             let validation_ticket = match validation_ticket {
                 Ok(ticket) => ticket,
                 Err(_) => {
+                    if let Some(lease) = runtime.lease().await {
+                        PreProviderDecisionAudit::new(
+                            observation_runtime.clone().into(),
+                            &lease,
+                            &request_id(),
+                            peer.ip(),
+                            &request,
+                        )
+                        .submit_deny(DecisionReasonCategory::InvalidPlan, 400);
+                    }
                     let mut rejected = HandledResponse::fixed(
                         StatusCode::BAD_REQUEST,
                         "invalid request framing\n",
@@ -1371,6 +1388,83 @@ impl ConnectTunnelPlan {
     }
 }
 
+struct PreProviderDecisionAudit {
+    target: DecisionSubmissionTarget,
+    level: Option<CompiledDecisionLogLevel>,
+    request_id: StableId,
+    method: Option<HttpMethod>,
+    url: Option<http_access_types::CanonicalUrl>,
+    peer_ip: IpAddr,
+    sensitive_header_presence: Box<[NeutralHeaderName]>,
+}
+
+impl PreProviderDecisionAudit {
+    fn new(
+        target: DecisionSubmissionTarget,
+        lease: &GenerationLease,
+        request_id: &str,
+        peer_ip: IpAddr,
+        request: &Request<Body>,
+    ) -> Self {
+        Self::from_policy(
+            target,
+            lease
+                .observation()
+                .decision_level(DecisionDisposition::Deny),
+            lease.standalone().sensitive_header_policy(),
+            request_id,
+            peer_ip,
+            request,
+        )
+    }
+
+    fn from_policy<B>(
+        target: DecisionSubmissionTarget,
+        level: Option<CompiledDecisionLogLevel>,
+        sensitive: &SensitiveHeaderPolicy,
+        request_id: &str,
+        peer_ip: IpAddr,
+        request: &Request<B>,
+    ) -> Self {
+        let sensitive_header_presence = sensitive
+            .names()
+            .iter()
+            .filter(|name| request.headers().contains_key(name.as_str()))
+            .cloned()
+            .collect();
+        Self {
+            target,
+            level,
+            request_id: StableId::new(request_id)
+                .expect("product request identifiers are checked at construction"),
+            method: HttpMethod::new(request.method().as_str()).ok(),
+            url: None,
+            peer_ip,
+            sensitive_header_presence,
+        }
+    }
+
+    fn bind_url(&mut self, url: &http_access_types::CanonicalUrl) {
+        self.url = Some(url.clone());
+    }
+
+    fn submit_deny(self, category: DecisionReasonCategory, code: u16) {
+        let source = DecisionAuditSource::Local(DecisionReason::new(category, code));
+        let facts = DecisionAuditFacts::new(DecisionAuditFactsInput {
+            request_id: &self.request_id,
+            disposition: DecisionDisposition::Deny,
+            method: self.method.as_ref(),
+            url: self.url.as_ref(),
+            peer_ip: Some(self.peer_ip),
+            source: &source,
+            sensitive_header_presence: &self.sensitive_header_presence,
+        })
+        .expect("ingress denial facts contain only checked product values");
+        let mut pending = PendingDecisionSubmission::new(self.target, self.level, facts);
+        pending.submit_now();
+    }
+}
+
 struct ConnectRequestExecution {
     config: IngressListenerConfig,
     peer: SocketAddr,
@@ -1405,7 +1499,8 @@ impl StandaloneTerminalService for StandaloneConnectTerminal {
         })
     }
 
-    fn respond(self, dispatch: StandaloneResponseDispatch) -> BoxFuture<'static, Self::Output> {
+    fn respond(self, mut dispatch: StandaloneResponseDispatch) -> BoxFuture<'static, Self::Output> {
+        dispatch.decision.submit_now();
         Box::pin(async move {
             let status = StatusCode::from_u16(dispatch.response.status())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -1440,6 +1535,7 @@ async fn execute_connect_terminal(
         resolved: _,
         sidecar,
         transport,
+        mut decision,
     } = dispatch;
     let StandaloneIngressTransport::OuterConnect {
         protocol,
@@ -1455,6 +1551,7 @@ async fn execute_connect_terminal(
     {
         return HandledResponse::fixed(StatusCode::INTERNAL_SERVER_ERROR, "request failed\n", true);
     }
+    decision.submit_now();
     drop((exchange, sidecar, retention, services));
 
     let Some(manager) = terminal.assets.mitm().cloned() else {
@@ -1553,16 +1650,34 @@ async fn execute_connect_request(
         .authority
         .ingress_mode()
         .expect("outer CONNECT is only dispatched on an explicit listener");
+    let request_id = request_id();
+    let started_at = Instant::now();
+    let Some(lease) = runtime.lease().await else {
+        return HandledResponse::fixed(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service unavailable\n",
+            true,
+        );
+    };
+    let mut decision_audit = PreProviderDecisionAudit::new(
+        observation_runtime.clone().into(),
+        &lease,
+        &request_id,
+        peer.ip(),
+        &request,
+    );
     let target = match reconcile_connect_outer_request(&mut request) {
         Ok(target) => target,
         Err(_) => {
+            decision_audit.submit_deny(DecisionReasonCategory::InvalidPlan, 400);
             return HandledResponse::fixed(
                 StatusCode::BAD_REQUEST,
                 "invalid CONNECT target\n",
                 true,
-            )
+            );
         }
     };
+    decision_audit.bind_url(target.url());
     let listener_denied = match request.version() {
         Version::HTTP_10 | Version::HTTP_11 => config.connect_http1_denied,
         _ => None,
@@ -1570,7 +1685,8 @@ async fn execute_connect_request(
     let listener_denied = match listener_denied {
         Some(denied) => denied,
         None => {
-            return HandledResponse::fixed(StatusCode::BAD_REQUEST, "CONNECT unsupported\n", true)
+            decision_audit.submit_deny(DecisionReasonCategory::InvalidPlan, 400);
+            return HandledResponse::fixed(StatusCode::BAD_REQUEST, "CONNECT unsupported\n", true);
         }
     };
     let validated = match validate_standalone_connect_ingress_request(
@@ -1580,22 +1696,14 @@ async fn execute_connect_request(
     ) {
         Ok(validated) => validated,
         Err(_) => {
+            decision_audit.submit_deny(DecisionReasonCategory::InvalidPlan, 400);
             return HandledResponse::fixed(
                 StatusCode::BAD_REQUEST,
                 "invalid CONNECT request\n",
                 true,
-            )
+            );
         }
     };
-    let Some(lease) = runtime.lease().await else {
-        return HandledResponse::fixed(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "service unavailable\n",
-            true,
-        );
-    };
-    let request_id = request_id();
-    let started_at = Instant::now();
     let preflight_target = match preflight_forwarding_target(
         target.url(),
         validated.ingress().sanitized(),
@@ -1604,7 +1712,8 @@ async fn execute_connect_request(
     ) {
         Ok(target) => target,
         Err(_) => {
-            return HandledResponse::fixed(StatusCode::FORBIDDEN, "destination denied\n", true)
+            decision_audit.submit_deny(DecisionReasonCategory::InvalidPlan, 403);
+            return HandledResponse::fixed(StatusCode::FORBIDDEN, "destination denied\n", true);
         }
     };
     let terminal = StandaloneConnectTerminal {
@@ -1613,7 +1722,7 @@ async fn execute_connect_request(
         peer,
         quota_key: quota_key.clone(),
         runtime,
-        observation_runtime,
+        observation_runtime: observation_runtime.clone(),
         upgrade_runtime,
         assets: assets.clone(),
         tunnel_tx,
@@ -1631,15 +1740,17 @@ async fn execute_connect_request(
         destinations: assets.destination_guard().clone(),
         clock: TokioRuntimeClock::new(started_at),
         listener_denied,
+        decision_target: observation_runtime.into(),
     };
     let (provider, request) = match StandalonePolicyProvider::prepare(lease, terminal, input) {
         Ok(prepared) => prepared,
         Err(_) => {
+            decision_audit.submit_deny(DecisionReasonCategory::InvalidPlan, 500);
             return HandledResponse::fixed(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "request failed\n",
                 true,
-            )
+            );
         }
     };
     RequestPipeline::new().execute(provider, request).await
@@ -1658,11 +1769,12 @@ fn connect_alpn_protocols(versions: &[CompiledHttpVersion]) -> Vec<Vec<u8>> {
 pub(super) struct HttpCaptureContext {
     runtime: Arc<ProductObservationRuntime>,
     epoch: Arc<CaptureEpoch>,
+    sensitive_headers: SensitiveHeaderPolicy,
     request_id: String,
-    url: String,
+    url: Option<SinkSafeUrl>,
+    canonical_url: Option<http_access_url::CanonicalUrl>,
     method: Method,
     client: SocketAddr,
-    target: Option<CaptureEndpoint>,
     ingress_mode: IngressMode,
     request_version: Version,
     max_expansion_ratio: usize,
@@ -1682,9 +1794,11 @@ struct DeniedCaptureBody {
 }
 
 impl HttpCaptureContext {
+    #[allow(clippy::too_many_arguments)]
     fn new<B>(
         runtime: Arc<ProductObservationRuntime>,
         epoch: Arc<CaptureEpoch>,
+        sensitive_headers: SensitiveHeaderPolicy,
         request_id: String,
         peer: SocketAddr,
         request: &Request<B>,
@@ -1694,11 +1808,12 @@ impl HttpCaptureContext {
         Self {
             runtime,
             epoch,
+            sensitive_headers,
             request_id,
-            url: String::new(),
+            url: None,
+            canonical_url: None,
             method: request.method().clone(),
             client: peer,
-            target: None,
             ingress_mode,
             request_version: request.version(),
             max_expansion_ratio,
@@ -1709,30 +1824,30 @@ impl HttpCaptureContext {
         if !self.epoch.is_enabled() {
             return;
         }
-        self.url = target.as_str().to_owned();
-        self.target = Some(CaptureEndpoint {
-            address: Some(target.authority().host().authority_form()),
-            port: Some(target.authority().effective_port()),
-        });
+        self.url = Some(SinkSafeUrl::from_canonical(target));
+        self.canonical_url = Some(target.clone());
     }
 
     pub(super) fn upgrade_capture_context(
         &self,
         target: &http_access_url::CanonicalUrl,
     ) -> UpgradeCaptureContext {
-        let mut base = self.request_record(CaptureDecision::Allow, None);
-        base.url = target.as_str().to_owned();
-        base.target = Some(CaptureEndpoint {
-            address: Some(target.authority().host().authority_form()),
-            port: Some(target.authority().effective_port()),
-        });
+        let base = self.record(
+            CaptureKind::Request,
+            CaptureDecision::Allow,
+            self.request_version,
+            None,
+            None,
+            false,
+            Some(target),
+        );
         UpgradeCaptureContext::new(self.runtime.clone(), base, self.max_expansion_ratio)
     }
 
     pub(super) fn begin(
         &self,
         event: CaptureEvent,
-        record: impl FnOnce() -> CaptureRecord,
+        record: impl FnOnce() -> SanitizedCaptureMetadata,
         body_headers: &HeaderMap,
     ) -> Option<CaptureSubmission> {
         HttpCaptureTap::try_begin(
@@ -1755,7 +1870,7 @@ impl HttpCaptureContext {
         &self,
         decision: CaptureDecision,
         headers: Option<&HeaderMap>,
-    ) -> CaptureRecord {
+    ) -> SanitizedCaptureMetadata {
         self.record(
             CaptureKind::Request,
             decision,
@@ -1763,6 +1878,7 @@ impl HttpCaptureContext {
             headers,
             None,
             false,
+            self.canonical_url.as_ref(),
         )
     }
 
@@ -1773,7 +1889,7 @@ impl HttpCaptureContext {
         headers: Option<&HeaderMap>,
         status: StatusCode,
         include_status_message: bool,
-    ) -> CaptureRecord {
+    ) -> SanitizedCaptureMetadata {
         self.record(
             CaptureKind::Response,
             decision,
@@ -1781,9 +1897,11 @@ impl HttpCaptureContext {
             headers,
             Some(status),
             include_status_message,
+            self.canonical_url.as_ref(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn record(
         &self,
         kind: CaptureKind,
@@ -1792,35 +1910,55 @@ impl HttpCaptureContext {
         headers: Option<&HeaderMap>,
         status: Option<StatusCode>,
         include_status_message: bool,
-    ) -> CaptureRecord {
-        CaptureRecord {
-            timestamp: Utc::now().to_rfc3339(),
-            request_id: self.request_id.clone(),
-            kind,
-            decision,
-            mode: CaptureMode::for_ingress(self.ingress_mode),
-            url: self.url.clone(),
-            method: self.method.to_string(),
-            status_code: status.map(|status| status.as_u16()),
-            status_message: if include_status_message {
-                status
-                    .and_then(|status| status.canonical_reason())
-                    .map(str::to_owned)
-            } else {
-                None
+        canonical_url: Option<&http_access_url::CanonicalUrl>,
+    ) -> SanitizedCaptureMetadata {
+        let event = match (kind, decision) {
+            (CaptureKind::Request, CaptureDecision::Allow) => CaptureEvent::RequestAllowed,
+            (CaptureKind::Response, CaptureDecision::Allow) => CaptureEvent::ResponseAllowed,
+            (CaptureKind::Request, CaptureDecision::Deny) => CaptureEvent::RequestDenied,
+            (CaptureKind::Response, CaptureDecision::Deny) => CaptureEvent::ResponseDenied,
+        };
+        let request_id = StableId::new(&self.request_id)
+            .expect("product request identifiers are stable identifiers");
+        let method = crate::proxy::facts::http_method(&self.method).ok();
+        let sanitized_headers = headers
+            .map(|headers| sanitize_capture_headers(headers, &self.sensitive_headers))
+            .unwrap_or_default();
+        let facts = CaptureFacts::new(
+            &self.sensitive_headers,
+            CaptureFactsInput {
+                request_id: &request_id,
+                event,
+                ingress_mode: self.ingress_mode,
+                method: method.as_ref(),
+                url: canonical_url,
+                client_ip: Some(self.client.ip()),
+                target: canonical_url.map(http_access_url::CanonicalUrl::authority),
+                version: crate::proxy::facts::http_version(version).ok(),
+                status: status.map(|status| status.as_u16()),
+                headers: &sanitized_headers,
             },
-            client: CaptureEndpoint {
-                address: Some(self.client.ip().to_string()),
-                port: Some(self.client.port()),
-            },
-            target: self.target.clone(),
-            http_version: Some(http_version(version).to_owned()),
-            headers: headers.map(headers_to_capture_map),
-            body: None,
-            body_truncated: None,
-            provider_replacement_omitted: None,
-            provider_replacement_size: None,
+        )
+        .expect("validated capture metadata satisfies shared bounds");
+        if canonical_url == self.canonical_url.as_ref() {
+            debug_assert_eq!(
+                facts.url().map(http_access_types::SinkSafeUrl::as_str),
+                self.url.as_ref().map(SinkSafeUrl::as_str)
+            );
         }
+        SanitizedCaptureMetadata::from_facts(
+            facts,
+            Utc::now().to_rfc3339(),
+            Some(self.client.port()),
+            headers.is_some(),
+            include_status_message
+                .then(|| {
+                    status
+                        .and_then(|status| status.canonical_reason())
+                        .map(str::to_owned)
+                })
+                .flatten(),
+        )
     }
 
     pub(super) fn begin_allowed_request(
@@ -1987,45 +2125,26 @@ impl Drop for CaptureSubmission {
     }
 }
 
-fn headers_to_capture_map(headers: &HeaderMap) -> crate::capture::HeaderMap {
-    let mut captured = crate::capture::HeaderMap::new();
+fn sanitize_capture_headers(
+    headers: &HeaderMap,
+    sensitive_headers: &SensitiveHeaderPolicy,
+) -> Vec<SanitizedHeaderField> {
+    let mut captured = Vec::with_capacity(headers.len());
     for (name, value) in headers {
         let name = name.as_str().to_ascii_lowercase();
-        let value = if is_sensitive_header_name(&name) {
-            serde_json::Value::String(REDACTED.to_owned())
-        } else if let Ok(value) = value.to_str() {
-            serde_json::Value::String(value.to_owned())
+        let neutral_name = NeutralHeaderName::new(name.as_str())
+            .expect("http header names are canonical neutral header names");
+        let field = if sensitive_headers.contains(&neutral_name) {
+            SanitizedHeaderField::redacted(neutral_name)
         } else {
-            continue;
+            let neutral_value = NeutralHeaderValue::new(value.as_bytes().to_vec())
+                .expect("http header values are valid neutral header values");
+            SanitizedHeaderField::visible(sensitive_headers, neutral_name, neutral_value)
+                .expect("non-sensitive header classification remains non-sensitive")
         };
-        match captured.entry(name) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(value);
-            }
-            std::collections::btree_map::Entry::Occupied(mut entry) => match entry.get_mut() {
-                serde_json::Value::String(existing) => {
-                    *entry.get_mut() = serde_json::Value::Array(vec![
-                        serde_json::Value::String(existing.clone()),
-                        value,
-                    ]);
-                }
-                serde_json::Value::Array(values) => values.push(value),
-                _ => unreachable!("capture headers contain only strings and string arrays"),
-            },
-        }
+        captured.push(field);
     }
     captured
-}
-
-fn http_version(version: Version) -> &'static str {
-    match version {
-        Version::HTTP_09 => "0.9",
-        Version::HTTP_10 => "1.0",
-        Version::HTTP_11 => "1.1",
-        Version::HTTP_2 => "2",
-        Version::HTTP_3 => "3",
-        _ => "unknown",
-    }
 }
 
 struct RequestExecution {
@@ -2057,7 +2176,8 @@ impl StandaloneTerminalService for StandaloneHttpTerminal {
         })
     }
 
-    fn respond(self, dispatch: StandaloneResponseDispatch) -> BoxFuture<'static, Self::Output> {
+    fn respond(self, mut dispatch: StandaloneResponseDispatch) -> BoxFuture<'static, Self::Output> {
+        dispatch.decision.submit_now();
         Box::pin(async move {
             let status = StatusCode::from_u16(dispatch.response.status())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -2181,9 +2301,17 @@ async fn execute_request_via_pipeline(
             true,
         );
     };
+    let mut decision_audit = PreProviderDecisionAudit::new(
+        observation_runtime.clone().into(),
+        &lease,
+        &request_id,
+        peer.ip(),
+        &request,
+    );
     let mut capture = HttpCaptureContext::new(
-        observation_runtime,
+        observation_runtime.clone(),
         lease.observation().capture_epoch().clone(),
+        lease.standalone().sensitive_header_policy().clone(),
         request_id.clone(),
         peer,
         &request,
@@ -2211,23 +2339,26 @@ async fn execute_request_via_pipeline(
     ) {
         Ok(target) => target,
         Err(_) => {
+            decision_audit.submit_deny(DecisionReasonCategory::InvalidPlan, 400);
             return capture.deny_metadata_only(
                 StatusCode::BAD_REQUEST,
                 "invalid request target\n",
                 true,
-            )
+            );
         }
     };
+    decision_audit.bind_url(target.url());
     capture.bind_target(target.url());
     let validated =
         match validate_standalone_ingress_request(ingress_mode, target.url().clone(), request) {
             Ok(validated) => validated,
             Err(_) => {
+                decision_audit.submit_deny(DecisionReasonCategory::InvalidPlan, 400);
                 return capture.deny_metadata_only(
                     StatusCode::BAD_REQUEST,
                     "invalid request\n",
                     true,
-                )
+                );
             }
         };
     let preflight_target = match preflight_forwarding_target(
@@ -2238,7 +2369,8 @@ async fn execute_request_via_pipeline(
     ) {
         Ok(target) => target,
         Err(_) => {
-            return capture.deny_metadata_only(StatusCode::FORBIDDEN, "destination denied\n", true)
+            decision_audit.submit_deny(DecisionReasonCategory::InvalidPlan, 403);
+            return capture.deny_metadata_only(StatusCode::FORBIDDEN, "destination denied\n", true);
         }
     };
     let terminal = StandaloneHttpTerminal {
@@ -2255,15 +2387,17 @@ async fn execute_request_via_pipeline(
         destinations: assets.destination_guard().clone(),
         clock: TokioRuntimeClock::new(started_at),
         listener_denied: false,
+        decision_target: observation_runtime.into(),
     };
     let (provider, request) = match StandalonePolicyProvider::prepare(lease, terminal, input) {
         Ok(prepared) => prepared,
         Err(_) => {
+            decision_audit.submit_deny(DecisionReasonCategory::InvalidPlan, 500);
             return HandledResponse::fixed(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "request failed\n",
                 true,
-            )
+            );
         }
     };
     RequestPipeline::new().execute(provider, request).await
@@ -2604,6 +2738,7 @@ mod tests {
 
     use super::*;
     use crate::activation::runner::ProductRuntime;
+    use crate::capture::CaptureRecord;
     use crate::config::{compile_config_text, load_and_compile_exact_config, ConfigTextInput};
     use crate::destination::{
         DestinationFacts, DestinationGuard, DestinationResolveError, DestinationResolver,
@@ -2669,6 +2804,65 @@ mod tests {
         for (authority, expected) in cases {
             assert_eq!(authority.ingress_mode(), expected);
         }
+    }
+
+    #[test]
+    fn pre_provider_denials_submit_one_checked_fact_per_failure_boundary() {
+        let policy = SensitiveHeaderPolicy::new([], [], []).unwrap();
+        let request = Request::builder()
+            .method(Method::from_bytes(b"lowercase").unwrap())
+            .uri("/")
+            .header("authorization", "never-copied")
+            .header("cookie", "session=never-copied")
+            .body(())
+            .unwrap();
+        let submissions = Arc::new(StdMutex::new(Vec::new()));
+        let target = DecisionSubmissionTarget::FactsProbe(submissions.clone());
+
+        PreProviderDecisionAudit::from_policy(
+            target.clone(),
+            Some(CompiledDecisionLogLevel::Warn),
+            &policy,
+            "pre-normalization",
+            "192.0.2.10".parse().unwrap(),
+            &request,
+        )
+        .submit_deny(DecisionReasonCategory::InvalidPlan, 400);
+
+        let canonical =
+            http_access_url::canonicalize_http_url("https://example.test/path").unwrap();
+        for (request_id, code) in [("validation", 400), ("preflight", 403), ("prepare", 500)] {
+            let mut audit = PreProviderDecisionAudit::from_policy(
+                target.clone(),
+                Some(CompiledDecisionLogLevel::Warn),
+                &policy,
+                request_id,
+                "192.0.2.10".parse().unwrap(),
+                &request,
+            );
+            audit.bind_url(&canonical);
+            audit.submit_deny(DecisionReasonCategory::InvalidPlan, code);
+        }
+
+        let facts = submissions.lock().unwrap();
+        assert_eq!(facts.len(), 4);
+        assert!(facts[0].method().is_none());
+        assert!(facts[0].url().is_none());
+        assert_eq!(
+            facts[0].sensitive_header_presence(),
+            &[
+                NeutralHeaderName::new("authorization").unwrap(),
+                NeutralHeaderName::new("cookie").unwrap(),
+            ]
+        );
+        assert!(facts[1..].iter().all(|fact| fact.url().is_some()));
+        assert_eq!(
+            facts
+                .iter()
+                .map(|fact| fact.reason().code())
+                .collect::<Vec<_>>(),
+            vec![400, 400, 403, 500]
+        );
     }
 
     async fn product(

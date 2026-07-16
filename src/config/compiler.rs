@@ -247,17 +247,17 @@ pub(crate) enum StaticMitmConfig {
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct StaticLoggingConfig {
-    pub(crate) level: CompiledLogLevel,
     pub(crate) directory: Option<PathBuf>,
     pub(crate) max_bytes: u64,
     pub(crate) max_files: usize,
     pub(crate) console: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) enum CompiledLogLevel {
     Trace,
     Debug,
+    #[default]
     Info,
     Warn,
     Error,
@@ -910,9 +910,50 @@ pub(crate) enum CompiledRedactionPayloads {
     Both,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct ObservationPlan {
+    pub(crate) logging: ReloadableLoggingPlan,
     pub(crate) capture: Option<CapturePlan>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReloadableLoggingPlan {
+    pub(crate) level: CompiledLogLevel,
+    pub(crate) policy_decisions: PolicyDecisionLoggingPlan,
+}
+
+impl Default for ReloadableLoggingPlan {
+    fn default() -> Self {
+        Self {
+            level: CompiledLogLevel::Info,
+            policy_decisions: PolicyDecisionLoggingPlan::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PolicyDecisionLoggingPlan {
+    pub(crate) allows: bool,
+    pub(crate) denies: bool,
+    pub(crate) allow_level: CompiledDecisionLogLevel,
+    pub(crate) deny_level: CompiledDecisionLogLevel,
+}
+
+impl Default for PolicyDecisionLoggingPlan {
+    fn default() -> Self {
+        Self {
+            allows: false,
+            denies: true,
+            allow_level: CompiledDecisionLogLevel::Info,
+            deny_level: CompiledDecisionLogLevel::Warn,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompiledDecisionLogLevel {
+    Info,
+    Warn,
 }
 
 #[derive(Clone)]
@@ -3509,6 +3550,14 @@ fn validate_logging_capture_limits(
         MAX_LOG_FILES,
     )?;
     compile_log_level(&logging.level, "observation.logging.level")?;
+    compile_decision_log_level(
+        &logging.policy_decisions.allow_level,
+        "observation.logging.policy_decisions.allow_level",
+    )?;
+    compile_decision_log_level(
+        &logging.policy_decisions.deny_level,
+        "observation.logging.policy_decisions.deny_level",
+    )?;
     if let Some(capture) = &config.observation.capture {
         check_range(
             "observation.capture.max_body_bytes",
@@ -5681,6 +5730,21 @@ fn compile_observation_plan(
     capture_working_set: Option<CaptureWorkingSetPlan>,
 ) -> Result<ObservationPlan, ConfigCompileError> {
     Ok(ObservationPlan {
+        logging: ReloadableLoggingPlan {
+            level: compile_log_level(&value.logging.level, "observation.logging.level")?,
+            policy_decisions: PolicyDecisionLoggingPlan {
+                allows: value.logging.policy_decisions.allows,
+                denies: value.logging.policy_decisions.denies,
+                allow_level: compile_decision_log_level(
+                    &value.logging.policy_decisions.allow_level,
+                    "observation.logging.policy_decisions.allow_level",
+                )?,
+                deny_level: compile_decision_log_level(
+                    &value.logging.policy_decisions.deny_level,
+                    "observation.logging.policy_decisions.deny_level",
+                )?,
+            },
+        },
         capture: value.capture.as_ref().map(|capture| {
             compile_capture_plan(
                 capture,
@@ -5688,6 +5752,17 @@ fn compile_observation_plan(
             )
         }),
     })
+}
+
+fn compile_decision_log_level(
+    value: &str,
+    path: &str,
+) -> Result<CompiledDecisionLogLevel, ConfigCompileError> {
+    match value {
+        "info" => Ok(CompiledDecisionLogLevel::Info),
+        "warn" => Ok(CompiledDecisionLogLevel::Warn),
+        _ => Err(ConfigCompileError::at(path, "must be info or warn")),
+    }
 }
 
 fn compile_log_level(value: &str, path: &str) -> Result<CompiledLogLevel, ConfigCompileError> {
@@ -5809,10 +5884,6 @@ fn compile_static_config(
             .as_ref()
             .map(|callback| callback.public_url.clone()),
         logging: StaticLoggingConfig {
-            level: compile_log_level(
-                &config.observation.logging.level,
-                "observation.logging.level",
-            )?,
             directory: config.observation.logging.directory.clone(),
             max_bytes: config.observation.logging.max_bytes,
             max_files: config.observation.logging.max_files,
@@ -8156,7 +8227,12 @@ filename = "{{requestId}}-{{suffix}}.json"
             ),
             format!("redaction={}", plan.redaction.profiles.len()),
             format!(
-                "observation={}:{}",
+                "observation={:?}:{}:{}:{:?}:{:?}:{}:{}",
+                plan.observation.logging.level,
+                plan.observation.logging.policy_decisions.allows,
+                plan.observation.logging.policy_decisions.denies,
+                plan.observation.logging.policy_decisions.allow_level,
+                plan.observation.logging.policy_decisions.deny_level,
                 plan.observation.capture.is_some(),
                 plan.observation
                     .capture
@@ -8316,6 +8392,53 @@ max_total_bytes = 16384
     }
 
     #[test]
+    fn policy_decision_logging_defaults_and_levels_compile_exactly() {
+        let defaults = compile(MINIMAL).unwrap();
+        assert_eq!(
+            defaults.reloadable_plan.observation.logging,
+            ReloadableLoggingPlan {
+                level: CompiledLogLevel::Info,
+                policy_decisions: PolicyDecisionLoggingPlan {
+                    allows: false,
+                    denies: true,
+                    allow_level: CompiledDecisionLogLevel::Info,
+                    deny_level: CompiledDecisionLogLevel::Warn,
+                },
+            }
+        );
+
+        let explicit = compile(&format!(
+            "{MINIMAL}\n[observation.logging.policy_decisions]\nallows = true\ndenies = false\nallow_level = \"warn\"\ndeny_level = \"info\"\n"
+        ))
+        .unwrap();
+        assert_eq!(
+            explicit
+                .reloadable_plan
+                .observation
+                .logging
+                .policy_decisions,
+            PolicyDecisionLoggingPlan {
+                allows: true,
+                denies: false,
+                allow_level: CompiledDecisionLogLevel::Warn,
+                deny_level: CompiledDecisionLogLevel::Info,
+            }
+        );
+
+        for (field, invalid) in [("allow_level", "debug"), ("deny_level", "error")] {
+            let error = compile(&format!(
+                "{MINIMAL}\n[observation.logging.policy_decisions]\n{field} = \"{invalid}\"\n"
+            ))
+            .unwrap_err();
+            assert_eq!(
+                error.path,
+                format!("observation.logging.policy_decisions.{field}")
+            );
+            assert_eq!(error.message, "must be info or warn");
+        }
+    }
+
+    #[test]
     fn static_and_reloadable_ownership_controls_the_fingerprint() {
         let callback = MINIMAL.replace(
             "[policy]",
@@ -8372,12 +8495,12 @@ console = false
 
         let log_level_changed =
             compile(&callback.replace("level = \"info\"", "level = \"debug\"")).unwrap();
-        assert_ne!(
+        assert_eq!(
             baseline.static_fingerprint,
             log_level_changed.static_fingerprint
         );
         assert_eq!(
-            log_level_changed.static_config.logging.level,
+            log_level_changed.reloadable_plan.observation.logging.level,
             CompiledLogLevel::Debug
         );
     }
@@ -8492,7 +8615,6 @@ header = "x-acl-proxy-request-id"
             ("logging rotation bytes", baseline.replace("max_bytes = 104857600", "max_bytes = 104857601")),
             ("logging rotation files", baseline.replace("max_files = 5", "max_files = 6")),
             ("logging console", baseline.replace("console = true", "console = false")),
-            ("logging level", baseline.replace("level = \"info\"", "level = \"debug\"")),
         ];
         for (name, mutation) in static_mutations {
             let compiled = compile(&mutation)
@@ -8513,6 +8635,11 @@ header = "x-acl-proxy-request-id"
             ("webhook request limit", baseline.replace("max_request_bytes = 65536", "max_request_bytes = 65535")),
             ("webhook response limit", baseline.replace("max_response_bytes = 65536", "max_response_bytes = 65535")),
             ("loop header", baseline.replace("x-acl-proxy-request-id", "x-acl-proxy-next-id")),
+            ("logging level", baseline.replace("level = \"info\"", "level = \"debug\"")),
+            ("policy decision logging", baseline.replace(
+                "console = true",
+                "console = true\n\n[observation.logging.policy_decisions]\nallows = true\ndenies = false\nallow_level = \"warn\"\ndeny_level = \"info\"",
+            )),
             ("policy rules", baseline.replace(
                 "[observation.logging]",
                 "[[policy.rules]]\nid = \"health\"\ndecision = \"allow\"\nmethods = [\"GET\"]\n\n[observation.logging]",

@@ -307,6 +307,28 @@ payloads = "text"
 Every listed environment variable is required during activation and reload.
 Its name and value are excluded from dumps, logs, captures, and diagnostics.
 
+Policy decision logging is reloadable with the observation snapshot. Decision
+events are disabled for allows and enabled for denies by default; their event
+levels accept only `info` or `warn`.
+
+```toml
+[observation.logging.policy_decisions]
+allows = false
+denies = true
+allow_level = "info"
+deny_level = "warn"
+```
+
+Each selected final decision is submitted without waiting to a bounded static
+INFO or WARN worker. The structured target is `acl_proxy::policy`, the message
+is `policy decision`, and the fields are `request_id`, `allowed`, sink-safe
+`url`, `method`, `client_ip`, `generation`, `effective_policy`,
+`reason_category`, `reason_code`, `trace_id`, and
+`sensitive_header_presence`. Missing pre-policy fields are empty;
+`effective_policy` is `default` or `<rule-id>#<zero-based-ordinal>`. Sensitive
+header presence is canonical, sorted, comma-separated names without values.
+Queue saturation, closure, or sink failure only omits the operational event.
+
 Capture is optional and bounded. It requires a redaction profile:
 
 ```toml

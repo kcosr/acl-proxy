@@ -8,13 +8,13 @@ use crate::authorization::callback::PendingTerminalCause;
 use crate::authorization::webhook::runtime::{
     WebhookAuthorizationRuntime, WebhookAuthorizationRuntimeError,
 };
-use crate::capture::CaptureWorkerStartError;
 use crate::config::{StaticFingerprint, StaticFingerprintError, StaticProductConfig};
 use crate::control::server::{
     ControlServer, ControlServerError, ControlServerFailureObserver, ControlServerRunError,
     ControlServerShutdownError,
 };
-use crate::observation::ProductObservationRuntime;
+use crate::logging::{process_logging_level_control, LoggingLevelControl};
+use crate::observation::{ProductObservationRuntime, ProductObservationRuntimeStartError};
 use crate::runtime::{BoxFuture, ServiceReadiness, StaticResourceBrand, StaticResources};
 use crate::safety::WireBodyPool;
 use crate::upgrade::{UpgradeRuntime, UpgradeRuntimeError, UpgradeRuntimeLimits};
@@ -50,6 +50,7 @@ pub(crate) struct ProductStaticResources {
     control: Mutex<ControlOwnership>,
     wire_body_pool: Arc<WireBodyPool>,
     observation_runtime: Arc<ProductObservationRuntime>,
+    logging_level: LoggingLevelControl,
     authorization_runtime: Arc<WebhookAuthorizationRuntime>,
     upgrade_runtime: Arc<UpgradeRuntime>,
 }
@@ -120,6 +121,7 @@ impl ProductStaticResources {
             static_config.service.max_upgrade_lifetime,
         ))?;
         let static_fingerprint = StaticFingerprint::from_config(static_config)?;
+        let logging_level = process_logging_level_control();
         // Start the process-owned worker last so construction cannot return an
         // error after a worker thread has been created.
         let observation_runtime = Arc::new(ProductObservationRuntime::try_new(
@@ -156,6 +158,7 @@ impl ProductStaticResources {
                     .max_inflight_wire_body_bytes_per_quota_key,
             ),
             observation_runtime,
+            logging_level,
             authorization_runtime,
             upgrade_runtime,
         }))
@@ -175,6 +178,10 @@ impl ProductStaticResources {
 
     pub(crate) fn observation_runtime(&self) -> Arc<ProductObservationRuntime> {
         self.observation_runtime.clone()
+    }
+
+    pub(crate) fn logging_level(&self) -> LoggingLevelControl {
+        self.logging_level.clone()
     }
 
     pub(crate) fn authorization_runtime(&self) -> Arc<WebhookAuthorizationRuntime> {
@@ -664,8 +671,8 @@ pub(crate) enum ProductStaticResourcesError {
     Authorization(#[from] WebhookAuthorizationRuntimeError),
     #[error("static upgrade runtime construction failed")]
     Upgrade(#[from] UpgradeRuntimeError),
-    #[error("static capture worker construction failed")]
-    CaptureWorker(#[from] CaptureWorkerStartError),
+    #[error("static observation runtime construction failed")]
+    Observation(#[from] ProductObservationRuntimeStartError),
     #[error("control server construction failed")]
     Control(#[from] ControlServerError),
     #[error(transparent)]

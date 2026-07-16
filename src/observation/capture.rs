@@ -556,6 +556,7 @@ mod tests {
                     max_inflight_body_bytes: limit,
                     working_set: CaptureWorkingSetPlan::default(),
                 }),
+                ..ObservationPlan::default()
             },
             &redaction,
             pool,

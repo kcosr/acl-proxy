@@ -17,7 +17,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
-use crate::capture::{CaptureArtifactJob, CaptureKind, CaptureRecord};
+use crate::capture::{CaptureArtifactJob, CaptureKind, SanitizedCaptureMetadata};
 use crate::observation::{CaptureBodyBuilder, CaptureEvent, ProductObservationRuntime};
 use crate::redaction::{PayloadClass, ProfileHandle};
 use crate::upgrade::{UpgradeRelayPair, UpgradeTerminalCause, UpgradedStreamSnapshot};
@@ -122,7 +122,7 @@ impl EstablishedUpgradeKind {
 #[derive(Clone)]
 pub(crate) struct UpgradeCaptureContext {
     runtime: Arc<ProductObservationRuntime>,
-    base: CaptureRecord,
+    base: SanitizedCaptureMetadata,
     max_expansion_ratio: usize,
     request_sequence: Arc<AtomicU64>,
     response_sequence: Arc<AtomicU64>,
@@ -131,17 +131,12 @@ pub(crate) struct UpgradeCaptureContext {
 impl UpgradeCaptureContext {
     pub(crate) fn new(
         runtime: Arc<ProductObservationRuntime>,
-        mut base: CaptureRecord,
+        base: SanitizedCaptureMetadata,
         max_expansion_ratio: usize,
     ) -> Self {
-        base.headers = None;
-        base.body = None;
-        base.body_truncated = None;
-        base.provider_replacement_omitted = None;
-        base.provider_replacement_size = None;
         Self {
             runtime,
-            base,
+            base: base.without_headers(),
             max_expansion_ratio,
             request_sequence: Arc::new(AtomicU64::new(0)),
             response_sequence: Arc::new(AtomicU64::new(0)),
@@ -172,12 +167,9 @@ impl UpgradeCaptureContext {
         let policy = epoch.capture()?;
         let operation = policy.try_admit(event)?;
         let limits = policy.profile().limits();
-        let mut metadata = self.base.clone();
-        metadata.timestamp = Utc::now().to_rfc3339();
-        metadata.request_id = format!("{}-ws-{label}-{sequence}", self.base.request_id);
-        metadata.kind = kind;
-        metadata.status_code = None;
-        metadata.status_message = None;
+        let metadata =
+            self.base
+                .for_websocket_message(Utc::now().to_rfc3339(), label, sequence, kind);
         let job = CaptureArtifactJob::begin_admitted(
             epoch,
             operation,
@@ -1703,7 +1695,9 @@ mod tests {
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     use super::*;
-    use crate::capture::{CaptureDecision, CaptureEndpoint, CaptureMode, CaptureSinkSpec};
+    use crate::capture::{
+        CaptureDecision, CaptureEndpoint, CaptureMode, CaptureRecord, CaptureSinkSpec,
+    };
     use crate::config::compiler::{
         CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledRedactionPayloads,
         ObservationPlan, RedactionPlan, RedactionProfilePlan, RedactionRulePlan,
@@ -1801,6 +1795,7 @@ mod tests {
                         max_inflight_body_bytes: limit,
                         working_set: CaptureWorkingSetPlan::default(),
                     }),
+                    ..ObservationPlan::default()
                 },
                 &redaction,
             )
@@ -1813,7 +1808,7 @@ mod tests {
     fn upgrade_capture_context(runtime: Arc<ProductObservationRuntime>) -> UpgradeCaptureContext {
         UpgradeCaptureContext::new(
             runtime,
-            CaptureRecord {
+            SanitizedCaptureMetadata::from_test_record(CaptureRecord {
                 timestamp: "not-retained".to_owned(),
                 request_id: "upgrade".to_owned(),
                 kind: CaptureKind::Request,
@@ -1837,7 +1832,7 @@ mod tests {
                 body_truncated: None,
                 provider_replacement_omitted: None,
                 provider_replacement_size: None,
-            },
+            }),
             16,
         )
     }

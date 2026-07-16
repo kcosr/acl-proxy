@@ -3,7 +3,7 @@ use std::sync::Arc;
 use http::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use http::HeaderMap;
 
-use super::{CaptureArtifactJob, CaptureRecord};
+use super::{CaptureArtifactJob, SanitizedCaptureMetadata};
 use crate::http_body::{parse_capture_content_encoding, CaptureContentEncoding};
 use crate::observation::{CaptureBodyBuilder, CaptureEpoch, CaptureEvent};
 
@@ -22,7 +22,7 @@ impl HttpCaptureTap {
     pub(crate) fn try_begin(
         epoch: Arc<CaptureEpoch>,
         event: CaptureEvent,
-        metadata: impl FnOnce() -> CaptureRecord,
+        metadata: impl FnOnce() -> SanitizedCaptureMetadata,
         headers: &HeaderMap,
         max_expansion_ratio: usize,
     ) -> Option<Self> {
@@ -113,7 +113,7 @@ mod tests {
     use super::*;
     use crate::capture::{
         CaptureArtifactPayload, CaptureDecision, CaptureEndpoint, CaptureKind, CaptureMode,
-        CaptureSinkSpec,
+        CaptureRecord, CaptureSinkSpec,
     };
     use crate::config::compiler::{
         CapturePlan, CaptureWorkingSetPlan, CompiledCaptureEvent, CompiledRedactionPayloads,
@@ -171,6 +171,7 @@ mod tests {
                     max_inflight_body_bytes: limit,
                     working_set: CaptureWorkingSetPlan::default(),
                 }),
+                ..ObservationPlan::default()
             },
             &redaction,
             pool.clone(),
@@ -184,8 +185,8 @@ mod tests {
         (pool.current_epoch(), pool, owner)
     }
 
-    fn metadata() -> CaptureRecord {
-        CaptureRecord {
+    fn metadata() -> SanitizedCaptureMetadata {
+        SanitizedCaptureMetadata::from_test_record(CaptureRecord {
             timestamp: "2026-01-01T00:00:00Z".to_owned(),
             request_id: "tap".to_owned(),
             kind: CaptureKind::Request,
@@ -203,7 +204,7 @@ mod tests {
             body_truncated: None,
             provider_replacement_omitted: None,
             provider_replacement_size: None,
-        }
+        })
     }
 
     fn body_bytes(body: &crate::observation::CaptureBody) -> Vec<u8> {

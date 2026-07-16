@@ -5,11 +5,22 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
+use http_access_runtime::BestEffortAdmission;
+#[cfg(not(test))]
+use http_access_runtime::ObservationQueue;
+pub(crate) use http_access_types::CaptureEvent;
+use http_access_types::{CaptureEventPolicy, DecisionAuditFacts, DecisionDisposition};
+
 use crate::capture::{
     CaptureArtifactJob, CaptureArtifactSubmitError, CaptureArtifactWorker, CaptureSinkSpec,
     CaptureWorkerStartError,
 };
-use crate::config::compiler::{CapturePlan, CompiledCaptureEvent, ObservationPlan};
+use crate::config::compiler::{
+    CapturePlan, CompiledCaptureEvent, CompiledDecisionLogLevel, CompiledLogLevel, ObservationPlan,
+    ReloadableLoggingPlan,
+};
+#[cfg(not(test))]
+use crate::logging::PolicyDecisionLogSink;
 use crate::redaction::{ProfileHandle, RedactionActivation, RedactionSnapshot};
 use crate::runtime::{GenerationOwner, ObservationSnapshot};
 
@@ -20,6 +31,13 @@ pub(crate) use capture::{
     CaptureWorkspace, CaptureWorkspaceAllocation, ReservedCaptureBodyBuilder,
 };
 
+#[cfg(not(test))]
+const DECISION_QUEUE_CAPACITY: usize = 1_024;
+#[cfg(not(test))]
+const DECISION_MAX_FACT_BYTES: usize = 8 * 1_024;
+#[cfg(not(test))]
+const DECISION_POOL_BYTES: usize = (DECISION_QUEUE_CAPACITY + 1) * DECISION_MAX_FACT_BYTES;
+
 /// Process-owned observation state shared by all candidate, active, and
 /// retiring generations. Static sink construction will live behind this same
 /// boundary; generations receive only their reloadable policy and narrow
@@ -27,13 +45,27 @@ pub(crate) use capture::{
 pub(crate) struct ProductObservationRuntime {
     capture_pool: Arc<CapturePool>,
     capture_worker: CaptureArtifactWorker,
+    #[cfg(not(test))]
+    info_decisions: ObservationQueue,
+    #[cfg(not(test))]
+    warn_decisions: ObservationQueue,
 }
 
 impl ProductObservationRuntime {
-    pub(crate) fn try_new(max_pending_records: usize) -> Result<Self, CaptureWorkerStartError> {
+    pub(crate) fn try_new(
+        max_pending_records: usize,
+    ) -> Result<Self, ProductObservationRuntimeStartError> {
+        #[cfg(not(test))]
+        let info_decisions = decision_queue(CompiledDecisionLogLevel::Info)?;
+        #[cfg(not(test))]
+        let warn_decisions = decision_queue(CompiledDecisionLogLevel::Warn)?;
         Ok(Self {
             capture_pool: CapturePool::new(),
             capture_worker: CaptureArtifactWorker::start(max_pending_records)?,
+            #[cfg(not(test))]
+            info_decisions,
+            #[cfg(not(test))]
+            warn_decisions,
         })
     }
 
@@ -58,9 +90,33 @@ impl ProductObservationRuntime {
         self.capture_worker.try_submit(job)
     }
 
+    pub(crate) fn try_submit_decision(
+        &self,
+        level: CompiledDecisionLogLevel,
+        facts: DecisionAuditFacts,
+    ) -> BestEffortAdmission {
+        #[cfg(not(test))]
+        {
+            match level {
+                CompiledDecisionLogLevel::Info => self.info_decisions.try_submit(facts),
+                CompiledDecisionLogLevel::Warn => self.warn_decisions.try_submit(facts),
+            }
+        }
+        #[cfg(test)]
+        {
+            let _ = (level, facts);
+            BestEffortAdmission::DroppedClosed
+        }
+    }
+
     pub(crate) fn begin_shutdown(&self) {
         self.capture_pool.close();
         self.capture_worker.begin_shutdown();
+        #[cfg(not(test))]
+        {
+            self.info_decisions.close_admission();
+            self.warn_decisions.close_admission();
+        }
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -72,6 +128,108 @@ impl ProductObservationRuntime {
     pub(crate) fn committed_capture_limit(&self) -> usize {
         self.capture_pool.committed_limit()
     }
+}
+
+/// One owned best-effort decision event. Moving this value through dispatch
+/// keeps submission single-shot; dropping a cancelled dispatch still attempts
+/// the same nonblocking submission.
+pub(crate) struct PendingDecisionSubmission {
+    target: DecisionSubmissionTarget,
+    level: Option<CompiledDecisionLogLevel>,
+    facts: Option<DecisionAuditFacts>,
+}
+
+impl PendingDecisionSubmission {
+    pub(crate) fn new(
+        target: DecisionSubmissionTarget,
+        level: Option<CompiledDecisionLogLevel>,
+        facts: DecisionAuditFacts,
+    ) -> Self {
+        Self {
+            target,
+            level,
+            facts: Some(facts),
+        }
+    }
+
+    pub(crate) fn submit_now(&mut self) {
+        let Some(facts) = self.facts.take() else {
+            return;
+        };
+        let Some(level) = self.level else {
+            return;
+        };
+        match &self.target {
+            DecisionSubmissionTarget::Runtime(runtime) => {
+                let _ = runtime.try_submit_decision(level, facts);
+            }
+            #[cfg(test)]
+            DecisionSubmissionTarget::Disabled => {}
+            #[cfg(test)]
+            DecisionSubmissionTarget::Probe(submissions) => {
+                submissions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            #[cfg(test)]
+            DecisionSubmissionTarget::FactsProbe(submissions) => {
+                submissions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(facts);
+            }
+        }
+    }
+
+    pub(crate) fn discard(mut self) {
+        self.facts.take();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn facts(&self) -> Option<&DecisionAuditFacts> {
+        self.facts.as_ref()
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum DecisionSubmissionTarget {
+    Runtime(Arc<ProductObservationRuntime>),
+    #[cfg(test)]
+    Disabled,
+    #[cfg(test)]
+    Probe(Arc<std::sync::atomic::AtomicUsize>),
+    #[cfg(test)]
+    FactsProbe(Arc<std::sync::Mutex<Vec<DecisionAuditFacts>>>),
+}
+
+impl From<Arc<ProductObservationRuntime>> for DecisionSubmissionTarget {
+    fn from(runtime: Arc<ProductObservationRuntime>) -> Self {
+        Self::Runtime(runtime)
+    }
+}
+
+impl Drop for PendingDecisionSubmission {
+    fn drop(&mut self) {
+        self.submit_now();
+    }
+}
+
+#[cfg(not(test))]
+fn decision_queue(
+    level: CompiledDecisionLogLevel,
+) -> Result<ObservationQueue, http_access_runtime::RuntimeError> {
+    ObservationQueue::new(
+        DECISION_QUEUE_CAPACITY,
+        DECISION_MAX_FACT_BYTES,
+        DECISION_POOL_BYTES,
+        Box::new(PolicyDecisionLogSink::new(level)),
+    )
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ProductObservationRuntimeStartError {
+    #[error("decision observation worker construction failed")]
+    Decision(#[from] http_access_runtime::RuntimeError),
+    #[error("capture worker construction failed")]
+    Capture(#[from] CaptureWorkerStartError),
 }
 
 /// Immutable capture-only state. Ordinary requests retain the epoch embedded
@@ -118,6 +276,7 @@ impl fmt::Debug for CaptureEpoch {
 }
 
 pub(crate) struct ProductObservationSnapshot {
+    decision_logging: DecisionLoggingPolicy,
     capture_epoch: Arc<CaptureEpoch>,
 }
 
@@ -125,6 +284,7 @@ impl fmt::Debug for ProductObservationSnapshot {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ProductObservationSnapshot")
+            .field("decision_logging", &self.decision_logging)
             .field("capture_enabled", &self.capture_epoch.is_enabled())
             .field(
                 "capture_event_count",
@@ -143,7 +303,8 @@ impl ProductObservationSnapshot {
         redaction: &RedactionActivation,
         capture_pool: Arc<CapturePool>,
     ) -> Result<ObservationActivation, ObservationActivationError> {
-        let capture = plan.capture;
+        let ObservationPlan { logging, capture } = plan;
+        let decision_logging = DecisionLoggingPolicy::from_plan(logging);
         let (capture_epoch, proposed_limit) = match capture {
             None => (Arc::new(CaptureEpoch::disabled()), 0),
             Some(plan) => {
@@ -170,7 +331,10 @@ impl ProductObservationSnapshot {
             proposed_limit,
         ));
         Ok(ObservationActivation {
-            snapshot: Self { capture_epoch },
+            snapshot: Self {
+                decision_logging,
+                capture_epoch,
+            },
             owner,
         })
     }
@@ -179,15 +343,64 @@ impl ProductObservationSnapshot {
         &self.capture_epoch
     }
 
+    pub(crate) const fn decision_level(
+        &self,
+        disposition: DecisionDisposition,
+    ) -> Option<CompiledDecisionLogLevel> {
+        self.decision_logging.level(disposition)
+    }
+
     #[cfg(test)]
     pub(crate) fn capture(&self) -> Option<&CapturePolicy> {
         self.capture_epoch.capture()
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DecisionLoggingPolicy {
+    allow: Option<CompiledDecisionLogLevel>,
+    deny: Option<CompiledDecisionLogLevel>,
+}
+
+impl DecisionLoggingPolicy {
+    fn from_plan(plan: ReloadableLoggingPlan) -> Self {
+        let decisions = plan.policy_decisions;
+        Self {
+            allow: decisions
+                .allows
+                .then_some(decisions.allow_level)
+                .filter(|level| log_level_admits(plan.level, *level)),
+            deny: decisions
+                .denies
+                .then_some(decisions.deny_level)
+                .filter(|level| log_level_admits(plan.level, *level)),
+        }
+    }
+
+    const fn level(self, disposition: DecisionDisposition) -> Option<CompiledDecisionLogLevel> {
+        match disposition {
+            DecisionDisposition::Allow => self.allow,
+            DecisionDisposition::Deny => self.deny,
+        }
+    }
+}
+
+const fn log_level_admits(threshold: CompiledLogLevel, event: CompiledDecisionLogLevel) -> bool {
+    match (threshold, event) {
+        (CompiledLogLevel::Trace | CompiledLogLevel::Debug | CompiledLogLevel::Info, _) => true,
+        (CompiledLogLevel::Warn, CompiledDecisionLogLevel::Warn) => true,
+        (CompiledLogLevel::Warn | CompiledLogLevel::Error, CompiledDecisionLogLevel::Info)
+        | (CompiledLogLevel::Error, CompiledDecisionLogLevel::Warn) => false,
+    }
+}
+
 impl ObservationSnapshot for ProductObservationSnapshot {
     fn capture_epoch(&self) -> &Arc<CaptureEpoch> {
         ProductObservationSnapshot::capture_epoch(self)
+    }
+
+    fn decision_level(&self, disposition: DecisionDisposition) -> Option<CompiledDecisionLogLevel> {
+        ProductObservationSnapshot::decision_level(self, disposition)
     }
 }
 
@@ -224,7 +437,7 @@ pub(crate) enum ObservationActivationError {
 }
 
 pub(crate) struct CapturePolicy {
-    events: CaptureEventSet,
+    events: CaptureEventPolicy,
     profile: ProfileHandle,
     sink: CaptureSinkSpec,
     max_body_bytes: usize,
@@ -254,7 +467,13 @@ impl CapturePolicy {
             ..
         } = plan;
         Self {
-            events: CaptureEventSet::from_compiled(events),
+            events: CaptureEventPolicy::new(events.into_iter().map(|event| match event {
+                CompiledCaptureEvent::RequestAllowed => CaptureEvent::RequestAllowed,
+                CompiledCaptureEvent::ResponseAllowed => CaptureEvent::ResponseAllowed,
+                CompiledCaptureEvent::RequestDenied => CaptureEvent::RequestDenied,
+                CompiledCaptureEvent::ResponseDenied => CaptureEvent::ResponseDenied,
+            }))
+            .expect("compiled capture events are nonempty and duplicate-free"),
             profile,
             sink,
             max_body_bytes,
@@ -263,7 +482,7 @@ impl CapturePolicy {
     }
 
     pub(crate) fn captures(&self, event: CaptureEvent) -> bool {
-        self.events.contains(event)
+        self.events.captures(event)
     }
 
     pub(crate) fn try_admit(&self, event: CaptureEvent) -> Option<CaptureOperation> {
@@ -286,57 +505,91 @@ impl CapturePolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CaptureEvent {
-    RequestAllowed,
-    ResponseAllowed,
-    RequestDenied,
-    ResponseDenied,
-}
-
-#[derive(Clone, Copy, Default)]
-struct CaptureEventSet(u8);
-
-impl CaptureEventSet {
-    fn from_compiled(events: Vec<CompiledCaptureEvent>) -> Self {
-        let mut set = Self::default();
-        for event in events {
-            set.0 |= match event {
-                CompiledCaptureEvent::RequestAllowed => 1 << 0,
-                CompiledCaptureEvent::ResponseAllowed => 1 << 1,
-                CompiledCaptureEvent::RequestDenied => 1 << 2,
-                CompiledCaptureEvent::ResponseDenied => 1 << 3,
-            };
-        }
-        set
-    }
-
-    fn contains(self, event: CaptureEvent) -> bool {
-        let bit = match event {
-            CaptureEvent::RequestAllowed => 1 << 0,
-            CaptureEvent::ResponseAllowed => 1 << 1,
-            CaptureEvent::RequestDenied => 1 << 2,
-            CaptureEvent::ResponseDenied => 1 << 3,
-        };
-        self.0 & bit != 0
-    }
-
-    fn len(self) -> usize {
-        self.0.count_ones() as usize
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
     use crate::config::compiler::{
-        CaptureWorkingSetPlan, CompiledRedactionPayloads, RedactionPlan, RedactionProfilePlan,
-        RedactionRulePlan,
+        CaptureWorkingSetPlan, CompiledRedactionPayloads, PolicyDecisionLoggingPlan, RedactionPlan,
+        RedactionProfilePlan, RedactionRulePlan,
     };
     use crate::redaction::RedactionSnapshot;
     use crate::runtime::{CleanupReason, RuntimeError};
+
+    fn decision_facts() -> DecisionAuditFacts {
+        let request_id = http_access_types::StableId::new("pending-decision").unwrap();
+        let method = http_access_types::HttpMethod::new("GET").unwrap();
+        let url = http_access_url::canonicalize_http_url("https://example.test/resource").unwrap();
+        let source = http_access_types::DecisionAuditSource::Policy(
+            http_access_types::DecisionProvenance::new(
+                http_access_types::PolicyGeneration::new(1).unwrap(),
+                http_access_types::EffectivePolicy::Default,
+                http_access_types::DecisionReason::new(
+                    http_access_types::DecisionReasonCategory::Policy,
+                    1,
+                ),
+                None,
+            ),
+        );
+        DecisionAuditFacts::new(http_access_types::DecisionAuditFactsInput {
+            request_id: &request_id,
+            disposition: DecisionDisposition::Allow,
+            method: Some(&method),
+            url: Some(&url),
+            peer_ip: None,
+            source: &source,
+            sensitive_header_presence: &[],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn pending_decision_explicit_submission_is_exactly_once() {
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let mut pending = PendingDecisionSubmission::new(
+            DecisionSubmissionTarget::Probe(submissions.clone()),
+            Some(CompiledDecisionLogLevel::Info),
+            decision_facts(),
+        );
+
+        pending.submit_now();
+        pending.submit_now();
+        drop(pending);
+
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn pending_decision_drop_is_the_single_fallback_submission() {
+        let submissions = Arc::new(AtomicUsize::new(0));
+        drop(PendingDecisionSubmission::new(
+            DecisionSubmissionTarget::Probe(submissions.clone()),
+            Some(CompiledDecisionLogLevel::Info),
+            decision_facts(),
+        ));
+
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn discarded_or_disabled_pending_decisions_do_not_submit() {
+        let submissions = Arc::new(AtomicUsize::new(0));
+        PendingDecisionSubmission::new(
+            DecisionSubmissionTarget::Probe(submissions.clone()),
+            Some(CompiledDecisionLogLevel::Info),
+            decision_facts(),
+        )
+        .discard();
+        drop(PendingDecisionSubmission::new(
+            DecisionSubmissionTarget::Probe(submissions.clone()),
+            None,
+            decision_facts(),
+        ));
+
+        assert_eq!(submissions.load(Ordering::SeqCst), 0);
+    }
 
     fn plan(
         profile_name: &str,
@@ -358,11 +611,12 @@ mod tests {
                 max_inflight_body_bytes: limit,
                 working_set: CaptureWorkingSetPlan::default(),
             }),
+            ..ObservationPlan::default()
         }
     }
 
     fn disabled_plan() -> ObservationPlan {
-        ObservationPlan { capture: None }
+        ObservationPlan::default()
     }
 
     fn profile_plan(max_body_bytes: usize) -> RedactionProfilePlan {
@@ -466,6 +720,67 @@ mod tests {
         assert!(capture.captures(CaptureEvent::RequestAllowed));
         assert!(capture.captures(CaptureEvent::ResponseDenied));
         assert!(!capture.captures(CaptureEvent::ResponseAllowed));
+    }
+
+    #[test]
+    fn generation_snapshot_filters_decisions_and_selects_static_severity_queue() {
+        let redaction = redaction(std::iter::empty());
+        let snapshot = ProductObservationSnapshot::activate(
+            ObservationPlan {
+                logging: ReloadableLoggingPlan {
+                    level: CompiledLogLevel::Info,
+                    policy_decisions: PolicyDecisionLoggingPlan {
+                        allows: true,
+                        denies: true,
+                        allow_level: CompiledDecisionLogLevel::Info,
+                        deny_level: CompiledDecisionLogLevel::Warn,
+                    },
+                },
+                capture: None,
+            },
+            &redaction,
+            CapturePool::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot
+                .snapshot()
+                .decision_level(DecisionDisposition::Allow),
+            Some(CompiledDecisionLogLevel::Info)
+        );
+        assert_eq!(
+            snapshot
+                .snapshot()
+                .decision_level(DecisionDisposition::Deny),
+            Some(CompiledDecisionLogLevel::Warn)
+        );
+
+        let warn_threshold = DecisionLoggingPolicy::from_plan(ReloadableLoggingPlan {
+            level: CompiledLogLevel::Warn,
+            policy_decisions: PolicyDecisionLoggingPlan {
+                allows: true,
+                denies: true,
+                allow_level: CompiledDecisionLogLevel::Info,
+                deny_level: CompiledDecisionLogLevel::Warn,
+            },
+        });
+        assert_eq!(warn_threshold.level(DecisionDisposition::Allow), None);
+        assert_eq!(
+            warn_threshold.level(DecisionDisposition::Deny),
+            Some(CompiledDecisionLogLevel::Warn)
+        );
+
+        let disabled = DecisionLoggingPolicy::from_plan(ReloadableLoggingPlan {
+            level: CompiledLogLevel::Trace,
+            policy_decisions: PolicyDecisionLoggingPlan {
+                allows: false,
+                denies: false,
+                allow_level: CompiledDecisionLogLevel::Warn,
+                deny_level: CompiledDecisionLogLevel::Warn,
+            },
+        });
+        assert_eq!(disabled.level(DecisionDisposition::Allow), None);
+        assert_eq!(disabled.level(DecisionDisposition::Deny), None);
     }
 
     #[test]

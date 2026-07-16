@@ -154,6 +154,13 @@ impl ObservationSnapshot for EmptySnapshot {
             std::sync::LazyLock::new(|| Arc::new(crate::observation::CaptureEpoch::disabled()));
         &DISABLED
     }
+
+    fn decision_level(
+        &self,
+        _disposition: http_access_types::DecisionDisposition,
+    ) -> Option<crate::config::compiler::CompiledDecisionLogLevel> {
+        None
+    }
 }
 impl SafetySnapshot for EmptySnapshot {
     fn contains_loop_marker(&self, _headers: &http::HeaderMap) -> bool {
