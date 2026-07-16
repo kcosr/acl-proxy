@@ -1,8 +1,11 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use bytes::Buf;
 use http::header::{HeaderValue, HOST};
 use http::{Method, Request, Response, StatusCode, Version};
 use http_access_types::{CanonicalUrl, HttpScheme};
@@ -11,6 +14,7 @@ use hyper::client::conn;
 use hyper::Body;
 use rustls::ServerName;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::Notify;
 use tokio::time::Instant;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
@@ -35,6 +39,10 @@ use super::headers::{
 const TERMINAL_DRIVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_EMPTY_RESPONSE_FRAMES: u64 = 65_536;
 const MAX_INTERNAL_RESPONSE_EVENTS_PER_POLL: usize = 64;
+const RESPONSE_LIFETIME_ACTIVE: u8 = 0;
+const RESPONSE_LIFETIME_IDLE_TIMEOUT: u8 = 1;
+const RESPONSE_LIFETIME_ABSOLUTE_TIMEOUT: u8 = 2;
+const RESPONSE_LIFETIME_COMPLETE: u8 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ForwardError {
@@ -179,8 +187,7 @@ pub(crate) struct ForwardBody {
     terminal_driver_abort_started: bool,
     driver: DriverTask,
     request_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
-    generation: Option<GenerationRetention>,
-    response_admission: Option<ForwardResponseAdmission>,
+    response_lifetime: Option<ForwardResponseLifetime>,
     response_limits: Option<ForwardResponseLimits>,
     response_idle_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
     pending_data: Option<Bytes>,
@@ -231,6 +238,13 @@ impl DriverTask {
         }
     }
 
+    fn abort_handle(&self) -> tokio::task::AbortHandle {
+        self.handle
+            .as_ref()
+            .expect("a newly forwarded response owns its connection driver")
+            .abort_handle()
+    }
+
     async fn abort_and_join(mut self) {
         self.abort();
         let _ = std::future::poll_fn(|context| self.poll(context)).await;
@@ -251,6 +265,163 @@ impl Drop for DriverTask {
     }
 }
 
+struct ForwardResponseLifetimeResources {
+    _generation: GenerationRetention,
+    _response_admission: ForwardResponseAdmission,
+}
+
+struct ForwardResponseLifetimeShared {
+    state: AtomicU8,
+    idle_deadline: Mutex<Option<Instant>>,
+    resources: Mutex<Option<ForwardResponseLifetimeResources>>,
+    driver_abort: tokio::task::AbortHandle,
+    changed: Notify,
+}
+
+impl ForwardResponseLifetimeShared {
+    fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        mutex.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
+    fn state(&self) -> u8 {
+        self.state.load(Ordering::Acquire)
+    }
+
+    fn reset_idle(&self, idle: Duration) {
+        if self.state.load(Ordering::Acquire) != RESPONSE_LIFETIME_ACTIVE {
+            return;
+        }
+        *Self::lock(&self.idle_deadline) = Some(Instant::now() + idle);
+        self.changed.notify_one();
+    }
+
+    fn disable_idle(&self) {
+        if self.state.load(Ordering::Acquire) != RESPONSE_LIFETIME_ACTIVE {
+            return;
+        }
+        *Self::lock(&self.idle_deadline) = None;
+        self.changed.notify_one();
+    }
+
+    fn expire(&self, cause: u8) {
+        debug_assert!(matches!(
+            cause,
+            RESPONSE_LIFETIME_IDLE_TIMEOUT | RESPONSE_LIFETIME_ABSOLUTE_TIMEOUT
+        ));
+        if self
+            .state
+            .compare_exchange(
+                RESPONSE_LIFETIME_ACTIVE,
+                cause,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        self.driver_abort.abort();
+        let resources = Self::lock(&self.resources).take();
+        self.changed.notify_waiters();
+        drop(resources);
+    }
+
+    fn complete(&self) {
+        if self
+            .state
+            .compare_exchange(
+                RESPONSE_LIFETIME_ACTIVE,
+                RESPONSE_LIFETIME_COMPLETE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let resources = Self::lock(&self.resources).take();
+        self.changed.notify_waiters();
+        drop(resources);
+    }
+}
+
+struct ForwardResponseLifetime {
+    shared: Arc<ForwardResponseLifetimeShared>,
+    watchdog: tokio::task::JoinHandle<()>,
+}
+
+impl ForwardResponseLifetime {
+    fn spawn(
+        absolute: Instant,
+        idle: Duration,
+        driver_abort: tokio::task::AbortHandle,
+        generation: GenerationRetention,
+        response_admission: ForwardResponseAdmission,
+    ) -> Self {
+        let shared = Arc::new(ForwardResponseLifetimeShared {
+            state: AtomicU8::new(RESPONSE_LIFETIME_ACTIVE),
+            idle_deadline: Mutex::new(Some(Instant::now() + idle)),
+            resources: Mutex::new(Some(ForwardResponseLifetimeResources {
+                _generation: generation,
+                _response_admission: response_admission,
+            })),
+            driver_abort,
+            changed: Notify::new(),
+        });
+        let watchdog_shared = shared.clone();
+        let watchdog = tokio::spawn(async move {
+            loop {
+                let changed = watchdog_shared.changed.notified();
+                if watchdog_shared.state.load(Ordering::Acquire) != RESPONSE_LIFETIME_ACTIVE {
+                    return;
+                }
+                let idle_deadline =
+                    *ForwardResponseLifetimeShared::lock(&watchdog_shared.idle_deadline);
+                let now = Instant::now();
+                if now >= absolute {
+                    watchdog_shared.expire(RESPONSE_LIFETIME_ABSOLUTE_TIMEOUT);
+                    return;
+                }
+                if idle_deadline.is_some_and(|deadline| now >= deadline) {
+                    watchdog_shared.expire(RESPONSE_LIFETIME_IDLE_TIMEOUT);
+                    return;
+                }
+                let idle_wake = idle_deadline.unwrap_or(absolute);
+                tokio::select! {
+                    biased;
+                    _ = changed => {}
+                    _ = tokio::time::sleep_until(absolute) => {}
+                    _ = tokio::time::sleep_until(idle_wake) => {}
+                }
+            }
+        });
+        Self { shared, watchdog }
+    }
+
+    fn state(&self) -> u8 {
+        self.shared.state()
+    }
+
+    fn reset_idle(&self, idle: Duration) {
+        self.shared.reset_idle(idle);
+    }
+
+    fn expire(&self, cause: u8) {
+        self.shared.expire(cause);
+    }
+
+    fn disable_idle(&self) {
+        self.shared.disable_idle();
+    }
+}
+
+impl Drop for ForwardResponseLifetime {
+    fn drop(&mut self) {
+        self.shared.complete();
+        self.watchdog.abort();
+    }
+}
+
 impl ForwardBody {
     fn new(body: Body, driver: DriverTask) -> Self {
         Self {
@@ -263,8 +434,7 @@ impl ForwardBody {
             terminal_driver_abort_started: false,
             driver,
             request_deadline: None,
-            generation: None,
-            response_admission: None,
+            response_lifetime: None,
             response_limits: None,
             response_idle_deadline: None,
             pending_data: None,
@@ -281,12 +451,20 @@ impl ForwardBody {
         policy: http_access_types::ResponsePolicy,
     ) {
         debug_assert!(self.request_deadline.is_none());
-        debug_assert!(self.generation.is_none());
-        debug_assert!(self.response_admission.is_none());
+        debug_assert!(self.response_lifetime.is_none());
         self.request_deadline = Some(Box::pin(tokio::time::sleep_until(deadline)));
-        self.generation = Some(generation);
-        self.response_admission = Some(response_admission);
         self.configure_response_policy(policy);
+        let idle = self
+            .response_limits
+            .expect("the checked response policy was installed")
+            .idle;
+        self.response_lifetime = Some(ForwardResponseLifetime::spawn(
+            deadline,
+            idle,
+            self.driver.abort_handle(),
+            generation,
+            response_admission,
+        ));
     }
 
     fn configure_response_policy(&mut self, policy: http_access_types::ResponsePolicy) {
@@ -332,8 +510,7 @@ impl ForwardBody {
     fn release_response_lifetime(&mut self) {
         self.request_deadline.take();
         self.response_idle_deadline.take();
-        self.response_admission.take();
-        self.generation.take();
+        self.response_lifetime.take();
     }
 
     fn reset_response_idle_deadline(&mut self) {
@@ -343,6 +520,28 @@ impl ForwardBody {
         if let Some(deadline) = self.response_idle_deadline.as_mut() {
             deadline.as_mut().reset(Instant::now() + limits.idle);
         }
+        if let Some(lifetime) = self.response_lifetime.as_ref() {
+            lifetime.reset_idle(limits.idle);
+        }
+    }
+
+    fn observe_response_lifetime_timeout(
+        &mut self,
+        context: &mut Context<'_>,
+        cause: u8,
+    ) -> Poll<ForwardBodyError> {
+        let timed_out = self
+            .response_lifetime
+            .as_ref()
+            .is_some_and(|lifetime| lifetime.state() == cause);
+        if !timed_out {
+            return Poll::Pending;
+        }
+        self.body.take();
+        self.pending_data.take();
+        self.trailers.take();
+        self.terminal_error.get_or_insert(ForwardBodyError::Timeout);
+        self.poll_terminal_error_join(context)
     }
 
     fn poll_response_idle_deadline(&mut self, context: &mut Context<'_>) -> Poll<ForwardBodyError> {
@@ -353,6 +552,9 @@ impl ForwardBody {
             return Poll::Pending;
         }
 
+        if let Some(lifetime) = self.response_lifetime.as_ref() {
+            lifetime.expire(RESPONSE_LIFETIME_IDLE_TIMEOUT);
+        }
         self.body.take();
         self.pending_data.take();
         self.trailers.take();
@@ -435,6 +637,9 @@ impl ForwardBody {
             return Poll::Pending;
         }
 
+        if let Some(lifetime) = self.response_lifetime.as_ref() {
+            lifetime.expire(RESPONSE_LIFETIME_ABSOLUTE_TIMEOUT);
+        }
         self.body.take();
         self.pending_data.take();
         self.trailers.take();
@@ -507,6 +712,9 @@ impl ForwardBody {
             None => None,
         };
         self.response_idle_deadline.take();
+        if let Some(lifetime) = self.response_lifetime.as_ref() {
+            lifetime.disable_idle();
+        }
         self.trailers = Some(trailers);
         self.begin_terminal_drain();
         Poll::Ready(Ok(()))
@@ -574,11 +782,21 @@ impl HttpBody for ForwardBody {
                 Poll::Ready(error) => Poll::Ready(Some(Err(error))),
             };
         }
+        if let Poll::Ready(error) =
+            self.observe_response_lifetime_timeout(context, RESPONSE_LIFETIME_ABSOLUTE_TIMEOUT)
+        {
+            return Poll::Ready(Some(Err(error)));
+        }
         if let Poll::Ready(error) = self.poll_request_deadline(context) {
             return Poll::Ready(Some(Err(error)));
         }
         if let Some(bytes) = self.next_data_slice() {
             return Poll::Ready(Some(Ok(bytes)));
+        }
+        if let Poll::Ready(error) =
+            self.observe_response_lifetime_timeout(context, RESPONSE_LIFETIME_IDLE_TIMEOUT)
+        {
+            return Poll::Ready(Some(Err(error)));
         }
         if let Poll::Ready(error) = self.poll_response_idle_deadline(context) {
             return Poll::Ready(Some(Err(error)));
@@ -657,7 +875,17 @@ impl HttpBody for ForwardBody {
                 Poll::Ready(error) => Poll::Ready(Err(error)),
             };
         }
+        if let Poll::Ready(error) =
+            self.observe_response_lifetime_timeout(context, RESPONSE_LIFETIME_ABSOLUTE_TIMEOUT)
+        {
+            return Poll::Ready(Err(error));
+        }
         if let Poll::Ready(error) = self.poll_request_deadline(context) {
+            return Poll::Ready(Err(error));
+        }
+        if let Poll::Ready(error) =
+            self.observe_response_lifetime_timeout(context, RESPONSE_LIFETIME_IDLE_TIMEOUT)
+        {
             return Poll::Ready(Err(error));
         }
         if let Poll::Ready(error) = self.poll_response_idle_deadline(context) {
@@ -1490,16 +1718,20 @@ where
 struct UpgradeRequestBody<B> {
     inner: Pin<Box<B>>,
     complete: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    exact_remaining: Option<u64>,
 }
 
 impl<B: HttpBody> UpgradeRequestBody<B> {
     fn new(body: B) -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
-        let complete =
-            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(body.is_end_stream()));
+        let exact_remaining = body.size_hint().exact();
+        let complete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+            body.is_end_stream() || exact_remaining == Some(0),
+        ));
         (
             Self {
                 inner: Box::pin(body),
                 complete: complete.clone(),
+                exact_remaining,
             },
             complete,
         )
@@ -1514,7 +1746,26 @@ impl<B: HttpBody> HttpBody for UpgradeRequestBody<B> {
         mut self: Pin<&mut Self>,
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
-        self.inner.as_mut().poll_data(context)
+        let result = self.inner.as_mut().poll_data(context);
+        if let Poll::Ready(Some(Ok(data))) = &result {
+            if let Some(remaining) = self.exact_remaining.as_mut() {
+                *remaining = remaining
+                    .checked_sub(u64::try_from(data.remaining()).unwrap_or(u64::MAX))
+                    .unwrap_or(u64::MAX);
+            }
+        }
+        let complete = match self.exact_remaining {
+            Some(remaining) => remaining == 0,
+            None => {
+                matches!(&result, Poll::Ready(Some(Ok(_))) | Poll::Ready(None))
+                    && self.inner.as_ref().is_end_stream()
+            }
+        };
+        if complete {
+            self.complete
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        result
     }
 
     fn poll_trailers(
@@ -1522,7 +1773,9 @@ impl<B: HttpBody> HttpBody for UpgradeRequestBody<B> {
         context: &mut Context<'_>,
     ) -> Poll<Result<Option<http::HeaderMap>, Self::Error>> {
         let result = self.inner.as_mut().poll_trailers(context);
-        if matches!(result, Poll::Ready(Ok(_))) {
+        if matches!(result, Poll::Ready(Ok(_)))
+            && self.exact_remaining.is_none_or(|remaining| remaining == 0)
+        {
             self.complete
                 .store(true, std::sync::atomic::Ordering::Release);
         }
@@ -1596,7 +1849,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use http::header::{CONNECTION, TE, UPGRADE};
+    use http::header::{CONNECTION, CONTENT_LENGTH, TE, UPGRADE};
     use hyper::server::conn::Http;
     use hyper::service::service_fn;
     use rcgen::generate_simple_self_signed;
@@ -1794,6 +2047,39 @@ mod tests {
             assert!(head.len() < 8 * 1024);
         }
         String::from_utf8(head).unwrap()
+    }
+
+    async fn read_http_line(stream: &mut DuplexStream) -> Vec<u8> {
+        let mut line = Vec::new();
+        loop {
+            let mut byte = [0_u8; 1];
+            stream.read_exact(&mut byte).await.unwrap();
+            line.push(byte[0]);
+            if line.ends_with(b"\r\n") {
+                line.truncate(line.len() - 2);
+                return line;
+            }
+            assert!(line.len() < 8 * 1024);
+        }
+    }
+
+    async fn read_chunked_http_body(stream: &mut DuplexStream) -> Vec<u8> {
+        let mut body = Vec::new();
+        loop {
+            let line = read_http_line(stream).await;
+            let size = line.split(|byte| *byte == b';').next().unwrap();
+            let size = usize::from_str_radix(std::str::from_utf8(size).unwrap(), 16).unwrap();
+            if size == 0 {
+                assert!(read_http_line(stream).await.is_empty());
+                return body;
+            }
+            let start = body.len();
+            body.resize(start + size, 0);
+            stream.read_exact(&mut body[start..]).await.unwrap();
+            let mut terminator = [0_u8; 2];
+            stream.read_exact(&mut terminator).await.unwrap();
+            assert_eq!(&terminator, b"\r\n");
+        }
     }
 
     fn tls_acceptor(alpn: &[u8]) -> TlsAcceptor {
@@ -2256,6 +2542,127 @@ mod tests {
         assert!(head.contains("\r\nconnection: upgrade\r\n"));
         assert!(head.contains("\r\nupgrade: websocket\r\n"));
         assert!(!head.contains("x-private"));
+    }
+
+    #[tokio::test]
+    async fn upgrade_waits_for_content_length_and_chunked_request_bodies_before_101() {
+        struct UpgradeTestBody {
+            data: Option<Bytes>,
+            chunked: bool,
+            complete: bool,
+        }
+
+        impl HttpBody for UpgradeTestBody {
+            type Data = Bytes;
+            type Error = io::Error;
+
+            fn poll_data(
+                mut self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+            ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
+                if let Some(data) = self.data.take() {
+                    return Poll::Ready(Some(Ok(data)));
+                }
+                self.complete = true;
+                Poll::Ready(None)
+            }
+
+            fn poll_trailers(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+            ) -> Poll<Result<Option<http::HeaderMap>, Self::Error>> {
+                Poll::Ready(Ok(None))
+            }
+
+            fn is_end_stream(&self) -> bool {
+                self.chunked && self.complete
+            }
+
+            fn size_hint(&self) -> SizeHint {
+                if self.chunked {
+                    SizeHint::default()
+                } else {
+                    SizeHint::with_exact(4)
+                }
+            }
+        }
+
+        let canonical = canonicalize_http_url("http://origin.example/socket").unwrap();
+
+        for chunked in [false, true] {
+            let body = UpgradeTestBody {
+                data: Some(Bytes::from_static(b"body")),
+                chunked,
+                complete: false,
+            };
+            let mut builder = Request::builder()
+                .method(Method::POST)
+                .version(Version::HTTP_11)
+                .uri("/untrusted-client-target")
+                .header(HOST, "untrusted-client.example")
+                .header(CONNECTION, "upgrade")
+                .header(UPGRADE, "test-echo");
+            if !chunked {
+                builder = builder.header(CONTENT_LENGTH, "4");
+            }
+            let request =
+                crate::proxy::headers::sanitize_untrusted_request(builder.body(body).unwrap())
+                    .unwrap();
+            let intent = request.upgrade_intent().unwrap().clone();
+            let request = prepare_origin_upgrade_request(
+                request,
+                &canonical,
+                RequestTargetForm::Origin,
+                OriginProtocol::Http1,
+            )
+            .unwrap();
+            let (client, mut server) = tokio::io::duplex(64 * 1024);
+            let server = tokio::spawn(async move {
+                let head = read_http_head(&mut server).await.to_ascii_lowercase();
+                assert!(head.contains("\r\nconnection: upgrade\r\n"));
+                assert!(head.contains("\r\nupgrade: test-echo\r\n"));
+                let body = if chunked {
+                    assert!(head.contains("\r\ntransfer-encoding: chunked\r\n"));
+                    read_chunked_http_body(&mut server).await
+                } else {
+                    assert!(head.contains("\r\ncontent-length: 4\r\n"));
+                    let mut body = vec![0_u8; 4];
+                    server.read_exact(&mut body).await.unwrap();
+                    body
+                };
+                assert_eq!(body, b"body");
+                server
+                    .write_all(
+                        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: test-echo\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                let mut ping = [0_u8; 4];
+                server.read_exact(&mut ping).await.unwrap();
+                assert_eq!(&ping, b"ping");
+                server.write_all(b"pong").await.unwrap();
+            });
+
+            let result = send_upgrade_request(
+                client,
+                request,
+                intent,
+                ForwardingTimeouts::for_test().begin_connect(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("chunked={chunked}: {error:?}"));
+            let ForwardUpgradeResult::SwitchingProtocols(upgrade) = result else {
+                panic!("a complete body-bearing upgrade must accept a valid 101");
+            };
+            let (_, pending) = upgrade.into_parts();
+            let mut upstream = pending.complete().await.unwrap();
+            upstream.write_all(b"ping").await.unwrap();
+            let mut pong = [0_u8; 4];
+            upstream.read_exact(&mut pong).await.unwrap();
+            assert_eq!(&pong, b"pong");
+            drop(upstream);
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use http_access_runtime::{RuntimeError, StandaloneExchange};
-use http_access_types::BodyFraming;
+use http_access_types::{BodyFraming, TrailerPolicy};
 use hyper::body::{HttpBody, SizeHint};
 
 use super::ingress::CaptureSubmission;
@@ -17,6 +17,7 @@ pub(crate) struct StandaloneExchangeBody {
     _sidecar: StandaloneRequestSidecar,
     state: BodyState,
     exact_remaining: Option<u64>,
+    trailers_allowed: bool,
     capture: Option<CaptureSubmission>,
 }
 
@@ -53,11 +54,16 @@ impl StandaloneExchangeBody {
             BodyFraming::ContentLength(length) => Some(length),
             BodyFraming::Chunked | BodyFraming::Http2Stream => None,
         };
+        let trailers_allowed = matches!(
+            exchange.plan().request_body().trailer_policy(),
+            TrailerPolicy::Allow
+        );
         Self {
             exchange,
             _sidecar: sidecar,
             state: BodyState::Data,
             exact_remaining,
+            trailers_allowed,
             capture: None,
         }
     }
@@ -116,7 +122,11 @@ impl HttpBody for StandaloneExchangeBody {
                 if let Some(capture) = self.capture.as_mut() {
                     capture.finish_data_if_complete(true);
                 }
-                self.state = BodyState::Trailers;
+                self.state = if self.trailers_allowed {
+                    BodyState::Trailers
+                } else {
+                    BodyState::Complete
+                };
                 Poll::Ready(None)
             }
             Poll::Ready(Err(error)) => {

@@ -7986,6 +7986,233 @@ allow_upgrades = true
         product.shutdown().await;
     }
 
+    fn response_watchdog_config(
+        proxy: SocketAddr,
+        origin: SocketAddr,
+        downstream_http2: bool,
+    ) -> String {
+        let connect_protocol = if downstream_http2 {
+            "http2 = \"deny\""
+        } else {
+            "http1 = \"deny\""
+        };
+        let policy = format!(
+            r#"[service.forwarding]
+connect_timeout = "1s"
+response_head_timeout = "1s"
+body_idle_timeout = "200ms"
+upgrade_idle_timeout = "1s"
+max_request_wire_bytes = 65536
+max_request_decoded_bytes = 65536
+max_response_wire_bytes = 67108864
+max_response_decoded_bytes = 67108864
+chunk_bytes = 65536
+preserve_request_trailers = false
+max_trailer_count = 4
+max_trailer_bytes = 256
+
+[listeners.explicit_http.connect]
+{connect_protocol}
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "watchdog-response"
+decision = "allow"
+methods = ["GET"]
+urls = ["http://{origin}/**"]
+"#
+        );
+        let config = base_config(proxy, "explicit_http", &policy).replacen(
+            "request_timeout = \"5s\"",
+            "request_timeout = \"750ms\"",
+            1,
+        );
+        if downstream_http2 {
+            config.replacen(
+                "http_versions = [\"http1\"]",
+                "http_versions = [\"http2\"]",
+                1,
+            )
+        } else {
+            config
+        }
+    }
+
+    #[tokio::test]
+    async fn h1_unread_response_body_watchdog_releases_admission_and_closes_origin() {
+        const RESPONSE_BYTES: usize = 64 * 1024 * 1024;
+        const CHUNK_BYTES: usize = 64 * 1024;
+
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let (origin_closed_tx, origin_closed_rx) = oneshot::channel();
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin_listener.accept().await.unwrap();
+            let request = read_http_head(&mut stream).await;
+            assert!(String::from_utf8_lossy(&request).contains("/unread"));
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {RESPONSE_BYTES}\r\nConnection: close\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let chunk = vec![b'x'; CHUNK_BYTES];
+            let mut sent = 0;
+            while sent < RESPONSE_BYTES {
+                match stream
+                    .write(&chunk[..CHUNK_BYTES.min(RESPONSE_BYTES - sent)])
+                    .await
+                {
+                    Ok(0) | Err(_) => break,
+                    Ok(written) => sent += written,
+                }
+            }
+            origin_closed_tx.send(sent).unwrap();
+        });
+        let (_directory, product) =
+            product(response_watchdog_config(proxy, origin, false), listeners).await;
+        let pool = product.wire_body_pool();
+
+        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        client
+            .write_all(
+                format!(
+                    "GET http://{origin}/unread HTTP/1.1\r\nHost: {origin}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let response = read_http_head(&mut client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200"));
+        assert!(
+            pool.global_charge() > 0,
+            "unread HTTP/1 response did not retain response admission"
+        );
+
+        let sent = tokio::time::timeout(Duration::from_secs(2), origin_closed_rx)
+            .await
+            .expect("the response watchdog did not close the HTTP/1 origin")
+            .unwrap();
+        assert!(
+            sent < RESPONSE_BYTES,
+            "the origin sent the complete body despite downstream backpressure"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.global_charge() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the unread HTTP/1 response retained admission past its deadline");
+
+        drop(client);
+        origin_task.await.unwrap();
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn h2_zero_window_watchdog_releases_admission_and_preserves_sibling_stream() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let (origin_closed_tx, origin_closed_rx) = oneshot::channel();
+        let origin_task = tokio::spawn(async move {
+            let (mut stalled, _) = origin_listener.accept().await.unwrap();
+            let first = tokio::spawn(async move {
+                let request = read_http_head(&mut stalled).await;
+                assert!(String::from_utf8_lossy(&request).contains("/stalled"));
+                stalled
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\nx")
+                    .await
+                    .unwrap();
+                let mut byte = [0_u8; 1];
+                let closed = tokio::time::timeout(Duration::from_secs(2), stalled.read(&mut byte))
+                    .await
+                    .expect("the response watchdog did not close the HTTP/2 origin");
+                assert!(
+                    matches!(closed, Ok(0) | Err(_)),
+                    "the stalled origin received later request bytes"
+                );
+                origin_closed_tx.send(()).unwrap();
+            });
+
+            let (mut sibling, _) = origin_listener.accept().await.unwrap();
+            let request = read_http_head(&mut sibling).await;
+            assert!(String::from_utf8_lossy(&request).contains("/sibling"));
+            sibling
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            first.await.unwrap();
+        });
+        let (_directory, product) =
+            product(response_watchdog_config(proxy, origin, true), listeners).await;
+        let pool = product.wire_body_pool();
+        let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let mut builder = conn::Builder::new();
+        builder.http2_only(true);
+        builder.http2_initial_stream_window_size(0);
+        let (mut sender, connection) = builder.handshake(stream).await.unwrap();
+        let driver = tokio::spawn(connection);
+
+        let stalled = sender
+            .send_request(
+                Request::builder()
+                    .uri(format!("http://{origin}/stalled"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stalled.status(), StatusCode::OK);
+        assert!(
+            pool.global_charge() > 0,
+            "zero-window HTTP/2 response did not retain response admission"
+        );
+        tokio::time::timeout(Duration::from_secs(2), origin_closed_rx)
+            .await
+            .expect("the zero-window response watchdog did not close the origin")
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.global_charge() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the zero-window HTTP/2 response retained admission past its deadline");
+
+        let sibling = sender
+            .send_request(
+                Request::builder()
+                    .uri(format!("http://{origin}/sibling"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("the stalled response failed the whole HTTP/2 connection");
+        assert_eq!(sibling.status(), StatusCode::NO_CONTENT);
+
+        drop(sibling);
+        drop(stalled);
+        drop(sender);
+        product.shutdown().await;
+        driver.await.unwrap().unwrap();
+        origin_task.await.unwrap();
+    }
+
     fn bounded_response_wire_config(
         proxy: SocketAddr,
         origin: SocketAddr,
