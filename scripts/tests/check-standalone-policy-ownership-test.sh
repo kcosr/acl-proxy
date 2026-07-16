@@ -20,18 +20,20 @@ for source in \
 do
     mkdir -p "$BASELINE/$(dirname -- "$source")"
     printf '%s\n' \
-        'fn production_transport() {}' \
-        '// crate::policy AllowedRequest request_header_effects response_header_effects' \
-        '/* PolicySnapshot PolicyEvaluation PolicyOutcome PolicyResult */' \
         '#[cfg(test)]' \
         'mod tests {' \
         '    const FORBIDDEN_TEST_TEXT: &str = "crate::policy .policy() AllowedRequest RequestDecision request_decision request_header_effects response_header_effects credential_actions allow_upgrades AuthoringConfig CompiledHttp1ConnectPolicy PolicySnapshot PolicyEvaluation PolicyOutcome PolicyResult";' \
-        '}' >"$BASELINE/$source"
+        '}' \
+        'fn production_transport() {}' \
+        '// crate::policy AllowedRequest request_header_effects response_header_effects' \
+        '/* PolicySnapshot PolicyEvaluation PolicyOutcome PolicyResult */' \
+        >"$BASELINE/$source"
 done
 
 runner() {
     local root=$1
-    "$root/scripts/check-standalone-policy-ownership.sh"
+    PIPELINE_OWNERSHIP_CHECK_MANIFEST="$SOURCE_ROOT/../access-runtime/Cargo.toml" \
+        "$root/scripts/check-standalone-policy-ownership.sh"
 }
 
 runner "$BASELINE" >"$TEST_ROOT/pass.log"
@@ -88,25 +90,55 @@ import sys
 path = pathlib.Path(sys.argv[1])
 mutation = sys.argv[2]
 source = path.read_text(encoding="utf-8")
-path.write_text(source.replace("fn production_transport() {}", mutation, 1), encoding="utf-8")
+replacement = f"fn production_transport() {{ {mutation} }}"
+path.write_text(
+    source.replace("fn production_transport() {}", replacement, 1),
+    encoding="utf-8",
+)
 PY
         expect_failure "$case_root" "$source mutation: $mutation" \
             'standalone listener/forwarding ownership violations:'
     done
 done
 
+case_index=$((case_index + 1))
 case_root="$TEST_ROOT/extra-decision"
 cp -R "$BASELINE" "$case_root"
-sed -i '1i fn bypass(other: Context, facts: Facts, request: Request) { other.decide(&facts, request); }' \
-    "$case_root/src/proxy/ingress.rs"
+printf '%s\n' 'fn bypass(other: Context, facts: Facts, request: Request) { other.decide(&facts, request); }' \
+    >>"$case_root/src/proxy/ingress.rs"
 expect_failure "$case_root" 'second DecisionProvider caller' \
     'DecisionProvider::decide must have no product production caller'
 
+case_index=$((case_index + 1))
+case_root="$TEST_ROOT/renamed-decision"
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' 'fn bypass(other: Context, request_facts: Facts, request: Request) { other.decide(&request_facts, request); }' \
+    >>"$case_root/src/proxy/ingress.rs"
+expect_failure "$case_root" 'renamed-facts DecisionProvider caller' \
+    'DecisionProvider::decide must have no product production caller'
+
+case_index=$((case_index + 1))
+case_root="$TEST_ROOT/ufcs-decision"
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' 'fn bypass(other: Context, request_facts: Facts, request: Request) { DecisionProvider::decide(&other, &request_facts, request); }' \
+    >>"$case_root/src/proxy/ingress.rs"
+expect_failure "$case_root" 'UFCS DecisionProvider caller' \
+    'DecisionProvider::decide must have no product production caller'
+
+case_index=$((case_index + 1))
+case_root="$TEST_ROOT/macro-decision"
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' 'macro_rules! bypass { () => { other.decide(&request_facts, request); } }' \
+    >>"$case_root/src/proxy/ingress.rs"
+expect_failure "$case_root" 'macro DecisionProvider caller' \
+    'DecisionProvider::decide must have no product production caller'
+
+case_index=$((case_index + 1))
 case_root="$TEST_ROOT/obsolete-pipeline"
 cp -R "$BASELINE" "$case_root"
 printf '%s\n' 'fn obsolete() {}' >"$case_root/src/request_pipeline.rs"
 expect_failure "$case_root" 'obsolete product pipeline owner' \
     'obsolete product request_pipeline.rs must be deleted'
 
-printf 'standalone policy ownership mutation tests passed (%d path/pattern mutations)\n' \
+printf 'standalone policy ownership mutation tests passed (%d mutations)\n' \
     "$case_index"
