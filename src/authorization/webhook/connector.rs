@@ -657,7 +657,7 @@ mod tests {
 
     impl WebhookLocalAddressSource for FailingLocalAddresses {
         fn snapshot(&self) -> io::Result<WebhookLocalAddressSnapshot> {
-            Err(io::Error::new(io::ErrorKind::Other, "injected failure"))
+            Err(io::Error::other("injected failure"))
         }
     }
 
@@ -929,23 +929,18 @@ mod tests {
         assert!(allocation.source().is_some());
 
         let resolution = WebhookConnectorError::Resolution(WebhookResolveError::Lookup(
-            io::Error::new(io::ErrorKind::Other, "sensitive lookup detail"),
+            io::Error::other("sensitive lookup detail"),
         ));
         let resolution_source = resolution.source().unwrap();
         assert!(resolution_source.source().is_some());
         assert!(!resolution.to_string().contains("sensitive lookup detail"));
 
         for error in [
-            WebhookConnectorError::LocalAddressEnumeration(io::Error::new(
-                io::ErrorKind::Other,
+            WebhookConnectorError::LocalAddressEnumeration(io::Error::other(
                 "sensitive interface detail",
             )),
-            WebhookConnectorError::PeerAddress(io::Error::new(
-                io::ErrorKind::Other,
-                "sensitive peer detail",
-            )),
-            WebhookConnectorError::ConnectionAttemptsExhausted(io::Error::new(
-                io::ErrorKind::Other,
+            WebhookConnectorError::PeerAddress(io::Error::other("sensitive peer detail")),
+            WebhookConnectorError::ConnectionAttemptsExhausted(io::Error::other(
                 "sensitive connect detail",
             )),
         ] {
