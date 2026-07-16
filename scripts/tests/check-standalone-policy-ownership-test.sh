@@ -166,6 +166,30 @@ expect_failure "$case_root" 'unaudited external decision macro' \
     'production macro is not ownership-audited'
 
 case_index=$((case_index + 1))
+case_root="$TEST_ROOT/qualified-safe-macro-decision"
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' 'fn bypass(other: Context, facts: Facts, request: Request) { untrusted::info!(other, facts, request); }' \
+    >>"$case_root/src/proxy/ingress.rs"
+expect_failure "$case_root" 'qualified safe-basename macro' \
+    'production macro is not ownership-audited'
+
+case_index=$((case_index + 1))
+case_root="$TEST_ROOT/qualified-local-macro-decision"
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' 'macro_rules! bridge { () => {} } fn bypass(other: Context, facts: Facts, request: Request) { untrusted::bridge!(other, facts, request); }' \
+    >>"$case_root/src/proxy/ingress.rs"
+expect_failure "$case_root" 'qualified local-name-collision macro' \
+    'production macro is not ownership-audited'
+
+case_index=$((case_index + 1))
+case_root="$TEST_ROOT/import-shadow-macro-decision"
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' 'use untrusted::info; fn bypass(other: Context, facts: Facts, request: Request) { info!(other, facts, request); }' \
+    >>"$case_root/src/proxy/ingress.rs"
+expect_failure "$case_root" 'safe-basename macro import shadow' \
+    'production macro is not ownership-audited'
+
+case_index=$((case_index + 1))
 case_root="$TEST_ROOT/obsolete-pipeline"
 cp -R "$BASELINE" "$case_root"
 printf '%s\n' 'fn obsolete() {}' >"$case_root/src/request_pipeline.rs"
