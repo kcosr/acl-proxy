@@ -9,15 +9,15 @@ use tokio_rustls::TlsConnector;
 use super::ack::{
     AcknowledgementError, AcknowledgementParser, AcknowledgementProgress, WebhookAcknowledgement,
 };
+use super::connector::{WebhookConnector, WebhookConnectorError};
 use super::pool::{WebhookInboundBuffer, WebhookOutboundBuffer, WebhookTransportLease};
 use super::provider::WebhookProvider;
 use super::wire::{encode_request_head, WebhookRequestHeadError};
-use crate::destination::{DestinationGuard, DestinationGuardError, DestinationTarget};
 use crate::http1::store::ParserStoreError;
 use crate::safety::GuardedBody;
 
 pub(crate) async fn connect_and_deliver<C>(
-    destination_guard: &DestinationGuard,
+    connector: &WebhookConnector,
     provider: &WebhookProvider,
     lease: WebhookTransportLease,
     request_body: GuardedBody,
@@ -35,17 +35,13 @@ where
         }
     };
     tokio::pin!(effective_cancellation);
-    let prepared = destination_guard.preflight(DestinationTarget::webhook(provider.url()))?;
-    let resolved = tokio::select! {
-        biased;
-        _ = effective_cancellation.as_mut() => return Err(WebhookDeliveryError::Cancelled),
-        result = destination_guard.complete_resolution(prepared) => result?,
-    };
-    let connected = tokio::select! {
-        biased;
-        _ = effective_cancellation.as_mut() => return Err(WebhookDeliveryError::Cancelled),
-        result = destination_guard.connect_system(resolved) => result?,
-    };
+    let connected = connector
+        .connect(provider.url(), effective_cancellation.as_mut())
+        .await
+        .map_err(|error| match error {
+            WebhookConnectorError::Cancelled => WebhookDeliveryError::Cancelled,
+            error => WebhookDeliveryError::Connector(error),
+        })?;
     let stream: Box<dyn WebhookIo> = if let Some(config) = provider.tls() {
         let server_name = rustls::ServerName::try_from(connected.resolution_host())
             .map_err(|_| WebhookDeliveryError::TlsServerName)?;
@@ -353,7 +349,7 @@ pub(crate) enum WebhookDeliveryError {
     #[error("webhook delivery was cancelled")]
     Cancelled,
     #[error("webhook destination validation or connection failed")]
-    Destination(#[from] DestinationGuardError),
+    Connector(#[from] WebhookConnectorError),
     #[error("webhook request head construction failed")]
     RequestHead(#[from] WebhookRequestHeadError),
     #[error("webhook request write failed")]
@@ -382,14 +378,14 @@ mod tests {
     use tokio_rustls::TlsAcceptor;
 
     use super::*;
+    use crate::authorization::webhook::connector::{
+        WebhookDestinationFacts, WebhookLocalAddressSnapshot, WebhookLocalAddressSource,
+        WebhookResolveFuture, WebhookResolver,
+    };
     use crate::authorization::webhook::pool::WebhookTransportArena;
     use crate::authorization::webhook::provider::WebhookProvider;
     use crate::config::compiler::{
         CompiledProviderFailureMode, CompiledTlsTrust, WebhookProviderPlan, WebhookTlsPlan,
-    };
-    use crate::destination::{
-        DestinationFacts, DestinationResolver, LocalAddressSnapshot, LocalAddressSource,
-        ResolveFuture,
     };
     use crate::safety::{HttpWireBodyGuard, WireBodyPool, WireBodyQuotaKey};
     use http_access_url::canonicalize_http_url;
@@ -413,16 +409,26 @@ mod tests {
 
     struct HangingResolver;
 
-    impl DestinationResolver for HangingResolver {
-        fn resolve(&self, _host: &str, _port: u16, _max_addresses: usize) -> ResolveFuture<'_> {
+    impl WebhookResolver for HangingResolver {
+        fn resolve(
+            &self,
+            _host: &str,
+            _port: u16,
+            _max_addresses: usize,
+        ) -> WebhookResolveFuture<'_> {
             Box::pin(std::future::pending())
         }
     }
 
     struct FixedResolver(SocketAddr);
 
-    impl DestinationResolver for FixedResolver {
-        fn resolve(&self, _host: &str, _port: u16, _max_addresses: usize) -> ResolveFuture<'_> {
+    impl WebhookResolver for FixedResolver {
+        fn resolve(
+            &self,
+            _host: &str,
+            _port: u16,
+            _max_addresses: usize,
+        ) -> WebhookResolveFuture<'_> {
             let endpoint = self.0;
             Box::pin(async move { Ok(vec![endpoint]) })
         }
@@ -430,9 +436,9 @@ mod tests {
 
     struct EmptyLocalAddresses;
 
-    impl LocalAddressSource for EmptyLocalAddresses {
-        fn snapshot(&self) -> io::Result<LocalAddressSnapshot> {
-            Ok(LocalAddressSnapshot::default())
+    impl WebhookLocalAddressSource for EmptyLocalAddresses {
+        fn snapshot(&self) -> io::Result<WebhookLocalAddressSnapshot> {
+            Ok(WebhookLocalAddressSnapshot::default())
         }
     }
 
@@ -493,9 +499,9 @@ mod tests {
         .unwrap()
     }
 
-    fn loopback_destination(endpoint: SocketAddr) -> DestinationGuard {
-        DestinationGuard::with_sources(
-            DestinationFacts::for_test([], None, None, 1).unwrap(),
+    fn loopback_destination(endpoint: SocketAddr) -> WebhookConnector {
+        WebhookConnector::with_sources(
+            WebhookDestinationFacts::for_test([], None, None, 1).unwrap(),
             Arc::new(FixedResolver(endpoint)),
             Arc::new(EmptyLocalAddresses),
         )
@@ -801,8 +807,8 @@ mod tests {
             || false,
         )
         .unwrap();
-        let destination = DestinationGuard::with_sources(
-            DestinationFacts::for_test([], None, None, 1).unwrap(),
+        let destination = WebhookConnector::with_sources(
+            WebhookDestinationFacts::for_test([], None, None, 1).unwrap(),
             Arc::new(HangingResolver),
             Arc::new(EmptyLocalAddresses),
         );
@@ -858,8 +864,8 @@ mod tests {
             || false,
         )
         .unwrap();
-        let destination = DestinationGuard::with_sources(
-            DestinationFacts::for_test([], None, None, 1).unwrap(),
+        let destination = WebhookConnector::with_sources(
+            WebhookDestinationFacts::for_test([], None, None, 1).unwrap(),
             Arc::new(FixedResolver(endpoint)),
             Arc::new(EmptyLocalAddresses),
         );

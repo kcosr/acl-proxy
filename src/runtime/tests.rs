@@ -19,6 +19,10 @@ use crate::authorization::callback::{
     CallbackClaimResult, PendingCapabilityStore, PendingDeadline, ResumeTokenDigest,
 };
 use crate::authorization::protocol::{ProviderDecision, ProviderRequest};
+use crate::authorization::webhook::connector::{
+    WebhookConnector, WebhookDestinationFacts, WebhookLocalAddressSnapshot,
+    WebhookLocalAddressSource, WebhookResolveFuture, WebhookResolver,
+};
 use crate::authorization::webhook::runtime::WebhookAuthorizationRuntime;
 use crate::authorization::ProductAuthorizationSnapshot;
 use crate::config::compiler::{
@@ -26,10 +30,6 @@ use crate::config::compiler::{
     CompiledProviderFailureMode, CredentialsPlan, PendingOperationLimit, WebhookProviderPlan,
 };
 use crate::config::{compile_config_text, CompiledConfig, ConfigTextInput};
-use crate::destination::{
-    DestinationFacts, DestinationGuard, DestinationResolver, LocalAddressSnapshot,
-    LocalAddressSource, ResolveFuture,
-};
 use crate::safety::{WireBodyPool, WireBodyQuotaKey};
 use crate::upgrade::{
     UpgradeAllocation, UpgradeEntryPlan, UpgradeRelayPair, UpgradeRuntime, UpgradeRuntimeLimits,
@@ -42,8 +42,8 @@ struct EmptySnapshot;
 
 struct FixedDestinationResolver(SocketAddr);
 
-impl DestinationResolver for FixedDestinationResolver {
-    fn resolve(&self, _host: &str, _port: u16, _max_addresses: usize) -> ResolveFuture<'_> {
+impl WebhookResolver for FixedDestinationResolver {
+    fn resolve(&self, _host: &str, _port: u16, _max_addresses: usize) -> WebhookResolveFuture<'_> {
         let endpoint = self.0;
         Box::pin(async move { Ok(vec![endpoint]) })
     }
@@ -51,9 +51,9 @@ impl DestinationResolver for FixedDestinationResolver {
 
 struct EmptyLocalAddressSource;
 
-impl LocalAddressSource for EmptyLocalAddressSource {
-    fn snapshot(&self) -> io::Result<LocalAddressSnapshot> {
-        Ok(LocalAddressSnapshot::default())
+impl WebhookLocalAddressSource for EmptyLocalAddressSource {
+    fn snapshot(&self) -> io::Result<WebhookLocalAddressSnapshot> {
+        Ok(WebhookLocalAddressSnapshot::default())
     }
 }
 
@@ -806,14 +806,14 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
         stream.shutdown().await.unwrap();
     });
 
-    let destination = DestinationGuard::with_sources(
-        DestinationFacts::for_test([], None, None, 16).unwrap(),
+    let connector = WebhookConnector::with_sources(
+        WebhookDestinationFacts::for_test([], None, None, 16).unwrap(),
         Arc::new(FixedDestinationResolver(endpoint)),
         Arc::new(EmptyLocalAddressSource),
     );
-    let webhook_runtime = WebhookAuthorizationRuntime::for_test_with_destination(
+    let webhook_runtime = WebhookAuthorizationRuntime::for_test_with_connector(
         Some("http://control.test/_acl/external-auth/callback"),
-        destination,
+        connector,
     );
     let authorization_plan = AuthorizationPlan {
         internal_context_headers: vec![],

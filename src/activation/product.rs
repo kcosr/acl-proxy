@@ -525,11 +525,6 @@ redaction_profile = "environment"
             &resources.authorization_runtime(),
             &activator.authorization_runtime_handle()
         ));
-        assert!(Arc::ptr_eq(
-            resources.ingress_assets().destination_guard(),
-            resources.authorization_runtime().destination_guard()
-        ));
-
         crate::runtime::StaticResources::begin_shutdown(resources.as_ref());
         assert!(
             !resources

@@ -1479,6 +1479,10 @@ mod tests {
 
     use super::*;
     use crate::activation::static_resources::ProductStaticResources;
+    use crate::authorization::webhook::connector::{
+        WebhookConnector, WebhookDestinationFacts, WebhookLocalAddressSnapshot,
+        WebhookLocalAddressSource, WebhookResolveFuture, WebhookResolver,
+    };
     use crate::authorization::webhook::runtime::WebhookAuthorizationRuntime;
     use crate::config::{compile_config_text, CompiledConfig, ConfigTextInput};
     use crate::control::callback::handle_callback_entity;
@@ -1550,6 +1554,18 @@ header = "x-test-loop"
         }
     }
 
+    impl WebhookResolver for FixedResolver {
+        fn resolve(&self, _host: &str, port: u16, _max: usize) -> WebhookResolveFuture<'_> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(vec![SocketAddr::new(
+                    Ipv4Addr::new(203, 0, 113, 10).into(),
+                    port,
+                )])
+            })
+        }
+    }
+
     struct WebhookTestResolver {
         calls: Arc<AtomicUsize>,
     }
@@ -1566,11 +1582,29 @@ header = "x-test-loop"
         }
     }
 
+    impl WebhookResolver for WebhookTestResolver {
+        fn resolve(&self, host: &str, port: u16, _max: usize) -> WebhookResolveFuture<'_> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let address = if host == "127.0.0.1" {
+                Ipv4Addr::LOCALHOST
+            } else {
+                Ipv4Addr::new(203, 0, 113, 10)
+            };
+            Box::pin(async move { Ok(vec![SocketAddr::new(address.into(), port)]) })
+        }
+    }
+
     struct NoLocalAddresses;
 
     impl LocalAddressSource for NoLocalAddresses {
         fn snapshot(&self) -> io::Result<LocalAddressSnapshot> {
             Ok(LocalAddressSnapshot::default())
+        }
+    }
+
+    impl WebhookLocalAddressSource for NoLocalAddresses {
+        fn snapshot(&self) -> io::Result<WebhookLocalAddressSnapshot> {
+            Ok(WebhookLocalAddressSnapshot::default())
         }
     }
 
@@ -1882,23 +1916,32 @@ header = "x-test-loop"
         .await
     }
 
-    async fn runtime_from_with_authorization_and_resolver(
+    async fn runtime_from_with_authorization_and_resolver<R>(
         initial: CompiledConfig,
-        resolver: Arc<dyn DestinationResolver>,
+        resolver: Arc<R>,
     ) -> (
         Arc<Runtime>,
         Arc<DestinationGuard>,
         Arc<WebhookAuthorizationRuntime>,
-    ) {
+    )
+    where
+        R: DestinationResolver + WebhookResolver + 'static,
+    {
         let facts = DestinationFacts::from_static(&initial.static_config).unwrap();
         let destinations = Arc::new(DestinationGuard::with_sources(
             facts,
+            resolver.clone(),
+            Arc::new(NoLocalAddresses),
+        ));
+        let webhook_connector = Arc::new(WebhookConnector::with_sources(
+            WebhookDestinationFacts::from_static(&initial.static_config).unwrap(),
             resolver,
             Arc::new(NoLocalAddresses),
         ));
-        let resources = ProductStaticResources::try_new_with_destination_guard(
+        let resources = ProductStaticResources::try_new_with_connectors(
             &initial.static_config,
             destinations.clone(),
+            webhook_connector,
         )
         .unwrap();
         let authorization = resources.authorization_runtime();

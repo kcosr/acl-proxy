@@ -13,6 +13,7 @@ root = pathlib.Path(sys.argv[1])
 executor_path = pathlib.Path("src/proxy/forwarding_executor.rs")
 transport_path = pathlib.Path("src/proxy/forward.rs")
 ingress_path = pathlib.Path("src/proxy/ingress.rs")
+webhook_connector_path = pathlib.Path("src/authorization/webhook/connector.rs")
 
 
 def mask_non_code(source: str) -> str:
@@ -192,6 +193,29 @@ sources = []
 for absolute in sorted((root / "src").rglob("*.rs")):
     relative = absolute.relative_to(root)
     sources.append((relative, production(relative)))
+
+webhook_connector = dict(sources).get(webhook_connector_path)
+if webhook_connector is None:
+    raise SystemExit("authorization webhook connector ownership path is missing")
+webhook_forbidden = {
+    "ordinary destination": r"\bcrate\s*::\s*destination\b",
+    "ordinary egress": r"\bcrate\s*::\s*egress\b",
+    "ordinary forwarding": r"\bcrate\s*::\s*proxy\s*::\s*forward\b",
+    "forwarding plan": r"\bForwardingPlan\b",
+    "credential execution": r"\b(?:ProductCredentialExecution|CredentialResolverSession|TransportCredentialBatch)\b",
+}
+webhook_violations = [
+    name
+    for name, pattern in webhook_forbidden.items()
+    if re.search(pattern, webhook_connector)
+]
+if webhook_violations:
+    print(
+        "authorization webhook connector must remain independent of ordinary forwarding ownership",
+        file=sys.stderr,
+    )
+    print("forbidden dependencies: " + ", ".join(webhook_violations), file=sys.stderr)
+    raise SystemExit(1)
 
 executor = dict(sources)[executor_path]
 forbidden = (

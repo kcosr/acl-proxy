@@ -68,7 +68,6 @@ impl DestinationResolver for SystemDestinationResolver {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DestinationRoute {
     Direct,
-    Webhook,
     Parent,
 }
 
@@ -85,10 +84,6 @@ pub(crate) struct DestinationTarget {
 impl DestinationTarget {
     pub(crate) fn direct(url: &CanonicalUrl) -> Self {
         Self::from_url(DestinationRoute::Direct, url)
-    }
-
-    pub(crate) fn webhook(url: &CanonicalUrl) -> Self {
-        Self::from_url(DestinationRoute::Webhook, url)
     }
 
     pub(crate) fn parent(parent_hop: &CanonicalAuthority, origin: &CanonicalUrl) -> Self {
@@ -964,7 +959,6 @@ mod tests {
         .expect("canonical destination URL");
         match route {
             DestinationRoute::Direct => DestinationTarget::direct(&url),
-            DestinationRoute::Webhook => DestinationTarget::webhook(&url),
             DestinationRoute::Parent => {
                 let parent = http_access_url::canonicalize_http_authority(
                     HttpScheme::Https,
@@ -1051,7 +1045,7 @@ mod tests {
             [LocalStep::Addresses(vec![])],
         );
 
-        let result = resolve(&guard, target(DestinationRoute::Webhook, 443)).await;
+        let result = resolve(&guard, target(DestinationRoute::Direct, 443)).await;
         assert!(matches!(
             result,
             Err(DestinationGuardError::ProtectedDestination {
@@ -1059,59 +1053,6 @@ mod tests {
                 ..
             })
         ));
-    }
-
-    #[tokio::test]
-    async fn webhook_provider_cannot_target_self_or_control_plane() {
-        for (facts, resolved, reason, port) in [
-            (
-                facts([endpoint("127.0.0.1:8443")], None),
-                endpoint("127.0.0.1:8443"),
-                ProtectedReason::Listener,
-                8443,
-            ),
-            (
-                facts([], Some(endpoint("127.0.0.1:8898"))),
-                endpoint("127.0.0.1:8898"),
-                ProtectedReason::Control,
-                8898,
-            ),
-        ] {
-            let resolver = Arc::new(FixedResolver::new([resolved]));
-            let guard = guard(facts, Arc::clone(&resolver), [LocalStep::Addresses(vec![])]);
-
-            assert!(matches!(
-                resolve(&guard, target(DestinationRoute::Webhook, port)).await,
-                Err(DestinationGuardError::ProtectedDestination {
-                    reason: actual,
-                    ..
-                }) if actual == reason
-            ));
-            assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
-        }
-
-        let callback_url = http_access_url::canonicalize_http_url(
-            "https://control.example/_acl/external-auth/callback",
-        )
-        .expect("canonical callback URL");
-        let resolver = Arc::new(FixedResolver::new([endpoint("192.0.2.60:443")]));
-        let guard = guard(
-            DestinationFacts::for_test(
-                [],
-                None,
-                Some(ReservedControlSubtree::new(&callback_url, "/_acl")),
-                8,
-            )
-            .expect("destination facts"),
-            Arc::clone(&resolver),
-            [LocalStep::Addresses(vec![])],
-        );
-
-        assert!(matches!(
-            resolve(&guard, DestinationTarget::webhook(&callback_url)).await,
-            Err(DestinationGuardError::ReservedControlSubtree)
-        ));
-        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1166,7 +1107,7 @@ mod tests {
             [LocalStep::Addresses(vec![])],
         );
         assert!(matches!(
-            resolve(&control_guard, target(DestinationRoute::Webhook, 8898)).await,
+            resolve(&control_guard, target(DestinationRoute::Direct, 8898)).await,
             Err(DestinationGuardError::ProtectedDestination {
                 reason: ProtectedReason::Control,
                 ..
@@ -1386,30 +1327,6 @@ mod tests {
             }) if expected == candidate && actual == different_peer
         ));
         assert!(connector.dropped.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn reserved_control_subtree_denies_before_dns() {
-        let resolver = Arc::new(FixedResolver::new([endpoint("192.0.2.60:443")]));
-        let callback_url = http_access_url::canonicalize_http_url(
-            "https://control.example/_acl/external-auth/callback",
-        )
-        .expect("canonical callback URL");
-        let facts = DestinationFacts::for_test(
-            [],
-            None,
-            Some(ReservedControlSubtree::new(&callback_url, "/_acl")),
-            8,
-        )
-        .expect("destination facts");
-        let guard = guard(facts, Arc::clone(&resolver), [LocalStep::Addresses(vec![])]);
-        let reserved = DestinationTarget::webhook(&callback_url);
-
-        assert!(matches!(
-            resolve(&guard, reserved).await,
-            Err(DestinationGuardError::ReservedControlSubtree)
-        ));
-        assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1688,25 +1605,24 @@ mod tests {
         assert_eq!(direct.semantic_path(), "/direct/path");
         assert_eq!(direct.stream().peer, candidate);
 
-        let webhook_url = http_access_url::canonicalize_http_url(
-            "https://webhook.example:9443/provider/decision",
-        )
-        .expect("webhook URL");
-        let webhook = resolve(&guard, DestinationTarget::webhook(&webhook_url))
+        let second_url =
+            http_access_url::canonicalize_http_url("https://second.example:9443/provider/decision")
+                .expect("second direct URL");
+        let second = resolve(&guard, DestinationTarget::direct(&second_url))
             .await
-            .expect("webhook resolution");
-        let mut webhook = guard
+            .expect("second direct resolution");
+        let mut second = guard
             .connect(
-                webhook,
+                second,
                 &FakeConnector::new([ConnectAction::Success(candidate)]),
             )
             .await
-            .expect("webhook connect");
-        assert_eq!(webhook.resolution_host(), "webhook.example");
-        assert_eq!(webhook.resolution_port(), 9443);
-        assert_eq!(webhook.semantic_authority(), "webhook.example:9443");
-        assert_eq!(webhook.semantic_path(), "/provider/decision");
-        assert_eq!(webhook.stream_mut().peer, candidate);
+            .expect("second direct connect");
+        assert_eq!(second.resolution_host(), "second.example");
+        assert_eq!(second.resolution_port(), 9443);
+        assert_eq!(second.semantic_authority(), "second.example:9443");
+        assert_eq!(second.semantic_path(), "/provider/decision");
+        assert_eq!(second.stream_mut().peer, candidate);
 
         let parent_hop =
             http_access_url::canonicalize_http_authority(HttpScheme::Https, "parent.example:3128")
@@ -1761,7 +1677,7 @@ mod tests {
             .reserved_control
             .as_ref()
             .expect("reserved control subtree")
-            .contains(&DestinationTarget::webhook(&callback)));
+            .contains(&DestinationTarget::direct(&callback)));
 
         let mut wrong_route = compiled.static_config.clone();
         wrong_route.callback_public_url =

@@ -9,7 +9,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 BASELINE="$TEST_ROOT/baseline"
-mkdir -p "$BASELINE/scripts" "$BASELINE/src/proxy"
+mkdir -p "$BASELINE/scripts" "$BASELINE/src/proxy" "$BASELINE/src/authorization/webhook"
 cp "$SOURCE_ROOT/scripts/check-forwarding-executor-ownership.sh" "$BASELINE/scripts/"
 
 cat >"$BASELINE/src/proxy/forward.rs" <<'EOF'
@@ -93,6 +93,10 @@ fn test_only() {
 }
 EOF
 
+cat >"$BASELINE/src/authorization/webhook/connector.rs" <<'EOF'
+struct WebhookConnector;
+EOF
+
 runner() {
     local root=$1
     "$root/scripts/check-forwarding-executor-ownership.sh"
@@ -115,6 +119,22 @@ expect_failure() {
         exit 1
     fi
 }
+
+case_index=0
+for dependency in \
+    'use crate::destination::DestinationGuard;' \
+    'use crate::egress::EgressSnapshot;' \
+    'use crate::proxy::forward::forward_request;' \
+    'fn escaped(_: ForwardingPlan) {}' \
+    'fn escaped(_: ProductCredentialExecution) {}'
+do
+    case_root="$TEST_ROOT/webhook-ownership-$case_index"
+    case_index=$((case_index + 1))
+    cp -R "$BASELINE" "$case_root"
+    printf '%s\n' "$dependency" >>"$case_root/src/authorization/webhook/connector.rs"
+    expect_failure "$case_root" "webhook connector dependency $dependency" \
+        'authorization webhook connector must remain independent of ordinary forwarding ownership'
+done
 
 forbidden_mutations=(
     'let _: AppState;'
@@ -146,7 +166,6 @@ forbidden_mutations=(
     'call_provider();'
 )
 
-case_index=0
 for mutation in "${forbidden_mutations[@]}"; do
     case_index=$((case_index + 1))
     case_root="$TEST_ROOT/case-$case_index"

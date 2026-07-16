@@ -5,6 +5,7 @@ use http_access_types::CanonicalUrl;
 use http_access_url::{canonicalize_http_url, UrlError};
 use tokio::sync::{oneshot, Notify};
 
+use super::connector::WebhookConnector;
 #[cfg(test)]
 use super::pool::WebhookTransportArenaCounts;
 use super::pool::{
@@ -21,9 +22,6 @@ use crate::authorization::callback::{
 use crate::authorization::protocol::{ProviderCredentialSet, ProviderDecision};
 use crate::config::compiler::AuthorizationCallbackPlan;
 use crate::config::StaticProductConfig;
-#[cfg(test)]
-use crate::destination::DestinationFacts;
-use crate::destination::{DestinationGuard, DestinationGuardError};
 use crate::runtime::{
     AuthorizationDispatchContext, AuthorizationInvocationMode, GenerationRetention,
     GenerationRetentionError,
@@ -33,7 +31,7 @@ use crate::safety::HttpWireBodyGuard;
 
 pub(crate) struct WebhookAuthorizationRuntime {
     transport: WebhookTransportArena,
-    destination: Arc<DestinationGuard>,
+    connector: Arc<WebhookConnector>,
     pending: PendingCapabilityStore<PendingWebhookOperation>,
     callback_url: Option<CanonicalUrl>,
     accepting: Mutex<bool>,
@@ -74,8 +72,6 @@ pub(crate) enum WebhookCompletionError {
 pub(crate) enum WebhookAuthorizationRuntimeError {
     #[error("webhook transport arena configuration is invalid")]
     Transport(#[from] WebhookTransportArenaError),
-    #[error("webhook destination facts are invalid")]
-    Destination(#[from] DestinationGuardError),
     #[error("callback public URL is invalid")]
     CallbackUrl(#[from] UrlError),
 }
@@ -109,9 +105,9 @@ pub(crate) enum WebhookDispatchError {
 }
 
 impl WebhookAuthorizationRuntime {
-    pub(crate) fn try_new(
+    pub(crate) fn try_new_with_connector(
         static_config: &StaticProductConfig,
-        destination: Arc<DestinationGuard>,
+        connector: Arc<WebhookConnector>,
     ) -> Result<Arc<Self>, WebhookAuthorizationRuntimeError> {
         let callback_url = static_config
             .callback_public_url
@@ -124,7 +120,7 @@ impl WebhookAuthorizationRuntime {
                 static_config.service.webhook_transport_buffer_bytes,
                 static_config.service.max_webhook_transport_bytes,
             )?,
-            destination,
+            connector,
             pending: PendingCapabilityStore::new(),
             callback_url,
             accepting: Mutex::new(true),
@@ -133,20 +129,24 @@ impl WebhookAuthorizationRuntime {
 
     #[cfg(test)]
     pub(crate) fn for_test(callback_url: Option<&str>) -> Arc<Self> {
-        Self::for_test_with_destination(
+        Self::for_test_with_connector(
             callback_url,
-            DestinationGuard::system(DestinationFacts::for_test([], None, None, 16).unwrap()),
+            WebhookConnector::with_sources(
+                super::connector::WebhookDestinationFacts::for_test([], None, None, 16).unwrap(),
+                Arc::new(super::connector::SystemWebhookResolver),
+                Arc::new(super::connector::SystemWebhookLocalAddressSource),
+            ),
         )
     }
 
     #[cfg(test)]
-    pub(crate) fn for_test_with_destination(
+    pub(crate) fn for_test_with_connector(
         callback_url: Option<&str>,
-        destination: DestinationGuard,
+        connector: WebhookConnector,
     ) -> Arc<Self> {
         Arc::new(Self {
             transport: WebhookTransportArena::try_new(1, 64 * 1024, 128 * 1024).unwrap(),
-            destination: Arc::new(destination),
+            connector: Arc::new(connector),
             pending: PendingCapabilityStore::new(),
             callback_url: callback_url.map(|url| canonicalize_http_url(url).unwrap()),
             accepting: Mutex::new(true),
@@ -185,11 +185,6 @@ impl WebhookAuthorizationRuntime {
             let payload = terminal.into_payload();
             payload.complete(Err(WebhookCompletionError::Terminal(cause)));
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn destination_guard(&self) -> &Arc<DestinationGuard> {
-        &self.destination
     }
 
     pub(crate) fn pending_store(&self) -> &PendingCapabilityStore<PendingWebhookOperation> {
@@ -269,7 +264,7 @@ impl WebhookAuthorizationRuntime {
             }
         };
         let delivery = connect_and_deliver(
-            &self.destination,
+            &self.connector,
             &provider,
             transport,
             request_body,

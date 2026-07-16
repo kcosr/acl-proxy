@@ -108,16 +108,43 @@ impl ProductStaticResources {
         Self::try_new_with_ingress_assets(static_config, ingress_assets)
     }
 
+    #[cfg(test)]
+    pub(crate) fn try_new_with_connectors(
+        static_config: &StaticProductConfig,
+        destination_guard: Arc<crate::destination::DestinationGuard>,
+        webhook_connector: Arc<crate::authorization::webhook::connector::WebhookConnector>,
+    ) -> Result<Arc<Self>, ProductStaticResourcesError> {
+        let ingress_assets =
+            ProductIngressAssets::with_destination_guard(static_config, destination_guard)?;
+        Self::try_new_with_ingress_assets_and_webhook_connector(
+            static_config,
+            ingress_assets,
+            webhook_connector,
+        )
+    }
+
     fn try_new_with_ingress_assets(
         static_config: &StaticProductConfig,
         ingress_assets: Arc<ProductIngressAssets>,
     ) -> Result<Arc<Self>, ProductStaticResourcesError> {
+        let webhook_connector =
+            crate::authorization::webhook::connector::WebhookConnector::system(static_config)?;
+        Self::try_new_with_ingress_assets_and_webhook_connector(
+            static_config,
+            ingress_assets,
+            webhook_connector,
+        )
+    }
+
+    fn try_new_with_ingress_assets_and_webhook_connector(
+        static_config: &StaticProductConfig,
+        ingress_assets: Arc<ProductIngressAssets>,
+        webhook_connector: Arc<crate::authorization::webhook::connector::WebhookConnector>,
+    ) -> Result<Arc<Self>, ProductStaticResourcesError> {
         let (control_failure, _) = watch::channel(None);
         let (proxy_failure, _) = watch::channel(None);
-        let authorization_runtime = WebhookAuthorizationRuntime::try_new(
-            static_config,
-            ingress_assets.destination_guard().clone(),
-        )?;
+        let authorization_runtime =
+            WebhookAuthorizationRuntime::try_new_with_connector(static_config, webhook_connector)?;
         let upgrade_runtime = UpgradeRuntime::try_new(UpgradeRuntimeLimits::new(
             static_config.service.max_active_upgrades,
             static_config.service.max_upgrade_buffer_bytes,
@@ -689,6 +716,8 @@ pub(crate) enum ProductStaticResourcesError {
     StaticFingerprint(#[from] StaticFingerprintError),
     #[error("static authorization runtime construction failed")]
     Authorization(#[from] WebhookAuthorizationRuntimeError),
+    #[error("static webhook connector construction failed")]
+    WebhookConnector(#[from] crate::authorization::webhook::connector::WebhookConnectorError),
     #[error("static credential I/O runtime construction failed")]
     CredentialIo(#[from] CredentialIoRuntimeError),
     #[error("static upgrade runtime construction failed")]
