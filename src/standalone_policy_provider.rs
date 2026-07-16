@@ -9,7 +9,8 @@ use http_access_policy_acl::{
 };
 use http_access_runtime::{
     BodyBounds, BodyBudget, BodyBudgetActivation, BoxFuture, Clock, DecisionProvider,
-    ProviderOutcome, RuntimeBody, RuntimeRequest, RuntimeResponse, StandaloneExchange,
+    ProviderOutcome, RequestPipelineError, RuntimeBody, RuntimeRequest, RuntimeResponse,
+    StandaloneDispatch, StandaloneExchange,
 };
 use http_access_types::{
     BodyFraming, BodyObservation, BodyObservationState, BodyRepresentation, DecisionAuditFacts,
@@ -40,7 +41,6 @@ use crate::proxy::forward::{
     resolve_forwarding_target, PreflightForwardingTarget, PreparedForwardingTarget,
     ResolvedForwardingTarget,
 };
-use crate::request_pipeline::{RequestPipelineError, StandaloneDispatch};
 use crate::runtime::{
     AuthorizationInvocationMode, ForwardingGenerationServices, GenerationLease,
     GenerationRetention, ProviderIndex,
@@ -1490,10 +1490,10 @@ mod tests {
         validate_standalone_connect_ingress_request, validate_standalone_ingress_request,
     };
     use crate::proxy::forward::preflight_forwarding_target;
-    use crate::request_pipeline::RequestPipeline;
     use crate::runtime::{
         ActivationCancellation, CandidateSource, Runtime, RuntimeError, StaticOwnership,
     };
+    use http_access_runtime::RequestPipeline;
 
     const CONFIG_PREFIX: &str = r#"schema_version = 3
 

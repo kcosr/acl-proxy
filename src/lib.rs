@@ -20,7 +20,6 @@ mod observation;
 mod policy;
 mod proxy;
 mod redaction;
-mod request_pipeline;
 mod runtime;
 mod runtime_body_source;
 mod safety;

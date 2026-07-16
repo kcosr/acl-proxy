@@ -29,24 +29,6 @@ do
         '}' >"$BASELINE/$source"
 done
 
-cat >"$BASELINE/src/request_pipeline.rs" <<'EOF'
-fn execute(context: Context, facts: Facts, request: Request) {
-    match context.decide(&facts, request) {
-        Respond(response) => context.respond(response),
-        Forward(exchange) => context.forward(exchange),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    fn test_only(second: Context, facts: Facts, request: Request) {
-        second.decide(&facts, request);
-        second.respond(response);
-        second.forward(exchange);
-    }
-}
-EOF
-
 runner() {
     local root=$1
     "$root/scripts/check-standalone-policy-ownership.sh"
@@ -118,20 +100,13 @@ cp -R "$BASELINE" "$case_root"
 sed -i '1i fn bypass(other: Context, facts: Facts, request: Request) { other.decide(&facts, request); }' \
     "$case_root/src/proxy/ingress.rs"
 expect_failure "$case_root" 'second DecisionProvider caller' \
-    'DecisionProvider::decide must have exactly one production caller'
+    'DecisionProvider::decide must have no product production caller'
 
-case_root="$TEST_ROOT/extra-respond"
+case_root="$TEST_ROOT/obsolete-pipeline"
 cp -R "$BASELINE" "$case_root"
-sed -i '/context.respond(response)/a\        Other(response) => context.respond(response),' \
-    "$case_root/src/request_pipeline.rs"
-expect_failure "$case_root" 'second terminal response dispatcher' \
-    'must own exactly one terminal respond and one terminal forward dispatch'
-
-case_root="$TEST_ROOT/missing-forward"
-cp -R "$BASELINE" "$case_root"
-sed -i '/context.forward(exchange)/d' "$case_root/src/request_pipeline.rs"
-expect_failure "$case_root" 'missing terminal forward dispatcher' \
-    'must own exactly one terminal respond and one terminal forward dispatch'
+printf '%s\n' 'fn obsolete() {}' >"$case_root/src/request_pipeline.rs"
+expect_failure "$case_root" 'obsolete product pipeline owner' \
+    'obsolete product request_pipeline.rs must be deleted'
 
 printf 'standalone policy ownership mutation tests passed (%d path/pattern mutations)\n' \
     "$case_index"

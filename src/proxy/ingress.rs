@@ -55,7 +55,6 @@ use crate::proxy::original_destination::{
     OriginalDestinationResolver, SystemOriginalDestinationResolver,
 };
 use crate::proxy::upgrade_relay::UpgradeCaptureContext;
-use crate::request_pipeline::{RequestPipeline, RequestPipelineError};
 use crate::runtime::{BoxFuture, GenerationLease, Runtime};
 use crate::safety::{GuardedBody, WireBodyQuotaKey};
 use crate::standalone_policy_provider::{
@@ -64,6 +63,7 @@ use crate::standalone_policy_provider::{
     StandaloneTerminalService, TokioRuntimeClock,
 };
 use crate::upgrade::UpgradeRuntime;
+use http_access_runtime::{RequestPipeline, RequestPipelineError};
 use http_access_types::{
     CanonicalHost, CaptureFacts, CaptureFactsInput, DecisionAuditFacts, DecisionAuditFactsInput,
     DecisionAuditSource, DecisionDisposition, DecisionReason, DecisionReasonCategory,

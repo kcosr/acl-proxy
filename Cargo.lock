@@ -743,6 +743,7 @@ dependencies = [
  "http-access-redaction",
  "http-access-types",
  "http-access-url",
+ "thiserror",
 ]
 
 [[package]]

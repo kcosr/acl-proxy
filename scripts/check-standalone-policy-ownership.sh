@@ -176,7 +176,8 @@ if violations:
     raise SystemExit(1)
 
 pipeline_path = pathlib.Path("src/request_pipeline.rs")
-pipeline = production(pipeline_path)
+if (root / pipeline_path).exists():
+    raise SystemExit("obsolete product request_pipeline.rs must be deleted")
 all_production = []
 for path in (root / "src").rglob("*.rs"):
     relative = path.relative_to(root)
@@ -191,22 +192,9 @@ for path, source in all_production:
     for match in decision_call.finditer(source):
         line = source.count("\n", 0, match.start()) + 1
         decision_calls.append(f"{path}:{line}")
-if len(decision_calls) != 1 or not decision_calls[0].startswith("src/request_pipeline.rs:"):
-    print("DecisionProvider::decide must have exactly one production caller in request_pipeline.rs", file=sys.stderr)
+if decision_calls:
+    print("DecisionProvider::decide must have no product production caller", file=sys.stderr)
     print("call sites: " + (", ".join(decision_calls) or "none"), file=sys.stderr)
-    raise SystemExit(1)
-
-respond_calls = re.findall(r"\bcontext\s*\.\s*respond\s*\(", pipeline)
-forward_calls = re.findall(r"\bcontext\s*\.\s*forward\s*\(", pipeline)
-if len(respond_calls) != 1 or len(forward_calls) != 1:
-    print(
-        "request_pipeline.rs must own exactly one terminal respond and one terminal forward dispatch",
-        file=sys.stderr,
-    )
-    print(
-        f"dispatch counts: respond={len(respond_calls)} forward={len(forward_calls)}",
-        file=sys.stderr,
-    )
     raise SystemExit(1)
 
 print("standalone policy ownership gate passed")
