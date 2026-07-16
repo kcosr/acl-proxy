@@ -3574,7 +3574,9 @@ def send(response):
 
 def complete(request):
     url = request["url"]
-    if url.endswith("/timeout") or url.endswith("/cancel"):
+    if request["method"] == "CONNECT":
+        send({{"id": request["id"], "type": "response", "decision": "allow"}})
+    elif url.endswith("/timeout") or url.endswith("/cancel"):
         time.sleep(30)
         send({{"id": request["id"], "type": "response", "decision": "allow", "values": {{"token": "late"}}}})
     elif url.endswith("/pass"):
@@ -3781,7 +3783,7 @@ methods = ["POST"]
             ProviderIngressCase::ConnectMitmInner => {
                 listener_table = "explicit_http";
                 listener_policy = format!(
-                    "[listeners.explicit_http.connect]\nhttp1 = \"mitm\"\n\n[mitm]\nmode = \"generated\"\ndirectory = \"mitm\"\n\n[[policy.rules]]\nid = \"connect-target\"\ndecision = \"allow\"\nurls = [\"https://{origin}/**\"]\nmethods = [\"CONNECT\"]\n\n{policy}"
+                    "[listeners.explicit_http.connect]\nhttp1 = \"mitm\"\n\n[mitm]\nmode = \"generated\"\ndirectory = \"mitm\"\n\n[[policy.rules]]\nid = \"connect-target\"\ndecision = \"delegate\"\nurls = [\"https://{origin}/**\"]\nmethods = [\"CONNECT\"]\nauthorization_provider = \"corpus\"\n\n{policy}"
                 );
             }
             ProviderIngressCase::TransparentHttps => {
@@ -3972,7 +3974,12 @@ methods = ["POST"]
                 "{case:?} timeout leaked body charge"
             );
             let calls = fs::read_to_string(&marker).unwrap();
-            assert_eq!(calls.lines().count(), 7, "{case:?} provider call count");
+            let connect_mitm = matches!(case, ProviderIngressCase::ConnectMitmInner);
+            assert_eq!(
+                calls.lines().count(),
+                if connect_mitm { 14 } else { 7 },
+                "{case:?} provider call count"
+            );
             for suffix in [
                 "/pass",
                 "/replace",
@@ -3986,6 +3993,14 @@ methods = ["POST"]
                     calls.lines().filter(|line| line.ends_with(suffix)).count(),
                     1,
                     "{case:?} {suffix} call count"
+                );
+            }
+            if connect_mitm {
+                let outer_url = format!("https://{}/", fixture.origin);
+                assert_eq!(
+                    calls.lines().filter(|line| *line == outer_url).count(),
+                    7,
+                    "{case:?} outer CONNECT provider call count"
                 );
             }
 
@@ -4004,11 +4019,27 @@ methods = ["POST"]
             let cancel_pool = cancel_fixture.product.wire_body_pool();
             let cancelled = cancel_fixture.begin_cancelled_request().await;
             wait_for_provider_call(&cancel_marker, "/cancel").await;
+            let cancel_calls = fs::read_to_string(&cancel_marker).unwrap();
             assert_eq!(
-                fs::read_to_string(&cancel_marker).unwrap().lines().count(),
-                1,
+                cancel_calls.lines().count(),
+                if matches!(case, ProviderIngressCase::ConnectMitmInner) {
+                    2
+                } else {
+                    1
+                },
                 "{case:?} cancellation provider call count"
             );
+            if matches!(case, ProviderIngressCase::ConnectMitmInner) {
+                let outer_url = format!("https://{}/", cancel_fixture.origin);
+                assert_eq!(
+                    cancel_calls
+                        .lines()
+                        .filter(|line| *line == outer_url)
+                        .count(),
+                    1,
+                    "{case:?} cancellation outer CONNECT provider call count"
+                );
+            }
             drop(cancelled);
             tokio::time::timeout(Duration::from_secs(2), cancel_fixture.product.shutdown())
                 .await
@@ -4120,12 +4151,25 @@ methods = ["POST"]
             );
 
             let calls = fs::read_to_string(&marker).unwrap();
-            assert_eq!(calls.lines().count(), 2, "{case:?} provider call count");
+            let connect_mitm = matches!(case, ProviderIngressCase::ConnectMitmInner);
+            assert_eq!(
+                calls.lines().count(),
+                if connect_mitm { 3 } else { 2 },
+                "{case:?} provider call count"
+            );
             for suffix in ["/replace", "/deny"] {
                 assert_eq!(
                     calls.lines().filter(|line| line.ends_with(suffix)).count(),
                     1,
                     "{case:?} {suffix} call count"
+                );
+            }
+            if connect_mitm {
+                let outer_url = format!("https://{}/", fixture.origin);
+                assert_eq!(
+                    calls.lines().filter(|line| *line == outer_url).count(),
+                    1,
+                    "{case:?} HTTP/2 outer CONNECT provider call count"
                 );
             }
 

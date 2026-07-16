@@ -2750,7 +2750,12 @@ time.sleep(30)
         body_request.body = Some(body);
         assert_eq!(
             provider
-                .decide_effects_allowed_for_test(body_request, &body_guard(), request_deadline())
+                .decide(
+                    body_request,
+                    AuthorizationInvocationMode::DecisionOnly,
+                    &body_guard(),
+                    request_deadline(),
+                )
                 .await,
             Err(ProcessRequestError::InvalidRequest)
         );

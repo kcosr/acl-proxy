@@ -1475,10 +1475,13 @@ mod tests {
     use http::{Method, Request, Version};
     use http_access_types::IngressMode;
     use hyper::Body;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
     use crate::activation::static_resources::ProductStaticResources;
+    use crate::authorization::webhook::runtime::WebhookAuthorizationRuntime;
     use crate::config::{compile_config_text, CompiledConfig, ConfigTextInput};
+    use crate::control::callback::handle_callback_entity;
     use crate::destination::{
         DestinationFacts, DestinationResolver, LocalAddressSnapshot, LocalAddressSource,
         ResolveFuture,
@@ -1544,6 +1547,22 @@ header = "x-test-loop"
                     port,
                 )])
             })
+        }
+    }
+
+    struct WebhookTestResolver {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl DestinationResolver for WebhookTestResolver {
+        fn resolve(&self, host: &str, port: u16, _max_addresses: usize) -> ResolveFuture<'_> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let address = if host == "127.0.0.1" {
+                Ipv4Addr::LOCALHOST
+            } else {
+                Ipv4Addr::new(203, 0, 113, 10)
+            };
+            Box::pin(async move { Ok(vec![SocketAddr::new(address.into(), port)]) })
         }
     }
 
@@ -1810,6 +1829,13 @@ header = "x-test-loop"
         .unwrap()
     }
 
+    fn unused_loopback_address() -> SocketAddr {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    }
+
     async fn runtime(
         default: &str,
         resolver_calls: Arc<AtomicUsize>,
@@ -1834,12 +1860,40 @@ header = "x-test-loop"
         initial: CompiledConfig,
         resolver_calls: Arc<AtomicUsize>,
     ) -> (Arc<Runtime>, Arc<DestinationGuard>) {
-        let facts = DestinationFacts::from_static(&initial.static_config).unwrap();
-        let destinations = Arc::new(DestinationGuard::with_sources(
-            facts,
+        let (runtime, destinations, _) =
+            runtime_from_with_authorization(initial, resolver_calls).await;
+        (runtime, destinations)
+    }
+
+    async fn runtime_from_with_authorization(
+        initial: CompiledConfig,
+        resolver_calls: Arc<AtomicUsize>,
+    ) -> (
+        Arc<Runtime>,
+        Arc<DestinationGuard>,
+        Arc<WebhookAuthorizationRuntime>,
+    ) {
+        runtime_from_with_authorization_and_resolver(
+            initial,
             Arc::new(FixedResolver {
                 calls: resolver_calls,
             }),
+        )
+        .await
+    }
+
+    async fn runtime_from_with_authorization_and_resolver(
+        initial: CompiledConfig,
+        resolver: Arc<dyn DestinationResolver>,
+    ) -> (
+        Arc<Runtime>,
+        Arc<DestinationGuard>,
+        Arc<WebhookAuthorizationRuntime>,
+    ) {
+        let facts = DestinationFacts::from_static(&initial.static_config).unwrap();
+        let destinations = Arc::new(DestinationGuard::with_sources(
+            facts,
+            resolver,
             Arc::new(NoLocalAddresses),
         ));
         let resources = ProductStaticResources::try_new_with_destination_guard(
@@ -1847,6 +1901,7 @@ header = "x-test-loop"
             destinations.clone(),
         )
         .unwrap();
+        let authorization = resources.authorization_runtime();
         let activator = resources.activator();
         let ownership = StaticOwnership::new(
             initial.static_config.clone(),
@@ -1857,7 +1912,7 @@ header = "x-test-loop"
             .await
             .unwrap();
         runtime.start(initial).await.unwrap();
-        (runtime, destinations)
+        (runtime, destinations, authorization)
     }
 
     #[cfg(unix)]
@@ -1962,6 +2017,137 @@ methods = ["CONNECT"]
             command.display(),
             after_pass
         ))
+    }
+
+    fn outer_connect_webhook_provider_config(
+        provider: SocketAddr,
+        control: SocketAddr,
+        after_pass: &str,
+    ) -> CompiledConfig {
+        compiled_text(&format!(
+            r#"[control]
+bind = "{control}"
+base_path = "/_acl-proxy"
+request_header_timeout = "1s"
+request_body_timeout = "2s"
+max_connections = 4
+max_request_body_bytes = 4096
+
+[authorization.callback]
+public_url = "http://{control}/_acl-proxy/external-auth/callback"
+resume_token_ttl = "2s"
+max_pending_operations = 4
+
+[authorization.providers.provider]
+kind = "webhook"
+url = "http://{provider}/authorize"
+timeout = "2s"
+on_failure = "error"
+max_request_bytes = 4096
+max_response_bytes = 4096
+
+[authorization.providers.provider.outputs.token]
+kind = "bearer"
+required = true
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "delegate-connect"
+decision = "delegate"
+methods = ["CONNECT"]
+authorization_provider = "provider"
+
+[[policy.rules]]
+id = "after-pass"
+decision = "{after_pass}"
+methods = ["CONNECT"]
+"#,
+        ))
+    }
+
+    async fn start_recording_webhook_provider() -> (
+        SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (requests, request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = tokio::select! {
+                    accepted = listener.accept() => accepted.unwrap(),
+                    _ = &mut shutdown_rx => return,
+                };
+                let mut wire = Vec::new();
+                let body_start = loop {
+                    let mut chunk = [0u8; 1024];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0, "webhook request ended before its head");
+                    wire.extend_from_slice(&chunk[..read]);
+                    if let Some(position) = wire.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        break position + 4;
+                    }
+                };
+                let head = std::str::from_utf8(&wire[..body_start]).unwrap();
+                let content_length = head
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("Content-Length: ")
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .unwrap();
+                while wire.len() < body_start + content_length {
+                    let mut chunk = [0u8; 1024];
+                    let read = stream.read(&mut chunk).await.unwrap();
+                    assert_ne!(read, 0, "webhook request ended before its body");
+                    wire.extend_from_slice(&chunk[..read]);
+                }
+                requests
+                    .send(wire[body_start..body_start + content_length].to_vec())
+                    .unwrap();
+                stream
+                    .write_all(
+                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+        (address, request_rx, shutdown_tx, task)
+    }
+
+    async fn complete_webhook_callback(
+        authorization: &WebhookAuthorizationRuntime,
+        request: &serde_json::Value,
+        decision: &str,
+    ) -> u16 {
+        let token = request["resumeToken"].as_str().unwrap();
+        let body = format!(
+            "{{\"resumeToken\":\"{token}\",\"type\":\"response\",\"decision\":\"{decision}\"}}"
+        )
+        .into_bytes();
+        let mut store = crate::http1::store::ParserStore::try_new().unwrap();
+        store.append(&body).unwrap();
+        let mut reader = tokio::io::empty();
+        handle_callback_entity(
+            &mut reader,
+            &mut store,
+            crate::http1::framing::BodyFraming::ContentLength(body.len() as u64),
+            authorization,
+            4096,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await
+        .response()
+        .unwrap()
+        .status()
     }
 
     #[cfg(unix)]
@@ -2284,6 +2470,74 @@ done
             assert!(request.get("body").is_none());
             runtime.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn delegated_outer_connect_uses_decision_only_webhook_dispatch() {
+        let (provider_address, mut provider_requests, shutdown, provider_task) =
+            start_recording_webhook_provider().await;
+        for (provider_decision, after_pass, expected) in [
+            ("allow", "deny", Terminal::Forward),
+            ("deny", "allow", Terminal::Response(403)),
+            ("pass", "allow", Terminal::Forward),
+        ] {
+            let resolver_calls = Arc::new(AtomicUsize::new(0));
+            let config = outer_connect_webhook_provider_config(
+                provider_address,
+                unused_loopback_address(),
+                after_pass,
+            );
+            let (runtime, destinations, authorization) =
+                runtime_from_with_authorization_and_resolver(
+                    config,
+                    Arc::new(WebhookTestResolver {
+                        calls: resolver_calls.clone(),
+                    }),
+                )
+                .await;
+            let lease = runtime.lease().await.unwrap();
+            let input = prepared_connect_input(&lease, destinations);
+            let (provider, request) =
+                StandalonePolicyProvider::prepare(lease, ConnectTerminal, input).unwrap();
+            let mut pipeline =
+                tokio::spawn(
+                    async move { RequestPipeline::new().execute(provider, request).await },
+                );
+
+            let provider_request_bytes = tokio::select! {
+                request = provider_requests.recv() => request.expect("webhook provider request"),
+                terminal = &mut pipeline => {
+                    panic!(
+                        "pipeline ended before webhook delivery after {} resolutions: {:?}",
+                        resolver_calls.load(Ordering::SeqCst),
+                        terminal.unwrap(),
+                    )
+                }
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                    panic!("webhook provider delivery timed out")
+                }
+            };
+            let provider_request: serde_json::Value =
+                serde_json::from_slice(&provider_request_bytes).unwrap();
+            assert_eq!(provider_request["type"], "request");
+            assert_eq!(provider_request["method"], "CONNECT");
+            assert_eq!(
+                provider_request["url"],
+                "https://standalone-provider.example.test/"
+            );
+            assert!(provider_request.get("body").is_none());
+            assert_eq!(
+                complete_webhook_callback(&authorization, &provider_request, provider_decision,)
+                    .await,
+                204
+            );
+
+            assert_eq!(pipeline.await.unwrap(), expected);
+            assert_eq!(resolver_calls.load(Ordering::SeqCst), 2);
+            runtime.shutdown().await;
+        }
+        shutdown.send(()).unwrap();
+        provider_task.await.unwrap();
     }
 
     #[tokio::test]
