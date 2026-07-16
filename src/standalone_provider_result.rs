@@ -1570,7 +1570,7 @@ header = "x-test-loop"
         .unwrap();
         let plan = result.plan.forwarding_plan_arc();
         let preparation = result.credentials.take().unwrap();
-        let mut execution = preparation
+        let execution = preparation
             .admit_for_plan(&plan, Arc::new(NeverCancelled))
             .unwrap();
         let mut request = http::Request::new(hyper::Body::empty());
@@ -1580,7 +1580,6 @@ header = "x-test-loop"
         request
             .headers_mut()
             .insert("x-rule-token", http::HeaderValue::from_static("replaced"));
-        execution.reserve_transport(request.headers_mut()).unwrap();
         execution.finalize(&mut request).await.unwrap();
 
         let headers = request.headers();
@@ -1707,7 +1706,7 @@ header = "x-test-loop"
         .unwrap();
         let plan = result.plan.forwarding_plan_arc();
         let preparation = result.credentials.take().unwrap();
-        let mut execution = preparation
+        let execution = preparation
             .admit_for_plan(&plan, Arc::new(NeverCancelled))
             .unwrap();
         let mut request = http::Request::new(hyper::Body::empty());
@@ -1717,7 +1716,6 @@ header = "x-test-loop"
         request
             .headers_mut()
             .insert("x-rule-token", http::HeaderValue::from_static("original"));
-        execution.reserve_transport(request.headers_mut()).unwrap();
         assert_eq!(
             execution.finalize(&mut request).await,
             Err(credential_core::CredentialError::ServiceUnavailable)
@@ -1761,15 +1759,13 @@ header = "x-test-loop"
         .unwrap();
         let plan = result.plan.forwarding_plan_arc();
         let preparation = result.credentials.take().unwrap();
-        let mut execution = preparation
+        let execution = preparation
             .admit_for_plan(&plan, Arc::new(NeverCancelled))
             .unwrap();
         let mut request = http::Request::new(hyper::Body::empty());
         request
             .headers_mut()
             .insert("x-visible", http::HeaderValue::from_static("unchanged"));
-        execution.reserve_transport(request.headers_mut()).unwrap();
-
         assert_eq!(
             execution.finalize(&mut request).await,
             Err(credential_core::CredentialError::InvalidMaterial)
