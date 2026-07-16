@@ -233,6 +233,29 @@ authorization_provider = "repo_acl"
 Webhook providers require a control listener and a canonical public callback
 URL. Control routes are never exposed by a data listener.
 
+#### Outer CONNECT Decisions
+
+When an HTTP/1 CONNECT is selected for MITM, a matching delegated policy rule
+still calls its process or webhook provider before the tunnel is established.
+This synthetic outer request is decision-only: the provider request has
+`method = "CONNECT"`, uses the canonical HTTPS root URL for the CONNECT
+authority, and never contains a body, even when the provider is configured
+with `include_request_body = true`.
+
+The provider must return only `allow`, `deny`, or `pass`. An `allow` response
+must not contain `values` or `requestBody`; effect-bearing responses are invalid
+and fail the CONNECT closed. For example, a process provider returns:
+
+```json
+{"id":"<request-id>","type":"response","decision":"allow"}
+```
+
+A webhook callback follows the same decision-only rule while retaining its
+normal `resumeToken` envelope. Providers that normally emit credential values
+should branch on `method = "CONNECT"` and return a bare decision for this
+invocation. The decrypted inner request is planned and authorized separately
+with normal body, required-output, credential, and replacement semantics.
+
 ### Credentials
 
 Credential sources are named and typed. Secret values are resolved only at the
