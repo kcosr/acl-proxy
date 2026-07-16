@@ -275,13 +275,15 @@ impl DecisionAuditContext {
             peer_ip: Some(self.peer_ip),
             source: &source,
             sensitive_header_presence: &self.sensitive_header_presence,
-        })
-        .expect("provider audit facts derive from checked request facts");
+        });
         let level = match disposition {
             DecisionDisposition::Allow => self.allow_level,
             DecisionDisposition::Deny => self.deny_level,
         };
-        PendingDecisionSubmission::new(self.target.clone(), level, facts)
+        match facts {
+            Ok(facts) => PendingDecisionSubmission::new(self.target.clone(), level, facts),
+            Err(_) => PendingDecisionSubmission::omitted(self.target.clone(), level),
+        }
     }
 }
 
@@ -2038,6 +2040,42 @@ done
         assert_eq!(provenance.effective_policy(), &EffectivePolicy::Default);
         assert!(presence.is_empty());
         assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn oversized_provider_decision_is_omitted_without_affecting_the_next_submission() {
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let context = |url| DecisionAuditContext {
+            target: DecisionSubmissionTarget::Probe(submissions.clone()),
+            request_id: StableId::new("provider-observation-bounds").unwrap(),
+            method: HttpMethod::new("GET").unwrap(),
+            url,
+            peer_ip: "192.0.2.10".parse().unwrap(),
+            sensitive_header_presence: Box::new([]),
+            allow_level: Some(CompiledDecisionLogLevel::Info),
+            deny_level: Some(CompiledDecisionLogLevel::Warn),
+        };
+        let source = || {
+            DecisionAuditSource::Local(DecisionReason::new(
+                DecisionReasonCategory::InvalidPlan,
+                500,
+            ))
+        };
+        let oversized = http_access_url::canonicalize_http_url(&format!(
+            "https://example.test/{}",
+            "x".repeat(1024 * 1024)
+        ))
+        .unwrap();
+        let bounded = http_access_url::canonicalize_http_url("https://example.test/next").unwrap();
+
+        context(oversized)
+            .pending(DecisionDisposition::Deny, source())
+            .submit_now();
+        context(bounded)
+            .pending(DecisionDisposition::Deny, source())
+            .submit_now();
+
         assert_eq!(submissions.load(Ordering::SeqCst), 1);
     }
 

@@ -160,6 +160,17 @@ impl PendingDecisionSubmission {
         }
     }
 
+    pub(crate) fn omitted(
+        target: DecisionSubmissionTarget,
+        level: Option<CompiledDecisionLogLevel>,
+    ) -> Self {
+        Self {
+            target,
+            level,
+            facts: None,
+        }
+    }
+
     pub(crate) fn submit_now(&mut self) {
         let Some(facts) = self.facts.take() else {
             return;
@@ -592,6 +603,20 @@ mod tests {
             None,
             decision_facts(),
         ));
+
+        assert_eq!(submissions.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn omitted_pending_decision_never_submits() {
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let mut pending = PendingDecisionSubmission::omitted(
+            DecisionSubmissionTarget::Probe(submissions.clone()),
+            Some(CompiledDecisionLogLevel::Warn),
+        );
+
+        pending.submit_now();
+        drop(pending);
 
         assert_eq!(submissions.load(Ordering::SeqCst), 0);
     }

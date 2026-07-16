@@ -1046,6 +1046,10 @@ async fn serve_http_connection(connection: HttpConnection) {
     let mut http = Http::new().with_executor(H2StreamExecutor);
     http.http1_keep_alive(true);
     http.http1_header_read_timeout(config.request_header_timeout);
+    http.http2_max_header_list_size(
+        u32::try_from(crate::http1::store::PARSER_STORE_BYTES)
+            .expect("the fixed parser store size fits the H2 settings field"),
+    );
     http.http2_max_concurrent_streams(config.max_concurrent_streams);
     if http2 {
         http.http2_keep_alive_interval(config.request_header_timeout);
@@ -1458,9 +1462,11 @@ impl PreProviderDecisionAudit {
             peer_ip: Some(self.peer_ip),
             source: &source,
             sensitive_header_presence: &self.sensitive_header_presence,
-        })
-        .expect("ingress denial facts contain only checked product values");
-        let mut pending = PendingDecisionSubmission::new(self.target, self.level, facts);
+        });
+        let mut pending = match facts {
+            Ok(facts) => PendingDecisionSubmission::new(self.target, self.level, facts),
+            Err(_) => PendingDecisionSubmission::omitted(self.target, self.level),
+        };
         pending.submit_now();
     }
 }
@@ -1831,7 +1837,7 @@ impl HttpCaptureContext {
     pub(super) fn upgrade_capture_context(
         &self,
         target: &http_access_url::CanonicalUrl,
-    ) -> UpgradeCaptureContext {
+    ) -> Option<UpgradeCaptureContext> {
         let base = self.record(
             CaptureKind::Request,
             CaptureDecision::Allow,
@@ -1840,14 +1846,18 @@ impl HttpCaptureContext {
             None,
             false,
             Some(target),
-        );
-        UpgradeCaptureContext::new(self.runtime.clone(), base, self.max_expansion_ratio)
+        )?;
+        Some(UpgradeCaptureContext::new(
+            self.runtime.clone(),
+            base,
+            self.max_expansion_ratio,
+        ))
     }
 
     pub(super) fn begin(
         &self,
         event: CaptureEvent,
-        record: impl FnOnce() -> SanitizedCaptureMetadata,
+        record: impl FnOnce() -> Option<SanitizedCaptureMetadata>,
         body_headers: &HeaderMap,
     ) -> Option<CaptureSubmission> {
         HttpCaptureTap::try_begin(
@@ -1870,7 +1880,7 @@ impl HttpCaptureContext {
         &self,
         decision: CaptureDecision,
         headers: Option<&HeaderMap>,
-    ) -> SanitizedCaptureMetadata {
+    ) -> Option<SanitizedCaptureMetadata> {
         self.record(
             CaptureKind::Request,
             decision,
@@ -1889,7 +1899,7 @@ impl HttpCaptureContext {
         headers: Option<&HeaderMap>,
         status: StatusCode,
         include_status_message: bool,
-    ) -> SanitizedCaptureMetadata {
+    ) -> Option<SanitizedCaptureMetadata> {
         self.record(
             CaptureKind::Response,
             decision,
@@ -1911,7 +1921,7 @@ impl HttpCaptureContext {
         status: Option<StatusCode>,
         include_status_message: bool,
         canonical_url: Option<&http_access_url::CanonicalUrl>,
-    ) -> SanitizedCaptureMetadata {
+    ) -> Option<SanitizedCaptureMetadata> {
         let event = match (kind, decision) {
             (CaptureKind::Request, CaptureDecision::Allow) => CaptureEvent::RequestAllowed,
             (CaptureKind::Response, CaptureDecision::Allow) => CaptureEvent::ResponseAllowed,
@@ -1939,14 +1949,14 @@ impl HttpCaptureContext {
                 headers: &sanitized_headers,
             },
         )
-        .expect("validated capture metadata satisfies shared bounds");
+        .ok()?;
         if canonical_url == self.canonical_url.as_ref() {
             debug_assert_eq!(
                 facts.url().map(http_access_types::SinkSafeUrl::as_str),
                 self.url.as_ref().map(SinkSafeUrl::as_str)
             );
         }
-        SanitizedCaptureMetadata::from_facts(
+        Some(SanitizedCaptureMetadata::from_facts(
             facts,
             Utc::now().to_rfc3339(),
             Some(self.client.port()),
@@ -1958,7 +1968,7 @@ impl HttpCaptureContext {
                         .map(str::to_owned)
                 })
                 .flatten(),
-        )
+        ))
     }
 
     pub(super) fn begin_allowed_request(
@@ -1971,9 +1981,9 @@ impl HttpCaptureContext {
             if let Some(mut submission) = self.begin(
                 CaptureEvent::RequestAllowed,
                 || {
-                    let mut record = self.request_record(CaptureDecision::Allow, Some(headers));
+                    let mut record = self.request_record(CaptureDecision::Allow, Some(headers))?;
                     record.mark_provider_replacement_omitted(size);
-                    record
+                    Some(record)
                 },
                 body_headers,
             ) {
@@ -2001,11 +2011,11 @@ impl HttpCaptureContext {
         let Some(mut submission) = self.begin(
             CaptureEvent::RequestDenied,
             || {
-                let mut record = self.request_record(CaptureDecision::Deny, headers);
+                let mut record = self.request_record(CaptureDecision::Deny, headers)?;
                 if let TerminalRequestBodyProvenance::ProviderReplacement { size } = provenance {
                     record.mark_provider_replacement_omitted(size);
                 }
-                record
+                Some(record)
             },
             &body_headers,
         ) else {
@@ -2863,6 +2873,69 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![400, 400, 403, 500]
         );
+    }
+
+    #[test]
+    fn oversized_pre_provider_decision_is_omitted_without_affecting_the_next_request() {
+        let policy = SensitiveHeaderPolicy::new([], [], []).unwrap();
+        let request = Request::builder().uri("/").body(()).unwrap();
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let target = DecisionSubmissionTarget::Probe(submissions.clone());
+        let oversized = http_access_url::canonicalize_http_url(&format!(
+            "https://example.test/{}",
+            "x".repeat(1024 * 1024)
+        ))
+        .unwrap();
+        let bounded = http_access_url::canonicalize_http_url("https://example.test/next").unwrap();
+
+        for (request_id, url) in [("oversized", &oversized), ("bounded", &bounded)] {
+            let mut audit = PreProviderDecisionAudit::from_policy(
+                target.clone(),
+                Some(CompiledDecisionLogLevel::Warn),
+                &policy,
+                request_id,
+                "192.0.2.10".parse().unwrap(),
+                &request,
+            );
+            audit.bind_url(url);
+            audit.submit_deny(DecisionReasonCategory::InvalidPlan, 400);
+        }
+
+        assert_eq!(submissions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_h2_capture_metadata_is_omitted_without_affecting_the_next_record() {
+        let runtime = Arc::new(ProductObservationRuntime::try_new(1).unwrap());
+        let request = Request::builder()
+            .version(Version::HTTP_2)
+            .uri("http://example.test/")
+            .body(())
+            .unwrap();
+        let capture = HttpCaptureContext::new(
+            runtime.clone(),
+            runtime.current_capture_epoch(),
+            SensitiveHeaderPolicy::new([], [], []).unwrap(),
+            "capture-bounds".to_owned(),
+            "192.0.2.10:1234".parse().unwrap(),
+            &request,
+            IngressMode::ExplicitHttp,
+            16,
+        );
+        let mut oversized_headers = HeaderMap::new();
+        oversized_headers.insert(
+            "x-large",
+            HeaderValue::from_bytes(&vec![b'x'; 1024 * 1024 + 1]).unwrap(),
+        );
+
+        assert!(capture
+            .request_record(CaptureDecision::Allow, Some(&oversized_headers))
+            .is_none());
+        assert!(capture
+            .request_record(CaptureDecision::Allow, Some(&HeaderMap::new()))
+            .is_some());
+
+        runtime.shutdown().await;
     }
 
     async fn product(
@@ -6203,6 +6276,74 @@ redaction_profile = "wire"
         product.shutdown().await;
         driver.await.unwrap().unwrap();
         origin_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cleartext_h2_oversized_header_block_is_stream_local() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let policy = r#"[listeners.explicit_http.connect]
+http2 = "deny"
+
+[policy]
+default = "deny"
+"#;
+        let config = base_config(proxy, "explicit_http", policy).replacen(
+            "http_versions = [\"http1\"]",
+            "http_versions = [\"http2\"]\nmax_concurrent_streams = 2",
+            1,
+        );
+        let (_directory, product) = product(config, listeners).await;
+        let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let mut builder = conn::Builder::new();
+        builder.http2_only(true);
+        let (mut sender, connection) = builder.handshake(stream).await.unwrap();
+        let driver = tokio::spawn(connection);
+
+        let oversized = sender
+            .send_request(
+                Request::builder()
+                    .uri(format!("http://{proxy}/oversized"))
+                    .header(
+                        "x-oversized",
+                        HeaderValue::from_bytes(&vec![
+                            b'x';
+                            crate::http1::store::PARSER_STORE_BYTES
+                        ])
+                        .unwrap(),
+                    )
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            oversized.status(),
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+        );
+        assert!(to_bytes(oversized.into_body()).await.unwrap().is_empty());
+
+        std::future::poll_fn(|context| sender.poll_ready(context))
+            .await
+            .unwrap();
+        let bounded = sender
+            .send_request(
+                Request::builder()
+                    .uri(format!("http://{proxy}/bounded"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bounded.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            to_bytes(bounded.into_body()).await.unwrap(),
+            "destination denied\n"
+        );
+
+        drop(sender);
+        product.shutdown().await;
+        driver.await.unwrap().unwrap();
     }
 
     #[tokio::test]

@@ -22,7 +22,7 @@ impl HttpCaptureTap {
     pub(crate) fn try_begin(
         epoch: Arc<CaptureEpoch>,
         event: CaptureEvent,
-        metadata: impl FnOnce() -> SanitizedCaptureMetadata,
+        metadata: impl FnOnce() -> Option<SanitizedCaptureMetadata>,
         headers: &HeaderMap,
         max_expansion_ratio: usize,
     ) -> Option<Self> {
@@ -35,11 +35,12 @@ impl HttpCaptureTap {
             .and_then(|value| value.to_str().ok())
             .map(str::to_owned);
         let content_encoding_present = headers.contains_key(CONTENT_ENCODING);
+        let metadata = metadata()?;
 
         let job = match CaptureArtifactJob::begin_admitted(
             epoch,
             operation,
-            metadata(),
+            metadata,
             max_expansion_ratio,
         ) {
             Ok(job) => job,
@@ -171,8 +172,8 @@ mod tests {
         (pool.current_epoch(), pool, owner)
     }
 
-    fn metadata() -> SanitizedCaptureMetadata {
-        SanitizedCaptureMetadata::from_test_record(CaptureRecord {
+    fn metadata() -> Option<SanitizedCaptureMetadata> {
+        Some(SanitizedCaptureMetadata::from_test_record(CaptureRecord {
             timestamp: "2026-01-01T00:00:00Z".to_owned(),
             request_id: "tap".to_owned(),
             kind: CaptureKind::Request,
@@ -190,7 +191,7 @@ mod tests {
             body_truncated: None,
             provider_replacement_omitted: None,
             provider_replacement_size: None,
-        })
+        }))
     }
 
     fn body_bytes(body: &crate::observation::CaptureBody) -> Vec<u8> {
@@ -328,5 +329,28 @@ mod tests {
         )
         .is_none());
         assert!(!materialized.get());
+    }
+
+    #[test]
+    fn omitted_metadata_releases_admission_for_the_next_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let (epoch, _pool, _owner) = epoch_with_limit(directory.path(), 128 * 1024);
+
+        assert!(HttpCaptureTap::try_begin(
+            epoch.clone(),
+            CaptureEvent::RequestAllowed,
+            || None,
+            &HeaderMap::new(),
+            16,
+        )
+        .is_none());
+        assert!(HttpCaptureTap::try_begin(
+            epoch,
+            CaptureEvent::RequestAllowed,
+            metadata,
+            &HeaderMap::new(),
+            16,
+        )
+        .is_some());
     }
 }

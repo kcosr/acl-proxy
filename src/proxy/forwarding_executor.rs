@@ -363,7 +363,7 @@ impl ForwardingExecutor {
 
 struct StandaloneUpgradeExecution {
     runtime: Arc<UpgradeRuntime>,
-    capture: UpgradeCaptureContext,
+    capture: Option<UpgradeCaptureContext>,
     binding: StandaloneUpgradeBinding,
     request: SanitizedRequest<StandaloneExchangeBody>,
     canonical: http_access_url::CanonicalUrl,
@@ -532,7 +532,7 @@ async fn execute_standalone_upgrade(
                         };
                         let prepared_relay = match kind.prepare(
                             runtime_for_task.limits().relay_buffer_bytes(),
-                            Some(upgrade_capture),
+                            upgrade_capture,
                         ) {
                             Ok(prepared_relay) => prepared_relay,
                             Err(_) => {
