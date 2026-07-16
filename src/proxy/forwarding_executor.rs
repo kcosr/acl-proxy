@@ -13,8 +13,9 @@ use crate::http1::ingress::RequestDisposition;
 use crate::observation::CaptureEvent;
 use crate::proxy::forward::{
     forward_request, forward_upgrade_request, ForwardError, ForwardUpgradeResult,
-    ForwardedResponse, ForwardingTimeouts, ResolvedForwardingTarget,
+    ForwardedDownstreamBody, ForwardingTimeouts, ResolvedForwardingTarget,
 };
+use crate::proxy::h2_stream_cancellation::H2StreamCancellation;
 use crate::proxy::headers::SanitizedRequest;
 use crate::proxy::ingress::{
     HandledResponse, ProxyResponseBody, StandaloneHttpTerminal, TerminalRequestBodyProvenance,
@@ -51,6 +52,7 @@ impl ForwardingExecutor {
                 true,
             );
         };
+        let h2_stream = parts.extensions.remove::<H2StreamCancellation>();
         let plan = dispatch.exchange.plan();
         let origin = plan.origin().clone();
         let plan_binding = plan.binding();
@@ -214,6 +216,7 @@ impl ForwardingExecutor {
                 protocol: upgrade_protocol,
                 response_admission,
                 response_policy,
+                h2_stream: h2_stream.clone(),
                 forwarding_timeouts,
                 upgrade_deadlines,
             })
@@ -316,12 +319,6 @@ impl ForwardingExecutor {
                 )
             }
         };
-        response.body_mut().bind_response_lifetime(
-            dispatch.deadline,
-            dispatch.retention,
-            response_admission,
-            response_policy,
-        );
         if apply_standalone_response_mutations(&response_mutations, response.headers_mut()).is_err()
         {
             return terminal.capture.fixed_response(
@@ -344,6 +341,17 @@ impl ForwardingExecutor {
             },
             response.headers(),
         );
+        let (parts, body) = response.into_parts();
+        let body = body
+            .bind_response_lifetime(
+                dispatch.deadline,
+                dispatch.retention,
+                response_admission,
+                response_policy,
+                h2_stream,
+            )
+            .await;
+        let response = Response::from_parts(parts, body);
         HandledResponse {
             response: response.map(|body| ProxyResponseBody::forwarded(body, response_capture)),
             close_connection: false,
@@ -368,12 +376,13 @@ struct StandaloneUpgradeExecution {
     protocol: HeaderValue,
     response_admission: crate::safety::ForwardResponseAdmission,
     response_policy: http_access_types::ResponsePolicy,
+    h2_stream: Option<H2StreamCancellation>,
     forwarding_timeouts: ForwardingTimeouts,
     upgrade_deadlines: UpgradeRelayDeadlines,
 }
 
 enum UpgradeHandshakeResponse {
-    Ordinary(Box<ForwardedResponse>),
+    Ordinary(Box<Response<ForwardedDownstreamBody>>),
     SwitchingProtocols(Response<Body>),
     Failed(StatusCode),
 }
@@ -440,6 +449,7 @@ async fn execute_standalone_upgrade(
         protocol,
         response_admission,
         response_policy,
+        h2_stream,
         forwarding_timeouts,
         upgrade_deadlines,
     } = execution;
@@ -478,13 +488,19 @@ async fn execute_standalone_upgrade(
                             ));
                             return;
                         }
-                        response.body_mut().bind_response_lifetime(
-                            deadline,
-                            retention,
-                            response_admission,
-                            response_policy,
-                        );
-                        let _ = response_tx.send(UpgradeHandshakeResponse::Ordinary(response));
+                        let (parts, body) = (*response).into_parts();
+                        let body = body
+                            .bind_response_lifetime(
+                                deadline,
+                                retention,
+                                response_admission,
+                                response_policy,
+                                h2_stream,
+                            )
+                            .await;
+                        let response = Response::from_parts(parts, body);
+                        let _ = response_tx
+                            .send(UpgradeHandshakeResponse::Ordinary(Box::new(response)));
                     }
                     Ok(Ok(ForwardUpgradeResult::SwitchingProtocols(upgrade))) => {
                         let (mut response, upstream_upgrade) = upgrade.into_parts();

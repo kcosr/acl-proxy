@@ -1,7 +1,6 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -13,8 +12,8 @@ use hyper::body::{Bytes, HttpBody, SizeHint};
 use hyper::client::conn;
 use hyper::Body;
 use rustls::ServerName;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::Notify;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::sync::{oneshot, watch};
 use tokio::time::Instant;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
@@ -30,6 +29,7 @@ use crate::egress::{
 use crate::runtime::{EgressSnapshot, GenerationRetention};
 use crate::safety::ForwardResponseAdmission;
 
+use super::h2_stream_cancellation::H2StreamCancellation;
 use super::headers::{
     prepare_downstream_upgrade_response, prepare_origin_request, prepare_origin_upgrade_request,
     strip_response_hop_by_hop, HeaderPreparationError, RequestTargetForm, SanitizedRequest,
@@ -39,10 +39,6 @@ use super::headers::{
 const TERMINAL_DRIVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_EMPTY_RESPONSE_FRAMES: u64 = 65_536;
 const MAX_INTERNAL_RESPONSE_EVENTS_PER_POLL: usize = 64;
-const RESPONSE_LIFETIME_ACTIVE: u8 = 0;
-const RESPONSE_LIFETIME_IDLE_TIMEOUT: u8 = 1;
-const RESPONSE_LIFETIME_ABSOLUTE_TIMEOUT: u8 = 2;
-const RESPONSE_LIFETIME_COMPLETE: u8 = 3;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ForwardError {
@@ -187,9 +183,9 @@ pub(crate) struct ForwardBody {
     terminal_driver_abort_started: bool,
     driver: DriverTask,
     request_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
-    response_lifetime: Option<ForwardResponseLifetime>,
     response_limits: Option<ForwardResponseLimits>,
     response_idle_deadline: Option<Pin<Box<tokio::time::Sleep>>>,
+    response_idle_updates: Option<watch::Sender<Option<Instant>>>,
     pending_data: Option<Bytes>,
     observed_wire_bytes: u64,
     empty_frames: u64,
@@ -238,13 +234,6 @@ impl DriverTask {
         }
     }
 
-    fn abort_handle(&self) -> tokio::task::AbortHandle {
-        self.handle
-            .as_ref()
-            .expect("a newly forwarded response owns its connection driver")
-            .abort_handle()
-    }
-
     async fn abort_and_join(mut self) {
         self.abort();
         let _ = std::future::poll_fn(|context| self.poll(context)).await;
@@ -265,163 +254,6 @@ impl Drop for DriverTask {
     }
 }
 
-struct ForwardResponseLifetimeResources {
-    _generation: GenerationRetention,
-    _response_admission: ForwardResponseAdmission,
-}
-
-struct ForwardResponseLifetimeShared {
-    state: AtomicU8,
-    idle_deadline: Mutex<Option<Instant>>,
-    resources: Mutex<Option<ForwardResponseLifetimeResources>>,
-    driver_abort: tokio::task::AbortHandle,
-    changed: Notify,
-}
-
-impl ForwardResponseLifetimeShared {
-    fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-        mutex.lock().unwrap_or_else(|error| error.into_inner())
-    }
-
-    fn state(&self) -> u8 {
-        self.state.load(Ordering::Acquire)
-    }
-
-    fn reset_idle(&self, idle: Duration) {
-        if self.state.load(Ordering::Acquire) != RESPONSE_LIFETIME_ACTIVE {
-            return;
-        }
-        *Self::lock(&self.idle_deadline) = Some(Instant::now() + idle);
-        self.changed.notify_one();
-    }
-
-    fn disable_idle(&self) {
-        if self.state.load(Ordering::Acquire) != RESPONSE_LIFETIME_ACTIVE {
-            return;
-        }
-        *Self::lock(&self.idle_deadline) = None;
-        self.changed.notify_one();
-    }
-
-    fn expire(&self, cause: u8) {
-        debug_assert!(matches!(
-            cause,
-            RESPONSE_LIFETIME_IDLE_TIMEOUT | RESPONSE_LIFETIME_ABSOLUTE_TIMEOUT
-        ));
-        if self
-            .state
-            .compare_exchange(
-                RESPONSE_LIFETIME_ACTIVE,
-                cause,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return;
-        }
-        self.driver_abort.abort();
-        let resources = Self::lock(&self.resources).take();
-        self.changed.notify_waiters();
-        drop(resources);
-    }
-
-    fn complete(&self) {
-        if self
-            .state
-            .compare_exchange(
-                RESPONSE_LIFETIME_ACTIVE,
-                RESPONSE_LIFETIME_COMPLETE,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return;
-        }
-        let resources = Self::lock(&self.resources).take();
-        self.changed.notify_waiters();
-        drop(resources);
-    }
-}
-
-struct ForwardResponseLifetime {
-    shared: Arc<ForwardResponseLifetimeShared>,
-    watchdog: tokio::task::JoinHandle<()>,
-}
-
-impl ForwardResponseLifetime {
-    fn spawn(
-        absolute: Instant,
-        idle: Duration,
-        driver_abort: tokio::task::AbortHandle,
-        generation: GenerationRetention,
-        response_admission: ForwardResponseAdmission,
-    ) -> Self {
-        let shared = Arc::new(ForwardResponseLifetimeShared {
-            state: AtomicU8::new(RESPONSE_LIFETIME_ACTIVE),
-            idle_deadline: Mutex::new(Some(Instant::now() + idle)),
-            resources: Mutex::new(Some(ForwardResponseLifetimeResources {
-                _generation: generation,
-                _response_admission: response_admission,
-            })),
-            driver_abort,
-            changed: Notify::new(),
-        });
-        let watchdog_shared = shared.clone();
-        let watchdog = tokio::spawn(async move {
-            loop {
-                let changed = watchdog_shared.changed.notified();
-                if watchdog_shared.state.load(Ordering::Acquire) != RESPONSE_LIFETIME_ACTIVE {
-                    return;
-                }
-                let idle_deadline =
-                    *ForwardResponseLifetimeShared::lock(&watchdog_shared.idle_deadline);
-                let now = Instant::now();
-                if now >= absolute {
-                    watchdog_shared.expire(RESPONSE_LIFETIME_ABSOLUTE_TIMEOUT);
-                    return;
-                }
-                if idle_deadline.is_some_and(|deadline| now >= deadline) {
-                    watchdog_shared.expire(RESPONSE_LIFETIME_IDLE_TIMEOUT);
-                    return;
-                }
-                let idle_wake = idle_deadline.unwrap_or(absolute);
-                tokio::select! {
-                    biased;
-                    _ = changed => {}
-                    _ = tokio::time::sleep_until(absolute) => {}
-                    _ = tokio::time::sleep_until(idle_wake) => {}
-                }
-            }
-        });
-        Self { shared, watchdog }
-    }
-
-    fn state(&self) -> u8 {
-        self.shared.state()
-    }
-
-    fn reset_idle(&self, idle: Duration) {
-        self.shared.reset_idle(idle);
-    }
-
-    fn expire(&self, cause: u8) {
-        self.shared.expire(cause);
-    }
-
-    fn disable_idle(&self) {
-        self.shared.disable_idle();
-    }
-}
-
-impl Drop for ForwardResponseLifetime {
-    fn drop(&mut self) {
-        self.shared.complete();
-        self.watchdog.abort();
-    }
-}
-
 impl ForwardBody {
     fn new(body: Body, driver: DriverTask) -> Self {
         Self {
@@ -434,40 +266,41 @@ impl ForwardBody {
             terminal_driver_abort_started: false,
             driver,
             request_deadline: None,
-            response_lifetime: None,
             response_limits: None,
             response_idle_deadline: None,
+            response_idle_updates: None,
             pending_data: None,
             observed_wire_bytes: 0,
             empty_frames: 0,
         }
     }
 
-    pub(crate) fn bind_response_lifetime(
-        &mut self,
+    pub(crate) async fn bind_response_lifetime(
+        mut self,
         deadline: Instant,
         generation: GenerationRetention,
         response_admission: ForwardResponseAdmission,
         policy: http_access_types::ResponsePolicy,
-    ) {
+        h2_stream: Option<H2StreamCancellation>,
+    ) -> ForwardedDownstreamBody {
         debug_assert!(self.request_deadline.is_none());
-        debug_assert!(self.response_lifetime.is_none());
         self.request_deadline = Some(Box::pin(tokio::time::sleep_until(deadline)));
-        self.configure_response_policy(policy);
-        let idle = self
-            .response_limits
-            .expect("the checked response policy was installed")
-            .idle;
-        self.response_lifetime = Some(ForwardResponseLifetime::spawn(
+        let idle_updates = self.configure_response_policy(policy);
+        ForwardedDownstreamBody::spawn(
+            self,
             deadline,
-            idle,
-            self.driver.abort_handle(),
+            idle_updates,
             generation,
             response_admission,
-        ));
+            h2_stream,
+        )
+        .await
     }
 
-    fn configure_response_policy(&mut self, policy: http_access_types::ResponsePolicy) {
+    fn configure_response_policy(
+        &mut self,
+        policy: http_access_types::ResponsePolicy,
+    ) -> watch::Receiver<Option<Instant>> {
         debug_assert!(self.response_limits.is_none());
         let limits = policy.limits();
         let response_limits = ForwardResponseLimits {
@@ -478,13 +311,17 @@ impl ForwardBody {
             trailer_bytes: limits.trailer_bytes(),
             idle: Duration::from_millis(policy.idle_ms()),
         };
-        self.response_idle_deadline = Some(Box::pin(tokio::time::sleep(response_limits.idle)));
+        let idle_deadline = Instant::now() + response_limits.idle;
+        self.response_idle_deadline = Some(Box::pin(tokio::time::sleep_until(idle_deadline)));
+        let (idle_updates, idle_receiver) = watch::channel(Some(idle_deadline));
+        self.response_idle_updates = Some(idle_updates);
         self.response_limits = Some(response_limits);
+        idle_receiver
     }
 
     #[cfg(test)]
     fn with_response_policy(mut self, policy: http_access_types::ResponsePolicy) -> Self {
-        self.configure_response_policy(policy);
+        let _ = self.configure_response_policy(policy);
         self
     }
 
@@ -510,38 +347,20 @@ impl ForwardBody {
     fn release_response_lifetime(&mut self) {
         self.request_deadline.take();
         self.response_idle_deadline.take();
-        self.response_lifetime.take();
+        self.response_idle_updates.take();
     }
 
     fn reset_response_idle_deadline(&mut self) {
         let Some(limits) = self.response_limits else {
             return;
         };
+        let next = Instant::now() + limits.idle;
         if let Some(deadline) = self.response_idle_deadline.as_mut() {
-            deadline.as_mut().reset(Instant::now() + limits.idle);
+            deadline.as_mut().reset(next);
         }
-        if let Some(lifetime) = self.response_lifetime.as_ref() {
-            lifetime.reset_idle(limits.idle);
+        if let Some(updates) = self.response_idle_updates.as_ref() {
+            updates.send_replace(Some(next));
         }
-    }
-
-    fn observe_response_lifetime_timeout(
-        &mut self,
-        context: &mut Context<'_>,
-        cause: u8,
-    ) -> Poll<ForwardBodyError> {
-        let timed_out = self
-            .response_lifetime
-            .as_ref()
-            .is_some_and(|lifetime| lifetime.state() == cause);
-        if !timed_out {
-            return Poll::Pending;
-        }
-        self.body.take();
-        self.pending_data.take();
-        self.trailers.take();
-        self.terminal_error.get_or_insert(ForwardBodyError::Timeout);
-        self.poll_terminal_error_join(context)
     }
 
     fn poll_response_idle_deadline(&mut self, context: &mut Context<'_>) -> Poll<ForwardBodyError> {
@@ -552,9 +371,6 @@ impl ForwardBody {
             return Poll::Pending;
         }
 
-        if let Some(lifetime) = self.response_lifetime.as_ref() {
-            lifetime.expire(RESPONSE_LIFETIME_IDLE_TIMEOUT);
-        }
         self.body.take();
         self.pending_data.take();
         self.trailers.take();
@@ -637,9 +453,6 @@ impl ForwardBody {
             return Poll::Pending;
         }
 
-        if let Some(lifetime) = self.response_lifetime.as_ref() {
-            lifetime.expire(RESPONSE_LIFETIME_ABSOLUTE_TIMEOUT);
-        }
         self.body.take();
         self.pending_data.take();
         self.trailers.take();
@@ -712,8 +525,8 @@ impl ForwardBody {
             None => None,
         };
         self.response_idle_deadline.take();
-        if let Some(lifetime) = self.response_lifetime.as_ref() {
-            lifetime.disable_idle();
+        if let Some(updates) = self.response_idle_updates.as_ref() {
+            updates.send_replace(None);
         }
         self.trailers = Some(trailers);
         self.begin_terminal_drain();
@@ -766,6 +579,295 @@ impl ForwardBody {
             }
         }
     }
+
+    async fn abort_and_join(&mut self) {
+        self.body.take();
+        self.pending_data.take();
+        self.trailers.take();
+        self.driver.abort();
+        let _ = std::future::poll_fn(|context| self.driver.poll(context)).await;
+        self.release_response_lifetime();
+    }
+}
+
+struct ForwardResponseResources {
+    _generation: GenerationRetention,
+    _response_admission: ForwardResponseAdmission,
+}
+
+pub(crate) struct ForwardedDownstreamBody {
+    body: Body,
+    exact_remaining: Option<u64>,
+    resources: Option<Arc<ForwardResponseResources>>,
+    cancel: Option<oneshot::Sender<()>>,
+}
+
+impl ForwardedDownstreamBody {
+    async fn spawn(
+        mut upstream: ForwardBody,
+        absolute: Instant,
+        idle_updates: watch::Receiver<Option<Instant>>,
+        generation: GenerationRetention,
+        response_admission: ForwardResponseAdmission,
+        h2_stream: Option<H2StreamCancellation>,
+    ) -> Self {
+        let exact_remaining = upstream.size_hint().exact();
+        let resources = Arc::new(ForwardResponseResources {
+            _generation: generation,
+            _response_admission: response_admission,
+        });
+        let pump_resources = resources.clone();
+        let (sender, body) = Body::channel();
+        let declared_over_limit = exact_remaining.is_some_and(|declared| {
+            declared
+                > upstream
+                    .response_limits
+                    .expect("the checked response policy was installed")
+                    .wire_bytes
+        });
+        if declared_over_limit {
+            if let Some(h2_stream) = h2_stream.as_ref() {
+                h2_stream.cancel();
+            }
+            sender.abort();
+            drop(tokio::spawn(async move {
+                upstream.abort_and_join().await;
+                drop(pump_resources);
+            }));
+            if h2_stream.is_some() {
+                tokio::task::yield_now().await;
+            }
+            return Self {
+                body,
+                exact_remaining,
+                resources: Some(resources),
+                cancel: None,
+            };
+        }
+        let (cancel, cancelled) = oneshot::channel();
+        drop(tokio::spawn(async move {
+            run_forward_response_pump(
+                upstream,
+                sender,
+                h2_stream,
+                absolute,
+                idle_updates,
+                cancelled,
+            )
+            .await;
+            drop(pump_resources);
+        }));
+        Self {
+            body,
+            exact_remaining,
+            resources: Some(resources),
+            cancel: Some(cancel),
+        }
+    }
+
+    fn finish(&mut self) {
+        self.cancel.take();
+        self.resources.take();
+    }
+}
+
+impl Drop for ForwardedDownstreamBody {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+    }
+}
+
+impl HttpBody for ForwardedDownstreamBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_data(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
+        let result = Pin::new(&mut self.body).poll_data(context);
+        if let Poll::Ready(Some(Ok(data))) = &result {
+            self.exact_remaining = self
+                .exact_remaining
+                .and_then(|remaining| remaining.checked_sub(data.len() as u64));
+        }
+        if matches!(result, Poll::Ready(Some(Err(_))) | Poll::Ready(None)) {
+            self.finish();
+        }
+        result
+    }
+
+    fn poll_trailers(
+        mut self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<Option<http::HeaderMap>, Self::Error>> {
+        let result = Pin::new(&mut self.body).poll_trailers(context);
+        if result.is_ready() {
+            self.finish();
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.exact_remaining
+            .map(SizeHint::with_exact)
+            .unwrap_or_else(|| self.body.size_hint())
+    }
+}
+
+enum PumpEvent<T> {
+    Output(T),
+    DeadlineChanged,
+    Cancelled,
+    Timeout,
+}
+
+async fn wait_for_upstream<F, T>(
+    future: F,
+    absolute: Instant,
+    idle_updates: &mut watch::Receiver<Option<Instant>>,
+    cancelled: &mut oneshot::Receiver<()>,
+) -> PumpEvent<T>
+where
+    F: Future<Output = T>,
+{
+    tokio::pin!(future);
+    let idle_deadline = *idle_updates.borrow();
+    let idle_wake = idle_deadline.unwrap_or(absolute);
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(absolute) => PumpEvent::Timeout,
+        output = &mut future => PumpEvent::Output(output),
+        _ = &mut *cancelled => PumpEvent::Cancelled,
+        _ = idle_updates.changed() => PumpEvent::DeadlineChanged,
+        _ = tokio::time::sleep_until(idle_wake), if idle_deadline.is_some() => PumpEvent::Timeout,
+    }
+}
+
+async fn send_downstream_data(
+    sender: &mut hyper::body::Sender,
+    data: Bytes,
+    absolute: Instant,
+    idle_deadline: Option<Instant>,
+    cancelled: &mut oneshot::Receiver<()>,
+) -> PumpEvent<Result<(), hyper::Error>> {
+    let idle_wake = idle_deadline.unwrap_or(absolute);
+    let send = sender.send_data(data);
+    tokio::pin!(send);
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(absolute) => PumpEvent::Timeout,
+        result = &mut send => PumpEvent::Output(result),
+        _ = &mut *cancelled => PumpEvent::Cancelled,
+        _ = tokio::time::sleep_until(idle_wake), if idle_deadline.is_some() => PumpEvent::Timeout,
+    }
+}
+
+async fn terminate_forward_response(
+    upstream: &mut ForwardBody,
+    sender: &mut Option<hyper::body::Sender>,
+    h2_stream: Option<&H2StreamCancellation>,
+) {
+    if let Some(h2_stream) = h2_stream {
+        h2_stream.cancel();
+    }
+    if let Some(sender) = sender.take() {
+        sender.abort();
+    }
+    upstream.abort_and_join().await;
+}
+
+async fn run_forward_response_pump(
+    mut upstream: ForwardBody,
+    sender: hyper::body::Sender,
+    h2_stream: Option<H2StreamCancellation>,
+    absolute: Instant,
+    mut idle_updates: watch::Receiver<Option<Instant>>,
+    mut cancelled: oneshot::Receiver<()>,
+) {
+    let mut sender = Some(sender);
+    loop {
+        let event =
+            wait_for_upstream(upstream.data(), absolute, &mut idle_updates, &mut cancelled).await;
+        match event {
+            PumpEvent::DeadlineChanged => continue,
+            PumpEvent::Cancelled => {
+                terminate_forward_response(&mut upstream, &mut sender, None).await;
+                return;
+            }
+            PumpEvent::Timeout => {
+                terminate_forward_response(&mut upstream, &mut sender, h2_stream.as_ref()).await;
+                return;
+            }
+            PumpEvent::Output(Some(Ok(data))) => {
+                let sender_ref = sender
+                    .as_mut()
+                    .expect("the active response pump owns its downstream sender");
+                let data = match sender_ref.try_send_data(data) {
+                    Ok(()) => continue,
+                    Err(data) => data,
+                };
+                let idle_deadline = *idle_updates.borrow();
+                match send_downstream_data(
+                    sender_ref,
+                    data,
+                    absolute,
+                    idle_deadline,
+                    &mut cancelled,
+                )
+                .await
+                {
+                    PumpEvent::Output(Ok(())) => {}
+                    PumpEvent::Output(Err(_)) | PumpEvent::Cancelled => {
+                        terminate_forward_response(&mut upstream, &mut sender, None).await;
+                        return;
+                    }
+                    PumpEvent::Timeout | PumpEvent::DeadlineChanged => {
+                        terminate_forward_response(&mut upstream, &mut sender, h2_stream.as_ref())
+                            .await;
+                        return;
+                    }
+                }
+            }
+            PumpEvent::Output(Some(Err(_))) => {
+                if let Some(h2_stream) = h2_stream.as_ref() {
+                    h2_stream.cancel();
+                }
+                if let Some(sender) = sender.take() {
+                    sender.abort();
+                }
+                return;
+            }
+            PumpEvent::Output(None) => {
+                match upstream.trailers().await {
+                    Ok(Some(trailers)) => {
+                        if let Some(sender) = sender.as_mut() {
+                            if sender.send_trailers(trailers).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        if let Some(h2_stream) = h2_stream.as_ref() {
+                            h2_stream.cancel();
+                        }
+                        if let Some(sender) = sender.take() {
+                            sender.abort();
+                        }
+                        return;
+                    }
+                }
+                return;
+            }
+        }
+    }
 }
 
 impl HttpBody for ForwardBody {
@@ -782,21 +884,11 @@ impl HttpBody for ForwardBody {
                 Poll::Ready(error) => Poll::Ready(Some(Err(error))),
             };
         }
-        if let Poll::Ready(error) =
-            self.observe_response_lifetime_timeout(context, RESPONSE_LIFETIME_ABSOLUTE_TIMEOUT)
-        {
-            return Poll::Ready(Some(Err(error)));
-        }
         if let Poll::Ready(error) = self.poll_request_deadline(context) {
             return Poll::Ready(Some(Err(error)));
         }
         if let Some(bytes) = self.next_data_slice() {
             return Poll::Ready(Some(Ok(bytes)));
-        }
-        if let Poll::Ready(error) =
-            self.observe_response_lifetime_timeout(context, RESPONSE_LIFETIME_IDLE_TIMEOUT)
-        {
-            return Poll::Ready(Some(Err(error)));
         }
         if let Poll::Ready(error) = self.poll_response_idle_deadline(context) {
             return Poll::Ready(Some(Err(error)));
@@ -875,17 +967,7 @@ impl HttpBody for ForwardBody {
                 Poll::Ready(error) => Poll::Ready(Err(error)),
             };
         }
-        if let Poll::Ready(error) =
-            self.observe_response_lifetime_timeout(context, RESPONSE_LIFETIME_ABSOLUTE_TIMEOUT)
-        {
-            return Poll::Ready(Err(error));
-        }
         if let Poll::Ready(error) = self.poll_request_deadline(context) {
-            return Poll::Ready(Err(error));
-        }
-        if let Poll::Ready(error) =
-            self.observe_response_lifetime_timeout(context, RESPONSE_LIFETIME_IDLE_TIMEOUT)
-        {
             return Poll::Ready(Err(error));
         }
         if let Poll::Ready(error) = self.poll_response_idle_deadline(context) {
@@ -1647,6 +1729,115 @@ where
     }
 }
 
+struct UpgradeRequestWriteState {
+    body_complete: std::sync::atomic::AtomicBool,
+    post_completion_bytes_written: std::sync::atomic::AtomicBool,
+    request_flushed: std::sync::atomic::AtomicBool,
+}
+
+impl UpgradeRequestWriteState {
+    fn new(body_complete: bool) -> Self {
+        Self {
+            body_complete: std::sync::atomic::AtomicBool::new(body_complete),
+            post_completion_bytes_written: std::sync::atomic::AtomicBool::new(false),
+            request_flushed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+struct UpgradeFlushTrackedIo<S> {
+    inner: S,
+    state: Arc<UpgradeRequestWriteState>,
+}
+
+impl<S> UpgradeFlushTrackedIo<S> {
+    fn new(inner: S, state: Arc<UpgradeRequestWriteState>) -> Self {
+        Self { inner, state }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for UpgradeFlushTrackedIo<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_read(context, buffer)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for UpgradeFlushTrackedIo<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffer: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_write(context, buffer);
+        if matches!(result, Poll::Ready(Ok(written)) if written != 0)
+            && this
+                .state
+                .body_complete
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            this.state
+                .post_completion_bytes_written
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        result
+    }
+
+    fn poll_flush(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_flush(context);
+        if matches!(&result, Poll::Ready(Ok(())))
+            && this
+                .state
+                .post_completion_bytes_written
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            this.state
+                .request_flushed
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        result
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        context: &mut Context<'_>,
+        buffers: &[std::io::IoSlice<'_>],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        let this = self.get_mut();
+        let result = Pin::new(&mut this.inner).poll_write_vectored(context, buffers);
+        if matches!(result, Poll::Ready(Ok(written)) if written != 0)
+            && this
+                .state
+                .body_complete
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            this.state
+                .post_completion_bytes_written
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        result
+    }
+}
+
 async fn send_upgrade_request<S, B>(
     stream: S,
     request: Request<B>,
@@ -1660,8 +1851,9 @@ where
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let (parts, body) = request.into_parts();
-    let (body, body_complete) = UpgradeRequestBody::new(body);
+    let (body, write_state) = UpgradeRequestBody::new(body);
     let request = Request::from_parts(parts, body);
+    let stream = UpgradeFlushTrackedIo::new(stream, write_state.clone());
     let (mut sender, connection) = connect_stage(deadlines, async {
         conn::Builder::new()
             .handshake(stream)
@@ -1695,7 +1887,10 @@ where
         )));
     }
 
-    if !body_complete.load(std::sync::atomic::Ordering::Acquire) {
+    if !write_state
+        .request_flushed
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
         driver.abort_and_join().await;
         return Err(ForwardError::UpgradeRequestBodyIncomplete);
     }
@@ -1717,23 +1912,23 @@ where
 
 struct UpgradeRequestBody<B> {
     inner: Pin<Box<B>>,
-    complete: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    write_state: Arc<UpgradeRequestWriteState>,
     exact_remaining: Option<u64>,
 }
 
 impl<B: HttpBody> UpgradeRequestBody<B> {
-    fn new(body: B) -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    fn new(body: B) -> (Self, Arc<UpgradeRequestWriteState>) {
         let exact_remaining = body.size_hint().exact();
-        let complete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        let write_state = Arc::new(UpgradeRequestWriteState::new(
             body.is_end_stream() || exact_remaining == Some(0),
         ));
         (
             Self {
                 inner: Box::pin(body),
-                complete: complete.clone(),
+                write_state: write_state.clone(),
                 exact_remaining,
             },
-            complete,
+            write_state,
         )
     }
 }
@@ -1762,7 +1957,8 @@ impl<B: HttpBody> HttpBody for UpgradeRequestBody<B> {
             }
         };
         if complete {
-            self.complete
+            self.write_state
+                .body_complete
                 .store(true, std::sync::atomic::Ordering::Release);
         }
         result
@@ -1776,7 +1972,8 @@ impl<B: HttpBody> HttpBody for UpgradeRequestBody<B> {
         if matches!(result, Poll::Ready(Ok(_)))
             && self.exact_remaining.is_none_or(|remaining| remaining == 0)
         {
-            self.complete
+            self.write_state
+                .body_complete
                 .store(true, std::sync::atomic::Ordering::Release);
         }
         result
@@ -2666,6 +2863,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upgrade_rejects_101_before_request_flush_completes() {
+        struct FlushPendingIo {
+            inner: DuplexStream,
+        }
+
+        impl AsyncRead for FlushPendingIo {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                context: &mut Context<'_>,
+                buffer: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.get_mut().inner).poll_read(context, buffer)
+            }
+        }
+
+        impl AsyncWrite for FlushPendingIo {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                context: &mut Context<'_>,
+                buffer: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Pin::new(&mut self.get_mut().inner).poll_write(context, buffer)
+            }
+
+            fn poll_flush(
+                self: Pin<&mut Self>,
+                _context: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Poll::Pending
+            }
+
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                context: &mut Context<'_>,
+            ) -> Poll<io::Result<()>> {
+                Pin::new(&mut self.get_mut().inner).poll_shutdown(context)
+            }
+
+            fn is_write_vectored(&self) -> bool {
+                self.inner.is_write_vectored()
+            }
+
+            fn poll_write_vectored(
+                self: Pin<&mut Self>,
+                context: &mut Context<'_>,
+                buffers: &[io::IoSlice<'_>],
+            ) -> Poll<io::Result<usize>> {
+                Pin::new(&mut self.get_mut().inner).poll_write_vectored(context, buffers)
+            }
+        }
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .version(Version::HTTP_11)
+            .uri("/socket")
+            .header(HOST, "origin.example")
+            .header(CONNECTION, "upgrade")
+            .header(UPGRADE, "test-echo")
+            .header(CONTENT_LENGTH, "4")
+            .body(Body::from("body"))
+            .unwrap();
+        let request = crate::proxy::headers::sanitize_untrusted_request(request).unwrap();
+        let intent = request.upgrade_intent().unwrap().clone();
+        let canonical = canonicalize_http_url("http://origin.example/socket").unwrap();
+        let request = prepare_origin_upgrade_request(
+            request,
+            &canonical,
+            RequestTargetForm::Origin,
+            OriginProtocol::Http1,
+        )
+        .unwrap();
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let head = read_http_head(&mut server).await.to_ascii_lowercase();
+            assert!(head.contains("\r\ncontent-length: 4\r\n"));
+            let mut body = [0_u8; 4];
+            server.read_exact(&mut body).await.unwrap();
+            assert_eq!(&body, b"body");
+            server
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: test-echo\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let mut tail = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), server.read_to_end(&mut tail))
+                .await
+                .expect("the unflushed upgrade did not close the origin connection")
+                .unwrap();
+        });
+
+        let error = send_upgrade_request(
+            FlushPendingIo { inner: client },
+            request,
+            intent,
+            ForwardingTimeouts::for_test().begin_connect(),
+        )
+        .await
+        .err()
+        .expect("a 101 received before request flush must fail");
+        assert!(matches!(error, ForwardError::UpgradeRequestBodyIncomplete));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn rejected_upgrade_remains_an_owned_ordinary_response() {
         let canonical = canonicalize_http_url("http://origin.example/socket").unwrap();
         let egress = activate(None);
@@ -2742,11 +3044,12 @@ mod tests {
 
     #[tokio::test]
     async fn upgrade_early_101_and_shutdown_restore_body_budget() {
-        struct PendingTrailersBody {
+        struct PrefixThenPendingBody {
+            prefix: Option<Bytes>,
             _charged_body: GuardedBody,
         }
 
-        impl HttpBody for PendingTrailersBody {
+        impl HttpBody for PrefixThenPendingBody {
             type Data = Bytes;
             type Error = std::convert::Infallible;
 
@@ -2754,14 +3057,23 @@ mod tests {
                 self: Pin<&mut Self>,
                 _context: &mut Context<'_>,
             ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
-                Poll::Ready(None)
+                match self.get_mut().prefix.take() {
+                    Some(prefix) => Poll::Ready(Some(Ok(prefix))),
+                    None => Poll::Pending,
+                }
             }
 
             fn poll_trailers(
                 self: Pin<&mut Self>,
                 _context: &mut Context<'_>,
             ) -> Poll<Result<Option<http::HeaderMap>, Self::Error>> {
-                Poll::Pending
+                Poll::Ready(Ok(None))
+            }
+
+            fn size_hint(&self) -> SizeHint {
+                let mut hint = SizeHint::new();
+                hint.set_exact(64 * 1024);
+                hint
             }
         }
 
@@ -2786,7 +3098,10 @@ mod tests {
             .header(HOST, "origin.example")
             .header(CONNECTION, "upgrade")
             .header(UPGRADE, "WebSocket")
-            .body(PendingTrailersBody {
+            .body(PrefixThenPendingBody {
+                prefix: Some(Bytes::from(
+                    [b"body-prefix".as_slice(), &vec![b'x'; 32 * 1024]].concat(),
+                )),
                 _charged_body: charged_body,
             })
             .unwrap();
@@ -2803,14 +3118,28 @@ mod tests {
         let (client, mut server) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(async move {
             let _ = read_http_head(&mut server).await;
+            let mut request_body = Vec::new();
+            while !request_body
+                .windows(b"body-prefix".len())
+                .any(|window| window == b"body-prefix")
+            {
+                let mut buffer = [0_u8; 128];
+                let read = server.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0, "request closed before writing the body prefix");
+                request_body.extend_from_slice(&buffer[..read]);
+                assert!(request_body.len() < 8 * 1024);
+            }
             server
                 .write_all(
                     b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: WebSocket\r\n\r\n",
                 )
                 .await
                 .unwrap();
-            let mut byte = [0_u8; 1];
-            assert_eq!(server.read(&mut byte).await.unwrap(), 0);
+            let mut tail = Vec::new();
+            tokio::time::timeout(Duration::from_secs(2), server.read_to_end(&mut tail))
+                .await
+                .expect("the rejected upgrade did not close the origin connection")
+                .unwrap();
         });
 
         let error = send_upgrade_request(

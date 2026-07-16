@@ -45,8 +45,9 @@ use crate::proxy::authority::{reconcile_connect_outer_request, reconcile_request
 use crate::proxy::facts::{
     validate_standalone_connect_ingress_request, validate_standalone_ingress_request,
 };
-use crate::proxy::forward::{preflight_forwarding_target, ForwardBody, ForwardBodyError};
+use crate::proxy::forward::{preflight_forwarding_target, ForwardedDownstreamBody};
 use crate::proxy::forwarding_executor::ForwardingExecutor;
+use crate::proxy::h2_stream_cancellation::{H2StreamCancellation, H2StreamExecutor};
 use crate::proxy::original_destination::{
     OriginalDestinationResolver, SystemOriginalDestinationResolver,
 };
@@ -1025,7 +1026,7 @@ async fn serve_http_connection(connection: HttpConnection) {
         }
     });
 
-    let mut http = Http::new();
+    let mut http = Http::new().with_executor(H2StreamExecutor);
     http.http1_keep_alive(true);
     http.http1_header_read_timeout(config.request_header_timeout);
     http.http2_max_concurrent_streams(config.max_concurrent_streams);
@@ -2167,6 +2168,9 @@ async fn execute_request_via_pipeline(
         upgrade_runtime,
         assets,
     } = execution;
+    if let Some(h2_stream) = H2StreamCancellation::current() {
+        request.extensions_mut().insert(h2_stream);
+    }
     let started_at = Instant::now();
     let request_id = request_id();
     let ingress_mode = authority.ingress_mode();
@@ -2282,13 +2286,16 @@ fn request_id() -> String {
 pub(super) enum ProxyResponseBody {
     Local(Body),
     Forwarded {
-        body: Box<ForwardBody>,
+        body: Box<ForwardedDownstreamBody>,
         capture: Option<Box<CaptureSubmission>>,
     },
 }
 
 impl ProxyResponseBody {
-    pub(super) fn forwarded(body: ForwardBody, capture: Option<CaptureSubmission>) -> Self {
+    pub(super) fn forwarded(
+        body: ForwardedDownstreamBody,
+        capture: Option<CaptureSubmission>,
+    ) -> Self {
         Self::Forwarded {
             body: Box::new(body),
             capture: capture.map(Box::new),
@@ -2301,7 +2308,7 @@ pub(super) enum ProxyResponseBodyError {
     #[error(transparent)]
     Local(#[from] hyper::Error),
     #[error(transparent)]
-    Forwarded(#[from] ForwardBodyError),
+    Forwarded(hyper::Error),
 }
 
 impl HttpBody for ProxyResponseBody {
@@ -8032,7 +8039,7 @@ urls = ["http://{origin}/**"]
         if downstream_http2 {
             config.replacen(
                 "http_versions = [\"http1\"]",
-                "http_versions = [\"http2\"]",
+                "http_versions = [\"http2\"]\nmax_concurrent_streams = 1",
                 1,
             )
         } else {
@@ -8107,6 +8114,14 @@ urls = ["http://{origin}/**"]
             sent < RESPONSE_BYTES,
             "the origin sent the complete body despite downstream backpressure"
         );
+        let mut downstream_tail = Vec::new();
+        let _downstream_close = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.read_to_end(&mut downstream_tail),
+        )
+        .await
+        .expect("the response watchdog did not terminate the HTTP/1 downstream");
+        origin_task.await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             while pool.global_charge() != 0 {
                 tokio::task::yield_now().await;
@@ -8115,8 +8130,6 @@ urls = ["http://{origin}/**"]
         .await
         .expect("the unread HTTP/1 response retained admission past its deadline");
 
-        drop(client);
-        origin_task.await.unwrap();
         product.shutdown().await;
     }
 
@@ -8182,35 +8195,103 @@ urls = ["http://{origin}/**"]
             pool.global_charge() > 0,
             "zero-window HTTP/2 response did not retain response admission"
         );
-        tokio::time::timeout(Duration::from_secs(2), origin_closed_rx)
-            .await
-            .expect("the zero-window response watchdog did not close the origin")
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while pool.global_charge() != 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the zero-window HTTP/2 response retained admission past its deadline");
 
-        let sibling = sender
-            .send_request(
+        let sibling = tokio::time::timeout(
+            Duration::from_secs(2),
+            sender.send_request(
                 Request::builder()
                     .uri(format!("http://{origin}/sibling"))
                     .body(Body::empty())
                     .unwrap(),
-            )
-            .await
-            .expect("the stalled response failed the whole HTTP/2 connection");
+            ),
+        )
+        .await
+        .expect("the watchdog did not release the sole HTTP/2 stream slot")
+        .expect("the stalled response failed the whole HTTP/2 connection");
         assert_eq!(sibling.status(), StatusCode::NO_CONTENT);
 
-        drop(sibling);
         drop(stalled);
+        drop(sibling);
+        tokio::time::timeout(Duration::from_secs(2), origin_closed_rx)
+            .await
+            .expect("the zero-window response watchdog did not close the origin")
+            .unwrap();
+        origin_task.await.unwrap();
+        let released = tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.global_charge() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            released.is_ok(),
+            "the zero-window HTTP/2 response retained {} admission bytes past its deadline",
+            pool.global_charge()
+        );
+
         drop(sender);
         product.shutdown().await;
         driver.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn h2_zero_window_watchdog_sends_stream_cancel() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin_listener.accept().await.unwrap();
+            let request = read_http_head(&mut stream).await;
+            assert!(String::from_utf8_lossy(&request).contains("/reset"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\nx")
+                .await
+                .unwrap();
+            let mut byte = [0_u8; 1];
+            let closed = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+                .await
+                .expect("the response watchdog did not close the reset origin");
+            assert!(matches!(closed, Ok(0) | Err(_)));
+        });
+        let (_directory, product) =
+            product(response_watchdog_config(proxy, origin, true), listeners).await;
+        let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let mut builder = h2::client::Builder::new();
+        builder.initial_window_size(0);
+        let (mut sender, connection) = builder.handshake::<_, Bytes>(stream).await.unwrap();
+        let driver = tokio::spawn(connection);
+
+        let (response, _request_body) = sender
+            .send_request(
+                Request::builder()
+                    .uri(format!("http://{origin}/reset"))
+                    .body(())
+                    .unwrap(),
+                true,
+            )
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), response)
+            .await
+            .expect("the proxy did not send the HTTP/2 response head")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let mut body = response.into_body();
+        let reset = tokio::time::timeout(Duration::from_secs(2), body.data())
+            .await
+            .expect("the response watchdog did not terminate the HTTP/2 stream")
+            .expect("the reset response body ended without RST_STREAM")
+            .expect_err("the zero-window response unexpectedly produced data");
+        assert!(reset.is_reset());
+        assert_eq!(reset.reason(), Some(h2::Reason::CANCEL));
+
         origin_task.await.unwrap();
+        drop(sender);
+        product.shutdown().await;
+        driver.await.unwrap().unwrap();
     }
 
     fn bounded_response_wire_config(

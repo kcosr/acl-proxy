@@ -32,7 +32,9 @@ struct ForwardingExecutor;
 
 impl ForwardingExecutor {
     fn execute_ordinary(request: Request) {
+        let h2_stream = parts.extensions.remove::<H2StreamCancellation>();
         forward_request(request);
+        body.bind_response_lifetime(deadline, retention, admission, policy, h2_stream);
     }
 
     #[cfg(test)]
@@ -47,6 +49,7 @@ impl ForwardingExecutor {
 
     fn execute_upgrade(request: Request) {
         forward_upgrade_request(request);
+        body.bind_response_lifetime(deadline, retention, admission, policy, h2_stream);
     }
 }
 
@@ -61,6 +64,12 @@ EOF
 cat >"$BASELINE/src/proxy/ingress.rs" <<'EOF'
 fn terminal_forward(dispatch: Dispatch) {
     ForwardingExecutor::execute(dispatch);
+}
+
+fn execute_request_via_pipeline(mut request: Request) {
+    if let Some(h2_stream) = H2StreamCancellation::current() {
+        request.extensions_mut().insert(h2_stream);
+    }
 }
 
 #[cfg(test)]
@@ -195,5 +204,110 @@ for primitive in forward_request forward_upgrade_request; do
         "must contain exactly one production $primitive transport call"
 done
 
+case_root="$TEST_ROOT/missing-h2-lookup"
+cp -R "$BASELINE" "$case_root"
+sed -i '/    if let Some(h2_stream) = H2StreamCancellation::current() {/d' \
+    "$case_root/src/proxy/ingress.rs"
+expect_failure "$case_root" 'missing H2 cancellation lookup' \
+    'H2StreamCancellation::current must have exactly one production lookup in ingress.rs'
+
+case_root="$TEST_ROOT/duplicate-h2-lookup"
+cp -R "$BASELINE" "$case_root"
+sed -i '/    if let Some(h2_stream) = H2StreamCancellation::current() {/a\    let _duplicate = H2StreamCancellation::current();' \
+    "$case_root/src/proxy/ingress.rs"
+expect_failure "$case_root" 'duplicate H2 cancellation lookup' \
+    'H2StreamCancellation::current must have exactly one production lookup in ingress.rs'
+
+case_root="$TEST_ROOT/escaped-h2-lookup"
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' 'fn escaped() { let _ = H2StreamCancellation::current(); }' \
+    >"$case_root/src/bypass.rs"
+expect_failure "$case_root" 'escaped H2 cancellation lookup' \
+    'H2StreamCancellation::current must have exactly one production lookup in ingress.rs'
+
+case_root="$TEST_ROOT/missing-h2-injection"
+cp -R "$BASELINE" "$case_root"
+sed -i '/        request.extensions_mut().insert(h2_stream);/d' \
+    "$case_root/src/proxy/ingress.rs"
+expect_failure "$case_root" 'missing H2 cancellation injection' \
+    'the H2 cancellation capability must be injected exactly once in ingress.rs'
+
+case_root="$TEST_ROOT/duplicate-h2-injection"
+cp -R "$BASELINE" "$case_root"
+sed -i '/        request.extensions_mut().insert(h2_stream);/a\        request.extensions_mut().insert(h2_stream);' \
+    "$case_root/src/proxy/ingress.rs"
+expect_failure "$case_root" 'duplicate H2 cancellation injection' \
+    'the H2 cancellation capability must be injected exactly once in ingress.rs'
+
+case_root="$TEST_ROOT/escaped-h2-injection"
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' 'fn escaped(mut request: Request) { request.extensions_mut().insert(h2_stream); }' \
+    >"$case_root/src/bypass.rs"
+expect_failure "$case_root" 'escaped H2 cancellation injection' \
+    'the H2 cancellation capability must be injected exactly once in ingress.rs'
+
+case_root="$TEST_ROOT/detached-h2-transfer"
+cp -R "$BASELINE" "$case_root"
+sed -i 's/if let Some(h2_stream) = H2StreamCancellation::current()/if let Some(detached) = H2StreamCancellation::current()/' \
+    "$case_root/src/proxy/ingress.rs"
+expect_failure "$case_root" 'detached H2 cancellation transfer' \
+    'the ingress H2 lookup must directly inject its typed cancellation capability'
+
+case_root="$TEST_ROOT/missing-h2-removal"
+cp -R "$BASELINE" "$case_root"
+sed -i '/        let h2_stream = parts.extensions.remove::<H2StreamCancellation>();/d' \
+    "$case_root/src/proxy/forwarding_executor.rs"
+expect_failure "$case_root" 'missing H2 cancellation removal' \
+    'the H2 cancellation capability must be removed exactly once in forwarding_executor.rs'
+
+case_root="$TEST_ROOT/duplicate-h2-removal"
+cp -R "$BASELINE" "$case_root"
+sed -i '/        let h2_stream = parts.extensions.remove::<H2StreamCancellation>();/a\        let _duplicate = parts.extensions.remove::<H2StreamCancellation>();' \
+    "$case_root/src/proxy/forwarding_executor.rs"
+expect_failure "$case_root" 'duplicate H2 cancellation removal' \
+    'the H2 cancellation capability must be removed exactly once in forwarding_executor.rs'
+
+case_root="$TEST_ROOT/escaped-h2-removal"
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' 'fn escaped(parts: Parts) { parts.extensions.remove::<H2StreamCancellation>(); }' \
+    >"$case_root/src/bypass.rs"
+expect_failure "$case_root" 'escaped H2 cancellation removal' \
+    'the H2 cancellation capability must be removed exactly once in forwarding_executor.rs'
+
+case_root="$TEST_ROOT/missing-h2-binding"
+cp -R "$BASELINE" "$case_root"
+python3 - "$case_root/src/proxy/forwarding_executor.rs" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+binding = "        body.bind_response_lifetime(deadline, retention, admission, policy, h2_stream);\n"
+path.write_text(source.replace(binding, "", 1), encoding="utf-8")
+PY
+expect_failure "$case_root" 'missing H2 response binding' \
+    'H2 response lifetime binding must have exactly two production calls in forwarding_executor.rs'
+
+case_root="$TEST_ROOT/duplicate-h2-binding"
+cp -R "$BASELINE" "$case_root"
+sed -i '/        body.bind_response_lifetime(deadline, retention, admission, policy, h2_stream);/a\        body.bind_response_lifetime(deadline, retention, admission, policy, h2_stream);' \
+    "$case_root/src/proxy/forwarding_executor.rs"
+expect_failure "$case_root" 'duplicate H2 response binding' \
+    'H2 response lifetime binding must have exactly two production calls in forwarding_executor.rs'
+
+case_root="$TEST_ROOT/escaped-h2-binding"
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' 'fn escaped() { body.bind_response_lifetime(deadline, retention, admission, policy, h2_stream); }' \
+    >"$case_root/src/bypass.rs"
+expect_failure "$case_root" 'escaped H2 response binding' \
+    'H2 response lifetime binding must have exactly two production calls in forwarding_executor.rs'
+
+case_root="$TEST_ROOT/wrong-h2-binding"
+cp -R "$BASELINE" "$case_root"
+sed -i '0,/policy, h2_stream);/s//policy, None);/' \
+    "$case_root/src/proxy/forwarding_executor.rs"
+expect_failure "$case_root" 'response binding without H2 capability' \
+    'each response lifetime binding must receive the executor-owned h2_stream capability'
+
 printf 'forwarding executor ownership mutation tests passed (%d mutations)\n' \
-    "$case_index"
+    "$((case_index + 14))"

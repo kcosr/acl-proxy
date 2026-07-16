@@ -179,11 +179,6 @@ def production(path: pathlib.Path) -> str:
     if not absolute.is_file():
         raise SystemExit(f"forwarding executor ownership scan path is missing: {path}")
     source = mask_non_code(absolute.read_text(encoding="utf-8"))
-    ownership_token = re.compile(
-        r"\b(?:ForwardingExecutor|forward_request|forward_upgrade_request)\b"
-    )
-    if path != executor_path and ownership_token.search(source) is None:
-        return ""
     try:
         return mask_test_items(source)
     except SystemExit as error:
@@ -270,6 +265,145 @@ if len(entries) != 1 or not entries[0].startswith(f"{ingress_path}:"):
         file=sys.stderr,
     )
     print("call sites: " + (", ".join(entries) or "none"), file=sys.stderr)
+    raise SystemExit(1)
+
+
+def locations(pattern: re.Pattern[str]):
+    matches = []
+    for path, source in sources:
+        for match in pattern.finditer(source):
+            line = source.count("\n", 0, match.start()) + 1
+            matches.append((path, line, match))
+    return matches
+
+
+ambient_lookup_pattern = re.compile(
+    r"\bH2StreamCancellation\s*::\s*current\s*\("
+)
+ambient_lookups = locations(ambient_lookup_pattern)
+if len(ambient_lookups) != 1 or ambient_lookups[0][0] != ingress_path:
+    print(
+        "H2StreamCancellation::current must have exactly one production lookup in ingress.rs",
+        file=sys.stderr,
+    )
+    print(
+        "lookup sites: "
+        + (
+            ", ".join(f"{path}:{line}" for path, line, _ in ambient_lookups)
+            or "none"
+        ),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+h2_injection_pattern = re.compile(
+    r"\brequest\s*\.\s*extensions_mut\s*\(\s*\)\s*"
+    r"\.\s*insert\s*\(\s*h2_stream\s*\)"
+)
+h2_injections = locations(h2_injection_pattern)
+if len(h2_injections) != 1 or h2_injections[0][0] != ingress_path:
+    print(
+        "the H2 cancellation capability must be injected exactly once in ingress.rs",
+        file=sys.stderr,
+    )
+    print(
+        "injection sites: "
+        + (
+            ", ".join(f"{path}:{line}" for path, line, _ in h2_injections)
+            or "none"
+        ),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+h2_transfer_pattern = re.compile(
+    r"\bif\s+let\s+Some\s*\(\s*h2_stream\s*\)\s*=\s*"
+    r"H2StreamCancellation\s*::\s*current\s*\(\s*\)\s*\{\s*"
+    r"request\s*\.\s*extensions_mut\s*\(\s*\)\s*"
+    r"\.\s*insert\s*\(\s*h2_stream\s*\)\s*;\s*\}"
+)
+h2_transfers = locations(h2_transfer_pattern)
+if len(h2_transfers) != 1 or h2_transfers[0][0] != ingress_path:
+    print(
+        "the ingress H2 lookup must directly inject its typed cancellation capability",
+        file=sys.stderr,
+    )
+    print(
+        "transfer sites: "
+        + (
+            ", ".join(f"{path}:{line}" for path, line, _ in h2_transfers)
+            or "none"
+        ),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+h2_removal_pattern = re.compile(
+    r"\.\s*extensions\s*\.\s*remove\s*::\s*<\s*"
+    r"H2StreamCancellation\s*>\s*\("
+)
+h2_removals = locations(h2_removal_pattern)
+if len(h2_removals) != 1 or h2_removals[0][0] != executor_path:
+    print(
+        "the H2 cancellation capability must be removed exactly once in forwarding_executor.rs",
+        file=sys.stderr,
+    )
+    print(
+        "removal sites: "
+        + (
+            ", ".join(f"{path}:{line}" for path, line, _ in h2_removals)
+            or "none"
+        ),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+
+def closing_parenthesis(source: str, opening: int) -> int:
+    depth = 0
+    for index in range(opening, len(source)):
+        if source[index] == "(":
+            depth += 1
+        elif source[index] == ")":
+            depth -= 1
+            if depth == 0:
+                return index
+    line = source.count("\n", 0, opening) + 1
+    raise SystemExit(
+        f"unterminated bind_response_lifetime call beginning near line {line}"
+    )
+
+
+bind_start_pattern = re.compile(r"\.\s*bind_response_lifetime\s*\(")
+h2_bindings = []
+invalid_h2_bindings = []
+for path, source in sources:
+    for match in bind_start_pattern.finditer(source):
+        opening = source.find("(", match.start(), match.end())
+        closing = closing_parenthesis(source, opening)
+        arguments = source[opening + 1 : closing]
+        line = source.count("\n", 0, match.start()) + 1
+        location = f"{path}:{line}"
+        h2_bindings.append((path, location))
+        if re.search(r"(?:^|,)\s*h2_stream\s*,?\s*$", arguments) is None:
+            invalid_h2_bindings.append(location)
+if len(h2_bindings) != 2 or any(path != executor_path for path, _ in h2_bindings):
+    print(
+        "H2 response lifetime binding must have exactly two production calls in forwarding_executor.rs",
+        file=sys.stderr,
+    )
+    print(
+        "binding sites: "
+        + (", ".join(location for _, location in h2_bindings) or "none"),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+if invalid_h2_bindings:
+    print(
+        "each response lifetime binding must receive the executor-owned h2_stream capability",
+        file=sys.stderr,
+    )
+    print("invalid binding sites: " + ", ".join(invalid_h2_bindings), file=sys.stderr)
     raise SystemExit(1)
 
 for primitive in ("forward_request", "forward_upgrade_request"):
