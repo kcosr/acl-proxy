@@ -304,6 +304,7 @@ fn adapt_provider_allow_inner(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn adapt_local_allow(
     lease: &GenerationLease,
     effects: MatchedEffects<ProductRuleEffectsRef>,
