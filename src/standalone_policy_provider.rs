@@ -42,12 +42,14 @@ use crate::proxy::forward::{
 };
 use crate::request_pipeline::{RequestPipelineError, StandaloneDispatch};
 use crate::runtime::{
-    ForwardingGenerationServices, GenerationLease, GenerationRetention, ProviderIndex,
+    AuthorizationInvocationMode, ForwardingGenerationServices, GenerationLease,
+    GenerationRetention, ProviderIndex,
 };
 use crate::runtime_body_source::{ProductBodySource, ProductBodySourceActivation};
 use crate::safety::{GuardedBody, WireBodyQuotaKey};
 use crate::standalone_provider_result::{
-    adapt_local_allow, adapt_provider_allow, StandaloneProviderAllowError, StandaloneRequestSidecar,
+    adapt_local_allow, adapt_provider_allow, StandaloneAllowMode, StandaloneProviderAllowError,
+    StandaloneRequestSidecar,
 };
 
 pub(crate) struct TokioRuntimeClock {
@@ -234,6 +236,13 @@ impl StandaloneIngressTransport {
                     && facts.method().as_str() == "CONNECT"
                     && facts.upgrade().is_none()
             }
+        }
+    }
+
+    fn allow_mode(&self) -> StandaloneAllowMode {
+        match self {
+            Self::Ordinary { .. } => StandaloneAllowMode::OriginRequest,
+            Self::OuterConnect { .. } => StandaloneAllowMode::OuterConnect,
         }
     }
 }
@@ -582,6 +591,7 @@ where
         let terminal = state.terminal.as_ref().ok_or(500_u16)?;
         let generation = &terminal.generation;
         let deadline = terminal.deadline;
+        let allow_mode = terminal.transport.allow_mode();
         if facts != request.facts()
             || request.binding().map_err(|_| 500_u16)? != state.initial_binding
             || request.body_observation().map_err(|_| 500_u16)?.state()
@@ -699,6 +709,7 @@ where
                         generation,
                         effects,
                         &provenance,
+                        allow_mode,
                         inspected_body,
                         guard,
                         replay_lease,
@@ -742,7 +753,18 @@ where
                         .authorization()
                         .provider_metadata(provider)
                         .ok_or(500_u16)?;
-                    if metadata.include_request_body && inspected.is_none() {
+                    let invocation_mode = match allow_mode {
+                        StandaloneAllowMode::OriginRequest => {
+                            AuthorizationInvocationMode::EffectsAllowed
+                        }
+                        StandaloneAllowMode::OuterConnect => {
+                            AuthorizationInvocationMode::DecisionOnly
+                        }
+                    };
+                    if invocation_mode == AuthorizationInvocationMode::EffectsAllowed
+                        && metadata.include_request_body
+                        && inspected.is_none()
+                    {
                         if request.facts().upgrade().is_some()
                             && matches!(
                                 request.facts().body().framing(),
@@ -758,7 +780,13 @@ where
                             return Err(500);
                         }
                     }
-                    validate_provider_limits(generation, ordinal, metadata, inspected.as_ref())?;
+                    validate_provider_limits(
+                        generation,
+                        ordinal,
+                        metadata,
+                        invocation_mode == AuthorizationInvocationMode::EffectsAllowed,
+                        inspected.as_ref(),
+                    )?;
                     let selected = provider_header_values(
                         metadata.include_headers,
                         &state.headers,
@@ -774,16 +802,19 @@ where
                     let provider_headers =
                         ProviderRequestHeaders::new(&included).map_err(|_| 500_u16)?;
                     let peer_ip = state.peer_ip.to_string();
-                    let provider_body = metadata.include_request_body.then(|| {
-                        let body = inspected
-                            .as_ref()
-                            .expect("body-including providers require mandatory inspection");
-                        GuardedProviderBody {
-                            content_type: body.content_type.as_deref(),
-                            content_encoding: Some("identity"),
-                            decoded: &body.decoded,
-                        }
-                    });
+                    let provider_body = (invocation_mode
+                        == AuthorizationInvocationMode::EffectsAllowed
+                        && metadata.include_request_body)
+                        .then(|| {
+                            let body = inspected
+                                .as_ref()
+                                .expect("body-including providers require mandatory inspection");
+                            GuardedProviderBody {
+                                content_type: body.content_type.as_deref(),
+                                content_encoding: Some("identity"),
+                                decoded: &body.decoded,
+                            }
+                        });
                     let provider_request = ProviderRequest {
                         request_id: &state.request_id,
                         url: request.facts().url().as_str(),
@@ -797,6 +828,7 @@ where
                             provider,
                             rule_id,
                             provider_request,
+                            invocation_mode,
                             &guard,
                             deadline,
                         )
@@ -865,6 +897,7 @@ where
                                     &provenance,
                                     provider,
                                     output,
+                                    allow_mode,
                                     inspected_body,
                                     guard,
                                     replay_lease,
@@ -1211,10 +1244,12 @@ fn validate_provider_limits(
     lease: &GenerationLease,
     ordinal: usize,
     metadata: crate::authorization::AuthorizationProviderMetadata<'_>,
+    include_provider_body: bool,
     body: Option<&InspectedBody>,
 ) -> Result<(), u16> {
     if let Some(body) = body {
-        if metadata.include_request_body
+        if include_provider_body
+            && metadata.include_request_body
             && (body.encoded_len > metadata.max_request_body_bytes
                 || body.decoded.len() > metadata.max_decoded_request_body_bytes)
         {
@@ -1892,6 +1927,44 @@ methods = ["GET"]
     }
 
     #[cfg(unix)]
+    fn outer_connect_process_provider_config(command: &Path, after_pass: &str) -> CompiledConfig {
+        compiled_text(&format!(
+            r#"[authorization.providers.provider]
+kind = "process"
+command = "{}"
+timeout = "2s"
+retire_timeout = "6s"
+on_failure = "error"
+include_request_body = true
+allow_request_body_replacement = true
+max_request_body_bytes = 4096
+max_decoded_request_body_bytes = 4096
+max_stdout_line_bytes = 4096
+
+[authorization.providers.provider.outputs.token]
+kind = "bearer"
+required = true
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "delegate-connect"
+decision = "delegate"
+methods = ["CONNECT"]
+authorization_provider = "provider"
+
+[[policy.rules]]
+id = "after-pass"
+decision = "{}"
+methods = ["CONNECT"]
+"#,
+            command.display(),
+            after_pass
+        ))
+    }
+
+    #[cfg(unix)]
     fn process_script(
         directory: &Path,
         decision: &str,
@@ -1912,6 +1985,35 @@ while IFS= read -r line; do
   [ -n "$id" ] && printf '{{"id":"%s","type":"response","decision":"{decision}"}}\n' "$id"
 done
 "#
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn recording_process_script(
+        directory: &Path,
+        decision: &str,
+        marker: &Path,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = directory.join("recording-provider.sh");
+        std::fs::write(
+            &path,
+            format!(
+                r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> '{}'
+  id=$(printf "%s" "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  [ -n "$id" ] && printf '{{"id":"%s","type":"response","decision":"{decision}"}}\n' "$id"
+done
+"#,
+                marker.display()
             ),
         )
         .unwrap();
@@ -2145,6 +2247,43 @@ done
 
         assert_eq!(terminal, Terminal::Forward);
         assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegated_outer_connect_uses_decision_only_process_dispatch() {
+        for (provider_decision, after_pass, expected) in [
+            ("allow", "deny", Terminal::Forward),
+            ("deny", "allow", Terminal::Response(403)),
+            ("pass", "allow", Terminal::Forward),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let marker = directory.path().join("requests.jsonl");
+            let provider_script =
+                recording_process_script(directory.path(), provider_decision, &marker);
+            let resolver_calls = Arc::new(AtomicUsize::new(0));
+            let config = outer_connect_process_provider_config(&provider_script, after_pass);
+            let (runtime, destinations) = runtime_from(config, resolver_calls.clone()).await;
+            let lease = runtime.lease().await.unwrap();
+            let input = prepared_connect_input(&lease, destinations);
+            let (provider, request) =
+                StandalonePolicyProvider::prepare(lease, ConnectTerminal, input).unwrap();
+
+            let terminal = RequestPipeline::new().execute(provider, request).await;
+
+            assert_eq!(terminal, expected, "provider decision {provider_decision}");
+            assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
+            let requests = std::fs::read_to_string(&marker).unwrap();
+            let mut lines = requests.lines();
+            let request: serde_json::Value =
+                serde_json::from_str(lines.next().expect("one provider request")).unwrap();
+            assert!(lines.next().is_none());
+            assert_eq!(request["type"], "request");
+            assert_eq!(request["method"], "CONNECT");
+            assert_eq!(request["url"], "https://standalone-provider.example.test/");
+            assert!(request.get("body").is_none());
+            runtime.shutdown().await;
+        }
     }
 
     #[tokio::test]

@@ -43,6 +43,12 @@ pub(crate) struct StandaloneProviderAllow {
     pub(crate) credentials: Option<ProductCredentialPreparation>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StandaloneAllowMode {
+    OriginRequest,
+    OuterConnect,
+}
+
 /// Product-only resources and secret bindings for one validated forwarding pair.
 ///
 /// The shared plan contains only opaque credential references. Provider values
@@ -143,6 +149,7 @@ pub(crate) fn adapt_provider_allow(
     provenance: &DecisionProvenance,
     provider: ProviderIndex,
     output: AuthorizationAllowOutput,
+    allow_mode: StandaloneAllowMode,
     inspected_body: Option<GuardedBody>,
     guard: HttpWireBodyGuard,
     replay_lease: RuntimeReplayLease,
@@ -155,6 +162,7 @@ pub(crate) fn adapt_provider_allow(
         provenance,
         provider,
         output,
+        allow_mode,
         inspected_body,
         guard,
         replay_lease,
@@ -174,6 +182,7 @@ fn adapt_provider_allow_inner(
     provenance: &DecisionProvenance,
     provider: ProviderIndex,
     output: AuthorizationAllowOutput,
+    allow_mode: StandaloneAllowMode,
     inspected_body: Option<GuardedBody>,
     guard: HttpWireBodyGuard,
     replay_lease: RuntimeReplayLease,
@@ -188,10 +197,13 @@ fn adapt_provider_allow_inner(
         .get(rule_ordinal)
         .filter(|rule| rule.ordinal() as usize == rule_ordinal)
         .ok_or(StandaloneProviderAllowError::Binding)?;
-    let outer_connect = request.facts().method().as_str() == "CONNECT";
+    let outer_connect = allow_mode == StandaloneAllowMode::OuterConnect;
     let (credentials, replacement) = authorization
         .consume_allow_output(provider, output)
         .ok_or(StandaloneProviderAllowError::Binding)?;
+    if outer_connect && (credentials.is_some() || replacement.is_some()) {
+        return Err(StandaloneProviderAllowError::Binding);
+    }
     let provider_replacement_size = replacement
         .as_ref()
         .map(|replacement| replacement.decoded_size());
@@ -279,6 +291,7 @@ fn adapt_provider_allow_inner(
         generation,
         Some((rule_ordinal, rule)),
         provenance,
+        allow_mode,
         provider_credentials,
         provider_wire,
         provider_content_type,
@@ -295,6 +308,7 @@ pub(crate) fn adapt_local_allow(
     lease: &GenerationLease,
     effects: MatchedEffects<ProductRuleEffectsRef>,
     provenance: &DecisionProvenance,
+    allow_mode: StandaloneAllowMode,
     inspected_body: Option<GuardedBody>,
     guard: HttpWireBodyGuard,
     replay_lease: RuntimeReplayLease,
@@ -329,6 +343,7 @@ pub(crate) fn adapt_local_allow(
         generation,
         rule,
         provenance,
+        allow_mode,
         Vec::new(),
         None,
         None,
@@ -368,6 +383,7 @@ fn finish_allow(
     generation: &StandaloneGenerationPlan,
     rule: Option<(usize, &crate::standalone::StandaloneRuleTemplate)>,
     provenance: &http_access_types::DecisionProvenance,
+    allow_mode: StandaloneAllowMode,
     provider_credentials: Vec<SelectedProviderCredential>,
     provider_wire: Option<ProviderCredentialWireStore>,
     provider_content_type: Option<HeaderMutationBatch>,
@@ -379,7 +395,7 @@ fn finish_allow(
     credential_io_runtime: Arc<crate::credential_io_runtime::CredentialIoRuntime>,
 ) -> Result<StandaloneProviderAllow, StandaloneProviderAllowError> {
     let rule_template = rule.map(|(_, rule)| rule);
-    let outer_connect = request.facts().method().as_str() == "CONNECT";
+    let outer_connect = allow_mode == StandaloneAllowMode::OuterConnect;
 
     let mut request_mutation_batches = Vec::new();
     if let Some(batch) = rule_template.and_then(|rule| rule.request_headers()) {
@@ -1214,6 +1230,31 @@ header = "x-test-loop"
         replay_lease: RuntimeReplayLease,
         request: RuntimeRequest,
     ) -> Result<StandaloneProviderAllow, StandaloneProviderAllowFailure> {
+        adapt_provider_allow_with_mode(
+            lease,
+            rule_ordinal,
+            provider,
+            output,
+            StandaloneAllowMode::OriginRequest,
+            inspected_body,
+            guard,
+            replay_lease,
+            request,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn adapt_provider_allow_with_mode(
+        lease: &GenerationLease,
+        rule_ordinal: usize,
+        provider: ProviderIndex,
+        output: AuthorizationAllowOutput,
+        allow_mode: StandaloneAllowMode,
+        inspected_body: Option<GuardedBody>,
+        guard: HttpWireBodyGuard,
+        replay_lease: RuntimeReplayLease,
+        request: RuntimeRequest,
+    ) -> Result<StandaloneProviderAllow, StandaloneProviderAllowFailure> {
         let input = EvaluationInput::new(
             request.facts(),
             "192.0.2.10".parse().unwrap(),
@@ -1255,6 +1296,7 @@ header = "x-test-loop"
             &provenance,
             provider,
             output,
+            allow_mode,
             inspected_body,
             guard,
             replay_lease,
@@ -1296,6 +1338,7 @@ header = "x-test-loop"
             lease,
             effects,
             &provenance,
+            StandaloneAllowMode::OriginRequest,
             inspected_body,
             guard,
             replay_lease,
@@ -1558,11 +1601,12 @@ header = "x-test-loop"
             .unwrap();
         let lineage = request.begin_provider_invocation();
 
-        let result = adapt_provider_allow(
+        let result = adapt_provider_allow_with_mode(
             &lease,
             0,
             provider,
             output(&lease, provider, false, None),
+            StandaloneAllowMode::OuterConnect,
             None,
             guard,
             replay,
@@ -1576,7 +1620,24 @@ header = "x-test-loop"
             .forwarding_plan()
             .credential_mutations()
             .is_empty());
-        drop((result, lineage, lease));
+        drop((result, lineage));
+
+        let request = connect_request(lease.standalone());
+        let (guard, replay) = admission_for_request(&lease, &request, peer);
+        let output_with_effects = output(&lease, provider, true, None);
+        assert!(adapt_provider_allow_with_mode(
+            &lease,
+            0,
+            provider,
+            output_with_effects,
+            StandaloneAllowMode::OuterConnect,
+            None,
+            guard,
+            replay,
+            request,
+        )
+        .is_err_and(|failure| matches!(failure.error, StandaloneProviderAllowError::Binding)));
+        drop(lease);
         runtime.shutdown().await;
     }
 
