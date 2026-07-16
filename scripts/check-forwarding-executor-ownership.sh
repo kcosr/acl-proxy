@@ -186,6 +186,54 @@ def production(path: pathlib.Path) -> str:
         raise SystemExit(f"{path}: {error}") from error
 
 
+def parsed_use_paths(source: str) -> list[tuple[str, ...]]:
+    """Resolve Rust use trees into their imported component paths."""
+    paths = []
+
+    def parse_body(body: str) -> None:
+        tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*|::|[{},*]", body)
+
+        def parse_group(index: int, prefix: tuple[str, ...]) -> int:
+            while index < len(tokens) and tokens[index] != "}":
+                index = parse_item(index, prefix)
+                if index < len(tokens) and tokens[index] == ",":
+                    index += 1
+            if index >= len(tokens) or tokens[index] != "}":
+                raise SystemExit("unterminated Rust use group")
+            return index + 1
+
+        def parse_item(index: int, prefix: tuple[str, ...]) -> int:
+            components = []
+            while index < len(tokens):
+                token = tokens[index]
+                if token in (",", "}"):
+                    break
+                if token == "as":
+                    index += 2
+                    break
+                if token == "::":
+                    index += 1
+                    continue
+                if token == "{":
+                    return parse_group(index + 1, prefix + tuple(components))
+                components.append(token)
+                index += 1
+            resolved = prefix + tuple(component for component in components if component != "self")
+            if resolved:
+                paths.append(resolved)
+            return index
+
+        index = 0
+        while index < len(tokens):
+            index = parse_item(index, ())
+            if index < len(tokens) and tokens[index] == ",":
+                index += 1
+
+    for match in re.finditer(r"\buse\s+([^;]+);", source):
+        parse_body(match.group(1))
+    return paths
+
+
 if not (root / executor_path).is_file():
     raise SystemExit(f"forwarding executor ownership scan path is missing: {executor_path}")
 
@@ -197,39 +245,26 @@ for absolute in sorted((root / "src").rglob("*.rs")):
 webhook_connector = dict(sources).get(webhook_connector_path)
 if webhook_connector is None:
     raise SystemExit("authorization webhook connector ownership path is missing")
-webhook_use_bodies = [match.group(1) for match in re.finditer(r"\buse\s+([^;]+);", webhook_connector)]
-webhook_forbidden = {
-    "ordinary destination": (
-        r"\b(?:crate|super)\s*::[^;\n]*\bdestination\b",
-        r"\bdestination\s*::",
-    ),
-    "ordinary egress": (
-        r"\b(?:crate|super)\s*::[^;\n]*\begress\b",
-        r"\begress\s*::",
-    ),
-    "ordinary forwarding": (
-        r"\b(?:crate|super)\s*::[^;\n]*\bproxy\s*::\s*(?:\{[^}]*\b)?forward(?:ing_executor)?\b",
-        r"\bproxy\s*::\s*(?:\{[^}]*\b)?forward(?:ing_executor)?\b",
-    ),
-    "forwarding plan": (r"\bForwardingPlan\b",),
-    "credential execution": (
+webhook_use_paths = parsed_use_paths(webhook_connector)
+webhook_violations = []
+for name, component in (
+    ("ordinary destination", "destination"),
+    ("ordinary egress", "egress"),
+    ("ordinary forwarding", "proxy"),
+):
+    if any(component in path for path in webhook_use_paths):
+        webhook_violations.append(name)
+for name, pattern in (
+    ("ordinary destination", r"\b(?:crate|super)\s*::\s*destination\b"),
+    ("ordinary egress", r"\b(?:crate|super)\s*::\s*egress\b"),
+    ("ordinary forwarding", r"\b(?:crate|super)\s*::\s*proxy\b"),
+    ("forwarding plan", r"\bForwardingPlan\b"),
+    (
+        "credential execution",
         r"\b(?:ProductCredentialExecution|CredentialResolverSession|TransportCredentialBatch)\b",
     ),
-}
-webhook_use_forbidden = {
-    "ordinary destination": r"\bdestination\b",
-    "ordinary egress": r"\begress\b",
-    "ordinary forwarding": r"\bproxy\b[\s\S]*\bforward(?:ing_executor)?\b",
-}
-webhook_violations = []
-for name, patterns in webhook_forbidden.items():
-    if any(re.search(pattern, webhook_connector) for pattern in patterns):
-        webhook_violations.append(name)
-        continue
-    use_pattern = webhook_use_forbidden.get(name)
-    if use_pattern is not None and any(
-        re.search(use_pattern, body) for body in webhook_use_bodies
-    ):
+):
+    if re.search(pattern, webhook_connector) and name not in webhook_violations:
         webhook_violations.append(name)
 if webhook_violations:
     print(
@@ -246,10 +281,15 @@ for path, source in sources:
         or path == pathlib.Path("src/egress.rs")
         or path.parts[:2] == ("src", "proxy")
     )
-    if ordinary_owner and re.search(
-        r"\b(?:WebhookConnector|authorization\s*::\s*webhook\s*::\s*connector)\b",
-        source,
-    ):
+    if not ordinary_owner:
+        continue
+    imports_authorization = any(
+        "authorization" in use_path for use_path in parsed_use_paths(source)
+    )
+    qualifies_webhook = re.search(
+        r"\b(?:WebhookConnector|authorization\s*::\s*webhook)\b", source
+    )
+    if imports_authorization or qualifies_webhook:
         ordinary_webhook_references.append(str(path))
 if ordinary_webhook_references:
     print(

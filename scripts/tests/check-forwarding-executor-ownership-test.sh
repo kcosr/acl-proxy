@@ -125,11 +125,16 @@ for dependency in \
     'use crate::destination::DestinationGuard;' \
     'use crate::{config::StaticProductConfig, destination::DestinationGuard};' \
     'use crate::{destination::{DestinationGuard}};' \
+    'use crate::destination::*;' \
     'fn escaped(_: crate::destination::DestinationGuard) {}' \
     'use crate::egress::EgressSnapshot;' \
     'use crate::{config::StaticProductConfig, egress::EgressSnapshot};' \
+    'use crate::{egress::*};' \
     'use crate::proxy::forward::forward_request;' \
     'use crate::{proxy::{forward::forward_request}};' \
+    'use crate::proxy as ordinary_proxy;' \
+    'use crate::{proxy as ordinary_proxy};' \
+    'use crate::proxy::{self as ordinary_proxy};' \
     'fn escaped(_: ForwardingPlan) {}' \
     'fn escaped(_: ProductCredentialExecution) {}'
 do
@@ -152,6 +157,11 @@ expect_failure "$case_root" 'multiline grouped webhook destination import' \
 for reference in \
     'use crate::authorization::webhook::connector::WebhookConnector;' \
     'use crate::{authorization::webhook::connector::WebhookConnector};' \
+    'use crate::authorization::webhook::*;' \
+    'use crate::authorization::{webhook::*};' \
+    'use crate::authorization::webhook as product_webhook;' \
+    'use crate::{authorization::webhook as product_webhook};' \
+    'use crate::authorization::{webhook as product_webhook};' \
     'fn escaped(_: crate::authorization::webhook::connector::WebhookConnector) {}'
 do
     case_root="$TEST_ROOT/webhook-reverse-ownership-$case_index"
@@ -161,6 +171,16 @@ do
     expect_failure "$case_root" "ordinary forwarding webhook reference $reference" \
         'ordinary destination and forwarding owners must not reference the authorization webhook connector'
 done
+
+case_root="$TEST_ROOT/webhook-reverse-alias-chain-$case_index"
+case_index=$((case_index + 1))
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' \
+    'use crate::authorization as auth;' \
+    'use auth::webhook::*;' \
+    >>"$case_root/src/proxy/forward.rs"
+expect_failure "$case_root" 'ordinary forwarding webhook alias chain' \
+    'ordinary destination and forwarding owners must not reference the authorization webhook connector'
 
 forbidden_mutations=(
     'let _: AppState;'

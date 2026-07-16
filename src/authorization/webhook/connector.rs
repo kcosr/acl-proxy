@@ -113,6 +113,7 @@ pub(crate) struct WebhookLocalAddressSnapshot {
 }
 
 impl WebhookLocalAddressSnapshot {
+    #[cfg(test)]
     pub(crate) fn new(addresses: impl IntoIterator<Item = WebhookLocalAddress>) -> Self {
         Self {
             addresses: addresses.into_iter().collect(),

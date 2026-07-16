@@ -477,7 +477,11 @@ impl DestinationGuard {
                     actual: peer,
                 });
             }
-            return Ok(ConnectedDestination { target, stream });
+            return Ok(ConnectedDestination {
+                #[cfg(test)]
+                target,
+                stream,
+            });
         }
 
         Err(DestinationGuardError::ConnectionAttemptsExhausted {
@@ -579,11 +583,13 @@ pub(crate) struct ResolvedDestination {
 
 #[derive(Debug)]
 pub(crate) struct ConnectedDestination<S> {
+    #[cfg(test)]
     target: DestinationTarget,
     stream: S,
 }
 
 impl<S> ConnectedDestination<S> {
+    #[cfg(test)]
     pub(crate) fn resolution_host(&self) -> &str {
         self.target.resolution_host()
     }
@@ -620,6 +626,7 @@ impl<S> ConnectedDestination<S> {
     #[cfg(test)]
     pub(crate) fn map_stream<T>(self, map: impl FnOnce(S) -> T) -> ConnectedDestination<T> {
         ConnectedDestination {
+            #[cfg(test)]
             target: self.target,
             stream: map(self.stream),
         }
