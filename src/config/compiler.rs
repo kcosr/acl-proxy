@@ -2116,6 +2116,16 @@ fn validate_credentials(
                         "exceeds the credential source locator limit",
                     ));
                 }
+                if !value
+                    .path
+                    .components()
+                    .any(|component| matches!(component, Component::Normal(_)))
+                {
+                    return Err(ConfigCompileError::at(
+                        format!("credentials.sources.{name}.path"),
+                        "must identify a credential file",
+                    ));
+                }
                 if value.path.components().any(|component| {
                     matches!(component, Component::Normal(name) if name.as_encoded_bytes().len() > MAX_CREDENTIAL_FILE_COMPONENT_BYTES)
                 }) {
@@ -6228,6 +6238,26 @@ path = "{exact_path}"
             ),
         );
         compile(&exact).unwrap();
+
+        for root_only_path in ["/", "/credential/.."] {
+            let error = compile(&MINIMAL.replace(
+                "[policy]",
+                &format!(
+                    r#"[credentials.sources.file]
+source = "file"
+path = "{root_only_path}"
+
+[policy]"#,
+                ),
+            ))
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("credentials.sources.file.path: must identify a credential file"),
+                "unexpected error for {root_only_path}: {error}"
+            );
+        }
 
         let oversized_environment =
             format!("A{}", "B".repeat(MAX_ENVIRONMENT_CREDENTIAL_NAME_BYTES));

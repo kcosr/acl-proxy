@@ -13,7 +13,9 @@ use crate::control::server::{
     ControlServer, ControlServerError, ControlServerFailureObserver, ControlServerRunError,
     ControlServerShutdownError,
 };
-use crate::credential_io_runtime::{CredentialIoRuntime, CredentialIoRuntimeError};
+use crate::credential_io_runtime::{
+    CredentialIoRuntime, CredentialIoRuntimeError, CredentialIoShutdownOutcome,
+};
 use crate::logging::{process_logging_level_control, LoggingLevelControl};
 use crate::observation::{ProductObservationRuntime, ProductObservationRuntimeStartError};
 use crate::runtime::{BoxFuture, ServiceReadiness, StaticResourceBrand, StaticResources};
@@ -652,7 +654,15 @@ impl StaticResources for ProductStaticResources {
                 }
             }
             self.authorization_runtime.wait_until_drained().await;
-            self.credential_io_runtime.shutdown_and_wait().await;
+            if let CredentialIoShutdownOutcome::DeadlineExceeded {
+                detached_operations,
+            } = self.credential_io_runtime.shutdown_and_wait(deadline).await
+            {
+                tracing::warn!(
+                    detached_operations,
+                    "credential I/O shutdown deadline reached; blocking operating-system workers remain detached"
+                );
+            }
             self.upgrade_shutdown
                 .get_or_init(|| self.upgrade_runtime.shutdown_and_wait(deadline))
                 .await;
@@ -706,6 +716,8 @@ pub(crate) enum ProductStaticResourcesError {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::mpsc as std_mpsc;
+    use std::sync::Condvar;
     use std::time::Duration;
 
     use tokio::sync::oneshot;
@@ -993,5 +1005,64 @@ header = "x-acl-proxy-request-id"
         assert_eq!(counts.uncommitted, 0);
         assert_eq!(counts.committed, 0);
         assert_eq!(counts.tracked_tasks, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn static_shutdown_deadline_detaches_blocked_credential_io() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<5>(&_test);
+        let addresses = reservations.addresses();
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = static_config(addresses, directory.path());
+        config.service.shutdown_drain_timeout = Some(Duration::from_millis(20));
+        let resources = ProductStaticResources::try_new(&config).unwrap();
+        let credential_runtime = resources.credential_io_runtime();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let gate_for_job = Arc::clone(&gate);
+        let (started_tx, started_rx) = std_mpsc::channel();
+        let (finished_tx, finished_rx) = std_mpsc::channel();
+        let operation = credential_runtime
+            .submit(Box::new(move |_| {
+                started_tx.send(()).unwrap();
+                let (open, changed) = &*gate_for_job;
+                let mut open = open.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                while !*open {
+                    open = changed
+                        .wait(open)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                finished_tx.send(()).unwrap();
+                Err(credential_core::CredentialError::UnknownReference)
+            }))
+            .unwrap();
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            StaticResources::shutdown(resources.as_ref()),
+        )
+        .await
+        .expect("static shutdown waited for blocked credential I/O");
+        assert!(matches!(
+            operation.await,
+            Err(credential_core::CredentialError::Cancelled)
+        ));
+        assert!(matches!(
+            finished_rx.try_recv(),
+            Err(std_mpsc::TryRecvError::Empty)
+        ));
+
+        let (open, changed) = &*gate;
+        *open.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        changed.notify_all();
+        tokio::task::spawn_blocking(move || finished_rx.recv().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            credential_runtime.shutdown_and_wait(None).await,
+            CredentialIoShutdownOutcome::Drained
+        );
     }
 }

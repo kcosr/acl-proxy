@@ -12,9 +12,7 @@ use http_access_types::{CredentialMutationKind, CredentialRef, ForwardingPlan};
 
 use crate::authorization::protocol::{ProviderCredentialWireStore, ProviderOutputIndex};
 use crate::credential_buffers::{projected_arc_allocation_bytes, ProductCredentialBufferContext};
-use crate::credential_io_runtime::{
-    projected_credential_io_operation_control_bytes, CredentialIoRuntime,
-};
+use crate::credential_io_runtime::{projected_credential_io_operation_bytes, CredentialIoRuntime};
 use crate::credentials::{
     open_credential_file, read_environment_credential, read_into_fixed_buffer,
     terminal_line_ending_len, OutboundCredentialLocator, OutboundCredentialSource,
@@ -260,8 +258,8 @@ pub(crate) fn projected_product_adapter_bytes(
         0
     };
     let header_map_bytes = projected_credential_header_map_bytes()?;
-    let operation_control_bytes = if has_external_source {
-        projected_credential_io_operation_control_bytes()
+    let operation_bytes = if has_external_source {
+        projected_credential_io_operation_bytes()
     } else {
         0
     };
@@ -276,7 +274,7 @@ pub(crate) fn projected_product_adapter_bytes(
         .checked_add(buffer_context_arc)
         .and_then(|bytes| bytes.checked_add(provider_wire_arc))
         .and_then(|bytes| bytes.checked_add(PROJECTED_CREDENTIAL_CANCELLATION_BYTES))
-        .and_then(|bytes| bytes.checked_add(operation_control_bytes))
+        .and_then(|bytes| bytes.checked_add(operation_bytes))
         .and_then(|bytes| bytes.checked_add(header_map_bytes))
         .ok_or(CredentialError::ResourceLimit)
 }
@@ -632,7 +630,7 @@ mod tests {
         projected_product_adapter_bytes, publish_converted_credentials, sensitive_header_value,
         CredentialCancellation, CredentialError,
     };
-    use crate::credential_io_runtime::projected_credential_io_operation_control_bytes;
+    use crate::credential_io_runtime::projected_credential_io_operation_bytes;
 
     struct Cancelled;
 
@@ -674,7 +672,7 @@ mod tests {
 
         assert_eq!(
             with_source - without_source,
-            projected_credential_io_operation_control_bytes()
+            projected_credential_io_operation_bytes()
         );
     }
 }

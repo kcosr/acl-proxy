@@ -2864,7 +2864,7 @@ mod tests {
             1
         );
         assert!(!head.contains("x-private"));
-        io.shutdown_and_wait().await;
+        io.shutdown_and_wait(None).await;
         std::env::remove_var(VARIABLE);
     }
 
@@ -3805,7 +3805,7 @@ mod tests {
         assert_eq!(headers.get_all("x-late-token").iter().count(), 1);
         assert_eq!(headers["x-late-token"], "h2-secret");
         server.await.unwrap();
-        io.shutdown_and_wait().await;
+        io.shutdown_and_wait(None).await;
         std::env::remove_var(VARIABLE);
     }
 
@@ -3854,7 +3854,7 @@ mod tests {
         ));
         assert!(captured_rx.await.is_err());
         server.await.unwrap();
-        io.shutdown_and_wait().await;
+        io.shutdown_and_wait(None).await;
     }
 
     #[test]
@@ -4207,7 +4207,7 @@ mod tests {
 
         assert!(matches!(error, ForwardError::Destination(_)));
         assert_eq!(connector.calls.load(Ordering::SeqCst), 1);
-        io.shutdown_and_wait().await;
+        io.shutdown_and_wait(None).await;
     }
 
     #[cfg(unix)]
@@ -4270,7 +4270,7 @@ mod tests {
             let mut body = response.into_body();
             assert!(body.data().await.is_none());
             server.await.unwrap();
-            io.shutdown_and_wait().await;
+            io.shutdown_and_wait(None).await;
         }
 
         fs::remove_file(&path).unwrap();
@@ -4311,7 +4311,7 @@ mod tests {
             ForwardError::Credential(credential_core::CredentialError::ServiceUnavailable)
         ));
         server.await.unwrap();
-        io.shutdown_and_wait().await;
+        io.shutdown_and_wait(None).await;
     }
 
     #[tokio::test]
@@ -4398,7 +4398,7 @@ mod tests {
         assert_eq!(headers["x-late-token"], "late-parent-secret");
         assert_eq!(body, b"request-body");
         server.await.unwrap();
-        io.shutdown_and_wait().await;
+        io.shutdown_and_wait(None).await;
         std::env::remove_var(VARIABLE);
     }
 
@@ -4454,7 +4454,7 @@ mod tests {
             ForwardError::ParentConnect(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
         ));
         server.await.unwrap();
-        io.shutdown_and_wait().await;
+        io.shutdown_and_wait(None).await;
     }
 
     #[tokio::test]
