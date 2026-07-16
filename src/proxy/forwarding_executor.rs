@@ -13,10 +13,10 @@ use crate::http1::ingress::RequestDisposition;
 use crate::observation::CaptureEvent;
 use crate::proxy::forward::{
     forward_request, forward_upgrade_request, ForwardError, ForwardUpgradeResult,
-    ForwardedDownstreamBody, ForwardingTimeouts, ResolvedForwardingTarget,
+    ForwardedDownstreamBody, ForwardingHeadContract, ForwardingTimeouts, ResolvedForwardingTarget,
 };
 use crate::proxy::h2_stream_cancellation::H2StreamCancellation;
-use crate::proxy::headers::SanitizedRequest;
+use crate::proxy::headers::PendingForwardRequest;
 use crate::proxy::ingress::{
     HandledResponse, ProxyResponseBody, StandaloneHttpTerminal, TerminalRequestBodyProvenance,
 };
@@ -59,7 +59,7 @@ impl ForwardingExecutor {
     ) -> HandledResponse {
         let StandaloneIngressTransport::Ordinary {
             mut parts,
-            protocol,
+            mut head,
             downstream_upgrade,
         } = dispatch.transport
         else {
@@ -75,6 +75,8 @@ impl ForwardingExecutor {
         let plan_arc = dispatch.exchange.plan_arc();
         let origin = plan.origin().clone();
         let plan_binding = plan.binding();
+        let plan_route = plan.route().clone();
+        let origin_protocol = plan.origin_protocol();
         let response_mutations = plan.response_mutation_batches().to_vec();
         let response_policy = plan.response();
         let stage_timeouts = plan.timeouts();
@@ -174,11 +176,9 @@ impl ForwardingExecutor {
                 true,
             );
         }
-        parts.headers = headers;
         let request_headers = capture_headers;
         let mut body = StandaloneExchangeBody::new(dispatch.exchange, dispatch.sidecar);
         body.set_capture(request_capture);
-        let mut request = SanitizedRequest::from_parts(*parts, body, protocol);
         let response_admission = match dispatch.services.begin_response(dispatch.quota_key) {
             Ok(admission) => admission,
             Err(_) => {
@@ -198,17 +198,7 @@ impl ForwardingExecutor {
                         h2_stream: h2_stream.clone(),
                     });
                 match preparation.admit_for_plan(&plan_arc, credential_cancellation) {
-                    Ok(mut execution) => {
-                        if execution.reserve_transport(request.headers_mut()).is_err() {
-                            return terminal.capture.fixed_response(
-                                CaptureDecision::Allow,
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "service unavailable\n",
-                                true,
-                            );
-                        }
-                        Some(execution)
-                    }
+                    Ok(execution) => Some(execution),
                     Err(_) => {
                         return terminal.capture.fixed_response(
                             CaptureDecision::Allow,
@@ -221,14 +211,22 @@ impl ForwardingExecutor {
             }
             None => None,
         };
+        if crate::proxy::headers::replace_sanitized_headers(&mut head, &headers).is_err() {
+            return terminal.capture.fixed_response(
+                CaptureDecision::Allow,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request failed\n",
+                true,
+            );
+        }
+        parts.headers = headers;
+        let request = PendingForwardRequest { head, parts, body };
 
         if !matches!(upgrade, UpgradePolicy::Deny) {
             let (Some(binding), Some(downstream_upgrade), Some(upgrade_protocol)) = (
                 upgrade_binding,
                 downstream_upgrade,
-                request
-                    .upgrade_intent()
-                    .map(|intent| intent.protocol().clone()),
+                request.upgrade_protocol().cloned(),
             ) else {
                 return terminal.capture.fixed_response(
                     CaptureDecision::Allow,
@@ -243,7 +241,7 @@ impl ForwardingExecutor {
                 capture: upgrade_capture,
                 binding,
                 request,
-                canonical: origin,
+                contract: ForwardingHeadContract::new(origin, plan_route, origin_protocol),
                 resolved: dispatch.resolved,
                 destinations: dispatch.destinations,
                 retention: dispatch.retention,
@@ -322,12 +320,12 @@ impl ForwardingExecutor {
             dispatch.deadline,
             forward_request(
                 request,
-                &origin,
                 dispatch.services.egress(),
                 &dispatch.destinations,
                 dispatch.resolved,
                 forwarding_timeouts,
                 credentials,
+                ForwardingHeadContract::new(origin, plan_route, origin_protocol),
             ),
         )
         .await
@@ -360,6 +358,15 @@ impl ForwardingExecutor {
             }
         };
         if apply_standalone_response_mutations(&response_mutations, response.headers_mut()).is_err()
+        {
+            return terminal.capture.fixed_response(
+                CaptureDecision::Allow,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "response failed\n",
+                true,
+            );
+        }
+        if crate::proxy::headers::sanitize_product_response_headers(response.headers_mut()).is_err()
         {
             return terminal.capture.fixed_response(
                 CaptureDecision::Allow,
@@ -404,8 +411,8 @@ struct StandaloneUpgradeExecution {
     runtime: Arc<UpgradeRuntime>,
     capture: Option<UpgradeCaptureContext>,
     binding: StandaloneUpgradeBinding,
-    request: SanitizedRequest<StandaloneExchangeBody>,
-    canonical: http_access_url::CanonicalUrl,
+    request: PendingForwardRequest<StandaloneExchangeBody>,
+    contract: ForwardingHeadContract,
     resolved: ResolvedForwardingTarget,
     destinations: Arc<crate::destination::DestinationGuard>,
     retention: GenerationRetention,
@@ -413,7 +420,7 @@ struct StandaloneUpgradeExecution {
     deadline: Instant,
     response_mutations: Vec<http_access_types::HeaderMutationBatch>,
     request_headers: HeaderMap,
-    protocol: HeaderValue,
+    protocol: http_access_types::UpgradeProtocol,
     response_admission: crate::safety::ForwardResponseAdmission,
     response_policy: http_access_types::ResponsePolicy,
     h2_stream: Option<H2StreamCancellation>,
@@ -479,7 +486,7 @@ async fn execute_standalone_upgrade(
         capture: upgrade_capture,
         binding,
         request,
-        canonical,
+        contract,
         resolved,
         destinations,
         retention,
@@ -509,12 +516,12 @@ async fn execute_standalone_upgrade(
                     deadline,
                     forward_upgrade_request(
                         request,
-                        &canonical,
                         &retention,
                         destinations,
                         resolved,
                         forwarding_timeouts,
                         credentials,
+                        contract,
                     ),
                 )
                 .await;
@@ -522,6 +529,16 @@ async fn execute_standalone_upgrade(
                     Ok(Ok(ForwardUpgradeResult::Response(mut response))) => {
                         if apply_standalone_response_mutations(
                             &response_mutations,
+                            response.headers_mut(),
+                        )
+                        .is_err()
+                        {
+                            let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                            ));
+                            return;
+                        }
+                        if crate::proxy::headers::sanitize_product_response_headers(
                             response.headers_mut(),
                         )
                         .is_err()
@@ -558,8 +575,28 @@ async fn execute_standalone_upgrade(
                             ));
                             return;
                         }
-                        let kind = match EstablishedUpgradeKind::from_handshake(
+                        if crate::proxy::headers::prepare_product_upgrade_response(
+                            response.status(),
+                            response.headers_mut(),
                             &protocol,
+                        )
+                        .is_err()
+                        {
+                            let _ = response_tx
+                                .send(UpgradeHandshakeResponse::Failed(StatusCode::BAD_GATEWAY));
+                            return;
+                        }
+                        let product_protocol = match HeaderValue::from_str(protocol.as_str()) {
+                            Ok(protocol) => protocol,
+                            Err(_) => {
+                                let _ = response_tx.send(UpgradeHandshakeResponse::Failed(
+                                    StatusCode::BAD_GATEWAY,
+                                ));
+                                return;
+                            }
+                        };
+                        let kind = match EstablishedUpgradeKind::from_handshake(
+                            &product_protocol,
                             &request_headers,
                             response.headers(),
                             task_profile.as_ref(),
@@ -668,6 +705,91 @@ fn body_headers(headers: &HeaderMap) -> HeaderMap {
 mod tests {
     use super::*;
     use crate::upgrade::{UpgradeAllocation, UpgradeRuntimeLimits};
+
+    fn append_mutation(name: &str, values: &[&[u8]]) -> http_access_types::HeaderMutationBatch {
+        http_access_types::HeaderMutationBatch::new(vec![
+            http_access_types::HeaderMutation::append(
+                http_access_types::HeaderMutationCondition::Always,
+                http_access_types::HeaderName::new(name).unwrap(),
+                values
+                    .iter()
+                    .map(|value| http_access_types::HeaderValue::new(value.to_vec()).unwrap())
+                    .collect(),
+            )
+            .unwrap(),
+        ])
+        .unwrap()
+    }
+
+    #[test]
+    fn response_mutations_are_followed_by_shared_sanitation() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("x-private"),
+        );
+        headers.insert("x-private", HeaderValue::from_static("remove-me"));
+        headers.append("x-repeat", HeaderValue::from_static("one"));
+        headers.append("x-repeat", HeaderValue::from_static("two"));
+        crate::proxy::headers::sanitize_product_response_headers(&mut headers).unwrap();
+        apply_standalone_response_mutations(
+            &[append_mutation("x-repeat", &[b"three"])],
+            &mut headers,
+        )
+        .unwrap();
+        crate::proxy::headers::sanitize_product_response_headers(&mut headers).unwrap();
+
+        assert!(!headers.contains_key("connection"));
+        assert!(!headers.contains_key("x-private"));
+        let values = headers
+            .get_all("x-repeat")
+            .iter()
+            .map(|value| value.as_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()]
+        );
+    }
+
+    #[test]
+    fn switching_protocols_is_revalidated_after_response_mutations() {
+        let protocol = http_access_types::UpgradeProtocol::new("WebSocket").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::CONNECTION,
+            HeaderValue::from_static("Upgrade"),
+        );
+        headers.insert(http::header::UPGRADE, HeaderValue::from_static("websocket"));
+        crate::proxy::headers::prepare_product_upgrade_response(
+            StatusCode::SWITCHING_PROTOCOLS,
+            &mut headers,
+            &protocol,
+        )
+        .unwrap();
+        apply_standalone_response_mutations(
+            &[append_mutation("x-policy", &[b"one", b"two"])],
+            &mut headers,
+        )
+        .unwrap();
+        crate::proxy::headers::prepare_product_upgrade_response(
+            StatusCode::SWITCHING_PROTOCOLS,
+            &mut headers,
+            &protocol,
+        )
+        .unwrap();
+
+        assert_eq!(headers.get_all("connection").iter().count(), 1);
+        assert_eq!(headers["connection"], "upgrade");
+        assert_eq!(headers.get_all("upgrade").iter().count(), 1);
+        assert_eq!(headers["upgrade"], "WebSocket");
+        let values = headers
+            .get_all("x-policy")
+            .iter()
+            .map(|value| value.as_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(values, [b"one".as_slice(), b"two".as_slice()]);
+    }
 
     struct DropSignal(Option<oneshot::Sender<()>>);
 

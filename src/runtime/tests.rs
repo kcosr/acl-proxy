@@ -67,6 +67,10 @@ impl EgressSnapshot for EmptySnapshot {
         panic!("empty test egress has no route")
     }
 
+    fn route_contract(&self) -> &http_access_types::Route {
+        &http_access_types::Route::Direct
+    }
+
     fn origin_tls(&self) -> &crate::egress::OriginTls {
         panic!("empty test egress has no origin TLS policy")
     }

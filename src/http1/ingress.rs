@@ -1205,7 +1205,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use crate::proxy::authority::{reconcile_request, AuthorityAdapterError};
-    use crate::proxy::headers::sanitize_untrusted_request;
+    use crate::proxy::headers::sanitize_product_request;
 
     use super::*;
 
@@ -1422,7 +1422,7 @@ mod tests {
                 let outcome = match reconcile_request(&mut request, ingress_mode, None, None, None)
                 {
                     Ok(_) => {
-                        let sanitized = sanitize_untrusted_request(request)
+                        let sanitized = sanitize_product_request(request)
                             .expect("accepted raw-H1 request must sanitize");
                         let (_, mut body, _) = sanitized.into_parts();
                         let mut body_bytes = Vec::new();

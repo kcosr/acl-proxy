@@ -116,6 +116,9 @@ pub(crate) trait EgressSnapshot: Send + Sync {
 
     fn route(&self) -> &crate::egress::EgressRoute;
 
+    #[cfg(test)]
+    fn route_contract(&self) -> &http_access_types::Route;
+
     fn origin_tls(&self) -> &crate::egress::OriginTls;
 }
 

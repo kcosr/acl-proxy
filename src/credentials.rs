@@ -202,6 +202,28 @@ impl InboundCredentialSnapshot {
     ) -> Result<InboundCredentials, CredentialError> {
         InboundCredentials::extract(self, headers)
     }
+
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self {
+            inbound: Arc::from([]),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(headers: impl IntoIterator<Item = HeaderName>) -> Self {
+        let inbound = headers
+            .into_iter()
+            .map(|header| InboundCredential {
+                header,
+                process_providers: Box::new([]),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            inbound: Arc::from(inbound),
+        }
+    }
 }
 
 fn activate_inbound(

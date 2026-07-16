@@ -1,22 +1,56 @@
-use http::header::{
-    HeaderMap, HeaderName as ProductHeaderName, HeaderValue as ProductHeaderValue, CONTENT_LENGTH,
-    TRANSFER_ENCODING,
-};
+use http::header::{HeaderMap, CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::{Method, Request, Version};
 use http_access_types::{
     apply_header_mutation_batches, BodyFraming, BodyMetadata, CanonicalUrl, HeaderField,
-    HeaderMutationBatch, HeaderName, HeaderValue, HttpMethod, HttpScheme, HttpVersion, IngressMode,
-    InterceptedRequestFacts, UpgradeIntent as NeutralUpgradeIntent, UpgradeProtocol, ValueError,
+    HeaderMutationBatch, HttpMethod, HttpScheme, HttpVersion, IngressMode, InterceptedRequestFacts,
+    UpgradeIntent as NeutralUpgradeIntent, UpgradeProtocol, ValueError,
 };
 
 use hyper::body::HttpBody;
 use hyper::Body;
 
+use crate::credentials::{InboundCredentialSnapshot, InboundCredentials};
 use crate::proxy::headers::{
     sanitize_untrusted_connect_ingress_request, sanitize_untrusted_ingress_request,
-    HeaderPreparationError, SanitizedConnectIngressRequest, SanitizedIngressRequest,
-    UpgradeIntent as ProductUpgradeIntent,
+    HeaderAdapterError, SanitizedConnectIngressRequest, SanitizedIngressRequest,
 };
+use crate::runtime::GenerationLease;
+
+pub(crate) struct IngressPartitionPolicy<'a> {
+    inbound: &'a InboundCredentialSnapshot,
+    internal_context: &'a [http::HeaderName],
+    sensitive: &'a [http_access_types::HeaderName],
+    observation_sensitive: &'a [http_access_types::HeaderName],
+}
+
+impl<'a> IngressPartitionPolicy<'a> {
+    pub(crate) fn from_lease(lease: &'a GenerationLease) -> Self {
+        Self {
+            inbound: lease.credentials(),
+            internal_context: lease.authorization().internal_context_headers(),
+            sensitive: lease.standalone().sensitive_headers(),
+            observation_sensitive: lease.standalone().sensitive_header_policy().names(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> IngressPartitionPolicy<'static> {
+        static EMPTY: std::sync::OnceLock<InboundCredentialSnapshot> = std::sync::OnceLock::new();
+        IngressPartitionPolicy {
+            inbound: EMPTY.get_or_init(InboundCredentialSnapshot::empty_for_test),
+            internal_context: &[],
+            sensitive: &[],
+            observation_sensitive: &[],
+        }
+    }
+}
+
+pub(crate) struct PartitionedIngressHeaders {
+    pub(crate) inbound: InboundCredentials,
+    pub(crate) internal_context: HeaderMap,
+    pub(crate) sensitive_presence: Vec<http_access_types::HeaderName>,
+    pub(crate) audit_sensitive_presence: Vec<http_access_types::HeaderName>,
+}
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum FactsError {
@@ -32,12 +66,14 @@ pub(crate) enum FactsError {
     InvalidContentLength,
     #[error("request Transfer-Encoding is invalid")]
     InvalidTransferEncoding,
-    #[error("request upgrade protocol is invalid")]
-    InvalidUpgrade,
     #[error("neutral facts contain a header name the product cannot represent")]
     InvalidProductHeaderName,
     #[error("neutral facts contain a header value the product cannot represent")]
     InvalidProductHeaderValue,
+    #[error("request contains an invalid header value")]
+    InvalidHeaderValue,
+    #[error("request sensitive-header partition is incomplete")]
+    SensitivePartition,
     #[error("request facts contain an invalid checked value")]
     Value(#[from] ValueError),
 }
@@ -50,9 +86,8 @@ pub(crate) enum ResponseMutationError {
     Mutation(#[from] http_access_types::MutationError),
 }
 
-/// A request identity whose transport-owned components have been checked before
-/// any product credential processing occurs. Header values are deliberately not
-/// retained here because configured inbound fields may contain secrets.
+/// A request identity derived after product-specific sensitive values have been
+/// partitioned out of the original product header map.
 pub(crate) struct ValidatedRequestFactShape {
     ingress_mode: IngressMode,
     version: HttpVersion,
@@ -62,11 +97,12 @@ pub(crate) struct ValidatedRequestFactShape {
     upgrade: Option<NeutralUpgradeIntent>,
 }
 
-/// One fact shape and transport owner derived atomically from the same ingress
-/// request before product credential extraction.
+/// One fact shape, sanitized transport owner, and sensitive partition derived
+/// atomically from the same ingress request.
 pub(crate) struct ValidatedStandaloneIngress {
     shape: ValidatedRequestFactShape,
     ingress: SanitizedStandaloneIngress,
+    partitioned: PartitionedIngressHeaders,
 }
 
 pub(crate) enum SanitizedStandaloneIngress {
@@ -74,22 +110,32 @@ pub(crate) enum SanitizedStandaloneIngress {
     OuterConnect(SanitizedConnectIngressRequest),
 }
 
+impl SanitizedStandaloneIngress {
+    pub(crate) fn protocol(&self) -> http_access_types::HttpProtocol {
+        match self {
+            Self::Ordinary(ingress) => {
+                crate::proxy::headers::product_protocol(ingress.head().ingress_version())
+            }
+            Self::OuterConnect(ingress) => {
+                crate::proxy::headers::product_protocol(ingress.head().ingress_version())
+            }
+        }
+    }
+}
+
 impl ValidatedStandaloneIngress {
     pub(crate) fn ingress(&self) -> &SanitizedStandaloneIngress {
         &self.ingress
     }
 
-    pub(crate) fn into_parts(self) -> (ValidatedRequestFactShape, SanitizedStandaloneIngress) {
-        (self.shape, self.ingress)
-    }
-}
-
-impl SanitizedStandaloneIngress {
-    pub(crate) fn sanitized(&self) -> &crate::proxy::headers::SanitizedRequest<Body> {
-        match self {
-            Self::Ordinary(ingress) => ingress.sanitized(),
-            Self::OuterConnect(ingress) => ingress.sanitized(),
-        }
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        ValidatedRequestFactShape,
+        SanitizedStandaloneIngress,
+        PartitionedIngressHeaders,
+    ) {
+        (self.shape, self.ingress, self.partitioned)
     }
 }
 
@@ -98,7 +144,9 @@ pub(crate) enum ValidatedStandaloneIngressError {
     #[error("request framing or facts are invalid")]
     Facts(#[from] FactsError),
     #[error("request headers are invalid")]
-    Headers(#[from] HeaderPreparationError),
+    Headers(#[from] HeaderAdapterError),
+    #[error("inbound credential partition failed")]
+    Credential(#[from] crate::credentials::CredentialError),
     #[error("outer CONNECT is valid only on an explicit listener")]
     ConnectIngressMode,
     #[error("outer CONNECT requires a canonical HTTPS root target")]
@@ -108,31 +156,36 @@ pub(crate) enum ValidatedStandaloneIngressError {
 }
 
 pub(crate) fn validate_standalone_ingress_request(
+    partition_policy: IngressPartitionPolicy<'_>,
     ingress_mode: IngressMode,
     canonical: CanonicalUrl,
-    request: Request<Body>,
+    mut request: Request<Body>,
 ) -> Result<ValidatedStandaloneIngress, ValidatedStandaloneIngressError> {
+    validate_raw_ingress_headers(request.headers())?;
     let framing = body_metadata(request.version(), request.headers())?;
+    let partitioned = partition_ingress_headers(&partition_policy, request.headers_mut())?;
     let ingress = sanitize_untrusted_ingress_request(request)?;
     let shape = validate_request_fact_shape(
         ingress_mode,
-        ingress.version(),
-        ingress.method(),
+        ingress.head().ingress_version(),
+        ingress.head().method(),
         canonical,
-        ingress.headers(),
+        ingress.head().headers(),
         framing,
-        ingress.upgrade_intent(),
+        ingress.head().upgrade_protocol(),
     )?;
     Ok(ValidatedStandaloneIngress {
         shape,
         ingress: SanitizedStandaloneIngress::Ordinary(ingress),
+        partitioned,
     })
 }
 
 pub(crate) fn validate_standalone_connect_ingress_request(
+    partition_policy: IngressPartitionPolicy<'_>,
     ingress_mode: IngressMode,
     canonical: CanonicalUrl,
-    request: Request<Body>,
+    mut request: Request<Body>,
 ) -> Result<ValidatedStandaloneIngress, ValidatedStandaloneIngressError> {
     if !matches!(
         ingress_mode,
@@ -146,6 +199,7 @@ pub(crate) fn validate_standalone_connect_ingress_request(
     {
         return Err(ValidatedStandaloneIngressError::ConnectTarget);
     }
+    validate_raw_ingress_headers(request.headers())?;
     let framing = body_metadata(request.version(), request.headers())?;
     if !matches!(
         framing.framing(),
@@ -154,20 +208,137 @@ pub(crate) fn validate_standalone_connect_ingress_request(
     {
         return Err(ValidatedStandaloneIngressError::ConnectBody);
     }
+    let partitioned = partition_ingress_headers(&partition_policy, request.headers_mut())?;
     let ingress = sanitize_untrusted_connect_ingress_request(request)?;
     let shape = validate_request_fact_shape(
         ingress_mode,
-        ingress.version(),
-        ingress.method(),
+        ingress.head().ingress_version(),
+        ingress.head().method(),
         canonical,
-        ingress.headers(),
+        ingress.head().headers(),
         framing,
         None,
     )?;
     Ok(ValidatedStandaloneIngress {
         shape,
         ingress: SanitizedStandaloneIngress::OuterConnect(ingress),
+        partitioned,
     })
+}
+
+fn partition_ingress_headers(
+    policy: &IngressPartitionPolicy<'_>,
+    headers: &mut HeaderMap,
+) -> Result<PartitionedIngressHeaders, ValidatedStandaloneIngressError> {
+    let connection_values = headers.get_all(http::header::CONNECTION);
+    let nominations = http_access_runtime::prepartition_connection_nominations(
+        connection_values.iter().map(http::HeaderValue::as_bytes),
+    )
+    .map_err(HeaderAdapterError::from)?;
+    for nomination in nominations {
+        headers.remove(nomination.as_str());
+    }
+    let mut audit_sensitive_presence = Vec::new();
+    audit_sensitive_presence
+        .try_reserve_exact(policy.observation_sensitive.len())
+        .map_err(|_| FactsError::Capacity)?;
+    for name in policy.observation_sensitive {
+        if headers.contains_key(name.as_str()) {
+            audit_sensitive_presence.push(name.clone());
+        }
+    }
+    let mut sensitive_presence = Vec::new();
+    sensitive_presence
+        .try_reserve_exact(policy.sensitive.len())
+        .map_err(|_| FactsError::Capacity)?;
+    for name in policy.sensitive {
+        if headers.contains_key(name.as_str()) {
+            sensitive_presence.push(name.clone());
+        }
+    }
+    while let Some(name) = headers
+        .keys()
+        .find(|name| http_access_runtime::is_prepartition_caller_credential_header(name.as_str()))
+        .cloned()
+    {
+        headers.remove(name);
+    }
+    let inbound = policy.inbound.extract(headers)?;
+    let internal_context = partition_internal_context(headers, policy.internal_context)?;
+    if policy
+        .sensitive
+        .iter()
+        .any(|name| headers.contains_key(name.as_str()))
+    {
+        return Err(FactsError::SensitivePartition.into());
+    }
+    Ok(PartitionedIngressHeaders {
+        inbound,
+        internal_context,
+        sensitive_presence,
+        audit_sensitive_presence,
+    })
+}
+
+fn validate_raw_ingress_headers(
+    headers: &HeaderMap,
+) -> Result<(), ValidatedStandaloneIngressError> {
+    let name_value_bytes = headers
+        .iter()
+        .try_fold(0usize, |total, (name, value)| {
+            total
+                .checked_add(name.as_str().len())?
+                .checked_add(value.as_bytes().len())
+        })
+        .ok_or(HeaderAdapterError::Hygiene(
+            http_access_runtime::HeaderHygieneError::LimitExceeded,
+        ))?;
+    http_access_runtime::validate_header_projection(headers.len(), name_value_bytes)
+        .map_err(HeaderAdapterError::from)?;
+    for value in headers.values() {
+        http_access_types::HeaderValue::validate(value.as_bytes())
+            .map_err(|_| FactsError::InvalidHeaderValue)?;
+    }
+    Ok(())
+}
+
+fn partition_internal_context(
+    headers: &mut HeaderMap,
+    names: &[http::HeaderName],
+) -> Result<HeaderMap, FactsError> {
+    let mut ordinary = HeaderMap::new();
+    ordinary
+        .try_reserve(headers.len())
+        .map_err(|_| FactsError::Capacity)?;
+    let mut internal = HeaderMap::new();
+    internal
+        .try_reserve(names.len())
+        .map_err(|_| FactsError::Capacity)?;
+    let mut current_name = None;
+    for (name, value) in headers.drain() {
+        if let Some(name) = name {
+            current_name = Some(name);
+        }
+        let name = current_name.as_ref().ok_or(FactsError::Capacity)?;
+        let target = if names.contains(name) {
+            &mut internal
+        } else {
+            &mut ordinary
+        };
+        target
+            .try_append(name.clone(), value)
+            .map_err(|_| FactsError::Capacity)?;
+    }
+    *headers = ordinary;
+    Ok(internal)
+}
+
+#[cfg(test)]
+pub(crate) fn partition_internal_context_for_test(
+    headers: &mut HeaderMap,
+    names: &[http::HeaderName],
+) -> Result<HeaderMap, FactsError> {
+    partition_internal_context(headers, names)
 }
 
 pub(crate) fn http_version(version: Version) -> Result<HttpVersion, FactsError> {
@@ -184,40 +355,19 @@ pub(crate) fn http_method(method: &Method) -> Result<HttpMethod, FactsError> {
 }
 
 pub(crate) fn neutral_headers(headers: &HeaderMap) -> Result<Vec<HeaderField>, FactsError> {
-    let mut names: Vec<_> = headers.keys().cloned().collect();
-    names.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
-
-    let mut fields = Vec::new();
-    fields
-        .try_reserve(headers.len())
-        .map_err(|_| FactsError::Capacity)?;
-    for name in names {
-        let checked_name = HeaderName::new(name.as_str())?;
-        for value in headers.get_all(&name).iter() {
-            fields.push(HeaderField::new(
-                checked_name.clone(),
-                HeaderValue::new(value.as_bytes().to_vec())?,
-            ));
-        }
-    }
-    Ok(fields)
+    crate::proxy::headers::neutral_headers(headers).map_err(|error| match error {
+        HeaderAdapterError::Capacity => FactsError::Capacity,
+        HeaderAdapterError::Value(error) => FactsError::Value(error),
+        _ => FactsError::InvalidProductHeaderValue,
+    })
 }
 
 pub(crate) fn product_headers(fields: &[HeaderField]) -> Result<HeaderMap, FactsError> {
-    let mut headers = HeaderMap::new();
-    headers
-        .try_reserve(fields.len())
-        .map_err(|_| FactsError::Capacity)?;
-    for field in fields {
-        let name = ProductHeaderName::from_bytes(field.name().as_str().as_bytes())
-            .map_err(|_| FactsError::InvalidProductHeaderName)?;
-        let value = ProductHeaderValue::from_bytes(field.value().as_bytes())
-            .map_err(|_| FactsError::InvalidProductHeaderValue)?;
-        headers
-            .try_append(name, value)
-            .map_err(|_| FactsError::Capacity)?;
-    }
-    Ok(headers)
+    crate::proxy::headers::product_headers(fields).map_err(|error| match error {
+        HeaderAdapterError::Capacity => FactsError::Capacity,
+        HeaderAdapterError::HeaderName => FactsError::InvalidProductHeaderName,
+        _ => FactsError::InvalidProductHeaderValue,
+    })
 }
 
 pub(crate) fn apply_response_mutations(
@@ -294,14 +444,11 @@ fn single_content_length(headers: &HeaderMap) -> Result<Option<u64>, FactsError>
 }
 
 pub(crate) fn upgrade_intent(
-    intent: Option<&ProductUpgradeIntent>,
+    intent: Option<&UpgradeProtocol>,
 ) -> Result<Option<NeutralUpgradeIntent>, FactsError> {
     intent
         .map(|intent| {
-            let protocol = intent
-                .protocol()
-                .to_str()
-                .map_err(|_| FactsError::InvalidUpgrade)?;
+            let protocol = intent.as_str();
             Ok(if protocol.eq_ignore_ascii_case("websocket") {
                 NeutralUpgradeIntent::WebSocket
             } else {
@@ -313,19 +460,14 @@ pub(crate) fn upgrade_intent(
 
 pub(crate) fn validate_request_fact_shape(
     ingress_mode: IngressMode,
-    version: Version,
-    method: &Method,
+    version: HttpVersion,
+    method: &HttpMethod,
     url: CanonicalUrl,
-    headers: &HeaderMap,
+    _headers: &[HeaderField],
     body: BodyMetadata,
-    upgrade: Option<&ProductUpgradeIntent>,
+    upgrade: Option<&UpgradeProtocol>,
 ) -> Result<ValidatedRequestFactShape, FactsError> {
-    for (name, value) in headers {
-        HeaderName::new(name.as_str())?;
-        HeaderValue::validate(value.as_bytes())?;
-    }
-    let version = http_version(version)?;
-    let method = http_method(method)?;
+    let method = method.clone();
     let upgrade = upgrade_intent(upgrade)?;
     InterceptedRequestFacts::new(
         ingress_mode,
@@ -371,7 +513,33 @@ mod tests {
     use http_access_url::canonicalize_http_url;
     use hyper::Body;
 
-    use crate::proxy::headers::sanitize_untrusted_request;
+    use crate::proxy::headers::sanitize_product_request;
+
+    fn validate_standalone_ingress_request(
+        ingress_mode: IngressMode,
+        canonical: CanonicalUrl,
+        request: Request<Body>,
+    ) -> Result<ValidatedStandaloneIngress, ValidatedStandaloneIngressError> {
+        super::validate_standalone_ingress_request(
+            IngressPartitionPolicy::empty_for_test(),
+            ingress_mode,
+            canonical,
+            request,
+        )
+    }
+
+    fn validate_standalone_connect_ingress_request(
+        ingress_mode: IngressMode,
+        canonical: CanonicalUrl,
+        request: Request<Body>,
+    ) -> Result<ValidatedStandaloneIngress, ValidatedStandaloneIngressError> {
+        super::validate_standalone_connect_ingress_request(
+            IngressPartitionPolicy::empty_for_test(),
+            ingress_mode,
+            canonical,
+            request,
+        )
+    }
 
     fn headers(entries: &[(&'static str, &'static str)]) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -485,12 +653,12 @@ mod tests {
         let validated =
             validate_standalone_ingress_request(IngressMode::ExplicitHttp, canonical, request)
                 .unwrap();
-        let (shape, ingress) = validated.into_parts();
+        let (shape, ingress, partitioned) = validated.into_parts();
         let SanitizedStandaloneIngress::Ordinary(ingress) = ingress else {
             panic!("ordinary validation returned CONNECT ingress");
         };
-        let (mut parts, _body, protocol, downstream_upgrade) = ingress.into_parts();
-        let headers = std::mem::take(&mut parts.headers);
+        let (parts, _body, head, downstream_upgrade) = ingress.into_parts();
+        let headers = product_headers(head.headers()).unwrap();
         let facts = shape.into_facts(&headers).unwrap();
 
         assert_eq!(facts.method().as_str(), "POST");
@@ -502,9 +670,15 @@ mod tests {
         ));
         assert_eq!(parts.method, Method::POST);
         assert_eq!(parts.version, Version::HTTP_11);
-        assert_eq!(protocol, http_access_types::HttpProtocol::Http1);
-        assert!(parts.extensions.get::<ProductUpgradeIntent>().is_some());
+        assert_eq!(
+            crate::proxy::headers::product_protocol(head.ingress_version()),
+            http_access_types::HttpProtocol::Http1
+        );
+        assert_eq!(head.upgrade_protocol().unwrap().as_str(), "chat/1");
         assert!(downstream_upgrade.is_some());
+        assert!(partitioned.internal_context.is_empty());
+        assert!(partitioned.sensitive_presence.is_empty());
+        assert!(partitioned.audit_sensitive_presence.is_empty());
     }
 
     #[test]
@@ -523,12 +697,12 @@ mod tests {
             let validated =
                 validate_standalone_connect_ingress_request(ingress_mode, canonical, request)
                     .unwrap();
-            let (shape, ingress) = validated.into_parts();
+            let (shape, ingress, partitioned) = validated.into_parts();
             let SanitizedStandaloneIngress::OuterConnect(ingress) = ingress else {
                 panic!("CONNECT validation returned ordinary ingress");
             };
-            let (mut parts, body, protocol, downstream_upgrade) = ingress.into_parts();
-            let headers = std::mem::take(&mut parts.headers);
+            let (parts, body, head, downstream_upgrade) = ingress.into_parts();
+            let headers = product_headers(head.headers()).unwrap();
             let facts = shape.into_facts(&headers).unwrap();
 
             assert_eq!(facts.ingress_mode(), ingress_mode);
@@ -540,9 +714,530 @@ mod tests {
             assert_eq!(parts.method, Method::CONNECT);
             assert_eq!(parts.version, Version::HTTP_11);
             assert!(body.is_end_stream());
-            assert_eq!(protocol, http_access_types::HttpProtocol::Http1);
+            assert_eq!(
+                crate::proxy::headers::product_protocol(head.ingress_version()),
+                http_access_types::HttpProtocol::Http1
+            );
             drop(downstream_upgrade);
+            assert!(partitioned.internal_context.is_empty());
+            assert!(partitioned.sensitive_presence.is_empty());
+            assert!(partitioned.audit_sensitive_presence.is_empty());
         }
+    }
+
+    fn sensitive_partition_fixture() -> (
+        InboundCredentialSnapshot,
+        [http::HeaderName; 1],
+        [http_access_types::HeaderName; 2],
+    ) {
+        let authorization = http::header::AUTHORIZATION;
+        let internal = http::HeaderName::from_static("x-internal-context");
+        let snapshot = InboundCredentialSnapshot::for_test([authorization.clone()]);
+        let sensitive = [
+            http_access_types::HeaderName::new(authorization.as_str()).unwrap(),
+            http_access_types::HeaderName::new(internal.as_str()).unwrap(),
+        ];
+        (snapshot, [internal], sensitive)
+    }
+
+    #[test]
+    fn ordinary_ingress_partitions_authorization_and_custom_internal_before_neutralization() {
+        let (snapshot, internal, sensitive) = sensitive_partition_fixture();
+        let policy = IngressPartitionPolicy {
+            inbound: &snapshot,
+            internal_context: &internal,
+            sensitive: &sensitive,
+            observation_sensitive: &sensitive,
+        };
+        let request = Request::builder()
+            .method(Method::GET)
+            .version(Version::HTTP_11)
+            .uri("http://example.test/resource")
+            .header("host", "example.test")
+            .header("authorization", "Bearer inbound-secret")
+            .header("x-internal-context", "internal-secret")
+            .header("x-visible", "ordinary")
+            .body(Body::empty())
+            .unwrap();
+        let canonical = canonicalize_http_url("http://example.test/resource").unwrap();
+
+        let validated = super::validate_standalone_ingress_request(
+            policy,
+            IngressMode::ExplicitHttp,
+            canonical,
+            request,
+        )
+        .unwrap();
+        let (_, ingress, partitioned) = validated.into_parts();
+        let SanitizedStandaloneIngress::Ordinary(ingress) = ingress else {
+            panic!("ordinary validation returned CONNECT ingress");
+        };
+        let (_, _, head, _) = ingress.into_parts();
+        let headers = product_headers(head.headers()).unwrap();
+
+        assert!(!headers.contains_key(http::header::AUTHORIZATION));
+        assert!(!headers.contains_key("x-internal-context"));
+        assert_eq!(headers["x-visible"], "ordinary");
+        assert!(partitioned.inbound.is_present(&http::header::AUTHORIZATION));
+        assert!(partitioned
+            .internal_context
+            .contains_key("x-internal-context"));
+        assert_eq!(partitioned.sensitive_presence, sensitive);
+        assert_eq!(partitioned.audit_sensitive_presence.as_slice(), sensitive);
+    }
+
+    #[test]
+    fn outer_connect_partitions_sensitive_values_before_neutralization() {
+        let (snapshot, internal, sensitive) = sensitive_partition_fixture();
+        let policy = IngressPartitionPolicy {
+            inbound: &snapshot,
+            internal_context: &internal,
+            sensitive: &sensitive,
+            observation_sensitive: &sensitive,
+        };
+        let request = Request::builder()
+            .method(Method::CONNECT)
+            .version(Version::HTTP_11)
+            .uri("example.test:443")
+            .header("host", "example.test:443")
+            .header("authorization", "Bearer tunnel-secret")
+            .header("x-internal-context", "tunnel-internal-secret")
+            .body(Body::empty())
+            .unwrap();
+        let canonical = canonicalize_http_url("https://example.test/").unwrap();
+
+        let validated = super::validate_standalone_connect_ingress_request(
+            policy,
+            IngressMode::ExplicitHttp,
+            canonical,
+            request,
+        )
+        .unwrap();
+        let (_, ingress, partitioned) = validated.into_parts();
+        let SanitizedStandaloneIngress::OuterConnect(ingress) = ingress else {
+            panic!("CONNECT validation returned ordinary ingress");
+        };
+        let (_, _, head, _) = ingress.into_parts();
+        let headers = product_headers(head.headers()).unwrap();
+
+        assert!(!headers.contains_key(http::header::AUTHORIZATION));
+        assert!(!headers.contains_key("x-internal-context"));
+        assert!(partitioned.inbound.is_present(&http::header::AUTHORIZATION));
+        assert!(partitioned
+            .internal_context
+            .contains_key("x-internal-context"));
+        assert_eq!(partitioned.sensitive_presence, sensitive);
+        assert_eq!(partitioned.audit_sensitive_presence.as_slice(), sensitive);
+    }
+
+    #[test]
+    fn prepartition_consumes_nominated_sensitive_fields_and_preserves_valid_upgrade_control() {
+        let (snapshot, internal, _) = sensitive_partition_fixture();
+        let observation = [http_access_types::HeaderName::new("x-observation-secret").unwrap()];
+        let policy = IngressPartitionPolicy {
+            inbound: &snapshot,
+            internal_context: &internal,
+            sensitive: &observation,
+            observation_sensitive: &observation,
+        };
+        let request = Request::builder()
+            .method(Method::GET)
+            .version(Version::HTTP_11)
+            .uri("http://example.test/resource")
+            .header("host", "example.test")
+            .header(
+                "connection",
+                "connection, upgrade, Authorization, X-Internal-Context, X-Observation-Secret",
+            )
+            .header("upgrade", "websocket")
+            .header("authorization", "Bearer nominated-secret")
+            .header("x-internal-context", "nominated-internal-secret")
+            .header("x-observation-secret", "nominated-observation-secret")
+            .body(Body::empty())
+            .unwrap();
+        let canonical = canonicalize_http_url("http://example.test/resource").unwrap();
+
+        let validated = super::validate_standalone_ingress_request(
+            policy,
+            IngressMode::ExplicitHttp,
+            canonical,
+            request,
+        )
+        .unwrap();
+        let (_, ingress, partitioned) = validated.into_parts();
+        let SanitizedStandaloneIngress::Ordinary(ingress) = ingress else {
+            panic!("ordinary validation returned CONNECT ingress");
+        };
+        let (_, _, head, _) = ingress.into_parts();
+        let headers = product_headers(head.headers()).unwrap();
+
+        assert!(!headers.contains_key(http::header::AUTHORIZATION));
+        assert!(!headers.contains_key("x-internal-context"));
+        assert!(!headers.contains_key("x-observation-secret"));
+        assert_eq!(head.upgrade_protocol().unwrap().as_str(), "websocket");
+        assert!(!partitioned.inbound.is_present(&http::header::AUTHORIZATION));
+        assert!(partitioned.internal_context.is_empty());
+        assert!(partitioned.sensitive_presence.is_empty());
+        assert!(partitioned.audit_sensitive_presence.is_empty());
+    }
+
+    #[test]
+    fn h2_invalid_te_remains_for_shared_validation_after_prepartition() {
+        let snapshot = InboundCredentialSnapshot::empty_for_test();
+        let observation = [http_access_types::HeaderName::new("x-observation-secret").unwrap()];
+        let policy = IngressPartitionPolicy {
+            inbound: &snapshot,
+            internal_context: &[],
+            sensitive: &observation,
+            observation_sensitive: &observation,
+        };
+        let request = Request::builder()
+            .method(Method::GET)
+            .version(Version::HTTP_2)
+            .uri("http://example.test/resource")
+            .header("host", "example.test")
+            .header("connection", "te, x-observation-secret")
+            .header("te", "gzip")
+            .header("x-observation-secret", "nominated-observation-secret")
+            .body(Body::empty())
+            .unwrap();
+        let canonical = canonicalize_http_url("http://example.test/resource").unwrap();
+
+        let error = expect_ingress_error(super::validate_standalone_ingress_request(
+            policy,
+            IngressMode::ExplicitHttp,
+            canonical,
+            request,
+        ));
+        assert!(matches!(
+            error,
+            ValidatedStandaloneIngressError::Headers(HeaderAdapterError::Hygiene(
+                http_access_runtime::HeaderHygieneError::InvalidTe
+            ))
+        ));
+    }
+
+    #[test]
+    fn connection_nominated_partition_owners_are_removed_before_connect_extraction() {
+        let (snapshot, internal, sensitive) = sensitive_partition_fixture();
+        let policy = IngressPartitionPolicy {
+            inbound: &snapshot,
+            internal_context: &internal,
+            sensitive: &sensitive,
+            observation_sensitive: &sensitive,
+        };
+        let request = Request::builder()
+            .method(Method::CONNECT)
+            .version(Version::HTTP_11)
+            .uri("example.test:443")
+            .header("host", "example.test:443")
+            .header("connection", "authorization, x-internal-context")
+            .header("authorization", "Bearer nominated-secret")
+            .header("x-internal-context", "nominated-internal-secret")
+            .body(Body::empty())
+            .unwrap();
+        let canonical = canonicalize_http_url("https://example.test/").unwrap();
+
+        let validated = super::validate_standalone_connect_ingress_request(
+            policy,
+            IngressMode::ExplicitHttp,
+            canonical,
+            request,
+        )
+        .unwrap();
+        let (_, ingress, partitioned) = validated.into_parts();
+        let SanitizedStandaloneIngress::OuterConnect(ingress) = ingress else {
+            panic!("CONNECT validation returned ordinary ingress");
+        };
+        let (_, _, head, _) = ingress.into_parts();
+        let headers = product_headers(head.headers()).unwrap();
+
+        assert!(!headers.contains_key(http::header::AUTHORIZATION));
+        assert!(!headers.contains_key("x-internal-context"));
+        assert!(!partitioned.inbound.is_present(&http::header::AUTHORIZATION));
+        assert!(partitioned.internal_context.is_empty());
+        assert!(partitioned.sensitive_presence.is_empty());
+        assert!(partitioned.audit_sensitive_presence.is_empty());
+    }
+
+    fn proxy_authorization_policy() -> [http_access_types::HeaderName; 1] {
+        [http_access_types::HeaderName::new("proxy-authorization").unwrap()]
+    }
+
+    #[test]
+    fn ordinary_proxy_authorization_presence_is_retained_but_value_never_becomes_neutral() {
+        let snapshot = InboundCredentialSnapshot::empty_for_test();
+        let sensitive = proxy_authorization_policy();
+        let policy = IngressPartitionPolicy {
+            inbound: &snapshot,
+            internal_context: &[],
+            sensitive: &sensitive,
+            observation_sensitive: &sensitive,
+        };
+        let request = Request::builder()
+            .method(Method::GET)
+            .version(Version::HTTP_11)
+            .uri("http://example.test/resource")
+            .header("host", "example.test")
+            .header("proxy-authorization", "Basic caller-secret")
+            .body(Body::empty())
+            .unwrap();
+        let canonical = canonicalize_http_url("http://example.test/resource").unwrap();
+
+        let validated = super::validate_standalone_ingress_request(
+            policy,
+            IngressMode::ExplicitHttp,
+            canonical,
+            request,
+        )
+        .unwrap();
+        let (_, ingress, partitioned) = validated.into_parts();
+        let SanitizedStandaloneIngress::Ordinary(ingress) = ingress else {
+            panic!("ordinary validation returned CONNECT ingress");
+        };
+        let (_, _, head, _) = ingress.into_parts();
+        let headers = product_headers(head.headers()).unwrap();
+
+        assert!(!headers.contains_key("proxy-authorization"));
+        assert_eq!(partitioned.sensitive_presence, sensitive);
+        assert_eq!(partitioned.audit_sensitive_presence, sensitive);
+    }
+
+    #[test]
+    fn connect_proxy_authorization_presence_is_retained_but_value_never_becomes_neutral() {
+        let snapshot = InboundCredentialSnapshot::empty_for_test();
+        let sensitive = proxy_authorization_policy();
+        let policy = IngressPartitionPolicy {
+            inbound: &snapshot,
+            internal_context: &[],
+            sensitive: &sensitive,
+            observation_sensitive: &sensitive,
+        };
+        let request = Request::builder()
+            .method(Method::CONNECT)
+            .version(Version::HTTP_11)
+            .uri("example.test:443")
+            .header("host", "example.test:443")
+            .header("proxy-authorization", "Basic caller-secret")
+            .body(Body::empty())
+            .unwrap();
+        let canonical = canonicalize_http_url("https://example.test/").unwrap();
+
+        let validated = super::validate_standalone_connect_ingress_request(
+            policy,
+            IngressMode::ExplicitHttp,
+            canonical,
+            request,
+        )
+        .unwrap();
+        let (_, ingress, partitioned) = validated.into_parts();
+        let SanitizedStandaloneIngress::OuterConnect(ingress) = ingress else {
+            panic!("CONNECT validation returned ordinary ingress");
+        };
+        let (_, _, head, _) = ingress.into_parts();
+        let headers = product_headers(head.headers()).unwrap();
+
+        assert!(!headers.contains_key("proxy-authorization"));
+        assert_eq!(partitioned.sensitive_presence, sensitive);
+        assert_eq!(partitioned.audit_sensitive_presence, sensitive);
+    }
+
+    fn internal_partition_policy<'a>(
+        snapshot: &'a InboundCredentialSnapshot,
+        internal: &'a [http::HeaderName],
+        sensitive: &'a [http_access_types::HeaderName],
+    ) -> IngressPartitionPolicy<'a> {
+        IngressPartitionPolicy {
+            inbound: snapshot,
+            internal_context: internal,
+            sensitive,
+            observation_sensitive: sensitive,
+        }
+    }
+
+    fn raw_internal_request(
+        method: Method,
+        uri: &'static str,
+        host: &'static str,
+        values: usize,
+        value_len: usize,
+    ) -> Request<Body> {
+        let mut request = Request::new(Body::empty());
+        *request.method_mut() = method;
+        *request.version_mut() = Version::HTTP_11;
+        *request.uri_mut() = uri.parse().unwrap();
+        request
+            .headers_mut()
+            .insert("host", HttpHeaderValue::from_static(host));
+        let value = HttpHeaderValue::from_bytes(&vec![b'a'; value_len]).unwrap();
+        for _ in 0..values {
+            request
+                .headers_mut()
+                .append("x-internal-context", value.clone());
+        }
+        request
+    }
+
+    fn is_header_limit(error: &ValidatedStandaloneIngressError) -> bool {
+        matches!(
+            error,
+            ValidatedStandaloneIngressError::Headers(HeaderAdapterError::Hygiene(
+                http_access_runtime::HeaderHygieneError::LimitExceeded
+            ))
+        )
+    }
+
+    fn expect_ingress_error(
+        result: Result<ValidatedStandaloneIngress, ValidatedStandaloneIngressError>,
+    ) -> ValidatedStandaloneIngressError {
+        match result {
+            Ok(_) => panic!("ingress validation unexpectedly succeeded"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn ordinary_raw_projection_bounds_precede_internal_partition() {
+        let snapshot = InboundCredentialSnapshot::empty_for_test();
+        let internal = [http::HeaderName::from_static("x-internal-context")];
+        let sensitive = [http_access_types::HeaderName::new("x-internal-context").unwrap()];
+        let canonical = || canonicalize_http_url("http://example.test/resource").unwrap();
+        let exact_count = raw_internal_request(
+            Method::GET,
+            "http://example.test/resource",
+            "example.test",
+            http_access_runtime::MAX_HEADER_HYGIENE_FIELDS - 1,
+            0,
+        );
+        let validated = super::validate_standalone_ingress_request(
+            internal_partition_policy(&snapshot, &internal, &sensitive),
+            IngressMode::ExplicitHttp,
+            canonical(),
+            exact_count,
+        )
+        .unwrap();
+        assert_eq!(
+            validated.into_parts().2.internal_context.len(),
+            http_access_runtime::MAX_HEADER_HYGIENE_FIELDS - 1
+        );
+
+        let count_over = raw_internal_request(
+            Method::GET,
+            "http://example.test/resource",
+            "example.test",
+            http_access_runtime::MAX_HEADER_HYGIENE_FIELDS,
+            0,
+        );
+        let error = expect_ingress_error(super::validate_standalone_ingress_request(
+            internal_partition_policy(&snapshot, &internal, &sensitive),
+            IngressMode::ExplicitHttp,
+            canonical(),
+            count_over,
+        ));
+        assert!(is_header_limit(&error));
+
+        let fixed_bytes = "host".len() + "example.test".len() + "x-internal-context".len();
+        let exact_value_len = http_access_runtime::MAX_HEADER_HYGIENE_BYTES - fixed_bytes;
+        let exact_bytes = raw_internal_request(
+            Method::GET,
+            "http://example.test/resource",
+            "example.test",
+            1,
+            exact_value_len,
+        );
+        super::validate_standalone_ingress_request(
+            internal_partition_policy(&snapshot, &internal, &sensitive),
+            IngressMode::ExplicitHttp,
+            canonical(),
+            exact_bytes,
+        )
+        .unwrap();
+        let byte_over = raw_internal_request(
+            Method::GET,
+            "http://example.test/resource",
+            "example.test",
+            1,
+            exact_value_len + 1,
+        );
+        let error = expect_ingress_error(super::validate_standalone_ingress_request(
+            internal_partition_policy(&snapshot, &internal, &sensitive),
+            IngressMode::ExplicitHttp,
+            canonical(),
+            byte_over,
+        ));
+        assert!(is_header_limit(&error));
+    }
+
+    #[test]
+    fn connect_raw_projection_bounds_precede_internal_partition() {
+        let snapshot = InboundCredentialSnapshot::empty_for_test();
+        let internal = [http::HeaderName::from_static("x-internal-context")];
+        let sensitive = [http_access_types::HeaderName::new("x-internal-context").unwrap()];
+        let canonical = || canonicalize_http_url("https://example.test/").unwrap();
+        let exact_count = raw_internal_request(
+            Method::CONNECT,
+            "example.test:443",
+            "example.test:443",
+            http_access_runtime::MAX_HEADER_HYGIENE_FIELDS - 1,
+            0,
+        );
+        let validated = super::validate_standalone_connect_ingress_request(
+            internal_partition_policy(&snapshot, &internal, &sensitive),
+            IngressMode::ExplicitHttp,
+            canonical(),
+            exact_count,
+        )
+        .unwrap();
+        assert_eq!(
+            validated.into_parts().2.internal_context.len(),
+            http_access_runtime::MAX_HEADER_HYGIENE_FIELDS - 1
+        );
+
+        let count_over = raw_internal_request(
+            Method::CONNECT,
+            "example.test:443",
+            "example.test:443",
+            http_access_runtime::MAX_HEADER_HYGIENE_FIELDS,
+            0,
+        );
+        let error = expect_ingress_error(super::validate_standalone_connect_ingress_request(
+            internal_partition_policy(&snapshot, &internal, &sensitive),
+            IngressMode::ExplicitHttp,
+            canonical(),
+            count_over,
+        ));
+        assert!(is_header_limit(&error));
+
+        let fixed_bytes = "host".len() + "example.test:443".len() + "x-internal-context".len();
+        let exact_value_len = http_access_runtime::MAX_HEADER_HYGIENE_BYTES - fixed_bytes;
+        let exact_bytes = raw_internal_request(
+            Method::CONNECT,
+            "example.test:443",
+            "example.test:443",
+            1,
+            exact_value_len,
+        );
+        super::validate_standalone_connect_ingress_request(
+            internal_partition_policy(&snapshot, &internal, &sensitive),
+            IngressMode::ExplicitHttp,
+            canonical(),
+            exact_bytes,
+        )
+        .unwrap();
+        let byte_over = raw_internal_request(
+            Method::CONNECT,
+            "example.test:443",
+            "example.test:443",
+            1,
+            exact_value_len + 1,
+        );
+        let error = expect_ingress_error(super::validate_standalone_connect_ingress_request(
+            internal_partition_policy(&snapshot, &internal, &sensitive),
+            IngressMode::ExplicitHttp,
+            canonical(),
+            byte_over,
+        ));
+        assert!(is_header_limit(&error));
     }
 
     #[test]
@@ -620,7 +1315,9 @@ mod tests {
                 ordinary_connect,
             ),
             Err(ValidatedStandaloneIngressError::Headers(
-                HeaderPreparationError::ConnectUnsupported
+                HeaderAdapterError::Hygiene(
+                    http_access_runtime::HeaderHygieneError::ConnectUnsupported
+                )
             ))
         ));
     }
@@ -672,8 +1369,10 @@ mod tests {
         assert_eq!(product["x-other"], "value");
     }
 
-    fn sanitized_upgrade(protocol: &'static str) -> crate::proxy::headers::SanitizedRequest {
-        sanitize_untrusted_request(
+    fn sanitized_upgrade(
+        protocol: &'static str,
+    ) -> crate::proxy::headers::PendingForwardRequest<Body> {
+        sanitize_product_request(
             Request::builder()
                 .version(Version::HTTP_11)
                 .uri("http://example.test/socket")
@@ -689,12 +1388,12 @@ mod tests {
     fn upgrade_intent_distinguishes_websocket_and_other_protocols() {
         let websocket = sanitized_upgrade("WebSocket");
         assert_eq!(
-            upgrade_intent(websocket.upgrade_intent()).unwrap(),
+            upgrade_intent(websocket.upgrade_protocol()).unwrap(),
             Some(NeutralUpgradeIntent::WebSocket)
         );
         let opaque = sanitized_upgrade("test-echo/1");
         assert_eq!(
-            upgrade_intent(opaque.upgrade_intent()).unwrap(),
+            upgrade_intent(opaque.upgrade_protocol()).unwrap(),
             Some(NeutralUpgradeIntent::Other(
                 UpgradeProtocol::new("test-echo/1").unwrap()
             ))
@@ -708,12 +1407,12 @@ mod tests {
         let headers = headers(&[("host", "example.test"), ("x-test", "one")]);
         let shape = validate_request_fact_shape(
             IngressMode::ExplicitHttp,
-            Version::HTTP_11,
-            &Method::GET,
+            HttpVersion::Http11,
+            &HttpMethod::new("GET").unwrap(),
             canonicalize_http_url("http://example.test/socket").unwrap(),
-            &headers,
+            &neutral_headers(&headers).unwrap(),
             BodyMetadata::new(BodyFraming::ContentLength(0)),
-            sanitized.upgrade_intent(),
+            sanitized.upgrade_protocol(),
         )
         .unwrap();
         let facts = shape.into_facts(&headers).unwrap();

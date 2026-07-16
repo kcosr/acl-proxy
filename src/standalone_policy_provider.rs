@@ -210,11 +210,11 @@ struct PreparedDispatch {
 pub(crate) enum StandaloneIngressTransport {
     Ordinary {
         parts: Box<http::request::Parts>,
-        protocol: HttpProtocol,
+        head: http_access_runtime::SanitizedRequestHead,
         downstream_upgrade: Option<hyper::upgrade::OnUpgrade>,
     },
     OuterConnect {
-        protocol: HttpProtocol,
+        head: http_access_runtime::SanitizedConnectRequestHead,
         downstream_upgrade: hyper::upgrade::OnUpgrade,
     },
 }
@@ -222,7 +222,12 @@ pub(crate) enum StandaloneIngressTransport {
 impl StandaloneIngressTransport {
     fn protocol(&self) -> HttpProtocol {
         match self {
-            Self::Ordinary { protocol, .. } | Self::OuterConnect { protocol, .. } => *protocol,
+            Self::Ordinary { head, .. } => {
+                crate::proxy::headers::product_protocol(head.ingress_version())
+            }
+            Self::OuterConnect { head, .. } => {
+                crate::proxy::headers::product_protocol(head.ingress_version())
+            }
         }
     }
 
@@ -231,8 +236,10 @@ impl StandaloneIngressTransport {
             Self::Ordinary {
                 downstream_upgrade, ..
             } => downstream_upgrade.is_some() == facts.upgrade().is_some(),
-            Self::OuterConnect { protocol, .. } => {
-                *protocol == HttpProtocol::Http1
+            Self::OuterConnect { head, .. } => {
+                crate::proxy::headers::product_protocol(head.ingress_version())
+                    == HttpProtocol::Http1
+                    && head.method().as_str() == "CONNECT"
                     && facts.method().as_str() == "CONNECT"
                     && facts.upgrade().is_none()
             }
@@ -268,7 +275,7 @@ struct DecisionAuditContext {
     method: HttpMethod,
     url: http_access_types::CanonicalUrl,
     peer_ip: IpAddr,
-    sensitive_header_presence: Box<[NeutralHeaderName]>,
+    sensitive_header_presence: Vec<NeutralHeaderName>,
     allow_level: Option<CompiledDecisionLogLevel>,
     deny_level: Option<CompiledDecisionLogLevel>,
 }
@@ -335,29 +342,31 @@ where
         terminal: T,
         input: StandaloneProviderInput,
     ) -> Result<(Self, RuntimeRequest), StandaloneProviderPrepareError> {
-        let (shape, ingress) = input.validated.into_parts();
-        let (mut headers, ingress_body, transport) = match ingress {
+        let (shape, ingress, partitioned) = input.validated.into_parts();
+        let (headers, ingress_body, transport) = match ingress {
             SanitizedStandaloneIngress::Ordinary(ingress) => {
-                let (mut parts, body, protocol, downstream_upgrade) = ingress.into_parts();
-                let headers = std::mem::take(&mut parts.headers);
+                let (parts, body, head, downstream_upgrade) = ingress.into_parts();
+                let headers = crate::proxy::headers::product_headers(head.headers())
+                    .map_err(|_| StandaloneProviderPrepareError::HeaderFacts)?;
                 (
                     headers,
                     body,
                     StandaloneIngressTransport::Ordinary {
-                        parts: Box::new(parts),
-                        protocol,
+                        parts,
+                        head,
                         downstream_upgrade,
                     },
                 )
             }
             SanitizedStandaloneIngress::OuterConnect(ingress) => {
-                let (mut parts, body, protocol, downstream_upgrade) = ingress.into_parts();
-                let headers = std::mem::take(&mut parts.headers);
+                let (_parts, body, head, downstream_upgrade) = ingress.into_parts();
+                let headers = crate::proxy::headers::product_headers(head.headers())
+                    .map_err(|_| StandaloneProviderPrepareError::HeaderFacts)?;
                 (
                     headers,
                     body,
                     StandaloneIngressTransport::OuterConnect {
-                        protocol,
+                        head,
                         downstream_upgrade,
                     },
                 )
@@ -367,35 +376,11 @@ where
         let audit_request_id = StableId::new(input.request_id.clone())
             .map_err(|_| StandaloneProviderPrepareError::RequestId)?;
         let transport_protocol = transport.protocol();
-        let audit_sensitive_header_presence = lease
-            .standalone()
-            .sensitive_header_policy()
-            .names()
-            .iter()
-            .filter(|name| headers.contains_key(name.as_str()))
-            .cloned()
-            .collect();
+        let audit_sensitive_header_presence = partitioned.audit_sensitive_presence;
         let sensitive_headers = lease.standalone().sensitive_headers().to_vec();
-        let mut sensitive_header_presence = Vec::new();
-        sensitive_header_presence
-            .try_reserve_exact(sensitive_headers.len())
-            .map_err(|_| StandaloneProviderPrepareError::HeaderFacts)?;
-        for name in &sensitive_headers {
-            if headers.contains_key(name.as_str()) {
-                sensitive_header_presence.push(name.clone());
-            }
-        }
-        let inbound = lease.credentials().extract(&mut headers)?;
-        let internal_context = take_internal_context(
-            &mut headers,
-            lease.authorization().internal_context_headers(),
-        )?;
-        if sensitive_headers
-            .iter()
-            .any(|name| headers.contains_key(name.as_str()))
-        {
-            return Err(StandaloneProviderPrepareError::HeaderFacts);
-        }
+        let sensitive_header_presence = partitioned.sensitive_presence;
+        let inbound = partitioned.inbound;
+        let internal_context = partitioned.internal_context;
         let facts = shape.into_facts(&headers)?;
         let audit_method = facts.method().clone();
         let audit_url = facts.url().clone();
@@ -1367,39 +1352,6 @@ fn provider_header_values(
         .collect())
 }
 
-fn take_internal_context(
-    headers: &mut HeaderMap,
-    names: &[HeaderName],
-) -> Result<HeaderMap, StandaloneProviderPrepareError> {
-    let mut ordinary = HeaderMap::new();
-    ordinary
-        .try_reserve(headers.len())
-        .map_err(|_| StandaloneProviderPrepareError::HeaderFacts)?;
-    let mut internal = HeaderMap::new();
-    internal
-        .try_reserve(names.len())
-        .map_err(|_| StandaloneProviderPrepareError::HeaderFacts)?;
-    let mut current_name = None;
-    for (name, value) in headers.drain() {
-        if let Some(name) = name {
-            current_name = Some(name);
-        }
-        let name = current_name
-            .as_ref()
-            .ok_or(StandaloneProviderPrepareError::HeaderFacts)?;
-        let target = if names.contains(name) {
-            &mut internal
-        } else {
-            &mut ordinary
-        };
-        target
-            .try_append(name.clone(), value)
-            .map_err(|_| StandaloneProviderPrepareError::HeaderFacts)?;
-    }
-    *headers = ordinary;
-    Ok(internal)
-}
-
 fn ingress_protocol(version: HttpVersion) -> HttpProtocol {
     match version {
         HttpVersion::Http10 | HttpVersion::Http11 => HttpProtocol::Http1,
@@ -1749,13 +1701,14 @@ header = "x-test-loop"
             Box::pin(async move {
                 assert_eq!(dispatch.exchange.facts().method().as_str(), "CONNECT");
                 assert!(dispatch.exchange.facts().upgrade().is_none());
-                assert!(matches!(
-                    &dispatch.transport,
-                    StandaloneIngressTransport::OuterConnect {
-                        protocol: HttpProtocol::Http1,
-                        ..
-                    }
-                ));
+                let StandaloneIngressTransport::OuterConnect { head, .. } = &dispatch.transport
+                else {
+                    panic!("CONNECT dispatch must retain its distinct transport head");
+                };
+                assert_eq!(
+                    crate::proxy::headers::product_protocol(head.ingress_version()),
+                    HttpProtocol::Http1
+                );
                 drop((self, dispatch));
                 Terminal::Forward
             })
@@ -2284,6 +2237,7 @@ done
         )
         .unwrap();
         let validated = validate_standalone_ingress_request(
+            crate::proxy::facts::IngressPartitionPolicy::from_lease(lease),
             IngressMode::ExplicitHttp,
             canonical.clone(),
             request,
@@ -2291,7 +2245,7 @@ done
         .unwrap();
         let preflight_target = preflight_forwarding_target(
             &canonical,
-            validated.ingress().sanitized(),
+            validated.ingress().protocol(),
             lease.egress(),
             &destinations,
         )
@@ -2327,6 +2281,7 @@ done
             .body(Body::empty())
             .unwrap();
         let validated = validate_standalone_connect_ingress_request(
+            crate::proxy::facts::IngressPartitionPolicy::from_lease(lease),
             IngressMode::ExplicitHttp,
             canonical.clone(),
             request,
@@ -2334,7 +2289,7 @@ done
         .unwrap();
         let preflight_target = preflight_forwarding_target(
             &canonical,
-            validated.ingress().sanitized(),
+            validated.ingress().protocol(),
             lease.egress(),
             &destinations,
         )
@@ -2388,7 +2343,7 @@ done
             method: HttpMethod::new("GET").unwrap(),
             url,
             peer_ip: "192.0.2.10".parse().unwrap(),
-            sensitive_header_presence: Box::new([]),
+            sensitive_header_presence: Vec::new(),
             allow_level: Some(CompiledDecisionLogLevel::Info),
             deny_level: Some(CompiledDecisionLogLevel::Warn),
         };
@@ -2941,8 +2896,11 @@ request_timeout = "20ms"
         );
         headers.insert("x-visible", http::HeaderValue::from_static("ordinary"));
 
-        let internal = take_internal_context(&mut headers, std::slice::from_ref(&internal_name))
-            .expect("partition");
+        let internal = crate::proxy::facts::partition_internal_context_for_test(
+            &mut headers,
+            std::slice::from_ref(&internal_name),
+        )
+        .expect("partition");
 
         assert!(!headers.contains_key(&internal_name));
         assert_eq!(headers["x-visible"], "ordinary");

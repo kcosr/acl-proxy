@@ -11,7 +11,7 @@ use http_access_types::{BodyFraming, HttpVersion, IngressMode};
 
 use super::authority::reconcile_request;
 use super::facts::{body_metadata, validate_request_fact_shape, ValidatedRequestFactShape};
-use super::headers::sanitize_untrusted_request;
+use super::headers::sanitize_product_request;
 
 #[derive(Clone, Copy)]
 struct DecodedField<'a> {
@@ -102,21 +102,22 @@ fn adapt_decoded_fields(
     let mut request = build_product_request(method, scheme, authority, path, &ordinary)?;
     let target = reconcile_request(&mut request, IngressMode::ExplicitHttp, None, None, None)
         .map_err(|_| AdapterError::ProductBoundary)?;
-    let sanitized =
-        sanitize_untrusted_request(request).map_err(|_| AdapterError::ProductBoundary)?;
-    let body_facts = body_metadata(Version::HTTP_2, sanitized.headers())
+    let sanitized = sanitize_product_request(request).map_err(|_| AdapterError::ProductBoundary)?;
+    let product_headers = super::facts::product_headers(sanitized.head.headers())
+        .map_err(|_| AdapterError::ProductBoundary)?;
+    let body_facts = body_metadata(Version::HTTP_2, &product_headers)
         .map_err(|_| AdapterError::ProductBoundary)?;
     let shape = validate_request_fact_shape(
         IngressMode::ExplicitHttp,
-        sanitized.version(),
-        sanitized.method(),
+        sanitized.head.ingress_version(),
+        sanitized.head.method(),
         target.url().clone(),
-        sanitized.headers(),
+        sanitized.head.headers(),
         body_facts,
-        sanitized.upgrade_intent(),
+        sanitized.upgrade_protocol(),
     )
     .map_err(|_| AdapterError::ProductBoundary)?;
-    let facts = ValidatedRequestFactShape::into_facts(shape, sanitized.headers())
+    let facts = ValidatedRequestFactShape::into_facts(shape, &product_headers)
         .map_err(|_| AdapterError::ProductBoundary)?;
 
     Ok(AcceptedEvidence {

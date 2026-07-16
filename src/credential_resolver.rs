@@ -1,7 +1,6 @@
 use std::mem::size_of;
 use std::sync::Arc;
 
-use allocator_api2::boxed::Box as FallibleBox;
 use credential_core::{
     BoxCredentialFuture, CredentialBufferContext, CredentialCancellation, CredentialDescriptor,
     CredentialDestination, CredentialError, CredentialProfile, CredentialProgram,
@@ -22,8 +21,6 @@ use crate::safety::HttpWireBodyGuard;
 #[cfg(test)]
 use credential_core::CredentialPurpose;
 
-type ConvertedCredential = Option<(http::HeaderName, http::HeaderValue)>;
-type ConvertedCredentialSlots = FallibleBox<[ConvertedCredential]>;
 const PROJECTED_CREDENTIAL_CANCELLATION_BYTES: u64 = 256;
 
 pub(crate) struct ProductCredentialResolver {
@@ -49,8 +46,6 @@ pub(crate) struct ProductCredentialExecution {
     program: CredentialProgram,
     resolver: ProductCredentialResolver,
     destinations: Box<[http::HeaderName]>,
-    converted: ConvertedCredentialSlots,
-    transport_reserved: bool,
     cancellation: Arc<dyn CredentialCancellation>,
 }
 
@@ -221,14 +216,11 @@ impl ProductCredentialPreparation {
             .buffers
             .composed_process_peak_bytes(self.program.projection(), self.projected_product_bytes)?;
         let program = self.program.admit(composed)?;
-        let converted = empty_conversion_slots(self.destinations.len())?;
         Ok(ProductCredentialExecution {
             plan: self.plan,
             program,
             resolver: self.resolver,
             destinations: self.destinations,
-            converted,
-            transport_reserved: false,
             cancellation,
         })
     }
@@ -301,43 +293,11 @@ fn projected_credential_header_map_bytes() -> Result<u64, CredentialError> {
     u64::try_from(growth_peak).map_err(|_| CredentialError::ResourceLimit)
 }
 
-fn empty_conversion_slots(len: usize) -> Result<ConvertedCredentialSlots, CredentialError> {
-    let mut slots =
-        FallibleBox::try_new_uninit_slice(len).map_err(|_| CredentialError::ResourceLimit)?;
-    for slot in slots.iter_mut() {
-        slot.write(None);
-    }
-    // SAFETY: every slot was initialized to None immediately above.
-    Ok(unsafe { slots.assume_init() })
-}
-
 impl ProductCredentialExecution {
-    pub(crate) fn reserve_transport(
-        &mut self,
-        headers: &mut http::HeaderMap,
-    ) -> Result<(), CredentialError> {
-        if self.transport_reserved {
-            return Err(CredentialError::InvalidContract);
-        }
-        let additional = self
-            .destinations
-            .iter()
-            .filter(|name| !headers.contains_key(*name))
-            .count();
-        headers
-            .try_reserve(additional)
-            .map_err(|_| CredentialError::ResourceLimit)?;
-        self.transport_reserved = true;
-        Ok(())
-    }
-
     pub(crate) async fn finalize<B>(
-        mut self,
+        self,
         request: &mut http::Request<B>,
     ) -> Result<(), CredentialError> {
-        if !self.transport_reserved {
-            return Err(CredentialError::InvalidContract);
-        }
         let rendered = self
             .program
             .execute(&self.resolver, self.cancellation.as_ref())
@@ -347,45 +307,140 @@ impl ProductCredentialExecution {
         if transport.len() != self.destinations.len() {
             return Err(CredentialError::BindingMismatch);
         }
-        for (index, expected) in self.destinations.iter().cloned().enumerate() {
+        validate_active_final_header_projection(
+            self.cancellation.as_ref(),
+            request.headers(),
+            &self.destinations,
+            transport.metadata(),
+        )?;
+        let mut final_headers =
+            stage_final_publication_headers(request.headers(), self.destinations.as_ref())?;
+        for expected in self.destinations.iter().cloned() {
             let credential = transport.next().ok_or(CredentialError::BindingMismatch)?;
             let (destination, bytes) = credential.into_parts();
             if !destination_matches(&destination, &expected) {
                 return Err(CredentialError::BindingMismatch);
             }
             let value = sensitive_header_value(bytes)?;
-            let slot = self
-                .converted
-                .get_mut(index)
-                .ok_or(CredentialError::BindingMismatch)?;
-            if slot.replace((expected, value)).is_some() {
+            if final_headers
+                .try_insert(expected, value)
+                .map_err(|_| CredentialError::ResourceLimit)?
+                .is_some()
+            {
                 return Err(CredentialError::InvalidContract);
             }
         }
         if transport.next().is_some() {
             return Err(CredentialError::BindingMismatch);
         }
-        publish_converted_credentials(
+        publish_staged_headers(
             self.cancellation.as_ref(),
-            &mut self.converted,
             request.headers_mut(),
+            final_headers,
         )
     }
 }
 
-fn publish_converted_credentials(
+fn stage_final_publication_headers(
+    headers: &http::HeaderMap,
+    destinations: &[http::HeaderName],
+) -> Result<http::HeaderMap, CredentialError> {
+    let retained_field_count = headers
+        .iter()
+        .filter(|(name, _)| !destinations.contains(name))
+        .count();
+    let final_field_count = retained_field_count
+        .checked_add(destinations.len())
+        .ok_or(CredentialError::ResourceLimit)?;
+    let mut staged = http::HeaderMap::new();
+    staged
+        .try_reserve(final_field_count)
+        .map_err(|_| CredentialError::ResourceLimit)?;
+    for (name, value) in headers {
+        if destinations.contains(name) {
+            continue;
+        }
+        staged
+            .try_append(name.clone(), value.clone())
+            .map_err(|_| CredentialError::ResourceLimit)?;
+    }
+    Ok(staged)
+}
+
+fn publish_staged_headers(
     cancellation: &dyn CredentialCancellation,
-    converted: &mut [Option<(http::HeaderName, http::HeaderValue)>],
     headers: &mut http::HeaderMap,
+    mut staged: http::HeaderMap,
 ) -> Result<(), CredentialError> {
     if cancellation.is_cancelled() {
         return Err(CredentialError::Cancelled);
     }
-    for slot in converted {
-        let (destination, value) = slot.take().ok_or(CredentialError::InvalidContract)?;
-        headers.insert(destination, value);
-    }
+    std::mem::swap(headers, &mut staged);
     Ok(())
+}
+
+fn validate_active_final_header_projection<'a>(
+    cancellation: &dyn CredentialCancellation,
+    headers: &http::HeaderMap,
+    destinations: &[http::HeaderName],
+    metadata: impl ExactSizeIterator<Item = (&'a CredentialDestination, usize)>,
+) -> Result<(), CredentialError> {
+    if cancellation.is_cancelled() {
+        return Err(CredentialError::Cancelled);
+    }
+    validate_final_header_projection(headers, destinations, metadata)
+}
+
+fn validate_final_header_projection<'a>(
+    headers: &http::HeaderMap,
+    destinations: &[http::HeaderName],
+    metadata: impl ExactSizeIterator<Item = (&'a CredentialDestination, usize)>,
+) -> Result<(), CredentialError> {
+    if metadata.len() != destinations.len() {
+        return Err(CredentialError::BindingMismatch);
+    }
+    let mut field_count = headers.len();
+    let mut name_value_bytes = headers
+        .iter()
+        .try_fold(0usize, |total, (name, value)| {
+            total
+                .checked_add(name.as_str().len())?
+                .checked_add(value.as_bytes().len())
+        })
+        .ok_or(CredentialError::ResourceLimit)?;
+
+    for (index, ((rendered_destination, value_len), destination)) in
+        metadata.zip(destinations).enumerate()
+    {
+        if !destination_matches(rendered_destination, destination) {
+            return Err(CredentialError::BindingMismatch);
+        }
+        if destinations[..index].contains(destination) {
+            return Err(CredentialError::InvalidContract);
+        }
+        let existing = headers.get_all(destination);
+        let existing_count = existing.iter().count();
+        let existing_bytes = existing
+            .iter()
+            .try_fold(0usize, |total, existing| {
+                total
+                    .checked_add(destination.as_str().len())?
+                    .checked_add(existing.as_bytes().len())
+            })
+            .ok_or(CredentialError::ResourceLimit)?;
+        field_count = field_count
+            .checked_sub(existing_count)
+            .and_then(|count| count.checked_add(1))
+            .ok_or(CredentialError::ResourceLimit)?;
+        name_value_bytes = name_value_bytes
+            .checked_sub(existing_bytes)
+            .and_then(|bytes| bytes.checked_add(destination.as_str().len()))
+            .and_then(|bytes| bytes.checked_add(value_len))
+            .ok_or(CredentialError::ResourceLimit)?;
+    }
+
+    http_access_runtime::validate_header_projection(field_count, name_value_bytes)
+        .map_err(|_| CredentialError::ResourceLimit)
 }
 
 fn sensitive_header_value(bytes: bytes::Bytes) -> Result<http::HeaderValue, CredentialError> {
@@ -634,10 +689,14 @@ fn execution_for_test(
 #[cfg(test)]
 mod tests {
     use super::{
-        projected_product_adapter_bytes, publish_converted_credentials, sensitive_header_value,
+        environment_execution_for_test, projected_product_adapter_bytes, publish_staged_headers,
+        sensitive_header_value, stage_final_publication_headers,
+        validate_active_final_header_projection, validate_final_header_projection,
         CredentialCancellation, CredentialError,
     };
     use crate::credential_io_runtime::projected_credential_io_operation_bytes;
+    use crate::safety::{WireBodyPool, WireBodyQuotaKey};
+    use std::net::{IpAddr, Ipv4Addr};
 
     struct Cancelled;
 
@@ -661,15 +720,241 @@ mod tests {
     fn cancellation_before_atomic_publication_leaves_headers_unchanged() {
         let destination = http::HeaderName::from_static("x-late-token");
         let value = sensitive_header_value(bytes::Bytes::from_static(b"owned-secret")).unwrap();
-        let mut converted = vec![Some((destination.clone(), value))];
         let mut headers = http::HeaderMap::new();
+        headers.insert("x-visible", http::HeaderValue::from_static("original"));
+        let mut staged = http::HeaderMap::new();
+        staged.insert(destination.clone(), value);
 
         assert_eq!(
-            publish_converted_credentials(&Cancelled, &mut converted, &mut headers),
+            publish_staged_headers(&Cancelled, &mut headers, staged),
             Err(CredentialError::Cancelled)
         );
         assert!(!headers.contains_key(destination));
-        assert_eq!(converted.len(), 1);
+        assert_eq!(headers["x-visible"], "original");
+    }
+
+    #[test]
+    fn cancellation_precedes_final_projection_validation() {
+        let destination = http::HeaderName::from_static("x-late-token");
+        let empty = std::iter::empty::<(&credential_core::CredentialDestination, usize)>();
+
+        assert_eq!(
+            validate_active_final_header_projection(
+                &Cancelled,
+                &http::HeaderMap::new(),
+                std::slice::from_ref(&destination),
+                empty,
+            ),
+            Err(CredentialError::Cancelled)
+        );
+    }
+
+    #[test]
+    fn staged_publication_preserves_duplicate_order_and_sensitive_bits() {
+        let destination = http::HeaderName::from_static("x-late-token");
+        let mut headers = http::HeaderMap::new();
+        let mut sensitive = http::HeaderValue::from_static("first");
+        sensitive.set_sensitive(true);
+        headers.append("x-visible", sensitive);
+        headers.append("x-visible", http::HeaderValue::from_static("second"));
+        headers.append(
+            destination.clone(),
+            http::HeaderValue::from_static("old-one"),
+        );
+        headers.append(
+            destination.clone(),
+            http::HeaderValue::from_static("old-two"),
+        );
+
+        let staged =
+            stage_final_publication_headers(&headers, std::slice::from_ref(&destination)).unwrap();
+        let visible = staged.get_all("x-visible").iter().collect::<Vec<_>>();
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0], "first");
+        assert_eq!(visible[1], "second");
+        assert!(visible[0].is_sensitive());
+        assert!(!visible[1].is_sensitive());
+        assert!(!staged.contains_key(destination));
+    }
+
+    #[tokio::test]
+    async fn exact_capacity_projection_failure_leaves_request_headers_unchanged() {
+        const VARIABLE: &str = "ACL_PROXY_ATOMIC_PUBLICATION_LIMIT_TOKEN";
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        std::env::set_var(VARIABLE, "secret");
+        let peak = 8 * 1024 * 1024;
+        let guard = WireBodyPool::new(peak, peak).begin_for_test(
+            peak,
+            WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::LOCALHOST), |_| false),
+        );
+        let (execution, io) = environment_execution_for_test(&guard, VARIABLE, "x-late-token");
+        let mut request = http::Request::new(());
+        for _ in 0..http_access_runtime::MAX_HEADER_HYGIENE_FIELDS {
+            request
+                .headers_mut()
+                .append("x-visible", http::HeaderValue::from_static("original"));
+        }
+
+        assert_eq!(
+            execution.finalize(&mut request).await,
+            Err(CredentialError::ResourceLimit)
+        );
+        assert_eq!(
+            request.headers().get_all("x-visible").iter().count(),
+            http_access_runtime::MAX_HEADER_HYGIENE_FIELDS
+        );
+        assert!(request
+            .headers()
+            .get_all("x-visible")
+            .iter()
+            .all(|value| value == "original"));
+        assert!(!request.headers().contains_key("x-late-token"));
+
+        io.shutdown_and_wait(None).await;
+        std::env::remove_var(VARIABLE);
+    }
+
+    #[test]
+    fn final_projection_replaces_all_existing_values_before_adding_one_secret() {
+        let destination = http::HeaderName::from_static("x-late-token");
+        let neutral_destination = http_access_types::HeaderName::new(destination.as_str()).unwrap();
+        let rendered = [credential_core::CredentialDestination::CustomHeader(
+            neutral_destination,
+        )];
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            destination.clone(),
+            http::HeaderValue::from_static("old-one"),
+        );
+        headers.append(
+            destination.clone(),
+            http::HeaderValue::from_static("old-two"),
+        );
+
+        assert_eq!(
+            validate_final_header_projection(
+                &headers,
+                std::slice::from_ref(&destination),
+                rendered.iter().map(|destination| (destination, 1)),
+            ),
+            Ok(())
+        );
+    }
+
+    fn repeated_empty_headers(name: &'static str, count: usize) -> http::HeaderMap {
+        let mut headers = http::HeaderMap::new();
+        for _ in 0..count {
+            headers.append(name, http::HeaderValue::from_static(""));
+        }
+        headers
+    }
+
+    fn custom_destination(
+        destination: &http::HeaderName,
+    ) -> credential_core::CredentialDestination {
+        credential_core::CredentialDestination::CustomHeader(
+            http_access_types::HeaderName::new(destination.as_str()).unwrap(),
+        )
+    }
+
+    #[test]
+    fn replacement_projection_accepts_exact_shared_limits_and_rejects_one_more_byte() {
+        let destination = http::HeaderName::from_static("x-late-token");
+        let mut headers =
+            repeated_empty_headers("x-fill", http_access_runtime::MAX_HEADER_HYGIENE_FIELDS - 1);
+        headers.append(destination.clone(), http::HeaderValue::from_static("old"));
+        let retained_bytes = (http_access_runtime::MAX_HEADER_HYGIENE_FIELDS - 1)
+            .checked_mul("x-fill".len())
+            .unwrap();
+        let exact_value_len = http_access_runtime::MAX_HEADER_HYGIENE_BYTES
+            - retained_bytes
+            - destination.as_str().len();
+        let rendered = [custom_destination(&destination)];
+
+        assert_eq!(
+            validate_final_header_projection(
+                &headers,
+                std::slice::from_ref(&destination),
+                rendered
+                    .iter()
+                    .map(|destination| (destination, exact_value_len)),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_final_header_projection(
+                &headers,
+                std::slice::from_ref(&destination),
+                rendered
+                    .iter()
+                    .map(|destination| (destination, exact_value_len + 1)),
+            ),
+            Err(CredentialError::ResourceLimit)
+        );
+    }
+
+    #[test]
+    fn absent_destination_projection_accepts_exact_shared_limits_and_rejects_plus_one() {
+        let destination = http::HeaderName::from_static("x-late-token");
+        let headers =
+            repeated_empty_headers("x-fill", http_access_runtime::MAX_HEADER_HYGIENE_FIELDS - 1);
+        let retained_bytes = (http_access_runtime::MAX_HEADER_HYGIENE_FIELDS - 1)
+            .checked_mul("x-fill".len())
+            .unwrap();
+        let exact_value_len = http_access_runtime::MAX_HEADER_HYGIENE_BYTES
+            - retained_bytes
+            - destination.as_str().len();
+        let rendered = [custom_destination(&destination)];
+
+        assert_eq!(
+            validate_final_header_projection(
+                &headers,
+                std::slice::from_ref(&destination),
+                rendered
+                    .iter()
+                    .map(|destination| (destination, exact_value_len)),
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            validate_final_header_projection(
+                &headers,
+                std::slice::from_ref(&destination),
+                rendered
+                    .iter()
+                    .map(|destination| (destination, exact_value_len + 1)),
+            ),
+            Err(CredentialError::ResourceLimit)
+        );
+
+        let field_overflow =
+            repeated_empty_headers("x-fill", http_access_runtime::MAX_HEADER_HYGIENE_FIELDS);
+        assert_eq!(
+            validate_final_header_projection(
+                &field_overflow,
+                std::slice::from_ref(&destination),
+                rendered.iter().map(|destination| (destination, 0)),
+            ),
+            Err(CredentialError::ResourceLimit)
+        );
+    }
+
+    #[test]
+    fn duplicate_credential_destinations_are_rejected_before_projection() {
+        let destination = http::HeaderName::from_static("x-late-token");
+        let rendered = [
+            custom_destination(&destination),
+            custom_destination(&destination),
+        ];
+
+        assert_eq!(
+            validate_final_header_projection(
+                &http::HeaderMap::new(),
+                &[destination.clone(), destination],
+                rendered.iter().map(|destination| (destination, 1)),
+            ),
+            Err(CredentialError::InvalidContract)
+        );
     }
 
     #[test]

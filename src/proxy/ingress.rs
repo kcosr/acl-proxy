@@ -47,6 +47,7 @@ use crate::observation::{
 use crate::proxy::authority::{reconcile_connect_outer_request, reconcile_request};
 use crate::proxy::facts::{
     validate_standalone_connect_ingress_request, validate_standalone_ingress_request,
+    IngressPartitionPolicy,
 };
 use crate::proxy::forward::{preflight_forwarding_target, ForwardedDownstreamBody};
 use crate::proxy::forwarding_executor::ForwardingExecutor;
@@ -1545,13 +1546,14 @@ async fn execute_connect_terminal(
         mut decision,
     } = dispatch;
     let StandaloneIngressTransport::OuterConnect {
-        protocol,
+        head,
         downstream_upgrade,
     } = transport
     else {
         return HandledResponse::fixed(StatusCode::INTERNAL_SERVER_ERROR, "request failed\n", true);
     };
-    if protocol != http_access_types::HttpProtocol::Http1
+    if crate::proxy::headers::product_protocol(head.ingress_version())
+        != http_access_types::HttpProtocol::Http1
         || exchange.facts().method().as_str() != "CONNECT"
         || exchange.plan().origin() != terminal.target.url()
         || !matches!(exchange.plan().upgrade(), UpgradePolicy::Deny)
@@ -1698,6 +1700,7 @@ async fn execute_connect_request(
         }
     };
     let validated = match validate_standalone_connect_ingress_request(
+        IngressPartitionPolicy::from_lease(&lease),
         ingress_mode,
         target.url().clone(),
         request,
@@ -1714,7 +1717,7 @@ async fn execute_connect_request(
     };
     let preflight_target = match preflight_forwarding_target(
         target.url(),
-        validated.ingress().sanitized(),
+        validated.ingress().protocol(),
         lease.egress(),
         assets.destination_guard(),
     ) {
@@ -2361,21 +2364,21 @@ async fn execute_request_via_pipeline(
     };
     decision_audit.bind_url(target.url());
     capture.bind_target(target.url());
-    let validated =
-        match validate_standalone_ingress_request(ingress_mode, target.url().clone(), request) {
-            Ok(validated) => validated,
-            Err(_) => {
-                decision_audit.submit_deny(DecisionReasonCategory::InvalidPlan, 400);
-                return capture.deny_metadata_only(
-                    StatusCode::BAD_REQUEST,
-                    "invalid request\n",
-                    true,
-                );
-            }
-        };
+    let validated = match validate_standalone_ingress_request(
+        IngressPartitionPolicy::from_lease(&lease),
+        ingress_mode,
+        target.url().clone(),
+        request,
+    ) {
+        Ok(validated) => validated,
+        Err(_) => {
+            decision_audit.submit_deny(DecisionReasonCategory::InvalidPlan, 400);
+            return capture.deny_metadata_only(StatusCode::BAD_REQUEST, "invalid request\n", true);
+        }
+    };
     let preflight_target = match preflight_forwarding_target(
         target.url(),
-        validated.ingress().sanitized(),
+        validated.ingress().protocol(),
         lease.egress(),
         assets.destination_guard(),
     ) {

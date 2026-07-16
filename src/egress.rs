@@ -31,6 +31,8 @@ use http_access_url::{canonicalize_http_url, canonicalize_tls_server_name};
 pub(crate) struct EgressSnapshot {
     identity: Arc<()>,
     route: EgressRoute,
+    #[cfg(test)]
+    route_contract: Route,
     origin_tls: OriginTls,
 }
 
@@ -168,6 +170,8 @@ impl EgressSnapshot {
             snapshot: Self {
                 identity: Arc::new(()),
                 route,
+                #[cfg(test)]
+                route_contract: neutral_route.clone(),
                 origin_tls,
             },
             neutral: NeutralEgressBindings {
@@ -183,6 +187,11 @@ impl EgressSnapshot {
 
     pub(crate) fn route(&self) -> &EgressRoute {
         &self.route
+    }
+
+    #[cfg(test)]
+    pub(crate) fn route_contract(&self) -> &Route {
+        &self.route_contract
     }
 
     pub(crate) fn origin_tls(&self) -> &OriginTls {
@@ -274,6 +283,11 @@ impl crate::runtime::EgressSnapshot for EgressSnapshot {
 
     fn route(&self) -> &EgressRoute {
         EgressSnapshot::route(self)
+    }
+
+    #[cfg(test)]
+    fn route_contract(&self) -> &Route {
+        EgressSnapshot::route_contract(self)
     }
 
     fn origin_tls(&self) -> &OriginTls {

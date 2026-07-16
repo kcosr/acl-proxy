@@ -7,7 +7,8 @@ use std::time::Duration;
 use bytes::Buf;
 use http::header::{HeaderValue, HOST};
 use http::{Method, Request, Response, StatusCode, Version};
-use http_access_types::{CanonicalUrl, HttpScheme};
+use http_access_runtime::{prepare_request_head, prepare_upgrade_request_head};
+use http_access_types::{CanonicalUrl, HttpScheme, Route, UpgradeProtocol};
 use hyper::body::{Bytes, HttpBody, SizeHint};
 use hyper::client::conn;
 use hyper::Body;
@@ -32,21 +33,36 @@ use http_access_types::HttpProtocol;
 
 use super::h2_stream_cancellation::H2StreamCancellation;
 use super::headers::{
-    prepare_downstream_upgrade_response, prepare_origin_request, prepare_origin_upgrade_request,
-    strip_response_hop_by_hop, HeaderPreparationError, RequestTargetForm, SanitizedRequest,
-    UpgradeIntent,
+    apply_prepared_head, prepare_product_upgrade_response, sanitize_product_response_headers,
+    HeaderAdapterError, PendingForwardRequest,
 };
 
 const TERMINAL_DRIVER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_EMPTY_RESPONSE_FRAMES: u64 = 65_536;
 const MAX_INTERNAL_RESPONSE_EVENTS_PER_POLL: usize = 64;
 
+pub(crate) struct ForwardingHeadContract {
+    origin: CanonicalUrl,
+    route: Route,
+    origin_protocol: HttpProtocol,
+}
+
+impl ForwardingHeadContract {
+    pub(crate) fn new(origin: CanonicalUrl, route: Route, origin_protocol: HttpProtocol) -> Self {
+        Self {
+            origin,
+            route,
+            origin_protocol,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ForwardError {
     #[error("destination validation or connection failed")]
     Destination(#[from] DestinationGuardError),
     #[error(transparent)]
-    Header(#[from] HeaderPreparationError),
+    Header(#[from] HeaderAdapterError),
     #[error("the canonical TLS server name is invalid")]
     TlsServerName,
     #[error("TLS connection failed")]
@@ -548,7 +564,10 @@ impl ForwardBody {
                     self.terminal_error = Some(error.clone());
                     return Poll::Ready(Err(error));
                 }
-                strip_response_hop_by_hop(&mut headers);
+                if sanitize_product_response_headers(&mut headers).is_err() {
+                    self.terminal_error = Some(ForwardBodyError::Limit);
+                    return Poll::Ready(Err(ForwardBodyError::Limit));
+                }
                 Some(headers)
             }
             None => None,
@@ -1122,11 +1141,10 @@ enum ResolvedForwardingRoute {
 /// Performs synchronous semantic destination checks before initial policy matching.
 pub(crate) fn preflight_forwarding_target(
     canonical: &CanonicalUrl,
-    request: &SanitizedRequest<impl Sized>,
+    ingress_protocol: HttpProtocol,
     egress: &dyn EgressSnapshot,
     destinations: &DestinationGuard,
 ) -> Result<PreflightForwardingTarget, ResolveForwardingError> {
-    let ingress_protocol = request.protocol();
     let origin_protocol = egress.origin_tls().select_protocol(ingress_protocol);
     let egress_identity = egress.identity().clone();
     let route = match egress.route() {
@@ -1221,13 +1239,13 @@ pub(crate) async fn resolve_forwarding_target(
 /// The resolved token carries the only DNS result; connect performs synchronous
 /// pre- and post-connect validation before any outbound bytes.
 pub(crate) async fn forward_request<B>(
-    request: SanitizedRequest<B>,
-    canonical: &CanonicalUrl,
+    request: PendingForwardRequest<B>,
     egress: &dyn EgressSnapshot,
     destinations: &DestinationGuard,
     target: ResolvedForwardingTarget,
     timeouts: ForwardingTimeouts,
     credentials: Option<ProductCredentialExecution>,
+    contract: ForwardingHeadContract,
 ) -> Result<ForwardedResponse, ForwardError>
 where
     B: HttpBody + Send + 'static,
@@ -1236,24 +1254,24 @@ where
 {
     forward_with_connector_timed(
         request,
-        canonical,
         egress,
         destinations,
         target,
         &TcpDestinationConnector,
         ForwardExecutionOptions::new(timeouts, credentials),
+        &contract,
     )
     .await
 }
 
 async fn forward_with_connector_timed<C, B>(
-    request: SanitizedRequest<B>,
-    canonical: &CanonicalUrl,
+    request: PendingForwardRequest<B>,
     egress: &dyn EgressSnapshot,
     destinations: &DestinationGuard,
     target: ResolvedForwardingTarget,
     connector: &C,
     execution: ForwardExecutionOptions,
+    contract: &ForwardingHeadContract,
 ) -> Result<ForwardedResponse, ForwardError>
 where
     C: DestinationConnector,
@@ -1262,10 +1280,14 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    let selected_origin_protocol = egress.origin_tls().select_protocol(request.protocol());
-    if target.canonical_url != canonical.as_str()
-        || target.ingress_protocol != request.protocol()
-        || target.origin_protocol != selected_origin_protocol
+    let ingress_protocol = request.ingress_protocol();
+    let selected_origin_protocol = egress.origin_tls().select_protocol(ingress_protocol);
+    if selected_origin_protocol != contract.origin_protocol {
+        return Err(ForwardError::ResolvedTargetMismatch);
+    }
+    if target.canonical_url != contract.origin.as_str()
+        || target.ingress_protocol != ingress_protocol
+        || target.origin_protocol != contract.origin_protocol
         || !std::sync::Arc::ptr_eq(&target.egress_identity, egress.identity())
     {
         return Err(ForwardError::ResolvedTargetMismatch);
@@ -1280,7 +1302,7 @@ where
                 .into_stream();
             forward_direct(
                 request,
-                canonical,
+                contract,
                 egress,
                 selected_origin_protocol,
                 stream,
@@ -1300,7 +1322,7 @@ where
                 .into_stream();
             forward_via_parent(
                 request,
-                canonical,
+                contract,
                 egress,
                 parent,
                 selected_origin_protocol,
@@ -1315,7 +1337,7 @@ where
 
 #[cfg(test)]
 async fn forward_with_connector<C, B>(
-    request: SanitizedRequest<B>,
+    request: PendingForwardRequest<B>,
     canonical: &CanonicalUrl,
     egress: &dyn EgressSnapshot,
     destinations: &DestinationGuard,
@@ -1329,14 +1351,55 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    let ingress_protocol = request.ingress_protocol();
+    let contract = ForwardingHeadContract::new(
+        canonical.clone(),
+        egress.route_contract().clone(),
+        egress.origin_tls().select_protocol(ingress_protocol),
+    );
     forward_with_connector_timed(
         request,
-        canonical,
         egress,
         destinations,
         target,
         connector,
         ForwardExecutionOptions::new(ForwardingTimeouts::for_test(), None),
+        &contract,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn forward_with_connector_timed_test<C, B>(
+    request: PendingForwardRequest<B>,
+    canonical: &CanonicalUrl,
+    egress: &dyn EgressSnapshot,
+    destinations: &DestinationGuard,
+    target: ResolvedForwardingTarget,
+    connector: &C,
+    execution: ForwardExecutionOptions,
+) -> Result<ForwardedResponse, ForwardError>
+where
+    C: DestinationConnector,
+    C::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let ingress_protocol = request.ingress_protocol();
+    let contract = ForwardingHeadContract::new(
+        canonical.clone(),
+        egress.route_contract().clone(),
+        egress.origin_tls().select_protocol(ingress_protocol),
+    );
+    forward_with_connector_timed(
+        request,
+        egress,
+        destinations,
+        target,
+        connector,
+        execution,
+        &contract,
     )
     .await
 }
@@ -1346,13 +1409,13 @@ where
 /// 101 returns the canonical response head and an owned upstream upgrade whose
 /// connection driver remains live until `complete` joins it.
 pub(crate) async fn forward_upgrade_request<B>(
-    request: SanitizedRequest<B>,
-    canonical: &CanonicalUrl,
+    request: PendingForwardRequest<B>,
     generation: &GenerationRetention,
     destinations: std::sync::Arc<DestinationGuard>,
     target: ResolvedForwardingTarget,
     timeouts: ForwardingTimeouts,
     credentials: Option<ProductCredentialExecution>,
+    contract: ForwardingHeadContract,
 ) -> Result<ForwardUpgradeResult, ForwardError>
 where
     B: HttpBody + Send + 'static,
@@ -1362,18 +1425,115 @@ where
     let egress = generation.egress();
     forward_upgrade_with_connector_timed(
         request,
-        canonical,
         egress,
         &destinations,
         target,
         &TcpDestinationConnector,
         ForwardExecutionOptions::new(timeouts, credentials),
+        &contract,
     )
     .await
 }
 
 async fn forward_upgrade_with_connector_timed<C, B>(
-    request: SanitizedRequest<B>,
+    request: PendingForwardRequest<B>,
+    egress: &dyn EgressSnapshot,
+    destinations: &DestinationGuard,
+    target: ResolvedForwardingTarget,
+    connector: &C,
+    execution: ForwardExecutionOptions,
+    contract: &ForwardingHeadContract,
+) -> Result<ForwardUpgradeResult, ForwardError>
+where
+    C: DestinationConnector,
+    C::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let intent = request
+        .upgrade_protocol()
+        .cloned()
+        .ok_or(http_access_runtime::HeaderHygieneError::InvalidUpgrade)
+        .map_err(HeaderAdapterError::from)?;
+    let ingress_protocol = request.ingress_protocol();
+    let selected_origin_protocol = egress.origin_tls().select_protocol(ingress_protocol);
+    if selected_origin_protocol != contract.origin_protocol
+        || contract.origin_protocol == HttpProtocol::Http2
+    {
+        return Err(ForwardError::UpgradeRequiresHttp1);
+    }
+    if target.canonical_url != contract.origin.as_str()
+        || target.ingress_protocol != ingress_protocol
+        || target.origin_protocol != contract.origin_protocol
+        || !std::sync::Arc::ptr_eq(&target.egress_identity, egress.identity())
+    {
+        return Err(ForwardError::ResolvedTargetMismatch);
+    }
+
+    let execution = execution.begin_connect();
+    let deadlines = execution.deadlines;
+    match (egress.route(), target.route) {
+        (EgressRoute::Direct, ResolvedForwardingRoute::Direct(resolved)) => {
+            let stream = connect_stage(deadlines, destinations.connect(resolved, connector))
+                .await?
+                .into_stream();
+            forward_upgrade_direct(request, contract, egress, stream, intent, execution).await
+        }
+        (
+            EgressRoute::Parent(parent),
+            ResolvedForwardingRoute::Parent {
+                parent_url,
+                destination: resolved,
+            },
+        ) if parent_url == parent.canonical_url() => {
+            let stream = connect_stage(deadlines, destinations.connect(resolved, connector))
+                .await?
+                .into_stream();
+            forward_upgrade_via_parent(request, contract, egress, parent, stream, intent, execution)
+                .await
+        }
+        _ => Err(ForwardError::ResolvedTargetMismatch),
+    }
+}
+
+#[cfg(test)]
+async fn forward_upgrade_with_connector<C, B>(
+    request: PendingForwardRequest<B>,
+    canonical: &CanonicalUrl,
+    egress: &dyn EgressSnapshot,
+    destinations: &DestinationGuard,
+    target: ResolvedForwardingTarget,
+    connector: &C,
+) -> Result<ForwardUpgradeResult, ForwardError>
+where
+    C: DestinationConnector,
+    C::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    B: HttpBody + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    let ingress_protocol = request.ingress_protocol();
+    let contract = ForwardingHeadContract::new(
+        canonical.clone(),
+        egress.route_contract().clone(),
+        egress.origin_tls().select_protocol(ingress_protocol),
+    );
+    forward_upgrade_with_connector_timed(
+        request,
+        egress,
+        destinations,
+        target,
+        connector,
+        ForwardExecutionOptions::new(ForwardingTimeouts::for_test(), None),
+        &contract,
+    )
+    .await
+}
+
+#[cfg(test)]
+async fn forward_upgrade_with_connector_timed_test<C, B>(
+    request: PendingForwardRequest<B>,
     canonical: &CanonicalUrl,
     egress: &dyn EgressSnapshot,
     destinations: &DestinationGuard,
@@ -1388,84 +1548,30 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    let intent = request
-        .upgrade_intent()
-        .cloned()
-        .ok_or(HeaderPreparationError::InvalidUpgrade)?;
-    let selected_origin_protocol = egress.origin_tls().select_protocol(request.protocol());
-    if selected_origin_protocol == HttpProtocol::Http2 {
-        return Err(ForwardError::UpgradeRequiresHttp1);
-    }
-    if target.canonical_url != canonical.as_str()
-        || target.ingress_protocol != request.protocol()
-        || target.origin_protocol != selected_origin_protocol
-        || !std::sync::Arc::ptr_eq(&target.egress_identity, egress.identity())
-    {
-        return Err(ForwardError::ResolvedTargetMismatch);
-    }
-
-    let execution = execution.begin_connect();
-    let deadlines = execution.deadlines;
-    match (egress.route(), target.route) {
-        (EgressRoute::Direct, ResolvedForwardingRoute::Direct(resolved)) => {
-            let stream = connect_stage(deadlines, destinations.connect(resolved, connector))
-                .await?
-                .into_stream();
-            forward_upgrade_direct(request, canonical, egress, stream, intent, execution).await
-        }
-        (
-            EgressRoute::Parent(parent),
-            ResolvedForwardingRoute::Parent {
-                parent_url,
-                destination: resolved,
-            },
-        ) if parent_url == parent.canonical_url() => {
-            let stream = connect_stage(deadlines, destinations.connect(resolved, connector))
-                .await?
-                .into_stream();
-            forward_upgrade_via_parent(
-                request, canonical, egress, parent, stream, intent, execution,
-            )
-            .await
-        }
-        _ => Err(ForwardError::ResolvedTargetMismatch),
-    }
-}
-
-#[cfg(test)]
-async fn forward_upgrade_with_connector<C, B>(
-    request: SanitizedRequest<B>,
-    canonical: &CanonicalUrl,
-    egress: &dyn EgressSnapshot,
-    destinations: &DestinationGuard,
-    target: ResolvedForwardingTarget,
-    connector: &C,
-) -> Result<ForwardUpgradeResult, ForwardError>
-where
-    C: DestinationConnector,
-    C::Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    B: HttpBody + Send + 'static,
-    B::Data: Send,
-    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
+    let ingress_protocol = request.ingress_protocol();
+    let contract = ForwardingHeadContract::new(
+        canonical.clone(),
+        egress.route_contract().clone(),
+        egress.origin_tls().select_protocol(ingress_protocol),
+    );
     forward_upgrade_with_connector_timed(
         request,
-        canonical,
         egress,
         destinations,
         target,
         connector,
-        ForwardExecutionOptions::new(ForwardingTimeouts::for_test(), None),
+        execution,
+        &contract,
     )
     .await
 }
 
 async fn forward_upgrade_direct<S, B>(
-    request: SanitizedRequest<B>,
-    canonical: &CanonicalUrl,
+    request: PendingForwardRequest<B>,
+    contract: &ForwardingHeadContract,
     egress: &dyn EgressSnapshot,
     stream: S,
-    intent: UpgradeIntent,
+    intent: UpgradeProtocol,
     execution: EstablishedForwardExecution,
 ) -> Result<ForwardUpgradeResult, ForwardError>
 where
@@ -1474,6 +1580,8 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    let canonical = &contract.origin;
+    let route = &contract.route;
     let EstablishedForwardExecution {
         deadlines,
         credentials,
@@ -1484,31 +1592,37 @@ where
             connect_origin_tls(stream, canonical, egress, HttpProtocol::Http1),
         )
         .await?;
-        let request = prepare_origin_upgrade_request(
+        send_upgrade_request(
+            stream,
             request,
             canonical,
-            RequestTargetForm::Origin,
-            HttpProtocol::Http1,
-        )?;
-        send_upgrade_request(stream, request, intent, deadlines, credentials).await
+            route,
+            intent,
+            deadlines,
+            credentials,
+        )
+        .await
     } else {
-        let request = prepare_origin_upgrade_request(
+        send_upgrade_request(
+            stream,
             request,
             canonical,
-            RequestTargetForm::Origin,
-            HttpProtocol::Http1,
-        )?;
-        send_upgrade_request(stream, request, intent, deadlines, credentials).await
+            route,
+            intent,
+            deadlines,
+            credentials,
+        )
+        .await
     }
 }
 
 async fn forward_upgrade_via_parent<S, B>(
-    request: SanitizedRequest<B>,
-    canonical: &CanonicalUrl,
+    request: PendingForwardRequest<B>,
+    contract: &ForwardingHeadContract,
     egress: &dyn EgressSnapshot,
     parent: &ParentEndpoint,
     stream: S,
-    intent: UpgradeIntent,
+    intent: UpgradeProtocol,
     execution: EstablishedForwardExecution,
 ) -> Result<ForwardUpgradeResult, ForwardError>
 where
@@ -1517,6 +1631,8 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    let canonical = &contract.origin;
+    let route = &contract.route;
     let EstablishedForwardExecution {
         deadlines,
         credentials,
@@ -1531,13 +1647,16 @@ where
                     connect_origin_tls(tunnel, canonical, egress, HttpProtocol::Http1),
                 )
                 .await?;
-                let request = prepare_origin_upgrade_request(
+                send_upgrade_request(
+                    origin,
                     request,
                     canonical,
-                    RequestTargetForm::Origin,
-                    HttpProtocol::Http1,
-                )?;
-                send_upgrade_request(origin, request, intent, deadlines, credentials).await
+                    route,
+                    intent,
+                    deadlines,
+                    credentials,
+                )
+                .await
             }
             ParentTransport::Https(tls) => {
                 let parent_stream =
@@ -1550,38 +1669,53 @@ where
                     connect_origin_tls(tunnel, canonical, egress, HttpProtocol::Http1),
                 )
                 .await?;
-                let request = prepare_origin_upgrade_request(
+                send_upgrade_request(
+                    origin,
                     request,
                     canonical,
-                    RequestTargetForm::Origin,
-                    HttpProtocol::Http1,
-                )?;
-                send_upgrade_request(origin, request, intent, deadlines, credentials).await
+                    route,
+                    intent,
+                    deadlines,
+                    credentials,
+                )
+                .await
             }
         }
     } else {
-        let request = prepare_origin_upgrade_request(
-            request,
-            canonical,
-            RequestTargetForm::Absolute,
-            HttpProtocol::Http1,
-        )?;
         match parent.transport() {
             ParentTransport::Http => {
-                send_upgrade_request(stream, request, intent, deadlines, credentials).await
+                send_upgrade_request(
+                    stream,
+                    request,
+                    canonical,
+                    route,
+                    intent,
+                    deadlines,
+                    credentials,
+                )
+                .await
             }
             ParentTransport::Https(tls) => {
                 let stream =
                     connect_stage(deadlines, connect_parent_tls(stream, tls, false)).await?;
-                send_upgrade_request(stream, request, intent, deadlines, credentials).await
+                send_upgrade_request(
+                    stream,
+                    request,
+                    canonical,
+                    route,
+                    intent,
+                    deadlines,
+                    credentials,
+                )
+                .await
             }
         }
     }
 }
 
 async fn forward_direct<S, B>(
-    request: SanitizedRequest<B>,
-    canonical: &CanonicalUrl,
+    request: PendingForwardRequest<B>,
+    contract: &ForwardingHeadContract,
     egress: &dyn EgressSnapshot,
     protocol: HttpProtocol,
     stream: S,
@@ -1593,6 +1727,8 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    let canonical = &contract.origin;
+    let route = &contract.route;
     let EstablishedForwardExecution {
         deadlines,
         credentials,
@@ -1603,19 +1739,33 @@ where
             connect_origin_tls(stream, canonical, egress, protocol),
         )
         .await?;
-        let request =
-            prepare_origin_request(request, canonical, RequestTargetForm::Origin, protocol)?;
-        send_request(stream, request, protocol, deadlines, credentials).await
+        send_request(
+            stream,
+            request,
+            canonical,
+            route,
+            protocol,
+            deadlines,
+            credentials,
+        )
+        .await
     } else {
-        let request =
-            prepare_origin_request(request, canonical, RequestTargetForm::Origin, protocol)?;
-        send_request(stream, request, protocol, deadlines, credentials).await
+        send_request(
+            stream,
+            request,
+            canonical,
+            route,
+            protocol,
+            deadlines,
+            credentials,
+        )
+        .await
     }
 }
 
 async fn forward_via_parent<S, B>(
-    request: SanitizedRequest<B>,
-    canonical: &CanonicalUrl,
+    request: PendingForwardRequest<B>,
+    contract: &ForwardingHeadContract,
     egress: &dyn EgressSnapshot,
     parent: &ParentEndpoint,
     protocol: HttpProtocol,
@@ -1628,6 +1778,8 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    let canonical = &contract.origin;
+    let route = &contract.route;
     let EstablishedForwardExecution {
         deadlines,
         credentials,
@@ -1644,13 +1796,16 @@ where
                     connect_origin_tls(tunnel, canonical, egress, protocol),
                 )
                 .await?;
-                let request = prepare_origin_request(
+                send_request(
+                    origin,
                     request,
                     canonical,
-                    RequestTargetForm::Origin,
+                    route,
                     protocol,
-                )?;
-                send_request(origin, request, protocol, deadlines, credentials).await
+                    deadlines,
+                    credentials,
+                )
+                .await
             }
             ParentTransport::Https(tls) => {
                 let parent_stream =
@@ -1663,21 +1818,31 @@ where
                     connect_origin_tls(tunnel, canonical, egress, protocol),
                 )
                 .await?;
-                let request = prepare_origin_request(
+                send_request(
+                    origin,
                     request,
                     canonical,
-                    RequestTargetForm::Origin,
+                    route,
                     protocol,
-                )?;
-                send_request(origin, request, protocol, deadlines, credentials).await
+                    deadlines,
+                    credentials,
+                )
+                .await
             }
         }
     } else {
-        let request =
-            prepare_origin_request(request, canonical, RequestTargetForm::Absolute, protocol)?;
         match parent.transport() {
             ParentTransport::Http => {
-                send_request(stream, request, protocol, deadlines, credentials).await
+                send_request(
+                    stream,
+                    request,
+                    canonical,
+                    route,
+                    protocol,
+                    deadlines,
+                    credentials,
+                )
+                .await
             }
             ParentTransport::Https(tls) => {
                 let stream = connect_stage(
@@ -1685,7 +1850,16 @@ where
                     connect_parent_tls(stream, tls, protocol == HttpProtocol::Http2),
                 )
                 .await?;
-                send_request(stream, request, protocol, deadlines, credentials).await
+                send_request(
+                    stream,
+                    request,
+                    canonical,
+                    route,
+                    protocol,
+                    deadlines,
+                    credentials,
+                )
+                .await
             }
         }
     }
@@ -1739,17 +1913,15 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let authority = canonical.authority().connect_authority();
-    let uri: http::Uri = authority
-        .parse()
-        .map_err(|_| HeaderPreparationError::Target)?;
-    let host = HeaderValue::from_str(authority).map_err(|_| HeaderPreparationError::Authority)?;
+    let uri: http::Uri = authority.parse().map_err(|_| HeaderAdapterError::Target)?;
+    let host = HeaderValue::from_str(authority).map_err(|_| HeaderAdapterError::HeaderValue)?;
     let request = Request::builder()
         .method(Method::CONNECT)
         .version(Version::HTTP_11)
         .uri(uri)
         .header(HOST, host)
         .body(Body::empty())
-        .map_err(|_| HeaderPreparationError::Target)?;
+        .map_err(|_| HeaderAdapterError::Target)?;
 
     let (mut sender, connection) = conn::Builder::new()
         .handshake(stream)
@@ -1893,8 +2065,10 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for UpgradeFlushTrackedIo<S> {
 
 async fn send_upgrade_request<S, B>(
     stream: S,
-    request: Request<B>,
-    intent: UpgradeIntent,
+    request: PendingForwardRequest<B>,
+    canonical: &CanonicalUrl,
+    route: &Route,
+    intent: UpgradeProtocol,
     deadlines: ForwardingDeadlines,
     credentials: Option<ProductCredentialExecution>,
 ) -> Result<ForwardUpgradeResult, ForwardError>
@@ -1904,9 +2078,9 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    let (parts, body) = request.into_parts();
+    let (parts, body, head) = request.into_parts();
     let (body, write_state) = UpgradeRequestBody::new(body);
-    let mut request = Request::from_parts(parts, body);
+    let request = Request::from_parts(*parts, body);
     let stream = UpgradeFlushTrackedIo::new(stream, write_state.clone());
     let (mut sender, connection) = connect_stage(deadlines, async {
         conn::Builder::new()
@@ -1916,6 +2090,11 @@ where
     })
     .await?;
     let driver = DriverTask::spawn(connection);
+    let prepared = prepare_upgrade_request_head(head, canonical, route, HttpProtocol::Http1)
+        .map_err(HeaderAdapterError::from)?;
+    let mut request = apply_prepared_head(request, prepared)?;
+    // Publish secrets only into the final product request. Neutral header
+    // storage has already been consumed and cannot retain credential bytes.
     if let Some(credentials) = credentials {
         if let Err(error) = credentials.finalize(&mut request).await {
             driver.abort_and_join().await;
@@ -1941,7 +2120,7 @@ where
 
     if response.status() != StatusCode::SWITCHING_PROTOCOLS {
         let (mut parts, body) = response.into_parts();
-        strip_response_hop_by_hop(&mut parts.headers);
+        sanitize_product_response_headers(&mut parts.headers)?;
         return Ok(ForwardUpgradeResult::Response(Box::new(
             Response::from_parts(parts, ForwardBody::new(body, driver)),
         )));
@@ -1956,7 +2135,7 @@ where
     }
 
     if let Err(error) =
-        prepare_downstream_upgrade_response(response.status(), response.headers_mut(), &intent)
+        prepare_product_upgrade_response(response.status(), response.headers_mut(), &intent)
     {
         driver.abort_and_join().await;
         return Err(ForwardError::Header(error));
@@ -2050,7 +2229,9 @@ impl<B: HttpBody> HttpBody for UpgradeRequestBody<B> {
 
 async fn send_request<S, B>(
     stream: S,
-    request: Request<B>,
+    request: PendingForwardRequest<B>,
+    canonical: &CanonicalUrl,
+    route: &Route,
     protocol: HttpProtocol,
     deadlines: ForwardingDeadlines,
     credentials: Option<ProductCredentialExecution>,
@@ -2070,7 +2251,13 @@ where
     })
     .await?;
     let driver = DriverTask::spawn(connection);
-    let mut request = request;
+    let (parts, body, head) = request.into_parts();
+    let request = Request::from_parts(*parts, body);
+    let prepared =
+        prepare_request_head(head, canonical, route, protocol).map_err(HeaderAdapterError::from)?;
+    let mut request = apply_prepared_head(request, prepared)?;
+    // Credential finalization is the final mutation before the single send;
+    // secret values never round-trip through neutral HeaderValue storage.
     if let Some(credentials) = credentials {
         if let Err(error) = credentials.finalize(&mut request).await {
             driver.abort_and_join().await;
@@ -2099,7 +2286,7 @@ where
         return Err(ForwardError::UnexpectedInformationalResponse(status));
     }
     let (mut parts, body) = response.into_parts();
-    strip_response_hop_by_hop(&mut parts.headers);
+    sanitize_product_response_headers(&mut parts.headers)?;
     Ok(Response::from_parts(parts, ForwardBody::new(body, driver)))
 }
 
@@ -2249,13 +2436,15 @@ mod tests {
 
     async fn prepare_and_resolve_target<B>(
         canonical: &CanonicalUrl,
-        request: &SanitizedRequest<B>,
+        request: &PendingForwardRequest<B>,
         egress: &dyn EgressSnapshot,
         destinations: &DestinationGuard,
     ) -> Result<ResolvedForwardingTarget, ResolveForwardingError> {
-        let prepared = preflight_forwarding_target(canonical, request, egress, destinations)?;
+        let ingress_protocol = request.ingress_protocol();
         let prepared =
-            prepared.bind_for_request(canonical, request.protocol(), egress, destinations)?;
+            preflight_forwarding_target(canonical, ingress_protocol, egress, destinations)?;
+        let prepared =
+            prepared.bind_for_request(canonical, ingress_protocol, egress, destinations)?;
         resolve_forwarding_target(prepared, destinations).await
     }
 
@@ -2307,11 +2496,11 @@ mod tests {
         .0
     }
 
-    fn request() -> SanitizedRequest {
+    fn request() -> PendingForwardRequest<Body> {
         request_with_version(Version::HTTP_11)
     }
 
-    fn request_with_version(version: Version) -> SanitizedRequest {
+    fn request_with_version(version: Version) -> PendingForwardRequest<Body> {
         let request = Request::builder()
             .method(Method::POST)
             .version(version)
@@ -2324,10 +2513,10 @@ mod tests {
             .header("proxy-authorization", "Basic parent-secret")
             .body(Body::from("request-body"))
             .unwrap();
-        crate::proxy::headers::sanitize_untrusted_request(request).unwrap()
+        crate::proxy::headers::sanitize_product_request(request).unwrap()
     }
 
-    fn upgrade_request() -> SanitizedRequest {
+    fn upgrade_request() -> PendingForwardRequest<Body> {
         let request = Request::builder()
             .method(Method::GET)
             .version(Version::HTTP_11)
@@ -2338,10 +2527,67 @@ mod tests {
             .header("x-private", "remove-me")
             .body(Body::empty())
             .unwrap();
-        crate::proxy::headers::sanitize_untrusted_request(request).unwrap()
+        crate::proxy::headers::sanitize_product_request(request).unwrap()
+    }
+
+    fn request_at_header_field_limit(
+        version: Version,
+        upgrade: bool,
+        credential_fields: usize,
+    ) -> PendingForwardRequest<Body> {
+        let mut request = Request::new(Body::empty());
+        *request.method_mut() = Method::GET;
+        *request.version_mut() = version;
+        *request.uri_mut() = "/limit".parse().unwrap();
+        request
+            .headers_mut()
+            .insert(HOST, HeaderValue::from_static("origin.example"));
+        let fixed_fields = if upgrade {
+            request
+                .headers_mut()
+                .insert(CONNECTION, HeaderValue::from_static("upgrade"));
+            request
+                .headers_mut()
+                .insert(UPGRADE, HeaderValue::from_static("websocket"));
+            3
+        } else {
+            1
+        };
+        let precredential_limit = http_access_runtime::MAX_HEADER_HYGIENE_FIELDS
+            .checked_sub(credential_fields)
+            .unwrap();
+        assert!(fixed_fields <= precredential_limit);
+        for _ in fixed_fields..precredential_limit {
+            request
+                .headers_mut()
+                .append("x-fill", HeaderValue::from_static(""));
+        }
+        crate::proxy::headers::sanitize_product_request(request).unwrap()
+    }
+
+    fn h2_request_at_header_byte_limit() -> PendingForwardRequest<Body> {
+        let host = "origin.example";
+        let fixed_bytes = HOST.as_str().len() + host.len() + "x-fill".len();
+        let fill_bytes = http_access_runtime::MAX_HEADER_HYGIENE_BYTES - fixed_bytes;
+        let mut request = Request::new(Body::empty());
+        *request.method_mut() = Method::GET;
+        *request.version_mut() = Version::HTTP_2;
+        *request.uri_mut() = "/limit".parse().unwrap();
+        request
+            .headers_mut()
+            .insert(HOST, HeaderValue::from_static(host));
+        request.headers_mut().insert(
+            "x-fill",
+            HeaderValue::from_bytes(&vec![b'a'; fill_bytes]).unwrap(),
+        );
+        crate::proxy::headers::sanitize_product_request(request).unwrap()
     }
 
     async fn read_http_head(stream: &mut DuplexStream) -> String {
+        read_http_head_with_limit(stream, 8 * 1024).await
+    }
+
+    async fn read_http_head_with_limit(stream: &mut DuplexStream, limit: usize) -> String {
         let mut head = Vec::new();
         loop {
             let mut byte = [0_u8; 1];
@@ -2350,7 +2596,7 @@ mod tests {
             if head.ends_with(b"\r\n\r\n") {
                 break;
             }
-            assert!(head.len() < 8 * 1024);
+            assert!(head.len() < limit);
         }
         String::from_utf8(head).unwrap()
     }
@@ -2608,8 +2854,12 @@ mod tests {
         let mut request = request_with_version(ingress_version);
         if ingress_version == Version::HTTP_2 {
             request
+                .head
                 .headers_mut()
-                .insert(TE, HeaderValue::from_static("trailers"));
+                .push(http_access_types::HeaderField::new(
+                    http_access_types::HeaderName::new("te").unwrap(),
+                    http_access_types::HeaderValue::new(b"trailers".to_vec()).unwrap(),
+                ));
         }
         let expected_ingress = if ingress_version == Version::HTTP_2 {
             HttpProtocol::Http2
@@ -2719,6 +2969,13 @@ mod tests {
         assert_eq!(bytes, b"upstream-response");
     }
 
+    async fn finish_empty_response(response: ForwardedResponse, status: StatusCode) {
+        assert_eq!(response.status(), status);
+        let mut body = response.into_body();
+        assert!(body.data().await.is_none());
+        assert!(body.trailers().await.unwrap().is_none());
+    }
+
     struct DropSignal(Option<oneshot::Sender<()>>);
 
     impl Drop for DropSignal {
@@ -2798,16 +3055,13 @@ mod tests {
         std::env::set_var(VARIABLE, "upgrade-secret");
         let canonical = canonicalize_http_url("http://origin.example/socket?q=1").unwrap();
         let egress = activate(None);
-        let mut request = upgrade_request();
+        let request = upgrade_request();
         let wire_guard = credential_guard();
-        let (mut credentials, io) = crate::credential_resolver::environment_execution_for_test(
+        let (credentials, io) = crate::credential_resolver::environment_execution_for_test(
             &wire_guard,
             VARIABLE,
             "x-late-token",
         );
-        credentials
-            .reserve_transport(request.headers_mut())
-            .unwrap();
         let (guard, _) = guard();
         let (client, mut server) = tokio::io::duplex(64 * 1024);
         let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
@@ -2829,7 +3083,7 @@ mod tests {
             head
         });
 
-        let result = forward_upgrade_with_connector_timed(
+        let result = forward_upgrade_with_connector_timed_test(
             request,
             &canonical,
             &egress,
@@ -2935,16 +3189,9 @@ mod tests {
                 builder = builder.header(CONTENT_LENGTH, "4");
             }
             let request =
-                crate::proxy::headers::sanitize_untrusted_request(builder.body(body).unwrap())
+                crate::proxy::headers::sanitize_product_request(builder.body(body).unwrap())
                     .unwrap();
-            let intent = request.upgrade_intent().unwrap().clone();
-            let request = prepare_origin_upgrade_request(
-                request,
-                &canonical,
-                RequestTargetForm::Origin,
-                HttpProtocol::Http1,
-            )
-            .unwrap();
+            let intent = request.upgrade_protocol().unwrap().clone();
             let (client, mut server) = tokio::io::duplex(64 * 1024);
             let server = tokio::spawn(async move {
                 let head = read_http_head(&mut server).await.to_ascii_lowercase();
@@ -2975,6 +3222,8 @@ mod tests {
             let result = send_upgrade_request(
                 client,
                 request,
+                &canonical,
+                &Route::Direct,
                 intent,
                 ForwardingTimeouts::for_test().begin_connect(),
                 None,
@@ -3057,16 +3306,9 @@ mod tests {
             .header(CONTENT_LENGTH, "4")
             .body(Body::from("body"))
             .unwrap();
-        let request = crate::proxy::headers::sanitize_untrusted_request(request).unwrap();
-        let intent = request.upgrade_intent().unwrap().clone();
+        let request = crate::proxy::headers::sanitize_product_request(request).unwrap();
+        let intent = request.upgrade_protocol().unwrap().clone();
         let canonical = canonicalize_http_url("http://origin.example/socket").unwrap();
-        let request = prepare_origin_upgrade_request(
-            request,
-            &canonical,
-            RequestTargetForm::Origin,
-            HttpProtocol::Http1,
-        )
-        .unwrap();
         let (client, mut server) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(async move {
             let head = read_http_head(&mut server).await.to_ascii_lowercase();
@@ -3091,6 +3333,8 @@ mod tests {
             send_upgrade_request(
                 FlushPendingIo { inner: client },
                 request,
+                &canonical,
+                &Route::Direct,
                 intent,
                 ForwardingTimeouts::for_test().begin_connect(),
                 None,
@@ -3173,7 +3417,9 @@ mod tests {
         );
         assert!(matches!(
             error,
-            ForwardError::Header(HeaderPreparationError::InvalidUpgrade)
+            ForwardError::Header(HeaderAdapterError::Hygiene(
+                http_access_runtime::HeaderHygieneError::InvalidUpgrade
+            ))
         ));
         server.await.unwrap();
     }
@@ -3241,16 +3487,9 @@ mod tests {
                 _charged_body: charged_body,
             })
             .unwrap();
-        let sanitized = crate::proxy::headers::sanitize_untrusted_request(request).unwrap();
-        let intent = sanitized.upgrade_intent().unwrap().clone();
+        let sanitized = crate::proxy::headers::sanitize_product_request(request).unwrap();
+        let intent = sanitized.upgrade_protocol().unwrap().clone();
         let canonical = canonicalize_http_url("http://origin.example/socket").unwrap();
-        let request = prepare_origin_upgrade_request(
-            sanitized,
-            &canonical,
-            RequestTargetForm::Origin,
-            HttpProtocol::Http1,
-        )
-        .unwrap();
         let (client, mut server) = tokio::io::duplex(64 * 1024);
         let server = tokio::spawn(async move {
             let _ = read_http_head(&mut server).await;
@@ -3281,7 +3520,9 @@ mod tests {
         let error = expect_forward_error(
             send_upgrade_request(
                 client,
-                request,
+                sanitized,
+                &canonical,
+                &Route::Direct,
                 intent,
                 ForwardingTimeouts::for_test().begin_connect(),
                 None,
@@ -3447,12 +3688,17 @@ mod tests {
             let mut byte = [0_u8; 1];
             assert_eq!(server.read(&mut byte).await.unwrap(), 0);
         });
-        let request = Request::builder()
-            .method(Method::GET)
-            .uri("/wait")
-            .header(HOST, "origin.example")
-            .body(Body::empty())
-            .unwrap();
+        let request = crate::proxy::headers::sanitize_product_request(
+            Request::builder()
+                .method(Method::GET)
+                .version(Version::HTTP_11)
+                .uri("/wait")
+                .header(HOST, "origin.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .unwrap();
+        let canonical = canonicalize_http_url("http://origin.example/wait").unwrap();
         let deadlines = ForwardingTimeouts::new(
             Instant::now() + Duration::from_secs(1),
             Duration::from_secs(1),
@@ -3460,7 +3706,16 @@ mod tests {
         )
         .begin_connect();
 
-        let error = match send_request(client, request, HttpProtocol::Http1, deadlines, None).await
+        let error = match send_request(
+            client,
+            request,
+            &canonical,
+            &Route::Direct,
+            HttpProtocol::Http1,
+            deadlines,
+            None,
+        )
+        .await
         {
             Ok(_) => panic!("a missing upstream response head must time out"),
             Err(error) => error,
@@ -3577,6 +3832,10 @@ mod tests {
                 .unwrap();
             let mut trailers = http::HeaderMap::new();
             trailers.insert("x-checksum", HeaderValue::from_static("verified"));
+            trailers.append("x-repeat", HeaderValue::from_static("one"));
+            trailers.append("x-repeat", HeaderValue::from_static("two"));
+            trailers.insert(CONNECTION, HeaderValue::from_static("bad token, x-private"));
+            trailers.insert("x-private", HeaderValue::from_static("remove-me"));
             trailers.insert(
                 "proxy-authenticate",
                 HeaderValue::from_static("Basic realm=parent"),
@@ -3591,6 +3850,13 @@ mod tests {
         assert!(!body.is_end_stream());
         let trailers = body.trailers().await.unwrap().unwrap();
         assert_eq!(trailers["x-checksum"], "verified");
+        assert!(!trailers.contains_key("x-private"));
+        let repeated = trailers
+            .get_all("x-repeat")
+            .iter()
+            .map(|value| value.as_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(repeated, [b"one".as_slice(), b"two".as_slice()]);
         assert!(!trailers.contains_key("proxy-authenticate"));
         assert!(body.is_end_stream());
     }
@@ -3775,16 +4041,13 @@ mod tests {
         std::env::set_var(VARIABLE, "h2-secret");
         let canonical = canonicalize_http_url("http://origin.example:8080/h2-credential").unwrap();
         let egress = activate_with_versions(None, vec![CompiledHttpVersion::Http2]);
-        let mut request = request_with_version(Version::HTTP_2);
+        let request = request_with_version(Version::HTTP_2);
         let wire_guard = credential_guard();
-        let (mut credentials, io) = crate::credential_resolver::environment_execution_for_test(
+        let (credentials, io) = crate::credential_resolver::environment_execution_for_test(
             &wire_guard,
             VARIABLE,
             "x-late-token",
         );
-        credentials
-            .reserve_transport(request.headers_mut())
-            .unwrap();
         let (guard, _) = guard();
         let (client, server) = tokio::io::duplex(64 * 1024);
         let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
@@ -3794,7 +4057,7 @@ mod tests {
             .await
             .unwrap();
 
-        let response = forward_with_connector_timed(
+        let response = forward_with_connector_timed_test(
             request,
             &canonical,
             &egress,
@@ -3821,16 +4084,13 @@ mod tests {
         std::env::remove_var(VARIABLE);
         let canonical = canonicalize_http_url("http://origin.example:8080/h2-missing").unwrap();
         let egress = activate_with_versions(None, vec![CompiledHttpVersion::Http2]);
-        let mut request = request_with_version(Version::HTTP_2);
+        let request = request_with_version(Version::HTTP_2);
         let wire_guard = credential_guard();
-        let (mut credentials, io) = crate::credential_resolver::environment_execution_for_test(
+        let (credentials, io) = crate::credential_resolver::environment_execution_for_test(
             &wire_guard,
             VARIABLE,
             "x-late-token",
         );
-        credentials
-            .reserve_transport(request.headers_mut())
-            .unwrap();
         let (guard, _) = guard();
         let (client, server) = tokio::io::duplex(64 * 1024);
         let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
@@ -3841,7 +4101,7 @@ mod tests {
             .unwrap();
 
         let error = expect_forward_error(
-            forward_with_connector_timed(
+            forward_with_connector_timed_test(
                 request,
                 &canonical,
                 &egress,
@@ -3862,6 +4122,260 @@ mod tests {
         io.shutdown_and_wait(None).await;
     }
 
+    #[tokio::test]
+    async fn h1_late_credential_succeeds_at_exact_final_field_capacity() {
+        const VARIABLE: &str = "ACL_PROXY_H1_EXACT_FIELD_LIMIT_TOKEN";
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        std::env::set_var(VARIABLE, "exact-secret");
+        let canonical = canonicalize_http_url("http://origin.example/exact-limit").unwrap();
+        let egress = activate_with_versions(None, vec![CompiledHttpVersion::Http1]);
+        let request = request_at_header_field_limit(Version::HTTP_11, false, 1);
+        let wire_guard = credential_guard();
+        let (credentials, io) = crate::credential_resolver::environment_execution_for_test(
+            &wire_guard,
+            VARIABLE,
+            "x-late-token",
+        );
+        let (guard, _) = guard();
+        let (client, mut server) = tokio::io::duplex(128 * 1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        let server = tokio::spawn(async move {
+            let head = read_http_head_with_limit(
+                &mut server,
+                http_access_runtime::MAX_HEADER_HYGIENE_BYTES,
+            )
+            .await;
+            server
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            head
+        });
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
+            .await
+            .unwrap();
+
+        let response = forward_with_connector_timed_test(
+            request,
+            &canonical,
+            &egress,
+            &guard,
+            target,
+            &connector,
+            ForwardExecutionOptions::new(ForwardingTimeouts::for_test(), Some(credentials)),
+        )
+        .await
+        .unwrap();
+        finish_empty_response(response, StatusCode::OK).await;
+        let head = server.await.unwrap().to_ascii_lowercase();
+        assert_eq!(
+            head.matches("\r\nx-late-token: exact-secret\r\n").count(),
+            1
+        );
+        io.shutdown_and_wait(None).await;
+        std::env::remove_var(VARIABLE);
+    }
+
+    #[tokio::test]
+    async fn h1_late_credential_field_overflow_emits_no_origin_request() {
+        const VARIABLE: &str = "ACL_PROXY_H1_FIELD_LIMIT_TOKEN";
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        std::env::set_var(VARIABLE, "x");
+        let canonical = canonicalize_http_url("http://origin.example/limit").unwrap();
+        let egress = activate_with_versions(None, vec![CompiledHttpVersion::Http1]);
+        let request = request_at_header_field_limit(Version::HTTP_11, false, 0);
+        let wire_guard = credential_guard();
+        let (credentials, io) = crate::credential_resolver::environment_execution_for_test(
+            &wire_guard,
+            VARIABLE,
+            "x-late-token",
+        );
+        let (guard, _) = guard();
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        let server = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            server.read_to_end(&mut bytes).await.unwrap();
+            assert!(bytes.is_empty(), "field overflow emitted request bytes");
+        });
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
+            .await
+            .unwrap();
+
+        let error = expect_forward_error(
+            forward_with_connector_timed_test(
+                request,
+                &canonical,
+                &egress,
+                &guard,
+                target,
+                &connector,
+                ForwardExecutionOptions::new(ForwardingTimeouts::for_test(), Some(credentials)),
+            )
+            .await,
+            "late credential must reject a field-count overflow",
+        );
+        assert!(matches!(
+            error,
+            ForwardError::Credential(credential_core::CredentialError::ResourceLimit)
+        ));
+        server.await.unwrap();
+        io.shutdown_and_wait(None).await;
+        std::env::remove_var(VARIABLE);
+    }
+
+    #[tokio::test]
+    async fn h2_late_credential_byte_overflow_opens_no_request_stream() {
+        const VARIABLE: &str = "ACL_PROXY_H2_BYTE_LIMIT_TOKEN";
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        std::env::set_var(VARIABLE, "x".repeat(512));
+        let canonical = canonicalize_http_url("http://origin.example:8080/limit").unwrap();
+        let egress = activate_with_versions(None, vec![CompiledHttpVersion::Http2]);
+        let request = h2_request_at_header_byte_limit();
+        let wire_guard = credential_guard();
+        let (credentials, io) = crate::credential_resolver::environment_execution_for_test(
+            &wire_guard,
+            VARIABLE,
+            "x-late-token",
+        );
+        let (guard, _) = guard();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        let (captured_tx, captured_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_h2(server, captured_tx));
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
+            .await
+            .unwrap();
+
+        let error = expect_forward_error(
+            forward_with_connector_timed_test(
+                request,
+                &canonical,
+                &egress,
+                &guard,
+                target,
+                &connector,
+                ForwardExecutionOptions::new(ForwardingTimeouts::for_test(), Some(credentials)),
+            )
+            .await,
+            "late credential must reject a header-byte overflow",
+        );
+        assert!(matches!(
+            error,
+            ForwardError::Credential(credential_core::CredentialError::ResourceLimit)
+        ));
+        assert!(captured_rx.await.is_err());
+        server.await.unwrap();
+        io.shutdown_and_wait(None).await;
+        std::env::remove_var(VARIABLE);
+    }
+
+    #[tokio::test]
+    async fn upgrade_late_credential_succeeds_at_exact_final_field_capacity() {
+        const VARIABLE: &str = "ACL_PROXY_UPGRADE_EXACT_FIELD_LIMIT_TOKEN";
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        std::env::set_var(VARIABLE, "exact-upgrade-secret");
+        let canonical = canonicalize_http_url("http://origin.example/exact-upgrade-limit").unwrap();
+        let egress = activate_with_versions(None, vec![CompiledHttpVersion::Http1]);
+        let request = request_at_header_field_limit(Version::HTTP_11, true, 1);
+        let wire_guard = credential_guard();
+        let (credentials, io) = crate::credential_resolver::environment_execution_for_test(
+            &wire_guard,
+            VARIABLE,
+            "x-late-token",
+        );
+        let (guard, _) = guard();
+        let (client, mut server) = tokio::io::duplex(128 * 1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        let server = tokio::spawn(async move {
+            let head = read_http_head_with_limit(
+                &mut server,
+                http_access_runtime::MAX_HEADER_HYGIENE_BYTES,
+            )
+            .await;
+            server
+                .write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            head
+        });
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
+            .await
+            .unwrap();
+
+        let result = forward_upgrade_with_connector_timed_test(
+            request,
+            &canonical,
+            &egress,
+            &guard,
+            target,
+            &connector,
+            ForwardExecutionOptions::new(ForwardingTimeouts::for_test(), Some(credentials)),
+        )
+        .await
+        .unwrap();
+        let ForwardUpgradeResult::Response(response) = result else {
+            panic!("a non-101 response must remain ordinary");
+        };
+        finish_empty_response(*response, StatusCode::FORBIDDEN).await;
+        let head = server.await.unwrap().to_ascii_lowercase();
+        assert_eq!(
+            head.matches("\r\nx-late-token: exact-upgrade-secret\r\n")
+                .count(),
+            1
+        );
+        io.shutdown_and_wait(None).await;
+        std::env::remove_var(VARIABLE);
+    }
+
+    #[tokio::test]
+    async fn upgrade_late_credential_field_overflow_emits_no_origin_request() {
+        const VARIABLE: &str = "ACL_PROXY_UPGRADE_FIELD_LIMIT_TOKEN";
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        std::env::set_var(VARIABLE, "x");
+        let canonical = canonicalize_http_url("http://origin.example/limit").unwrap();
+        let egress = activate_with_versions(None, vec![CompiledHttpVersion::Http1]);
+        let request = request_at_header_field_limit(Version::HTTP_11, true, 0);
+        let wire_guard = credential_guard();
+        let (credentials, io) = crate::credential_resolver::environment_execution_for_test(
+            &wire_guard,
+            VARIABLE,
+            "x-late-token",
+        );
+        let (guard, _) = guard();
+        let (client, mut server) = tokio::io::duplex(64 * 1024);
+        let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
+        let server = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            server.read_to_end(&mut bytes).await.unwrap();
+            assert!(bytes.is_empty(), "upgrade overflow emitted request bytes");
+        });
+        let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
+            .await
+            .unwrap();
+
+        let error = expect_forward_error(
+            forward_upgrade_with_connector_timed_test(
+                request,
+                &canonical,
+                &egress,
+                &guard,
+                target,
+                &connector,
+                ForwardExecutionOptions::new(ForwardingTimeouts::for_test(), Some(credentials)),
+            )
+            .await,
+            "late credential must reject an upgrade field-count overflow",
+        );
+        assert!(matches!(
+            error,
+            ForwardError::Credential(credential_core::CredentialError::ResourceLimit)
+        ));
+        server.await.unwrap();
+        io.shutdown_and_wait(None).await;
+        std::env::remove_var(VARIABLE);
+    }
+
     #[test]
     fn preflight_binding_rejects_foreign_request_protocol_and_egress_before_resolution() {
         let canonical = canonicalize_http_url("http://origin.example:8080/resource").unwrap();
@@ -3873,11 +4387,12 @@ mod tests {
         let request = request();
 
         let foreign_request =
-            preflight_forwarding_target(&canonical, &request, &egress, &guard).unwrap();
+            preflight_forwarding_target(&canonical, request.ingress_protocol(), &egress, &guard)
+                .unwrap();
         assert!(matches!(
             foreign_request.bind_for_request(
                 &foreign_canonical,
-                request.protocol(),
+                request.ingress_protocol(),
                 &egress,
                 &guard,
             ),
@@ -3885,18 +4400,20 @@ mod tests {
         ));
 
         let foreign_protocol =
-            preflight_forwarding_target(&canonical, &request, &egress, &guard).unwrap();
+            preflight_forwarding_target(&canonical, request.ingress_protocol(), &egress, &guard)
+                .unwrap();
         assert!(matches!(
             foreign_protocol.bind_for_request(&canonical, HttpProtocol::Http2, &egress, &guard,),
             Err(ResolveForwardingError::Binding)
         ));
 
         let foreign_snapshot =
-            preflight_forwarding_target(&canonical, &request, &egress, &guard).unwrap();
+            preflight_forwarding_target(&canonical, request.ingress_protocol(), &egress, &guard)
+                .unwrap();
         assert!(matches!(
             foreign_snapshot.bind_for_request(
                 &canonical,
-                request.protocol(),
+                request.ingress_protocol(),
                 &foreign_egress,
                 &guard,
             ),
@@ -4006,7 +4523,7 @@ mod tests {
                 tokio_stream::wrappers::ReceiverStream::new(body_receiver),
             ))
             .unwrap();
-        let request = crate::proxy::headers::sanitize_untrusted_request(request).unwrap();
+        let request = crate::proxy::headers::sanitize_product_request(request).unwrap();
         let (guard, _) = guard();
         let (client, mut server) = tokio::io::duplex(64 * 1024);
         let connector = FakeConnector::new(CANDIDATE.parse().unwrap(), client);
@@ -4063,13 +4580,14 @@ mod tests {
         let server = tokio::spawn(serve_h1(server, captured_tx));
 
         let request = request();
-        let prepared = preflight_forwarding_target(&canonical, &request, &egress, &guard)
-            .expect("semantic preflight");
+        let prepared =
+            preflight_forwarding_target(&canonical, request.ingress_protocol(), &egress, &guard)
+                .expect("semantic preflight");
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);
         assert_eq!(connector.calls.load(Ordering::SeqCst), 0);
 
         let prepared = prepared
-            .bind_for_request(&canonical, request.protocol(), &egress, &guard)
+            .bind_for_request(&canonical, request.ingress_protocol(), &egress, &guard)
             .unwrap();
         let target = resolve_forwarding_target(prepared, &guard).await.unwrap();
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 1);
@@ -4178,26 +4696,23 @@ mod tests {
         std::env::remove_var(VARIABLE);
         let canonical = canonicalize_http_url("http://origin.example/fail").unwrap();
         let egress = activate(None);
-        let mut request = request();
+        let request = request();
         let (destinations, _) = guard();
         let target = prepare_and_resolve_target(&canonical, &request, &egress, &destinations)
             .await
             .unwrap();
         let wire_guard = credential_guard();
-        let (mut credentials, io) = crate::credential_resolver::environment_execution_for_test(
+        let (credentials, io) = crate::credential_resolver::environment_execution_for_test(
             &wire_guard,
             VARIABLE,
             "x-late-token",
         );
-        credentials
-            .reserve_transport(request.headers_mut())
-            .unwrap();
         let connector = FailingConnector {
             calls: AtomicUsize::new(0),
         };
 
         let error = expect_forward_error(
-            forward_with_connector_timed(
+            forward_with_connector_timed_test(
                 request,
                 &canonical,
                 &egress,
@@ -4236,13 +4751,10 @@ mod tests {
             fs::write(&replacement, expected).unwrap();
             fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
             fs::rename(&replacement, &path).unwrap();
-            let (_wire_guard, (mut credentials, io)) = prepared.remove(0);
+            let (_wire_guard, (credentials, io)) = prepared.remove(0);
             let canonical = canonicalize_http_url("http://origin.example/rotated").unwrap();
             let egress = activate(None);
-            let mut request = request();
-            credentials
-                .reserve_transport(request.headers_mut())
-                .unwrap();
+            let request = request();
             let (destinations, _) = guard();
             let target = prepare_and_resolve_target(&canonical, &request, &egress, &destinations)
                 .await
@@ -4260,7 +4772,7 @@ mod tests {
                     .unwrap();
             });
 
-            let response = forward_with_connector_timed(
+            let response = forward_with_connector_timed_test(
                 request,
                 &canonical,
                 &egress,
@@ -4279,13 +4791,10 @@ mod tests {
         }
 
         fs::remove_file(&path).unwrap();
-        let (_wire_guard, (mut credentials, io)) = prepared.remove(0);
+        let (_wire_guard, (credentials, io)) = prepared.remove(0);
         let canonical = canonicalize_http_url("http://origin.example/missing").unwrap();
         let egress = activate(None);
-        let mut request = request();
-        credentials
-            .reserve_transport(request.headers_mut())
-            .unwrap();
+        let request = request();
         let (destinations, _) = guard();
         let target = prepare_and_resolve_target(&canonical, &request, &egress, &destinations)
             .await
@@ -4299,7 +4808,7 @@ mod tests {
         });
 
         let error = expect_forward_error(
-            forward_with_connector_timed(
+            forward_with_connector_timed_test(
                 request,
                 &canonical,
                 &egress,
@@ -4350,21 +4859,18 @@ mod tests {
             let tls = tls_acceptor(b"http/1.1").accept(server).await.unwrap();
             serve_h1(tls, origin_tx).await;
         });
-        let mut request = request();
+        let request = request();
         let wire_guard = credential_guard();
-        let (mut credentials, io) = crate::credential_resolver::environment_execution_for_test(
+        let (credentials, io) = crate::credential_resolver::environment_execution_for_test(
             &wire_guard,
             VARIABLE,
             "x-late-token",
         );
-        credentials
-            .reserve_transport(request.headers_mut())
-            .unwrap();
         let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
             .await
             .unwrap();
 
-        let response = forward_with_connector_timed(
+        let response = forward_with_connector_timed_test(
             request,
             &canonical,
             &egress,
@@ -4427,22 +4933,19 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let mut request = request();
+        let request = request();
         let wire_guard = credential_guard();
-        let (mut credentials, io) = crate::credential_resolver::environment_execution_for_test(
+        let (credentials, io) = crate::credential_resolver::environment_execution_for_test(
             &wire_guard,
             VARIABLE,
             "x-late-token",
         );
-        credentials
-            .reserve_transport(request.headers_mut())
-            .unwrap();
         let target = prepare_and_resolve_target(&canonical, &request, &egress, &guard)
             .await
             .unwrap();
 
         let error = expect_forward_error(
-            forward_with_connector_timed(
+            forward_with_connector_timed_test(
                 request,
                 &canonical,
                 &egress,
