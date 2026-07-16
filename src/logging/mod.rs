@@ -138,8 +138,25 @@ impl PolicyDecisionLogSink {
 
 #[cfg(not(test))]
 macro_rules! emit_policy_decision {
-    ($level:ident, $record:ident) => {
-        tracing::$level!(
+    (info, $record:ident) => {
+        tracing::info!(
+            target: "acl_proxy::policy",
+            request_id = %$record.request_id,
+            allowed = $record.allowed,
+            url = %$record.url,
+            method = %$record.method,
+            client_ip = %$record.client_ip,
+            generation = %$record.generation,
+            effective_policy = %$record.effective_policy,
+            reason_category = $record.reason_category,
+            reason_code = $record.reason_code,
+            trace_id = %$record.trace_id,
+            sensitive_header_presence = %$record.sensitive_header_presence,
+            "policy decision"
+        )
+    };
+    (warn, $record:ident) => {
+        tracing::warn!(
             target: "acl_proxy::policy",
             request_id = %$record.request_id,
             allowed = $record.allowed,

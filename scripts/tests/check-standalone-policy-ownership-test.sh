@@ -118,11 +118,35 @@ expect_failure "$case_root" 'renamed-facts DecisionProvider caller' \
     'DecisionProvider::decide must have no product production caller'
 
 case_index=$((case_index + 1))
+case_root="$TEST_ROOT/borrowed-decision"
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' 'fn bypass(other: Context, request_facts: &Facts, request: Request) { other.decide(request_facts, request); }' \
+    >>"$case_root/src/proxy/ingress.rs"
+expect_failure "$case_root" 'borrowed-facts DecisionProvider caller' \
+    'DecisionProvider::decide must have no product production caller'
+
+case_index=$((case_index + 1))
 case_root="$TEST_ROOT/ufcs-decision"
 cp -R "$BASELINE" "$case_root"
 printf '%s\n' 'fn bypass(other: Context, request_facts: Facts, request: Request) { DecisionProvider::decide(&other, &request_facts, request); }' \
     >>"$case_root/src/proxy/ingress.rs"
 expect_failure "$case_root" 'UFCS DecisionProvider caller' \
+    'DecisionProvider::decide must have no product production caller'
+
+case_index=$((case_index + 1))
+case_root="$TEST_ROOT/borrowed-ufcs-decision"
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' 'fn bypass(other: Context, request_facts: &Facts, request: Request) { DecisionProvider::decide(&other, request_facts, request); }' \
+    >>"$case_root/src/proxy/ingress.rs"
+expect_failure "$case_root" 'borrowed-facts UFCS DecisionProvider caller' \
+    'DecisionProvider::decide must have no product production caller'
+
+case_index=$((case_index + 1))
+case_root="$TEST_ROOT/aliased-decision"
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' 'fn bypass(other: Context, request_facts: Facts, request: Request) { let call = DecisionProvider::decide; call(&other, &request_facts, request); }' \
+    >>"$case_root/src/proxy/ingress.rs"
+expect_failure "$case_root" 'aliased DecisionProvider caller' \
     'DecisionProvider::decide must have no product production caller'
 
 case_index=$((case_index + 1))
@@ -132,6 +156,14 @@ printf '%s\n' 'macro_rules! bypass { () => { other.decide(&request_facts, reques
     >>"$case_root/src/proxy/ingress.rs"
 expect_failure "$case_root" 'macro DecisionProvider caller' \
     'DecisionProvider::decide must have no product production caller'
+
+case_index=$((case_index + 1))
+case_root="$TEST_ROOT/external-macro-decision"
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' 'fn bypass(other: Context, facts: Facts, request: Request) { external_decision_call!(other, facts, request); }' \
+    >>"$case_root/src/proxy/ingress.rs"
+expect_failure "$case_root" 'unaudited external decision macro' \
+    'production macro is not ownership-audited'
 
 case_index=$((case_index + 1))
 case_root="$TEST_ROOT/obsolete-pipeline"
