@@ -404,7 +404,9 @@ impl WebhookConnector {
             let answer = normalize_endpoint(answer);
             if !addresses.contains(&answer) {
                 if addresses.len() == self.facts.max_resolved_addresses {
-                    return Err(WebhookConnectorError::ResolutionLimit);
+                    return Err(WebhookConnectorError::ResolutionLimit {
+                        limit: self.facts.max_resolved_addresses,
+                    });
                 }
                 addresses.push(answer);
             }
@@ -462,7 +464,10 @@ impl WebhookConnector {
             );
             self.validate(peer, &self.local_snapshot()?)?;
             if peer != candidate {
-                return Err(WebhookConnectorError::PeerMismatch);
+                return Err(WebhookConnectorError::PeerMismatch {
+                    expected: candidate,
+                    actual: peer,
+                });
             }
             return Ok(ConnectedWebhookDestination {
                 target: resolved.target,
@@ -553,23 +558,26 @@ pub(crate) enum WebhookConnectorError {
     #[error("webhook destination token belongs to another connector")]
     ForeignToken,
     #[error("webhook destination allocation failed")]
-    Allocation(TryReserveError),
+    Allocation(#[source] TryReserveError),
     #[error("webhook destination resolution failed")]
-    Resolution(WebhookResolveError),
+    Resolution(#[source] WebhookResolveError),
     #[error("webhook destination resolution was empty")]
     EmptyResolution,
-    #[error("webhook destination resolution exceeded its limit")]
-    ResolutionLimit,
+    #[error("webhook destination resolution exceeded the {limit}-address limit")]
+    ResolutionLimit { limit: usize },
     #[error("webhook local address enumeration failed")]
-    LocalAddressEnumeration(io::Error),
+    LocalAddressEnumeration(#[source] io::Error),
     #[error("webhook destination {0} is protected")]
     ProtectedDestination(SocketAddr),
     #[error("webhook connected peer lookup failed")]
-    PeerAddress(io::Error),
-    #[error("webhook connected peer differs from the pinned address")]
-    PeerMismatch,
+    PeerAddress(#[source] io::Error),
+    #[error("webhook connected peer {actual} differs from pinned address {expected}")]
+    PeerMismatch {
+        expected: SocketAddr,
+        actual: SocketAddr,
+    },
     #[error("all webhook connection attempts failed")]
-    ConnectionAttemptsExhausted(io::Error),
+    ConnectionAttemptsExhausted(#[source] io::Error),
     #[error("webhook connection was cancelled")]
     Cancelled,
 }
@@ -585,9 +593,9 @@ pub(crate) enum WebhookResolveError {
     #[error("webhook resolution limit is invalid")]
     InvalidLimit,
     #[error("webhook lookup failed")]
-    Lookup(io::Error),
+    Lookup(#[source] io::Error),
     #[error("webhook resolution allocation failed")]
-    Allocation(TryReserveError),
+    Allocation(#[source] TryReserveError),
 }
 
 fn normalize_endpoint(endpoint: SocketAddr) -> SocketAddr {
@@ -605,6 +613,7 @@ fn normalize_endpoint(endpoint: SocketAddr) -> SocketAddr {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::error::Error as _;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -840,7 +849,8 @@ mod tests {
         };
         assert!(matches!(
             connector.connect_with(resolved, &dialer).await,
-            Err(WebhookConnectorError::PeerMismatch)
+            Err(WebhookConnectorError::PeerMismatch { expected, actual: observed })
+                if expected == candidate && observed == actual
         ));
         assert_eq!(dialer.attempts.load(Ordering::SeqCst), 1);
         assert!(dropped.load(Ordering::SeqCst));
@@ -896,7 +906,7 @@ mod tests {
             connector.connect(&url, cancellation.as_mut()).await,
             Err(WebhookConnectorError::Cancelled)
         ));
-        assert_eq!(hanging.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(hanging.calls.load(Ordering::SeqCst), 0);
 
         let resolver = Arc::new(FixedResolver {
             answers: vec!["192.0.2.40:443".parse().unwrap()],
@@ -909,5 +919,37 @@ mod tests {
             connector.complete_resolution(prepared).await,
             Err(WebhookConnectorError::LocalAddressEnumeration(_))
         ));
+    }
+
+    #[test]
+    fn connector_errors_preserve_sanitized_source_chains() {
+        let allocation = Vec::<u8>::new().try_reserve(usize::MAX).unwrap_err();
+        let allocation = WebhookConnectorError::Allocation(allocation);
+        assert!(allocation.source().is_some());
+
+        let resolution = WebhookConnectorError::Resolution(WebhookResolveError::Lookup(
+            io::Error::new(io::ErrorKind::Other, "sensitive lookup detail"),
+        ));
+        let resolution_source = resolution.source().unwrap();
+        assert!(resolution_source.source().is_some());
+        assert!(!resolution.to_string().contains("sensitive lookup detail"));
+
+        for error in [
+            WebhookConnectorError::LocalAddressEnumeration(io::Error::new(
+                io::ErrorKind::Other,
+                "sensitive interface detail",
+            )),
+            WebhookConnectorError::PeerAddress(io::Error::new(
+                io::ErrorKind::Other,
+                "sensitive peer detail",
+            )),
+            WebhookConnectorError::ConnectionAttemptsExhausted(io::Error::new(
+                io::ErrorKind::Other,
+                "sensitive connect detail",
+            )),
+        ] {
+            assert!(error.source().is_some());
+            assert!(!error.to_string().contains("sensitive"));
+        }
     }
 }

@@ -197,24 +197,66 @@ for absolute in sorted((root / "src").rglob("*.rs")):
 webhook_connector = dict(sources).get(webhook_connector_path)
 if webhook_connector is None:
     raise SystemExit("authorization webhook connector ownership path is missing")
+webhook_use_bodies = [match.group(1) for match in re.finditer(r"\buse\s+([^;]+);", webhook_connector)]
 webhook_forbidden = {
-    "ordinary destination": r"\bcrate\s*::\s*destination\b",
-    "ordinary egress": r"\bcrate\s*::\s*egress\b",
-    "ordinary forwarding": r"\bcrate\s*::\s*proxy\s*::\s*forward\b",
-    "forwarding plan": r"\bForwardingPlan\b",
-    "credential execution": r"\b(?:ProductCredentialExecution|CredentialResolverSession|TransportCredentialBatch)\b",
+    "ordinary destination": (
+        r"\b(?:crate|super)\s*::[^;\n]*\bdestination\b",
+        r"\bdestination\s*::",
+    ),
+    "ordinary egress": (
+        r"\b(?:crate|super)\s*::[^;\n]*\begress\b",
+        r"\begress\s*::",
+    ),
+    "ordinary forwarding": (
+        r"\b(?:crate|super)\s*::[^;\n]*\bproxy\s*::\s*(?:\{[^}]*\b)?forward(?:ing_executor)?\b",
+        r"\bproxy\s*::\s*(?:\{[^}]*\b)?forward(?:ing_executor)?\b",
+    ),
+    "forwarding plan": (r"\bForwardingPlan\b",),
+    "credential execution": (
+        r"\b(?:ProductCredentialExecution|CredentialResolverSession|TransportCredentialBatch)\b",
+    ),
 }
-webhook_violations = [
-    name
-    for name, pattern in webhook_forbidden.items()
-    if re.search(pattern, webhook_connector)
-]
+webhook_use_forbidden = {
+    "ordinary destination": r"\bdestination\b",
+    "ordinary egress": r"\begress\b",
+    "ordinary forwarding": r"\bproxy\b[\s\S]*\bforward(?:ing_executor)?\b",
+}
+webhook_violations = []
+for name, patterns in webhook_forbidden.items():
+    if any(re.search(pattern, webhook_connector) for pattern in patterns):
+        webhook_violations.append(name)
+        continue
+    use_pattern = webhook_use_forbidden.get(name)
+    if use_pattern is not None and any(
+        re.search(use_pattern, body) for body in webhook_use_bodies
+    ):
+        webhook_violations.append(name)
 if webhook_violations:
     print(
         "authorization webhook connector must remain independent of ordinary forwarding ownership",
         file=sys.stderr,
     )
     print("forbidden dependencies: " + ", ".join(webhook_violations), file=sys.stderr)
+    raise SystemExit(1)
+
+ordinary_webhook_references = []
+for path, source in sources:
+    ordinary_owner = (
+        path == pathlib.Path("src/destination/mod.rs")
+        or path == pathlib.Path("src/egress.rs")
+        or path.parts[:2] == ("src", "proxy")
+    )
+    if ordinary_owner and re.search(
+        r"\b(?:WebhookConnector|authorization\s*::\s*webhook\s*::\s*connector)\b",
+        source,
+    ):
+        ordinary_webhook_references.append(str(path))
+if ordinary_webhook_references:
+    print(
+        "ordinary destination and forwarding owners must not reference the authorization webhook connector",
+        file=sys.stderr,
+    )
+    print("escaped references: " + ", ".join(ordinary_webhook_references), file=sys.stderr)
     raise SystemExit(1)
 
 executor = dict(sources)[executor_path]

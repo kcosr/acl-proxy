@@ -123,8 +123,13 @@ expect_failure() {
 case_index=0
 for dependency in \
     'use crate::destination::DestinationGuard;' \
+    'use crate::{config::StaticProductConfig, destination::DestinationGuard};' \
+    'use crate::{destination::{DestinationGuard}};' \
+    'fn escaped(_: crate::destination::DestinationGuard) {}' \
     'use crate::egress::EgressSnapshot;' \
+    'use crate::{config::StaticProductConfig, egress::EgressSnapshot};' \
     'use crate::proxy::forward::forward_request;' \
+    'use crate::{proxy::{forward::forward_request}};' \
     'fn escaped(_: ForwardingPlan) {}' \
     'fn escaped(_: ProductCredentialExecution) {}'
 do
@@ -134,6 +139,27 @@ do
     printf '%s\n' "$dependency" >>"$case_root/src/authorization/webhook/connector.rs"
     expect_failure "$case_root" "webhook connector dependency $dependency" \
         'authorization webhook connector must remain independent of ordinary forwarding ownership'
+done
+
+case_root="$TEST_ROOT/webhook-ownership-$case_index"
+case_index=$((case_index + 1))
+cp -R "$BASELINE" "$case_root"
+printf '%s\n' 'use crate::{' '    config::StaticProductConfig,' '    destination,' '};' \
+    >>"$case_root/src/authorization/webhook/connector.rs"
+expect_failure "$case_root" 'multiline grouped webhook destination import' \
+    'authorization webhook connector must remain independent of ordinary forwarding ownership'
+
+for reference in \
+    'use crate::authorization::webhook::connector::WebhookConnector;' \
+    'use crate::{authorization::webhook::connector::WebhookConnector};' \
+    'fn escaped(_: crate::authorization::webhook::connector::WebhookConnector) {}'
+do
+    case_root="$TEST_ROOT/webhook-reverse-ownership-$case_index"
+    case_index=$((case_index + 1))
+    cp -R "$BASELINE" "$case_root"
+    printf '%s\n' "$reference" >>"$case_root/src/proxy/forward.rs"
+    expect_failure "$case_root" "ordinary forwarding webhook reference $reference" \
+        'ordinary destination and forwarding owners must not reference the authorization webhook connector'
 done
 
 forbidden_mutations=(

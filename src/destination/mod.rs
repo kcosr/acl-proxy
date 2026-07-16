@@ -485,13 +485,6 @@ impl DestinationGuard {
         })
     }
 
-    pub(crate) async fn connect_system(
-        &self,
-        resolved: ResolvedDestination,
-    ) -> Result<ConnectedDestination<tokio::net::TcpStream>, DestinationGuardError> {
-        self.connect(resolved, &TcpDestinationConnector).await
-    }
-
     fn local_snapshot(&self) -> Result<LocalAddressSnapshot, DestinationGuardError> {
         self.local_addresses
             .snapshot()
