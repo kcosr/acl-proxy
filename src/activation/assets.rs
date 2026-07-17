@@ -130,7 +130,7 @@ fn forwarding_network_facts(
         .map_err(|_| ForwardingNetworkError::InvalidFacts)?;
     let reserved_control_base_path = reserved_control_url
         .as_ref()
-        .and_then(|_| config.control.as_ref())
+        .and(config.control.as_ref())
         .map(|control| control.base_path.clone());
 
     ForwardingNetworkFacts::new(
