@@ -33,13 +33,17 @@ use http_access_runtime::{
 fn adapter(mut parts: Parts, executor: Executor, dispatch: Dispatch, resources: Resources) {
     let h2_stream = parts.extensions.remove::<H2StreamCancellation>();
     let outcome = executor.execute(dispatch.exchange, dispatch.resolved, resources);
+    complete_empty_h1_response(&mut empty_body);
     let body = ProxyResponseBody::forwarded(
         body,
         Arc::clone(&observation),
         h2_stream,
         downstream_supports_trailers,
+        h1_content_length,
     );
 }
+
+fn complete_empty_h1_response(body: &mut Body) {}
 
 // AppState ProductConfig ForwardingExecutor forward_request TcpStream::connect(endpoint)
 /* nested /* ForwardingOutcome */ HttpsConnector */
@@ -65,6 +69,30 @@ fn execute_request_via_pipeline(mut request: Request) {
     if let Some(h2_stream) = H2StreamCancellation::current() {
         request.extensions_mut().insert(h2_stream);
     }
+}
+
+struct ForwardedState {
+    h1_remaining: Option<u64>,
+    pending_h1_final: Option<Chunk>,
+    h1_source_done: bool,
+}
+
+fn forwarded(h1_content_length: Option<u64>) -> ForwardedState {
+    ForwardedState {
+        h1_remaining: h1_content_length,
+        pending_h1_final: None,
+        h1_source_done: false,
+    }
+}
+
+fn poll_forwarded_h1_eof() {}
+fn poll_forwarded_h1_fixed_final() {}
+
+fn poll_forwarded_data() {
+    poll_forwarded_h1_eof();
+    poll_forwarded_h1_eof();
+    poll_forwarded_h1_fixed_final();
+    poll_forwarded_h1_fixed_final();
 }
 
 fn retained_listener() {
@@ -307,7 +335,45 @@ new_case
 sed -i 's/        h2_stream,/        None,/' \
     "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
 expect_failure "$CASE_ROOT" 'missing response-lifetime H2 transfer' \
-    'adapter H2 response-lifetime transfer ownership violation'
+    'adapter response-lifetime capability transfer ownership violation'
+
+new_case
+sed -i 's/        h1_content_length,/        None,/' \
+    "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'missing H1 completion-length transfer' \
+    'adapter response-lifetime capability transfer ownership violation'
+
+new_case
+sed -i 's/h1_remaining: h1_content_length/h1_remaining: None/' \
+    "$CASE_ROOT/src/proxy/ingress.rs"
+expect_failure "$CASE_ROOT" 'detached H1 completion-length binding' \
+    'ingress H1 content-length completion binding ownership violation'
+
+new_case
+sed -i '/^fn poll_forwarded_h1_eof() {}$/d' "$CASE_ROOT/src/proxy/ingress.rs"
+expect_failure "$CASE_ROOT" 'missing H1 EOF completion owner' \
+    'ingress poll_forwarded_h1_eof completion owner ownership violation'
+
+new_case
+sed -i '/^fn poll_forwarded_h1_fixed_final() {}$/d' "$CASE_ROOT/src/proxy/ingress.rs"
+expect_failure "$CASE_ROOT" 'missing H1 fixed-length completion owner' \
+    'ingress poll_forwarded_h1_fixed_final completion owner ownership violation'
+
+new_case
+printf '%s\n' 'fn escaped() { let _ = pending_h1_final; }' >"$CASE_ROOT/src/bypass.rs"
+expect_failure "$CASE_ROOT" 'escaped H1 completion state' \
+    'H1 response completion state pending_h1_final must remain confined non-vacuously to ingress.rs'
+
+new_case
+sed -i '/    complete_empty_h1_response(&mut empty_body);/d' \
+    "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'missing empty-H1 completion call' \
+    'adapter empty-H1 completion owner ownership violation'
+
+new_case
+printf '%s\n' 'fn complete_empty_h1_response() {}' >"$CASE_ROOT/src/bypass.rs"
+expect_failure "$CASE_ROOT" 'escaped empty-H1 completion owner' \
+    'adapter empty-H1 completion owner ownership violation'
 
 for primitive in \
     'forward_request(request);' \

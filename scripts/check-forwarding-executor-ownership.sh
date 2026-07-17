@@ -476,14 +476,51 @@ require_exact_locations(
 h2_response_transfer = re.compile(
     r"ProxyResponseBody\s*::\s*forwarded\s*\(\s*body\s*,"
     r"\s*Arc\s*::\s*clone\s*\(\s*&\s*observation\s*\)\s*,\s*h2_stream\s*,"
-    r"\s*downstream_supports_trailers\s*,?\s*\)"
+    r"\s*downstream_supports_trailers\s*,\s*h1_content_length\s*,?\s*\)"
 )
 require_exact_locations(
-    "adapter H2 response-lifetime transfer",
+    "adapter response-lifetime capability transfer",
     locations(sources, h2_response_transfer),
     {adapter_path},
     1,
 )
+
+h1_length_binding = re.compile(r"\bh1_remaining\s*:\s*h1_content_length\b")
+require_exact_locations(
+    "ingress H1 content-length completion binding",
+    locations(sources, h1_length_binding),
+    {ingress_path},
+    1,
+)
+
+for helper in ("poll_forwarded_h1_eof", "poll_forwarded_h1_fixed_final"):
+    require_exact_locations(
+        f"ingress {helper} completion owner",
+        locations(sources, re.compile(rf"\b{helper}\b")),
+        {ingress_path},
+        3,
+    )
+
+require_exact_locations(
+    "adapter empty-H1 completion owner",
+    locations(sources, re.compile(r"\bcomplete_empty_h1_response\b")),
+    {adapter_path},
+    2,
+)
+
+for state_name in ("h1_remaining", "pending_h1_final", "h1_source_done"):
+    state_locations = locations(sources, re.compile(rf"\b{state_name}\b"))
+    if not state_locations or any(path != ingress_path for path, _, _ in state_locations):
+        print(
+            f"H1 response completion state {state_name} must remain confined non-vacuously to ingress.rs",
+            file=sys.stderr,
+        )
+        print(
+            "locations: "
+            + (", ".join(f"{path}:{line}" for path, line, _ in state_locations) or "none"),
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
 
 private_forwarding_symbols = re.compile(
     r"\b(?:forward_request|forward_upgrade_request|DestinationGuard|DestinationConnector|StandaloneBody)\b"
