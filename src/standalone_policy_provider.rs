@@ -9,8 +9,9 @@ use http_access_policy_acl::{
 };
 use http_access_runtime::{
     BodyBounds, BodyBudget, BodyBudgetActivation, BoxFuture, Clock, DecisionProvider,
-    ProviderOutcome, RequestPipelineError, RuntimeBody, RuntimeRequest, RuntimeResponse,
-    StandaloneDispatch, StandaloneExchange,
+    ForwardingCancellation, ForwardingNetworkGuard, ForwardingTargetPreflight,
+    PreparedForwardingTarget, ProviderOutcome, RequestPipelineError, ResolvedForwardingTarget,
+    RuntimeBody, RuntimeRequest, RuntimeResponse, StandaloneDispatch, StandaloneExchange,
 };
 use http_access_types::{
     BodyFraming, BodyObservation, BodyObservationState, BodyRepresentation, DecisionAuditFacts,
@@ -31,15 +32,10 @@ use crate::config::compiler::{
 };
 use crate::credential_resolver::ProductCredentialPreparation;
 use crate::credentials::InboundCredentials;
-use crate::destination::DestinationGuard;
 use crate::http_body::{read_mandatory_runtime_request_body, HttpBodyReadError};
 use crate::observation::{DecisionSubmissionTarget, PendingDecisionSubmission};
 use crate::policy::{HttpWireBodyPlanIndex, ProductRuleEffectsRef};
 use crate::proxy::facts::{FactsError, SanitizedStandaloneIngress, ValidatedStandaloneIngress};
-use crate::proxy::forward::{
-    resolve_forwarding_target, PreflightForwardingTarget, PreparedForwardingTarget,
-    ResolvedForwardingTarget,
-};
 use crate::runtime::{
     AuthorizationInvocationMode, ForwardingGenerationServices, GenerationLease,
     GenerationRetention, ProviderIndex,
@@ -110,8 +106,9 @@ pub(crate) struct StandaloneProviderInput {
     pub(crate) peer_ip: IpAddr,
     pub(crate) quota_key: WireBodyQuotaKey,
     pub(crate) started_at: Instant,
-    pub(crate) preflight_target: PreflightForwardingTarget,
-    pub(crate) destinations: Arc<DestinationGuard>,
+    pub(crate) preflight_target: ForwardingTargetPreflight,
+    pub(crate) network: Arc<ForwardingNetworkGuard>,
+    pub(crate) cancellation: ProductForwardingCancellation,
     pub(crate) clock: Arc<TokioRuntimeClock>,
     pub(crate) listener_denied: bool,
     pub(crate) decision_target: DecisionSubmissionTarget,
@@ -189,7 +186,8 @@ struct PreparedTerminalState {
     request_id: String,
     quota_key: WireBodyQuotaKey,
     deadline: Instant,
-    destinations: Arc<DestinationGuard>,
+    network: Arc<ForwardingNetworkGuard>,
+    cancellation: ProductForwardingCancellation,
     transport: StandaloneIngressTransport,
 }
 
@@ -199,8 +197,8 @@ struct PreparedDispatch {
     quota_key: WireBodyQuotaKey,
     retention: GenerationRetention,
     deadline: Instant,
-    destinations: Arc<DestinationGuard>,
     resolved: ResolvedForwardingTarget,
+    cancellation: ProductForwardingCancellation,
     sidecar: StandaloneRequestSidecar,
     credentials: Option<ProductCredentialPreparation>,
     transport: StandaloneIngressTransport,
@@ -261,12 +259,34 @@ pub(crate) struct StandaloneForwardDispatch {
     pub(crate) quota_key: WireBodyQuotaKey,
     pub(crate) retention: GenerationRetention,
     pub(crate) deadline: Instant,
-    pub(crate) destinations: Arc<DestinationGuard>,
     pub(crate) resolved: ResolvedForwardingTarget,
+    pub(crate) cancellation: ProductForwardingCancellation,
     pub(crate) sidecar: StandaloneRequestSidecar,
     pub(crate) credentials: Option<ProductCredentialPreparation>,
     pub(crate) transport: StandaloneIngressTransport,
     pub(crate) decision: PendingDecisionSubmission,
+}
+
+pub(crate) struct ProductForwardingCancellation {
+    capability: ForwardingCancellation,
+}
+
+impl ProductForwardingCancellation {
+    pub(crate) fn new() -> Self {
+        Self {
+            capability: ForwardingCancellation::new(),
+        }
+    }
+
+    pub(crate) fn capability(&self) -> ForwardingCancellation {
+        self.capability.clone()
+    }
+}
+
+impl Drop for ProductForwardingCancellation {
+    fn drop(&mut self) {
+        self.capability.cancel();
+    }
 }
 
 struct DecisionAuditContext {
@@ -395,16 +415,6 @@ where
             sensitive_headers,
         )
         .map_err(|_| StandaloneProviderPrepareError::HeaderFacts)?;
-        let prepared_target = input
-            .preflight_target
-            .bind_for_request(
-                facts.url(),
-                transport_protocol,
-                lease.egress(),
-                &input.destinations,
-            )
-            .map_err(|_| StandaloneProviderPrepareError::Target)?;
-
         let evaluation_input = EvaluationInput::new(
             &facts,
             input.peer_ip,
@@ -504,6 +514,17 @@ where
             body,
             absolute_deadline_millis,
         )?;
+        let prepared_target = input
+            .preflight_target
+            .bind_for_request(
+                &request,
+                lease
+                    .standalone()
+                    .origin_protocol(request.facts().version()),
+                lease.standalone().route(),
+                &input.network,
+            )
+            .map_err(|_| StandaloneProviderPrepareError::Target)?;
         if request.binding()? != initial_binding
             || request.body_observation()?.state() != BodyObservationState::Unobserved
         {
@@ -532,7 +553,8 @@ where
                 request_id: input.request_id.clone(),
                 quota_key: input.quota_key.clone(),
                 deadline,
-                destinations: input.destinations,
+                network: input.network,
+                cancellation: input.cancellation,
                 transport,
             }),
             initial_binding,
@@ -600,18 +622,18 @@ where
             return Err(504);
         }
 
-        let resolution = tokio::time::timeout_at(
-            deadline,
-            resolve_forwarding_target(state.prepared_target, &terminal.destinations),
-        )
-        .await;
+        let resolution = terminal
+            .network
+            .resolve(state.prepared_target, &terminal.cancellation.capability)
+            .await;
         if Instant::now() >= deadline {
             return Err(504);
         }
         let resolved = match resolution {
-            Ok(Ok(resolved)) => resolved,
-            Ok(Err(_)) => return Err(403),
-            Err(_) => return Err(504),
+            Ok(resolved) => resolved,
+            Err(http_access_runtime::ForwardingNetworkError::DeadlineExceeded) => return Err(504),
+            Err(http_access_runtime::ForwardingNetworkError::Cancelled) => return Err(503),
+            Err(_) => return Err(403),
         };
 
         let admission = generation
@@ -632,7 +654,7 @@ where
             .map_err(|_| 500_u16)?;
         state
             .body_source_activation
-            .activate(&guard, staging)
+            .activate(guard.clone(), replay_lease, staging)
             .map_err(|_| 500_u16)?;
 
         let content_type = state
@@ -697,7 +719,6 @@ where
                         allow_mode,
                         inspected_body,
                         guard,
-                        replay_lease,
                         request,
                     )
                     .map_err(adapter_error_status)?;
@@ -885,7 +906,6 @@ where
                                     allow_mode,
                                     inspected_body,
                                     guard,
-                                    replay_lease,
                                     request,
                                 ) {
                                     Ok(allowed) => allowed,
@@ -978,8 +998,8 @@ where
             quota_key: terminal.quota_key,
             retention,
             deadline: terminal.deadline,
-            destinations: terminal.destinations,
             resolved,
+            cancellation: terminal.cancellation,
             sidecar,
             credentials,
             transport: terminal.transport,
@@ -1209,8 +1229,8 @@ where
             quota_key: dispatch.quota_key,
             retention: dispatch.retention,
             deadline: dispatch.deadline,
-            destinations: dispatch.destinations,
             resolved: dispatch.resolved,
+            cancellation: dispatch.cancellation,
             sidecar: dispatch.sidecar,
             credentials: dispatch.credentials,
             transport: dispatch.transport,
@@ -1438,18 +1458,13 @@ mod tests {
     use crate::authorization::webhook::runtime::WebhookAuthorizationRuntime;
     use crate::config::{compile_config_text, CompiledConfig, ConfigTextInput};
     use crate::control::callback::handle_callback_entity;
-    use crate::destination::{
-        DestinationFacts, DestinationResolver, LocalAddressSnapshot, LocalAddressSource,
-        ResolveFuture,
-    };
     use crate::proxy::facts::{
         validate_standalone_connect_ingress_request, validate_standalone_ingress_request,
     };
-    use crate::proxy::forward::preflight_forwarding_target;
     use crate::runtime::{
         ActivationCancellation, CandidateSource, Runtime, RuntimeError, StaticOwnership,
     };
-    use http_access_runtime::RequestPipeline;
+    use http_access_runtime::{ForwardingDevHarness, ForwardingNetworkFacts, RequestPipeline};
 
     const CONFIG_PREFIX: &str = r#"schema_version = 3
 
@@ -1494,18 +1509,6 @@ header = "x-test-loop"
         calls: Arc<AtomicUsize>,
     }
 
-    impl DestinationResolver for FixedResolver {
-        fn resolve(&self, _host: &str, port: u16, _max_addresses: usize) -> ResolveFuture<'_> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move {
-                Ok(vec![SocketAddr::new(
-                    Ipv4Addr::new(203, 0, 113, 10).into(),
-                    port,
-                )])
-            })
-        }
-    }
-
     impl WebhookResolver for FixedResolver {
         fn resolve(&self, _host: &str, port: u16, _max: usize) -> WebhookResolveFuture<'_> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -1522,18 +1525,6 @@ header = "x-test-loop"
         calls: Arc<AtomicUsize>,
     }
 
-    impl DestinationResolver for WebhookTestResolver {
-        fn resolve(&self, host: &str, port: u16, _max_addresses: usize) -> ResolveFuture<'_> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let address = if host == "127.0.0.1" {
-                Ipv4Addr::LOCALHOST
-            } else {
-                Ipv4Addr::new(203, 0, 113, 10)
-            };
-            Box::pin(async move { Ok(vec![SocketAddr::new(address.into(), port)]) })
-        }
-    }
-
     impl WebhookResolver for WebhookTestResolver {
         fn resolve(&self, host: &str, port: u16, _max: usize) -> WebhookResolveFuture<'_> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -1547,12 +1538,6 @@ header = "x-test-loop"
     }
 
     struct NoLocalAddresses;
-
-    impl LocalAddressSource for NoLocalAddresses {
-        fn snapshot(&self) -> io::Result<LocalAddressSnapshot> {
-            Ok(LocalAddressSnapshot::default())
-        }
-    }
 
     impl WebhookLocalAddressSource for NoLocalAddresses {
         fn snapshot(&self) -> io::Result<WebhookLocalAddressSnapshot> {
@@ -1823,17 +1808,43 @@ header = "x-test-loop"
             .unwrap()
     }
 
+    fn forwarding_network() -> Arc<ForwardingNetworkGuard> {
+        let http_target = http_access_url::canonicalize_http_url(
+            "http://standalone-provider.example.test/resource",
+        )
+        .unwrap();
+        let https_target =
+            http_access_url::canonicalize_http_url("https://standalone-provider.example.test/")
+                .unwrap();
+        let facts =
+            ForwardingNetworkFacts::new(vec!["127.0.0.1:8881".parse().unwrap()], None, None, None)
+                .unwrap();
+        let guard = ForwardingDevHarness::new(facts)
+            .map_prebound(
+                &http_target,
+                SocketAddr::new(Ipv4Addr::new(203, 0, 113, 10).into(), 80),
+            )
+            .unwrap()
+            .map_prebound(
+                &https_target,
+                SocketAddr::new(Ipv4Addr::new(203, 0, 113, 10).into(), 443),
+            )
+            .unwrap()
+            .into_standalone_guard();
+        Arc::new(guard)
+    }
+
     async fn runtime(
         default: &str,
         resolver_calls: Arc<AtomicUsize>,
-    ) -> (Arc<Runtime>, Arc<DestinationGuard>) {
+    ) -> (Arc<Runtime>, Arc<ForwardingNetworkGuard>) {
         runtime_from(compiled(default), resolver_calls).await
     }
 
     async fn runtime_with_allow_observation(
         default: &str,
         resolver_calls: Arc<AtomicUsize>,
-    ) -> (Arc<Runtime>, Arc<DestinationGuard>) {
+    ) -> (Arc<Runtime>, Arc<ForwardingNetworkGuard>) {
         runtime_from(
             compiled_text(&format!(
                 "[policy]\ndefault = \"{default}\"\n\n[observation.logging.policy_decisions]\nallows = true\n"
@@ -1846,10 +1857,9 @@ header = "x-test-loop"
     async fn runtime_from(
         initial: CompiledConfig,
         resolver_calls: Arc<AtomicUsize>,
-    ) -> (Arc<Runtime>, Arc<DestinationGuard>) {
-        let (runtime, destinations, _) =
-            runtime_from_with_authorization(initial, resolver_calls).await;
-        (runtime, destinations)
+    ) -> (Arc<Runtime>, Arc<ForwardingNetworkGuard>) {
+        let (runtime, network, _) = runtime_from_with_authorization(initial, resolver_calls).await;
+        (runtime, network)
     }
 
     async fn runtime_from_with_authorization(
@@ -1857,7 +1867,7 @@ header = "x-test-loop"
         resolver_calls: Arc<AtomicUsize>,
     ) -> (
         Arc<Runtime>,
-        Arc<DestinationGuard>,
+        Arc<ForwardingNetworkGuard>,
         Arc<WebhookAuthorizationRuntime>,
     ) {
         runtime_from_with_authorization_and_resolver(
@@ -1874,18 +1884,13 @@ header = "x-test-loop"
         resolver: Arc<R>,
     ) -> (
         Arc<Runtime>,
-        Arc<DestinationGuard>,
+        Arc<ForwardingNetworkGuard>,
         Arc<WebhookAuthorizationRuntime>,
     )
     where
-        R: DestinationResolver + WebhookResolver + 'static,
+        R: WebhookResolver + 'static,
     {
-        let facts = DestinationFacts::from_static(&initial.static_config).unwrap();
-        let destinations = Arc::new(DestinationGuard::with_sources(
-            facts,
-            resolver.clone(),
-            Arc::new(NoLocalAddresses),
-        ));
+        let network = forwarding_network();
         let webhook_connector = Arc::new(WebhookConnector::with_sources(
             WebhookDestinationFacts::from_static(&initial.static_config).unwrap(),
             resolver,
@@ -1893,7 +1898,7 @@ header = "x-test-loop"
         ));
         let resources = ProductStaticResources::try_new_with_connectors(
             &initial.static_config,
-            destinations.clone(),
+            network.clone(),
             webhook_connector,
         )
         .unwrap();
@@ -1908,7 +1913,7 @@ header = "x-test-loop"
             .await
             .unwrap();
         runtime.start(initial).await.unwrap();
-        (runtime, destinations, authorization)
+        (runtime, network, authorization)
     }
 
     #[cfg(unix)]
@@ -2207,7 +2212,7 @@ done
 
     fn prepared_input(
         lease: &GenerationLease,
-        destinations: Arc<DestinationGuard>,
+        network: Arc<ForwardingNetworkGuard>,
         body: Body,
         extra_headers: &[(&str, &str)],
     ) -> StandaloneProviderInput {
@@ -2224,12 +2229,12 @@ done
                 http::HeaderValue::from_str(value).unwrap(),
             );
         }
-        prepared_input_from_request(lease, destinations, request)
+        prepared_input_from_request(lease, network, request)
     }
 
     fn prepared_input_from_request(
         lease: &GenerationLease,
-        destinations: Arc<DestinationGuard>,
+        network: Arc<ForwardingNetworkGuard>,
         request: Request<Body>,
     ) -> StandaloneProviderInput {
         let canonical = http_access_url::canonicalize_http_url(
@@ -2243,13 +2248,18 @@ done
             request,
         )
         .unwrap();
-        let preflight_target = preflight_forwarding_target(
-            &canonical,
-            validated.ingress().protocol(),
-            lease.egress(),
-            &destinations,
-        )
-        .unwrap();
+        let ingress_protocol = validated.ingress().protocol();
+        let preflight_target = network
+            .preflight(
+                &canonical,
+                ingress_protocol,
+                lease.standalone().origin_protocol(match ingress_protocol {
+                    HttpProtocol::Http1 => HttpVersion::Http11,
+                    HttpProtocol::Http2 => HttpVersion::Http2,
+                }),
+                lease.standalone().route(),
+            )
+            .unwrap();
         let peer_ip = "192.0.2.10".parse().unwrap();
         let started_at = Instant::now();
         StandaloneProviderInput {
@@ -2259,7 +2269,8 @@ done
             quota_key: WireBodyQuotaKey::from_peer(peer_ip, |_| false),
             started_at,
             preflight_target,
-            destinations,
+            network,
+            cancellation: ProductForwardingCancellation::new(),
             clock: TokioRuntimeClock::new(started_at),
             listener_denied: false,
             decision_target: DecisionSubmissionTarget::Disabled,
@@ -2268,7 +2279,7 @@ done
 
     fn prepared_connect_input(
         lease: &GenerationLease,
-        destinations: Arc<DestinationGuard>,
+        network: Arc<ForwardingNetworkGuard>,
     ) -> StandaloneProviderInput {
         let canonical =
             http_access_url::canonicalize_http_url("https://standalone-provider.example.test/")
@@ -2287,13 +2298,18 @@ done
             request,
         )
         .unwrap();
-        let preflight_target = preflight_forwarding_target(
-            &canonical,
-            validated.ingress().protocol(),
-            lease.egress(),
-            &destinations,
-        )
-        .unwrap();
+        let ingress_protocol = validated.ingress().protocol();
+        let preflight_target = network
+            .preflight(
+                &canonical,
+                ingress_protocol,
+                lease.standalone().origin_protocol(match ingress_protocol {
+                    HttpProtocol::Http1 => HttpVersion::Http11,
+                    HttpProtocol::Http2 => HttpVersion::Http2,
+                }),
+                lease.standalone().route(),
+            )
+            .unwrap();
         let peer_ip = "192.0.2.10".parse().unwrap();
         let started_at = Instant::now();
         StandaloneProviderInput {
@@ -2303,7 +2319,8 @@ done
             quota_key: WireBodyQuotaKey::from_peer(peer_ip, |_| false),
             started_at,
             preflight_target,
-            destinations,
+            network,
+            cancellation: ProductForwardingCancellation::new(),
             clock: TokioRuntimeClock::new(started_at),
             listener_denied: false,
             decision_target: DecisionSubmissionTarget::Disabled,
@@ -2311,7 +2328,7 @@ done
     }
 
     #[tokio::test]
-    async fn default_allow_resolves_once_and_forwards_through_the_common_pipeline() {
+    async fn default_allow_forwards_with_policy_provenance_and_one_submission() {
         let resolver_calls = Arc::new(AtomicUsize::new(0));
         let (runtime, destinations) =
             runtime_with_allow_observation("allow", resolver_calls.clone()).await;
@@ -2330,7 +2347,6 @@ done
         };
         assert_eq!(provenance.effective_policy(), &EffectivePolicy::Default);
         assert!(presence.is_empty());
-        assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
         assert_eq!(submissions.load(Ordering::SeqCst), 1);
     }
 
@@ -2430,7 +2446,6 @@ done
         let terminal = RequestPipeline::new().execute(provider, request).await;
 
         assert_eq!(terminal, Terminal::Forward);
-        assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(unix)]
@@ -2456,7 +2471,6 @@ done
             let terminal = RequestPipeline::new().execute(provider, request).await;
 
             assert_eq!(terminal, expected, "provider decision {provider_decision}");
-            assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
             let requests = std::fs::read_to_string(&marker).unwrap();
             let mut lines = requests.lines();
             let request: serde_json::Value =
@@ -2531,7 +2545,7 @@ done
             );
 
             assert_eq!(pipeline.await.unwrap(), expected);
-            assert_eq!(resolver_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
             runtime.shutdown().await;
         }
         shutdown.send(()).unwrap();
@@ -2569,7 +2583,6 @@ done
                 };
                 assert_eq!(reason.category(), DecisionReasonCategory::Loop);
             }
-            assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
             assert_eq!(submissions.load(Ordering::SeqCst), 1);
         }
     }
@@ -2629,7 +2642,6 @@ done
                 .send_data(bytes::Bytes::from_static(b"late"))
                 .await
                 .is_err());
-            assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
             assert_eq!(submissions.load(Ordering::SeqCst), 1);
             runtime.shutdown().await;
         }
@@ -2643,22 +2655,15 @@ done
         let provider_script = process_script(directory.path(), "allow", Some(&marker));
         let resolver_calls = Arc::new(AtomicUsize::new(0));
         let config = process_provider_config(&provider_script, "deny");
-        let (runtime, destinations) = runtime_from(config, resolver_calls.clone()).await;
+        let (runtime, network) = runtime_from(config, resolver_calls.clone()).await;
         let lease = runtime.lease().await.unwrap();
-        let mut input = prepared_input(&lease, destinations, Body::empty(), &[]);
-        input.destinations = Arc::new(DestinationGuard::with_sources(
-            DestinationFacts::for_test([], None, None, 8).unwrap(),
-            Arc::new(FixedResolver {
-                calls: Arc::new(AtomicUsize::new(0)),
-            }),
-            Arc::new(NoLocalAddresses),
-        ));
+        let mut input = prepared_input(&lease, network, Body::empty(), &[]);
+        input.network = forwarding_network();
 
         assert!(matches!(
             StandalonePolicyProvider::prepare(lease, TestTerminal, input),
             Err(StandaloneProviderPrepareError::Target)
         ));
-        assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
         assert!(!marker.exists());
         runtime.shutdown().await;
     }
@@ -2706,7 +2711,6 @@ rules = [{ literals = ["password"], payloads = "text" }]
         let outcome = RequestPipeline::new().execute(provider, request).await;
 
         assert_eq!(outcome, Terminal::Forward);
-        assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
         runtime.shutdown().await;
     }
 
@@ -2745,7 +2749,6 @@ request_timeout = "20ms"
             response.poll_trailers(&mut context),
             Poll::Ready(Ok(None))
         ));
-        assert_eq!(resolver_calls.load(Ordering::SeqCst), 0);
         drop((response, provider));
         runtime.shutdown().await;
     }
@@ -2781,7 +2784,6 @@ request_timeout = "20ms"
             panic!("resumed allow must identify its matched rule");
         };
         assert_eq!(id.as_str(), "after-pass");
-        assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
         assert_eq!(submissions.load(Ordering::SeqCst), 1);
         runtime.shutdown().await;
     }
@@ -2821,7 +2823,6 @@ request_timeout = "20ms"
             provenance.reason().category(),
             DecisionReasonCategory::Provider
         );
-        assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
         assert_eq!(submissions.load(Ordering::SeqCst), 1);
         runtime.shutdown().await;
     }
@@ -2858,7 +2859,6 @@ request_timeout = "20ms"
             .await
             .is_err());
         assert!(!marker.exists());
-        assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
         assert_eq!(submissions.load(Ordering::SeqCst), 1);
         drop(provider);
         runtime.shutdown().await;
