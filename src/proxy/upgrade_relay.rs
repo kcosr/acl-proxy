@@ -391,13 +391,16 @@ impl PreparedUpgradeRelay {
     /// Transfers the established streams and pre-commit state into the two
     /// coordinator-owned relay directions. This step performs no semantic
     /// validation or fallible opaque-buffer allocation.
-    pub(crate) fn establish(
+    pub(crate) fn establish<Upstream>(
         self,
         downstream: Upgraded,
-        upstream: Upgraded,
+        upstream: Upstream,
         snapshot: UpgradedStreamSnapshot,
         deadlines: UpgradeRelayDeadlines,
-    ) -> UpgradeRelayPair {
+    ) -> UpgradeRelayPair
+    where
+        Upstream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         debug_assert!(
             !matches!(&self.kind, PreparedUpgradeKind::WebSocket { .. })
                 || snapshot.wire_redaction().is_some()

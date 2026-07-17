@@ -1622,7 +1622,7 @@ mod tests {
         ParentProxyTlsPlan,
     };
     use crate::config::{compile_config_text, ConfigTextInput};
-    use crate::egress::EgressSnapshot;
+    use crate::egress::EgressActivation;
 
     const PLAN: &str = r#"schema_version = 3
 
@@ -1790,14 +1790,14 @@ header = "x-acl-proxy-request-id"
             }
         }
         let draft = UnboundStandaloneGenerationPlan::compile(plan, id).unwrap();
-        let activation = EgressSnapshot::activate(
+        let activation = EgressActivation::activate(
             egress,
             draft.identity(),
             PolicyGeneration::new(draft.version()).unwrap(),
             || false,
         )
         .unwrap();
-        let (_, neutral) = activation.into_parts();
+        let (neutral, _) = activation.into_parts();
         draft.finalize(neutral).unwrap()
     }
 

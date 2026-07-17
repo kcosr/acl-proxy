@@ -21,7 +21,7 @@
 - `src/policy/adapter.rs` — Product compilation and resources for the shared ACL evaluator.
 - `src/activation/` and `src/runtime/` — Product activation, reload, ownership, and shutdown.
 - `src/proxy/ingress.rs` — Common explicit, transparent, CONNECT MITM, TLS, and upgrade ingress.
-- `src/proxy/forward.rs` — Direct and parent request/response forwarding.
+- `src/proxy/forwarding_adapter.rs` — Product observation, lifetime, and downstream upgrade adaptation for the shared forwarding runtime.
 - `src/authorization/` — Process and webhook authorization lifecycles.
 - `src/capture/mod.rs` — Request/response capture to JSON files.
 - `src/certs/mod.rs` — CA and per-host certificate generation and caching.

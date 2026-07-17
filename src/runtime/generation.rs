@@ -210,11 +210,11 @@ pub(crate) enum AuthorizationInvocationMode {
 pub(crate) trait SafetySnapshot: Send + Sync {
     fn contains_loop_marker(&self, headers: &HeaderMap) -> bool;
 
-    fn inject_loop_marker(
+    fn loop_marker(
         &self,
-        headers: &mut HeaderMap,
+        plan: &http_access_types::ForwardingPlan,
         request_id: &str,
-    ) -> Result<(), crate::safety::InvalidLoopMarker>;
+    ) -> Result<Option<http_access_runtime::ForwardingLoopMarker>, crate::safety::InvalidLoopMarker>;
 
     fn begin_http_body(
         &self,
@@ -450,12 +450,13 @@ impl ForwardingGenerationServices {
         &self.executor
     }
 
-    pub(crate) fn inject_loop_marker(
+    pub(crate) fn loop_marker(
         &self,
-        headers: &mut HeaderMap,
+        plan: &http_access_types::ForwardingPlan,
         request_id: &str,
-    ) -> Result<(), crate::safety::InvalidLoopMarker> {
-        self.safety.inject_loop_marker(headers, request_id)
+    ) -> Result<Option<http_access_runtime::ForwardingLoopMarker>, crate::safety::InvalidLoopMarker>
+    {
+        self.safety.loop_marker(plan, request_id)
     }
 
     pub(crate) fn begin_response(

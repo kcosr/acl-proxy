@@ -9,7 +9,6 @@ mod credential_buffers;
 mod credential_io_runtime;
 mod credential_resolver;
 mod credentials;
-mod destination;
 mod egress;
 mod filesystem;
 mod http1;

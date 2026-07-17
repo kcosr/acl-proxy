@@ -1,7 +1,6 @@
-use http::{HeaderMap, Request, Uri, Version};
+use http::{HeaderMap, Request, Version};
 use http_access_runtime::{
-    prepare_upgrade_response_headers, sanitize_connect_request_head, sanitize_request_head,
-    sanitize_response_headers, HeaderHygieneError, PreparedRequestHead,
+    sanitize_connect_request_head, sanitize_request_head, HeaderHygieneError,
     SanitizedConnectRequestHead, SanitizedRequestHead,
 };
 use http_access_types::{
@@ -13,10 +12,6 @@ use hyper::Body;
 pub(crate) enum HeaderAdapterError {
     #[error(transparent)]
     Hygiene(#[from] HeaderHygieneError),
-    #[error("the HTTP adapter cannot represent the checked method")]
-    Method,
-    #[error("the HTTP adapter cannot represent the checked request target")]
-    Target,
     #[error("the HTTP adapter cannot represent a checked header name")]
     HeaderName,
     #[error("the HTTP adapter cannot represent a checked header value")]
@@ -50,20 +45,6 @@ pub(crate) struct PendingForwardRequest<B> {
     pub(crate) head: SanitizedRequestHead,
     pub(crate) parts: Box<http::request::Parts>,
     pub(crate) body: B,
-}
-
-impl<B> PendingForwardRequest<B> {
-    pub(crate) fn ingress_protocol(&self) -> HttpProtocol {
-        product_protocol(self.head.ingress_version())
-    }
-
-    pub(crate) fn upgrade_protocol(&self) -> Option<&http_access_types::UpgradeProtocol> {
-        self.head.upgrade_protocol()
-    }
-
-    pub(crate) fn into_parts(self) -> (Box<http::request::Parts>, B, SanitizedRequestHead) {
-        (self.parts, self.body, self.head)
-    }
 }
 
 impl SanitizedIngressRequest {
@@ -210,71 +191,6 @@ pub(crate) fn product_headers(fields: &[HeaderField]) -> Result<HeaderMap, Heade
             .map_err(|_| HeaderAdapterError::Capacity)?;
     }
     Ok(headers)
-}
-
-pub(crate) fn replace_sanitized_headers(
-    head: &mut SanitizedRequestHead,
-    headers: &HeaderMap,
-) -> Result<(), HeaderAdapterError> {
-    *head.headers_mut() = neutral_headers(headers)?;
-    Ok(())
-}
-
-pub(crate) fn sanitize_product_response_headers(
-    headers: &mut HeaderMap,
-) -> Result<(), HeaderAdapterError> {
-    let sanitized = sanitize_response_headers(neutral_headers(headers)?)?;
-    *headers = product_headers(&sanitized)?;
-    Ok(())
-}
-
-pub(crate) fn prepare_product_upgrade_response(
-    status: http::StatusCode,
-    headers: &mut HeaderMap,
-    protocol: &http_access_types::UpgradeProtocol,
-) -> Result<(), HeaderAdapterError> {
-    let prepared =
-        prepare_upgrade_response_headers(status.as_u16(), neutral_headers(headers)?, protocol)?;
-    *headers = product_headers(&prepared)?;
-    Ok(())
-}
-
-/// Rebuilds a Hyper request from the runtime's final prepared head while
-/// preserving body, extensions, and the reserved header-map allocation.
-/// Credential publication occurs only after this conversion, so secret values
-/// never enter neutral `HeaderValue` storage.
-pub(crate) fn apply_prepared_head<B>(
-    request: Request<B>,
-    prepared: PreparedRequestHead,
-) -> Result<Request<B>, HeaderAdapterError> {
-    let (mut parts, body) = request.into_parts();
-    let (method, protocol, target, headers, _upgrade) = prepared.into_parts();
-    parts.method = http::Method::from_bytes(method.as_str().as_bytes())
-        .map_err(|_| HeaderAdapterError::Method)?;
-    parts.version = match protocol {
-        HttpProtocol::Http1 => Version::HTTP_11,
-        HttpProtocol::Http2 => Version::HTTP_2,
-    };
-    parts.uri = target
-        .rendered()
-        .parse::<Uri>()
-        .map_err(|_| HeaderAdapterError::Target)?;
-    parts.headers.clear();
-    parts
-        .headers
-        .try_reserve(headers.len())
-        .map_err(|_| HeaderAdapterError::Capacity)?;
-    for field in &headers {
-        let name = http::HeaderName::from_bytes(field.name().as_str().as_bytes())
-            .map_err(|_| HeaderAdapterError::HeaderName)?;
-        let value = http::HeaderValue::from_bytes(field.value().as_bytes())
-            .map_err(|_| HeaderAdapterError::HeaderValue)?;
-        parts
-            .headers
-            .try_append(name, value)
-            .map_err(|_| HeaderAdapterError::Capacity)?;
-    }
-    Ok(Request::from_parts(parts, body))
 }
 
 #[cfg(test)]

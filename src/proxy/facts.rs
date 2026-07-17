@@ -1,9 +1,9 @@
 use http::header::{HeaderMap, CONTENT_LENGTH, TRANSFER_ENCODING};
 use http::{Method, Request, Version};
 use http_access_types::{
-    apply_header_mutation_batches, BodyFraming, BodyMetadata, CanonicalUrl, HeaderField,
-    HeaderMutationBatch, HttpMethod, HttpScheme, HttpVersion, IngressMode, InterceptedRequestFacts,
-    UpgradeIntent as NeutralUpgradeIntent, UpgradeProtocol, ValueError,
+    BodyFraming, BodyMetadata, CanonicalUrl, HeaderField, HttpMethod, HttpScheme, HttpVersion,
+    IngressMode, InterceptedRequestFacts, UpgradeIntent as NeutralUpgradeIntent, UpgradeProtocol,
+    ValueError,
 };
 
 use hyper::body::HttpBody;
@@ -76,14 +76,6 @@ pub(crate) enum FactsError {
     SensitivePartition,
     #[error("request facts contain an invalid checked value")]
     Value(#[from] ValueError),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum ResponseMutationError {
-    #[error("response headers cannot be represented by the neutral contract")]
-    Facts(#[from] FactsError),
-    #[error("response header mutations are invalid")]
-    Mutation(#[from] http_access_types::MutationError),
 }
 
 /// A request identity derived after product-specific sensitive values have been
@@ -368,15 +360,6 @@ pub(crate) fn product_headers(fields: &[HeaderField]) -> Result<HeaderMap, Facts
         HeaderAdapterError::HeaderName => FactsError::InvalidProductHeaderName,
         _ => FactsError::InvalidProductHeaderValue,
     })
-}
-
-pub(crate) fn apply_response_mutations(
-    headers: &HeaderMap,
-    batches: &[HeaderMutationBatch],
-) -> Result<HeaderMap, ResponseMutationError> {
-    let neutral = neutral_headers(headers)?;
-    let mutated = apply_header_mutation_batches(&neutral, batches)?;
-    product_headers(&mutated).map_err(Into::into)
 }
 
 pub(crate) fn body_metadata(

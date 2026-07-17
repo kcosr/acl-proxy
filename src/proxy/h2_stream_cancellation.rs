@@ -28,10 +28,6 @@ impl H2StreamCancellation {
         }
     }
 
-    pub(crate) fn is_cancelled(&self) -> bool {
-        self.0.cancelled.load(Ordering::Acquire)
-    }
-
     async fn cancelled(&self) {
         if self.0.cancelled.load(Ordering::Acquire) {
             return;

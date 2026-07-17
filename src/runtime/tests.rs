@@ -57,24 +57,6 @@ impl WebhookLocalAddressSource for EmptyLocalAddressSource {
     }
 }
 
-impl EgressSnapshot for EmptySnapshot {
-    fn identity(&self) -> &Arc<()> {
-        static IDENTITY: std::sync::OnceLock<Arc<()>> = std::sync::OnceLock::new();
-        IDENTITY.get_or_init(|| Arc::new(()))
-    }
-
-    fn route(&self) -> &crate::egress::EgressRoute {
-        panic!("empty test egress has no route")
-    }
-
-    fn route_contract(&self) -> &http_access_types::Route {
-        &http_access_types::Route::Direct
-    }
-
-    fn origin_tls(&self) -> &crate::egress::OriginTls {
-        panic!("empty test egress has no origin TLS policy")
-    }
-}
 impl AuthorizationSnapshot for EmptySnapshot {
     fn internal_context_headers(&self) -> &[http::HeaderName] {
         &[]
@@ -135,6 +117,30 @@ impl AuthorizationSnapshot for EmptySnapshot {
         Box::pin(async { Err(crate::authorization::AuthorizationDispatchError::UnknownProvider) })
     }
 }
+
+fn test_forwarding_executor(
+    standalone: &crate::standalone::StandaloneGenerationPlan,
+) -> Arc<http_access_runtime::ForwardingExecutor> {
+    let facts =
+        http_access_runtime::ForwardingNetworkFacts::new(Vec::new(), None, None, None).unwrap();
+    let network = Arc::new(http_access_runtime::ForwardingNetworkGuard::system(facts));
+    let protocols = http_access_types::HttpProtocolSet::new(vec![
+        http_access_types::HttpProtocol::Http1,
+        http_access_types::HttpProtocol::Http2,
+    ])
+    .unwrap();
+    Arc::new(
+        http_access_runtime::ForwardingExecutor::activate(
+            network,
+            protocols,
+            http_access_types::TlsTrust::Insecure,
+            http_access_types::Route::Direct,
+            standalone.snapshot_lease(),
+            &http_access_runtime::ForwardingCancellation::new(),
+        )
+        .unwrap(),
+    )
+}
 impl ObservationSnapshot for EmptySnapshot {
     fn capture_epoch(&self) -> &Arc<crate::observation::CaptureEpoch> {
         static DISABLED: std::sync::LazyLock<Arc<crate::observation::CaptureEpoch>> =
@@ -168,12 +174,13 @@ impl SafetySnapshot for EmptySnapshot {
         false
     }
 
-    fn inject_loop_marker(
+    fn loop_marker(
         &self,
-        _headers: &mut http::HeaderMap,
+        _plan: &http_access_types::ForwardingPlan,
         _request_id: &str,
-    ) -> Result<(), crate::safety::InvalidLoopMarker> {
-        Ok(())
+    ) -> Result<Option<http_access_runtime::ForwardingLoopMarker>, crate::safety::InvalidLoopMarker>
+    {
+        Ok(None)
     }
 
     fn begin_http_body(
@@ -691,13 +698,14 @@ impl CandidateActivator for FakeActivator {
             let standalone = crate::standalone::UnboundStandaloneGenerationPlan::compile(&plan, id)
                 .map_err(|error| RuntimeError::CandidateActivation(error.to_string()))?
                 .into_bound_for_runtime_test();
+            let forwarding_executor = test_forwarding_executor(&standalone);
             let snapshot = Arc::new(EmptySnapshot);
             Ok(ActivatedGeneration {
                 standalone,
                 request_timeout: plan.request_timeout,
                 max_content_decoding_expansion_ratio: plan.max_content_decoding_expansion_ratio,
                 resource_plan: plan.resource_plan,
-                egress: snapshot.clone(),
+                forwarding_executor,
                 authorization: snapshot.clone(),
                 credentials: empty_inbound_credentials(),
                 credential_io_runtime: crate::credential_io_runtime::CredentialIoRuntime::new()
@@ -860,6 +868,7 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
     .unwrap()
     .into_bound_for_runtime_test();
     let empty = Arc::new(EmptySnapshot);
+    let forwarding_executor = test_forwarding_executor(&standalone);
     let generation = Arc::new(Generation::from_activated(
         GenerationId::new(1),
         ActivatedGeneration {
@@ -867,7 +876,7 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
             request_timeout: Duration::from_secs(30),
             max_content_decoding_expansion_ratio: 128,
             resource_plan: compiled.reloadable_plan.resource_plan.clone(),
-            egress: empty.clone(),
+            forwarding_executor,
             authorization: Arc::new(authorization),
             credentials: empty_inbound_credentials(),
             credential_io_runtime: crate::credential_io_runtime::CredentialIoRuntime::new()

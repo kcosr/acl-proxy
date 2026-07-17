@@ -30,45 +30,15 @@ pub(crate) enum ClientTrust {
     Insecure,
 }
 
-#[derive(Clone)]
-pub(crate) struct LoadedClientTrust {
-    trust: ClientTrust,
-    custom_ca_der: Option<Vec<Vec<u8>>>,
-}
-
-impl LoadedClientTrust {
-    #[cfg(test)]
-    pub(crate) fn new(trust: ClientTrust, custom_ca_der: Option<Vec<Vec<u8>>>) -> Self {
-        Self {
-            trust,
-            custom_ca_der,
-        }
-    }
-
-    pub(crate) fn into_parts(self) -> (ClientTrust, Option<Vec<Vec<u8>>>) {
-        (self.trust, self.custom_ca_der)
-    }
-
-    pub(crate) fn custom_ca_der(&self) -> Option<&[Vec<u8>]> {
-        self.custom_ca_der.as_deref()
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ClientAlpn {
-    #[cfg(test)]
-    None,
     Http1,
-    Http2,
 }
 
 impl ClientAlpn {
     fn protocols(self) -> Vec<Vec<u8>> {
         match self {
-            #[cfg(test)]
-            Self::None => Vec::new(),
             Self::Http1 => vec![b"http/1.1".to_vec()],
-            Self::Http2 => vec![b"h2".to_vec()],
         }
     }
 }
@@ -78,69 +48,27 @@ pub(crate) fn load_client_trust(
     ca_certificate: Option<&Path>,
     is_cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<ClientTrust, TlsActivationError> {
-    load_client_trust_with_material(trust, ca_certificate, is_cancelled).map(|loaded| loaded.trust)
-}
-
-pub(crate) fn load_client_trust_with_material(
-    trust: CompiledTlsTrust,
-    ca_certificate: Option<&Path>,
-    is_cancelled: &mut dyn FnMut() -> bool,
-) -> Result<LoadedClientTrust, TlsActivationError> {
-    load_client_trust_with_cached_material(trust, ca_certificate, None, is_cancelled)
-}
-
-pub(crate) fn load_client_trust_with_cached_material(
-    trust: CompiledTlsTrust,
-    ca_certificate: Option<&Path>,
-    cached_custom_ca_der: Option<Vec<Vec<u8>>>,
-    is_cancelled: &mut dyn FnMut() -> bool,
-) -> Result<LoadedClientTrust, TlsActivationError> {
-    load_client_trust_from_loaders(
-        trust,
-        is_cancelled,
-        root_store_with_native_roots,
-        |is_cancelled| match cached_custom_ca_der {
-            Some(certificates) => Ok(certificates),
-            None => load_custom_ca_der(
+    match trust {
+        CompiledTlsTrust::System => {
+            root_store_with_native_roots(is_cancelled).map(ClientTrust::Roots)
+        }
+        CompiledTlsTrust::Custom => {
+            let custom_ca_der = load_custom_ca_der(
                 ca_certificate.ok_or(TlsActivationError::CaUnavailable)?,
                 is_cancelled,
-            ),
-        },
-    )
-}
-
-fn load_client_trust_from_loaders(
-    trust: CompiledTlsTrust,
-    is_cancelled: &mut dyn FnMut() -> bool,
-    load_native: impl FnOnce(&mut dyn FnMut() -> bool) -> Result<RootCertStore, TlsActivationError>,
-    load_custom: impl FnOnce(&mut dyn FnMut() -> bool) -> Result<Vec<Vec<u8>>, TlsActivationError>,
-) -> Result<LoadedClientTrust, TlsActivationError> {
-    match trust {
-        CompiledTlsTrust::System => Ok(LoadedClientTrust {
-            trust: ClientTrust::Roots(load_native(is_cancelled)?),
-            custom_ca_der: None,
-        }),
-        CompiledTlsTrust::Custom => {
-            let custom_ca_der = load_custom(is_cancelled)?;
-            let roots = root_store_from_custom_ca(&custom_ca_der)?;
-            Ok(LoadedClientTrust {
-                trust: ClientTrust::Roots(roots),
-                custom_ca_der: Some(custom_ca_der),
-            })
+            )?;
+            root_store_from_custom_ca(&custom_ca_der).map(ClientTrust::Roots)
         }
         CompiledTlsTrust::SystemPlusCustom => {
-            let mut roots = load_native(is_cancelled)?;
-            let custom_ca_der = load_custom(is_cancelled)?;
+            let mut roots = root_store_with_native_roots(is_cancelled)?;
+            let custom_ca_der = load_custom_ca_der(
+                ca_certificate.ok_or(TlsActivationError::CaUnavailable)?,
+                is_cancelled,
+            )?;
             add_custom_ca(&mut roots, &custom_ca_der)?;
-            Ok(LoadedClientTrust {
-                trust: ClientTrust::Roots(roots),
-                custom_ca_der: Some(custom_ca_der),
-            })
+            Ok(ClientTrust::Roots(roots))
         }
-        CompiledTlsTrust::Insecure => Ok(LoadedClientTrust {
-            trust: ClientTrust::Insecure,
-            custom_ca_der: None,
-        }),
+        CompiledTlsTrust::Insecure => Ok(ClientTrust::Insecure),
     }
 }
 
@@ -255,56 +183,5 @@ impl ServerCertVerifier for NoVerifyServerCert {
         _now: std::time::SystemTime,
     ) -> Result<ServerCertVerified, RustlsError> {
         Ok(ServerCertVerified::assertion())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::cell::RefCell;
-
-    use super::*;
-
-    #[test]
-    fn caller_selects_exact_client_alpn_and_sni_policy() {
-        let trust = ClientTrust::Insecure;
-        let none = build_client_config(&trust, ClientAlpn::None, true);
-        let http1 = build_client_config(&trust, ClientAlpn::Http1, true);
-        let http2 = build_client_config(&trust, ClientAlpn::Http2, false);
-
-        assert!(none.alpn_protocols.is_empty());
-        assert_eq!(http1.alpn_protocols, [b"http/1.1".to_vec()]);
-        assert_eq!(http2.alpn_protocols, [b"h2".to_vec()]);
-        assert!(none.enable_sni);
-        assert!(!http2.enable_sni);
-    }
-
-    #[test]
-    fn empty_native_root_store_is_rejected() {
-        assert_eq!(
-            validate_native_root_store(RootCertStore::empty()).unwrap_err(),
-            TlsActivationError::NativeRoots
-        );
-    }
-
-    #[test]
-    fn system_plus_custom_preserves_native_failure_precedence() {
-        let order = RefCell::new(Vec::new());
-        let error = load_client_trust_from_loaders(
-            CompiledTlsTrust::SystemPlusCustom,
-            &mut || false,
-            |_| {
-                order.borrow_mut().push("native");
-                Err(TlsActivationError::NativeRoots)
-            },
-            |_| {
-                order.borrow_mut().push("custom");
-                Err(TlsActivationError::CaUnavailable)
-            },
-        )
-        .err()
-        .unwrap();
-
-        assert_eq!(error, TlsActivationError::NativeRoots);
-        assert_eq!(&*order.borrow(), &["native"]);
     }
 }

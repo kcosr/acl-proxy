@@ -4758,28 +4758,10 @@ fn compile_credential_finalization_peak(
         };
         ConfigCompileError::at("credentials", message)
     })?;
-    let destination_literal_bytes =
-        mutations
-            .iter()
-            .try_fold(0usize, |total, mutation| match mutation.kind() {
-                CredentialMutationKind::CustomHeader { name, .. } => {
-                    total.checked_add(name.as_str().len()).ok_or_else(|| {
-                        ConfigCompileError::at(
-                            "credentials",
-                            "credential destination projection overflow",
-                        )
-                    })
-                }
-                CredentialMutationKind::Bearer(_) | CredentialMutationKind::Basic { .. } => {
-                    Ok(total)
-                }
-            })?;
     let product = projected_product_adapter_bytes(
         total,
         reference_literal_bytes,
         maximum_environment_staging_bytes,
-        total,
-        destination_literal_bytes,
         rule_count != 0 || !config.egress.credential_actions.is_empty(),
         provider_count != 0,
     )

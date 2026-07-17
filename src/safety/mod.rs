@@ -4,7 +4,7 @@ pub(crate) mod wire_body;
 use std::fmt;
 use std::sync::Arc;
 
-use http::header::{HeaderMap, HeaderValue};
+use http::header::HeaderMap;
 
 use crate::config::compiler::{CompiledResourcePlan, HttpBodyResourcePlan, SafetyPlan};
 use crate::policy::{HttpWireBodyPlanBrand, HttpWireBodyPlanIndex};
@@ -110,17 +110,22 @@ impl SafetySnapshot for ProductSafetySnapshot {
         headers.contains_key(&self.loop_detection.header)
     }
 
-    fn inject_loop_marker(
+    fn loop_marker(
         &self,
-        headers: &mut HeaderMap,
+        plan: &http_access_types::ForwardingPlan,
         request_id: &str,
-    ) -> Result<(), InvalidLoopMarker> {
+    ) -> Result<Option<http_access_runtime::ForwardingLoopMarker>, InvalidLoopMarker> {
         if !self.loop_detection.inject {
-            return Ok(());
+            return Ok(None);
         }
-        let value = HeaderValue::from_str(request_id).map_err(|_| InvalidLoopMarker)?;
-        headers.insert(self.loop_detection.header.clone(), value);
-        Ok(())
+        let name = http_access_types::HeaderName::new(self.loop_detection.header.as_str())
+            .map_err(|_| InvalidLoopMarker)?;
+        let value = http_access_types::HeaderValue::new(request_id.as_bytes().to_vec())
+            .map_err(|_| InvalidLoopMarker)?;
+        let field = http_access_types::HeaderField::new(name, value);
+        http_access_runtime::ForwardingLoopMarker::new(plan, field)
+            .map(Some)
+            .map_err(|_| InvalidLoopMarker)
     }
 
     fn begin_http_body(
@@ -229,35 +234,7 @@ mod tests {
         headers.insert("x-loop-marker", HeaderValue::from_static("upstream"));
 
         assert!(snapshot.contains_loop_marker(&headers));
-        snapshot
-            .inject_loop_marker(&mut headers, "replacement")
-            .expect("disabled injection is a no-op");
         assert_eq!(headers["x-loop-marker"], "upstream");
-    }
-
-    #[test]
-    fn enabled_injection_replaces_the_existing_origin_marker() {
-        let snapshot = snapshot(true);
-        let mut headers = HeaderMap::new();
-        headers.insert("x-loop-marker", HeaderValue::from_static("old"));
-
-        snapshot
-            .inject_loop_marker(&mut headers, "request-123")
-            .expect("valid request ID");
-        assert_eq!(headers["x-loop-marker"], "request-123");
-    }
-
-    #[test]
-    fn invalid_marker_is_atomic() {
-        let snapshot = snapshot(true);
-        let mut headers = HeaderMap::new();
-        headers.insert("x-loop-marker", HeaderValue::from_static("old"));
-
-        assert_eq!(
-            snapshot.inject_loop_marker(&mut headers, "bad\nvalue"),
-            Err(InvalidLoopMarker)
-        );
-        assert_eq!(headers["x-loop-marker"], "old");
     }
 
     #[test]
