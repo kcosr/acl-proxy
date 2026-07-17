@@ -10,10 +10,15 @@ import re
 import sys
 
 root = pathlib.Path(sys.argv[1])
-executor_path = pathlib.Path("src/proxy/forwarding_executor.rs")
-transport_path = pathlib.Path("src/proxy/forward.rs")
+adapter_path = pathlib.Path("src/proxy/forwarding_adapter.rs")
 ingress_path = pathlib.Path("src/proxy/ingress.rs")
+activation_path = pathlib.Path("src/activation/product.rs")
+generation_path = pathlib.Path("src/runtime/generation.rs")
+proxy_module_path = pathlib.Path("src/proxy/mod.rs")
 webhook_connector_path = pathlib.Path("src/authorization/webhook/connector.rs")
+webhook_provider_path = pathlib.Path("src/authorization/webhook/provider.rs")
+tls_path = pathlib.Path("src/tls.rs")
+test_only_paths = set()
 
 
 def mask_non_code(source: str) -> str:
@@ -132,9 +137,7 @@ def matching_brace(source: str, opening: int) -> int:
             if depth == 0:
                 return index + 1
     line = source.count("\n", 0, opening) + 1
-    raise SystemExit(
-        f"unterminated #[cfg(test)] item beginning near line {line} while scanning ownership"
-    )
+    raise SystemExit(f"unterminated #[cfg(test)] item near line {line}")
 
 
 def mask_range(source: str, start: int, end: int) -> str:
@@ -178,8 +181,10 @@ def mask_test_items(source: str) -> str:
 def production(path: pathlib.Path) -> str:
     absolute = root / path
     if not absolute.is_file():
-        raise SystemExit(f"forwarding executor ownership scan path is missing: {path}")
+        raise SystemExit(f"forwarding ownership scan path is missing: {path}")
     source = mask_non_code(absolute.read_text(encoding="utf-8"))
+    if path in test_only_paths:
+        return mask_range(source, 0, len(source))
     try:
         return mask_test_items(source)
     except SystemExit as error:
@@ -234,17 +239,341 @@ def parsed_use_paths(source: str) -> list[tuple[str, ...]]:
     return paths
 
 
-if not (root / executor_path).is_file():
-    raise SystemExit(f"forwarding executor ownership scan path is missing: {executor_path}")
+def locations(sources, pattern: re.Pattern[str]):
+    matches = []
+    for path, source in sources.items():
+        for match in pattern.finditer(source):
+            line = source.count("\n", 0, match.start()) + 1
+            matches.append((path, line, match.group(0)))
+    return matches
 
-sources = []
+
+def require_exact_locations(description, matches, allowed_paths, count):
+    escaped = [(path, line, text) for path, line, text in matches if path not in allowed_paths]
+    if len(matches) != count or escaped:
+        rendered = ", ".join(f"{path}:{line}" for path, line, _ in matches) or "none"
+        print(f"{description} ownership violation", file=sys.stderr)
+        print(f"locations: {rendered}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+obsolete_files = (
+    pathlib.Path("src/proxy/forward.rs"),
+    pathlib.Path("src/proxy/forwarding_executor.rs"),
+    pathlib.Path("src/proxy/standalone_body.rs"),
+    pathlib.Path("src/destination.rs"),
+)
+obsolete = [str(path) for path in obsolete_files if (root / path).exists()]
+destination_dir = root / "src/destination"
+if destination_dir.exists() and any(destination_dir.rglob("*")):
+    obsolete.append("src/destination/")
+if obsolete:
+    print("obsolete product forwarding owners must remain deleted", file=sys.stderr)
+    print("obsolete paths: " + ", ".join(obsolete), file=sys.stderr)
+    raise SystemExit(1)
+
+required_paths = (
+    adapter_path,
+    ingress_path,
+    activation_path,
+    generation_path,
+    proxy_module_path,
+    webhook_connector_path,
+    webhook_provider_path,
+    tls_path,
+)
+for path in required_paths:
+    if not (root / path).is_file():
+        raise SystemExit(f"forwarding ownership scan path is missing: {path}")
+
+# External test modules are separate files, so their own source does not carry the
+# cfg(test) attribute. Resolve conventional external test files and explicit
+# cfg(test) module declarations before scanning the production source set.
 for absolute in sorted((root / "src").rglob("*.rs")):
     relative = absolute.relative_to(root)
-    sources.append((relative, production(relative)))
+    if relative.name == "tests.rs" or relative.stem.endswith("_tests"):
+        test_only_paths.add(relative)
+    module_source = mask_non_code(absolute.read_text(encoding="utf-8"))
+    for match in re.finditer(
+        r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*"
+        r"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;",
+        module_source,
+    ):
+        module = match.group(1)
+        if relative.name in ("lib.rs", "main.rs", "mod.rs"):
+            base = relative.parent
+        else:
+            base = relative.parent / relative.stem
+        flat = base / f"{module}.rs"
+        nested = base / module / "mod.rs"
+        if (root / flat).is_file():
+            test_only_paths.add(flat)
+        if (root / nested).is_file():
+            test_only_paths.add(nested)
 
-webhook_connector = dict(sources).get(webhook_connector_path)
-if webhook_connector is None:
-    raise SystemExit("authorization webhook connector ownership path is missing")
+sources = {}
+for absolute in sorted((root / "src").rglob("*.rs")):
+    relative = absolute.relative_to(root)
+    sources[relative] = production(relative)
+
+proxy_module = sources[proxy_module_path]
+if len(re.findall(r"\bmod\s+forwarding_adapter\s*;", proxy_module)) != 1:
+    raise SystemExit("src/proxy/mod.rs must declare forwarding_adapter exactly once")
+obsolete_modules = re.findall(
+    r"\bmod\s+(forward|forwarding_executor|standalone_body|destination)\s*;",
+    proxy_module,
+)
+if obsolete_modules:
+    raise SystemExit("obsolete product forwarding module declarations must remain deleted")
+
+adapter = sources[adapter_path]
+adapter_forbidden = (
+    ("application state", re.compile(r"\bAppState\b")),
+    ("generation lease", re.compile(r"\bGenerationLease\b")),
+    ("product configuration", re.compile(r"\b(?:[A-Za-z_][A-Za-z0-9_]*)?Config\b")),
+    ("configuration module", re.compile(r"\b(?:crate|super)\s*::\s*config\b")),
+    ("authoring dependency", re.compile(r"\bAuthoring[A-Za-z0-9_]*\b|\bauthoring\b")),
+    (
+        "product policy evaluation",
+        re.compile(
+            r"\bcrate\s*::\s*policy\b|\b(?:evaluate|compile)_policy\b"
+            r"|\b(?:PolicySnapshot|PolicyEvaluation|PolicyOutcome|PolicyResult)\b"
+        ),
+    ),
+    (
+        "provider dispatch",
+        re.compile(
+            r"\b(?:StandalonePolicyProvider|DecisionProvider|ProviderDispatcher)\b"
+            r"|\.\s*decide\s*\("
+        ),
+    ),
+)
+adapter_violations = []
+for description, pattern in adapter_forbidden:
+    for match in pattern.finditer(adapter):
+        line = adapter.count("\n", 0, match.start()) + 1
+        adapter_violations.append(
+            f"{adapter_path}:{line}: forbidden {description}: {match.group(0)}"
+        )
+if adapter_violations:
+    print("forwarding adapter dependency violations:", file=sys.stderr)
+    print("\n".join(adapter_violations), file=sys.stderr)
+    raise SystemExit(1)
+
+ingress_entry = re.compile(r"\b(?:crate\s*::\s*)?proxy\s*::\s*forwarding_adapter\s*::\s*execute\s*\(")
+require_exact_locations(
+    "ingress-to-adapter terminal entry",
+    locations(sources, ingress_entry),
+    {ingress_path},
+    1,
+)
+
+shared_execute = re.compile(
+    r"\.\s*execute\s*\(\s*dispatch\s*\.\s*exchange\s*,"
+    r"\s*dispatch\s*\.\s*resolved\s*,\s*resources\s*\)"
+)
+require_exact_locations(
+    "adapter-to-shared-executor terminal call",
+    locations(sources, shared_execute),
+    {adapter_path},
+    1,
+)
+
+activation_call = re.compile(r"\bForwardingExecutor\s*::\s*activate\s*\(")
+require_exact_locations(
+    "shared forwarding executor activation",
+    locations(sources, activation_call),
+    {activation_path},
+    1,
+)
+
+executor_type = re.compile(r"\bForwardingExecutor\b")
+executor_locations = locations(sources, executor_type)
+executor_allowed = {activation_path, generation_path}
+escaped_executor = [
+    (path, line, text)
+    for path, line, text in executor_locations
+    if path not in executor_allowed
+]
+if escaped_executor:
+    print(
+        "ForwardingExecutor storage and activation must remain confined to activation/product.rs and runtime/generation.rs",
+        file=sys.stderr,
+    )
+    print(
+        "escaped locations: "
+        + ", ".join(f"{path}:{line}" for path, line, _ in escaped_executor),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+adapter_only_types = (
+    "ForwardingAdmission",
+    "ForwardingObservation",
+    "ForwardingOutcome",
+    "ForwardingRequestHead",
+    "ForwardingResources",
+    "ForwardingResponseHead",
+    "ForwardingRetention",
+    "ForwardingTerminal",
+    "ForwardingTerminalOutcome",
+    "ForwardingTerminalOwner",
+    "PreparedUpgradeHandoff",
+    "UpgradeHandoff",
+    "UpgradeOffer",
+    "UpstreamUpgradeBounds",
+)
+for symbol in adapter_only_types:
+    matches = locations(sources, re.compile(rf"\b{symbol}\b"))
+    if not matches or any(path != adapter_path for path, _, _ in matches):
+        rendered = ", ".join(f"{path}:{line}" for path, line, _ in matches) or "none"
+        print(f"{symbol} must be owned exclusively and non-vacuously by forwarding_adapter.rs", file=sys.stderr)
+        print("locations: " + rendered, file=sys.stderr)
+        raise SystemExit(1)
+
+h2_lookup = re.compile(r"\bH2StreamCancellation\s*::\s*current\s*\(")
+require_exact_locations(
+    "ambient H2 cancellation lookup",
+    locations(sources, h2_lookup),
+    {ingress_path},
+    1,
+)
+
+h2_injection = re.compile(
+    r"\brequest\s*\.\s*extensions_mut\s*\(\s*\)\s*"
+    r"\.\s*insert\s*\(\s*h2_stream\s*\)"
+)
+require_exact_locations(
+    "typed H2 cancellation injection",
+    locations(sources, h2_injection),
+    {ingress_path},
+    1,
+)
+
+h2_direct_transfer = re.compile(
+    r"\bif\s+let\s+Some\s*\(\s*h2_stream\s*\)\s*=\s*"
+    r"H2StreamCancellation\s*::\s*current\s*\(\s*\)\s*\{\s*"
+    r"request\s*\.\s*extensions_mut\s*\(\s*\)\s*"
+    r"\.\s*insert\s*\(\s*h2_stream\s*\)\s*;\s*\}"
+)
+require_exact_locations(
+    "direct H2 cancellation capability transfer",
+    locations(sources, h2_direct_transfer),
+    {ingress_path},
+    1,
+)
+
+h2_removal = re.compile(
+    r"\.\s*extensions\s*\.\s*remove\s*::\s*<\s*H2StreamCancellation\s*>\s*\("
+)
+require_exact_locations(
+    "adapter H2 cancellation ownership take",
+    locations(sources, h2_removal),
+    {adapter_path},
+    1,
+)
+
+h2_response_transfer = re.compile(
+    r"ProxyResponseBody\s*::\s*forwarded\s*\(\s*body\s*,"
+    r"\s*Arc\s*::\s*clone\s*\(\s*&\s*observation\s*\)\s*,\s*h2_stream\s*\)"
+)
+require_exact_locations(
+    "adapter H2 response-lifetime transfer",
+    locations(sources, h2_response_transfer),
+    {adapter_path},
+    1,
+)
+
+private_forwarding_symbols = re.compile(
+    r"\b(?:forward_request|forward_upgrade_request|DestinationGuard|DestinationConnector|StandaloneBody)\b"
+)
+private_locations = locations(sources, private_forwarding_symbols)
+if private_locations:
+    print("obsolete product-private ordinary forwarding primitives must remain absent", file=sys.stderr)
+    print(
+        "locations: " + ", ".join(f"{path}:{line}" for path, line, _ in private_locations),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+client_transport_patterns = (
+    ("socket dialing", re.compile(r"\b(?:(?:tokio|std)\s*::\s*net\s*::\s*)?(?:TcpStream|UnixStream)\s*::\s*connect\s*\(|\bTcpSocket\s*::|\bsocket2\s*::\s*Socket\b")),
+    ("DNS resolution", re.compile(r"\b(?:tokio\s*::\s*net\s*::\s*)?lookup_host\s*\(|\bToSocketAddrs\b")),
+    ("private Hyper client", re.compile(r"\bhyper\s*::\s*client\b|\bclient\s*::\s*conn\b|\bHttpConnector\b|\bHttpsConnector\b|\bhyper\s*::\s*Client\b")),
+    ("private TLS connector", re.compile(r"\b(?:tokio_rustls\s*::\s*)?TlsConnector\b|\bhyper_rustls\b")),
+    ("private client TLS config", re.compile(r"\b(?:rustls\s*::\s*)?(?:ClientConfig|ClientConnection)\b|\b(?:native_tls|tokio_native_tls|hyper_tls)\b")),
+)
+transport_allowed = {
+    path for path in sources if path.parts[:3] == ("src", "authorization", "webhook")
+}
+transport_allowed.add(tls_path)
+listener_socket_paths = {
+    pathlib.Path("src/control/server.rs"),
+    ingress_path,
+    pathlib.Path("src/proxy/original_destination.rs"),
+}
+transport_violations = []
+for description, pattern in client_transport_patterns:
+    for path, line, text in locations(sources, pattern):
+        if path not in transport_allowed:
+            transport_violations.append(
+                f"{path}:{line}: forbidden product-owned {description}: {text}"
+            )
+for path, source in sources.items():
+    if path in transport_allowed:
+        continue
+    for use_path in parsed_use_paths(source):
+        components = set(use_path)
+        accepted_listener_socket = (
+            path in listener_socket_paths
+            and bool(components & {"tokio", "std"})
+            and "net" in components
+            and bool(components & {"TcpStream", "UnixStream", "TcpSocket"})
+        )
+        private_import = (
+            ("hyper" in components and bool(components & {"client", "Client", "HttpConnector", "HttpsConnector"}))
+            or bool(components & {"hyper_rustls", "hyper_tls", "native_tls", "tokio_native_tls", "socket2"})
+            or (
+                bool(components & {"tokio", "std"})
+                and "net" in components
+                and bool(components & {"TcpStream", "UnixStream", "TcpSocket", "lookup_host", "ToSocketAddrs"})
+            )
+            or ("tokio_rustls" in components and "TlsConnector" in components)
+            or (
+                "rustls" in components
+                and bool(components & {"ClientConfig", "ClientConnection"})
+            )
+        )
+        if private_import and not accepted_listener_socket:
+            transport_violations.append(
+                f"{path}: forbidden product-owned client transport import: {'::'.join(use_path)}"
+            )
+if transport_violations:
+    print(
+        "ordinary product forwarding must not own dialing, client TLS, or private Hyper client transport",
+        file=sys.stderr,
+    )
+    print("\n".join(transport_violations), file=sys.stderr)
+    raise SystemExit(1)
+
+tls_helpers = re.compile(r"\b(?:build_client_config|load_client_trust|ClientAlpn)\b")
+tls_helper_locations = locations(sources, tls_helpers)
+tls_helper_allowed = {tls_path, webhook_provider_path}
+escaped_tls_helpers = [
+    (path, line, text)
+    for path, line, text in tls_helper_locations
+    if path not in tls_helper_allowed
+]
+if escaped_tls_helpers:
+    print("retained client TLS helpers must remain webhook-only", file=sys.stderr)
+    print(
+        "escaped locations: "
+        + ", ".join(f"{path}:{line}" for path, line, _ in escaped_tls_helpers),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+webhook_connector = sources[webhook_connector_path]
 webhook_use_paths = parsed_use_paths(webhook_connector)
 webhook_violations = []
 for name, component in (
@@ -259,10 +588,7 @@ for name, pattern in (
     ("ordinary egress", r"\b(?:crate|super)\s*::\s*egress\b"),
     ("ordinary forwarding", r"\b(?:crate|super)\s*::\s*proxy\b"),
     ("forwarding plan", r"\bForwardingPlan\b"),
-    (
-        "credential execution",
-        r"\b(?:ProductCredentialExecution|CredentialResolverSession|TransportCredentialBatch)\b",
-    ),
+    ("credential execution", r"\b(?:ProductCredentialExecution|CredentialResolverSession|TransportCredentialBatch)\b"),
 ):
     if re.search(pattern, webhook_connector) and name not in webhook_violations:
         webhook_violations.append(name)
@@ -275,274 +601,23 @@ if webhook_violations:
     raise SystemExit(1)
 
 ordinary_webhook_references = []
-for path, source in sources:
-    ordinary_owner = (
-        path == pathlib.Path("src/destination/mod.rs")
-        or path == pathlib.Path("src/egress.rs")
-        or path.parts[:2] == ("src", "proxy")
-    )
-    if not ordinary_owner:
+for path in (adapter_path, pathlib.Path("src/egress.rs")):
+    source = sources.get(path)
+    if source is None:
         continue
     imports_authorization = any(
         "authorization" in use_path for use_path in parsed_use_paths(source)
     )
-    qualifies_webhook = re.search(
-        r"\b(?:WebhookConnector|authorization\s*::\s*webhook)\b", source
-    )
+    qualifies_webhook = re.search(r"\b(?:WebhookConnector|authorization\s*::\s*webhook)\b", source)
     if imports_authorization or qualifies_webhook:
         ordinary_webhook_references.append(str(path))
 if ordinary_webhook_references:
     print(
-        "ordinary destination and forwarding owners must not reference the authorization webhook connector",
+        "ordinary egress and forwarding adapter owners must not reference the authorization webhook connector",
         file=sys.stderr,
     )
     print("escaped references: " + ", ".join(ordinary_webhook_references), file=sys.stderr)
     raise SystemExit(1)
 
-executor = dict(sources)[executor_path]
-forbidden = (
-    ("AppState dependency", re.compile(r"\bAppState\b")),
-    ("broad generation lease", re.compile(r"\bGenerationLease\b")),
-    ("product runtime", re.compile(r"\bRuntime\b")),
-    (
-        "broad generation snapshot capability",
-        re.compile(r"\b(?:CredentialResolver|EgressSnapshot|SafetySnapshot)\b"),
-    ),
-    (
-        "product configuration type",
-        re.compile(r"\b(?:[A-Za-z_][A-Za-z0-9_]*)?Config\b"),
-    ),
-    (
-        "product configuration module/read",
-        re.compile(
-            r"\b(?:crate|super|self)\s*::\s*config\b"
-            r"|\bconfig\s*\."
-            r"|\.\s*config\b"
-        ),
-    ),
-    (
-        "authoring dependency",
-        re.compile(r"\bAuthoring[A-Za-z0-9_]*\b|\bauthoring\b"),
-    ),
-    (
-        "product policy dependency/read",
-        re.compile(
-            r"\bcrate\s*::\s*policy\b"
-            r"|\.\s*policy\s*\("
-            r"|\b(?:PolicySnapshot|PolicyEvaluation|PolicyOutcome|PolicyResult)\b"
-            r"|\bCompiled[A-Za-z0-9_]*Policy\b"
-            r"|\bAllowedRequest\b"
-            r"|\b(?:evaluate|compile)_policy\b"
-        ),
-    ),
-    (
-        "provider dispatch dependency/read",
-        re.compile(
-            r"\b(?:StandalonePolicyProvider|DecisionProvider|ProviderDispatcher)\b"
-            r"|\.\s*decide\s*\("
-            r"|\b(?:dispatch|invoke|call)_provider\b"
-        ),
-    ),
-)
-
-violations = []
-for description, pattern in forbidden:
-    for match in pattern.finditer(executor):
-        line = executor.count("\n", 0, match.start()) + 1
-        violations.append(
-            f"{executor_path}:{line}: forbidden {description}: {match.group(0)}"
-        )
-if violations:
-    print("forwarding executor dependency violations:", file=sys.stderr)
-    print("\n".join(violations), file=sys.stderr)
-    raise SystemExit(1)
-
-entry_pattern = re.compile(r"\bForwardingExecutor\s*::\s*execute\s*\(")
-entries = []
-for path, source in sources:
-    if path == executor_path:
-        continue
-    for match in entry_pattern.finditer(source):
-        line = source.count("\n", 0, match.start()) + 1
-        entries.append(f"{path}:{line}")
-if len(entries) != 1 or not entries[0].startswith(f"{ingress_path}:"):
-    print(
-        "ForwardingExecutor::execute must have exactly one production terminal caller in ingress.rs",
-        file=sys.stderr,
-    )
-    print("call sites: " + (", ".join(entries) or "none"), file=sys.stderr)
-    raise SystemExit(1)
-
-
-def locations(pattern: re.Pattern[str]):
-    matches = []
-    for path, source in sources:
-        for match in pattern.finditer(source):
-            line = source.count("\n", 0, match.start()) + 1
-            matches.append((path, line, match))
-    return matches
-
-
-ambient_lookup_pattern = re.compile(
-    r"\bH2StreamCancellation\s*::\s*current\s*\("
-)
-ambient_lookups = locations(ambient_lookup_pattern)
-if len(ambient_lookups) != 1 or ambient_lookups[0][0] != ingress_path:
-    print(
-        "H2StreamCancellation::current must have exactly one production lookup in ingress.rs",
-        file=sys.stderr,
-    )
-    print(
-        "lookup sites: "
-        + (
-            ", ".join(f"{path}:{line}" for path, line, _ in ambient_lookups)
-            or "none"
-        ),
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-
-h2_injection_pattern = re.compile(
-    r"\brequest\s*\.\s*extensions_mut\s*\(\s*\)\s*"
-    r"\.\s*insert\s*\(\s*h2_stream\s*\)"
-)
-h2_injections = locations(h2_injection_pattern)
-if len(h2_injections) != 1 or h2_injections[0][0] != ingress_path:
-    print(
-        "the H2 cancellation capability must be injected exactly once in ingress.rs",
-        file=sys.stderr,
-    )
-    print(
-        "injection sites: "
-        + (
-            ", ".join(f"{path}:{line}" for path, line, _ in h2_injections)
-            or "none"
-        ),
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-
-h2_transfer_pattern = re.compile(
-    r"\bif\s+let\s+Some\s*\(\s*h2_stream\s*\)\s*=\s*"
-    r"H2StreamCancellation\s*::\s*current\s*\(\s*\)\s*\{\s*"
-    r"request\s*\.\s*extensions_mut\s*\(\s*\)\s*"
-    r"\.\s*insert\s*\(\s*h2_stream\s*\)\s*;\s*\}"
-)
-h2_transfers = locations(h2_transfer_pattern)
-if len(h2_transfers) != 1 or h2_transfers[0][0] != ingress_path:
-    print(
-        "the ingress H2 lookup must directly inject its typed cancellation capability",
-        file=sys.stderr,
-    )
-    print(
-        "transfer sites: "
-        + (
-            ", ".join(f"{path}:{line}" for path, line, _ in h2_transfers)
-            or "none"
-        ),
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-
-h2_removal_pattern = re.compile(
-    r"\.\s*extensions\s*\.\s*remove\s*::\s*<\s*"
-    r"H2StreamCancellation\s*>\s*\("
-)
-h2_removals = locations(h2_removal_pattern)
-if len(h2_removals) != 1 or h2_removals[0][0] != executor_path:
-    print(
-        "the H2 cancellation capability must be removed exactly once in forwarding_executor.rs",
-        file=sys.stderr,
-    )
-    print(
-        "removal sites: "
-        + (
-            ", ".join(f"{path}:{line}" for path, line, _ in h2_removals)
-            or "none"
-        ),
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-
-
-def closing_parenthesis(source: str, opening: int) -> int:
-    depth = 0
-    for index in range(opening, len(source)):
-        if source[index] == "(":
-            depth += 1
-        elif source[index] == ")":
-            depth -= 1
-            if depth == 0:
-                return index
-    line = source.count("\n", 0, opening) + 1
-    raise SystemExit(
-        f"unterminated bind_response_lifetime call beginning near line {line}"
-    )
-
-
-bind_start_pattern = re.compile(r"\.\s*bind_response_lifetime\s*\(")
-h2_bindings = []
-invalid_h2_bindings = []
-for path, source in sources:
-    for match in bind_start_pattern.finditer(source):
-        opening = source.find("(", match.start(), match.end())
-        closing = closing_parenthesis(source, opening)
-        arguments = source[opening + 1 : closing]
-        line = source.count("\n", 0, match.start()) + 1
-        location = f"{path}:{line}"
-        h2_bindings.append((path, location))
-        if re.search(r"(?:^|,)\s*h2_stream\s*,?\s*$", arguments) is None:
-            invalid_h2_bindings.append(location)
-if len(h2_bindings) != 2 or any(path != executor_path for path, _ in h2_bindings):
-    print(
-        "H2 response lifetime binding must have exactly two production calls in forwarding_executor.rs",
-        file=sys.stderr,
-    )
-    print(
-        "binding sites: "
-        + (", ".join(location for _, location in h2_bindings) or "none"),
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-if invalid_h2_bindings:
-    print(
-        "each response lifetime binding must receive the executor-owned h2_stream capability",
-        file=sys.stderr,
-    )
-    print("invalid binding sites: " + ", ".join(invalid_h2_bindings), file=sys.stderr)
-    raise SystemExit(1)
-
-for primitive in ("forward_request", "forward_upgrade_request"):
-    reference_pattern = re.compile(rf"\b{primitive}\b")
-    call_pattern = re.compile(rf"\b{primitive}\s*\(")
-    escaped = []
-    calls = []
-    for path, source in sources:
-        if path == transport_path:
-            continue
-        for match in reference_pattern.finditer(source):
-            line = source.count("\n", 0, match.start()) + 1
-            location = f"{path}:{line}"
-            if path != executor_path:
-                escaped.append(location)
-        if path == executor_path:
-            for match in call_pattern.finditer(source):
-                line = source.count("\n", 0, match.start()) + 1
-                calls.append(f"{path}:{line}")
-    if escaped:
-        print(
-            f"{primitive} references must be confined to the forwarding executor transport seam",
-            file=sys.stderr,
-        )
-        print("escaped references: " + ", ".join(escaped), file=sys.stderr)
-        raise SystemExit(1)
-    if len(calls) != 1:
-        print(
-            f"the forwarding executor must contain exactly one production {primitive} transport call",
-            file=sys.stderr,
-        )
-        print("call sites: " + (", ".join(calls) or "none"), file=sys.stderr)
-        raise SystemExit(1)
-
-print("forwarding executor ownership gate passed")
+print("shared forwarding adapter ownership gate passed")
 PY

@@ -2,68 +2,58 @@
 set -euo pipefail
 
 SOURCE_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/forwarding-executor-ownership-test.XXXXXX")
+TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/forwarding-adapter-ownership-test.XXXXXX")
 cleanup() {
     rm -rf -- "$TEST_ROOT"
 }
 trap cleanup EXIT INT TERM
 
 BASELINE="$TEST_ROOT/baseline"
-mkdir -p "$BASELINE/scripts" "$BASELINE/src/proxy" "$BASELINE/src/authorization/webhook"
+mkdir -p \
+    "$BASELINE/scripts" \
+    "$BASELINE/src/activation" \
+    "$BASELINE/src/authorization/webhook" \
+    "$BASELINE/src/proxy" \
+    "$BASELINE/src/runtime"
 cp "$SOURCE_ROOT/scripts/check-forwarding-executor-ownership.sh" "$BASELINE/scripts/"
 
-cat >"$BASELINE/src/proxy/forward.rs" <<'EOF'
-async fn forward_request(request: Request) {}
-async fn forward_upgrade_request(request: Request) {}
+cat >"$BASELINE/src/proxy/mod.rs" <<'EOF'
+pub(crate) mod forwarding_adapter;
+pub(crate) mod ingress;
+EOF
+
+cat >"$BASELINE/src/proxy/forwarding_adapter.rs" <<'EOF'
+use http_access_runtime::{
+    ForwardingAdmission, ForwardingObservation, ForwardingOutcome, ForwardingRequestHead,
+    ForwardingResources, ForwardingResponseHead, ForwardingRetention, ForwardingTerminal,
+    ForwardingTerminalOutcome, ForwardingTerminalOwner, PreparedUpgradeHandoff, UpgradeHandoff,
+    UpgradeOffer, UpstreamUpgradeBounds,
+};
+
+fn adapter(mut parts: Parts, executor: Executor, dispatch: Dispatch, resources: Resources) {
+    let h2_stream = parts.extensions.remove::<H2StreamCancellation>();
+    let outcome = executor.execute(dispatch.exchange, dispatch.resolved, resources);
+    let body = ProxyResponseBody::forwarded(body, Arc::clone(&observation), h2_stream);
+}
+
+// AppState ProductConfig ForwardingExecutor forward_request TcpStream::connect(endpoint)
+/* nested /* ForwardingOutcome */ HttpsConnector */
+const TEXT: &str = "ForwardingExecutor::activate ForwardingResources client::conn";
+const RAW: &str = r#"H2StreamCancellation::current() DestinationGuard"#;
 
 #[cfg(test)]
 mod tests {
-    fn test_only() {
-        forward_request(request);
-        forward_upgrade_request(request);
+    fn ignored() {
+        ForwardingExecutor::activate();
+        executor.execute(dispatch.exchange, dispatch.resolved, resources);
+        TcpStream::connect(endpoint);
     }
 }
-EOF
-
-cat >"$BASELINE/src/proxy/forwarding_executor.rs" <<'EOF'
-use crate::proxy::forward::{forward_request, forward_upgrade_request};
-
-struct ForwardingExecutor;
-
-impl ForwardingExecutor {
-    fn execute_ordinary(request: Request) {
-        let h2_stream = parts.extensions.remove::<H2StreamCancellation>();
-        forward_request(request);
-        body.bind_response_lifetime(deadline, retention, admission, policy, h2_stream);
-    }
-
-    #[cfg(test)]
-    fn test_only_method() {
-        let _: AppState;
-        let _: ProductConfig;
-        crate::policy::evaluate_policy();
-        StandalonePolicyProvider::prepare();
-        forward_request(request);
-        forward_upgrade_request(request);
-    }
-
-    fn execute_upgrade(request: Request) {
-        forward_upgrade_request(request);
-        body.bind_response_lifetime(deadline, retention, admission, policy, h2_stream);
-    }
-}
-
-// AppState ProductConfig AuthoringConfig PolicySnapshot StandalonePolicyProvider
-/* crate::policy nested /* DecisionProvider */ forward_request(request); */
-const TEXT: &str = "AppState Config crate::policy forward_upgrade_request(request)";
-const RAW: &str = r#"ForwardingExecutor::execute(dispatch); forward_request(request)"#;
-const CHARACTER: char = 'x';
-const BYTE: u8 = b'{';
 EOF
 
 cat >"$BASELINE/src/proxy/ingress.rs" <<'EOF'
-fn terminal_forward(dispatch: Dispatch) {
-    ForwardingExecutor::execute(dispatch);
+fn terminal(terminal: Terminal, dispatch: Dispatch) {
+    crate::proxy::forwarding_adapter::execute(terminal, dispatch);
 }
 
 fn execute_request_via_pipeline(mut request: Request) {
@@ -72,29 +62,57 @@ fn execute_request_via_pipeline(mut request: Request) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    fn test_only() {
-        ForwardingExecutor::execute(dispatch);
-        forward_request(request);
-        forward_upgrade_request(request);
-    }
+fn retained_listener() {
+    let _: tokio_rustls::TlsAcceptor;
+    hyper::server::conn::Http::new();
 }
 
-fn production_after_test_module() {}
+#[cfg(test)]
+fn ignored_test_client() {
+    hyper::client::conn::handshake(stream);
+    tokio::net::TcpStream::connect(endpoint);
+}
 EOF
 
-cat >"$BASELINE/src/test_only.rs" <<'EOF'
-#![cfg(test)]
-fn test_only() {
-    ForwardingExecutor::execute(dispatch);
-    forward_request(request);
-    forward_upgrade_request(request);
+cat >"$BASELINE/src/activation/product.rs" <<'EOF'
+fn activate() {
+    let forwarding_executor = http_access_runtime::ForwardingExecutor::activate(bindings);
+}
+EOF
+
+cat >"$BASELINE/src/runtime/generation.rs" <<'EOF'
+struct Generation {
+    forwarding_executor: Arc<http_access_runtime::ForwardingExecutor>,
 }
 EOF
 
 cat >"$BASELINE/src/authorization/webhook/connector.rs" <<'EOF'
-struct WebhookConnector;
+fn connect() {
+    tokio::net::TcpStream::connect(endpoint);
+    tokio::net::lookup_host(endpoint);
+    hyper::client::conn::handshake(stream);
+    let _: tokio_rustls::TlsConnector;
+}
+EOF
+
+cat >"$BASELINE/src/authorization/webhook/provider.rs" <<'EOF'
+use crate::tls::{build_client_config, load_client_trust, ClientAlpn};
+EOF
+
+cat >"$BASELINE/src/tls.rs" <<'EOF'
+use rustls::ClientConfig;
+fn build_client_config() { let _: ClientConfig; }
+fn load_client_trust() {}
+enum ClientAlpn { Http1 }
+EOF
+
+cat >"$BASELINE/src/test_only.rs" <<'EOF'
+#![cfg(test)]
+fn ignored() {
+    let _: ForwardingOutcome;
+    let _: ForwardingExecutor;
+    tokio::net::TcpStream::connect(endpoint);
+}
 EOF
 
 runner() {
@@ -103,7 +121,7 @@ runner() {
 }
 
 runner "$BASELINE" >"$TEST_ROOT/pass.log"
-grep -Fq 'forwarding executor ownership gate passed' "$TEST_ROOT/pass.log"
+grep -Fq 'shared forwarding adapter ownership gate passed' "$TEST_ROOT/pass.log"
 
 expect_failure() {
     local root=$1
@@ -120,259 +138,235 @@ expect_failure() {
     fi
 }
 
-case_index=0
+mutations=0
+new_case() {
+    mutations=$((mutations + 1))
+    CASE_ROOT="$TEST_ROOT/case-$mutations"
+    cp -R "$BASELINE" "$CASE_ROOT"
+}
+
+new_case
+rm "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'missing adapter' 'forwarding ownership scan path is missing: src/proxy/forwarding_adapter.rs'
+
+for obsolete in \
+    src/proxy/forward.rs \
+    src/proxy/forwarding_executor.rs \
+    src/proxy/standalone_body.rs \
+    src/destination.rs
+do
+    new_case
+    mkdir -p "$(dirname -- "$CASE_ROOT/$obsolete")"
+    printf '%s\n' 'fn obsolete() {}' >"$CASE_ROOT/$obsolete"
+    expect_failure "$CASE_ROOT" "restored obsolete path $obsolete" \
+        'obsolete product forwarding owners must remain deleted'
+done
+
+new_case
+mkdir -p "$CASE_ROOT/src/destination"
+printf '%s\n' 'fn obsolete() {}' >"$CASE_ROOT/src/destination/mod.rs"
+expect_failure "$CASE_ROOT" 'restored destination directory' \
+    'obsolete product forwarding owners must remain deleted'
+
+new_case
+printf '%s\n' 'mod forward;' >>"$CASE_ROOT/src/proxy/mod.rs"
+expect_failure "$CASE_ROOT" 'restored obsolete module declaration' \
+    'obsolete product forwarding module declarations must remain deleted'
+
+for dependency in \
+    'let _: AppState;' \
+    'let _: GenerationLease;' \
+    'let _: ProductConfig;' \
+    'use crate::config;' \
+    'let _: AuthoringForwardingRule;' \
+    'use crate::policy;' \
+    'evaluate_policy();' \
+    'let _: PolicySnapshot;' \
+    'let _: StandalonePolicyProvider;' \
+    'provider.decide();'
+do
+    new_case
+    printf '%s\n' "$dependency" >>"$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+    expect_failure "$CASE_ROOT" "adapter dependency $dependency" \
+        'forwarding adapter dependency violations:'
+done
+
+new_case
+printf '%s\n' \
+    'fn bypass(terminal: Terminal, dispatch: Dispatch) {' \
+    '    crate::proxy::forwarding_adapter::execute(terminal, dispatch);' \
+    '}' >"$CASE_ROOT/src/bypass.rs"
+expect_failure "$CASE_ROOT" 'second adapter entry' \
+    'ingress-to-adapter terminal entry ownership violation'
+
+new_case
+sed -i 's/crate::proxy::forwarding_adapter::execute/terminal_response/' \
+    "$CASE_ROOT/src/proxy/ingress.rs"
+expect_failure "$CASE_ROOT" 'missing adapter entry' \
+    'ingress-to-adapter terminal entry ownership violation'
+
+new_case
+printf '%s\n' \
+    'fn bypass(executor: Executor, dispatch: Dispatch, resources: Resources) {' \
+    '    executor.execute(dispatch.exchange, dispatch.resolved, resources);' \
+    '}' >"$CASE_ROOT/src/bypass.rs"
+expect_failure "$CASE_ROOT" 'shared executor bypass' \
+    'adapter-to-shared-executor terminal call ownership violation'
+
+new_case
+sed -i 's/executor.execute(dispatch.exchange, dispatch.resolved, resources)/terminal_response(dispatch)/' \
+    "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'missing shared executor call' \
+    'adapter-to-shared-executor terminal call ownership violation'
+
+new_case
+printf '%s\n' 'fn escaped() { ForwardingExecutor::activate(bindings); }' \
+    >"$CASE_ROOT/src/bypass.rs"
+expect_failure "$CASE_ROOT" 'escaped executor activation' \
+    'shared forwarding executor activation ownership violation'
+
+new_case
+sed -i 's/ForwardingExecutor::activate/ForwardingRuntime::activate/' \
+    "$CASE_ROOT/src/activation/product.rs"
+expect_failure "$CASE_ROOT" 'missing executor activation' \
+    'shared forwarding executor activation ownership violation'
+
+new_case
+printf '%s\n' 'struct Escaped(Arc<ForwardingExecutor>);' >"$CASE_ROOT/src/bypass.rs"
+expect_failure "$CASE_ROOT" 'escaped executor storage' \
+    'ForwardingExecutor storage and activation must remain confined'
+
+for symbol in \
+    ForwardingAdmission \
+    ForwardingObservation \
+    ForwardingOutcome \
+    ForwardingRequestHead \
+    ForwardingResources \
+    ForwardingResponseHead \
+    ForwardingRetention \
+    ForwardingTerminal \
+    ForwardingTerminalOutcome \
+    ForwardingTerminalOwner \
+    PreparedUpgradeHandoff \
+    UpgradeHandoff \
+    UpgradeOffer \
+    UpstreamUpgradeBounds
+do
+    new_case
+    printf '%s\n' "fn escaped(_: $symbol) {}" >"$CASE_ROOT/src/bypass.rs"
+    expect_failure "$CASE_ROOT" "escaped adapter type $symbol" \
+        "$symbol must be owned exclusively and non-vacuously by forwarding_adapter.rs"
+done
+
+new_case
+sed -i '/if let Some(h2_stream) = H2StreamCancellation::current()/d' \
+    "$CASE_ROOT/src/proxy/ingress.rs"
+expect_failure "$CASE_ROOT" 'missing H2 lookup' \
+    'ambient H2 cancellation lookup ownership violation'
+
+new_case
+printf '%s\n' 'fn escaped() { H2StreamCancellation::current(); }' >"$CASE_ROOT/src/bypass.rs"
+expect_failure "$CASE_ROOT" 'escaped H2 lookup' \
+    'ambient H2 cancellation lookup ownership violation'
+
+new_case
+sed -i 's/if let Some(h2_stream) = H2StreamCancellation::current()/if let Some(detached) = H2StreamCancellation::current()/' \
+    "$CASE_ROOT/src/proxy/ingress.rs"
+expect_failure "$CASE_ROOT" 'detached H2 lookup and injection' \
+    'direct H2 cancellation capability transfer ownership violation'
+
+new_case
+sed -i '/request.extensions_mut().insert(h2_stream);/d' "$CASE_ROOT/src/proxy/ingress.rs"
+expect_failure "$CASE_ROOT" 'missing H2 injection' \
+    'typed H2 cancellation injection ownership violation'
+
+new_case
+printf '%s\n' 'fn escaped(mut request: Request) { request.extensions_mut().insert(h2_stream); }' \
+    >"$CASE_ROOT/src/bypass.rs"
+expect_failure "$CASE_ROOT" 'escaped H2 injection' \
+    'typed H2 cancellation injection ownership violation'
+
+new_case
+sed -i '/let h2_stream = parts.extensions.remove::<H2StreamCancellation>();/d' \
+    "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'missing adapter H2 take' \
+    'adapter H2 cancellation ownership take ownership violation'
+
+new_case
+printf '%s\n' 'fn escaped(mut parts: Parts) { parts.extensions.remove::<H2StreamCancellation>(); }' \
+    >"$CASE_ROOT/src/bypass.rs"
+expect_failure "$CASE_ROOT" 'escaped H2 take' \
+    'adapter H2 cancellation ownership take ownership violation'
+
+new_case
+sed -i 's/Arc::clone(&observation), h2_stream/Arc::clone(\&observation), None/' \
+    "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'missing response-lifetime H2 transfer' \
+    'adapter H2 response-lifetime transfer ownership violation'
+
+for primitive in \
+    'forward_request(request);' \
+    'forward_upgrade_request(request);' \
+    'let _: DestinationGuard;' \
+    'let _: DestinationConnector;' \
+    'let _: StandaloneBody;'
+do
+    new_case
+    printf '%s\n' "$primitive" >"$CASE_ROOT/src/bypass.rs"
+    expect_failure "$CASE_ROOT" "obsolete private primitive $primitive" \
+        'obsolete product-private ordinary forwarding primitives must remain absent'
+done
+
+for primitive in \
+    'tokio::net::TcpStream::connect(endpoint);' \
+    'std::net::TcpStream::connect(endpoint);' \
+    'TcpSocket::new_v4();' \
+    'socket2::Socket::new(domain, kind, protocol);' \
+    'tokio::net::lookup_host(endpoint);' \
+    'let _: std::net::ToSocketAddrs;' \
+    'hyper::client::conn::handshake(stream);' \
+    'use hyper::{client as private_client};' \
+    'let _: hyper::Client;' \
+    'let _: HttpConnector;' \
+    'let _: HttpsConnector;' \
+    'let _: tokio_rustls::TlsConnector;' \
+    'let _: rustls::ClientConfig;' \
+    'let _: rustls::ClientConnection;' \
+    'use tokio_rustls::{TlsConnector as OutboundTls};'
+do
+    new_case
+    printf '%s\n' "$primitive" >"$CASE_ROOT/src/bypass.rs"
+    expect_failure "$CASE_ROOT" "escaped client transport $primitive" \
+        'ordinary product forwarding must not own dialing, client TLS, or private Hyper client transport'
+done
+
+for helper in build_client_config load_client_trust ClientAlpn; do
+    new_case
+    printf '%s\n' "fn escaped() { let _ = $helper; }" >"$CASE_ROOT/src/egress.rs"
+    expect_failure "$CASE_ROOT" "ordinary use of webhook TLS helper $helper" \
+        'retained client TLS helpers must remain webhook-only'
+done
+
 for dependency in \
     'use crate::destination::DestinationGuard;' \
-    'use crate::{config::StaticProductConfig, destination::DestinationGuard};' \
-    'use crate::{destination::{DestinationGuard}};' \
-    'use crate::destination::*;' \
-    'fn escaped(_: crate::destination::DestinationGuard) {}' \
-    'use crate::egress::EgressSnapshot;' \
-    'use crate::{config::StaticProductConfig, egress::EgressSnapshot};' \
-    'use crate::{egress::*};' \
-    'use crate::proxy::forward::forward_request;' \
-    'use crate::{proxy::{forward::forward_request}};' \
-    'use crate::proxy as ordinary_proxy;' \
-    'use crate::{proxy as ordinary_proxy};' \
-    'use crate::proxy::{self as ordinary_proxy};' \
+    'use crate::egress::EgressActivation;' \
+    'use crate::proxy::forwarding_adapter;' \
     'fn escaped(_: ForwardingPlan) {}' \
     'fn escaped(_: ProductCredentialExecution) {}'
 do
-    case_root="$TEST_ROOT/webhook-ownership-$case_index"
-    case_index=$((case_index + 1))
-    cp -R "$BASELINE" "$case_root"
-    printf '%s\n' "$dependency" >>"$case_root/src/authorization/webhook/connector.rs"
-    expect_failure "$case_root" "webhook connector dependency $dependency" \
-        'authorization webhook connector must remain independent of ordinary forwarding ownership'
+    new_case
+    printf '%s\n' "$dependency" >>"$CASE_ROOT/src/authorization/webhook/connector.rs"
+    expected='authorization webhook connector must remain independent of ordinary forwarding ownership'
+    if [[ $dependency == *DestinationGuard* ]]; then
+        expected='obsolete product-private ordinary forwarding primitives must remain absent'
+    fi
+    expect_failure "$CASE_ROOT" "webhook dependency $dependency" "$expected"
 done
 
-case_root="$TEST_ROOT/webhook-ownership-$case_index"
-case_index=$((case_index + 1))
-cp -R "$BASELINE" "$case_root"
-printf '%s\n' 'use crate::{' '    config::StaticProductConfig,' '    destination,' '};' \
-    >>"$case_root/src/authorization/webhook/connector.rs"
-expect_failure "$case_root" 'multiline grouped webhook destination import' \
-    'authorization webhook connector must remain independent of ordinary forwarding ownership'
+new_case
+printf '%s\n' 'use crate::authorization::webhook::connector::WebhookConnector;' \
+    >>"$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'adapter webhook dependency' \
+    'ordinary egress and forwarding adapter owners must not reference the authorization webhook connector'
 
-for reference in \
-    'use crate::authorization::webhook::connector::WebhookConnector;' \
-    'use crate::{authorization::webhook::connector::WebhookConnector};' \
-    'use crate::authorization::webhook::*;' \
-    'use crate::authorization::{webhook::*};' \
-    'use crate::authorization::webhook as product_webhook;' \
-    'use crate::{authorization::webhook as product_webhook};' \
-    'use crate::authorization::{webhook as product_webhook};' \
-    'fn escaped(_: crate::authorization::webhook::connector::WebhookConnector) {}'
-do
-    case_root="$TEST_ROOT/webhook-reverse-ownership-$case_index"
-    case_index=$((case_index + 1))
-    cp -R "$BASELINE" "$case_root"
-    printf '%s\n' "$reference" >>"$case_root/src/proxy/forward.rs"
-    expect_failure "$case_root" "ordinary forwarding webhook reference $reference" \
-        'ordinary destination and forwarding owners must not reference the authorization webhook connector'
-done
-
-case_root="$TEST_ROOT/webhook-reverse-alias-chain-$case_index"
-case_index=$((case_index + 1))
-cp -R "$BASELINE" "$case_root"
-printf '%s\n' \
-    'use crate::authorization as auth;' \
-    'use auth::webhook::*;' \
-    >>"$case_root/src/proxy/forward.rs"
-expect_failure "$case_root" 'ordinary forwarding webhook alias chain' \
-    'ordinary destination and forwarding owners must not reference the authorization webhook connector'
-
-forbidden_mutations=(
-    'let _: AppState;'
-    'let _: GenerationLease;'
-    'let _: Runtime;'
-    'let _: CredentialResolver;'
-    'let _: EgressSnapshot;'
-    'let _: SafetySnapshot;'
-    'let _: ProductConfig;'
-    'let _: Config;'
-    'let _ = config.timeout;'
-    'let _ = self.config;'
-    'let _: AuthoringForwardingRule;'
-    'use crate::policy;'
-    'let _ = state.policy();'
-    'let _: PolicySnapshot;'
-    'let _: PolicyEvaluation;'
-    'let _: PolicyOutcome;'
-    'let _: PolicyResult;'
-    'let _: CompiledForwardingPolicy;'
-    'let _: AllowedRequest;'
-    'evaluate_policy();'
-    'let _: StandalonePolicyProvider;'
-    'let _: DecisionProvider;'
-    'let _: ProviderDispatcher;'
-    'provider.decide();'
-    'dispatch_provider();'
-    'invoke_provider();'
-    'call_provider();'
-)
-
-for mutation in "${forbidden_mutations[@]}"; do
-    case_index=$((case_index + 1))
-    case_root="$TEST_ROOT/case-$case_index"
-    cp -R "$BASELINE" "$case_root"
-    python3 - "$case_root/src/proxy/forwarding_executor.rs" "$mutation" <<'PY'
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-mutation = sys.argv[2]
-source = path.read_text(encoding="utf-8")
-path.write_text(source.replace("struct ForwardingExecutor;", mutation, 1), encoding="utf-8")
-PY
-    expect_failure "$case_root" "executor dependency mutation: $mutation" \
-        'forwarding executor dependency violations:'
-done
-
-case_root="$TEST_ROOT/extra-entry"
-cp -R "$BASELINE" "$case_root"
-printf '%s\n' 'fn bypass(dispatch: Dispatch) { ForwardingExecutor::execute(dispatch); }' \
-    >"$case_root/src/bypass.rs"
-expect_failure "$case_root" 'second executor entry' \
-    'must have exactly one production terminal caller in ingress.rs'
-
-case_root="$TEST_ROOT/missing-entry"
-cp -R "$BASELINE" "$case_root"
-sed -i 's/ForwardingExecutor::execute(dispatch);/terminal_response(dispatch);/' \
-    "$case_root/src/proxy/ingress.rs"
-expect_failure "$case_root" 'missing executor entry' \
-    'must have exactly one production terminal caller in ingress.rs'
-
-for primitive in forward_request forward_upgrade_request; do
-    case_index=$((case_index + 1))
-    case_root="$TEST_ROOT/case-$case_index"
-    cp -R "$BASELINE" "$case_root"
-    sed -i "1i use crate::proxy::forward::$primitive as escaped_transport;" \
-        "$case_root/src/proxy/ingress.rs"
-    expect_failure "$case_root" "$primitive alias outside executor" \
-        "$primitive references must be confined to the forwarding executor transport seam"
-
-    case_index=$((case_index + 1))
-    case_root="$TEST_ROOT/case-$case_index"
-    cp -R "$BASELINE" "$case_root"
-    sed -i "/        $primitive(request);/a\        $primitive(request);" \
-        "$case_root/src/proxy/forwarding_executor.rs"
-    expect_failure "$case_root" "second executor $primitive call" \
-        "must contain exactly one production $primitive transport call"
-
-    case_index=$((case_index + 1))
-    case_root="$TEST_ROOT/case-$case_index"
-    cp -R "$BASELINE" "$case_root"
-    sed -i "/        $primitive(request);/d" \
-        "$case_root/src/proxy/forwarding_executor.rs"
-    expect_failure "$case_root" "missing executor $primitive call" \
-        "must contain exactly one production $primitive transport call"
-done
-
-case_root="$TEST_ROOT/missing-h2-lookup"
-cp -R "$BASELINE" "$case_root"
-sed -i '/    if let Some(h2_stream) = H2StreamCancellation::current() {/d' \
-    "$case_root/src/proxy/ingress.rs"
-expect_failure "$case_root" 'missing H2 cancellation lookup' \
-    'H2StreamCancellation::current must have exactly one production lookup in ingress.rs'
-
-case_root="$TEST_ROOT/duplicate-h2-lookup"
-cp -R "$BASELINE" "$case_root"
-sed -i '/    if let Some(h2_stream) = H2StreamCancellation::current() {/a\    let _duplicate = H2StreamCancellation::current();' \
-    "$case_root/src/proxy/ingress.rs"
-expect_failure "$case_root" 'duplicate H2 cancellation lookup' \
-    'H2StreamCancellation::current must have exactly one production lookup in ingress.rs'
-
-case_root="$TEST_ROOT/escaped-h2-lookup"
-cp -R "$BASELINE" "$case_root"
-printf '%s\n' 'fn escaped() { let _ = H2StreamCancellation::current(); }' \
-    >"$case_root/src/bypass.rs"
-expect_failure "$case_root" 'escaped H2 cancellation lookup' \
-    'H2StreamCancellation::current must have exactly one production lookup in ingress.rs'
-
-case_root="$TEST_ROOT/missing-h2-injection"
-cp -R "$BASELINE" "$case_root"
-sed -i '/        request.extensions_mut().insert(h2_stream);/d' \
-    "$case_root/src/proxy/ingress.rs"
-expect_failure "$case_root" 'missing H2 cancellation injection' \
-    'the H2 cancellation capability must be injected exactly once in ingress.rs'
-
-case_root="$TEST_ROOT/duplicate-h2-injection"
-cp -R "$BASELINE" "$case_root"
-sed -i '/        request.extensions_mut().insert(h2_stream);/a\        request.extensions_mut().insert(h2_stream);' \
-    "$case_root/src/proxy/ingress.rs"
-expect_failure "$case_root" 'duplicate H2 cancellation injection' \
-    'the H2 cancellation capability must be injected exactly once in ingress.rs'
-
-case_root="$TEST_ROOT/escaped-h2-injection"
-cp -R "$BASELINE" "$case_root"
-printf '%s\n' 'fn escaped(mut request: Request) { request.extensions_mut().insert(h2_stream); }' \
-    >"$case_root/src/bypass.rs"
-expect_failure "$case_root" 'escaped H2 cancellation injection' \
-    'the H2 cancellation capability must be injected exactly once in ingress.rs'
-
-case_root="$TEST_ROOT/detached-h2-transfer"
-cp -R "$BASELINE" "$case_root"
-sed -i 's/if let Some(h2_stream) = H2StreamCancellation::current()/if let Some(detached) = H2StreamCancellation::current()/' \
-    "$case_root/src/proxy/ingress.rs"
-expect_failure "$case_root" 'detached H2 cancellation transfer' \
-    'the ingress H2 lookup must directly inject its typed cancellation capability'
-
-case_root="$TEST_ROOT/missing-h2-removal"
-cp -R "$BASELINE" "$case_root"
-sed -i '/        let h2_stream = parts.extensions.remove::<H2StreamCancellation>();/d' \
-    "$case_root/src/proxy/forwarding_executor.rs"
-expect_failure "$case_root" 'missing H2 cancellation removal' \
-    'the H2 cancellation capability must be removed exactly once in forwarding_executor.rs'
-
-case_root="$TEST_ROOT/duplicate-h2-removal"
-cp -R "$BASELINE" "$case_root"
-sed -i '/        let h2_stream = parts.extensions.remove::<H2StreamCancellation>();/a\        let _duplicate = parts.extensions.remove::<H2StreamCancellation>();' \
-    "$case_root/src/proxy/forwarding_executor.rs"
-expect_failure "$case_root" 'duplicate H2 cancellation removal' \
-    'the H2 cancellation capability must be removed exactly once in forwarding_executor.rs'
-
-case_root="$TEST_ROOT/escaped-h2-removal"
-cp -R "$BASELINE" "$case_root"
-printf '%s\n' 'fn escaped(parts: Parts) { parts.extensions.remove::<H2StreamCancellation>(); }' \
-    >"$case_root/src/bypass.rs"
-expect_failure "$case_root" 'escaped H2 cancellation removal' \
-    'the H2 cancellation capability must be removed exactly once in forwarding_executor.rs'
-
-case_root="$TEST_ROOT/missing-h2-binding"
-cp -R "$BASELINE" "$case_root"
-python3 - "$case_root/src/proxy/forwarding_executor.rs" <<'PY'
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-source = path.read_text(encoding="utf-8")
-binding = "        body.bind_response_lifetime(deadline, retention, admission, policy, h2_stream);\n"
-path.write_text(source.replace(binding, "", 1), encoding="utf-8")
-PY
-expect_failure "$case_root" 'missing H2 response binding' \
-    'H2 response lifetime binding must have exactly two production calls in forwarding_executor.rs'
-
-case_root="$TEST_ROOT/duplicate-h2-binding"
-cp -R "$BASELINE" "$case_root"
-sed -i '/        body.bind_response_lifetime(deadline, retention, admission, policy, h2_stream);/a\        body.bind_response_lifetime(deadline, retention, admission, policy, h2_stream);' \
-    "$case_root/src/proxy/forwarding_executor.rs"
-expect_failure "$case_root" 'duplicate H2 response binding' \
-    'H2 response lifetime binding must have exactly two production calls in forwarding_executor.rs'
-
-case_root="$TEST_ROOT/escaped-h2-binding"
-cp -R "$BASELINE" "$case_root"
-printf '%s\n' 'fn escaped() { body.bind_response_lifetime(deadline, retention, admission, policy, h2_stream); }' \
-    >"$case_root/src/bypass.rs"
-expect_failure "$case_root" 'escaped H2 response binding' \
-    'H2 response lifetime binding must have exactly two production calls in forwarding_executor.rs'
-
-case_root="$TEST_ROOT/wrong-h2-binding"
-cp -R "$BASELINE" "$case_root"
-sed -i '0,/policy, h2_stream);/s//policy, None);/' \
-    "$case_root/src/proxy/forwarding_executor.rs"
-expect_failure "$case_root" 'response binding without H2 capability' \
-    'each response lifetime binding must receive the executor-owned h2_stream capability'
-
-printf 'forwarding executor ownership mutation tests passed (%d mutations)\n' \
-    "$((case_index + 14))"
+printf 'shared forwarding adapter ownership mutation tests passed (%d mutations)\n' "$mutations"
