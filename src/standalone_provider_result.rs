@@ -24,7 +24,7 @@ use crate::credential_resolver::{ProductCredentialBinding, ProductCredentialPrep
 use crate::credentials::OutboundCredentialSource;
 use crate::policy::ProductRuleEffectsRef;
 use crate::runtime::{GenerationLease, ProviderIndex};
-use crate::safety::{GuardedBody, HttpWireBodyGuard, RuntimeReplayLease};
+use crate::safety::{GuardedBody, HttpWireBodyGuard};
 use crate::standalone::{
     BoundCredentialSource, ProviderCredentialTemplates, StandaloneCaptureEvent,
     StandaloneGenerationPlan,
@@ -56,8 +56,6 @@ pub(crate) enum StandaloneAllowMode {
 /// plan binding.
 pub(crate) struct StandaloneRequestSidecar {
     plan_binding: PlanBinding,
-    _guard: HttpWireBodyGuard,
-    _replay_lease: RuntimeReplayLease,
     capture_body: StandaloneCaptureBody,
     upgrade: Option<StandaloneUpgradeBinding>,
 }
@@ -152,7 +150,6 @@ pub(crate) fn adapt_provider_allow(
     allow_mode: StandaloneAllowMode,
     inspected_body: Option<GuardedBody>,
     guard: HttpWireBodyGuard,
-    replay_lease: RuntimeReplayLease,
     request: RuntimeRequest,
 ) -> Result<StandaloneProviderAllow, StandaloneProviderAllowFailure> {
     let mut provider_replacement_size = None;
@@ -165,7 +162,6 @@ pub(crate) fn adapt_provider_allow(
         allow_mode,
         inspected_body,
         guard,
-        replay_lease,
         request,
         &mut provider_replacement_size,
     )
@@ -185,7 +181,6 @@ fn adapt_provider_allow_inner(
     allow_mode: StandaloneAllowMode,
     inspected_body: Option<GuardedBody>,
     guard: HttpWireBodyGuard,
-    replay_lease: RuntimeReplayLease,
     mut request: RuntimeRequest,
     failure_replacement_size: &mut Option<usize>,
 ) -> Result<StandaloneProviderAllow, StandaloneProviderAllowError> {
@@ -298,7 +293,6 @@ fn adapt_provider_allow_inner(
         provider_replacement_size,
         upgrade_binding,
         guard,
-        replay_lease,
         request,
         lease.credential_io_runtime(),
     )
@@ -312,7 +306,6 @@ pub(crate) fn adapt_local_allow(
     allow_mode: StandaloneAllowMode,
     inspected_body: Option<GuardedBody>,
     guard: HttpWireBodyGuard,
-    replay_lease: RuntimeReplayLease,
     mut request: RuntimeRequest,
 ) -> Result<StandaloneProviderAllow, StandaloneProviderAllowError> {
     let generation = lease.standalone();
@@ -351,7 +344,6 @@ pub(crate) fn adapt_local_allow(
         None,
         upgrade_binding,
         guard,
-        replay_lease,
         request,
         lease.credential_io_runtime(),
     )
@@ -391,7 +383,6 @@ fn finish_allow(
     provider_replacement_size: Option<usize>,
     upgrade_binding: Option<StandaloneUpgradeBinding>,
     guard: HttpWireBodyGuard,
-    replay_lease: RuntimeReplayLease,
     request: RuntimeRequest,
     credential_io_runtime: Arc<crate::credential_io_runtime::CredentialIoRuntime>,
 ) -> Result<StandaloneProviderAllow, StandaloneProviderAllowError> {
@@ -516,8 +507,6 @@ fn finish_allow(
     };
     let sidecar = StandaloneRequestSidecar {
         plan_binding,
-        _guard: guard,
-        _replay_lease: replay_lease,
         capture_body,
         upgrade: upgrade_binding,
     };
@@ -1108,19 +1097,17 @@ header = "x-test-loop"
         bytes
     }
 
-    fn admission(
-        lease: &GenerationLease,
-    ) -> (HttpWireBodyGuard, RuntimeReplayLease, ProviderIndex) {
-        let (guard, replay) = local_admission(lease);
+    fn admission(lease: &GenerationLease) -> (HttpWireBodyGuard, ProviderIndex) {
+        let guard = local_admission(lease);
         let provider = lease
             .standalone()
             .activated()
             .rule_provider_for_test(0)
             .unwrap();
-        (guard, replay, provider)
+        (guard, provider)
     }
 
-    fn local_admission(lease: &GenerationLease) -> (HttpWireBodyGuard, RuntimeReplayLease) {
+    fn local_admission(lease: &GenerationLease) -> HttpWireBodyGuard {
         let peer: IpAddr = "192.0.2.10".parse().unwrap();
         let request = request(lease.standalone(), Vec::new());
         admission_for_request(lease, &request, peer)
@@ -1130,7 +1117,7 @@ header = "x-test-loop"
         lease: &GenerationLease,
         request: &RuntimeRequest,
         peer: IpAddr,
-    ) -> (HttpWireBodyGuard, RuntimeReplayLease) {
+    ) -> HttpWireBodyGuard {
         let input = EvaluationInput::new(
             request.facts(),
             peer,
@@ -1167,7 +1154,8 @@ header = "x-test-loop"
             .unwrap();
         let (guard, replay, staging) = admission.into_parts();
         drop(staging);
-        (guard, replay)
+        drop(replay);
+        guard
     }
 
     fn replacement(
@@ -1233,7 +1221,6 @@ header = "x-test-loop"
         output: AuthorizationAllowOutput,
         inspected_body: Option<GuardedBody>,
         guard: HttpWireBodyGuard,
-        replay_lease: RuntimeReplayLease,
         request: RuntimeRequest,
     ) -> Result<StandaloneProviderAllow, StandaloneProviderAllowFailure> {
         adapt_provider_allow_with_mode(
@@ -1244,7 +1231,6 @@ header = "x-test-loop"
             StandaloneAllowMode::OriginRequest,
             inspected_body,
             guard,
-            replay_lease,
             request,
         )
     }
@@ -1258,7 +1244,6 @@ header = "x-test-loop"
         allow_mode: StandaloneAllowMode,
         inspected_body: Option<GuardedBody>,
         guard: HttpWireBodyGuard,
-        replay_lease: RuntimeReplayLease,
         request: RuntimeRequest,
     ) -> Result<StandaloneProviderAllow, StandaloneProviderAllowFailure> {
         let input = EvaluationInput::new(
@@ -1305,7 +1290,6 @@ header = "x-test-loop"
             allow_mode,
             inspected_body,
             guard,
-            replay_lease,
             request,
         )
     }
@@ -1315,7 +1299,6 @@ header = "x-test-loop"
         rule_ordinal: Option<usize>,
         inspected_body: Option<GuardedBody>,
         guard: HttpWireBodyGuard,
-        replay_lease: RuntimeReplayLease,
         request: RuntimeRequest,
     ) -> Result<StandaloneProviderAllow, StandaloneProviderAllowError> {
         let input = EvaluationInput::new(
@@ -1347,7 +1330,6 @@ header = "x-test-loop"
             StandaloneAllowMode::OriginRequest,
             inspected_body,
             guard,
-            replay_lease,
             request,
         )
     }
@@ -1364,7 +1346,7 @@ header = "x-test-loop"
         for fragments in cases {
             let (runtime, lease, pool) = runtime().await;
             let generation = lease.standalone();
-            let (guard, replay, provider) = admission(&lease);
+            let (guard, provider) = admission(&lease);
             let replacement = replacement(&guard, &fragments, Some("application/provider"));
             let expected = fragments.concat();
             let before = request(generation, vec![b"original".to_vec()]);
@@ -1377,7 +1359,6 @@ header = "x-test-loop"
                 output(&lease, provider, true, Some(replacement)),
                 None,
                 guard,
-                replay,
                 before,
             )
             .unwrap();
@@ -1479,7 +1460,7 @@ header = "x-test-loop"
         ] {
             let (runtime, lease, _pool) = runtime().await;
             let generation = lease.standalone();
-            let (guard, replay, provider) = admission(&lease);
+            let (guard, provider) = admission(&lease);
             let replacement =
                 replacement_type.map(|content_type| replacement(&guard, &[b"body"], content_type));
             let mut result = adapt_provider_allow(
@@ -1489,7 +1470,6 @@ header = "x-test-loop"
                 output(&lease, provider, true, replacement),
                 None,
                 guard,
-                replay,
                 request(generation, vec![b"original".to_vec()]),
             )
             .unwrap();
@@ -1556,7 +1536,7 @@ header = "x-test-loop"
 
         let (primary_runtime, lease, _pool) = runtime().await;
         let generation = lease.standalone();
-        let (guard, replay, provider) = admission(&lease);
+        let (guard, provider) = admission(&lease);
         let mut result = adapt_provider_allow(
             &lease,
             0,
@@ -1564,7 +1544,6 @@ header = "x-test-loop"
             output(&lease, provider, true, None),
             None,
             guard,
-            replay,
             request(generation, vec![b"original".to_vec()]),
         )
         .unwrap();
@@ -1605,7 +1584,7 @@ header = "x-test-loop"
         let (runtime, lease, _pool) = runtime_from_config(&config).await;
         let request = connect_request(lease.standalone());
         let peer = "192.0.2.10".parse().unwrap();
-        let (guard, replay) = admission_for_request(&lease, &request, peer);
+        let guard = admission_for_request(&lease, &request, peer);
         let provider = lease
             .standalone()
             .activated()
@@ -1621,7 +1600,6 @@ header = "x-test-loop"
             StandaloneAllowMode::OuterConnect,
             None,
             guard,
-            replay,
             request,
         )
         .expect("outer CONNECT must not require origin credential outputs");
@@ -1635,7 +1613,7 @@ header = "x-test-loop"
         drop((result, lineage));
 
         let request = connect_request(lease.standalone());
-        let (guard, replay) = admission_for_request(&lease, &request, peer);
+        let guard = admission_for_request(&lease, &request, peer);
         let output_with_effects = output(&lease, provider, true, None);
         assert!(adapt_provider_allow_with_mode(
             &lease,
@@ -1645,7 +1623,6 @@ header = "x-test-loop"
             StandaloneAllowMode::OuterConnect,
             None,
             guard,
-            replay,
             request,
         )
         .is_err_and(|failure| matches!(failure.error, StandaloneProviderAllowError::Binding)));
@@ -1657,7 +1634,7 @@ header = "x-test-loop"
     async fn credential_preparation_rejects_same_binding_with_different_plan_allocation() {
         let (primary_runtime, lease, _pool) = runtime().await;
         let generation = lease.standalone();
-        let (guard, replay, provider) = admission(&lease);
+        let (guard, provider) = admission(&lease);
         let mut result = adapt_provider_allow(
             &lease,
             0,
@@ -1665,7 +1642,6 @@ header = "x-test-loop"
             output(&lease, provider, true, None),
             None,
             guard,
-            replay,
             request(generation, vec![b"original".to_vec()]),
         )
         .unwrap();
@@ -1692,7 +1668,7 @@ header = "x-test-loop"
 
         let (runtime, lease, _pool) = runtime().await;
         let generation = lease.standalone();
-        let (guard, replay, provider) = admission(&lease);
+        let (guard, provider) = admission(&lease);
         let mut result = adapt_provider_allow(
             &lease,
             0,
@@ -1700,7 +1676,6 @@ header = "x-test-loop"
             output(&lease, provider, true, None),
             None,
             guard,
-            replay,
             request(generation, vec![b"original".to_vec()]),
         )
         .unwrap();
@@ -1745,7 +1720,7 @@ header = "x-test-loop"
 
         let (runtime, lease, _pool) = runtime().await;
         let generation = lease.standalone();
-        let (guard, replay, provider) = admission(&lease);
+        let (guard, provider) = admission(&lease);
         let mut result = adapt_provider_allow(
             &lease,
             0,
@@ -1753,7 +1728,6 @@ header = "x-test-loop"
             output(&lease, provider, true, None),
             None,
             guard,
-            replay,
             request(generation, vec![b"original".to_vec()]),
         )
         .unwrap();
@@ -1784,7 +1758,7 @@ header = "x-test-loop"
     async fn provider_replacement_is_redacted_before_the_single_runtime_commit() {
         let (runtime, lease, _pool) = runtime().await;
         let generation = lease.standalone();
-        let (guard, replay, provider) = admission(&lease);
+        let (guard, provider) = admission(&lease);
         let replacement = replacement(&guard, &[b"before secret after"], Some("text/plain"));
         let request = request(generation, vec![b"original".to_vec()]);
         let original_revision = request.revision();
@@ -1796,7 +1770,6 @@ header = "x-test-loop"
             output(&lease, provider, false, Some(replacement)),
             None,
             guard,
-            replay,
             request,
         )
         .unwrap();
@@ -1826,7 +1799,7 @@ header = "x-test-loop"
     async fn provider_allow_without_replacement_rehomes_and_redacts_the_inspected_body_once() {
         let (runtime, lease, pool) = runtime().await;
         let generation = lease.standalone();
-        let (guard, replay, provider) = admission(&lease);
+        let (guard, provider) = admission(&lease);
         let mut inspected = guard.buffer();
         inspected
             .try_extend_from_slice(b"before secret after")
@@ -1842,7 +1815,6 @@ header = "x-test-loop"
             output(&lease, provider, true, None),
             Some(inspected.finish()),
             guard,
-            replay,
             request,
         )
         .unwrap();
@@ -1872,7 +1844,7 @@ header = "x-test-loop"
             .replace("authorization_provider = \"approval\"\n", "");
         let (runtime, lease, pool) = runtime_from_config(&local_config).await;
         let generation = lease.standalone();
-        let (guard, replay) = local_admission(&lease);
+        let guard = local_admission(&lease);
         let mut inspected = guard.buffer();
         inspected
             .try_extend_from_slice(b"local secret body")
@@ -1881,15 +1853,8 @@ header = "x-test-loop"
         let original_revision = request.revision();
         let lineage = request.begin_provider_invocation();
 
-        let result = adapt_local_allow(
-            &lease,
-            Some(0),
-            Some(inspected.finish()),
-            guard,
-            replay,
-            request,
-        )
-        .unwrap();
+        let result =
+            adapt_local_allow(&lease, Some(0), Some(inspected.finish()), guard, request).unwrap();
 
         assert_eq!(result.request.revision(), original_revision + 1);
         assert_eq!(
@@ -1925,7 +1890,7 @@ header = "x-test-loop"
             .rule_provider_for_test(0)
             .unwrap();
         let foreign_output = output(&foreign_lease, foreign_provider, true, None);
-        let (guard, replay, provider) = admission(&lease);
+        let (guard, provider) = admission(&lease);
 
         let error = adapt_provider_allow(
             &lease,
@@ -1934,7 +1899,6 @@ header = "x-test-loop"
             foreign_output,
             None,
             guard,
-            replay,
             request(generation, vec![b"original".to_vec()]),
         )
         .err()
@@ -1943,7 +1907,7 @@ header = "x-test-loop"
         assert!(matches!(error.error, StandaloneProviderAllowError::Binding));
         assert_eq!(pool.global_charge(), 0);
 
-        let (guard, replay, provider) = admission(&lease);
+        let (guard, provider) = admission(&lease);
         let foreign_plain_allow = output(&foreign_lease, foreign_provider, false, None);
         assert!(adapt_provider_allow(
             &lease,
@@ -1952,27 +1916,25 @@ header = "x-test-loop"
             foreign_plain_allow,
             None,
             guard,
-            replay,
             request(generation, vec![b"original".to_vec()]),
         )
         .is_err_and(|failure| matches!(failure.error, StandaloneProviderAllowError::Binding)));
         assert_eq!(pool.global_charge(), 0);
 
-        let (foreign_guard, foreign_replay, _) = admission(&foreign_lease);
+        let (foreign_guard, _) = admission(&foreign_lease);
         let foreign_replacement = replacement(
             &foreign_guard,
             &[b"foreign replacement"],
             Some("application/foreign"),
         );
         drop(foreign_guard);
-        drop(foreign_replay);
         let foreign_replacement_allow = output(
             &foreign_lease,
             foreign_provider,
             false,
             Some(foreign_replacement),
         );
-        let (guard, replay, provider) = admission(&lease);
+        let (guard, provider) = admission(&lease);
         assert!(adapt_provider_allow(
             &lease,
             0,
@@ -1980,7 +1942,6 @@ header = "x-test-loop"
             foreign_replacement_allow,
             None,
             guard,
-            replay,
             request(generation, vec![b"original".to_vec()]),
         )
         .is_err_and(|failure| matches!(failure.error, StandaloneProviderAllowError::Binding)));
@@ -1996,7 +1957,7 @@ header = "x-test-loop"
     async fn non_identity_provider_replacement_fails_before_commit_and_releases_charges() {
         let (runtime, lease, pool) = runtime().await;
         let generation = lease.standalone();
-        let (guard, replay, provider) = admission(&lease);
+        let (guard, provider) = admission(&lease);
         let replacement = replacement_with_encoding(&guard, b"replacement", "gzip");
         let request = request(generation, vec![b"original".to_vec()]);
 
@@ -2007,7 +1968,6 @@ header = "x-test-loop"
             output(&lease, provider, true, Some(replacement)),
             None,
             guard,
-            replay,
             request,
         )
         .err()
@@ -2040,7 +2000,7 @@ header = "x-test-loop"
     async fn invalid_content_type_releases_all_product_charges() {
         let (runtime, lease, pool) = runtime().await;
         let generation = lease.standalone();
-        let (guard, replay, provider) = admission(&lease);
+        let (guard, provider) = admission(&lease);
         let replacement = replacement(&guard, &[b"replacement"], Some("invalid\nvalue"));
         let error = adapt_provider_allow(
             &lease,
@@ -2049,7 +2009,6 @@ header = "x-test-loop"
             output(&lease, provider, true, Some(replacement)),
             None,
             guard,
-            replay,
             request(generation, vec![b"original".to_vec()]),
         )
         .err()

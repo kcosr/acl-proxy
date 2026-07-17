@@ -11,7 +11,7 @@ use hyper::body::HttpBody;
 use hyper::Body;
 
 use crate::safety::wire_body::{RequestStagingBodyBuilder, WireBodyBufferError};
-use crate::safety::{GuardedBody, HttpWireBodyGuard, RequestStagingAuthority};
+use crate::safety::{GuardedBody, HttpWireBodyGuard, RequestStagingAuthority, RuntimeReplayLease};
 
 const MAX_SOURCE_FRAMES: usize = 65_536;
 const MAX_BODY_BYTES: u64 = 1024 * 1024 * 1024;
@@ -20,9 +20,15 @@ const COPY_BLOCK_BYTES: usize = 64 * 1024;
 
 enum ActivationState {
     Unarmed,
-    Armed(RequestStagingAuthority),
+    Armed(ArmedBodySource),
     Claimed,
     Terminal,
+}
+
+struct ArmedBodySource {
+    guard: HttpWireBodyGuard,
+    replay_lease: RuntimeReplayLease,
+    staging: RequestStagingAuthority,
 }
 
 struct ActivationSlot {
@@ -38,11 +44,12 @@ impl ProductBodySourceActivation {
     /// Installs staging authority branded by the selected request guard.
     pub(crate) fn activate(
         self,
-        guard: &HttpWireBodyGuard,
+        guard: HttpWireBodyGuard,
+        replay_lease: RuntimeReplayLease,
         staging: RequestStagingAuthority,
     ) -> Result<(), RuntimeError> {
         staging
-            .validate_guard(guard)
+            .validate_guard(&guard)
             .map_err(|_| RuntimeError::BindingMismatch)?;
         let slot = self.slot.upgrade().ok_or(RuntimeError::InvalidInput)?;
         let mut slot = slot
@@ -51,7 +58,11 @@ impl ProductBodySourceActivation {
         if !matches!(slot.state, ActivationState::Unarmed) {
             return Err(RuntimeError::InvalidInput);
         }
-        slot.state = ActivationState::Armed(staging);
+        slot.state = ActivationState::Armed(ArmedBodySource {
+            guard,
+            replay_lease,
+            staging,
+        });
         Ok(())
     }
 }
@@ -60,6 +71,8 @@ impl ProductBodySourceActivation {
 pub(crate) struct ProductBodySource {
     body: Body,
     activation: Arc<Mutex<ActivationSlot>>,
+    _guard: Option<HttpWireBodyGuard>,
+    _replay_lease: Option<RuntimeReplayLease>,
     staging: Option<RequestStagingAuthority>,
     chunk_bytes: usize,
     trailer_count: usize,
@@ -115,6 +128,8 @@ impl ProductBodySource {
             Self {
                 body,
                 activation,
+                _guard: None,
+                _replay_lease: None,
                 staging: None,
                 chunk_bytes,
                 trailer_count,
@@ -152,9 +167,11 @@ impl ProductBodySource {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let state = std::mem::replace(&mut slot.state, ActivationState::Terminal);
         match state {
-            ActivationState::Armed(staging) => {
+            ActivationState::Armed(armed) => {
                 slot.state = ActivationState::Claimed;
-                self.staging = Some(staging);
+                self._guard = Some(armed.guard);
+                self._replay_lease = Some(armed.replay_lease);
+                self.staging = Some(armed.staging);
                 Ok(())
             }
             ActivationState::Unarmed => Err(RuntimeError::InvalidInput),
@@ -537,12 +554,35 @@ mod tests {
         WireBodyQuotaKey::from_peer(IpAddr::V4(Ipv4Addr::LOCALHOST), |_| true)
     }
 
-    fn guard_for(max_staging_bytes: usize) -> (Arc<WireBodyPool>, HttpWireBodyGuard) {
+    fn activation_parts(
+        max_staging_bytes: usize,
+        replay_bytes: usize,
+    ) -> (
+        Arc<WireBodyPool>,
+        HttpWireBodyGuard,
+        RuntimeReplayLease,
+        RequestStagingAuthority,
+    ) {
         let peak = guarded_body_allocation_bytes(max_staging_bytes)
             .expect("test staging peak is representable")
+            .max(replay_bytes)
             .max(1);
         let pool = WireBodyPool::new(peak, peak);
-        let guard = pool.begin_for_test(peak, quota_key());
+        let admission = pool
+            .begin_admission_for_test(peak, replay_bytes, quota_key())
+            .unwrap();
+        let (guard, replay_lease, staging) = admission.into_parts();
+        (pool, guard, replay_lease, staging)
+    }
+
+    fn arm_source(
+        activation: ProductBodySourceActivation,
+        max_staging_bytes: usize,
+    ) -> (Arc<WireBodyPool>, HttpWireBodyGuard) {
+        let (pool, guard, replay_lease, staging) = activation_parts(max_staging_bytes, 0);
+        activation
+            .activate(guard.clone(), replay_lease, staging)
+            .unwrap();
         (pool, guard)
     }
 
@@ -559,9 +599,9 @@ mod tests {
     ) -> (ProductBodySource, HttpWireBodyGuard, Arc<WireBodyPool>) {
         let (source, activation) =
             ProductBodySource::unarmed(body, chunk_bytes as u64, 0, 0).unwrap();
-        let (pool, guard) = guard_for(chunk_bytes.max(1));
+        let (pool, guard, replay_lease, staging) = activation_parts(chunk_bytes.max(1), 0);
         activation
-            .activate(&guard, RequestStagingAuthority::for_test(&guard))
+            .activate(guard.clone(), replay_lease, staging)
             .unwrap();
         (source, guard, pool)
     }
@@ -675,6 +715,26 @@ mod tests {
     }
 
     #[test]
+    fn armed_source_owns_admission_authorities_until_drop() {
+        let (mut source, activation) = ProductBodySource::unarmed(Body::empty(), 8, 0, 0).unwrap();
+        let (pool, guard, replay_lease, staging) = activation_parts(8, 128);
+        activation.activate(guard, replay_lease, staging).unwrap();
+        assert_eq!(pool.global_charge(), 128);
+
+        assert_eq!(
+            collect_data(&mut source, &budget(4096)).unwrap(),
+            (0, Vec::<Vec<u8>>::new())
+        );
+        assert!(source._guard.is_some());
+        assert!(source._replay_lease.is_some());
+        assert!(source.staging.is_some());
+        assert_eq!(pool.global_charge(), 128);
+
+        drop(source);
+        assert_eq!(pool.global_charge(), 0);
+    }
+
+    #[test]
     fn prearm_poll_is_terminal_and_never_polls_hyper() {
         let polls = Arc::new(AtomicUsize::new(0));
         let body = Body::wrap_stream(CountingPendingStream {
@@ -689,9 +749,9 @@ mod tests {
         );
         assert_eq!(polls.load(Ordering::Relaxed), 0);
 
-        let (_pool, guard) = guard_for(8);
+        let (_pool, guard, replay_lease, staging) = activation_parts(8, 0);
         assert_eq!(
-            activation.activate(&guard, RequestStagingAuthority::for_test(&guard)),
+            activation.activate(guard, replay_lease, staging),
             Err(RuntimeError::InvalidInput)
         );
         assert_eq!(polls.load(Ordering::Relaxed), 0);
@@ -706,9 +766,9 @@ mod tests {
                 .poll_trailers(&mut Context::from_waker(std::task::Waker::noop()), &budget,),
             Poll::Ready(Err(RuntimeError::InvalidInput))
         ));
-        let (_pool, guard) = guard_for(8);
+        let (_pool, guard, replay_lease, staging) = activation_parts(8, 0);
         assert_eq!(
-            activation.activate(&guard, RequestStagingAuthority::for_test(&guard)),
+            activation.activate(guard, replay_lease, staging),
             Err(RuntimeError::InvalidInput)
         );
     }
@@ -719,12 +779,12 @@ mod tests {
         let duplicate = ProductBodySourceActivation {
             slot: Weak::clone(&activation.slot),
         };
-        let (_pool, guard) = guard_for(8);
-        activation
-            .activate(&guard, RequestStagingAuthority::for_test(&guard))
-            .unwrap();
+        let (_pool, guard, replay_lease, staging) = activation_parts(8, 0);
+        activation.activate(guard, replay_lease, staging).unwrap();
+        let (_duplicate_pool, duplicate_guard, duplicate_replay, duplicate_staging) =
+            activation_parts(8, 0);
         assert_eq!(
-            duplicate.activate(&guard, RequestStagingAuthority::for_test(&guard)),
+            duplicate.activate(duplicate_guard, duplicate_replay, duplicate_staging),
             Err(RuntimeError::InvalidInput)
         );
         drop(source);
@@ -733,13 +793,10 @@ mod tests {
     #[test]
     fn foreign_staging_authority_is_rejected() {
         let (_source, activation) = ProductBodySource::unarmed(Body::empty(), 8, 0, 0).unwrap();
-        let (_first_pool, first_guard) = guard_for(8);
-        let (_second_pool, second_guard) = guard_for(8);
+        let (_first_pool, _first_guard, _first_replay, first_staging) = activation_parts(8, 0);
+        let (_second_pool, second_guard, second_replay, _second_staging) = activation_parts(8, 0);
         assert_eq!(
-            activation.activate(
-                &second_guard,
-                RequestStagingAuthority::for_test(&first_guard),
-            ),
+            activation.activate(second_guard, second_replay, first_staging),
             Err(RuntimeError::BindingMismatch)
         );
     }
@@ -748,9 +805,9 @@ mod tests {
     fn dropped_source_invalidates_activation_and_drops_staging_charge() {
         let (source, activation) = ProductBodySource::unarmed(Body::empty(), 8, 0, 0).unwrap();
         drop(source);
-        let (_pool, guard) = guard_for(8);
+        let (_pool, guard, replay_lease, staging) = activation_parts(8, 0);
         assert_eq!(
-            activation.activate(&guard, RequestStagingAuthority::for_test(&guard)),
+            activation.activate(guard, replay_lease, staging),
             Err(RuntimeError::InvalidInput)
         );
 
@@ -811,10 +868,7 @@ mod tests {
             sender.send_trailers(trailers).await.unwrap();
         });
         let (mut source, activation) = ProductBodySource::unarmed(body, 8, 1, 32).unwrap();
-        let (_pool, guard) = guard_for(8);
-        activation
-            .activate(&guard, RequestStagingAuthority::for_test(&guard))
-            .unwrap();
+        let (_pool, _guard) = arm_source(activation, 8);
         let budget = budget(4096);
 
         loop {
@@ -845,10 +899,7 @@ mod tests {
             sender.send_trailers(trailers).await.unwrap();
         });
         let (mut source, activation) = ProductBodySource::unarmed(body, 8, 1, 7).unwrap();
-        let (_pool, guard) = guard_for(8);
-        activation
-            .activate(&guard, RequestStagingAuthority::for_test(&guard))
-            .unwrap();
+        let (_pool, _guard) = arm_source(activation, 8);
         let runtime_budget = budget(4096);
         assert_eq!(
             poll_fn(|context| Pin::new(&mut source).poll_next(context, &runtime_budget))
@@ -871,10 +922,7 @@ mod tests {
             sender.send_trailers(trailers).await.unwrap();
         });
         let (mut source, activation) = ProductBodySource::unarmed(body, 8, 1, 32).unwrap();
-        let (_pool, guard) = guard_for(8);
-        activation
-            .activate(&guard, RequestStagingAuthority::for_test(&guard))
-            .unwrap();
+        let (_pool, _guard) = arm_source(activation, 8);
         let runtime_budget = budget(4096);
         assert_eq!(
             poll_fn(|context| Pin::new(&mut source).poll_next(context, &runtime_budget))
@@ -899,10 +947,7 @@ mod tests {
             sender.send_trailers(trailers).await.unwrap();
         });
         let (mut source, activation) = ProductBodySource::unarmed(body, 8, 1, 32).unwrap();
-        let (_pool, guard) = guard_for(8);
-        activation
-            .activate(&guard, RequestStagingAuthority::for_test(&guard))
-            .unwrap();
+        let (_pool, _guard) = arm_source(activation, 8);
         let runtime_budget = budget(4096);
         assert_eq!(
             poll_fn(|context| Pin::new(&mut source).poll_next(context, &runtime_budget))
@@ -923,10 +968,7 @@ mod tests {
             sender.send_trailers(trailers).await.unwrap();
         });
         let (mut source, activation) = ProductBodySource::unarmed(body, 8, 1, 7).unwrap();
-        let (_pool, guard) = guard_for(8);
-        activation
-            .activate(&guard, RequestStagingAuthority::for_test(&guard))
-            .unwrap();
+        let (_pool, _guard) = arm_source(activation, 8);
         let runtime_budget = budget(4096);
         assert_eq!(
             poll_fn(|context| Pin::new(&mut source).poll_next(context, &runtime_budget))
@@ -954,10 +996,7 @@ mod tests {
         });
         let (mut source, activation) =
             ProductBodySource::unarmed(body, 8, 1, payload as u64).unwrap();
-        let (pool, guard) = guard_for(8);
-        activation
-            .activate(&guard, RequestStagingAuthority::for_test(&guard))
-            .unwrap();
+        let (pool, guard) = arm_source(activation, 8);
         let capacity =
             BodyBudget::required_replay_storage_bytes(0, 8, 1, payload as u64, None).unwrap();
         let runtime_budget = budget(capacity);
