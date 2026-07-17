@@ -11,6 +11,7 @@ trap cleanup EXIT INT TERM
 BASELINE="$TEST_ROOT/baseline"
 mkdir -p \
     "$BASELINE/scripts" \
+    "$BASELINE/access-runtime/crates/http-access-runtime/src" \
     "$BASELINE/src/activation" \
     "$BASELINE/src/authorization/webhook" \
     "$BASELINE/src/proxy" \
@@ -203,27 +204,87 @@ struct Generation {
 EOF
 
 cat >"$BASELINE/src/authorization/webhook/connector.rs" <<'EOF'
-fn connect() {
-    tokio::net::TcpStream::connect(endpoint);
-    tokio::net::lookup_host(endpoint);
-    hyper::client::conn::handshake(stream);
-    let _: tokio_rustls::TlsConnector;
+trait WebhookDialer {
+    type Stream;
+}
+struct SystemWebhookDialer;
+impl WebhookDialer for SystemWebhookDialer {
+    type Stream = tokio::net::TcpStream;
+
+    fn connect() {
+        tokio::net::TcpStream::connect(endpoint);
+    }
+}
+
+trait WebhookResolver {}
+struct SystemWebhookResolver;
+impl WebhookResolver for SystemWebhookResolver {
+    fn resolve() {
+        tokio::net::lookup_host(endpoint);
+    }
 }
 EOF
 
 cat >"$BASELINE/src/authorization/webhook/provider.rs" <<'EOF'
+use rustls::ClientConfig;
 use crate::tls::{build_client_config, load_client_trust, ClientAlpn};
+
+struct WebhookProvider {
+    tls: Option<Arc<ClientConfig>>,
+}
+
+fn tls(provider: &WebhookProvider) -> Option<Arc<ClientConfig>> {
+    provider.tls.clone()
+}
+EOF
+
+cat >"$BASELINE/src/authorization/webhook/runtime.rs" <<'EOF'
+struct WebhookAuthorizationRuntime;
+EOF
+
+cat >"$BASELINE/src/authorization/webhook/transport.rs" <<'EOF'
+use tokio_rustls::TlsConnector;
+
+async fn connect_and_deliver() {
+    TlsConnector::from(config).connect(server_name, stream);
+}
 EOF
 
 cat >"$BASELINE/src/tls.rs" <<'EOF'
 use rustls::ClientConfig;
 fn build_client_config() { let _: ClientConfig; }
+fn client_config_builders() {
+    let _: rustls::ClientConfig;
+    let _: ClientConfig;
+}
 fn load_client_trust() {}
 enum ClientAlpn { Http1 }
 EOF
 
+cat >"$BASELINE/access-runtime/crates/http-access-runtime/src/lib.rs" <<'EOF'
+pub struct ManagedForwardingExecutor;
+
+#[cfg(test)]
+mod removed_api_tests;
+EOF
+
+cat >"$BASELINE/access-runtime/crates/http-access-runtime/src/removed_api_tests.rs" <<'EOF'
+fn ignored() {
+    let _: ManagedStreamTermination;
+}
+EOF
+
+cat >"$BASELINE/src/lib.rs" <<'EOF'
+#[cfg(test)]
+mod test_only;
+
+#[cfg(test)]
+mod included_test_only {
+    include!("included_test_only.rs");
+}
+EOF
+
 cat >"$BASELINE/src/test_only.rs" <<'EOF'
-#![cfg(test)]
 fn ignored() {
     let _: ForwardingOutcome;
     let _: ForwardingExecutor;
@@ -231,9 +292,16 @@ fn ignored() {
 }
 EOF
 
+cat >"$BASELINE/src/included_test_only.rs" <<'EOF'
+fn ignored() {
+    hyper::client::conn::handshake(stream);
+}
+EOF
+
 runner() {
     local root=$1
-    "$root/scripts/check-forwarding-executor-ownership.sh"
+    ACCESS_RUNTIME_ROOT="$root/access-runtime" \
+        "$root/scripts/check-forwarding-executor-ownership.sh"
 }
 
 runner "$BASELINE" >"$TEST_ROOT/pass.log"
@@ -616,7 +684,19 @@ done
 
 for primitive in \
     'tokio::net::TcpStream::connect(endpoint);' \
+    '(std::net::TcpStream::connect)(endpoint);' \
+    'let dial = std::net::TcpStream::connect; dial(endpoint);' \
+    'std::net::TcpStream::connect_timeout(endpoint, timeout);' \
+    '(std::net::TcpStream::connect_timeout)(endpoint, timeout);' \
+    'let dial = std::net::TcpStream::connect_timeout; dial(endpoint, timeout);' \
     'std::net::TcpStream::connect(endpoint);' \
+    '(std::os::unix::net::UnixStream::connect)(path);' \
+    'let dial = std::os::unix::net::UnixStream::connect; dial(path);' \
+    'type ProductSocket = std::net::TcpStream; fn dial() { ProductSocket::connect(endpoint); }' \
+    'use std::net::TcpStream as ProductSocket; fn dial() { ProductSocket::connect(endpoint); }' \
+    'use hyper as h; fn dial() { h::client::conn::handshake(stream); }' \
+    'use hyper::{self as h}; fn dial() { h::client::conn::handshake(stream); }' \
+    'extern crate hyper as h; fn dial() { h::Client::builder().build_http(); }' \
     'TcpSocket::new_v4();' \
     'socket2::Socket::new(domain, kind, protocol);' \
     'tokio::net::lookup_host(endpoint);' \
@@ -636,6 +716,66 @@ do
     expect_failure "$CASE_ROOT" "escaped client transport $primitive" \
         'ordinary product forwarding must not own dialing, client TLS, or private Hyper client transport'
 done
+
+for owner in \
+    src/tls.rs \
+    src/authorization/webhook/transport.rs \
+    src/authorization/webhook/provider.rs \
+    src/authorization/webhook/runtime.rs
+do
+    for primitive in \
+        'tokio::net::TcpStream::connect(endpoint);' \
+        'hyper::client::conn::handshake(stream);'
+    do
+        new_case
+        printf '%s\n' "$primitive" >>"$CASE_ROOT/$owner"
+        expect_failure "$CASE_ROOT" "escaped client transport in $owner: $primitive" \
+            'ordinary product forwarding must not own dialing, client TLS, or private Hyper client transport'
+    done
+done
+
+new_case
+printf '%s\n' 'tokio::net::TcpStream::connect(second_endpoint);' \
+    >>"$CASE_ROOT/src/authorization/webhook/connector.rs"
+expect_failure "$CASE_ROOT" 'second webhook dial site' \
+    'ordinary product forwarding must not own dialing, client TLS, or private Hyper client transport'
+
+new_case
+printf '%s\n' 'tokio::net::lookup_host(second_endpoint);' \
+    >>"$CASE_ROOT/src/authorization/webhook/connector.rs"
+expect_failure "$CASE_ROOT" 'second webhook DNS site' \
+    'ordinary product forwarding must not own dialing, client TLS, or private Hyper client transport'
+
+new_case
+printf '%s\n' 'TlsConnector::from(other_config).connect(server_name, stream);' \
+    >>"$CASE_ROOT/src/authorization/webhook/transport.rs"
+expect_failure "$CASE_ROOT" 'second webhook TLS connector site' \
+    'ordinary product forwarding must not own dialing, client TLS, or private Hyper client transport'
+
+new_case
+sed -i '/        tokio::net::TcpStream::connect(endpoint);/d' \
+    "$CASE_ROOT/src/authorization/webhook/connector.rs"
+printf '%s\n' 'fn escaped_dial() { tokio::net::TcpStream::connect(endpoint); }' \
+    >>"$CASE_ROOT/src/authorization/webhook/connector.rs"
+expect_failure "$CASE_ROOT" 'webhook dial moved outside its sealed owner' \
+    'ordinary product forwarding must not own dialing, client TLS, or private Hyper client transport'
+
+new_case
+sed -i '/        tokio::net::lookup_host(endpoint);/d' \
+    "$CASE_ROOT/src/authorization/webhook/connector.rs"
+printf '%s\n' 'fn escaped_resolve() { tokio::net::lookup_host(endpoint); }' \
+    >>"$CASE_ROOT/src/authorization/webhook/connector.rs"
+expect_failure "$CASE_ROOT" 'webhook DNS moved outside its sealed owner' \
+    'ordinary product forwarding must not own dialing, client TLS, or private Hyper client transport'
+
+new_case
+sed -i '/    TlsConnector::from(config).connect(server_name, stream);/d' \
+    "$CASE_ROOT/src/authorization/webhook/transport.rs"
+printf '%s\n' \
+    'fn escaped_tls() { TlsConnector::from(config).connect(server_name, stream); }' \
+    >>"$CASE_ROOT/src/authorization/webhook/transport.rs"
+expect_failure "$CASE_ROOT" 'webhook TLS moved outside its sealed owner' \
+    'ordinary product forwarding must not own dialing, client TLS, or private Hyper client transport'
 
 for helper in build_client_config load_client_trust ClientAlpn; do
     new_case
@@ -659,6 +799,95 @@ do
     fi
     expect_failure "$CASE_ROOT" "webhook dependency $dependency" "$expected"
 done
+
+for owner in \
+    src/authorization/webhook/transport.rs \
+    src/authorization/webhook/provider.rs \
+    src/authorization/webhook/runtime.rs
+do
+    new_case
+    printf '%s\n' 'fn escaped(_: ForwardingPlan) {}' >>"$CASE_ROOT/$owner"
+    expect_failure "$CASE_ROOT" "ordinary forwarding dependency in $owner" \
+        'authorization webhook connector must remain independent of ordinary forwarding ownership'
+done
+
+for obsolete in \
+    AuditedManagedRedemption \
+    ConnectionBoundManagedRedemption \
+    ManagedRedemptionFailure \
+    CredentializedManagedConnection \
+    ManagedFirstOriginWrite \
+    ManagedConnection \
+    ManagedSecureConnector \
+    ManagedFirstWriteTransport \
+    ManagedPostWriteConnection \
+    ManagedStreamLease \
+    ManagedStreamLeaseFailure \
+    ManagedStreamTerminationReason \
+    ManagedStreamTermination
+do
+    new_case
+    printf '%s\n' "struct $obsolete;" \
+        >>"$CASE_ROOT/access-runtime/crates/http-access-runtime/src/lib.rs"
+    expect_failure "$CASE_ROOT" "restored obsolete managed type $obsolete" \
+        'obsolete P09 managed forwarding API must remain deleted'
+done
+
+new_case
+printf '%s\n' 'fn restored() { ManagedConnectionEvidence::new(); }' \
+    >>"$CASE_ROOT/access-runtime/crates/http-access-runtime/src/lib.rs"
+expect_failure "$CASE_ROOT" 'restored caller-constructible managed evidence' \
+    'obsolete P09 managed forwarding API must remain deleted'
+
+for adoption in \
+    'use http_access_runtime::ManagedForwardingExecutor;' \
+    'fn adopt() { ManagedForwardingExecutor::execute(plan, request, services, resources); }' \
+    'fn adopt(_: HostEnforcer) {}' \
+    'fn adopt(_: ValidatedManagedPlan) {}'
+do
+    new_case
+    printf '%s\n' "$adoption" >"$CASE_ROOT/src/managed_adoption.rs"
+    expect_failure "$CASE_ROOT" "premature managed execution adoption $adoption" \
+        'acl-proxy must not adopt managed forwarding execution before P12'
+done
+
+new_case
+cat >"$CASE_ROOT/src/production_transport_tests.rs" <<'EOF'
+fn dial() {
+    tokio::net::TcpStream::connect(endpoint);
+}
+EOF
+printf '%s\n' 'mod production_transport_tests;' >>"$CASE_ROOT/src/lib.rs"
+expect_failure "$CASE_ROOT" 'unconditional product tests-suffixed transport module' \
+    'ordinary product forwarding must not own dialing, client TLS, or private Hyper client transport'
+
+new_case
+cat >"$CASE_ROOT/src/production_transport_tests.rs" <<'EOF'
+fn dial() {
+    tokio::net::TcpStream::connect(endpoint);
+}
+EOF
+printf '%s\n' 'include!("production_transport_tests.rs");' >>"$CASE_ROOT/src/lib.rs"
+expect_failure "$CASE_ROOT" 'unconditional product tests-suffixed transport include' \
+    'ordinary product forwarding must not own dialing, client TLS, or private Hyper client transport'
+
+new_case
+cat >"$CASE_ROOT/access-runtime/crates/http-access-runtime/src/production_managed_tests.rs" <<'EOF'
+pub struct ManagedStreamTermination;
+EOF
+printf '%s\n' 'mod production_managed_tests;' \
+    >>"$CASE_ROOT/access-runtime/crates/http-access-runtime/src/lib.rs"
+expect_failure "$CASE_ROOT" 'unconditional runtime tests-suffixed obsolete module' \
+    'obsolete P09 managed forwarding API must remain deleted'
+
+new_case
+cat >"$CASE_ROOT/access-runtime/crates/http-access-runtime/src/production_managed_tests.rs" <<'EOF'
+pub struct ManagedStreamTermination;
+EOF
+printf '%s\n' 'include!("production_managed_tests.rs");' \
+    >>"$CASE_ROOT/access-runtime/crates/http-access-runtime/src/lib.rs"
+expect_failure "$CASE_ROOT" 'unconditional runtime tests-suffixed obsolete include' \
+    'obsolete P09 managed forwarding API must remain deleted'
 
 new_case
 printf '%s\n' 'use crate::authorization::webhook::connector::WebhookConnector;' \

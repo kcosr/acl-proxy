@@ -5,6 +5,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
 python3 - "$ROOT" <<'PY'
+import os
 import pathlib
 import re
 import sys
@@ -17,8 +18,13 @@ generation_path = pathlib.Path("src/runtime/generation.rs")
 proxy_module_path = pathlib.Path("src/proxy/mod.rs")
 webhook_connector_path = pathlib.Path("src/authorization/webhook/connector.rs")
 webhook_provider_path = pathlib.Path("src/authorization/webhook/provider.rs")
+webhook_runtime_path = pathlib.Path("src/authorization/webhook/runtime.rs")
+webhook_transport_path = pathlib.Path("src/authorization/webhook/transport.rs")
 tls_path = pathlib.Path("src/tls.rs")
 h2_context_path = pathlib.Path("src/proxy/h2_stream_cancellation.rs")
+runtime_root = pathlib.Path(
+    os.environ.get("ACCESS_RUNTIME_ROOT", root.parent / "access-runtime")
+).resolve()
 test_only_paths = set()
 
 
@@ -179,6 +185,123 @@ def mask_test_items(source: str) -> str:
         source = mask_range(source, match.start(), end)
 
 
+def module_source_base(path: pathlib.Path) -> pathlib.Path:
+    if path.name in ("lib.rs", "main.rs", "mod.rs"):
+        return path.parent
+    return path.parent / path.stem
+
+
+def parsed_external_sources(
+    source_root: pathlib.Path, path: pathlib.Path, source: str, raw: str
+) -> set[pathlib.Path]:
+    targets = set()
+    attributes = r"(?:#\s*\[[^\]]*\]\s*)*"
+    module = re.compile(
+        rf"(?P<attrs>{attributes})"
+        r"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+"
+        r"(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*;"
+    )
+    for match in module.finditer(source):
+        raw_attributes = raw[match.start("attrs"):match.end("attrs")]
+        override = re.search(
+            r"#\s*\[\s*path\s*=\s*\"([^\"]+)\"\s*\]",
+            raw_attributes,
+        )
+        if override is not None:
+            candidates = (path.parent / override.group(1),)
+        else:
+            base = module_source_base(path)
+            name = match.group("name")
+            candidates = (base / f"{name}.rs", base / name / "mod.rs")
+        for candidate in candidates:
+            if (source_root / candidate).is_file():
+                targets.add(candidate)
+
+    include = re.compile(
+        rf"(?P<attrs>{attributes})"
+        r"include\s*!\s*\(\s*[^)]*\)\s*;"
+    )
+    for match in include.finditer(source):
+        raw_call = raw[match.start():match.end()]
+        literal = re.search(r"include\s*!\s*\(\s*\"([^\"]+)\"\s*\)", raw_call)
+        if literal is None:
+            continue
+        candidate = path.parent / literal.group(1)
+        if candidate.suffix == ".rs" and (source_root / candidate).is_file():
+            targets.add(candidate)
+    return targets
+
+
+def discover_test_only_paths(source_root: pathlib.Path) -> set[pathlib.Path]:
+    files = {
+        absolute.relative_to(source_root)
+        for absolute in source_root.rglob("*.rs")
+        if absolute.is_file()
+    }
+    edges = {}
+    inner_test_only = set()
+    for path in files:
+        raw = (source_root / path).read_text(encoding="utf-8")
+        all_source = mask_non_code(raw)
+        production_source = mask_test_items(all_source)
+        all_targets = parsed_external_sources(source_root, path, all_source, raw)
+        production_targets = parsed_external_sources(
+            source_root, path, production_source, raw
+        )
+        edges[path] = (production_targets, all_targets)
+        if re.search(r"#!\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]", all_source):
+            inner_test_only.add(path)
+
+    roots = set()
+    for name in ("lib.rs", "main.rs"):
+        candidate = pathlib.Path(name)
+        if candidate in files:
+            roots.add(candidate)
+    bin_root = source_root / "bin"
+    if bin_root.is_dir():
+        roots.update(pathlib.Path("bin") / path.name for path in bin_root.glob("*.rs"))
+        roots.update(
+            pathlib.Path("bin") / path.parent.name / path.name
+            for path in bin_root.glob("*/main.rs")
+        )
+
+    production_reachable = set()
+    test_reachable = set()
+    production_queue = []
+    test_queue = []
+
+    def enqueue(path: pathlib.Path, test_only: bool) -> None:
+        if path not in files:
+            return
+        if test_only or path in inner_test_only:
+            if path not in test_reachable:
+                test_reachable.add(path)
+                test_queue.append(path)
+        elif path not in production_reachable:
+            production_reachable.add(path)
+            production_queue.append(path)
+
+    for path in inner_test_only:
+        enqueue(path, True)
+    for path in roots:
+        enqueue(path, False)
+    while production_queue or test_queue:
+        while production_queue:
+            parent = production_queue.pop()
+            production_targets, all_targets = edges[parent]
+            for target in production_targets:
+                enqueue(target, False)
+            for target in all_targets - production_targets:
+                enqueue(target, True)
+        while test_queue:
+            parent = test_queue.pop()
+            _, all_targets = edges[parent]
+            for target in all_targets:
+                enqueue(target, True)
+
+    return test_reachable - production_reachable
+
+
 def production(path: pathlib.Path) -> str:
     absolute = root / path
     if not absolute.is_file():
@@ -192,9 +315,9 @@ def production(path: pathlib.Path) -> str:
         raise SystemExit(f"{path}: {error}") from error
 
 
-def parsed_use_paths(source: str) -> list[tuple[str, ...]]:
-    """Resolve Rust use trees into their imported component paths."""
-    paths = []
+def parsed_use_imports(source: str) -> list[tuple[tuple[str, ...], str | None]]:
+    """Resolve Rust use trees into imported paths and optional local aliases."""
+    imports = []
 
     def parse_body(body: str) -> None:
         tokens = re.findall(r"[A-Za-z_][A-Za-z0-9_]*|::|[{},*]", body)
@@ -210,11 +333,15 @@ def parsed_use_paths(source: str) -> list[tuple[str, ...]]:
 
         def parse_item(index: int, prefix: tuple[str, ...]) -> int:
             components = []
+            alias = None
             while index < len(tokens):
                 token = tokens[index]
                 if token in (",", "}"):
                     break
                 if token == "as":
+                    if index + 1 >= len(tokens):
+                        raise SystemExit("incomplete Rust use alias")
+                    alias = tokens[index + 1]
                     index += 2
                     break
                 if token == "::":
@@ -226,7 +353,7 @@ def parsed_use_paths(source: str) -> list[tuple[str, ...]]:
                 index += 1
             resolved = prefix + tuple(component for component in components if component != "self")
             if resolved:
-                paths.append(resolved)
+                imports.append((resolved, alias))
             return index
 
         index = 0
@@ -237,7 +364,11 @@ def parsed_use_paths(source: str) -> list[tuple[str, ...]]:
 
     for match in re.finditer(r"\buse\s+([^;]+);", source):
         parse_body(match.group(1))
-    return paths
+    return imports
+
+
+def parsed_use_paths(source: str) -> list[tuple[str, ...]]:
+    return [path for path, _ in parsed_use_imports(source)]
 
 
 def locations(sources, pattern: re.Pattern[str]):
@@ -281,6 +412,8 @@ required_paths = (
     proxy_module_path,
     webhook_connector_path,
     webhook_provider_path,
+    webhook_runtime_path,
+    webhook_transport_path,
     tls_path,
     h2_context_path,
 )
@@ -288,35 +421,90 @@ for path in required_paths:
     if not (root / path).is_file():
         raise SystemExit(f"forwarding ownership scan path is missing: {path}")
 
-# External test modules are separate files, so their own source does not carry the
-# cfg(test) attribute. Resolve conventional external test files and explicit
-# cfg(test) module declarations before scanning the production source set.
-for absolute in sorted((root / "src").rglob("*.rs")):
-    relative = absolute.relative_to(root)
-    if relative.name == "tests.rs" or relative.stem.endswith("_tests"):
-        test_only_paths.add(relative)
-    module_source = mask_non_code(absolute.read_text(encoding="utf-8"))
-    for match in re.finditer(
-        r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*"
-        r"(?:pub(?:\s*\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;",
-        module_source,
-    ):
-        module = match.group(1)
-        if relative.name in ("lib.rs", "main.rs", "mod.rs"):
-            base = relative.parent
-        else:
-            base = relative.parent / relative.stem
-        flat = base / f"{module}.rs"
-        nested = base / module / "mod.rs"
-        if (root / flat).is_file():
-            test_only_paths.add(flat)
-        if (root / nested).is_file():
-            test_only_paths.add(nested)
+test_only_paths.update(
+    pathlib.Path("src") / path for path in discover_test_only_paths(root / "src")
+)
 
 sources = {}
 for absolute in sorted((root / "src").rglob("*.rs")):
     relative = absolute.relative_to(root)
     sources[relative] = production(relative)
+
+managed_execution_symbols = (
+    "ManagedForwardingAdmission",
+    "ManagedForwardingExecutor",
+    "ManagedForwardingResources",
+    "ManagedForwardingServices",
+    "HostEnforcer",
+    "ValidatedManagedPlan",
+)
+managed_execution_pattern = re.compile(
+    rf"\b(?:{'|'.join(map(re.escape, managed_execution_symbols))})\b"
+)
+managed_execution_locations = locations(sources, managed_execution_pattern)
+if managed_execution_locations:
+    print(
+        "acl-proxy must not adopt managed forwarding execution before P12",
+        file=sys.stderr,
+    )
+    print(
+        "locations: "
+        + ", ".join(
+            f"{path}:{line}" for path, line, _ in managed_execution_locations
+        ),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+runtime_crates = runtime_root / "crates"
+if not runtime_crates.is_dir():
+    raise SystemExit(f"shared runtime crates are missing: {runtime_crates}")
+managed_api_sources = dict(sources)
+for crate_root in sorted(path for path in runtime_crates.iterdir() if path.is_dir()):
+    source_root = crate_root / "src"
+    if not source_root.is_dir():
+        continue
+    runtime_test_only = discover_test_only_paths(source_root)
+    for absolute in sorted(source_root.rglob("*.rs")):
+        crate_relative = absolute.relative_to(source_root)
+        relative = pathlib.Path("access-runtime") / absolute.relative_to(runtime_root)
+        source = mask_non_code(absolute.read_text(encoding="utf-8"))
+        if crate_relative in runtime_test_only:
+            source = mask_range(source, 0, len(source))
+        else:
+            source = mask_test_items(source)
+        managed_api_sources[relative] = source
+
+obsolete_managed_types = (
+    "AuditedManagedRedemption",
+    "ConnectionBoundManagedRedemption",
+    "ManagedRedemptionFailure",
+    "CredentializedManagedConnection",
+    "ManagedFirstOriginWrite",
+    "ManagedConnection",
+    "ManagedSecureConnector",
+    "ManagedFirstWriteTransport",
+    "ManagedPostWriteConnection",
+    "ManagedStreamLease",
+    "ManagedStreamLeaseFailure",
+    "ManagedStreamTerminationReason",
+    "ManagedStreamTermination",
+)
+obsolete_managed_pattern = re.compile(
+    rf"\b(?:{'|'.join(map(re.escape, obsolete_managed_types))})\b"
+    r"|\bManagedConnectionEvidence\s*::\s*new\s*\("
+)
+obsolete_managed_locations = locations(managed_api_sources, obsolete_managed_pattern)
+if obsolete_managed_locations:
+    print("obsolete P09 managed forwarding API must remain deleted", file=sys.stderr)
+    print(
+        "locations: "
+        + ", ".join(
+            f"{path}:{line}" for path, line, _ in obsolete_managed_locations
+        ),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 
 proxy_module = sources[proxy_module_path]
 if len(re.findall(r"\bmod\s+forwarding_adapter\s*;", proxy_module)) != 1:
@@ -822,32 +1010,155 @@ if private_locations:
     )
     raise SystemExit(1)
 
-client_transport_patterns = (
-    ("socket dialing", re.compile(r"\b(?:(?:tokio|std)\s*::\s*net\s*::\s*)?(?:TcpStream|UnixStream)\s*::\s*connect\s*\(|\bTcpSocket\s*::|\bsocket2\s*::\s*Socket\b")),
-    ("DNS resolution", re.compile(r"\b(?:tokio\s*::\s*net\s*::\s*)?lookup_host\s*\(|\bToSocketAddrs\b")),
-    ("private Hyper client", re.compile(r"\bhyper\s*::\s*client\b|\bclient\s*::\s*conn\b|\bHttpConnector\b|\bHttpsConnector\b|\bhyper\s*::\s*Client\b")),
-    ("private TLS connector", re.compile(r"\b(?:tokio_rustls\s*::\s*)?TlsConnector\b|\bhyper_rustls\b")),
-    ("private client TLS config", re.compile(r"\b(?:rustls\s*::\s*)?(?:ClientConfig|ClientConnection)\b|\b(?:native_tls|tokio_native_tls|hyper_tls)\b")),
+socket_dial_pattern = re.compile(
+    r"\b(?:(?:tokio|std)\s*::\s*net\s*::\s*)?"
+    r"(?:TcpStream|UnixStream)\s*::\s*(?:connect|connect_timeout)\b|\bTcpSocket\s*::|"
+    r"\bsocket2\s*::\s*Socket\b"
 )
-transport_allowed = {
-    path for path in sources if path.parts[:3] == ("src", "authorization", "webhook")
-}
-transport_allowed.add(tls_path)
+dns_resolution_pattern = re.compile(
+    r"\b(?:tokio\s*::\s*net\s*::\s*)?lookup_host\s*\(|\bToSocketAddrs\b"
+)
+hyper_client_pattern = re.compile(
+    r"\bhyper\s*::\s*client\b|\bclient\s*::\s*conn\b|\bHttpConnector\b|"
+    r"\bHttpsConnector\b|\bhyper\s*::\s*Client\b"
+)
+tls_connector_pattern = re.compile(
+    r"\b(?:tokio_rustls\s*::\s*)?TlsConnector\b|\bhyper_rustls\b"
+)
+client_tls_config_pattern = re.compile(
+    r"\b(?:rustls\s*::\s*)?(?:ClientConfig|ClientConnection)\b|"
+    r"\b(?:native_tls|tokio_native_tls|hyper_tls)\b"
+)
+
+client_transport_contracts = (
+    (
+        "socket dialing",
+        socket_dial_pattern,
+        {webhook_connector_path},
+        1,
+    ),
+    (
+        "DNS resolution",
+        dns_resolution_pattern,
+        {webhook_connector_path},
+        1,
+    ),
+    (
+        "private Hyper client",
+        hyper_client_pattern,
+        set(),
+        0,
+    ),
+    (
+        "private TLS connector",
+        tls_connector_pattern,
+        {webhook_transport_path},
+        2,
+    ),
+    (
+        "private client TLS config",
+        client_tls_config_pattern,
+        {tls_path, webhook_provider_path},
+        7,
+    ),
+)
 listener_socket_paths = {
     pathlib.Path("src/control/server.rs"),
     ingress_path,
     pathlib.Path("src/proxy/original_destination.rs"),
 }
 transport_violations = []
-for description, pattern in client_transport_patterns:
-    for path, line, text in locations(sources, pattern):
-        if path not in transport_allowed:
-            transport_violations.append(
-                f"{path}:{line}: forbidden product-owned {description}: {text}"
-            )
+for description, pattern, allowed_paths, expected_count in client_transport_contracts:
+    matches = locations(sources, pattern)
+    escaped = [
+        (path, line, text)
+        for path, line, text in matches
+        if path not in allowed_paths
+    ]
+    if len(matches) != expected_count or escaped:
+        rendered = ", ".join(f"{path}:{line}" for path, line, _ in matches) or "none"
+        transport_violations.append(
+            f"exact retained {description} ownership changed; locations: {rendered}"
+        )
+
+
+def exact_item_source(
+    source: str, header: re.Pattern[str], description: str
+) -> str:
+    declarations = list(header.finditer(source))
+    if len(declarations) != 1:
+        transport_violations.append(
+            f"exact retained {description} owner changed"
+        )
+        return ""
+    opening = source.find("{", declarations[0].end())
+    if opening == -1:
+        transport_violations.append(
+            f"exact retained {description} owner has no body"
+        )
+        return ""
+    return source[declarations[0].start():matching_brace(source, opening)]
+
+
+webhook_connector = sources[webhook_connector_path]
+system_dialer = exact_item_source(
+    webhook_connector,
+    re.compile(r"\bimpl\s+WebhookDialer\s+for\s+SystemWebhookDialer\b"),
+    "webhook system dialer",
+)
+if len(list(socket_dial_pattern.finditer(system_dialer))) != 1:
+    transport_violations.append(
+        "exact retained socket dial must remain inside SystemWebhookDialer"
+    )
+
+transport_type_alias = re.compile(
+    r"\btype\s+(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+    r"(?P<target>[^;]*(?:TcpStream|UnixStream|TcpSocket|socket2\s*::\s*Socket|"
+    r"TlsConnector|ClientConfig|ClientConnection|HttpConnector|HttpsConnector)[^;]*)\s*;"
+)
+allowed_webhook_stream_alias = re.compile(
+    r"\btype\s+Stream\s*=\s*tokio\s*::\s*net\s*::\s*TcpStream\s*;"
+)
 for path, source in sources.items():
-    if path in transport_allowed:
-        continue
+    for match in transport_type_alias.finditer(source):
+        if (
+            path == webhook_connector_path
+            and allowed_webhook_stream_alias.fullmatch(match.group(0)) is not None
+            and match.group(0) in system_dialer
+            and len(list(allowed_webhook_stream_alias.finditer(webhook_connector))) == 1
+        ):
+            continue
+        line = source.count("\n", 0, match.start()) + 1
+        transport_violations.append(
+            f"{path}:{line}: forbidden product-owned client transport type alias: "
+            f"{match.group('alias')}"
+        )
+
+system_resolver = exact_item_source(
+    webhook_connector,
+    re.compile(r"\bimpl\s+WebhookResolver\s+for\s+SystemWebhookResolver\b"),
+    "webhook system resolver",
+)
+if len(list(dns_resolution_pattern.finditer(system_resolver))) != 1:
+    transport_violations.append(
+        "exact retained DNS resolution must remain inside SystemWebhookResolver"
+    )
+
+webhook_transport = sources[webhook_transport_path]
+connect_and_deliver = exact_item_source(
+    webhook_transport,
+    re.compile(r"\b(?:pub\s*\(\s*crate\s*\)\s+)?async\s+fn\s+connect_and_deliver\b"),
+    "webhook connect_and_deliver function",
+)
+tls_handshake = re.compile(
+    r"\bTlsConnector\s*::\s*from\s*\([^)]*\)\s*\.\s*connect\s*\("
+)
+if len(list(tls_handshake.finditer(connect_and_deliver))) != 1:
+    transport_violations.append(
+        "exact retained TLS connect must remain inside connect_and_deliver"
+    )
+
+for path, source in sources.items():
     for use_path in parsed_use_paths(source):
         components = set(use_path)
         accepted_listener_socket = (
@@ -855,6 +1166,25 @@ for path, source in sources.items():
             and bool(components & {"tokio", "std"})
             and "net" in components
             and bool(components & {"TcpStream", "UnixStream", "TcpSocket"})
+        )
+        accepted_webhook_socket = (
+            path == webhook_connector_path
+            and bool(components & {"tokio", "std"})
+            and "net" in components
+            and bool(
+                components
+                & {"TcpStream", "UnixStream", "TcpSocket", "lookup_host", "ToSocketAddrs"}
+            )
+        )
+        accepted_webhook_tls_connector = (
+            path == webhook_transport_path
+            and "tokio_rustls" in components
+            and "TlsConnector" in components
+        )
+        accepted_webhook_tls_config = (
+            path in {tls_path, webhook_provider_path}
+            and "rustls" in components
+            and bool(components & {"ClientConfig", "ClientConnection"})
         )
         private_import = (
             ("hyper" in components and bool(components & {"client", "Client", "HttpConnector", "HttpsConnector"}))
@@ -870,10 +1200,51 @@ for path, source in sources.items():
                 and bool(components & {"ClientConfig", "ClientConnection"})
             )
         )
-        if private_import and not accepted_listener_socket:
+        if private_import and not (
+            accepted_listener_socket
+            or accepted_webhook_socket
+            or accepted_webhook_tls_connector
+            or accepted_webhook_tls_config
+        ):
             transport_violations.append(
                 f"{path}: forbidden product-owned client transport import: {'::'.join(use_path)}"
             )
+    for use_path, alias in parsed_use_imports(source):
+        if alias is None:
+            continue
+        components = set(use_path)
+        transport_alias = (
+            use_path == ("hyper",)
+            or ("hyper" in components and bool(components & {"client", "Client", "HttpConnector", "HttpsConnector"}))
+            or bool(components & {"hyper_rustls", "hyper_tls", "native_tls", "tokio_native_tls", "socket2"})
+            or (
+                bool(components & {"tokio", "std"})
+                and "net" in components
+                and bool(components & {"TcpStream", "UnixStream", "TcpSocket", "lookup_host", "ToSocketAddrs"})
+            )
+            or ("tokio_rustls" in components and "TlsConnector" in components)
+            or (
+                "rustls" in components
+                and bool(components & {"ClientConfig", "ClientConnection"})
+            )
+        )
+        if transport_alias:
+            transport_violations.append(
+                f"{path}: forbidden product-owned client transport alias: "
+                f"{'::'.join(use_path)} as {alias}"
+            )
+    extern_transport_alias = re.compile(
+        r"\bextern\s+crate\s+"
+        r"(?P<crate>hyper|hyper_rustls|hyper_tls|native_tls|tokio_native_tls|"
+        r"socket2|tokio_rustls|rustls)\s+as\s+"
+        r"(?P<alias>[A-Za-z_][A-Za-z0-9_]*)\s*;"
+    )
+    for match in extern_transport_alias.finditer(source):
+        line = source.count("\n", 0, match.start()) + 1
+        transport_violations.append(
+            f"{path}:{line}: forbidden product-owned client transport extern-crate "
+            f"alias: {match.group('crate')} as {match.group('alias')}"
+        )
 if transport_violations:
     print(
         "ordinary product forwarding must not own dialing, client TLS, or private Hyper client transport",
@@ -899,31 +1270,37 @@ if escaped_tls_helpers:
     )
     raise SystemExit(1)
 
-webhook_connector = sources[webhook_connector_path]
-webhook_use_paths = parsed_use_paths(webhook_connector)
 webhook_violations = []
-for name, component in (
-    ("ordinary destination", "destination"),
-    ("ordinary egress", "egress"),
-    ("ordinary forwarding", "proxy"),
-):
-    if any(component in path for path in webhook_use_paths):
-        webhook_violations.append(name)
-for name, pattern in (
-    ("ordinary destination", r"\b(?:crate|super)\s*::\s*destination\b"),
-    ("ordinary egress", r"\b(?:crate|super)\s*::\s*egress\b"),
-    ("ordinary forwarding", r"\b(?:crate|super)\s*::\s*proxy\b"),
-    ("forwarding plan", r"\bForwardingPlan\b"),
-    ("credential execution", r"\b(?:ProductCredentialExecution|CredentialResolverSession|TransportCredentialBatch)\b"),
-):
-    if re.search(pattern, webhook_connector) and name not in webhook_violations:
-        webhook_violations.append(name)
+webhook_sources = {
+    path: source
+    for path, source in sources.items()
+    if path.parts[:3] == ("src", "authorization", "webhook")
+}
+for path, source in webhook_sources.items():
+    use_paths = parsed_use_paths(source)
+    for name, component in (
+        ("ordinary destination", "destination"),
+        ("ordinary egress", "egress"),
+        ("ordinary forwarding", "proxy"),
+    ):
+        if any(component in use_path for use_path in use_paths):
+            webhook_violations.append(f"{path}: {name}")
+    for name, pattern in (
+        ("ordinary destination", r"\b(?:crate|super)\s*::\s*destination\b"),
+        ("ordinary egress", r"\b(?:crate|super)\s*::\s*egress\b"),
+        ("ordinary forwarding", r"\b(?:crate|super)\s*::\s*proxy\b"),
+        ("forwarding plan", r"\b(?:ValidatedManagedPlan|StandalonePlan|ForwardingPlan)\b"),
+        ("forwarding executor", r"\b(?:ManagedForwardingExecutor|ForwardingExecutor)\b"),
+        ("credential execution", r"\b(?:ProductCredentialExecution|CredentialResolverSession|TransportCredentialBatch)\b"),
+    ):
+        if re.search(pattern, source):
+            webhook_violations.append(f"{path}: {name}")
 if webhook_violations:
     print(
         "authorization webhook connector must remain independent of ordinary forwarding ownership",
         file=sys.stderr,
     )
-    print("forbidden dependencies: " + ", ".join(webhook_violations), file=sys.stderr)
+    print("forbidden dependencies: " + ", ".join(sorted(set(webhook_violations))), file=sys.stderr)
     raise SystemExit(1)
 
 ordinary_webhook_references = []
