@@ -1424,7 +1424,7 @@ mod tests {
                     Ok(_) => {
                         let sanitized = sanitize_product_request(request)
                             .expect("accepted raw-H1 request must sanitize");
-                        let (_, mut body, _) = sanitized.into_parts();
+                        let mut body = sanitized.body;
                         let mut body_bytes = Vec::new();
                         let mut body_error = false;
                         while let Some(chunk) = body.data().await {

@@ -1388,12 +1388,12 @@ mod tests {
     fn upgrade_intent_distinguishes_websocket_and_other_protocols() {
         let websocket = sanitized_upgrade("WebSocket");
         assert_eq!(
-            upgrade_intent(websocket.upgrade_protocol()).unwrap(),
+            upgrade_intent(websocket.head.upgrade_protocol()).unwrap(),
             Some(NeutralUpgradeIntent::WebSocket)
         );
         let opaque = sanitized_upgrade("test-echo/1");
         assert_eq!(
-            upgrade_intent(opaque.upgrade_protocol()).unwrap(),
+            upgrade_intent(opaque.head.upgrade_protocol()).unwrap(),
             Some(NeutralUpgradeIntent::Other(
                 UpgradeProtocol::new("test-echo/1").unwrap()
             ))
@@ -1412,7 +1412,7 @@ mod tests {
             canonicalize_http_url("http://example.test/socket").unwrap(),
             &neutral_headers(&headers).unwrap(),
             BodyMetadata::new(BodyFraming::ContentLength(0)),
-            sanitized.upgrade_protocol(),
+            sanitized.head.upgrade_protocol(),
         )
         .unwrap();
         let facts = shape.into_facts(&headers).unwrap();

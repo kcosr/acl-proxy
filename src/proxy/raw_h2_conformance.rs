@@ -114,7 +114,7 @@ fn adapt_decoded_fields(
         target.url().clone(),
         sanitized.head.headers(),
         body_facts,
-        sanitized.upgrade_protocol(),
+        sanitized.head.upgrade_protocol(),
     )
     .map_err(|_| AdapterError::ProductBoundary)?;
     let facts = ValidatedRequestFactShape::into_facts(shape, &product_headers)
