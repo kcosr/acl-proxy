@@ -75,15 +75,10 @@ fn base_protected_headers() {
 }
 EOF
 cat >"$PRODUCT/src/credential_resolver.rs" <<'EOF'
-use http_access_runtime::validate_header_projection;
-
-fn validate_final_header_projection() {
-    validate_header_projection();
-}
+fn credential_resolver() {}
 EOF
 cat >"$PRODUCT/src/proxy/mod.rs" <<'EOF'
 mod facts;
-mod forward;
 mod headers;
 EOF
 cat >"$PRODUCT/src/proxy/facts.rs" <<'EOF'
@@ -120,7 +115,6 @@ fn http_version() {}
 fn http_method() {}
 fn neutral_headers() {}
 fn product_headers() {}
-fn apply_response_mutations() {}
 fn body_metadata() {}
 fn single_content_length() {}
 fn upgrade_intent() {}
@@ -129,23 +123,16 @@ EOF
 cat >"$PRODUCT/src/proxy/headers.rs" <<'EOF'
 use http::{HeaderMap, Uri};
 use http_access_runtime::{
-    prepare_upgrade_response_headers, sanitize_connect_request_head,
-    sanitize_request_head, sanitize_response_headers,
+    sanitize_connect_request_head, sanitize_request_head,
 };
 
-struct OrdinaryIngress;
-impl OrdinaryIngress {
-    fn ingress_protocol() {}
-    fn upgrade_protocol() {}
-    fn into_parts() {}
-}
-struct PendingRequest;
-impl PendingRequest {
+struct SanitizedIngressRequest;
+impl SanitizedIngressRequest {
     fn head() {}
     fn into_parts() {}
 }
-struct ConnectIngress;
-impl ConnectIngress {
+struct SanitizedConnectIngressRequest;
+impl SanitizedConnectIngressRequest {
     fn head() {}
     fn into_parts() {}
 }
@@ -163,21 +150,11 @@ fn sanitize_untrusted_connect_ingress_request() {
     sanitize_connect_request_head();
 }
 
-fn sanitize_product_response_headers() {
-    sanitize_response_headers();
-}
-
-fn prepare_product_upgrade_response() {
-    prepare_upgrade_response_headers();
-}
-
 fn neutral_version() {}
 fn product_protocol() {}
 fn neutral_method() {}
 fn neutral_headers() {}
 fn product_headers() {}
-fn replace_sanitized_headers() {}
-fn apply_prepared_head() {}
 
 #[cfg(test)]
 mod tests {
@@ -189,17 +166,6 @@ mod tests {
 
 const TEXT: &str = "CONNECTION split trim canonical_path_and_query";
 // use http::header::UPGRADE;
-EOF
-cat >"$PRODUCT/src/proxy/forward.rs" <<'EOF'
-use http_access_runtime::{prepare_request_head, prepare_upgrade_request_head};
-
-fn send_request() {
-    prepare_request_head();
-}
-
-fn send_upgrade_request() {
-    prepare_upgrade_request_head();
-}
 EOF
 cat >"$PRODUCT/src/unrelated.rs" <<'EOF'
 fn unrelated() {}
@@ -221,33 +187,46 @@ import sys
 
 root = pathlib.Path(sys.argv[1]).resolve()
 mode = sys.argv[2]
-kind = None
-path = root.parent / "access-runtime" / "crates" / "http-access-runtime"
-version = "=0.1.0"
-rename = None
-include = True
+expected_path = root.parent / "access-runtime" / "crates" / "http-access-runtime"
+
+def dependency(kind, features):
+    return {
+        "name": "http-access-runtime",
+        "kind": kind,
+        "path": str(expected_path),
+        "req": "=0.1.0",
+        "rename": None,
+        "source": None,
+        "optional": False,
+        "uses_default_features": True,
+        "features": features,
+        "target": None,
+    }
+
+dependencies = [dependency(None, []), dependency("dev", ["dev-harness"])]
 if mode == "missing":
-    include = False
+    dependencies.pop(0)
 elif mode == "dev":
-    kind = "dev"
+    dependencies[0]["kind"] = "dev"
 elif mode == "wrong-path":
-    path = root.parent / "access-runtime" / "crates" / "http-access-types"
+    dependencies[0]["path"] = str(
+        root.parent / "access-runtime" / "crates" / "http-access-types"
+    )
 elif mode == "loose-version":
-    version = "0.1.0"
+    dependencies[0]["req"] = "0.1.0"
 elif mode == "renamed":
-    rename = "shared-runtime"
+    dependencies[0]["rename"] = "shared-runtime"
+elif mode == "missing-dev-harness":
+    dependencies.pop(1)
+elif mode == "extra-dev-feature":
+    dependencies[1]["features"].append("unexpected")
+elif mode == "dev-wrong-path":
+    dependencies[1]["path"] = str(
+        root.parent / "access-runtime" / "crates" / "http-access-types"
+    )
 elif mode != "valid":
     raise SystemExit(f"unknown metadata mode: {mode}")
 
-dependencies = []
-if include:
-    dependencies.append({
-        "name": "http-access-runtime",
-        "kind": kind,
-        "path": str(path),
-        "req": version,
-        "rename": rename,
-    })
 json.dump({"packages": [{"name": "acl-proxy", "dependencies": dependencies}]}, sys.stdout)
 PY
 EOF
@@ -493,14 +472,19 @@ for operation in "${operations[@]}"; do
     expect_failure "$case_parent/acl-proxy" "macro escaped shared call: $operation" \
         'referenced outside its adapter owner'
 
+done
+
+product_adopted_operations=(
+    sanitize_request_head sanitize_connect_request_head validate_header_projection
+    prepartition_connection_nominations is_prepartition_caller_credential_header
+)
+for operation in "${product_adopted_operations[@]}"; do
     case_index=$((case_index + 1))
     case_parent="$TEST_ROOT/missing-call-$case_index"
     cp -R "$BASE_PARENT" "$case_parent"
     sed -i "/^[[:space:]]*$operation();$/d" \
-        "$case_parent/acl-proxy/src/credential_resolver.rs" \
         "$case_parent/acl-proxy/src/proxy/facts.rs" \
-        "$case_parent/acl-proxy/src/proxy/headers.rs" \
-        "$case_parent/acl-proxy/src/proxy/forward.rs"
+        "$case_parent/acl-proxy/src/proxy/headers.rs"
     expect_failure "$case_parent/acl-proxy" "missing shared call: $operation" \
         "shared header operation $operation must have exactly its active product calls"
 
@@ -508,21 +492,13 @@ for operation in "${operations[@]}"; do
     case_parent="$TEST_ROOT/dead-call-$case_index"
     cp -R "$BASE_PARENT" "$case_parent"
     sed -i "/^[[:space:]]*$operation();$/d" \
-        "$case_parent/acl-proxy/src/credential_resolver.rs" \
         "$case_parent/acl-proxy/src/proxy/facts.rs" \
-        "$case_parent/acl-proxy/src/proxy/headers.rs" \
-        "$case_parent/acl-proxy/src/proxy/forward.rs"
+        "$case_parent/acl-proxy/src/proxy/headers.rs"
     case "$operation" in
-        sanitize_request_head|sanitize_connect_request_head|sanitize_response_headers|prepare_upgrade_response_headers)
+        sanitize_request_head|sanitize_connect_request_head)
             dead_owner="$case_parent/acl-proxy/src/proxy/headers.rs"
             ;;
-        prepare_request_head|prepare_upgrade_request_head)
-            dead_owner="$case_parent/acl-proxy/src/proxy/forward.rs"
-            ;;
-        validate_header_projection)
-            dead_owner="$case_parent/acl-proxy/src/credential_resolver.rs"
-            ;;
-        prepartition_connection_nominations|is_prepartition_caller_credential_header)
+        validate_header_projection|prepartition_connection_nominations|is_prepartition_caller_credential_header)
             dead_owner="$case_parent/acl-proxy/src/proxy/facts.rs"
             ;;
     esac
@@ -547,19 +523,13 @@ printf '\nfn escaped_residual_helper() { let _ = "connection"; }\n' \
 expect_failure "$case_parent/acl-proxy" 'hop literal outside exact residual function' \
     'contains hop-header literal'
 
-for owner in credential facts; do
-    case_index=$((case_index + 1))
-    case_parent="$TEST_ROOT/missing-projection-owner-$case_index"
-    cp -R "$BASE_PARENT" "$case_parent"
-    if [[ $owner == credential ]]; then
-        projection_source="$case_parent/acl-proxy/src/credential_resolver.rs"
-    else
-        projection_source="$case_parent/acl-proxy/src/proxy/facts.rs"
-    fi
-    sed -i '/^[[:space:]]*validate_header_projection();$/d' "$projection_source"
-    expect_failure "$case_parent/acl-proxy" "missing $owner projection owner" \
-        'shared header operation validate_header_projection must have exactly its active product calls'
-done
+case_index=$((case_index + 1))
+case_parent="$TEST_ROOT/missing-projection-owner-$case_index"
+cp -R "$BASE_PARENT" "$case_parent"
+sed -i '/^[[:space:]]*validate_header_projection();$/d' \
+    "$case_parent/acl-proxy/src/proxy/facts.rs"
+expect_failure "$case_parent/acl-proxy" 'missing facts projection owner' \
+    'shared header operation validate_header_projection must have exactly its active product calls'
 
 case_index=$((case_index + 1))
 case_parent="$TEST_ROOT/allowed-parenthesized-call-$case_index"
@@ -571,7 +541,7 @@ expect_success "$case_parent/acl-proxy" 'allowed parenthesized shared call'
 case_index=$((case_index + 1))
 case_parent="$TEST_ROOT/renamed-import-$case_index"
 cp -R "$BASE_PARENT" "$case_parent"
-sed -i 's/sanitize_request_head, sanitize_response_headers/sanitize_request_head as hidden, sanitize_response_headers/' \
+sed -i 's/sanitize_connect_request_head, sanitize_request_head/sanitize_connect_request_head, sanitize_request_head as hidden/' \
     "$case_parent/acl-proxy/src/proxy/headers.rs"
 expect_failure "$case_parent/acl-proxy" 'renamed shared operation import' \
     'shared header operation import must not be renamed'
@@ -768,12 +738,15 @@ sed -i '/mod tests {/a\    #[test] fn h1_parent_uses_exact_absolute_form() {}' \
 expect_failure "$case_parent/acl-proxy" 'obsolete product semantic test' \
     'obsolete product-owned header semantic test remains:'
 
-for mode in missing dev wrong-path loose-version renamed; do
+for mode in \
+    missing dev wrong-path loose-version renamed \
+    missing-dev-harness extra-dev-feature dev-wrong-path
+do
     if FAKE_METADATA_MODE="$mode" runner "$PRODUCT" >"$TEST_ROOT/failure.log" 2>&1; then
         printf 'metadata mutation %s was accepted\n' "$mode" >&2
         exit 1
     fi
 done
 
-printf 'shared header ownership mutation tests passed (%d source/test mutations, 5 metadata mutations)\n' \
+printf 'shared header ownership mutation tests passed (%d source/test mutations, 8 metadata mutations)\n' \
     "$case_index"

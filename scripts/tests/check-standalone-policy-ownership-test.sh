@@ -12,13 +12,13 @@ BASELINE="$TEST_ROOT/baseline"
 mkdir -p "$BASELINE/scripts" "$BASELINE/src/proxy" "$BASELINE/src/http1"
 cp "$SOURCE_ROOT/scripts/check-standalone-policy-ownership.sh" "$BASELINE/scripts/"
 printf '%s\n' 'mod proxy;' 'mod http1;' >"$BASELINE/src/lib.rs"
-printf '%s\n' 'mod ingress;' 'mod forward;' 'mod upgrade_relay;' \
+printf '%s\n' 'mod ingress;' 'mod forwarding_adapter;' 'mod upgrade_relay;' \
     >"$BASELINE/src/proxy/mod.rs"
 printf '%s\n' 'mod ingress;' >"$BASELINE/src/http1/mod.rs"
 
 for source in \
     src/proxy/ingress.rs \
-    src/proxy/forward.rs \
+    src/proxy/forwarding_adapter.rs \
     src/proxy/upgrade_relay.rs \
     src/http1/ingress.rs
 do
@@ -88,7 +88,7 @@ mutations=(
 case_index=0
 for source in \
     src/proxy/ingress.rs \
-    src/proxy/forward.rs \
+    src/proxy/forwarding_adapter.rs \
     src/proxy/upgrade_relay.rs \
     src/http1/ingress.rs
 do

@@ -27,18 +27,30 @@ matches = [
     for dependency in package["dependencies"]
     if dependency["name"] == "http-access-runtime"
 ]
-if len(matches) != 1:
-    raise SystemExit("acl-proxy must have exactly one unrenamed http-access-runtime dependency")
-dependency = matches[0]
-if dependency.get("rename") is not None:
-    raise SystemExit("http-access-runtime must not be renamed")
-if dependency["kind"] is not None:
-    raise SystemExit("http-access-runtime must be a production dependency")
-if dependency["req"] != "=0.1.0":
-    raise SystemExit("http-access-runtime must use exact version =0.1.0")
 expected = runtime / "crates" / "http-access-runtime"
-if pathlib.Path(dependency["path"]).resolve() != expected:
-    raise SystemExit(f"http-access-runtime must use the exact sibling path {expected}")
+production = [dependency for dependency in matches if dependency["kind"] is None]
+development = [dependency for dependency in matches if dependency["kind"] == "dev"]
+if len(production) != 1:
+    raise SystemExit("acl-proxy must have exactly one production http-access-runtime dependency")
+if len(development) != 1:
+    raise SystemExit("acl-proxy must have exactly one dev-harness http-access-runtime dependency")
+if len(matches) != 2:
+    raise SystemExit("acl-proxy has an unexpected additional http-access-runtime dependency")
+for dependency in matches:
+    if dependency.get("rename") is not None:
+        raise SystemExit("http-access-runtime must not be renamed")
+    if dependency["req"] != "=0.1.0":
+        raise SystemExit("http-access-runtime must use exact version =0.1.0")
+    if pathlib.Path(dependency["path"]).resolve() != expected:
+        raise SystemExit(f"http-access-runtime must use the exact sibling path {expected}")
+    if dependency.get("source") is not None or dependency.get("optional"):
+        raise SystemExit("http-access-runtime must be a required local path dependency")
+    if dependency.get("target") is not None or not dependency.get("uses_default_features", True):
+        raise SystemExit("http-access-runtime dependency scope/default features changed")
+if production[0].get("features") != []:
+    raise SystemExit("production http-access-runtime dependency must not enable test features")
+if development[0].get("features") != ["dev-harness"]:
+    raise SystemExit("development http-access-runtime dependency must enable only dev-harness")
 PY
 
 runtime_inventory=$(mktemp "${TMPDIR:-/tmp}/shared-header-runtime-tests.XXXXXX")

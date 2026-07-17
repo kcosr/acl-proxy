@@ -33,7 +33,12 @@ use http_access_runtime::{
 fn adapter(mut parts: Parts, executor: Executor, dispatch: Dispatch, resources: Resources) {
     let h2_stream = parts.extensions.remove::<H2StreamCancellation>();
     let outcome = executor.execute(dispatch.exchange, dispatch.resolved, resources);
-    let body = ProxyResponseBody::forwarded(body, Arc::clone(&observation), h2_stream);
+    let body = ProxyResponseBody::forwarded(
+        body,
+        Arc::clone(&observation),
+        h2_stream,
+        downstream_supports_trailers,
+    );
 }
 
 // AppState ProductConfig ForwardingExecutor forward_request TcpStream::connect(endpoint)
@@ -299,7 +304,7 @@ expect_failure "$CASE_ROOT" 'escaped H2 take' \
     'adapter H2 cancellation ownership take ownership violation'
 
 new_case
-sed -i 's/Arc::clone(&observation), h2_stream/Arc::clone(\&observation), None/' \
+sed -i 's/        h2_stream,/        None,/' \
     "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
 expect_failure "$CASE_ROOT" 'missing response-lifetime H2 transfer' \
     'adapter H2 response-lifetime transfer ownership violation'

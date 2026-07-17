@@ -475,7 +475,8 @@ require_exact_locations(
 
 h2_response_transfer = re.compile(
     r"ProxyResponseBody\s*::\s*forwarded\s*\(\s*body\s*,"
-    r"\s*Arc\s*::\s*clone\s*\(\s*&\s*observation\s*\)\s*,\s*h2_stream\s*\)"
+    r"\s*Arc\s*::\s*clone\s*\(\s*&\s*observation\s*\)\s*,\s*h2_stream\s*,"
+    r"\s*downstream_supports_trailers\s*,?\s*\)"
 )
 require_exact_locations(
     "adapter H2 response-lifetime transfer",
