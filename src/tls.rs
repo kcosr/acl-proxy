@@ -214,7 +214,7 @@ fn add_custom_ca(
     Ok(())
 }
 
-fn load_custom_ca_der(
+pub(crate) fn load_custom_ca_der(
     path: &Path,
     is_cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<Vec<Vec<u8>>, TlsActivationError> {

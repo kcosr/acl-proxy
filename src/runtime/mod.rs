@@ -15,8 +15,8 @@ pub(crate) use core::{
 pub(crate) use generation::Generation;
 pub(crate) use generation::{
     ActivatedGeneration, AuthorizationDispatchContext, AuthorizationInvocationMode,
-    AuthorizationSnapshot, CleanupReason, EgressSnapshot, ForwardingGenerationServices,
-    GenerationId, GenerationLease, GenerationOwner, GenerationRetention, GenerationRetentionError,
+    AuthorizationSnapshot, CleanupReason, ForwardingGenerationServices, GenerationId,
+    GenerationLease, GenerationOwner, GenerationRetention, GenerationRetentionError,
     ObservationSnapshot, ProviderIndex, ProviderRegistry, PublicationGuard, SafetySnapshot,
 };
 pub(crate) use readiness::ServiceReadiness;

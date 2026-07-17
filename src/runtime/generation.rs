@@ -111,17 +111,6 @@ mod index_registry_tests {
     }
 }
 
-pub(crate) trait EgressSnapshot: Send + Sync {
-    fn identity(&self) -> &Arc<()>;
-
-    fn route(&self) -> &crate::egress::EgressRoute;
-
-    #[cfg(test)]
-    fn route_contract(&self) -> &http_access_types::Route;
-
-    fn origin_tls(&self) -> &crate::egress::OriginTls;
-}
-
 pub(crate) trait ObservationSnapshot: Send + Sync {
     fn capture_epoch(&self) -> &Arc<crate::observation::CaptureEpoch>;
 
@@ -274,7 +263,7 @@ pub(crate) struct ActivatedGeneration {
     pub(crate) request_timeout: Duration,
     pub(crate) max_content_decoding_expansion_ratio: usize,
     pub(crate) resource_plan: CompiledResourcePlan,
-    pub(crate) egress: Arc<dyn EgressSnapshot>,
+    pub(crate) forwarding_executor: Arc<http_access_runtime::ForwardingExecutor>,
     pub(crate) authorization: Arc<dyn AuthorizationSnapshot>,
     pub(crate) credentials: Arc<crate::credentials::InboundCredentialSnapshot>,
     pub(crate) credential_io_runtime: Arc<crate::credential_io_runtime::CredentialIoRuntime>,
@@ -289,7 +278,7 @@ pub(crate) struct Generation {
     request_timeout: Duration,
     max_content_decoding_expansion_ratio: usize,
     resource_plan: CompiledResourcePlan,
-    egress: Arc<dyn EgressSnapshot>,
+    forwarding_executor: Arc<http_access_runtime::ForwardingExecutor>,
     authorization: Arc<dyn AuthorizationSnapshot>,
     credentials: Arc<crate::credentials::InboundCredentialSnapshot>,
     credential_io_runtime: Arc<crate::credential_io_runtime::CredentialIoRuntime>,
@@ -322,7 +311,7 @@ impl Generation {
             request_timeout: value.request_timeout,
             max_content_decoding_expansion_ratio: value.max_content_decoding_expansion_ratio,
             resource_plan: value.resource_plan,
-            egress: value.egress,
+            forwarding_executor: value.forwarding_executor,
             authorization: value.authorization,
             credentials: value.credentials,
             credential_io_runtime: value.credential_io_runtime,
@@ -353,10 +342,6 @@ impl Generation {
 
     pub(crate) fn resource_plan(&self) -> &CompiledResourcePlan {
         &self.resource_plan
-    }
-
-    pub(crate) fn egress(&self) -> &dyn EgressSnapshot {
-        self.egress.as_ref()
     }
 
     pub(crate) fn authorization(&self) -> &dyn AuthorizationSnapshot {
@@ -456,13 +441,13 @@ pub(crate) struct GenerationLease {
 }
 
 pub(crate) struct ForwardingGenerationServices {
-    egress: Arc<dyn EgressSnapshot>,
+    executor: Arc<http_access_runtime::ForwardingExecutor>,
     safety: Arc<dyn SafetySnapshot>,
 }
 
 impl ForwardingGenerationServices {
-    pub(crate) fn egress(&self) -> &dyn EgressSnapshot {
-        self.egress.as_ref()
+    pub(crate) fn executor(&self) -> &Arc<http_access_runtime::ForwardingExecutor> {
+        &self.executor
     }
 
     pub(crate) fn inject_loop_marker(
@@ -504,7 +489,7 @@ impl GenerationLease {
 
     pub(crate) fn into_forwarding_services(self) -> ForwardingGenerationServices {
         ForwardingGenerationServices {
-            egress: Arc::clone(&self.generation.egress),
+            executor: Arc::clone(&self.generation.forwarding_executor),
             safety: Arc::clone(&self.generation.safety),
         }
     }
@@ -561,10 +546,6 @@ pub(crate) struct GenerationRetention {
 impl GenerationRetention {
     pub(crate) fn id(&self) -> GenerationId {
         self.generation.id()
-    }
-
-    pub(crate) fn egress(&self) -> &dyn EgressSnapshot {
-        self.generation.egress()
     }
 }
 

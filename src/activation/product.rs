@@ -6,7 +6,7 @@ use crate::authorization::{
 use crate::config::compiler::ReloadableProductPlan;
 use crate::config::StaticFingerprint;
 use crate::credentials::CredentialActivation;
-use crate::egress::{EgressActivationError, EgressSnapshot};
+use crate::egress::{EgressActivation, EgressActivationError};
 use crate::redaction::ProductRedactionActivationError;
 use crate::runtime::{
     ActivatedGeneration, ActivationCancellation, BoxFuture, CandidateActivator, CleanupReason,
@@ -172,7 +172,7 @@ impl ProductActivator {
             .map_err(|error| candidate_error(&cancellation, "observation", error.to_string()))?;
         cancellation.check()?;
 
-        let egress = EgressSnapshot::activate(
+        let egress = EgressActivation::activate(
             egress,
             standalone.identity(),
             http_access_types::PolicyGeneration::new(standalone.version())
@@ -180,7 +180,7 @@ impl ProductActivator {
             || cancellation.is_cancelled(),
         )
         .map_err(|error| map_egress_error(error, &cancellation))?;
-        let (egress, neutral_egress) = egress.into_parts();
+        let (neutral_egress, executor_bindings) = egress.into_parts();
         standalone = standalone.finalize(neutral_egress).map_err(|error| {
             candidate_error(
                 &cancellation,
@@ -188,6 +188,27 @@ impl ProductActivator {
                 error.to_string(),
             )
         })?;
+        cancellation.check()?;
+
+        let forwarding_cancellation = http_access_runtime::ForwardingCancellation::new();
+        let activation_cancellation = cancellation.clone();
+        let bridged_cancellation = forwarding_cancellation.clone();
+        let cancellation_bridge = tokio::spawn(async move {
+            activation_cancellation.cancelled().await;
+            bridged_cancellation.cancel();
+        });
+        let (protocols, origin_https_trust, route) = executor_bindings.into_parts();
+        let forwarding_executor = http_access_runtime::ForwardingExecutor::activate(
+            Arc::clone(self.static_resources.ingress_assets().forwarding_network()),
+            protocols,
+            origin_https_trust,
+            route,
+            standalone.snapshot_lease(),
+            &forwarding_cancellation,
+        );
+        cancellation_bridge.abort();
+        let forwarding_executor = forwarding_executor
+            .map_err(|error| map_forwarding_activation_error(error, &cancellation))?;
         cancellation.check()?;
 
         // Process providers start only after the other generation-owned
@@ -243,7 +264,7 @@ impl ProductActivator {
             request_timeout,
             max_content_decoding_expansion_ratio,
             resource_plan,
-            egress: Arc::new(egress),
+            forwarding_executor: Arc::new(forwarding_executor),
             authorization: Arc::new(authorization),
             credentials: Arc::new(credentials),
             credential_io_runtime: self.static_resources.credential_io_runtime(),
@@ -304,6 +325,17 @@ fn map_egress_error(
         RuntimeError::ActivationCancelled
     } else {
         candidate_error(cancellation, "egress", error.to_string())
+    }
+}
+
+fn map_forwarding_activation_error(
+    error: http_access_runtime::ForwardingActivationError,
+    cancellation: &ActivationCancellation,
+) -> RuntimeError {
+    if error == http_access_runtime::ForwardingActivationError::Cancelled {
+        RuntimeError::ActivationCancelled
+    } else {
+        candidate_error(cancellation, "forwarding executor", error.to_string())
     }
 }
 
@@ -866,17 +898,8 @@ redaction_profile = "environment"
             http_access_types::EffectivePolicy::Default
         ));
 
-        assert!(matches!(
-            activated.egress.route(),
-            crate::egress::EgressRoute::Direct
-        ));
-        assert_eq!(
-            activated.egress.origin_tls().protocols().protocols().len(),
-            2
-        );
         assert!(standalone_bindings.global_credentials().is_empty());
         let mut request_headers = http::HeaderMap::new();
-        let _origin_trust = activated.egress.origin_tls().trust();
 
         let _inbound = activated.credentials.extract(&mut request_headers).unwrap();
         assert!(!request_headers.contains_key(http::header::AUTHORIZATION));
