@@ -2,13 +2,15 @@ use std::sync::Arc;
 
 use tokio_rustls::TlsAcceptor;
 
+use http_access_runtime::{ForwardingNetworkError, ForwardingNetworkFacts, ForwardingNetworkGuard};
+use http_access_url::canonicalize_http_url;
+
 use crate::certs::{CertError, MitmCertificateManager};
 use crate::config::compiler::{CompiledHttpVersion, StaticProductConfig};
-use crate::destination::{DestinationFacts, DestinationGuard, DestinationGuardError};
 use crate::tls_identity::{load_static_tls_acceptor, StaticTlsIdentityError};
 
 pub(crate) struct ProductIngressAssets {
-    destination_guard: Arc<DestinationGuard>,
+    forwarding_network: Arc<ForwardingNetworkGuard>,
     explicit_https_tls: Option<TlsAcceptor>,
     transparent_https_alpn: Box<[Vec<u8>]>,
     mitm: Option<Arc<MitmCertificateManager>>,
@@ -18,15 +20,14 @@ impl ProductIngressAssets {
     pub(crate) fn from_static(
         config: &StaticProductConfig,
     ) -> Result<Arc<Self>, ProductIngressAssetsError> {
-        let destination_guard = Arc::new(DestinationGuard::system(DestinationFacts::from_static(
-            config,
-        )?));
-        Self::from_static_with_destination_guard(config, destination_guard)
+        let facts = forwarding_network_facts(config)?;
+        let forwarding_network = Arc::new(ForwardingNetworkGuard::system(facts));
+        Self::from_static_with_forwarding_network(config, forwarding_network)
     }
 
-    fn from_static_with_destination_guard(
+    fn from_static_with_forwarding_network(
         config: &StaticProductConfig,
-        destination_guard: Arc<DestinationGuard>,
+        forwarding_network: Arc<ForwardingNetworkGuard>,
     ) -> Result<Arc<Self>, ProductIngressAssetsError> {
         let explicit_https_alpn = config
             .listeners
@@ -63,7 +64,7 @@ impl ProductIngressAssets {
         }
 
         Ok(Arc::new(Self {
-            destination_guard,
+            forwarding_network,
             explicit_https_tls,
             transparent_https_alpn: transparent_https_alpn.into_boxed_slice(),
             mitm,
@@ -71,15 +72,15 @@ impl ProductIngressAssets {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_destination_guard(
+    pub(crate) fn with_forwarding_network(
         config: &StaticProductConfig,
-        destination_guard: Arc<DestinationGuard>,
+        forwarding_network: Arc<ForwardingNetworkGuard>,
     ) -> Result<Arc<Self>, ProductIngressAssetsError> {
-        Self::from_static_with_destination_guard(config, destination_guard)
+        Self::from_static_with_forwarding_network(config, forwarding_network)
     }
 
-    pub(crate) fn destination_guard(&self) -> &Arc<DestinationGuard> {
-        &self.destination_guard
+    pub(crate) fn forwarding_network(&self) -> &Arc<ForwardingNetworkGuard> {
+        &self.forwarding_network
     }
 
     pub(crate) fn explicit_https_tls(&self) -> Option<&TlsAcceptor> {
@@ -95,6 +96,51 @@ impl ProductIngressAssets {
     }
 }
 
+fn forwarding_network_facts(
+    config: &StaticProductConfig,
+) -> Result<ForwardingNetworkFacts, ForwardingNetworkError> {
+    let listeners = &config.listeners;
+    let listener_binds = [
+        listeners
+            .explicit_http
+            .as_ref()
+            .map(|listener| listener.bind),
+        listeners
+            .transparent_http
+            .as_ref()
+            .map(|listener| listener.bind),
+        listeners
+            .explicit_https
+            .as_ref()
+            .map(|listener| listener.bind),
+        listeners
+            .transparent_https
+            .as_ref()
+            .map(|listener| listener.bind),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let control_bind = config.control.as_ref().map(|control| control.bind);
+    let reserved_control_url = config
+        .callback_public_url
+        .as_deref()
+        .map(canonicalize_http_url)
+        .transpose()
+        .map_err(|_| ForwardingNetworkError::InvalidFacts)?;
+    let reserved_control_base_path = reserved_control_url
+        .as_ref()
+        .and_then(|_| config.control.as_ref())
+        .map(|control| control.base_path.clone());
+
+    ForwardingNetworkFacts::new(
+        listener_binds,
+        control_bind,
+        reserved_control_url,
+        reserved_control_base_path,
+    )
+}
+
 fn alpn_protocols(versions: &[CompiledHttpVersion]) -> Vec<Vec<u8>> {
     versions
         .iter()
@@ -108,7 +154,7 @@ fn alpn_protocols(versions: &[CompiledHttpVersion]) -> Vec<Vec<u8>> {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ProductIngressAssetsError {
     #[error(transparent)]
-    Destination(#[from] DestinationGuardError),
+    ForwardingNetwork(#[from] ForwardingNetworkError),
     #[error(transparent)]
     TlsIdentity(#[from] StaticTlsIdentityError),
     #[error(transparent)]
@@ -120,7 +166,9 @@ pub(crate) enum ProductIngressAssetsError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
+    use http_access_types::{HttpProtocol, Route};
     use rcgen::{CertificateParams, KeyPair};
     use tempfile::tempdir;
 
@@ -184,6 +232,65 @@ default = "deny"
                 .count(),
             0
         );
-        assert_eq!(Arc::strong_count(assets.destination_guard()), 1);
+        assert_eq!(Arc::strong_count(assets.forwarding_network()), 1);
+    }
+
+    #[test]
+    fn forwarding_network_facts_derive_from_compiled_static_config() {
+        let mut compiled = crate::config::compile_config_text(crate::config::ConfigTextInput {
+            text: include_str!("../../tests/fixtures/production/host-proxy.toml"),
+            source_path: Path::new("host-proxy.toml"),
+            config_root: Path::new("/etc/acl-proxy"),
+        })
+        .expect("production fixture compiles");
+        compiled.static_config.callback_public_url =
+            Some("https://control.example/_acl-proxy/external-auth/callback".to_string());
+
+        let guard = ForwardingNetworkGuard::system(
+            forwarding_network_facts(&compiled.static_config)
+                .expect("validated static forwarding facts derive"),
+        );
+        let callback =
+            canonicalize_http_url("https://control.example/_acl-proxy/external-auth/callback")
+                .expect("canonical callback URL");
+        assert!(matches!(
+            guard.preflight(
+                &callback,
+                HttpProtocol::Http1,
+                HttpProtocol::Http1,
+                &Route::Direct,
+            ),
+            Err(ForwardingNetworkError::ReservedControl)
+        ));
+        let listener =
+            canonicalize_http_url("http://127.0.0.1:8881/").expect("canonical listener URL");
+        assert!(matches!(
+            guard.preflight(
+                &listener,
+                HttpProtocol::Http1,
+                HttpProtocol::Http1,
+                &Route::Direct,
+            ),
+            Err(ForwardingNetworkError::ProtectedDestination)
+        ));
+
+        let mut callback_without_control = compiled.static_config.clone();
+        callback_without_control.control = None;
+        assert!(matches!(
+            forwarding_network_facts(&callback_without_control),
+            Err(ForwardingNetworkError::InvalidFacts)
+        ));
+
+        let mut overlapping = compiled.static_config;
+        overlapping
+            .listeners
+            .explicit_http
+            .as_mut()
+            .expect("explicit HTTP listener")
+            .bind = "127.0.0.1:8898".parse().expect("test bind");
+        assert!(matches!(
+            forwarding_network_facts(&overlapping),
+            Err(ForwardingNetworkError::InvalidFacts)
+        ));
     }
 }

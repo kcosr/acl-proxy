@@ -99,23 +99,23 @@ impl ProductStaticResources {
     }
 
     #[cfg(test)]
-    pub(crate) fn try_new_with_destination_guard(
+    pub(crate) fn try_new_with_forwarding_network(
         static_config: &StaticProductConfig,
-        destination_guard: Arc<crate::destination::DestinationGuard>,
+        forwarding_network: Arc<http_access_runtime::ForwardingNetworkGuard>,
     ) -> Result<Arc<Self>, ProductStaticResourcesError> {
         let ingress_assets =
-            ProductIngressAssets::with_destination_guard(static_config, destination_guard)?;
+            ProductIngressAssets::with_forwarding_network(static_config, forwarding_network)?;
         Self::try_new_with_ingress_assets(static_config, ingress_assets)
     }
 
     #[cfg(test)]
     pub(crate) fn try_new_with_connectors(
         static_config: &StaticProductConfig,
-        destination_guard: Arc<crate::destination::DestinationGuard>,
+        forwarding_network: Arc<http_access_runtime::ForwardingNetworkGuard>,
         webhook_connector: Arc<crate::authorization::webhook::connector::WebhookConnector>,
     ) -> Result<Arc<Self>, ProductStaticResourcesError> {
         let ingress_assets =
-            ProductIngressAssets::with_destination_guard(static_config, destination_guard)?;
+            ProductIngressAssets::with_forwarding_network(static_config, forwarding_network)?;
         Self::try_new_with_ingress_assets_and_webhook_connector(
             static_config,
             ingress_assets,

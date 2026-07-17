@@ -56,27 +56,27 @@ impl ProductRuntime {
     }
 
     #[cfg(test)]
-    pub(crate) async fn prepare_from_prebound_with_destination_guard(
+    pub(crate) async fn prepare_from_prebound_with_forwarding_network(
         loaded: LoadedCompiledConfig,
         listeners: Vec<std::net::TcpListener>,
-        destination_guard: Arc<crate::destination::DestinationGuard>,
+        forwarding_network: Arc<http_access_runtime::ForwardingNetworkGuard>,
     ) -> Result<Arc<Self>, ProductRuntimeError> {
-        Self::prepare_inner(loaded, Some(listeners), Some(destination_guard)).await
+        Self::prepare_inner(loaded, Some(listeners), Some(forwarding_network)).await
     }
 
     async fn prepare_inner(
         loaded: LoadedCompiledConfig,
         prebound: Option<Vec<std::net::TcpListener>>,
-        destination_guard: Option<Arc<crate::destination::DestinationGuard>>,
+        forwarding_network: Option<Arc<http_access_runtime::ForwardingNetworkGuard>>,
     ) -> Result<Arc<Self>, ProductRuntimeError> {
         let LoadedCompiledConfig { metadata, compiled } = loaded;
         #[cfg(not(test))]
-        let _ = (prebound, destination_guard);
+        let _ = (prebound, forwarding_network);
         #[cfg(test)]
-        let static_resources = match destination_guard {
-            Some(destination_guard) => ProductStaticResources::try_new_with_destination_guard(
+        let static_resources = match forwarding_network {
+            Some(forwarding_network) => ProductStaticResources::try_new_with_forwarding_network(
                 &compiled.static_config,
-                destination_guard,
+                forwarding_network,
             )?,
             None => ProductStaticResources::try_new(&compiled.static_config)?,
         };
