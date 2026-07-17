@@ -339,13 +339,90 @@ impl From<TlsActivationError> for EgressActivationError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::io::{self, Write};
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex, Once};
 
     use http_access_types::CanonicalHost;
     use rcgen::generate_simple_self_signed;
     use tempfile::TempDir;
+    use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    #[derive(Clone, Copy)]
+    struct TestLogWriterFactory;
+
+    struct TestLogWriter(Option<CapturedLogs>);
+
+    thread_local! {
+        static ACTIVE_LOG_CAPTURE: RefCell<Option<CapturedLogs>> = const { RefCell::new(None) };
+    }
+
+    static TEST_LOG_SUBSCRIBER: Once = Once::new();
+
+    impl Write for TestLogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if let Some(logs) = &self.0 {
+                logs.0.lock().unwrap().extend_from_slice(bytes);
+            }
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for TestLogWriterFactory {
+        type Writer = TestLogWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            TestLogWriter(ACTIVE_LOG_CAPTURE.with(|capture| capture.borrow().clone()))
+        }
+    }
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
+
+    struct ActiveLogCapture;
+
+    impl Drop for ActiveLogCapture {
+        fn drop(&mut self) {
+            ACTIVE_LOG_CAPTURE.with(|capture| {
+                capture.borrow_mut().take();
+            });
+        }
+    }
+
+    fn capture_logs(operation: impl FnOnce()) -> String {
+        TEST_LOG_SUBSCRIBER.call_once(|| {
+            let subscriber = tracing_subscriber::fmt()
+                .without_time()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(TestLogWriterFactory)
+                .finish();
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("test tracing subscriber must be installed only once");
+        });
+        let logs = CapturedLogs::default();
+        ACTIVE_LOG_CAPTURE.with(|capture| {
+            let previous = capture.borrow_mut().replace(logs.clone());
+            assert!(previous.is_none(), "test log captures must not be nested");
+        });
+        let active = ActiveLogCapture;
+        operation();
+        drop(active);
+        logs.text()
+    }
 
     fn origin(trust: CompiledTlsTrust, ca_certificate: Option<PathBuf>) -> TransportTlsPlan {
         TransportTlsPlan {
@@ -434,6 +511,278 @@ mod tests {
             &CanonicalHost::new("parent.example").unwrap()
         );
         assert!(matches!(intent.trust(), TlsTrust::CustomRoots(_)));
+    }
+
+    #[test]
+    fn neutral_root_bindings_change_for_content_and_generation_and_preserve_trust_mode() {
+        let first_directory = TempDir::new().unwrap();
+        let second_directory = TempDir::new().unwrap();
+        let first_ca = write_ca(&first_directory);
+        let second_ca = write_ca(&second_directory);
+        let identity = SnapshotIdentity::new();
+        let activate_trust = |trust, ca: PathBuf, generation| {
+            EgressActivation::activate(direct(trust, Some(ca)), &identity, generation, || false)
+                .unwrap()
+                .neutral
+        };
+
+        let custom = activate_trust(
+            CompiledTlsTrust::Custom,
+            first_ca.clone(),
+            PolicyGeneration::new(7).unwrap(),
+        );
+        let TlsTrust::CustomRoots(custom_ref) = &custom.origin_https_trust else {
+            panic!("custom trust must remain custom-only")
+        };
+        assert_eq!(custom.tls_roots.len(), 1);
+
+        let combined = activate_trust(
+            CompiledTlsTrust::SystemPlusCustom,
+            first_ca.clone(),
+            PolicyGeneration::new(7).unwrap(),
+        );
+        let TlsTrust::SystemAndCustomRoots(combined_ref) = &combined.origin_https_trust else {
+            panic!("combined trust must retain system roots")
+        };
+        assert_eq!(custom_ref.binding(), combined_ref.binding());
+
+        let substituted = activate_trust(
+            CompiledTlsTrust::Custom,
+            second_ca,
+            PolicyGeneration::new(7).unwrap(),
+        );
+        let TlsTrust::CustomRoots(substituted_ref) = &substituted.origin_https_trust else {
+            panic!("substituted trust remains custom-only")
+        };
+        assert_ne!(custom_ref.binding(), substituted_ref.binding());
+
+        let rotated = activate_trust(
+            CompiledTlsTrust::Custom,
+            first_ca,
+            PolicyGeneration::new(8).unwrap(),
+        );
+        let TlsTrust::CustomRoots(rotated_ref) = &rotated.origin_https_trust else {
+            panic!("rotated trust remains custom-only")
+        };
+        assert_eq!(custom_ref.version(), 7);
+        assert_eq!(rotated_ref.version(), 8);
+        assert_ne!(custom_ref.binding(), rotated_ref.binding());
+    }
+
+    #[test]
+    fn one_custom_ca_read_feeds_origin_parent_and_exact_registrations() {
+        let directory = TempDir::new().unwrap();
+        let ca = write_ca(&directory);
+        let plan = EgressPlan {
+            route: CompiledEgressRoute::ParentProxy,
+            origin_tls: origin(CompiledTlsTrust::Custom, Some(ca.clone())),
+            parent_proxy: Some(ParentProxyPlan {
+                #[cfg(test)]
+                kind: crate::config::compiler::CompiledParentProxyKind::Generic,
+                url: "https://parent.example:8443/".to_owned(),
+                host: "parent.example".to_owned(),
+                port: 8443,
+                tls: Some(ParentProxyTlsPlan {
+                    trust: CompiledTlsTrust::Custom,
+                    ca_certificate: Some(ca),
+                    server_name: "authenticated-parent.example".to_owned(),
+                }),
+            }),
+            request_headers: Vec::new(),
+            credential_actions: Vec::new(),
+        };
+        let identity = SnapshotIdentity::new();
+        let activation =
+            EgressActivation::activate(plan, &identity, PolicyGeneration::new(7).unwrap(), || {
+                false
+            })
+            .unwrap();
+
+        assert_eq!(activation.custom_ca_file_reads(), 1);
+        assert_eq!(activation.neutral.tls_roots.len(), 2);
+        assert_eq!(
+            activation.neutral.protocols.protocols(),
+            [HttpProtocol::Http2, HttpProtocol::Http1]
+        );
+        let TlsTrust::CustomRoots(origin_ref) = &activation.neutral.origin_https_trust else {
+            panic!("origin must retain custom-only trust")
+        };
+        assert_eq!(origin_ref.id().as_str(), "egress-origin-roots");
+        assert!(origin_ref.belongs_to(&identity));
+        let Route::Parent { target, security } = &activation.neutral.route else {
+            panic!("neutral route must retain parent")
+        };
+        assert_eq!(target.as_str(), "https://parent.example:8443/");
+        let TransportSecurity::Tls(intent) = security else {
+            panic!("HTTPS parent must retain TLS intent")
+        };
+        assert_eq!(
+            intent.authenticated_name().as_str(),
+            "authenticated-parent.example"
+        );
+        let TlsTrust::CustomRoots(parent_ref) = intent.trust() else {
+            panic!("parent must retain custom-only trust")
+        };
+        assert_eq!(parent_ref.id().as_str(), "egress-parent-roots");
+        assert!(parent_ref.belongs_to(&identity));
+        assert_eq!(origin_ref.binding(), parent_ref.binding());
+    }
+
+    #[test]
+    fn http_parent_owns_canonical_endpoint_and_kind() {
+        let parent = ParentProxyPlan {
+            #[cfg(test)]
+            kind: crate::config::compiler::CompiledParentProxyKind::AclProxy,
+            url: "http://parent.example:8080/".to_owned(),
+            host: "parent.example".to_owned(),
+            port: 8080,
+            tls: None,
+        };
+        #[cfg(test)]
+        assert!(matches!(
+            parent.kind,
+            crate::config::compiler::CompiledParentProxyKind::AclProxy
+        ));
+        let activation = activate(EgressPlan {
+            route: CompiledEgressRoute::ParentProxy,
+            origin_tls: origin(CompiledTlsTrust::System, None),
+            parent_proxy: Some(parent),
+            request_headers: Vec::new(),
+            credential_actions: Vec::new(),
+        });
+        let (_, executor) = activation.into_parts();
+        let (_, _, Route::Parent { target, security }) = executor.into_parts() else {
+            panic!("expected parent route")
+        };
+        assert_eq!(target.as_str(), "http://parent.example:8080/");
+        assert_eq!(security, TransportSecurity::Cleartext);
+    }
+
+    #[test]
+    fn insecure_origin_and_parent_each_emit_one_sanitized_warning() {
+        let origin_logs = capture_logs(|| {
+            activate(direct(CompiledTlsTrust::Insecure, None));
+        });
+        assert_eq!(
+            origin_logs
+                .matches("TLS certificate verification is disabled")
+                .count(),
+            1
+        );
+        assert!(origin_logs.contains("tls_scope=\"origin\""));
+
+        let parent_logs = capture_logs(|| {
+            activate(EgressPlan {
+                route: CompiledEgressRoute::ParentProxy,
+                origin_tls: origin(CompiledTlsTrust::Insecure, None),
+                parent_proxy: Some(ParentProxyPlan {
+                    #[cfg(test)]
+                    kind: crate::config::compiler::CompiledParentProxyKind::Generic,
+                    url: "https://parent.example/".to_owned(),
+                    host: "parent.example".to_owned(),
+                    port: 443,
+                    tls: Some(ParentProxyTlsPlan {
+                        trust: CompiledTlsTrust::Insecure,
+                        ca_certificate: None,
+                        server_name: "sensitive-parent-name.example".to_owned(),
+                    }),
+                }),
+                request_headers: Vec::new(),
+                credential_actions: Vec::new(),
+            });
+        });
+        assert_eq!(
+            parent_logs
+                .matches("TLS certificate verification is disabled")
+                .count(),
+            2
+        );
+        assert!(parent_logs.contains("tls_scope=\"origin\""));
+        assert!(parent_logs.contains("tls_scope=\"parent\""));
+        assert!(!parent_logs.contains("sensitive-parent-name.example"));
+    }
+
+    #[test]
+    fn custom_ca_failures_are_classified_without_exposing_paths() {
+        let directory = TempDir::new().unwrap();
+        let cases = [
+            (directory.path().join("missing-sensitive.pem"), None),
+            (directory.path().join("empty-sensitive.pem"), Some(&b""[..])),
+            (
+                directory.path().join("invalid-sensitive.pem"),
+                Some(&b"-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n"[..]),
+            ),
+        ];
+
+        for (index, (path, contents)) in cases.into_iter().enumerate() {
+            if let Some(contents) = contents {
+                std::fs::write(&path, contents).unwrap();
+            }
+            let error = EgressActivation::activate(
+                direct(CompiledTlsTrust::Custom, Some(path.clone())),
+                &SnapshotIdentity::new(),
+                PolicyGeneration::new(7).unwrap(),
+                || false,
+            )
+            .err()
+            .expect("invalid CA input must fail activation");
+            match index {
+                0 => assert_eq!(error, EgressActivationError::CaUnavailable),
+                1 => assert_eq!(error, EgressActivationError::CaEmpty),
+                2 => assert!(matches!(
+                    error,
+                    EgressActivationError::CaInvalid | EgressActivationError::NeutralTls
+                )),
+                _ => unreachable!(),
+            }
+            assert!(!error.to_string().contains(path.to_str().unwrap()));
+            assert!(!error
+                .to_string()
+                .contains(directory.path().to_str().unwrap()));
+        }
+    }
+
+    #[test]
+    fn custom_ca_material_reads_are_bracketed_by_cancellation_checks() {
+        let directory = TempDir::new().unwrap();
+        let ca = write_ca(&directory);
+
+        let pre_read_checks = Cell::new(0_usize);
+        let missing = directory.path().join("unopened-sensitive-ca.pem");
+        let pre_read_error = EgressActivation::activate(
+            direct(CompiledTlsTrust::Custom, Some(missing.clone())),
+            &SnapshotIdentity::new(),
+            PolicyGeneration::new(7).unwrap(),
+            || {
+                let next = pre_read_checks.get() + 1;
+                pre_read_checks.set(next);
+                next == 2
+            },
+        )
+        .err()
+        .expect("pre-read cancellation must win over missing-file failure");
+        assert_eq!(pre_read_error, EgressActivationError::ActivationCancelled);
+        assert_eq!(pre_read_checks.get(), 2);
+        assert!(!pre_read_error
+            .to_string()
+            .contains(missing.to_str().unwrap()));
+
+        let post_read_checks = Cell::new(0_usize);
+        let post_read_error = EgressActivation::activate(
+            direct(CompiledTlsTrust::Custom, Some(ca.clone())),
+            &SnapshotIdentity::new(),
+            PolicyGeneration::new(7).unwrap(),
+            || {
+                let next = post_read_checks.get() + 1;
+                post_read_checks.set(next);
+                next == 5
+            },
+        )
+        .err()
+        .expect("post-read cancellation must prevent activation");
+        assert_eq!(post_read_error, EgressActivationError::ActivationCancelled);
+        assert_eq!(post_read_checks.get(), 5);
+        assert!(!post_read_error.to_string().contains(ca.to_str().unwrap()));
     }
 
     #[test]
