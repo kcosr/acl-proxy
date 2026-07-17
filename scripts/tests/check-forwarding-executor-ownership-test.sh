@@ -33,7 +33,7 @@ use http_access_runtime::{
 fn adapter(mut parts: Parts, executor: Executor, dispatch: Dispatch, resources: Resources) {
     let h2_stream = parts.extensions.remove::<H2StreamCancellation>();
     let outcome = executor.execute(dispatch.exchange, dispatch.resolved, resources);
-    complete_empty_h1_response(&mut empty_body);
+    complete_empty_response(&mut empty_body);
     let body = ProxyResponseBody::forwarded(
         body,
         Arc::clone(&observation),
@@ -43,7 +43,7 @@ fn adapter(mut parts: Parts, executor: Executor, dispatch: Dispatch, resources: 
     );
 }
 
-fn complete_empty_h1_response(body: &mut Body) {}
+fn complete_empty_response(body: &mut Body) {}
 
 // AppState ProductConfig ForwardingExecutor forward_request TcpStream::connect(endpoint)
 /* nested /* ForwardingOutcome */ HttpsConnector */
@@ -365,15 +365,20 @@ expect_failure "$CASE_ROOT" 'escaped H1 completion state' \
     'H1 response completion state pending_h1_final must remain confined non-vacuously to ingress.rs'
 
 new_case
-sed -i '/    complete_empty_h1_response(&mut empty_body);/d' \
+sed -i '/    complete_empty_response(&mut empty_body);/d' \
     "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
-expect_failure "$CASE_ROOT" 'missing empty-H1 completion call' \
-    'adapter empty-H1 completion owner ownership violation'
+expect_failure "$CASE_ROOT" 'missing suppressed-body completion call' \
+    'adapter suppressed-body completion owner ownership violation'
+
+new_case
+printf '%s\n' 'fn complete_empty_response() {}' >"$CASE_ROOT/src/bypass.rs"
+expect_failure "$CASE_ROOT" 'escaped suppressed-body completion owner' \
+    'adapter suppressed-body completion owner ownership violation'
 
 new_case
 printf '%s\n' 'fn complete_empty_h1_response() {}' >"$CASE_ROOT/src/bypass.rs"
-expect_failure "$CASE_ROOT" 'escaped empty-H1 completion owner' \
-    'adapter empty-H1 completion owner ownership violation'
+expect_failure "$CASE_ROOT" 'restored H1-specific completion helper' \
+    'the H1-specific empty-response completion helper must remain deleted'
 
 for primitive in \
     'forward_request(request);' \

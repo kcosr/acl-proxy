@@ -502,11 +502,19 @@ for helper in ("poll_forwarded_h1_eof", "poll_forwarded_h1_fixed_final"):
     )
 
 require_exact_locations(
-    "adapter empty-H1 completion owner",
-    locations(sources, re.compile(r"\bcomplete_empty_h1_response\b")),
+    "adapter suppressed-body completion owner",
+    locations(sources, re.compile(r"\bcomplete_empty_response\b")),
     {adapter_path},
     2,
 )
+obsolete_empty_h1 = locations(sources, re.compile(r"\bcomplete_empty_h1_response\b"))
+if obsolete_empty_h1:
+    print("the H1-specific empty-response completion helper must remain deleted", file=sys.stderr)
+    print(
+        "locations: " + ", ".join(f"{path}:{line}" for path, line, _ in obsolete_empty_h1),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 
 for state_name in ("h1_remaining", "pending_h1_final", "h1_source_done"):
     state_locations = locations(sources, re.compile(rf"\b{state_name}\b"))
