@@ -4490,7 +4490,10 @@ default = "allow"
                         });
                         Ok::<_, Infallible>(
                             Response::builder()
-                                .header(TRAILER, "x-sequence, x-other, connection, x-remove")
+                                .header(
+                                    http::header::TRAILER,
+                                    "x-sequence, x-other, connection, x-remove",
+                                )
                                 .body(body)
                                 .unwrap(),
                         )
