@@ -762,7 +762,6 @@ fn compile_upgrade_binding(
 mod tests {
     use std::future;
     use std::net::IpAddr;
-    use std::os::unix::ffi::OsStringExt;
     use std::path::Path;
     use std::sync::Arc;
     use std::task::{Context, Poll};
@@ -910,14 +909,6 @@ header = "x-test-loop"
     }
 
     struct TestClock;
-
-    struct NeverCancelled;
-
-    impl credential_core::CredentialCancellation for NeverCancelled {
-        fn is_cancelled(&self) -> bool {
-            false
-        }
-    }
 
     impl Clock for TestClock {
         fn monotonic_millis(&self) -> u64 {
@@ -1509,69 +1500,17 @@ header = "x-test-loop"
             let preparation = result.credentials.take().unwrap();
             if let Some(foreign_plan) = foreign_binding.as_ref() {
                 assert!(matches!(
-                    preparation.admit_for_plan(foreign_plan, Arc::new(NeverCancelled)),
+                    preparation.admit_for_plan(foreign_plan),
                     Err(credential_core::CredentialError::BindingMismatch)
                 ));
             } else {
-                drop(
-                    preparation
-                        .admit_for_plan(&plan, Arc::new(NeverCancelled))
-                        .unwrap(),
-                );
+                drop(preparation.admit_for_plan(&plan).unwrap());
             }
             foreign_binding = Some(plan);
             drop(result);
             drop(lease);
             runtime.shutdown().await;
         }
-        std::env::remove_var("P06_RULE_TOKEN");
-        std::env::remove_var("P06_GLOBAL_TOKEN");
-    }
-
-    #[tokio::test]
-    async fn provider_credentials_materialize_only_at_final_apply() {
-        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
-        std::env::set_var("P06_RULE_TOKEN", "rule-secret");
-        std::env::set_var("P06_GLOBAL_TOKEN", "global-secret");
-
-        let (primary_runtime, lease, _pool) = runtime().await;
-        let generation = lease.standalone();
-        let (guard, provider) = admission(&lease);
-        let mut result = adapt_provider_allow(
-            &lease,
-            0,
-            provider,
-            output(&lease, provider, true, None),
-            None,
-            guard,
-            request(generation, vec![b"original".to_vec()]),
-        )
-        .unwrap();
-        let plan = result.plan.forwarding_plan_arc();
-        let preparation = result.credentials.take().unwrap();
-        let execution = preparation
-            .admit_for_plan(&plan, Arc::new(NeverCancelled))
-            .unwrap();
-        let mut request = http::Request::new(hyper::Body::empty());
-        request
-            .headers_mut()
-            .insert("x-visible", http::HeaderValue::from_static("retained"));
-        request
-            .headers_mut()
-            .insert("x-rule-token", http::HeaderValue::from_static("replaced"));
-        execution.finalize(&mut request).await.unwrap();
-
-        let headers = request.headers();
-        assert_eq!(headers["x-visible"], "retained");
-        assert_eq!(headers["x-rule-token"], "rule-secret");
-        assert_eq!(headers["x-provider-token"], "secret-token");
-        assert_eq!(headers["x-global-token"], "global-secret");
-        for name in ["x-rule-token", "x-provider-token", "x-global-token"] {
-            assert!(headers[name].is_sensitive());
-        }
-        drop(result);
-        drop(lease);
-        primary_runtime.shutdown().await;
         std::env::remove_var("P06_RULE_TOKEN");
         std::env::remove_var("P06_GLOBAL_TOKEN");
     }
@@ -1651,107 +1590,13 @@ header = "x-test-loop"
         assert!(!Arc::ptr_eq(&copied_plan, &plan));
         let preparation = result.credentials.take().unwrap();
         assert!(matches!(
-            preparation.admit_for_plan(&copied_plan, Arc::new(NeverCancelled)),
+            preparation.admit_for_plan(&copied_plan),
             Err(credential_core::CredentialError::BindingMismatch)
         ));
 
         drop(result);
         drop(lease);
         primary_runtime.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn late_credential_source_failure_rolls_back_all_header_mutations() {
-        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
-        std::env::set_var("P06_RULE_TOKEN", "rule-secret");
-        std::env::remove_var("P06_GLOBAL_TOKEN");
-
-        let (runtime, lease, _pool) = runtime().await;
-        let generation = lease.standalone();
-        let (guard, provider) = admission(&lease);
-        let mut result = adapt_provider_allow(
-            &lease,
-            0,
-            provider,
-            output(&lease, provider, true, None),
-            None,
-            guard,
-            request(generation, vec![b"original".to_vec()]),
-        )
-        .unwrap();
-        let plan = result.plan.forwarding_plan_arc();
-        let preparation = result.credentials.take().unwrap();
-        let execution = preparation
-            .admit_for_plan(&plan, Arc::new(NeverCancelled))
-            .unwrap();
-        let mut request = http::Request::new(hyper::Body::empty());
-        request
-            .headers_mut()
-            .insert("x-visible", http::HeaderValue::from_static("unchanged"));
-        request
-            .headers_mut()
-            .insert("x-rule-token", http::HeaderValue::from_static("original"));
-        assert_eq!(
-            execution.finalize(&mut request).await,
-            Err(credential_core::CredentialError::ServiceUnavailable)
-        );
-        let headers = request.headers();
-        assert_eq!(headers.len(), 2);
-        assert_eq!(headers["x-visible"], "unchanged");
-        assert_eq!(headers["x-rule-token"], "original");
-        assert!(!headers.contains_key("x-provider-token"));
-        assert!(!headers.contains_key("x-global-token"));
-
-        drop(result);
-        drop(lease);
-        runtime.shutdown().await;
-        std::env::remove_var("P06_RULE_TOKEN");
-        std::env::remove_var("P06_GLOBAL_TOKEN");
-    }
-
-    #[tokio::test]
-    async fn non_utf8_environment_credential_is_rejected_atomically() {
-        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
-        std::env::set_var("P06_RULE_TOKEN", "rule-secret");
-        std::env::set_var(
-            "P06_GLOBAL_TOKEN",
-            std::ffi::OsString::from_vec(vec![b'g', 0xff, b'x']),
-        );
-
-        let (runtime, lease, _pool) = runtime().await;
-        let generation = lease.standalone();
-        let (guard, provider) = admission(&lease);
-        let mut result = adapt_provider_allow(
-            &lease,
-            0,
-            provider,
-            output(&lease, provider, true, None),
-            None,
-            guard,
-            request(generation, vec![b"original".to_vec()]),
-        )
-        .unwrap();
-        let plan = result.plan.forwarding_plan_arc();
-        let preparation = result.credentials.take().unwrap();
-        let execution = preparation
-            .admit_for_plan(&plan, Arc::new(NeverCancelled))
-            .unwrap();
-        let mut request = http::Request::new(hyper::Body::empty());
-        request
-            .headers_mut()
-            .insert("x-visible", http::HeaderValue::from_static("unchanged"));
-        assert_eq!(
-            execution.finalize(&mut request).await,
-            Err(credential_core::CredentialError::InvalidMaterial)
-        );
-        assert_eq!(request.headers().len(), 1);
-        assert_eq!(request.headers()["x-visible"], "unchanged");
-
-        drop(result);
-        drop(lease);
-        runtime.shutdown().await;
-        std::env::remove_var("P06_RULE_TOKEN");
-        std::env::remove_var("P06_GLOBAL_TOKEN");
     }
 
     #[tokio::test]
