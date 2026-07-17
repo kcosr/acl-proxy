@@ -3065,30 +3065,18 @@ mod tests {
         let loaded = load_and_compile_exact_config(&path).unwrap();
         let assets = ProductIngressAssets::with_forwarding_network(
             &loaded.compiled.static_config,
-            forwarding_network,
+            forwarding_network.clone(),
         )
         .unwrap();
-        let product = ProductRuntime::prepare_from_prebound(loaded, listeners)
-            .await
-            .unwrap();
+        let product = ProductRuntime::prepare_from_prebound_with_forwarding_network(
+            loaded,
+            listeners,
+            forwarding_network,
+        )
+        .await
+        .unwrap();
         product.activate_initial().await.unwrap();
         (directory, product, assets)
-    }
-
-    struct OverrideIngressAssetsStarter {
-        inner: ProductProxySupervisorStarter,
-        assets: Arc<ProductIngressAssets>,
-    }
-
-    impl ProxySupervisorStarter for OverrideIngressAssetsStarter {
-        fn start(
-            &mut self,
-            listener: PreparedProxyListener,
-            _assets: &Arc<ProductIngressAssets>,
-            failure_observer: Arc<dyn ProxySupervisorFailureObserver>,
-        ) -> Result<Arc<dyn ProxySupervisor>, ProxySupervisorStartError> {
-            self.inner.start(listener, &self.assets, failure_observer)
-        }
     }
 
     async fn listener_product_with_forwarding_network(
@@ -3100,23 +3088,19 @@ mod tests {
         let path = directory.path().join("acl-proxy.toml");
         fs::write(&path, text).unwrap();
         let loaded = load_and_compile_exact_config(&path).unwrap();
-        let assets = ProductIngressAssets::with_forwarding_network(
-            &loaded.compiled.static_config,
+        let product = ProductRuntime::prepare_from_prebound_with_forwarding_network(
+            loaded,
+            listeners,
             forwarding_network,
         )
+        .await
         .unwrap();
-        let product = ProductRuntime::prepare_from_prebound(loaded, listeners)
-            .await
-            .unwrap();
         product.activate_initial().await.unwrap();
-        let mut starter = OverrideIngressAssetsStarter {
-            inner: ProductProxySupervisorStarter::new(
-                product.runtime().clone(),
-                product.observation_runtime().clone(),
-                product.upgrade_runtime(),
-            ),
-            assets,
-        };
+        let mut starter = ProductProxySupervisorStarter::new(
+            product.runtime().clone(),
+            product.observation_runtime().clone(),
+            product.upgrade_runtime(),
+        );
         product.start_proxy_supervisors(&mut starter).await.unwrap();
         (directory, product)
     }
@@ -3153,6 +3137,189 @@ mod tests {
             request,
         )
         .await
+    }
+
+    fn serve_direct_h1<I>(
+        product: Arc<ProductRuntime>,
+        assets: Arc<ProductIngressAssets>,
+        io: I,
+    ) -> JoinHandle<()>
+    where
+        I: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        tokio::spawn(async move {
+            let service = service_fn(move |request| {
+                let product = product.clone();
+                let assets = assets.clone();
+                async move {
+                    Ok::<_, Infallible>(execute_direct(&product, assets, request).await.response)
+                }
+            });
+            let mut http = Http::new();
+            http.http1_only(true);
+            let _ = http.serve_connection(io, service).with_upgrades().await;
+        })
+    }
+
+    struct PendingWriteIo<I> {
+        inner: I,
+        write_attempted: Arc<Notify>,
+    }
+
+    impl<I> PendingWriteIo<I> {
+        fn new(inner: I, write_attempted: Arc<Notify>) -> Self {
+            Self {
+                inner,
+                write_attempted,
+            }
+        }
+
+        fn pending_write<T>(&self) -> Poll<io::Result<T>> {
+            self.write_attempted.notify_one();
+            Poll::Pending
+        }
+    }
+
+    impl<I> AsyncRead for PendingWriteIo<I>
+    where
+        I: AsyncRead + Unpin,
+    {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            destination: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(context, destination)
+        }
+    }
+
+    impl<I> AsyncWrite for PendingWriteIo<I>
+    where
+        I: AsyncWrite + Unpin,
+    {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _source: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.pending_write()
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.pending_write()
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.pending_write()
+        }
+    }
+
+    struct ObservedWriteIo<I> {
+        inner: I,
+        write_attempts: Arc<AtomicUsize>,
+        write_attempted: Arc<Notify>,
+    }
+
+    impl<I> ObservedWriteIo<I> {
+        fn new(inner: I, write_attempts: Arc<AtomicUsize>, write_attempted: Arc<Notify>) -> Self {
+            Self {
+                inner,
+                write_attempts,
+                write_attempted,
+            }
+        }
+
+        fn record_write(&self) {
+            self.write_attempts.fetch_add(1, Ordering::SeqCst);
+            self.write_attempted.notify_one();
+        }
+    }
+
+    impl<I> AsyncRead for ObservedWriteIo<I>
+    where
+        I: AsyncRead + Unpin,
+    {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            destination: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(context, destination)
+        }
+    }
+
+    impl<I> AsyncWrite for ObservedWriteIo<I>
+    where
+        I: AsyncWrite + Unpin,
+    {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            source: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.record_write();
+            Pin::new(&mut self.inner).poll_write(context, source)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(context)
+        }
+    }
+
+    async fn wait_for_write_attempts(attempts: &AtomicUsize, attempted: &Notify, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while attempts.load(Ordering::SeqCst) < expected {
+                attempted.notified().await;
+            }
+        })
+        .await
+        .expect("downstream response did not reach the blocked write boundary");
+    }
+
+    async fn wait_for_one_committed_upgrade(runtime: &UpgradeRuntime) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let counts = runtime.counts();
+                if counts.reserved_slots == 1
+                    && counts.reserved_bytes > 0
+                    && counts.uncommitted == 0
+                    && counts.committed == 1
+                    && counts.tracked_tasks > 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("upgrade did not enter the committed product runtime");
+    }
+
+    async fn wait_for_released_upgrade(runtime: &UpgradeRuntime, product: &ProductRuntime) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let counts = runtime.counts();
+                if counts.reserved_slots == 0
+                    && counts.reserved_bytes == 0
+                    && counts.uncommitted == 0
+                    && counts.committed == 0
+                    && counts.tracked_tasks == 0
+                    && product.wire_body_pool().global_charge() == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("upgrade retained product runtime or wire-body admission");
     }
 
     fn base_config(listener: SocketAddr, listener_table: &str, policy: &str) -> String {
@@ -9052,29 +9219,111 @@ max_trailer_bytes = 256
     }
 
     #[tokio::test]
-    async fn abandoned_uncommitted_upgrade_is_bounded_by_the_request_deadline() {
+    async fn downstream_cancellation_after_accepted_101_releases_committed_upgrade_once() {
         let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
         let ([proxy], listeners) = prebound_listeners::<1>();
         let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
         let origin = origin_listener.local_addr().unwrap();
-        let (accepted_tx, accepted_rx) = oneshot::channel();
         let origin_task = tokio::spawn(async move {
             let (mut stream, _) = origin_listener.accept().await.unwrap();
             let request = read_http_head(&mut stream).await;
             let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
             assert!(request.contains("\r\nconnection: upgrade\r\n"));
             assert!(request.contains("\r\nupgrade: test-echo\r\n"));
-            accepted_tx.send(()).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: test-echo\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            let mut byte = [0_u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+                .await
+                .expect("cancelled upgrade kept its origin connection open")
+                .unwrap();
+            assert_eq!(read, 0, "cancelled upgrade wrote later origin bytes");
+        });
+        let logical_url = "http://upgrade.test/socket";
+        let policy = format!(
+            r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "cancelled-committed-upgrade"
+decision = "allow"
+methods = ["GET"]
+urls = ["{logical_url}"]
+allow_upgrades = true
+"#
+        );
+        let forwarding_network = test_forwarding_network(proxy, [(logical_url.to_owned(), origin)]);
+        let (_directory, product, assets) = product_with_forwarding_network(
+            base_config(proxy, "explicit_http", &policy),
+            listeners,
+            forwarding_network,
+        )
+        .await;
+        let runtime = product.upgrade_runtime();
+
+        let write_attempts = Arc::new(AtomicUsize::new(0));
+        let write_attempted = Arc::new(Notify::new());
+        let (server, mut client) = tokio::io::duplex(1);
+        let server_task = serve_direct_h1(
+            product.clone(),
+            assets,
+            ObservedWriteIo::new(server, write_attempts.clone(), write_attempted.clone()),
+        );
+        client
+            .write_all(
+                b"GET http://upgrade.test/socket HTTP/1.1\r\nHost: upgrade.test\r\nConnection: Upgrade\r\nUpgrade: test-echo\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        wait_for_one_committed_upgrade(&runtime).await;
+        wait_for_write_attempts(&write_attempts, &write_attempted, 2).await;
+
+        drop(client);
+        wait_for_released_upgrade(&runtime, &product).await;
+        origin_task.await.unwrap();
+        server_task.await.unwrap();
+        product.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn absolute_deadline_bounds_committed_upgrade_setup() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin_listener.accept().await.unwrap();
+            let request = read_http_head(&mut stream).await;
+            let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            assert!(request.contains("\r\nconnection: upgrade\r\n"));
+            assert!(request.contains("\r\nupgrade: test-echo\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: test-echo\r\n\r\n",
+                )
+                .await
+                .unwrap();
 
             let mut byte = [0_u8; 1];
             let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
                 .await
                 .expect("deadline-bounded upgrade kept its origin connection open")
                 .unwrap();
-            assert_eq!(read, 0, "abandoned upgrade wrote later origin bytes");
+            assert_eq!(read, 0, "expired upgrade wrote later origin bytes");
         });
+        let logical_url = "http://upgrade.test/socket";
         let policy = format!(
             r#"[listeners.explicit_http.connect]
 http1 = "deny"
@@ -9086,70 +9335,54 @@ default = "deny"
 id = "deadline-bounded-upgrade"
 decision = "allow"
 methods = ["GET"]
-urls = ["http://{origin}/socket"]
+urls = ["{logical_url}"]
 allow_upgrades = true
 "#
         );
         let config = base_config(proxy, "explicit_http", &policy).replacen(
             "request_timeout = \"5s\"",
-            "request_timeout = \"500ms\"",
+            "request_timeout = \"750ms\"",
             1,
         );
-        let (_directory, product) = product(config, listeners).await;
+        let forwarding_network = test_forwarding_network(proxy, [(logical_url.to_owned(), origin)]);
+        let (_directory, product, assets) =
+            product_with_forwarding_network(config, listeners, forwarding_network).await;
         let runtime = product.upgrade_runtime();
-        let pool = product.wire_body_pool();
 
-        let mut client = tokio::net::TcpStream::connect(proxy).await.unwrap();
+        let write_attempted = Arc::new(Notify::new());
+        let (server, mut client) = tokio::io::duplex(16 * 1024);
+        let server_task = serve_direct_h1(
+            product.clone(),
+            assets,
+            PendingWriteIo::new(server, write_attempted.clone()),
+        );
+        let started = Instant::now();
         client
             .write_all(
-                format!(
-                    "GET http://{origin}/socket HTTP/1.1\r\nHost: {origin}\r\nConnection: Upgrade\r\nUpgrade: test-echo\r\n\r\n"
-                )
-                .as_bytes(),
+                b"GET http://upgrade.test/socket HTTP/1.1\r\nHost: upgrade.test\r\nConnection: Upgrade\r\nUpgrade: test-echo\r\n\r\n",
             )
             .await
             .unwrap();
-        accepted_rx.await.unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let counts = runtime.counts();
-                if counts.reserved_slots == 1
-                    && counts.reserved_bytes > 0
-                    && counts.uncommitted == 1
-                    && counts.committed == 0
-                    && counts.tracked_tasks == 1
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("upgrade did not reach the uncommitted response-head wait");
+        wait_for_one_committed_upgrade(&runtime).await;
+        tokio::time::timeout(Duration::from_secs(2), write_attempted.notified())
+            .await
+            .expect("downstream response did not reach the blocked write boundary");
+
+        wait_for_released_upgrade(&runtime, &product).await;
+        let elapsed = started.elapsed();
         assert!(
-            pool.global_charge() > 0,
-            "uncommitted upgrade did not retain response admission"
+            elapsed >= Duration::from_millis(750),
+            "committed setup was released before its request deadline: {elapsed:?}"
         );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "committed setup was not bounded by its request deadline: {elapsed:?}"
+        );
+        origin_task.await.unwrap();
 
         drop(client);
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let counts = runtime.counts();
-                if counts.reserved_slots == 0
-                    && counts.reserved_bytes == 0
-                    && counts.uncommitted == 0
-                    && counts.committed == 0
-                    && counts.tracked_tasks == 0
-                    && pool.global_charge() == 0
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("deadline-bounded upgrade retained runtime or wire-body admission");
-        origin_task.await.unwrap();
+        server_task.abort();
+        assert!(server_task.await.unwrap_err().is_cancelled());
         product.shutdown().await;
     }
 
