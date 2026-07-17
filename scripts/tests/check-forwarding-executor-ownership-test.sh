@@ -32,17 +32,28 @@ use http_access_runtime::{
 
 struct ProductDownstreamAbort(H2StreamCancellation);
 
-impl ForwardingDownstreamAbort for ProductDownstreamAbort {}
+impl ForwardingDownstreamAbort for ProductDownstreamAbort {
+    fn abort(self: Box<Self>) { self.0.cancel(); }
+}
 
 fn adapter(mut parts: Parts, executor: Executor, dispatch: Dispatch, mut resources: Resources) {
     let h2_stream = parts.extensions.remove::<H2StreamCancellation>();
+    if !h2_stream_context_matches(downstream_supports_trailers, h2_stream.is_some()) {
+        return internal_failure(&terminal.capture);
+    }
     resources = resources.with_downstream_abort(ProductDownstreamAbort(h2_stream));
     let handoff = ProductUpgradeHandoff::admit(runtime);
     resources = resources.with_upgrade_handoff(handoff, bounds);
     let outcome = executor.execute(dispatch.exchange, dispatch.resolved, resources);
+    let no_content = head.status() == StatusCode::NO_CONTENT.as_u16();
     let reset_content = head.status() == StatusCode::RESET_CONTENT.as_u16();
+    let h1_content_length = if downstream_supports_trailers || no_content || reset_content {
+        None
+    } else {
+        single_content_length()
+    };
     let downstream_suppresses_body =
-        downstream_is_head || reset_content || matches!(head.status(), 204 | 304);
+        downstream_is_head || no_content || reset_content || head.status() == 304;
     let completion = if downstream_suppresses_body {
         drain_suppressed_response(&mut body).await
     } else {
@@ -55,12 +66,18 @@ fn adapter(mut parts: Parts, executor: Executor, dispatch: Dispatch, mut resourc
         downstream_supports_trailers,
         h1_content_length,
     );
-    if reset_content {
+    if no_content {
+        response.headers_mut().remove(CONTENT_LENGTH);
+    } else if reset_content {
         response.headers_mut().remove(CONTENT_LENGTH);
         response
             .headers_mut()
             .insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
     }
+}
+
+fn h2_stream_context_matches(downstream_is_h2: bool, h2_stream_present: bool) -> bool {
+    downstream_is_h2 == h2_stream_present
 }
 
 fn complete_empty_response(body: &mut Body) {}
@@ -131,13 +148,45 @@ fn poll_forwarded_data() {
 
 fn retained_listener() {
     let _: tokio_rustls::TlsAcceptor;
-    hyper::server::conn::Http::new();
+    let _ = Http::new().with_executor(H2StreamExecutor);
 }
 
 #[cfg(test)]
 fn ignored_test_client() {
     hyper::client::conn::handshake(stream);
     tokio::net::TcpStream::connect(endpoint);
+}
+EOF
+
+cat >"$BASELINE/src/proxy/h2_stream_cancellation.rs" <<'EOF'
+tokio::task_local! {
+    static CURRENT_H2_STREAM: H2StreamCancellation;
+}
+
+impl H2StreamCancellation {
+    fn current() -> Option<Self> {
+        CURRENT_H2_STREAM.try_with(Clone::clone).ok()
+    }
+}
+
+impl<F> Executor<F> for H2StreamExecutor {
+    fn execute(&self, future: F) {
+        let cancellation = H2StreamCancellation(Arc::new(H2StreamCancellationState {
+            cancelled: AtomicBool::new(false),
+            changed: Notify::new(),
+        }));
+        let scoped_cancellation = cancellation.clone();
+        drop(tokio::spawn(CURRENT_H2_STREAM.scope(
+            scoped_cancellation,
+            async move {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => {}
+                    _ = future => {}
+                }
+            },
+        )));
+    }
 }
 EOF
 
@@ -422,6 +471,41 @@ expect_failure "$CASE_ROOT" 'missing downstream-abort implementation' \
     'adapter downstream-abort implementation ownership violation'
 
 new_case
+sed -i 's/self.0.cancel()/drop(self)/' "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'detached H2 stream cancellation' \
+    'adapter exact H2 stream cancellation ownership violation'
+
+new_case
+sed -i 's/Http::new().with_executor(H2StreamExecutor)/Http::new()/' \
+    "$CASE_ROOT/src/proxy/ingress.rs"
+expect_failure "$CASE_ROOT" 'missing H2 stream executor installation' \
+    'ingress exact H2 stream executor installation ownership violation'
+
+new_case
+sed -i 's/CURRENT_H2_STREAM.scope(/DETACHED_H2_STREAM.scope(/' \
+    "$CASE_ROOT/src/proxy/h2_stream_cancellation.rs"
+expect_failure "$CASE_ROOT" 'detached H2 task-local scope' \
+    'H2 stream cancellation context ownership violation:'
+
+new_case
+sed -i '/                    biased;/d' \
+    "$CASE_ROOT/src/proxy/h2_stream_cancellation.rs"
+expect_failure "$CASE_ROOT" 'unprioritized H2 cancellation' \
+    'H2 stream cancellation context ownership violation:'
+
+new_case
+sed -i 's/downstream_is_h2 == h2_stream_present/downstream_is_h2 \&\& h2_stream_present/' \
+    "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'one-sided H2 context implication' \
+    'adapter exact downstream-version/H2-context equivalence ownership violation'
+
+new_case
+sed -i '/if !h2_stream_context_matches/,+2d' \
+    "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'removed fail-closed H2 context check' \
+    'adapter fail-closed H2 context validation ownership violation'
+
+new_case
 sed -i '/with_downstream_abort/d' "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
 expect_failure "$CASE_ROOT" 'missing shared downstream-abort transfer' \
     'adapter shared downstream-abort capability transfer ownership violation'
@@ -475,9 +559,27 @@ expect_failure "$CASE_ROOT" 'inexact reset-content classification' \
     'adapter exact reset-content classification ownership violation'
 
 new_case
-sed -i 's/downstream_is_head || reset_content ||/downstream_is_head ||/' \
+sed -i 's/StatusCode::NO_CONTENT.as_u16()/204/' \
+    "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'inexact no-content classification' \
+    'adapter exact no-content classification ownership violation'
+
+new_case
+sed -i 's/ || no_content || reset_content/ || reset_content/' \
+    "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'suppressed status content-length parse' \
+    'adapter suppressed H1 content-length parse bypass ownership violation'
+
+new_case
+sed -i 's/downstream_is_head || no_content || reset_content ||/downstream_is_head ||/' \
     "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
 expect_failure "$CASE_ROOT" 'reset content omitted from response suppression' \
+    'adapter semantic response-body suppression selection ownership violation'
+
+new_case
+sed -i 's/ || head.status() == 304//' \
+    "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'not-modified omitted from response suppression' \
     'adapter semantic response-body suppression selection ownership violation'
 
 new_case

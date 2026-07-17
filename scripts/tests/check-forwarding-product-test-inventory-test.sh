@@ -36,12 +36,22 @@ ingress_retained_cases=(
     absolute_deadline_bounds_committed_upgrade_setup
     downstream_cancellation_after_accepted_101_releases_committed_upgrade_once
 )
+adapter_context_cases=(
+    downstream_version_requires_matching_h2_stream_context
+)
 ingress_c03_cases=(
+    h1_204_removes_content_length_and_preserves_pipeline
     h1_consumed_origin_trailers_remove_the_downstream_declaration
     h1_205_normalizes_nonzero_content_length_and_preserves_pipeline
     h1_response_wire_limit_closes_before_committing_a_partial_response
+    h2_204_removes_content_length_data_and_trailers
     h2_205_response_suppresses_origin_data_and_completes_terminal
+    h2_304_preserves_representation_content_length
+    h2_exact_final_chunk_window_watchdog_resets_before_eof_poll
+    h2_one_byte_window_complete_cl2_watchdog_resets_without_window_update
     h2_response_wire_limit_resets_only_the_failed_stream
+    h2_zero_window_complete_cl0_watchdog_resets_and_releases_admission
+    h2_zero_window_complete_cl1_watchdog_resets_and_preserves_sibling_stream
     h2_zero_window_watchdog_releases_admission_and_preserves_sibling_stream
     h2_zero_window_watchdog_sends_stream_cancel
     head_h1_response_completes_terminal_without_body_polling
@@ -66,6 +76,7 @@ write_test_module() {
 write_test_module "$BASELINE/src/credential_resolver.rs" "${credential_cases[@]}"
 write_test_module "$BASELINE/src/activation/assets.rs" "${activation_cases[@]}"
 write_test_module "$BASELINE/src/egress.rs" "${egress_cases[@]}"
+write_test_module "$BASELINE/src/proxy/forwarding_adapter.rs" "${adapter_context_cases[@]}"
 write_test_module "$BASELINE/src/proxy/ingress.rs" \
     "${ingress_retained_cases[@]}" "${ingress_c03_cases[@]}"
 
@@ -75,7 +86,7 @@ runner() {
 }
 
 runner "$BASELINE" >"$TEST_ROOT/pass.log"
-grep -Fq 'product forwarding test inventory passed (13 retained contract cases, 10 C03 E2E oracles)' \
+grep -Fq 'product forwarding test inventory passed (13 retained contract cases, 1 H2 context oracle, 17 C03 E2E oracles)' \
     "$TEST_ROOT/pass.log"
 
 expect_failure() {
@@ -110,6 +121,7 @@ mutate_cases() {
 mutate_cases src/credential_resolver.rs "${credential_cases[@]}"
 mutate_cases src/activation/assets.rs "${activation_cases[@]}"
 mutate_cases src/egress.rs "${egress_cases[@]}"
+mutate_cases src/proxy/forwarding_adapter.rs "${adapter_context_cases[@]}"
 mutate_cases src/proxy/ingress.rs \
     "${ingress_retained_cases[@]}" "${ingress_c03_cases[@]}"
 

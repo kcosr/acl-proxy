@@ -283,6 +283,9 @@ pub(super) async fn execute(
         dispatch.exchange.facts().version(),
         http_access_types::HttpVersion::Http2
     );
+    if !h2_stream_context_matches(downstream_supports_trailers, h2_stream.is_some()) {
+        return internal_failure(&terminal.capture);
+    }
     let downstream_is_head = dispatch.exchange.facts().method().as_str() == "HEAD";
     let plan = dispatch.exchange.plan_arc();
     let upgrade_policy = plan.upgrade().clone();
@@ -414,8 +417,9 @@ pub(super) async fn execute(
     {
         Ok(ForwardingOutcome::Response(response)) => {
             let (head, mut body) = response.into_parts();
+            let no_content = head.status() == StatusCode::NO_CONTENT.as_u16();
             let reset_content = head.status() == StatusCode::RESET_CONTENT.as_u16();
-            let h1_content_length = if downstream_supports_trailers || reset_content {
+            let h1_content_length = if downstream_supports_trailers || no_content || reset_content {
                 None
             } else {
                 let headers = match crate::proxy::facts::product_headers(head.headers()) {
@@ -428,7 +432,7 @@ pub(super) async fn execute(
                 }
             };
             let downstream_suppresses_body =
-                downstream_is_head || reset_content || matches!(head.status(), 204 | 304);
+                downstream_is_head || no_content || reset_content || head.status() == 304;
             let h1_empty_body = !downstream_supports_trailers && h1_content_length == Some(0);
             let response_body = if downstream_suppresses_body || h1_empty_body {
                 let completion = if downstream_suppresses_body {
@@ -454,7 +458,9 @@ pub(super) async fn execute(
                 Ok(response) => response,
                 Err(_) => return internal_failure(&terminal.capture),
             };
-            if reset_content {
+            if no_content {
+                response.headers_mut().remove(CONTENT_LENGTH);
+            } else if reset_content {
                 response.headers_mut().remove(CONTENT_LENGTH);
                 response
                     .headers_mut()
@@ -539,6 +545,10 @@ fn internal_failure(capture: &HttpCaptureContext) -> HandledResponse {
         "request failed\n",
         true,
     )
+}
+
+fn h2_stream_context_matches(downstream_is_h2: bool, h2_stream_present: bool) -> bool {
+    downstream_is_h2 == h2_stream_present
 }
 
 fn body_headers(headers: &HeaderMap) -> HeaderMap {
@@ -798,4 +808,17 @@ impl AsyncWrite for ProductUpstreamUpgradeIo {
 
 fn closed_upgrade() -> io::Error {
     io::Error::new(io::ErrorKind::ConnectionAborted, "upstream upgrade closed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::h2_stream_context_matches;
+
+    #[test]
+    fn downstream_version_requires_matching_h2_stream_context() {
+        assert!(h2_stream_context_matches(false, false));
+        assert!(h2_stream_context_matches(true, true));
+        assert!(!h2_stream_context_matches(false, true));
+        assert!(!h2_stream_context_matches(true, false));
+    }
 }

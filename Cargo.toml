@@ -76,5 +76,8 @@ h2 = "0.3"
 http-access-runtime = { path = "../access-runtime/crates/http-access-runtime", version = "=0.1.0", features = ["dev-harness"] }
 http-access-conformance = { path = "../access-runtime/crates/http-access-conformance", version = "=0.1.0" }
 
+[patch.crates-io]
+hyper = { path = "third_party/hyper" }
+
 [profile.release]
 opt-level = 3

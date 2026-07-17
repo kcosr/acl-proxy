@@ -18,6 +18,7 @@ proxy_module_path = pathlib.Path("src/proxy/mod.rs")
 webhook_connector_path = pathlib.Path("src/authorization/webhook/connector.rs")
 webhook_provider_path = pathlib.Path("src/authorization/webhook/provider.rs")
 tls_path = pathlib.Path("src/tls.rs")
+h2_context_path = pathlib.Path("src/proxy/h2_stream_cancellation.rs")
 test_only_paths = set()
 
 
@@ -281,6 +282,7 @@ required_paths = (
     webhook_connector_path,
     webhook_provider_path,
     tls_path,
+    h2_context_path,
 )
 for path in required_paths:
     if not (root / path).is_file():
@@ -506,6 +508,70 @@ require_exact_locations(
     1,
 )
 
+require_exact_locations(
+    "adapter exact H2 stream cancellation",
+    locations(sources, re.compile(r"\bself\s*\.\s*0\s*\.\s*cancel\s*\(\s*\)")),
+    {adapter_path},
+    1,
+)
+
+h2_executor_install = re.compile(
+    r"\bHttp\s*::\s*new\s*\(\s*\)\s*\.\s*with_executor\s*\(\s*H2StreamExecutor\s*\)"
+)
+require_exact_locations(
+    "ingress exact H2 stream executor installation",
+    locations(sources, h2_executor_install),
+    {ingress_path},
+    1,
+)
+
+h2_context = sources[h2_context_path]
+h2_context_invariants = (
+    (
+        r"tokio\s*::\s*task_local!\s*\{\s*static\s+CURRENT_H2_STREAM\s*:\s*H2StreamCancellation\s*;\s*\}",
+        "one typed task-local H2 stream context is required",
+    ),
+    (
+        r"CURRENT_H2_STREAM\s*\.\s*try_with\s*\(\s*Clone\s*::\s*clone\s*\)\s*\.\s*ok\s*\(\s*\)",
+        "H2 cancellation lookup must clone only the current stream context",
+    ),
+    (
+        r"let\s+cancellation\s*=\s*H2StreamCancellation\s*\(\s*Arc\s*::\s*new\s*\(\s*H2StreamCancellationState\s*\{\s*cancelled\s*:\s*AtomicBool\s*::\s*new\s*\(\s*false\s*\)\s*,\s*changed\s*:\s*Notify\s*::\s*new\s*\(\s*\)\s*,?\s*\}\s*\)\s*\)\s*;",
+        "each Hyper H2 stream future must receive a fresh cancellation state",
+    ),
+    (
+        r"CURRENT_H2_STREAM\s*\.\s*scope\s*\(\s*scoped_cancellation\s*,\s*async\s+move\s*\{\s*tokio\s*::\s*select!\s*\{\s*biased\s*;\s*_\s*=\s*cancellation\s*\.\s*cancelled\s*\(\s*\)\s*=>\s*\{\s*\}\s*_\s*=\s*future\s*=>\s*\{\s*\}\s*\}\s*\}\s*,?\s*\)",
+        "the exact stream context must cancel its scoped Hyper future with priority",
+    ),
+)
+for pattern, description in h2_context_invariants:
+    if re.search(pattern, h2_context, re.S) is None:
+        raise SystemExit(f"H2 stream cancellation context ownership violation: {description}")
+
+h2_context_equivalence = re.compile(
+    r"\bfn\s+h2_stream_context_matches\s*\(\s*downstream_is_h2\s*:\s*bool\s*,\s*"
+    r"h2_stream_present\s*:\s*bool\s*\)\s*->\s*bool\s*\{\s*"
+    r"downstream_is_h2\s*==\s*h2_stream_present\s*\}"
+)
+require_exact_locations(
+    "adapter exact downstream-version/H2-context equivalence",
+    locations(sources, h2_context_equivalence),
+    {adapter_path},
+    1,
+)
+
+h2_context_fail_closed = re.compile(
+    r"\bif\s+!\s*h2_stream_context_matches\s*\(\s*downstream_supports_trailers\s*,\s*"
+    r"h2_stream\s*\.\s*is_some\s*\(\s*\)\s*\)\s*\{\s*"
+    r"return\s+internal_failure\s*\(\s*&\s*terminal\s*\.\s*capture\s*\)\s*;\s*\}"
+)
+require_exact_locations(
+    "adapter fail-closed H2 context validation",
+    locations(sources, h2_context_fail_closed),
+    {adapter_path},
+    1,
+)
+
 downstream_abort_transfer = re.compile(
     r"\bresources\s*=\s*resources\s*\.\s*with_downstream_abort\s*\(\s*"
     r"ProductDownstreamAbort\s*\(\s*h2_stream\s*\)\s*\)"
@@ -641,10 +707,31 @@ require_exact_locations(
     1,
 )
 
+no_content_selection = re.compile(
+    r"\blet\s+no_content\s*=\s*head\s*\.\s*status\s*\(\s*\)\s*==\s*"
+    r"StatusCode\s*::\s*NO_CONTENT\s*\.\s*as_u16\s*\(\s*\)\s*;"
+)
+require_exact_locations(
+    "adapter exact no-content classification",
+    locations(sources, no_content_selection),
+    {adapter_path},
+    1,
+)
+
+h1_suppressed_length_bypass = re.compile(
+    r"\blet\s+h1_content_length\s*=\s*if\s+downstream_supports_trailers\s*\|\|\s*"
+    r"no_content\s*\|\|\s*reset_content\s*\{\s*None"
+)
+require_exact_locations(
+    "adapter suppressed H1 content-length parse bypass",
+    locations(sources, h1_suppressed_length_bypass),
+    {adapter_path},
+    1,
+)
+
 suppressed_body_selection = re.compile(
     r"\blet\s+downstream_suppresses_body\s*=\s*downstream_is_head\s*\|\|\s*"
-    r"reset_content\s*\|\|\s*matches!\s*\(\s*head\s*\.\s*status\s*\(\s*\)\s*,\s*"
-    r"204\s*\|\s*304\s*\)\s*;"
+    r"no_content\s*\|\|\s*reset_content\s*\|\|\s*head\s*\.\s*status\s*\(\s*\)\s*==\s*304\s*;"
 )
 require_exact_locations(
     "adapter semantic response-body suppression selection",
@@ -654,7 +741,9 @@ require_exact_locations(
 )
 
 reset_content_normalization = re.compile(
-    r"\bif\s+reset_content\s*\{\s*"
+    r"\bif\s+no_content\s*\{\s*"
+    r"response\s*\.\s*headers_mut\s*\(\s*\)\s*\.\s*remove\s*\(\s*"
+    r"CONTENT_LENGTH\s*\)\s*;\s*\}\s*else\s+if\s+reset_content\s*\{\s*"
     r"response\s*\.\s*headers_mut\s*\(\s*\)\s*\.\s*remove\s*\(\s*"
     r"CONTENT_LENGTH\s*\)\s*;\s*"
     r"response\s*\.\s*headers_mut\s*\(\s*\)\s*\.\s*insert\s*\(\s*"

@@ -58,13 +58,23 @@ ingress_retained_cases=(
     absolute_deadline_bounds_committed_upgrade_setup
     downstream_cancellation_after_accepted_101_releases_committed_upgrade_once
 )
+adapter_context_cases=(
+    downstream_version_requires_matching_h2_stream_context
+)
 
 ingress_c03_oracles=(
+    h1_204_removes_content_length_and_preserves_pipeline
     h1_consumed_origin_trailers_remove_the_downstream_declaration
     h1_205_normalizes_nonzero_content_length_and_preserves_pipeline
     h1_response_wire_limit_closes_before_committing_a_partial_response
+    h2_204_removes_content_length_data_and_trailers
     h2_205_response_suppresses_origin_data_and_completes_terminal
+    h2_304_preserves_representation_content_length
+    h2_exact_final_chunk_window_watchdog_resets_before_eof_poll
+    h2_one_byte_window_complete_cl2_watchdog_resets_without_window_update
     h2_response_wire_limit_resets_only_the_failed_stream
+    h2_zero_window_complete_cl0_watchdog_resets_and_releases_admission
+    h2_zero_window_complete_cl1_watchdog_resets_and_preserves_sibling_stream
     h2_zero_window_watchdog_releases_admission_and_preserves_sibling_stream
     h2_zero_window_watchdog_sends_stream_cancel
     head_h1_response_completes_terminal_without_body_polling
@@ -75,12 +85,14 @@ ingress_c03_oracles=(
 collect_inventory src/credential_resolver.rs credentials
 collect_inventory src/activation/assets.rs activation
 collect_inventory src/egress.rs egress
+collect_inventory src/proxy/forwarding_adapter.rs adapter
 collect_inventory src/proxy/ingress.rs ingress
 
 require_cases retained-credentials credentials "${credential_retained_cases[@]}"
 require_cases retained-activation activation "${activation_retained_cases[@]}"
 require_cases retained-egress egress "${egress_retained_cases[@]}"
 require_cases retained-ingress ingress "${ingress_retained_cases[@]}"
+require_cases h2-context adapter "${adapter_context_cases[@]}"
 require_cases c03-product-e2e ingress "${ingress_c03_oracles[@]}"
 
 retained_count=$((${#credential_retained_cases[@]}
@@ -92,11 +104,11 @@ if ((retained_count != 13)); then
         "$retained_count" >&2
     exit 1
 fi
-if ((${#ingress_c03_oracles[@]} != 10)); then
+if ((${#ingress_c03_oracles[@]} != 17)); then
     printf 'product C03 forwarding oracle inventory has unexpected size: %d\n' \
         "${#ingress_c03_oracles[@]}" >&2
     exit 1
 fi
 
-printf 'product forwarding test inventory passed (%d retained contract cases, %d C03 E2E oracles)\n' \
-    "$retained_count" "${#ingress_c03_oracles[@]}"
+printf 'product forwarding test inventory passed (%d retained contract cases, %d H2 context oracle, %d C03 E2E oracles)\n' \
+    "$retained_count" "${#adapter_context_cases[@]}" "${#ingress_c03_oracles[@]}"
