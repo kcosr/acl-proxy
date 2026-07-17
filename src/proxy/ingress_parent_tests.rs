@@ -18,11 +18,9 @@ use tokio_rustls::{TlsAcceptor, TlsConnector};
 use super::ProductProxySupervisorStarter;
 use crate::activation::runner::ProductRuntime;
 use crate::config::load_and_compile_exact_config;
-use crate::destination::{
-    DestinationFacts, DestinationGuard, DestinationResolver, LocalAddressSnapshot,
-    LocalAddressSource, ResolveFuture,
-};
 use crate::proxy::original_destination::{OriginalDestinationError, OriginalDestinationResolver};
+use http_access_runtime::{ForwardingDevHarness, ForwardingNetworkFacts};
+use http_access_url::canonicalize_http_url;
 
 const PARENT_HOST: &str = "parent.test";
 const ORIGIN_HOST: &str = "localhost";
@@ -32,26 +30,6 @@ struct TestIdentity {
     private_key_path: PathBuf,
     certificate_der: Vec<u8>,
     private_key_der: Vec<u8>,
-}
-
-struct FixedResolver(SocketAddr);
-
-impl DestinationResolver for FixedResolver {
-    fn resolve(&self, host: &str, port: u16, _max_addresses: usize) -> ResolveFuture<'_> {
-        assert_eq!(host, PARENT_HOST);
-        assert_eq!(port, self.0.port());
-        let endpoint = self.0;
-        Box::pin(async move { Ok(vec![endpoint]) })
-    }
-}
-
-#[derive(Default)]
-struct EmptyLocalAddresses;
-
-impl LocalAddressSource for EmptyLocalAddresses {
-    fn snapshot(&self) -> io::Result<LocalAddressSnapshot> {
-        Ok(LocalAddressSnapshot::default())
-    }
 }
 
 struct FixedOriginalDestination(SocketAddr);
@@ -405,13 +383,28 @@ async fn start_product(
     directory: &Path,
     config: String,
     listener: StdTcpListener,
+    origin: SocketAddr,
 ) -> Arc<ProductRuntime> {
+    let bind = listener.local_addr().unwrap();
     let path = directory.join("acl-proxy.toml");
     fs::write(&path, config).unwrap();
     let loaded = load_and_compile_exact_config(&path).unwrap();
-    let product = ProductRuntime::prepare_from_prebound(loaded, vec![listener])
-        .await
+    let facts = ForwardingNetworkFacts::new(vec![bind], None, None, None).unwrap();
+    let origin_url = canonicalize_http_url(&format!("https://{ORIGIN_HOST}:{}/", origin.port()))
         .unwrap();
+    let network = Arc::new(
+        ForwardingDevHarness::new(facts)
+            .map_prebound(&origin_url, origin)
+            .unwrap()
+            .into_standalone_guard(),
+    );
+    let product = ProductRuntime::prepare_from_prebound_with_forwarding_network(
+        loaded,
+        vec![listener],
+        network,
+    )
+    .await
+    .unwrap();
     product.activate_initial().await.unwrap();
     let mut starter = ProductProxySupervisorStarter::new(
         product.runtime().clone(),
@@ -429,21 +422,26 @@ async fn start_child_product(
     parent: SocketAddr,
     origin: SocketAddr,
 ) -> Arc<ProductRuntime> {
+    let bind = listener.local_addr().unwrap();
     let path = directory.join("acl-proxy.toml");
     fs::write(&path, config).unwrap();
     let loaded = load_and_compile_exact_config(&path).unwrap();
-    let facts = DestinationFacts::from_static(&loaded.compiled.static_config).unwrap();
-    let guard = Arc::new(
-        DestinationGuard::with_sources_allowing_local_parent_for_test(
-            facts,
-            Arc::new(FixedResolver(parent)),
-            Arc::new(EmptyLocalAddresses),
-        ),
+    let facts = ForwardingNetworkFacts::new(vec![bind], None, None, None).unwrap();
+    let parent_url = canonicalize_http_url(&format!("https://{PARENT_HOST}:{}/", parent.port()))
+        .unwrap();
+    let network = Arc::new(
+        ForwardingDevHarness::new(facts)
+            .map_local_parent(&parent_url, parent)
+            .unwrap()
+            .into_standalone_guard(),
     );
-    let product =
-        ProductRuntime::prepare_from_prebound_with_destination_guard(loaded, vec![listener], guard)
-            .await
-            .unwrap();
+    let product = ProductRuntime::prepare_from_prebound_with_forwarding_network(
+        loaded,
+        vec![listener],
+        network,
+    )
+    .await
+    .unwrap();
     product.activate_initial().await.unwrap();
     let mut starter = ProductProxySupervisorStarter::with_original_destination_resolver(
         product.runtime().clone(),
@@ -493,6 +491,7 @@ async fn topology(
             &origin_identity.certificate_path,
         ),
         parent_listener,
+        origin,
     )
     .await;
     let parent_mitm_ca = parent_directory.join("mitm/ca-cert.pem");

@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use bytes::Buf;
 use chrono::Utc;
-use http::header::{CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, TRAILER, UPGRADE};
+use http::header::{CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, UPGRADE};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Version};
 use hyper::body::{Bytes, HttpBody, SizeHint};
 use hyper::server::conn::Http;
@@ -49,8 +49,6 @@ use crate::proxy::facts::{
     validate_standalone_connect_ingress_request, validate_standalone_ingress_request,
     IngressPartitionPolicy,
 };
-use crate::proxy::forward::{preflight_forwarding_target, ForwardedDownstreamBody};
-use crate::proxy::forwarding_executor::ForwardingExecutor;
 use crate::proxy::h2_stream_cancellation::{H2StreamCancellation, H2StreamExecutor};
 use crate::proxy::original_destination::{
     OriginalDestinationResolver, SystemOriginalDestinationResolver,
@@ -59,12 +57,15 @@ use crate::proxy::upgrade_relay::UpgradeCaptureContext;
 use crate::runtime::{BoxFuture, GenerationLease, Runtime};
 use crate::safety::{GuardedBody, WireBodyQuotaKey};
 use crate::standalone_policy_provider::{
-    StandaloneForwardDispatch, StandaloneIngressTransport, StandalonePolicyProvider,
-    StandaloneProviderInput, StandaloneResponseBodyProvenance, StandaloneResponseDispatch,
-    StandaloneTerminalService, TokioRuntimeClock,
+    ProductForwardingCancellation, StandaloneForwardDispatch, StandaloneIngressTransport,
+    StandalonePolicyProvider, StandaloneProviderInput, StandaloneResponseBodyProvenance,
+    StandaloneResponseDispatch, StandaloneTerminalService, TokioRuntimeClock,
 };
 use crate::upgrade::UpgradeRuntime;
-use http_access_runtime::{RequestPipeline, RequestPipelineError};
+use http_access_runtime::{
+    ForwardingResponseBody, ForwardingResponseChunk, RequestPipeline, RequestPipelineError,
+    RuntimeError as AccessRuntimeError,
+};
 use http_access_types::{
     CanonicalHost, CaptureFacts, CaptureFactsInput, DecisionAuditFacts, DecisionAuditFactsInput,
     DecisionAuditSource, DecisionDisposition, DecisionReason, DecisionReasonCategory,
@@ -1538,8 +1539,8 @@ async fn execute_connect_terminal(
         quota_key: _,
         retention,
         deadline,
-        destinations: _,
         resolved: _,
+        cancellation: _,
         sidecar,
         credentials,
         transport,
@@ -1715,11 +1716,16 @@ async fn execute_connect_request(
             );
         }
     };
-    let preflight_target = match preflight_forwarding_target(
+    let ingress_protocol = validated.ingress().protocol();
+    let origin_protocol = lease.standalone().origin_protocol(match ingress_protocol {
+        http_access_types::HttpProtocol::Http1 => http_access_types::HttpVersion::Http11,
+        http_access_types::HttpProtocol::Http2 => http_access_types::HttpVersion::Http2,
+    });
+    let preflight_target = match assets.forwarding_network().preflight(
         target.url(),
-        validated.ingress().protocol(),
-        lease.egress(),
-        assets.destination_guard(),
+        ingress_protocol,
+        origin_protocol,
+        lease.standalone().route(),
     ) {
         Ok(target) => target,
         Err(_) => {
@@ -1748,7 +1754,8 @@ async fn execute_connect_request(
         quota_key,
         started_at,
         preflight_target,
-        destinations: assets.destination_guard().clone(),
+        network: assets.forwarding_network().clone(),
+        cancellation: ProductForwardingCancellation::new(),
         clock: TokioRuntimeClock::new(started_at),
         listener_denied,
         decision_target: observation_runtime.into(),
@@ -1777,6 +1784,7 @@ fn connect_alpn_protocols(versions: &[CompiledHttpVersion]) -> Vec<Vec<u8>> {
         .collect()
 }
 
+#[derive(Clone)]
 pub(super) struct HttpCaptureContext {
     runtime: Arc<ProductObservationRuntime>,
     epoch: Arc<CaptureEpoch>,
@@ -1872,13 +1880,7 @@ impl HttpCaptureContext {
             body_headers,
             self.max_expansion_ratio,
         )
-        .map(|tap| {
-            CaptureSubmission::new(
-                self.runtime.clone(),
-                tap,
-                body_headers.contains_key(TRAILER),
-            )
-        })
+        .map(|tap| CaptureSubmission::new(self.runtime.clone(), tap))
     }
 
     fn request_record(
@@ -2087,19 +2089,13 @@ impl HttpCaptureContext {
 pub(super) struct CaptureSubmission {
     runtime: Arc<ProductObservationRuntime>,
     tap: Option<HttpCaptureTap>,
-    expect_trailers: bool,
 }
 
 impl CaptureSubmission {
-    fn new(
-        runtime: Arc<ProductObservationRuntime>,
-        tap: HttpCaptureTap,
-        expect_trailers: bool,
-    ) -> Self {
+    fn new(runtime: Arc<ProductObservationRuntime>, tap: HttpCaptureTap) -> Self {
         Self {
             runtime,
             tap: Some(tap),
-            expect_trailers,
         }
     }
 
@@ -2112,12 +2108,6 @@ impl CaptureSubmission {
     pub(super) fn finish(&mut self) {
         if let Some(tap) = self.tap.take() {
             self.submit(tap.finish());
-        }
-    }
-
-    pub(super) fn finish_data_if_complete(&mut self, complete: bool) {
-        if complete && !self.expect_trailers {
-            self.finish();
         }
     }
 
@@ -2286,7 +2276,7 @@ impl StandaloneTerminalService for StandaloneHttpTerminal {
     }
 
     fn forward(self, dispatch: StandaloneForwardDispatch) -> BoxFuture<'static, Self::Output> {
-        Box::pin(ForwardingExecutor::execute(self, dispatch))
+        Box::pin(crate::proxy::forwarding_adapter::execute(self, dispatch))
     }
 }
 
@@ -2376,11 +2366,16 @@ async fn execute_request_via_pipeline(
             return capture.deny_metadata_only(StatusCode::BAD_REQUEST, "invalid request\n", true);
         }
     };
-    let preflight_target = match preflight_forwarding_target(
+    let ingress_protocol = validated.ingress().protocol();
+    let origin_protocol = lease.standalone().origin_protocol(match ingress_protocol {
+        http_access_types::HttpProtocol::Http1 => http_access_types::HttpVersion::Http11,
+        http_access_types::HttpProtocol::Http2 => http_access_types::HttpVersion::Http2,
+    });
+    let preflight_target = match assets.forwarding_network().preflight(
         target.url(),
-        validated.ingress().protocol(),
-        lease.egress(),
-        assets.destination_guard(),
+        ingress_protocol,
+        origin_protocol,
+        lease.standalone().route(),
     ) {
         Ok(target) => target,
         Err(_) => {
@@ -2399,7 +2394,8 @@ async fn execute_request_via_pipeline(
         quota_key,
         started_at,
         preflight_target,
-        destinations: assets.destination_guard().clone(),
+        network: assets.forwarding_network().clone(),
+        cancellation: ProductForwardingCancellation::new(),
         clock: TokioRuntimeClock::new(started_at),
         listener_denied: false,
         decision_target: observation_runtime.into(),
@@ -2435,19 +2431,61 @@ fn request_id() -> String {
 pub(super) enum ProxyResponseBody {
     Local(Body),
     Forwarded {
-        body: Box<ForwardedDownstreamBody>,
-        capture: Option<Box<CaptureSubmission>>,
+        body: Box<ForwardingResponseBody>,
+        observation: Arc<StdMutex<crate::proxy::forwarding_adapter::ProductObservationState>>,
+        h2_stream: Option<H2StreamCancellation>,
+        data_done: bool,
+        trailers_done: bool,
     },
 }
 
 impl ProxyResponseBody {
     pub(super) fn forwarded(
-        body: ForwardedDownstreamBody,
-        capture: Option<CaptureSubmission>,
+        body: ForwardingResponseBody,
+        observation: Arc<StdMutex<crate::proxy::forwarding_adapter::ProductObservationState>>,
+        h2_stream: Option<H2StreamCancellation>,
     ) -> Self {
         Self::Forwarded {
             body: Box::new(body),
-            capture: capture.map(Box::new),
+            observation,
+            h2_stream,
+            data_done: false,
+            trailers_done: false,
+        }
+    }
+}
+
+pub(super) enum ProxyBodyChunk {
+    Local(Bytes),
+    Forwarded {
+        chunk: ForwardingResponseChunk,
+        offset: usize,
+    },
+}
+
+impl Buf for ProxyBodyChunk {
+    fn remaining(&self) -> usize {
+        match self {
+            Self::Local(bytes) => bytes.remaining(),
+            Self::Forwarded { chunk, offset } => chunk.len().saturating_sub(*offset),
+        }
+    }
+
+    fn chunk(&self) -> &[u8] {
+        match self {
+            Self::Local(bytes) => bytes.chunk(),
+            Self::Forwarded { chunk, offset } => &chunk.as_bytes()[*offset..],
+        }
+    }
+
+    fn advance(&mut self, count: usize) {
+        assert!(
+            count <= self.remaining(),
+            "body chunk advance exceeds remaining bytes"
+        );
+        match self {
+            Self::Local(bytes) => bytes.advance(count),
+            Self::Forwarded { offset, .. } => *offset += count,
         }
     }
 }
@@ -2457,11 +2495,11 @@ pub(super) enum ProxyResponseBodyError {
     #[error(transparent)]
     Local(#[from] hyper::Error),
     #[error(transparent)]
-    Forwarded(hyper::Error),
+    Forwarded(AccessRuntimeError),
 }
 
 impl HttpBody for ProxyResponseBody {
-    type Data = Bytes;
+    type Data = ProxyBodyChunk;
     type Error = ProxyResponseBodyError;
 
     fn poll_data(
@@ -2469,37 +2507,35 @@ impl HttpBody for ProxyResponseBody {
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Self::Data, Self::Error>>> {
         match self.get_mut() {
-            Self::Local(body) => Pin::new(body)
-                .poll_data(context)
-                .map(|item| item.map(|item| item.map_err(ProxyResponseBodyError::Local))),
-            Self::Forwarded { body, capture } => {
-                let exact_remaining = body.size_hint().exact();
-                match Pin::new(&mut **body).poll_data(context) {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(Some(Ok(data))) => {
-                        let data_len = data.remaining();
-                        if let Some(capture) = capture.as_mut() {
-                            capture.push(data.chunk());
-                            capture.finish_data_if_complete(
-                                body.is_end_stream() || exact_remaining == Some(data_len as u64),
-                            );
-                        }
-                        Poll::Ready(Some(Ok(data)))
-                    }
-                    Poll::Ready(Some(Err(error))) => {
-                        if let Some(capture) = capture.as_mut() {
-                            capture.abandon();
-                        }
-                        Poll::Ready(Some(Err(ProxyResponseBodyError::Forwarded(error))))
-                    }
-                    Poll::Ready(None) => {
-                        if let Some(capture) = capture.as_mut() {
-                            capture.finish_data_if_complete(true);
-                        }
-                        Poll::Ready(None)
-                    }
+            Self::Local(body) => Pin::new(body).poll_data(context).map(|item| {
+                item.map(|item| {
+                    item.map(ProxyBodyChunk::Local)
+                        .map_err(ProxyResponseBodyError::Local)
+                })
+            }),
+            Self::Forwarded {
+                body,
+                observation,
+                h2_stream,
+                data_done,
+                ..
+            } => match body.poll_data(context) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(Some(chunk))) => {
+                    Poll::Ready(Some(Ok(ProxyBodyChunk::Forwarded { chunk, offset: 0 })))
                 }
-            }
+                Poll::Ready(Ok(None)) => {
+                    *data_done = true;
+                    Poll::Ready(None)
+                }
+                Poll::Ready(Err(error)) => {
+                    if let Some(h2_stream) = h2_stream {
+                        h2_stream.cancel();
+                    }
+                    crate::proxy::forwarding_adapter::abandon_observation(observation);
+                    Poll::Ready(Some(Err(ProxyResponseBodyError::Forwarded(error))))
+                }
+            },
         }
     }
 
@@ -2511,36 +2547,63 @@ impl HttpBody for ProxyResponseBody {
             Self::Local(body) => Pin::new(body)
                 .poll_trailers(context)
                 .map_err(ProxyResponseBodyError::Local),
-            Self::Forwarded { body, capture } => match Pin::new(&mut **body).poll_trailers(context)
-            {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Ok(trailers)) => {
-                    if let Some(capture) = capture.as_mut() {
-                        capture.finish();
-                    }
-                    Poll::Ready(Ok(trailers))
+            Self::Forwarded {
+                body,
+                observation,
+                h2_stream,
+                data_done,
+                trailers_done,
+            } => {
+                if !*data_done {
+                    return Poll::Ready(Err(ProxyResponseBodyError::Forwarded(
+                        AccessRuntimeError::InvalidInput,
+                    )));
                 }
-                Poll::Ready(Err(error)) => {
-                    if let Some(capture) = capture.as_mut() {
-                        capture.abandon();
+                match body.poll_trailers(context) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Ok(trailers)) => {
+                        let trailers = match trailers
+                            .map(|trailers| crate::proxy::facts::product_headers(&trailers))
+                            .transpose()
+                        {
+                            Ok(trailers) => trailers,
+                            Err(_) => {
+                                if let Some(h2_stream) = h2_stream {
+                                    h2_stream.cancel();
+                                }
+                                crate::proxy::forwarding_adapter::abandon_observation(observation);
+                                return Poll::Ready(Err(ProxyResponseBodyError::Forwarded(
+                                    AccessRuntimeError::InvalidInput,
+                                )));
+                            }
+                        };
+                        *trailers_done = true;
+                        crate::proxy::forwarding_adapter::finish_response_observation(observation);
+                        Poll::Ready(Ok(trailers))
                     }
-                    Poll::Ready(Err(ProxyResponseBodyError::Forwarded(error)))
+                    Poll::Ready(Err(error)) => {
+                        if let Some(h2_stream) = h2_stream {
+                            h2_stream.cancel();
+                        }
+                        crate::proxy::forwarding_adapter::abandon_observation(observation);
+                        Poll::Ready(Err(ProxyResponseBodyError::Forwarded(error)))
+                    }
                 }
-            },
+            }
         }
     }
 
     fn is_end_stream(&self) -> bool {
         match self {
             Self::Local(body) => body.is_end_stream(),
-            Self::Forwarded { body, .. } => body.is_end_stream(),
+            Self::Forwarded { trailers_done, .. } => *trailers_done,
         }
     }
 
     fn size_hint(&self) -> SizeHint {
         match self {
             Self::Local(body) => body.size_hint(),
-            Self::Forwarded { body, .. } => body.size_hint(),
+            Self::Forwarded { .. } => SizeHint::default(),
         }
     }
 }
@@ -2755,9 +2818,8 @@ mod tests {
     use crate::activation::runner::ProductRuntime;
     use crate::capture::CaptureRecord;
     use crate::config::{compile_config_text, load_and_compile_exact_config, ConfigTextInput};
-    use crate::destination::{
-        DestinationFacts, DestinationGuard, DestinationResolveError, DestinationResolver,
-        LocalAddressSnapshot, LocalAddressSource, ResolveFuture,
+    use http_access_runtime::{
+        ForwardingDevHarness, ForwardingNetworkFacts, ForwardingNetworkGuard,
     };
 
     struct ChannelFailureObserver(StdMutex<Option<oneshot::Sender<Arc<ProxySupervisorFailure>>>>);
@@ -2987,10 +3049,10 @@ mod tests {
         (directory, product)
     }
 
-    async fn product_with_destination_guard(
+    async fn product_with_forwarding_network(
         text: String,
         listeners: Vec<StdTcpListener>,
-        destination_guard: Arc<DestinationGuard>,
+        forwarding_network: Arc<ForwardingNetworkGuard>,
     ) -> (
         tempfile::TempDir,
         Arc<ProductRuntime>,
@@ -3000,9 +3062,9 @@ mod tests {
         let path = directory.path().join("acl-proxy.toml");
         fs::write(&path, text).unwrap();
         let loaded = load_and_compile_exact_config(&path).unwrap();
-        let assets = ProductIngressAssets::with_destination_guard(
+        let assets = ProductIngressAssets::with_forwarding_network(
             &loaded.compiled.static_config,
-            destination_guard,
+            forwarding_network,
         )
         .unwrap();
         let product = ProductRuntime::prepare_from_prebound(loaded, listeners)
@@ -3028,18 +3090,18 @@ mod tests {
         }
     }
 
-    async fn listener_product_with_destination_guard(
+    async fn listener_product_with_forwarding_network(
         text: String,
         listeners: Vec<StdTcpListener>,
-        destination_guard: Arc<DestinationGuard>,
+        forwarding_network: Arc<ForwardingNetworkGuard>,
     ) -> (tempfile::TempDir, Arc<ProductRuntime>) {
         let directory = tempdir().unwrap();
         let path = directory.path().join("acl-proxy.toml");
         fs::write(&path, text).unwrap();
         let loaded = load_and_compile_exact_config(&path).unwrap();
-        let assets = ProductIngressAssets::with_destination_guard(
+        let assets = ProductIngressAssets::with_forwarding_network(
             &loaded.compiled.static_config,
-            destination_guard,
+            forwarding_network,
         )
         .unwrap();
         let product = ProductRuntime::prepare_from_prebound(loaded, listeners)
@@ -3058,80 +3120,17 @@ mod tests {
         (directory, product)
     }
 
-    #[derive(Default)]
-    struct EmptyLocalAddresses;
-
-    impl LocalAddressSource for EmptyLocalAddresses {
-        fn snapshot(&self) -> io::Result<LocalAddressSnapshot> {
-            Ok(LocalAddressSnapshot::default())
-        }
-    }
-
-    struct ResolverDrop(Arc<AtomicBool>);
-
-    impl Drop for ResolverDrop {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::Release);
-        }
-    }
-
-    struct PendingResolver {
-        calls: AtomicUsize,
-        dropped: Arc<AtomicBool>,
-    }
-
-    impl PendingResolver {
-        fn new() -> (Arc<Self>, Arc<AtomicBool>) {
-            let dropped = Arc::new(AtomicBool::new(false));
-            (
-                Arc::new(Self {
-                    calls: AtomicUsize::new(0),
-                    dropped: dropped.clone(),
-                }),
-                dropped,
-            )
-        }
-    }
-
-    impl DestinationResolver for PendingResolver {
-        fn resolve(&self, _host: &str, _port: u16, _max_addresses: usize) -> ResolveFuture<'_> {
-            self.calls.fetch_add(1, Ordering::AcqRel);
-            let dropped = self.dropped.clone();
-            Box::pin(async move {
-                let _drop = ResolverDrop(dropped);
-                std::future::pending::<Result<Vec<SocketAddr>, DestinationResolveError>>().await
-            })
-        }
-    }
-
-    struct DelayedResolver {
-        calls: AtomicUsize,
-        delay: Duration,
-        endpoint: SocketAddr,
-    }
-
-    impl DestinationResolver for DelayedResolver {
-        fn resolve(&self, _host: &str, _port: u16, _max_addresses: usize) -> ResolveFuture<'_> {
-            self.calls.fetch_add(1, Ordering::AcqRel);
-            let delay = self.delay;
-            let endpoint = self.endpoint;
-            Box::pin(async move {
-                tokio::time::sleep(delay).await;
-                Ok(vec![endpoint])
-            })
-        }
-    }
-
-    fn test_destination_guard(
+    fn test_forwarding_network(
         proxy: SocketAddr,
-        resolver: Arc<dyn DestinationResolver>,
-    ) -> Arc<DestinationGuard> {
-        let facts = DestinationFacts::for_test([proxy], None, None, 8).unwrap();
-        Arc::new(DestinationGuard::with_sources(
-            facts,
-            resolver,
-            Arc::new(EmptyLocalAddresses),
-        ))
+        mappings: impl IntoIterator<Item = (String, SocketAddr)>,
+    ) -> Arc<ForwardingNetworkGuard> {
+        let facts = ForwardingNetworkFacts::new(vec![proxy], None, None, None).unwrap();
+        let mut harness = ForwardingDevHarness::new(facts);
+        for (url, endpoint) in mappings {
+            let canonical = http_access_url::canonicalize_http_url(&url).unwrap();
+            harness = harness.map_prebound(&canonical, endpoint).unwrap();
+        }
+        Arc::new(harness.into_standalone_guard())
     }
 
     async fn execute_direct(
@@ -4316,18 +4315,17 @@ max_total_bytes = 16777216
     async fn immediate_policy_denial_precedes_dns_resolution() {
         let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
         let ([proxy], listeners) = prebound_listeners::<1>();
-        let (resolver, dropped) = PendingResolver::new();
-        let guard = test_destination_guard(proxy, resolver.clone());
+        let network = test_forwarding_network(proxy, []);
         let policy = r#"[listeners.explicit_http.connect]
 http1 = "deny"
 
 [policy]
 default = "deny"
 "#;
-        let (_directory, product, assets) = product_with_destination_guard(
+        let (_directory, product, assets) = product_with_forwarding_network(
             base_config(proxy, "explicit_http", policy),
             listeners,
-            guard,
+            network,
         )
         .await;
 
@@ -4346,8 +4344,6 @@ default = "deny"
         .expect("policy denial must not poll the pending resolver");
 
         assert_eq!(handled.response.status(), StatusCode::FORBIDDEN);
-        assert_eq!(resolver.calls.load(Ordering::Acquire), 0);
-        assert!(!dropped.load(Ordering::Acquire));
         product.shutdown().await;
     }
 
@@ -4380,25 +4376,20 @@ default = "deny"
                 });
             }
         });
-        let resolver = Arc::new(DelayedResolver {
-            calls: AtomicUsize::new(0),
-            delay: Duration::ZERO,
-            endpoint: origin,
-        });
-        let guard = test_destination_guard(proxy, resolver.clone());
+        let authority = format!("wire.test:{}", origin.port());
+        let network = test_forwarding_network(proxy, [(format!("http://{authority}/"), origin)]);
         let policy = r#"[listeners.explicit_http.connect]
 http1 = "deny"
 
 [policy]
 default = "allow"
 "#;
-        let (_directory, product) = listener_product_with_destination_guard(
+        let (_directory, product) = listener_product_with_forwarding_network(
             base_config(proxy, "explicit_http", policy),
             listeners,
-            guard,
+            network,
         )
         .await;
-        let authority = format!("wire.test:{}", origin.port());
         let target = format!("http://{authority}/body");
         let malformed = [
             format!(
@@ -4421,11 +4412,6 @@ default = "allow"
                 "invalid framing reached Hyper: {}",
                 String::from_utf8_lossy(&response)
             );
-            assert_eq!(
-                resolver.calls.load(Ordering::Acquire),
-                0,
-                "invalid framing reached destination resolution"
-            );
         }
 
         let content_length_zero = format!(
@@ -4434,8 +4420,7 @@ default = "allow"
         let response = send_raw_http(proxy, content_length_zero.as_bytes()).await;
         assert!(
             response.starts_with(b"HTTP/1.1 200"),
-            "unexpected CL0 response (resolver calls={}): {}",
-            resolver.calls.load(Ordering::Acquire),
+            "unexpected CL0 response: {}",
             String::from_utf8_lossy(&response),
         );
         assert!(response.ends_with(b"body-bytes=0"));
@@ -4469,11 +4454,95 @@ default = "allow"
             String::from_utf8_lossy(&response)
         );
         assert!(response.ends_with(b"body-bytes=1"));
-        assert_eq!(resolver.calls.load(Ordering::Acquire), 3);
-
         product.shutdown().await;
         origin_task.abort();
         let _ = origin_task.await;
+    }
+
+    #[tokio::test]
+    async fn ordinary_forwarding_preserves_response_trailers_end_to_end() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin_listener.accept().await.unwrap();
+            Http::new()
+                .http1_only(true)
+                .serve_connection(
+                    stream,
+                    service_fn(|_request| async {
+                        let (mut sender, body) = Body::channel();
+                        tokio::spawn(async move {
+                            sender
+                                .send_data(Bytes::from_static(b"response-body"))
+                                .await
+                                .unwrap();
+                            let mut trailers = HeaderMap::new();
+                            trailers.append("x-sequence", HeaderValue::from_static("first"));
+                            trailers.append("x-other", HeaderValue::from_static("middle"));
+                            trailers.append("x-sequence", HeaderValue::from_static("second"));
+                            trailers.insert(CONNECTION, HeaderValue::from_static("x-remove"));
+                            trailers.insert("x-remove", HeaderValue::from_static("private"));
+                            sender.send_trailers(trailers).await.unwrap();
+                        });
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .header(TRAILER, "x-sequence, x-other, connection, x-remove")
+                                .body(body)
+                                .unwrap(),
+                        )
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let authority = format!("trailers.test:{}", origin.port());
+        let network = test_forwarding_network(proxy, [(format!("http://{authority}/"), origin)]);
+        let policy = r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "allow"
+"#;
+        let (_directory, product) = listener_product_with_forwarding_network(
+            base_config(proxy, "explicit_http", policy),
+            listeners,
+            network,
+        )
+        .await;
+
+        let mut response = send_request(
+            proxy,
+            Request::builder()
+                .uri(format!("http://{authority}/response"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = Vec::new();
+        while let Some(chunk) = response.body_mut().data().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(body, b"response-body");
+        let trailers = response.body_mut().trailers().await.unwrap().unwrap();
+        assert_eq!(
+            trailers
+                .get_all("x-sequence")
+                .iter()
+                .map(|value| value.to_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert_eq!(trailers["x-other"], "middle");
+        assert!(!trailers.contains_key(CONNECTION));
+        assert!(!trailers.contains_key("x-remove"));
+
+        product.shutdown().await;
+        origin_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -4482,13 +4551,8 @@ default = "allow"
         let ([proxy], listeners) = prebound_listeners::<1>();
         let unused_origin = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let origin = unused_origin.local_addr().unwrap();
-        let resolver = Arc::new(DelayedResolver {
-            calls: AtomicUsize::new(0),
-            delay: Duration::ZERO,
-            endpoint: origin,
-        });
-        let guard = test_destination_guard(proxy, resolver.clone());
         let authority = format!("pipeline.test:{}", origin.port());
+        let network = test_forwarding_network(proxy, [(format!("http://{authority}/"), origin)]);
         let policy = format!(
             r#"[listeners.explicit_http.connect]
 http1 = "deny"
@@ -4503,10 +4567,10 @@ urls = ["http://{authority}/two"]
 methods = ["GET"]
 "#
         );
-        let (_directory, product) = listener_product_with_destination_guard(
+        let (_directory, product) = listener_product_with_forwarding_network(
             base_config(proxy, "explicit_http", &policy),
             listeners,
-            guard,
+            network,
         )
         .await;
 
@@ -4519,7 +4583,6 @@ methods = ["GET"]
             "declared body prevented close response: {}",
             String::from_utf8_lossy(&response)
         );
-        assert_eq!(resolver.calls.load(Ordering::Acquire), 0);
 
         let pipelined = format!(
             "POST http://{authority}/one HTTP/1.1\r\nHost: {authority}\r\nContent-Length: 4\r\n\r\nbodyGET http://{authority}/two HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
@@ -4531,9 +4594,12 @@ methods = ["GET"]
             String::from_utf8_lossy(&response)
         );
         assert_eq!(
-            resolver.calls.load(Ordering::Acquire),
-            0,
-            "the second pipelined request reached destination resolution"
+            response
+                .windows(b"HTTP/1.1 ".len())
+                .filter(|window| *window == b"HTTP/1.1 ")
+                .count(),
+            1,
+            "the second pipelined request produced a response"
         );
 
         product.shutdown().await;
@@ -4546,13 +4612,8 @@ methods = ["GET"]
         let ([proxy], listeners) = prebound_listeners::<1>();
         let unused_origin = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let origin = unused_origin.local_addr().unwrap();
-        let resolver = Arc::new(DelayedResolver {
-            calls: AtomicUsize::new(0),
-            delay: Duration::ZERO,
-            endpoint: origin,
-        });
-        let guard = test_destination_guard(proxy, resolver.clone());
         let authority = format!("provider-pipeline.test:{}", origin.port());
+        let network = test_forwarding_network(proxy, [(format!("http://{authority}/"), origin)]);
         let policy = format!(
             r#"[listeners.explicit_http.connect]
 http1 = "deny"
@@ -4605,10 +4666,10 @@ urls = ["http://{authority}/two"]
 methods = ["GET"]
 "#,
         );
-        let (_directory, product) = listener_product_with_destination_guard(
+        let (_directory, product) = listener_product_with_forwarding_network(
             base_config(proxy, "explicit_http", &policy),
             listeners,
-            guard,
+            network,
         )
         .await;
 
@@ -4631,12 +4692,6 @@ methods = ["GET"]
                 "the queued request produced a second response after {path}"
             );
         }
-        assert_eq!(
-            resolver.calls.load(Ordering::Acquire),
-            3,
-            "only each provider-owned first request may resolve"
-        );
-
         product.shutdown().await;
     }
 
@@ -4690,121 +4745,6 @@ urls = ["http://{unavailable_origin}/failure"]
         }
 
         product.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn matched_rule_deadline_cancels_pending_resolution() {
-        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
-        let ([proxy], listeners) = prebound_listeners::<1>();
-        let (resolver, dropped) = PendingResolver::new();
-        let guard = test_destination_guard(proxy, resolver.clone());
-        let policy = r#"[listeners.explicit_http.connect]
-http1 = "deny"
-
-[policy]
-default = "deny"
-
-[[policy.rules]]
-id = "short-resolution"
-decision = "allow"
-urls = ["http://slow.example/**"]
-request_timeout = "40ms"
-"#;
-        let (_directory, product, assets) = product_with_destination_guard(
-            base_config(proxy, "explicit_http", policy),
-            listeners,
-            guard,
-        )
-        .await;
-
-        let handled = tokio::time::timeout(
-            Duration::from_secs(1),
-            execute_direct(
-                &product,
-                assets,
-                Request::builder()
-                    .uri("http://slow.example/resource")
-                    .body(Body::empty())
-                    .unwrap(),
-            ),
-        )
-        .await
-        .expect("the matched rule deadline must bound resolution");
-
-        assert_eq!(handled.response.status(), StatusCode::GATEWAY_TIMEOUT);
-        assert_eq!(resolver.calls.load(Ordering::Acquire), 1);
-        assert!(dropped.load(Ordering::Acquire));
-        product.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn matched_rule_deadline_can_exceed_service_default_during_resolution() {
-        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
-        let ([proxy], listeners) = prebound_listeners::<1>();
-        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .unwrap();
-        let origin = origin_listener.local_addr().unwrap();
-        let origin_task = tokio::spawn(async move {
-            let (stream, _) = origin_listener.accept().await.unwrap();
-            Http::new()
-                .http1_only(true)
-                .serve_connection(
-                    stream,
-                    service_fn(|_request| async {
-                        Ok::<_, Infallible>(Response::new(Body::from("resolved")))
-                    }),
-                )
-                .await
-                .unwrap();
-        });
-        let resolver = Arc::new(DelayedResolver {
-            calls: AtomicUsize::new(0),
-            delay: Duration::from_millis(75),
-            endpoint: origin,
-        });
-        let guard = test_destination_guard(proxy, resolver.clone());
-        let policy = format!(
-            r#"[listeners.explicit_http.connect]
-http1 = "deny"
-
-[policy]
-default = "deny"
-
-[[policy.rules]]
-id = "long-resolution"
-decision = "allow"
-urls = ["http://slow.example:{}/resource"]
-request_timeout = "500ms"
-"#,
-            origin.port()
-        );
-        let config = base_config(proxy, "explicit_http", &policy).replacen(
-            "request_timeout = \"5s\"",
-            "request_timeout = \"20ms\"",
-            1,
-        );
-        let (_directory, product, assets) =
-            product_with_destination_guard(config, listeners, guard).await;
-
-        let handled = execute_direct(
-            &product,
-            assets,
-            Request::builder()
-                .uri(format!("http://slow.example:{}/resource", origin.port()))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await;
-
-        assert_eq!(handled.response.status(), StatusCode::OK);
-        assert_eq!(resolver.calls.load(Ordering::Acquire), 1);
-        assert_eq!(
-            to_bytes(handled.response.into_body()).await.unwrap(),
-            "resolved"
-        );
-        product.shutdown().await;
-        origin_task.await.unwrap();
     }
 
     fn read_capture_records(directory: &std::path::Path) -> Vec<CaptureRecord> {
@@ -6034,12 +5974,8 @@ value = "policy"
                 .await
                 .unwrap();
         });
-        let resolver = Arc::new(DelayedResolver {
-            calls: AtomicUsize::new(0),
-            delay: Duration::ZERO,
-            endpoint: origin,
-        });
-        let destination_guard = test_destination_guard(proxy, resolver.clone());
+        let forwarding_network =
+            test_forwarding_network(proxy, [("https://ingest.sentry.io/".to_owned(), origin)]);
         let policy = r#"[listeners.explicit_http.connect]
 http1 = "deny"
 
@@ -6094,7 +6030,7 @@ redaction_profile = "sensitive_strings"
                 1,
             );
         let (_directory, product, assets) =
-            product_with_destination_guard(config, listeners, destination_guard).await;
+            product_with_forwarding_network(config, listeners, forwarding_network).await;
         let wire_body_pool = product.wire_body_pool();
 
         let telemetry = deterministic_telemetry_body(16_000, 1_200_000);
@@ -6131,7 +6067,6 @@ redaction_profile = "sensitive_strings"
             origin_body.len().to_string()
         );
         assert_eq!(origin_headers[CONTENT_TYPE], "application/json");
-        assert_eq!(resolver.calls.load(Ordering::Acquire), 1);
         assert_eq!(wire_body_pool.global_charge(), 0);
 
         product.shutdown().await;
