@@ -29,7 +29,7 @@ dependencies = [
  "http-access-url",
  "httparse",
  "humantime",
- "hyper",
+ "hyper 0.14.32",
  "idna",
  "if-addrs",
  "ipnet",
@@ -755,7 +755,7 @@ dependencies = [
  "http-access-redaction",
  "http-access-types",
  "http-access-url",
- "hyper",
+ "hyper 0.14.32 (registry+https://github.com/rust-lang/crates.io-index)",
  "if-addrs",
  "rustls 0.23.42",
  "rustls-native-certs 0.8.3",
@@ -818,6 +818,30 @@ checksum = "15cdd26707701c53297e2fa6afb323d55fbc1d0810c3aec078ae3ef0424c3c15"
 [[package]]
 name = "hyper"
 version = "0.14.32"
+dependencies = [
+ "bytes",
+ "futures-channel",
+ "futures-core",
+ "futures-util",
+ "h2",
+ "http",
+ "http-body",
+ "httparse",
+ "httpdate",
+ "itoa",
+ "pin-project-lite",
+ "socket2 0.5.10",
+ "tokio",
+ "tower-service",
+ "tracing",
+ "want",
+]
+
+[[package]]
+name = "hyper"
+version = "0.14.32"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41dfc780fdec9373c01bae43289ea34c972e40ee3c9f6b3c8801a35f35586ce7"
 dependencies = [
  "bytes",
  "futures-channel",

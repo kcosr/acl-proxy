@@ -29,9 +29,15 @@ def fail(message: str) -> None:
 
 
 cargo = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
-patch = cargo.get("patch", {}).get("crates-io", {}).get("hyper")
-if patch != {"path": "third_party/hyper"}:
-    fail("Cargo must select only the repository-owned Hyper patch")
+dependency = cargo.get("dependencies", {}).get("hyper")
+if dependency != {
+    "path": "third_party/hyper",
+    "version": "=0.14.32",
+    "features": ["full"],
+}:
+    fail("Cargo must select the exact repository-owned Hyper dependency")
+if "patch" in cargo or "replace" in cargo:
+    fail("Cargo source overrides are forbidden")
 
 vendor_cargo = tomllib.loads(
     (root / "third_party/hyper/Cargo.toml").read_text(encoding="utf-8")
@@ -41,10 +47,14 @@ if vendor_cargo.get("package", {}).get("name") != "hyper" or vendor_cargo.get("p
 
 lock = (root / "Cargo.lock").read_text(encoding="utf-8")
 locked = re.findall(r'\[\[package\]\]\s+name = "hyper"\s+version = "([^"]+)"(.*?)(?=\n\[\[package\]\]|\Z)', lock, re.S)
-if len(locked) != 1 or locked[0][0] != "0.14.32":
-    fail("Cargo.lock must resolve exactly one Hyper 0.14.32")
-if re.search(r'^source\s*=|^checksum\s*=', locked[0][1], re.M):
-    fail("the locked Hyper package must resolve through the path patch")
+if len(locked) != 2 or any(version != "0.14.32" for version, _ in locked):
+    fail("Cargo.lock must resolve exactly the local server and registry client Hyper 0.14.32 packages")
+local = [tail for _, tail in locked if re.search(r'^source\s*=|^checksum\s*=', tail, re.M) is None]
+registry = [tail for _, tail in locked if 'source = "registry+https://github.com/rust-lang/crates.io-index"' in tail]
+if len(local) != 1 or len(registry) != 1:
+    fail("Cargo.lock must distinguish one local server Hyper from one registry client Hyper")
+if 'checksum = "41dfc780fdec9373c01bae43289ea34c972e40ee3c9f6b3c8801a35f35586ce7"' not in registry[0]:
+    fail("the private shared client must retain the exact crates.io Hyper 0.14.32 source")
 
 note = (root / "third_party/hyper/ACL_PROXY_PATCH.md").read_text(encoding="utf-8")
 for required in ("Hyper 0.14.32", "src/proto/h2/server.rs", "finished", "RST_STREAM(CANCEL)"):

@@ -34,8 +34,16 @@ new_case() {
 }
 
 new_case
-sed -i '/^\[patch.crates-io\]/,+1d' "$CASE_ROOT/Cargo.toml"
-expect_failure "$CASE_ROOT" 'removed Cargo patch'
+sed -i 's#path = "third_party/hyper", ##' "$CASE_ROOT/Cargo.toml"
+expect_failure "$CASE_ROOT" 'removed repository-owned Hyper path'
+
+new_case
+sed -i 's/version = "=0.14.32"/version = "0.14"/' "$CASE_ROOT/Cargo.toml"
+expect_failure "$CASE_ROOT" 'weakened direct Hyper version pin'
+
+new_case
+printf '\n[patch.crates-io]\nhyper = { path = "third_party/hyper" }\n' >>"$CASE_ROOT/Cargo.toml"
+expect_failure "$CASE_ROOT" 'added a Cargo source override'
 
 new_case
 sed -i '0,/version = "0.14.32"/s//version = "0.14.31"/' \

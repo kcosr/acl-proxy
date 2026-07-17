@@ -4,6 +4,10 @@ This directory is the crates.io source for Hyper 0.14.32, retained under its
 upstream MIT license. acl-proxy uses it until the planned transport dependency
 modernization removes the Hyper 0.14 server.
 
+The product's downstream server selects this tree as an exact direct path
+dependency. The shared runtime's private upstream client remains on the exact
+crates.io Hyper 0.14.32 package; no Cargo source override couples the two.
+
 The sole behavioral patch is in `src/proto/h2/server.rs`: dropping an
 unfinished server `H2Stream` explicitly sends `RST_STREAM(CANCEL)`. Upstream
 Hyper delegates response bytes to h2 before flow control has necessarily sent
