@@ -24,16 +24,30 @@ EOF
 
 cat >"$BASELINE/src/proxy/forwarding_adapter.rs" <<'EOF'
 use http_access_runtime::{
-    ForwardingAdmission, ForwardingObservation, ForwardingOutcome, ForwardingRequestHead,
-    ForwardingResources, ForwardingResponseHead, ForwardingRetention, ForwardingTerminal,
-    ForwardingTerminalOutcome, ForwardingTerminalOwner, PreparedUpgradeHandoff, UpgradeHandoff,
-    UpgradeOffer, UpstreamUpgradeBounds,
+    ForwardingAdmission, ForwardingDownstreamAbort, ForwardingObservation, ForwardingOutcome,
+    ForwardingRequestHead, ForwardingResources, ForwardingResponseHead, ForwardingRetention,
+    ForwardingTerminal, ForwardingTerminalOutcome, ForwardingTerminalOwner,
+    PreparedUpgradeHandoff, UpgradeHandoff, UpgradeOffer, UpstreamUpgradeBounds,
 };
 
-fn adapter(mut parts: Parts, executor: Executor, dispatch: Dispatch, resources: Resources) {
+struct ProductDownstreamAbort(H2StreamCancellation);
+
+impl ForwardingDownstreamAbort for ProductDownstreamAbort {}
+
+fn adapter(mut parts: Parts, executor: Executor, dispatch: Dispatch, mut resources: Resources) {
     let h2_stream = parts.extensions.remove::<H2StreamCancellation>();
+    resources = resources.with_downstream_abort(ProductDownstreamAbort(h2_stream));
+    let handoff = ProductUpgradeHandoff::admit(runtime);
+    resources = resources.with_upgrade_handoff(handoff, bounds);
     let outcome = executor.execute(dispatch.exchange, dispatch.resolved, resources);
-    complete_empty_response(&mut empty_body);
+    let reset_content = head.status() == StatusCode::RESET_CONTENT.as_u16();
+    let downstream_suppresses_body =
+        downstream_is_head || reset_content || matches!(head.status(), 204 | 304);
+    let completion = if downstream_suppresses_body {
+        drain_suppressed_response(&mut body).await
+    } else {
+        complete_empty_response(&mut body).await
+    };
     let body = ProxyResponseBody::forwarded(
         body,
         Arc::clone(&observation),
@@ -41,9 +55,25 @@ fn adapter(mut parts: Parts, executor: Executor, dispatch: Dispatch, resources: 
         downstream_supports_trailers,
         h1_content_length,
     );
+    if reset_content {
+        response.headers_mut().remove(CONTENT_LENGTH);
+        response
+            .headers_mut()
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
+    }
 }
 
 fn complete_empty_response(body: &mut Body) {}
+fn drain_suppressed_response(body: &mut Body) {}
+
+struct ProductUpgradeHandoff;
+
+impl ProductUpgradeHandoff {
+    fn admit(runtime: Runtime) -> Self {
+        runtime.try_spawn_handshake(allocation, |_| async {});
+        Self
+    }
+}
 
 // AppState ProductConfig ForwardingExecutor forward_request TcpStream::connect(endpoint)
 /* nested /* ForwardingOutcome */ HttpsConnector */
@@ -75,6 +105,8 @@ struct ForwardedState {
     h1_remaining: Option<u64>,
     pending_h1_final: Option<Chunk>,
     h1_source_done: bool,
+    data_done: bool,
+    trailers_done: bool,
 }
 
 fn forwarded(h1_content_length: Option<u64>) -> ForwardedState {
@@ -82,6 +114,8 @@ fn forwarded(h1_content_length: Option<u64>) -> ForwardedState {
         h1_remaining: h1_content_length,
         pending_h1_final: None,
         h1_source_done: false,
+        data_done: false,
+        trailers_done: false,
     }
 }
 
@@ -271,6 +305,7 @@ expect_failure "$CASE_ROOT" 'escaped executor storage' \
 
 for symbol in \
     ForwardingAdmission \
+    ForwardingDownstreamAbort \
     ForwardingObservation \
     ForwardingOutcome \
     ForwardingRequestHead \
@@ -362,10 +397,10 @@ expect_failure "$CASE_ROOT" 'missing H1 fixed-length completion owner' \
 new_case
 printf '%s\n' 'fn escaped() { let _ = pending_h1_final; }' >"$CASE_ROOT/src/bypass.rs"
 expect_failure "$CASE_ROOT" 'escaped H1 completion state' \
-    'H1 response completion state pending_h1_final must remain confined non-vacuously to ingress.rs'
+    'response completion state pending_h1_final must remain confined non-vacuously to ingress.rs'
 
 new_case
-sed -i '/    complete_empty_response(&mut empty_body);/d' \
+sed -i '/        complete_empty_response(&mut body).await/d' \
     "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
 expect_failure "$CASE_ROOT" 'missing suppressed-body completion call' \
     'adapter suppressed-body completion owner ownership violation'
@@ -379,6 +414,90 @@ new_case
 printf '%s\n' 'fn complete_empty_h1_response() {}' >"$CASE_ROOT/src/bypass.rs"
 expect_failure "$CASE_ROOT" 'restored H1-specific completion helper' \
     'the H1-specific empty-response completion helper must remain deleted'
+
+new_case
+sed -i '/impl ForwardingDownstreamAbort for ProductDownstreamAbort/d' \
+    "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'missing downstream-abort implementation' \
+    'adapter downstream-abort implementation ownership violation'
+
+new_case
+sed -i '/with_downstream_abort/d' "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'missing shared downstream-abort transfer' \
+    'adapter shared downstream-abort capability transfer ownership violation'
+
+new_case
+printf '%s\n' 'struct ProductDownstreamAbort;' >"$CASE_ROOT/src/bypass.rs"
+expect_failure "$CASE_ROOT" 'escaped product downstream-abort owner' \
+    'ProductDownstreamAbort must remain confined non-vacuously to forwarding_adapter.rs'
+
+new_case
+sed -i '/let handoff = ProductUpgradeHandoff::admit(runtime);/d' \
+    "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'missing pre-connect upgrade admission' \
+    'adapter pre-connect upgrade admission ownership violation'
+
+new_case
+sed -i '/with_upgrade_handoff/d' "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'missing admitted upgrade transfer' \
+    'adapter admitted upgrade handoff transfer ownership violation'
+
+new_case
+sed -i '/runtime.try_spawn_handshake/d' "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+printf '%s\n' 'impl UpgradeHandoff for ProductUpgradeHandoff { fn prepare() { runtime.try_spawn_handshake(allocation, |_| async {}); } }' \
+    >>"$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'upgrade admission moved into post-connect prepare' \
+    'upgrade runtime admission must occur exactly once inside ProductUpgradeHandoff::admit'
+
+new_case
+sed -i '/let handoff = ProductUpgradeHandoff::admit(runtime);/d' \
+    "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+sed -i '/let outcome = executor.execute/a\    let handoff = ProductUpgradeHandoff::admit(runtime);' \
+    "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'upgrade admission after shared publication' \
+    'downstream abort and admitted upgrade handoff must be installed before shared executor publication'
+
+new_case
+sed -i '/drain_suppressed_response(&mut body).await/d' \
+    "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'missing suppressed response drain' \
+    'adapter suppressed-body drain owner ownership violation'
+
+new_case
+printf '%s\n' 'fn drain_suppressed_response() {}' >"$CASE_ROOT/src/bypass.rs"
+expect_failure "$CASE_ROOT" 'escaped suppressed response drain' \
+    'adapter suppressed-body drain owner ownership violation'
+
+new_case
+sed -i 's/StatusCode::RESET_CONTENT.as_u16()/204/' \
+    "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'inexact reset-content classification' \
+    'adapter exact reset-content classification ownership violation'
+
+new_case
+sed -i 's/downstream_is_head || reset_content ||/downstream_is_head ||/' \
+    "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'reset content omitted from response suppression' \
+    'adapter semantic response-body suppression selection ownership violation'
+
+new_case
+sed -i '/response.headers_mut().remove(CONTENT_LENGTH);/d' \
+    "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'reset content retains original content length' \
+    'adapter reset-content framing normalization ownership violation'
+
+new_case
+sed -i 's/HeaderValue::from_static("0")/HeaderValue::from_static("1")/' \
+    "$CASE_ROOT/src/proxy/forwarding_adapter.rs"
+expect_failure "$CASE_ROOT" 'reset content publishes nonzero content length' \
+    'adapter reset-content framing normalization ownership violation'
+
+for state in data_done trailers_done; do
+    new_case
+    printf '%s\n' "fn escaped() { let _ = $state; }" >"$CASE_ROOT/src/bypass.rs"
+    expect_failure "$CASE_ROOT" "escaped response completion state $state" \
+        "response completion state $state must remain confined non-vacuously to ingress.rs"
+done
 
 for primitive in \
     'forward_request(request);' \

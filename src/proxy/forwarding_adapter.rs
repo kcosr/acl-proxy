@@ -1,16 +1,19 @@
 use std::io;
 use std::pin::Pin;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use http::header::{CONTENT_ENCODING, TRAILER};
+use http::header::{CONTENT_ENCODING, CONTENT_LENGTH, TRAILER};
 use http::{HeaderMap, HeaderValue, Response, StatusCode, Version};
 use http_access_runtime::{
-    BoxFuture, ForwardingAdmission, ForwardingError, ForwardingObservation, ForwardingOutcome,
-    ForwardingRequestHead, ForwardingResources, ForwardingResponseHead, ForwardingRetention,
-    ForwardingTerminal, ForwardingTerminalOutcome, ForwardingTerminalOwner, PreparedUpgradeHandoff,
-    RuntimeError, UpgradeHandoff, UpgradeOffer, UpstreamUpgradeBounds,
+    BoxFuture, ForwardingAdmission, ForwardingDownstreamAbort, ForwardingError,
+    ForwardingObservation, ForwardingOutcome, ForwardingRequestHead, ForwardingResources,
+    ForwardingResponseBody, ForwardingResponseHead, ForwardingRetention, ForwardingTerminal,
+    ForwardingTerminalOutcome, ForwardingTerminalOwner, PreparedUpgradeHandoff, RuntimeError,
+    UpgradeHandoff, UpgradeOffer, UpstreamUpgradeBounds,
 };
 use http_access_types::{HeaderField, UpgradePolicy, UpgradeProtocol};
 use hyper::Body;
@@ -46,6 +49,30 @@ pub(super) struct ProductObservationState {
     response: Option<CaptureSubmission>,
 }
 
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(super) struct ForwardingTerminalProbe(Arc<AtomicU8>);
+
+#[cfg(test)]
+impl ForwardingTerminalProbe {
+    pub(super) fn assert_completed(&self) {
+        assert_eq!(self.0.load(Ordering::SeqCst), 1);
+    }
+
+    fn finish(&self, outcome: ForwardingTerminalOutcome) {
+        let value = if matches!(outcome, ForwardingTerminalOutcome::Completed) {
+            1
+        } else {
+            2
+        };
+        self.0.store(value, Ordering::SeqCst);
+    }
+
+    fn abandon(&self) {
+        self.0.store(3, Ordering::SeqCst);
+    }
+}
+
 impl ProductObservationState {
     fn new(
         capture: HttpCaptureContext,
@@ -71,6 +98,23 @@ impl ProductObservationState {
     fn finish_response(&mut self) {
         if let Some(mut response) = self.response.take() {
             response.finish();
+        }
+    }
+
+    fn capture_failed_request(&mut self, headers: &HeaderMap) {
+        if self.request_headers.is_some() {
+            return;
+        }
+        let mut body_headers = body_headers(headers);
+        if self.canonical_identity {
+            body_headers.insert(CONTENT_ENCODING, HeaderValue::from_static("identity"));
+        }
+        self.request_headers = Some(headers.clone());
+        if let Some(mut request) =
+            self.capture
+                .begin_allowed_request(headers, &body_headers, self.request_provenance)
+        {
+            request.abandon();
         }
     }
 
@@ -174,6 +218,16 @@ impl ForwardingObservation for ProductForwardingObservation {
 struct ProductForwardingTerminal {
     cancellation: Option<ProductForwardingCancellation>,
     observation: Arc<Mutex<ProductObservationState>>,
+    #[cfg(test)]
+    probe: Option<ForwardingTerminalProbe>,
+}
+
+struct ProductDownstreamAbort(H2StreamCancellation);
+
+impl ForwardingDownstreamAbort for ProductDownstreamAbort {
+    fn abort(self: Box<Self>) {
+        self.0.cancel();
+    }
 }
 
 impl ForwardingTerminal for ProductForwardingTerminal {
@@ -181,6 +235,10 @@ impl ForwardingTerminal for ProductForwardingTerminal {
         &mut self,
         outcome: ForwardingTerminalOutcome,
     ) -> BoxFuture<'static, Result<(), RuntimeError>> {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.finish(outcome);
+        }
         if !matches!(outcome, ForwardingTerminalOutcome::Completed) {
             abandon_observation(&self.observation);
         }
@@ -192,6 +250,10 @@ impl ForwardingTerminal for ProductForwardingTerminal {
     }
 
     fn abandon(&mut self) {
+        #[cfg(test)]
+        if let Some(probe) = &self.probe {
+            probe.abandon();
+        }
         abandon_observation(&self.observation);
         self.cancellation.take();
     }
@@ -215,6 +277,13 @@ pub(super) async fn execute(
         );
     };
     let h2_stream = parts.extensions.remove::<H2StreamCancellation>();
+    #[cfg(test)]
+    let terminal_probe = parts.extensions.remove::<ForwardingTerminalProbe>();
+    let downstream_supports_trailers = matches!(
+        dispatch.exchange.facts().version(),
+        http_access_types::HttpVersion::Http2
+    );
+    let downstream_is_head = dispatch.exchange.facts().method().as_str() == "HEAD";
     let plan = dispatch.exchange.plan_arc();
     let upgrade_policy = plan.upgrade().clone();
     let upgrade_binding = match dispatch.sidecar.take_upgrade_binding(plan.binding()) {
@@ -222,6 +291,8 @@ pub(super) async fn execute(
         Err(_) => return internal_failure(&terminal.capture),
     };
     let capture_body = dispatch.sidecar.capture_body();
+    let fallback_request_headers =
+        crate::proxy::facts::product_headers(dispatch.exchange.facts().headers()).ok();
     let canonical_identity = matches!(
         capture_body,
         StandaloneCaptureBody::Stream {
@@ -275,6 +346,8 @@ pub(super) async fn execute(
     let terminal_owner = ForwardingTerminalOwner::new(ProductForwardingTerminal {
         cancellation: Some(dispatch.cancellation),
         observation: Arc::clone(&observation),
+        #[cfg(test)]
+        probe: terminal_probe,
     });
     let admission = ForwardingAdmission::new(&plan, response_admission);
     let retention = ForwardingRetention::new(&plan, (dispatch.retention, dispatch.sidecar));
@@ -283,6 +356,9 @@ pub(super) async fn execute(
             .with_observation(ProductForwardingObservation {
                 state: Arc::clone(&observation),
             });
+    if let Some(h2_stream) = h2_stream.clone() {
+        resources = resources.with_downstream_abort(ProductDownstreamAbort(h2_stream));
+    }
     if let Some(marker) = loop_marker {
         resources = resources.with_loop_marker(marker);
     }
@@ -302,18 +378,28 @@ pub(super) async fn execute(
                 Ok(bounds) => bounds,
                 Err(_) => return internal_failure(&terminal.capture),
             };
-            let handoff = ProductUpgradeHandoff {
-                runtime: terminal.upgrade_runtime.clone(),
+            let handoff = match ProductUpgradeHandoff::admit(
+                &terminal.upgrade_runtime,
                 binding,
                 downstream_upgrade,
-                deadline: dispatch.deadline,
-                deadlines: UpgradeRelayDeadlines::new(
+                dispatch.deadline,
+                UpgradeRelayDeadlines::new(
                     Duration::from_millis(plan.timeouts().upgrade_idle_ms()),
                     dispatch.deadline,
                 ),
                 protocol,
-                observation: Arc::clone(&observation),
-                capture: terminal.capture.upgrade_capture_context(plan.origin()),
+                Arc::clone(&observation),
+                terminal.capture.upgrade_capture_context(plan.origin()),
+            ) {
+                Ok(handoff) => handoff,
+                Err(()) => {
+                    return terminal.capture.fixed_response(
+                        CaptureDecision::Allow,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "service unavailable\n",
+                        true,
+                    );
+                }
             };
             resources = resources.with_upgrade_handoff(handoff, bounds);
         }
@@ -327,14 +413,56 @@ pub(super) async fn execute(
         .await
     {
         Ok(ForwardingOutcome::Response(response)) => {
-            let (head, body) = response.into_parts();
-            let response = match product_response(
-                &head,
-                ProxyResponseBody::forwarded(body, Arc::clone(&observation), h2_stream),
-            ) {
+            let (head, mut body) = response.into_parts();
+            let reset_content = head.status() == StatusCode::RESET_CONTENT.as_u16();
+            let h1_content_length = if downstream_supports_trailers || reset_content {
+                None
+            } else {
+                let headers = match crate::proxy::facts::product_headers(head.headers()) {
+                    Ok(headers) => headers,
+                    Err(_) => return internal_failure(&terminal.capture),
+                };
+                match crate::proxy::facts::single_content_length(&headers) {
+                    Ok(length) => length,
+                    Err(_) => return internal_failure(&terminal.capture),
+                }
+            };
+            let downstream_suppresses_body =
+                downstream_is_head || reset_content || matches!(head.status(), 204 | 304);
+            let h1_empty_body = !downstream_supports_trailers && h1_content_length == Some(0);
+            let response_body = if downstream_suppresses_body || h1_empty_body {
+                let completion = if downstream_suppresses_body {
+                    drain_suppressed_response(&mut body).await
+                } else {
+                    complete_empty_response(&mut body).await
+                };
+                if completion.is_err() {
+                    return internal_failure(&terminal.capture);
+                }
+                finish_response_observation(&observation);
+                ProxyResponseBody::Local(Body::empty())
+            } else {
+                ProxyResponseBody::forwarded(
+                    body,
+                    Arc::clone(&observation),
+                    h2_stream,
+                    downstream_supports_trailers,
+                    h1_content_length,
+                )
+            };
+            let mut response = match product_response(&head, response_body) {
                 Ok(response) => response,
                 Err(_) => return internal_failure(&terminal.capture),
             };
+            if reset_content {
+                response.headers_mut().remove(CONTENT_LENGTH);
+                response
+                    .headers_mut()
+                    .insert(CONTENT_LENGTH, HeaderValue::from_static("0"));
+            }
+            if !downstream_supports_trailers {
+                response.headers_mut().remove(TRAILER);
+            }
             HandledResponse {
                 response,
                 close_connection: false,
@@ -365,6 +493,13 @@ pub(super) async fn execute(
             "service unavailable\n",
             true,
         ),
+        Err(ForwardingError::Header) => {
+            if let Some(headers) = &fallback_request_headers {
+                lock_observation(&observation).capture_failed_request(headers);
+            }
+            internal_failure(&terminal.capture)
+        }
+        Err(ForwardingError::Binding) => internal_failure(&terminal.capture),
         Err(error) => {
             tracing::error!(error = ?error, "upstream request failed");
             terminal.capture.fixed_response(
@@ -375,6 +510,26 @@ pub(super) async fn execute(
             )
         }
     }
+}
+
+async fn complete_empty_response(body: &mut ForwardingResponseBody) -> Result<(), RuntimeError> {
+    if std::future::poll_fn(|context| body.poll_data(context))
+        .await?
+        .is_some()
+    {
+        return Err(RuntimeError::InvalidInput);
+    }
+    let _ = std::future::poll_fn(|context| body.poll_trailers(context)).await?;
+    Ok(())
+}
+
+async fn drain_suppressed_response(body: &mut ForwardingResponseBody) -> Result<(), RuntimeError> {
+    while std::future::poll_fn(|context| body.poll_data(context))
+        .await?
+        .is_some()
+    {}
+    let _ = std::future::poll_fn(|context| body.poll_trailers(context)).await?;
+    Ok(())
 }
 
 fn internal_failure(capture: &HttpCaptureContext) -> HandledResponse {
@@ -430,14 +585,95 @@ fn upgrade_protocol(policy: &UpgradePolicy) -> UpgradeProtocol {
 }
 
 struct ProductUpgradeHandoff {
-    runtime: Arc<UpgradeRuntime>,
-    binding: StandaloneUpgradeBinding,
-    downstream_upgrade: hyper::upgrade::OnUpgrade,
-    deadline: Instant,
-    deadlines: UpgradeRelayDeadlines,
-    protocol: UpgradeProtocol,
-    observation: Arc<Mutex<ProductObservationState>>,
-    capture: Option<UpgradeCaptureContext>,
+    prepare_tx: oneshot::Sender<ProductUpgradePreparation>,
+}
+
+struct ProductUpgradePreparation {
+    head: ForwardingResponseHead,
+    result_tx: oneshot::Sender<Result<PreparedProductUpgrade, RuntimeError>>,
+}
+
+impl ProductUpgradeHandoff {
+    #[allow(clippy::too_many_arguments)]
+    fn admit(
+        runtime: &Arc<UpgradeRuntime>,
+        binding: StandaloneUpgradeBinding,
+        downstream_upgrade: hyper::upgrade::OnUpgrade,
+        deadline: Instant,
+        deadlines: UpgradeRelayDeadlines,
+        protocol: UpgradeProtocol,
+        observation: Arc<Mutex<ProductObservationState>>,
+        capture: Option<UpgradeCaptureContext>,
+    ) -> Result<Self, ()> {
+        let StandaloneUpgradeBinding {
+            allocation,
+            wire_redaction,
+        } = binding;
+        let relay_buffer_bytes = runtime.limits().relay_buffer_bytes();
+        let (prepare_tx, prepare_rx) = oneshot::channel::<ProductUpgradePreparation>();
+        runtime
+            .try_spawn_handshake(allocation, move |handshake| async move {
+                let Ok(preparation) = prepare_rx.await else {
+                    return;
+                };
+                let ProductUpgradePreparation { head, result_tx } = preparation;
+                let result = async move {
+                    let response_headers = crate::proxy::facts::product_headers(head.headers())
+                        .map_err(|_| RuntimeError::InvalidInput)?;
+                    let request_headers = lock_observation(&observation)
+                        .request_headers
+                        .clone()
+                        .ok_or(RuntimeError::BindingMismatch)?;
+                    let protocol = HeaderValue::from_str(protocol.as_str())
+                        .map_err(|_| RuntimeError::InvalidInput)?;
+                    let kind = EstablishedUpgradeKind::from_handshake(
+                        &protocol,
+                        &request_headers,
+                        &response_headers,
+                        wire_redaction.as_ref(),
+                    )
+                    .map_err(|_| RuntimeError::InvalidInput)?;
+                    let prepared_relay = kind
+                        .prepare(relay_buffer_bytes, capture)
+                        .map_err(|_| RuntimeError::LimitExceeded)?;
+                    let offer = Arc::new(Mutex::new(None));
+                    let (offer_tx, offer_rx) = oneshot::channel();
+                    let established_offer = Arc::clone(&offer);
+                    // Setup owns every raw resource; this supervised task stays pending
+                    // so coordinator cleanup can cancel and join it exactly once.
+                    let terminal_control =
+                        UpgradeTerminalControl::new(std::future::pending::<()>, move |cause| {
+                            finish_upgrade_offer(established_offer, Some(cause))
+                        });
+                    let setup_offer = Arc::clone(&offer);
+                    let entry_plan =
+                        UpgradeEntryPlan::new(terminal_control, move |snapshot| async move {
+                            let received = offer_rx
+                                .await
+                                .map_err(|_| UpgradeTerminalCause::SetupFailed)?;
+                            *lock_offer(&setup_offer) = Some(received);
+                            let downstream = tokio::time::timeout_at(deadline, downstream_upgrade)
+                                .await
+                                .map_err(|_| UpgradeTerminalCause::LifetimeExpired)?
+                                .map_err(|_| UpgradeTerminalCause::DownstreamWriteFailed)?;
+                            Ok(prepared_relay.establish(
+                                downstream,
+                                ProductUpstreamUpgradeIo { offer: setup_offer },
+                                snapshot,
+                                deadlines,
+                            ))
+                        });
+                    handshake
+                        .commit(wire_redaction, entry_plan)
+                        .map_err(|_| RuntimeError::ServiceFailure)?;
+                    Ok(PreparedProductUpgrade { offer_tx })
+                }
+                .await;
+                let _ = result_tx.send(result);
+            })
+            .map_err(|_| ())?;
+        Ok(Self { prepare_tx })
+    }
 }
 
 impl UpgradeHandoff for ProductUpgradeHandoff {
@@ -446,66 +682,14 @@ impl UpgradeHandoff for ProductUpgradeHandoff {
         head: ForwardingResponseHead,
     ) -> BoxFuture<'static, Result<Box<dyn PreparedUpgradeHandoff>, RuntimeError>> {
         Box::pin(async move {
-            let response_headers = crate::proxy::facts::product_headers(head.headers())
-                .map_err(|_| RuntimeError::InvalidInput)?;
-            let request_headers = lock_observation(&self.observation)
-                .request_headers
-                .clone()
-                .ok_or(RuntimeError::BindingMismatch)?;
-            let protocol = HeaderValue::from_str(self.protocol.as_str())
-                .map_err(|_| RuntimeError::InvalidInput)?;
-            let kind = EstablishedUpgradeKind::from_handshake(
-                &protocol,
-                &request_headers,
-                &response_headers,
-                self.binding.wire_redaction.as_ref(),
-            )
-            .map_err(|_| RuntimeError::InvalidInput)?;
-            let prepared_relay = kind
-                .prepare(self.runtime.limits().relay_buffer_bytes(), self.capture)
-                .map_err(|_| RuntimeError::LimitExceeded)?;
-            let offer = Arc::new(Mutex::new(None));
-            let (offer_tx, offer_rx) = oneshot::channel();
-            let established_offer = Arc::clone(&offer);
-            // Setup owns every raw resource; this supervised task stays pending
-            // so coordinator cleanup can cancel and join it exactly once.
-            let terminal_control =
-                UpgradeTerminalControl::new(std::future::pending::<()>, move |cause| {
-                    finish_upgrade_offer(established_offer, Some(cause))
-                });
-            let setup_offer = Arc::clone(&offer);
-            let downstream_upgrade = self.downstream_upgrade;
-            let deadline = self.deadline;
-            let deadlines = self.deadlines;
-            let entry_plan = UpgradeEntryPlan::new(terminal_control, move |snapshot| async move {
-                let received = offer_rx
-                    .await
-                    .map_err(|_| UpgradeTerminalCause::SetupFailed)?;
-                *lock_offer(&setup_offer) = Some(received);
-                let downstream = tokio::time::timeout_at(deadline, downstream_upgrade)
-                    .await
-                    .map_err(|_| UpgradeTerminalCause::LifetimeExpired)?
-                    .map_err(|_| UpgradeTerminalCause::DownstreamWriteFailed)?;
-                Ok(prepared_relay.establish(
-                    downstream,
-                    ProductUpstreamUpgradeIo { offer: setup_offer },
-                    snapshot,
-                    deadlines,
-                ))
-            });
-            let (committed_tx, committed_rx) = oneshot::channel();
-            let wire_redaction = self.binding.wire_redaction;
-            self.runtime
-                .try_spawn_handshake(self.binding.allocation, move |handshake| async move {
-                    let committed = handshake.commit(wire_redaction, entry_plan).is_ok();
-                    let _ = committed_tx.send(committed);
-                })
+            let (result_tx, result_rx) = oneshot::channel();
+            self.prepare_tx
+                .send(ProductUpgradePreparation { head, result_tx })
                 .map_err(|_| RuntimeError::ServiceFailure)?;
-            match committed_rx.await {
-                Ok(true) => Ok(Box::new(PreparedProductUpgrade { offer_tx })
-                    as Box<dyn PreparedUpgradeHandoff>),
-                _ => Err(RuntimeError::ServiceFailure),
-            }
+            let prepared = result_rx
+                .await
+                .map_err(|_| RuntimeError::ServiceFailure)??;
+            Ok(Box::new(prepared) as Box<dyn PreparedUpgradeHandoff>)
         })
     }
 }

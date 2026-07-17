@@ -405,7 +405,7 @@ pub(crate) fn body_metadata(
     Ok(BodyMetadata::new(framing))
 }
 
-fn single_content_length(headers: &HeaderMap) -> Result<Option<u64>, FactsError> {
+pub(crate) fn single_content_length(headers: &HeaderMap) -> Result<Option<u64>, FactsError> {
     let mut values = headers.get_all(CONTENT_LENGTH).iter();
     let Some(value) = values.next() else {
         return Ok(None);

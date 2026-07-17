@@ -2434,6 +2434,10 @@ pub(super) enum ProxyResponseBody {
         body: Box<ForwardingResponseBody>,
         observation: Arc<StdMutex<crate::proxy::forwarding_adapter::ProductObservationState>>,
         h2_stream: Option<H2StreamCancellation>,
+        downstream_supports_trailers: bool,
+        h1_remaining: Option<u64>,
+        pending_h1_final: Option<ForwardingResponseChunk>,
+        h1_source_done: bool,
         data_done: bool,
         trailers_done: bool,
     },
@@ -2444,11 +2448,17 @@ impl ProxyResponseBody {
         body: ForwardingResponseBody,
         observation: Arc<StdMutex<crate::proxy::forwarding_adapter::ProductObservationState>>,
         h2_stream: Option<H2StreamCancellation>,
+        downstream_supports_trailers: bool,
+        h1_content_length: Option<u64>,
     ) -> Self {
         Self::Forwarded {
             body: Box::new(body),
             observation,
             h2_stream,
+            downstream_supports_trailers,
+            h1_remaining: h1_content_length,
+            pending_h1_final: None,
+            h1_source_done: false,
             data_done: false,
             trailers_done: false,
         }
@@ -2498,6 +2508,106 @@ pub(super) enum ProxyResponseBodyError {
     Forwarded(AccessRuntimeError),
 }
 
+fn poll_forwarded_trailers(
+    body: &mut ForwardingResponseBody,
+    observation: &Arc<StdMutex<crate::proxy::forwarding_adapter::ProductObservationState>>,
+    h2_stream: &mut Option<H2StreamCancellation>,
+    trailers_done: &mut bool,
+    context: &mut Context<'_>,
+) -> Poll<Result<Option<HeaderMap>, ProxyResponseBodyError>> {
+    if *trailers_done {
+        return Poll::Ready(Ok(None));
+    }
+    match body.poll_trailers(context) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Ok(trailers)) => {
+            let trailers = match trailers
+                .map(|trailers| crate::proxy::facts::product_headers(&trailers))
+                .transpose()
+            {
+                Ok(trailers) => trailers,
+                Err(_) => {
+                    if let Some(h2_stream) = h2_stream {
+                        h2_stream.cancel();
+                    }
+                    crate::proxy::forwarding_adapter::abandon_observation(observation);
+                    return Poll::Ready(Err(ProxyResponseBodyError::Forwarded(
+                        AccessRuntimeError::InvalidInput,
+                    )));
+                }
+            };
+            *trailers_done = true;
+            crate::proxy::forwarding_adapter::finish_response_observation(observation);
+            Poll::Ready(Ok(trailers))
+        }
+        Poll::Ready(Err(error)) => {
+            if let Some(h2_stream) = h2_stream {
+                h2_stream.cancel();
+            }
+            crate::proxy::forwarding_adapter::abandon_observation(observation);
+            Poll::Ready(Err(ProxyResponseBodyError::Forwarded(error)))
+        }
+    }
+}
+
+fn poll_forwarded_h1_eof(
+    body: &mut ForwardingResponseBody,
+    observation: &Arc<StdMutex<crate::proxy::forwarding_adapter::ProductObservationState>>,
+    h2_stream: &mut Option<H2StreamCancellation>,
+    trailers_done: &mut bool,
+    context: &mut Context<'_>,
+) -> Poll<Option<Result<ProxyBodyChunk, ProxyResponseBodyError>>> {
+    match poll_forwarded_trailers(body, observation, h2_stream, trailers_done, context) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Ok(_)) => Poll::Ready(None),
+        Poll::Ready(Err(error)) => Poll::Ready(Some(Err(error))),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn poll_forwarded_h1_fixed_final(
+    body: &mut ForwardingResponseBody,
+    observation: &Arc<StdMutex<crate::proxy::forwarding_adapter::ProductObservationState>>,
+    h2_stream: &mut Option<H2StreamCancellation>,
+    pending_final: &mut Option<ForwardingResponseChunk>,
+    source_done: &mut bool,
+    trailers_done: &mut bool,
+    context: &mut Context<'_>,
+) -> Poll<Option<Result<ProxyBodyChunk, ProxyResponseBodyError>>> {
+    if !*source_done {
+        match body.poll_data(context) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Ok(None)) => *source_done = true,
+            Poll::Ready(Ok(Some(_))) => {
+                if let Some(h2_stream) = h2_stream {
+                    h2_stream.cancel();
+                }
+                crate::proxy::forwarding_adapter::abandon_observation(observation);
+                return Poll::Ready(Some(Err(ProxyResponseBodyError::Forwarded(
+                    AccessRuntimeError::InvalidInput,
+                ))));
+            }
+            Poll::Ready(Err(error)) => {
+                if let Some(h2_stream) = h2_stream {
+                    h2_stream.cancel();
+                }
+                crate::proxy::forwarding_adapter::abandon_observation(observation);
+                return Poll::Ready(Some(Err(ProxyResponseBodyError::Forwarded(error))));
+            }
+        }
+    }
+    match poll_forwarded_trailers(body, observation, h2_stream, trailers_done, context) {
+        Poll::Pending => Poll::Pending,
+        Poll::Ready(Ok(_)) => match pending_final.take() {
+            Some(chunk) => Poll::Ready(Some(Ok(ProxyBodyChunk::Forwarded { chunk, offset: 0 }))),
+            None => Poll::Ready(Some(Err(ProxyResponseBodyError::Forwarded(
+                AccessRuntimeError::InvalidInput,
+            )))),
+        },
+        Poll::Ready(Err(error)) => Poll::Ready(Some(Err(error))),
+    }
+}
+
 impl HttpBody for ProxyResponseBody {
     type Data = ProxyBodyChunk;
     type Error = ProxyResponseBodyError;
@@ -2517,25 +2627,94 @@ impl HttpBody for ProxyResponseBody {
                 body,
                 observation,
                 h2_stream,
+                downstream_supports_trailers,
+                h1_remaining,
+                pending_h1_final,
+                h1_source_done,
                 data_done,
-                ..
-            } => match body.poll_data(context) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(Ok(Some(chunk))) => {
-                    Poll::Ready(Some(Ok(ProxyBodyChunk::Forwarded { chunk, offset: 0 })))
+                trailers_done,
+            } => {
+                if pending_h1_final.is_some() {
+                    return poll_forwarded_h1_fixed_final(
+                        body,
+                        observation,
+                        h2_stream,
+                        pending_h1_final,
+                        h1_source_done,
+                        trailers_done,
+                        context,
+                    );
                 }
-                Poll::Ready(Ok(None)) => {
-                    *data_done = true;
-                    Poll::Ready(None)
+                if *data_done {
+                    return if *downstream_supports_trailers {
+                        Poll::Ready(None)
+                    } else {
+                        poll_forwarded_h1_eof(body, observation, h2_stream, trailers_done, context)
+                    };
                 }
-                Poll::Ready(Err(error)) => {
-                    if let Some(h2_stream) = h2_stream {
-                        h2_stream.cancel();
+                match body.poll_data(context) {
+                    Poll::Pending => Poll::Pending,
+                    Poll::Ready(Ok(Some(chunk))) => {
+                        let chunk_bytes = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+                        if let Some(remaining) = h1_remaining.as_mut() {
+                            let Some(next) = remaining.checked_sub(chunk_bytes) else {
+                                if let Some(h2_stream) = h2_stream {
+                                    h2_stream.cancel();
+                                }
+                                crate::proxy::forwarding_adapter::abandon_observation(observation);
+                                return Poll::Ready(Some(Err(ProxyResponseBodyError::Forwarded(
+                                    AccessRuntimeError::InvalidInput,
+                                ))));
+                            };
+                            *remaining = next;
+                            if next == 0 {
+                                *pending_h1_final = Some(chunk);
+                                *data_done = true;
+                                return poll_forwarded_h1_fixed_final(
+                                    body,
+                                    observation,
+                                    h2_stream,
+                                    pending_h1_final,
+                                    h1_source_done,
+                                    trailers_done,
+                                    context,
+                                );
+                            }
+                        }
+                        Poll::Ready(Some(Ok(ProxyBodyChunk::Forwarded { chunk, offset: 0 })))
                     }
-                    crate::proxy::forwarding_adapter::abandon_observation(observation);
-                    Poll::Ready(Some(Err(ProxyResponseBodyError::Forwarded(error))))
+                    Poll::Ready(Ok(None)) => {
+                        if h1_remaining.is_some_and(|remaining| remaining != 0) {
+                            if let Some(h2_stream) = h2_stream {
+                                h2_stream.cancel();
+                            }
+                            crate::proxy::forwarding_adapter::abandon_observation(observation);
+                            return Poll::Ready(Some(Err(ProxyResponseBodyError::Forwarded(
+                                AccessRuntimeError::InvalidInput,
+                            ))));
+                        }
+                        *data_done = true;
+                        if *downstream_supports_trailers {
+                            Poll::Ready(None)
+                        } else {
+                            poll_forwarded_h1_eof(
+                                body,
+                                observation,
+                                h2_stream,
+                                trailers_done,
+                                context,
+                            )
+                        }
+                    }
+                    Poll::Ready(Err(error)) => {
+                        if let Some(h2_stream) = h2_stream {
+                            h2_stream.cancel();
+                        }
+                        crate::proxy::forwarding_adapter::abandon_observation(observation);
+                        Poll::Ready(Some(Err(ProxyResponseBodyError::Forwarded(error))))
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -2553,42 +2732,14 @@ impl HttpBody for ProxyResponseBody {
                 h2_stream,
                 data_done,
                 trailers_done,
+                ..
             } => {
                 if !*data_done {
                     return Poll::Ready(Err(ProxyResponseBodyError::Forwarded(
                         AccessRuntimeError::InvalidInput,
                     )));
                 }
-                match body.poll_trailers(context) {
-                    Poll::Pending => Poll::Pending,
-                    Poll::Ready(Ok(trailers)) => {
-                        let trailers = match trailers
-                            .map(|trailers| crate::proxy::facts::product_headers(&trailers))
-                            .transpose()
-                        {
-                            Ok(trailers) => trailers,
-                            Err(_) => {
-                                if let Some(h2_stream) = h2_stream {
-                                    h2_stream.cancel();
-                                }
-                                crate::proxy::forwarding_adapter::abandon_observation(observation);
-                                return Poll::Ready(Err(ProxyResponseBodyError::Forwarded(
-                                    AccessRuntimeError::InvalidInput,
-                                )));
-                            }
-                        };
-                        *trailers_done = true;
-                        crate::proxy::forwarding_adapter::finish_response_observation(observation);
-                        Poll::Ready(Ok(trailers))
-                    }
-                    Poll::Ready(Err(error)) => {
-                        if let Some(h2_stream) = h2_stream {
-                            h2_stream.cancel();
-                        }
-                        crate::proxy::forwarding_adapter::abandon_observation(observation);
-                        Poll::Ready(Err(ProxyResponseBodyError::Forwarded(error)))
-                    }
-                }
+                poll_forwarded_trailers(body, observation, h2_stream, trailers_done, context)
             }
         }
     }
@@ -3161,6 +3312,30 @@ mod tests {
         })
     }
 
+    fn serve_direct_h1_with_terminal_probe<I>(
+        product: Arc<ProductRuntime>,
+        assets: Arc<ProductIngressAssets>,
+        io: I,
+        probe: crate::proxy::forwarding_adapter::ForwardingTerminalProbe,
+    ) -> JoinHandle<()>
+    where
+        I: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        tokio::spawn(async move {
+            let service = service_fn(move |mut request| {
+                request.extensions_mut().insert(probe.clone());
+                let product = product.clone();
+                let assets = assets.clone();
+                async move {
+                    Ok::<_, Infallible>(execute_direct(&product, assets, request).await.response)
+                }
+            });
+            let mut http = Http::new();
+            http.http1_only(true);
+            let _ = http.serve_connection(io, service).await;
+        })
+    }
+
     struct PendingWriteIo<I> {
         inner: I,
         write_attempted: Arc<Notify>,
@@ -3368,6 +3543,22 @@ header = "x-test-loop"
         Response::from_parts(parts, Body::from(body))
     }
 
+    async fn send_streaming_h2_request(
+        address: SocketAddr,
+        request: Request<Body>,
+    ) -> (Response<Body>, JoinHandle<Result<(), hyper::Error>>) {
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) = conn::Builder::new()
+            .http2_only(true)
+            .handshake(stream)
+            .await
+            .unwrap();
+        let driver = tokio::spawn(connection);
+        let response = sender.send_request(request).await.unwrap();
+        drop(sender);
+        (response, driver)
+    }
+
     async fn read_http_head(stream: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
         let mut head = Vec::new();
         let mut byte = [0_u8; 1];
@@ -3380,6 +3571,15 @@ header = "x-test-loop"
             assert!(head.len() <= 32 * 1024, "HTTP head exceeded the test bound");
         }
         head
+    }
+
+    async fn read_empty_chunked_body(stream: &mut (impl AsyncRead + Unpin)) {
+        let mut body = [0_u8; 5];
+        tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut body))
+            .await
+            .expect("empty chunked request body timed out")
+            .expect("empty chunked request body ended early");
+        assert_eq!(&body, b"0\r\n\r\n");
     }
 
     async fn send_raw_http(address: SocketAddr, wire: &[u8]) -> Vec<u8> {
@@ -4638,7 +4838,7 @@ default = "allow"
         let origin_task = tokio::spawn(async move {
             let (stream, _) = origin_listener.accept().await.unwrap();
             Http::new()
-                .http1_only(true)
+                .http2_only(true)
                 .serve_connection(
                     stream,
                     service_fn(|_request| async {
@@ -4652,16 +4852,11 @@ default = "allow"
                             trailers.append("x-sequence", HeaderValue::from_static("first"));
                             trailers.append("x-other", HeaderValue::from_static("middle"));
                             trailers.append("x-sequence", HeaderValue::from_static("second"));
-                            trailers.insert(CONNECTION, HeaderValue::from_static("x-remove"));
-                            trailers.insert("x-remove", HeaderValue::from_static("private"));
                             sender.send_trailers(trailers).await.unwrap();
                         });
                         Ok::<_, Infallible>(
                             Response::builder()
-                                .header(
-                                    http::header::TRAILER,
-                                    "x-sequence, x-other, connection, x-remove",
-                                )
+                                .header(http::header::TRAILER, "x-sequence, x-other")
                                 .body(body)
                                 .unwrap(),
                         )
@@ -4673,21 +4868,23 @@ default = "allow"
         let authority = format!("trailers.test:{}", origin.port());
         let network = test_forwarding_network(proxy, [(format!("http://{authority}/"), origin)]);
         let policy = r#"[listeners.explicit_http.connect]
-http1 = "deny"
+http2 = "deny"
 
 [policy]
 default = "allow"
 "#;
         let (_directory, product) = listener_product_with_forwarding_network(
-            base_config(proxy, "explicit_http", policy),
+            base_config(proxy, "explicit_http", policy)
+                .replace("http_versions = [\"http1\"]", "http_versions = [\"http2\"]"),
             listeners,
             network,
         )
         .await;
 
-        let mut response = send_request(
+        let (mut response, driver) = send_streaming_h2_request(
             proxy,
             Request::builder()
+                .version(Version::HTTP_2)
                 .uri(format!("http://{authority}/response"))
                 .body(Body::empty())
                 .unwrap(),
@@ -4709,11 +4906,300 @@ default = "allow"
             ["first", "second"]
         );
         assert_eq!(trailers["x-other"], "middle");
-        assert!(!trailers.contains_key(CONNECTION));
-        assert!(!trailers.contains_key("x-remove"));
+        driver.await.unwrap().unwrap();
 
         product.shutdown().await;
         origin_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn h2_205_response_suppresses_origin_data_and_completes_terminal() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin_listener.accept().await.unwrap();
+            Http::new()
+                .http2_only(true)
+                .serve_connection(
+                    stream,
+                    service_fn(|_request| async {
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(StatusCode::RESET_CONTENT)
+                                .header(CONTENT_LENGTH, "23")
+                                .body(Body::from("forbidden-response-data"))
+                                .unwrap(),
+                        )
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let authority = format!("suppressed.test:{}", origin.port());
+        let network = test_forwarding_network(proxy, [(format!("http://{authority}/"), origin)]);
+        let policy = r#"[listeners.explicit_http.connect]
+http2 = "deny"
+
+[policy]
+default = "allow"
+"#;
+        let (_directory, product) = listener_product_with_forwarding_network(
+            base_config(proxy, "explicit_http", policy)
+                .replace("http_versions = [\"http1\"]", "http_versions = [\"http2\"]"),
+            listeners,
+            network,
+        )
+        .await;
+        let pool = product.wire_body_pool();
+
+        let (mut response, driver) = send_streaming_h2_request(
+            proxy,
+            Request::builder()
+                .version(Version::HTTP_2)
+                .uri(format!("http://{authority}/suppressed"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        let status = response.status();
+        assert_eq!(response.headers()[CONTENT_LENGTH], "0");
+        assert!(response.body().is_end_stream());
+        let mut data = Vec::new();
+        while let Some(chunk) = response.body_mut().data().await {
+            data.extend_from_slice(&chunk.unwrap());
+        }
+        assert!(response.body_mut().trailers().await.unwrap().is_none());
+
+        driver.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while pool.global_charge() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("suppressed H2 response retained wire-body admission");
+        product.shutdown().await;
+        origin_task.await.unwrap();
+
+        assert_eq!(status, StatusCode::RESET_CONTENT);
+        assert!(data.is_empty(), "205 forwarded forbidden DATA: {data:?}");
+    }
+
+    #[tokio::test]
+    async fn h1_205_normalizes_nonzero_content_length_and_preserves_pipeline() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = origin_listener.accept().await.unwrap();
+                let request = read_http_head(&mut stream).await;
+                if request
+                    .windows(b"/first".len())
+                    .any(|window| window == b"/first")
+                {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 205 Reset Content\r\nContent-Length: 23\r\nConnection: close\r\n\r\nforbidden-response-data",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    assert!(request
+                        .windows(b"/second".len())
+                        .any(|window| window == b"/second"));
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let authority = format!("suppressed.test:{}", origin.port());
+        let network = test_forwarding_network(proxy, [(format!("http://{authority}/"), origin)]);
+        let policy = r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "allow"
+"#;
+        let (_directory, product) = listener_product_with_forwarding_network(
+            base_config(proxy, "explicit_http", policy),
+            listeners,
+            network,
+        )
+        .await;
+
+        let response = send_raw_http(
+            proxy,
+            format!(
+                "GET http://{authority}/first HTTP/1.1\r\nHost: {authority}\r\n\r\nGET http://{authority}/second HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        product.shutdown().await;
+        origin_task.await.unwrap();
+
+        let first_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("first response head is complete")
+            + 4;
+        let first_head = String::from_utf8_lossy(&response[..first_end]).to_ascii_lowercase();
+        assert!(first_head.starts_with("http/1.1 205"));
+        assert_eq!(first_head.matches("\r\ncontent-length: 0\r\n").count(), 1);
+        assert!(response[first_end..].starts_with(b"HTTP/1.1 200"));
+        assert!(response.ends_with(b"\r\n\r\nok"));
+        assert!(!response
+            .windows(b"forbidden-response-data".len())
+            .any(|window| window == b"forbidden-response-data"));
+    }
+
+    #[tokio::test]
+    async fn h1_consumed_origin_trailers_remove_the_downstream_declaration() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin_listener.accept().await.unwrap();
+            let _request = read_http_head(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: x-final\r\nConnection: close\r\n\r\n4\r\nbody\r\n0\r\nX-Final: done\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let authority = format!("trailers.test:{}", origin.port());
+        let network = test_forwarding_network(proxy, [(format!("http://{authority}/"), origin)]);
+        let policy = r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "allow"
+"#;
+        let (_directory, product) = listener_product_with_forwarding_network(
+            base_config(proxy, "explicit_http", policy),
+            listeners,
+            network,
+        )
+        .await;
+
+        let response = send_raw_http(
+            proxy,
+            format!(
+                "GET http://{authority}/trailers HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        product.shutdown().await;
+        origin_task.await.unwrap();
+
+        let head_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("downstream response head is complete");
+        let head = String::from_utf8_lossy(&response[..head_end]).to_ascii_lowercase();
+        assert!(
+            head.starts_with("http/1.1 200"),
+            "unexpected response: {head}"
+        );
+        assert!(
+            !head.contains("\r\ntrailer:"),
+            "downstream declared trailers that the adapter consumed: {head}"
+        );
+        assert!(response.windows(4).any(|window| window == b"body"));
+        assert!(!response
+            .windows(b"x-final: done".len())
+            .any(|window| window.eq_ignore_ascii_case(b"x-final: done")));
+    }
+
+    #[tokio::test]
+    async fn head_h1_response_completes_terminal_without_body_polling() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin_listener.accept().await.unwrap();
+            Http::new()
+                .http1_only(true)
+                .serve_connection(
+                    stream,
+                    service_fn(|_request| async {
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .header(CONTENT_LENGTH, "8")
+                                .header(CONTENT_ENCODING, "identity")
+                                .body(Body::empty())
+                                .unwrap(),
+                        )
+                    }),
+                )
+                .await
+                .unwrap();
+        });
+        let authority = format!("empty.test:{}", origin.port());
+        let network = test_forwarding_network(proxy, [(format!("http://{authority}/"), origin)]);
+        let policy = r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "allow"
+"#;
+        let (_directory, product, assets) = product_with_forwarding_network(
+            base_config(proxy, "explicit_http", policy),
+            listeners,
+            network,
+        )
+        .await;
+
+        let terminal_probe = crate::proxy::forwarding_adapter::ForwardingTerminalProbe::default();
+        let (server, client) = tokio::io::duplex(16 * 1024);
+        let server_task = serve_direct_h1_with_terminal_probe(
+            product.clone(),
+            assets,
+            server,
+            terminal_probe.clone(),
+        );
+        let (mut sender, connection) = conn::handshake(client).await.unwrap();
+        let driver = tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .method(http::Method::HEAD)
+                    .uri(format!("http://{authority}/empty"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.into_body().is_end_stream());
+        drop(sender);
+        driver.await.unwrap().unwrap();
+        server_task.await.unwrap();
+
+        product.shutdown().await;
+        origin_task.await.unwrap();
+        terminal_probe.assert_completed();
     }
 
     #[tokio::test]
@@ -6029,6 +6515,12 @@ value = "policy"
                 .as_deref(),
             Some("identity")
         );
+        let response_capture = captured
+            .capture_records
+            .iter()
+            .find(|record| record.kind == CaptureKind::Response)
+            .expect("missing completed HTTP/1 response capture");
+        assert_eq!(response_capture.decode_body_bytes().unwrap(), b"accepted");
     }
 
     #[tokio::test]
@@ -8760,6 +9252,10 @@ urls = ["http://{origin}/**"]
             let first = tokio::spawn(async move {
                 let request = read_http_head(&mut stalled).await;
                 assert!(String::from_utf8_lossy(&request).contains("/stalled"));
+                assert!(String::from_utf8_lossy(&request)
+                    .to_ascii_lowercase()
+                    .contains("transfer-encoding: chunked\r\n"));
+                read_empty_chunked_body(&mut stalled).await;
                 stalled
                     .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\nx")
                     .await
@@ -8859,6 +9355,10 @@ urls = ["http://{origin}/**"]
             let (mut stream, _) = origin_listener.accept().await.unwrap();
             let request = read_http_head(&mut stream).await;
             assert!(String::from_utf8_lossy(&request).contains("/reset"));
+            assert!(String::from_utf8_lossy(&request)
+                .to_ascii_lowercase()
+                .contains("transfer-encoding: chunked\r\n"));
+            read_empty_chunked_body(&mut stream).await;
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\nx")
                 .await

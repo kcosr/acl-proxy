@@ -6812,78 +6812,121 @@ methods = ["POST"]
 
     #[test]
     fn upstream_body_free_delegate_holds_merged_body_across_provider_stages() {
-        let output_headers = (0..MAX_TEST_PROVIDER_OUTPUTS_WITHIN_SHARED_RAW_BATCH)
-            .map(|index| format!("\"x-output-{index}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let outputs = (0..MAX_TEST_PROVIDER_OUTPUTS_WITHIN_SHARED_RAW_BATCH)
-            .map(|index| {
-                format!(
-                    r#"
-[authorization.providers.first.outputs.value_{index}]
-kind = "custom_header"
-header = "x-output-{index}"
-"#
-                )
-            })
-            .collect::<String>();
-        let definitions = format!(
-            r#"
-[credentials]
-allowed_custom_headers = [{output_headers}]
-
+        let later_limit = 1;
+        let input = resource_config(
+            "",
+            &format!(
+                r#"
 [authorization.providers.first]
 kind = "process"
 command = "/bin/first-provider"
 max_stdout_line_bytes = {MAX_PROCESS_STDOUT_LINE_BYTES}
 retire_timeout = "1s"
-{outputs}
 
 [authorization.providers.later]
 kind = "process"
 command = "/bin/later-provider"
 include_request_body = true
-max_request_body_bytes = {MIB}
-max_decoded_request_body_bytes = {MIB}
+max_request_body_bytes = {later_limit}
+max_decoded_request_body_bytes = {later_limit}
 max_stdout_line_bytes = 80
 retire_timeout = "1s"
-"#
-        );
-        let input = resource_config(
-            "",
-            &definitions,
+"#,
+            ),
             r#"
 [[policy.rules]]
 id = "first"
 decision = "delegate"
-authorization_provider = "first"
 methods = ["POST"]
+authorization_provider = "first"
 
 [[policy.rules]]
 id = "later"
 decision = "delegate"
-authorization_provider = "later"
 methods = ["POST"]
+authorization_provider = "later"
 "#,
         );
         let authored: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
         let first = compile_http_rule_schedule(&authored, &authored.policy.rules[0]).unwrap();
+        let later = compile_http_rule_schedule(&authored, &authored.policy.rules[1]).unwrap();
         let compiled = compile(&input).unwrap();
-        let merged_original = guarded(MIB);
-        let first_provider_stage = first.max_incoming_additional_bytes();
-        let decode = decode_peak(MIB, MIB).unwrap();
-        let replay = default_runtime_replay_storage();
+        let merged_original = guarded(later_limit);
+        let decode = decode_peak(later_limit, later_limit).unwrap();
+        let body_free_provider_stage = first.max_incoming_additional_bytes();
+        let required_overlap = merged_original
+            + body_free_provider_stage
+            + canonical_runtime_replay_storage(later_limit);
 
         assert_eq!(first.local_body_allocation, None);
-        assert!(merged_original + first_provider_stage > decode);
-        let peaks = &compiled
+        assert_eq!(later.local_body_allocation, Some(merged_original));
+        assert_eq!(
+            body_free_provider_stage,
+            guarded(
+                provider_response_guarded_suffix_bytes(
+                    MAX_PROCESS_STDOUT_LINE_BYTES,
+                    "authorization.providers.first.max_stdout_line_bytes",
+                )
+                .unwrap()
+            )
+        );
+        assert!(body_free_provider_stage > guarded(PROVIDER_REQUEST_STREAM_SCRATCH_BYTES));
+        let first_peak = compiled
             .reloadable_plan
             .resource_plan
-            .combined_http_body_peaks_for_test();
-        assert!(peaks[0] >= merged_original + first_provider_stage);
-        assert!(peaks[0] >= replay);
-        assert!(peaks[1] >= decode);
-        assert_eq!(peaks[2], 0);
+            .combined_http_body_peaks_for_test()[0];
+        assert!(
+            first_peak >= required_overlap,
+            "compiled peak {first_peak} omitted merged body-free overlap {required_overlap}"
+        );
+        assert!(first_peak >= decode + canonical_runtime_replay_storage(later_limit));
+    }
+
+    #[test]
+    fn dominant_body_free_stage_adds_the_merged_body_allocation() {
+        let input = resource_config(
+            "",
+            "",
+            r#"
+[[policy.rules]]
+id = "body-free-delegate"
+decision = "delegate"
+methods = ["POST"]
+"#,
+        );
+        let authored: super::super::authoring::AuthoringConfig = toml::from_str(&input).unwrap();
+        let merged_original = guarded(MIB);
+        let decode = decode_peak(MIB, MIB).unwrap();
+        let body_free_provider_stage = decode + guarded(1);
+        let schedule = HttpRuleAllocationSchedule {
+            initial_peak: 0,
+            local_body_allocation: None,
+            retained_original_after_pass: None,
+            replacement_decoded_limit: None,
+            incoming_stages: vec![IncomingBodyStage {
+                additional_bytes: body_free_provider_stage,
+            }],
+            webhook_request_allocation: None,
+            webhook_callback_allocation: None,
+        };
+        let limits = HttpBodyReadLimits::try_new(MIB, MIB).unwrap();
+
+        let path = compile_reachable_http_path(
+            &authored,
+            &schedule,
+            &authored.policy.rules[0],
+            ReachableHttpPath::default(),
+            HttpBodyReadPlan::Mandatory(limits),
+            0,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            path.product_peak_bytes,
+            merged_original + body_free_provider_stage
+        );
+        assert_eq!(path.body_free_stage_peak_bytes, body_free_provider_stage);
     }
 
     #[test]
@@ -10038,8 +10081,8 @@ max_stdout_line_bytes = 80
 retire_timeout = "1s"
 
 [redaction.profiles.strict]
-max_body_bytes = 1
-max_decoded_body_bytes = 1
+max_body_bytes = 33554432
+max_decoded_body_bytes = 33554432
 rules = [{{ literals = ["x"] }}]
 "#,
             64 * MIB,
@@ -10071,10 +10114,11 @@ authorization_provider = "larger"
         let current = compile_http_rule_schedule(&authored, &authored.policy.rules[0]).unwrap();
         let merged_decode = decode_peak(MIB, 64 * MIB).unwrap();
         let merged_original = guarded(64 * MIB);
-        assert_eq!(current.local_body_allocation, Some(guarded(1)));
+        assert_eq!(current.local_body_allocation, Some(guarded(32 * MIB)));
         assert!(
             merged_original + current.max_incoming_additional_bytes() > merged_decode,
-            "without pre-stage local enforcement the merged body would exceed the compiled peak"
+            "without pre-stage local enforcement the merged body would exceed the compiled peak: original={merged_original}, incoming={}, decode={merged_decode}",
+            current.max_incoming_additional_bytes(),
         );
 
         let compiled = compile(&input).unwrap();

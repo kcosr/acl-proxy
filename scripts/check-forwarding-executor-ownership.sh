@@ -409,6 +409,7 @@ if escaped_executor:
 
 adapter_only_types = (
     "ForwardingAdmission",
+    "ForwardingDownstreamAbort",
     "ForwardingObservation",
     "ForwardingOutcome",
     "ForwardingRequestHead",
@@ -473,6 +474,49 @@ require_exact_locations(
     1,
 )
 
+product_downstream_abort = locations(
+    sources, re.compile(r"\bProductDownstreamAbort\b")
+)
+if not product_downstream_abort or any(
+    path != adapter_path for path, _, _ in product_downstream_abort
+):
+    print(
+        "ProductDownstreamAbort must remain confined non-vacuously to forwarding_adapter.rs",
+        file=sys.stderr,
+    )
+    print(
+        "locations: "
+        + (
+            ", ".join(f"{path}:{line}" for path, line, _ in product_downstream_abort)
+            or "none"
+        ),
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+
+require_exact_locations(
+    "adapter downstream-abort implementation",
+    locations(
+        sources,
+        re.compile(
+            r"\bimpl\s+ForwardingDownstreamAbort\s+for\s+ProductDownstreamAbort\b"
+        ),
+    ),
+    {adapter_path},
+    1,
+)
+
+downstream_abort_transfer = re.compile(
+    r"\bresources\s*=\s*resources\s*\.\s*with_downstream_abort\s*\(\s*"
+    r"ProductDownstreamAbort\s*\(\s*h2_stream\s*\)\s*\)"
+)
+require_exact_locations(
+    "adapter shared downstream-abort capability transfer",
+    locations(sources, downstream_abort_transfer),
+    {adapter_path},
+    1,
+)
+
 h2_response_transfer = re.compile(
     r"ProxyResponseBody\s*::\s*forwarded\s*\(\s*body\s*,"
     r"\s*Arc\s*::\s*clone\s*\(\s*&\s*observation\s*\)\s*,\s*h2_stream\s*,"
@@ -484,6 +528,78 @@ require_exact_locations(
     {adapter_path},
     1,
 )
+
+upgrade_admission = re.compile(r"\bProductUpgradeHandoff\s*::\s*admit\s*\(")
+require_exact_locations(
+    "adapter pre-connect upgrade admission",
+    locations(sources, upgrade_admission),
+    {adapter_path},
+    1,
+)
+
+upgrade_transfer = re.compile(
+    r"\bresources\s*=\s*resources\s*\.\s*with_upgrade_handoff\s*\(\s*"
+    r"handoff\s*,\s*bounds\s*\)"
+)
+require_exact_locations(
+    "adapter admitted upgrade handoff transfer",
+    locations(sources, upgrade_transfer),
+    {adapter_path},
+    1,
+)
+
+
+def braced_item_range(source: str, header: re.Pattern[str], description: str) -> tuple[int, int]:
+    declarations = list(header.finditer(source))
+    if len(declarations) != 1:
+        raise SystemExit(f"forwarding_adapter.rs must define exactly one {description}")
+    opening = source.find("{", declarations[0].end())
+    if opening == -1:
+        raise SystemExit(f"forwarding_adapter.rs {description} has no body")
+    return declarations[0].start(), matching_brace(source, opening)
+
+
+def function_range(source: str, name: str) -> tuple[int, int]:
+    declarations = list(re.finditer(rf"\bfn\s+{re.escape(name)}\s*\(", source))
+    if len(declarations) != 1:
+        raise SystemExit(
+            f"forwarding_adapter.rs must define exactly one production {name} function"
+        )
+    opening = source.find("{", declarations[0].end())
+    if opening == -1:
+        raise SystemExit(f"forwarding_adapter.rs {name} function has no body")
+    return declarations[0].start(), matching_brace(source, opening)
+
+
+handoff_impl_start, handoff_impl_end = braced_item_range(
+    adapter,
+    re.compile(r"\bimpl\s+ProductUpgradeHandoff\s*\{"),
+    "inherent ProductUpgradeHandoff implementation",
+)
+handoff_impl = adapter[handoff_impl_start:handoff_impl_end]
+admit_start, admit_end = function_range(handoff_impl, "admit")
+admit_source = handoff_impl[admit_start:admit_end]
+try_spawn = re.compile(r"\.\s*try_spawn_handshake\s*\(")
+if len(list(try_spawn.finditer(adapter))) != 1 or try_spawn.search(admit_source) is None:
+    raise SystemExit(
+        "upgrade runtime admission must occur exactly once inside ProductUpgradeHandoff::admit"
+    )
+
+admission_match = upgrade_admission.search(adapter)
+upgrade_transfer_match = upgrade_transfer.search(adapter)
+shared_execute_match = shared_execute.search(adapter)
+downstream_abort_match = downstream_abort_transfer.search(adapter)
+if not (
+    admission_match
+    and upgrade_transfer_match
+    and shared_execute_match
+    and downstream_abort_match
+    and downstream_abort_match.start() < shared_execute_match.start()
+    and admission_match.start() < upgrade_transfer_match.start() < shared_execute_match.start()
+):
+    raise SystemExit(
+        "downstream abort and admitted upgrade handoff must be installed before shared executor publication"
+    )
 
 h1_length_binding = re.compile(r"\bh1_remaining\s*:\s*h1_content_length\b")
 require_exact_locations(
@@ -507,6 +623,75 @@ require_exact_locations(
     {adapter_path},
     2,
 )
+require_exact_locations(
+    "adapter suppressed-body drain owner",
+    locations(sources, re.compile(r"\bdrain_suppressed_response\b")),
+    {adapter_path},
+    2,
+)
+
+reset_content_selection = re.compile(
+    r"\blet\s+reset_content\s*=\s*head\s*\.\s*status\s*\(\s*\)\s*==\s*"
+    r"StatusCode\s*::\s*RESET_CONTENT\s*\.\s*as_u16\s*\(\s*\)\s*;"
+)
+require_exact_locations(
+    "adapter exact reset-content classification",
+    locations(sources, reset_content_selection),
+    {adapter_path},
+    1,
+)
+
+suppressed_body_selection = re.compile(
+    r"\blet\s+downstream_suppresses_body\s*=\s*downstream_is_head\s*\|\|\s*"
+    r"reset_content\s*\|\|\s*matches!\s*\(\s*head\s*\.\s*status\s*\(\s*\)\s*,\s*"
+    r"204\s*\|\s*304\s*\)\s*;"
+)
+require_exact_locations(
+    "adapter semantic response-body suppression selection",
+    locations(sources, suppressed_body_selection),
+    {adapter_path},
+    1,
+)
+
+reset_content_normalization = re.compile(
+    r"\bif\s+reset_content\s*\{\s*"
+    r"response\s*\.\s*headers_mut\s*\(\s*\)\s*\.\s*remove\s*\(\s*"
+    r"CONTENT_LENGTH\s*\)\s*;\s*"
+    r"response\s*\.\s*headers_mut\s*\(\s*\)\s*\.\s*insert\s*\(\s*"
+    r"CONTENT_LENGTH\s*,\s*HeaderValue\s*::\s*from_static\s*\(\s*\)\s*\)\s*;\s*\}"
+)
+require_exact_locations(
+    "adapter reset-content framing normalization",
+    locations(sources, reset_content_normalization),
+    {adapter_path},
+    1,
+)
+
+zero_content_length_token = "OWNERSHIP_EXACT_ZERO_CONTENT_LENGTH"
+adapter_with_zero_literal = mask_test_items(
+    mask_non_code(
+        (root / adapter_path)
+        .read_text(encoding="utf-8")
+        .replace('"0"', zero_content_length_token)
+    )
+)
+zero_content_length_insert = re.compile(
+    rf"\.\s*insert\s*\(\s*CONTENT_LENGTH\s*,\s*HeaderValue\s*::\s*"
+    rf"from_static\s*\(\s*{zero_content_length_token}\s*\)\s*\)"
+)
+if len(list(zero_content_length_insert.finditer(adapter_with_zero_literal))) != 1:
+    raise SystemExit("adapter reset-content framing normalization ownership violation")
+
+suppressed_body_completion = re.compile(
+    r"\bif\s+downstream_suppresses_body\s*\{\s*"
+    r"drain_suppressed_response\s*\(\s*&\s*mut\s+body\s*\)\s*\.\s*await"
+)
+require_exact_locations(
+    "adapter semantic response-body suppression completion",
+    locations(sources, suppressed_body_completion),
+    {adapter_path},
+    1,
+)
 obsolete_empty_h1 = locations(sources, re.compile(r"\bcomplete_empty_h1_response\b"))
 if obsolete_empty_h1:
     print("the H1-specific empty-response completion helper must remain deleted", file=sys.stderr)
@@ -516,11 +701,17 @@ if obsolete_empty_h1:
     )
     raise SystemExit(1)
 
-for state_name in ("h1_remaining", "pending_h1_final", "h1_source_done"):
+for state_name in (
+    "h1_remaining",
+    "pending_h1_final",
+    "h1_source_done",
+    "data_done",
+    "trailers_done",
+):
     state_locations = locations(sources, re.compile(rf"\b{state_name}\b"))
     if not state_locations or any(path != ingress_path for path, _, _ in state_locations):
         print(
-            f"H1 response completion state {state_name} must remain confined non-vacuously to ingress.rs",
+            f"response completion state {state_name} must remain confined non-vacuously to ingress.rs",
             file=sys.stderr,
         )
         print(
