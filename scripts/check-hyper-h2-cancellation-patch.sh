@@ -3,15 +3,17 @@ set -euo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 VENDOR="$ROOT/third_party/hyper"
-EXPECTED_UPSTREAM_TREE=a4209cbb6edbb87334988f1a93916760815cc7d19a50ec704f936ecefaf19751
-EXPECTED_PATCHED_SERVER=d4df9c076c7bcae71e54472d018471399891585ea4381450793a64d5aeb826e7
+EXPECTED_UPSTREAM_TREE=a8f246d50fd4dca4dbf010e335d08d955a65f8ec5f29a9436f5aa1655337e93d
+EXPECTED_PATCHED_H1_ROLE=b1b4857c5ee2fc99c94646d5e4c3a991ab89b3029ef1984fda75480007bd545e
+EXPECTED_PATCHED_H2_SERVER=d4df9c076c7bcae71e54472d018471399891585ea4381450793a64d5aeb826e7
 
 fail() {
-    printf 'Hyper H2 cancellation patch ownership violation: %s\n' "$1" >&2
+    printf 'Hyper local server patch ownership violation: %s\n' "$1" >&2
     exit 1
 }
 
 [[ -f "$VENDOR/ACL_PROXY_PATCH.md" ]] || fail 'missing patch provenance'
+[[ -f "$VENDOR/src/proto/h1/role.rs" ]] || fail 'missing patched H1 response owner'
 [[ -f "$VENDOR/src/proto/h2/server.rs" ]] || fail 'missing patched server owner'
 
 python3 - "$ROOT" <<'PY' || exit 1
@@ -24,7 +26,7 @@ root = pathlib.Path(sys.argv[1])
 
 
 def fail(message: str) -> None:
-    print(f"Hyper H2 cancellation patch ownership violation: {message}", file=sys.stderr)
+    print(f"Hyper local server patch ownership violation: {message}", file=sys.stderr)
     raise SystemExit(1)
 
 
@@ -57,7 +59,14 @@ if 'checksum = "41dfc780fdec9373c01bae43289ea34c972e40ee3c9f6b3c8801a35f35586ce7
     fail("the private shared client must retain the exact crates.io Hyper 0.14.32 source")
 
 note = (root / "third_party/hyper/ACL_PROXY_PATCH.md").read_text(encoding="utf-8")
-for required in ("Hyper 0.14.32", "src/proto/h2/server.rs", "finished", "RST_STREAM(CANCEL)"):
+for required in (
+    "Hyper 0.14.32",
+    "src/proto/h1/role.rs",
+    "304 Not Modified",
+    "src/proto/h2/server.rs",
+    "finished",
+    "RST_STREAM(CANCEL)",
+):
     if required not in note:
         fail(f"patch provenance must document {required}")
 
@@ -71,12 +80,32 @@ checks = (
 for pattern, message in checks:
     if re.search(pattern, server, re.S) is None:
         fail(message)
+
+role = (root / "third_party/hyper/src/proto/h1/role.rs").read_text(encoding="utf-8")
+role_checks = (
+    (
+        r"None\s*=>\s*\{.*?if\s+msg\.req_method\s*==\s*&Some\(Method::HEAD\)\s*\|\|\s*msg\.head\.subject\s*==\s*StatusCode::NOT_MODIFIED\s*\{\s*debug_assert_eq!\(encoder,\s*Encoder::length\(0\)\);",
+        "bodyless 304 must preserve explicit content length with a zero-length encoder",
+    ),
+    (
+        r"fn\s+can_have_content_length\([^)]*\)\s*->\s*bool\s*\{.*?StatusCode::NO_CONTENT\s*\|\s*StatusCode::NOT_MODIFIED\s*=>\s*false",
+        "upstream content-length classification must remain unchanged",
+    ),
+    (
+        r"if\s+!Server::can_have_body\(msg\.req_method,\s*msg\.head\.subject\)\s*\{.*?encoder\s*=\s*Encoder::length\(0\);",
+        "body-forbidden responses must retain the final zero-length encoder override",
+    ),
+)
+for pattern, message in role_checks:
+    if re.search(pattern, role, re.S) is None:
+        fail(message)
 PY
 
 actual_upstream_tree=$(
     cd "$VENDOR"
     find . -type f \
         ! -path './src/proto/h2/server.rs' \
+        ! -path './src/proto/h1/role.rs' \
         ! -path './ACL_PROXY_PATCH.md' \
         -print0 \
         | sort -z \
@@ -87,10 +116,14 @@ actual_upstream_tree=$(
         | cut -d' ' -f1
 )
 [[ $actual_upstream_tree == "$EXPECTED_UPSTREAM_TREE" ]] \
-    || fail 'vendored tree differs from the upstream 0.14.32 crate outside the two documented exceptions'
+    || fail 'vendored tree differs from upstream 0.14.32 outside the documented patch owners'
+
+actual_role=$(sha256sum "$VENDOR/src/proto/h1/role.rs" | cut -d' ' -f1)
+[[ $actual_role == "$EXPECTED_PATCHED_H1_ROLE" ]] \
+    || fail 'patched role.rs differs from the reviewed 304 framing implementation'
 
 actual_server=$(sha256sum "$VENDOR/src/proto/h2/server.rs" | cut -d' ' -f1)
-[[ $actual_server == "$EXPECTED_PATCHED_SERVER" ]] \
+[[ $actual_server == "$EXPECTED_PATCHED_H2_SERVER" ]] \
     || fail 'patched server.rs differs from the reviewed pinned-drop implementation'
 
-printf 'Hyper 0.14.32 H2 cancellation patch ownership gate passed\n'
+printf 'Hyper 0.14.32 local server patch ownership gate passed\n'

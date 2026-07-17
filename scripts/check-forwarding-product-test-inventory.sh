@@ -66,6 +66,7 @@ ingress_c03_oracles=(
     h1_204_removes_content_length_and_preserves_pipeline
     h1_consumed_origin_trailers_remove_the_downstream_declaration
     h1_205_normalizes_nonzero_content_length_and_preserves_pipeline
+    h1_304_preserves_representation_content_length_and_pipeline
     h1_response_wire_limit_closes_before_committing_a_partial_response
     h2_204_removes_content_length_data_and_trailers
     h2_205_response_suppresses_origin_data_and_completes_terminal
@@ -104,7 +105,7 @@ if ((retained_count != 13)); then
         "$retained_count" >&2
     exit 1
 fi
-if ((${#ingress_c03_oracles[@]} != 17)); then
+if ((${#ingress_c03_oracles[@]} != 18)); then
     printf 'product C03 forwarding oracle inventory has unexpected size: %d\n' \
         "${#ingress_c03_oracles[@]}" >&2
     exit 1

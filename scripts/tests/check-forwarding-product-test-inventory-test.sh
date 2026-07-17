@@ -43,6 +43,7 @@ ingress_c03_cases=(
     h1_204_removes_content_length_and_preserves_pipeline
     h1_consumed_origin_trailers_remove_the_downstream_declaration
     h1_205_normalizes_nonzero_content_length_and_preserves_pipeline
+    h1_304_preserves_representation_content_length_and_pipeline
     h1_response_wire_limit_closes_before_committing_a_partial_response
     h2_204_removes_content_length_data_and_trailers
     h2_205_response_suppresses_origin_data_and_completes_terminal
@@ -86,7 +87,7 @@ runner() {
 }
 
 runner "$BASELINE" >"$TEST_ROOT/pass.log"
-grep -Fq 'product forwarding test inventory passed (13 retained contract cases, 1 H2 context oracle, 17 C03 E2E oracles)' \
+grep -Fq 'product forwarding test inventory passed (13 retained contract cases, 1 H2 context oracle, 18 C03 E2E oracles)' \
     "$TEST_ROOT/pass.log"
 
 expect_failure() {

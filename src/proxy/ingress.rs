@@ -5147,6 +5147,80 @@ default = "allow"
     }
 
     #[tokio::test]
+    async fn h1_304_preserves_representation_content_length_and_pipeline() {
+        let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+        let ([proxy], listeners) = prebound_listeners::<1>();
+        let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin = origin_listener.local_addr().unwrap();
+        let origin_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = origin_listener.accept().await.unwrap();
+                let request = read_http_head(&mut stream).await;
+                if request
+                    .windows(b"/first".len())
+                    .any(|window| window == b"/first")
+                {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 304 Not Modified\r\nContent-Length: 8\r\nConnection: close\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    assert!(request
+                        .windows(b"/second".len())
+                        .any(|window| window == b"/second"));
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let authority = format!("suppressed.test:{}", origin.port());
+        let network = test_forwarding_network(proxy, [(format!("http://{authority}/"), origin)]);
+        let policy = r#"[listeners.explicit_http.connect]
+http1 = "deny"
+
+[policy]
+default = "allow"
+"#;
+        let (_directory, product) = listener_product_with_forwarding_network(
+            base_config(proxy, "explicit_http", policy),
+            listeners,
+            network,
+        )
+        .await;
+
+        let response = send_raw_http(
+            proxy,
+            format!(
+                "GET http://{authority}/first HTTP/1.1\r\nHost: {authority}\r\n\r\nGET http://{authority}/second HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await;
+        product.shutdown().await;
+        origin_task.await.unwrap();
+
+        let first_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("first response head is complete")
+            + 4;
+        let first_head = String::from_utf8_lossy(&response[..first_end]).to_ascii_lowercase();
+        assert!(first_head.starts_with("http/1.1 304"));
+        assert_eq!(first_head.matches("\r\ncontent-length:").count(), 1);
+        assert_eq!(first_head.matches("\r\ncontent-length: 8\r\n").count(), 1);
+        assert!(response[first_end..].starts_with(b"HTTP/1.1 200"));
+        assert!(response.ends_with(b"\r\n\r\nok"));
+    }
+
+    #[tokio::test]
     async fn h2_204_removes_content_length_data_and_trailers() {
         let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
         let ([proxy], listeners) = prebound_listeners::<1>();

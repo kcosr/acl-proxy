@@ -14,7 +14,7 @@ cp -R "$SOURCE_ROOT/third_party/hyper" "$BASELINE/third_party/"
 
 runner() { "$1/scripts/check-hyper-h2-cancellation-patch.sh"; }
 runner "$BASELINE" >"$TEST_ROOT/pass.log"
-grep -Fq 'Hyper 0.14.32 H2 cancellation patch ownership gate passed' "$TEST_ROOT/pass.log"
+grep -Fq 'Hyper 0.14.32 local server patch ownership gate passed' "$TEST_ROOT/pass.log"
 
 expect_failure() {
     local root=$1
@@ -23,7 +23,7 @@ expect_failure() {
         printf '%s was accepted\n' "$description" >&2
         exit 1
     fi
-    grep -Fq 'Hyper H2 cancellation patch ownership violation:' "$TEST_ROOT/failure.log"
+    grep -Fq 'Hyper local server patch ownership violation:' "$TEST_ROOT/failure.log"
 }
 
 mutations=0
@@ -59,6 +59,31 @@ printf 'extra\n' >"$CASE_ROOT/third_party/hyper/EXTRA"
 expect_failure "$CASE_ROOT" 'added unreviewed vendor file'
 
 new_case
+sed -i '/|| msg.head.subject == StatusCode::NOT_MODIFIED/d' \
+    "$CASE_ROOT/third_party/hyper/src/proto/h1/role.rs"
+expect_failure "$CASE_ROOT" 'removed bodyless 304 content-length exception'
+
+new_case
+sed -i 's/debug_assert_eq!(encoder, Encoder::length(0));/debug_assert_eq!(encoder, Encoder::length(8));/' \
+    "$CASE_ROOT/third_party/hyper/src/proto/h1/role.rs"
+expect_failure "$CASE_ROOT" 'changed bodyless 304 encoder invariant'
+
+new_case
+python3 - "$CASE_ROOT/third_party/hyper/src/proto/h1/role.rs" <<'PY'
+import pathlib
+import sys
+path = pathlib.Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+anchor = "StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED => false"
+if source.count(anchor) != 2:
+    raise SystemExit("unexpected Hyper content-length classification shape")
+index = source.rfind(anchor)
+source = source[:index] + "StatusCode::NO_CONTENT => false" + source[index + len(anchor):]
+path.write_text(source, encoding="utf-8")
+PY
+expect_failure "$CASE_ROOT" 'changed upstream content-length classification'
+
+new_case
 sed -i 's/finished: bool,/finished_state: bool,/' \
     "$CASE_ROOT/third_party/hyper/src/proto/h2/server.rs"
 expect_failure "$CASE_ROOT" 'removed exact finished bit'
@@ -83,4 +108,4 @@ sed -i '0,/send_reset(Reason::CANCEL)/s//send_reset(Reason::INTERNAL_ERROR)/' \
     "$CASE_ROOT/third_party/hyper/src/proto/h2/server.rs"
 expect_failure "$CASE_ROOT" 'changed unfinished reset reason'
 
-printf 'Hyper H2 cancellation patch mutation tests passed (%d mutations)\n' "$mutations"
+printf 'Hyper local server patch mutation tests passed (%d mutations)\n' "$mutations"

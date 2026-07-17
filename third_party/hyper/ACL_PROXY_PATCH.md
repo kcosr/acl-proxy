@@ -8,12 +8,18 @@ The product's downstream server selects this tree as an exact direct path
 dependency. The shared runtime's private upstream client remains on the exact
 crates.io Hyper 0.14.32 package; no Cargo source override couples the two.
 
-The sole behavioral patch is in `src/proto/h2/server.rs`: dropping an
-unfinished server `H2Stream` explicitly sends `RST_STREAM(CANCEL)`. Upstream
-Hyper delegates response bytes to h2 before flow control has necessarily sent
-the complete `Buf`. Dropping the stream future after a partial send otherwise
-leaves that queued remainder referenced, so h2 cannot infer cancellation and
-the stream remains open indefinitely.
+Two exact behavioral patches are retained:
+
+- `src/proto/h1/role.rs` preserves an explicit `Content-Length` on a bodyless
+  `304 Not Modified` response, matching the existing HEAD response handling.
+  The response encoder remains fixed at length zero, and the upstream
+  `can_have_content_length` classification remains unchanged.
+- `src/proto/h2/server.rs` explicitly sends `RST_STREAM(CANCEL)` when an
+  unfinished server `H2Stream` is dropped. Upstream Hyper delegates response
+  bytes to h2 before flow control has necessarily sent the complete `Buf`.
+  Dropping the stream future after a partial send otherwise leaves that queued
+  remainder referenced, so h2 cannot infer cancellation and the stream remains
+  open indefinitely.
 
 The added `finished` bit distinguishes normal future completion from
 cancellation. A pinned drop sends `CANCEL` only when the future has not reached
