@@ -38,10 +38,8 @@ TLS_VERSIONS = {
 }
 FORBIDDEN_PACKAGES = {"rcgen", "rustls-pemfile", "x509-parser", "yasna"}
 DEPENDENCY_TABLES = {"dependencies", "dev-dependencies", "build-dependencies"}
-ADVISORY_IGNORE_ARGUMENT = re.compile(
-    r"--ignore(?:[\s=,:'\"\[\]{}()\\]|\\[rn])*RUSTSEC-",
-    re.IGNORECASE,
-)
+ADVISORY_IGNORE_OPTION = re.compile(r"(?<![\w-])--ignore\b", re.IGNORECASE)
+RUSTSEC_ADVISORY_ID = re.compile(r"RUSTSEC-", re.IGNORECASE)
 SHELL_LINE_CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
 WORKFLOW_ADVISORY_IGNORE = re.compile(
     r"(?mi)^\s*ignore\s*:\s*(?:[^\n]*RUSTSEC-|\n\s*-\s*[^\n]*RUSTSEC-)",
@@ -182,21 +180,14 @@ def check_advisory_config(path: Path) -> None:
 
 
 def check_cargo_aliases(path: Path) -> None:
-    aliases = load_toml(path).get("alias")
-    if not isinstance(aliases, dict):
-        return
-    for name, command in aliases.items():
-        if isinstance(command, str):
-            command_text = command
-        elif isinstance(command, list) and all(
-            isinstance(argument, str) for argument in command
-        ):
-            command_text = " ".join(command)
-        else:
-            continue
-        logical_command = SHELL_LINE_CONTINUATION.sub(" ", command_text)
-        if ADVISORY_IGNORE_ARGUMENT.search(logical_command):
-            fail(f"{path}: Cargo alias {name!r} must not ignore RustSec IDs")
+    load_toml(path)
+    text = SHELL_LINE_CONTINUATION.sub(" ", path.read_text(encoding="utf-8"))
+    if contains_advisory_ignore(text):
+        fail(f"{path}: Cargo configuration must not ignore RustSec IDs")
+
+
+def contains_advisory_ignore(text: str) -> bool:
+    return bool(ADVISORY_IGNORE_OPTION.search(text) and RUSTSEC_ADVISORY_ID.search(text))
 
 
 def repository_files(root: Path, filename: str) -> Iterator[Path]:
@@ -232,7 +223,7 @@ def check_advisory_policy(root: Path) -> None:
     for path in sorted(command_files):
         text = path.read_text(encoding="utf-8")
         logical_text = SHELL_LINE_CONTINUATION.sub(" ", text)
-        if ADVISORY_IGNORE_ARGUMENT.search(logical_text):
+        if contains_advisory_ignore(logical_text):
             fail(f"{path}: advisory command must not ignore RustSec IDs")
         if path.suffix in {".yaml", ".yml"} and WORKFLOW_ADVISORY_IGNORE.search(text):
             fail(f"{path}: advisory workflow must not ignore RustSec IDs")

@@ -273,6 +273,22 @@ elif mode == "argv-audit-command-ignore":
         f'import subprocess\nsubprocess.run(["cargo", "audit", "--ignore", "{rustsec}"])\n',
         encoding="utf-8",
     )
+elif mode == "variable-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0018"
+    scripts = root / "acl-proxy/scripts"
+    scripts.mkdir()
+    (scripts / "audit.sh").write_text(
+        f'#!/bin/sh\nadvisory={rustsec}\ncargo audit --ignore "$advisory"\n',
+        encoding="utf-8",
+    )
+elif mode == "workflow-env-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0019"
+    workflows = root / "acl-proxy/.github/workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "audit.yml").write_text(
+        f'env:\n  ADVISORY: {rustsec}\nsteps:\n  - run: cargo audit --ignore "$ADVISORY"\n',
+        encoding="utf-8",
+    )
 elif mode == "js-audit-command-ignore":
     rustsec = "RUST" + "SEC-2026-0005"
     scripts = root / "acl-proxy/scripts"
@@ -363,6 +379,8 @@ mutations=(
     cargo-global-option-audit-command-ignore
     folded-workflow-audit-command-ignore
     argv-audit-command-ignore
+    variable-audit-command-ignore
+    workflow-env-audit-command-ignore
     js-audit-command-ignore
     workflow-advisory-ignore
     workflow-multiline-advisory-ignore
