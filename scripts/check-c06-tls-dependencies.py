@@ -38,12 +38,13 @@ TLS_VERSIONS = {
 }
 FORBIDDEN_PACKAGES = {"rcgen", "rustls-pemfile", "x509-parser", "yasna"}
 DEPENDENCY_TABLES = {"dependencies", "dev-dependencies", "build-dependencies"}
-ADVISORY_IGNORE_OPTION = re.compile(r"(?<![\w-])--ignore\b", re.IGNORECASE)
+ADVISORY_IGNORE_TOKEN = re.compile(r"(?<![\w-])(?:--)?ignore\b", re.IGNORECASE)
 RUSTSEC_ADVISORY_ID = re.compile(r"RUSTSEC-", re.IGNORECASE)
-SHELL_LINE_CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
-WORKFLOW_ADVISORY_IGNORE = re.compile(
-    r"(?mi)^\s*ignore\s*:\s*(?:[^\n]*RUSTSEC-|\n\s*-\s*[^\n]*RUSTSEC-)",
-)
+ADVISORY_POLICY_SOURCE_EXCLUSIONS = {
+    Path("scripts/check-c06-tls-dependencies.py"),
+    Path("scripts/tests/check-c06-tls-dependencies-test.sh"),
+    Path("scripts/tests/check-mitm-dependency-shape-test.sh"),
+}
 
 
 def fail(message: str) -> None:
@@ -179,15 +180,8 @@ def check_advisory_config(path: Path) -> None:
             fail(f"{path}: advisory ignore list must be empty")
 
 
-def check_cargo_aliases(path: Path) -> None:
-    load_toml(path)
-    text = SHELL_LINE_CONTINUATION.sub(" ", path.read_text(encoding="utf-8"))
-    if contains_advisory_ignore(text):
-        fail(f"{path}: Cargo configuration must not ignore RustSec IDs")
-
-
 def contains_advisory_ignore(text: str) -> bool:
-    return bool(ADVISORY_IGNORE_OPTION.search(text) and RUSTSEC_ADVISORY_ID.search(text))
+    return bool(ADVISORY_IGNORE_TOKEN.search(text) and RUSTSEC_ADVISORY_ID.search(text))
 
 
 def repository_files(root: Path, filename: str) -> Iterator[Path]:
@@ -197,36 +191,36 @@ def repository_files(root: Path, filename: str) -> Iterator[Path]:
         yield path
 
 
-def check_advisory_policy(root: Path) -> None:
-    config_paths = set(repository_files(root, "deny.toml"))
-    config_paths.update(repository_files(root, "audit.toml"))
-    config_paths.update(repository_files(root, "Cargo.toml"))
-    for path in sorted(config_paths):
-        check_advisory_config(path)
-    cargo_config_paths = set(repository_files(root, "config.toml"))
-    cargo_config_paths.update(repository_files(root, "config"))
-    for path in sorted(path for path in cargo_config_paths if path.parent.name == ".cargo"):
-        check_cargo_aliases(path)
-
-    command_files: set[Path] = set()
-    command_suffixes = {".js", ".mjs", ".py", ".sh", ".toml", ".yaml", ".yml"}
+def repository_regular_files(root: Path) -> Iterator[Path]:
     for path in root.rglob("*"):
         if not path.is_file() or any(part in {".git", "target"} for part in path.parts):
             continue
+        yield path
+
+
+def read_utf8_text(path: Path) -> str | None:
+    try:
+        contents = path.read_bytes()
+    except OSError as error:
+        fail(f"cannot read {path}: {error}")
+    if b"\0" in contents:
+        return None
+    try:
+        return contents.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def check_advisory_policy(root: Path) -> None:
+    for path in repository_regular_files(root):
         relative = path.relative_to(root)
-        if relative.parts[:2] == ("scripts", "tests"):
+        if path.suffix == ".toml" or (path.name == "config" and path.parent.name == ".cargo"):
+            check_advisory_config(path)
+        if relative in ADVISORY_POLICY_SOURCE_EXCLUSIONS:
             continue
-        if path.resolve() == Path(__file__).resolve():
-            continue
-        if path.suffix in command_suffixes or path.name in {"Makefile", "Justfile"}:
-            command_files.add(path)
-    for path in sorted(command_files):
-        text = path.read_text(encoding="utf-8")
-        logical_text = SHELL_LINE_CONTINUATION.sub(" ", text)
-        if contains_advisory_ignore(logical_text):
-            fail(f"{path}: advisory command must not ignore RustSec IDs")
-        if path.suffix in {".yaml", ".yml"} and WORKFLOW_ADVISORY_IGNORE.search(text):
-            fail(f"{path}: advisory workflow must not ignore RustSec IDs")
+        text = read_utf8_text(path)
+        if text is not None and contains_advisory_ignore(text):
+            fail(f"{path}: repository text must not ignore RustSec IDs")
 
 
 def check_repository(acl_root: Path, runtime_root: Path) -> None:

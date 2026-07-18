@@ -289,6 +289,59 @@ elif mode == "workflow-env-audit-command-ignore":
         f'env:\n  ADVISORY: {rustsec}\nsteps:\n  - run: cargo audit --ignore "$ADVISORY"\n',
         encoding="utf-8",
     )
+elif mode == "custom-toml-advisory-ignore":
+    rustsec = "RUST" + "SEC-2026-0020"
+    policy = root / "acl-proxy/policy/security.toml"
+    policy.parent.mkdir(parents=True)
+    policy.write_text(f'[advisories]\nignore = ["{rustsec}"]\n', encoding="utf-8")
+elif mode == "extensionless-executable-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0021"
+    script = root / "acl-proxy/scripts/audit"
+    script.parent.mkdir()
+    script.write_text(f'#!/bin/sh\ncargo audit --ignore {rustsec}\n', encoding="utf-8")
+    script.chmod(0o755)
+elif mode == "rust-launcher-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0022"
+    launcher = root / "acl-proxy/tools/audit.rs"
+    launcher.parent.mkdir()
+    launcher.write_text(
+        f'Command::new("cargo").args(["audit", "--ignore", "{rustsec}"]);\n',
+        encoding="utf-8",
+    )
+elif mode == "json-task-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0023"
+    (root / "acl-proxy/package.json").write_text(
+        f'{{"scripts":{{"audit":"cargo audit --ignore {rustsec}"}}}}\n', encoding="utf-8"
+    )
+elif mode == "scripts-tests-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0024"
+    script = root / "acl-proxy/scripts/tests/audit.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text(f'#!/bin/sh\ncargo audit --ignore {rustsec}\n', encoding="utf-8")
+elif mode == "workflow-block-advisory-ignore":
+    rustsec = "RUST" + "SEC-2026-0025"
+    workflow = root / "access-runtime/.github/workflows/audit.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text(
+        f'uses: rustsec/audit-check@v2\nwith:\n  ignore: |\n    {rustsec}\n',
+        encoding="utf-8",
+    )
+elif mode == "workflow-anchor-advisory-ignore":
+    rustsec = "RUST" + "SEC-2026-0026"
+    workflow = root / "access-runtime/.github/workflows/audit.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text(
+        f'env:\n  ADVISORY: &advisory {rustsec}\nwith:\n  ignore: *advisory\n',
+        encoding="utf-8",
+    )
+elif mode == "workflow-inline-advisory-ignore":
+    rustsec = "RUST" + "SEC-2026-0027"
+    workflow = root / "access-runtime/.github/workflows/audit.yml"
+    workflow.parent.mkdir(parents=True)
+    workflow.write_text(
+        f'uses: rustsec/audit-check@v2\nwith: {{ ignore: {rustsec} }}\n',
+        encoding="utf-8",
+    )
 elif mode == "js-audit-command-ignore":
     rustsec = "RUST" + "SEC-2026-0005"
     scripts = root / "acl-proxy/scripts"
@@ -381,6 +434,14 @@ mutations=(
     argv-audit-command-ignore
     variable-audit-command-ignore
     workflow-env-audit-command-ignore
+    custom-toml-advisory-ignore
+    extensionless-executable-audit-command-ignore
+    rust-launcher-audit-command-ignore
+    json-task-audit-command-ignore
+    scripts-tests-audit-command-ignore
+    workflow-block-advisory-ignore
+    workflow-anchor-advisory-ignore
+    workflow-inline-advisory-ignore
     js-audit-command-ignore
     workflow-advisory-ignore
     workflow-multiline-advisory-ignore
