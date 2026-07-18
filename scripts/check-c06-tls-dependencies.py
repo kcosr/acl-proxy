@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import re
+import subprocess
 import sys
 import tomllib
 from typing import Any, Iterator
@@ -38,13 +39,8 @@ TLS_VERSIONS = {
 }
 FORBIDDEN_PACKAGES = {"rcgen", "rustls-pemfile", "x509-parser", "yasna"}
 DEPENDENCY_TABLES = {"dependencies", "dev-dependencies", "build-dependencies"}
-ADVISORY_IGNORE_TOKEN = re.compile(r"(?<![\w-])(?:--)?ignore\b", re.IGNORECASE)
-RUSTSEC_ADVISORY_ID = re.compile(r"RUSTSEC-", re.IGNORECASE)
-ADVISORY_POLICY_SOURCE_EXCLUSIONS = {
-    Path("scripts/check-c06-tls-dependencies.py"),
-    Path("scripts/tests/check-c06-tls-dependencies-test.sh"),
-    Path("scripts/tests/check-mitm-dependency-shape-test.sh"),
-}
+ADVISORY_IGNORE_BYTES = re.compile(rb"(?<![\w-])(?:--)?ignore\b", re.IGNORECASE)
+RUSTSEC_ADVISORY_ID_BYTES = re.compile(b"RUST" b"SEC-", re.IGNORECASE)
 
 
 def fail(message: str) -> None:
@@ -174,53 +170,75 @@ def check_advisory_config(path: Path) -> None:
             continue
         advisory_scope = any(part.lower() in {"advisory", "advisories", "audit"}
                              for part in key_path[:-1])
-        rustsec_value = "RUSTSEC-" in repr(value).upper()
+        rustsec_value = "RUST" "SEC-" in repr(value).upper()
         nonempty = value not in (None, "", [], {})
         if nonempty and (advisory_scope or rustsec_value):
             fail(f"{path}: advisory ignore list must be empty")
 
 
-def contains_advisory_ignore(text: str) -> bool:
-    return bool(ADVISORY_IGNORE_TOKEN.search(text) and RUSTSEC_ADVISORY_ID.search(text))
+def contains_advisory_ignore_bytes(contents: bytes) -> bool:
+    return bool(
+        ADVISORY_IGNORE_BYTES.search(contents) and RUSTSEC_ADVISORY_ID_BYTES.search(contents)
+    )
 
 
 def repository_files(root: Path, filename: str) -> Iterator[Path]:
-    for path in root.rglob(filename):
-        if any(part in {".git", "target"} for part in path.parts):
+    for path in repository_regular_files(root):
+        if path.name == filename:
+            yield path
+
+
+def tracked_repository_files(root: Path) -> Iterator[Path]:
+    if not (root / ".git").exists():
+        return
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z"],
+            check=False,
+            capture_output=True,
+        )
+    except OSError as error:
+        fail(f"cannot enumerate tracked files in {root}: {error}")
+    if result.returncode != 0:
+        fail(f"cannot enumerate tracked files in {root}: {result.stderr.decode(errors='replace')}")
+    for encoded_path in result.stdout.split(b"\0"):
+        if not encoded_path:
             continue
-        yield path
+        try:
+            relative = Path(encoded_path.decode("utf-8"))
+        except UnicodeDecodeError as error:
+            fail(f"tracked path in {root} is not UTF-8: {error}")
+        path = root / relative
+        if path.is_file():
+            yield path
 
 
 def repository_regular_files(root: Path) -> Iterator[Path]:
+    observed: set[Path] = set()
     for path in root.rglob("*"):
-        if not path.is_file() or any(part in {".git", "target"} for part in path.parts):
+        relative = path.relative_to(root)
+        if not path.is_file() or any(part in {".git", "target"} for part in relative.parts):
             continue
+        observed.add(path)
         yield path
+    for path in tracked_repository_files(root):
+        if path not in observed:
+            yield path
 
 
-def read_utf8_text(path: Path) -> str | None:
+def read_contents(path: Path) -> bytes:
     try:
-        contents = path.read_bytes()
+        return path.read_bytes()
     except OSError as error:
         fail(f"cannot read {path}: {error}")
-    if b"\0" in contents:
-        return None
-    try:
-        return contents.decode("utf-8")
-    except UnicodeDecodeError:
-        return None
 
 
 def check_advisory_policy(root: Path) -> None:
     for path in repository_regular_files(root):
-        relative = path.relative_to(root)
         if path.suffix == ".toml" or (path.name == "config" and path.parent.name == ".cargo"):
             check_advisory_config(path)
-        if relative in ADVISORY_POLICY_SOURCE_EXCLUSIONS:
-            continue
-        text = read_utf8_text(path)
-        if text is not None and contains_advisory_ignore(text):
-            fail(f"{path}: repository text must not ignore RustSec IDs")
+        if contains_advisory_ignore_bytes(read_contents(path)):
+            fail(f"{path}: repository file must not ignore RustSec IDs")
 
 
 def check_repository(acl_root: Path, runtime_root: Path) -> None:

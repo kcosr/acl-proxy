@@ -82,6 +82,7 @@ mutate() {
     python3 - "$mode" "$fixture" <<'PY'
 from pathlib import Path
 import re
+import subprocess
 import sys
 
 mode = sys.argv[1]
@@ -99,6 +100,12 @@ def replace(path, old, new):
 
 def append(path, text):
     path.write_text(path.read_text(encoding="utf-8") + text, encoding="utf-8")
+
+def force_track(repo, path):
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "add", "-f", str(path.relative_to(repo))], check=True
+    )
 
 if mode == "acl-missing-rustls":
     replace(acl, 'rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std", "tls12"] }\n', '')
@@ -300,6 +307,56 @@ elif mode == "extensionless-executable-audit-command-ignore":
     script.parent.mkdir()
     script.write_text(f'#!/bin/sh\ncargo audit --ignore {rustsec}\n', encoding="utf-8")
     script.chmod(0o755)
+elif mode == "invalid-utf8-executable-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0028"
+    script = root / "acl-proxy/scripts/audit-invalid"
+    script.parent.mkdir()
+    script.write_bytes(
+        f'#!/bin/sh\ncargo audit --ignore {rustsec}\n'.encode("ascii") + b'# invalid: \xff\n'
+    )
+    script.chmod(0o755)
+elif mode == "nul-executable-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0030"
+    script = root / "acl-proxy/scripts/audit-nul"
+    script.parent.mkdir()
+    script.write_bytes(
+        f'#!/bin/sh\ncargo audit --ignore {rustsec}\n'.encode("ascii") + b'# invalid: \0\n'
+    )
+    script.chmod(0o755)
+elif mode == "nested-target-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0029"
+    script = root / "acl-proxy/scripts/target/audit.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text(f'#!/bin/sh\ncargo audit --ignore {rustsec}\n', encoding="utf-8")
+    force_track(root / "acl-proxy", script)
+elif mode == "nested-target-manifest-forbidden-dependency":
+    manifest = root / "acl-proxy/components/target/Cargo.toml"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        '[package]\nname = "nested-target"\nversion = "0.1.0"\n\n'
+        '[dependencies]\nrcgen = "=0.13.2"\n',
+        encoding="utf-8",
+    )
+    force_track(root / "acl-proxy", manifest)
+elif mode == "nested-target-lock-forbidden-dependency":
+    lock = root / "acl-proxy/components/target/Cargo.lock"
+    lock.parent.mkdir(parents=True)
+    lock.write_text(
+        'version = 4\n\n[[package]]\nname = "rcgen"\nversion = "0.13.2"\n',
+        encoding="utf-8",
+    )
+    force_track(root / "acl-proxy", lock)
+elif mode == "root-target-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0032"
+    script = root / "acl-proxy/target/audit.sh"
+    script.parent.mkdir(parents=True)
+    script.write_text(f'#!/bin/sh\ncargo audit --ignore {rustsec}\n', encoding="utf-8")
+    force_track(root / "acl-proxy", script)
+elif mode == "cross-repository-authority-path-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0031"
+    script = root / "access-runtime/scripts/check-c06-tls-dependencies.py"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text(f'cargo audit --ignore {rustsec}\n', encoding="utf-8")
 elif mode == "rust-launcher-audit-command-ignore":
     rustsec = "RUST" + "SEC-2026-0022"
     launcher = root / "acl-proxy/tools/audit.rs"
@@ -436,6 +493,13 @@ mutations=(
     workflow-env-audit-command-ignore
     custom-toml-advisory-ignore
     extensionless-executable-audit-command-ignore
+    invalid-utf8-executable-audit-command-ignore
+    nul-executable-audit-command-ignore
+    nested-target-audit-command-ignore
+    nested-target-manifest-forbidden-dependency
+    nested-target-lock-forbidden-dependency
+    root-target-audit-command-ignore
+    cross-repository-authority-path-audit-command-ignore
     rust-launcher-audit-command-ignore
     json-task-audit-command-ignore
     scripts-tests-audit-command-ignore
