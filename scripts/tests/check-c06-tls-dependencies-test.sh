@@ -191,6 +191,17 @@ elif mode == "audit-command-ignore":
     scripts = root / "acl-proxy/scripts"
     scripts.mkdir()
     (scripts / "audit.sh").write_text(f'#!/bin/sh\ncargo audit --ignore {rustsec}\n', encoding="utf-8")
+elif mode == "multiline-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0008"
+    scripts = root / "acl-proxy/scripts"
+    scripts.mkdir()
+    (scripts / "audit.sh").write_text(
+        '#!/bin/sh\n'
+        'cargo audit \\\n'
+        '  --deny warnings \\\n'
+        f'  --ignore {rustsec}\n',
+        encoding="utf-8",
+    )
 elif mode == "js-audit-command-ignore":
     rustsec = "RUST" + "SEC-2026-0005"
     scripts = root / "acl-proxy/scripts"
@@ -271,6 +282,7 @@ mutations=(
     runtime-audit-ignore
     cargo-metadata-ignore
     audit-command-ignore
+    multiline-audit-command-ignore
     js-audit-command-ignore
     workflow-advisory-ignore
     workflow-multiline-advisory-ignore

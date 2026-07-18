@@ -39,7 +39,8 @@ TLS_VERSIONS = {
 FORBIDDEN_PACKAGES = {"rcgen", "rustls-pemfile", "x509-parser", "yasna"}
 DEPENDENCY_TABLES = {"dependencies", "dev-dependencies", "build-dependencies"}
 AUDIT_COMMAND_IGNORE = re.compile(
-    r"cargo\s+(?:audit|deny\s+check(?:\s+advisories)?)\b[^\n]*"
+    r"cargo\s+(?:audit|deny\s+check(?:\s+advisories)?)\b"
+    r"(?:[^\r\n]|\\\r?\n)*"
     r"--ignore(?:=|\s+)[\"']?RUSTSEC-",
     re.IGNORECASE,
 )

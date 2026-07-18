@@ -545,6 +545,58 @@ mod tests {
         })
     }
 
+    fn spawn_resumption_acknowledgements(
+        listener: tokio::net::TcpListener,
+        acceptor: TlsAcceptor,
+    ) -> tokio::task::JoinHandle<Vec<rustls::HandshakeKind>> {
+        tokio::spawn(async move {
+            let mut handshakes = Vec::with_capacity(2);
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = acceptor.accept(stream).await.unwrap();
+                handshakes.push(stream.get_ref().1.handshake_kind().unwrap());
+                let mut request = Vec::new();
+                stream.read_to_end(&mut request).await.unwrap();
+                stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+                let _ = stream.shutdown().await;
+            }
+            handshakes
+        })
+    }
+
+    #[tokio::test]
+    async fn webhook_tls_reuses_the_provider_session_cache() {
+        let fixture = tls_fixture("localhost");
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = spawn_resumption_acknowledgements(listener, fixture.acceptor.clone());
+        let provider = tls_provider(
+            "localhost",
+            endpoint.port(),
+            CompiledTlsTrust::Custom,
+            Some(fixture.ca_certificate.clone()),
+        );
+
+        for _ in 0..2 {
+            assert_eq!(
+                deliver_over_loopback(endpoint, &provider)
+                    .await
+                    .unwrap()
+                    .status,
+                204
+            );
+        }
+        assert_eq!(
+            server.await.unwrap(),
+            [rustls::HandshakeKind::Full, rustls::HandshakeKind::Resumed]
+        );
+    }
+
     #[tokio::test]
     async fn webhook_tls_activation_and_transport_matrix() {
         let trusted = tls_fixture("localhost");

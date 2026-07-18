@@ -101,7 +101,6 @@ pub(crate) fn build_client_config(
     };
     config.alpn_protocols = alpn.protocols();
     config.enable_sni = enable_sni;
-    config.resumption = rustls::client::Resumption::disabled();
     Ok(config)
 }
 
