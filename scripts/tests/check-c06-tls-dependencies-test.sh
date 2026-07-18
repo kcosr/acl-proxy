@@ -202,6 +202,41 @@ elif mode == "multiline-audit-command-ignore":
         f'  --ignore {rustsec}\n',
         encoding="utf-8",
     )
+elif mode == "split-subcommand-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0009"
+    scripts = root / "acl-proxy/scripts"
+    scripts.mkdir()
+    (scripts / "audit.sh").write_text(
+        '#!/bin/sh\n'
+        'cargo \\\n'
+        '  audit \\\n'
+        f'  --ignore {rustsec}\n',
+        encoding="utf-8",
+    )
+elif mode == "split-ignore-value-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0010"
+    scripts = root / "acl-proxy/scripts"
+    scripts.mkdir()
+    (scripts / "audit.sh").write_text(
+        '#!/bin/sh\n'
+        'cargo audit --ignore \\\n'
+        f'  {rustsec}\n',
+        encoding="utf-8",
+    )
+elif mode == "toolchain-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0011"
+    scripts = root / "acl-proxy/scripts"
+    scripts.mkdir()
+    (scripts / "audit.sh").write_text(
+        f'#!/bin/sh\ncargo +stable audit --ignore {rustsec}\n', encoding="utf-8"
+    )
+elif mode == "cargo-alias-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0012"
+    cargo_config = root / "acl-proxy/.cargo/config.toml"
+    cargo_config.parent.mkdir(exist_ok=True)
+    cargo_config.write_text(
+        f'[alias]\nsecurity = "audit --ignore {rustsec}"\n', encoding="utf-8"
+    )
 elif mode == "js-audit-command-ignore":
     rustsec = "RUST" + "SEC-2026-0005"
     scripts = root / "acl-proxy/scripts"
@@ -283,6 +318,10 @@ mutations=(
     cargo-metadata-ignore
     audit-command-ignore
     multiline-audit-command-ignore
+    split-subcommand-audit-command-ignore
+    split-ignore-value-audit-command-ignore
+    toolchain-audit-command-ignore
+    cargo-alias-audit-command-ignore
     js-audit-command-ignore
     workflow-advisory-ignore
     workflow-multiline-advisory-ignore

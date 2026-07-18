@@ -39,11 +39,11 @@ TLS_VERSIONS = {
 FORBIDDEN_PACKAGES = {"rcgen", "rustls-pemfile", "x509-parser", "yasna"}
 DEPENDENCY_TABLES = {"dependencies", "dev-dependencies", "build-dependencies"}
 AUDIT_COMMAND_IGNORE = re.compile(
-    r"cargo\s+(?:audit|deny\s+check(?:\s+advisories)?)\b"
-    r"(?:[^\r\n]|\\\r?\n)*"
+    r"cargo\s+(?:\+[^\s]+\s+)?(?:audit|deny\s+check(?:\s+advisories)?)\b[^\r\n]*"
     r"--ignore(?:=|\s+)[\"']?RUSTSEC-",
     re.IGNORECASE,
 )
+SHELL_LINE_CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
 WORKFLOW_ADVISORY_IGNORE = re.compile(
     r"(?mi)^\s*ignore\s*:\s*(?:[^\n]*RUSTSEC-|\n\s*-\s*[^\n]*RUSTSEC-)",
 )
@@ -182,6 +182,18 @@ def check_advisory_config(path: Path) -> None:
             fail(f"{path}: advisory ignore list must be empty")
 
 
+def check_cargo_aliases(path: Path) -> None:
+    aliases = load_toml(path).get("alias")
+    if not isinstance(aliases, dict):
+        return
+    for name, command in aliases.items():
+        if not isinstance(command, str):
+            continue
+        logical_command = SHELL_LINE_CONTINUATION.sub(" ", command)
+        if AUDIT_COMMAND_IGNORE.search(f"cargo {logical_command}"):
+            fail(f"{path}: Cargo alias {name!r} must not ignore RustSec IDs")
+
+
 def repository_files(root: Path, filename: str) -> Iterator[Path]:
     for path in root.rglob(filename):
         if any(part in {".git", "target"} for part in path.parts):
@@ -195,6 +207,10 @@ def check_advisory_policy(root: Path) -> None:
     config_paths.update(repository_files(root, "Cargo.toml"))
     for path in sorted(config_paths):
         check_advisory_config(path)
+    cargo_config_paths = set(repository_files(root, "config.toml"))
+    cargo_config_paths.update(repository_files(root, "config"))
+    for path in sorted(path for path in cargo_config_paths if path.parent.name == ".cargo"):
+        check_cargo_aliases(path)
 
     command_files: set[Path] = set()
     command_suffixes = {".js", ".mjs", ".py", ".sh", ".toml", ".yaml", ".yml"}
@@ -210,7 +226,8 @@ def check_advisory_policy(root: Path) -> None:
             command_files.add(path)
     for path in sorted(command_files):
         text = path.read_text(encoding="utf-8")
-        if AUDIT_COMMAND_IGNORE.search(text):
+        logical_text = SHELL_LINE_CONTINUATION.sub(" ", text)
+        if AUDIT_COMMAND_IGNORE.search(logical_text):
             fail(f"{path}: advisory audit command must not ignore RustSec IDs")
         if path.suffix in {".yaml", ".yml"} and WORKFLOW_ADVISORY_IGNORE.search(text):
             fail(f"{path}: advisory workflow must not ignore RustSec IDs")
