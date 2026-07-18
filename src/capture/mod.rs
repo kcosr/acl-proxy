@@ -795,7 +795,7 @@ impl CaptureRecord {
 
 fn canonical_base64_decoded_len(encoded: &str) -> Option<usize> {
     let bytes = encoded.as_bytes();
-    if !bytes.len().is_multiple_of(4) {
+    if bytes.len() & 3 != 0 {
         return None;
     }
     if bytes.is_empty() {

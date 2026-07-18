@@ -24,6 +24,12 @@ pub(crate) fn write_private_file(path: &Path, contents: impl AsRef<[u8]>) -> io:
     set_private_file_permissions(path)
 }
 
+#[cfg(test)]
+pub(crate) fn write_public_file(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
+    fs::write(path, contents)?;
+    set_public_file_permissions(path)
+}
+
 pub(crate) fn open_private_file_for_append(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent() {
         create_private_dir_all(parent)?;
@@ -69,5 +75,15 @@ fn set_private_file_permissions(path: &Path) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn set_private_file_permissions(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+fn set_public_file_permissions(path: &Path) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o644))
+}
+
+#[cfg(all(test, not(unix)))]
+fn set_public_file_permissions(_path: &Path) -> io::Result<()> {
     Ok(())
 }

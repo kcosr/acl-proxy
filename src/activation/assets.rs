@@ -290,32 +290,27 @@ pub(crate) enum ProductIngressAssetsError {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     use http_access_types::{HttpProtocol, Route};
-    use rcgen::{CertificateParams, KeyPair};
     use tempfile::tempdir;
 
     use super::*;
     use crate::config::{compile_config_text, ConfigTextInput};
+    use crate::test_certificates::TestTlsIdentity;
 
     #[tokio::test]
     async fn listener_tls_assets_preserve_each_exact_role_and_protocol_set() {
         let directory = tempdir().unwrap();
-        let key = KeyPair::generate().unwrap();
-        let certificate = CertificateParams::new(vec!["localhost".to_string()])
-            .unwrap()
-            .self_signed(&key)
-            .unwrap();
-        fs::write(directory.path().join("server.pem"), certificate.pem()).unwrap();
-        fs::write(directory.path().join("server-key.pem"), key.serialize_pem()).unwrap();
-        #[cfg(unix)]
-        fs::set_permissions(
-            directory.path().join("server-key.pem"),
-            fs::Permissions::from_mode(0o600),
+        let identity = TestTlsIdentity::new("localhost");
+        crate::filesystem::write_public_file(
+            &directory.path().join("server.pem"),
+            identity.certificate_chain_pem(),
+        )
+        .unwrap();
+        crate::filesystem::write_private_file(
+            &directory.path().join("server-key.pem"),
+            identity.private_key_pem(),
         )
         .unwrap();
         let text = r#"schema_version = 3

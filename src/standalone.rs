@@ -1613,7 +1613,6 @@ mod tests {
     use std::path::Path;
 
     use http_access_types::{CredentialMutationKind, HeaderField, PolicyHeaderFacts};
-    use rcgen::generate_simple_self_signed;
     use tempfile::TempDir;
 
     use super::*;
@@ -1623,6 +1622,7 @@ mod tests {
     };
     use crate::config::{compile_config_text, ConfigTextInput};
     use crate::egress::EgressActivation;
+    use crate::test_certificates::TestTlsIdentity;
 
     const PLAN: &str = r#"schema_version = 3
 
@@ -1766,10 +1766,9 @@ header = "x-acl-proxy-request-id"
         id: GenerationId,
     ) -> UnboundStandaloneGenerationPlan {
         let directory = TempDir::new().unwrap();
-        let certificate =
-            generate_simple_self_signed(vec!["standalone-root.example".to_owned()]).unwrap();
+        let certificate = TestTlsIdentity::new("standalone-root.example");
         let ca = directory.path().join("root.pem");
-        std::fs::write(&ca, certificate.cert.pem()).unwrap();
+        crate::filesystem::write_public_file(&ca, certificate.root_certificate_pem()).unwrap();
         let mut egress = plan.egress.clone();
         if matches!(
             egress.origin_tls.trust,

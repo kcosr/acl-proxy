@@ -3,8 +3,13 @@ use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
-use rustls::client::{ServerCertVerified, ServerCertVerifier};
-use rustls::{Certificate, ClientConfig, Error as RustlsError, RootCertStore, ServerName};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, WebPkiSupportedAlgorithms};
+use rustls::pki_types::pem::PemObject as _;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{
+    ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
+};
 
 use crate::config::compiler::CompiledTlsTrust;
 
@@ -22,6 +27,8 @@ pub(crate) enum TlsActivationError {
     CaEmpty,
     #[error("custom CA certificate bundle contains an unusable certificate")]
     CaUnusable,
+    #[error("TLS client configuration is unavailable")]
+    Configuration,
 }
 
 #[derive(Clone)]
@@ -76,26 +83,26 @@ pub(crate) fn build_client_config(
     trust: &ClientTrust,
     alpn: ClientAlpn,
     enable_sni: bool,
-) -> ClientConfig {
+) -> Result<ClientConfig, TlsActivationError> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|_| TlsActivationError::Configuration)?;
     let mut config = match trust {
-        ClientTrust::Roots(roots) => ClientConfig::builder()
-            .with_safe_defaults()
+        ClientTrust::Roots(roots) => builder
             .with_root_certificates(roots.clone())
             .with_no_client_auth(),
-        ClientTrust::Insecure => {
-            let mut config = ClientConfig::builder()
-                .with_safe_defaults()
-                .with_root_certificates(RootCertStore::empty())
-                .with_no_client_auth();
-            config
-                .dangerous()
-                .set_certificate_verifier(Arc::new(NoVerifyServerCert));
-            config
-        }
+        ClientTrust::Insecure => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerifyServerCert {
+                algorithms: provider.signature_verification_algorithms,
+            }))
+            .with_no_client_auth(),
     };
     config.alpn_protocols = alpn.protocols();
     config.enable_sni = enable_sni;
-    config
+    config.resumption = rustls::client::Resumption::disabled();
+    Ok(config)
 }
 
 fn root_store_with_native_roots(
@@ -105,10 +112,12 @@ fn root_store_with_native_roots(
     check_activation_cancellation(is_cancelled)?;
     let certificates = rustls_native_certs::load_native_certs();
     check_activation_cancellation(is_cancelled)?;
-    let certificates = certificates.map_err(|_| TlsActivationError::NativeRoots)?;
-    for certificate in certificates {
+    if !certificates.errors.is_empty() || certificates.certs.is_empty() {
+        return Err(TlsActivationError::NativeRoots);
+    }
+    for certificate in certificates.certs {
         roots
-            .add(&Certificate(certificate.0))
+            .add(certificate)
             .map_err(|_| TlsActivationError::NativeRoots)?;
     }
     validate_native_root_store(roots)
@@ -136,7 +145,7 @@ fn add_custom_ca(
 ) -> Result<(), TlsActivationError> {
     for certificate in certificates {
         roots
-            .add(&Certificate(certificate.clone()))
+            .add(CertificateDer::from(certificate.clone()))
             .map_err(|_| TlsActivationError::CaUnusable)?;
     }
     Ok(())
@@ -151,13 +160,17 @@ pub(crate) fn load_custom_ca_der(
     check_activation_cancellation(is_cancelled)?;
     let file = file.map_err(|_| TlsActivationError::CaUnavailable)?;
     check_activation_cancellation(is_cancelled)?;
-    let certificates = rustls_pemfile::certs(&mut BufReader::new(file));
+    let certificates =
+        CertificateDer::pem_reader_iter(BufReader::new(file)).collect::<Result<Vec<_>, _>>();
     check_activation_cancellation(is_cancelled)?;
     let certificates = certificates.map_err(|_| TlsActivationError::CaInvalid)?;
     if certificates.is_empty() {
         return Err(TlsActivationError::CaEmpty);
     }
-    Ok(certificates)
+    Ok(certificates
+        .into_iter()
+        .map(|certificate| certificate.as_ref().to_vec())
+        .collect())
 }
 
 fn check_activation_cancellation(
@@ -170,18 +183,42 @@ fn check_activation_cancellation(
     }
 }
 
-struct NoVerifyServerCert;
+#[derive(Debug)]
+struct NoVerifyServerCert {
+    algorithms: WebPkiSupportedAlgorithms,
+}
 
 impl ServerCertVerifier for NoVerifyServerCert {
     fn verify_server_cert(
         &self,
-        _end_entity: &Certificate,
-        _intermediates: &[Certificate],
-        _server_name: &ServerName,
-        _scts: &mut dyn Iterator<Item = &[u8]>,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: std::time::SystemTime,
+        _now: UnixTime,
     ) -> Result<ServerCertVerified, RustlsError> {
         Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        verify_tls12_signature(message, certificate, signature, &self.algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        certificate: &CertificateDer<'_>,
+        signature: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, RustlsError> {
+        verify_tls13_signature(message, certificate, signature, &self.algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.algorithms.supported_schemes()
     }
 }

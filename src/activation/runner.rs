@@ -326,8 +326,7 @@ mod tests {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use http_access_mitm::{GeneratedCertificateAuthority, PrivateStorageRoot};
-    use rcgen::{CertificateParams, KeyPair};
-    use rustls::{Certificate, ClientConfig, PrivateKey, RootCertStore, ServerConfig, ServerName};
+    use rustls::pki_types::ServerName;
     use tempfile::tempdir;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
     use tokio::sync::oneshot;
@@ -335,6 +334,7 @@ mod tests {
 
     use super::*;
     use crate::config::load_and_compile_exact_config;
+    use crate::test_certificates::{client_config_for_roots, TestTlsIdentity};
 
     fn config(explicit_http: SocketAddr, control: SocketAddr, extra: &str) -> String {
         format!(
@@ -1187,21 +1187,9 @@ allow_upgrades = true
             .await
             .unwrap();
         let origin_address = origin.local_addr().unwrap();
-        let origin_key = KeyPair::generate().unwrap();
-        let origin_certificate = CertificateParams::new(vec!["localhost".to_owned()])
-            .unwrap()
-            .self_signed(&origin_key)
-            .unwrap();
-        let mut origin_tls = ServerConfig::builder()
-            .with_safe_defaults()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![Certificate(origin_certificate.der().to_vec())],
-                PrivateKey(origin_key.serialize_der()),
-            )
-            .unwrap();
-        origin_tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-        let origin_acceptor = TlsAcceptor::from(Arc::new(origin_tls));
+        let origin_identity = TestTlsIdentity::new("localhost");
+        let origin_acceptor =
+            TlsAcceptor::from(Arc::new(origin_identity.server_config(&[b"http/1.1"])));
 
         let extra = format!(
             r#"[mitm]
@@ -1302,15 +1290,7 @@ allow_upgrades = true
             String::from_utf8_lossy(&outer)
         );
 
-        let mut roots = RootCertStore::empty();
-        for certificate in ca_chain {
-            roots.add(&Certificate(certificate)).unwrap();
-        }
-        let mut client_tls = ClientConfig::builder()
-            .with_safe_defaults()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        client_tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let client_tls = client_config_for_roots(ca_chain, &[b"http/1.1"]);
         let connector = TlsConnector::from(Arc::new(client_tls));
         let mut tunnel = connector
             .connect(ServerName::try_from("localhost").unwrap(), client)

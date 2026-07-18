@@ -10,14 +10,14 @@ use http_access_mitm::{GeneratedCertificateAuthority, PrivateStorageRoot};
 use http_access_runtime::{
     ForwardingDevHarness, ForwardingNetworkFacts, OriginalDestinationProvider,
 };
-use rcgen::{CertificateParams, KeyPair};
-use rustls::{Certificate, ClientConfig, PrivateKey, RootCertStore, ServerConfig, ServerName};
+use rustls::pki_types::ServerName;
 use tempfile::{tempdir, TempDir};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use super::*;
+use crate::test_certificates::{client_config_for_roots, TestTlsIdentity};
 
 trait ParityIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> ParityIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -26,8 +26,7 @@ struct TestIdentity {
     _directory: TempDir,
     certificate_path: std::path::PathBuf,
     private_key_path: std::path::PathBuf,
-    certificate_der: Vec<u8>,
-    private_key_der: Vec<u8>,
+    tls: TestTlsIdentity,
 }
 
 struct FixedOriginalDestination(SocketAddr);
@@ -48,48 +47,25 @@ fn prebound_listener() -> (SocketAddr, StdTcpListener) {
 
 fn test_identity(dns_name: &str) -> TestIdentity {
     let directory = tempdir().unwrap();
-    let key = KeyPair::generate().unwrap();
-    let certificate = CertificateParams::new(vec![dns_name.to_owned()])
-        .unwrap()
-        .self_signed(&key)
-        .unwrap();
+    let tls = TestTlsIdentity::new(dns_name);
     let certificate_path = directory.path().join("server.pem");
     let private_key_path = directory.path().join("server-key.pem");
-    fs::write(&certificate_path, certificate.pem()).unwrap();
-    crate::filesystem::write_private_file(&private_key_path, key.serialize_pem()).unwrap();
+    crate::filesystem::write_public_file(&certificate_path, tls.certificate_chain_pem()).unwrap();
+    crate::filesystem::write_private_file(&private_key_path, tls.private_key_pem()).unwrap();
     TestIdentity {
         _directory: directory,
         certificate_path,
         private_key_path,
-        certificate_der: certificate.der().to_vec(),
-        private_key_der: key.serialize_der(),
+        tls,
     }
 }
 
 fn tls_acceptor(identity: &TestIdentity) -> TlsAcceptor {
-    let mut config = ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![Certificate(identity.certificate_der.clone())],
-            PrivateKey(identity.private_key_der.clone()),
-        )
-        .unwrap();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    TlsAcceptor::from(Arc::new(config))
+    TlsAcceptor::from(Arc::new(identity.tls.server_config(&[b"http/1.1"])))
 }
 
 fn tls_connector(certificates: impl IntoIterator<Item = Vec<u8>>, alpn: &[u8]) -> TlsConnector {
-    let mut roots = RootCertStore::empty();
-    for certificate in certificates {
-        roots.add(&Certificate(certificate)).unwrap();
-    }
-    let mut config = ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    config.alpn_protocols = vec![alpn.to_vec()];
-    TlsConnector::from(Arc::new(config))
+    TlsConnector::from(Arc::new(client_config_for_roots(certificates, &[alpn])))
 }
 
 fn initialize_generated_ca(directory: &Path) -> Vec<Vec<u8>> {
@@ -311,7 +287,7 @@ async fn http10_requests_reach_policy_in_all_five_ingress_modes() {
     );
     let text = base_config(proxy, "explicit_https", "\"http1\"", &extra);
     let (_directory, product) = start_product(&text, listener, None, None).await;
-    let connector = tls_connector([identity.certificate_der.clone()], b"http/1.1");
+    let connector = tls_connector([identity.tls.root_certificate_der()], b"http/1.1");
     let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
     let mut stream = connector
         .connect(ServerName::try_from("localhost").unwrap(), stream)
@@ -628,7 +604,7 @@ async fn explicit_https_negotiates_http2_and_serves_an_http2_request() {
     );
     let text = base_config(proxy, "explicit_https", "\"http2\"", &extra);
     let (_directory, product) = start_product(&text, listener, None, None).await;
-    let connector = tls_connector([identity.certificate_der.clone()], b"h2");
+    let connector = tls_connector([identity.tls.root_certificate_der()], b"h2");
     let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
     let stream = connector
         .connect(ServerName::try_from("localhost").unwrap(), stream)
@@ -862,7 +838,7 @@ methods = ["GET"]
         let mapping = format!("http://{origin}/");
         let (_directory, product) =
             start_product(&text, listener, Some((&mapping, origin)), None).await;
-        let connector = tls_connector([identity.certificate_der.clone()], alpn);
+        let connector = tls_connector([identity.tls.root_certificate_der()], alpn);
         let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
         let mut stream = connector
             .connect(ServerName::try_from("localhost").unwrap(), stream)
@@ -1091,7 +1067,8 @@ async fn http2_process_provider_equivalence_covers_all_five_ingress_modes() {
                 Box::new(tokio::net::TcpStream::connect(proxy).await.unwrap())
             }
             ProviderIngressCase::ExplicitHttps => {
-                let connector = tls_connector([incoming_identity.certificate_der.clone()], b"h2");
+                let connector =
+                    tls_connector([incoming_identity.tls.root_certificate_der()], b"h2");
                 let stream = tokio::net::TcpStream::connect(proxy).await.unwrap();
                 Box::new(
                     connector

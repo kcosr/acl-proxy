@@ -22,4 +22,6 @@ mod safety;
 mod standalone;
 mod standalone_policy_provider;
 mod standalone_provider_result;
+#[cfg(test)]
+mod test_certificates;
 mod tls;

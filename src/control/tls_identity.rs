@@ -2,7 +2,10 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rustls::{Certificate, PrivateKey, ServerConfig, SignatureScheme};
+use rustls::pki_types::pem::{Error as PemError, PemObject as _};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::sign::{CertifiedKey, SigningKey};
+use rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
 #[derive(Debug, thiserror::Error)]
@@ -18,7 +21,7 @@ pub(crate) enum StaticTlsIdentityError {
     InvalidCertificateChain {
         path: PathBuf,
         #[source]
-        source: std::io::Error,
+        source: PemError,
     },
 
     #[error("certificate chain {path} must contain at least one PEM certificate")]
@@ -35,7 +38,7 @@ pub(crate) enum StaticTlsIdentityError {
     InvalidPrivateKey {
         path: PathBuf,
         #[source]
-        source: std::io::Error,
+        source: PemError,
     },
 
     #[error("private key {path} must contain a supported PKCS8, RSA, or EC PEM private key")]
@@ -55,11 +58,13 @@ pub(crate) fn load_static_server_config(
     validate_certificate_key_match(&certificates, &private_key)
         .map_err(StaticTlsIdentityError::InvalidIdentity)?;
 
-    let mut config = ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
-        .with_single_cert(certificates, private_key)
-        .map_err(|err| StaticTlsIdentityError::InvalidIdentity(err.to_string()))?;
+    let mut config =
+        ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .map_err(|err| StaticTlsIdentityError::InvalidIdentity(err.to_string()))?
+            .with_no_client_auth()
+            .with_single_cert(certificates, private_key)
+            .map_err(|err| StaticTlsIdentityError::InvalidIdentity(err.to_string()))?;
     config.alpn_protocols = alpn_protocols;
     Ok(config)
 }
@@ -73,124 +78,93 @@ pub(crate) fn load_static_tls_acceptor(
         .map(|config| TlsAcceptor::from(Arc::new(config)))
 }
 
-fn load_pem_certificates(path: &Path) -> Result<Vec<Certificate>, StaticTlsIdentityError> {
+fn load_pem_certificates(
+    path: &Path,
+) -> Result<Vec<CertificateDer<'static>>, StaticTlsIdentityError> {
     let file = std::fs::File::open(path).map_err(|source| {
         StaticTlsIdentityError::ReadCertificateChain {
             path: path.to_path_buf(),
             source,
         }
     })?;
-    let mut reader = BufReader::new(file);
-    let certificates = rustls_pemfile::certs(&mut reader).map_err(|source| {
-        StaticTlsIdentityError::InvalidCertificateChain {
+    let certificates = CertificateDer::pem_reader_iter(BufReader::new(file))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| StaticTlsIdentityError::InvalidCertificateChain {
             path: path.to_path_buf(),
             source,
-        }
-    })?;
+        })?;
     if certificates.is_empty() {
         return Err(StaticTlsIdentityError::EmptyCertificateChain {
             path: path.to_path_buf(),
         });
     }
-    Ok(certificates.into_iter().map(Certificate).collect())
+    Ok(certificates)
 }
 
-fn load_supported_private_key(path: &Path) -> Result<PrivateKey, StaticTlsIdentityError> {
+fn load_supported_private_key(
+    path: &Path,
+) -> Result<PrivateKeyDer<'static>, StaticTlsIdentityError> {
     let file =
         std::fs::File::open(path).map_err(|source| StaticTlsIdentityError::ReadPrivateKey {
             path: path.to_path_buf(),
             source,
         })?;
-    let mut reader = BufReader::new(file);
-    loop {
-        let item = rustls_pemfile::read_one(&mut reader).map_err(|source| {
-            StaticTlsIdentityError::InvalidPrivateKey {
-                path: path.to_path_buf(),
-                source,
-            }
+    for key in PrivateKeyDer::pem_reader_iter(BufReader::new(file)) {
+        let key = key.map_err(|source| StaticTlsIdentityError::InvalidPrivateKey {
+            path: path.to_path_buf(),
+            source,
         })?;
-        let key = match item {
-            Some(rustls_pemfile::Item::PKCS8Key(key))
-            | Some(rustls_pemfile::Item::RSAKey(key))
-            | Some(rustls_pemfile::Item::ECKey(key)) => PrivateKey(key),
-            Some(_) => continue,
-            None => {
-                return Err(StaticTlsIdentityError::UnsupportedPrivateKey {
-                    path: path.to_path_buf(),
-                })
-            }
-        };
-        if rustls::sign::any_supported_type(&key).is_ok() {
+        if parse_signing_key(&key).is_ok() {
             return Ok(key);
         }
     }
+    Err(StaticTlsIdentityError::UnsupportedPrivateKey {
+        path: path.to_path_buf(),
+    })
 }
 
 pub(crate) fn validate_certificate_key_match(
-    cert_chain: &[Certificate],
-    private_key: &PrivateKey,
+    cert_chain: &[CertificateDer<'static>],
+    private_key: &PrivateKeyDer<'_>,
 ) -> Result<(), String> {
     let mut parsed = cert_chain.iter().enumerate().map(|(index, certificate)| {
-        webpki::EndEntityCert::try_from(certificate.0.as_slice())
+        webpki::EndEntityCert::try_from(certificate)
             .map_err(|err| format!("failed to parse certificate {}: {err}", index + 1))
     });
-    let end_entity = parsed
+    parsed
         .next()
         .ok_or_else(|| "certificate chain is empty".to_string())??;
     for certificate in parsed {
         certificate?;
     }
-    let signing_key = rustls::sign::any_supported_type(private_key)
-        .map_err(|err| format!("unsupported private key: {err}"))?;
-    let offered = [
-        SignatureScheme::ED25519,
-        SignatureScheme::ECDSA_NISTP256_SHA256,
-        SignatureScheme::ECDSA_NISTP384_SHA384,
-        SignatureScheme::RSA_PSS_SHA256,
-        SignatureScheme::RSA_PKCS1_SHA256,
-    ];
-    let signer = signing_key
-        .choose_scheme(&offered)
-        .ok_or_else(|| "private key has no supported signature scheme".to_string())?;
-    let algorithm = match signer.scheme() {
-        SignatureScheme::ED25519 => &webpki::ED25519,
-        SignatureScheme::ECDSA_NISTP256_SHA256 => &webpki::ECDSA_P256_SHA256,
-        SignatureScheme::ECDSA_NISTP384_SHA384 => &webpki::ECDSA_P384_SHA384,
-        SignatureScheme::RSA_PSS_SHA256 => &webpki::RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
-        SignatureScheme::RSA_PKCS1_SHA256 => &webpki::RSA_PKCS1_2048_8192_SHA256,
-        scheme => {
-            return Err(format!(
-                "unsupported private-key signature scheme {scheme:?}"
-            ))
-        }
-    };
-
-    let challenge = b"acl-proxy static TLS identity key check";
-    let signature = signer
-        .sign(challenge)
-        .map_err(|err| format!("failed to sign key-check challenge: {err}"))?;
-    end_entity
-        .verify_signature(algorithm, challenge, &signature)
+    let signing_key =
+        parse_signing_key(private_key).map_err(|err| format!("unsupported private key: {err}"))?;
+    CertifiedKey::new(cert_chain.to_vec(), signing_key)
+        .keys_match()
         .map_err(|_| "certificate public key does not match private key".to_string())
+}
+
+fn parse_signing_key(
+    private_key: &PrivateKeyDer<'_>,
+) -> Result<Arc<dyn SigningKey>, rustls::Error> {
+    rustls::crypto::ring::sign::any_supported_type(private_key)
 }
 
 #[cfg(test)]
 mod tests {
-    use rcgen::{CertificateParams, KeyPair};
     use tempfile::TempDir;
 
     use super::*;
+    use crate::test_certificates::TestTlsIdentity;
 
     fn write_identity(directory: &TempDir, name: &str) -> (PathBuf, PathBuf) {
-        let key = KeyPair::generate().expect("generate key");
-        let certificate = CertificateParams::new(vec!["localhost".to_string()])
-            .expect("certificate params")
-            .self_signed(&key)
-            .expect("self-signed certificate");
+        let identity = TestTlsIdentity::new("localhost");
         let certificate_path = directory.path().join(format!("{name}-certificate.pem"));
         let private_key_path = directory.path().join(format!("{name}-private-key.pem"));
-        std::fs::write(&certificate_path, certificate.pem()).expect("write certificate");
-        std::fs::write(&private_key_path, key.serialize_pem()).expect("write private key");
+        crate::filesystem::write_public_file(&certificate_path, identity.certificate_chain_pem())
+            .expect("write certificate");
+        crate::filesystem::write_private_file(&private_key_path, identity.private_key_pem())
+            .expect("write private key");
         (certificate_path, private_key_path)
     }
 
@@ -226,14 +200,15 @@ mod tests {
         ));
 
         let empty_key_path = directory.path().join("empty-key.pem");
-        std::fs::write(&empty_key_path, []).expect("write empty key");
+        crate::filesystem::write_private_file(&empty_key_path, []).expect("write empty key");
         assert!(matches!(
             load_static_server_config(&certificate_path, &empty_key_path, Vec::new()),
             Err(StaticTlsIdentityError::UnsupportedPrivateKey { .. })
         ));
 
         let empty_certificate_path = directory.path().join("empty-certificate.pem");
-        std::fs::write(&empty_certificate_path, []).expect("write empty certificate");
+        crate::filesystem::write_public_file(&empty_certificate_path, [])
+            .expect("write empty certificate");
         assert!(matches!(
             load_static_server_config(&empty_certificate_path, &private_key_path, Vec::new()),
             Err(StaticTlsIdentityError::EmptyCertificateChain { .. })

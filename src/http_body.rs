@@ -613,7 +613,8 @@ impl CaptureWebSocketInflateSession {
         let output_offset = align_up(size_of::<InflateState>(), std::mem::align_of::<u128>())
             .filter(|offset| *offset < workspace.len())
             .ok_or(CaptureHttpDecodeError::ResourceExhausted)?;
-        if !(workspace.as_mut_ptr() as usize).is_multiple_of(std::mem::align_of::<InflateState>()) {
+        let state_alignment = std::mem::align_of::<InflateState>();
+        if (workspace.as_mut_ptr() as usize) & (state_alignment - 1) != 0 {
             return Err(CaptureHttpDecodeError::ResourceExhausted);
         }
         let (state_bytes, _) = workspace.as_mut_bytes().split_at_mut(output_offset);
@@ -939,9 +940,9 @@ impl<A: AllocationAuthority + Send + Sync> InflateSession<A> {
         control: DecodeControl,
     ) -> Result<Self, HttpBodyReadError> {
         let mut workspace = allocate_codec_workspace(guard, workspace_bytes, control).await?;
+        let state_alignment = std::mem::align_of::<InflateState>();
         if workspace.len() < size_of::<InflateState>()
-            || !(workspace.as_mut_ptr() as usize)
-                .is_multiple_of(std::mem::align_of::<InflateState>())
+            || (workspace.as_mut_ptr() as usize) & (state_alignment - 1) != 0
         {
             return Err(HttpBodyReadError::ResourceExhausted);
         }

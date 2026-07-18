@@ -987,8 +987,6 @@ pub(crate) enum ProductStaticResourcesError {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::mpsc as std_mpsc;
     use std::sync::Condvar;
@@ -1068,17 +1066,12 @@ header = "x-acl-proxy-request-id"
             connect: None,
         });
         std::fs::create_dir_all(identity_directory).unwrap();
-        let key = rcgen::KeyPair::generate().unwrap();
-        let certificate = rcgen::CertificateParams::new(vec!["localhost".to_string()])
-            .unwrap()
-            .self_signed(&key)
-            .unwrap();
+        let identity = crate::test_certificates::TestTlsIdentity::new("localhost");
         let certificate_chain = identity_directory.join("server.pem");
         let private_key = identity_directory.join("server-key.pem");
-        std::fs::write(&certificate_chain, certificate.pem()).unwrap();
-        std::fs::write(&private_key, key.serialize_pem()).unwrap();
-        #[cfg(unix)]
-        std::fs::set_permissions(&private_key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        crate::filesystem::write_public_file(&certificate_chain, identity.certificate_chain_pem())
+            .unwrap();
+        crate::filesystem::write_private_file(&private_key, identity.private_key_pem()).unwrap();
         config.listeners.explicit_https = Some(StaticExplicitHttpsListener {
             bind: explicit_https,
             http_versions: versions.clone(),

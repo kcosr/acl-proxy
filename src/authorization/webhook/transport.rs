@@ -43,8 +43,9 @@ where
             error => WebhookDeliveryError::Connector(error),
         })?;
     let stream: Box<dyn WebhookIo> = if let Some(config) = provider.tls() {
-        let server_name = rustls::ServerName::try_from(connected.resolution_host())
-            .map_err(|_| WebhookDeliveryError::TlsServerName)?;
+        let server_name =
+            rustls::pki_types::ServerName::try_from(connected.resolution_host().to_owned())
+                .map_err(|_| WebhookDeliveryError::TlsServerName)?;
         let stream = connected.into_stream();
         let tls = tokio::select! {
             biased;
@@ -371,8 +372,6 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use rcgen::{CertificateParams, KeyPair};
-    use rustls::{Certificate, PrivateKey, ServerConfig};
     use tempfile::TempDir;
     use tokio::sync::oneshot;
     use tokio_rustls::TlsAcceptor;
@@ -388,6 +387,7 @@ mod tests {
         CompiledProviderFailureMode, CompiledTlsTrust, WebhookProviderPlan, WebhookTlsPlan,
     };
     use crate::safety::{HttpWireBodyGuard, WireBodyPool, WireBodyQuotaKey};
+    use crate::test_certificates::TestTlsIdentity;
     use http_access_url::canonicalize_http_url;
 
     fn guard() -> HttpWireBodyGuard {
@@ -450,27 +450,15 @@ mod tests {
 
     fn tls_fixture(hostname: &str) -> TlsFixture {
         let directory = TempDir::new().unwrap();
-        let key = KeyPair::generate().unwrap();
-        let certificate = CertificateParams::new(vec![hostname.to_owned()])
-            .unwrap()
-            .self_signed(&key)
-            .unwrap();
+        let identity = TestTlsIdentity::new(hostname);
         let ca_certificate = directory.path().join("ca.pem");
-        std::fs::write(&ca_certificate, certificate.pem()).unwrap();
-
-        let mut config = ServerConfig::builder()
-            .with_safe_defaults()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![Certificate(certificate.der().to_vec())],
-                PrivateKey(key.serialize_der()),
-            )
+        crate::filesystem::write_public_file(&ca_certificate, identity.root_certificate_pem())
             .unwrap();
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
         TlsFixture {
             _directory: directory,
             ca_certificate,
-            acceptor: TlsAcceptor::from(Arc::new(config)),
+            acceptor: TlsAcceptor::from(Arc::new(identity.server_config(&[b"h2", b"http/1.1"]))),
         }
     }
 

@@ -61,11 +61,10 @@ impl WebhookProvider {
                         WebhookActivationError::Tls(error)
                     }
                 })?;
-            Some(Arc::new(build_client_config(
-                &trust,
-                ClientAlpn::Http1,
-                true,
-            )))
+            Some(Arc::new(
+                build_client_config(&trust, ClientAlpn::Http1, true)
+                    .map_err(WebhookActivationError::Tls)?,
+            ))
         } else {
             debug_assert!(plan.tls.is_none(), "HTTP webhook TLS was compile-rejected");
             None

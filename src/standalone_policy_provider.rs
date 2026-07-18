@@ -177,7 +177,7 @@ impl TokioRuntimeClock {
     fn deadline_millis(&self, deadline: Instant) -> Option<u64> {
         let elapsed = deadline.checked_duration_since(self.epoch)?;
         let whole = u64::try_from(elapsed.as_millis()).ok()?;
-        let rounded = u64::from(!elapsed.subsec_nanos().is_multiple_of(1_000_000));
+        let rounded = u64::from(elapsed.subsec_nanos() % 1_000_000 != 0);
         whole.checked_add(rounded)
     }
 
@@ -1784,6 +1784,26 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod local_response_contract_tests {
     use super::*;
+
+    #[test]
+    fn absolute_deadline_millis_rounds_submillisecond_remainders_up() {
+        let epoch = Instant::now();
+        let clock = TokioRuntimeClock::new(epoch);
+        assert_eq!(clock.deadline_millis(epoch), Some(0));
+        assert_eq!(
+            clock.deadline_millis(epoch + Duration::from_nanos(999_999)),
+            Some(1)
+        );
+        assert_eq!(
+            clock.deadline_millis(epoch + Duration::from_millis(1)),
+            Some(1)
+        );
+        assert_eq!(
+            clock.deadline_millis(epoch + Duration::from_nanos(1_000_001)),
+            Some(2)
+        );
+        assert_eq!(clock.deadline_millis(epoch - Duration::from_nanos(1)), None);
+    }
 
     fn request_and_clock() -> (RuntimeRequest, Arc<TokioRuntimeClock>) {
         request_and_clock_with_deadline(60_000)

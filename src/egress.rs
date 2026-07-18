@@ -332,7 +332,9 @@ impl From<TlsActivationError> for EgressActivationError {
             TlsActivationError::CaUnavailable => Self::CaUnavailable,
             TlsActivationError::CaInvalid => Self::CaInvalid,
             TlsActivationError::CaEmpty => Self::CaEmpty,
-            TlsActivationError::NativeRoots | TlsActivationError::CaUnusable => Self::NeutralTls,
+            TlsActivationError::NativeRoots
+            | TlsActivationError::CaUnusable
+            | TlsActivationError::Configuration => Self::NeutralTls,
         }
     }
 }
@@ -345,11 +347,11 @@ mod tests {
     use std::sync::{Arc, Mutex, Once};
 
     use http_access_types::CanonicalHost;
-    use rcgen::generate_simple_self_signed;
     use tempfile::TempDir;
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
+    use crate::test_certificates::TestTlsIdentity;
 
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
@@ -453,9 +455,9 @@ mod tests {
     }
 
     fn write_ca(directory: &TempDir) -> PathBuf {
-        let generated = generate_simple_self_signed(vec!["test-ca.example".to_string()]).unwrap();
+        let generated = TestTlsIdentity::new("test-ca.example");
         let path = directory.path().join("ca.pem");
-        std::fs::write(&path, generated.cert.pem()).unwrap();
+        crate::filesystem::write_public_file(&path, generated.root_certificate_pem()).unwrap();
         path
     }
 

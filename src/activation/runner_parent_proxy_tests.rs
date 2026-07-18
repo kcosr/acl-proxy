@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{self, BufReader};
+use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -12,14 +12,14 @@ use http_access_runtime::{
     ForwardingDevHarness, ForwardingNetworkFacts, OriginalDestinationProvider,
 };
 use http_access_url::canonicalize_http_url;
-use rcgen::{CertificateParams, KeyPair};
-use rustls::{Certificate, ClientConfig, PrivateKey, RootCertStore, ServerConfig, ServerName};
+use rustls::pki_types::ServerName;
 use tempfile::{tempdir, TempDir};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use super::*;
+use crate::test_certificates::{client_config_for_pem_roots, TestTlsIdentity};
 
 const PARENT_HOST: &str = "parent.test";
 const ORIGIN_HOST: &str = "localhost";
@@ -27,8 +27,7 @@ const ORIGIN_HOST: &str = "localhost";
 struct TestIdentity {
     certificate_path: PathBuf,
     private_key_path: PathBuf,
-    certificate_der: Vec<u8>,
-    private_key_der: Vec<u8>,
+    tls: TestTlsIdentity,
 }
 
 struct FixedOriginalDestination(SocketAddr);
@@ -64,48 +63,25 @@ fn prebound_listener() -> (SocketAddr, StdTcpListener) {
 }
 
 fn write_identity(directory: &Path, name: &str, dns_name: &str) -> TestIdentity {
-    let key = KeyPair::generate().unwrap();
-    let certificate = CertificateParams::new(vec![dns_name.to_owned()])
-        .unwrap()
-        .self_signed(&key)
-        .unwrap();
+    let tls = TestTlsIdentity::new(dns_name);
     let certificate_path = directory.join(format!("{name}-cert.pem"));
     let private_key_path = directory.join(format!("{name}-key.pem"));
-    fs::write(&certificate_path, certificate.pem()).unwrap();
-    crate::filesystem::write_private_file(&private_key_path, key.serialize_pem()).unwrap();
+    crate::filesystem::write_public_file(&certificate_path, tls.certificate_chain_pem()).unwrap();
+    crate::filesystem::write_private_file(&private_key_path, tls.private_key_pem()).unwrap();
     TestIdentity {
         certificate_path,
         private_key_path,
-        certificate_der: certificate.der().to_vec(),
-        private_key_der: key.serialize_der(),
+        tls,
     }
 }
 
 fn tls_acceptor(identity: &TestIdentity) -> TlsAcceptor {
-    let mut config = ServerConfig::builder()
-        .with_safe_defaults()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![Certificate(identity.certificate_der.clone())],
-            PrivateKey(identity.private_key_der.clone()),
-        )
-        .unwrap();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    TlsAcceptor::from(Arc::new(config))
+    TlsAcceptor::from(Arc::new(identity.tls.server_config(&[b"http/1.1"])))
 }
 
 fn tls_connector(certificate_path: &Path) -> TlsConnector {
-    let mut roots = RootCertStore::empty();
-    let mut reader = BufReader::new(fs::File::open(certificate_path).unwrap());
-    for certificate in rustls_pemfile::certs(&mut reader).unwrap() {
-        roots.add(&Certificate(certificate)).unwrap();
-    }
-    let mut config = ClientConfig::builder()
-        .with_safe_defaults()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    TlsConnector::from(Arc::new(config))
+    let pem = fs::read(certificate_path).unwrap();
+    TlsConnector::from(Arc::new(client_config_for_pem_roots(&pem, &[b"http/1.1"])))
 }
 
 fn initialize_generated_ca(directory: &Path, public_chain_path: &Path) {

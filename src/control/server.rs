@@ -844,8 +844,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use std::time::Duration;
 
-    use rcgen::{CertificateParams, KeyPair};
-    use rustls::{Certificate, ClientConfig, RootCertStore, ServerName};
+    use rustls::pki_types::ServerName;
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::Notify;
@@ -853,6 +852,7 @@ mod tests {
 
     use super::*;
     use crate::config::compiler::CompiledTlsIdentity;
+    use crate::test_certificates::{client_config_for_roots, TestTlsIdentity};
 
     fn config(max_connections: usize) -> StaticControlConfig {
         StaticControlConfig {
@@ -888,31 +888,24 @@ mod tests {
 
     fn tls_config(max_connections: usize) -> (StaticControlConfig, TempDir, Vec<u8>) {
         let directory = TempDir::new().unwrap();
-        let key = KeyPair::generate().unwrap();
-        let certificate = CertificateParams::new(vec!["localhost".to_string()])
-            .unwrap()
-            .self_signed(&key)
-            .unwrap();
+        let identity = TestTlsIdentity::new("localhost");
         let certificate_path = directory.path().join("control-certificate.pem");
         let private_key_path = directory.path().join("control-private-key.pem");
-        std::fs::write(&certificate_path, certificate.pem()).unwrap();
-        std::fs::write(&private_key_path, key.serialize_pem()).unwrap();
+        crate::filesystem::write_public_file(&certificate_path, identity.certificate_chain_pem())
+            .unwrap();
+        crate::filesystem::write_private_file(&private_key_path, identity.private_key_pem())
+            .unwrap();
         let mut config = config(max_connections);
         config.tls = Some(CompiledTlsIdentity {
             certificate_chain: certificate_path,
             private_key: private_key_path,
         });
-        (config, directory, certificate.der().to_vec())
+        (config, directory, identity.root_certificate_der())
     }
 
     fn tls_connector(certificate: Vec<u8>, alpn_protocols: Vec<Vec<u8>>) -> TlsConnector {
-        let mut roots = RootCertStore::empty();
-        roots.add(&Certificate(certificate)).unwrap();
-        let mut config = ClientConfig::builder()
-            .with_safe_defaults()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        config.alpn_protocols = alpn_protocols;
+        let authored_alpn = alpn_protocols.iter().map(Vec::as_slice).collect::<Vec<_>>();
+        let config = client_config_for_roots([certificate], &authored_alpn);
         TlsConnector::from(Arc::new(config))
     }
 
