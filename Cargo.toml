@@ -60,6 +60,7 @@ credential-core = { path = "../access-runtime/crates/credential-core", version =
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+rustix = { version = "=1.1.4", default-features = false, features = ["std", "fs", "process"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 socket2 = { version = "0.6", features = ["all"] }

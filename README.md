@@ -122,12 +122,21 @@ that listener's `max_connections`; HTTP/2-only connections do not allocate it.
 The validator checks request framing before Hyper can dispatch policy,
 credential, or destination work.
 
-Generated CA material is private process state. Distribute only the generated
-`ca-cert.pem` to clients. File-backed mode uses explicit `ca_certificate` and
-`ca_private_key` paths. The certificate file may contain an ordered PEM CA
-chain: its first certificate must match the private key and be CA-capable, and
-the complete chain is served with generated leaf certificates. Private keys
-must not grant group or other access. Generated leaf certificates use a
+Generated CA material is private process state with no stable internal file
+names. Export only its public certificate chain to a new caller-selected file:
+
+```bash
+acl-proxy --config /etc/acl-proxy/acl-proxy.toml export-ca --output ./acl-proxy-ca.pem
+```
+
+The command never overwrites an existing file and cannot write inside the
+private generated-storage directory. It is supported on Unix; other platforms
+fail before touching generated storage or the output path. File-backed mode
+uses explicit `ca_certificate` and `ca_private_key` paths. The certificate file
+may contain an ordered PEM CA chain: its first certificate must match the
+private key and be CA-capable, and the complete chain is served with generated
+leaf certificates. Private keys must not grant group or other access. Generated
+leaf certificates use a
 30-day validity window clamped to the signing CA. When leaf persistence is
 enabled, the dynamic directory retains at most `max_cached_certificates`
 distinct host certificate/key/chain sets and prunes older sets on startup and

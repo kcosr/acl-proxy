@@ -14,6 +14,8 @@ use crate::config::{
 use crate::logging::LoggingSettings;
 use crate::runtime::{ReloadTriggerResult, Runtime};
 
+mod export_ca;
+
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
     #[error("{0}")]
@@ -37,6 +39,25 @@ pub enum CliError {
 
     #[error("{0}")]
     Process(String),
+
+    #[error(
+        "generated MITM CA export requires a strict configuration with [mitm] mode = \"generated\""
+    )]
+    ExportCaUnavailable,
+
+    #[error("failed to initialize the generated MITM certificate authority")]
+    ExportCaGeneration,
+
+    #[error("failed to atomically publish the generated MITM public CA certificate")]
+    ExportCaOutput,
+
+    #[error(
+        "the generated MITM public CA certificate was published, but directory durability could not be confirmed"
+    )]
+    ExportCaPublishedUnconfirmed,
+
+    #[error("generated MITM CA export is unsupported on this platform")]
+    ExportCaUnsupportedPlatform,
 }
 
 #[derive(Debug, Parser)]
@@ -69,6 +90,13 @@ pub enum Command {
     Policy {
         #[command(subcommand)]
         command: PolicyCommand,
+    },
+
+    /// Export the generated MITM public CA chain without exposing its private key.
+    ExportCa {
+        /// New caller-selected PEM file. Existing files are never overwritten.
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -168,6 +196,13 @@ pub fn run() -> Result<ExitCode, CliError> {
                 Ok(ExitCode::SUCCESS)
             }
         },
+        Command::ExportCa { output } => {
+            let loaded = load_and_compile_config(config_path)
+                .map_err(|error| CliError::Config(error.to_string()))?;
+            export_ca::export_generated_ca(&loaded.compiled.static_config, &output)?;
+            println!("Exported generated MITM CA to {}", output.display());
+            Ok(ExitCode::SUCCESS)
+        }
     }
 }
 

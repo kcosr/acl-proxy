@@ -33,14 +33,6 @@ require_command() {
     command -v "$1" >/dev/null 2>&1 || fail "required command not found: $1"
 }
 
-file_mode() {
-    if stat -c '%a' "$1" >/dev/null 2>&1; then
-        stat -c '%a' "$1"
-    else
-        stat -f '%Lp' "$1"
-    fi
-}
-
 ephemeral_port() {
     python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()'
 }
@@ -70,7 +62,7 @@ wait_for_exit() {
     return 1
 }
 
-for command in curl openssl python3 stat; do
+for command in curl openssl python3; do
     require_command "$command"
 done
 
@@ -89,6 +81,7 @@ readonly PROXY_BIN
 umask 077
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/acl-proxy-loopback-smoke.XXXXXX")
 mkdir -p "$TMP_DIR/home"
+readonly CA_CERT="$TMP_DIR/mitm-public-ca.pem"
 
 cat >"$TMP_DIR/origin.py" <<'PY'
 import http.server
@@ -219,6 +212,13 @@ EOF
             >"$TMP_DIR/config-validate.log" 2>&1 \
             || fail "generated strict v3 smoke configuration is invalid"
 
+        if [[ ! -s "$CA_CERT" ]]; then
+            env -i HOME="$TMP_DIR/home" PATH="$PATH" \
+                "$PROXY_BIN" export-ca --config "$TMP_DIR/acl-proxy.toml" --output "$CA_CERT" \
+                >"$TMP_DIR/export-ca.log" 2>&1 \
+                || fail "generated public MITM CA export failed"
+        fi
+
         env -i HOME="$TMP_DIR/home" PATH="$PATH" \
             "$PROXY_BIN" run --config "$TMP_DIR/acl-proxy.toml" \
             >"$TMP_DIR/proxy.stdout" 2>"$TMP_DIR/proxy.stderr" &
@@ -280,17 +280,12 @@ http_body=$("${CURL[@]}" --fail --proxy "http://127.0.0.1:$DATA_PORT" \
 [[ "$http_body" == 'origin-ok:http:/allowed' ]] \
     || fail "unexpected allowed HTTP response: $http_body"
 
-readonly CA_CERT="$TMP_DIR/mitm/ca-cert.pem"
-readonly CA_KEY="$TMP_DIR/mitm/ca-key.pem"
-for attempt in {1..120}; do
-    [[ -s "$CA_CERT" && -s "$CA_KEY" ]] && break
-    sleep 0.05
-done
-[[ -s "$CA_CERT" && -s "$CA_KEY" ]] || fail "generated MITM CA files are missing"
-[[ "$(file_mode "$TMP_DIR/mitm")" == 700 ]] \
-    || fail "generated MITM directory is not mode 0700"
-[[ "$(file_mode "$CA_KEY")" == 600 ]] \
-    || fail "generated CA private key is not mode 0600"
+[[ -s "$CA_CERT" ]] || fail "generated public MITM CA export is missing"
+grep -Fq -- '-----BEGIN CERTIFICATE-----' "$CA_CERT" \
+    || fail "generated public MITM CA export is not PEM"
+if grep -Fq -- 'PRIVATE KEY' "$CA_CERT"; then
+    fail "generated public MITM CA export contains private-key material"
+fi
 
 https_body=$("${CURL[@]}" --fail --http1.1 \
     --proxy "http://127.0.0.1:$DATA_PORT" --cacert "$CA_CERT" \

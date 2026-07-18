@@ -41,6 +41,7 @@ dependencies = [
  "predicates",
  "rand",
  "regex",
+ "rustix",
  "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
