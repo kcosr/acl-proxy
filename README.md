@@ -13,7 +13,22 @@ parser or migration mode.
 ## Install
 
 Release archives contain `acl-proxy`, the capture-body extraction helper, this
-README, and `acl-proxy.sample.toml`. To build locally:
+README, `LICENSE`, `THIRD_PARTY_NOTICES`, and `acl-proxy.sample.toml`. To build
+locally:
+
+```text
+acl-proxy-0.2.0-extraction-checkpoint-<acl12>/
+  bin/acl-proxy
+  bin/acl-proxy-extract-capture-body
+  README.md
+  LICENSE
+  THIRD_PARTY_NOTICES
+  acl-proxy.sample.toml
+```
+
+`<acl12>` is the first 12 lowercase hexadecimal characters of the exact
+packaged `acl-proxy` commit. The versioned directory is the archive root, and
+the two executables are its only `bin/` entries.
 
 ```bash
 cargo build --release --locked
@@ -436,4 +451,5 @@ implementation records are under `docs/implementation/`.
 
 ## License
 
-MIT. See `LICENSE`.
+MIT. See `LICENSE`. Dependency attribution and license notices are in
+`THIRD_PARTY_NOTICES`.

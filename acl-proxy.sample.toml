@@ -81,7 +81,7 @@ inject = true
 header = "x-acl-proxy-request-id"
 
 # CONNECT MITM or transparent HTTPS requires a MITM authority. Prefer generated
-# mode for local evaluation; distribute only ca-cert.pem to clients.
+# mode for local evaluation; export its public chain with `acl-proxy export-ca`.
 #
 # [mitm]
 # mode = "generated"

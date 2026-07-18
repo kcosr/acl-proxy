@@ -5,6 +5,7 @@ ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 
 ownership_gates=(
+    scripts/check-packaging-policy.sh
     scripts/check-shared-url-ownership.sh
     scripts/check-shared-acl-ownership.sh
     # Supersedes the deleted standalone, forwarding, product-inventory, and
@@ -16,6 +17,7 @@ ownership_gates=(
     scripts/check-production-websocket-smoke.sh
 )
 mutation_suites=(
+    scripts/tests/check-packaging-policy-test.sh
     scripts/tests/check-shared-url-ownership-test.sh
     scripts/tests/check-shared-acl-ownership-test.sh
     scripts/tests/check-c05-shared-listener-ownership-test.sh
