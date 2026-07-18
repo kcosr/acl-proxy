@@ -443,6 +443,7 @@ impl<A: AllocationAuthority> StableBody<A> {
         self.authority.release(released_charge);
     }
 
+    #[cfg(test)]
     pub(crate) fn current_chunk(&self, offset: usize) -> &[u8] {
         self.head
             .as_deref()
@@ -457,6 +458,7 @@ impl<A: AllocationAuthority> StableBody<A> {
             .is_some_and(|head| head.bytes[..bytes].iter().all(|byte| *byte == 0))
     }
 
+    #[cfg(test)]
     pub(crate) fn consume(&mut self, mut count: usize, head_offset: &mut usize) {
         assert!(count <= self.len, "stable body advance overflow");
         while count != 0 {

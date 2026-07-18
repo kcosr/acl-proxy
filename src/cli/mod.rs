@@ -12,7 +12,6 @@ use crate::config::{
     StaticProductConfig,
 };
 use crate::logging::LoggingSettings;
-use crate::proxy::ingress::ProductProxySupervisorStarter;
 use crate::runtime::{ReloadTriggerResult, Runtime};
 
 #[derive(Debug, thiserror::Error)]
@@ -177,14 +176,8 @@ async fn run_product(loaded: LoadedCompiledConfig) -> Result<(), CliError> {
     let product = ProductRuntime::prepare(loaded)
         .await
         .map_err(|error| CliError::Product(error.to_string()))?;
-    let mut starter = ProductProxySupervisorStarter::new(
-        product.runtime().clone(),
-        product.observation_runtime().clone(),
-        product.upgrade_runtime(),
-    );
-
     product
-        .start_proxy_supervisors(&mut starter)
+        .start_listeners()
         .await
         .map_err(|error| CliError::Product(error.to_string()))?;
     let generation = product
@@ -230,10 +223,10 @@ async fn supervise_process(
                     }
                 }
             }
-            failure = product.wait_for_proxy_failure() => {
+            failure = product.wait_for_listener_failure() => {
                 let message = failure.map_or_else(
                     || "proxy failure observer closed without a terminal result".to_string(),
-                    |error| format!("proxy supervisor failed: {error}"),
+                    |error| format!("proxy listener failed: {error}"),
                 );
                 break Err(CliError::Process(message));
             }

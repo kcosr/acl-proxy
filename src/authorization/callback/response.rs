@@ -1098,7 +1098,7 @@ mod tests {
     }
 
     #[test]
-    fn callback_http_contract_framing_and_parser_bounds() {
+    fn callback_response_body_and_parser_limits_are_exact() {
         let outputs = outputs(false);
         let response = body("\"type\":\"response\",\"decision\":\"deny\"}");
         let (_, guard) = guard(response.len());

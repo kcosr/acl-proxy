@@ -263,7 +263,6 @@ impl ProductActivator {
             standalone,
             request_timeout,
             max_content_decoding_expansion_ratio,
-            resource_plan,
             forwarding_executor: Arc::new(forwarding_executor),
             authorization: Arc::new(authorization),
             credentials: Arc::new(credentials),
@@ -412,10 +411,12 @@ header = "x-acl-proxy-request-id"
         .expect("test configuration compiles")
     }
 
-    fn product_activator(
+    async fn product_activator(
         static_config: &crate::config::StaticProductConfig,
     ) -> Arc<ProductActivator> {
-        let resources = ProductStaticResources::try_new(static_config).unwrap();
+        let resources = ProductStaticResources::try_new(static_config)
+            .await
+            .unwrap();
         resources.activator()
     }
 
@@ -460,7 +461,9 @@ redaction_profile = "environment"
     async fn product_runtime(
         initial: &crate::config::CompiledConfig,
     ) -> (Arc<crate::runtime::Runtime>, Arc<ProductCandidateSource>) {
-        let resources = ProductStaticResources::try_new(&initial.static_config).unwrap();
+        let resources = ProductStaticResources::try_new(&initial.static_config)
+            .await
+            .unwrap();
         let activator = resources.activator();
         let source = Arc::new(ProductCandidateSource::default());
         let ownership = crate::runtime::StaticOwnership::new(
@@ -486,7 +489,7 @@ redaction_profile = "environment"
             crate::config::compiler::CompiledTlsTrust::Custom;
         compiled.reloadable_plan.egress.origin_tls.ca_certificate =
             Some("/sensitive/missing/ca.pem".into());
-        let activator = product_activator(&compiled.static_config);
+        let activator = product_activator(&compiled.static_config).await;
 
         let error = activator
             .activate_generation(
@@ -512,15 +515,26 @@ redaction_profile = "environment"
             .activated()
             .rule_redaction(0)
             .expect("standalone generation binds the rule redaction profile");
+        let capacity = 1024 * 1024;
+        let pool = crate::safety::WireBodyPool::new(capacity, capacity);
+        let guard = pool.begin_for_test(
+            capacity,
+            crate::safety::WireBodyQuotaKey::from_peer(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                |_| true,
+            ),
+        );
+        let mut input_body = guard.buffer();
+        input_body.try_extend_from_slice(input).unwrap();
         let redacted = binding
             .handle()
             .redact_websocket_message(
-                &crate::redaction::UpgradeRedactionContext::for_profile(binding.handle()),
-                crate::redaction::UpgradeRedactionBody::new(input.to_vec()).unwrap(),
+                &guard,
+                input_body.finish(),
                 http_access_redaction::PayloadClass::Text,
             )
             .unwrap();
-        redacted.into_body().into_vec().unwrap()
+        redacted.into_body().segments().flatten().copied().collect()
     }
 
     #[tokio::test]
@@ -596,7 +610,9 @@ redaction_profile = "environment"
     #[tokio::test]
     async fn product_static_owner_and_activator_share_one_authorization_runtime() {
         let compiled = compile(MINIMAL);
-        let resources = ProductStaticResources::try_new(&compiled.static_config).unwrap();
+        let resources = ProductStaticResources::try_new(&compiled.static_config)
+            .await
+            .unwrap();
         let activator = resources.activator();
         assert!(Arc::ptr_eq(
             &resources.authorization_runtime(),
@@ -629,7 +645,9 @@ redaction_profile = "environment"
             "{minimal}\n[control]\nbind = \"127.0.0.1:8898\"\nbase_path = \"/_acl-proxy\"\nrequest_header_timeout = \"100ms\"\nrequest_body_timeout = \"1s\"\nmax_connections = 2\nmax_request_body_bytes = 65536\n"
         );
         let compiled = compile(&text);
-        let resources = ProductStaticResources::try_new(&compiled.static_config).unwrap();
+        let resources = ProductStaticResources::try_new(&compiled.static_config)
+            .await
+            .unwrap();
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = resources
             .start_control_with_listener(listener)
@@ -687,7 +705,9 @@ redaction_profile = "environment"
             "{minimal}\n[control]\nbind = \"127.0.0.1:8898\"\nbase_path = \"/_acl-proxy\"\nrequest_header_timeout = \"30s\"\nrequest_body_timeout = \"1s\"\nmax_connections = 1\nmax_request_body_bytes = 65536\n"
         );
         let compiled = compile(&text);
-        let resources = ProductStaticResources::try_new(&compiled.static_config).unwrap();
+        let resources = ProductStaticResources::try_new(&compiled.static_config)
+            .await
+            .unwrap();
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = resources
             .start_control_with_listener(listener)
@@ -744,7 +764,9 @@ redaction_profile = "environment"
             "{minimal}\n[control]\nbind = \"127.0.0.1:8898\"\nbase_path = \"/_acl-proxy\"\nrequest_header_timeout = \"5s\"\nrequest_body_timeout = \"1s\"\nmax_connections = 1\nmax_request_body_bytes = 65536\n"
         );
         let compiled = compile(&text);
-        let resources = ProductStaticResources::try_new(&compiled.static_config).unwrap();
+        let resources = ProductStaticResources::try_new(&compiled.static_config)
+            .await
+            .unwrap();
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         let address = resources
             .start_control_with_listener(listener)
@@ -779,7 +801,9 @@ redaction_profile = "environment"
             "{MINIMAL}\n[control]\nbind = \"127.0.0.1:8898\"\nbase_path = \"/_acl-proxy\"\nrequest_header_timeout = \"1s\"\nrequest_body_timeout = \"1s\"\nmax_connections = 1\nmax_request_body_bytes = 65536\n"
         );
         let compiled = compile(&text);
-        let resources = ProductStaticResources::try_new(&compiled.static_config).unwrap();
+        let resources = ProductStaticResources::try_new(&compiled.static_config)
+            .await
+            .unwrap();
         let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         resources
             .start_control_with_accept_errors(
@@ -840,7 +864,7 @@ redaction_profile = "environment"
             "{MINIMAL}\n[redaction.profiles.audit]\nrules = [{{ literals = [\"marker\"] }}]\n\n[observation.capture]\nevents = [\"request.denied\"]\nredaction_profile = \"audit\"\ndirectory = \"captures\"\nmax_body_bytes = 1024\nmax_inflight_body_bytes = {INITIAL_CAPTURE_LIMIT}\n"
         );
         let compiled = compile(&text);
-        let activator = product_activator(&compiled.static_config);
+        let activator = product_activator(&compiled.static_config).await;
         let observation_runtime = activator.observation_runtime_handle();
 
         let activated = activator
@@ -961,7 +985,7 @@ redaction_profile = "environment"
     #[tokio::test]
     async fn logging_level_changes_only_with_generation_publication() {
         let initial = compile(&MINIMAL.replace("level = \"info\"", "level = \"warn\""));
-        let activator = product_activator(&initial.static_config);
+        let activator = product_activator(&initial.static_config).await;
         let logging = activator.logging_level_handle();
         assert_eq!(
             logging.current(),
@@ -1023,7 +1047,7 @@ redaction_profile = "environment"
     #[tokio::test]
     async fn pre_cancelled_candidate_has_no_publication_effect() {
         let compiled = compile(MINIMAL);
-        let activator = product_activator(&compiled.static_config);
+        let activator = product_activator(&compiled.static_config).await;
         let observation_runtime = activator.observation_runtime_handle();
         let cancellation = ActivationCancellation::new_for_test();
         cancellation.cancel_for_test();
@@ -1042,7 +1066,7 @@ redaction_profile = "environment"
             "{MINIMAL}\n[redaction.profiles.audit]\nrules = [{{ literals = [\"marker\"] }}]\n\n[observation.capture]\nevents = [\"request.denied\"]\nredaction_profile = \"audit\"\ndirectory = \"captures\"\nmax_body_bytes = 1024\n"
         );
         let compiled = compile(&text);
-        let activator = product_activator(&compiled.static_config);
+        let activator = product_activator(&compiled.static_config).await;
         let activated = activator
             .activate_generation(
                 compiled.reloadable_plan,
@@ -1102,7 +1126,7 @@ default = "deny""#,
             config_root: directory.path(),
         })
         .unwrap();
-        let activator = product_activator(&compiled.static_config);
+        let activator = product_activator(&compiled.static_config).await;
 
         let activated = activator
             .activate_generation(
@@ -1159,7 +1183,7 @@ default = "deny""#,
             config_root: directory.path(),
         })
         .unwrap();
-        let activator = product_activator(&compiled.static_config);
+        let activator = product_activator(&compiled.static_config).await;
         let cancellation = ActivationCancellation::new_for_test();
         let hook_cancellation = cancellation.clone();
         let observed = Arc::new(Mutex::new(None));
@@ -1234,7 +1258,7 @@ default = "deny""#,
             config_root: directory.path(),
         })
         .unwrap();
-        let activator = product_activator(&compiled.static_config);
+        let activator = product_activator(&compiled.static_config).await;
         let observed = Arc::new(Mutex::new(None));
         let hook_observed = observed.clone();
 
@@ -1298,7 +1322,7 @@ default = "deny""#
             ),
         );
         let compiled = compile(&text);
-        let activator = product_activator(&compiled.static_config);
+        let activator = product_activator(&compiled.static_config).await;
 
         let result = activator
             .activate_generation(
@@ -1324,8 +1348,8 @@ default = "deny""#
         );
         let first_config = compile(&text);
         let second_config = compile(&text);
-        let first = product_activator(&first_config.static_config);
-        let second = product_activator(&second_config.static_config);
+        let first = product_activator(&first_config.static_config).await;
+        let second = product_activator(&second_config.static_config).await;
         let first_observation = first.observation_runtime_handle();
         let second_observation = second.observation_runtime_handle();
         let first_authorization = first.authorization_runtime_handle();

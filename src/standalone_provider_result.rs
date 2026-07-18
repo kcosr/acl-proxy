@@ -6,7 +6,10 @@ use std::sync::Arc;
 use http_access_policy_acl::MatchedEffects;
 #[cfg(all(test, unix))]
 use http_access_policy_acl::{EvaluationInput, PolicyEvaluation, ProviderDisposition};
-use http_access_runtime::{RuntimeRequest, StandalonePlan, StandaloneTrusted};
+use http_access_runtime::{
+    RuntimeRequest, StandalonePlan, StandaloneTrusted, UpgradeAdmissionPlan,
+    UpgradeAdmissionPlanError,
+};
 #[cfg(all(test, unix))]
 use http_access_types::BodyObservation;
 use http_access_types::{
@@ -29,12 +32,6 @@ use crate::standalone::{
     BoundCredentialSource, ProviderCredentialTemplates, StandaloneCaptureEvent,
     StandaloneGenerationPlan,
 };
-use crate::upgrade::UpgradeAllocation;
-
-pub(crate) struct StandaloneUpgradeBinding {
-    pub(crate) allocation: UpgradeAllocation,
-    pub(crate) wire_redaction: Option<http_access_redaction::RedactionProfile>,
-}
 
 pub(crate) struct StandaloneProviderAllow {
     pub(crate) plan: StandalonePlan,
@@ -57,7 +54,7 @@ pub(crate) enum StandaloneAllowMode {
 pub(crate) struct StandaloneRequestSidecar {
     plan_binding: PlanBinding,
     capture_body: StandaloneCaptureBody,
-    upgrade: Option<StandaloneUpgradeBinding>,
+    upgrade: Option<UpgradeAdmissionPlan>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +97,8 @@ pub(crate) enum StandaloneProviderAllowError {
     Runtime(#[source] http_access_runtime::RuntimeError),
     #[error("provider allow forwarding intent is invalid")]
     Plan(#[source] http_access_types::ContractError),
+    #[error("provider allow upgrade admission is invalid")]
+    Upgrade(#[source] UpgradeAdmissionPlanError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -129,10 +128,10 @@ impl StandaloneRequestSidecar {
         self.capture_body
     }
 
-    pub(crate) fn take_upgrade_binding(
+    pub(crate) fn take_upgrade_admission(
         &mut self,
         plan_binding: PlanBinding,
-    ) -> Result<Option<StandaloneUpgradeBinding>, StandaloneProviderAllowError> {
+    ) -> Result<Option<UpgradeAdmissionPlan>, StandaloneProviderAllowError> {
         if plan_binding != self.plan_binding {
             return Err(StandaloneProviderAllowError::Binding);
         }
@@ -211,7 +210,7 @@ fn adapt_provider_allow_inner(
         .get(provider.get())
         .filter(|templates| templates.ordinal() == provider.get())
         .ok_or(StandaloneProviderAllowError::Binding)?;
-    let upgrade_binding = compile_upgrade_binding(lease, Some(rule_ordinal), &request)?;
+    let upgrade_redaction = compile_upgrade_redaction(lease, Some(rule_ordinal), &request)?;
 
     let (provider_credentials, provider_wire) = if outer_connect {
         (Vec::new(), None)
@@ -291,7 +290,7 @@ fn adapt_provider_allow_inner(
         provider_wire,
         provider_content_type,
         provider_replacement_size,
-        upgrade_binding,
+        upgrade_redaction,
         guard,
         request,
         lease.credential_io_runtime(),
@@ -332,7 +331,7 @@ pub(crate) fn adapt_local_allow(
             inspected_body,
         )?;
     }
-    let upgrade_binding = compile_upgrade_binding(lease, rule_ordinal, &request)?;
+    let upgrade_redaction = compile_upgrade_redaction(lease, rule_ordinal, &request)?;
     finish_allow(
         generation,
         rule,
@@ -342,7 +341,7 @@ pub(crate) fn adapt_local_allow(
         None,
         None,
         None,
-        upgrade_binding,
+        upgrade_redaction,
         guard,
         request,
         lease.credential_io_runtime(),
@@ -381,7 +380,7 @@ fn finish_allow(
     provider_wire: Option<ProviderCredentialWireStore>,
     provider_content_type: Option<HeaderMutationBatch>,
     provider_replacement_size: Option<usize>,
-    upgrade_binding: Option<StandaloneUpgradeBinding>,
+    upgrade_redaction: Option<http_access_redaction::RedactionProfile>,
     guard: HttpWireBodyGuard,
     request: RuntimeRequest,
     credential_io_runtime: Arc<crate::credential_io_runtime::CredentialIoRuntime>,
@@ -493,6 +492,17 @@ fn finish_allow(
     let plan_binding = plan.binding();
     let plan = StandaloneTrusted::validate(plan, &request, generation.snapshot_lease())
         .map_err(StandaloneProviderAllowError::Runtime)?;
+    let upgrade_admission = if matches!(plan.forwarding_plan().upgrade(), UpgradePolicy::Deny) {
+        if upgrade_redaction.is_some() {
+            return Err(StandaloneProviderAllowError::Binding);
+        }
+        None
+    } else {
+        Some(
+            UpgradeAdmissionPlan::new(plan.forwarding_plan(), upgrade_redaction)
+                .map_err(StandaloneProviderAllowError::Upgrade)?,
+        )
+    };
     let credential_preparation = if outer_connect {
         None
     } else {
@@ -508,7 +518,7 @@ fn finish_allow(
     let sidecar = StandaloneRequestSidecar {
         plan_binding,
         capture_body,
-        upgrade: upgrade_binding,
+        upgrade: upgrade_admission,
     };
     Ok(StandaloneProviderAllow {
         plan,
@@ -730,32 +740,21 @@ fn compile_upgrade(
     }
 }
 
-fn compile_upgrade_binding(
+fn compile_upgrade_redaction(
     lease: &GenerationLease,
     rule_ordinal: Option<usize>,
     request: &RuntimeRequest,
-) -> Result<Option<StandaloneUpgradeBinding>, StandaloneProviderAllowError> {
+) -> Result<Option<http_access_redaction::RedactionProfile>, StandaloneProviderAllowError> {
     if request.facts().upgrade().is_none() {
         return Ok(None);
     }
     let ordinal = rule_ordinal.ok_or(StandaloneProviderAllowError::Binding)?;
-    let compiled_wire_bytes = lease
-        .resource_plan()
-        .upgrade_wire_working_set_bytes_by_rule
-        .get(ordinal)
-        .copied()
-        .flatten();
-    let allocation = UpgradeAllocation::from_compiled_rule(ordinal, compiled_wire_bytes)
-        .map_err(|_| StandaloneProviderAllowError::Binding)?;
     let wire_redaction = lease
         .standalone()
         .activated()
         .rule_redaction(ordinal)
         .map(|binding| binding.handle().clone());
-    Ok(Some(StandaloneUpgradeBinding {
-        allocation,
-        wire_redaction,
-    }))
+    Ok(wire_redaction)
 }
 
 #[cfg(all(test, unix))]
@@ -950,7 +949,9 @@ header = "x-test-loop"
         Arc<crate::safety::WireBodyPool>,
     ) {
         let initial = compiled_text(text);
-        let resources = ProductStaticResources::try_new(&initial.static_config).unwrap();
+        let resources = ProductStaticResources::try_new(&initial.static_config)
+            .await
+            .unwrap();
         let pool = resources.wire_body_pool();
         let activator = resources.activator();
         let ownership = StaticOwnership::new(

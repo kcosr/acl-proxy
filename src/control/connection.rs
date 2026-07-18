@@ -6,9 +6,8 @@ use tokio::time::Instant;
 
 use crate::authorization::webhook::runtime::WebhookAuthorizationRuntime;
 use crate::config::compiler::StaticControlConfig;
-use crate::http1::framing::BodyFraming;
-use crate::http1::head::{parse_request_head, HeadParse, RequestHead};
 use crate::runtime::ServiceReadiness;
+use http_access_runtime::http1::{parse_request_head, BodyFraming, HeadParse, RequestHead};
 
 use super::admission::ControlConnectionLease;
 use super::callback::handle_callback_entity;
@@ -53,18 +52,18 @@ where
 
         // The control protocol never emits an interim response. Closing here
         // avoids waiting on a caller that withheld its entity for 100 Continue.
-        if head.expect_present {
+        if head.expect_present() {
             return Ok(());
         }
 
-        let client_closes = head.connection_close;
+        let client_closes = head.connection_close();
         let body_deadline = Instant::now() + context.config.request_body_timeout;
         let outcome = match context.router.classify(&head) {
             ControlRoute::Callback => {
                 let outcome = handle_callback_entity(
                     &mut stream,
                     lease.parser_store_mut(),
-                    head.framing,
+                    head.framing(),
                     context.authorization,
                     context.config.max_request_body_bytes,
                     body_deadline,
@@ -78,7 +77,7 @@ where
             ControlRoute::Readiness => RequestOutcome {
                 response: Some(ControlResponse::readiness(context.readiness.is_ready())),
                 reusable: matches!(
-                    head.framing,
+                    head.framing(),
                     BodyFraming::None | BodyFraming::ContentLength(0)
                 ),
             },
@@ -398,11 +397,7 @@ mod tests {
         let mut lease = arena.try_acquire().unwrap();
         lease.parser_store_mut().writable().fill(0xa5);
         assert!(prepare_parser_store_for_response(&mut lease, true, false));
-        assert!(lease
-            .parser_store()
-            .complete_storage()
-            .iter()
-            .all(|byte| *byte == 0));
+        assert!(lease.parser_store().storage_is_zeroed());
 
         lease
             .parser_store_mut()
@@ -410,11 +405,7 @@ mod tests {
             .unwrap();
         assert!(!prepare_parser_store_for_response(&mut lease, false, false));
         assert_eq!(lease.parser_store().initialized_len(), 0);
-        assert!(lease
-            .parser_store()
-            .complete_storage()
-            .iter()
-            .all(|byte| *byte == 0));
+        assert!(lease.parser_store().storage_is_zeroed());
     }
 
     #[tokio::test]

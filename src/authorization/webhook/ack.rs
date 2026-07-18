@@ -1,10 +1,9 @@
 use std::fmt;
 
-use crate::http1::framing::{
-    BodyFramer, BodyFraming, BodyProgress, FramingError, FramingProcessError,
+use http_access_runtime::http1::{
+    parse_response_head, BodyFramer, BodyFraming, BodyProgress, FramingError, FramingProcessError,
+    HeadError, HeadParse, ParserStore,
 };
-use crate::http1::head::{parse_response_head, HeadError, HeadParse};
-use crate::http1::store::ParserStore;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct WebhookAcknowledgement {
@@ -64,7 +63,7 @@ impl AcknowledgementParser {
                 HeadParse::Incomplete => return Ok(AcknowledgementProgress::NeedInput),
                 HeadParse::Complete(head) => head,
             };
-            match head.framing {
+            match head.framing() {
                 BodyFraming::ContentLength(length) => {
                     if length > self.max_response_bytes {
                         return Err(AcknowledgementError::ResponseBodyTooLarge);
@@ -73,8 +72,8 @@ impl AcknowledgementParser {
                 BodyFraming::Chunked | BodyFraming::CloseDelimited | BodyFraming::None => {}
             }
             self.state = ParserState::Body {
-                status: head.status,
-                framer: BodyFramer::new(head.framing),
+                status: head.status(),
+                framer: BodyFramer::new(head.framing()),
             };
         }
 
@@ -192,9 +191,9 @@ impl std::error::Error for AcknowledgementError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http1::framing::MAX_CHUNK_LINE_BYTES;
-    use crate::http1::head::{MAX_FIELD_LINE_BYTES, MAX_HEADER_FIELDS};
-    use crate::http1::store::PARSER_STORE_BYTES;
+    use http_access_runtime::http1::{
+        MAX_CHUNK_LINE_BYTES, MAX_FIELD_LINE_BYTES, MAX_HEADER_FIELDS, PARSER_STORE_BYTES,
+    };
 
     #[test]
     fn webhook_delivery_ack_and_failure_matrix() {
@@ -309,8 +308,8 @@ mod tests {
             Ok(AcknowledgementProgress::NeedInput)
         );
         assert_eq!(store.initialized_len(), 0);
-        assert_eq!(store.zeroized_bytes_for_test(), PARSER_STORE_BYTES);
-        assert!(store.complete_storage().iter().all(|byte| *byte == 0));
+        assert_eq!(store.zeroized_bytes(), PARSER_STORE_BYTES);
+        assert!(store.storage_is_zeroed());
 
         let mut chunk_line = b"4;edge=".to_vec();
         chunk_line.extend(std::iter::repeat_n(

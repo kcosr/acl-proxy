@@ -5,13 +5,9 @@ use std::pin::pin;
 use std::ptr;
 use std::task::{Context, Poll};
 
-#[cfg(test)]
-use bytes::Buf;
 use http::header::{HeaderMap, CONTENT_ENCODING, TRAILER};
 use http_access_runtime::{RuntimeError, RuntimeRequest};
 use http_access_types::{BodyFraming, BodyObservationState};
-#[cfg(test)]
-use hyper::body::HttpBody;
 use miniz_oxide::inflate::stream::{inflate, InflateState};
 use miniz_oxide::{DataFormat, MZFlush, MZStatus};
 use tokio::time::Instant;
@@ -382,81 +378,6 @@ async fn allocate_codec_workspace<C: DecodeContext>(
     Ok(allocation.finish())
 }
 
-#[cfg(test)]
-async fn read_mandatory_request_body<B>(
-    headers: &HeaderMap,
-    mut body: B,
-    limits: HttpBodyReadLimits,
-    max_expansion_ratio: usize,
-    deadline: Instant,
-    guard: &HttpWireBodyGuard,
-) -> Result<GuardedRequestBody, HttpBodyReadError>
-where
-    B: HttpBody + Unpin,
-    B::Data: Buf,
-{
-    let encoding = parse_content_encoding(headers)?;
-    if headers.contains_key(TRAILER) {
-        return Err(HttpBodyReadError::RequestTrailersUnsupported);
-    }
-    let mut encoded = guard.buffer();
-    loop {
-        check_deadline(deadline)?;
-        let next = tokio::time::timeout_at(deadline, body.data())
-            .await
-            .map_err(|_| HttpBodyReadError::TimedOut)?;
-        let Some(chunk) = next else {
-            break;
-        };
-        let mut chunk = chunk.map_err(|_| HttpBodyReadError::ReadFailed)?;
-        if !chunk.has_remaining() {
-            cooperative_checkpoint(deadline).await?;
-            continue;
-        }
-        while chunk.has_remaining() {
-            check_deadline(deadline)?;
-            let available = chunk.chunk();
-            let bytes = &available[..available.len().min(MAX_BUFFER_GROWTH_BYTES)];
-            if bytes.is_empty() {
-                return Err(HttpBodyReadError::ReadFailed);
-            }
-            let next_len = encoded
-                .len()
-                .checked_add(bytes.len())
-                .ok_or(HttpBodyReadError::EncodedLimitExceeded)?;
-            if next_len > limits.max_encoded_bytes() {
-                return Err(HttpBodyReadError::EncodedLimitExceeded);
-            }
-            encoded.try_extend_from_slice(bytes)?;
-            chunk.advance(bytes.len());
-            cooperative_checkpoint(deadline).await?;
-        }
-    }
-    let trailers = tokio::time::timeout_at(deadline, body.trailers())
-        .await
-        .map_err(|_| HttpBodyReadError::TimedOut)?
-        .map_err(|_| HttpBodyReadError::ReadFailed)?;
-    if trailers.is_some_and(|trailers| !trailers.is_empty()) {
-        return Err(HttpBodyReadError::RequestTrailersUnsupported);
-    }
-
-    let encoded = encoded.finish();
-    let encoded_len = encoded.len();
-    let decoded = decode_complete_http_body(
-        encoding,
-        encoded,
-        guard,
-        limits.max_decoded_bytes(),
-        max_expansion_ratio,
-        DecodeControl::wire(deadline),
-    )
-    .await?;
-    Ok(GuardedRequestBody {
-        encoded_len,
-        body: decoded,
-    })
-}
-
 pub(crate) async fn read_mandatory_runtime_request_body(
     request: &mut RuntimeRequest,
     limits: HttpBodyReadLimits,
@@ -477,7 +398,7 @@ pub(crate) async fn read_mandatory_runtime_request_body(
     {
         return Err(HttpBodyReadError::ReadFailed);
     }
-    let headers = crate::proxy::facts::product_headers(request.facts().headers())
+    let headers = crate::proxy::private_fields::product_headers(request.facts().headers())
         .map_err(|_| HttpBodyReadError::ReadFailed)?;
     let encoding = parse_content_encoding(&headers)?;
     if headers.contains_key(TRAILER) {
@@ -1777,7 +1698,6 @@ mod tests {
     use std::task::{Context, Poll};
     use std::time::Duration;
 
-    use bytes::Bytes;
     use flate2::write::{DeflateEncoder, GzEncoder, ZlibEncoder};
     use flate2::{Compress, Compression, FlushCompress, Status};
     use http::HeaderValue;
@@ -1791,8 +1711,6 @@ mod tests {
         HttpVersion, IngressMode, InterceptedRequestFacts, PolicyHeaderFacts,
     };
     use http_access_url::canonicalize_http_url;
-    use hyper::Body;
-    use tokio_stream::StreamExt;
 
     use crate::capture::CaptureSinkSpec;
     use crate::config::compiler::{
@@ -1837,13 +1755,19 @@ mod tests {
         let peak = compiled_peak(max_encoded, max_decoded);
         let pool = WireBodyPool::new(peak, peak);
         let guard = pool.begin_for_test(peak, key());
-        let mut headers = HeaderMap::new();
-        if let Some(encoding) = encoding {
-            headers.insert(CONTENT_ENCODING, HeaderValue::from_str(encoding).unwrap());
-        }
-        let result = read_mandatory_request_body(
-            &headers,
-            Body::from(encoded),
+        let headers = encoding
+            .map(|encoding| {
+                vec![HeaderField::new(
+                    NeutralHeaderName::new("content-encoding").unwrap(),
+                    NeutralHeaderValue::new(encoding.as_bytes().to_vec()).unwrap(),
+                )]
+            })
+            .unwrap_or_default();
+        let encoded_len = encoded.len() as u64;
+        let mut request =
+            runtime_request_from_chunks_with_headers(vec![encoded], encoded_len, headers);
+        let result = read_mandatory_runtime_request_body(
+            &mut request,
             limits(max_encoded, max_decoded),
             ratio,
             Instant::now() + Duration::from_secs(5),
@@ -2772,153 +2696,6 @@ mod tests {
         assert_eq!(pool.global_charge(), 0);
     }
 
-    #[tokio::test]
-    async fn mandatory_normalization_rejects_declared_and_delivered_trailers() {
-        let max = 1024;
-        let peak = compiled_peak(max, max);
-        let pool = WireBodyPool::new(peak, peak);
-        let guard = pool.begin_for_test(peak, key());
-        let mut headers = HeaderMap::new();
-        headers.insert(TRAILER, HeaderValue::from_static("x-checksum"));
-        let error = read_mandatory_request_body(
-            &headers,
-            Body::from("body"),
-            limits(max, max),
-            1,
-            Instant::now() + Duration::from_secs(1),
-            &guard,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error, HttpBodyReadError::RequestTrailersUnsupported);
-        assert_eq!(pool.global_charge(), 0);
-
-        let pool = WireBodyPool::new(peak, peak);
-        let guard = pool.begin_for_test(peak, key());
-        let (mut sender, body) = Body::channel();
-        let producer = tokio::spawn(async move {
-            sender.send_data(Bytes::from_static(b"body")).await.unwrap();
-            let mut trailers = HeaderMap::new();
-            trailers.insert("x-checksum", HeaderValue::from_static("private"));
-            sender.send_trailers(trailers).await.unwrap();
-        });
-        let error = read_mandatory_request_body(
-            &HeaderMap::new(),
-            body,
-            limits(max, max),
-            1,
-            Instant::now() + Duration::from_secs(1),
-            &guard,
-        )
-        .await
-        .unwrap_err();
-        producer.await.unwrap();
-        assert_eq!(error, HttpBodyReadError::RequestTrailersUnsupported);
-        assert!(!error.to_string().contains("private"));
-        assert_eq!(guard.live_bytes(), 0);
-        assert_eq!(pool.global_charge(), 0);
-    }
-
-    #[tokio::test]
-    async fn timeout_and_read_error_restore_every_charge() {
-        let max = 1024;
-        let peak = compiled_peak(max, max);
-        let headers = HeaderMap::new();
-
-        let pool = WireBodyPool::new(peak, peak);
-        let guard = pool.begin_for_test(peak, key());
-        let pending = tokio_stream::pending::<Result<Bytes, std::io::Error>>();
-        let error = read_mandatory_request_body(
-            &headers,
-            Body::wrap_stream(pending),
-            limits(max, max),
-            1,
-            Instant::now() + Duration::from_millis(10),
-            &guard,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error, HttpBodyReadError::TimedOut);
-        assert_eq!(guard.live_bytes(), 0);
-        assert_eq!(pool.global_charge(), 0);
-
-        let pool = WireBodyPool::new(peak, peak);
-        let guard = pool.begin_for_test(peak, key());
-        let failed = tokio_stream::iter([Err::<Bytes, _>(std::io::Error::other("private"))]);
-        let error = read_mandatory_request_body(
-            &headers,
-            Body::wrap_stream(failed),
-            limits(max, max),
-            1,
-            Instant::now() + Duration::from_secs(1),
-            &guard,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error, HttpBodyReadError::ReadFailed);
-        assert!(!error.to_string().contains("private"));
-        assert_eq!(guard.live_bytes(), 0);
-        assert_eq!(pool.global_charge(), 0);
-    }
-
-    #[tokio::test]
-    async fn cancellation_restores_encoded_input_charge() {
-        let max = 1024;
-        let peak = compiled_peak(max, max);
-        let pool = WireBodyPool::new(peak, peak);
-        let guard = pool.begin_for_test(peak, key());
-        let observed_pool = pool.clone();
-        let stream = tokio_stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"held"))])
-            .chain(tokio_stream::pending());
-        let task = tokio::spawn(async move {
-            read_mandatory_request_body(
-                &HeaderMap::new(),
-                Body::wrap_stream(stream),
-                limits(max, max),
-                1,
-                Instant::now() + Duration::from_secs(30),
-                &guard,
-            )
-            .await
-        });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while observed_pool.global_charge() == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        assert_eq!(observed_pool.global_charge(), 0);
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn immediately_ready_large_data_chunk_is_cooperatively_cancellable() {
-        let max = 8 * MIB;
-        let peak = compiled_peak(max, max);
-        let pool = WireBodyPool::new(peak, peak);
-        let guard = pool.begin_for_test(peak, key());
-        let observed_pool = pool.clone();
-        let task = tokio::spawn(async move {
-            read_mandatory_request_body(
-                &HeaderMap::new(),
-                Body::from(vec![0x41; max]),
-                limits(max, max),
-                1,
-                Instant::now() + Duration::from_secs(30),
-                &guard,
-            )
-            .await
-        });
-        while observed_pool.global_charge() == 0 {
-            tokio::task::yield_now().await;
-        }
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        assert_eq!(observed_pool.global_charge(), 0);
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn partially_initialized_workspace_is_cooperatively_cancellable() {
         let requested = 20 * MIB;
@@ -2940,57 +2717,6 @@ mod tests {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(observed_pool.global_charge(), 0);
-    }
-
-    #[tokio::test]
-    async fn http_decoder_workspace_is_bounded_and_charged() {
-        let plain = b"workspace accounting".repeat(4096);
-        let cases = [
-            (
-                "gzip",
-                gzip(&plain),
-                http_decoder_workspace_sizes().unwrap().deflate,
-            ),
-            (
-                "deflate",
-                raw_deflate(&plain),
-                http_decoder_workspace_sizes().unwrap().deflate,
-            ),
-            (
-                "br",
-                brotli(&plain),
-                http_decoder_workspace_sizes().unwrap().brotli,
-            ),
-            (
-                "zstd",
-                zstd(&plain),
-                http_decoder_workspace_sizes().unwrap().zstd,
-            ),
-        ];
-        for (encoding, encoded, workspace) in cases {
-            let expected_peak = guarded_body_allocation_bytes(encoded.len()).unwrap()
-                + guarded_body_allocation_bytes(plain.len()).unwrap()
-                + guarded_body_allocation_bytes(HTTP_DECODER_OUTPUT_STAGING_BYTES).unwrap()
-                + guarded_workspace_allocation_bytes(workspace).unwrap();
-            let pool = WireBodyPool::new(expected_peak, expected_peak);
-            let guard = pool.begin_for_test(expected_peak, key());
-            let mut headers = HeaderMap::new();
-            headers.insert(CONTENT_ENCODING, HeaderValue::from_str(encoding).unwrap());
-            let body = read_mandatory_request_body(
-                &headers,
-                Body::from(encoded.clone()),
-                limits(encoded.len(), plain.len()),
-                128,
-                Instant::now() + Duration::from_secs(5),
-                &guard,
-            )
-            .await
-            .unwrap_or_else(|error| panic!("encoding {encoding}: {error:?}"));
-            assert_eq!(pool.peak_global_charge(), expected_peak, "{encoding}");
-            drop(body);
-            assert_eq!(guard.live_bytes(), 0);
-            assert_eq!(pool.global_charge(), 0);
-        }
     }
 
     #[tokio::test]

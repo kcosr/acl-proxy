@@ -6,7 +6,7 @@ use allocator_api2::boxed::Box as FallibleBox;
 use tokio::sync::Notify;
 use zeroize::Zeroize;
 
-use crate::http1::store::{ParserStore, ParserStoreAllocationError, PARSER_STORE_BYTES};
+use http_access_runtime::http1::{ParserStore, ParserStoreAllocationError, PARSER_STORE_BYTES};
 
 #[derive(Clone)]
 pub(crate) struct WebhookTransportArena {
@@ -524,11 +524,7 @@ mod tests {
         assert_eq!(replacement.outbound().len(), BUFFER_BYTES);
         assert_eq!(replacement.inbound().capacity(), BUFFER_BYTES);
         assert!(replacement.outbound().iter().all(|byte| *byte == 0));
-        assert!(replacement
-            .inbound()
-            .complete_storage()
-            .iter()
-            .all(|byte| *byte == 0));
+        assert!(replacement.inbound().storage_is_zeroed());
 
         drop(second);
         drop(replacement);
@@ -667,11 +663,7 @@ mod tests {
         let replacement = arena.try_acquire().unwrap();
         assert!(replacement.outbound().iter().all(|byte| *byte == 0));
         assert_eq!(replacement.inbound().initialized_len(), 0);
-        assert!(replacement
-            .inbound()
-            .complete_storage()
-            .iter()
-            .all(|byte| *byte == 0));
+        assert!(replacement.inbound().storage_is_zeroed());
     }
 
     #[test]

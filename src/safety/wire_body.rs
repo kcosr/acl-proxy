@@ -316,58 +316,34 @@ impl HttpBodyAdmission {
         RequestStagingAuthority,
     ) {
         let staging = RequestStagingAuthority {
-            inner: Arc::clone(&self.guard.inner),
+            _inner: Arc::clone(&self.guard.inner),
         };
         (self.guard, self.replay_lease, staging)
     }
 }
 
 pub(crate) struct RequestStagingAuthority {
-    inner: Arc<GuardInner>,
+    _inner: Arc<GuardInner>,
 }
 
 impl RequestStagingAuthority {
     #[cfg(test)]
     pub(crate) fn for_test(guard: &HttpWireBodyGuard) -> Self {
         Self {
-            inner: Arc::clone(&guard.inner),
+            _inner: Arc::clone(&guard.inner),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn validate_guard(
         &self,
         guard: &HttpWireBodyGuard,
     ) -> Result<(), WireBodyBufferError> {
-        if Arc::ptr_eq(&self.inner, &guard.inner) {
+        if Arc::ptr_eq(&self._inner, &guard.inner) {
             Ok(())
         } else {
             Err(WireBodyBufferError::ForeignGuard)
         }
-    }
-
-    pub(crate) fn buffer(&self) -> RequestStagingBodyBuilder {
-        RequestStagingBodyBuilder(GuardedBodyBuilder::new(WireAllocationAuthority(
-            Arc::clone(&self.inner),
-        )))
-    }
-}
-
-pub(crate) struct RequestStagingBodyBuilder(GuardedBodyBuilder);
-
-impl RequestStagingBodyBuilder {
-    pub(crate) fn try_extend_from_slice(
-        &mut self,
-        bytes: &[u8],
-    ) -> Result<(), WireBodyBufferError> {
-        self.0.try_extend_from_slice(bytes)
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    pub(crate) fn finish(self) -> GuardedBody {
-        self.0.finish()
     }
 }
 

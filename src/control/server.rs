@@ -18,9 +18,9 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::authorization::webhook::runtime::WebhookAuthorizationRuntime;
 use crate::config::compiler::StaticControlConfig;
-use crate::http1::store::PARSER_STORE_BYTES;
+use crate::control::tls_identity::StaticTlsIdentityError;
 use crate::runtime::ServiceReadiness;
-use crate::tls_identity::StaticTlsIdentityError;
+use http_access_runtime::http1::PARSER_STORE_BYTES;
 
 use super::admission::{
     ControlAdmissionError, ControlArenaCounts, ControlArenaError, ControlConnectionLease,
@@ -267,7 +267,7 @@ impl PreparedControlServer {
             .tls
             .as_ref()
             .map(|identity| {
-                crate::tls_identity::load_static_tls_acceptor(
+                crate::control::tls_identity::load_static_tls_acceptor(
                     &identity.certificate_chain,
                     &identity.private_key,
                     vec![HTTP1_ALPN.to_vec()],

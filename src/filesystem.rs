@@ -1,5 +1,7 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
+#[cfg(test)]
+use std::io::Write;
 use std::path::Path;
 
 #[cfg(unix)]
@@ -10,6 +12,7 @@ pub(crate) fn create_private_dir_all(path: &Path) -> io::Result<()> {
     set_private_dir_permissions(path)
 }
 
+#[cfg(test)]
 pub(crate) fn write_private_file(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         create_private_dir_all(parent)?;

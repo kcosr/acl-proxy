@@ -1,14 +1,21 @@
+use std::collections::HashSet;
 use std::io;
-use std::net::{SocketAddr, TcpListener};
-use std::sync::Arc;
+use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
+
+use http_access_runtime::{
+    Http1ConnectPolicy, ListenerConfig, ListenerLimits, ListenerMode, LocalAddressProvider,
+    OriginalDestinationProvider, PreboundListener, PreboundListenerBundle,
+    RuntimeError as SharedRuntimeError,
+};
+use http_access_types::{HttpProtocol, HttpProtocolSet};
 
 use crate::config::compiler::{
-    StaticCleartextListener, StaticExplicitHttpsListener, StaticListenersConfig,
-    StaticTransparentHttpsListener,
+    CompiledHttp1ConnectPolicy, CompiledHttpVersion, StaticCleartextListener,
+    StaticExplicitHttpsListener, StaticListenersConfig, StaticTransparentHttpsListener,
 };
-use crate::runtime::BoxFuture;
-
-use super::assets::ProductIngressAssets;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ProxyListenerKind {
@@ -16,6 +23,7 @@ pub(crate) enum ProxyListenerKind {
     TransparentHttp,
     ExplicitHttps,
     TransparentHttps,
+    LocalAddressRefresh,
 }
 
 impl ProxyListenerKind {
@@ -25,6 +33,16 @@ impl ProxyListenerKind {
             Self::TransparentHttp => "transparent_http",
             Self::ExplicitHttps => "explicit_https",
             Self::TransparentHttps => "transparent_https",
+            Self::LocalAddressRefresh => "local_address_refresh",
+        }
+    }
+
+    pub(crate) fn from_shared(mode: ListenerMode) -> Self {
+        match mode {
+            ListenerMode::ExplicitHttp => Self::ExplicitHttp,
+            ListenerMode::TransparentHttp => Self::TransparentHttp,
+            ListenerMode::ExplicitHttps => Self::ExplicitHttps,
+            ListenerMode::TransparentHttps => Self::TransparentHttps,
         }
     }
 }
@@ -35,37 +53,15 @@ impl std::fmt::Display for ProxyListenerKind {
     }
 }
 
-pub(crate) trait ProxySupervisorFailureObserver: Send + Sync {
-    fn failed(&self, error: Arc<ProxySupervisorFailure>);
-}
-
-pub(crate) trait ProxySupervisor: Send + Sync {
-    fn begin_shutdown(&self);
-    fn close_and_join(&self) -> BoxFuture<'_, Result<(), ProxySupervisorFailure>>;
-    fn abort_and_join(&self) -> BoxFuture<'_, Result<(), ProxySupervisorFailure>>;
-}
-
-pub(crate) trait ProxySupervisorStarter {
-    fn start(
-        &mut self,
-        listener: PreparedProxyListener,
-        assets: &Arc<ProductIngressAssets>,
-        failure_observer: Arc<dyn ProxySupervisorFailureObserver>,
-    ) -> Result<Arc<dyn ProxySupervisor>, ProxySupervisorStartError>;
-}
-
 #[derive(Debug, thiserror::Error)]
-#[error("{listener} proxy supervisor startup failed: {message}")]
-pub(crate) struct ProxySupervisorStartError {
+#[error("{listener} proxy listener failed: {message}")]
+pub(crate) struct ProxyListenerFailure {
     pub(crate) listener: ProxyListenerKind,
     pub(crate) message: String,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error("{listener} proxy supervisor failed: {message}")]
-pub(crate) struct ProxySupervisorFailure {
-    pub(crate) listener: ProxyListenerKind,
-    pub(crate) message: String,
+pub(super) trait LocalAddressRefreshFailureObserver: Send + Sync {
+    fn failed(&self, error: Arc<ProxyListenerFailure>);
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -98,12 +94,6 @@ impl ProxyListenerConfig {
 pub(crate) struct PreparedProxyListener {
     pub(crate) config: ProxyListenerConfig,
     pub(crate) listener: TcpListener,
-}
-
-impl PreparedProxyListener {
-    pub(crate) fn kind(&self) -> ProxyListenerKind {
-        self.config.kind()
-    }
 }
 
 #[derive(Default)]
@@ -171,6 +161,317 @@ impl PreparedProxyListeners {
         .flatten()
         .collect()
     }
+
+    pub(super) fn into_shared_bundle_with_transparent_support(
+        self,
+        transparent_supported: bool,
+    ) -> Result<PreboundListenerBundle, SharedRuntimeError> {
+        if !transparent_supported
+            && (self.transparent_http.is_some() || self.transparent_https.is_some())
+        {
+            return Err(SharedRuntimeError::InvalidInput);
+        }
+        let listeners = self
+            .into_entries()
+            .into_iter()
+            .map(PreparedProxyListener::into_shared)
+            .collect::<Result<Vec<_>, _>>()?;
+        PreboundListenerBundle::new(listeners)
+    }
+}
+
+impl PreparedProxyListener {
+    fn into_shared(self) -> Result<PreboundListener, SharedRuntimeError> {
+        let config = match self.config {
+            ProxyListenerConfig::ExplicitHttp(config) => ListenerConfig::explicit_http(
+                protocol_set(&config.http_versions)?,
+                connect_policy(config.connect.as_ref().and_then(|connect| connect.http1)),
+                listener_limits(
+                    config.max_connections,
+                    config.max_concurrent_streams,
+                    config.request_header_timeout,
+                )?,
+            )?,
+            ProxyListenerConfig::TransparentHttp(config) => ListenerConfig::transparent_http(
+                protocol_set(&config.http_versions)?,
+                listener_limits(
+                    config.max_connections,
+                    config.max_concurrent_streams,
+                    config.request_header_timeout,
+                )?,
+            )?,
+            ProxyListenerConfig::ExplicitHttps(config) => ListenerConfig::explicit_https(
+                protocol_set(&config.http_versions)?,
+                connect_policy(config.connect.http1),
+                config.handshake_timeout,
+                listener_limits(
+                    config.max_connections,
+                    config.max_concurrent_streams,
+                    config.request_header_timeout,
+                )?,
+            )?,
+            ProxyListenerConfig::TransparentHttps(config) => ListenerConfig::transparent_https(
+                protocol_set(&config.http_versions)?,
+                config.handshake_timeout,
+                listener_limits(
+                    config.max_connections,
+                    config.max_concurrent_streams,
+                    config.request_header_timeout,
+                )?,
+            )?,
+        };
+        PreboundListener::new(config, self.listener)
+    }
+}
+
+fn protocol_set(versions: &[CompiledHttpVersion]) -> Result<HttpProtocolSet, SharedRuntimeError> {
+    HttpProtocolSet::new(
+        versions
+            .iter()
+            .map(|version| match version {
+                CompiledHttpVersion::Http1 => HttpProtocol::Http1,
+                CompiledHttpVersion::Http2 => HttpProtocol::Http2,
+            })
+            .collect(),
+    )
+    .map_err(|_| SharedRuntimeError::InvalidInput)
+}
+
+fn connect_policy(policy: Option<CompiledHttp1ConnectPolicy>) -> Http1ConnectPolicy {
+    match policy {
+        Some(CompiledHttp1ConnectPolicy::Mitm) => Http1ConnectPolicy::Mitm,
+        Some(CompiledHttp1ConnectPolicy::Deny) | None => Http1ConnectPolicy::Deny,
+    }
+}
+
+fn listener_limits(
+    max_connections: usize,
+    max_concurrent_streams: u32,
+    request_header_timeout: std::time::Duration,
+) -> Result<ListenerLimits, SharedRuntimeError> {
+    ListenerLimits::new(
+        max_connections,
+        max_concurrent_streams,
+        request_header_timeout,
+    )
+}
+
+#[derive(Default)]
+pub(super) struct SystemOriginalDestinationProvider;
+
+impl OriginalDestinationProvider for SystemOriginalDestinationProvider {
+    fn original_destination(&self, stream: &TcpStream) -> Result<SocketAddr, SharedRuntimeError> {
+        system_original_destination(stream)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn system_original_destination(stream: &TcpStream) -> Result<SocketAddr, SharedRuntimeError> {
+    let local = stream
+        .local_addr()
+        .map_err(|_| SharedRuntimeError::ServiceFailure)?;
+    let destination = match local {
+        SocketAddr::V4(_) => socket2::SockRef::from(stream)
+            .original_dst_v4()
+            .map(|address| address.as_socket()),
+        SocketAddr::V6(_) => socket2::SockRef::from(stream)
+            .original_dst_v6()
+            .map(|address| address.as_socket()),
+    }
+    .map_err(|_| SharedRuntimeError::ServiceFailure)?
+    .ok_or(SharedRuntimeError::ServiceFailure)?;
+    let destination = crate::network::canonical_socket_addr(destination);
+    if destination.port() == 0 {
+        return Err(SharedRuntimeError::InvalidInput);
+    }
+    Ok(destination)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn system_original_destination(_stream: &TcpStream) -> Result<SocketAddr, SharedRuntimeError> {
+    Err(SharedRuntimeError::ServiceFailure)
+}
+
+pub(super) struct ProductLocalAddressRuntime {
+    provider: Arc<SystemLocalAddressProvider>,
+    shutdown_requested: Arc<AtomicBool>,
+    stop: tokio::sync::watch::Sender<bool>,
+    supervisor: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl ProductLocalAddressRuntime {
+    pub(super) async fn activate(
+        failure_observer: Arc<dyn LocalAddressRefreshFailureObserver>,
+    ) -> Result<Arc<Self>, SharedRuntimeError> {
+        Self::activate_with(
+            Arc::new(SystemLocalAddressSnapshotSource),
+            Duration::from_secs(1),
+            failure_observer,
+        )
+        .await
+    }
+
+    async fn activate_with(
+        source: Arc<dyn LocalAddressSnapshotSource>,
+        refresh_interval: Duration,
+        failure_observer: Arc<dyn LocalAddressRefreshFailureObserver>,
+    ) -> Result<Arc<Self>, SharedRuntimeError> {
+        let handle =
+            tokio::runtime::Handle::try_current().map_err(|_| SharedRuntimeError::InvalidInput)?;
+        let initial_source = Arc::clone(&source);
+        let initial_snapshot = tokio::task::spawn_blocking(move || initial_source.snapshot())
+            .await
+            .map_err(|_| SharedRuntimeError::ServiceFailure)??;
+        let provider = SystemLocalAddressProvider::from_snapshot(initial_snapshot)?;
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let (stop, stop_receive) = tokio::sync::watch::channel(false);
+        let worker_provider = Arc::clone(&provider);
+        let worker = handle.spawn(refresh_local_addresses(
+            worker_provider,
+            source,
+            refresh_interval,
+            stop_receive,
+        ));
+        let supervisor_shutdown = Arc::clone(&shutdown_requested);
+        let supervisor = handle.spawn(async move {
+            let failure = match worker.await {
+                Ok(Ok(())) if supervisor_shutdown.load(Ordering::Acquire) => None,
+                Ok(Ok(())) => Some("local-address refresh worker stopped unexpectedly"),
+                Ok(Err(())) => Some("local-address refresh worker failed"),
+                Err(_) => Some("local-address refresh worker panicked"),
+            };
+            if let Some(message) = failure {
+                failure_observer.failed(Arc::new(ProxyListenerFailure {
+                    listener: ProxyListenerKind::LocalAddressRefresh,
+                    message: message.to_string(),
+                }));
+            }
+        });
+        Ok(Arc::new(Self {
+            provider,
+            shutdown_requested,
+            stop,
+            supervisor: tokio::sync::Mutex::new(Some(supervisor)),
+        }))
+    }
+
+    pub(super) fn provider(&self) -> Arc<SystemLocalAddressProvider> {
+        Arc::clone(&self.provider)
+    }
+
+    pub(super) fn begin_shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::Release);
+        self.stop.send_replace(true);
+    }
+
+    #[cfg(test)]
+    fn stop_without_shutdown_for_test(&self) {
+        self.stop.send_replace(true);
+    }
+
+    pub(super) async fn shutdown_and_join(&self) {
+        self.begin_shutdown();
+        let mut supervisor = self.supervisor.lock().await;
+        if let Some(task) = supervisor.as_mut() {
+            let _ = task.await;
+        }
+        *supervisor = None;
+    }
+}
+
+pub(super) struct SystemLocalAddressProvider {
+    addresses: RwLock<HashSet<IpAddr>>,
+}
+
+impl SystemLocalAddressProvider {
+    fn from_snapshot(addresses: HashSet<IpAddr>) -> Result<Arc<Self>, SharedRuntimeError> {
+        if addresses.is_empty() {
+            return Err(SharedRuntimeError::ServiceFailure);
+        }
+        Ok(Arc::new(Self {
+            addresses: RwLock::new(addresses),
+        }))
+    }
+
+    fn replace(&self, addresses: HashSet<IpAddr>) -> Result<(), SharedRuntimeError> {
+        if addresses.is_empty() {
+            return Err(SharedRuntimeError::ServiceFailure);
+        }
+        *self
+            .addresses
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = addresses;
+        Ok(())
+    }
+}
+
+impl LocalAddressProvider for SystemLocalAddressProvider {
+    fn is_local_address(&self, address: IpAddr) -> Result<bool, SharedRuntimeError> {
+        let address = crate::network::canonical_ip(address);
+        Ok(address.is_loopback()
+            || self
+                .addresses
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains(&address))
+    }
+}
+
+trait LocalAddressSnapshotSource: Send + Sync {
+    fn snapshot(&self) -> Result<HashSet<IpAddr>, SharedRuntimeError>;
+}
+
+struct SystemLocalAddressSnapshotSource;
+
+impl LocalAddressSnapshotSource for SystemLocalAddressSnapshotSource {
+    fn snapshot(&self) -> Result<HashSet<IpAddr>, SharedRuntimeError> {
+        let interfaces =
+            if_addrs::get_if_addrs().map_err(|_| SharedRuntimeError::ServiceFailure)?;
+        let mut addresses = HashSet::new();
+        addresses
+            .try_reserve(interfaces.len())
+            .map_err(|_| SharedRuntimeError::LimitExceeded)?;
+        addresses.extend(
+            interfaces
+                .into_iter()
+                .map(|interface| crate::network::canonical_ip(interface.ip())),
+        );
+        Ok(addresses)
+    }
+}
+
+async fn refresh_local_addresses(
+    provider: Arc<SystemLocalAddressProvider>,
+    source: Arc<dyn LocalAddressSnapshotSource>,
+    refresh_interval: Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), ()> {
+    loop {
+        tokio::select! {
+            biased;
+            changed = stop.changed() => {
+                return if changed.is_ok() && *stop.borrow() { Ok(()) } else { Err(()) };
+            }
+            _ = tokio::time::sleep(refresh_interval) => {}
+        }
+        let refresh_source = Arc::clone(&source);
+        let snapshot = tokio::task::spawn_blocking(move || refresh_source.snapshot())
+            .await
+            .map_err(|_| ())?;
+        if *stop.borrow() {
+            return Ok(());
+        }
+        match snapshot {
+            Ok(addresses) => {
+                if provider.replace(addresses).is_err() {
+                    tracing::warn!("local-address refresh returned an empty snapshot");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "cannot refresh local-address snapshot");
+            }
+        }
+    }
 }
 
 fn bind_configured(
@@ -203,8 +504,11 @@ pub(crate) struct ProxyListenerBindError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::net::Ipv4Addr;
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Condvar, Mutex};
     use std::time::Duration;
 
     use super::*;
@@ -219,6 +523,133 @@ mod tests {
             .try_into()
             .ok()
             .unwrap()
+    }
+
+    fn transparent_http_listener(listener: TcpListener) -> PreparedProxyListener {
+        PreparedProxyListener {
+            config: ProxyListenerConfig::TransparentHttp(Box::new(StaticCleartextListener {
+                bind: listener.local_addr().unwrap(),
+                http_versions: vec![CompiledHttpVersion::Http1],
+                request_header_timeout: Duration::from_secs(1),
+                max_connections: 1,
+                max_concurrent_streams: 1,
+                connect: None,
+            })),
+            listener,
+        }
+    }
+
+    enum SnapshotBehavior {
+        Addresses(HashSet<IpAddr>),
+        Error,
+        Panic,
+        Block(Arc<(Mutex<bool>, Condvar)>),
+    }
+
+    struct MutableSnapshotSource {
+        behavior: Mutex<SnapshotBehavior>,
+        calls: AtomicUsize,
+        called: tokio::sync::Notify,
+    }
+
+    impl MutableSnapshotSource {
+        fn new(addresses: impl IntoIterator<Item = IpAddr>) -> Arc<Self> {
+            Arc::new(Self {
+                behavior: Mutex::new(SnapshotBehavior::Addresses(addresses.into_iter().collect())),
+                calls: AtomicUsize::new(0),
+                called: tokio::sync::Notify::new(),
+            })
+        }
+
+        fn set(&self, behavior: SnapshotBehavior) {
+            *self
+                .behavior
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = behavior;
+        }
+
+        async fn wait_for_call_after(&self, prior_calls: usize) {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while self.calls.load(Ordering::Acquire) <= prior_calls {
+                    self.called.notified().await;
+                }
+            })
+            .await
+            .expect("local-address source was not called");
+        }
+    }
+
+    impl LocalAddressSnapshotSource for MutableSnapshotSource {
+        fn snapshot(&self) -> Result<HashSet<IpAddr>, SharedRuntimeError> {
+            let behavior = {
+                let behavior = self
+                    .behavior
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                match &*behavior {
+                    SnapshotBehavior::Addresses(addresses) => {
+                        SnapshotBehavior::Addresses(addresses.clone())
+                    }
+                    SnapshotBehavior::Error => SnapshotBehavior::Error,
+                    SnapshotBehavior::Panic => SnapshotBehavior::Panic,
+                    SnapshotBehavior::Block(gate) => SnapshotBehavior::Block(Arc::clone(gate)),
+                }
+            };
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.called.notify_waiters();
+            match behavior {
+                SnapshotBehavior::Addresses(addresses) => Ok(addresses),
+                SnapshotBehavior::Error => Err(SharedRuntimeError::ServiceFailure),
+                SnapshotBehavior::Panic => panic!("injected local-address source panic"),
+                SnapshotBehavior::Block(gate) => {
+                    let (open, changed) = &*gate;
+                    let mut open = open.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    while !*open {
+                        open = changed
+                            .wait(open)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                    Err(SharedRuntimeError::ServiceFailure)
+                }
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingRefreshObserver {
+        failures: Mutex<VecDeque<Arc<ProxyListenerFailure>>>,
+        failed: tokio::sync::Notify,
+    }
+
+    impl LocalAddressRefreshFailureObserver for RecordingRefreshObserver {
+        fn failed(&self, error: Arc<ProxyListenerFailure>) {
+            self.failures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push_back(error);
+            self.failed.notify_waiters();
+        }
+    }
+
+    impl RecordingRefreshObserver {
+        async fn next_failure(&self) -> Arc<ProxyListenerFailure> {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let notified = self.failed.notified();
+                    if let Some(failure) = self
+                        .failures
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .pop_front()
+                    {
+                        return failure;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .expect("local-address failure was not reported")
+        }
     }
 
     #[test]
@@ -279,7 +710,7 @@ mod tests {
         assert_eq!(entries.len(), 4);
         for (index, entry) in entries.iter().enumerate() {
             assert_eq!(
-                entry.kind(),
+                entry.config.kind(),
                 [
                     ProxyListenerKind::ExplicitHttp,
                     ProxyListenerKind::TransparentHttp,
@@ -309,5 +740,222 @@ mod tests {
             ProxyListenerConfig::TransparentHttps(actual)
                 if Some(actual.as_ref()) == config.transparent_https.as_ref()
         ));
+
+        let shared = entries
+            .into_iter()
+            .map(PreparedProxyListener::into_shared)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            shared
+                .iter()
+                .map(|listener| listener.config().mode())
+                .collect::<Vec<_>>(),
+            [
+                ListenerMode::ExplicitHttp,
+                ListenerMode::TransparentHttp,
+                ListenerMode::ExplicitHttps,
+                ListenerMode::TransparentHttps,
+            ]
+        );
+        assert_eq!(
+            shared[0].config().protocols().protocols(),
+            [HttpProtocol::Http1, HttpProtocol::Http2]
+        );
+        assert_eq!(
+            shared[0].config().http1_connect_policy(),
+            Http1ConnectPolicy::Deny
+        );
+        assert_eq!(shared[0].config().limits().max_connections(), 17);
+        assert_eq!(shared[0].config().limits().max_concurrent_streams(), 19);
+        assert_eq!(
+            shared[2].config().handshake_timeout(),
+            Some(Duration::from_secs(3))
+        );
+        assert_eq!(
+            shared[3].config().handshake_timeout(),
+            Some(Duration::from_secs(7))
+        );
+    }
+
+    #[test]
+    fn transparent_listener_is_rejected_when_the_platform_cannot_support_it() {
+        let [listener] = prebound_listeners::<1>();
+        let prepared = PreparedProxyListeners {
+            transparent_http: Some(transparent_http_listener(listener)),
+            ..PreparedProxyListeners::default()
+        };
+
+        assert!(matches!(
+            prepared.into_shared_bundle_with_transparent_support(false),
+            Err(SharedRuntimeError::InvalidInput)
+        ));
+    }
+
+    #[test]
+    fn local_address_provider_reads_only_the_retained_snapshot() {
+        let provider = SystemLocalAddressProvider::from_snapshot(HashSet::from(["192.0.2.1"
+            .parse()
+            .unwrap()]))
+        .unwrap();
+
+        assert!(provider
+            .is_local_address("192.0.2.1".parse().unwrap())
+            .unwrap());
+        assert!(provider
+            .is_local_address("127.42.0.9".parse().unwrap())
+            .unwrap());
+        assert!(!provider
+            .is_local_address("198.51.100.1".parse().unwrap())
+            .unwrap());
+    }
+
+    #[test]
+    fn successful_local_address_refresh_replaces_the_complete_snapshot() {
+        let provider = SystemLocalAddressProvider::from_snapshot(HashSet::from([
+            "192.0.2.1".parse().unwrap(),
+            "192.0.2.2".parse().unwrap(),
+        ]))
+        .unwrap();
+
+        provider
+            .replace(HashSet::from(["198.51.100.7".parse().unwrap()]))
+            .unwrap();
+
+        assert!(!provider
+            .is_local_address("192.0.2.1".parse().unwrap())
+            .unwrap());
+        assert!(!provider
+            .is_local_address("192.0.2.2".parse().unwrap())
+            .unwrap());
+        assert!(provider
+            .is_local_address("198.51.100.7".parse().unwrap())
+            .unwrap());
+    }
+
+    #[test]
+    fn local_address_activation_rejects_an_empty_snapshot() {
+        assert!(matches!(
+            SystemLocalAddressProvider::from_snapshot(HashSet::new()),
+            Err(SharedRuntimeError::ServiceFailure)
+        ));
+    }
+
+    #[tokio::test]
+    async fn refresh_error_retains_prior_snapshot_and_later_success_replaces_it() {
+        let old: IpAddr = "192.0.2.1".parse().unwrap();
+        let new: IpAddr = "198.51.100.1".parse().unwrap();
+        let source = MutableSnapshotSource::new([old]);
+        let observer = Arc::new(RecordingRefreshObserver::default());
+        let runtime = ProductLocalAddressRuntime::activate_with(
+            source.clone(),
+            Duration::from_millis(10),
+            observer.clone(),
+        )
+        .await
+        .unwrap();
+        let provider = runtime.provider();
+
+        source.set(SnapshotBehavior::Error);
+        source.wait_for_call_after(1).await;
+        assert!(provider.is_local_address(old).unwrap());
+
+        let prior_calls = source.calls.load(Ordering::Acquire);
+        source.set(SnapshotBehavior::Addresses(HashSet::from([new])));
+        source.wait_for_call_after(prior_calls).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while provider.is_local_address(old).unwrap()
+                || !provider.is_local_address(new).unwrap()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("refreshed local-address snapshot was not published");
+        assert!(!provider.is_local_address(old).unwrap());
+        assert!(provider.is_local_address(new).unwrap());
+
+        runtime.shutdown_and_join().await;
+        assert!(observer
+            .failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_worker_panic_is_reported_as_listener_failure() {
+        let source = MutableSnapshotSource::new(["192.0.2.1".parse().unwrap()]);
+        let observer = Arc::new(RecordingRefreshObserver::default());
+        let runtime = ProductLocalAddressRuntime::activate_with(
+            source.clone(),
+            Duration::from_millis(10),
+            observer.clone(),
+        )
+        .await
+        .unwrap();
+        source.set(SnapshotBehavior::Panic);
+
+        let failure = observer.next_failure().await;
+
+        assert_eq!(failure.listener, ProxyListenerKind::LocalAddressRefresh);
+        assert!(failure.message.contains("failed"));
+        runtime.shutdown_and_join().await;
+    }
+
+    #[tokio::test]
+    async fn unexpected_refresh_worker_completion_is_reported_as_listener_failure() {
+        let source = MutableSnapshotSource::new(["192.0.2.1".parse().unwrap()]);
+        let observer = Arc::new(RecordingRefreshObserver::default());
+        let runtime = ProductLocalAddressRuntime::activate_with(
+            source,
+            Duration::from_secs(60),
+            observer.clone(),
+        )
+        .await
+        .unwrap();
+
+        runtime.stop_without_shutdown_for_test();
+        let failure = observer.next_failure().await;
+
+        assert_eq!(failure.listener, ProxyListenerKind::LocalAddressRefresh);
+        assert!(failure.message.contains("unexpectedly"));
+        runtime.shutdown_and_join().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_local_address_shutdown_retains_the_supervisor_join_handle() {
+        let source = MutableSnapshotSource::new(["192.0.2.1".parse().unwrap()]);
+        let observer = Arc::new(RecordingRefreshObserver::default());
+        let runtime = ProductLocalAddressRuntime::activate_with(
+            source.clone(),
+            Duration::from_millis(10),
+            observer.clone(),
+        )
+        .await
+        .unwrap();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        source.set(SnapshotBehavior::Block(Arc::clone(&gate)));
+        source.wait_for_call_after(1).await;
+
+        let first_runtime = Arc::clone(&runtime);
+        let first_shutdown = tokio::spawn(async move {
+            first_runtime.shutdown_and_join().await;
+        });
+        tokio::task::yield_now().await;
+        first_shutdown.abort();
+        assert!(first_shutdown.await.unwrap_err().is_cancelled());
+
+        let (open, changed) = &*gate;
+        *open.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        changed.notify_all();
+        tokio::time::timeout(Duration::from_secs(1), runtime.shutdown_and_join())
+            .await
+            .expect("retry did not recover and join the retained supervisor");
+        assert!(observer
+            .failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
     }
 }

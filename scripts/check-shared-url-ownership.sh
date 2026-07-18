@@ -14,10 +14,23 @@ cargo run --quiet --locked \
     --manifest-path "$RUNTIME_ROOT/Cargo.toml" \
     -p pipeline-ownership-check -- fact-product "$ROOT"
 
-if [[ $(sed -n '1p' src/proxy/raw_h2_conformance.rs) != '#![cfg(test)]' ]]; then
-    printf 'the raw HTTP/2 conformance adapter must remain test-only\n' >&2
+if [[ -e src/proxy/raw_h2_conformance.rs ]]; then
+    printf 'the product raw HTTP/2 conformance adapter must remain deleted\n' >&2
     exit 1
 fi
+shared_raw_h2="$RUNTIME_ROOT/crates/http-access-runtime/src/raw_h2_conformance.rs"
+if [[ ! -f "$shared_raw_h2" ]]; then
+    printf 'the shared raw HTTP/2 conformance owner is missing\n' >&2
+    exit 1
+fi
+for case_id in \
+    raw_h2_suite_matches_the_decoded_product_boundary \
+    accepted_fields_body_and_trailers_survive_fact_materialization; do
+    if [[ $(rg -c "fn ${case_id}\\(" "$shared_raw_h2") != 1 ]]; then
+        printf 'the shared raw HTTP/2 conformance owner is missing %s\n' "$case_id" >&2
+        exit 1
+    fi
+done
 
 metadata=$(cargo metadata --format-version 1 --no-deps)
 python3 - "$ROOT" "$metadata" <<'PY'

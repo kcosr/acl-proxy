@@ -130,21 +130,27 @@ reset_source_case() {
     cp -R "$SOURCE_ROOT/src" "$source_case/"
 }
 
-python3 - "$source_case/src/proxy/headers.rs" <<'PY'
-import pathlib
-import sys
+touch "$source_case/src/proxy/facts.rs"
+expect_source_failure 'restored product facts.rs' \
+    'deleted product request-fact/header owner was restored: src/proxy/facts.rs'
 
-path = pathlib.Path(sys.argv[1])
-source = path.read_text(encoding="utf-8")
-source = source.replace(
-    "#[cfg(test)]\nmod tests {",
-    "fn escaped_fact_materializer() { let _ = InterceptedRequestFacts::new; }\n\n#[cfg(test)]\nmod tests {",
-    1,
-)
-path.write_text(source, encoding="utf-8")
-PY
-expect_source_failure 'headers.rs InterceptedRequestFacts::new' \
-    'InterceptedRequestFacts::new reference must remain inside the credential-safe facts owner'
+reset_source_case
+touch "$source_case/src/proxy/headers.rs"
+expect_source_failure 'restored product headers.rs' \
+    'deleted product request-fact/header owner was restored: src/proxy/headers.rs'
+
+reset_source_case
+touch "$source_case/src/proxy/raw_h2_conformance.rs"
+expect_source_failure 'restored product raw HTTP/2 conformance adapter' \
+    'product raw HTTP/2 conformance adapter must remain deleted'
+
+reset_source_case
+cat >>"$source_case/src/standalone_policy_provider.rs" <<'EOF'
+
+fn escaped_fact_constructor() { http_access_types::InterceptedRequestFacts::new(); }
+EOF
+expect_source_failure 'constructor outside private-field rebuild' \
+    'InterceptedRequestFacts::new must remain inside rebuild_standalone_facts'
 
 reset_source_case
 cat >>"$source_case/src/standalone_policy_provider.rs" <<'EOF'
@@ -158,11 +164,11 @@ expect_source_failure 'renamed InterceptedRequestFacts constructor' \
 reset_source_case
 cat >>"$source_case/src/standalone_policy_provider.rs" <<'EOF'
 
-use crate::proxy::headers::neutral_headers as convert_headers;
-fn escaped_neutral_alias() { convert_headers(); }
+use crate::proxy::private_fields::visible_fields as convert_headers;
+fn escaped_visible_alias() { convert_headers(); }
 EOF
-expect_source_failure 'renamed neutral_headers funnel' \
-    'neutral_headers import must not be renamed around the ingress funnel'
+expect_source_failure 'renamed visible_fields funnel' \
+    'visible_fields import must not be renamed around the private-field funnel'
 
 reset_source_case
 cat >>"$source_case/src/standalone_policy_provider.rs" <<'EOF'
@@ -181,11 +187,11 @@ reset_source_case
 cat >>"$source_case/src/standalone_policy_provider.rs" <<'EOF'
 
 macro_rules! escaped_neutral_macro {
-    () => { crate::proxy::headers::neutral_headers() };
+    () => { neutral_headers() };
 }
 EOF
 expect_source_failure 'neutralization inside macro definition' \
-    'neutral_headers and aliases are forbidden inside production macros'
+    'deleted product neutral_headers funnel is forbidden inside production macros'
 
 reset_source_case
 cat >>"$source_case/src/standalone_policy_provider.rs" <<'EOF'
@@ -195,17 +201,59 @@ macro_rules! escaped_materialization_macro {
 }
 EOF
 expect_source_failure 'fact materialization inside macro definition' \
-    'request-facts materialization is forbidden inside production macros'
+    'deleted product into_facts materializer is forbidden inside production macros'
 
 reset_source_case
-cat >>"$source_case/src/proxy/headers.rs" <<'EOF'
+cat >>"$source_case/src/standalone_policy_provider.rs" <<'EOF'
+
+fn neutral_headers() {}
+EOF
+expect_source_failure 'restored neutral_headers function' \
+    'deleted product neutral_headers funnel may not be restored'
+
+reset_source_case
+cat >>"$source_case/src/standalone_policy_provider.rs" <<'EOF'
+
+fn visible_fields() {}
+EOF
+expect_source_failure 'visible_fields outside private owner' \
+    'visible_fields must remain inside the private-field owner'
+
+reset_source_case
+python3 - "$source_case/src/proxy/private_fields.rs" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+source = source.replace("fn rebuild_standalone_facts(", "fn escaped_rebuild_standalone_facts(", 1)
+path.write_text(source, encoding="utf-8")
+PY
+expect_source_failure 'renamed sole facts rebuild' \
+    'InterceptedRequestFacts::new must remain inside rebuild_standalone_facts'
+
+reset_source_case
+python3 - "$source_case/src/proxy/private_fields.rs" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+source = path.read_text(encoding="utf-8")
+source = source.replace("let visible = visible_fields(&private)?;", "let visible = Vec::new();", 1)
+path.write_text(source, encoding="utf-8")
+PY
+expect_source_failure 'removed sole visible-field conversion' \
+    'visible_fields must run exactly once after private-field partitioning'
+
+reset_source_case
+cat >>"$source_case/src/proxy/private_fields.rs" <<'EOF'
 
 mod tests {
 }
 fn escaped_after_fake_test_truncation() { InterceptedRequestFacts::new(); }
 EOF
 expect_source_failure 'fake test module truncation' \
-    'InterceptedRequestFacts::new must remain inside the credential-safe facts owner'
+    'InterceptedRequestFacts::new must remain inside rebuild_standalone_facts'
 
 reset_source_case
 cat >>"$source_case/src/policy/adapter.rs" <<'EOF'

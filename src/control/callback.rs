@@ -14,10 +14,11 @@ use crate::authorization::webhook::provider::WebhookProvider;
 use crate::authorization::webhook::runtime::{
     PendingWebhookOperation, WebhookAuthorizationRuntime, WebhookCompletionError,
 };
-use crate::http1::framing::{BodyFramer, BodyFraming, BodyProgress, FramingProcessError};
-use crate::http1::store::ParserStore;
 use crate::runtime::AuthorizationInvocationMode;
 use crate::safety::ProviderResponseCharge;
+use http_access_runtime::http1::{
+    BodyFramer, BodyFraming, BodyProgress, FramingProcessError, ParserStore,
+};
 
 use super::response::{ControlResponse, EmptyResponseStatus};
 
@@ -751,7 +752,7 @@ mod tests {
 
     fn assert_store_wiped(store: &ParserStore) {
         assert_eq!(store.initialized_len(), 0);
-        assert!(store.complete_storage().iter().all(|byte| *byte == 0));
+        assert!(store.storage_is_zeroed());
     }
 
     #[tokio::test]

@@ -9,7 +9,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 BASELINE="$TEST_ROOT/baseline"
-mkdir -p "$BASELINE/scripts" "$BASELINE/src" "$TEST_ROOT/fake-bin"
+mkdir -p "$BASELINE/scripts" "$BASELINE/src/activation" "$TEST_ROOT/fake-bin"
 cp "$SOURCE_ROOT/scripts/check-shared-credential-ownership.sh" "$BASELINE/scripts/"
 cat >"$BASELINE/src/credential_resolver.rs" <<'EOF'
 use credential_core::{CredentialProgram, CredentialResolver};
@@ -30,6 +30,22 @@ enum OutboundCredentialLocator {
 struct ProviderCredentialWireStore;
 
 fn sensitive_header_value() {}
+EOF
+
+cat >"$BASELINE/src/activation/runner.rs" <<'EOF'
+#[cfg(test)]
+mod tests {
+    mod connect_mitm_tests {
+        include!("runner_connect_mitm_tests.rs");
+    }
+}
+EOF
+
+cat >"$BASELINE/src/activation/runner_connect_mitm_tests.rs" <<'EOF'
+fn test_only_environment_setup() {
+    std::env::set_var("TOKEN", "secret");
+    std::env::remove_var("TOKEN");
+}
 EOF
 
 cat >"$TEST_ROOT/fake-bin/cargo" <<'EOF'
@@ -196,6 +212,34 @@ cat >>"$case_root/src/credential_resolver.rs" <<'EOF'
 const LEGACY_NAMES: &str = r#"struct StandaloneCredentialProgram; fn stage_credentials() {}; env::remove_var("TOKEN")"#;
 EOF
 expect_success "$case_root" 'legacy credential names in comments and literals'
+
+source_case_count=$((source_case_count + 1))
+case_root="$TEST_ROOT/connect-suite-without-test-owner"
+cp -R "$BASELINE" "$case_root"
+sed -i '/#\[cfg(test)\]/d' "$case_root/src/activation/runner.rs"
+expect_failure "$case_root" 'CONNECT/MITM include without cfg(test) owner' \
+    'activation runner must have exactly one #[cfg(test)] mod tests owner'
+
+source_case_count=$((source_case_count + 1))
+case_root="$TEST_ROOT/connect-suite-renamed-include"
+cp -R "$BASELINE" "$case_root"
+sed -i 's/runner_connect_mitm_tests\.rs/other_tests.rs/' \
+    "$case_root/src/activation/runner.rs"
+expect_failure "$case_root" 'renamed CONNECT/MITM include' \
+    'CONNECT/MITM suite must have exactly one test-only include'
+
+source_case_count=$((source_case_count + 1))
+case_root="$TEST_ROOT/connect-suite-duplicate-include"
+cp -R "$BASELINE" "$case_root"
+cat >>"$case_root/src/activation/runner.rs" <<'EOF'
+
+#[cfg(test)]
+mod duplicate_tests {
+    include!("runner_connect_mitm_tests.rs");
+}
+EOF
+expect_failure "$case_root" 'duplicate CONNECT/MITM include' \
+    'CONNECT/MITM suite must have exactly one test-only include'
 
 for pair in \
     'impl CredentialResolver for ProductCredentialResolver|impl ProductResolver for ProductCredentialResolver|product credential adapter must implement shared CredentialResolver' \

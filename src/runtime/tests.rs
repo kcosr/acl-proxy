@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 #[cfg(unix)]
 use std::ffi::OsString;
+use std::fs;
 use std::io;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
@@ -31,10 +32,6 @@ use crate::config::compiler::{
 };
 use crate::config::{compile_config_text, CompiledConfig, ConfigTextInput};
 use crate::safety::{WireBodyPool, WireBodyQuotaKey};
-use crate::upgrade::{
-    UpgradeAllocation, UpgradeEntryPlan, UpgradeRelayPair, UpgradeRuntime, UpgradeRuntimeLimits,
-    UpgradeTerminalCause, UpgradeTerminalControl,
-};
 
 use super::*;
 
@@ -704,7 +701,6 @@ impl CandidateActivator for FakeActivator {
                 standalone,
                 request_timeout: plan.request_timeout,
                 max_content_decoding_expansion_ratio: plan.max_content_decoding_expansion_ratio,
-                resource_plan: plan.resource_plan,
                 forwarding_executor,
                 authorization: snapshot.clone(),
                 credentials: empty_inbound_credentials(),
@@ -875,7 +871,6 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
             standalone,
             request_timeout: Duration::from_secs(30),
             max_content_decoding_expansion_ratio: 128,
-            resource_plan: compiled.reloadable_plan.resource_plan.clone(),
             forwarding_executor,
             authorization: Arc::new(authorization),
             credentials: empty_inbound_credentials(),
@@ -1276,6 +1271,399 @@ async fn wait_for_retiring(runtime: &Runtime, expected: usize) {
     }
 }
 
+fn live_upgrade_product_config(
+    explicit_http: SocketAddr,
+    control: SocketAddr,
+    origin: SocketAddr,
+    path: &str,
+    wire_literal: &str,
+    wire_replacement: &str,
+    capture_replacement: &str,
+) -> String {
+    format!(
+        r#"schema_version = 3
+
+[service]
+shutdown_drain_timeout = "1s"
+max_active_upgrades = 2
+
+[control]
+bind = "{control}"
+base_path = "/_acl-proxy"
+request_header_timeout = "1s"
+request_body_timeout = "1s"
+max_connections = 2
+max_request_body_bytes = 65536
+
+[listeners.explicit_http]
+bind = "{explicit_http}"
+http_versions = ["http1"]
+
+[listeners.explicit_http.connect]
+http1 = "deny"
+
+[redaction.profiles.wire]
+replacement = "{wire_replacement}"
+max_message_bytes = 1048576
+allow_permessage_deflate = false
+rules = [{{ literals = ["{wire_literal}"], payloads = "text" }}]
+
+[redaction.profiles.capture]
+replacement = "{capture_replacement}"
+max_message_bytes = 1048576
+allow_permessage_deflate = false
+rules = [{{ literals = ["capture-secret"], payloads = "text" }}]
+
+[observation.capture]
+events = ["request.allowed", "response.allowed"]
+redaction_profile = "capture"
+directory = "captures"
+max_body_bytes = 1048576
+max_inflight_body_bytes = 134217728
+max_pending_records = 16
+max_files = 16
+max_total_bytes = 1048576
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "live-upgrade"
+decision = "allow"
+methods = ["GET"]
+urls = ["http://{origin}/{path}"]
+allow_upgrades = true
+redaction_profile = "wire"
+"#
+    )
+}
+
+fn websocket_frame(fin: bool, opcode: u8, masked: bool, payload: &[u8]) -> Vec<u8> {
+    assert!(
+        payload.len() < 126,
+        "fixture frames use the compact length form"
+    );
+    let mut frame = Vec::with_capacity(2 + usize::from(masked) * 4 + payload.len());
+    frame.push(u8::from(fin) << 7 | opcode);
+    frame.push(u8::from(masked) << 7 | payload.len() as u8);
+    if masked {
+        let mask = [0x13, 0x37, 0x42, 0x99];
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ mask[index % mask.len()]),
+        );
+    } else {
+        frame.extend_from_slice(payload);
+    }
+    frame
+}
+
+async fn read_websocket_frame(
+    stream: &mut tokio::net::TcpStream,
+    expected_masked: bool,
+) -> (bool, u8, Vec<u8>) {
+    let mut head = [0_u8; 2];
+    stream.read_exact(&mut head).await.unwrap();
+    let fin = head[0] & 0x80 != 0;
+    let opcode = head[0] & 0x0f;
+    let masked = head[1] & 0x80 != 0;
+    assert_eq!(masked, expected_masked);
+    let payload_len = usize::from(head[1] & 0x7f);
+    assert!(
+        payload_len < 126,
+        "fixture frames use the compact length form"
+    );
+    let mask = if masked {
+        let mut mask = [0_u8; 4];
+        stream.read_exact(&mut mask).await.unwrap();
+        Some(mask)
+    } else {
+        None
+    };
+    let mut payload = vec![0_u8; payload_len];
+    stream.read_exact(&mut payload).await.unwrap();
+    if let Some(mask) = mask {
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index % mask.len()];
+        }
+    }
+    (fin, opcode, payload)
+}
+
+async fn read_complete_http_head(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+    let mut head = Vec::new();
+    loop {
+        if head.windows(4).any(|window| window == b"\r\n\r\n") {
+            return head;
+        }
+        let mut buffer = [0_u8; 4096];
+        let count = stream.read(&mut buffer).await.unwrap();
+        assert_ne!(count, 0, "HTTP peer closed before sending a complete head");
+        head.extend_from_slice(&buffer[..count]);
+    }
+}
+
+fn product_capture_records(directory: &Path) -> Vec<crate::capture::CaptureRecord> {
+    let mut records = Vec::new();
+    for entry in fs::read_dir(directory).unwrap() {
+        let path = entry.unwrap().path();
+        if !path.is_file() {
+            continue;
+        }
+        let contents = fs::read_to_string(path).unwrap();
+        records.extend(
+            contents
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_str(line).unwrap()),
+        );
+    }
+    records
+}
+
+#[tokio::test]
+async fn live_upgrade_reload_retires_generation_and_releases_terminal_once() {
+    let listener_test = crate::activation::LISTENER_TEST_LOCK.lock().await;
+    let reservations = crate::activation::reserve_listeners::<2>(&listener_test);
+    let addresses = reservations.addresses();
+    let origin = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let origin_address = origin.local_addr().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("acl-proxy.toml");
+    fs::write(
+        &config_path,
+        live_upgrade_product_config(
+            addresses[0],
+            addresses[1],
+            origin_address,
+            "old",
+            "old-secret",
+            "[WIRE-OLD]",
+            "[CAPTURE-OLD]",
+        ),
+    )
+    .unwrap();
+    let loaded = crate::config::load_and_compile_exact_config(&config_path).unwrap();
+    let product = crate::activation::runner::ProductRuntime::prepare_from_prebound(
+        loaded,
+        reservations.into_listeners(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(product.forwarding_terminal_completions_for_test(), 0);
+    let first_generation = product.activate_initial().await.unwrap();
+    product.start_listeners().await.unwrap();
+
+    let origin_task = tokio::spawn(async move {
+        let (mut old_stream, _) = origin.accept().await.unwrap();
+        let old_request = read_complete_http_head(&mut old_stream).await;
+        assert!(String::from_utf8_lossy(&old_request).contains("/old HTTP/1.1"));
+        old_stream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let (fin, opcode, payload) = read_websocket_frame(&mut old_stream, true).await;
+        assert!(fin);
+        assert_eq!(opcode, 0x9);
+        assert_eq!(payload, b"capture-started");
+        old_stream
+            .write_all(&websocket_frame(true, 0xA, false, b"capture-started"))
+            .await
+            .unwrap();
+        let (fin, opcode, payload) = read_websocket_frame(&mut old_stream, true).await;
+        assert!(fin);
+        assert_eq!(opcode, 0x1);
+        assert_eq!(payload, b"[WIRE-OLD] capture-secret old-boundary");
+        let (fin, opcode, payload) = read_websocket_frame(&mut old_stream, true).await;
+        assert!(fin);
+        assert_eq!(opcode, 0x1);
+        assert_eq!(
+            payload,
+            b"[WIRE-OLD] new-secret capture-secret new-boundary"
+        );
+
+        let (mut new_stream, _) = origin.accept().await.unwrap();
+        let new_request = read_complete_http_head(&mut new_stream).await;
+        assert!(String::from_utf8_lossy(&new_request).contains("/new HTTP/1.1"));
+        new_stream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let (fin, opcode, payload) = read_websocket_frame(&mut new_stream, true).await;
+        assert!(fin);
+        assert_eq!(opcode, 0x1);
+        assert_eq!(payload, b"old-secret [WIRE-NEW]");
+    });
+
+    let mut old_client = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+    old_client
+        .write_all(
+            format!(
+                "GET http://{origin_address}/old HTTP/1.1\r\nHost: {origin_address}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert!(read_complete_http_head(&mut old_client)
+        .await
+        .starts_with(b"HTTP/1.1 101"));
+    old_client
+        .write_all(&websocket_frame(
+            false,
+            0x1,
+            true,
+            b"old-secret capture-secret ",
+        ))
+        .await
+        .unwrap();
+    old_client
+        .write_all(&websocket_frame(true, 0x9, true, b"capture-started"))
+        .await
+        .unwrap();
+    let (fin, opcode, payload) = read_websocket_frame(&mut old_client, false).await;
+    assert!(fin);
+    assert_eq!(opcode, 0xA);
+    assert_eq!(payload, b"capture-started");
+
+    fs::write(
+        &config_path,
+        live_upgrade_product_config(
+            addresses[0],
+            addresses[1],
+            origin_address,
+            "new",
+            "new-secret",
+            "[WIRE-NEW]",
+            "[CAPTURE-NEW]",
+        ),
+    )
+    .unwrap();
+    let ReloadTriggerResult::Completed {
+        attempts,
+        generation: second_generation,
+    } = product.runtime().trigger_reload().await.unwrap()
+    else {
+        panic!("the live product reload unexpectedly coalesced");
+    };
+    assert_eq!(attempts, 1);
+    assert_ne!(first_generation, second_generation);
+    assert_eq!(
+        product.runtime().active_generation_id(),
+        Some(second_generation)
+    );
+    wait_for_retiring(product.runtime(), 0).await;
+
+    old_client
+        .write_all(&websocket_frame(true, 0x0, true, b"old-boundary"))
+        .await
+        .unwrap();
+    old_client
+        .write_all(&websocket_frame(
+            true,
+            0x1,
+            true,
+            b"old-secret new-secret capture-secret new-boundary",
+        ))
+        .await
+        .unwrap();
+
+    let mut new_client = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+    new_client
+        .write_all(
+            format!(
+                "GET http://{origin_address}/new HTTP/1.1\r\nHost: {origin_address}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert!(read_complete_http_head(&mut new_client)
+        .await
+        .starts_with(b"HTTP/1.1 101"));
+    new_client
+        .write_all(&websocket_frame(true, 0x1, true, b"old-secret new-secret"))
+        .await
+        .unwrap();
+
+    drop(old_client);
+    drop(new_client);
+    origin_task.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), product.shutdown())
+        .await
+        .expect("live Upgrade terminals did not release during product shutdown");
+    assert_eq!(product.forwarding_terminal_completions_for_test(), 2);
+
+    let records = product_capture_records(&directory.path().join("captures"));
+    let old_url = format!("http://{origin_address}/old");
+    let old_records = records
+        .iter()
+        .filter(|record| record.url == old_url)
+        .collect::<Vec<_>>();
+    assert_eq!(old_records.len(), 3, "old terminal submitted capture twice");
+    assert_eq!(
+        old_records
+            .iter()
+            .filter(|record| record.kind == crate::capture::CaptureKind::Response)
+            .count(),
+        0
+    );
+    let old_boundary = old_records
+        .iter()
+        .find(|record| {
+            record.body.as_ref().is_some_and(|_| {
+                record
+                    .decode_body_bytes()
+                    .unwrap()
+                    .ends_with(b"old-boundary")
+            })
+        })
+        .expect("missing fragmented old-epoch WebSocket capture");
+    assert_eq!(
+        old_boundary.decode_body_bytes().unwrap(),
+        b"old-secret [CAPTURE-OLD] old-boundary"
+    );
+    let new_boundary = old_records
+        .iter()
+        .find(|record| {
+            record.body.as_ref().is_some_and(|_| {
+                record
+                    .decode_body_bytes()
+                    .unwrap()
+                    .ends_with(b"new-boundary")
+            })
+        })
+        .expect("missing successor-epoch WebSocket capture");
+    assert_eq!(
+        new_boundary.decode_body_bytes().unwrap(),
+        b"old-secret new-secret [CAPTURE-NEW] new-boundary"
+    );
+
+    let new_url = format!("http://{origin_address}/new");
+    let new_records = records
+        .iter()
+        .filter(|record| record.url == new_url)
+        .collect::<Vec<_>>();
+    assert_eq!(new_records.len(), 2, "new terminal submitted capture twice");
+    assert_eq!(
+        new_records
+            .iter()
+            .filter(|record| record.kind == crate::capture::CaptureKind::Response)
+            .count(),
+        0
+    );
+    crate::activation::assert_listener_addresses_released(&listener_test, addresses);
+}
+
 #[tokio::test]
 async fn initial_publish_installs_one_ready_generation() {
     let (runtime, initial, _source, activator, _static_resources) =
@@ -1497,62 +1885,6 @@ async fn old_lease_delays_retirement_cleanup_and_releases_it_once() {
     tokio::task::yield_now().await;
     assert_eq!(old_owner.retirements.load(Ordering::Acquire), 1);
     assert_eq!(old_owner.events().len(), 2);
-}
-
-#[tokio::test]
-async fn upgraded_stream_does_not_pin_retiring_generation() {
-    let initial_text = config("30s", "127.0.0.1:8881", 1);
-    let (runtime, initial, source, activator, _static_resources) =
-        runtime_fixture(&initial_text).await;
-    runtime.start(initial).await.unwrap();
-
-    let old_lease = runtime.lease().await.unwrap();
-    let old_owner = activator.owner(0);
-    let upgrades =
-        UpgradeRuntime::try_new(UpgradeRuntimeLimits::new(1, 8, 2, Duration::from_secs(60)))
-            .unwrap();
-    let (committed_tx, committed_rx) = oneshot::channel();
-    upgrades
-        .try_spawn_handshake(
-            UpgradeAllocation::from_compiled_rule(0, Some(0)).unwrap(),
-            move |handshake| async move {
-                let entry = handshake
-                    .commit(
-                        None,
-                        UpgradeEntryPlan::new(
-                            UpgradeTerminalControl::new(std::future::pending::<()>, |_| async {}),
-                            |snapshot| async move {
-                                assert!(snapshot.wire_redaction().is_none());
-                                Ok(UpgradeRelayPair::new(
-                                    std::future::pending::<UpgradeTerminalCause>(),
-                                    std::future::pending::<UpgradeTerminalCause>(),
-                                ))
-                            },
-                        ),
-                    )
-                    .unwrap();
-                committed_tx.send(entry).unwrap();
-            },
-        )
-        .unwrap();
-    let entry = committed_rx.await.unwrap();
-    drop(old_lease);
-
-    for timeout in ["31s", "32s", "33s"] {
-        source.push(config(timeout, "127.0.0.1:8881", 1));
-        runtime.trigger_reload().await.unwrap();
-        wait_for_retiring(&runtime, 0).await;
-    }
-
-    assert_eq!(runtime.active_generation_id().unwrap().get(), 4);
-    assert_eq!(old_owner.retirements.load(Ordering::Acquire), 1);
-    assert_eq!(upgrades.counts().committed, 1);
-
-    upgrades
-        .shutdown_and_wait(Some(tokio::time::Instant::now()))
-        .await;
-    entry.wait_closed().await;
-    assert_eq!(upgrades.counts().committed, 0);
 }
 
 #[tokio::test]

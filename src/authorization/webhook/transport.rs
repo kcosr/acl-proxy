@@ -13,8 +13,8 @@ use super::connector::{WebhookConnector, WebhookConnectorError};
 use super::pool::{WebhookInboundBuffer, WebhookOutboundBuffer, WebhookTransportLease};
 use super::provider::WebhookProvider;
 use super::wire::{encode_request_head, WebhookRequestHeadError};
-use crate::http1::store::ParserStoreError;
 use crate::safety::GuardedBody;
+use http_access_runtime::http1::ParserStoreError;
 
 pub(crate) async fn connect_and_deliver<C>(
     connector: &WebhookConnector,

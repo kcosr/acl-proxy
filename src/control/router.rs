@@ -1,6 +1,8 @@
 use std::fmt;
 
-use crate::http1::head::{ContentType, RequestHead, RequestMethod, MAX_REQUEST_TARGET_BYTES};
+use http_access_runtime::http1::{
+    ContentType, RequestHead, RequestMethod, MAX_REQUEST_TARGET_BYTES,
+};
 
 use super::response::{AllowedMethod, ControlResponse, EmptyResponseStatus};
 
@@ -22,20 +24,20 @@ impl ControlRouter {
     }
 
     pub(crate) fn classify(&self, head: &RequestHead) -> ControlRoute {
-        if head.target.as_bytes() == self.callback_target.as_ref() {
+        if head.target().as_bytes() == self.callback_target.as_ref() {
             return self.classify_callback(head);
         }
-        if head.target.as_bytes() == self.readiness_target.as_ref() {
+        if head.target().as_bytes() == self.readiness_target.as_ref() {
             return self.classify_readiness(head);
         }
         ControlRoute::Respond(ControlResponse::empty(EmptyResponseStatus::NotFound))
     }
 
     fn classify_callback(&self, head: &RequestHead) -> ControlRoute {
-        if head.method != RequestMethod::Post {
+        if head.method() != RequestMethod::Post {
             return ControlRoute::Respond(ControlResponse::method_not_allowed(AllowedMethod::Post));
         }
-        if head.content_type != ContentType::ApplicationJson || head.content_encoding_present {
+        if head.content_type() != ContentType::ApplicationJson || head.content_encoding_present() {
             return ControlRoute::Respond(ControlResponse::empty(
                 EmptyResponseStatus::UnsupportedMediaType,
             ));
@@ -44,7 +46,7 @@ impl ControlRouter {
     }
 
     fn classify_readiness(&self, head: &RequestHead) -> ControlRoute {
-        if head.method == RequestMethod::Get {
+        if head.method() == RequestMethod::Get {
             ControlRoute::Readiness
         } else {
             ControlRoute::Respond(ControlResponse::method_not_allowed(AllowedMethod::Get))
@@ -98,8 +100,7 @@ impl std::error::Error for ControlRouterError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http1::head::{parse_request_head, HeadParse};
-    use crate::http1::store::ParserStore;
+    use http_access_runtime::http1::{parse_request_head, HeadParse, ParserStore};
 
     fn classify(request: &[u8]) -> ControlRoute {
         let router = ControlRouter::try_new("/_acl-proxy").unwrap();

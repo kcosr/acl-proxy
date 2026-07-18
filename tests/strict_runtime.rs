@@ -170,16 +170,84 @@ fn read_response(stream: &mut TcpStream) -> HttpResponse {
         let (name, value) = line.split_once(':').expect("response header");
         headers.insert(name.to_ascii_lowercase(), value.trim().to_string());
     }
-    let length = headers
+    let body = if let Some(length) = headers
         .get("content-length")
         .and_then(|value| value.parse::<usize>().ok())
-        .expect("response Content-Length");
-    let mut body = vec![0; length];
-    stream.read_exact(&mut body).expect("read response body");
+    {
+        let mut body = vec![0; length];
+        stream.read_exact(&mut body).expect("read response body");
+        body
+    } else if headers.get("transfer-encoding").is_some_and(|value| {
+        value
+            .split(',')
+            .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"))
+    }) {
+        read_chunked_body(stream)
+    } else if (100..200).contains(&status) || matches!(status, 204 | 304) {
+        Vec::new()
+    } else {
+        assert_eq!(
+            headers.get("connection").map(String::as_str),
+            Some("close"),
+            "response omitted a body framing delimiter"
+        );
+        let mut body = Vec::new();
+        stream
+            .read_to_end(&mut body)
+            .expect("read close-delimited response body");
+        body
+    };
     HttpResponse {
         status,
         headers,
         body,
+    }
+}
+
+fn read_chunked_body(stream: &mut TcpStream) -> Vec<u8> {
+    let mut body = Vec::new();
+    loop {
+        let size_line = read_crlf_line(stream);
+        let size = std::str::from_utf8(&size_line)
+            .expect("chunk size is ASCII")
+            .split(';')
+            .next()
+            .and_then(|value| usize::from_str_radix(value.trim(), 16).ok())
+            .expect("valid chunk size");
+        if size == 0 {
+            while !read_crlf_line(stream).is_empty() {}
+            return body;
+        }
+        assert!(
+            body.len()
+                .checked_add(size)
+                .is_some_and(|total| total <= 64 * 1024 * 1024),
+            "chunked response body exceeded 64 MiB"
+        );
+        let start = body.len();
+        body.resize(start + size, 0);
+        stream
+            .read_exact(&mut body[start..])
+            .expect("read response chunk");
+        let mut terminator = [0_u8; 2];
+        stream
+            .read_exact(&mut terminator)
+            .expect("read response chunk terminator");
+        assert_eq!(&terminator, b"\r\n");
+    }
+}
+
+fn read_crlf_line(stream: &mut TcpStream) -> Vec<u8> {
+    let mut line = Vec::new();
+    loop {
+        assert!(line.len() < 64 * 1024, "HTTP line exceeded 64 KiB");
+        let mut byte = [0_u8; 1];
+        stream.read_exact(&mut byte).expect("read HTTP line");
+        line.push(byte[0]);
+        if line.ends_with(b"\r\n") {
+            line.truncate(line.len() - 2);
+            return line;
+        }
     }
 }
 

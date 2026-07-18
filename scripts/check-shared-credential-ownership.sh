@@ -280,10 +280,57 @@ def production(path: pathlib.Path) -> str:
         raise SystemExit(f"{path}: {error}") from error
 
 
+def verified_test_only_include() -> pathlib.Path:
+    runner_path = pathlib.Path("src/activation/runner.rs")
+    included_path = pathlib.Path("src/activation/runner_connect_mitm_tests.rs")
+    absolute_runner = root / runner_path
+    absolute_included = root / included_path
+    if not absolute_runner.is_file():
+        raise SystemExit(f"activation runner is missing: {runner_path}")
+    if not absolute_included.is_file():
+        raise SystemExit(f"CONNECT/MITM test suite is missing: {included_path}")
+
+    raw = absolute_runner.read_text(encoding="utf-8")
+    code = mask_non_code(raw)
+    test_modules = list(
+        re.finditer(
+            r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*mod\s+tests\s*\{",
+            code,
+        )
+    )
+    if len(test_modules) != 1:
+        raise SystemExit(
+            "activation runner must have exactly one #[cfg(test)] mod tests owner"
+        )
+
+    body_start = code.find("{", test_modules[0].start(), test_modules[0].end())
+    body_end = matching_delimiter(code, body_start, "{", "}")
+    raw_body = raw[body_start + 1 : body_end - 1]
+    code_body = code[body_start + 1 : body_end - 1]
+    include_pattern = re.compile(
+        r'\bmod\s+connect_mitm_tests\s*\{\s*'
+        r'include!\s*\(\s*"runner_connect_mitm_tests\.rs"\s*\)\s*;\s*\}'
+    )
+    includes = [
+        match
+        for match in include_pattern.finditer(raw_body)
+        if code_body[match.start() : match.start() + 3] == "mod"
+    ]
+    literal = 'include!("runner_connect_mitm_tests.rs")'
+    if len(includes) != 1 or raw.count(literal) != 1:
+        raise SystemExit(
+            "CONNECT/MITM suite must have exactly one test-only include in "
+            "src/activation/runner.rs"
+        )
+    return included_path
+
+
+included_test_sources = {verified_test_only_include()}
 sources = []
 for path in sorted((root / "src").rglob("*.rs")):
     relative = path.relative_to(root)
-    sources.append((relative, production(relative)))
+    source = "" if relative in included_test_sources else production(relative)
+    sources.append((relative, source))
 
 forbidden = (
     ("credential source ordinal", re.compile(r"\b(?:struct|enum|type)\s+CredentialSourceIndex\b")),

@@ -1,17 +1,19 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use http::header::{HeaderMap, HeaderName, CONTENT_TYPE};
+use http::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_ENCODING, CONTENT_TYPE};
+use http::StatusCode;
 use http_access_policy_acl::{
     EvaluationInput, MatchedEffects, PolicyEvaluation, ProviderDisposition,
 };
 use http_access_runtime::{
     BodyBounds, BodyBudget, BodyBudgetActivation, BoxFuture, Clock, DecisionProvider,
     ForwardingCancellation, ForwardingNetworkGuard, ForwardingTargetPreflight,
-    PreparedForwardingTarget, ProviderOutcome, RequestPipelineError, ResolvedForwardingTarget,
-    RuntimeBody, RuntimeRequest, RuntimeResponse, StandaloneDispatch, StandaloneExchange,
+    PreparedForwardingTarget, PreparedStandaloneRequest, ProviderOutcome, RequestPipelineError,
+    ResolvedForwardingTarget, RuntimeBody, RuntimeRequest, RuntimeResponse, StandaloneDispatch,
+    StandaloneExchange, StandaloneIngress, StandaloneIngressBody, StandaloneRequestFactory,
+    StandaloneTerminal,
 };
 use http_access_types::{
     BodyFraming, BodyObservation, BodyObservationState, BodyRepresentation, DecisionAuditFacts,
@@ -19,29 +21,37 @@ use http_access_types::{
     DecisionReason, DecisionReasonCategory, EffectivePolicy, HeaderName as NeutralHeaderName,
     HttpMethod, HttpVersion, PolicyHeaderFacts, RequestBinding, StableId, TrailerPolicy,
 };
-use hyper::body::HttpBody;
 use tokio::time::Instant;
 
+use crate::activation::assets::ProductIngressAssets;
 use crate::authorization::protocol::{
     GuardedProviderBody, IncludedHeader, ProviderBodyReplacementDecodeError, ProviderRequest,
     ProviderRequestHeaders,
 };
 use crate::authorization::AuthorizationDecision;
+use crate::capture::CaptureDecision;
 use crate::config::compiler::{
     CompiledDecisionLogLevel, CompiledProviderFailureMode, HttpBodyReadPlan,
 };
 use crate::credential_resolver::ProductCredentialPreparation;
 use crate::credentials::InboundCredentials;
 use crate::http_body::{read_mandatory_runtime_request_body, HttpBodyReadError};
-use crate::observation::{DecisionSubmissionTarget, PendingDecisionSubmission};
+use crate::observation::{
+    DecisionSubmissionTarget, PendingDecisionSubmission, ProductObservationRuntime,
+};
 use crate::policy::{HttpWireBodyPlanIndex, ProductRuleEffectsRef};
-use crate::proxy::facts::{FactsError, SanitizedStandaloneIngress, ValidatedStandaloneIngress};
+use crate::proxy::observation_adapter::{
+    DeniedCaptureBody, HttpCaptureContext, TerminalRequestBodyProvenance,
+};
+use crate::proxy::private_fields::{
+    partition_standalone_private_fields, rebuild_standalone_facts, IngressPartitionPolicy,
+    PartitionedIngressHeaders, ProductPartitionError,
+};
 use crate::runtime::{
     AuthorizationInvocationMode, ForwardingGenerationServices, GenerationLease,
-    GenerationRetention, ProviderIndex,
+    GenerationRetention, ProviderIndex, Runtime,
 };
-use crate::runtime_body_source::{ProductBodySource, ProductBodySourceActivation};
-use crate::safety::{GuardedBody, WireBodyQuotaKey};
+use crate::safety::{GuardedBody, WireBodyPool, WireBodyQuotaKey};
 use crate::standalone_provider_result::{
     adapt_local_allow, adapt_provider_allow, StandaloneAllowMode, StandaloneProviderAllowError,
     StandaloneRequestSidecar,
@@ -51,6 +61,98 @@ use http_access_types::HttpProtocol;
 pub(crate) struct TokioRuntimeClock {
     epoch: Instant,
     unix_epoch_millis: u64,
+}
+
+/// Reusable product owner for neutral standalone request preparation.
+pub(crate) struct ProductStandaloneRequestFactory {
+    runtime: Arc<Runtime>,
+    observation: Arc<ProductObservationRuntime>,
+    assets: Arc<ProductIngressAssets>,
+    wire_body_pool: Arc<WireBodyPool>,
+}
+
+impl ProductStandaloneRequestFactory {
+    pub(crate) fn new(
+        runtime: Arc<Runtime>,
+        observation: Arc<ProductObservationRuntime>,
+        assets: Arc<ProductIngressAssets>,
+        wire_body_pool: Arc<WireBodyPool>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            runtime,
+            observation,
+            assets,
+            wire_body_pool,
+        })
+    }
+}
+
+impl StandaloneRequestFactory for ProductStandaloneRequestFactory {
+    fn prepare(
+        &self,
+        ingress: StandaloneIngress,
+    ) -> BoxFuture<'_, Result<PreparedStandaloneRequest, http_access_runtime::RuntimeError>> {
+        Box::pin(async move {
+            let started_at = Instant::now();
+            let (facts, peer, peer_is_local, listener_connect_denied, body, private_fields) =
+                ingress.into_parts();
+            let lease = self
+                .runtime
+                .lease()
+                .await
+                .ok_or(http_access_runtime::RuntimeError::ServiceFailure)?;
+            let request_id = request_id();
+            let (visible_fields, partitioned) = partition_standalone_private_fields(
+                &IngressPartitionPolicy::from_lease(&lease),
+                private_fields,
+            )
+            .map_err(|_| http_access_runtime::RuntimeError::InvalidInput)?;
+            let facts = rebuild_standalone_facts(facts, visible_fields)
+                .map_err(|_| http_access_runtime::RuntimeError::InvalidInput)?;
+            let ingress_protocol = ingress_protocol(facts.version());
+            let preflight_target = self
+                .assets
+                .forwarding_network()
+                .preflight(
+                    facts.url(),
+                    ingress_protocol,
+                    lease.standalone().origin_protocol(facts.version()),
+                    lease.standalone().route(),
+                )
+                .ok();
+            let clock = TokioRuntimeClock::new(started_at);
+            let capture = HttpCaptureContext::from_checked_standalone(
+                Arc::clone(&self.observation),
+                lease.observation().capture_epoch().clone(),
+                lease.standalone().sensitive_header_policy().clone(),
+                request_id.clone(),
+                peer,
+                &facts,
+                lease.max_content_decoding_expansion_ratio(),
+            )
+            .map_err(|_| http_access_runtime::RuntimeError::InvalidInput)?;
+            let input = StandaloneProviderInput {
+                request_id,
+                facts,
+                peer,
+                quota_key: WireBodyQuotaKey::from_peer(peer.ip(), |_| peer_is_local),
+                body,
+                partitioned,
+                started_at,
+                preflight_target,
+                network: Arc::clone(self.assets.forwarding_network()),
+                cancellation: ProductForwardingCancellation::new(),
+                clock,
+                listener_denied: listener_connect_denied,
+                decision_target: Arc::clone(&self.observation).into(),
+                capture,
+            };
+            let (context, request) =
+                StandalonePolicyProvider::prepare(lease, Arc::clone(&self.wire_body_pool), input)
+                    .map_err(|_| http_access_runtime::RuntimeError::InvalidInput)?;
+            Ok(PreparedStandaloneRequest::new(request, context))
+        })
+    }
 }
 
 impl TokioRuntimeClock {
@@ -100,32 +202,24 @@ impl Clock for TokioRuntimeClock {
     }
 }
 
-pub(crate) struct StandaloneProviderInput {
+struct StandaloneProviderInput {
     pub(crate) request_id: String,
-    pub(crate) validated: ValidatedStandaloneIngress,
-    pub(crate) peer_ip: IpAddr,
+    pub(crate) facts: http_access_types::InterceptedRequestFacts,
+    pub(crate) peer: SocketAddr,
     pub(crate) quota_key: WireBodyQuotaKey,
+    pub(crate) body: StandaloneIngressBody,
+    pub(crate) partitioned: PartitionedIngressHeaders,
     pub(crate) started_at: Instant,
-    pub(crate) preflight_target: ForwardingTargetPreflight,
+    pub(crate) preflight_target: Option<ForwardingTargetPreflight>,
     pub(crate) network: Arc<ForwardingNetworkGuard>,
     pub(crate) cancellation: ProductForwardingCancellation,
     pub(crate) clock: Arc<TokioRuntimeClock>,
     pub(crate) listener_denied: bool,
     pub(crate) decision_target: DecisionSubmissionTarget,
+    pub(crate) capture: HttpCaptureContext,
 }
 
-pub(crate) trait StandaloneTerminalService: Send + 'static {
-    type Output: Send + 'static;
-
-    fn fail_closed(self, error: RequestPipelineError) -> BoxFuture<'static, Self::Output>;
-
-    fn respond(self, dispatch: StandaloneResponseDispatch) -> BoxFuture<'static, Self::Output>;
-
-    fn forward(self, dispatch: StandaloneForwardDispatch) -> BoxFuture<'static, Self::Output>;
-}
-
-pub(crate) struct StandalonePolicyProvider<T> {
-    terminal: Mutex<Option<T>>,
+pub(crate) struct StandalonePolicyProvider {
     decision: Mutex<Option<PreparedDecision>>,
     dispatch: Mutex<Option<PreparedDispatch>>,
     responses: Mutex<PreparedResponses>,
@@ -133,12 +227,7 @@ pub(crate) struct StandalonePolicyProvider<T> {
     decision_source: Mutex<Option<DecisionAuditSource>>,
     response_decision: Mutex<Option<PendingDecisionSubmission>>,
     audit: DecisionAuditContext,
-}
-
-pub(crate) struct StandaloneResponseDispatch {
-    pub(crate) response: RuntimeResponse,
-    pub(crate) observation: Option<StandaloneResponseObservation>,
-    pub(crate) decision: PendingDecisionSubmission,
+    capture: HttpCaptureContext,
 }
 
 pub(crate) struct StandaloneResponseObservation {
@@ -175,20 +264,21 @@ struct PreparedDecision {
     quota_key: WireBodyQuotaKey,
     body_budget: BodyBudget,
     body_budget_activation: BodyBudgetActivation,
-    body_source_activation: ProductBodySourceActivation,
-    prepared_target: PreparedForwardingTarget,
+    prepared_target: Option<PreparedForwardingTarget>,
     early_deny_source: Option<DecisionAuditSource>,
     ingress_body_complete: bool,
 }
 
 struct PreparedTerminalState {
     generation: GenerationLease,
+    stable_wire_body_pool: Arc<WireBodyPool>,
     request_id: String,
     quota_key: WireBodyQuotaKey,
     deadline: Instant,
     network: Arc<ForwardingNetworkGuard>,
     cancellation: ProductForwardingCancellation,
-    transport: StandaloneIngressTransport,
+    allow_mode: StandaloneAllowMode,
+    private_fields: Option<HeaderMap>,
 }
 
 struct PreparedDispatch {
@@ -196,59 +286,37 @@ struct PreparedDispatch {
     request_id: String,
     quota_key: WireBodyQuotaKey,
     retention: GenerationRetention,
-    deadline: Instant,
     resolved: ResolvedForwardingTarget,
     cancellation: ProductForwardingCancellation,
     sidecar: StandaloneRequestSidecar,
     credentials: Option<ProductCredentialPreparation>,
-    transport: StandaloneIngressTransport,
+    private_fields: ProductPrivateFields,
     decision: PendingDecisionSubmission,
+    capture: HttpCaptureContext,
+    body_resources: ProductBodyResources,
+    stable_wire_body_pool: Arc<WireBodyPool>,
 }
 
-pub(crate) enum StandaloneIngressTransport {
-    Ordinary {
-        parts: Box<http::request::Parts>,
-        head: http_access_runtime::SanitizedRequestHead,
-        downstream_upgrade: Option<hyper::upgrade::OnUpgrade>,
-    },
-    OuterConnect {
-        head: http_access_runtime::SanitizedConnectRequestHead,
-        downstream_upgrade: hyper::upgrade::OnUpgrade,
-    },
+pub(crate) struct ProductBodyResources {
+    _replay: crate::safety::RuntimeReplayLease,
+    _staging: crate::safety::RequestStagingAuthority,
 }
 
-impl StandaloneIngressTransport {
-    fn protocol(&self) -> HttpProtocol {
-        match self {
-            Self::Ordinary { head, .. } => {
-                crate::proxy::headers::product_protocol(head.ingress_version())
-            }
-            Self::OuterConnect { head, .. } => {
-                crate::proxy::headers::product_protocol(head.ingress_version())
-            }
-        }
-    }
+pub(crate) struct ProductPrivateFields {
+    _inbound: InboundCredentials,
+    _internal_context: HeaderMap,
+    _retained: HeaderMap,
+}
 
-    fn matches_facts(&self, facts: &http_access_types::InterceptedRequestFacts) -> bool {
-        match self {
-            Self::Ordinary {
-                downstream_upgrade, ..
-            } => downstream_upgrade.is_some() == facts.upgrade().is_some(),
-            Self::OuterConnect { head, .. } => {
-                crate::proxy::headers::product_protocol(head.ingress_version())
-                    == HttpProtocol::Http1
-                    && head.method().as_str() == "CONNECT"
-                    && facts.method().as_str() == "CONNECT"
-                    && facts.upgrade().is_none()
-            }
-        }
-    }
-
-    fn allow_mode(&self) -> StandaloneAllowMode {
-        match self {
-            Self::Ordinary { .. } => StandaloneAllowMode::OriginRequest,
-            Self::OuterConnect { .. } => StandaloneAllowMode::OuterConnect,
-        }
+impl ProductPrivateFields {
+    pub(crate) fn validates_visible(&self, visible: &[http_access_types::HeaderField]) -> bool {
+        visible.iter().all(|field| {
+            let name = field.name().as_str();
+            !self._inbound.reserves_header(name)
+                && !self._internal_context.contains_key(name)
+                && !self._retained.contains_key(name)
+                && !http_access_runtime::is_prepartition_caller_credential_header(name)
+        })
     }
 }
 
@@ -258,13 +326,15 @@ pub(crate) struct StandaloneForwardDispatch {
     pub(crate) request_id: String,
     pub(crate) quota_key: WireBodyQuotaKey,
     pub(crate) retention: GenerationRetention,
-    pub(crate) deadline: Instant,
     pub(crate) resolved: ResolvedForwardingTarget,
     pub(crate) cancellation: ProductForwardingCancellation,
     pub(crate) sidecar: StandaloneRequestSidecar,
     pub(crate) credentials: Option<ProductCredentialPreparation>,
-    pub(crate) transport: StandaloneIngressTransport,
+    pub(crate) private_fields: ProductPrivateFields,
     pub(crate) decision: PendingDecisionSubmission,
+    pub(crate) capture: HttpCaptureContext,
+    pub(crate) body_resources: ProductBodyResources,
+    pub(crate) stable_wire_body_pool: Arc<WireBodyPool>,
 }
 
 pub(crate) struct ProductForwardingCancellation {
@@ -328,7 +398,67 @@ impl DecisionAuditContext {
 
 struct PreparedResponses {
     policy: http_access_runtime::LocalResponsePolicy,
-    body: Option<RuntimeBody>,
+    context: LocalResponseContext,
+    bounds: BodyBounds,
+    clock: Arc<dyn Clock>,
+    budget: Option<BodyBudget>,
+}
+
+const LOCAL_RESPONSE_BODY_BYTES: u64 = 64;
+const CONNECT_DENIAL_RESPONSE_BODY: &str = "CONNECT denied\n";
+const DENIAL_RESPONSE_BODY: &str = "request denied\n";
+const TIMEOUT_RESPONSE_BODY: &str = "request timed out\n";
+const BODY_DENIAL_RESPONSE_BODY: &str = "request body denied\n";
+const UNAVAILABLE_RESPONSE_BODY: &str = "service unavailable\n";
+const FAILURE_RESPONSE_BODY: &str = "request failed\n";
+
+#[derive(Clone, Copy)]
+enum LocalResponseBodyKind {
+    ConnectDenial,
+    Denial,
+    Timeout,
+    BodyDenial,
+    Unavailable,
+    Failure,
+}
+
+impl LocalResponseBodyKind {
+    const fn text(self) -> &'static str {
+        match self {
+            Self::ConnectDenial => CONNECT_DENIAL_RESPONSE_BODY,
+            Self::Denial => DENIAL_RESPONSE_BODY,
+            Self::Timeout => TIMEOUT_RESPONSE_BODY,
+            Self::BodyDenial => BODY_DENIAL_RESPONSE_BODY,
+            Self::Unavailable => UNAVAILABLE_RESPONSE_BODY,
+            Self::Failure => FAILURE_RESPONSE_BODY,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum LocalResponseContext {
+    Standard,
+    ListenerDeniedConnect,
+}
+
+const fn local_response_body_kind(
+    status: u16,
+    context: LocalResponseContext,
+) -> LocalResponseBodyKind {
+    match status {
+        403 if matches!(context, LocalResponseContext::ListenerDeniedConnect) => {
+            LocalResponseBodyKind::ConnectDenial
+        }
+        403 => LocalResponseBodyKind::Denial,
+        504 => LocalResponseBodyKind::Timeout,
+        400 | 408 | 413 | 415 => LocalResponseBodyKind::BodyDenial,
+        503 => LocalResponseBodyKind::Unavailable,
+        _ => LocalResponseBodyKind::Failure,
+    }
+}
+
+fn local_response_capture_body(status: u16, context: LocalResponseContext) -> &'static str {
+    local_response_body_kind(status, context).text()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -340,9 +470,7 @@ pub(crate) enum StandaloneProviderPrepareError {
     #[error("request credential extraction failed")]
     Credential(#[from] crate::credentials::CredentialError),
     #[error("request facts are invalid")]
-    Facts(#[from] FactsError),
-    #[error("forwarding target does not belong to this request")]
-    Target,
+    Facts(#[from] ProductPartitionError),
     #[error("ingress transport does not match checked request facts")]
     Transport,
     #[error("request deadline cannot be represented")]
@@ -353,60 +481,53 @@ pub(crate) enum StandaloneProviderPrepareError {
     Policy,
 }
 
-impl<T> StandalonePolicyProvider<T>
-where
-    T: StandaloneTerminalService,
-{
-    pub(crate) fn prepare(
+impl StandalonePolicyProvider {
+    fn prepare(
         lease: GenerationLease,
-        terminal: T,
+        stable_wire_body_pool: Arc<WireBodyPool>,
         input: StandaloneProviderInput,
     ) -> Result<(Self, RuntimeRequest), StandaloneProviderPrepareError> {
-        let (shape, ingress, partitioned) = input.validated.into_parts();
-        let (headers, ingress_body, transport) = match ingress {
-            SanitizedStandaloneIngress::Ordinary(ingress) => {
-                let (parts, body, head, downstream_upgrade) = ingress.into_parts();
-                let headers = crate::proxy::headers::product_headers(head.headers())
-                    .map_err(|_| StandaloneProviderPrepareError::HeaderFacts)?;
-                (
-                    headers,
-                    body,
-                    StandaloneIngressTransport::Ordinary {
-                        parts,
-                        head,
-                        downstream_upgrade,
-                    },
-                )
-            }
-            SanitizedStandaloneIngress::OuterConnect(ingress) => {
-                let (_parts, body, head, downstream_upgrade) = ingress.into_parts();
-                let headers = crate::proxy::headers::product_headers(head.headers())
-                    .map_err(|_| StandaloneProviderPrepareError::HeaderFacts)?;
-                (
-                    headers,
-                    body,
-                    StandaloneIngressTransport::OuterConnect {
-                        head,
-                        downstream_upgrade,
-                    },
-                )
-            }
-        };
+        let StandaloneProviderInput {
+            request_id,
+            facts,
+            peer,
+            quota_key,
+            body: ingress_body,
+            partitioned,
+            started_at,
+            preflight_target,
+            network,
+            cancellation,
+            clock,
+            listener_denied,
+            decision_target,
+            capture,
+        } = input;
         let ingress_body_complete = ingress_body.is_end_stream();
-        let audit_request_id = StableId::new(input.request_id.clone())
+        let audit_request_id = StableId::new(request_id.clone())
             .map_err(|_| StandaloneProviderPrepareError::RequestId)?;
-        let transport_protocol = transport.protocol();
         let audit_sensitive_header_presence = partitioned.audit_sensitive_presence;
         let sensitive_headers = lease.standalone().sensitive_headers().to_vec();
         let sensitive_header_presence = partitioned.sensitive_presence;
         let inbound = partitioned.inbound;
         let internal_context = partitioned.internal_context;
-        let facts = shape.into_facts(&headers)?;
+        let private_fields = partitioned.retained_private;
+        let headers = crate::proxy::private_fields::product_headers(facts.headers())?;
         let audit_method = facts.method().clone();
         let audit_url = facts.url().clone();
-        if transport_protocol != ingress_protocol(facts.version())
-            || !transport.matches_facts(&facts)
-        {
+        let allow_mode = if facts.method().as_str() == "CONNECT"
+            && ingress_protocol(facts.version()) == HttpProtocol::Http1
+            && facts.upgrade().is_none()
+            && matches!(
+                facts.ingress_mode(),
+                http_access_types::IngressMode::ExplicitHttp
+                    | http_access_types::IngressMode::ExplicitHttps
+            ) {
+            StandaloneAllowMode::OuterConnect
+        } else {
+            StandaloneAllowMode::OriginRequest
+        };
+        if listener_denied && allow_mode != StandaloneAllowMode::OuterConnect {
             return Err(StandaloneProviderPrepareError::Transport);
         }
         let header_facts = PolicyHeaderFacts::from_partitioned(
@@ -417,7 +538,7 @@ where
         .map_err(|_| StandaloneProviderPrepareError::HeaderFacts)?;
         let evaluation_input = EvaluationInput::new(
             &facts,
-            input.peer_ip,
+            peer.ip(),
             &header_facts,
             RuntimeRequest::INITIAL_REVISION,
             BodyRepresentation::PreservedContentCoded,
@@ -452,15 +573,13 @@ where
             .and_then(|ordinal| lease.standalone().rules().get(ordinal))
             .and_then(crate::standalone::StandaloneRuleTemplate::request_timeout)
             .unwrap_or_else(|| lease.request_timeout());
-        let deadline = input
-            .started_at
+        let deadline = started_at
             .checked_add(request_timeout)
             .ok_or(StandaloneProviderPrepareError::Deadline)?;
-        let absolute_deadline_millis = input
-            .clock
+        let absolute_deadline_millis = clock
             .deadline_millis(deadline)
             .ok_or(StandaloneProviderPrepareError::Deadline)?;
-        let early_deny_source = if input.listener_denied {
+        let mut early_deny_source = if listener_denied {
             Some(local_source(DecisionReasonCategory::Policy, 1))
         } else if lease.safety().contains_loop_marker(&headers) {
             Some(local_source(DecisionReasonCategory::Loop, 1))
@@ -491,16 +610,9 @@ where
             trailer_bytes,
             lease.standalone().timeouts().body_idle_ms(),
         )?;
-        let (source, body_source_activation) = ProductBodySource::unarmed(
-            ingress_body,
-            limits.chunk_bytes(),
-            trailer_count,
-            trailer_bytes,
-        )?;
         let (body_budget, body_budget_activation) = BodyBudget::unarmed();
-        let runtime_clock: Arc<dyn Clock> = input.clock.clone();
-        let body = RuntimeBody::new(
-            Box::pin(source),
+        let runtime_clock: Arc<dyn Clock> = clock.clone();
+        let body = ingress_body.into_runtime_body(
             bounds,
             runtime_clock,
             body_budget.clone(),
@@ -508,23 +620,27 @@ where
         )?;
         let request = RuntimeRequest::new(
             facts,
-            input.peer_ip,
+            peer.ip(),
             header_facts,
             BodyRepresentation::PreservedContentCoded,
             body,
             absolute_deadline_millis,
         )?;
-        let prepared_target = input
-            .preflight_target
-            .bind_for_request(
-                &request,
-                lease
-                    .standalone()
-                    .origin_protocol(request.facts().version()),
-                lease.standalone().route(),
-                &input.network,
-            )
-            .map_err(|_| StandaloneProviderPrepareError::Target)?;
+        let prepared_target = preflight_target.and_then(|preflight_target| {
+            preflight_target
+                .bind_for_request(
+                    &request,
+                    lease
+                        .standalone()
+                        .origin_protocol(request.facts().version()),
+                    lease.standalone().route(),
+                    &network,
+                )
+                .ok()
+        });
+        if prepared_target.is_none() && early_deny_source.is_none() {
+            early_deny_source = Some(local_source(DecisionReasonCategory::InvalidPlan, 3));
+        }
         if request.binding()? != initial_binding
             || request.body_observation()?.state() != BodyObservationState::Unobserved
         {
@@ -532,13 +648,18 @@ where
                 http_access_runtime::RuntimeError::InvalidInput,
             ));
         }
-        let responses = PreparedResponses::new(&request, input.clock.clone())?;
+        let local_response_context = if listener_denied {
+            LocalResponseContext::ListenerDeniedConnect
+        } else {
+            LocalResponseContext::Standard
+        };
+        let responses = PreparedResponses::new(&request, clock.clone(), local_response_context)?;
         let audit = DecisionAuditContext {
-            target: input.decision_target,
+            target: decision_target,
             request_id: audit_request_id,
             method: audit_method,
             url: audit_url,
-            peer_ip: input.peer_ip,
+            peer_ip: peer.ip(),
             sensitive_header_presence: audit_sensitive_header_presence,
             allow_level: lease
                 .observation()
@@ -550,33 +671,33 @@ where
         let prepared = PreparedDecision {
             terminal: Some(PreparedTerminalState {
                 generation: lease,
-                request_id: input.request_id.clone(),
-                quota_key: input.quota_key.clone(),
+                stable_wire_body_pool,
+                request_id: request_id.clone(),
+                quota_key: quota_key.clone(),
                 deadline,
-                network: input.network,
-                cancellation: input.cancellation,
-                transport,
+                network,
+                cancellation,
+                allow_mode,
+                private_fields: Some(private_fields),
             }),
             initial_binding,
             evaluation,
             body_read_plan,
             wire_body_plan,
-            request_id: input.request_id,
+            request_id,
             headers,
             inbound,
             internal_context,
-            peer_ip: input.peer_ip,
-            quota_key: input.quota_key,
+            peer_ip: peer.ip(),
+            quota_key,
             body_budget,
             body_budget_activation,
-            body_source_activation,
             prepared_target,
             early_deny_source,
             ingress_body_complete,
         };
         Ok((
             Self {
-                terminal: Mutex::new(Some(terminal)),
                 decision: Mutex::new(Some(prepared)),
                 dispatch: Mutex::new(None),
                 responses: Mutex::new(responses),
@@ -584,6 +705,7 @@ where
                 decision_source: Mutex::new(None),
                 response_decision: Mutex::new(None),
                 audit,
+                capture,
             },
             request,
         ))
@@ -598,7 +720,7 @@ where
         let terminal = state.terminal.as_ref().ok_or(500_u16)?;
         let generation = &terminal.generation;
         let deadline = terminal.deadline;
-        let allow_mode = terminal.transport.allow_mode();
+        let allow_mode = terminal.allow_mode;
         if facts != request.facts()
             || request.binding().map_err(|_| 500_u16)? != state.initial_binding
             || request.body_observation().map_err(|_| 500_u16)?.state()
@@ -609,7 +731,7 @@ where
         let mut evaluation = state.evaluation;
         if let Some(source) = state.early_deny_source.take() {
             self.set_decision_source(source);
-            let close_connection = !state.ingress_body_complete;
+            let close_connection = early_deny_close_connection(state.ingress_body_complete);
             self.record_denial(
                 &mut state.headers,
                 None,
@@ -622,9 +744,10 @@ where
             return Err(504);
         }
 
+        let prepared_target = state.prepared_target.ok_or(500_u16)?;
         let resolution = terminal
             .network
-            .resolve(state.prepared_target, &terminal.cancellation.capability)
+            .resolve(prepared_target, &terminal.cancellation.capability)
             .await;
         if Instant::now() >= deadline {
             return Err(504);
@@ -652,10 +775,10 @@ where
             .body_budget_activation
             .activate(&state.body_budget, replay_capacity)
             .map_err(|_| 500_u16)?;
-        state
-            .body_source_activation
-            .activate(guard.clone(), replay_lease, staging)
-            .map_err(|_| 500_u16)?;
+        let body_resources = ProductBodyResources {
+            _replay: replay_lease,
+            _staging: staging,
+        };
 
         let content_type = state
             .headers
@@ -723,8 +846,19 @@ where
                     )
                     .map_err(adapter_error_status)?;
                     self.set_decision_source(DecisionAuditSource::Policy(provenance));
-                    let terminal = state.terminal.take().ok_or(500_u16)?;
-                    return self.finish_forward(resolved, allowed, terminal);
+                    let mut terminal = state.terminal.take().ok_or(500_u16)?;
+                    let private_fields = ProductPrivateFields {
+                        _inbound: state.inbound,
+                        _internal_context: state.internal_context,
+                        _retained: terminal.private_fields.take().ok_or(500_u16)?,
+                    };
+                    return self.finish_forward(
+                        resolved,
+                        allowed,
+                        terminal,
+                        body_resources,
+                        private_fields,
+                    );
                 }
                 PolicyEvaluation::Deny { provenance } => {
                     self.set_decision_source(DecisionAuditSource::Policy(provenance.clone()));
@@ -926,9 +1060,20 @@ where
                                         return Err(status);
                                     }
                                 };
-                            let terminal = state.terminal.take().ok_or(500_u16)?;
+                            let mut terminal = state.terminal.take().ok_or(500_u16)?;
                             self.set_decision_source(DecisionAuditSource::Policy(provenance));
-                            return self.finish_forward(resolved, allowed, terminal);
+                            let private_fields = ProductPrivateFields {
+                                _inbound: state.inbound,
+                                _internal_context: state.internal_context,
+                                _retained: terminal.private_fields.take().ok_or(500_u16)?,
+                            };
+                            return self.finish_forward(
+                                resolved,
+                                allowed,
+                                terminal,
+                                body_resources,
+                                private_fields,
+                            );
                         }
                         AuthorizationDecision::Deny => {
                             let policy_result = resolve_delegate(
@@ -972,13 +1117,43 @@ where
         resolved: ResolvedForwardingTarget,
         allowed: crate::standalone_provider_result::StandaloneProviderAllow,
         terminal: PreparedTerminalState,
+        body_resources: ProductBodyResources,
+        private_fields: ProductPrivateFields,
     ) -> Result<ProviderOutcome, u16> {
         let crate::standalone_provider_result::StandaloneProviderAllow {
             plan,
             request,
-            sidecar,
+            mut sidecar,
             credentials,
         } = allowed;
+        if terminal.allow_mode == StandaloneAllowMode::OuterConnect {
+            if credentials.is_some()
+                || sidecar
+                    .take_upgrade_admission(plan.binding())
+                    .map_err(|_| 500_u16)?
+                    .is_some()
+            {
+                return Err(500);
+            }
+            let source = self
+                .take_decision_source()
+                .expect("allowed CONNECT owns final policy provenance");
+            let decision = self.audit.pending(DecisionDisposition::Allow, source);
+            let previous = lock(&self.response_decision).replace(decision);
+            debug_assert!(previous.is_none());
+            drop((
+                resolved,
+                plan,
+                request,
+                sidecar,
+                terminal,
+                body_resources,
+                private_fields,
+            ));
+            return Ok(ProviderOutcome::Respond(
+                lock(&self.responses).build(200).map_err(|_| 500_u16)?,
+            ));
+        }
         let mut dispatch = lock(&self.dispatch);
         if dispatch.is_some() {
             return Err(500);
@@ -997,13 +1172,15 @@ where
             request_id: terminal.request_id,
             quota_key: terminal.quota_key,
             retention,
-            deadline: terminal.deadline,
             resolved,
             cancellation: terminal.cancellation,
             sidecar,
             credentials,
-            transport: terminal.transport,
+            private_fields,
             decision,
+            capture: self.capture.clone(),
+            body_resources,
+            stable_wire_body_pool: terminal.stable_wire_body_pool,
         });
         Ok(ProviderOutcome::Forward { plan, request })
     }
@@ -1089,10 +1266,74 @@ where
         self.record_denial(headers, body, body_provenance, close_connection);
     }
 
-    fn take_terminal(&self) -> T {
-        lock(&self.terminal)
-            .take()
-            .expect("the consumed request context owns one terminal service")
+    fn submit_local_capture(
+        &self,
+        status: u16,
+        observation: Option<StandaloneResponseObservation>,
+    ) {
+        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        if let Some(observation) = observation {
+            let (body, provenance) = match (observation.body, observation.body_provenance) {
+                (
+                    Some(body),
+                    body_provenance @ (StandaloneResponseBodyProvenance::CompleteOriginal
+                    | StandaloneResponseBodyProvenance::CompleteWireRedacted),
+                ) => {
+                    let mut headers = HeaderMap::new();
+                    if let Some(content_type) = body
+                        .content_type
+                        .as_deref()
+                        .and_then(|value| HeaderValue::from_str(value).ok())
+                    {
+                        headers.insert(CONTENT_TYPE, content_type);
+                    }
+                    headers.insert(CONTENT_ENCODING, HeaderValue::from_static("identity"));
+                    let provenance = match body_provenance {
+                        StandaloneResponseBodyProvenance::CompleteOriginal => {
+                            TerminalRequestBodyProvenance::CompleteOriginal
+                        }
+                        StandaloneResponseBodyProvenance::CompleteWireRedacted => {
+                            TerminalRequestBodyProvenance::CompleteWireRedacted
+                        }
+                        _ => unreachable!("the match arm restricts body provenance"),
+                    };
+                    (
+                        Some(DeniedCaptureBody {
+                            headers,
+                            decoded: body.decoded,
+                        }),
+                        provenance,
+                    )
+                }
+                (None, StandaloneResponseBodyProvenance::ProviderReplacement { size }) => (
+                    None,
+                    TerminalRequestBodyProvenance::ProviderReplacement { size },
+                ),
+                (None, StandaloneResponseBodyProvenance::CompleteOriginal) => {
+                    (None, TerminalRequestBodyProvenance::CompleteOriginal)
+                }
+                (None, StandaloneResponseBodyProvenance::CompleteWireRedacted) => {
+                    (None, TerminalRequestBodyProvenance::CompleteWireRedacted)
+                }
+                _ => (None, TerminalRequestBodyProvenance::Unconsumed),
+            };
+            self.capture
+                .submit_denied_request(Some(&observation.headers), body, provenance);
+        } else if status != StatusCode::OK {
+            self.capture.submit_denied_request(
+                None,
+                None,
+                TerminalRequestBodyProvenance::Unconsumed,
+            );
+        }
+        if status != StatusCode::OK {
+            let context = lock(&self.responses).context;
+            self.capture.submit_local_response(
+                CaptureDecision::Deny,
+                status,
+                local_response_capture_body(status.as_u16(), context),
+            );
+        }
     }
 
     fn set_decision_source(&self, source: DecisionAuditSource) {
@@ -1112,42 +1353,76 @@ impl PreparedResponses {
     fn new(
         request: &RuntimeRequest,
         clock: Arc<TokioRuntimeClock>,
+        context: LocalResponseContext,
     ) -> Result<Self, http_access_runtime::RuntimeError> {
-        let bounds = BodyBounds::new(1, 1, 1, 0, 0, 600_000)?;
+        let bounds = BodyBounds::new(
+            LOCAL_RESPONSE_BODY_BYTES,
+            LOCAL_RESPONSE_BODY_BYTES,
+            LOCAL_RESPONSE_BODY_BYTES,
+            0,
+            0,
+            600_000,
+        )?;
         let policy = request.local_response_policy(bounds, 8, 4_096)?;
         let runtime_clock: Arc<dyn Clock> = clock;
-        let mut body = RuntimeBody::from_chunks(
-            Vec::new(),
-            bounds,
-            runtime_clock,
-            BodyBudget::new(1)?,
-            request.absolute_deadline_millis(),
-        )?;
-        let mut context = Context::from_waker(std::task::Waker::noop());
-        if !matches!(body.poll_next_chunk(&mut context), Poll::Ready(Ok(None)))
-            || !matches!(body.poll_trailers(&mut context), Poll::Ready(Ok(None)))
-        {
-            return Err(http_access_runtime::RuntimeError::InvalidInput);
-        }
+        let maximum_payload_bytes = [
+            LocalResponseBodyKind::ConnectDenial,
+            LocalResponseBodyKind::Denial,
+            LocalResponseBodyKind::Timeout,
+            LocalResponseBodyKind::BodyDenial,
+            LocalResponseBodyKind::Unavailable,
+            LocalResponseBodyKind::Failure,
+        ]
+        .into_iter()
+        .map(|kind| kind.text().len())
+        .max()
+        .and_then(|length| u64::try_from(length).ok())
+        .ok_or(http_access_runtime::RuntimeError::LimitExceeded)?;
+        let response_budget = BodyBudget::new(BodyBudget::required_storage_bytes(
+            maximum_payload_bytes,
+            1,
+        )?)?;
         Ok(Self {
             policy,
-            body: Some(body),
+            context,
+            bounds,
+            clock: runtime_clock,
+            budget: Some(response_budget),
         })
     }
 
     fn build(&mut self, status: u16) -> Result<RuntimeResponse, http_access_runtime::RuntimeError> {
-        let body = self
-            .body
-            .take()
-            .ok_or(http_access_runtime::RuntimeError::InvalidInput)?;
-        RuntimeResponse::new(status, Vec::new(), body, self.policy)
+        let (headers, chunks) = if status == 200 {
+            (Vec::new(), Vec::new())
+        } else {
+            let headers = vec![http_access_types::HeaderField::new(
+                http_access_types::HeaderName::new("content-type")
+                    .expect("the static header name is valid"),
+                http_access_types::HeaderValue::new(b"text/plain; charset=utf-8".to_vec())
+                    .expect("the static header value is valid"),
+            )];
+            let payload = local_response_body_kind(status, self.context).text();
+            (headers, vec![payload.as_bytes().to_vec()])
+        };
+        let deadline_millis = self
+            .clock
+            .monotonic_millis()
+            .checked_add(self.policy.max_delivery_millis())
+            .ok_or(http_access_runtime::RuntimeError::LimitExceeded)?;
+        let body = RuntimeBody::from_chunks(
+            chunks,
+            self.bounds,
+            Arc::clone(&self.clock),
+            self.budget
+                .take()
+                .ok_or(http_access_runtime::RuntimeError::InvalidInput)?,
+            deadline_millis,
+        )?;
+        RuntimeResponse::new(status, headers, body, self.policy)
     }
 }
 
-impl<T> DecisionProvider for StandalonePolicyProvider<T>
-where
-    T: StandaloneTerminalService,
-{
+impl DecisionProvider for StandalonePolicyProvider {
     fn decide<'a>(
         &'a self,
         facts: &'a http_access_types::InterceptedRequestFacts,
@@ -1174,13 +1449,10 @@ where
     }
 }
 
-impl<T> StandaloneDispatch for StandalonePolicyProvider<T>
-where
-    T: StandaloneTerminalService,
-{
-    type Output = T::Output;
+impl StandaloneDispatch for StandalonePolicyProvider {
+    type Output = StandaloneTerminal;
 
-    fn fail_closed(&self, error: RequestPipelineError) -> BoxFuture<'_, Self::Output> {
+    fn fail_closed(&self, _error: RequestPipelineError) -> BoxFuture<'_, Self::Output> {
         if let Some(dispatch) = lock(&self.dispatch).take() {
             dispatch.decision.discard();
         }
@@ -1192,7 +1464,16 @@ where
             local_source(DecisionReasonCategory::InvalidPlan, 4),
         );
         decision.submit_now();
-        self.take_terminal().fail_closed(error)
+        let response = lock(&self.responses)
+            .build(500)
+            .expect("the consuming request pipeline owns one local response");
+        self.submit_local_capture(500, None);
+        Box::pin(async move {
+            StandaloneTerminal::Local {
+                response: Box::new(response),
+                close_connection: true,
+            }
+        })
     }
 
     fn respond(&self, response: RuntimeResponse) -> BoxFuture<'_, Self::Output> {
@@ -1200,15 +1481,25 @@ where
             dispatch.decision.discard();
         }
         let observation = lock(&self.response_observation).take();
-        self.take_terminal().respond(StandaloneResponseDispatch {
-            response,
-            observation,
-            decision: lock(&self.response_decision).take().unwrap_or_else(|| {
-                self.audit.pending(
-                    DecisionDisposition::Deny,
-                    local_source(DecisionReasonCategory::InvalidPlan, 5),
-                )
-            }),
+        let close_connection = local_terminal_close_connection(
+            response.status(),
+            observation
+                .as_ref()
+                .map(|observation| observation.close_connection),
+        );
+        let mut decision = lock(&self.response_decision).take().unwrap_or_else(|| {
+            self.audit.pending(
+                DecisionDisposition::Deny,
+                local_source(DecisionReasonCategory::InvalidPlan, 5),
+            )
+        });
+        decision.submit_now();
+        self.submit_local_capture(response.status(), observation);
+        Box::pin(async move {
+            StandaloneTerminal::Local {
+                response: Box::new(response),
+                close_connection,
+            }
         })
     }
 
@@ -1221,21 +1512,48 @@ where
             dispatch.decision.discard();
             return self.fail_closed(RequestPipelineError::InvalidProviderOutput);
         }
-        let terminal = self.take_terminal();
-        terminal.forward(StandaloneForwardDispatch {
+        let forwarding = crate::proxy::forwarding_adapter::prepare(StandaloneForwardDispatch {
             exchange,
             services: dispatch.services,
             request_id: dispatch.request_id,
             quota_key: dispatch.quota_key,
             retention: dispatch.retention,
-            deadline: dispatch.deadline,
             resolved: dispatch.resolved,
             cancellation: dispatch.cancellation,
             sidecar: dispatch.sidecar,
             credentials: dispatch.credentials,
-            transport: dispatch.transport,
+            private_fields: dispatch.private_fields,
             decision: dispatch.decision,
-        })
+            capture: dispatch.capture,
+            body_resources: dispatch.body_resources,
+            stable_wire_body_pool: dispatch.stable_wire_body_pool,
+        });
+        match forwarding {
+            Ok(forwarding) => {
+                Box::pin(async move { StandaloneTerminal::Forward(Box::new(forwarding)) })
+            }
+            Err(error) => {
+                let status = match error {
+                    http_access_runtime::RuntimeError::ServiceFailure
+                    | http_access_runtime::RuntimeError::LimitExceeded => 503,
+                    _ => 500,
+                };
+                let mut decision = self
+                    .audit
+                    .pending(DecisionDisposition::Deny, local_status_source(status));
+                decision.submit_now();
+                let response = lock(&self.responses)
+                    .build(status)
+                    .expect("the consuming request pipeline owns one local response");
+                self.submit_local_capture(status, None);
+                Box::pin(async move {
+                    StandaloneTerminal::Local {
+                        response: Box::new(response),
+                        close_connection: true,
+                    }
+                })
+            }
+        }
     }
 }
 
@@ -1315,6 +1633,17 @@ fn local_status_source(status: u16) -> DecisionAuditSource {
     local_source(category, status)
 }
 
+const fn early_deny_close_connection(ingress_body_complete: bool) -> bool {
+    !ingress_body_complete
+}
+
+const fn local_terminal_close_connection(status: u16, observed_close: Option<bool>) -> bool {
+    match observed_close {
+        Some(close) => close,
+        None => status != 200,
+    }
+}
+
 fn adapter_error_status(error: StandaloneProviderAllowError) -> u16 {
     match error {
         StandaloneProviderAllowError::ProviderReplacement(
@@ -1338,7 +1667,8 @@ fn adapter_error_status(error: StandaloneProviderAllowError) -> u16 {
         | StandaloneProviderAllowError::ProviderCredential(_)
         | StandaloneProviderAllowError::Credential(_)
         | StandaloneProviderAllowError::Runtime(_)
-        | StandaloneProviderAllowError::Plan(_) => 500,
+        | StandaloneProviderAllowError::Plan(_)
+        | StandaloneProviderAllowError::Upgrade(_) => 500,
         StandaloneProviderAllowError::Redaction => 403,
     }
 }
@@ -1377,6 +1707,20 @@ fn ingress_protocol(version: HttpVersion) -> HttpProtocol {
         HttpVersion::Http10 | HttpVersion::Http11 => HttpProtocol::Http1,
         HttpVersion::Http2 => HttpProtocol::Http2,
     }
+}
+
+fn request_id() -> String {
+    use rand::RngCore;
+    use std::fmt::Write;
+
+    let mut token = [0_u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut token);
+    let mut id = String::with_capacity(36);
+    id.push_str("req-");
+    for byte in token {
+        let _ = write!(&mut id, "{byte:02x}");
+    }
+    id
 }
 
 fn policy_provenance(evaluation: &PolicyEvaluation<ProductRuleEffectsRef>) -> &DecisionProvenance {
@@ -1438,1479 +1782,181 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::io;
-    use std::net::{Ipv4Addr, SocketAddr};
-    use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use http::{Method, Request, Version};
-    use http_access_types::IngressMode;
-    use hyper::Body;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
+mod local_response_contract_tests {
     use super::*;
-    use crate::activation::static_resources::ProductStaticResources;
-    use crate::authorization::webhook::connector::{
-        WebhookConnector, WebhookDestinationFacts, WebhookLocalAddressSnapshot,
-        WebhookLocalAddressSource, WebhookResolveFuture, WebhookResolver,
-    };
-    use crate::authorization::webhook::runtime::WebhookAuthorizationRuntime;
-    use crate::config::{compile_config_text, CompiledConfig, ConfigTextInput};
-    use crate::control::callback::handle_callback_entity;
-    use crate::proxy::facts::{
-        validate_standalone_connect_ingress_request, validate_standalone_ingress_request,
-    };
-    use crate::runtime::{
-        ActivationCancellation, CandidateSource, Runtime, RuntimeError, StaticOwnership,
-    };
-    use http_access_runtime::{ForwardingDevHarness, ForwardingNetworkFacts, RequestPipeline};
 
-    const CONFIG_PREFIX: &str = r#"schema_version = 3
-
-[service]
-request_timeout = "5s"
-max_retiring_generations = 4
-
-[listeners.explicit_http]
-bind = "127.0.0.1:8881"
-http_versions = ["http1"]
-
-[listeners.explicit_http.connect]
-http1 = "deny"
-
-[egress]
-route = "direct"
-
-[egress.origin_tls]
-trust = "system"
-
-[observation.logging]
-level = "info"
-console = true
-
-[safety.loop_detection]
-inject = true
-header = "x-test-loop"
-"#;
-
-    struct EmptySource;
-
-    impl CandidateSource for EmptySource {
-        fn load_latest(
-            &self,
-            _cancellation: ActivationCancellation,
-        ) -> BoxFuture<'_, Result<CompiledConfig, RuntimeError>> {
-            Box::pin(async { Err(RuntimeError::CandidateSource("unused".into())) })
-        }
+    fn request_and_clock() -> (RuntimeRequest, Arc<TokioRuntimeClock>) {
+        request_and_clock_with_deadline(60_000)
     }
 
-    struct FixedResolver {
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl WebhookResolver for FixedResolver {
-        fn resolve(&self, _host: &str, port: u16, _max: usize) -> WebhookResolveFuture<'_> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move {
-                Ok(vec![SocketAddr::new(
-                    Ipv4Addr::new(203, 0, 113, 10).into(),
-                    port,
-                )])
-            })
-        }
-    }
-
-    struct WebhookTestResolver {
-        calls: Arc<AtomicUsize>,
-    }
-
-    impl WebhookResolver for WebhookTestResolver {
-        fn resolve(&self, host: &str, port: u16, _max: usize) -> WebhookResolveFuture<'_> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            let address = if host == "127.0.0.1" {
-                Ipv4Addr::LOCALHOST
-            } else {
-                Ipv4Addr::new(203, 0, 113, 10)
-            };
-            Box::pin(async move { Ok(vec![SocketAddr::new(address.into(), port)]) })
-        }
-    }
-
-    struct NoLocalAddresses;
-
-    impl WebhookLocalAddressSource for NoLocalAddresses {
-        fn snapshot(&self) -> io::Result<WebhookLocalAddressSnapshot> {
-            Ok(WebhookLocalAddressSnapshot::default())
-        }
-    }
-
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum Terminal {
-        Response(u16),
-        Forward,
-        FailClosed,
-    }
-
-    struct TestTerminal;
-
-    impl StandaloneTerminalService for TestTerminal {
-        type Output = Terminal;
-
-        fn fail_closed(self, _error: RequestPipelineError) -> BoxFuture<'static, Self::Output> {
-            Box::pin(async { Terminal::FailClosed })
-        }
-
-        fn respond(self, dispatch: StandaloneResponseDispatch) -> BoxFuture<'static, Self::Output> {
-            let status = dispatch.response.status();
-            Box::pin(async move { Terminal::Response(status) })
-        }
-
-        fn forward(self, dispatch: StandaloneForwardDispatch) -> BoxFuture<'static, Self::Output> {
-            Box::pin(async move {
-                drop((self, dispatch));
-                Terminal::Forward
-            })
-        }
-    }
-
-    #[derive(Debug)]
-    enum AuditedTerminal {
-        Response(u16, DecisionAuditSource, Box<[String]>),
-        Forward(DecisionAuditSource, Box<[String]>),
-        FailClosed,
-    }
-
-    struct AuditTerminal;
-
-    impl StandaloneTerminalService for AuditTerminal {
-        type Output = AuditedTerminal;
-
-        fn fail_closed(self, _error: RequestPipelineError) -> BoxFuture<'static, Self::Output> {
-            Box::pin(async { AuditedTerminal::FailClosed })
-        }
-
-        fn respond(self, dispatch: StandaloneResponseDispatch) -> BoxFuture<'static, Self::Output> {
-            let status = dispatch.response.status();
-            let facts = dispatch
-                .decision
-                .facts()
-                .expect("response carries one pending decision");
-            assert_eq!(facts.disposition(), DecisionDisposition::Deny);
-            let source = facts.source().clone();
-            let presence = facts
-                .sensitive_header_presence()
-                .iter()
-                .map(|name| name.as_str().to_owned())
-                .collect();
-            Box::pin(async move { AuditedTerminal::Response(status, source, presence) })
-        }
-
-        fn forward(self, dispatch: StandaloneForwardDispatch) -> BoxFuture<'static, Self::Output> {
-            let facts = dispatch
-                .decision
-                .facts()
-                .expect("forward carries one pending decision");
-            assert_eq!(facts.disposition(), DecisionDisposition::Allow);
-            let source = facts.source().clone();
-            let presence = facts
-                .sensitive_header_presence()
-                .iter()
-                .map(|name| name.as_str().to_owned())
-                .collect();
-            Box::pin(async move { AuditedTerminal::Forward(source, presence) })
-        }
-    }
-
-    #[derive(Debug, Eq, PartialEq)]
-    struct ObservedResponse {
-        status: u16,
-        close_connection: bool,
-        body_provenance: StandaloneResponseBodyProvenance,
-    }
-
-    struct ObservationTerminal;
-
-    impl StandaloneTerminalService for ObservationTerminal {
-        type Output = ObservedResponse;
-
-        fn fail_closed(self, _error: RequestPipelineError) -> BoxFuture<'static, Self::Output> {
-            Box::pin(async {
-                ObservedResponse {
-                    status: 500,
-                    close_connection: true,
-                    body_provenance: StandaloneResponseBodyProvenance::Unconsumed,
-                }
-            })
-        }
-
-        fn respond(self, dispatch: StandaloneResponseDispatch) -> BoxFuture<'static, Self::Output> {
-            Box::pin(async move {
-                let observation = dispatch
-                    .observation
-                    .expect("the policy provider records denial state");
-                ObservedResponse {
-                    status: dispatch.response.status(),
-                    close_connection: observation.close_connection,
-                    body_provenance: observation.body_provenance,
-                }
-            })
-        }
-
-        fn forward(self, _dispatch: StandaloneForwardDispatch) -> BoxFuture<'static, Self::Output> {
-            Box::pin(async {
-                ObservedResponse {
-                    status: 200,
-                    close_connection: false,
-                    body_provenance: StandaloneResponseBodyProvenance::Unconsumed,
-                }
-            })
-        }
-    }
-
-    struct ConnectTerminal;
-
-    impl StandaloneTerminalService for ConnectTerminal {
-        type Output = Terminal;
-
-        fn fail_closed(self, _error: RequestPipelineError) -> BoxFuture<'static, Self::Output> {
-            Box::pin(async { Terminal::FailClosed })
-        }
-
-        fn respond(self, dispatch: StandaloneResponseDispatch) -> BoxFuture<'static, Self::Output> {
-            let status = dispatch.response.status();
-            Box::pin(async move { Terminal::Response(status) })
-        }
-
-        fn forward(self, dispatch: StandaloneForwardDispatch) -> BoxFuture<'static, Self::Output> {
-            Box::pin(async move {
-                assert_eq!(dispatch.exchange.facts().method().as_str(), "CONNECT");
-                assert!(dispatch.exchange.facts().upgrade().is_none());
-                let StandaloneIngressTransport::OuterConnect { head, .. } = &dispatch.transport
-                else {
-                    panic!("CONNECT dispatch must retain its distinct transport head");
-                };
-                assert_eq!(
-                    crate::proxy::headers::product_protocol(head.ingress_version()),
-                    HttpProtocol::Http1
-                );
-                drop((self, dispatch));
-                Terminal::Forward
-            })
-        }
-    }
-
-    struct UpgradeTerminal;
-
-    impl StandaloneTerminalService for UpgradeTerminal {
-        type Output = Terminal;
-
-        fn fail_closed(self, _error: RequestPipelineError) -> BoxFuture<'static, Self::Output> {
-            Box::pin(async move { Terminal::FailClosed })
-        }
-
-        fn respond(self, dispatch: StandaloneResponseDispatch) -> BoxFuture<'static, Self::Output> {
-            Box::pin(async move {
-                let status = dispatch.response.status();
-                Terminal::Response(status)
-            })
-        }
-
-        fn forward(self, dispatch: StandaloneForwardDispatch) -> BoxFuture<'static, Self::Output> {
-            Box::pin(async move {
-                assert_eq!(
-                    dispatch.exchange.plan().request_body().trailer_policy(),
-                    TrailerPolicy::Deny
-                );
-                assert_eq!(
-                    dispatch.exchange.plan().request_body().representation(),
-                    BodyRepresentation::PreservedContentCoded
-                );
-                assert!(matches!(
-                    &dispatch.transport,
-                    StandaloneIngressTransport::Ordinary {
-                        downstream_upgrade: Some(_),
-                        ..
-                    }
-                ));
-                drop(dispatch);
-                Terminal::Forward
-            })
-        }
-    }
-
-    #[derive(Debug, Eq, PartialEq)]
-    enum BodyTerminalOutcome {
-        Response(u16),
-        Forward(Vec<u8>, DecisionAuditSource),
-        FailClosed,
-    }
-
-    struct BodyTerminal;
-
-    impl StandaloneTerminalService for BodyTerminal {
-        type Output = BodyTerminalOutcome;
-
-        fn fail_closed(self, _error: RequestPipelineError) -> BoxFuture<'static, Self::Output> {
-            Box::pin(async { BodyTerminalOutcome::FailClosed })
-        }
-
-        fn respond(self, dispatch: StandaloneResponseDispatch) -> BoxFuture<'static, Self::Output> {
-            let status = dispatch.response.status();
-            Box::pin(async move { BodyTerminalOutcome::Response(status) })
-        }
-
-        fn forward(
-            self,
-            mut dispatch: StandaloneForwardDispatch,
-        ) -> BoxFuture<'static, Self::Output> {
-            let facts = dispatch
-                .decision
-                .facts()
-                .expect("forward carries one pending decision");
-            assert_eq!(facts.disposition(), DecisionDisposition::Allow);
-            let source = facts.source().clone();
-            Box::pin(async move {
-                let mut bytes = Vec::new();
-                while let Some(chunk) =
-                    std::future::poll_fn(|context| dispatch.exchange.poll_body_chunk(context))
-                        .await
-                        .unwrap()
-                {
-                    bytes.extend_from_slice(chunk.as_bytes());
-                }
-                drop((self, dispatch));
-                BodyTerminalOutcome::Forward(bytes, source)
-            })
-        }
-    }
-
-    fn compiled(default: &str) -> CompiledConfig {
-        compiled_text(&format!("[policy]\ndefault = \"{default}\"\n"))
-    }
-
-    fn compiled_text(suffix: &str) -> CompiledConfig {
-        let directory = Path::new("/tmp/p06-standalone-policy-provider");
-        std::fs::create_dir_all(directory).unwrap();
-        let text = format!("{CONFIG_PREFIX}\n{suffix}");
-        compile_config_text(ConfigTextInput {
-            text: &text,
-            source_path: &directory.join("acl-proxy.toml"),
-            config_root: directory,
-        })
-        .unwrap()
-    }
-
-    fn unused_loopback_address() -> SocketAddr {
-        std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-    }
-
-    fn forwarding_network() -> Arc<ForwardingNetworkGuard> {
-        let http_target = http_access_url::canonicalize_http_url(
-            "http://standalone-provider.example.test/resource",
+    fn request_and_clock_with_deadline(
+        deadline_after_millis: u64,
+    ) -> (RuntimeRequest, Arc<TokioRuntimeClock>) {
+        let clock = TokioRuntimeClock::new(Instant::now());
+        let deadline = clock
+            .monotonic_millis()
+            .saturating_add(deadline_after_millis);
+        let bounds = BodyBounds::new(64, 64, 64, 0, 0, 60_000).unwrap();
+        let runtime_clock: Arc<dyn Clock> = clock.clone();
+        let body = RuntimeBody::from_chunks(
+            Vec::new(),
+            bounds,
+            runtime_clock,
+            BodyBudget::new(64).unwrap(),
+            deadline,
         )
         .unwrap();
-        let https_target =
-            http_access_url::canonicalize_http_url("https://standalone-provider.example.test/")
-                .unwrap();
-        let facts =
-            ForwardingNetworkFacts::new(vec!["127.0.0.1:8881".parse().unwrap()], None, None, None)
-                .unwrap();
-        let guard = ForwardingDevHarness::new(facts)
-            .map_prebound(
-                &http_target,
-                SocketAddr::new(Ipv4Addr::new(203, 0, 113, 10).into(), 80),
-            )
-            .unwrap()
-            .map_prebound(
-                &https_target,
-                SocketAddr::new(Ipv4Addr::new(203, 0, 113, 10).into(), 443),
-            )
-            .unwrap()
-            .into_standalone_guard();
-        Arc::new(guard)
-    }
-
-    async fn runtime(
-        default: &str,
-        resolver_calls: Arc<AtomicUsize>,
-    ) -> (Arc<Runtime>, Arc<ForwardingNetworkGuard>) {
-        runtime_from(compiled(default), resolver_calls).await
-    }
-
-    async fn runtime_with_allow_observation(
-        default: &str,
-        resolver_calls: Arc<AtomicUsize>,
-    ) -> (Arc<Runtime>, Arc<ForwardingNetworkGuard>) {
-        runtime_from(
-            compiled_text(&format!(
-                "[policy]\ndefault = \"{default}\"\n\n[observation.logging.policy_decisions]\nallows = true\n"
-            )),
-            resolver_calls,
-        )
-        .await
-    }
-
-    async fn runtime_from(
-        initial: CompiledConfig,
-        resolver_calls: Arc<AtomicUsize>,
-    ) -> (Arc<Runtime>, Arc<ForwardingNetworkGuard>) {
-        let (runtime, network, _) = runtime_from_with_authorization(initial, resolver_calls).await;
-        (runtime, network)
-    }
-
-    async fn runtime_from_with_authorization(
-        initial: CompiledConfig,
-        resolver_calls: Arc<AtomicUsize>,
-    ) -> (
-        Arc<Runtime>,
-        Arc<ForwardingNetworkGuard>,
-        Arc<WebhookAuthorizationRuntime>,
-    ) {
-        runtime_from_with_authorization_and_resolver(
-            initial,
-            Arc::new(FixedResolver {
-                calls: resolver_calls,
-            }),
-        )
-        .await
-    }
-
-    async fn runtime_from_with_authorization_and_resolver<R>(
-        initial: CompiledConfig,
-        resolver: Arc<R>,
-    ) -> (
-        Arc<Runtime>,
-        Arc<ForwardingNetworkGuard>,
-        Arc<WebhookAuthorizationRuntime>,
-    )
-    where
-        R: WebhookResolver + 'static,
-    {
-        let network = forwarding_network();
-        let webhook_connector = Arc::new(WebhookConnector::with_sources(
-            WebhookDestinationFacts::from_static(&initial.static_config).unwrap(),
-            resolver,
-            Arc::new(NoLocalAddresses),
-        ));
-        let resources = ProductStaticResources::try_new_with_connectors(
-            &initial.static_config,
-            network.clone(),
-            webhook_connector,
+        let facts = http_access_types::InterceptedRequestFacts::new(
+            http_access_types::IngressMode::ExplicitHttp,
+            HttpVersion::Http11,
+            HttpMethod::new("GET").unwrap(),
+            http_access_url::canonicalize_http_url("http://example.test/resource").unwrap(),
+            Vec::new(),
+            http_access_types::BodyMetadata::new(BodyFraming::None),
+            None,
         )
         .unwrap();
-        let authorization = resources.authorization_runtime();
-        let activator = resources.activator();
-        let ownership = StaticOwnership::new(
-            initial.static_config.clone(),
-            initial.static_fingerprint.clone(),
-            resources,
-        );
-        let runtime = Runtime::new(ownership, Arc::new(EmptySource), activator)
-            .await
-            .unwrap();
-        runtime.start(initial).await.unwrap();
-        (runtime, network, authorization)
-    }
-
-    #[cfg(unix)]
-    fn process_provider_config(command: &Path, decision: &str) -> CompiledConfig {
-        compiled_text(&format!(
-            r#"[authorization.providers.provider]
-kind = "process"
-command = "{}"
-timeout = "2s"
-retire_timeout = "6s"
-include_request_body = true
-max_request_body_bytes = 4096
-max_decoded_request_body_bytes = 4096
-
-[policy]
-default = "deny"
-
-[observation.logging.policy_decisions]
-allows = true
-
-[[policy.rules]]
-id = "delegate"
-decision = "delegate"
-methods = ["GET"]
-authorization_provider = "provider"
-
-[[policy.rules]]
-id = "after-pass"
-decision = "{}"
-methods = ["GET"]
-"#,
-            command.display(),
-            decision
-        ))
-    }
-
-    #[cfg(unix)]
-    fn process_provider_without_body_config(command: &Path, decision: &str) -> CompiledConfig {
-        compiled_text(&format!(
-            r#"[authorization.providers.provider]
-kind = "process"
-command = "{}"
-timeout = "2s"
-retire_timeout = "6s"
-on_failure = "deny"
-include_request_body = false
-max_request_body_bytes = 4096
-max_decoded_request_body_bytes = 4096
-
-[policy]
-default = "deny"
-
-[[policy.rules]]
-id = "delegate"
-decision = "delegate"
-methods = ["GET"]
-authorization_provider = "provider"
-
-[[policy.rules]]
-id = "after-pass"
-decision = "{}"
-methods = ["GET"]
-"#,
-            command.display(),
-            decision
-        ))
-    }
-
-    #[cfg(unix)]
-    fn outer_connect_process_provider_config(command: &Path, after_pass: &str) -> CompiledConfig {
-        compiled_text(&format!(
-            r#"[authorization.providers.provider]
-kind = "process"
-command = "{}"
-timeout = "2s"
-retire_timeout = "6s"
-on_failure = "error"
-include_request_body = true
-allow_request_body_replacement = true
-max_request_body_bytes = 4096
-max_decoded_request_body_bytes = 4096
-max_stdout_line_bytes = 4096
-
-[authorization.providers.provider.outputs.token]
-kind = "bearer"
-required = true
-
-[policy]
-default = "deny"
-
-[[policy.rules]]
-id = "delegate-connect"
-decision = "delegate"
-methods = ["CONNECT"]
-authorization_provider = "provider"
-
-[[policy.rules]]
-id = "after-pass"
-decision = "{}"
-methods = ["CONNECT"]
-"#,
-            command.display(),
-            after_pass
-        ))
-    }
-
-    fn outer_connect_webhook_provider_config(
-        provider: SocketAddr,
-        control: SocketAddr,
-        after_pass: &str,
-    ) -> CompiledConfig {
-        compiled_text(&format!(
-            r#"[control]
-bind = "{control}"
-base_path = "/_acl-proxy"
-request_header_timeout = "1s"
-request_body_timeout = "2s"
-max_connections = 4
-max_request_body_bytes = 4096
-
-[authorization.callback]
-public_url = "http://{control}/_acl-proxy/external-auth/callback"
-resume_token_ttl = "2s"
-max_pending_operations = 4
-
-[authorization.providers.provider]
-kind = "webhook"
-url = "http://{provider}/authorize"
-timeout = "2s"
-on_failure = "error"
-max_request_bytes = 4096
-max_response_bytes = 4096
-
-[authorization.providers.provider.outputs.token]
-kind = "bearer"
-required = true
-
-[policy]
-default = "deny"
-
-[[policy.rules]]
-id = "delegate-connect"
-decision = "delegate"
-methods = ["CONNECT"]
-authorization_provider = "provider"
-
-[[policy.rules]]
-id = "after-pass"
-decision = "{after_pass}"
-methods = ["CONNECT"]
-"#,
-        ))
-    }
-
-    async fn start_recording_webhook_provider() -> (
-        SocketAddr,
-        tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-        tokio::sync::oneshot::Sender<()>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let (requests, request_rx) = tokio::sync::mpsc::unbounded_channel();
-        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
-        let task = tokio::spawn(async move {
-            loop {
-                let (mut stream, _) = tokio::select! {
-                    accepted = listener.accept() => accepted.unwrap(),
-                    _ = &mut shutdown_rx => return,
-                };
-                let mut wire = Vec::new();
-                let body_start = loop {
-                    let mut chunk = [0u8; 1024];
-                    let read = stream.read(&mut chunk).await.unwrap();
-                    assert_ne!(read, 0, "webhook request ended before its head");
-                    wire.extend_from_slice(&chunk[..read]);
-                    if let Some(position) = wire.windows(4).position(|window| window == b"\r\n\r\n")
-                    {
-                        break position + 4;
-                    }
-                };
-                let head = std::str::from_utf8(&wire[..body_start]).unwrap();
-                let content_length = head
-                    .lines()
-                    .find_map(|line| {
-                        line.strip_prefix("Content-Length: ")
-                            .and_then(|value| value.parse::<usize>().ok())
-                    })
-                    .unwrap();
-                while wire.len() < body_start + content_length {
-                    let mut chunk = [0u8; 1024];
-                    let read = stream.read(&mut chunk).await.unwrap();
-                    assert_ne!(read, 0, "webhook request ended before its body");
-                    wire.extend_from_slice(&chunk[..read]);
-                }
-                requests
-                    .send(wire[body_start..body_start + content_length].to_vec())
-                    .unwrap();
-                stream
-                    .write_all(
-                        b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                    )
-                    .await
-                    .unwrap();
-                stream.shutdown().await.unwrap();
-            }
-        });
-        (address, request_rx, shutdown_tx, task)
-    }
-
-    async fn complete_webhook_callback(
-        authorization: &WebhookAuthorizationRuntime,
-        request: &serde_json::Value,
-        decision: &str,
-    ) -> u16 {
-        let token = request["resumeToken"].as_str().unwrap();
-        let body = format!(
-            "{{\"resumeToken\":\"{token}\",\"type\":\"response\",\"decision\":\"{decision}\"}}"
+        let header_facts =
+            PolicyHeaderFacts::from_partitioned(Vec::new(), Vec::new(), Vec::new()).unwrap();
+        let request = RuntimeRequest::new(
+            facts,
+            "127.0.0.1".parse().unwrap(),
+            header_facts,
+            BodyRepresentation::PreservedContentCoded,
+            body,
+            deadline,
         )
-        .into_bytes();
-        let mut store = crate::http1::store::ParserStore::try_new().unwrap();
-        store.append(&body).unwrap();
-        let mut reader = tokio::io::empty();
-        handle_callback_entity(
-            &mut reader,
-            &mut store,
-            crate::http1::framing::BodyFraming::ContentLength(body.len() as u64),
-            authorization,
-            4096,
-            Instant::now() + Duration::from_secs(2),
-        )
-        .await
-        .response()
-        .unwrap()
-        .status()
+        .unwrap();
+        (request, clock)
     }
 
-    #[cfg(unix)]
-    fn process_script(
-        directory: &Path,
-        decision: &str,
-        marker: Option<&Path>,
-    ) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
-        let path = directory.join("provider.sh");
-        let marker_write = marker
-            .map(|path| format!("printf x >> '{}'\n", path.display()))
-            .unwrap_or_default();
-        std::fs::write(
-            &path,
-            format!(
-                r#"#!/bin/sh
-while IFS= read -r line; do
-  {marker_write}  id=$(printf "%s" "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-  [ -n "$id" ] && printf '{{"id":"%s","type":"response","decision":"{decision}"}}\n' "$id"
-done
-"#
+    #[tokio::test]
+    async fn local_status_responses_leave_framing_to_shared_runtime() {
+        for (status, context, expected_body) in [
+            (
+                403,
+                LocalResponseContext::ListenerDeniedConnect,
+                CONNECT_DENIAL_RESPONSE_BODY,
             ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&path, permissions).unwrap();
-        path
-    }
-
-    #[cfg(unix)]
-    fn recording_process_script(
-        directory: &Path,
-        decision: &str,
-        marker: &Path,
-    ) -> std::path::PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-
-        let path = directory.join("recording-provider.sh");
-        std::fs::write(
-            &path,
-            format!(
-                r#"#!/bin/sh
-while IFS= read -r line; do
-  printf '%s\n' "$line" >> '{}'
-  id=$(printf "%s" "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
-  [ -n "$id" ] && printf '{{"id":"%s","type":"response","decision":"{decision}"}}\n' "$id"
-done
-"#,
-                marker.display()
+            (403, LocalResponseContext::Standard, DENIAL_RESPONSE_BODY),
+            (504, LocalResponseContext::Standard, TIMEOUT_RESPONSE_BODY),
+            (
+                400,
+                LocalResponseContext::Standard,
+                BODY_DENIAL_RESPONSE_BODY,
             ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&path, permissions).unwrap();
-        path
-    }
-
-    fn prepared_input(
-        lease: &GenerationLease,
-        network: Arc<ForwardingNetworkGuard>,
-        body: Body,
-        extra_headers: &[(&str, &str)],
-    ) -> StandaloneProviderInput {
-        let mut request = Request::builder()
-            .method(Method::GET)
-            .version(Version::HTTP_11)
-            .uri("/resource")
-            .header("host", "standalone-provider.example.test")
-            .body(body)
-            .unwrap();
-        for (name, value) in extra_headers {
-            request.headers_mut().insert(
-                http::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
-                http::HeaderValue::from_str(value).unwrap(),
-            );
-        }
-        prepared_input_from_request(lease, network, request)
-    }
-
-    fn prepared_input_from_request(
-        lease: &GenerationLease,
-        network: Arc<ForwardingNetworkGuard>,
-        request: Request<Body>,
-    ) -> StandaloneProviderInput {
-        let canonical = http_access_url::canonicalize_http_url(
-            "http://standalone-provider.example.test/resource",
-        )
-        .unwrap();
-        let validated = validate_standalone_ingress_request(
-            crate::proxy::facts::IngressPartitionPolicy::from_lease(lease),
-            IngressMode::ExplicitHttp,
-            canonical.clone(),
-            request,
-        )
-        .unwrap();
-        let ingress_protocol = validated.ingress().protocol();
-        let preflight_target = network
-            .preflight(
-                &canonical,
-                ingress_protocol,
-                lease.standalone().origin_protocol(match ingress_protocol {
-                    HttpProtocol::Http1 => HttpVersion::Http11,
-                    HttpProtocol::Http2 => HttpVersion::Http2,
-                }),
-                lease.standalone().route(),
-            )
-            .unwrap();
-        let peer_ip = "192.0.2.10".parse().unwrap();
-        let started_at = Instant::now();
-        StandaloneProviderInput {
-            request_id: "p06-provider-test".to_owned(),
-            validated,
-            peer_ip,
-            quota_key: WireBodyQuotaKey::from_peer(peer_ip, |_| false),
-            started_at,
-            preflight_target,
-            network,
-            cancellation: ProductForwardingCancellation::new(),
-            clock: TokioRuntimeClock::new(started_at),
-            listener_denied: false,
-            decision_target: DecisionSubmissionTarget::Disabled,
-        }
-    }
-
-    fn prepared_connect_input(
-        lease: &GenerationLease,
-        network: Arc<ForwardingNetworkGuard>,
-    ) -> StandaloneProviderInput {
-        let canonical =
-            http_access_url::canonicalize_http_url("https://standalone-provider.example.test/")
+            (
+                408,
+                LocalResponseContext::Standard,
+                BODY_DENIAL_RESPONSE_BODY,
+            ),
+            (
+                413,
+                LocalResponseContext::Standard,
+                BODY_DENIAL_RESPONSE_BODY,
+            ),
+            (
+                415,
+                LocalResponseContext::Standard,
+                BODY_DENIAL_RESPONSE_BODY,
+            ),
+            (
+                503,
+                LocalResponseContext::Standard,
+                UNAVAILABLE_RESPONSE_BODY,
+            ),
+            (500, LocalResponseContext::Standard, FAILURE_RESPONSE_BODY),
+        ] {
+            let (request, clock) = request_and_clock();
+            let mut response = PreparedResponses::new(&request, clock, context)
+                .unwrap()
+                .build(status)
                 .unwrap();
-        let request = Request::builder()
-            .method(Method::CONNECT)
-            .version(Version::HTTP_11)
-            .uri("standalone-provider.example.test:443")
-            .header("host", "standalone-provider.example.test:443")
-            .body(Body::empty())
-            .unwrap();
-        let validated = validate_standalone_connect_ingress_request(
-            crate::proxy::facts::IngressPartitionPolicy::from_lease(lease),
-            IngressMode::ExplicitHttp,
-            canonical.clone(),
-            request,
+            assert_eq!(response.status(), status);
+            assert_eq!(response.headers().len(), 1);
+            assert_eq!(response.headers()[0].name().as_str(), "content-type");
+
+            let mut task_context = std::task::Context::from_waker(std::task::Waker::noop());
+            let chunk = match response.poll_body_chunk(&mut task_context) {
+                std::task::Poll::Ready(Ok(Some(chunk))) => chunk,
+                other => panic!("expected the local failure body, got {other:?}"),
+            };
+            assert_eq!(chunk.as_bytes(), expected_body.as_bytes());
+            assert_eq!(local_response_capture_body(status, context), expected_body);
+            assert!(matches!(
+                response.poll_body_chunk(&mut task_context),
+                std::task::Poll::Ready(Ok(None))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn local_response_body_rejects_a_budget_one_byte_below_exact_storage() {
+        let (request, clock) = request_and_clock();
+        let bounds = BodyBounds::new(
+            LOCAL_RESPONSE_BODY_BYTES,
+            LOCAL_RESPONSE_BODY_BYTES,
+            LOCAL_RESPONSE_BODY_BYTES,
+            0,
+            0,
+            600_000,
         )
         .unwrap();
-        let ingress_protocol = validated.ingress().protocol();
-        let preflight_target = network
-            .preflight(
-                &canonical,
-                ingress_protocol,
-                lease.standalone().origin_protocol(match ingress_protocol {
-                    HttpProtocol::Http1 => HttpVersion::Http11,
-                    HttpProtocol::Http2 => HttpVersion::Http2,
-                }),
-                lease.standalone().route(),
+        for payload in [
+            CONNECT_DENIAL_RESPONSE_BODY,
+            DENIAL_RESPONSE_BODY,
+            TIMEOUT_RESPONSE_BODY,
+            BODY_DENIAL_RESPONSE_BODY,
+            UNAVAILABLE_RESPONSE_BODY,
+            FAILURE_RESPONSE_BODY,
+        ] {
+            let payload_bytes = u64::try_from(payload.len()).unwrap();
+            let exact = BodyBudget::required_storage_bytes(payload_bytes, 1).unwrap();
+            let runtime_clock: Arc<dyn Clock> = clock.clone();
+            let mut body = RuntimeBody::from_chunks(
+                vec![payload.as_bytes().to_vec()],
+                bounds,
+                runtime_clock,
+                BodyBudget::new(exact - 1).unwrap(),
+                request.absolute_deadline_millis(),
             )
             .unwrap();
-        let peer_ip = "192.0.2.10".parse().unwrap();
-        let started_at = Instant::now();
-        StandaloneProviderInput {
-            request_id: "p06-connect-provider-test".to_owned(),
-            validated,
-            peer_ip,
-            quota_key: WireBodyQuotaKey::from_peer(peer_ip, |_| false),
-            started_at,
-            preflight_target,
-            network,
-            cancellation: ProductForwardingCancellation::new(),
-            clock: TokioRuntimeClock::new(started_at),
-            listener_denied: false,
-            decision_target: DecisionSubmissionTarget::Disabled,
+
+            assert!(matches!(
+                body.poll_next_chunk(&mut std::task::Context::from_waker(std::task::Waker::noop())),
+                std::task::Poll::Ready(Err(http_access_runtime::RuntimeError::LimitExceeded))
+            ));
         }
     }
 
     #[tokio::test]
-    async fn default_allow_forwards_with_policy_provenance_and_one_submission() {
-        let resolver_calls = Arc::new(AtomicUsize::new(0));
-        let (runtime, destinations) =
-            runtime_with_allow_observation("allow", resolver_calls.clone()).await;
-        let lease = runtime.lease().await.unwrap();
-        let mut input = prepared_input(&lease, destinations, Body::empty(), &[]);
-        let submissions = Arc::new(AtomicUsize::new(0));
-        input.decision_target = DecisionSubmissionTarget::Probe(submissions.clone());
-        let (provider, request) =
-            StandalonePolicyProvider::prepare(lease, AuditTerminal, input).unwrap();
-
-        let terminal = RequestPipeline::new().execute(provider, request).await;
-
-        let AuditedTerminal::Forward(DecisionAuditSource::Policy(provenance), presence) = terminal
-        else {
-            panic!("default allow must retain policy provenance");
-        };
-        assert_eq!(provenance.effective_policy(), &EffectivePolicy::Default);
-        assert!(presence.is_empty());
-        assert_eq!(submissions.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn oversized_provider_decision_is_omitted_without_affecting_the_next_submission() {
-        let submissions = Arc::new(AtomicUsize::new(0));
-        let context = |url| DecisionAuditContext {
-            target: DecisionSubmissionTarget::Probe(submissions.clone()),
-            request_id: StableId::new("provider-observation-bounds").unwrap(),
-            method: HttpMethod::new("GET").unwrap(),
-            url,
-            peer_ip: "192.0.2.10".parse().unwrap(),
-            sensitive_header_presence: Vec::new(),
-            allow_level: Some(CompiledDecisionLogLevel::Info),
-            deny_level: Some(CompiledDecisionLogLevel::Warn),
-        };
-        let source = || {
-            DecisionAuditSource::Local(DecisionReason::new(
-                DecisionReasonCategory::InvalidPlan,
-                500,
-            ))
-        };
-        let oversized = http_access_url::canonicalize_http_url(&format!(
-            "https://example.test/{}",
-            "x".repeat(1024 * 1024)
-        ))
-        .unwrap();
-        let bounded = http_access_url::canonicalize_http_url("https://example.test/next").unwrap();
-
-        context(oversized)
-            .pending(DecisionDisposition::Deny, source())
-            .submit_now();
-        context(bounded)
-            .pending(DecisionDisposition::Deny, source())
-            .submit_now();
-
-        assert_eq!(submissions.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn fail_closed_replaces_pending_allow_with_one_deny_submission() {
-        let resolver_calls = Arc::new(AtomicUsize::new(0));
-        let (runtime, destinations) = runtime("allow", resolver_calls).await;
-        let lease = runtime.lease().await.unwrap();
-        let mut input = prepared_input(&lease, destinations, Body::empty(), &[]);
-        let submissions = Arc::new(AtomicUsize::new(0));
-        input.decision_target = DecisionSubmissionTarget::Probe(submissions.clone());
-        let (provider, request) =
-            StandalonePolicyProvider::prepare(lease, AuditTerminal, input).unwrap();
-        let facts = request.facts().clone();
-
-        let outcome = provider.decide(&facts, request).await;
-        assert!(matches!(outcome, ProviderOutcome::Forward { .. }));
-        let terminal = provider
-            .fail_closed(RequestPipelineError::InvalidProviderOutput)
-            .await;
-
-        assert!(matches!(terminal, AuditedTerminal::FailClosed));
-        assert_eq!(submissions.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn decision_presence_uses_full_observation_sensitive_union() {
-        let resolver_calls = Arc::new(AtomicUsize::new(0));
-        let (runtime, destinations) = runtime("deny", resolver_calls).await;
-        let lease = runtime.lease().await.unwrap();
-        let input = prepared_input(
-            &lease,
-            destinations,
-            Body::empty(),
-            &[("authorization", "secret"), ("cookie", "session=secret")],
-        );
-        let (provider, request) =
-            StandalonePolicyProvider::prepare(lease, AuditTerminal, input).unwrap();
-
-        let terminal = RequestPipeline::new().execute(provider, request).await;
-
-        let AuditedTerminal::Response(403, _, presence) = terminal else {
-            panic!("default deny must retain full sensitive-name presence");
-        };
-        assert_eq!(
-            presence.as_ref(),
-            &["authorization".to_owned(), "cookie".to_owned()]
-        );
-    }
-
-    #[tokio::test]
-    async fn outer_connect_owner_reaches_the_common_pipeline_without_becoming_an_ordinary_request()
-    {
-        let resolver_calls = Arc::new(AtomicUsize::new(0));
-        let (runtime, destinations) = runtime("allow", resolver_calls.clone()).await;
-        let lease = runtime.lease().await.unwrap();
-        let input = prepared_connect_input(&lease, destinations);
-        let (provider, request) =
-            StandalonePolicyProvider::prepare(lease, ConnectTerminal, input).unwrap();
-
-        let terminal = RequestPipeline::new().execute(provider, request).await;
-
-        assert_eq!(terminal, Terminal::Forward);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn delegated_outer_connect_uses_decision_only_process_dispatch() {
-        for (provider_decision, after_pass, expected) in [
-            ("allow", "deny", Terminal::Forward),
-            ("deny", "allow", Terminal::Response(403)),
-            ("pass", "allow", Terminal::Forward),
-        ] {
-            let directory = tempfile::tempdir().unwrap();
-            let marker = directory.path().join("requests.jsonl");
-            let provider_script =
-                recording_process_script(directory.path(), provider_decision, &marker);
-            let resolver_calls = Arc::new(AtomicUsize::new(0));
-            let config = outer_connect_process_provider_config(&provider_script, after_pass);
-            let (runtime, destinations) = runtime_from(config, resolver_calls.clone()).await;
-            let lease = runtime.lease().await.unwrap();
-            let input = prepared_connect_input(&lease, destinations);
-            let (provider, request) =
-                StandalonePolicyProvider::prepare(lease, ConnectTerminal, input).unwrap();
-
-            let terminal = RequestPipeline::new().execute(provider, request).await;
-
-            assert_eq!(terminal, expected, "provider decision {provider_decision}");
-            let requests = std::fs::read_to_string(&marker).unwrap();
-            let mut lines = requests.lines();
-            let request: serde_json::Value =
-                serde_json::from_str(lines.next().expect("one provider request")).unwrap();
-            assert!(lines.next().is_none());
-            assert_eq!(request["type"], "request");
-            assert_eq!(request["method"], "CONNECT");
-            assert_eq!(request["url"], "https://standalone-provider.example.test/");
-            assert!(request.get("body").is_none());
-            runtime.shutdown().await;
-        }
-    }
-
-    #[tokio::test]
-    async fn delegated_outer_connect_uses_decision_only_webhook_dispatch() {
-        let (provider_address, mut provider_requests, shutdown, provider_task) =
-            start_recording_webhook_provider().await;
-        for (provider_decision, after_pass, expected) in [
-            ("allow", "deny", Terminal::Forward),
-            ("deny", "allow", Terminal::Response(403)),
-            ("pass", "allow", Terminal::Forward),
-        ] {
-            let resolver_calls = Arc::new(AtomicUsize::new(0));
-            let config = outer_connect_webhook_provider_config(
-                provider_address,
-                unused_loopback_address(),
-                after_pass,
-            );
-            let (runtime, destinations, authorization) =
-                runtime_from_with_authorization_and_resolver(
-                    config,
-                    Arc::new(WebhookTestResolver {
-                        calls: resolver_calls.clone(),
-                    }),
-                )
-                .await;
-            let lease = runtime.lease().await.unwrap();
-            let input = prepared_connect_input(&lease, destinations);
-            let (provider, request) =
-                StandalonePolicyProvider::prepare(lease, ConnectTerminal, input).unwrap();
-            let mut pipeline =
-                tokio::spawn(
-                    async move { RequestPipeline::new().execute(provider, request).await },
-                );
-
-            let provider_request_bytes = tokio::select! {
-                request = provider_requests.recv() => request.expect("webhook provider request"),
-                terminal = &mut pipeline => {
-                    panic!(
-                        "pipeline ended before webhook delivery after {} resolutions: {:?}",
-                        resolver_calls.load(Ordering::SeqCst),
-                        terminal.unwrap(),
-                    )
-                }
-                _ = tokio::time::sleep(Duration::from_secs(2)) => {
-                    panic!("webhook provider delivery timed out")
-                }
-            };
-            let provider_request: serde_json::Value =
-                serde_json::from_slice(&provider_request_bytes).unwrap();
-            assert_eq!(provider_request["type"], "request");
-            assert_eq!(provider_request["method"], "CONNECT");
-            assert_eq!(
-                provider_request["url"],
-                "https://standalone-provider.example.test/"
-            );
-            assert!(provider_request.get("body").is_none());
-            assert_eq!(
-                complete_webhook_callback(&authorization, &provider_request, provider_decision,)
-                    .await,
-                204
-            );
-
-            assert_eq!(pipeline.await.unwrap(), expected);
-            assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
-            runtime.shutdown().await;
-        }
-        shutdown.send(()).unwrap();
-        provider_task.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn policy_and_loop_denials_do_not_resolve_or_poll_the_body() {
-        for (default, headers, policy_source) in [
-            ("deny", &[][..], true),
-            ("allow", &[("x-test-loop", "loop")][..], false),
-        ] {
-            let resolver_calls = Arc::new(AtomicUsize::new(0));
-            let (runtime, destinations) = runtime(default, resolver_calls.clone()).await;
-            let lease = runtime.lease().await.unwrap();
-            let mut input = prepared_input(&lease, destinations, Body::empty(), headers);
-            let submissions = Arc::new(AtomicUsize::new(0));
-            input.decision_target = DecisionSubmissionTarget::Probe(submissions.clone());
-            let (provider, request) =
-                StandalonePolicyProvider::prepare(lease, AuditTerminal, input).unwrap();
-
-            let terminal = RequestPipeline::new().execute(provider, request).await;
-
-            let AuditedTerminal::Response(403, source, _) = terminal else {
-                panic!("early denial must retain one audit source");
-            };
-            if policy_source {
-                let DecisionAuditSource::Policy(provenance) = source else {
-                    panic!("policy denial must retain policy provenance");
-                };
-                assert_eq!(provenance.effective_policy(), &EffectivePolicy::Default);
-            } else {
-                let DecisionAuditSource::Local(reason) = source else {
-                    panic!("loop denial must be identified as local");
-                };
-                assert_eq!(reason.category(), DecisionReasonCategory::Loop);
-            }
-            assert_eq!(submissions.load(Ordering::SeqCst), 1);
-        }
-    }
-
-    #[test]
-    fn one_millisecond_deadline_ceil_does_not_round_current_time_up() {
-        let epoch = Instant::now();
-        let clock = TokioRuntimeClock::new(epoch);
-
-        assert_eq!(
-            clock.deadline_millis(epoch + Duration::from_millis(1)),
-            Some(1)
-        );
-        assert_eq!(
-            TokioRuntimeClock::monotonic_duration_millis(Duration::from_nanos(999_999)),
-            Some(0)
-        );
-        assert_eq!(clock.epoch, epoch);
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn unread_declared_body_closes_for_provider_deny_failure_and_pass_resumed_deny() {
-        for (provider_decision, resumed_decision) in
-            [("deny", "allow"), ("invalid", "allow"), ("pass", "deny")]
-        {
-            let directory = tempfile::tempdir().unwrap();
-            let provider_script = process_script(directory.path(), provider_decision, None);
-            let resolver_calls = Arc::new(AtomicUsize::new(0));
-            let config = process_provider_without_body_config(&provider_script, resumed_decision);
-            let (runtime, destinations) = runtime_from(config, resolver_calls.clone()).await;
-            let lease = runtime.lease().await.unwrap();
-            let (mut sender, body) = Body::channel();
-            let mut input = prepared_input(
-                &lease,
-                destinations,
-                body,
-                &[("content-length", "4"), ("content-type", "text/plain")],
-            );
-            let submissions = Arc::new(AtomicUsize::new(0));
-            input.decision_target = DecisionSubmissionTarget::Probe(submissions.clone());
-            let (provider, request) =
-                StandalonePolicyProvider::prepare(lease, ObservationTerminal, input).unwrap();
-
-            let response = RequestPipeline::new().execute(provider, request).await;
-
-            assert_eq!(
-                response,
-                ObservedResponse {
-                    status: 403,
-                    close_connection: true,
-                    body_provenance: StandaloneResponseBodyProvenance::Unconsumed,
-                },
-                "provider decision {provider_decision}, resumed decision {resumed_decision}"
-            );
-            assert!(sender
-                .send_data(bytes::Bytes::from_static(b"late"))
-                .await
-                .is_err());
-            assert_eq!(submissions.load(Ordering::SeqCst), 1);
-            runtime.shutdown().await;
-        }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn foreign_preflight_guard_fails_before_resolution_or_provider_dispatch() {
-        let directory = tempfile::tempdir().unwrap();
-        let marker = directory.path().join("provider-dispatched");
-        let provider_script = process_script(directory.path(), "allow", Some(&marker));
-        let resolver_calls = Arc::new(AtomicUsize::new(0));
-        let config = process_provider_config(&provider_script, "deny");
-        let (runtime, network) = runtime_from(config, resolver_calls.clone()).await;
-        let lease = runtime.lease().await.unwrap();
-        let mut input = prepared_input(&lease, network, Body::empty(), &[]);
-        input.network = forwarding_network();
-
-        assert!(matches!(
-            StandalonePolicyProvider::prepare(lease, TestTerminal, input),
-            Err(StandaloneProviderPrepareError::Target)
-        ));
-        assert!(!marker.exists());
-        runtime.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn upgrade_uses_trailer_deny_bounds_even_when_ordinary_trailers_are_preserved() {
-        let config = compiled_text(
-            r#"[service.forwarding]
-preserve_request_trailers = true
-
-[policy]
-default = "deny"
-
-[[policy.rules]]
-id = "upgrade"
-decision = "allow"
-methods = ["GET"]
-allow_upgrades = true
-redaction_profile = "wire"
-
-[redaction.profiles.wire]
-replacement = "[REDACTED]"
-max_frame_bytes = 1024
-max_message_bytes = 1024
-rules = [{ literals = ["password"], payloads = "text" }]
-"#,
-        );
-        let resolver_calls = Arc::new(AtomicUsize::new(0));
-        let (runtime, destinations) = runtime_from(config, resolver_calls.clone()).await;
-        let lease = runtime.lease().await.unwrap();
-        let request = Request::builder()
-            .method(Method::GET)
-            .version(Version::HTTP_11)
-            .uri("/resource")
-            .header("host", "standalone-provider.example.test")
-            .header("connection", "upgrade")
-            .header("upgrade", "websocket")
-            .body(Body::empty())
-            .unwrap();
-        let input = prepared_input_from_request(&lease, destinations, request);
-        let terminal = UpgradeTerminal;
-        let (provider, request) =
-            StandalonePolicyProvider::prepare(lease, terminal, input).unwrap();
-
-        let outcome = RequestPipeline::new().execute(provider, request).await;
-
-        assert_eq!(outcome, Terminal::Forward);
-        runtime.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn expired_local_response_body_remains_a_complete_empty_stream() {
-        let config = compiled_text(
-            r#"[policy]
-default = "deny"
-
-[[policy.rules]]
-id = "short-lived"
-decision = "allow"
-methods = ["GET"]
-request_timeout = "20ms"
-"#,
-        );
-        let resolver_calls = Arc::new(AtomicUsize::new(0));
-        let (runtime, destinations) = runtime_from(config, resolver_calls.clone()).await;
-        let lease = runtime.lease().await.unwrap();
-        let input = prepared_input(&lease, destinations, Body::empty(), &[]);
-        let (provider, request) =
-            StandalonePolicyProvider::prepare(lease, TestTerminal, input).unwrap();
-        let facts = request.facts().clone();
+    async fn selected_timeout_body_gets_a_bounded_delivery_window_after_request_expiry() {
+        let (request, clock) = request_and_clock_with_deadline(20);
+        let mut responses =
+            PreparedResponses::new(&request, clock, LocalResponseContext::Standard).unwrap();
         tokio::time::sleep(Duration::from_millis(30)).await;
 
-        let ProviderOutcome::Respond(mut response) = provider.decide(&facts, request).await else {
-            panic!("expired request must return a local response");
+        let mut response = responses.build(504).unwrap();
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let std::task::Poll::Ready(Ok(Some(chunk))) = response.poll_body_chunk(&mut context) else {
+            panic!("expected a timeout response body after the request deadline");
         };
-        assert_eq!(response.status(), 504);
-        let mut context = Context::from_waker(std::task::Waker::noop());
+        assert_eq!(chunk.as_bytes(), TIMEOUT_RESPONSE_BODY.as_bytes());
         assert!(matches!(
             response.poll_body_chunk(&mut context),
-            Poll::Ready(Ok(None))
+            std::task::Poll::Ready(Ok(None))
         ));
-        assert!(matches!(
-            response.poll_trailers(&mut context),
-            Poll::Ready(Ok(None))
-        ));
-        drop((response, provider));
-        runtime.shutdown().await;
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn process_provider_pass_resumes_at_the_later_rule_and_rehomes_the_inspected_body() {
-        let directory = tempfile::tempdir().unwrap();
-        let provider_script = process_script(directory.path(), "pass", None);
-        let resolver_calls = Arc::new(AtomicUsize::new(0));
-        let config = process_provider_config(&provider_script, "allow");
-        let (runtime, destinations) = runtime_from(config, resolver_calls.clone()).await;
-        let lease = runtime.lease().await.unwrap();
-        let mut input = prepared_input(
-            &lease,
-            destinations,
-            Body::from("inspected request body"),
-            &[("content-length", "22"), ("content-type", "text/plain")],
-        );
-        let submissions = Arc::new(AtomicUsize::new(0));
-        input.decision_target = DecisionSubmissionTarget::Probe(submissions.clone());
-        let (provider, request) =
-            StandalonePolicyProvider::prepare(lease, BodyTerminal, input).unwrap();
-
-        let terminal = RequestPipeline::new().execute(provider, request).await;
-
-        let BodyTerminalOutcome::Forward(body, DecisionAuditSource::Policy(provenance)) = terminal
-        else {
-            panic!("resumed allow must retain policy provenance");
-        };
-        assert_eq!(body, b"inspected request body");
-        let EffectivePolicy::Rule { id, .. } = provenance.effective_policy() else {
-            panic!("resumed allow must identify its matched rule");
-        };
-        assert_eq!(id.as_str(), "after-pass");
-        assert_eq!(submissions.load(Ordering::SeqCst), 1);
-        runtime.shutdown().await;
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn process_provider_allow_is_a_terminal_typed_allow() {
-        let directory = tempfile::tempdir().unwrap();
-        let provider_script = process_script(directory.path(), "allow", None);
-        let resolver_calls = Arc::new(AtomicUsize::new(0));
-        let config = process_provider_config(&provider_script, "deny");
-        let (runtime, destinations) = runtime_from(config, resolver_calls.clone()).await;
-        let lease = runtime.lease().await.unwrap();
-        let mut input = prepared_input(
-            &lease,
-            destinations,
-            Body::from("provider-visible"),
-            &[("content-length", "16"), ("content-type", "text/plain")],
-        );
-        let submissions = Arc::new(AtomicUsize::new(0));
-        input.decision_target = DecisionSubmissionTarget::Probe(submissions.clone());
-        let (provider, request) =
-            StandalonePolicyProvider::prepare(lease, BodyTerminal, input).unwrap();
-
-        let terminal = RequestPipeline::new().execute(provider, request).await;
-
-        let BodyTerminalOutcome::Forward(body, DecisionAuditSource::Policy(provenance)) = terminal
-        else {
-            panic!("provider allow must retain policy provenance");
-        };
-        assert_eq!(body, b"provider-visible");
-        let EffectivePolicy::Rule { id, .. } = provenance.effective_policy() else {
-            panic!("provider allow must identify its delegated rule");
-        };
-        assert_eq!(id.as_str(), "delegate");
-        assert_eq!(
-            provenance.reason().category(),
-            DecisionReasonCategory::Provider
-        );
-        assert_eq!(submissions.load(Ordering::SeqCst), 1);
-        runtime.shutdown().await;
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn cancelling_a_mandatory_body_read_releases_the_ingress_body_before_dispatch() {
-        let directory = tempfile::tempdir().unwrap();
-        let marker = directory.path().join("provider-dispatched");
-        let provider_script = process_script(directory.path(), "allow", Some(&marker));
-        let resolver_calls = Arc::new(AtomicUsize::new(0));
-        let config = process_provider_config(&provider_script, "deny");
-        let (runtime, destinations) = runtime_from(config, resolver_calls.clone()).await;
-        let lease = runtime.lease().await.unwrap();
-        let (mut sender, body) = Body::channel();
-        let mut input = prepared_input(
-            &lease,
-            destinations,
-            body,
-            &[("content-length", "16"), ("content-type", "text/plain")],
-        );
-        let submissions = Arc::new(AtomicUsize::new(0));
-        input.decision_target = DecisionSubmissionTarget::Probe(submissions.clone());
-        let (provider, request) =
-            StandalonePolicyProvider::prepare(lease, TestTerminal, input).unwrap();
-        let facts = request.facts().clone();
-        let decision = provider.decide(&facts, request);
-
-        assert!(tokio::time::timeout(Duration::from_millis(20), decision)
-            .await
-            .is_err());
-        assert!(sender
-            .send_data(bytes::Bytes::from_static(b"late"))
-            .await
-            .is_err());
-        assert!(!marker.exists());
-        assert_eq!(submissions.load(Ordering::SeqCst), 1);
-        drop(provider);
-        runtime.shutdown().await;
     }
 
     #[test]
-    fn status_mapping_is_closed_and_sanitized() {
-        assert_eq!(
-            body_error_status(HttpBodyReadError::RequestTrailersUnsupported),
-            400
-        );
-        assert_eq!(body_error_status(HttpBodyReadError::TimedOut), 408);
-        assert_eq!(
-            body_error_status(HttpBodyReadError::DecodedLimitExceeded),
-            413
-        );
-        assert_eq!(
-            body_error_status(HttpBodyReadError::UnsupportedContentEncoding),
-            415
-        );
-        assert_eq!(body_error_status(HttpBodyReadError::ResourceExhausted), 503);
-    }
-
-    #[test]
-    fn internal_context_partition_moves_duplicate_values_out_of_ordinary_headers() {
-        let internal_name = http::header::HeaderName::from_static("x-internal");
-        let mut headers = HeaderMap::new();
-        headers.append(
-            internal_name.clone(),
-            http::HeaderValue::from_static("first"),
-        );
-        headers.append(
-            internal_name.clone(),
-            http::HeaderValue::from_static("second"),
-        );
-        headers.insert("x-visible", http::HeaderValue::from_static("ordinary"));
-
-        let internal = crate::proxy::facts::partition_internal_context_for_test(
-            &mut headers,
-            std::slice::from_ref(&internal_name),
-        )
-        .expect("partition");
-
-        assert!(!headers.contains_key(&internal_name));
-        assert_eq!(headers["x-visible"], "ordinary");
-        assert_eq!(
-            internal
-                .get_all(&internal_name)
-                .iter()
-                .map(|value| value.to_str().unwrap())
-                .collect::<Vec<_>>(),
-            ["first", "second"]
-        );
+    fn unread_early_deny_closes_but_allowed_connect_reuses_http1() {
+        let unread_early_deny = early_deny_close_connection(false);
+        assert!(unread_early_deny);
+        assert!(local_terminal_close_connection(
+            403,
+            Some(unread_early_deny)
+        ));
+        assert!(!early_deny_close_connection(true));
+        assert!(!local_terminal_close_connection(200, None));
     }
 }

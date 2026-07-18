@@ -1,19 +1,27 @@
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use tokio_rustls::TlsAcceptor;
-
+use http_access_mitm::{
+    GeneratedCertificateAuthority, GeneratedStorageError, MitmError, MitmIdentityManager,
+    MitmLimits, MitmTlsAcceptor, MitmTlsError, PrivateStorageRoot, StandaloneCaError,
+    StandaloneCertificateAuthority, StaticTlsAcceptor, StaticTlsIdentity, StorageError,
+    TrustedIdentityFiles,
+};
 use http_access_runtime::{ForwardingNetworkError, ForwardingNetworkFacts, ForwardingNetworkGuard};
+use http_access_types::{HttpProtocol, HttpProtocolSet};
 use http_access_url::canonicalize_http_url;
 
-use crate::certs::{CertError, MitmCertificateManager};
-use crate::config::compiler::{CompiledHttpVersion, StaticProductConfig};
-use crate::tls_identity::{load_static_tls_acceptor, StaticTlsIdentityError};
+use crate::config::compiler::{
+    CompiledHttp1ConnectPolicy, CompiledHttpVersion, StaticMitmConfig, StaticProductConfig,
+};
 
 pub(crate) struct ProductIngressAssets {
     forwarding_network: Arc<ForwardingNetworkGuard>,
-    explicit_https_tls: Option<TlsAcceptor>,
-    transparent_https_alpn: Box<[Vec<u8>]>,
-    mitm: Option<Arc<MitmCertificateManager>>,
+    static_https: Option<Arc<StaticTlsAcceptor>>,
+    mitm_manager: Option<Arc<MitmIdentityManager>>,
+    plaintext_connect: Option<Arc<MitmTlsAcceptor>>,
+    tls_connect: Option<Arc<MitmTlsAcceptor>>,
+    transparent_https: Option<Arc<MitmTlsAcceptor>>,
 }
 
 impl ProductIngressAssets {
@@ -29,45 +37,79 @@ impl ProductIngressAssets {
         config: &StaticProductConfig,
         forwarding_network: Arc<ForwardingNetworkGuard>,
     ) -> Result<Arc<Self>, ProductIngressAssetsError> {
-        let explicit_https_alpn = config
-            .listeners
-            .explicit_https
-            .as_ref()
-            .map(|listener| alpn_protocols(&listener.http_versions))
-            .unwrap_or_default();
-        let explicit_https_tls = config
+        let static_https = config
             .listeners
             .explicit_https
             .as_ref()
             .map(|listener| {
-                load_static_tls_acceptor(
+                let files = TrustedIdentityFiles::open(
                     &listener.tls.certificate_chain,
                     &listener.tls.private_key,
-                    explicit_https_alpn.clone(),
-                )
+                )?;
+                let identity = StaticTlsIdentity::from_files(files)?;
+                let protocols = protocol_set(&listener.http_versions)?;
+                StaticTlsAcceptor::new(identity, protocols)
+                    .map(Arc::new)
+                    .map_err(ProductIngressAssetsError::Tls)
             })
             .transpose()?;
-        let transparent_https_alpn = config
+
+        let plaintext_connect_protocols = config
+            .listeners
+            .explicit_http
+            .as_ref()
+            .filter(|listener| {
+                matches!(
+                    listener.connect.as_ref().and_then(|connect| connect.http1),
+                    Some(CompiledHttp1ConnectPolicy::Mitm)
+                )
+            })
+            .map(|listener| protocol_set(&listener.http_versions))
+            .transpose()?;
+        let tls_connect_protocols = config
+            .listeners
+            .explicit_https
+            .as_ref()
+            .filter(|listener| {
+                matches!(
+                    listener.connect.http1,
+                    Some(CompiledHttp1ConnectPolicy::Mitm)
+                )
+            })
+            .map(|listener| protocol_set(&listener.http_versions))
+            .transpose()?;
+        let transparent_https_protocols = config
             .listeners
             .transparent_https
             .as_ref()
-            .map(|listener| alpn_protocols(&listener.http_versions))
-            .unwrap_or_default();
-        let mitm = config
-            .mitm
-            .as_ref()
-            .map(MitmCertificateManager::from_static)
-            .transpose()?
-            .map(Arc::new);
-        if config.listeners.transparent_https.is_some() && mitm.is_none() {
+            .map(|listener| protocol_set(&listener.http_versions))
+            .transpose()?;
+        let requires_mitm = plaintext_connect_protocols.is_some()
+            || tls_connect_protocols.is_some()
+            || transparent_https_protocols.is_some();
+        if requires_mitm && config.mitm.is_none() {
             return Err(ProductIngressAssetsError::MissingMitmManager);
         }
+        let mitm_manager = config
+            .mitm
+            .as_ref()
+            .map(activate_mitm_manager)
+            .transpose()?
+            .map(Arc::new);
+        let plaintext_connect = plaintext_connect_protocols
+            .map(|protocols| mitm_acceptor(mitm_manager.as_ref().unwrap(), protocols));
+        let tls_connect = tls_connect_protocols
+            .map(|protocols| mitm_acceptor(mitm_manager.as_ref().unwrap(), protocols));
+        let transparent_https = transparent_https_protocols
+            .map(|protocols| mitm_acceptor(mitm_manager.as_ref().unwrap(), protocols));
 
         Ok(Arc::new(Self {
             forwarding_network,
-            explicit_https_tls,
-            transparent_https_alpn: transparent_https_alpn.into_boxed_slice(),
-            mitm,
+            static_https,
+            mitm_manager,
+            plaintext_connect,
+            tls_connect,
+            transparent_https,
         }))
     }
 
@@ -83,17 +125,100 @@ impl ProductIngressAssets {
         &self.forwarding_network
     }
 
-    pub(crate) fn explicit_https_tls(&self) -> Option<&TlsAcceptor> {
-        self.explicit_https_tls.as_ref()
+    pub(crate) fn static_https(&self) -> Option<Arc<StaticTlsAcceptor>> {
+        self.static_https.clone()
     }
 
-    pub(crate) fn transparent_https_alpn(&self) -> &[Vec<u8>] {
-        &self.transparent_https_alpn
+    pub(crate) fn plaintext_connect(&self) -> Option<Arc<MitmTlsAcceptor>> {
+        self.plaintext_connect.clone()
     }
 
-    pub(crate) fn mitm(&self) -> Option<&Arc<MitmCertificateManager>> {
-        self.mitm.as_ref()
+    pub(crate) fn tls_connect(&self) -> Option<Arc<MitmTlsAcceptor>> {
+        self.tls_connect.clone()
     }
+
+    pub(crate) fn transparent_https(&self) -> Option<Arc<MitmTlsAcceptor>> {
+        self.transparent_https.clone()
+    }
+
+    pub(crate) fn mitm_manager(&self) -> Option<&Arc<MitmIdentityManager>> {
+        self.mitm_manager.as_ref()
+    }
+}
+
+fn activate_mitm_manager(
+    config: &StaticMitmConfig,
+) -> Result<MitmIdentityManager, ProductIngressAssetsError> {
+    let (directory, max_cached_certificates, persist_leaf_certificates) = match config {
+        StaticMitmConfig::Generated {
+            directory,
+            max_cached_certificates,
+            persist_leaf_certificates,
+        }
+        | StaticMitmConfig::Files {
+            directory,
+            max_cached_certificates,
+            persist_leaf_certificates,
+            ..
+        } => (
+            directory,
+            *max_cached_certificates,
+            *persist_leaf_certificates,
+        ),
+    };
+    let limits = MitmLimits::new(max_cached_certificates)?;
+    let root = PrivateStorageRoot::open_or_create(directory)?;
+    match config {
+        StaticMitmConfig::Generated { .. } => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| ProductIngressAssetsError::Clock)?
+                .as_secs();
+            let now = i64::try_from(now).map_err(|_| ProductIngressAssetsError::Clock)?;
+            let authority = GeneratedCertificateAuthority::open_or_generate(root, now)?;
+            if persist_leaf_certificates {
+                authority.into_persisting_identity_manager(limits)
+            } else {
+                authority.into_identity_manager(limits)
+            }
+        }
+        StaticMitmConfig::Files {
+            ca_certificate,
+            ca_private_key,
+            ..
+        } => {
+            let files = TrustedIdentityFiles::open(ca_certificate, ca_private_key)?;
+            let authority = StandaloneCertificateAuthority::from_files(files)?;
+            if persist_leaf_certificates {
+                authority.into_persisting_identity_manager(&root, limits)
+            } else {
+                authority.into_identity_manager(&root, limits)
+            }
+        }
+    }
+    .map_err(Into::into)
+}
+
+fn mitm_acceptor(
+    manager: &Arc<MitmIdentityManager>,
+    protocols: HttpProtocolSet,
+) -> Arc<MitmTlsAcceptor> {
+    Arc::new(MitmTlsAcceptor::new(Arc::clone(manager), protocols))
+}
+
+pub(super) fn protocol_set(
+    versions: &[CompiledHttpVersion],
+) -> Result<HttpProtocolSet, ProductIngressAssetsError> {
+    HttpProtocolSet::new(
+        versions
+            .iter()
+            .map(|version| match version {
+                CompiledHttpVersion::Http1 => HttpProtocol::Http1,
+                CompiledHttpVersion::Http2 => HttpProtocol::Http2,
+            })
+            .collect(),
+    )
+    .map_err(|_| ProductIngressAssetsError::InvalidListenerProtocols)
 }
 
 fn forwarding_network_facts(
@@ -141,31 +266,33 @@ fn forwarding_network_facts(
     )
 }
 
-fn alpn_protocols(versions: &[CompiledHttpVersion]) -> Vec<Vec<u8>> {
-    versions
-        .iter()
-        .map(|version| match version {
-            CompiledHttpVersion::Http1 => b"http/1.1".to_vec(),
-            CompiledHttpVersion::Http2 => b"h2".to_vec(),
-        })
-        .collect()
-}
-
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ProductIngressAssetsError {
     #[error(transparent)]
     ForwardingNetwork(#[from] ForwardingNetworkError),
     #[error(transparent)]
-    TlsIdentity(#[from] StaticTlsIdentityError),
+    Storage(#[from] StorageError),
     #[error(transparent)]
-    Mitm(#[from] CertError),
-    #[error("transparent HTTPS requires an activated MITM manager")]
+    GeneratedStorage(#[from] GeneratedStorageError),
+    #[error(transparent)]
+    StandaloneCa(#[from] StandaloneCaError),
+    #[error(transparent)]
+    Mitm(#[from] MitmError),
+    #[error(transparent)]
+    Tls(#[from] MitmTlsError),
+    #[error("system clock is unavailable")]
+    Clock,
+    #[error("compiled listener protocols are invalid")]
+    InvalidListenerProtocols,
+    #[error("a MITM listener requires an activated MITM manager")]
     MissingMitmManager,
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
 
     use http_access_types::{HttpProtocol, Route};
@@ -175,8 +302,8 @@ mod tests {
     use super::*;
     use crate::config::{compile_config_text, ConfigTextInput};
 
-    #[test]
-    fn https_assets_use_each_listeners_exact_compiled_alpn_set() {
+    #[tokio::test]
+    async fn listener_tls_assets_preserve_each_exact_role_and_protocol_set() {
         let directory = tempdir().unwrap();
         let key = KeyPair::generate().unwrap();
         let certificate = CertificateParams::new(vec!["localhost".to_string()])
@@ -185,14 +312,27 @@ mod tests {
             .unwrap();
         fs::write(directory.path().join("server.pem"), certificate.pem()).unwrap();
         fs::write(directory.path().join("server-key.pem"), key.serialize_pem()).unwrap();
+        #[cfg(unix)]
+        fs::set_permissions(
+            directory.path().join("server-key.pem"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         let text = r#"schema_version = 3
+
+[listeners.explicit_http]
+bind = "127.0.0.2:31880"
+http_versions = ["http1"]
+
+[listeners.explicit_http.connect]
+http1 = "mitm"
 
 [listeners.explicit_https]
 bind = "127.0.0.2:31881"
 http_versions = ["http2", "http1"]
 
 [listeners.explicit_https.connect]
-http1 = "deny"
+http1 = "mitm"
 http2 = "deny"
 
 [listeners.explicit_https.tls]
@@ -221,18 +361,46 @@ default = "deny"
 
         let assets = ProductIngressAssets::from_static(&compiled.static_config).unwrap();
 
-        assert!(assets.explicit_https_tls().is_some());
-        assert_eq!(assets.transparent_https_alpn(), [b"http/1.1".to_vec()]);
-        assert!(assets.mitm().is_some());
-        let dynamic_certificates = directory.path().join("mitm/dynamic");
-        assert!(dynamic_certificates.is_dir());
         assert_eq!(
-            fs::read_dir(dynamic_certificates)
-                .expect("read dynamic certificate directory")
-                .count(),
-            0
+            assets
+                .static_https()
+                .expect("explicit HTTPS acceptor")
+                .protocols()
+                .protocols(),
+            [HttpProtocol::Http2, HttpProtocol::Http1]
         );
+        assert_eq!(
+            assets
+                .transparent_https()
+                .expect("transparent HTTPS acceptor")
+                .protocols()
+                .protocols(),
+            [HttpProtocol::Http1]
+        );
+        assert!(assets.mitm_manager().is_some());
+        let plaintext_connect = assets
+            .plaintext_connect()
+            .expect("plaintext CONNECT acceptor");
+        let tls_connect = assets.tls_connect().expect("TLS CONNECT acceptor");
+        let transparent_https = assets
+            .transparent_https()
+            .expect("transparent HTTPS acceptor");
+        assert_eq!(
+            plaintext_connect.protocols().protocols(),
+            [HttpProtocol::Http1]
+        );
+        assert_eq!(
+            tls_connect.protocols().protocols(),
+            [HttpProtocol::Http2, HttpProtocol::Http1]
+        );
+        assert!(!Arc::ptr_eq(&plaintext_connect, &tls_connect));
+        assert!(!Arc::ptr_eq(&tls_connect, &transparent_https));
         assert_eq!(Arc::strong_count(assets.forwarding_network()), 1);
+        assets
+            .mitm_manager()
+            .expect("MITM identity manager")
+            .shutdown_and_join()
+            .await;
     }
 
     #[test]

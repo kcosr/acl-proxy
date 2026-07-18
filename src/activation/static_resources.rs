@@ -1,8 +1,15 @@
 use std::net::{SocketAddr, TcpListener};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use tokio::sync::watch;
+
+use http_access_runtime::{
+    ListenerRuntime, LocalAddressProvider, UpgradeRuntime, UpgradeRuntimeError,
+    UpgradeRuntimeLimits,
+};
 
 use crate::authorization::callback::PendingTerminalCause;
 use crate::authorization::webhook::runtime::{
@@ -20,11 +27,11 @@ use crate::logging::{process_logging_level_control, LoggingLevelControl};
 use crate::observation::{ProductObservationRuntime, ProductObservationRuntimeStartError};
 use crate::runtime::{BoxFuture, ServiceReadiness, StaticResourceBrand, StaticResources};
 use crate::safety::WireBodyPool;
-use crate::upgrade::{UpgradeRuntime, UpgradeRuntimeError, UpgradeRuntimeLimits};
 
 use super::assets::{ProductIngressAssets, ProductIngressAssetsError};
 use super::listeners::{
-    PreparedProxyListeners, ProxyListenerBindError, ProxySupervisor, ProxySupervisorFailure,
+    LocalAddressRefreshFailureObserver, PreparedProxyListeners, ProductLocalAddressRuntime,
+    ProxyListenerBindError, ProxyListenerFailure,
 };
 use super::product::ProductActivator;
 
@@ -42,10 +49,14 @@ pub(crate) struct ProductStaticResources {
     shutdown_deadline: Mutex<Option<tokio::time::Instant>>,
     control_failure: watch::Sender<Option<Arc<ControlServerRunError>>>,
     control_shutdown_error: Mutex<Option<Arc<ControlServerShutdownError>>>,
-    proxy_failure: watch::Sender<Option<Arc<ProxySupervisorFailure>>>,
-    proxy_shutdown_error: Mutex<Option<Arc<ProxySupervisorFailure>>>,
-    proxy_supervisors: Mutex<Vec<Arc<dyn ProxySupervisor>>>,
-    proxy_shutdown: tokio::sync::OnceCell<()>,
+    listener_failure: watch::Sender<Option<Arc<ProxyListenerFailure>>>,
+    #[cfg(test)]
+    listener_failure_notifications: AtomicUsize,
+    listener_runtime: Mutex<Option<Arc<ListenerRuntime>>>,
+    listener_shutdown_started: AtomicBool,
+    listener_admission_closed: tokio::sync::OnceCell<()>,
+    listener_shutdown: tokio::sync::OnceCell<()>,
+    local_addresses_shutdown: tokio::sync::OnceCell<()>,
     upgrade_shutdown: tokio::sync::OnceCell<()>,
     mitm_shutdown: tokio::sync::OnceCell<()>,
     ingress_assets: Arc<ProductIngressAssets>,
@@ -57,6 +68,7 @@ pub(crate) struct ProductStaticResources {
     credential_io_runtime: Arc<CredentialIoRuntime>,
     authorization_runtime: Arc<WebhookAuthorizationRuntime>,
     upgrade_runtime: Arc<UpgradeRuntime>,
+    local_addresses: OnceLock<Arc<ProductLocalAddressRuntime>>,
 }
 
 struct IngressOwnership {
@@ -79,6 +91,85 @@ struct ProductControlFailureObserver {
     owner: Weak<ProductStaticResources>,
 }
 
+struct ProductLocalAddressFailureObserver {
+    owner: Weak<ProductStaticResources>,
+}
+
+enum ProductIngressAssetSource {
+    System,
+    #[cfg(test)]
+    ForwardingNetwork(Arc<http_access_runtime::ForwardingNetworkGuard>),
+}
+
+enum ConstructionControl {
+    Continue,
+    #[cfg(test)]
+    FailAfterObservationActivation,
+    #[cfg(test)]
+    PauseAfterObservationActivation {
+        reached: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+        coordinator_complete: Arc<tokio::sync::Notify>,
+    },
+}
+
+struct ProductStaticResourceStages {
+    ingress_assets: Option<Arc<ProductIngressAssets>>,
+    authorization_runtime: Option<Arc<WebhookAuthorizationRuntime>>,
+    upgrade_runtime: Option<Arc<UpgradeRuntime>>,
+    credential_io_runtime: Option<Arc<CredentialIoRuntime>>,
+    observation_runtime: Option<Arc<ProductObservationRuntime>>,
+}
+
+impl ProductStaticResourceStages {
+    fn new() -> Self {
+        Self {
+            ingress_assets: None,
+            authorization_runtime: None,
+            upgrade_runtime: None,
+            credential_io_runtime: None,
+            observation_runtime: None,
+        }
+    }
+
+    async fn shutdown(&mut self) {
+        if let Some(observation) = self.observation_runtime.take() {
+            observation.shutdown().await;
+        }
+        if let Some(credential_io) = self.credential_io_runtime.take() {
+            let _ = credential_io
+                .shutdown_and_wait(Some(tokio::time::Instant::now()))
+                .await;
+        }
+        if let Some(upgrade) = self.upgrade_runtime.take() {
+            upgrade
+                .shutdown_and_wait(Some(std::time::Instant::now()))
+                .await;
+        }
+        if let Some(authorization) = self.authorization_runtime.take() {
+            authorization.begin_shutdown(Some(tokio::time::Instant::now()));
+            authorization.final_cancel_all(PendingTerminalCause::Shutdown);
+            authorization.wait_until_drained().await;
+        }
+        if let Some(assets) = self.ingress_assets.take() {
+            if let Some(mitm) = assets.mitm_manager() {
+                mitm.shutdown_and_join().await;
+            }
+        }
+    }
+}
+
+impl LocalAddressRefreshFailureObserver for ProductLocalAddressFailureObserver {
+    fn failed(&self, error: Arc<ProxyListenerFailure>) {
+        let Some(owner) = self.owner.upgrade() else {
+            return;
+        };
+        tracing::error!(error = %error, "local-address refresh failed");
+        owner.record_listener_failure(error);
+        StaticResources::begin_shutdown(owner.as_ref());
+    }
+}
+
 impl ControlServerFailureObserver for ProductControlFailureObserver {
     fn failed(&self, error: Arc<ControlServerRunError>) {
         let Some(owner) = self.owner.upgrade() else {
@@ -91,75 +182,166 @@ impl ControlServerFailureObserver for ProductControlFailureObserver {
 }
 
 impl ProductStaticResources {
-    pub(crate) fn try_new(
+    pub(crate) async fn try_new(
         static_config: &StaticProductConfig,
     ) -> Result<Arc<Self>, ProductStaticResourcesError> {
-        let ingress_assets = ProductIngressAssets::from_static(static_config)?;
-        Self::try_new_with_ingress_assets(static_config, ingress_assets)
+        Self::try_new_coordinated(
+            static_config.clone(),
+            ProductIngressAssetSource::System,
+            None,
+            ConstructionControl::Continue,
+        )
+        .await
     }
 
     #[cfg(test)]
-    pub(crate) fn try_new_with_forwarding_network(
+    pub(crate) async fn try_new_with_forwarding_network(
         static_config: &StaticProductConfig,
         forwarding_network: Arc<http_access_runtime::ForwardingNetworkGuard>,
     ) -> Result<Arc<Self>, ProductStaticResourcesError> {
-        let ingress_assets =
-            ProductIngressAssets::with_forwarding_network(static_config, forwarding_network)?;
-        Self::try_new_with_ingress_assets(static_config, ingress_assets)
+        Self::try_new_coordinated(
+            static_config.clone(),
+            ProductIngressAssetSource::ForwardingNetwork(forwarding_network),
+            None,
+            ConstructionControl::Continue,
+        )
+        .await
     }
 
     #[cfg(test)]
-    pub(crate) fn try_new_with_connectors(
+    async fn try_new_failing_after_worker_activation(
         static_config: &StaticProductConfig,
-        forwarding_network: Arc<http_access_runtime::ForwardingNetworkGuard>,
-        webhook_connector: Arc<crate::authorization::webhook::connector::WebhookConnector>,
     ) -> Result<Arc<Self>, ProductStaticResourcesError> {
-        let ingress_assets =
-            ProductIngressAssets::with_forwarding_network(static_config, forwarding_network)?;
-        Self::try_new_with_ingress_assets_and_webhook_connector(
-            static_config,
-            ingress_assets,
-            webhook_connector,
+        Self::try_new_coordinated(
+            static_config.clone(),
+            ProductIngressAssetSource::System,
+            None,
+            ConstructionControl::FailAfterObservationActivation,
         )
+        .await
     }
 
-    fn try_new_with_ingress_assets(
-        static_config: &StaticProductConfig,
-        ingress_assets: Arc<ProductIngressAssets>,
+    async fn try_new_coordinated(
+        static_config: StaticProductConfig,
+        asset_source: ProductIngressAssetSource,
+        webhook_connector: Option<Arc<crate::authorization::webhook::connector::WebhookConnector>>,
+        construction_control: ConstructionControl,
     ) -> Result<Arc<Self>, ProductStaticResourcesError> {
-        let webhook_connector =
-            crate::authorization::webhook::connector::WebhookConnector::system(static_config)?;
-        Self::try_new_with_ingress_assets_and_webhook_connector(
-            static_config,
-            ingress_assets,
-            webhook_connector,
-        )
+        let (result_send, result_receive) = tokio::sync::oneshot::channel();
+        #[cfg(test)]
+        let coordinator_complete = match &construction_control {
+            ConstructionControl::PauseAfterObservationActivation {
+                coordinator_complete,
+                ..
+            } => Some(Arc::clone(coordinator_complete)),
+            _ => None,
+        };
+        tokio::spawn(async move {
+            let result = Self::try_new_staged(
+                static_config,
+                asset_source,
+                webhook_connector,
+                construction_control,
+            )
+            .await;
+            if let Err(Ok(resources)) = result_send.send(result) {
+                StaticResources::shutdown(resources.as_ref()).await;
+            }
+            #[cfg(test)]
+            if let Some(complete) = coordinator_complete {
+                complete.notify_waiters();
+            }
+        });
+        result_receive
+            .await
+            .map_err(|_| ProductStaticResourcesError::ConstructionCoordinator)?
     }
 
-    fn try_new_with_ingress_assets_and_webhook_connector(
-        static_config: &StaticProductConfig,
-        ingress_assets: Arc<ProductIngressAssets>,
-        webhook_connector: Arc<crate::authorization::webhook::connector::WebhookConnector>,
+    async fn try_new_staged(
+        static_config: StaticProductConfig,
+        asset_source: ProductIngressAssetSource,
+        webhook_connector: Option<Arc<crate::authorization::webhook::connector::WebhookConnector>>,
+        construction_control: ConstructionControl,
     ) -> Result<Arc<Self>, ProductStaticResourcesError> {
+        let static_fingerprint = StaticFingerprint::from_config(&static_config)?;
+        let webhook_connector = match webhook_connector {
+            Some(connector) => connector,
+            None => {
+                crate::authorization::webhook::connector::WebhookConnector::system(&static_config)?
+            }
+        };
+        let mut stages = ProductStaticResourceStages::new();
+        let ingress_assets = match asset_source {
+            ProductIngressAssetSource::System => ProductIngressAssets::from_static(&static_config),
+            #[cfg(test)]
+            ProductIngressAssetSource::ForwardingNetwork(network) => {
+                ProductIngressAssets::with_forwarding_network(&static_config, network)
+            }
+        }?;
+        stages.ingress_assets = Some(Arc::clone(&ingress_assets));
         let (control_failure, _) = watch::channel(None);
-        let (proxy_failure, _) = watch::channel(None);
-        let authorization_runtime =
-            WebhookAuthorizationRuntime::try_new_with_connector(static_config, webhook_connector)?;
-        let upgrade_runtime = UpgradeRuntime::try_new(UpgradeRuntimeLimits::new(
+        let (listener_failure, _) = watch::channel(None);
+        let authorization_runtime = match WebhookAuthorizationRuntime::try_new_with_connector(
+            &static_config,
+            webhook_connector,
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                stages.shutdown().await;
+                return Err(error.into());
+            }
+        };
+        stages.authorization_runtime = Some(Arc::clone(&authorization_runtime));
+        let upgrade_runtime = match UpgradeRuntime::activate(UpgradeRuntimeLimits::new(
             static_config.service.max_active_upgrades,
             static_config.service.max_upgrade_buffer_bytes,
             static_config.service.upgrade_relay_buffer_bytes,
             static_config.service.max_upgrade_lifetime,
-        ))?;
-        let credential_io_runtime = CredentialIoRuntime::new()?;
-        let static_fingerprint = StaticFingerprint::from_config(static_config)?;
+        )) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                stages.shutdown().await;
+                return Err(error.into());
+            }
+        };
+        stages.upgrade_runtime = Some(Arc::clone(&upgrade_runtime));
+        let credential_io_runtime = match CredentialIoRuntime::new() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                stages.shutdown().await;
+                return Err(error.into());
+            }
+        };
+        stages.credential_io_runtime = Some(Arc::clone(&credential_io_runtime));
         let logging_level = process_logging_level_control();
-        // Start the process-owned worker last so construction cannot return an
-        // error after a worker thread has been created.
-        let observation_runtime = Arc::new(ProductObservationRuntime::try_new(
-            static_config.capture.max_pending_records,
-        )?);
-        Ok(Arc::new(Self {
+        let observation_runtime =
+            match ProductObservationRuntime::try_new(static_config.capture.max_pending_records) {
+                Ok(runtime) => Arc::new(runtime),
+                Err(error) => {
+                    stages.shutdown().await;
+                    return Err(error.into());
+                }
+            };
+        stages.observation_runtime = Some(Arc::clone(&observation_runtime));
+        match construction_control {
+            ConstructionControl::Continue => {}
+            #[cfg(test)]
+            ConstructionControl::FailAfterObservationActivation => {
+                stages.shutdown().await;
+                return Err(ProductStaticResourcesError::InjectedConstructionFailure);
+            }
+            #[cfg(test)]
+            ConstructionControl::PauseAfterObservationActivation {
+                reached, release, ..
+            } => {
+                let _ = reached.send(());
+                if release.await.is_err() {
+                    stages.shutdown().await;
+                    return Err(ProductStaticResourcesError::InjectedConstructionFailure);
+                }
+            }
+        }
+        let resources = Arc::new(Self {
             readiness: Arc::new(ServiceReadiness::new()),
             brand: StaticResourceBrand::new(),
             static_fingerprint,
@@ -168,10 +350,14 @@ impl ProductStaticResources {
             shutdown_deadline: Mutex::new(None),
             control_failure,
             control_shutdown_error: Mutex::new(None),
-            proxy_failure,
-            proxy_shutdown_error: Mutex::new(None),
-            proxy_supervisors: Mutex::new(Vec::new()),
-            proxy_shutdown: tokio::sync::OnceCell::new(),
+            listener_failure,
+            #[cfg(test)]
+            listener_failure_notifications: AtomicUsize::new(0),
+            listener_runtime: Mutex::new(None),
+            listener_shutdown_started: AtomicBool::new(false),
+            listener_admission_closed: tokio::sync::OnceCell::new(),
+            listener_shutdown: tokio::sync::OnceCell::new(),
+            local_addresses_shutdown: tokio::sync::OnceCell::new(),
             upgrade_shutdown: tokio::sync::OnceCell::new(),
             mitm_shutdown: tokio::sync::OnceCell::new(),
             ingress_assets,
@@ -194,7 +380,31 @@ impl ProductStaticResources {
             credential_io_runtime,
             authorization_runtime,
             upgrade_runtime,
-        }))
+            local_addresses: OnceLock::new(),
+        });
+        let local_addresses = match ProductLocalAddressRuntime::activate(Arc::new(
+            ProductLocalAddressFailureObserver {
+                owner: Arc::downgrade(&resources),
+            },
+        ))
+        .await
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                StaticResources::shutdown(resources.as_ref()).await;
+                return Err(error.into());
+            }
+        };
+        resources
+            .local_addresses
+            .set(local_addresses)
+            .unwrap_or_else(|_| panic!("local-address runtime is installed exactly once"));
+        stages.ingress_assets = None;
+        stages.authorization_runtime = None;
+        stages.upgrade_runtime = None;
+        stages.credential_io_runtime = None;
+        stages.observation_runtime = None;
+        Ok(resources)
     }
 
     pub(crate) fn static_fingerprint(&self) -> &StaticFingerprint {
@@ -231,6 +441,13 @@ impl ProductStaticResources {
 
     pub(crate) fn ingress_assets(&self) -> &Arc<ProductIngressAssets> {
         &self.ingress_assets
+    }
+
+    pub(crate) fn local_address_provider(&self) -> Arc<dyn LocalAddressProvider> {
+        self.local_addresses
+            .get()
+            .expect("local-address runtime is activated before publication")
+            .provider()
     }
 
     pub(crate) fn activator(self: &Arc<Self>) -> Arc<ProductActivator> {
@@ -331,7 +548,7 @@ impl ProductStaticResources {
     ///
     /// The caller must return the successfully started supervisors to this owner
     /// before yielding so shutdown continues to own and join every ingress task.
-    pub(super) fn take_prepared_proxy_listeners_for_supervisor_start(
+    pub(super) fn take_prepared_listener_bundle(
         &self,
     ) -> Result<PreparedProxyListeners, ProductStaticResourcesError> {
         let mut ingress = self
@@ -467,26 +684,33 @@ impl ProductStaticResources {
             .clone()
     }
 
-    pub(super) fn adopt_proxy_supervisors(
+    pub(super) fn adopt_listener_runtime(
         &self,
-        supervisors: &mut Vec<Arc<dyn ProxySupervisor>>,
+        runtime: ListenerRuntime,
     ) -> Result<(), ProductStaticResourcesError> {
         let mut owned = self
-            .proxy_supervisors
+            .listener_runtime
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if owned.is_some() {
+            return Err(ProductStaticResourcesError::ListenerRuntimeAlreadyAdopted);
+        }
+        *owned = Some(Arc::new(runtime));
         if self.shutdown_started.load(Ordering::Acquire) {
+            owned
+                .as_ref()
+                .expect("listener runtime was just installed")
+                .begin_shutdown();
             return Err(ProductStaticResourcesError::ShuttingDown);
         }
-        if !owned.is_empty() {
-            return Err(ProductStaticResourcesError::ProxySupervisorsAlreadyAdopted);
-        }
-        owned.append(supervisors);
         Ok(())
     }
 
-    pub(super) fn record_proxy_failure(&self, error: Arc<ProxySupervisorFailure>) {
-        let _ = self.proxy_failure.send_if_modified(|recorded| {
+    pub(super) fn record_listener_failure(&self, error: Arc<ProxyListenerFailure>) {
+        #[cfg(test)]
+        self.listener_failure_notifications
+            .fetch_add(1, Ordering::AcqRel);
+        let _ = self.listener_failure.send_if_modified(|recorded| {
             if recorded.is_some() {
                 return false;
             }
@@ -495,8 +719,13 @@ impl ProductStaticResources {
         });
     }
 
-    pub(crate) async fn wait_for_proxy_failure(&self) -> Option<Arc<ProxySupervisorFailure>> {
-        let mut failure = self.proxy_failure.subscribe();
+    #[cfg(test)]
+    pub(crate) fn listener_failure_notifications_for_test(&self) -> usize {
+        self.listener_failure_notifications.load(Ordering::Acquire)
+    }
+
+    pub(crate) async fn wait_for_listener_failure(&self) -> Option<Arc<ProxyListenerFailure>> {
+        let mut failure = self.listener_failure.subscribe();
         loop {
             if let Some(error) = failure.borrow().clone() {
                 return Some(error);
@@ -507,60 +736,41 @@ impl ProductStaticResources {
         }
     }
 
-    pub(crate) fn proxy_shutdown_error(&self) -> Option<Arc<ProxySupervisorFailure>> {
-        self.proxy_shutdown_error
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
-    async fn shutdown_proxy_supervisors(&self) {
-        let supervisors = self
-            .proxy_supervisors
+    async fn shutdown_listener_runtime(&self) {
+        let runtime = self
+            .listener_runtime
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let deadline = *self
-            .shutdown_deadline
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut joins = tokio::task::JoinSet::new();
-        for supervisor in supervisors {
-            joins.spawn(async move {
-                if let Some(deadline) = deadline {
-                    tokio::select! {
-                        biased;
-                        _ = tokio::time::sleep_until(deadline) => supervisor.abort_and_join().await,
-                        result = supervisor.close_and_join() => result,
-                    }
-                } else {
-                    supervisor.close_and_join().await
-                }
-            });
-        }
-        while let Some(result) = joins.join_next().await {
-            let error = match result {
-                Ok(Ok(())) => continue,
-                Ok(Err(error)) => Arc::new(error),
-                Err(error) => {
-                    tracing::error!(%error, "proxy supervisor shutdown coordinator failed");
-                    continue;
-                }
-            };
-            tracing::error!(error = %error, "proxy supervisor shutdown failed");
-            let mut recorded = self
-                .proxy_shutdown_error
+        if let Some(runtime) = runtime {
+            self.listener_shutdown_started
+                .store(true, Ordering::Release);
+            let deadline = *self
+                .shutdown_deadline
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if recorded.is_none() {
-                *recorded = Some(error);
-            }
+            runtime
+                .shutdown_and_wait(deadline.map(tokio::time::Instant::into_std))
+                .await;
         }
     }
 
     #[cfg(test)]
     pub(crate) fn shutdown_started_for_test(&self) -> bool {
         self.shutdown_started.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn listener_shutdown_started_for_test(&self) -> bool {
+        self.listener_shutdown_started.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn owns_listener_runtime_for_test(&self) -> bool {
+        self.listener_runtime
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
     }
 
     fn record_control_shutdown_error(&self, error: Arc<ControlServerShutdownError>) {
@@ -606,13 +816,13 @@ impl StaticResources for ProductStaticResources {
         if self.shutdown_started.swap(true, Ordering::AcqRel) {
             return;
         }
-        for supervisor in self
-            .proxy_supervisors
+        let listener_runtime = self
+            .listener_runtime
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-        {
-            supervisor.begin_shutdown();
+            .clone();
+        if let Some(runtime) = listener_runtime.as_ref() {
+            runtime.begin_shutdown();
         }
         if matches!(ingress.state, IngressState::Prepared(_)) {
             ingress.state = IngressState::Adopted;
@@ -627,8 +837,14 @@ impl StaticResources for ProductStaticResources {
         self.observation_runtime.begin_shutdown();
         self.credential_io_runtime.begin_shutdown();
         self.authorization_runtime.begin_shutdown(deadline);
-        self.upgrade_runtime.begin_shutdown(deadline);
-        if let Some(mitm) = self.ingress_assets.mitm() {
+        if listener_runtime.is_none() {
+            self.upgrade_runtime
+                .begin_shutdown(deadline.map(tokio::time::Instant::into_std));
+        }
+        if let Some(local_addresses) = self.local_addresses.get() {
+            local_addresses.begin_shutdown();
+        }
+        if let Some(mitm) = self.ingress_assets.mitm_manager() {
             mitm.begin_shutdown();
         }
     }
@@ -641,6 +857,18 @@ impl StaticResources for ProductStaticResources {
                 .shutdown_deadline
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let listener_runtime = self
+                .listener_runtime
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Some(runtime) = listener_runtime {
+                self.listener_admission_closed
+                    .get_or_init(|| runtime.stop_admission_and_wait_closed())
+                    .await;
+                self.upgrade_runtime
+                    .begin_shutdown(deadline.map(tokio::time::Instant::into_std));
+            }
             let deadline_won = if let Some(deadline) = deadline {
                 tokio::select! {
                     biased;
@@ -691,14 +919,22 @@ impl StaticResources for ProductStaticResources {
                 );
             }
             self.upgrade_shutdown
-                .get_or_init(|| self.upgrade_runtime.shutdown_and_wait(deadline))
+                .get_or_init(|| {
+                    self.upgrade_runtime
+                        .shutdown_and_wait(deadline.map(tokio::time::Instant::into_std))
+                })
                 .await;
-            self.proxy_shutdown
-                .get_or_init(|| self.shutdown_proxy_supervisors())
+            self.listener_shutdown
+                .get_or_init(|| self.shutdown_listener_runtime())
                 .await;
+            if let Some(local_addresses) = self.local_addresses.get() {
+                self.local_addresses_shutdown
+                    .get_or_init(|| local_addresses.shutdown_and_join())
+                    .await;
+            }
             self.mitm_shutdown
                 .get_or_init(|| async {
-                    if let Some(mitm) = self.ingress_assets.mitm() {
+                    if let Some(mitm) = self.ingress_assets.mitm_manager() {
                         mitm.shutdown_and_join().await;
                     }
                 })
@@ -710,6 +946,11 @@ impl StaticResources for ProductStaticResources {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ProductStaticResourcesError {
+    #[error("static resource construction coordinator did not complete")]
+    ConstructionCoordinator,
+    #[cfg(test)]
+    #[error("injected failure after static worker activation")]
+    InjectedConstructionFailure,
     #[error(transparent)]
     IngressAssets(#[from] ProductIngressAssetsError),
     #[error("static fingerprint derivation failed")]
@@ -722,6 +963,8 @@ pub(crate) enum ProductStaticResourcesError {
     CredentialIo(#[from] CredentialIoRuntimeError),
     #[error("static upgrade runtime construction failed")]
     Upgrade(#[from] UpgradeRuntimeError),
+    #[error("static local-address runtime construction failed")]
+    LocalAddress(#[from] http_access_runtime::RuntimeError),
     #[error("static observation runtime construction failed")]
     Observation(#[from] ProductObservationRuntimeStartError),
     #[error("control server construction failed")]
@@ -736,20 +979,20 @@ pub(crate) enum ProductStaticResourcesError {
     IngressAlreadyAdopted,
     #[error("control server has already started")]
     ControlAlreadyStarted,
-    #[error("proxy supervisors have already been adopted")]
-    ProxySupervisorsAlreadyAdopted,
+    #[error("the listener runtime has already been adopted")]
+    ListenerRuntimeAlreadyAdopted,
     #[error("static resources are shutting down")]
     ShuttingDown,
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::mpsc as std_mpsc;
     use std::sync::Condvar;
     use std::time::Duration;
-
-    use tokio::sync::oneshot;
 
     use super::*;
     use crate::config::compiler::{
@@ -757,18 +1000,6 @@ mod tests {
         StaticMitmConfig, StaticTransparentHttpsListener,
     };
     use crate::config::{compile_config_text, ConfigTextInput};
-    use crate::upgrade::UpgradeAllocation;
-
-    struct DropSignal(Option<oneshot::Sender<()>>);
-
-    impl Drop for DropSignal {
-        fn drop(&mut self) {
-            if let Some(signal) = self.0.take() {
-                let _ = signal.send(());
-            }
-        }
-    }
-
     fn static_config(addresses: [SocketAddr; 5], identity_directory: &Path) -> StaticProductConfig {
         let [explicit_http, transparent_http, explicit_https, transparent_https, control] =
             addresses;
@@ -846,6 +1077,8 @@ header = "x-acl-proxy-request-id"
         let private_key = identity_directory.join("server-key.pem");
         std::fs::write(&certificate_chain, certificate.pem()).unwrap();
         std::fs::write(&private_key, key.serialize_pem()).unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&private_key, std::fs::Permissions::from_mode(0o600)).unwrap();
         config.listeners.explicit_https = Some(StaticExplicitHttpsListener {
             bind: explicit_https,
             http_versions: versions.clone(),
@@ -882,7 +1115,9 @@ header = "x-acl-proxy-request-id"
         let addresses = reservations.addresses();
         let directory = tempfile::tempdir().unwrap();
         let resources =
-            ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
+            ProductStaticResources::try_new(&static_config(addresses, directory.path()))
+                .await
+                .unwrap();
 
         resources
             .prepare_ingress_from_prebound(reservations.into_listeners())
@@ -911,7 +1146,9 @@ header = "x-acl-proxy-request-id"
         let blocker = listeners.remove(2);
         let directory = tempfile::tempdir().unwrap();
         let resources =
-            ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
+            ProductStaticResources::try_new(&static_config(addresses, directory.path()))
+                .await
+                .unwrap();
 
         assert!(matches!(
             resources.prepare_ingress_from_prebound(listeners),
@@ -934,7 +1171,9 @@ header = "x-acl-proxy-request-id"
         let addresses = reservations.addresses();
         let directory = tempfile::tempdir().unwrap();
         let resources =
-            ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
+            ProductStaticResources::try_new(&static_config(addresses, directory.path()))
+                .await
+                .unwrap();
 
         assert!(matches!(
             resources.prepare_ingress_with(
@@ -957,7 +1196,9 @@ header = "x-acl-proxy-request-id"
         let addresses = reservations.addresses();
         let directory = tempfile::tempdir().unwrap();
         let resources =
-            ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
+            ProductStaticResources::try_new(&static_config(addresses, directory.path()))
+                .await
+                .unwrap();
         resources
             .prepare_ingress_from_prebound(reservations.into_listeners())
             .unwrap();
@@ -966,7 +1207,7 @@ header = "x-acl-proxy-request-id"
 
         super::super::assert_listener_addresses_released(&_test, addresses);
         assert!(matches!(
-            resources.take_prepared_proxy_listeners_for_supervisor_start(),
+            resources.take_prepared_listener_bundle(),
             Err(ProductStaticResourcesError::IngressAlreadyAdopted)
         ));
     }
@@ -978,7 +1219,9 @@ header = "x-acl-proxy-request-id"
         let addresses = reservations.addresses();
         let directory = tempfile::tempdir().unwrap();
         let resources =
-            ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
+            ProductStaticResources::try_new(&static_config(addresses, directory.path()))
+                .await
+                .unwrap();
 
         for address in addresses {
             assert!(
@@ -992,48 +1235,103 @@ header = "x-acl-proxy-request-id"
     }
 
     #[tokio::test]
-    async fn static_owner_closes_and_joins_runtime_owned_upgrade_tasks() {
+    async fn later_construction_failure_joins_every_activated_worker() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<5>(&_test);
+        let addresses = reservations.addresses();
+        let directory = tempfile::tempdir().unwrap();
+        let config = static_config(addresses, directory.path());
+
+        assert!(matches!(
+            ProductStaticResources::try_new_failing_after_worker_activation(&config).await,
+            Err(ProductStaticResourcesError::InjectedConstructionFailure)
+        ));
+
+        let resources = ProductStaticResources::try_new(&config)
+            .await
+            .expect("a later failure left a process worker or MITM storage owner active");
+        StaticResources::shutdown(resources.as_ref()).await;
+        drop(reservations);
+        super::super::assert_listener_addresses_released(&_test, addresses);
+    }
+
+    #[tokio::test]
+    async fn cancelled_constructor_recovers_and_joins_every_activated_worker() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<5>(&_test);
+        let addresses = reservations.addresses();
+        let directory = tempfile::tempdir().unwrap();
+        let config = static_config(addresses, directory.path());
+        let (reached_send, reached_receive) = tokio::sync::oneshot::channel();
+        let (release_send, release_receive) = tokio::sync::oneshot::channel();
+        let coordinator_complete = Arc::new(tokio::sync::Notify::new());
+        let completion_observer = Arc::clone(&coordinator_complete);
+        let completion = completion_observer.notified();
+        let construction_config = config.clone();
+        let constructor = tokio::spawn(async move {
+            ProductStaticResources::try_new_coordinated(
+                construction_config,
+                ProductIngressAssetSource::System,
+                None,
+                ConstructionControl::PauseAfterObservationActivation {
+                    reached: reached_send,
+                    release: release_receive,
+                    coordinator_complete,
+                },
+            )
+            .await
+        });
+        reached_receive
+            .await
+            .expect("construction did not activate every worker");
+
+        constructor.abort();
+        assert!(matches!(
+            constructor.await,
+            Err(error) if error.is_cancelled()
+        ));
+        release_send
+            .send(())
+            .expect("construction coordinator stopped before cleanup");
+        tokio::time::timeout(Duration::from_secs(2), completion)
+            .await
+            .expect("construction coordinator did not recover and join resources");
+
+        let resources = ProductStaticResources::try_new(&config)
+            .await
+            .expect("canceled construction left a process worker active");
+        StaticResources::shutdown(resources.as_ref()).await;
+        drop(reservations);
+        super::super::assert_listener_addresses_released(&_test, addresses);
+    }
+
+    #[tokio::test]
+    async fn static_owner_activates_and_joins_shared_upgrade_runtime() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let reservations = super::super::reserve_listeners::<5>(&_test);
         let addresses = reservations.addresses();
         let directory = tempfile::tempdir().unwrap();
         let resources =
-            ProductStaticResources::try_new(&static_config(addresses, directory.path())).unwrap();
+            ProductStaticResources::try_new(&static_config(addresses, directory.path()))
+                .await
+                .unwrap();
         let runtime = resources.upgrade_runtime();
-        let counts = runtime.counts();
-        assert_eq!(counts.maximum_slots, 256);
-        assert_eq!(counts.maximum_bytes, 2_147_483_648);
-
-        let (started_tx, started_rx) = oneshot::channel();
-        let (dropped_tx, dropped_rx) = oneshot::channel();
-        runtime
-            .try_spawn_handshake(
-                UpgradeAllocation::from_compiled_rule(0, Some(0)).unwrap(),
-                move |_| async move {
-                    let _drop = DropSignal(Some(dropped_tx));
-                    let _ = started_tx.send(());
-                    std::future::pending::<()>().await;
-                },
-            )
-            .unwrap();
-        started_rx.await.unwrap();
+        let limits = runtime.limits();
+        assert_eq!(limits.max_active_upgrades(), 256);
+        assert_eq!(limits.max_upgrade_buffer_bytes(), 2_147_483_648);
+        assert_eq!(limits.relay_buffer_bytes(), 65_536);
+        assert_eq!(
+            limits.max_upgrade_lifetime(),
+            Duration::from_secs(8 * 60 * 60)
+        );
 
         StaticResources::begin_shutdown(resources.as_ref());
-        assert!(!runtime.counts().accepting);
         tokio::time::timeout(
             Duration::from_secs(2),
             StaticResources::shutdown(resources.as_ref()),
         )
         .await
-        .expect("static shutdown did not join the upgrade task");
-        dropped_rx.await.unwrap();
-
-        let counts = runtime.counts();
-        assert_eq!(counts.reserved_slots, 0);
-        assert_eq!(counts.reserved_bytes, 0);
-        assert_eq!(counts.uncommitted, 0);
-        assert_eq!(counts.committed, 0);
-        assert_eq!(counts.tracked_tasks, 0);
+        .expect("static shutdown did not join the shared upgrade runtime");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1044,7 +1342,7 @@ header = "x-acl-proxy-request-id"
         let directory = tempfile::tempdir().unwrap();
         let mut config = static_config(addresses, directory.path());
         config.service.shutdown_drain_timeout = Some(Duration::from_millis(20));
-        let resources = ProductStaticResources::try_new(&config).unwrap();
+        let resources = ProductStaticResources::try_new(&config).await.unwrap();
         let credential_runtime = resources.credential_io_runtime();
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let gate_for_job = Arc::clone(&gate);

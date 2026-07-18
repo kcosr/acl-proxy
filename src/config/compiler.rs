@@ -42,7 +42,6 @@ use crate::capture::CaptureSinkSpec;
 use crate::credential_buffers::ProductCredentialProjectionContext;
 use crate::credential_resolver::projected_product_adapter_bytes;
 use crate::credentials::{MAX_CREDENTIAL_BYTES, MAX_FILE_READ_BYTES};
-use crate::http1::store::PARSER_STORE_BYTES;
 use crate::http_body::{http_decoder_workspace_sizes, HTTP_DECODER_OUTPUT_STAGING_BYTES};
 use crate::network::{canonical_socket_addr, socket_binds_overlap};
 use crate::redaction::{
@@ -51,6 +50,7 @@ use crate::redaction::{
 #[cfg(test)]
 use crate::safety::wire_body::MAX_BUFFER_GROWTH_BYTES;
 use crate::safety::wire_body::{guarded_body_allocation_bytes, guarded_workspace_allocation_bytes};
+use http_access_runtime::http1::PARSER_STORE_BYTES;
 use http_access_url::{canonicalize_http_url, CompiledUrlPattern};
 
 use super::authoring::{
@@ -237,15 +237,6 @@ pub(crate) struct StaticConnectPolicy {
 pub(crate) enum CompiledHttp1ConnectPolicy {
     Deny,
     Mitm,
-}
-
-impl StaticConnectPolicy {
-    pub(crate) fn http1_listener_denied(&self) -> Option<bool> {
-        self.http1.map(|mode| match mode {
-            CompiledHttp1ConnectPolicy::Deny => true,
-            CompiledHttp1ConnectPolicy::Mitm => false,
-        })
-    }
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
@@ -10242,20 +10233,6 @@ methods = ["DELETE"]
                 None,
             ]
         );
-        assert_eq!(
-            crate::upgrade::UpgradeAllocation::from_compiled_rule(
-                0,
-                plan.upgrade_wire_working_set_bytes_by_rule[0],
-            )
-            .unwrap()
-            .wire_bytes(),
-            0
-        );
-        assert!(crate::upgrade::UpgradeAllocation::from_compiled_rule(
-            3,
-            plan.upgrade_wire_working_set_bytes_by_rule[3],
-        )
-        .is_err());
         assert_eq!(
             plan.max_upgrade_allocation_per_stream,
             transport + 4 * MIB + deflate_scratch + WEBSOCKET_DEFLATE_SCRATCH_BYTES

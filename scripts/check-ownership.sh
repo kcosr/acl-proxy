@@ -7,24 +7,20 @@ cd "$ROOT"
 ownership_gates=(
     scripts/check-shared-url-ownership.sh
     scripts/check-shared-acl-ownership.sh
-    scripts/check-standalone-policy-ownership.sh
-    scripts/check-forwarding-executor-ownership.sh
-    scripts/check-forwarding-product-test-inventory.sh
-    scripts/check-hyper-h2-cancellation-patch.sh
+    # Supersedes the deleted standalone, forwarding, product-inventory, and
+    # product-header gates after their owners moved behind the shared listener.
+    scripts/check-c05-shared-listener-ownership.sh
     scripts/check-shared-redaction-ownership.sh
     scripts/check-shared-credential-ownership.sh
-    scripts/check-shared-header-ownership.sh
+    scripts/check-production-websocket-smoke.sh
 )
 mutation_suites=(
     scripts/tests/check-shared-url-ownership-test.sh
     scripts/tests/check-shared-acl-ownership-test.sh
-    scripts/tests/check-standalone-policy-ownership-test.sh
-    scripts/tests/check-forwarding-executor-ownership-test.sh
-    scripts/tests/check-forwarding-product-test-inventory-test.sh
-    scripts/tests/check-hyper-h2-cancellation-patch-test.sh
+    scripts/tests/check-c05-shared-listener-ownership-test.sh
     scripts/tests/check-shared-redaction-ownership-test.sh
     scripts/tests/check-shared-credential-ownership-test.sh
-    scripts/tests/check-shared-header-ownership-test.sh
+    scripts/tests/check-production-websocket-smoke-test.sh
 )
 
 for gate in "${ownership_gates[@]}"; do

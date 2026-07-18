@@ -317,7 +317,7 @@ mod tests {
     use http_access_runtime::{
         prepare_standalone_exchange, BodyBounds, BodyBudget, BoxFuture, Clock, ForwardingAdmission,
         ForwardingCancellation, ForwardingDevHarness, ForwardingError, ForwardingExecutor,
-        ForwardingNetworkFacts, ForwardingNetworkGuard, ForwardingOutcome, ForwardingResources,
+        ForwardingNetworkFacts, ForwardingNetworkGuard, ForwardingResources, ForwardingResponse,
         ForwardingRetention, ForwardingTerminal, ForwardingTerminalOutcome,
         ForwardingTerminalOwner, RuntimeBody, RuntimeError, RuntimeRequest, RuntimeResourceLimits,
         SnapshotLease, SnapshotLeaseInput, SnapshotRegistries, StandaloneExchange,
@@ -389,7 +389,7 @@ mod tests {
         async fn execute(
             self,
         ) -> (
-            Result<ForwardingOutcome, ForwardingError>,
+            Result<ForwardingResponse, ForwardingError>,
             Arc<CredentialIoRuntime>,
         ) {
             let result = self
@@ -588,11 +588,8 @@ mod tests {
         String::from_utf8(head).unwrap()
     }
 
-    async fn finish_empty_response(outcome: ForwardingOutcome) {
-        let ForwardingOutcome::Response(response) = outcome else {
-            panic!("expected ordinary response");
-        };
-        let (_, mut body) = response.into_parts();
+    async fn finish_empty_response(response: ForwardingResponse) {
+        let (_, mut body) = response.into_parts().expect("expected ordinary response");
         assert!(std::future::poll_fn(|context| body.poll_data(context))
             .await
             .unwrap()
@@ -603,7 +600,7 @@ mod tests {
             .is_none());
     }
 
-    fn expect_error(result: Result<ForwardingOutcome, ForwardingError>) -> ForwardingError {
+    fn expect_error(result: Result<ForwardingResponse, ForwardingError>) -> ForwardingError {
         match result {
             Ok(_) => panic!("forwarding unexpectedly succeeded"),
             Err(error) => error,

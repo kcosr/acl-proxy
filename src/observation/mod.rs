@@ -47,6 +47,8 @@ const DECISION_POOL_BYTES: usize = (DECISION_QUEUE_CAPACITY + 1) * DECISION_MAX_
 pub(crate) struct ProductObservationRuntime {
     capture_pool: Arc<CapturePool>,
     capture_worker: CaptureArtifactWorker,
+    #[cfg(test)]
+    forwarding_terminal_completions: std::sync::atomic::AtomicUsize,
     #[cfg(not(test))]
     info_decisions: ObservationQueue,
     #[cfg(not(test))]
@@ -64,6 +66,8 @@ impl ProductObservationRuntime {
         Ok(Self {
             capture_pool: CapturePool::new(),
             capture_worker: CaptureArtifactWorker::start(max_pending_records)?,
+            #[cfg(test)]
+            forwarding_terminal_completions: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(not(test))]
             info_decisions,
             #[cfg(not(test))]
@@ -136,6 +140,18 @@ impl ProductObservationRuntime {
     pub(crate) fn committed_capture_limit(&self) -> usize {
         self.capture_pool.committed_limit()
     }
+
+    #[cfg(test)]
+    pub(crate) fn record_forwarding_terminal_completion(&self) {
+        self.forwarding_terminal_completions
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forwarding_terminal_completions(&self) -> usize {
+        self.forwarding_terminal_completions
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 /// One owned best-effort decision event. Moving this value through dispatch
@@ -183,17 +199,8 @@ impl PendingDecisionSubmission {
                 let _ = runtime.try_submit_decision(level, facts);
             }
             #[cfg(test)]
-            DecisionSubmissionTarget::Disabled => {}
-            #[cfg(test)]
             DecisionSubmissionTarget::Probe(submissions) => {
                 submissions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            }
-            #[cfg(test)]
-            DecisionSubmissionTarget::FactsProbe(submissions) => {
-                submissions
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(facts);
             }
         }
     }
@@ -201,22 +208,13 @@ impl PendingDecisionSubmission {
     pub(crate) fn discard(mut self) {
         self.facts.take();
     }
-
-    #[cfg(test)]
-    pub(crate) fn facts(&self) -> Option<&DecisionAuditFacts> {
-        self.facts.as_ref()
-    }
 }
 
 #[derive(Clone)]
 pub(crate) enum DecisionSubmissionTarget {
     Runtime(Arc<ProductObservationRuntime>),
     #[cfg(test)]
-    Disabled,
-    #[cfg(test)]
     Probe(Arc<std::sync::atomic::AtomicUsize>),
-    #[cfg(test)]
-    FactsProbe(Arc<std::sync::Mutex<Vec<DecisionAuditFacts>>>),
 }
 
 impl From<Arc<ProductObservationRuntime>> for DecisionSubmissionTarget {

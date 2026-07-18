@@ -392,6 +392,12 @@ struct CapturedInboundCredential {
 }
 
 impl InboundCredentials {
+    pub(crate) fn reserves_header(&self, name: &str) -> bool {
+        self.metadata
+            .iter()
+            .any(|metadata| metadata.header.as_str() == name)
+    }
+
     fn extract(
         snapshot: &InboundCredentialSnapshot,
         headers: &mut HeaderMap,

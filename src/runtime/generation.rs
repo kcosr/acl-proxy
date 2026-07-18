@@ -9,7 +9,6 @@ use http::header::HeaderMap;
 
 use tokio::sync::Notify;
 
-use crate::config::compiler::CompiledResourcePlan;
 use crate::standalone::StandaloneGenerationPlan;
 
 use super::activation::{BoxFuture, RuntimeError};
@@ -262,7 +261,6 @@ pub(crate) struct ActivatedGeneration {
     pub(crate) standalone: StandaloneGenerationPlan,
     pub(crate) request_timeout: Duration,
     pub(crate) max_content_decoding_expansion_ratio: usize,
-    pub(crate) resource_plan: CompiledResourcePlan,
     pub(crate) forwarding_executor: Arc<http_access_runtime::ForwardingExecutor>,
     pub(crate) authorization: Arc<dyn AuthorizationSnapshot>,
     pub(crate) credentials: Arc<crate::credentials::InboundCredentialSnapshot>,
@@ -277,7 +275,6 @@ pub(crate) struct Generation {
     standalone: StandaloneGenerationPlan,
     request_timeout: Duration,
     max_content_decoding_expansion_ratio: usize,
-    resource_plan: CompiledResourcePlan,
     forwarding_executor: Arc<http_access_runtime::ForwardingExecutor>,
     authorization: Arc<dyn AuthorizationSnapshot>,
     credentials: Arc<crate::credentials::InboundCredentialSnapshot>,
@@ -310,7 +307,6 @@ impl Generation {
             standalone: value.standalone,
             request_timeout: value.request_timeout,
             max_content_decoding_expansion_ratio: value.max_content_decoding_expansion_ratio,
-            resource_plan: value.resource_plan,
             forwarding_executor: value.forwarding_executor,
             authorization: value.authorization,
             credentials: value.credentials,
@@ -338,10 +334,6 @@ impl Generation {
 
     pub(crate) fn max_content_decoding_expansion_ratio(&self) -> usize {
         self.max_content_decoding_expansion_ratio
-    }
-
-    pub(crate) fn resource_plan(&self) -> &CompiledResourcePlan {
-        &self.resource_plan
     }
 
     pub(crate) fn authorization(&self) -> &dyn AuthorizationSnapshot {

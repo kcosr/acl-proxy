@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex, TryLockError};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::http1::store::{ParserStore, PARSER_STORE_BYTES};
+use http_access_runtime::http1::{ParserStore, PARSER_STORE_BYTES};
 
 #[derive(Clone)]
 pub(crate) struct ControlParserArena {
@@ -253,11 +253,7 @@ mod tests {
         );
         let lease = arena.try_acquire().unwrap();
         assert_eq!(lease.parser_store().initialized_len(), 0);
-        assert!(lease
-            .parser_store()
-            .complete_storage()
-            .iter()
-            .all(|byte| *byte == 0));
+        assert!(lease.parser_store().storage_is_zeroed());
     }
 
     #[test]
@@ -346,21 +342,16 @@ mod tests {
         let arena = ControlParserArena::try_new(1).unwrap();
         let mut lease = arena.try_acquire().unwrap();
         lease.parser_store_mut().append(b"handled request").unwrap();
-        let handled = lease.parser_store().initialized_len();
-        lease.parser_store_mut().consume_prefix(handled).unwrap();
-        let before = lease.parser_store().zeroized_bytes_for_test();
+        lease.parser_store_mut().wipe();
+        let before = lease.parser_store().zeroized_bytes();
 
         lease.prepare_for_next_request().unwrap();
 
         assert_eq!(
-            lease.parser_store().zeroized_bytes_for_test() - before,
+            lease.parser_store().zeroized_bytes() - before,
             PARSER_STORE_BYTES
         );
-        assert!(lease
-            .parser_store()
-            .complete_storage()
-            .iter()
-            .all(|byte| *byte == 0));
+        assert!(lease.parser_store().storage_is_zeroed());
     }
 
     #[test]
@@ -384,10 +375,6 @@ mod tests {
 
         let lease = arena.try_acquire().unwrap();
         assert_eq!(lease.parser_store().initialized_len(), 0);
-        assert!(lease
-            .parser_store()
-            .complete_storage()
-            .iter()
-            .all(|byte| *byte == 0));
+        assert!(lease.parser_store().storage_is_zeroed());
     }
 }
