@@ -38,9 +38,8 @@ TLS_VERSIONS = {
 }
 FORBIDDEN_PACKAGES = {"rcgen", "rustls-pemfile", "x509-parser", "yasna"}
 DEPENDENCY_TABLES = {"dependencies", "dev-dependencies", "build-dependencies"}
-AUDIT_COMMAND_IGNORE = re.compile(
-    r"cargo\s+(?:\+[^\s]+\s+)?(?:audit|deny\s+check(?:\s+advisories)?)\b[^\r\n]*"
-    r"--ignore(?:=|\s+)[\"']?RUSTSEC-",
+ADVISORY_IGNORE_ARGUMENT = re.compile(
+    r"--ignore(?:[\s=,:'\"\[\]{}()\\]|\\[rn])*RUSTSEC-",
     re.IGNORECASE,
 )
 SHELL_LINE_CONTINUATION = re.compile(r"\\\r?\n[ \t]*")
@@ -187,10 +186,16 @@ def check_cargo_aliases(path: Path) -> None:
     if not isinstance(aliases, dict):
         return
     for name, command in aliases.items():
-        if not isinstance(command, str):
+        if isinstance(command, str):
+            command_text = command
+        elif isinstance(command, list) and all(
+            isinstance(argument, str) for argument in command
+        ):
+            command_text = " ".join(command)
+        else:
             continue
-        logical_command = SHELL_LINE_CONTINUATION.sub(" ", command)
-        if AUDIT_COMMAND_IGNORE.search(f"cargo {logical_command}"):
+        logical_command = SHELL_LINE_CONTINUATION.sub(" ", command_text)
+        if ADVISORY_IGNORE_ARGUMENT.search(logical_command):
             fail(f"{path}: Cargo alias {name!r} must not ignore RustSec IDs")
 
 
@@ -227,8 +232,8 @@ def check_advisory_policy(root: Path) -> None:
     for path in sorted(command_files):
         text = path.read_text(encoding="utf-8")
         logical_text = SHELL_LINE_CONTINUATION.sub(" ", text)
-        if AUDIT_COMMAND_IGNORE.search(logical_text):
-            fail(f"{path}: advisory audit command must not ignore RustSec IDs")
+        if ADVISORY_IGNORE_ARGUMENT.search(logical_text):
+            fail(f"{path}: advisory command must not ignore RustSec IDs")
         if path.suffix in {".yaml", ".yml"} and WORKFLOW_ADVISORY_IGNORE.search(text):
             fail(f"{path}: advisory workflow must not ignore RustSec IDs")
 

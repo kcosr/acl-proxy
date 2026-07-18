@@ -237,6 +237,42 @@ elif mode == "cargo-alias-audit-command-ignore":
     cargo_config.write_text(
         f'[alias]\nsecurity = "audit --ignore {rustsec}"\n', encoding="utf-8"
     )
+elif mode == "cargo-alias-array-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0013"
+    cargo_config = root / "acl-proxy/.cargo/config.toml"
+    cargo_config.parent.mkdir(exist_ok=True)
+    cargo_config.write_text(
+        f'[alias]\nsecurity = ["audit", "--ignore", "{rustsec}"]\n', encoding="utf-8"
+    )
+elif mode == "direct-cargo-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0014"
+    scripts = root / "acl-proxy/scripts"
+    scripts.mkdir()
+    (scripts / "audit.sh").write_text(
+        f'#!/bin/sh\ncargo-audit audit --ignore {rustsec}\n', encoding="utf-8"
+    )
+elif mode == "cargo-global-option-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0015"
+    scripts = root / "acl-proxy/scripts"
+    scripts.mkdir()
+    (scripts / "audit.sh").write_text(
+        f'#!/bin/sh\ncargo --color never audit --ignore {rustsec}\n', encoding="utf-8"
+    )
+elif mode == "folded-workflow-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0016"
+    workflows = root / "acl-proxy/.github/workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "audit.yml").write_text(
+        f'run: >\n  cargo audit\n  --ignore {rustsec}\n', encoding="utf-8"
+    )
+elif mode == "argv-audit-command-ignore":
+    rustsec = "RUST" + "SEC-2026-0017"
+    scripts = root / "acl-proxy/scripts"
+    scripts.mkdir()
+    (scripts / "audit.py").write_text(
+        f'import subprocess\nsubprocess.run(["cargo", "audit", "--ignore", "{rustsec}"])\n',
+        encoding="utf-8",
+    )
 elif mode == "js-audit-command-ignore":
     rustsec = "RUST" + "SEC-2026-0005"
     scripts = root / "acl-proxy/scripts"
@@ -322,6 +358,11 @@ mutations=(
     split-ignore-value-audit-command-ignore
     toolchain-audit-command-ignore
     cargo-alias-audit-command-ignore
+    cargo-alias-array-audit-command-ignore
+    direct-cargo-audit-command-ignore
+    cargo-global-option-audit-command-ignore
+    folded-workflow-audit-command-ignore
+    argv-audit-command-ignore
     js-audit-command-ignore
     workflow-advisory-ignore
     workflow-multiline-advisory-ignore
