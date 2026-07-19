@@ -7,10 +7,11 @@ TMP=$(mktemp -d "${TMPDIR:-/tmp}/acl-proxy-packaging-policy.XXXXXX")
 trap 'rm -rf "$TMP"' EXIT
 
 BASELINE="$TMP/baseline"
-mkdir -p "$BASELINE"
+mkdir -p "$BASELINE/scripts"
 for file in Cargo.toml Cargo.lock README.md acl-proxy.sample.toml deny.toml PROVENANCE.md THIRD_PARTY_NOTICES; do
     cp "$ROOT/$file" "$BASELINE/$file"
 done
+cp "$ROOT/scripts/check-packaging-policy.sh" "$BASELINE/scripts/"
 cargo metadata --locked --offline --format-version 1 >"$BASELINE/metadata.json"
 
 run_gate() {
@@ -137,10 +138,12 @@ expect_rejected lock-duplicate-hyper $'name = "hyper-util"\nversion = "0.1.20"' 
 expect_rejected brotli-copyright 'Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors.' 'Copyright removed from Brotli.' THIRD_PARTY_NOTICES
 expect_rejected dropbox-copyright 'Copyright (c) 2016 Dropbox, Inc.' 'Copyright removed from Dropbox brotli.' THIRD_PARTY_NOTICES
 expect_rejected zstd-copyright 'Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.' 'Copyright removed from Zstandard.' THIRD_PARTY_NOTICES
-expect_rejected provenance-runtime '8e5360a9f00587f9a06d9678ec05884c6399521e' 'wrong-runtime-commit' PROVENANCE.md
+expect_rejected hyper-license-copyright 'Copyright (c) 2014-2026 Sean McArthur' 'Copyright removed from Hyper.' THIRD_PARTY_NOTICES
+expect_rejected provenance-runtime '9bf11cdbe73e63d69ac4ec9935cf9da68612d243' 'wrong-runtime-commit' PROVENANCE.md
 expect_rejected provenance-brotli-license 'Google Brotli C implementation it compiles is MIT' 'Google Brotli C implementation has the wrong license' PROVENANCE.md
 expect_rejected provenance-zstd-license 'Zstandard source under BSD-3-Clause' 'Zstandard source has the wrong license' PROVENANCE.md
 expect_rejected archive-notices 'README, `LICENSE`, `THIRD_PARTY_NOTICES`' 'README, `LICENSE`, `REMOVED_NOTICES`' README.md
+expect_rejected advisory-gate 'advisories licenses sources' 'licenses sources' scripts/check-packaging-policy.sh
 expect_rejected archive-root 'acl-proxy-0.2.0-extraction-checkpoint-<acl12>/' 'acl-proxy-extraction-checkpoint/' README.md
 expect_rejected archive-hardcoded-sha 'acl-proxy-0.2.0-extraction-checkpoint-<acl12>/' 'acl-proxy-0.2.0-extraction-checkpoint-0123456789ab/' README.md
 expect_rejected archive-bin '  bin/acl-proxy-extract-capture-body' '  acl-proxy-extract-capture-body' README.md

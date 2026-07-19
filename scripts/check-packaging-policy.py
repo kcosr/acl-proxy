@@ -21,7 +21,7 @@ ALLOWED_LICENSES = {
     "Unicode-3.0",
 }
 REGISTRY = "https://github.com/rust-lang/crates.io-index"
-RUNTIME_COMMIT = "8e5360a9f00587f9a06d9678ec05884c6399521e"
+RUNTIME_COMMIT = "9bf11cdbe73e63d69ac4ec9935cf9da68612d243"
 PRODUCT_INITIAL_COMMIT = "a829f43552c7118d1f206b9e4112b3c747eecd50"
 TRANSPORT_PACKAGES = {
     "h2": ("0.4.15", True),
@@ -31,6 +31,25 @@ TRANSPORT_PACKAGES = {
     "hyper": ("1.10.1", False),
     "hyper-util": ("0.1.20", True),
 }
+HYPER_MIT_TEXT = """Copyright (c) 2014-2026 Sean McArthur
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE."""
 BSL_TEXT = """Boost Software License - Version 1.0 - August 17th, 2003
 
 Permission is hereby granted, free of charge, to any person or organization
@@ -349,6 +368,8 @@ def check_notices(root: Path, metadata: dict[str, Any]) -> None:
         fail("THIRD_PARTY_NOTICES must contain one exact Dropbox BSD-3-Clause notice")
     if notices.count(ZSTANDARD_BSD_TEXT) != 1:
         fail("THIRD_PARTY_NOTICES must contain one exact Zstandard BSD-3-Clause notice")
+    if notices.count(HYPER_MIT_TEXT) != 1:
+        fail("THIRD_PARTY_NOTICES must contain one exact Hyper MIT notice")
 
     heading = "The product directly uses the following third-party runtime crates:\n"
     section_start = notices.find(heading)
@@ -433,6 +454,10 @@ def check_shipped_docs(root: Path) -> None:
         fail("sample configuration lacks generated public-CA export guidance")
     if "ca-cert.pem" in sample or "ca-key.pem" in sample:
         fail("sample configuration names obsolete generated CA storage files")
+    packaging_gate = read_text(root / "scripts/check-packaging-policy.sh")
+    advisory_command = "cargo deny --locked check advisories licenses sources"
+    if packaging_gate.count(advisory_command) != 1:
+        fail("packaging gate must run the exact advisory, license, and source scan")
 
 
 def main() -> int:
