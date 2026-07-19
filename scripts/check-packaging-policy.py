@@ -21,7 +21,7 @@ ALLOWED_LICENSES = {
     "Unicode-3.0",
 }
 REGISTRY = "https://github.com/rust-lang/crates.io-index"
-RUNTIME_COMMIT = "9bf11cdbe73e63d69ac4ec9935cf9da68612d243"
+RUNTIME_COMMIT = "bca85d11787afe988dc63cad817f20434523cf66"
 PRODUCT_INITIAL_COMMIT = "a829f43552c7118d1f206b9e4112b3c747eecd50"
 TRANSPORT_PACKAGES = {
     "h2": ("0.4.15", True),

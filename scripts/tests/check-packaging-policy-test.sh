@@ -139,7 +139,7 @@ expect_rejected brotli-copyright 'Copyright (c) 2009, 2010, 2013-2016 by the Bro
 expect_rejected dropbox-copyright 'Copyright (c) 2016 Dropbox, Inc.' 'Copyright removed from Dropbox brotli.' THIRD_PARTY_NOTICES
 expect_rejected zstd-copyright 'Copyright (c) Meta Platforms, Inc. and affiliates. All rights reserved.' 'Copyright removed from Zstandard.' THIRD_PARTY_NOTICES
 expect_rejected hyper-license-copyright 'Copyright (c) 2014-2026 Sean McArthur' 'Copyright removed from Hyper.' THIRD_PARTY_NOTICES
-expect_rejected provenance-runtime '9bf11cdbe73e63d69ac4ec9935cf9da68612d243' 'wrong-runtime-commit' PROVENANCE.md
+expect_rejected provenance-runtime 'bca85d11787afe988dc63cad817f20434523cf66' 'wrong-runtime-commit' PROVENANCE.md
 expect_rejected provenance-brotli-license 'Google Brotli C implementation it compiles is MIT' 'Google Brotli C implementation has the wrong license' PROVENANCE.md
 expect_rejected provenance-zstd-license 'Zstandard source under BSD-3-Clause' 'Zstandard source has the wrong license' PROVENANCE.md
 expect_rejected archive-notices 'README, `LICENSE`, `THIRD_PARTY_NOTICES`' 'README, `LICENSE`, `REMOVED_NOTICES`' README.md
