@@ -291,11 +291,8 @@ def check_transport_resolution(root: Path, metadata: dict[str, Any]) -> None:
 
 def check_deny_policy(root: Path) -> None:
     policy = load_toml(root / "deny.toml")
-    if set(policy) != {"advisories", "licenses", "sources"}:
-        fail("deny.toml must contain only advisories, licenses, and sources policy")
-    advisories = policy.get("advisories")
-    if advisories != {"ignore": []}:
-        fail("deny.toml advisory ignore list must be empty")
+    if set(policy) != {"licenses", "sources"}:
+        fail("deny.toml must contain only licenses and sources policy")
     licenses = policy.get("licenses")
     if not isinstance(licenses, dict):
         fail("deny.toml lacks [licenses]")
@@ -475,11 +472,15 @@ def check_shipped_docs(root: Path) -> None:
     if "ca-cert.pem" in sample or "ca-key.pem" in sample:
         fail("sample configuration names obsolete generated CA storage files")
     packaging_gate = read_text(root / "scripts/check-packaging-policy.sh")
-    advisory_command = (
-        "cargo deny --locked --offline check -D warnings advisories licenses sources"
-    )
-    if packaging_gate.splitlines().count(advisory_command) != 1:
-        fail("packaging gate must run the exact advisory, license, and source scan")
+    audit_command = "cargo audit --no-fetch --no-yanked --deny warnings"
+    deny_command = "cargo deny --locked --offline check -D warnings licenses sources"
+    gate_lines = packaging_gate.splitlines()
+    if gate_lines.count(audit_command) != 1:
+        fail("packaging gate must run the exact offline advisory scan")
+    if gate_lines.count(deny_command) != 1:
+        fail("packaging gate must run the exact offline license and source scan")
+    if gate_lines.index(deny_command) != gate_lines.index(audit_command) + 1:
+        fail("packaging gate must run the advisory scan before the license and source scan")
 
 
 def main() -> int:

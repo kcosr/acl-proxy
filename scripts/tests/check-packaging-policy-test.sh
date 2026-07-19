@@ -120,6 +120,7 @@ expect_rejected missing-patch '[patch.crates-io]' '[patch.removed]' Cargo.toml
 expect_rejected wrong-patch-path '../access-runtime/third_party/hyper' '../wrong-runtime/third_party/hyper' Cargo.toml
 expect_rejected extra-patch $'hyper = { path = "../access-runtime/third_party/hyper" }' $'hyper = { path = "../access-runtime/third_party/hyper" }\nhttp = { path = "../access-runtime/third_party/hyper" }' Cargo.toml
 expect_rejected replace-override $'[profile.release]' $'[replace]\n"hyper:1.10.1" = { path = "../access-runtime/third_party/hyper" }\n\n[profile.release]' Cargo.toml
+expect_rejected obsolete-advisories-policy '[licenses]' $'[advisories]\nignore = []\n\n[licenses]' deny.toml
 expect_rejected global-bsl '"Unicode-3.0"]' '"Unicode-3.0", "BSL-1.0"]' deny.toml
 expect_rejected exception-version 'version = "=1.2.0"' 'version = "^1.2.0"' deny.toml
 expect_rejected exception-name 'name = "compu-brotli-sys"' 'name = "brotli"' deny.toml
@@ -148,10 +149,17 @@ expect_rejected provenance-runtime 'bca85d11787afe988dc63cad817f20434523cf66' 'w
 expect_rejected provenance-brotli-license 'Google Brotli C implementation it compiles is MIT' 'Google Brotli C implementation has the wrong license' PROVENANCE.md
 expect_rejected provenance-zstd-license 'Zstandard source under BSD-3-Clause' 'Zstandard source has the wrong license' PROVENANCE.md
 expect_rejected archive-notices 'README, `LICENSE`, `THIRD_PARTY_NOTICES`' 'README, `LICENSE`, `REMOVED_NOTICES`' README.md
-expect_rejected advisory-gate 'advisories licenses sources' 'licenses sources' scripts/check-packaging-policy.sh
-expect_rejected advisory-gate-online '--offline ' '' scripts/check-packaging-policy.sh
-expect_rejected advisory-gate-warnings ' -D warnings' '' scripts/check-packaging-policy.sh
-expect_rejected advisory-gate-comment 'cargo deny --locked --offline check -D warnings advisories licenses sources' '# cargo deny --locked --offline check -D warnings advisories licenses sources' scripts/check-packaging-policy.sh
+expect_rejected audit-gate-fetch ' --no-fetch' '' scripts/check-packaging-policy.sh
+expect_rejected audit-gate-yanked ' --no-yanked' '' scripts/check-packaging-policy.sh
+expect_rejected audit-gate-warnings ' --deny warnings' '' scripts/check-packaging-policy.sh
+expect_rejected audit-gate-ignore 'cargo audit --no-fetch --no-yanked --deny warnings' 'cargo audit --no-fetch --no-yanked --deny warnings --ignore FORBIDDEN-ADVISORY' scripts/check-packaging-policy.sh
+expect_rejected audit-gate-db-override 'cargo audit --no-fetch --no-yanked --deny warnings' 'cargo audit --no-fetch --no-yanked --deny warnings --db /tmp/repository-advisory-db' scripts/check-packaging-policy.sh
+expect_rejected audit-gate-comment 'cargo audit --no-fetch --no-yanked --deny warnings' '# cargo audit --no-fetch --no-yanked --deny warnings' scripts/check-packaging-policy.sh
+expect_rejected deny-gate-advisories 'licenses sources' 'advisories licenses sources' scripts/check-packaging-policy.sh
+expect_rejected deny-gate-online '--offline ' '' scripts/check-packaging-policy.sh
+expect_rejected deny-gate-warnings ' -D warnings' '' scripts/check-packaging-policy.sh
+expect_rejected deny-gate-comment 'cargo deny --locked --offline check -D warnings licenses sources' '# cargo deny --locked --offline check -D warnings licenses sources' scripts/check-packaging-policy.sh
+expect_rejected gate-order $'cargo audit --no-fetch --no-yanked --deny warnings\ncargo deny --locked --offline check -D warnings licenses sources' $'cargo deny --locked --offline check -D warnings licenses sources\ncargo audit --no-fetch --no-yanked --deny warnings' scripts/check-packaging-policy.sh
 expect_rejected archive-root 'acl-proxy-<version>-<acl12>/' 'acl-proxy-release/' README.md
 expect_rejected archive-hardcoded-sha 'acl-proxy-<version>-<acl12>/' 'acl-proxy-0.3.0-rc.1-0123456789ab/' README.md
 expect_rejected candidate-doc-version 'The `0.3.0-rc.1` candidate requires' 'The `0.3.0-rc.2` candidate requires' README.md
