@@ -6,6 +6,7 @@ cd "$ROOT"
 
 ownership_gates=(
     scripts/check-packaging-policy.sh
+    scripts/check-public-api.sh
     scripts/check-shared-url-ownership.sh
     scripts/check-shared-acl-ownership.sh
     # Supersedes the deleted standalone, forwarding, product-inventory, and
@@ -19,6 +20,7 @@ ownership_gates=(
 )
 mutation_suites=(
     scripts/tests/check-packaging-policy-test.sh
+    scripts/tests/check-public-api-test.sh
     scripts/tests/check-shared-url-ownership-test.sh
     scripts/tests/check-shared-acl-ownership-test.sh
     scripts/tests/check-c05-shared-listener-ownership-test.sh

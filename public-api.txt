@@ -1,0 +1,413 @@
+pub mod acl_proxy
+pub mod acl_proxy::capture
+pub enum acl_proxy::capture::CaptureBodyDecodeError
+pub acl_proxy::capture::CaptureBodyDecodeError::InvalidBase64(base64::decode::DecodeError)
+pub acl_proxy::capture::CaptureBodyDecodeError::MissingBody
+pub acl_proxy::capture::CaptureBodyDecodeError::UnsupportedEncoding
+pub acl_proxy::capture::CaptureBodyDecodeError::UnsupportedEncoding::encoding: alloc::string::String
+impl core::error::Error for acl_proxy::capture::CaptureBodyDecodeError
+pub fn acl_proxy::capture::CaptureBodyDecodeError::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Debug for acl_proxy::capture::CaptureBodyDecodeError
+pub fn acl_proxy::capture::CaptureBodyDecodeError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for acl_proxy::capture::CaptureBodyDecodeError
+pub fn acl_proxy::capture::CaptureBodyDecodeError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Freeze for acl_proxy::capture::CaptureBodyDecodeError
+impl core::marker::Send for acl_proxy::capture::CaptureBodyDecodeError
+impl core::marker::Sync for acl_proxy::capture::CaptureBodyDecodeError
+impl core::marker::Unpin for acl_proxy::capture::CaptureBodyDecodeError
+impl core::marker::UnsafeUnpin for acl_proxy::capture::CaptureBodyDecodeError
+impl core::panic::unwind_safe::RefUnwindSafe for acl_proxy::capture::CaptureBodyDecodeError
+impl core::panic::unwind_safe::UnwindSafe for acl_proxy::capture::CaptureBodyDecodeError
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for acl_proxy::capture::CaptureBodyDecodeError where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for acl_proxy::capture::CaptureBodyDecodeError where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<T, U> core::convert::Into<U> for acl_proxy::capture::CaptureBodyDecodeError where U: core::convert::From<T>
+pub fn acl_proxy::capture::CaptureBodyDecodeError::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for acl_proxy::capture::CaptureBodyDecodeError where U: core::convert::Into<T>
+pub type acl_proxy::capture::CaptureBodyDecodeError::Error = core::convert::Infallible
+pub fn acl_proxy::capture::CaptureBodyDecodeError::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for acl_proxy::capture::CaptureBodyDecodeError where U: core::convert::TryFrom<T>
+pub type acl_proxy::capture::CaptureBodyDecodeError::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn acl_proxy::capture::CaptureBodyDecodeError::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::string::ToString for acl_proxy::capture::CaptureBodyDecodeError where T: core::fmt::Display + ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureBodyDecodeError::to_string(&self) -> alloc::string::String
+impl<T> core::any::Any for acl_proxy::capture::CaptureBodyDecodeError where T: 'static + ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureBodyDecodeError::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for acl_proxy::capture::CaptureBodyDecodeError where T: ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureBodyDecodeError::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for acl_proxy::capture::CaptureBodyDecodeError where T: ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureBodyDecodeError::borrow_mut(&mut self) -> &mut T
+impl<T> core::convert::From<T> for acl_proxy::capture::CaptureBodyDecodeError
+pub fn acl_proxy::capture::CaptureBodyDecodeError::from(T) -> T
+impl<T> tracing::instrument::Instrument for acl_proxy::capture::CaptureBodyDecodeError
+impl<T> tracing::instrument::WithSubscriber for acl_proxy::capture::CaptureBodyDecodeError
+impl<T> typenum::type_operators::Same for acl_proxy::capture::CaptureBodyDecodeError
+pub type acl_proxy::capture::CaptureBodyDecodeError::Output = T
+impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for acl_proxy::capture::CaptureBodyDecodeError where T: ?core::marker::Sized
+impl<V, T> ppv_lite86::types::VZip<V> for acl_proxy::capture::CaptureBodyDecodeError where V: ppv_lite86::types::MultiLane<T>
+pub fn acl_proxy::capture::CaptureBodyDecodeError::vzip(self) -> V
+pub enum acl_proxy::capture::CaptureDecision
+pub acl_proxy::capture::CaptureDecision::Allow
+pub acl_proxy::capture::CaptureDecision::Deny
+impl core::clone::Clone for acl_proxy::capture::CaptureDecision
+pub fn acl_proxy::capture::CaptureDecision::clone(&self) -> acl_proxy::capture::CaptureDecision
+impl core::cmp::Eq for acl_proxy::capture::CaptureDecision
+impl core::cmp::PartialEq for acl_proxy::capture::CaptureDecision
+pub fn acl_proxy::capture::CaptureDecision::eq(&self, &acl_proxy::capture::CaptureDecision) -> bool
+impl core::fmt::Debug for acl_proxy::capture::CaptureDecision
+pub fn acl_proxy::capture::CaptureDecision::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for acl_proxy::capture::CaptureDecision
+impl core::marker::StructuralPartialEq for acl_proxy::capture::CaptureDecision
+impl serde_core::ser::Serialize for acl_proxy::capture::CaptureDecision
+pub fn acl_proxy::capture::CaptureDecision::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for acl_proxy::capture::CaptureDecision
+pub fn acl_proxy::capture::CaptureDecision::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for acl_proxy::capture::CaptureDecision
+impl core::marker::Send for acl_proxy::capture::CaptureDecision
+impl core::marker::Sync for acl_proxy::capture::CaptureDecision
+impl core::marker::Unpin for acl_proxy::capture::CaptureDecision
+impl core::marker::UnsafeUnpin for acl_proxy::capture::CaptureDecision
+impl core::panic::unwind_safe::RefUnwindSafe for acl_proxy::capture::CaptureDecision
+impl core::panic::unwind_safe::UnwindSafe for acl_proxy::capture::CaptureDecision
+impl<Q, K> equivalent::Equivalent<K> for acl_proxy::capture::CaptureDecision where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureDecision::equivalent(&self, &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for acl_proxy::capture::CaptureDecision where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureDecision::equivalent(&self, &K) -> bool
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for acl_proxy::capture::CaptureDecision where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for acl_proxy::capture::CaptureDecision where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<T, U> core::convert::Into<U> for acl_proxy::capture::CaptureDecision where U: core::convert::From<T>
+pub fn acl_proxy::capture::CaptureDecision::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for acl_proxy::capture::CaptureDecision where U: core::convert::Into<T>
+pub type acl_proxy::capture::CaptureDecision::Error = core::convert::Infallible
+pub fn acl_proxy::capture::CaptureDecision::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for acl_proxy::capture::CaptureDecision where U: core::convert::TryFrom<T>
+pub type acl_proxy::capture::CaptureDecision::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn acl_proxy::capture::CaptureDecision::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for acl_proxy::capture::CaptureDecision where T: core::clone::Clone
+pub type acl_proxy::capture::CaptureDecision::Owned = T
+pub fn acl_proxy::capture::CaptureDecision::clone_into(&self, &mut T)
+pub fn acl_proxy::capture::CaptureDecision::to_owned(&self) -> T
+impl<T> core::any::Any for acl_proxy::capture::CaptureDecision where T: 'static + ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureDecision::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for acl_proxy::capture::CaptureDecision where T: ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureDecision::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for acl_proxy::capture::CaptureDecision where T: ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureDecision::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for acl_proxy::capture::CaptureDecision where T: core::clone::Clone
+pub unsafe fn acl_proxy::capture::CaptureDecision::clone_to_uninit(&self, *mut u8)
+impl<T> core::convert::From<T> for acl_proxy::capture::CaptureDecision
+pub fn acl_proxy::capture::CaptureDecision::from(T) -> T
+impl<T> serde_core::de::DeserializeOwned for acl_proxy::capture::CaptureDecision where T: for<'de> serde_core::de::Deserialize<'de>
+impl<T> tracing::instrument::Instrument for acl_proxy::capture::CaptureDecision
+impl<T> tracing::instrument::WithSubscriber for acl_proxy::capture::CaptureDecision
+impl<T> typenum::type_operators::Same for acl_proxy::capture::CaptureDecision
+pub type acl_proxy::capture::CaptureDecision::Output = T
+impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for acl_proxy::capture::CaptureDecision where T: ?core::marker::Sized
+impl<V, T> ppv_lite86::types::VZip<V> for acl_proxy::capture::CaptureDecision where V: ppv_lite86::types::MultiLane<T>
+pub fn acl_proxy::capture::CaptureDecision::vzip(self) -> V
+pub enum acl_proxy::capture::CaptureKind
+pub acl_proxy::capture::CaptureKind::Request
+pub acl_proxy::capture::CaptureKind::Response
+impl core::clone::Clone for acl_proxy::capture::CaptureKind
+pub fn acl_proxy::capture::CaptureKind::clone(&self) -> acl_proxy::capture::CaptureKind
+impl core::cmp::Eq for acl_proxy::capture::CaptureKind
+impl core::cmp::PartialEq for acl_proxy::capture::CaptureKind
+pub fn acl_proxy::capture::CaptureKind::eq(&self, &acl_proxy::capture::CaptureKind) -> bool
+impl core::fmt::Debug for acl_proxy::capture::CaptureKind
+pub fn acl_proxy::capture::CaptureKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for acl_proxy::capture::CaptureKind
+impl core::marker::StructuralPartialEq for acl_proxy::capture::CaptureKind
+impl serde_core::ser::Serialize for acl_proxy::capture::CaptureKind
+pub fn acl_proxy::capture::CaptureKind::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for acl_proxy::capture::CaptureKind
+pub fn acl_proxy::capture::CaptureKind::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for acl_proxy::capture::CaptureKind
+impl core::marker::Send for acl_proxy::capture::CaptureKind
+impl core::marker::Sync for acl_proxy::capture::CaptureKind
+impl core::marker::Unpin for acl_proxy::capture::CaptureKind
+impl core::marker::UnsafeUnpin for acl_proxy::capture::CaptureKind
+impl core::panic::unwind_safe::RefUnwindSafe for acl_proxy::capture::CaptureKind
+impl core::panic::unwind_safe::UnwindSafe for acl_proxy::capture::CaptureKind
+impl<Q, K> equivalent::Equivalent<K> for acl_proxy::capture::CaptureKind where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureKind::equivalent(&self, &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for acl_proxy::capture::CaptureKind where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureKind::equivalent(&self, &K) -> bool
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for acl_proxy::capture::CaptureKind where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for acl_proxy::capture::CaptureKind where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<T, U> core::convert::Into<U> for acl_proxy::capture::CaptureKind where U: core::convert::From<T>
+pub fn acl_proxy::capture::CaptureKind::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for acl_proxy::capture::CaptureKind where U: core::convert::Into<T>
+pub type acl_proxy::capture::CaptureKind::Error = core::convert::Infallible
+pub fn acl_proxy::capture::CaptureKind::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for acl_proxy::capture::CaptureKind where U: core::convert::TryFrom<T>
+pub type acl_proxy::capture::CaptureKind::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn acl_proxy::capture::CaptureKind::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for acl_proxy::capture::CaptureKind where T: core::clone::Clone
+pub type acl_proxy::capture::CaptureKind::Owned = T
+pub fn acl_proxy::capture::CaptureKind::clone_into(&self, &mut T)
+pub fn acl_proxy::capture::CaptureKind::to_owned(&self) -> T
+impl<T> core::any::Any for acl_proxy::capture::CaptureKind where T: 'static + ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureKind::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for acl_proxy::capture::CaptureKind where T: ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureKind::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for acl_proxy::capture::CaptureKind where T: ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureKind::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for acl_proxy::capture::CaptureKind where T: core::clone::Clone
+pub unsafe fn acl_proxy::capture::CaptureKind::clone_to_uninit(&self, *mut u8)
+impl<T> core::convert::From<T> for acl_proxy::capture::CaptureKind
+pub fn acl_proxy::capture::CaptureKind::from(T) -> T
+impl<T> serde_core::de::DeserializeOwned for acl_proxy::capture::CaptureKind where T: for<'de> serde_core::de::Deserialize<'de>
+impl<T> tracing::instrument::Instrument for acl_proxy::capture::CaptureKind
+impl<T> tracing::instrument::WithSubscriber for acl_proxy::capture::CaptureKind
+impl<T> typenum::type_operators::Same for acl_proxy::capture::CaptureKind
+pub type acl_proxy::capture::CaptureKind::Output = T
+impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for acl_proxy::capture::CaptureKind where T: ?core::marker::Sized
+impl<V, T> ppv_lite86::types::VZip<V> for acl_proxy::capture::CaptureKind where V: ppv_lite86::types::MultiLane<T>
+pub fn acl_proxy::capture::CaptureKind::vzip(self) -> V
+pub enum acl_proxy::capture::CaptureMode
+pub acl_proxy::capture::CaptureMode::HttpProxy
+impl core::clone::Clone for acl_proxy::capture::CaptureMode
+pub fn acl_proxy::capture::CaptureMode::clone(&self) -> acl_proxy::capture::CaptureMode
+impl core::cmp::Eq for acl_proxy::capture::CaptureMode
+impl core::cmp::PartialEq for acl_proxy::capture::CaptureMode
+pub fn acl_proxy::capture::CaptureMode::eq(&self, &acl_proxy::capture::CaptureMode) -> bool
+impl core::fmt::Debug for acl_proxy::capture::CaptureMode
+pub fn acl_proxy::capture::CaptureMode::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for acl_proxy::capture::CaptureMode
+impl core::marker::StructuralPartialEq for acl_proxy::capture::CaptureMode
+impl serde_core::ser::Serialize for acl_proxy::capture::CaptureMode
+pub fn acl_proxy::capture::CaptureMode::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for acl_proxy::capture::CaptureMode
+pub fn acl_proxy::capture::CaptureMode::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for acl_proxy::capture::CaptureMode
+impl core::marker::Send for acl_proxy::capture::CaptureMode
+impl core::marker::Sync for acl_proxy::capture::CaptureMode
+impl core::marker::Unpin for acl_proxy::capture::CaptureMode
+impl core::marker::UnsafeUnpin for acl_proxy::capture::CaptureMode
+impl core::panic::unwind_safe::RefUnwindSafe for acl_proxy::capture::CaptureMode
+impl core::panic::unwind_safe::UnwindSafe for acl_proxy::capture::CaptureMode
+impl<Q, K> equivalent::Equivalent<K> for acl_proxy::capture::CaptureMode where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureMode::equivalent(&self, &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for acl_proxy::capture::CaptureMode where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureMode::equivalent(&self, &K) -> bool
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for acl_proxy::capture::CaptureMode where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for acl_proxy::capture::CaptureMode where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<T, U> core::convert::Into<U> for acl_proxy::capture::CaptureMode where U: core::convert::From<T>
+pub fn acl_proxy::capture::CaptureMode::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for acl_proxy::capture::CaptureMode where U: core::convert::Into<T>
+pub type acl_proxy::capture::CaptureMode::Error = core::convert::Infallible
+pub fn acl_proxy::capture::CaptureMode::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for acl_proxy::capture::CaptureMode where U: core::convert::TryFrom<T>
+pub type acl_proxy::capture::CaptureMode::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn acl_proxy::capture::CaptureMode::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for acl_proxy::capture::CaptureMode where T: core::clone::Clone
+pub type acl_proxy::capture::CaptureMode::Owned = T
+pub fn acl_proxy::capture::CaptureMode::clone_into(&self, &mut T)
+pub fn acl_proxy::capture::CaptureMode::to_owned(&self) -> T
+impl<T> core::any::Any for acl_proxy::capture::CaptureMode where T: 'static + ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureMode::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for acl_proxy::capture::CaptureMode where T: ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureMode::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for acl_proxy::capture::CaptureMode where T: ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureMode::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for acl_proxy::capture::CaptureMode where T: core::clone::Clone
+pub unsafe fn acl_proxy::capture::CaptureMode::clone_to_uninit(&self, *mut u8)
+impl<T> core::convert::From<T> for acl_proxy::capture::CaptureMode
+pub fn acl_proxy::capture::CaptureMode::from(T) -> T
+impl<T> serde_core::de::DeserializeOwned for acl_proxy::capture::CaptureMode where T: for<'de> serde_core::de::Deserialize<'de>
+impl<T> tracing::instrument::Instrument for acl_proxy::capture::CaptureMode
+impl<T> tracing::instrument::WithSubscriber for acl_proxy::capture::CaptureMode
+impl<T> typenum::type_operators::Same for acl_proxy::capture::CaptureMode
+pub type acl_proxy::capture::CaptureMode::Output = T
+impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for acl_proxy::capture::CaptureMode where T: ?core::marker::Sized
+impl<V, T> ppv_lite86::types::VZip<V> for acl_proxy::capture::CaptureMode where V: ppv_lite86::types::MultiLane<T>
+pub fn acl_proxy::capture::CaptureMode::vzip(self) -> V
+pub struct acl_proxy::capture::CaptureBody
+pub acl_proxy::capture::CaptureBody::content_encoding: core::option::Option<alloc::string::String>
+pub acl_proxy::capture::CaptureBody::content_type: core::option::Option<alloc::string::String>
+pub acl_proxy::capture::CaptureBody::data: alloc::string::String
+pub acl_proxy::capture::CaptureBody::encoding: alloc::string::String
+pub acl_proxy::capture::CaptureBody::length: usize
+impl core::clone::Clone for acl_proxy::capture::CaptureBody
+pub fn acl_proxy::capture::CaptureBody::clone(&self) -> acl_proxy::capture::CaptureBody
+impl core::cmp::Eq for acl_proxy::capture::CaptureBody
+impl core::cmp::PartialEq for acl_proxy::capture::CaptureBody
+pub fn acl_proxy::capture::CaptureBody::eq(&self, &acl_proxy::capture::CaptureBody) -> bool
+impl core::fmt::Debug for acl_proxy::capture::CaptureBody
+pub fn acl_proxy::capture::CaptureBody::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for acl_proxy::capture::CaptureBody
+impl serde_core::ser::Serialize for acl_proxy::capture::CaptureBody
+pub fn acl_proxy::capture::CaptureBody::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for acl_proxy::capture::CaptureBody
+pub fn acl_proxy::capture::CaptureBody::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for acl_proxy::capture::CaptureBody
+impl core::marker::Send for acl_proxy::capture::CaptureBody
+impl core::marker::Sync for acl_proxy::capture::CaptureBody
+impl core::marker::Unpin for acl_proxy::capture::CaptureBody
+impl core::marker::UnsafeUnpin for acl_proxy::capture::CaptureBody
+impl core::panic::unwind_safe::RefUnwindSafe for acl_proxy::capture::CaptureBody
+impl core::panic::unwind_safe::UnwindSafe for acl_proxy::capture::CaptureBody
+impl<Q, K> equivalent::Equivalent<K> for acl_proxy::capture::CaptureBody where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureBody::equivalent(&self, &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for acl_proxy::capture::CaptureBody where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureBody::equivalent(&self, &K) -> bool
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for acl_proxy::capture::CaptureBody where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for acl_proxy::capture::CaptureBody where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<T, U> core::convert::Into<U> for acl_proxy::capture::CaptureBody where U: core::convert::From<T>
+pub fn acl_proxy::capture::CaptureBody::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for acl_proxy::capture::CaptureBody where U: core::convert::Into<T>
+pub type acl_proxy::capture::CaptureBody::Error = core::convert::Infallible
+pub fn acl_proxy::capture::CaptureBody::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for acl_proxy::capture::CaptureBody where U: core::convert::TryFrom<T>
+pub type acl_proxy::capture::CaptureBody::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn acl_proxy::capture::CaptureBody::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for acl_proxy::capture::CaptureBody where T: core::clone::Clone
+pub type acl_proxy::capture::CaptureBody::Owned = T
+pub fn acl_proxy::capture::CaptureBody::clone_into(&self, &mut T)
+pub fn acl_proxy::capture::CaptureBody::to_owned(&self) -> T
+impl<T> core::any::Any for acl_proxy::capture::CaptureBody where T: 'static + ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureBody::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for acl_proxy::capture::CaptureBody where T: ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureBody::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for acl_proxy::capture::CaptureBody where T: ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureBody::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for acl_proxy::capture::CaptureBody where T: core::clone::Clone
+pub unsafe fn acl_proxy::capture::CaptureBody::clone_to_uninit(&self, *mut u8)
+impl<T> core::convert::From<T> for acl_proxy::capture::CaptureBody
+pub fn acl_proxy::capture::CaptureBody::from(T) -> T
+impl<T> serde_core::de::DeserializeOwned for acl_proxy::capture::CaptureBody where T: for<'de> serde_core::de::Deserialize<'de>
+impl<T> tracing::instrument::Instrument for acl_proxy::capture::CaptureBody
+impl<T> tracing::instrument::WithSubscriber for acl_proxy::capture::CaptureBody
+impl<T> typenum::type_operators::Same for acl_proxy::capture::CaptureBody
+pub type acl_proxy::capture::CaptureBody::Output = T
+impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for acl_proxy::capture::CaptureBody where T: ?core::marker::Sized
+impl<V, T> ppv_lite86::types::VZip<V> for acl_proxy::capture::CaptureBody where V: ppv_lite86::types::MultiLane<T>
+pub fn acl_proxy::capture::CaptureBody::vzip(self) -> V
+pub struct acl_proxy::capture::CaptureEndpoint
+pub acl_proxy::capture::CaptureEndpoint::address: core::option::Option<alloc::string::String>
+pub acl_proxy::capture::CaptureEndpoint::port: core::option::Option<u16>
+impl core::clone::Clone for acl_proxy::capture::CaptureEndpoint
+pub fn acl_proxy::capture::CaptureEndpoint::clone(&self) -> acl_proxy::capture::CaptureEndpoint
+impl core::cmp::Eq for acl_proxy::capture::CaptureEndpoint
+impl core::cmp::PartialEq for acl_proxy::capture::CaptureEndpoint
+pub fn acl_proxy::capture::CaptureEndpoint::eq(&self, &acl_proxy::capture::CaptureEndpoint) -> bool
+impl core::default::Default for acl_proxy::capture::CaptureEndpoint
+pub fn acl_proxy::capture::CaptureEndpoint::default() -> acl_proxy::capture::CaptureEndpoint
+impl core::fmt::Debug for acl_proxy::capture::CaptureEndpoint
+pub fn acl_proxy::capture::CaptureEndpoint::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for acl_proxy::capture::CaptureEndpoint
+impl serde_core::ser::Serialize for acl_proxy::capture::CaptureEndpoint
+pub fn acl_proxy::capture::CaptureEndpoint::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for acl_proxy::capture::CaptureEndpoint
+pub fn acl_proxy::capture::CaptureEndpoint::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for acl_proxy::capture::CaptureEndpoint
+impl core::marker::Send for acl_proxy::capture::CaptureEndpoint
+impl core::marker::Sync for acl_proxy::capture::CaptureEndpoint
+impl core::marker::Unpin for acl_proxy::capture::CaptureEndpoint
+impl core::marker::UnsafeUnpin for acl_proxy::capture::CaptureEndpoint
+impl core::panic::unwind_safe::RefUnwindSafe for acl_proxy::capture::CaptureEndpoint
+impl core::panic::unwind_safe::UnwindSafe for acl_proxy::capture::CaptureEndpoint
+impl<Q, K> equivalent::Equivalent<K> for acl_proxy::capture::CaptureEndpoint where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureEndpoint::equivalent(&self, &K) -> bool
+impl<Q, K> hashbrown::Equivalent<K> for acl_proxy::capture::CaptureEndpoint where Q: core::cmp::Eq + ?core::marker::Sized, K: core::borrow::Borrow<Q> + ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureEndpoint::equivalent(&self, &K) -> bool
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for acl_proxy::capture::CaptureEndpoint where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for acl_proxy::capture::CaptureEndpoint where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<T, U> core::convert::Into<U> for acl_proxy::capture::CaptureEndpoint where U: core::convert::From<T>
+pub fn acl_proxy::capture::CaptureEndpoint::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for acl_proxy::capture::CaptureEndpoint where U: core::convert::Into<T>
+pub type acl_proxy::capture::CaptureEndpoint::Error = core::convert::Infallible
+pub fn acl_proxy::capture::CaptureEndpoint::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for acl_proxy::capture::CaptureEndpoint where U: core::convert::TryFrom<T>
+pub type acl_proxy::capture::CaptureEndpoint::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn acl_proxy::capture::CaptureEndpoint::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for acl_proxy::capture::CaptureEndpoint where T: core::clone::Clone
+pub type acl_proxy::capture::CaptureEndpoint::Owned = T
+pub fn acl_proxy::capture::CaptureEndpoint::clone_into(&self, &mut T)
+pub fn acl_proxy::capture::CaptureEndpoint::to_owned(&self) -> T
+impl<T> core::any::Any for acl_proxy::capture::CaptureEndpoint where T: 'static + ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureEndpoint::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for acl_proxy::capture::CaptureEndpoint where T: ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureEndpoint::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for acl_proxy::capture::CaptureEndpoint where T: ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureEndpoint::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for acl_proxy::capture::CaptureEndpoint where T: core::clone::Clone
+pub unsafe fn acl_proxy::capture::CaptureEndpoint::clone_to_uninit(&self, *mut u8)
+impl<T> core::convert::From<T> for acl_proxy::capture::CaptureEndpoint
+pub fn acl_proxy::capture::CaptureEndpoint::from(T) -> T
+impl<T> serde_core::de::DeserializeOwned for acl_proxy::capture::CaptureEndpoint where T: for<'de> serde_core::de::Deserialize<'de>
+impl<T> tracing::instrument::Instrument for acl_proxy::capture::CaptureEndpoint
+impl<T> tracing::instrument::WithSubscriber for acl_proxy::capture::CaptureEndpoint
+impl<T> typenum::type_operators::Same for acl_proxy::capture::CaptureEndpoint
+pub type acl_proxy::capture::CaptureEndpoint::Output = T
+impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for acl_proxy::capture::CaptureEndpoint where T: ?core::marker::Sized
+impl<V, T> ppv_lite86::types::VZip<V> for acl_proxy::capture::CaptureEndpoint where V: ppv_lite86::types::MultiLane<T>
+pub fn acl_proxy::capture::CaptureEndpoint::vzip(self) -> V
+pub struct acl_proxy::capture::CaptureRecord
+pub acl_proxy::capture::CaptureRecord::body: core::option::Option<acl_proxy::capture::CaptureBody>
+pub acl_proxy::capture::CaptureRecord::body_truncated: core::option::Option<bool>
+pub acl_proxy::capture::CaptureRecord::client: acl_proxy::capture::CaptureEndpoint
+pub acl_proxy::capture::CaptureRecord::decision: acl_proxy::capture::CaptureDecision
+pub acl_proxy::capture::CaptureRecord::headers: core::option::Option<acl_proxy::capture::HeaderMap>
+pub acl_proxy::capture::CaptureRecord::http_version: core::option::Option<alloc::string::String>
+pub acl_proxy::capture::CaptureRecord::kind: acl_proxy::capture::CaptureKind
+pub acl_proxy::capture::CaptureRecord::method: alloc::string::String
+pub acl_proxy::capture::CaptureRecord::mode: acl_proxy::capture::CaptureMode
+pub acl_proxy::capture::CaptureRecord::provider_replacement_omitted: core::option::Option<bool>
+pub acl_proxy::capture::CaptureRecord::provider_replacement_size: core::option::Option<usize>
+pub acl_proxy::capture::CaptureRecord::request_id: alloc::string::String
+pub acl_proxy::capture::CaptureRecord::status_code: core::option::Option<u16>
+pub acl_proxy::capture::CaptureRecord::status_message: core::option::Option<alloc::string::String>
+pub acl_proxy::capture::CaptureRecord::target: core::option::Option<acl_proxy::capture::CaptureEndpoint>
+pub acl_proxy::capture::CaptureRecord::timestamp: alloc::string::String
+pub acl_proxy::capture::CaptureRecord::url: alloc::string::String
+impl acl_proxy::capture::CaptureRecord
+pub fn acl_proxy::capture::CaptureRecord::decode_body_bytes(&self) -> core::result::Result<alloc::vec::Vec<u8>, acl_proxy::capture::CaptureBodyDecodeError>
+impl core::clone::Clone for acl_proxy::capture::CaptureRecord
+pub fn acl_proxy::capture::CaptureRecord::clone(&self) -> acl_proxy::capture::CaptureRecord
+impl core::fmt::Debug for acl_proxy::capture::CaptureRecord
+pub fn acl_proxy::capture::CaptureRecord::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl serde_core::ser::Serialize for acl_proxy::capture::CaptureRecord
+pub fn acl_proxy::capture::CaptureRecord::serialize<S>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error> where S: serde_core::ser::Serializer
+impl<'de> serde_core::de::Deserialize<'de> for acl_proxy::capture::CaptureRecord
+pub fn acl_proxy::capture::CaptureRecord::deserialize<D>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error> where D: serde_core::de::Deserializer<'de>
+impl core::marker::Freeze for acl_proxy::capture::CaptureRecord
+impl core::marker::Send for acl_proxy::capture::CaptureRecord
+impl core::marker::Sync for acl_proxy::capture::CaptureRecord
+impl core::marker::Unpin for acl_proxy::capture::CaptureRecord
+impl core::marker::UnsafeUnpin for acl_proxy::capture::CaptureRecord
+impl core::panic::unwind_safe::RefUnwindSafe for acl_proxy::capture::CaptureRecord
+impl core::panic::unwind_safe::UnwindSafe for acl_proxy::capture::CaptureRecord
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Initialized, zerocopy::pointer::invariant::Initialized> for acl_proxy::capture::CaptureRecord where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<ST, DT> zerocopy::pointer::invariant::CastableFrom<ST, zerocopy::pointer::invariant::Uninit, zerocopy::pointer::invariant::Uninit> for acl_proxy::capture::CaptureRecord where ST: ?core::marker::Sized, DT: ?core::marker::Sized
+impl<T, U> core::convert::Into<U> for acl_proxy::capture::CaptureRecord where U: core::convert::From<T>
+pub fn acl_proxy::capture::CaptureRecord::into(self) -> U
+impl<T, U> core::convert::TryFrom<U> for acl_proxy::capture::CaptureRecord where U: core::convert::Into<T>
+pub type acl_proxy::capture::CaptureRecord::Error = core::convert::Infallible
+pub fn acl_proxy::capture::CaptureRecord::try_from(U) -> core::result::Result<T, <T as core::convert::TryFrom<U>>::Error>
+impl<T, U> core::convert::TryInto<U> for acl_proxy::capture::CaptureRecord where U: core::convert::TryFrom<T>
+pub type acl_proxy::capture::CaptureRecord::Error = <U as core::convert::TryFrom<T>>::Error
+pub fn acl_proxy::capture::CaptureRecord::try_into(self) -> core::result::Result<U, <U as core::convert::TryFrom<T>>::Error>
+impl<T> alloc::borrow::ToOwned for acl_proxy::capture::CaptureRecord where T: core::clone::Clone
+pub type acl_proxy::capture::CaptureRecord::Owned = T
+pub fn acl_proxy::capture::CaptureRecord::clone_into(&self, &mut T)
+pub fn acl_proxy::capture::CaptureRecord::to_owned(&self) -> T
+impl<T> core::any::Any for acl_proxy::capture::CaptureRecord where T: 'static + ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureRecord::type_id(&self) -> core::any::TypeId
+impl<T> core::borrow::Borrow<T> for acl_proxy::capture::CaptureRecord where T: ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureRecord::borrow(&self) -> &T
+impl<T> core::borrow::BorrowMut<T> for acl_proxy::capture::CaptureRecord where T: ?core::marker::Sized
+pub fn acl_proxy::capture::CaptureRecord::borrow_mut(&mut self) -> &mut T
+impl<T> core::clone::CloneToUninit for acl_proxy::capture::CaptureRecord where T: core::clone::Clone
+pub unsafe fn acl_proxy::capture::CaptureRecord::clone_to_uninit(&self, *mut u8)
+impl<T> core::convert::From<T> for acl_proxy::capture::CaptureRecord
+pub fn acl_proxy::capture::CaptureRecord::from(T) -> T
+impl<T> serde_core::de::DeserializeOwned for acl_proxy::capture::CaptureRecord where T: for<'de> serde_core::de::Deserialize<'de>
+impl<T> tracing::instrument::Instrument for acl_proxy::capture::CaptureRecord
+impl<T> tracing::instrument::WithSubscriber for acl_proxy::capture::CaptureRecord
+impl<T> typenum::type_operators::Same for acl_proxy::capture::CaptureRecord
+pub type acl_proxy::capture::CaptureRecord::Output = T
+impl<T> zerocopy::pointer::invariant::Read<zerocopy::pointer::invariant::Exclusive, zerocopy::pointer::invariant::BecauseExclusive> for acl_proxy::capture::CaptureRecord where T: ?core::marker::Sized
+impl<V, T> ppv_lite86::types::VZip<V> for acl_proxy::capture::CaptureRecord where V: ppv_lite86::types::MultiLane<T>
+pub fn acl_proxy::capture::CaptureRecord::vzip(self) -> V
+pub type acl_proxy::capture::HeaderMap = alloc::collections::btree::map::BTreeMap<alloc::string::String, serde_json::value::Value>
+pub fn acl_proxy::run() -> std::process::ExitCode

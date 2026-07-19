@@ -147,8 +147,8 @@ expect_rejected advisory-gate 'advisories licenses sources' 'licenses sources' s
 expect_rejected advisory-gate-online '--offline ' '' scripts/check-packaging-policy.sh
 expect_rejected advisory-gate-warnings ' -D warnings' '' scripts/check-packaging-policy.sh
 expect_rejected advisory-gate-comment 'cargo deny --locked --offline check -D warnings advisories licenses sources' '# cargo deny --locked --offline check -D warnings advisories licenses sources' scripts/check-packaging-policy.sh
-expect_rejected archive-root 'acl-proxy-0.2.0-extraction-checkpoint-<acl12>/' 'acl-proxy-extraction-checkpoint/' README.md
-expect_rejected archive-hardcoded-sha 'acl-proxy-0.2.0-extraction-checkpoint-<acl12>/' 'acl-proxy-0.2.0-extraction-checkpoint-0123456789ab/' README.md
+expect_rejected archive-root 'acl-proxy-<version>-<acl12>/' 'acl-proxy-release/' README.md
+expect_rejected archive-hardcoded-sha 'acl-proxy-<version>-<acl12>/' 'acl-proxy-0.3.0-rc.1-0123456789ab/' README.md
 expect_rejected archive-bin '  bin/acl-proxy-extract-capture-body' '  acl-proxy-extract-capture-body' README.md
 expect_rejected sample-export 'acl-proxy export-ca' 'ca-cert.pem' acl-proxy.sample.toml
 

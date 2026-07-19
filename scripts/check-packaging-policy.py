@@ -418,7 +418,7 @@ def check_provenance(root: Path) -> None:
         if marker not in provenance:
             fail(f"PROVENANCE.md lacks required marker: {marker}")
     if provenance.count(RUNTIME_COMMIT) != 1:
-        fail("PROVENANCE.md must name the exact P13 runtime commit once")
+        fail("PROVENANCE.md must name the exact accepted runtime commit once")
 
 
 def check_shipped_docs(root: Path) -> None:
@@ -430,8 +430,8 @@ def check_shipped_docs(root: Path) -> None:
         "`acl-proxy.sample.toml`."
     )
     if archive_inventory not in normalized:
-        fail("README lacks the exact extraction-checkpoint archive inventory")
-    archive_root = "acl-proxy-0.2.0-extraction-checkpoint-<acl12>/"
+        fail("README lacks the exact release archive inventory")
+    archive_root = "acl-proxy-<version>-<acl12>/"
     required_layout = (
         archive_root,
         "  bin/acl-proxy",
@@ -442,11 +442,12 @@ def check_shipped_docs(root: Path) -> None:
         "  acl-proxy.sample.toml",
     )
     if any(entry not in readme for entry in required_layout):
-        fail("README lacks the exact versioned extraction-checkpoint layout")
+        fail("README lacks the exact versioned release layout")
     if re.search(
-        r"acl-proxy-0\.2\.0-extraction-checkpoint-[0-9a-f]{12}/", readme
+        r"acl-proxy-[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?-[0-9a-f]{12}/",
+        readme,
     ):
-        fail("README hardcodes a future extraction-checkpoint SHA prefix")
+        fail("README hardcodes a future release SHA prefix")
     sample = read_text(root / "acl-proxy.sample.toml")
     if "schema_version = 3" not in sample:
         fail("sample configuration is not schema version 3")

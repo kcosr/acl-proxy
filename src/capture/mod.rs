@@ -25,6 +25,9 @@ use crate::observation::{
     CaptureAllocationError, CaptureBody as OwnedCaptureBody, CaptureEpoch, CaptureExactBytes,
     CaptureOperation,
 };
+
+#[cfg(test)]
+mod integration_tests;
 use http_access_redaction::{PayloadClass, RedactionError};
 
 mod tap;
@@ -87,7 +90,7 @@ pub struct CaptureEndpoint {
 pub type HeaderMap = BTreeMap<String, JsonValue>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CaptureSinkSpec {
+pub(crate) struct CaptureSinkSpec {
     directory: PathBuf,
     filename_template: String,
     max_files: usize,
@@ -95,7 +98,7 @@ pub struct CaptureSinkSpec {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum CaptureSinkSpecError {
+pub(crate) enum CaptureSinkSpecError {
     #[error("capture directory must not be empty")]
     EmptyDirectory,
     #[error("capture filename template must be a nonempty basename")]
@@ -107,7 +110,7 @@ pub enum CaptureSinkSpecError {
 }
 
 impl CaptureSinkSpec {
-    pub fn new(
+    pub(crate) fn new(
         directory: PathBuf,
         filename_template: String,
         max_files: usize,
@@ -133,19 +136,19 @@ impl CaptureSinkSpec {
         })
     }
 
-    pub fn directory(&self) -> &Path {
+    pub(crate) fn directory(&self) -> &Path {
         &self.directory
     }
 
-    pub fn filename_template(&self) -> &str {
+    pub(crate) fn filename_template(&self) -> &str {
         &self.filename_template
     }
 
-    pub fn max_files(&self) -> usize {
+    pub(crate) fn max_files(&self) -> usize {
         self.max_files
     }
 
-    pub fn max_total_bytes(&self) -> u64 {
+    pub(crate) fn max_total_bytes(&self) -> u64 {
         self.max_total_bytes
     }
 }
@@ -707,7 +710,7 @@ impl Serialize for BorrowedCaptureArtifactRecord<'_> {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum CaptureRecordInvariantError {
+enum CaptureRecordInvariantError {
     #[error("bodyTruncated must be present only as true for a shorter base64 body prefix")]
     InvalidBodyTruncated,
     #[error("providerReplacementOmitted must be true and paired with providerReplacementSize")]
@@ -785,7 +788,7 @@ impl CaptureRecord {
         Ok(())
     }
 
-    pub fn mark_provider_replacement_omitted(&mut self, size: usize) {
+    pub(crate) fn mark_provider_replacement_omitted(&mut self, size: usize) {
         self.body = None;
         self.body_truncated = None;
         self.provider_replacement_omitted = Some(true);
@@ -941,7 +944,7 @@ pub enum CaptureBodyDecodeError {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum CaptureError {
+pub(crate) enum CaptureError {
     #[error("failed to create capture directory {path}: {source}")]
     CreateDir {
         path: PathBuf,
@@ -1038,7 +1041,7 @@ fn sanitize_path_component(input: &str) -> String {
 /// Filenames are produced from `capture.filename` using `{requestId}`,
 /// `{kind}`, and `{suffix}` placeholders. The `requestId` placeholder
 /// is sanitized to avoid introducing path separators. The directory is
-pub fn resolve_capture_path(sink: &CaptureSinkSpec, record: &CaptureRecord) -> PathBuf {
+pub(crate) fn resolve_capture_path(sink: &CaptureSinkSpec, record: &CaptureRecord) -> PathBuf {
     let kind_suffix = match record.kind {
         CaptureKind::Request => "req",
         CaptureKind::Response => "res",
@@ -1068,7 +1071,7 @@ struct CaptureFileEntry {
     is_written_file: bool,
 }
 
-pub fn write_capture_record(
+pub(crate) fn write_capture_record(
     sink: &CaptureSinkSpec,
     record: &CaptureRecord,
 ) -> Result<PathBuf, CaptureError> {

@@ -7,7 +7,7 @@ use base64::engine::general_purpose;
 use base64::Engine as _;
 use tempfile::TempDir;
 
-use acl_proxy::capture::{
+use crate::capture::{
     CaptureBody, CaptureDecision, CaptureEndpoint, CaptureKind, CaptureMode, CaptureRecord,
     CaptureSinkSpec, HeaderMap,
 };
@@ -106,11 +106,11 @@ fn capture_write_creates_expected_file_and_json() {
         usize::MAX,
         u64::MAX,
     );
-    let path = acl_proxy::capture::write_capture_record(&sink, &record).unwrap();
+    let path = crate::capture::write_capture_record(&sink, &record).unwrap();
 
     assert!(path.exists(), "capture file should exist");
     let contents = fs::read_to_string(&path).expect("read capture file");
-    let decoded: acl_proxy::capture::CaptureRecord =
+    let decoded: crate::capture::CaptureRecord =
         serde_json::from_str(&contents).expect("decode capture");
     assert_eq!(decoded.request_id, "req-1");
     assert_eq!(decoded.method, "POST");
@@ -132,7 +132,7 @@ fn capture_write_prunes_by_max_files() {
 
     for request_id in ["req-001", "req-002", "req-003"] {
         let record = capture_record(request_id);
-        acl_proxy::capture::write_capture_record(&sink, &record).unwrap();
+        crate::capture::write_capture_record(&sink, &record).unwrap();
     }
 
     assert_eq!(
@@ -150,7 +150,7 @@ fn capture_write_prunes_by_max_total_bytes() {
 
     for request_id in ["req-001", "req-002", "req-003"] {
         let record = capture_record(request_id);
-        acl_proxy::capture::write_capture_record(&sink, &record).unwrap();
+        crate::capture::write_capture_record(&sink, &record).unwrap();
     }
 
     assert_eq!(
@@ -174,7 +174,7 @@ fn concurrent_capture_writes_prune_as_one_transaction_per_directory() {
             thread::spawn(move || {
                 let record = capture_record(&format!("req-{index:03}"));
                 barrier.wait();
-                acl_proxy::capture::write_capture_record(&sink, &record)
+                crate::capture::write_capture_record(&sink, &record)
             })
         })
         .collect();
@@ -187,7 +187,7 @@ fn concurrent_capture_writes_prune_as_one_transaction_per_directory() {
     let names = capture_file_names(&capture_dir);
     assert_eq!(names.len(), 1, "retention must leave exactly one capture");
     let contents = fs::read_to_string(capture_dir.join(&names[0])).expect("read retained capture");
-    let decoded: acl_proxy::capture::CaptureRecord =
+    let decoded: crate::capture::CaptureRecord =
         serde_json::from_str(&contents).expect("decode retained capture");
     assert!(decoded.request_id.starts_with("req-"));
     assert!(
@@ -212,7 +212,7 @@ fn concurrent_filename_collisions_keep_complete_records() {
             thread::spawn(move || {
                 let record = capture_record(request_id);
                 barrier.wait();
-                acl_proxy::capture::write_capture_record(&sink, &record)
+                crate::capture::write_capture_record(&sink, &record)
             })
         })
         .collect();
@@ -240,7 +240,7 @@ fn concurrent_filename_collisions_keep_complete_records() {
         .iter()
         .map(|path| {
             let contents = fs::read_to_string(path).expect("read capture");
-            let decoded: acl_proxy::capture::CaptureRecord =
+            let decoded: crate::capture::CaptureRecord =
                 serde_json::from_str(&contents).expect("decode complete capture");
             decoded.request_id
         })
@@ -278,7 +278,7 @@ fn aliased_capture_directories_share_collision_and_retention_transaction() {
             let barrier = Arc::clone(&barrier);
             thread::spawn(move || {
                 barrier.wait();
-                acl_proxy::capture::write_capture_record(&sink, &capture_record(request_id))
+                crate::capture::write_capture_record(&sink, &capture_record(request_id))
             })
         })
         .collect();
@@ -304,7 +304,7 @@ fn stale_internal_temp_files_do_not_consume_retention() {
 
     let sink = capture_sink(&capture_dir, "capture.json", 1, 1024);
 
-    let path = acl_proxy::capture::write_capture_record(&sink, &capture_record("current"))
+    let path = crate::capture::write_capture_record(&sink, &capture_record("current"))
         .expect("write capture with stale temp");
 
     assert_eq!(path.file_name().unwrap(), "capture.json");
@@ -322,7 +322,7 @@ fn overlapping_processes_preserve_colliding_capture_records() {
     let mut children: Vec<_> = (0..6)
         .map(|index| {
             Command::new(&test_binary)
-                .arg("capture_subprocess_writer")
+                .arg("capture::integration_tests::capture_subprocess_writer")
                 .arg("--exact")
                 .env("ACL_PROXY_CAPTURE_TEST_DIR", &capture_dir)
                 .env("ACL_PROXY_CAPTURE_TEST_ID", format!("process-{index}"))
@@ -341,7 +341,7 @@ fn overlapping_processes_preserve_colliding_capture_records() {
         .iter()
         .map(|name| {
             let contents = fs::read_to_string(capture_dir.join(name)).expect("read capture");
-            serde_json::from_str::<acl_proxy::capture::CaptureRecord>(&contents)
+            serde_json::from_str::<crate::capture::CaptureRecord>(&contents)
                 .expect("decode complete capture")
                 .request_id
         })
@@ -364,7 +364,7 @@ fn overlapping_processes_serialize_retention_limits() {
     let mut children: Vec<_> = (0..8)
         .map(|index| {
             Command::new(&test_binary)
-                .arg("capture_subprocess_writer")
+                .arg("capture::integration_tests::capture_subprocess_writer")
                 .arg("--exact")
                 .env("ACL_PROXY_CAPTURE_TEST_DIR", &capture_dir)
                 .env("ACL_PROXY_CAPTURE_TEST_ID", format!("retention-{index}"))
@@ -392,7 +392,7 @@ fn overlapping_processes_serialize_retention_limits() {
     );
     for name in names {
         let contents = fs::read_to_string(capture_dir.join(name)).expect("read capture");
-        serde_json::from_str::<acl_proxy::capture::CaptureRecord>(&contents)
+        serde_json::from_str::<crate::capture::CaptureRecord>(&contents)
             .expect("decode retained capture");
     }
 }
@@ -417,6 +417,6 @@ fn capture_subprocess_writer() {
         max_files,
         max_total_bytes,
     );
-    acl_proxy::capture::write_capture_record(&sink, &capture_record(&request_id))
+    crate::capture::write_capture_record(&sink, &capture_record(&request_id))
         .expect("write subprocess capture");
 }

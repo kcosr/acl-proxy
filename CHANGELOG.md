@@ -16,6 +16,9 @@
 - Removed per-policy-decision logging switches. The process-lifetime logging
   level and sinks are now static configuration, while capture is the bounded
   request/response observation mechanism.
+- Removed the public CLI parser and operational-error DTO surface. The Rust
+  library now exposes only one `run() -> ExitCode` process entry alongside the
+  intentional capture artifact API.
 
 ### Added
 
@@ -29,6 +32,10 @@
 
 ### Changed
 
+- Moved canonical URL, ACL/redaction and credential cores, forwarding,
+  listeners, MITM, HTTP serving, and WebSocket relay behind the neutral
+  `access-runtime`; `acl-proxy` retains product configuration, adapters,
+  observation sinks, lifecycle, CLI, and packaging ownership.
 - Established one strict URL contract for policy evaluation and forwarding: DNS hosts use IDNA/STD3 validation, fragments and ambiguous double encoding are rejected, encoded delimiters remain opaque, and the exact canonical URL authorized by policy is forwarded upstream.
 - Decoupled ingress HTTP versions from selected outbound protocols, normalizing request targets, authority, Host, TE, and ALPN across direct and parent routes.
 - Validate HTTP/1 request heads in a fixed zeroizing 64 KiB per-connection

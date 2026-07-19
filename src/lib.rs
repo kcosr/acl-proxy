@@ -1,7 +1,7 @@
 mod activation;
 mod authorization;
 pub mod capture;
-pub mod cli;
+mod cli;
 mod config;
 mod control;
 mod credential_buffers;
@@ -25,3 +25,5 @@ mod standalone_provider_result;
 #[cfg(test)]
 mod test_certificates;
 mod tls;
+
+pub use cli::run;

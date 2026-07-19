@@ -18,11 +18,11 @@ The product source was developed in this repository. It is not a vendored copy
 of the shared runtime and does not carry a parallel forwarding, listener, MITM,
 or WebSocket implementation.
 
-## Shared Access Runtime P13 Transport Cutover
+## Shared Access Runtime
 
 - Source repository: this `acl-proxy` repository
 - Destination repository: `access-runtime`
-- Accepted P13 C02 source commit:
+- Accepted runtime commit:
   `9bf11cdbe73e63d69ac4ec9935cf9da68612d243`
 - Dependency version: `0.1.0`
 - License: MIT

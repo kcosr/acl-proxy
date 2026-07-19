@@ -17,7 +17,7 @@ use crate::runtime::{ReloadTriggerResult, Runtime};
 mod export_ca;
 
 #[derive(Debug, thiserror::Error)]
-pub enum CliError {
+enum CliError {
     #[error("{0}")]
     Config(String),
 
@@ -56,6 +56,7 @@ pub enum CliError {
     )]
     ExportCaPublishedUnconfirmed,
 
+    #[cfg(not(unix))]
     #[error("generated MITM CA export is unsupported on this platform")]
     ExportCaUnsupportedPlatform,
 }
@@ -66,17 +67,17 @@ pub enum CliError {
     version,
     about = "ACL-aware HTTP/HTTPS proxy (Rust)"
 )]
-pub struct Cli {
+struct Cli {
     /// Path to the strict TOML configuration file.
     #[arg(long, global = true)]
-    pub config: Option<PathBuf>,
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
-    pub command: Option<Command>,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
-pub enum Command {
+enum Command {
     /// Run the proxy.
     Run,
 
@@ -101,7 +102,7 @@ pub enum Command {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum ConfigCommand {
+enum ConfigCommand {
     /// Validate configuration file without starting the proxy.
     Validate,
 
@@ -113,7 +114,7 @@ pub enum ConfigCommand {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum PolicyCommand {
+enum PolicyCommand {
     /// Dump the fully resolved policy rules for inspection.
     Dump {
         /// Output format: json (machine-readable) or table (human-friendly).
@@ -123,12 +124,22 @@ pub enum PolicyCommand {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum OutputFormat {
+enum OutputFormat {
     Json,
     Table,
 }
 
-pub fn run() -> Result<ExitCode, CliError> {
+pub fn run() -> ExitCode {
+    match run_inner() {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("{error}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_inner() -> Result<ExitCode, CliError> {
     let cli = Cli::parse();
     let config_path = cli.config.as_deref();
 

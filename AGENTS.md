@@ -20,11 +20,11 @@
 - `src/config/` — Strict schema-3 authoring, loading, compilation, and templates.
 - `src/policy/adapter.rs` — Product compilation and resources for the shared ACL evaluator.
 - `src/activation/` and `src/runtime/` — Product activation, reload, ownership, and shutdown.
-- `src/proxy/ingress.rs` — Common explicit, transparent, CONNECT MITM, TLS, and upgrade ingress.
-- `src/proxy/forwarding_adapter.rs` — Product observation, lifetime, and downstream upgrade adaptation for the shared forwarding runtime.
+- `src/activation/listeners.rs` — Product listener binding, local-address refresh, and original-destination OS adaptation into the shared listener runtime.
+- `src/proxy/` — Product forwarding, observation/capture, and private-field partition adapters; shared runtime owns the data-plane engine.
 - `src/authorization/` — Process and webhook authorization lifecycles.
 - `src/capture/mod.rs` — Request/response capture to JSON files.
-- `src/certs/mod.rs` — CA and per-host certificate generation and caching.
+- `src/activation/assets.rs` — Product MITM, TLS, and forwarding asset compilation into shared runtime inputs.
 - `src/logging/mod.rs` — Structured logging with file rotation.
 - `src/bin/extract-capture-body.rs` — Helper CLI to decode captured bodies.
 
@@ -112,6 +112,7 @@ script. Then add a fresh `## [Unreleased]` section with the standard
 
 Release archives are packaged separately after the GitHub release exists. Use
 the README release section as the source of truth for archive names and
-contents. The supported release platforms are currently `linux-x86_64` and
-`macos-arm64`, with `bin/acl-proxy` and
-`bin/acl-proxy-extract-capture-body` in the archive.
+contents. The intended platform set includes `linux-x86_64` and `macos-arm64`,
+with both binaries in the archive. The current local core program has validated
+Linux x86_64 and Linux arm64 compilation only; macOS arm64 and Windows MSVC
+x86_64 remain incomplete until suitable hosts are available.

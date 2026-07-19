@@ -17,7 +17,7 @@ README, `LICENSE`, `THIRD_PARTY_NOTICES`, and `acl-proxy.sample.toml`. To build
 locally:
 
 ```text
-acl-proxy-0.2.0-extraction-checkpoint-<acl12>/
+acl-proxy-<version>-<acl12>/
   bin/acl-proxy
   bin/acl-proxy-extract-capture-body
   README.md
@@ -26,9 +26,10 @@ acl-proxy-0.2.0-extraction-checkpoint-<acl12>/
   acl-proxy.sample.toml
 ```
 
-`<acl12>` is the first 12 lowercase hexadecimal characters of the exact
-packaged `acl-proxy` commit. The versioned directory is the archive root, and
-the two executables are its only `bin/` entries.
+`<version>` is the exact Cargo package version and `<acl12>` is the first 12
+lowercase hexadecimal characters of the packaged `acl-proxy` commit. That
+directory is the archive root, and the two executables are its only `bin/`
+entries.
 
 ```bash
 cargo build --release --locked
@@ -68,6 +69,22 @@ To make an explicit HTTP request after adding a matching allow rule:
 ```bash
 curl --proxy http://127.0.0.1:8881 http://example.test/resource
 ```
+
+## Architecture
+
+This repository owns the product shell: strict schema-3 compilation, listener
+binding and OS integration, authorization/provider and credential-I/O adapters,
+capture/logging sinks, reload and signal policy, CLI, samples, and packaging.
+The sibling `access-runtime` repository owns canonical URLs, ACL/redaction and
+credential cores, forwarding, listeners, MITM, HTTP serving, and WebSocket
+relay. `src/proxy` contains only the product forwarding, observation, and
+private-field adapters into that shared runtime; it is not a second proxy
+engine.
+
+The Rust library surface is intentionally small. It exposes the capture
+artifact format used by the extraction helper and one `run() -> ExitCode`
+process entry. CLI parser and operational error types are private, and the
+exact surface is checked against `public-api.txt`.
 
 ## Configuration
 
@@ -444,6 +461,7 @@ secrets. It never reads production files or broker configuration.
 cargo fmt --check
 cargo test --locked
 cargo clippy --all-targets --all-features -- -D warnings
+scripts/check-ownership.sh
 ```
 
 Repository-local agent instructions are in `AGENTS.md`. Detailed design and
