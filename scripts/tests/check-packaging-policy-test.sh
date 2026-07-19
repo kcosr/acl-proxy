@@ -101,6 +101,11 @@ PY
     fi
 }
 
+expect_rejected product-version 'version = "0.3.0-rc.1"' 'version = "0.3.0-rc.2"' Cargo.toml
+expect_rejected publish-guard 'publish = false' 'publish = true' Cargo.toml
+expect_rejected lock-product-version $'name = "acl-proxy"\nversion = "0.3.0-rc.1"' $'name = "acl-proxy"\nversion = "0.3.0-rc.2"' Cargo.lock
+expect_metadata_rejected metadata-product-version acl-proxy version 0.3.0-rc.2
+expect_metadata_rejected metadata-publish-guard acl-proxy publish unexpected
 expect_rejected compu-version '=1.2.0' '^1.2.0' Cargo.toml
 expect_rejected http-version 'http = "=1.4.2"' 'http = "1.4"' Cargo.toml
 expect_rejected h2-version 'h2 = "=0.4.15"' 'h2 = "0.4"' Cargo.toml
@@ -149,6 +154,7 @@ expect_rejected advisory-gate-warnings ' -D warnings' '' scripts/check-packaging
 expect_rejected advisory-gate-comment 'cargo deny --locked --offline check -D warnings advisories licenses sources' '# cargo deny --locked --offline check -D warnings advisories licenses sources' scripts/check-packaging-policy.sh
 expect_rejected archive-root 'acl-proxy-<version>-<acl12>/' 'acl-proxy-release/' README.md
 expect_rejected archive-hardcoded-sha 'acl-proxy-<version>-<acl12>/' 'acl-proxy-0.3.0-rc.1-0123456789ab/' README.md
+expect_rejected candidate-doc-version 'The `0.3.0-rc.1` candidate requires' 'The `0.3.0-rc.2` candidate requires' README.md
 expect_rejected archive-bin '  bin/acl-proxy-extract-capture-body' '  acl-proxy-extract-capture-body' README.md
 expect_rejected sample-export 'acl-proxy export-ca' 'ca-cert.pem' acl-proxy.sample.toml
 

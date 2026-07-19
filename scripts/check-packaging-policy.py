@@ -21,6 +21,7 @@ ALLOWED_LICENSES = {
     "Unicode-3.0",
 }
 REGISTRY = "https://github.com/rust-lang/crates.io-index"
+PRODUCT_VERSION = "0.3.0-rc.1"
 RUNTIME_COMMIT = "bca85d11787afe988dc63cad817f20434523cf66"
 PRODUCT_INITIAL_COMMIT = "a829f43552c7118d1f206b9e4112b3c747eecd50"
 TRANSPORT_PACKAGES = {
@@ -177,8 +178,20 @@ def check_manifest(root: Path) -> None:
     package = manifest.get("package")
     if not isinstance(package, dict):
         fail("Cargo.toml lacks [package]")
-    if package.get("version") != "0.2.0" or package.get("license") != "MIT":
-        fail("product package must remain version 0.2.0 under MIT")
+    if package.get("version") != PRODUCT_VERSION or package.get("license") != "MIT":
+        fail(f"product package must remain version {PRODUCT_VERSION} under MIT")
+    if package.get("publish") is not False:
+        fail("product package must remain non-publishable during the local candidate program")
+
+    lock = load_toml(root / "Cargo.lock")
+    lock_packages = lock.get("package")
+    if not isinstance(lock_packages, list):
+        fail("Cargo.lock lacks package records")
+    locked_product = [
+        package for package in lock_packages if package.get("name") == "acl-proxy"
+    ]
+    if len(locked_product) != 1 or locked_product[0].get("version") != PRODUCT_VERSION:
+        fail(f"Cargo.lock must contain exactly one acl-proxy {PRODUCT_VERSION} package")
     dependencies = manifest.get("dependencies")
     if not isinstance(dependencies, dict):
         fail("Cargo.toml lacks [dependencies]")
@@ -248,6 +261,10 @@ def check_transport_resolution(root: Path, metadata: dict[str, Any]) -> None:
     product = [package for package in packages if package.get("name") == "acl-proxy"]
     if len(product) != 1 or not isinstance(product[0].get("manifest_path"), str):
         fail("locked metadata lacks one canonical acl-proxy manifest path")
+    if product[0].get("version") != PRODUCT_VERSION:
+        fail(f"locked metadata must resolve acl-proxy {PRODUCT_VERSION}")
+    if product[0].get("publish") != []:
+        fail("locked metadata must retain the acl-proxy publication guard")
     hyper = next(package for package in packages if package.get("name") == "hyper")
     manifest_path = hyper.get("manifest_path")
     if not isinstance(manifest_path, str):
@@ -424,6 +441,8 @@ def check_provenance(root: Path) -> None:
 def check_shipped_docs(root: Path) -> None:
     readme = read_text(root / "README.md")
     normalized = " ".join(readme.split())
+    if f"The `{PRODUCT_VERSION}` candidate requires `schema_version = 3`" not in normalized:
+        fail("README lacks the exact strict-v3 candidate version marker")
     archive_inventory = (
         "Release archives contain `acl-proxy`, the capture-body extraction helper, "
         "this README, `LICENSE`, `THIRD_PARTY_NOTICES`, and "

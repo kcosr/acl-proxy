@@ -31,6 +31,12 @@ lowercase hexadecimal characters of the packaged `acl-proxy` commit. That
 directory is the archive root, and the two executables are its only `bin/`
 entries.
 
+The `0.3.0-rc.1` candidate requires `schema_version = 3`; configurations for
+the `0.2.x` contract must be rewritten rather than migrated through aliases or
+fallback parsing. This local candidate is validated for build and runtime on
+Linux x86_64 and for compilation on Linux aarch64. macOS arm64 and Windows MSVC
+x86_64 have not been validated because suitable hosts are unavailable.
+
 ```bash
 cargo build --release --locked
 ```

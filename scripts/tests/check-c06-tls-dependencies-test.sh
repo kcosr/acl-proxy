@@ -24,7 +24,7 @@ rustls-webpki = { version = "=0.103.13", default-features = false, features = ["
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
 '''
 (root / "acl-proxy/Cargo.toml").write_text(
-    '[package]\nname = "acl-proxy"\nversion = "0.2.0"\n\n[dependencies]\n' + tls,
+    '[package]\nname = "acl-proxy"\nversion = "0.3.0-rc.1"\n\n[dependencies]\n' + tls,
     encoding="utf-8",
 )
 (root / "access-runtime/Cargo.toml").write_text(
