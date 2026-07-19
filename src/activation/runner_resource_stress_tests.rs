@@ -1219,7 +1219,7 @@ fn process_resource_thresholds_are_exact_and_non_vacuous() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
-async fn in_process_transport_stress_releases_body_and_origin_ownership() {
+async fn in_process_resource_stress_releases_body_and_origin_ownership() {
     let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
     let batch_count = WARMUP_BATCHES + MEASURED_BATCHES;
     let origins = StressOrigins::start(batch_count).await;
@@ -1258,8 +1258,8 @@ async fn in_process_transport_stress_releases_body_and_origin_ownership() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
-#[ignore = "run explicitly against each frozen P12 and P13 binary"]
-async fn external_process_transport_stress_obeys_frozen_linux_envelope() {
+#[ignore = "run explicitly against the current release candidate binary"]
+async fn external_release_candidate_resource_stress_obeys_linux_envelope() {
     let binary = external_binary();
     assert!(
         binary.is_file(),
@@ -1284,7 +1284,7 @@ async fn external_process_transport_stress_obeys_frozen_linux_envelope() {
     let baseline_fds =
         process_sample(pid, origins.active_count(), proxy, false, true).file_descriptors;
     eprintln!(
-        "P13 stress child pid={pid} data_address={proxy} tokio_worker_threads={EXTERNAL_TOKIO_WORKER_THREADS} baseline_fds={baseline_fds}"
+        "resource stress child pid={pid} data_address={proxy} tokio_worker_threads={EXTERNAL_TOKIO_WORKER_THREADS} baseline_fds={baseline_fds}"
     );
     let mut samples = Vec::with_capacity(MEASURED_BATCHES);
     for measured in 0..MEASURED_BATCHES {
@@ -1295,7 +1295,7 @@ async fn external_process_transport_stress_obeys_frozen_linux_envelope() {
         assert!(child_live, "stress proxy exited during sampling");
         let sample = process_sample(pid, origins.active_count(), proxy, true, child_live);
         eprintln!(
-            "P13 stress sample measured={measured} data_address={} listener_probe_succeeded={} child_live={} fds={} rss_bytes={} active_origin_sockets={}",
+            "resource stress sample measured={measured} data_address={} listener_probe_succeeded={} child_live={} fds={} rss_bytes={} active_origin_sockets={}",
             sample.data_address,
             sample.listener_probe_succeeded,
             sample.child_live,
@@ -1307,7 +1307,7 @@ async fn external_process_transport_stress_obeys_frozen_linux_envelope() {
     }
     assert_process_envelope(baseline_fds, proxy, &samples);
     eprintln!(
-        "P13 stress envelope rss_slope_bytes_per_batch={}",
+        "resource stress envelope rss_slope_bytes_per_batch={}",
         ordinary_least_squares_slope(&samples)
     );
     child.terminate_gracefully();

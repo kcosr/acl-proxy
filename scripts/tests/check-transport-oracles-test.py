@@ -11,26 +11,26 @@ import tempfile
 
 sys.dont_write_bytecode = True
 SOURCE_ROOT = Path(__file__).resolve().parents[2]
-GATE_PATH = SOURCE_ROOT / "scripts/check-p13-transport-oracles.py"
+GATE_PATH = SOURCE_ROOT / "scripts/check-transport-oracles.py"
 EXPECTED_ORACLES = 10
 EXPECTED_HELPERS = 16
 
 
 BEHAVIOR_MUTATIONS = (
-    ("p13_assert_cancel_reset", "assert!(reset.is_reset());", "assert!(!reset.is_reset());", "unfinished drop reset"),
-    ("p13_assert_cancel_reset", "assert_eq!(reset.reason(), Some(h2::Reason::CANCEL));", "assert_eq!(reset.reason(), Some(h2::Reason::INTERNAL_ERROR));", "reset reason"),
-    ("p13_assert_complete_h2_response_watchdog", "data.is_empty() && !body.is_end_stream()", "data.is_empty()", "premature END_STREAM"),
-    ("h2_zero_window_complete_cl0_watchdog_resets_and_releases_admission", 'p13_assert_complete_h2_response_watchdog("/complete-cl0", 0, b"", b"", false).await;', 'p13_assert_complete_h2_response_watchdog("/complete-cl0", 1, b"", b"", false).await;', "zero-length watchdog arm"),
-    ("h2_exact_final_chunk_window_watchdog_resets_before_eof_poll", 'p13_assert_complete_h2_response_watchdog("/complete-final-chunk", 2, b"xy", b"xy", false).await;', 'p13_assert_complete_h2_response_watchdog("/complete-final-chunk", 2, b"xy", b"", false).await;', "exact-final-data EOF"),
-    ("p13_assert_complete_h2_response_watchdog", "sender.poll_ready(context)", "std::future::ready(Ok(())).await", "sole-slot release"),
-    ("p13_assert_complete_h2_response_watchdog", "assert!( pool.global_charge() > 0,", "assert!(pool.global_charge() >= 0,", "admission retention"),
-    ("p13_assert_complete_h2_response_watchdog", "p13_assert_body_pool_released(", "skip_body_pool_release(", "admission release"),
-    ("p13_assert_complete_h2_response_watchdog", "p13_assert_origin_closed(", "skip_origin_close(", "origin reuse"),
-    ("h1_response_wire_limit_closes_before_committing_a_partial_response", "p13_assert_no_partial_h1_response(&response);", "assert!(!response.is_empty());", "H1 prevalidation and partial commit"),
-    ("h2_response_wire_limit_resets_only_the_failed_stream", "p13_assert_h2_limit_sibling(sibling_status, &bytes);", "drop((sibling_status, bytes));", "H2 connection-wide failure"),
-    ("p13_assert_304_pipeline", 'assert_eq!(first_head.matches("\\r\\ncontent-length: 8\\r\\n").count(), 1);', 'assert_eq!(first_head.matches("\\r\\ncontent-length: 8\\r\\n").count(), 0);', "304 length stripping"),
-    ("p13_assert_304_pipeline", 'assert_eq!(first_head.matches("\\r\\ncontent-length:").count(), 1);', 'assert!(first_head.matches("\\r\\ncontent-length:").count() >= 1);', "304 length duplication"),
-    ("p13_assert_304_pipeline", 'assert!(response[first_end..].starts_with(b"HTTP/1.1 200"));', 'assert!(response.windows(12).any(|window| window == b"HTTP/1.1 200"));', "304 framing"),
+    ("assert_cancel_reset", "assert!(reset.is_reset());", "assert!(!reset.is_reset());", "unfinished drop reset"),
+    ("assert_cancel_reset", "assert_eq!(reset.reason(), Some(h2::Reason::CANCEL));", "assert_eq!(reset.reason(), Some(h2::Reason::INTERNAL_ERROR));", "reset reason"),
+    ("assert_complete_h2_response_watchdog", "data.is_empty() && !body.is_end_stream()", "data.is_empty()", "premature END_STREAM"),
+    ("h2_zero_window_complete_cl0_watchdog_resets_and_releases_admission", 'assert_complete_h2_response_watchdog("/complete-cl0", 0, b"", b"", false).await;', 'assert_complete_h2_response_watchdog("/complete-cl0", 1, b"", b"", false).await;', "zero-length watchdog arm"),
+    ("h2_exact_final_chunk_window_watchdog_resets_before_eof_poll", 'assert_complete_h2_response_watchdog("/complete-final-chunk", 2, b"xy", b"xy", false).await;', 'assert_complete_h2_response_watchdog("/complete-final-chunk", 2, b"xy", b"", false).await;', "exact-final-data EOF"),
+    ("assert_complete_h2_response_watchdog", "sender.poll_ready(context)", "std::future::ready(Ok(())).await", "sole-slot release"),
+    ("assert_complete_h2_response_watchdog", "assert!( pool.global_charge() > 0,", "assert!(pool.global_charge() >= 0,", "admission retention"),
+    ("assert_complete_h2_response_watchdog", "assert_body_pool_released(", "skip_body_pool_release(", "admission release"),
+    ("assert_complete_h2_response_watchdog", "assert_origin_closed(", "skip_origin_close(", "origin reuse"),
+    ("h1_response_wire_limit_closes_before_committing_a_partial_response", "assert_no_partial_h1_response(&response);", "assert!(!response.is_empty());", "H1 prevalidation and partial commit"),
+    ("h2_response_wire_limit_resets_only_the_failed_stream", "assert_h2_limit_sibling(sibling_status, &bytes);", "drop((sibling_status, bytes));", "H2 connection-wide failure"),
+    ("assert_304_pipeline", 'assert_eq!(first_head.matches("\\r\\ncontent-length: 8\\r\\n").count(), 1);', 'assert_eq!(first_head.matches("\\r\\ncontent-length: 8\\r\\n").count(), 0);', "304 length stripping"),
+    ("assert_304_pipeline", 'assert_eq!(first_head.matches("\\r\\ncontent-length:").count(), 1);', 'assert!(first_head.matches("\\r\\ncontent-length:").count() >= 1);', "304 length duplication"),
+    ("assert_304_pipeline", 'assert!(response[first_end..].starts_with(b"HTTP/1.1 200"));', 'assert!(response.windows(12).any(|window| window == b"HTTP/1.1 200"));', "304 framing"),
     ("response_watchdog_config", 'body_idle_timeout = "200ms"', 'body_idle_timeout = "2s"', "watchdog timeout fixture"),
     ("response_watchdog_config", 'max_concurrent_streams = 1', 'max_concurrent_streams = 2', "concurrency fixture"),
     ("bounded_response_wire_config", "max_response_wire_bytes = 5", "max_response_wire_bytes = 6", "wire-limit fixture"),
@@ -38,7 +38,7 @@ BEHAVIOR_MUTATIONS = (
 
 
 def load_gate():
-    spec = importlib.util.spec_from_file_location("p13_transport_oracle_gate", GATE_PATH)
+    spec = importlib.util.spec_from_file_location("transport_oracle_gate", GATE_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load {GATE_PATH}")
     module = importlib.util.module_from_spec(spec)
@@ -94,7 +94,7 @@ def main() -> int:
 
     baseline = synthetic_source(gate)
     with tempfile.TemporaryDirectory(
-        prefix=".p13-oracle-gate.", dir=SOURCE_ROOT
+        prefix=".transport-oracle-gate.", dir=SOURCE_ROOT
     ) as directory:
         source_path = Path(directory) / "runner_response_parity_tests.rs"
         source_path.write_text(baseline, encoding="utf-8")
@@ -160,7 +160,7 @@ def main() -> int:
             raise AssertionError("self-test did not exercise additive behavior mutation")
 
     print(
-        "P13 transport oracle gate self-test passed: "
+        "transport response oracle gate self-test passed: "
         f"{EXPECTED_ORACLES} ID removals, "
         f"{EXPECTED_HELPERS} helper removals, "
         f"{sum(len(items) for _, items in all_requirements)} semantic removals, "

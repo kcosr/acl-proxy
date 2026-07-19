@@ -35,41 +35,41 @@ def requirements(*items: tuple[str, str]) -> tuple[Requirement, ...]:
 
 
 HELPER_REQUIREMENTS = {
-    "p13_assert_empty_chunked_request_body": requirements(
+    "assert_empty_chunked_request_body": requirements(
         ("two-second empty-body bound", "tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut body))"),
         ("exact empty chunked request body", 'assert_eq!(&body, b"0\\r\\n\\r\\n");'),
     ),
-    "p13_assert_body_pool_released": requirements(
+    "assert_body_pool_released": requirements(
         ("product body-pool authority", "let pool = product.wire_body_pool();"),
         ("two-second charge-release bound", "tokio::time::timeout(Duration::from_secs(2), async"),
         ("exact zero pool charge", "while pool.global_charge() != 0"),
     ),
-    "p13_assert_exact_request_path": requirements(
+    "assert_exact_request_path": requirements(
         ("request-target extraction", "line.split_ascii_whitespace().nth(1)"),
         ("exact path assertion", 'assert_eq!(actual, Some(path), "origin did not receive exact path");'),
     ),
-    "p13_assert_origin_closed": requirements(
+    "assert_origin_closed": requirements(
         ("origin closure assertion", "assert!(matches!(result, Ok(0) | Err(_)), \"{message}\");"),
     ),
-    "p13_accept_origin": requirements(
+    "accept_origin": requirements(
         ("two-second accept bound", "tokio::time::timeout(Duration::from_secs(2), listener.accept())"),
     ),
-    "p13_assert_downstream_terminated": requirements(
+    "assert_downstream_terminated": requirements(
         ("two-second downstream bound", "tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut tail))"),
         ("timeout is a failure", 'Err(_) => panic!("the response watchdog did not terminate the HTTP/1 downstream")'),
     ),
-    "p13_assert_cancel_reset": requirements(
+    "assert_cancel_reset": requirements(
         ("stream reset assertion", "assert!(reset.is_reset());"),
         ("exact cancel reason", "assert_eq!(reset.reason(), Some(h2::Reason::CANCEL));"),
     ),
-    "p13_assert_no_partial_h1_response": requirements(
+    "assert_no_partial_h1_response": requirements(
         ("zero partial response bytes", "assert!( response.is_empty(),"),
     ),
-    "p13_assert_h2_limit_sibling": requirements(
+    "assert_h2_limit_sibling": requirements(
         ("200 sibling", "assert_eq!(status, StatusCode::OK);"),
         ("exact sibling body", 'assert_eq!(body, b"ok");'),
     ),
-    "p13_assert_304_pipeline": requirements(
+    "assert_304_pipeline": requirements(
         ("304 first response", 'assert!(first_head.starts_with("http/1.1 304"));'),
         ("one content-length", 'assert_eq!(first_head.matches("\\r\\ncontent-length:").count(), 1);'),
         ("representation length eight", 'assert_eq!(first_head.matches("\\r\\ncontent-length: 8\\r\\n").count(), 1);'),
@@ -90,24 +90,24 @@ HELPER_REQUIREMENTS = {
         ("empty end-stream request", ".body(())"),
         ("request body is complete", "true,"),
     ),
-    "p13_assert_complete_h2_response_watchdog": requirements(
-        ("bounded origin accept", 'p13_accept_origin(&origin_listener, "the watchdog origin was not contacted").await'),
-        ("exact origin path assertion", "p13_assert_exact_request_path(&request, path);"),
+    "assert_complete_h2_response_watchdog": requirements(
+        ("bounded origin accept", 'accept_origin(&origin_listener, "the watchdog origin was not contacted").await'),
+        ("exact origin path assertion", "assert_exact_request_path(&request, path);"),
         ("chunked request assertion", 'assert!(request_text.contains("transfer-encoding: chunked\\r\\n"));'),
-        ("empty request helper wiring", "p13_assert_empty_chunked_request_body(&mut stream).await;"),
+        ("empty request helper wiring", "assert_empty_chunked_request_body(&mut stream).await;"),
         ("bounded origin close", "tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))"),
-        ("origin-close helper wiring", "p13_assert_origin_closed("),
+        ("origin-close helper wiring", "assert_origin_closed("),
         ("same sender issues selected request", "response_h2_send(&mut sender, origin, path).await"),
         ("200 response head", "assert_eq!(response.status(), StatusCode::OK);"),
         ("stalled response retains charge", "assert!( pool.global_charge() > 0,"),
         ("exact window-sized data", "assert_eq!(data.as_ref(), expected_data);"),
         ("no premature end stream", "data.is_empty() && !body.is_end_stream()"),
-        ("cancel-reset helper wiring", "p13_assert_cancel_reset(&reset);"),
+        ("cancel-reset helper wiring", "assert_cancel_reset(&reset);"),
         ("bounded close notification", "tokio::time::timeout(Duration::from_secs(2), origin_closed_rx)"),
         ("sole stream slot release", "sender.poll_ready(context)"),
         ("same-connection sibling", 'response_h2_send(&mut sender, origin, "/sibling").await'),
         ("204 sibling", "assert_eq!(sibling.status(), StatusCode::NO_CONTENT);"),
-        ("pool-release helper wiring", "p13_assert_body_pool_released("),
+        ("pool-release helper wiring", "assert_body_pool_released("),
     ),
     "bounded_response_wire_config": requirements(
         ("five-byte response wire limit", "max_response_wire_bytes = 5"),
@@ -122,33 +122,33 @@ HELPER_REQUIREMENTS = {
 
 ORACLE_REQUIREMENTS = {
     ORACLE_IDS[0]: requirements(
-        ("CL1 zero-window fixture", 'p13_assert_complete_h2_response_watchdog("/complete-cl1", 0, b"x", b"", true).await;'),
+        ("CL1 zero-window fixture", 'assert_complete_h2_response_watchdog("/complete-cl1", 0, b"x", b"", true).await;'),
     ),
     ORACLE_IDS[1]: requirements(
-        ("CL2 one-byte-window fixture", 'p13_assert_complete_h2_response_watchdog("/complete-cl2-partial", 1, b"xy", b"x", false).await;'),
+        ("CL2 one-byte-window fixture", 'assert_complete_h2_response_watchdog("/complete-cl2-partial", 1, b"xy", b"x", false).await;'),
     ),
     ORACLE_IDS[2]: requirements(
-        ("CL0 zero-window fixture", 'p13_assert_complete_h2_response_watchdog("/complete-cl0", 0, b"", b"", false).await;'),
+        ("CL0 zero-window fixture", 'assert_complete_h2_response_watchdog("/complete-cl0", 0, b"", b"", false).await;'),
     ),
     ORACLE_IDS[3]: requirements(
-        ("exact-final-chunk fixture", 'p13_assert_complete_h2_response_watchdog("/complete-final-chunk", 2, b"xy", b"xy", false).await;'),
+        ("exact-final-chunk fixture", 'assert_complete_h2_response_watchdog("/complete-final-chunk", 2, b"xy", b"xy", false).await;'),
     ),
     ORACLE_IDS[4]: requirements(
         ("64MiB declared body", "const RESPONSE_BYTES: usize = 64 * 1024 * 1024;"),
-        ("bounded origin accept", 'p13_accept_origin(&origin_listener, "the unread origin was not contacted").await'),
-        ("exact unread path", 'p13_assert_exact_request_path(&request, "/unread");'),
+        ("bounded origin accept", 'accept_origin(&origin_listener, "the unread origin was not contacted").await'),
+        ("exact unread path", 'assert_exact_request_path(&request, "/unread");'),
         ("200 response head", 'assert!(response.starts_with(b"HTTP/1.1 200"));'),
         ("unread response retains charge", "assert!( pool.global_charge() > 0,"),
         ("bounded origin close", "tokio::time::timeout(Duration::from_secs(2), origin_closed_rx)"),
         ("bounded prefix", "assert!( sent < RESPONSE_BYTES,"),
-        ("bounded downstream termination", "p13_assert_downstream_terminated(&mut client).await;"),
-        ("pool-release helper wiring", "p13_assert_body_pool_released("),
+        ("bounded downstream termination", "assert_downstream_terminated(&mut client).await;"),
+        ("pool-release helper wiring", "assert_body_pool_released("),
     ),
     ORACLE_IDS[5]: requirements(
-        ("bounded origin accept", 'p13_accept_origin(&origin_listener, "the stalled origin was not contacted").await'),
-        ("exact stalled path", 'p13_assert_exact_request_path(&request, "/stalled");'),
+        ("bounded origin accept", 'accept_origin(&origin_listener, "the stalled origin was not contacted").await'),
+        ("exact stalled path", 'assert_exact_request_path(&request, "/stalled");'),
         ("chunked request assertion", 'assert!(request_text.contains("transfer-encoding: chunked\\r\\n"));'),
-        ("empty request helper wiring", "p13_assert_empty_chunked_request_body(&mut stalled).await;"),
+        ("empty request helper wiring", "assert_empty_chunked_request_body(&mut stalled).await;"),
         ("bounded origin close", "tokio::time::timeout(Duration::from_secs(2), stalled.read(&mut byte))"),
         ("zero initial window", "response_h2_client(proxy, 0).await"),
         ("200 stalled head", "assert_eq!(stalled.status(), StatusCode::OK);"),
@@ -157,38 +157,38 @@ ORACLE_REQUIREMENTS = {
         ("same-connection sibling", 'response_h2_send(&mut sender, origin, "/sibling").await'),
         ("204 sibling", "assert_eq!(sibling.status(), StatusCode::NO_CONTENT);"),
         ("bounded close notification", "tokio::time::timeout(Duration::from_secs(2), origin_closed_rx)"),
-        ("pool-release helper wiring", "p13_assert_body_pool_released("),
+        ("pool-release helper wiring", "assert_body_pool_released("),
     ),
     ORACLE_IDS[6]: requirements(
-        ("bounded origin accept", 'p13_accept_origin(&origin_listener, "the reset origin was not contacted").await'),
-        ("exact reset path", 'p13_assert_exact_request_path(&request, "/reset");'),
+        ("bounded origin accept", 'accept_origin(&origin_listener, "the reset origin was not contacted").await'),
+        ("exact reset path", 'assert_exact_request_path(&request, "/reset");'),
         ("chunked request assertion", 'assert!(request_text.contains("transfer-encoding: chunked\\r\\n"));'),
-        ("empty request helper wiring", "p13_assert_empty_chunked_request_body(&mut stream).await;"),
+        ("empty request helper wiring", "assert_empty_chunked_request_body(&mut stream).await;"),
         ("zero initial window", "response_h2_client(proxy, 0).await"),
         ("200 response head", "assert_eq!(response.status(), StatusCode::OK);"),
-        ("cancel-reset helper wiring", "p13_assert_cancel_reset(&reset);"),
+        ("cancel-reset helper wiring", "assert_cancel_reset(&reset);"),
     ),
     ORACLE_IDS[7]: requirements(
         ("over-limit route", 'http://{origin}/oversized'),
-        ("zero partial bytes", "p13_assert_no_partial_h1_response(&response);"),
+        ("zero partial bytes", "assert_no_partial_h1_response(&response);"),
     ),
     ORACLE_IDS[8]: requirements(
         ("over-limit request", 'response_h2_send(&mut sender, origin, "/oversized").await'),
         ("no successful response head", "assert!( oversized.is_err(),"),
         ("failed stream releases readiness", "sender.poll_ready(context)"),
         ("same-connection sibling", 'response_h2_send(&mut sender, origin, "/sibling").await'),
-        ("200 and exact sibling body", "p13_assert_h2_limit_sibling(sibling_status, &bytes);"),
+        ("200 and exact sibling body", "assert_h2_limit_sibling(sibling_status, &bytes);"),
     ),
     ORACLE_IDS[9]: requirements(
         ("two pipelined requests", 'GET http://{origin}/first HTTP/1.1'),
         ("following request", 'GET http://{origin}/second HTTP/1.1'),
-        ("304 pipeline helper wiring", "p13_assert_304_pipeline(&response);"),
+        ("304 pipeline helper wiring", "assert_304_pipeline(&response);"),
     ),
 }
 
 
 FORBIDDEN_REQUIREMENTS = {
-    "p13_assert_complete_h2_response_watchdog": requirements(
+    "assert_complete_h2_response_watchdog": requirements(
         (
             "explicit H2 receive-window capacity release",
             "body.flow_control().release_capacity(",
@@ -278,16 +278,16 @@ def check_source(path: Path) -> None:
 def main() -> int:
     script_root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(
-        description="Enforce the frozen P13 transport-oracle inventory and semantics"
+        description="Enforce the frozen transport response-oracle inventory and semantics"
     )
     parser.add_argument("--source", type=Path, default=script_root / ORACLE_SOURCE)
     args = parser.parse_args()
     try:
         check_source(args.source)
     except ValueError as error:
-        print(f"P13 transport oracle gate failed: {error}", file=sys.stderr)
+        print(f"transport response oracle gate failed: {error}", file=sys.stderr)
         return 1
-    print(f"P13 transport oracle gate passed: {len(ORACLE_IDS)} exact live tests")
+    print(f"transport response oracle gate passed: {len(ORACLE_IDS)} exact live tests")
     return 0
 
 

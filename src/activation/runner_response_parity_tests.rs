@@ -419,7 +419,7 @@ urls = ["http://{unavailable_origin}/failure"]
     product.shutdown().await;
 }
 
-async fn p13_assert_empty_chunked_request_body(stream: &mut (impl AsyncRead + Unpin)) {
+async fn assert_empty_chunked_request_body(stream: &mut (impl AsyncRead + Unpin)) {
     let mut body = [0_u8; 5];
     tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut body))
         .await
@@ -428,7 +428,7 @@ async fn p13_assert_empty_chunked_request_body(stream: &mut (impl AsyncRead + Un
     assert_eq!(&body, b"0\r\n\r\n");
 }
 
-async fn p13_assert_body_pool_released(product: &ProductRuntime, message: &str) {
+async fn assert_body_pool_released(product: &ProductRuntime, message: &str) {
     let pool = product.wire_body_pool();
     tokio::time::timeout(Duration::from_secs(2), async {
         while pool.global_charge() != 0 {
@@ -439,7 +439,7 @@ async fn p13_assert_body_pool_released(product: &ProductRuntime, message: &str) 
     .unwrap_or_else(|_| panic!("{message}: {} bytes remain", pool.global_charge()));
 }
 
-fn p13_assert_exact_request_path(request: &[u8], path: &str) {
+fn assert_exact_request_path(request: &[u8], path: &str) {
     let request_line = String::from_utf8_lossy(request);
     let actual = request_line
         .lines()
@@ -448,11 +448,11 @@ fn p13_assert_exact_request_path(request: &[u8], path: &str) {
     assert_eq!(actual, Some(path), "origin did not receive exact path");
 }
 
-fn p13_assert_origin_closed(result: std::io::Result<usize>, message: &str) {
+fn assert_origin_closed(result: std::io::Result<usize>, message: &str) {
     assert!(matches!(result, Ok(0) | Err(_)), "{message}");
 }
 
-async fn p13_accept_origin(
+async fn accept_origin(
     listener: &tokio::net::TcpListener,
     message: &str,
 ) -> (tokio::net::TcpStream, SocketAddr) {
@@ -462,7 +462,7 @@ async fn p13_accept_origin(
         .unwrap()
 }
 
-async fn p13_assert_downstream_terminated(stream: &mut tokio::net::TcpStream) {
+async fn assert_downstream_terminated(stream: &mut tokio::net::TcpStream) {
     let mut tail = Vec::new();
     match tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut tail)).await {
         Ok(Ok(_)) | Ok(Err(_)) => {}
@@ -470,24 +470,24 @@ async fn p13_assert_downstream_terminated(stream: &mut tokio::net::TcpStream) {
     }
 }
 
-fn p13_assert_cancel_reset(reset: &h2::Error) {
+fn assert_cancel_reset(reset: &h2::Error) {
     assert!(reset.is_reset());
     assert_eq!(reset.reason(), Some(h2::Reason::CANCEL));
 }
 
-fn p13_assert_no_partial_h1_response(response: &[u8]) {
+fn assert_no_partial_h1_response(response: &[u8]) {
     assert!(
         response.is_empty(),
         "over-limit response committed partial HTTP/1 bytes: {response:?}"
     );
 }
 
-fn p13_assert_h2_limit_sibling(status: StatusCode, body: &[u8]) {
+fn assert_h2_limit_sibling(status: StatusCode, body: &[u8]) {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, b"ok");
 }
 
-fn p13_assert_304_pipeline(response: &[u8]) {
+fn assert_304_pipeline(response: &[u8]) {
     let first_end = response
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
@@ -584,7 +584,7 @@ async fn response_h2_send(
     response
 }
 
-async fn p13_assert_complete_h2_response_watchdog(
+async fn assert_complete_h2_response_watchdog(
     path: &'static str,
     initial_window_size: u32,
     response_body: &'static [u8],
@@ -600,12 +600,12 @@ async fn p13_assert_complete_h2_response_watchdog(
     let (origin_closed_tx, origin_closed_rx) = tokio::sync::oneshot::channel();
     let origin_task = tokio::spawn(async move {
         let (mut stream, _) =
-            p13_accept_origin(&origin_listener, "the watchdog origin was not contacted").await;
+            accept_origin(&origin_listener, "the watchdog origin was not contacted").await;
         let request = response_read_head(&mut stream).await;
         let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
-        p13_assert_exact_request_path(&request, path);
+        assert_exact_request_path(&request, path);
         assert!(request_text.contains("transfer-encoding: chunked\r\n"));
-        p13_assert_empty_chunked_request_body(&mut stream).await;
+        assert_empty_chunked_request_body(&mut stream).await;
         stream
             .write_all(
                 format!(
@@ -622,7 +622,7 @@ async fn p13_assert_complete_h2_response_watchdog(
         let closed = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
             .await
             .expect("the complete-response watchdog did not close the origin");
-        p13_assert_origin_closed(
+        assert_origin_closed(
             closed,
             "the origin connection remained reusable after downstream delivery stalled",
         );
@@ -630,7 +630,7 @@ async fn p13_assert_complete_h2_response_watchdog(
 
         if expect_sibling {
             let (mut sibling, _) =
-                p13_accept_origin(&origin_listener, "the sibling origin was not contacted").await;
+                accept_origin(&origin_listener, "the sibling origin was not contacted").await;
             let request = response_read_head(&mut sibling).await;
             assert!(String::from_utf8_lossy(&request).contains("/sibling"));
             sibling
@@ -684,7 +684,7 @@ async fn p13_assert_complete_h2_response_watchdog(
     })
     .await
     .expect("the complete-response watchdog did not terminate the HTTP/2 stream");
-    p13_assert_cancel_reset(&reset);
+    assert_cancel_reset(&reset);
     drop(body);
 
     tokio::time::timeout(Duration::from_secs(2), origin_closed_rx)
@@ -710,7 +710,7 @@ async fn p13_assert_complete_h2_response_watchdog(
         assert_eq!(sibling.status(), StatusCode::NO_CONTENT);
     }
 
-    p13_assert_body_pool_released(
+    assert_body_pool_released(
         &product,
         "the complete HTTP/2 response retained admission past its deadline",
     )
@@ -723,22 +723,22 @@ async fn p13_assert_complete_h2_response_watchdog(
 
 #[tokio::test]
 async fn h2_zero_window_complete_cl1_watchdog_resets_and_preserves_sibling_stream() {
-    p13_assert_complete_h2_response_watchdog("/complete-cl1", 0, b"x", b"", true).await;
+    assert_complete_h2_response_watchdog("/complete-cl1", 0, b"x", b"", true).await;
 }
 
 #[tokio::test]
 async fn h2_one_byte_window_complete_cl2_watchdog_resets_without_window_update() {
-    p13_assert_complete_h2_response_watchdog("/complete-cl2-partial", 1, b"xy", b"x", false).await;
+    assert_complete_h2_response_watchdog("/complete-cl2-partial", 1, b"xy", b"x", false).await;
 }
 
 #[tokio::test]
 async fn h2_zero_window_complete_cl0_watchdog_resets_and_releases_admission() {
-    p13_assert_complete_h2_response_watchdog("/complete-cl0", 0, b"", b"", false).await;
+    assert_complete_h2_response_watchdog("/complete-cl0", 0, b"", b"", false).await;
 }
 
 #[tokio::test]
 async fn h2_exact_final_chunk_window_watchdog_resets_before_eof_poll() {
-    p13_assert_complete_h2_response_watchdog("/complete-final-chunk", 2, b"xy", b"xy", false).await;
+    assert_complete_h2_response_watchdog("/complete-final-chunk", 2, b"xy", b"xy", false).await;
 }
 
 #[tokio::test]
@@ -755,9 +755,9 @@ async fn h1_unread_response_body_watchdog_releases_admission_and_closes_origin()
     let (origin_closed_tx, origin_closed_rx) = tokio::sync::oneshot::channel();
     let origin_task = tokio::spawn(async move {
         let (mut stream, _) =
-            p13_accept_origin(&origin_listener, "the unread origin was not contacted").await;
+            accept_origin(&origin_listener, "the unread origin was not contacted").await;
         let request = response_read_head(&mut stream).await;
-        p13_assert_exact_request_path(&request, "/unread");
+        assert_exact_request_path(&request, "/unread");
         stream
             .write_all(
                 format!(
@@ -810,9 +810,9 @@ async fn h1_unread_response_body_watchdog_releases_admission_and_closes_origin()
         sent < RESPONSE_BYTES,
         "the origin sent the complete body despite downstream backpressure"
     );
-    p13_assert_downstream_terminated(&mut client).await;
+    assert_downstream_terminated(&mut client).await;
     origin_task.await.unwrap();
-    p13_assert_body_pool_released(
+    assert_body_pool_released(
         &product,
         "the unread HTTP/1 response retained admission past its deadline",
     )
@@ -831,13 +831,13 @@ async fn h2_zero_window_watchdog_releases_admission_and_preserves_sibling_stream
     let (origin_closed_tx, origin_closed_rx) = tokio::sync::oneshot::channel();
     let origin_task = tokio::spawn(async move {
         let (mut stalled, _) =
-            p13_accept_origin(&origin_listener, "the stalled origin was not contacted").await;
+            accept_origin(&origin_listener, "the stalled origin was not contacted").await;
         let first = tokio::spawn(async move {
             let request = response_read_head(&mut stalled).await;
             let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
-            p13_assert_exact_request_path(&request, "/stalled");
+            assert_exact_request_path(&request, "/stalled");
             assert!(request_text.contains("transfer-encoding: chunked\r\n"));
-            p13_assert_empty_chunked_request_body(&mut stalled).await;
+            assert_empty_chunked_request_body(&mut stalled).await;
             stalled
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\nx")
                 .await
@@ -846,12 +846,12 @@ async fn h2_zero_window_watchdog_releases_admission_and_preserves_sibling_stream
             let closed = tokio::time::timeout(Duration::from_secs(2), stalled.read(&mut byte))
                 .await
                 .expect("the response watchdog did not close the HTTP/2 origin");
-            p13_assert_origin_closed(closed, "the stalled origin received later request bytes");
+            assert_origin_closed(closed, "the stalled origin received later request bytes");
             origin_closed_tx.send(()).unwrap();
         });
 
         let (mut sibling, _) =
-            p13_accept_origin(&origin_listener, "the sibling origin was not contacted").await;
+            accept_origin(&origin_listener, "the sibling origin was not contacted").await;
         let request = response_read_head(&mut sibling).await;
         assert!(String::from_utf8_lossy(&request).contains("/sibling"));
         sibling
@@ -902,7 +902,7 @@ async fn h2_zero_window_watchdog_releases_admission_and_preserves_sibling_stream
         .expect("the zero-window response watchdog did not close the origin")
         .unwrap();
     origin_task.await.unwrap();
-    p13_assert_body_pool_released(
+    assert_body_pool_released(
         &product,
         "the zero-window HTTP/2 response retained admission past its deadline",
     )
@@ -923,12 +923,12 @@ async fn h2_zero_window_watchdog_sends_stream_cancel() {
     let origin = origin_listener.local_addr().unwrap();
     let origin_task = tokio::spawn(async move {
         let (mut stream, _) =
-            p13_accept_origin(&origin_listener, "the reset origin was not contacted").await;
+            accept_origin(&origin_listener, "the reset origin was not contacted").await;
         let request = response_read_head(&mut stream).await;
         let request_text = String::from_utf8_lossy(&request).to_ascii_lowercase();
-        p13_assert_exact_request_path(&request, "/reset");
+        assert_exact_request_path(&request, "/reset");
         assert!(request_text.contains("transfer-encoding: chunked\r\n"));
-        p13_assert_empty_chunked_request_body(&mut stream).await;
+        assert_empty_chunked_request_body(&mut stream).await;
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\nx")
             .await
@@ -937,7 +937,7 @@ async fn h2_zero_window_watchdog_sends_stream_cancel() {
         let closed = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
             .await
             .expect("the response watchdog did not close the reset origin");
-        p13_assert_origin_closed(closed, "the reset origin remained open");
+        assert_origin_closed(closed, "the reset origin remained open");
     });
     let config = response_watchdog_config(proxy, origin, true);
     let (_directory, product) =
@@ -959,7 +959,7 @@ async fn h2_zero_window_watchdog_sends_stream_cancel() {
         .expect("the response watchdog did not terminate the HTTP/2 stream")
         .expect("the reset response body ended without RST_STREAM")
         .expect_err("the zero-window response unexpectedly produced data");
-    p13_assert_cancel_reset(&reset);
+    assert_cancel_reset(&reset);
 
     origin_task.await.unwrap();
     drop(sender);
@@ -1018,7 +1018,7 @@ urls = ["http://{origin}/**"]
 async fn serve_bounded_response_origin(listener: tokio::net::TcpListener, requests: usize) {
     for _ in 0..requests {
         let (mut stream, _) =
-            p13_accept_origin(&listener, "the bounded-response origin was not contacted").await;
+            accept_origin(&listener, "the bounded-response origin was not contacted").await;
         let request = response_read_head(&mut stream).await;
         let response = if request
             .windows(b"/oversized".len())
@@ -1054,7 +1054,7 @@ async fn h1_response_wire_limit_closes_before_committing_a_partial_response() {
         .as_bytes(),
     )
     .await;
-    p13_assert_no_partial_h1_response(&response);
+    assert_no_partial_h1_response(&response);
 
     origin_task.await.unwrap();
     product.shutdown().await;
@@ -1108,7 +1108,7 @@ async fn h2_response_wire_limit_resets_only_the_failed_stream() {
     {
         bytes.extend_from_slice(&data.unwrap());
     }
-    p13_assert_h2_limit_sibling(sibling_status, &bytes);
+    assert_h2_limit_sibling(sibling_status, &bytes);
 
     drop(sender);
     product.shutdown().await;
@@ -1127,7 +1127,7 @@ async fn h1_304_preserves_representation_content_length_and_pipeline() {
     let origin_task = tokio::spawn(async move {
         for _ in 0..2 {
             let (mut stream, _) =
-                p13_accept_origin(&origin_listener, "the 304 origin was not contacted").await;
+                accept_origin(&origin_listener, "the 304 origin was not contacted").await;
             let request = response_read_head(&mut stream).await;
             if request
                 .windows(b"/first".len())
@@ -1172,7 +1172,7 @@ default = "allow"
     product.shutdown().await;
     origin_task.await.unwrap();
 
-    p13_assert_304_pipeline(&response);
+    assert_304_pipeline(&response);
 }
 
 #[tokio::test]

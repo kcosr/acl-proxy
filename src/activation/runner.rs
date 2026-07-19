@@ -1650,8 +1650,8 @@ private_key = "missing-server-key.pem"
         include!("runner_response_parity_tests.rs");
     }
 
-    mod transport_stress_tests {
-        include!("runner_transport_stress_tests.rs");
+    mod resource_stress_tests {
+        include!("runner_resource_stress_tests.rs");
     }
 
     mod listener_lifecycle_tests {
