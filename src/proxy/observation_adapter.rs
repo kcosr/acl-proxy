@@ -85,8 +85,7 @@ impl HttpCaptureContext {
             http_access_types::HttpVersion::Http11 => Version::HTTP_11,
             http_access_types::HttpVersion::Http2 => Version::HTTP_2,
         };
-        let canonical_url =
-            http_access_url::canonicalize_http_url(facts.url().as_str()).map_err(|_| ())?;
+        let canonical_url = facts.url().clone();
         let mut capture = Self {
             runtime,
             epoch,

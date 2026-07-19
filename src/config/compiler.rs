@@ -2934,7 +2934,10 @@ fn validate_capture_filename(filename: &str) -> Result<(), ConfigCompileError> {
             "must be a basename containing {requestId} and {suffix}",
         ));
     }
-    let stripped = filename.replace("{requestId}", "").replace("{suffix}", "");
+    let stripped = filename
+        .replace("{requestId}", "")
+        .replace("{kind}", "")
+        .replace("{suffix}", "");
     if stripped.contains('{') || stripped.contains('}') {
         return Err(ConfigCompileError::at(
             "observation.capture.filename",
@@ -8536,6 +8539,21 @@ max_total_bytes = 16384
     }
 
     #[test]
+    fn capture_filename_accepts_the_runtime_kind_placeholder() {
+        let input = capture_config(None).replace(
+            "{requestId}-{suffix}.json",
+            "{requestId}-{kind}-{suffix}.json",
+        );
+        let compiled = compile(&input).unwrap();
+        let capture = compiled.reloadable_plan.observation.capture.unwrap();
+
+        assert_eq!(
+            capture.sink.filename_template(),
+            "{requestId}-{kind}-{suffix}.json"
+        );
+    }
+
+    #[test]
     fn capture_sink_and_body_policy_fields_remain_reloadable() {
         let baseline = compile(&capture_config(None)).unwrap();
         let changed_input = capture_config(None)
@@ -8881,6 +8899,83 @@ urls = ["https://**.example.test/v1/**"]"#,
             .is_match(&canonicalize_http_url("https://a.b.example.test/v1/resources").unwrap()));
         assert!(!rule.urls[0]
             .is_match(&canonicalize_http_url("https://example.test/v1/resources").unwrap()));
+    }
+
+    #[test]
+    fn shared_url_contract_crosses_compiled_product_policy_evaluation() {
+        use http_access_conformance::{load_matching_suite, MatchOutcome, UrlErrorCode};
+        use http_access_policy_acl::PolicyEvaluation;
+        use http_access_types::EffectivePolicy;
+
+        for case in load_matching_suite().unwrap().into_cases() {
+            let input = format!(
+                r#"{MINIMAL}
+[[policy.rules]]
+id = "url-contract"
+decision = "allow"
+urls = [{:?}]
+"#,
+                case.input.pattern
+            );
+            let compiled = compile(&input);
+            if matches!(
+                case.expected,
+                MatchOutcome::Rejected {
+                    error: UrlErrorCode::Pattern
+                }
+            ) {
+                let error = compiled.expect_err("invalid corpus pattern must fail compilation");
+                assert!(
+                    error.to_string().contains("policy.rules[0].urls[0]"),
+                    "{}: compiler did not locate the invalid pattern: {error}",
+                    case.id
+                );
+                continue;
+            }
+
+            let compiled = compiled.unwrap_or_else(|error| {
+                panic!(
+                    "{}: valid corpus pattern failed compilation: {error}",
+                    case.id
+                )
+            });
+            let canonical = canonicalize_http_url(&case.input.url);
+            let MatchOutcome::Accepted { matches } = case.expected else {
+                assert!(
+                    canonical.is_err(),
+                    "{}: invalid corpus request URL crossed the facts boundary",
+                    case.id
+                );
+                continue;
+            };
+            let canonical = canonical.unwrap_or_else(|error| {
+                panic!("{}: accepted corpus request URL failed: {error}", case.id)
+            });
+            let snapshot = crate::policy::ProductAclSnapshot::compile(
+                &compiled.reloadable_plan.policy,
+                http_access_types::PolicyGeneration::new(1).unwrap(),
+                http_access_types::SnapshotIdentity::new(),
+                &[],
+            )
+            .unwrap_or_else(|error| panic!("{}: compiled product policy failed: {error}", case.id));
+            let decision =
+                evaluate_test_policy(&snapshot, &canonical, "192.0.2.10".parse().unwrap());
+
+            match (decision, matches) {
+                (PolicyEvaluation::Allow { provenance, .. }, true) => assert!(matches!(
+                    provenance.effective_policy(),
+                    EffectivePolicy::Rule { id, ordinal: 0 } if id.as_str() == "url-contract"
+                )),
+                (PolicyEvaluation::Deny { provenance }, false) => assert!(matches!(
+                    provenance.effective_policy(),
+                    EffectivePolicy::Default
+                )),
+                (_, expected) => panic!(
+                    "{}: compiled product decision disagreed with matches={expected}",
+                    case.id
+                ),
+            }
+        }
     }
 
     #[test]

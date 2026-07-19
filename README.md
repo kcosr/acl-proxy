@@ -168,13 +168,16 @@ acl-proxy --config /etc/acl-proxy/acl-proxy.toml export-ca --output ./acl-proxy-
 ```
 
 The command never overwrites an existing file and cannot write inside the
-private generated-storage directory. It is supported on Unix; other platforms
-fail before touching generated storage or the output path. File-backed mode
-uses explicit `ca_certificate` and `ca_private_key` paths. The certificate file
-may contain an ordered PEM CA chain: its first certificate must match the
-private key and be CA-capable, and the complete chain is served with generated
-leaf certificates. Private keys must not grant group or other access. Generated
-leaf certificates use a
+private generated-storage directory. The output parent must already exist, be
+owned by the effective user, and have neither its group-write nor other-write
+permission bit set; use `chmod go-w <directory>` before export when necessary.
+The command fails closed when this ownership and permission requirement is not
+met. It is supported on Unix; other platforms fail before touching generated
+storage or the output path. File-backed mode uses explicit `ca_certificate` and
+`ca_private_key` paths. The certificate file may contain an ordered PEM CA
+chain: its first certificate must match the private key and be CA-capable, and
+the complete chain is served with generated leaf certificates. Private keys
+must not grant group or other access. Generated leaf certificates use a
 30-day validity window clamped to the signing CA. When leaf persistence is
 enabled, the dynamic directory retains at most `max_cached_certificates`
 distinct host certificate/key/chain sets and prunes older sets on startup and
@@ -358,6 +361,13 @@ data, while close reasons are treated as text; close status codes are
 preserved. Every resulting control frame remains within the protocol's
 125-byte payload limit.
 
+An established WebSocket keeps the wire-redaction matcher selected when the
+stream was authorized. Observation capture is independent: it selects the
+current capture epoch at the first frame of each logical message and keeps that
+epoch through the message's final frame. A reload therefore never splits a
+fragmented message, while the next message can use updated capture settings or
+redaction without changing the stream's authorized wire behavior.
+
 ```toml
 [redaction.profiles.sensitive]
 replacement = "[REDACTED]"
@@ -376,6 +386,11 @@ payloads = "text"
 
 Every listed environment variable is required during activation and reload.
 Its name and value are excluded from dumps, logs, captures, and diagnostics.
+
+Destination semantic preflight failures are fail-closed policy outcomes. They
+are audited as `InvalidPlan` and return a sanitized HTTP 403 because no DNS,
+dial, or transport attempt has begun; HTTP 502 and 503 remain transport and
+availability failures.
 
 Policy decision logging is reloadable with the observation snapshot. Decision
 events are disabled for allows and enabled for denies by default; their event

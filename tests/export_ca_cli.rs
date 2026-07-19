@@ -15,6 +15,17 @@ use rustls::pki_types::pem::PemObject as _;
 use rustls::pki_types::CertificateDer;
 use tempfile::TempDir;
 
+#[cfg(unix)]
+const UNSAFE_OUTPUT_PARENT_ERROR: &str = "generated MITM CA export output parent must be owned by the effective user and must not be writable by group or others; run `chmod go-w <directory>`";
+
+fn private_tempdir() -> TempDir {
+    let directory = TempDir::new().expect("create private temporary directory");
+    #[cfg(unix)]
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("set private temporary directory permissions");
+    directory
+}
+
 fn command(config: &Path, output: &Path) -> Command {
     let mut command = Command::new(assert_cmd::cargo_bin!("acl-proxy"));
     command
@@ -72,7 +83,7 @@ fn assert_no_export_temps(directory: &Path) {
 #[cfg(unix)]
 #[test]
 fn exports_stable_certificate_only_pem_without_stable_private_storage_files() {
-    let directory = TempDir::new().expect("create temporary directory");
+    let directory = private_tempdir();
     let private_root = directory.path().join("private-mitm");
     let config = write_config(&directory, Some(GENERATED_MITM));
     let first = directory.path().join("public-ca.pem");
@@ -127,7 +138,7 @@ fn exports_stable_certificate_only_pem_without_stable_private_storage_files() {
 #[cfg(unix)]
 #[test]
 fn refuses_symlink_outputs_and_symlinked_parent_directories() {
-    let directory = TempDir::new().expect("create temporary directory");
+    let directory = private_tempdir();
     let config = write_config(&directory, Some(GENERATED_MITM));
     let initialize = directory.path().join("initialize.pem");
     command(&config, &initialize).assert().success();
@@ -165,7 +176,7 @@ fn refuses_symlink_outputs_and_symlinked_parent_directories() {
 #[cfg(unix)]
 #[test]
 fn refuses_to_replace_an_existing_output() {
-    let directory = TempDir::new().expect("create temporary directory");
+    let directory = private_tempdir();
     let config = write_config(&directory, Some(GENERATED_MITM));
     let output = directory.path().join("existing.pem");
     fs::write(&output, b"caller-owned contents").expect("write existing output");
@@ -185,7 +196,7 @@ fn refuses_to_replace_an_existing_output() {
 #[cfg(unix)]
 #[test]
 fn rejects_output_inside_the_generated_private_storage_root() {
-    let directory = TempDir::new().expect("create temporary directory");
+    let directory = private_tempdir();
     let private_root = directory.path().join("private-mitm");
     let config = write_config(&directory, Some(GENERATED_MITM));
     let outside = directory.path().join("initialize.pem");
@@ -203,7 +214,7 @@ fn rejects_output_inside_the_generated_private_storage_root() {
 #[cfg(unix)]
 #[test]
 fn rejects_configurations_without_generated_mitm_storage() {
-    let absent_directory = TempDir::new().expect("create absent-MITM fixture");
+    let absent_directory = private_tempdir();
     let absent_config = write_config(&absent_directory, None);
     let absent_output = absent_directory.path().join("public-ca.pem");
     command(&absent_config, &absent_output)
@@ -212,7 +223,7 @@ fn rejects_configurations_without_generated_mitm_storage() {
         .stderr(contains("requires a strict configuration with [mitm]"));
     assert!(!absent_output.exists());
 
-    let files_directory = TempDir::new().expect("create files-MITM fixture");
+    let files_directory = private_tempdir();
     let files_mitm = r#"
 [mitm]
 mode = "files"
@@ -232,7 +243,7 @@ directory = "private-mitm"
 #[cfg(unix)]
 #[test]
 fn export_is_static_except_for_generated_ca_and_caller_output() {
-    let directory = TempDir::new().expect("create temporary directory");
+    let directory = private_tempdir();
     let marker = directory.path().join("provider-ran");
     let logging_target = directory.path().join("logging-target-is-a-file");
     fs::write(&logging_target, b"keep").expect("write logging sentinel");
@@ -296,10 +307,49 @@ default = "deny"
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn output_parent_write_permissions_have_an_exact_fail_closed_boundary() {
+    let directory = private_tempdir();
+    let config = write_config(&directory, Some(GENERATED_MITM));
+
+    for (name, mode) in [("private", 0o700), ("publicly-readable", 0o755)] {
+        let parent = directory.path().join(name);
+        fs::create_dir(&parent).expect("create safe output parent");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(mode))
+            .expect("set safe output parent permissions");
+        let output = parent.join("public-ca.pem");
+
+        command(&config, &output).assert().success();
+        assert_eq!(
+            fs::metadata(&output)
+                .expect("read exported CA metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+    }
+
+    for (name, mode) in [("group-writable", 0o770), ("other-writable", 0o707)] {
+        let parent = directory.path().join(name);
+        fs::create_dir(&parent).expect("create unsafe output parent");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(mode))
+            .expect("set unsafe output parent permissions");
+        let output = parent.join("public-ca.pem");
+
+        command(&config, &output)
+            .assert()
+            .failure()
+            .stderr(format!("{UNSAFE_OUTPUT_PARENT_ERROR}\n"));
+        assert!(!output.exists());
+    }
+}
+
 #[cfg(not(unix))]
 #[test]
 fn unsupported_platform_fails_before_touching_storage_or_output_paths() {
-    let directory = TempDir::new().expect("create temporary directory");
+    let directory = private_tempdir();
     let config = write_config(&directory, Some(GENERATED_MITM));
     let private_root = directory.path().join("private-mitm");
     let output_parent = directory.path().join("missing-output-parent");

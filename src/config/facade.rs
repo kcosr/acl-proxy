@@ -458,6 +458,18 @@ rules = [{{ expressions = ['\b{SECRET}\b'], literal_environment_variables = ["MI
         assert_eq!(loaded.compiled.reloadable_plan.policy.rules.len(), 0);
     }
 
+    #[test]
+    fn shipped_sample_strictly_loads_and_compiles_through_the_facade() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("acl-proxy.sample.toml");
+
+        let loaded = load_and_compile_exact_config(&path)
+            .expect("shipped sample must pass the real strict loader and compiler");
+
+        assert_eq!(loaded.metadata.path, path);
+        assert_eq!(loaded.compiled.static_config.schema_version, 3);
+        assert_eq!(loaded.compiled.reloadable_plan.policy.rules.len(), 0);
+    }
+
     fn assert_secret_absent(error: &ConfigFacadeError, secret: &str) {
         assert!(!error.to_string().contains(secret), "{error}");
         assert!(!format!("{error:?}").contains(secret), "{error:?}");

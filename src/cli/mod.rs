@@ -52,6 +52,11 @@ enum CliError {
     ExportCaOutput,
 
     #[error(
+        "generated MITM CA export output parent must be owned by the effective user and must not be writable by group or others; run `chmod go-w <directory>`"
+    )]
+    ExportCaUnsafeOutputParent,
+
+    #[error(
         "the generated MITM public CA certificate was published, but directory durability could not be confirmed"
     )]
     ExportCaPublishedUnconfirmed,

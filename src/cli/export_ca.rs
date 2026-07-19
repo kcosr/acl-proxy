@@ -165,10 +165,27 @@ mod unix {
     fn validate_output_parent(directory: &File) -> Result<(), CliError> {
         let metadata = fstat(directory).map_err(|_| CliError::ExportCaOutput)?;
         let permissions = Mode::from_raw_mode(metadata.st_mode);
-        let trusted = FileType::from_raw_mode(metadata.st_mode) == FileType::Directory
-            && metadata.st_uid == geteuid().as_raw()
-            && !permissions.intersects(Mode::WGRP | Mode::WOTH);
-        trusted.then_some(()).ok_or(CliError::ExportCaOutput)
+        validate_output_parent_metadata(
+            FileType::from_raw_mode(metadata.st_mode),
+            metadata.st_uid,
+            geteuid().as_raw(),
+            permissions,
+        )
+    }
+
+    fn validate_output_parent_metadata(
+        file_type: FileType,
+        owner_uid: u32,
+        effective_uid: u32,
+        permissions: Mode,
+    ) -> Result<(), CliError> {
+        if file_type != FileType::Directory {
+            return Err(CliError::ExportCaOutput);
+        }
+        if owner_uid != effective_uid || permissions.intersects(Mode::WGRP | Mode::WOTH) {
+            return Err(CliError::ExportCaUnsafeOutputParent);
+        }
+        Ok(())
     }
 
     fn encode_chain(chain: &[Vec<u8>]) -> Vec<u8> {
@@ -347,6 +364,54 @@ mod unix {
             let root = PrivateStorageRoot::open_or_create(&root_path).unwrap();
             assert!(matches!(
                 open_output_parent(&root_path, &root),
+                Err(CliError::ExportCaOutput)
+            ));
+        }
+
+        #[test]
+        fn output_parent_metadata_has_an_exact_trust_boundary() {
+            assert!(validate_output_parent_metadata(
+                FileType::Directory,
+                1000,
+                1000,
+                Mode::from_raw_mode(0o700),
+            )
+            .is_ok());
+            assert!(validate_output_parent_metadata(
+                FileType::Directory,
+                1000,
+                1000,
+                Mode::from_raw_mode(0o755),
+            )
+            .is_ok());
+
+            for mode in [0o770, 0o707] {
+                assert!(matches!(
+                    validate_output_parent_metadata(
+                        FileType::Directory,
+                        1000,
+                        1000,
+                        Mode::from_raw_mode(mode),
+                    ),
+                    Err(CliError::ExportCaUnsafeOutputParent)
+                ));
+            }
+            assert!(matches!(
+                validate_output_parent_metadata(
+                    FileType::Directory,
+                    1001,
+                    1000,
+                    Mode::from_raw_mode(0o700),
+                ),
+                Err(CliError::ExportCaUnsafeOutputParent)
+            ));
+            assert!(matches!(
+                validate_output_parent_metadata(
+                    FileType::RegularFile,
+                    1000,
+                    1000,
+                    Mode::from_raw_mode(0o700),
+                ),
                 Err(CliError::ExportCaOutput)
             ));
         }
