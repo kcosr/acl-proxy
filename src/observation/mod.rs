@@ -111,6 +111,11 @@ impl ProductObservationRuntime {
         self.capture_pool.current_epoch()
     }
 
+    #[cfg(test)]
+    pub(crate) fn capture_pool_used(&self) -> usize {
+        self.capture_pool.used()
+    }
+
     pub(crate) fn try_submit_capture(
         &self,
         job: CaptureArtifactJob,

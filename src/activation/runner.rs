@@ -134,6 +134,11 @@ impl ProductRuntime {
     }
 
     #[cfg(test)]
+    pub(crate) fn capture_pool_used_for_test(&self) -> usize {
+        self.observation_runtime.capture_pool_used()
+    }
+
+    #[cfg(test)]
     pub(crate) fn forwarding_terminal_completions_for_test(&self) -> usize {
         self.observation_runtime.forwarding_terminal_completions()
     }

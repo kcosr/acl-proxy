@@ -511,6 +511,12 @@ level = "info"
 directory = "logs"
 console = false
 
+[observation.logging.policy_decisions]
+allows = true
+denies = true
+allow_level = "info"
+deny_level = "warn"
+
 [observation.capture]
 events = ["request.allowed", "response.allowed", "request.denied", "response.denied"]
 redaction_profile = "wire"
@@ -782,8 +788,18 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
     );
     assert_ne!(data_callback.status, 204, "data listener exposed callbacks");
 
+    const DECISION_LOG_SECRET: &str = "decision-log-sensitive-header-value";
     let allow_url = format!("http://{origin}/provider-allow");
-    let allow = proxy_request(data, "GET", &allow_url, &[]);
+    let mut allow_connection = connect(data);
+    let allow = send_request(
+        &mut allow_connection,
+        "GET",
+        &allow_url,
+        &origin.to_string(),
+        &[("X-Provider-Token", DECISION_LOG_SECRET)],
+        &[],
+        true,
+    );
     assert_eq!(allow.status, 200);
     assert_eq!(allow.header("x-seen-provider-token"), Some("typed-secret"));
     assert_eq!(allow.header("x-generation"), Some("one"));
@@ -937,6 +953,10 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
 
     let status = proxy.terminate();
     assert!(status.success(), "acl-proxy shutdown failed: {status}");
+    let decision_logs = fs::read_to_string(directory.path().join("logs/acl-proxy.log")).unwrap();
+    assert!(decision_logs.contains("policy decision"));
+    assert!(decision_logs.contains("sensitive_header_presence=x-provider-token"));
+    assert!(!decision_logs.contains(DECISION_LOG_SECRET));
     std::net::TcpListener::bind(data).expect("data listener was not released");
     std::net::TcpListener::bind(control).expect("control listener was not released");
 }

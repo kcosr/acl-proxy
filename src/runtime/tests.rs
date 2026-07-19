@@ -1271,6 +1271,12 @@ async fn wait_for_retiring(runtime: &Runtime, expected: usize) {
     }
 }
 
+struct LiveUpgradeCaptureProfile<'a> {
+    replacement: &'a str,
+    max_frame_bytes: usize,
+    max_message_bytes: usize,
+}
+
 fn live_upgrade_product_config(
     explicit_http: SocketAddr,
     control: SocketAddr,
@@ -1278,8 +1284,13 @@ fn live_upgrade_product_config(
     path: &str,
     wire_literal: &str,
     wire_replacement: &str,
-    capture_replacement: &str,
+    capture: LiveUpgradeCaptureProfile<'_>,
 ) -> String {
+    let LiveUpgradeCaptureProfile {
+        replacement: capture_replacement,
+        max_frame_bytes: capture_max_frame_bytes,
+        max_message_bytes: capture_max_message_bytes,
+    } = capture;
     format!(
         r#"schema_version = 3
 
@@ -1310,7 +1321,8 @@ rules = [{{ literals = ["{wire_literal}"], payloads = "text" }}]
 
 [redaction.profiles.capture]
 replacement = "{capture_replacement}"
-max_message_bytes = 1048576
+max_frame_bytes = {capture_max_frame_bytes}
+max_message_bytes = {capture_max_message_bytes}
 allow_permessage_deflate = false
 rules = [{{ literals = ["capture-secret"], payloads = "text" }}]
 
@@ -1444,7 +1456,11 @@ async fn live_upgrade_reload_retires_generation_and_releases_terminal_once() {
             "old",
             "old-secret",
             "[WIRE-OLD]",
-            "[CAPTURE-OLD]",
+            LiveUpgradeCaptureProfile {
+                replacement: "[CAPTURE-OLD]",
+                max_frame_bytes: 1048576,
+                max_message_bytes: 1048576,
+            },
         ),
     )
     .unwrap();
@@ -1544,7 +1560,11 @@ async fn live_upgrade_reload_retires_generation_and_releases_terminal_once() {
             "new",
             "new-secret",
             "[WIRE-NEW]",
-            "[CAPTURE-NEW]",
+            LiveUpgradeCaptureProfile {
+                replacement: "[CAPTURE-NEW]",
+                max_frame_bytes: 1048576,
+                max_message_bytes: 1048576,
+            },
         ),
     )
     .unwrap();
@@ -1661,6 +1681,144 @@ async fn live_upgrade_reload_retires_generation_and_releases_terminal_once() {
             .count(),
         0
     );
+    crate::activation::assert_listener_addresses_released(&listener_test, addresses);
+}
+
+#[tokio::test]
+async fn websocket_capture_submits_metadata_for_over_limit_and_incomplete_messages() {
+    let listener_test = crate::activation::LISTENER_TEST_LOCK.lock().await;
+    let reservations = crate::activation::reserve_listeners::<2>(&listener_test);
+    let addresses = reservations.addresses();
+    let origin = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let origin_address = origin.local_addr().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let config_path = directory.path().join("acl-proxy.toml");
+    fs::write(
+        &config_path,
+        live_upgrade_product_config(
+            addresses[0],
+            addresses[1],
+            origin_address,
+            "capture-limits",
+            "wire-secret",
+            "[WIRE]",
+            LiveUpgradeCaptureProfile {
+                replacement: "[CAPTURE]",
+                max_frame_bytes: 64,
+                max_message_bytes: 96,
+            },
+        ),
+    )
+    .unwrap();
+    let loaded = crate::config::load_and_compile_exact_config(&config_path).unwrap();
+    let product = crate::activation::runner::ProductRuntime::prepare_from_prebound(
+        loaded,
+        reservations.into_listeners(),
+    )
+    .await
+    .unwrap();
+    product.activate_initial().await.unwrap();
+    product.start_listeners().await.unwrap();
+
+    let oversized = vec![b'a'; 65];
+    let first_fragment = vec![b'b'; 50];
+    let over_limit_fragment = vec![b'c'; 47];
+    let final_fragment = b"d".to_vec();
+    let incomplete = b"partial".to_vec();
+    let mut reassembled = first_fragment.clone();
+    reassembled.extend_from_slice(&over_limit_fragment);
+    reassembled.extend_from_slice(&final_fragment);
+    let expected = [(true, 0x1, oversized.clone()), (true, 0x1, reassembled)];
+    let origin_task = tokio::spawn(async move {
+        let (mut stream, _) = origin.accept().await.unwrap();
+        let request = read_complete_http_head(&mut stream).await;
+        assert!(String::from_utf8_lossy(&request).contains("/capture-limits HTTP/1.1"));
+        stream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        for expected in expected {
+            let (fin, opcode, payload) = read_websocket_frame(&mut stream, true).await;
+            assert_eq!((fin, opcode, payload), expected);
+        }
+        let mut eof = [0_u8; 1];
+        assert_eq!(stream.read(&mut eof).await.unwrap(), 0);
+    });
+
+    let mut client = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
+    client
+        .write_all(
+            format!(
+                "GET http://{origin_address}/capture-limits HTTP/1.1\r\nHost: {origin_address}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    assert!(read_complete_http_head(&mut client)
+        .await
+        .starts_with(b"HTTP/1.1 101"));
+    client
+        .write_all(&websocket_frame(true, 0x1, true, &oversized))
+        .await
+        .unwrap();
+    client
+        .write_all(&websocket_frame(false, 0x1, true, &first_fragment))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while product.capture_pool_used_for_test() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fragmented WebSocket capture did not charge its buffered prefix");
+
+    client
+        .write_all(&websocket_frame(false, 0x0, true, &over_limit_fragment))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while product.capture_pool_used_for_test() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("over-limit WebSocket capture retained its buffered prefix");
+
+    for frame in [
+        websocket_frame(true, 0x0, true, &final_fragment),
+        websocket_frame(false, 0x1, true, &incomplete),
+    ] {
+        client.write_all(&frame).await.unwrap();
+    }
+    drop(client);
+    origin_task.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), product.shutdown())
+        .await
+        .expect("incomplete WebSocket capture did not release during shutdown");
+
+    let records = product_capture_records(&directory.path().join("captures"));
+    let mut websocket_records = records
+        .iter()
+        .filter(|record| record.request_id.contains("-ws-request-"))
+        .collect::<Vec<_>>();
+    websocket_records.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+    assert_eq!(websocket_records.len(), 3);
+    assert!(websocket_records.iter().all(|record| {
+        record.body.is_none()
+            && record.body_truncated.is_none()
+            && record.provider_replacement_omitted.is_none()
+    }));
+    for (sequence, record) in websocket_records.iter().enumerate() {
+        assert!(record
+            .request_id
+            .ends_with(&format!("-ws-request-{sequence}")));
+    }
     crate::activation::assert_listener_addresses_released(&listener_test, addresses);
 }
 

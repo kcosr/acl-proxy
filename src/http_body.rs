@@ -2915,6 +2915,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_zstd_frame_rejects_oversized_window_and_restores_all_charges() {
+        let encoded = zstd_with_window(b"first", 24);
+        let decoded_limit = 64 * KIB;
+        let (result, guard, pool) = invoke(
+            encoded.clone(),
+            Some("zstd"),
+            encoded.len(),
+            decoded_limit,
+            128,
+        )
+        .await;
+
+        assert_eq!(
+            result.unwrap_err(),
+            HttpBodyReadError::DecoderWindowExceeded
+        );
+        assert_eq!(guard.live_bytes(), 0);
+        assert_eq!(pool.global_charge(), 0);
+    }
+
+    #[tokio::test]
     async fn every_concatenated_zstd_frame_enforces_the_standard_window() {
         let first = zstd(b"first");
         let oversized = zstd_with_window(b"second", 24);

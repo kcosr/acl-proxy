@@ -188,6 +188,7 @@ struct RequestOutcome {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -236,13 +237,21 @@ mod tests {
     async fn run_server(
         server: DuplexStream,
         config: StaticControlConfig,
+        shutdown: watch::Receiver<ControlConnectionSignal>,
+    ) -> io::Result<()> {
+        run_server_with_readiness(server, config, shutdown, Arc::new(ServiceReadiness::new())).await
+    }
+
+    async fn run_server_with_readiness(
+        server: DuplexStream,
+        config: StaticControlConfig,
         mut shutdown: watch::Receiver<ControlConnectionSignal>,
+        readiness: Arc<ServiceReadiness>,
     ) -> io::Result<()> {
         let arena = ControlParserArena::try_new(1).unwrap();
         let lease = arena.try_acquire().unwrap();
         let router = ControlRouter::try_new(&config.base_path).unwrap();
         let runtime = WebhookAuthorizationRuntime::for_test(None);
-        let readiness = ServiceReadiness::new();
         let first_header_deadline = Instant::now() + config.request_header_timeout;
         serve_control_connection(
             server,
@@ -251,7 +260,7 @@ mod tests {
             ControlConnectionContext {
                 router: &router,
                 authorization: &runtime,
-                readiness: &readiness,
+                readiness: readiness.as_ref(),
                 config: &config,
                 shutdown: &mut shutdown,
             },
@@ -309,6 +318,46 @@ mod tests {
             .windows(b"Connection: close".len())
             .any(|window| window == b"Connection: close"));
         assert!(task.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn ready_keep_alive_observes_shutdown_as_not_ready() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let (shutdown, shutdown_rx) = watch::channel(ControlConnectionSignal::Running);
+        let readiness = Arc::new(ServiceReadiness::new());
+        readiness.mark_ready_for_test();
+        let server_readiness = Arc::clone(&readiness);
+        let task = tokio::spawn(run_server_with_readiness(
+            server,
+            config(Duration::from_secs(1), Duration::from_secs(1)),
+            shutdown_rx,
+            server_readiness,
+        ));
+
+        client
+            .write_all(b"GET /_acl-proxy/ready HTTP/1.1\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let ready = read_response(&mut client).await;
+        assert_eq!(
+            ready,
+            b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\nCache-Control: no-store\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ready\"}"
+        );
+
+        readiness.begin_shutdown();
+        client
+            .write_all(
+                b"GET /_acl-proxy/ready HTTP/1.1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let not_ready = read_response(&mut client).await;
+        assert_eq!(
+            not_ready,
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 22\r\nCache-Control: no-store\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"not_ready\"}"
+        );
+        assert!(task.await.unwrap().is_ok());
+        drop(shutdown);
     }
 
     #[tokio::test]

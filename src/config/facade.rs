@@ -468,6 +468,22 @@ rules = [{{ expressions = ['\b{SECRET}\b'], literal_environment_variables = ["MI
         assert_eq!(loaded.metadata.path, path);
         assert_eq!(loaded.compiled.static_config.schema_version, 3);
         assert_eq!(loaded.compiled.reloadable_plan.policy.rules.len(), 0);
+        assert_eq!(
+            loaded
+                .compiled
+                .static_config
+                .service
+                .max_inflight_wire_body_bytes,
+            16 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            loaded
+                .compiled
+                .static_config
+                .service
+                .max_inflight_wire_body_bytes_per_quota_key,
+            2 * 1024 * 1024 * 1024
+        );
     }
 
     fn assert_secret_absent(error: &ConfigFacadeError, secret: &str) {

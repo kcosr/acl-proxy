@@ -14,8 +14,8 @@ max_webhook_transport_bytes = 67108864
 upgrade_relay_buffer_bytes = 65536
 max_upgrade_buffer_bytes = 2147483648
 max_upgrade_lifetime = "8h"
-max_inflight_wire_body_bytes = 8589934592
-max_inflight_wire_body_bytes_per_quota_key = 1073741824
+max_inflight_wire_body_bytes = 17179869184
+max_inflight_wire_body_bytes_per_quota_key = 2147483648
 min_wire_body_concurrency = 64
 max_content_decoding_expansion_ratio = 128
 

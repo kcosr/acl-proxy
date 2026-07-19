@@ -7,7 +7,8 @@ use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use http::{HeaderMap, HeaderValue, Method, StatusCode, Version};
 use http_access_redaction::PayloadClass;
 use http_access_runtime::{
-    UpgradeCaptureAttempt, UpgradeCaptureDirection, UpgradeCaptureFactory, UpgradeCaptureMessage,
+    UpgradeCaptureAttempt, UpgradeCaptureCompletion, UpgradeCaptureDirection,
+    UpgradeCaptureFactory, UpgradeCaptureMessage,
 };
 use http_access_types::{
     CaptureFacts, CaptureFactsInput, HeaderName as NeutralHeaderName,
@@ -440,7 +441,7 @@ impl ProductUpgradeCaptureContext {
             self.max_expansion_ratio,
         )
         .ok()?;
-        let body = job.operation().body_buffer();
+        let body = Some(job.operation().body_buffer());
         Some(WebSocketMessageCapture {
             runtime: self.runtime.clone(),
             job,
@@ -450,7 +451,6 @@ impl ProductUpgradeCaptureContext {
             max_frame_bytes: limits.max_frame_bytes(),
             max_message_bytes: limits.max_message_bytes(),
             encoded_bytes: 0,
-            omitted: false,
         })
     }
 }
@@ -465,27 +465,29 @@ impl UpgradeCaptureFactory for ProductUpgradeCaptureContext {
 struct WebSocketMessageCapture {
     runtime: Arc<ProductObservationRuntime>,
     job: CaptureArtifactJob,
-    body: CaptureBodyBuilder,
+    body: Option<CaptureBodyBuilder>,
     compressed: bool,
     class: PayloadClass,
     max_frame_bytes: usize,
     max_message_bytes: usize,
     encoded_bytes: usize,
-    omitted: bool,
 }
 
 impl UpgradeCaptureAttempt for WebSocketMessageCapture {
+    fn omit_body(&mut self) {
+        if self.body.take().is_some() {
+            self.job.omit_body();
+        }
+    }
+
     fn try_begin_frame(&mut self, encoded_payload_bytes: usize) -> bool {
         if encoded_payload_bytes > self.max_frame_bytes {
-            self.omitted = true;
             return false;
         }
         let Some(total) = self.encoded_bytes.checked_add(encoded_payload_bytes) else {
-            self.omitted = true;
             return false;
         };
         if total > self.max_message_bytes {
-            self.omitted = true;
             return false;
         }
         self.encoded_bytes = total;
@@ -493,25 +495,35 @@ impl UpgradeCaptureAttempt for WebSocketMessageCapture {
     }
 
     fn try_push_fragment(&mut self, fragment: &[u8]) -> bool {
-        if self.omitted || self.body.try_extend_from_slice(fragment).is_err() {
-            self.omitted = true;
-            false
-        } else {
-            true
-        }
+        self.body
+            .as_mut()
+            .is_some_and(|body| body.try_extend_from_slice(fragment).is_ok())
     }
 
-    fn finish(mut self: Box<Self>) {
-        if self.omitted {
-            return;
+    fn finish(mut self: Box<Self>, completion: UpgradeCaptureCompletion) {
+        if completion == UpgradeCaptureCompletion::Complete {
+            let Some(body) = self.body.take() else {
+                return self.submit();
+            };
+            let encoded = body.finish();
+            if self
+                .job
+                .complete_websocket_message(encoded, self.compressed, self.class)
+                .is_err()
+            {
+                self.job.omit_body();
+            }
+        } else {
+            self.omit_body();
         }
-        let encoded = self.body.finish();
-        if self
-            .job
-            .complete_websocket_message(encoded, self.compressed, self.class)
-            .is_ok()
-        {
-            let _ = self.runtime.try_submit_capture(self.job);
+        self.submit();
+    }
+}
+
+impl WebSocketMessageCapture {
+    fn submit(self: Box<Self>) {
+        if let Err(error) = self.runtime.try_submit_capture(self.job) {
+            tracing::debug!(error = ?error, "WebSocket capture queue omitted record");
         }
     }
 }

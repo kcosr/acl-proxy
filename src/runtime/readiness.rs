@@ -51,6 +51,12 @@ impl ServiceReadiness {
     pub(crate) fn begin_shutdown(&self) {
         self.state.store(CLOSED, Ordering::Release);
     }
+
+    #[cfg(test)]
+    pub(crate) fn mark_ready_for_test(&self) {
+        self.mark_runtime_published();
+        self.mark_ingress_started();
+    }
 }
 
 #[cfg(test)]

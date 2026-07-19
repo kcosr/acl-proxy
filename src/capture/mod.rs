@@ -1653,6 +1653,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn artifact_worker_redacts_websocket_message_before_truncation() {
+        let directory = tempfile::tempdir().unwrap();
+        let (epoch, _owner) = capture_engine_epoch(directory.path(), 5, false);
+        let mut metadata = sample_record_with_body(None);
+        metadata.request_id = "websocket-boundary".to_owned();
+        let mut job = CaptureArtifactJob::try_begin(
+            epoch,
+            crate::observation::CaptureEvent::ResponseAllowed,
+            metadata,
+            16,
+        )
+        .unwrap()
+        .expect("capture admission");
+        let encoded = operation_body(&job, b"AAsecretBB");
+        job.complete_websocket_message(encoded, false, PayloadClass::Text)
+            .unwrap();
+
+        let worker = CaptureArtifactWorker::start(1).unwrap();
+        worker.try_submit(job).unwrap();
+        worker.shutdown().await;
+
+        let record = read_only_capture_record(directory.path());
+        assert_eq!(record.decode_body_bytes().unwrap(), b"AARED");
+        assert_eq!(record.body.as_ref().unwrap().length, 12);
+        assert_eq!(record.body_truncated, Some(true));
+        assert!(!fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| fs::read(entry.path()).ok())
+            .any(|bytes| bytes
+                .windows(b"secret".len())
+                .any(|window| window == b"secret")));
+    }
+
+    #[tokio::test]
     async fn artifact_worker_emits_metadata_only_for_complete_empty_websocket_message() {
         let directory = tempfile::tempdir().unwrap();
         let (epoch, _owner) = capture_engine_epoch(directory.path(), 1024, true);
