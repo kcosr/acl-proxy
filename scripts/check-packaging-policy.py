@@ -21,8 +21,16 @@ ALLOWED_LICENSES = {
     "Unicode-3.0",
 }
 REGISTRY = "https://github.com/rust-lang/crates.io-index"
-RUNTIME_COMMIT = "248104b0615da8e73b857fc497afb2b0d1d7520f"
+RUNTIME_COMMIT = "8e5360a9f00587f9a06d9678ec05884c6399521e"
 PRODUCT_INITIAL_COMMIT = "a829f43552c7118d1f206b9e4112b3c747eecd50"
+TRANSPORT_PACKAGES = {
+    "h2": ("0.4.15", True),
+    "http": ("1.4.2", True),
+    "http-body": ("1.0.1", True),
+    "http-body-util": ("0.1.3", True),
+    "hyper": ("1.10.1", False),
+    "hyper-util": ("0.1.20", True),
+}
 BSL_TEXT = """Boost Software License - Version 1.0 - August 17th, 2003
 
 Permission is hereby granted, free of charge, to any person or organization
@@ -157,6 +165,92 @@ def check_manifest(root: Path) -> None:
         fail("Cargo.toml lacks [dependencies]")
     if dependencies.get("compu-brotli-sys") != "=1.2.0":
         fail("compu-brotli-sys must remain a direct exact =1.2.0 dependency")
+    if dependencies.get("http") != "=1.4.2":
+        fail("http must remain an exact production =1.4.2 dependency")
+    dev_dependencies = manifest.get("dev-dependencies")
+    if not isinstance(dev_dependencies, dict) or dev_dependencies.get("h2") != "=0.4.15":
+        fail("h2 must remain an exact development-only =0.4.15 dependency")
+
+    expected_patch = {"crates-io": {"hyper": {"path": "../access-runtime/third_party/hyper"}}}
+    if manifest.get("patch") != expected_patch:
+        fail("Cargo.toml must contain only the exact product-root Hyper source redirect")
+    if "replace" in manifest:
+        fail("Cargo.toml must not contain [replace] source overrides")
+
+    dependency_tables: list[tuple[str, dict[str, Any]]] = []
+    for table_name in ("dependencies", "dev-dependencies", "build-dependencies"):
+        table = manifest.get(table_name)
+        if isinstance(table, dict):
+            dependency_tables.append((table_name, table))
+    targets = manifest.get("target")
+    if isinstance(targets, dict):
+        for target_name, target in targets.items():
+            if not isinstance(target, dict):
+                continue
+            for table_name in ("dependencies", "dev-dependencies", "build-dependencies"):
+                table = target.get(table_name)
+                if isinstance(table, dict):
+                    dependency_tables.append((f"target.{target_name}.{table_name}", table))
+    for table_name, table in dependency_tables:
+        for name, specification in table.items():
+            package = specification.get("package") if isinstance(specification, dict) else None
+            resolved_name = package or name
+            if resolved_name in {"http-body", "http-body-util", "hyper", "hyper-util"}:
+                fail(
+                    "acl-proxy must not directly depend on private transport package "
+                    f"{resolved_name} ({table_name}.{name})"
+                )
+            if resolved_name == "http" and (table_name != "dependencies" or name != "http"):
+                fail("http must remain the canonical root production dependency")
+            if (name == "h2" or package == "h2") and (
+                table_name != "dev-dependencies" or name != "h2" or package is not None
+            ):
+                fail("h2 must remain the canonical root development-only dependency")
+
+
+def check_transport_resolution(root: Path, metadata: dict[str, Any]) -> None:
+    packages = metadata.get("packages")
+    if not isinstance(packages, list):
+        fail("locked metadata lacks package records")
+    for name, (version, registry) in TRANSPORT_PACKAGES.items():
+        matches = [package for package in packages if package.get("name") == name]
+        if len(matches) != 1:
+            fail(f"locked graph must resolve exactly one {name} package")
+        package = matches[0]
+        if package.get("version") != version:
+            fail(f"locked graph resolves forbidden {name} version {package.get('version')!r}")
+        source = package.get("source")
+        if registry:
+            if source != f"registry+{REGISTRY}":
+                fail(f"locked {name} {version} must resolve from crates.io")
+        elif source is not None:
+            fail("locked Hyper 1.10.1 must be source-less and resolve from the runtime fork")
+
+    product = [package for package in packages if package.get("name") == "acl-proxy"]
+    if len(product) != 1 or not isinstance(product[0].get("manifest_path"), str):
+        fail("locked metadata lacks one canonical acl-proxy manifest path")
+    hyper = next(package for package in packages if package.get("name") == "hyper")
+    manifest_path = hyper.get("manifest_path")
+    if not isinstance(manifest_path, str):
+        fail("locked Hyper 1.10.1 lacks its resolved manifest path")
+    product_root = Path(product[0]["manifest_path"]).parent
+    expected = (product_root.parent / "access-runtime" / "third_party" / "hyper" / "Cargo.toml").resolve()
+    if Path(manifest_path).resolve() != expected:
+        fail("locked Hyper 1.10.1 does not resolve to the canonical sibling runtime fork")
+
+    lock = load_toml(root / "Cargo.lock")
+    lock_packages = lock.get("package")
+    if not isinstance(lock_packages, list):
+        fail("Cargo.lock lacks package records")
+    for name, (version, registry) in TRANSPORT_PACKAGES.items():
+        matches = [package for package in lock_packages if package.get("name") == name]
+        if len(matches) != 1 or matches[0].get("version") != version:
+            fail(f"Cargo.lock must contain exactly one {name} {version} package")
+        source = matches[0].get("source")
+        if registry and source != f"registry+{REGISTRY}":
+            fail(f"Cargo.lock {name} {version} must resolve from crates.io")
+        if not registry and source is not None:
+            fail("Cargo.lock Hyper 1.10.1 must be source-less")
 
 
 def check_deny_policy(root: Path) -> None:
@@ -302,6 +396,8 @@ def check_provenance(root: Path) -> None:
     ):
         if marker not in provenance:
             fail(f"PROVENANCE.md lacks required marker: {marker}")
+    if provenance.count(RUNTIME_COMMIT) != 1:
+        fail("PROVENANCE.md must name the exact P13 runtime commit once")
 
 
 def check_shipped_docs(root: Path) -> None:
@@ -349,6 +445,7 @@ def main() -> int:
         check_manifest(root)
         check_deny_policy(root)
         metadata = load_metadata(root, args.metadata)
+        check_transport_resolution(root, metadata)
         check_notices(root, metadata)
         check_provenance(root)
         check_shipped_docs(root)

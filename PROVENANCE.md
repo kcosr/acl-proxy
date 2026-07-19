@@ -18,28 +18,34 @@ The product source was developed in this repository. It is not a vendored copy
 of the shared runtime and does not carry a parallel forwarding, listener, MITM,
 or WebSocket implementation.
 
-## Shared Access Runtime Extraction
+## Shared Access Runtime P13 Transport Cutover
 
 - Source repository: this `acl-proxy` repository
 - Destination repository: `access-runtime`
-- Accepted P12 source commit:
-  `248104b0615da8e73b857fc497afb2b0d1d7520f`
+- Accepted P13 C02 source commit:
+  `8e5360a9f00587f9a06d9678ec05884c6399521e`
 - Dependency version: `0.1.0`
 - License: MIT
 - Material changes: product-specific inputs were replaced by versionless,
   transport-neutral contracts; shared forwarding, listener, interception,
   upgrade, credential, URL, ACL, and redaction owners were deleted from the
-  product as each extracted owner was adopted.
+  product as each extracted owner was adopted. P13 modernized the runtime's
+  private HTTP transport family and retained the reviewed Hyper fork in the
+  runtime repository.
 
 The authoritative path-by-path moved-source record, including each immutable
 `acl-proxy` source commit and material modification, is
 `access-runtime/PROVENANCE.md` at the accepted commit above. This repository
 consumes the shared crates through exact-version canonical sibling path
-dependencies and does not vendor their source.
+dependencies and does not vendor their source. Its root Cargo workspace applies
+the required relative Hyper source redirect to the runtime-owned fork so all
+transitive consumers resolve the same implementation and type family.
 
 ## Third-Party Source
 
-`acl-proxy` does not vendor a third-party source tree. Cargo resolves the exact
+`acl-proxy` does not vendor a third-party source tree. The reviewed Hyper 1.10.1
+fork is owned and documented by `access-runtime`; this product only redirects
+Cargo resolution to that sibling source. Cargo resolves all other exact
 registry packages and checksums in `Cargo.lock`. In particular,
 the `compu-brotli-sys` 1.2.0 Rust wrapper/package is distributed under
 BSL-1.0, while the bundled Google Brotli C implementation it compiles is MIT.

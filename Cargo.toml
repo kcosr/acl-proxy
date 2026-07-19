@@ -42,7 +42,7 @@ rand = "0.8"
 tokio = { version = "1.39", features = ["macros", "rt-multi-thread", "sync", "time", "net", "io-util", "signal", "process"] }
 httparse = "1.10.1"
 chrono = { version = "0.4", features = ["serde", "clock"] }
-http = "0.2"
+http = "=1.4.2"
 rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "=0.8.3"
 rustls-pki-types = "=1.15.0"
@@ -69,7 +69,7 @@ socket2 = { version = "0.6", features = ["all"] }
 assert_cmd = "2.0"
 predicates = "3.1"
 tempfile = "3.10"
-h2 = "0.3"
+h2 = "=0.4.15"
 p256 = { version = "=0.13.2", default-features = false, features = ["ecdsa", "pem", "pkcs8", "std"] }
 x509-cert = { version = "=0.2.5", default-features = false, features = ["builder", "pem"] }
 http-access-runtime = { path = "../access-runtime/crates/http-access-runtime", version = "=0.1.0", features = ["dev-harness"] }
@@ -77,3 +77,6 @@ http-access-conformance = { path = "../access-runtime/crates/http-access-conform
 
 [profile.release]
 opt-level = 3
+
+[patch.crates-io]
+hyper = { path = "../access-runtime/third_party/hyper" }
