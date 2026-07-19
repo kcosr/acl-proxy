@@ -456,7 +456,7 @@ def check_shipped_docs(root: Path) -> None:
         fail("sample configuration names obsolete generated CA storage files")
     packaging_gate = read_text(root / "scripts/check-packaging-policy.sh")
     advisory_command = "cargo deny --locked check advisories licenses sources"
-    if packaging_gate.count(advisory_command) != 1:
+    if packaging_gate.splitlines().count(advisory_command) != 1:
         fail("packaging gate must run the exact advisory, license, and source scan")
 
 
