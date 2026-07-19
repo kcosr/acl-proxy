@@ -192,6 +192,10 @@ impl ForwardingTerminal for ProductForwardingTerminal {
         lock_observation(&self.observation)
             .capture
             .record_forwarding_terminal_completion();
+        #[cfg(test)]
+        lock_observation(&self.observation)
+            .capture
+            .record_forwarding_terminal_outcome(outcome);
         if matches!(outcome, ForwardingTerminalOutcome::Completed) {
             let mut observation = lock_observation(&self.observation);
             observation.finish_request();
@@ -211,6 +215,10 @@ impl ForwardingTerminal for ProductForwardingTerminal {
         lock_observation(&self.observation)
             .capture
             .record_forwarding_terminal_completion();
+        #[cfg(test)]
+        lock_observation(&self.observation)
+            .capture
+            .record_forwarding_terminal_abandonment();
         abandon_observation(&self.observation);
         self.cancellation.take();
     }

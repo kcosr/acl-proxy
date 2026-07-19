@@ -49,6 +49,14 @@ pub(crate) struct ProductObservationRuntime {
     capture_worker: CaptureArtifactWorker,
     #[cfg(test)]
     forwarding_terminal_completions: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    forwarding_terminal_completed: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    forwarding_terminal_failed: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    forwarding_terminal_cancelled: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    forwarding_terminal_abandoned: std::sync::atomic::AtomicUsize,
     #[cfg(not(test))]
     info_decisions: ObservationQueue,
     #[cfg(not(test))]
@@ -68,6 +76,14 @@ impl ProductObservationRuntime {
             capture_worker: CaptureArtifactWorker::start(max_pending_records)?,
             #[cfg(test)]
             forwarding_terminal_completions: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            forwarding_terminal_completed: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            forwarding_terminal_failed: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            forwarding_terminal_cancelled: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            forwarding_terminal_abandoned: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(not(test))]
             info_decisions,
             #[cfg(not(test))]
@@ -152,6 +168,59 @@ impl ProductObservationRuntime {
         self.forwarding_terminal_completions
             .load(std::sync::atomic::Ordering::Acquire)
     }
+
+    #[cfg(test)]
+    pub(crate) fn record_forwarding_terminal_outcome(
+        &self,
+        outcome: http_access_runtime::ForwardingTerminalOutcome,
+    ) {
+        let counter = match outcome {
+            http_access_runtime::ForwardingTerminalOutcome::Completed => {
+                &self.forwarding_terminal_completed
+            }
+            http_access_runtime::ForwardingTerminalOutcome::Failed => {
+                &self.forwarding_terminal_failed
+            }
+            http_access_runtime::ForwardingTerminalOutcome::Cancelled => {
+                &self.forwarding_terminal_cancelled
+            }
+            _ => panic!("unrecognized forwarding terminal outcome"),
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn record_forwarding_terminal_abandonment(&self) {
+        self.forwarding_terminal_abandoned
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forwarding_terminal_outcomes(&self) -> ForwardingTerminalCounts {
+        ForwardingTerminalCounts {
+            completed: self
+                .forwarding_terminal_completed
+                .load(std::sync::atomic::Ordering::Acquire),
+            failed: self
+                .forwarding_terminal_failed
+                .load(std::sync::atomic::Ordering::Acquire),
+            cancelled: self
+                .forwarding_terminal_cancelled
+                .load(std::sync::atomic::Ordering::Acquire),
+            abandoned: self
+                .forwarding_terminal_abandoned
+                .load(std::sync::atomic::Ordering::Acquire),
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ForwardingTerminalCounts {
+    pub(crate) completed: usize,
+    pub(crate) failed: usize,
+    pub(crate) cancelled: usize,
+    pub(crate) abandoned: usize,
 }
 
 /// One owned best-effort decision event. Moving this value through dispatch

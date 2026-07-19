@@ -138,6 +138,13 @@ impl ProductRuntime {
         self.observation_runtime.forwarding_terminal_completions()
     }
 
+    #[cfg(test)]
+    pub(crate) fn forwarding_terminal_outcomes_for_test(
+        &self,
+    ) -> crate::observation::ForwardingTerminalCounts {
+        self.observation_runtime.forwarding_terminal_outcomes()
+    }
+
     /// Transfers the complete prepared socket bundle into shared activation.
     pub(super) fn take_prepared_proxy_listeners_for_start(
         &self,
@@ -1641,6 +1648,10 @@ private_key = "missing-server-key.pem"
 
     mod response_parity_tests {
         include!("runner_response_parity_tests.rs");
+    }
+
+    mod transport_stress_tests {
+        include!("runner_transport_stress_tests.rs");
     }
 
     mod listener_lifecycle_tests {

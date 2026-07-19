@@ -15,6 +15,7 @@ ownership_gates=(
     scripts/check-shared-redaction-ownership.sh
     scripts/check-shared-credential-ownership.sh
     scripts/check-production-websocket-smoke.sh
+    scripts/check-p13-transport-oracles.py
 )
 mutation_suites=(
     scripts/tests/check-packaging-policy-test.sh
@@ -25,6 +26,7 @@ mutation_suites=(
     scripts/tests/check-shared-redaction-ownership-test.sh
     scripts/tests/check-shared-credential-ownership-test.sh
     scripts/tests/check-production-websocket-smoke-test.sh
+    scripts/tests/check-p13-transport-oracles-test.py
 )
 
 for gate in "${ownership_gates[@]}"; do

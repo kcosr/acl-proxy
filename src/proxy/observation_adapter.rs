@@ -57,6 +57,19 @@ impl HttpCaptureContext {
         self.runtime.record_forwarding_terminal_completion();
     }
 
+    #[cfg(test)]
+    pub(super) fn record_forwarding_terminal_outcome(
+        &self,
+        outcome: http_access_runtime::ForwardingTerminalOutcome,
+    ) {
+        self.runtime.record_forwarding_terminal_outcome(outcome);
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_forwarding_terminal_abandonment(&self) {
+        self.runtime.record_forwarding_terminal_abandonment();
+    }
+
     pub(crate) fn from_checked_standalone(
         runtime: Arc<ProductObservationRuntime>,
         epoch: Arc<CaptureEpoch>,
