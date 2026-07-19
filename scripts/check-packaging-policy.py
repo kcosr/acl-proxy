@@ -455,7 +455,9 @@ def check_shipped_docs(root: Path) -> None:
     if "ca-cert.pem" in sample or "ca-key.pem" in sample:
         fail("sample configuration names obsolete generated CA storage files")
     packaging_gate = read_text(root / "scripts/check-packaging-policy.sh")
-    advisory_command = "cargo deny --locked check advisories licenses sources"
+    advisory_command = (
+        "cargo deny --locked --offline check -D warnings advisories licenses sources"
+    )
     if packaging_gate.splitlines().count(advisory_command) != 1:
         fail("packaging gate must run the exact advisory, license, and source scan")
 

@@ -144,7 +144,9 @@ expect_rejected provenance-brotli-license 'Google Brotli C implementation it com
 expect_rejected provenance-zstd-license 'Zstandard source under BSD-3-Clause' 'Zstandard source has the wrong license' PROVENANCE.md
 expect_rejected archive-notices 'README, `LICENSE`, `THIRD_PARTY_NOTICES`' 'README, `LICENSE`, `REMOVED_NOTICES`' README.md
 expect_rejected advisory-gate 'advisories licenses sources' 'licenses sources' scripts/check-packaging-policy.sh
-expect_rejected advisory-gate-comment 'cargo deny --locked check advisories licenses sources' '# cargo deny --locked check advisories licenses sources' scripts/check-packaging-policy.sh
+expect_rejected advisory-gate-online '--offline ' '' scripts/check-packaging-policy.sh
+expect_rejected advisory-gate-warnings ' -D warnings' '' scripts/check-packaging-policy.sh
+expect_rejected advisory-gate-comment 'cargo deny --locked --offline check -D warnings advisories licenses sources' '# cargo deny --locked --offline check -D warnings advisories licenses sources' scripts/check-packaging-policy.sh
 expect_rejected archive-root 'acl-proxy-0.2.0-extraction-checkpoint-<acl12>/' 'acl-proxy-extraction-checkpoint/' README.md
 expect_rejected archive-hardcoded-sha 'acl-proxy-0.2.0-extraction-checkpoint-<acl12>/' 'acl-proxy-0.2.0-extraction-checkpoint-0123456789ab/' README.md
 expect_rejected archive-bin '  bin/acl-proxy-extract-capture-body' '  acl-proxy-extract-capture-body' README.md
