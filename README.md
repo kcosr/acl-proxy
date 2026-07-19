@@ -463,6 +463,14 @@ secrets. It never reads production files or broker configuration.
 
 ## Development
 
+On a fresh machine, provision the RustSec advisory database and check the
+crates.io index for yanked packages once before running the offline ownership
+gate:
+
+```bash
+cargo audit --deny warnings
+```
+
 ```bash
 cargo fmt --check
 cargo test --locked
