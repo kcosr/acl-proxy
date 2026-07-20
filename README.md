@@ -268,14 +268,14 @@ upgrade.
 ### Authorization Providers
 
 Process providers exchange bounded newline-delimited JSON and are owned by the
-active generation. Ambient environment inheritance is off by default.
-
-Process response framing is intentionally stricter than general JSON member
-ordering: `id` must be the first member. Bounded spaces or horizontal tabs are
-accepted only before the opening `{` and between `{`, `"id"`, the colon, and
-the opening value quote. Standard serializers work when they preserve `id` as
-the first inserted member; arbitrary member order and whitespace elsewhere do
-not.
+active generation. Ambient environment inheritance is off by default. A
+relative `command` resolves from the configuration directory, the child uses
+that directory as its working directory, and relative arguments therefore
+resolve there as well. The child environment is cleared and rebuilt from
+`pass_environment` and literal `environment` entries unless
+`inherit_environment = true` is explicitly selected; inheritance emits a
+startup warning. Every passed name must exist, and a name cannot also be a
+literal entry.
 
 ```toml
 [authorization.providers.repo_acl]
@@ -285,13 +285,22 @@ args = ["providers/repo_acl.py", "--config", "providers/repo_acl.json"]
 timeout = "1s"
 on_failure = "deny"
 inherit_environment = false
+pass_environment = []
 environment = { PATH = "/usr/bin:/bin" }
 include_headers = ["x-workload-id"]
-include_request_body = false
-allow_request_body_replacement = false
+include_request_body = true
+allow_request_body_replacement = true
+max_request_body_bytes = 10485760
+max_decoded_request_body_bytes = 52428800
+max_stdout_line_bytes = 1048576
 max_pending_requests = 128
 restart_backoff = "1s"
 retire_timeout = "30s"
+
+[authorization.providers.repo_acl.outputs.access_token]
+kind = "bearer"
+transport_security = "tls_required"
+required = true
 
 [[policy.rules]]
 id = "delegate-repositories"
@@ -299,6 +308,70 @@ decision = "delegate"
 urls = ["https://git.example.test/**"]
 authorization_provider = "repo_acl"
 ```
+
+Each stdin request is one compact JSON object followed by LF. The fixed fields
+are `id`, `requestId`, `type`, `url`, `method`, and `clientIp`; `headers` and
+`body` are present only when selected by the provider configuration. Header
+names are lowercase and each array preserves duplicate field order. An
+included body contains decoded bytes, never content-coded bytes:
+
+```json
+{"id":"<dispatch-id>","requestId":"<request-id>","type":"request","url":"https://git.example.test/project","method":"POST","clientIp":"192.0.2.10","headers":{"x-workload-id":["runner-1"]},"body":{"encoding":"base64","contentType":"application/json","contentEncoding":"identity","data":"e30="}}
+```
+
+`requestId` is the stable request identifier. `id` is a fixed-width correlation
+identifier for one dispatch in one child epoch, and the provider must echo it.
+Responses are one JSON object followed by LF or CRLF. The response `id` must be
+the first member so the bounded reader can assign the response before admitting
+the remaining bytes. Before and within that prefix, only bounded ASCII space or
+horizontal tab is accepted between the `{`, `"id"`, colon, and opening value
+quote. After the closing ID quote, ordinary single-line JSON whitespace is
+accepted. `type` and `decision` may appear in either order; both must precede an
+optional `values` object, and an optional `requestBody` must be last. This means
+ordinary serializers work when `id` is inserted first.
+
+An allow response may return values only for names declared under the
+provider's `outputs` table. Every output has a fixed credential kind,
+destination, required flag, and `transport_security`; the response cannot
+choose those properties dynamically:
+
+```json
+{"id":"<dispatch-id>","type":"response","decision":"allow","values":{"access_token":"fixture-value"}}
+```
+
+When body replacement is enabled, `requestBody` uses base64 data with optional
+validated content metadata. `contentEncoding`, when present, must be
+`identity`:
+
+```json
+{"id":"<dispatch-id>","decision":"allow","type":"response","values":{"access_token":"fixture-value"},"requestBody":{"encoding":"base64","contentType":"application/json","contentEncoding":"identity","data":"e30="}}
+```
+
+`deny` and `pass` forbid `values` and `requestBody`. Unknown or duplicate
+non-ID members, undeclared values, missing required values, invalid material,
+and unapproved body replacement fail closed. A syntactically complete response
+with a live assigned ID fails only that request when its shape is invalid. A
+repeated, unusable, or unsolicited ID, malformed framing, invalid UTF-8, or a
+line over the configured bound makes the child epoch fatal and fails every
+unanswered request without replay.
+
+Candidate activation eagerly starts one child per process provider, and every
+successful reload starts a fresh child even when its configuration is
+unchanged. A child observed exited by the publication liveness check rejects
+the candidate. After a clean active-generation exit, complete responses
+already written to stdout are given up to the one-second cleanup grace to
+drain; unanswered requests then fail, without replay. While the generation
+remains active, a replacement is attempted after `restart_backoff`, and a
+failed spawn schedules another attempt after the same backoff.
+Retiring generations keep their own child only while admitted work may finish,
+bounded by `retire_timeout`.
+
+On Unix, each provider is placed in its own process group. Controlled cleanup
+sends `SIGTERM` to the group, retains the unreaped leader for a one-second grace
+period when needed, then sends `SIGKILL`. If the leader is already observed
+exited, remaining group members receive `SIGKILL` immediately. These guarantees
+cover members that remain in the owned process group; a child that deliberately
+detaches into another process group is outside that authority.
 
 Webhook providers require a control listener and a canonical public callback
 URL. Control routes are never exposed by a data listener.
@@ -413,6 +486,15 @@ expressions = ["token-[A-Za-z0-9_.-]{20,}"]
 payloads = "text"
 ```
 
+Complete HTTP bodies are classified as text only when they are valid UTF-8;
+otherwise they are binary. Text-only literals and every expression are skipped
+for a binary body, while literals configured with `payloads = "both"` still
+apply. If a selected wire-redaction profile contains any protection that
+requires text classification, a binary body fails closed instead of being
+forwarded with that protection skipped. Best-effort capture under such a
+profile keeps the metadata but omits the body with
+`bodyOmission.reason = "text_protections_skipped"`.
+
 Every listed environment variable is required during activation and reload.
 Its name and value are excluded from dumps, logs, captures, and diagnostics.
 
@@ -489,14 +571,23 @@ acl-proxy config validate --config /etc/acl-proxy/acl-proxy.toml
 acl-proxy policy dump --format table --config /etc/acl-proxy/acl-proxy.toml
 ```
 
-`SIGHUP` compiles and activates a complete reloadable generation. A failed
-reload leaves the current generation published. Static listener, control,
-filesystem ownership, and process-wide resource changes are rejected as static
-changes. `SIGINT` and `SIGTERM` initiate joined graceful shutdown.
+`SIGHUP` compiles and activates a complete reloadable generation. Invalid TOML,
+an invalid schema, activation failure, or a rejected static change leaves the
+current generation published and readiness unchanged; a later corrected reload
+can publish normally. Static listener, control, filesystem ownership, and
+process-wide resource changes are rejected as static changes.
 
-Readiness is HTTP 200 only after static resources, proxy supervisors, and the
-initial generation are all active. It changes to HTTP 503 while not ready and
-uses `Cache-Control: no-store`.
+`SIGINT` and `SIGTERM` initiate joined graceful shutdown and continue to be
+polled while admitted work drains within `service.shutdown_drain_timeout`.
+`SIGHUP` is ignored after shutdown begins. A second `SIGINT` or `SIGTERM`
+abandons the graceful wait and forces prompt process termination.
+
+Configured sockets are reserved during static preparation, but proxy listeners
+cannot start admitting data-plane work until the initial generation has
+published. Readiness is HTTP 200 only after static resources, proxy
+supervisors, and that initial generation are all active. It changes to HTTP 503
+before initial publication and during shutdown, and uses
+`Cache-Control: no-store`.
 
 ## Smoke Tests
 
