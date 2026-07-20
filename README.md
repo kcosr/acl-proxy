@@ -429,6 +429,12 @@ max_files = 10000
 max_total_bytes = 1073741824
 ```
 
+Selected `response.allowed` capture also records sanitized listener-generated
+forwarding failures. The 500, 502, 503, or 504 status and pre-redaction fixed
+body come from the listener's authoritative mapping; persisted headers and body
+remain subject to the configured capture redaction and omission policy.
+Incomplete request or upstream response captures remain abandoned.
+
 All HTTP ingress paths, including requests decrypted inside CONNECT MITM,
 serialize capture `mode` as `http_proxy`.
 

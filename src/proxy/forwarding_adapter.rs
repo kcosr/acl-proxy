@@ -3,10 +3,10 @@ use std::sync::{Arc, Mutex};
 use http::header::CONTENT_ENCODING;
 use http::{HeaderMap, HeaderValue, StatusCode, Version};
 use http_access_runtime::{
-    BoxFuture, ForwardingAdmission, ForwardingObservation, ForwardingRequestHead,
-    ForwardingResources, ForwardingResponseHead, ForwardingRetention, ForwardingTerminal,
-    ForwardingTerminalOutcome, ForwardingTerminalOwner, RuntimeError, StandaloneForwarding,
-    UpgradeCaptureFactory,
+    BoxFuture, ForwardingAdmission, ForwardingLocalResponse, ForwardingObservation,
+    ForwardingRequestHead, ForwardingResources, ForwardingResponseHead, ForwardingRetention,
+    ForwardingTerminal, ForwardingTerminalOutcome, ForwardingTerminalOwner, RuntimeError,
+    StandaloneForwarding, UpgradeCaptureFactory,
 };
 use http_access_types::HeaderField;
 
@@ -141,6 +141,16 @@ impl ForwardingObservation for ProductForwardingObservation {
 
     fn request_complete(&mut self) -> Result<(), RuntimeError> {
         lock_observation(&self.state).finish_request();
+        Ok(())
+    }
+
+    fn local_response(&mut self, response: &ForwardingLocalResponse) -> Result<(), RuntimeError> {
+        let status =
+            StatusCode::from_u16(response.status()).map_err(|_| RuntimeError::InvalidInput)?;
+        let state = lock_observation(&self.state);
+        state
+            .capture
+            .submit_local_response(CaptureDecision::Allow, status, response.body());
         Ok(())
     }
 

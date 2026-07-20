@@ -56,6 +56,8 @@
 - Made capture publication collision-safe and retention-atomic across threads,
   path aliases, and overlapping proxy processes; abandoned temp files no longer
   consume retention limits.
+- Restored `response.allowed` capture records for sanitized listener-generated
+  forwarding failures while abandoning incomplete request and upstream taps.
 
 ## [0.2.0] - 2026-06-25
 

@@ -419,6 +419,96 @@ urls = ["http://{unavailable_origin}/failure"]
     product.shutdown().await;
 }
 
+#[tokio::test]
+async fn closed_origin_captures_exact_local_502_and_abandons_incomplete_request() {
+    let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+    let (proxy, listener) = response_prebound_listener();
+    let closed = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let unavailable_origin = closed.local_addr().unwrap();
+    drop(closed);
+    let policy = format!(
+        r#"[redaction.profiles.failure_capture]
+replacement = "[MASKED]"
+rules = [{{ literals = ["unused-test-literal"], payloads = "both" }}]
+
+[observation.capture]
+events = ["request.allowed", "response.allowed"]
+redaction_profile = "failure_capture"
+directory = "captures"
+max_body_bytes = 1048576
+max_inflight_body_bytes = 134217728
+max_pending_records = 8
+max_files = 8
+max_total_bytes = 1048576
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "allow-unavailable-origin"
+decision = "allow"
+urls = ["http://{unavailable_origin}/failure"]
+methods = ["POST"]
+"#,
+    );
+    let config = response_base_config(proxy, &policy);
+    let (directory, product) = start_response_product(
+        &config,
+        listener,
+        [(format!("http://{unavailable_origin}/"), unavailable_origin)],
+    )
+    .await;
+    let request = format!(
+        "POST http://{unavailable_origin}/failure HTTP/1.1\r\nHost: {unavailable_origin}\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n7\r\npartial\r\n"
+    );
+
+    let response = response_send_raw(proxy, request.as_bytes()).await;
+    assert!(response.starts_with(b"HTTP/1.1 502"));
+    assert_eq!(response_decoded_body(&response), b"upstream failed\n");
+
+    product.shutdown().await;
+    let mut records = Vec::new();
+    for entry in fs::read_dir(directory.path().join("captures")).unwrap() {
+        let path = entry.unwrap().path();
+        if !path.is_file() {
+            continue;
+        }
+        let contents = fs::read_to_string(path).unwrap();
+        records.extend(
+            contents
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_str::<crate::capture::CaptureRecord>(line).unwrap()),
+        );
+    }
+    let request = records
+        .iter()
+        .find(|record| record.kind == crate::capture::CaptureKind::Request)
+        .expect("missing abandoned request metadata");
+    assert!(request.body.is_none());
+    assert!(request.body_truncated.is_none());
+    let captured = records
+        .iter()
+        .find(|record| record.kind == crate::capture::CaptureKind::Response)
+        .expect("missing local failure response capture");
+    assert_eq!(captured.kind, crate::capture::CaptureKind::Response);
+    assert_eq!(captured.decision, crate::capture::CaptureDecision::Allow);
+    assert_eq!(captured.status_code, Some(502));
+    assert_eq!(captured.status_message.as_deref(), Some("Bad Gateway"));
+    assert_eq!(captured.decode_body_bytes().unwrap(), b"upstream failed\n");
+    let headers = captured.headers.as_ref().unwrap();
+    assert_eq!(
+        headers.get("content-type"),
+        Some(&serde_json::Value::String(
+            "text/plain; charset=utf-8".to_owned()
+        ))
+    );
+    assert_eq!(
+        headers.get("content-length"),
+        Some(&serde_json::Value::String("16".to_owned()))
+    );
+}
+
 async fn assert_empty_chunked_request_body(stream: &mut (impl AsyncRead + Unpin)) {
     let mut body = [0_u8; 5];
     tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut body))
