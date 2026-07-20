@@ -299,15 +299,15 @@ pub struct CaptureRecord {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "reason", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CaptureBodyOmission {
-    Empty,
-    Incomplete,
-    LimitExceeded,
-    ResourceExhausted,
-    DecodingFailed,
-    RedactionFailed,
-    TextProtectionsSkipped,
-    ArtifactEncodingFailed,
-    HeadPreparationFailed,
+    Empty {},
+    Incomplete {},
+    LimitExceeded {},
+    ResourceExhausted {},
+    DecodingFailed {},
+    RedactionFailed {},
+    TextProtectionsSkipped {},
+    ArtifactEncodingFailed {},
+    HeadPreparationFailed {},
     ProviderReplacement { size: usize },
 }
 
@@ -585,26 +585,26 @@ impl CaptureArtifactProcessError {
                 | CaptureHttpDecodeError::DecodedLimitExceeded
                 | CaptureHttpDecodeError::ExpansionRatioExceeded
                 | CaptureHttpDecodeError::DecoderWindowExceeded,
-            ) => CaptureBodyOmission::LimitExceeded,
+            ) => CaptureBodyOmission::LimitExceeded {},
             Self::HttpDecode(CaptureHttpDecodeError::ResourceExhausted) => {
-                CaptureBodyOmission::ResourceExhausted
+                CaptureBodyOmission::ResourceExhausted {}
             }
             Self::HttpDecode(_) | Self::UnsupportedWebSocketCompression => {
-                CaptureBodyOmission::DecodingFailed
+                CaptureBodyOmission::DecodingFailed {}
             }
             Self::Redaction(
                 RedactionError::PayloadTooLarge { .. } | RedactionError::OutputTooLarge,
-            ) => CaptureBodyOmission::LimitExceeded,
+            ) => CaptureBodyOmission::LimitExceeded {},
             Self::Redaction(
                 RedactionError::Buffer(_) | RedactionError::ScratchAllocationFailed,
-            ) => CaptureBodyOmission::ResourceExhausted,
-            Self::Redaction(RedactionError::InvalidText) => CaptureBodyOmission::RedactionFailed,
+            ) => CaptureBodyOmission::ResourceExhausted {},
+            Self::Redaction(RedactionError::InvalidText) => CaptureBodyOmission::RedactionFailed {},
             Self::Artifact(CaptureArtifactBodyError::Allocation(_)) => {
-                CaptureBodyOmission::ResourceExhausted
+                CaptureBodyOmission::ResourceExhausted {}
             }
             Self::Artifact(
                 CaptureArtifactBodyError::LengthOverflow | CaptureArtifactBodyError::Encode(_),
-            ) => CaptureBodyOmission::ArtifactEncodingFailed,
+            ) => CaptureBodyOmission::ArtifactEncodingFailed {},
         }
     }
 }
@@ -637,7 +637,7 @@ impl CaptureArtifactJob {
             operation,
             epoch,
             metadata: SanitizedCaptureMetadata::from_test_record(metadata),
-            payload: CaptureArtifactPayload::Omitted(CaptureBodyOmission::Incomplete),
+            payload: CaptureArtifactPayload::Omitted(CaptureBodyOmission::Incomplete {}),
             max_expansion_ratio,
         }))
     }
@@ -655,7 +655,7 @@ impl CaptureArtifactJob {
             operation,
             epoch,
             metadata,
-            payload: CaptureArtifactPayload::Omitted(CaptureBodyOmission::Incomplete),
+            payload: CaptureArtifactPayload::Omitted(CaptureBodyOmission::Incomplete {}),
             max_expansion_ratio,
         })
     }
@@ -737,7 +737,7 @@ impl CaptureArtifactJob {
     fn process_body(&mut self) -> Result<Option<CaptureArtifactBody>, CaptureArtifactProcessError> {
         let payload = std::mem::replace(
             &mut self.payload,
-            CaptureArtifactPayload::Omitted(CaptureBodyOmission::Incomplete),
+            CaptureArtifactPayload::Omitted(CaptureBodyOmission::Incomplete {}),
         );
         let Some(policy) = self.epoch.capture() else {
             return Ok(None);
@@ -770,12 +770,14 @@ impl CaptureArtifactJob {
                 {
                     self.metadata
                         .record
-                        .omit_body(CaptureBodyOmission::TextProtectionsSkipped);
+                        .omit_body(CaptureBodyOmission::TextProtectionsSkipped {});
                     return Ok(None);
                 }
                 let redacted = redacted.into_body();
                 if redacted.is_empty() {
-                    self.metadata.record.omit_body(CaptureBodyOmission::Empty);
+                    self.metadata
+                        .record
+                        .omit_body(CaptureBodyOmission::Empty {});
                     return Ok(None);
                 }
                 let body = CaptureArtifactBody::encode(
@@ -808,7 +810,7 @@ impl CaptureArtifactJob {
                 if class == PayloadClass::Binary && policy.profile().requires_text_class() {
                     self.metadata
                         .record
-                        .omit_body(CaptureBodyOmission::TextProtectionsSkipped);
+                        .omit_body(CaptureBodyOmission::TextProtectionsSkipped {});
                     return Ok(None);
                 }
                 let redacted =
@@ -817,7 +819,9 @@ impl CaptureArtifactJob {
                         .redact_websocket_message(&self.operation, decoded, class)?;
                 let redacted = redacted.into_body();
                 if redacted.is_empty() {
-                    self.metadata.record.omit_body(CaptureBodyOmission::Empty);
+                    self.metadata
+                        .record
+                        .omit_body(CaptureBodyOmission::Empty {});
                     return Ok(None);
                 }
                 let body = CaptureArtifactBody::encode(
@@ -1929,7 +1933,7 @@ mod tests {
         assert!(record.body_truncated.is_none());
         assert_eq!(
             record.body_omission,
-            Some(CaptureBodyOmission::DecodingFailed)
+            Some(CaptureBodyOmission::DecodingFailed {})
         );
     }
 
@@ -1956,7 +1960,7 @@ mod tests {
         let record = read_only_capture_record(directory.path());
         assert!(record.body.is_none());
         assert!(record.body_truncated.is_none());
-        assert_eq!(record.body_omission, Some(CaptureBodyOmission::Empty));
+        assert_eq!(record.body_omission, Some(CaptureBodyOmission::Empty {}));
     }
 
     #[tokio::test]
@@ -2015,7 +2019,7 @@ mod tests {
         let record = read_only_capture_record(directory.path());
         assert_eq!(
             record.body_omission,
-            Some(CaptureBodyOmission::TextProtectionsSkipped)
+            Some(CaptureBodyOmission::TextProtectionsSkipped {})
         );
         assert!(record.body.is_none());
         let artifact = fs::read_dir(directory.path())
@@ -2124,7 +2128,7 @@ mod tests {
         let record = read_only_capture_record(directory.path());
         assert!(record.body.is_none());
         assert!(record.body_truncated.is_none());
-        assert_eq!(record.body_omission, Some(CaptureBodyOmission::Empty));
+        assert_eq!(record.body_omission, Some(CaptureBodyOmission::Empty {}));
     }
 
     #[tokio::test]
@@ -2487,7 +2491,7 @@ mod tests {
     #[test]
     fn invalid_body_truncated_shapes_are_rejected() {
         let mut empty = sample_record_with_body(None);
-        empty.body_omission = Some(CaptureBodyOmission::Empty);
+        empty.body_omission = Some(CaptureBodyOmission::Empty {});
         let mut value = serde_json::to_value(&empty).unwrap();
         value["bodyTruncated"] = JsonValue::Bool(false);
         assert!(serde_json::from_value::<CaptureRecord>(value).is_err());
@@ -2540,7 +2544,7 @@ mod tests {
     #[test]
     fn invalid_body_outcome_shapes_are_rejected() {
         let mut absent = sample_record_with_body(None);
-        absent.body_omission = Some(CaptureBodyOmission::Empty);
+        absent.body_omission = Some(CaptureBodyOmission::Empty {});
         let base = serde_json::to_value(absent).unwrap();
 
         let mut neither = base.clone();
@@ -2551,6 +2555,10 @@ mod tests {
         both["body"] = serde_json::json!({"encoding":"base64","length":0,"data":""});
         assert!(serde_json::from_value::<CaptureRecord>(both).is_err());
 
+        let mut unexpected = base.clone();
+        unexpected["bodyOmission"] = serde_json::json!({"reason":"empty","size":0});
+        assert!(serde_json::from_value::<CaptureRecord>(unexpected).is_err());
+
         let mut unknown = base;
         unknown["bodyOmission"] = serde_json::json!({"reason":"unknown"});
         assert!(serde_json::from_value::<CaptureRecord>(unknown).is_err());
@@ -2559,15 +2567,15 @@ mod tests {
     #[test]
     fn every_typed_body_omission_round_trips_and_legacy_fields_are_rejected() {
         let reasons = [
-            CaptureBodyOmission::Empty,
-            CaptureBodyOmission::Incomplete,
-            CaptureBodyOmission::LimitExceeded,
-            CaptureBodyOmission::ResourceExhausted,
-            CaptureBodyOmission::DecodingFailed,
-            CaptureBodyOmission::RedactionFailed,
-            CaptureBodyOmission::TextProtectionsSkipped,
-            CaptureBodyOmission::ArtifactEncodingFailed,
-            CaptureBodyOmission::HeadPreparationFailed,
+            CaptureBodyOmission::Empty {},
+            CaptureBodyOmission::Incomplete {},
+            CaptureBodyOmission::LimitExceeded {},
+            CaptureBodyOmission::ResourceExhausted {},
+            CaptureBodyOmission::DecodingFailed {},
+            CaptureBodyOmission::RedactionFailed {},
+            CaptureBodyOmission::TextProtectionsSkipped {},
+            CaptureBodyOmission::ArtifactEncodingFailed {},
+            CaptureBodyOmission::HeadPreparationFailed {},
             CaptureBodyOmission::ProviderReplacement { size: 73 },
         ];
         for reason in reasons {
@@ -2583,7 +2591,7 @@ mod tests {
         }
 
         let mut record = sample_record_with_body(None);
-        record.body_omission = Some(CaptureBodyOmission::Empty);
+        record.body_omission = Some(CaptureBodyOmission::Empty {});
         let mut legacy = serde_json::to_value(record).unwrap();
         legacy["providerReplacementOmitted"] = JsonValue::Bool(true);
         legacy["providerReplacementSize"] = JsonValue::from(1);
@@ -2593,7 +2601,7 @@ mod tests {
     #[test]
     fn trailers_omitted_is_true_only_and_round_trips_with_each_body_outcome() {
         let mut omitted = sample_record_with_body(None);
-        omitted.body_omission = Some(CaptureBodyOmission::Empty);
+        omitted.body_omission = Some(CaptureBodyOmission::Empty {});
         omitted.trailers_omitted = Some(true);
         let value = serde_json::to_value(&omitted).unwrap();
         assert_eq!(value["trailersOmitted"], true);
@@ -2702,7 +2710,7 @@ mod tests {
             headers: None,
             body: None,
             body_truncated: None,
-            body_omission: Some(CaptureBodyOmission::Empty),
+            body_omission: Some(CaptureBodyOmission::Empty {}),
             trailers_omitted: None,
         };
 
@@ -2779,7 +2787,7 @@ mod tests {
             headers: None,
             body: None,
             body_truncated: None,
-            body_omission: Some(CaptureBodyOmission::Empty),
+            body_omission: Some(CaptureBodyOmission::Empty {}),
             trailers_omitted: None,
         };
 

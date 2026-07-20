@@ -8,7 +8,7 @@ use predicates::str::contains;
 use tempfile::{NamedTempFile, TempDir};
 
 fn sample_record(body: Option<CaptureBody>) -> CaptureRecord {
-    let body_omission = body.is_none().then_some(CaptureBodyOmission::Empty);
+    let body_omission = body.is_none().then_some(CaptureBodyOmission::Empty {});
     CaptureRecord {
         timestamp: "2024-01-01T00:00:00Z".to_string(),
         request_id: "req-1".to_string(),

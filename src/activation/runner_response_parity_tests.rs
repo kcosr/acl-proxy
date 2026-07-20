@@ -361,7 +361,7 @@ default = "allow"
     assert!(captured.body_truncated.is_none());
     assert_eq!(
         captured.body_omission,
-        Some(crate::capture::CaptureBodyOmission::ResourceExhausted)
+        Some(crate::capture::CaptureBodyOmission::ResourceExhausted {})
     );
 }
 
@@ -631,7 +631,7 @@ methods = ["POST"]
     assert!(request.body_truncated.is_none());
     assert_eq!(
         request.body_omission,
-        Some(crate::capture::CaptureBodyOmission::Incomplete)
+        Some(crate::capture::CaptureBodyOmission::Incomplete {})
     );
     assert_sanitized_local_failure_capture(
         &records,
@@ -784,7 +784,7 @@ replace = {replacement:?}
     assert!(request_capture.body_truncated.is_none());
     assert_eq!(
         request_capture.body_omission,
-        Some(crate::capture::CaptureBodyOmission::HeadPreparationFailed)
+        Some(crate::capture::CaptureBodyOmission::HeadPreparationFailed {})
     );
     assert_sanitized_local_failure_capture(
         &records,

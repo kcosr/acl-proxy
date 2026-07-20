@@ -36,7 +36,7 @@ fn capture_record(request_id: &str) -> CaptureRecord {
         headers: None,
         body: None,
         body_truncated: None,
-        body_omission: Some(super::CaptureBodyOmission::Empty),
+        body_omission: Some(super::CaptureBodyOmission::Empty {}),
         trailers_omitted: None,
     }
 }

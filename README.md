@@ -198,6 +198,13 @@ trust = "system" # system | custom | system_plus_custom | insecure
 http_versions = ["http1", "http2"]
 ```
 
+Every candidate activation loads and validates one bounded snapshot of the
+native system trust store, then binds that exact typed root set into the shared
+runtime snapshot. This is deliberate even when the candidate's configured
+routes currently use only custom trust, insecure TLS, or cleartext: activation
+fails if the native trust store cannot be loaded, and request paths never
+reload or reinterpret it.
+
 For a parent proxy:
 
 ```toml

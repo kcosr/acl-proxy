@@ -1825,9 +1825,9 @@ async fn websocket_capture_submits_metadata_for_over_limit_and_incomplete_messag
     websocket_records.sort_by(|left, right| left.request_id.cmp(&right.request_id));
     assert_eq!(websocket_records.len(), 3);
     let expected_omissions = [
-        CaptureBodyOmission::LimitExceeded,
-        CaptureBodyOmission::LimitExceeded,
-        CaptureBodyOmission::Incomplete,
+        CaptureBodyOmission::LimitExceeded {},
+        CaptureBodyOmission::LimitExceeded {},
+        CaptureBodyOmission::Incomplete {},
     ];
     for (sequence, (record, expected_omission)) in
         websocket_records.iter().zip(expected_omissions).enumerate()

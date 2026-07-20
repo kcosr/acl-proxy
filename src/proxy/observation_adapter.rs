@@ -302,7 +302,7 @@ impl HttpCaptureContext {
             CaptureEvent::RequestAllowed,
             || {
                 let mut record = self.request_record(CaptureDecision::Allow, None)?;
-                record.omit_body(CaptureBodyOmission::HeadPreparationFailed);
+                record.omit_body(CaptureBodyOmission::HeadPreparationFailed {});
                 Some(record)
             },
             &body_headers,
@@ -522,20 +522,20 @@ struct WebSocketMessageCapture {
 
 impl UpgradeCaptureAttempt for WebSocketMessageCapture {
     fn omit_body(&mut self) {
-        self.omit_body_with(CaptureBodyOmission::Incomplete);
+        self.omit_body_with(CaptureBodyOmission::Incomplete {});
     }
 
     fn try_begin_frame(&mut self, encoded_payload_bytes: usize) -> bool {
         if encoded_payload_bytes > self.max_frame_bytes {
-            self.omit_body_with(CaptureBodyOmission::LimitExceeded);
+            self.omit_body_with(CaptureBodyOmission::LimitExceeded {});
             return false;
         }
         let Some(total) = self.encoded_bytes.checked_add(encoded_payload_bytes) else {
-            self.omit_body_with(CaptureBodyOmission::LimitExceeded);
+            self.omit_body_with(CaptureBodyOmission::LimitExceeded {});
             return false;
         };
         if total > self.max_message_bytes {
-            self.omit_body_with(CaptureBodyOmission::LimitExceeded);
+            self.omit_body_with(CaptureBodyOmission::LimitExceeded {});
             return false;
         }
         self.encoded_bytes = total;
@@ -548,7 +548,7 @@ impl UpgradeCaptureAttempt for WebSocketMessageCapture {
             .as_mut()
             .is_some_and(|body| body.try_extend_from_slice(fragment).is_ok());
         if !appended && self.body.is_some() {
-            self.omit_body_with(CaptureBodyOmission::ResourceExhausted);
+            self.omit_body_with(CaptureBodyOmission::ResourceExhausted {});
         }
         appended
     }
@@ -564,7 +564,8 @@ impl UpgradeCaptureAttempt for WebSocketMessageCapture {
                 .complete_websocket_message(encoded, self.compressed, self.class)
                 .is_err()
             {
-                self.job.omit_body(CaptureBodyOmission::ResourceExhausted);
+                self.job
+                    .omit_body(CaptureBodyOmission::ResourceExhausted {});
             }
         } else {
             self.omit_body();
