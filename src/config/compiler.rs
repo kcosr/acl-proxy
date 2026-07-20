@@ -25,12 +25,12 @@ use http_access_redaction::{
 };
 use http_access_runtime::BodyBudget;
 use http_access_types::{
-    BodyLimits, CredentialMutation, CredentialMutationKind, CredentialRef,
-    HeaderName as NeutralHeaderName, RedirectPolicy, ResponsePolicy, SnapshotIdentity, StableId,
+    BodyLimits, CanonicalUrl, CredentialMutation, CredentialMutationKind, CredentialRef,
+    HeaderName as NeutralHeaderName, HttpScheme, RedirectPolicy, ResponsePolicy, SnapshotIdentity,
+    StableId,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use url::{Host, Url};
 
 use crate::authorization::protocol::{
     projected_provider_credential_wire_metadata_bytes, CALLBACK_RESPONSE_PREFIX_BYTES,
@@ -38,7 +38,7 @@ use crate::authorization::protocol::{
     PROCESS_PROVIDER_MIN_DECISION_RESPONSE_BYTES, PROCESS_PROVIDER_RESPONSE_PREFIX_BYTES,
     PROCESS_PROVIDER_RESPONSE_TERMINATOR_BYTES,
 };
-use crate::capture::CaptureSinkSpec;
+use crate::capture::{CaptureSinkSpec, CaptureSinkSpecError};
 use crate::credential_buffers::ProductCredentialProjectionContext;
 use crate::credential_resolver::projected_product_adapter_bytes;
 use crate::credentials::{MAX_CREDENTIAL_BYTES, MAX_FILE_READ_BYTES};
@@ -50,6 +50,7 @@ use crate::redaction::{
 #[cfg(test)]
 use crate::safety::wire_body::MAX_BUFFER_GROWTH_BYTES;
 use crate::safety::wire_body::{guarded_body_allocation_bytes, guarded_workspace_allocation_bytes};
+use crate::standalone::UnboundStandaloneGenerationPlan;
 use http_access_runtime::http1::PARSER_STORE_BYTES;
 use http_access_url::{canonicalize_http_url, CompiledUrlPattern};
 
@@ -59,7 +60,7 @@ use super::authoring::{
     HeaderEffectWhen, Http1ConnectPolicy, HttpVersion, ListenersConfig, MitmConfig,
     ObservationConfig, ParentProxyKind, PolicyConfig, PolicyRuleConfig, RedactionConfig,
     RedactionPayloads, RuleDecision, SafetyConfig, StaticTlsIdentityConfig, TlsTrust,
-    TransportTlsConfig,
+    TransportSecurity, TransportTlsConfig,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -142,9 +143,23 @@ pub(crate) struct StaticProductConfig {
     pub(crate) control: Option<StaticControlConfig>,
     pub(crate) listeners: StaticListenersConfig,
     pub(crate) mitm: Option<StaticMitmConfig>,
-    pub(crate) callback_public_url: Option<String>,
+    #[serde(serialize_with = "serialize_optional_canonical_url")]
+    pub(crate) callback_public_url: Option<CanonicalUrl>,
     pub(crate) logging: StaticLoggingConfig,
     pub(crate) capture: StaticCaptureConfig,
+}
+
+fn serialize_optional_canonical_url<S>(
+    value: &Option<CanonicalUrl>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    value
+        .as_ref()
+        .map(CanonicalUrl::as_str)
+        .serialize(serializer)
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize)]
@@ -371,9 +386,7 @@ pub(crate) enum CompiledTlsTrust {
 pub(crate) struct ParentProxyPlan {
     #[cfg(test)]
     pub(crate) kind: CompiledParentProxyKind,
-    pub(crate) url: String,
-    pub(crate) host: String,
-    pub(crate) port: u16,
+    pub(crate) target: CanonicalUrl,
     pub(crate) tls: Option<ParentProxyTlsPlan>,
 }
 
@@ -536,15 +549,34 @@ pub(crate) enum CompiledHeaderEffectWhen {
 pub(crate) enum CredentialActionPlan {
     Bearer {
         credential: String,
+        transport_security: CompiledTransportSecurity,
     },
     Basic {
         username: String,
         password_credential: String,
+        transport_security: CompiledTransportSecurity,
     },
     CustomHeader {
         header: HeaderName,
         credential: String,
+        transport_security: CompiledTransportSecurity,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CompiledTransportSecurity {
+    TlsRequired,
+    CleartextAllowed,
+}
+
+impl CompiledTransportSecurity {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::TlsRequired => "tls_required",
+            Self::CleartextAllowed => "cleartext_allowed",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -581,7 +613,7 @@ pub(crate) enum AuthorizationProviderPlan {
 
 #[derive(Clone)]
 pub(crate) struct WebhookProviderPlan {
-    pub(crate) url: String,
+    pub(crate) url: CanonicalUrl,
     pub(crate) timeout: Duration,
     pub(crate) on_failure: CompiledProviderFailureMode,
     pub(crate) include_headers: Vec<HeaderName>,
@@ -627,9 +659,20 @@ pub(crate) enum CompiledProviderFailureMode {
 
 #[derive(Clone)]
 pub(crate) enum ProviderOutputPlan {
-    Bearer { required: bool },
-    Basic { username: String, required: bool },
-    CustomHeader { header: HeaderName, required: bool },
+    Bearer {
+        required: bool,
+        transport_security: CompiledTransportSecurity,
+    },
+    Basic {
+        username: String,
+        required: bool,
+        transport_security: CompiledTransportSecurity,
+    },
+    CustomHeader {
+        header: HeaderName,
+        required: bool,
+        transport_security: CompiledTransportSecurity,
+    },
 }
 
 #[derive(Clone)]
@@ -844,23 +887,32 @@ pub(super) fn compile_config(
 ) -> Result<CompiledProductConfig, ConfigCompileError> {
     let config_root = normalize_config_root(config_root)?;
     normalize_authored_paths(&mut config, &config_root)?;
-    normalize_endpoint_urls(&mut config)?;
+    let endpoint_urls = canonical_endpoint_urls(&config)?;
 
     validate_positive_limits(&config)?;
     let listener_facts = validate_listener_control_mitm_matrix(&config)?;
-    validate_tls_and_parent_matrix(&config, &listener_facts)?;
+    validate_tls_and_parent_matrix(&config, &listener_facts, &endpoint_urls)?;
     let validation = validate_references_and_security_boundaries(&config)?;
     let redaction = compile_redaction_plan(&config.redaction)?;
     let resource_plan = compile_resource_plan(&config, &redaction)?;
 
-    let static_config = compile_static_config(&config, config_root.clone())?;
+    let static_config =
+        compile_static_config(&config, config_root.clone(), endpoint_urls.callback.clone())?;
+    let ValidationFacts {
+        compiled_urls_by_rule,
+        capture_sink,
+    } = validation;
     let reloadable_plan = compile_reloadable_plan(
         &config,
         &config_root,
-        validation.compiled_urls_by_rule,
+        &endpoint_urls,
+        compiled_urls_by_rule,
+        capture_sink,
         resource_plan,
         redaction,
     )?;
+    UnboundStandaloneGenerationPlan::preflight(&reloadable_plan)
+        .map_err(|error| ConfigCompileError::at("compiled_generation", error.to_string()))?;
     let static_fingerprint = StaticFingerprint::from_config(&static_config)
         .map_err(|error| ConfigCompileError::at("schema_version", error.to_string()))?;
 
@@ -871,31 +923,50 @@ pub(super) fn compile_config(
     })
 }
 
-fn normalize_endpoint_urls(
-    config: &mut super::authoring::AuthoringConfig,
-) -> Result<(), ConfigCompileError> {
-    if let Some(parent) = config.egress.parent_proxy.as_mut() {
-        parent.url = canonical_endpoint_url(&parent.url, "egress.parent_proxy.url")?;
-    }
-    if let Some(callback) = config.authorization.callback.as_mut() {
-        callback.public_url =
-            canonical_endpoint_url(&callback.public_url, "authorization.callback.public_url")?;
-    }
-    for (name, provider) in &mut config.authorization.providers {
-        if let AuthorizationProviderConfig::Webhook(webhook) = provider {
-            webhook.url = canonical_endpoint_url(
-                &webhook.url,
-                &format!("authorization.providers.{name}.url"),
-            )?;
-        }
-    }
-    Ok(())
+struct CanonicalEndpointUrls {
+    parent_proxy: Option<CanonicalUrl>,
+    callback: Option<CanonicalUrl>,
+    webhooks: BTreeMap<String, CanonicalUrl>,
 }
 
-fn canonical_endpoint_url(value: &str, path: &str) -> Result<String, ConfigCompileError> {
-    canonicalize_http_url(value)
-        .map(|url| url.as_str().to_owned())
-        .map_err(|error| ConfigCompileError::at(path, error.to_string()))
+fn canonical_endpoint_urls(
+    config: &super::authoring::AuthoringConfig,
+) -> Result<CanonicalEndpointUrls, ConfigCompileError> {
+    let parent_proxy = config
+        .egress
+        .parent_proxy
+        .as_ref()
+        .map(|parent| canonical_endpoint_url(&parent.url, "egress.parent_proxy.url"))
+        .transpose()?;
+    let callback = config
+        .authorization
+        .callback
+        .as_ref()
+        .map(|callback| {
+            canonical_endpoint_url(&callback.public_url, "authorization.callback.public_url")
+        })
+        .transpose()?;
+    let mut webhooks = BTreeMap::new();
+    for (name, provider) in &config.authorization.providers {
+        if let AuthorizationProviderConfig::Webhook(webhook) = provider {
+            webhooks.insert(
+                name.clone(),
+                canonical_endpoint_url(
+                    &webhook.url,
+                    &format!("authorization.providers.{name}.url"),
+                )?,
+            );
+        }
+    }
+    Ok(CanonicalEndpointUrls {
+        parent_proxy,
+        callback,
+        webhooks,
+    })
+}
+
+fn canonical_endpoint_url(value: &str, path: &str) -> Result<CanonicalUrl, ConfigCompileError> {
+    canonicalize_http_url(value).map_err(|error| ConfigCompileError::at(path, error.to_string()))
 }
 
 fn normalize_config_root(root: &Path) -> Result<PathBuf, ConfigCompileError> {
@@ -1639,6 +1710,7 @@ fn is_canonical_control_path_byte(byte: u8) -> bool {
 fn validate_tls_and_parent_matrix(
     config: &super::authoring::AuthoringConfig,
     listeners: &ListenerFacts,
+    endpoint_urls: &CanonicalEndpointUrls,
 ) -> Result<(), ConfigCompileError> {
     validate_transport_tls(&config.egress.origin_tls, "egress.origin_tls")?;
     match config.egress.route {
@@ -1663,15 +1735,23 @@ fn validate_tls_and_parent_matrix(
                     "is required when egress.route is parent_proxy",
                 )
             })?;
-            let url = validate_endpoint_url(&parent.url, "egress.parent_proxy.url", true)?;
+            let url = endpoint_urls.parent_proxy.as_ref().ok_or_else(|| {
+                ConfigCompileError::at("egress.parent_proxy.url", "canonical parent URL is missing")
+            })?;
+            if url.path() != "/" || url.query().is_some() {
+                return Err(ConfigCompileError::at(
+                    "egress.parent_proxy.url",
+                    "parent URL must not contain a path or query",
+                ));
+            }
             match url.scheme() {
-                "http" if parent.tls.is_some() => {
+                HttpScheme::Http if parent.tls.is_some() => {
                     return Err(ConfigCompileError::at(
                         "egress.parent_proxy.tls",
                         "must be absent for an HTTP parent URL",
                     ));
                 }
-                "https" => {
+                HttpScheme::Https => {
                     let tls = parent.tls.as_ref().ok_or_else(|| {
                         ConfigCompileError::at(
                             "egress.parent_proxy.tls",
@@ -1690,9 +1770,9 @@ fn validate_tls_and_parent_matrix(
                         )?;
                     }
                 }
-                _ => {}
+                HttpScheme::Http => {}
             }
-            if let Some(address) = literal_url_socket_addr(&url) {
+            if let Some(address) = literal_url_socket_addr(url) {
                 if config.control.as_ref().is_some_and(|control| {
                     socket_binds_overlap(canonical_socket_addr(control.bind), address)
                 }) {
@@ -1742,12 +1822,14 @@ fn validate_tls_and_parent_matrix(
     for (name, provider) in &config.authorization.providers {
         if let AuthorizationProviderConfig::Webhook(webhook) = provider {
             let prefix = format!("authorization.providers.{name}");
-            validate_endpoint_length(&webhook.url, &format!("{prefix}.url"))?;
-            let url = validate_endpoint_url(&webhook.url, &format!("{prefix}.url"), false)?;
-            validate_encoded_target_length(&url, &format!("{prefix}.url"))?;
+            let url = endpoint_urls.webhooks.get(name).ok_or_else(|| {
+                ConfigCompileError::at(format!("{prefix}.url"), "canonical webhook URL is missing")
+            })?;
+            validate_endpoint_length(url, &format!("{prefix}.url"))?;
+            validate_encoded_target_length(url, &format!("{prefix}.url"))?;
             match url.scheme() {
-                "http" => {
-                    if !url_host_is_loopback(&url) {
+                HttpScheme::Http => {
+                    if !url_host_is_loopback(url) {
                         return Err(ConfigCompileError::at(
                             format!("{prefix}.url"),
                             "plain HTTP is allowed only for a loopback webhook",
@@ -1760,7 +1842,7 @@ fn validate_tls_and_parent_matrix(
                         ));
                     }
                 }
-                "https" => {
+                HttpScheme::Https => {
                     if let Some(tls) = &webhook.tls {
                         validate_trust_matrix(
                             tls.trust,
@@ -1769,11 +1851,10 @@ fn validate_tls_and_parent_matrix(
                         )?;
                     }
                 }
-                _ => unreachable!("validated endpoint URL scheme"),
             }
         }
     }
-    validate_callback_matrix(config)?;
+    validate_callback_matrix(config, endpoint_urls)?;
     Ok(())
 }
 
@@ -1802,31 +1883,6 @@ fn validate_trust_matrix(
         ));
     }
     Ok(())
-}
-
-fn validate_endpoint_url(value: &str, path: &str, parent: bool) -> Result<Url, ConfigCompileError> {
-    let url = Url::parse(value).map_err(|error| {
-        ConfigCompileError::at(path, format!("must be an absolute URL: {error}"))
-    })?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err(ConfigCompileError::at(
-            path,
-            "must use HTTP or HTTPS and include a host",
-        ));
-    }
-    if !url.username().is_empty() || url.password().is_some() || url.fragment().is_some() {
-        return Err(ConfigCompileError::at(
-            path,
-            "must not contain userinfo or a fragment",
-        ));
-    }
-    if parent && (url.path() != "/" || url.query().is_some()) {
-        return Err(ConfigCompileError::at(
-            path,
-            "parent URL must not contain a path or query",
-        ));
-    }
-    Ok(url)
 }
 
 fn validate_dns_server_name(value: &str, path: &str) -> Result<(), ConfigCompileError> {
@@ -1863,29 +1919,25 @@ fn dns_name_has_safe_ascii_shape(value: &str) -> bool {
         })
 }
 
-fn literal_url_socket_addr(url: &Url) -> Option<SocketAddr> {
-    let host = match url.host()? {
-        Host::Ipv4(address) => IpAddr::V4(address),
-        Host::Ipv6(address) => IpAddr::V6(address),
-        Host::Domain(_) => return None,
-    };
+fn literal_url_socket_addr(url: &CanonicalUrl) -> Option<SocketAddr> {
+    let host = url.authority().host().as_str().parse::<IpAddr>().ok()?;
     Some(canonical_socket_addr(SocketAddr::new(
         host,
-        url.port_or_known_default()?,
+        url.authority().effective_port(),
     )))
 }
 
-fn url_host_is_loopback(url: &Url) -> bool {
-    match url.host() {
-        Some(Host::Ipv4(address)) => address.is_loopback(),
-        Some(Host::Ipv6(address)) => address.is_loopback(),
-        Some(Host::Domain(domain)) => domain == "localhost",
-        None => false,
-    }
+fn url_host_is_loopback(url: &CanonicalUrl) -> bool {
+    let host = url.authority().host().as_str();
+    host == "localhost"
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn validate_callback_matrix(
     config: &super::authoring::AuthoringConfig,
+    endpoint_urls: &CanonicalEndpointUrls,
 ) -> Result<(), ConfigCompileError> {
     let webhook_delegated = config.policy.rules.iter().any(|rule| {
         rule.authorization_provider.as_ref().is_some_and(|name| {
@@ -1907,7 +1959,7 @@ fn validate_callback_matrix(
             "is required when a rule delegates to a webhook provider",
         ));
     }
-    let Some(callback) = &config.authorization.callback else {
+    let Some(_callback) = &config.authorization.callback else {
         return Ok(());
     };
     let control = config.control.as_ref().ok_or_else(|| {
@@ -1920,12 +1972,13 @@ fn validate_callback_matrix(
         ));
     }
     let expected_path = format!("{}{CALLBACK_ROUTE_SUFFIX}", control.base_path);
-    validate_endpoint_length(&callback.public_url, "authorization.callback.public_url")?;
-    let url = validate_endpoint_url(
-        &callback.public_url,
-        "authorization.callback.public_url",
-        false,
-    )?;
+    let url = endpoint_urls.callback.as_ref().ok_or_else(|| {
+        ConfigCompileError::at(
+            "authorization.callback.public_url",
+            "canonical callback URL is missing",
+        )
+    })?;
+    validate_endpoint_length(url, "authorization.callback.public_url")?;
     if url.path() != expected_path || url.query().is_some() {
         return Err(ConfigCompileError::at(
             "authorization.callback.public_url",
@@ -1933,28 +1986,31 @@ fn validate_callback_matrix(
         ));
     }
     let control_bind = canonical_socket_addr(control.bind);
-    if url.scheme() == "http" && (!url_host_is_loopback(&url) || !control_bind.ip().is_loopback()) {
+    if url.scheme() == HttpScheme::Http
+        && (!url_host_is_loopback(url) || !control_bind.ip().is_loopback())
+    {
         return Err(ConfigCompileError::at(
             "authorization.callback.public_url",
             "plain HTTP requires both a loopback URL host and loopback control bind",
         ));
     }
-    let callback_url = canonicalize_http_url(&callback.public_url)
-        .expect("callback URL was canonicalized before validation");
     for (name, provider) in &config.authorization.providers {
-        let AuthorizationProviderConfig::Webhook(provider) = provider else {
+        let AuthorizationProviderConfig::Webhook(_provider) = provider else {
             continue;
         };
-        let provider_url = canonicalize_http_url(&provider.url)
-            .expect("provider URL was canonicalized before validation");
+        let provider_url = endpoint_urls.webhooks.get(name).ok_or_else(|| {
+            ConfigCompileError::at(
+                format!("authorization.providers.{name}.url"),
+                "canonical webhook URL is missing",
+            )
+        })?;
         let provider_in_control_subtree = provider_url.path() == control.base_path
             || provider_url
                 .path()
                 .strip_prefix(&control.base_path)
                 .is_some_and(|suffix| suffix.starts_with('/'));
-        if provider_url.authority().host() == callback_url.authority().host()
-            && provider_url.authority().effective_port()
-                == callback_url.authority().effective_port()
+        if provider_url.authority().host() == url.authority().host()
+            && provider_url.authority().effective_port() == url.authority().effective_port()
             && provider_in_control_subtree
         {
             return Err(ConfigCompileError::at(
@@ -1966,8 +2022,8 @@ fn validate_callback_matrix(
     Ok(())
 }
 
-fn validate_endpoint_length(value: &str, path: &str) -> Result<(), ConfigCompileError> {
-    if value.len() > MAX_ENDPOINT_BYTES {
+fn validate_endpoint_length(value: &CanonicalUrl, path: &str) -> Result<(), ConfigCompileError> {
+    if value.as_str().len() > MAX_ENDPOINT_BYTES {
         return Err(ConfigCompileError::at(
             path,
             format!("canonical URL must be at most {MAX_ENDPOINT_BYTES} bytes"),
@@ -1976,7 +2032,10 @@ fn validate_endpoint_length(value: &str, path: &str) -> Result<(), ConfigCompile
     Ok(())
 }
 
-fn validate_encoded_target_length(url: &Url, path: &str) -> Result<(), ConfigCompileError> {
+fn validate_encoded_target_length(
+    url: &CanonicalUrl,
+    path: &str,
+) -> Result<(), ConfigCompileError> {
     let query_length = url.query().map_or(Ok(0), |query| {
         query
             .len()
@@ -1997,6 +2056,7 @@ fn validate_encoded_target_length(url: &Url, path: &str) -> Result<(), ConfigCom
 
 struct ValidationFacts {
     compiled_urls_by_rule: Vec<Vec<CompiledUrlPattern>>,
+    capture_sink: Option<CaptureSinkSpec>,
 }
 
 fn validate_references_and_security_boundaries(
@@ -2007,10 +2067,12 @@ fn validate_references_and_security_boundaries(
     validate_internal_context(config)?;
     validate_provider_security(config, &credential_destinations)?;
     let compiled_urls_by_rule = validate_policy(config)?;
-    validate_capture(config)?;
+    validate_credential_transport_security(config, &compiled_urls_by_rule)?;
+    let capture_sink = validate_capture(config)?;
 
     Ok(ValidationFacts {
         compiled_urls_by_rule,
+        capture_sink,
     })
 }
 
@@ -2561,12 +2623,19 @@ fn validate_policy(
             .iter()
             .enumerate()
             .map(|(pattern_index, pattern)| {
-                CompiledUrlPattern::compile(pattern).map_err(|error| {
-                    ConfigCompileError::at(
-                        format!("{prefix}.urls[{pattern_index}]"),
-                        error.to_string(),
-                    )
-                })
+                let path = format!("{prefix}.urls[{pattern_index}]");
+                let compiled = CompiledUrlPattern::compile(pattern)
+                    .map_err(|error| ConfigCompileError::at(&path, error.to_string()))?;
+                if compiled
+                    .path_pattern()
+                    .is_some_and(|path_pattern| path_pattern.contains("//"))
+                {
+                    return Err(ConfigCompileError::at(
+                        path,
+                        "path must not contain an empty segment",
+                    ));
+                }
+                Ok(compiled)
             })
             .collect::<Result<Vec<_>, _>>()?;
         compiled_urls_by_rule.push(patterns);
@@ -2629,6 +2698,109 @@ fn validate_policy(
         }
     }
     Ok(compiled_urls_by_rule)
+}
+
+fn validate_credential_transport_security(
+    config: &super::authoring::AuthoringConfig,
+    compiled_urls_by_rule: &[Vec<CompiledUrlPattern>],
+) -> Result<(), ConfigCompileError> {
+    if matches!(
+        config.policy.default,
+        super::authoring::PolicyDefaultDecision::Allow
+    ) {
+        require_cleartext_credential_actions(
+            &config.egress.credential_actions,
+            "egress.credential_actions",
+        )?;
+    }
+
+    for (index, (rule, patterns)) in config
+        .policy
+        .rules
+        .iter()
+        .zip(compiled_urls_by_rule)
+        .enumerate()
+    {
+        if matches!(rule.decision, RuleDecision::Deny) || !policy_rule_can_reach_http(patterns) {
+            continue;
+        }
+
+        require_cleartext_credential_actions(
+            &config.egress.credential_actions,
+            "egress.credential_actions",
+        )?;
+        require_cleartext_credential_actions(
+            &rule.credential_actions,
+            &format!("policy.rules[{index}].credential_actions"),
+        )?;
+
+        let Some(provider_name) = &rule.authorization_provider else {
+            continue;
+        };
+        let provider = config
+            .authorization
+            .providers
+            .get(provider_name)
+            .expect("policy provider reference was validated before transport security");
+        let outputs = match provider {
+            AuthorizationProviderConfig::Webhook(provider) => &provider.outputs,
+            AuthorizationProviderConfig::Process(provider) => &provider.outputs,
+        };
+        for (name, output) in outputs {
+            let transport_security = match output {
+                super::authoring::ProviderOutputConfig::Bearer(output) => output.transport_security,
+                super::authoring::ProviderOutputConfig::Basic(output) => output.transport_security,
+                super::authoring::ProviderOutputConfig::CustomHeader(output) => {
+                    output.transport_security
+                }
+            };
+            require_cleartext_transport_security(
+                transport_security,
+                &format!(
+                    "authorization.providers.{provider_name}.outputs.{name}.transport_security"
+                ),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn policy_rule_can_reach_http(patterns: &[CompiledUrlPattern]) -> bool {
+    patterns.is_empty()
+        || patterns
+            .iter()
+            .any(|pattern| pattern.scheme() != Some(HttpScheme::Https))
+}
+
+fn require_cleartext_credential_actions(
+    actions: &[CredentialActionConfig],
+    path: &str,
+) -> Result<(), ConfigCompileError> {
+    for (index, action) in actions.iter().enumerate() {
+        let transport_security = match action {
+            CredentialActionConfig::Bearer(action) => action.transport_security,
+            CredentialActionConfig::Basic(action) => action.transport_security,
+            CredentialActionConfig::CustomHeader(action) => action.transport_security,
+        };
+        require_cleartext_transport_security(
+            transport_security,
+            &format!("{path}[{index}].transport_security"),
+        )?;
+    }
+    Ok(())
+}
+
+fn require_cleartext_transport_security(
+    transport_security: TransportSecurity,
+    path: &str,
+) -> Result<(), ConfigCompileError> {
+    if matches!(transport_security, TransportSecurity::TlsRequired) {
+        return Err(ConfigCompileError::at(
+            path,
+            "must be cleartext_allowed because this credential can reach an HTTP origin",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_methods(methods: &[String], path: &str) -> Result<(), ConfigCompileError> {
@@ -2881,9 +3053,11 @@ fn effect_header_name(effect: &HeaderEffectConfig) -> Option<String> {
     })
 }
 
-fn validate_capture(config: &super::authoring::AuthoringConfig) -> Result<(), ConfigCompileError> {
+fn validate_capture(
+    config: &super::authoring::AuthoringConfig,
+) -> Result<Option<CaptureSinkSpec>, ConfigCompileError> {
     let Some(capture) = &config.observation.capture else {
-        return Ok(());
+        return Ok(None);
     };
     if capture.events.is_empty() {
         return Err(ConfigCompileError::at(
@@ -2916,35 +3090,27 @@ fn validate_capture(config: &super::authoring::AuthoringConfig) -> Result<(), Co
             "must name an existing redaction profile",
         ));
     }
-    validate_capture_filename(&capture.filename)?;
-    Ok(())
+    CaptureSinkSpec::new(
+        capture.directory.clone(),
+        capture.filename.clone(),
+        capture.max_files,
+        capture.max_total_bytes,
+    )
+    .map(Some)
+    .map_err(map_capture_sink_error)
 }
 
-fn validate_capture_filename(filename: &str) -> Result<(), ConfigCompileError> {
-    if filename.is_empty()
-        || filename.contains('/')
-        || filename.contains('\\')
-        || filename.contains("..")
-        || filename.chars().any(char::is_control)
-        || !filename.contains("{requestId}")
-        || !filename.contains("{suffix}")
-    {
-        return Err(ConfigCompileError::at(
-            "observation.capture.filename",
-            "must be a basename containing {requestId} and {suffix}",
-        ));
-    }
-    let stripped = filename
-        .replace("{requestId}", "")
-        .replace("{kind}", "")
-        .replace("{suffix}", "");
-    if stripped.contains('{') || stripped.contains('}') {
-        return Err(ConfigCompileError::at(
-            "observation.capture.filename",
-            "contains an unknown template variable",
-        ));
-    }
-    Ok(())
+fn map_capture_sink_error(error: CaptureSinkSpecError) -> ConfigCompileError {
+    let path = match &error {
+        CaptureSinkSpecError::EmptyDirectory => "observation.capture.directory",
+        CaptureSinkSpecError::InvalidFilenameBasename
+        | CaptureSinkSpecError::MissingRequestIdPlaceholder
+        | CaptureSinkSpecError::MissingSuffixPlaceholder
+        | CaptureSinkSpecError::UnknownFilenamePlaceholder => "observation.capture.filename",
+        CaptureSinkSpecError::ZeroMaxFiles => "observation.capture.max_files",
+        CaptureSinkSpecError::ZeroMaxTotalBytes => "observation.capture.max_total_bytes",
+    };
+    ConfigCompileError::at(path, error.to_string())
 }
 
 fn validate_provider_limits(
@@ -5137,7 +5303,9 @@ fn upgrade_wire_peak(
 fn compile_reloadable_plan(
     config: &super::authoring::AuthoringConfig,
     working_directory: &Path,
+    endpoint_urls: &CanonicalEndpointUrls,
     compiled_urls_by_rule: Vec<Vec<CompiledUrlPattern>>,
+    capture_sink: Option<CaptureSinkSpec>,
     resource_plan: CompiledResourcePlan,
     redaction: ProductRedactionPlan,
 ) -> Result<ReloadableProductPlan, ConfigCompileError> {
@@ -5147,16 +5315,24 @@ fn compile_reloadable_plan(
         request_timeout: config.service.request_timeout.get(),
         max_content_decoding_expansion_ratio: config.service.max_content_decoding_expansion_ratio,
         forwarding: compile_forwarding_plan(&config.service.forwarding),
-        egress: compile_egress_plan(&config.egress)?,
+        egress: compile_egress_plan(&config.egress, endpoint_urls.parent_proxy.as_ref())?,
         policy: compile_policy_plan(
             &config.policy,
             compiled_urls_by_rule,
             http_body_read_plans_by_cursor,
         )?,
-        authorization: compile_authorization_plan(&config.authorization, working_directory)?,
+        authorization: compile_authorization_plan(
+            &config.authorization,
+            working_directory,
+            &endpoint_urls.webhooks,
+        )?,
         credentials: compile_credentials_plan(&config.credentials)?,
         redaction,
-        observation: compile_observation_plan(&config.observation, capture_working_set)?,
+        observation: compile_observation_plan(
+            &config.observation,
+            capture_sink,
+            capture_working_set,
+        )?,
         safety: compile_safety_plan(&config.safety)?,
         resource_plan,
     })
@@ -5179,18 +5355,26 @@ fn compile_forwarding_plan(value: &super::authoring::ForwardingConfig) -> Forwar
     }
 }
 
-fn compile_egress_plan(value: &EgressConfig) -> Result<EgressPlan, ConfigCompileError> {
+fn compile_egress_plan(
+    value: &EgressConfig,
+    parent_target: Option<&CanonicalUrl>,
+) -> Result<EgressPlan, ConfigCompileError> {
     Ok(EgressPlan {
         route: match value.route {
             EgressRoute::Direct => CompiledEgressRoute::Direct,
             EgressRoute::ParentProxy => CompiledEgressRoute::ParentProxy,
         },
         origin_tls: compile_transport_tls_plan(&value.origin_tls),
-        parent_proxy: value
-            .parent_proxy
-            .as_ref()
-            .map(compile_parent_proxy_plan)
-            .transpose()?,
+        parent_proxy: match (&value.parent_proxy, parent_target) {
+            (Some(parent), Some(target)) => Some(compile_parent_proxy_plan(parent, target)),
+            (None, None) => None,
+            _ => {
+                return Err(ConfigCompileError::at(
+                    "egress.parent_proxy.url",
+                    "canonical parent URL does not match the authored configuration",
+                ));
+            }
+        },
         request_headers: compile_header_effects(&value.request_headers, "egress.request_headers")?,
         credential_actions: compile_credential_actions(
             &value.credential_actions,
@@ -5218,28 +5402,24 @@ fn compile_tls_trust(value: TlsTrust) -> CompiledTlsTrust {
 
 fn compile_parent_proxy_plan(
     value: &super::authoring::ParentProxyConfig,
-) -> Result<ParentProxyPlan, ConfigCompileError> {
-    let canonical = canonicalize_http_url(&value.url).map_err(|error| {
-        ConfigCompileError::at("egress.parent_proxy.url", format!("invalid URL: {error}"))
-    })?;
-    Ok(ParentProxyPlan {
+    target: &CanonicalUrl,
+) -> ParentProxyPlan {
+    ParentProxyPlan {
         #[cfg(test)]
         kind: match value.kind {
             ParentProxyKind::AclProxy => CompiledParentProxyKind::AclProxy,
             ParentProxyKind::Generic => CompiledParentProxyKind::Generic,
         },
-        url: canonical.as_str().to_owned(),
-        host: canonical.authority().host().as_str().to_owned(),
-        port: canonical.authority().effective_port(),
+        target: target.clone(),
         tls: value.tls.as_ref().map(|tls| ParentProxyTlsPlan {
             trust: compile_tls_trust(tls.trust),
             ca_certificate: tls.ca_certificate.clone(),
             server_name: tls
                 .server_name
                 .clone()
-                .unwrap_or_else(|| canonical.authority().host().as_str().to_owned()),
+                .unwrap_or_else(|| target.authority().host().as_str().to_owned()),
         }),
-    })
+    }
 }
 
 fn compile_policy_plan(
@@ -5481,14 +5661,17 @@ fn compile_credential_actions(
             Ok(match value {
                 CredentialActionConfig::Bearer(value) => CredentialActionPlan::Bearer {
                     credential: value.credential.clone(),
+                    transport_security: compile_transport_security(value.transport_security),
                 },
                 CredentialActionConfig::Basic(value) => CredentialActionPlan::Basic {
                     username: value.username.clone(),
                     password_credential: value.password_credential.clone(),
+                    transport_security: compile_transport_security(value.transport_security),
                 },
                 CredentialActionConfig::CustomHeader(value) => CredentialActionPlan::CustomHeader {
                     header: compile_header_name(&value.header, &format!("{path}[{index}].header"))?,
                     credential: value.credential.clone(),
+                    transport_security: compile_transport_security(value.transport_security),
                 },
             })
         })
@@ -5498,12 +5681,13 @@ fn compile_credential_actions(
 fn compile_authorization_plan(
     value: &AuthorizationConfig,
     working_directory: &Path,
+    webhook_urls: &BTreeMap<String, CanonicalUrl>,
 ) -> Result<AuthorizationPlan, ConfigCompileError> {
     let providers = value
         .providers
         .iter()
         .map(|(name, provider)| {
-            compile_provider_plan(name, provider, working_directory)
+            compile_provider_plan(name, provider, working_directory, webhook_urls)
                 .map(|provider| (name.clone(), provider))
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
@@ -5530,12 +5714,16 @@ fn compile_provider_plan(
     name: &str,
     value: &AuthorizationProviderConfig,
     working_directory: &Path,
+    webhook_urls: &BTreeMap<String, CanonicalUrl>,
 ) -> Result<AuthorizationProviderPlan, ConfigCompileError> {
     let prefix = format!("authorization.providers.{name}");
     Ok(match value {
         AuthorizationProviderConfig::Webhook(value) => {
+            let url = webhook_urls.get(name).ok_or_else(|| {
+                ConfigCompileError::at(format!("{prefix}.url"), "canonical webhook URL is missing")
+            })?;
             AuthorizationProviderPlan::Webhook(WebhookProviderPlan {
-                url: value.url.clone(),
+                url: url.clone(),
                 timeout: value.timeout.get(),
                 on_failure: compile_provider_failure(value.on_failure),
                 include_headers: compile_header_names(
@@ -5588,6 +5776,13 @@ fn compile_provider_failure(
     }
 }
 
+fn compile_transport_security(value: TransportSecurity) -> CompiledTransportSecurity {
+    match value {
+        TransportSecurity::TlsRequired => CompiledTransportSecurity::TlsRequired,
+        TransportSecurity::CleartextAllowed => CompiledTransportSecurity::CleartextAllowed,
+    }
+}
+
 fn compile_provider_outputs(
     values: &BTreeMap<String, super::authoring::ProviderOutputConfig>,
     path: &str,
@@ -5599,11 +5794,13 @@ fn compile_provider_outputs(
                 super::authoring::ProviderOutputConfig::Bearer(value) => {
                     ProviderOutputPlan::Bearer {
                         required: value.required,
+                        transport_security: compile_transport_security(value.transport_security),
                     }
                 }
                 super::authoring::ProviderOutputConfig::Basic(value) => ProviderOutputPlan::Basic {
                     username: value.username.clone(),
                     required: value.required,
+                    transport_security: compile_transport_security(value.transport_security),
                 },
                 super::authoring::ProviderOutputConfig::CustomHeader(value) => {
                     ProviderOutputPlan::CustomHeader {
@@ -5612,6 +5809,7 @@ fn compile_provider_outputs(
                             &format!("{path}.{name}.header"),
                         )?,
                         required: value.required,
+                        transport_security: compile_transport_security(value.transport_security),
                     }
                 }
             };
@@ -5788,8 +5986,21 @@ fn compile_redaction_plan(
 
 fn compile_observation_plan(
     value: &ObservationConfig,
+    capture_sink: Option<CaptureSinkSpec>,
     capture_working_set: Option<CaptureWorkingSetPlan>,
 ) -> Result<ObservationPlan, ConfigCompileError> {
+    let capture = match (value.capture.as_ref(), capture_sink, capture_working_set) {
+        (Some(value), Some(sink), Some(working_set)) => {
+            Some(compile_capture_plan(value, sink, working_set))
+        }
+        (None, None, None) => None,
+        _ => {
+            return Err(ConfigCompileError::at(
+                "observation.capture",
+                "validated capture plan is inconsistent",
+            ));
+        }
+    };
     Ok(ObservationPlan {
         logging: ReloadableLoggingPlan {
             level: compile_log_level(&value.logging.level, "observation.logging.level")?,
@@ -5806,12 +6017,7 @@ fn compile_observation_plan(
                 )?,
             },
         },
-        capture: value.capture.as_ref().map(|capture| {
-            compile_capture_plan(
-                capture,
-                capture_working_set.expect("enabled capture has a compiled working-set plan"),
-            )
-        }),
+        capture,
     })
 }
 
@@ -5842,6 +6048,7 @@ fn compile_log_level(value: &str, path: &str) -> Result<CompiledLogLevel, Config
 
 fn compile_capture_plan(
     value: &super::authoring::AuthoringCaptureConfig,
+    sink: CaptureSinkSpec,
     working_set: CaptureWorkingSetPlan,
 ) -> CapturePlan {
     #[cfg(not(test))]
@@ -5866,13 +6073,7 @@ fn compile_capture_plan(
             })
             .collect(),
         redaction_profile: value.redaction_profile.clone(),
-        sink: CaptureSinkSpec::new(
-            value.directory.clone(),
-            value.filename.clone(),
-            value.max_files,
-            value.max_total_bytes,
-        )
-        .expect("validated observation capture sink"),
+        sink,
         max_body_bytes: value.max_body_bytes,
         max_inflight_body_bytes: value.max_inflight_body_bytes,
         #[cfg(test)]
@@ -5915,6 +6116,7 @@ fn compile_header_name(value: &str, path: &str) -> Result<HeaderName, ConfigComp
 fn compile_static_config(
     config: &super::authoring::AuthoringConfig,
     config_root: PathBuf,
+    callback_public_url: Option<CanonicalUrl>,
 ) -> Result<StaticProductConfig, ConfigCompileError> {
     Ok(StaticProductConfig {
         schema_version: config.schema_version.number(),
@@ -5939,11 +6141,7 @@ fn compile_static_config(
         control: config.control.as_ref().map(compile_control),
         listeners: compile_listeners(&config.listeners),
         mitm: config.mitm.as_ref().map(compile_mitm),
-        callback_public_url: config
-            .authorization
-            .callback
-            .as_ref()
-            .map(|callback| callback.public_url.clone()),
+        callback_public_url,
         logging: StaticLoggingConfig {
             directory: config.observation.logging.directory.clone(),
             max_bytes: config.observation.logging.max_bytes,
@@ -6299,6 +6497,187 @@ path = "{oversized_component}"
         compile_config(config, Path::new("/etc/acl-proxy"))
     }
 
+    fn policy_rule_with_id(id: &str) -> String {
+        format!(
+            r#"{MINIMAL}
+[[policy.rules]]
+id = {id:?}
+decision = "allow"
+methods = ["GET"]
+"#
+        )
+    }
+
+    fn policy_rule_with_methods(methods: Vec<String>, include_url: bool) -> String {
+        let urls = if include_url {
+            r#"urls = ["https://example.test/**"]"#
+        } else {
+            ""
+        };
+        format!(
+            r#"{MINIMAL}
+[[policy.rules]]
+id = "method-budget"
+decision = "allow"
+methods = {methods:?}
+{urls}
+"#
+        )
+    }
+
+    fn header_predicate_config(kind: &str, values: Vec<String>) -> String {
+        format!(
+            r#"{MINIMAL}
+[[policy.rules]]
+id = "header-values"
+decision = "allow"
+
+[policy.rules.headers.{kind}]
+x-contract = {values:?}
+"#
+        )
+    }
+
+    fn delegate_provider_config(provider: &str) -> String {
+        format!(
+            r#"{MINIMAL}
+[authorization.providers.{provider}]
+kind = "process"
+command = "/bin/false"
+retire_timeout = "30s"
+
+[[policy.rules]]
+id = "delegate-provider"
+decision = "delegate"
+methods = ["GET"]
+authorization_provider = {provider:?}
+"#
+        )
+    }
+
+    fn literal_header_values_config(value_count: usize) -> String {
+        let values = vec!["value".to_owned(); value_count];
+        format!(
+            r#"{MINIMAL}
+[[egress.request_headers]]
+operation = "set"
+when = "always"
+name = "x-many-values"
+values = {values:?}
+"#
+        )
+    }
+
+    #[test]
+    fn structural_preflight_checks_rule_stable_id_boundaries() {
+        let exact = "r".repeat(StableId::MAX_LEN);
+        compile(&policy_rule_with_id(&exact)).expect("the exact stable ID boundary is valid");
+
+        let oversized = "r".repeat(StableId::MAX_LEN + 1);
+        let error = compile(&policy_rule_with_id(&oversized))
+            .expect_err("an oversized rule stable ID must fail structural compilation");
+        assert!(
+            error.to_string().contains("invalid compiled ACL"),
+            "{error}"
+        );
+
+        let error = compile(&policy_rule_with_id("bad\tid"))
+            .expect_err("a control-containing rule stable ID must fail structural compilation");
+        assert!(
+            error.to_string().contains("invalid compiled ACL"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn structural_preflight_checks_provider_stable_id_boundaries() {
+        let exact = "p".repeat(StableId::MAX_LEN);
+        compile(&delegate_provider_config(&exact))
+            .expect("the exact provider stable ID boundary is valid");
+
+        let oversized = "p".repeat(StableId::MAX_LEN + 1);
+        let error = compile(&delegate_provider_config(&oversized))
+            .expect_err("an oversized provider stable ID must fail structural compilation");
+        assert!(
+            error.to_string().contains("invalid compiled ACL"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn structural_preflight_checks_combined_semantic_predicate_boundaries() {
+        let exact_methods = (0..http_access_policy_acl::MAX_SEMANTIC_PREDICATES_PER_RULE - 1)
+            .map(|index| format!("M{index}"))
+            .collect();
+        compile(&policy_rule_with_methods(exact_methods, true))
+            .expect("one URL plus the remaining methods is the exact shared boundary");
+
+        let oversized_methods = (0..http_access_policy_acl::MAX_SEMANTIC_PREDICATES_PER_RULE)
+            .map(|index| format!("M{index}"))
+            .collect();
+        let error = compile(&policy_rule_with_methods(oversized_methods, true))
+            .expect_err("combined semantic predicates above the shared bound must fail");
+        assert!(
+            error.to_string().contains("invalid compiled ACL"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn structural_preflight_checks_neutral_method_length_boundaries() {
+        compile(&policy_rule_with_methods(vec!["M".repeat(64)], false))
+            .expect("the exact neutral method length boundary is valid");
+
+        let error = compile(&policy_rule_with_methods(vec!["M".repeat(65)], false))
+            .expect_err("a method above the neutral length bound must fail");
+        assert!(
+            error.to_string().contains("invalid compiled ACL"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn structural_preflight_checks_header_predicate_value_boundaries() {
+        compile(&header_predicate_config("all", vec!["v".repeat(64 * 1024)]))
+            .expect("the exact shared header predicate value boundary is valid");
+
+        let error = compile(&header_predicate_config(
+            "none",
+            vec!["v".repeat(64 * 1024 + 1)],
+        ))
+        .expect_err("a header predicate value above the shared bound must fail");
+        assert!(
+            error.to_string().contains("invalid compiled ACL"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn structural_preflight_checks_header_predicate_group_boundaries() {
+        let exact = vec!["g".repeat(64 * 1024); 16];
+        compile(&header_predicate_config("all", exact))
+            .expect("the exact shared header predicate group boundary is valid");
+
+        let mut oversized = vec!["g".repeat(64 * 1024); 16];
+        oversized.push("x".to_owned());
+        let error = compile(&header_predicate_config("none", oversized))
+            .expect_err("a header predicate group above the shared bound must fail");
+        assert!(
+            error.to_string().contains("invalid compiled ACL"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn structural_preflight_covers_non_acl_generation_contracts() {
+        compile(&literal_header_values_config(256))
+            .expect("the exact shared header-mutation value-count boundary is valid");
+
+        let error = compile(&literal_header_values_config(257))
+            .expect_err("full preflight must reject a non-ACL generation contract violation");
+        assert!(error.to_string().contains("header mutation"), "{error}");
+    }
+
     #[test]
     fn pure_compiler_rejects_regexes_outside_the_bounded_dfa_subset() {
         let input = format!(
@@ -6326,10 +6705,14 @@ rules = [{{ expressions = ['\bsecret-marker\b'] }}]
 rules = [{{ literals = ["{literal}"] }}]
 "#
         );
-        let error = compile(&input).expect_err("the literal horizon exceeds one MiB of scratch");
+        let error = compile(&input)
+            .expect_err("the literal exceeds the scratch-derived single-literal ceiling");
         let rendered = format!("{error:?} {error}");
-        assert!(rendered.contains("redaction.profiles.secrets"));
-        assert!(rendered.contains("invalid redaction limit"));
+        assert_eq!(
+            error.path,
+            "redaction.profiles.secrets.rules[0].literals[0]"
+        );
+        assert_eq!(error.message, "invalid redaction literal");
         assert!(!rendered.contains(&literal));
     }
 
@@ -6344,7 +6727,11 @@ rules = [{{ literal_environment_variables = ["TEST_REDACTION_SECRET"] }}]
 "#
         );
         let error = compile(&input).expect_err("the configured source horizon exceeds scratch");
-        assert!(error.to_string().contains("invalid redaction limit"));
+        assert_eq!(
+            error.path,
+            "redaction.profiles.secrets.max_environment_literal_bytes"
+        );
+        assert_eq!(error.message, "must be between 1 and 65536");
     }
 
     fn resource_config(service: &str, definitions: &str, rules: &str) -> String {
@@ -6936,6 +7323,7 @@ methods = ["POST"]
                     r#"
 [authorization.providers.provider.outputs.value_{index}]
 kind = "custom_header"
+transport_security = "cleartext_allowed"
 header = "x-output-{index}"
 "#,
                 )
@@ -7316,6 +7704,7 @@ retire_timeout = "1s"
 
 [authorization.providers.decision.outputs.token]
 kind = "bearer"
+transport_security = "tls_required"
 "#
             ),
             r#"
@@ -7362,6 +7751,7 @@ retire_timeout = "1s"
 
 [authorization.providers.replacing.outputs.token]
 kind = "bearer"
+transport_security = "tls_required"
 
 [redaction.profiles.small]
 max_body_bytes = 1
@@ -7426,9 +7816,11 @@ retire_timeout = "1s"
 
 [authorization.providers.later.outputs.token]
 kind = "bearer"
+transport_security = "cleartext_allowed"
 
 [authorization.providers.later.outputs.trace]
 kind = "custom_header"
+transport_security = "cleartext_allowed"
 header = "x-trace-token"
 "#
             ),
@@ -7497,6 +7889,7 @@ retire_timeout = "1s"
 
 [authorization.providers.later.outputs.token]
 kind = "bearer"
+transport_security = "cleartext_allowed"
 
 [redaction.profiles.small]
 max_body_bytes = 1
@@ -8374,7 +8767,9 @@ filename = "{{requestId}}-{{suffix}}.json"
             .map(|(name, provider)| match provider {
                 AuthorizationProviderPlan::Webhook(provider) => format!(
                     "{name}:webhook:{}:{}:{}",
-                    provider.url, provider.max_request_bytes, provider.max_response_bytes
+                    provider.url.as_str(),
+                    provider.max_request_bytes,
+                    provider.max_response_bytes
                 ),
                 AuthorizationProviderPlan::Process(provider) => format!(
                     "{name}:process:{}:{}",
@@ -8551,6 +8946,34 @@ max_total_bytes = 16384
             capture.sink.filename_template(),
             "{requestId}-{kind}-{suffix}.json"
         );
+    }
+
+    #[test]
+    fn capture_filename_failures_are_typed_by_the_authoritative_sink_validator() {
+        for (filename, expected) in [
+            (
+                "C:{requestId}-{suffix}.json",
+                CaptureSinkSpecError::InvalidFilenameBasename,
+            ),
+            (
+                "capture-{suffix}.json",
+                CaptureSinkSpecError::MissingRequestIdPlaceholder,
+            ),
+            (
+                "{requestId}.json",
+                CaptureSinkSpecError::MissingSuffixPlaceholder,
+            ),
+            (
+                "{requestId}-{unknown}-{suffix}.json",
+                CaptureSinkSpecError::UnknownFilenamePlaceholder,
+            ),
+        ] {
+            let input = capture_config(None).replace("{requestId}-{suffix}.json", filename);
+            let error = compile(&input).expect_err("invalid capture filename must not compile");
+
+            assert_eq!(error.path, "observation.capture.filename");
+            assert_eq!(error.message, expected.to_string());
+        }
     }
 
     #[test]
@@ -8902,6 +9325,49 @@ urls = ["https://**.example.test/v1/**"]"#,
     }
 
     #[test]
+    fn policy_url_patterns_reject_empty_path_segments_only() {
+        for pattern in [
+            "https://example.test//admin",
+            "https://example.test/a//b",
+            "https://example.test///",
+        ] {
+            let input = format!(
+                r#"{MINIMAL}
+[[policy.rules]]
+id = "empty-path-segment"
+decision = "deny"
+urls = [{pattern:?}]
+"#
+            );
+            let error = compile(&input).expect_err("an empty path segment must be rejected");
+            assert_eq!(error.path, "policy.rules[0].urls[0]");
+            assert!(
+                error.message.contains("empty segment"),
+                "unexpected error for {pattern}: {error}"
+            );
+        }
+
+        for pattern in [
+            "**",
+            "https://example.test/",
+            "https://example.test/a/",
+            "https://example.test/%2F",
+            "https://example.test/callback?next=//",
+        ] {
+            let input = format!(
+                r#"{MINIMAL}
+[[policy.rules]]
+id = "valid-path-shape"
+decision = "deny"
+urls = [{pattern:?}]
+"#
+            );
+            compile(&input)
+                .unwrap_or_else(|error| panic!("valid pattern {pattern} failed: {error}"));
+        }
+    }
+
+    #[test]
     fn shared_url_contract_crosses_compiled_product_policy_evaluation() {
         use http_access_conformance::{load_matching_suite, MatchOutcome, UrlErrorCode};
         use http_access_policy_acl::PolicyEvaluation;
@@ -8974,6 +9440,59 @@ urls = [{:?}]
                     "{}: compiled product decision disagreed with matches={expected}",
                     case.id
                 ),
+            }
+        }
+    }
+
+    #[test]
+    fn dns_glob_denies_do_not_capture_ip_literals_under_default_allow() {
+        use http_access_policy_acl::PolicyEvaluation;
+        use http_access_types::EffectivePolicy;
+
+        let input = MINIMAL.replace(
+            "[policy]\ndefault = \"deny\"",
+            r#"[policy]
+default = "allow"
+
+[[policy.rules]]
+id = "dns-deny"
+decision = "deny"
+urls = ["https://*.example.test/**"]
+
+[[policy.rules]]
+id = "ip-deny"
+decision = "deny"
+urls = ["https://192.0.2.10/**"]"#,
+        );
+        let compiled = compile(&input).unwrap();
+        let snapshot = crate::policy::ProductAclSnapshot::compile(
+            &compiled.reloadable_plan.policy,
+            http_access_types::PolicyGeneration::new(1).unwrap(),
+            SnapshotIdentity::new(),
+            &[],
+        )
+        .unwrap();
+
+        for (url, expected_rule) in [
+            ("https://api.example.test/resource", Some("dns-deny")),
+            ("https://192.0.2.10/resource", Some("ip-deny")),
+            ("https://192.0.2.11/resource", None),
+        ] {
+            let decision = evaluate_test_policy(
+                &snapshot,
+                &canonicalize_http_url(url).unwrap(),
+                "192.0.2.20".parse().unwrap(),
+            );
+            match (decision, expected_rule) {
+                (PolicyEvaluation::Deny { provenance }, Some(expected)) => assert!(matches!(
+                    provenance.effective_policy(),
+                    EffectivePolicy::Rule { id, .. } if id.as_str() == expected
+                )),
+                (PolicyEvaluation::Allow { provenance, .. }, None) => assert!(matches!(
+                    provenance.effective_policy(),
+                    EffectivePolicy::Default
+                )),
+                (_, expected) => panic!("unexpected decision for expected rule {expected:?}"),
             }
         }
     }
@@ -9123,6 +9642,36 @@ url = "{url}"
             let error = compile(&input).unwrap_err();
             assert!(error.to_string().contains(expected), "{name}: {error}");
         }
+    }
+
+    #[test]
+    fn ipv6_parent_without_authored_server_name_validates_and_activates() {
+        let input = format!(
+            r#"{MINIMAL}
+
+[egress]
+route = "parent_proxy"
+
+[egress.parent_proxy]
+kind = "acl_proxy"
+url = "https://[2001:db8::10]:8443"
+
+[egress.parent_proxy.tls]
+trust = "insecure"
+"#
+        );
+        let compiled = compile(&input).expect("canonical IPv6 parent must validate");
+        let activation = crate::egress::EgressActivation::activate(
+            compiled.reloadable_plan.egress,
+            &SnapshotIdentity::new(),
+            http_access_types::PolicyGeneration::new(1).unwrap(),
+            || false,
+        )
+        .expect("a validated canonical IPv6 parent must activate");
+
+        let (neutral, _) = activation.into_parts();
+        let (_, _, route, _) = neutral.into_parts();
+        assert!(matches!(route, http_access_types::Route::Parent { .. }));
     }
 
     #[test]
@@ -9456,14 +10005,26 @@ public_url = "http://[::ffff:127.0.0.1]:8898/_acl-proxy/external-auth/callback"
         );
         let compiled =
             compile(&input).expect("mapped loopback control and plaintext callback must compile");
+        let canonical = compile(&input.replace("[::ffff:127.0.0.1]", "127.0.0.1"))
+            .expect("equivalent canonical callback spelling must compile");
         assert_eq!(
             compiled.static_config.control.as_ref().unwrap().bind,
             "127.0.0.1:8898".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(
-            compiled.static_config.callback_public_url.as_deref(),
+            compiled
+                .static_config
+                .callback_public_url
+                .as_ref()
+                .map(CanonicalUrl::as_str),
             Some("http://127.0.0.1:8898/_acl-proxy/external-auth/callback")
         );
+        assert!(compiled.static_config == canonical.static_config);
+        assert_eq!(
+            serde_json::to_vec(&compiled.static_config).unwrap(),
+            serde_json::to_vec(&canonical.static_config).unwrap()
+        );
+        assert_eq!(compiled.static_fingerprint, canonical.static_fingerprint);
     }
 
     #[test]
@@ -10137,6 +10698,7 @@ redaction_profile = "small"
                     r#"
 [authorization.providers.current.outputs.value_{index}]
 kind = "custom_header"
+transport_security = "cleartext_allowed"
 header = "x-output-{index}"
 "#
                 )
@@ -10408,11 +10970,195 @@ url = "https://approval.example.test/authorize"
 
 [authorization.providers.unused.outputs.bad]
 kind = "custom_header"
+transport_security = "tls_required"
 header = "x-not-allowed"
 "#
         );
         let error = compile(&input).expect_err("unused provider outputs remain configured input");
         assert!(error.to_string().contains("allowed_custom_headers"));
+    }
+
+    fn transport_security_config(definitions: &str, policy: &str) -> String {
+        MINIMAL
+            .replace("[policy]", &format!("{definitions}\n[policy]"))
+            .replace("[policy]\ndefault = \"deny\"", policy)
+    }
+
+    const TOKEN_SOURCE: &str = r#"[credentials.sources.token]
+source = "environment"
+variable = "TEST_TOKEN"
+"#;
+
+    fn bearer_action(scope: &str, transport_security: &str) -> String {
+        format!(
+            r#"[[{scope}.credential_actions]]
+kind = "bearer"
+transport_security = "{transport_security}"
+credential = "token"
+"#
+        )
+    }
+
+    #[test]
+    fn cleartext_transport_security_covers_global_local_provider_and_default_allow() {
+        let http_allow = r#"[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "http"
+decision = "allow"
+urls = ["http://example.test/**"]
+"#;
+        for scope in ["egress", "policy.rules"] {
+            let definitions = if scope == "egress" {
+                format!("{TOKEN_SOURCE}\n{}", bearer_action(scope, "tls_required"))
+            } else {
+                TOKEN_SOURCE.to_string()
+            };
+            let policy = if scope == "egress" {
+                http_allow.to_string()
+            } else {
+                format!("{http_allow}\n{}", bearer_action(scope, "tls_required"))
+            };
+            let error = compile(&transport_security_config(&definitions, &policy))
+                .expect_err("an HTTP-reachable TLS-only action must fail");
+            assert!(error.to_string().contains("cleartext_allowed"), "{error}");
+
+            let clear = transport_security_config(&definitions, &policy).replace(
+                "transport_security = \"tls_required\"",
+                "transport_security = \"cleartext_allowed\"",
+            );
+            compile(&clear).expect("the explicit cleartext opt-in must compile");
+        }
+
+        let provider = r#"[authorization.providers.auth]
+kind = "process"
+command = "/bin/authorize"
+
+[authorization.providers.auth.outputs.token]
+kind = "bearer"
+transport_security = "tls_required"
+"#;
+        let delegate = r#"[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "http-provider"
+decision = "delegate"
+urls = ["http://example.test/**"]
+authorization_provider = "auth"
+"#;
+        let input = transport_security_config(provider, delegate);
+        let error = compile(&input).expect_err("selected TLS-only output must fail on HTTP");
+        assert!(error.to_string().contains("cleartext_allowed"), "{error}");
+        compile(&input.replace("tls_required", "cleartext_allowed"))
+            .expect("selected cleartext provider output must compile");
+
+        let definitions = format!(
+            "{TOKEN_SOURCE}\n{}",
+            bearer_action("egress", "tls_required")
+        );
+        let default_allow = "[policy]\ndefault = \"allow\"";
+        let error = compile(&transport_security_config(&definitions, default_allow))
+            .expect_err("default allow can reach HTTP");
+        assert!(error.to_string().contains("cleartext_allowed"), "{error}");
+        compile(&transport_security_config(
+            &definitions.replace("tls_required", "cleartext_allowed"),
+            default_allow,
+        ))
+        .expect("default allow accepts an explicit global cleartext opt-in");
+    }
+
+    #[test]
+    fn cleartext_transport_security_covers_mixed_unconstrained_and_match_all_rules() {
+        let definitions = format!(
+            r#"[credentials]
+allowed_custom_headers = ["x-local-token"]
+
+{TOKEN_SOURCE}
+[credentials.sources.local]
+source = "environment"
+variable = "LOCAL_TOKEN"
+
+{}
+"#,
+            bearer_action("egress", "cleartext_allowed")
+        );
+        let local_tls = r#"[[policy.rules.credential_actions]]
+kind = "custom_header"
+transport_security = "tls_required"
+header = "x-local-token"
+credential = "local"
+"#;
+        for predicate in ["methods = [\"GET\"]", "urls = [\"**\"]"] {
+            let policy = format!(
+                r#"[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "http-reachable"
+decision = "allow"
+{predicate}
+
+{local_tls}"#
+            );
+            let error = compile(&transport_security_config(&definitions, &policy))
+                .expect_err("URL-less and match-all rules can reach HTTP");
+            assert!(error.to_string().contains("cleartext_allowed"), "{error}");
+        }
+    }
+
+    #[test]
+    fn tls_required_credentials_accept_https_even_through_an_http_parent() {
+        let definitions = format!(
+            r#"{TOKEN_SOURCE}
+[egress]
+route = "parent_proxy"
+
+[egress.parent_proxy]
+kind = "acl_proxy"
+url = "http://192.0.2.10:8080"
+
+{}"#,
+            bearer_action("egress", "tls_required")
+        );
+        let policy = r#"[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "https"
+decision = "allow"
+urls = ["https://example.test/**"]
+"#;
+        compile(&transport_security_config(&definitions, policy))
+            .expect("HTTPS origin credentials remain TLS-protected through an HTTP parent");
+    }
+
+    #[test]
+    fn deny_rules_and_unselected_provider_outputs_do_not_inject_credentials() {
+        let provider = r#"[authorization.providers.unused]
+kind = "process"
+command = "/bin/authorize"
+
+[authorization.providers.unused.outputs.token]
+kind = "bearer"
+transport_security = "tls_required"
+"#;
+        let policy = r#"[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "deny-http"
+decision = "deny"
+urls = ["http://blocked.example.test/**"]
+
+[[policy.rules]]
+id = "allow-http"
+decision = "allow"
+urls = ["http://example.test/**"]
+"#;
+        compile(&transport_security_config(provider, policy))
+            .expect("an unused provider output must not become an effective credential");
     }
 
     #[test]
@@ -10427,6 +11173,7 @@ command = "/bin/authorize"
 
 [authorization.providers.auth.outputs.{name}]
 kind = "bearer"
+transport_security = "tls_required"
 "#
             )
         }
@@ -10460,6 +11207,7 @@ command = "/bin/authorize"
 
 [authorization.providers.auth.outputs.bearer]
 kind = "bearer"
+transport_security = "tls_required"
 "#;
         let cases = [
             (
@@ -10473,10 +11221,12 @@ methods = ["GET"]
 
 [[policy.rules.credential_actions]]
 kind = "bearer"
+transport_security = "tls_required"
 credential = "token"
 
 [[policy.rules.credential_actions]]
 kind = "basic"
+transport_security = "tls_required"
 username = "agent"
 password_credential = "password"
 "#
@@ -10494,6 +11244,7 @@ authorization_provider = "auth"
 
 [[policy.rules.credential_actions]]
 kind = "bearer"
+transport_security = "tls_required"
 credential = "token"
 "#
                 .to_string(),
@@ -10508,9 +11259,11 @@ command = "/bin/authorize"
 
 [authorization.providers.auth.outputs.first]
 kind = "bearer"
+transport_security = "tls_required"
 
 [authorization.providers.auth.outputs.second]
 kind = "basic"
+transport_security = "tls_required"
 username = "agent"
 "#
                 ),
@@ -10524,6 +11277,7 @@ username = "agent"
 
 [[egress.credential_actions]]
 kind = "bearer"
+transport_security = "tls_required"
 credential = "token"
 "#
                 ),
@@ -10535,6 +11289,7 @@ methods = ["GET"]
 
 [[policy.rules.credential_actions]]
 kind = "basic"
+transport_security = "tls_required"
 username = "agent"
 password_credential = "password"
 "#
@@ -10548,6 +11303,7 @@ password_credential = "password"
 
 [[egress.credential_actions]]
 kind = "bearer"
+transport_security = "tls_required"
 credential = "token"
 "#
                 ),
@@ -10577,11 +11333,13 @@ methods = ["GET"]
 
 [[policy.rules.credential_actions]]
 kind = "custom_header"
+transport_security = "tls_required"
 header = "X-Api-Key"
 credential = "token"
 
 [[policy.rules.credential_actions]]
 kind = "custom_header"
+transport_security = "tls_required"
 header = "x-api-key"
 credential = "password"
 "#
@@ -10638,6 +11396,7 @@ methods = ["GET"]
 
 [[policy.rules.credential_actions]]
 kind = "custom_header"
+transport_security = "tls_required"
 header = "x-api-key"
 credential = "token"
 "#;

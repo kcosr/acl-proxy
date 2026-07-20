@@ -1,5 +1,7 @@
 # Policy Header Value Matching Design
 
+> Historical pre-schema-3 implementation record. It does not describe the current configuration contract; use `README.md` for supported authoring.
+
 Status: Locked
 
 ## 1. Purpose

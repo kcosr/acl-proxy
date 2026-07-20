@@ -210,6 +210,19 @@ impl UnboundStandaloneGenerationPlan {
     ) -> Result<Self, StandaloneCompileError> {
         let generation =
             PolicyGeneration::new(id.get()).map_err(|_| StandaloneCompileError::Generation)?;
+        Self::compile_with_generation(plan, generation)
+    }
+
+    pub(crate) fn preflight(plan: &ReloadableProductPlan) -> Result<(), StandaloneCompileError> {
+        let generation =
+            PolicyGeneration::new(1).expect("the structural preflight generation is nonzero");
+        Self::compile_with_generation(plan, generation).map(drop)
+    }
+
+    fn compile_with_generation(
+        plan: &ReloadableProductPlan,
+        generation: PolicyGeneration,
+    ) -> Result<Self, StandaloneCompileError> {
         let identity = SnapshotIdentity::new();
         let version = generation.get();
 
@@ -763,7 +776,7 @@ fn compile_resource_proof(
 
 fn credential_source_name(action: &CredentialActionPlan) -> &str {
     match action {
-        CredentialActionPlan::Bearer { credential }
+        CredentialActionPlan::Bearer { credential, .. }
         | CredentialActionPlan::CustomHeader { credential, .. } => credential,
         CredentialActionPlan::Basic {
             password_credential,
@@ -775,14 +788,18 @@ fn credential_source_name(action: &CredentialActionPlan) -> &str {
 impl StandaloneProviderOutputShape {
     fn from_plan(plan: &ProviderOutputPlan) -> Self {
         match plan {
-            ProviderOutputPlan::Bearer { required } => Self::Bearer {
+            ProviderOutputPlan::Bearer { required, .. } => Self::Bearer {
                 required: *required,
             },
-            ProviderOutputPlan::Basic { username, required } => Self::Basic {
+            ProviderOutputPlan::Basic {
+                username, required, ..
+            } => Self::Basic {
                 username: username.clone(),
                 required: *required,
             },
-            ProviderOutputPlan::CustomHeader { header, required } => Self::CustomHeader {
+            ProviderOutputPlan::CustomHeader {
+                header, required, ..
+            } => Self::CustomHeader {
                 header: header.clone(),
                 required: *required,
             },
@@ -1278,6 +1295,15 @@ fn compile_sensitive_headers(
                 .iter()
                 .map(neutral_header_name),
         )
+        .chain(
+            http_access_runtime::PREPARTITION_CALLER_CREDENTIAL_HEADERS
+                .iter()
+                .map(|name| {
+                    HeaderName::new(*name).map_err(|_| {
+                        StandaloneCompileError::Checked("caller credential header name")
+                    })
+                }),
+        )
         .collect::<Result<Vec<_>, _>>()?;
     headers.sort();
     if headers.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -1460,15 +1486,19 @@ fn compile_provider_credential(
     reference: CredentialRef,
 ) -> Result<(bool, CredentialMutation), StandaloneCompileError> {
     match output {
-        ProviderOutputPlan::Bearer { required } => {
+        ProviderOutputPlan::Bearer { required, .. } => {
             Ok((*required, CredentialMutation::bearer(reference)))
         }
-        ProviderOutputPlan::Basic { username, required } => Ok((
+        ProviderOutputPlan::Basic {
+            username, required, ..
+        } => Ok((
             *required,
             CredentialMutation::basic(username.clone(), reference)
                 .map_err(|_| StandaloneCompileError::Checked("provider basic credential"))?,
         )),
-        ProviderOutputPlan::CustomHeader { header, required } => Ok((
+        ProviderOutputPlan::CustomHeader {
+            header, required, ..
+        } => Ok((
             *required,
             CredentialMutation::custom_header(neutral_header_name(header)?, reference).map_err(
                 |_| StandaloneCompileError::Checked("provider custom-header credential"),
@@ -1679,6 +1709,7 @@ include_headers = ["x-zeta-secret", "x-alpha-secret", "x-internal-context"]
 
 [authorization.providers.approval.outputs.token]
 kind = "custom_header"
+transport_security = "cleartext_allowed"
 header = "x-provider-token"
 required = true
 
@@ -1702,6 +1733,7 @@ name = "x-internal-context"
 
 [[egress.credential_actions]]
 kind = "custom_header"
+transport_security = "cleartext_allowed"
 header = "x-global-token"
 credential = "global"
 
@@ -1740,6 +1772,7 @@ name = "x-private"
 
 [[policy.rules.credential_actions]]
 kind = "custom_header"
+transport_security = "cleartext_allowed"
 header = "x-rule-token"
 credential = "rule"
 
@@ -1869,7 +1902,12 @@ header = "x-acl-proxy-request-id"
                 .iter()
                 .map(HeaderName::as_str)
                 .collect::<Vec<_>>(),
-            ["x-alpha-secret", "x-internal-context", "x-zeta-secret"]
+            [
+                "proxy-authorization",
+                "x-alpha-secret",
+                "x-internal-context",
+                "x-zeta-secret",
+            ]
         );
         assert_eq!(
             plan.sensitive_header_policy()
@@ -2003,6 +2041,7 @@ header = "x-acl-proxy-request-id"
         )
         .unwrap();
         let complete_headers = [
+            ("proxy-authorization", b"caller-secret".as_slice()),
             ("x-alpha-secret", b"alpha".as_slice()),
             ("x-internal-context", b"context".as_slice()),
             ("x-ordinary", b"ordinary".as_slice()),
@@ -2026,7 +2065,12 @@ header = "x-acl-proxy-request-id"
                 .iter()
                 .map(HeaderName::as_str)
                 .collect::<Vec<_>>(),
-            ["x-alpha-secret", "x-internal-context", "x-zeta-secret"]
+            [
+                "proxy-authorization",
+                "x-alpha-secret",
+                "x-internal-context",
+                "x-zeta-secret",
+            ]
         );
         assert_eq!(
             partition
@@ -2034,7 +2078,12 @@ header = "x-acl-proxy-request-id"
                 .iter()
                 .map(HeaderName::as_str)
                 .collect::<Vec<_>>(),
-            ["x-alpha-secret", "x-internal-context", "x-zeta-secret"]
+            [
+                "proxy-authorization",
+                "x-alpha-secret",
+                "x-internal-context",
+                "x-zeta-secret",
+            ]
         );
         assert_eq!(partition.ordinary_headers().len(), 1);
         assert_eq!(
@@ -2082,9 +2131,8 @@ header = "x-acl-proxy-request-id"
         compiled.reloadable_plan.egress.route = CompiledEgressRoute::ParentProxy;
         compiled.reloadable_plan.egress.parent_proxy = Some(ParentProxyPlan {
             kind: CompiledParentProxyKind::Generic,
-            url: "https://parent.example.test:8443/".to_owned(),
-            host: "parent.example.test".to_owned(),
-            port: 8443,
+            target: http_access_url::canonicalize_http_url("https://parent.example.test:8443/")
+                .unwrap(),
             tls: Some(ParentProxyTlsPlan {
                 trust: CompiledTlsTrust::Custom,
                 ca_certificate: Some("parent-root.pem".into()),

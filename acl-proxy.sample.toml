@@ -111,6 +111,7 @@ header = "x-acl-proxy-request-id"
 #
 # [[egress.credential_actions]]
 # kind = "custom_header"
+# transport_security = "tls_required"
 # header = "x-workload-token"
 # credential = "workload"
 

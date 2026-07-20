@@ -1,9 +1,0 @@
-{
-  "allow": [
-    "https://repo.example.com/**",
-    "https://packages.example.com/public/**"
-  ],
-  "headers": {
-    "x-api-key": ["demo-key"]
-  }
-}

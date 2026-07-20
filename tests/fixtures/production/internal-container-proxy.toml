@@ -52,6 +52,7 @@ value = "fixture-internal"
 
 [[egress.credential_actions]]
 kind = "custom_header"
+transport_security = "cleartext_allowed"
 header = "x-aw-identity-token"
 credential = "aw_identity"
 

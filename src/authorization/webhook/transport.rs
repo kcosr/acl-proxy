@@ -470,7 +470,7 @@ mod tests {
     ) -> Arc<WebhookProvider> {
         WebhookProvider::activate(
             WebhookProviderPlan {
-                url: format!("https://{host}:{port}/authorize"),
+                url: canonicalize_http_url(&format!("https://{host}:{port}/authorize")).unwrap(),
                 timeout: Duration::from_secs(2),
                 on_failure: CompiledProviderFailureMode::Deny,
                 include_headers: vec![],
@@ -482,6 +482,7 @@ mod tests {
                     ca_certificate,
                 }),
             },
+            http_access_types::PolicyGeneration::new(7).unwrap(),
             || false,
         )
         .unwrap()
@@ -835,7 +836,7 @@ mod tests {
     async fn provider_deadline_covers_resolution_and_releases_admission() {
         let provider = WebhookProvider::activate(
             WebhookProviderPlan {
-                url: "http://localhost/authorize".to_owned(),
+                url: canonicalize_http_url("http://localhost/authorize").unwrap(),
                 timeout: Duration::from_millis(10),
                 on_failure: CompiledProviderFailureMode::Deny,
                 include_headers: vec![],
@@ -844,6 +845,7 @@ mod tests {
                 outputs: BTreeMap::new(),
                 tls: None,
             },
+            http_access_types::PolicyGeneration::new(7).unwrap(),
             || false,
         )
         .unwrap();
@@ -892,7 +894,11 @@ mod tests {
         });
         let provider = WebhookProvider::activate(
             WebhookProviderPlan {
-                url: format!("http://localhost:{}/authorize", endpoint.port()),
+                url: canonicalize_http_url(&format!(
+                    "http://localhost:{}/authorize",
+                    endpoint.port()
+                ))
+                .unwrap(),
                 timeout: Duration::from_millis(100),
                 on_failure: CompiledProviderFailureMode::Deny,
                 include_headers: vec![],
@@ -901,6 +907,7 @@ mod tests {
                 outputs: BTreeMap::new(),
                 tls: None,
             },
+            http_access_types::PolicyGeneration::new(7).unwrap(),
             || false,
         )
         .unwrap();

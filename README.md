@@ -244,7 +244,13 @@ URL patterns are component aware:
 - `*` as a hostname label matches exactly one DNS label.
 - `**` as a hostname label matches one or more DNS labels.
 - `*` inside a hostname label is label-local and never crosses a dot.
+- Hostname wildcards match DNS names only; IP addresses require exact IPv4 or
+  IPv6 patterns.
 - `**` in a path or query is the recursive component wildcard.
+- A whole pattern of `**` matches every canonical HTTP/HTTPS URL.
+- Query text is matched as an opaque, ordered string. Duplicate keys and their
+  order are significant, and a pattern without a query ignores the request
+  query.
 - Scheme and port are exact; list HTTP and HTTPS separately when both are
   intended.
 
@@ -256,6 +262,13 @@ upgrade.
 
 Process providers exchange bounded newline-delimited JSON and are owned by the
 active generation. Ambient environment inheritance is off by default.
+
+Process response framing is intentionally stricter than general JSON member
+ordering: `id` must be the first member. Bounded spaces or horizontal tabs are
+accepted only before the opening `{` and between `{`, `"id"`, the colon, and
+the opening value quote. Standard serializers work when they preserve `id` as
+the first inserted member; arbitrary member order and whitespace elsewhere do
+not.
 
 ```toml
 [authorization.providers.repo_acl]
@@ -321,12 +334,21 @@ variable = "WORKLOAD_TOKEN"
 
 [[egress.credential_actions]]
 kind = "custom_header"
+transport_security = "tls_required"
 header = "x-workload-token"
 credential = "workload"
 ```
 
 A credential action replaces all attacker-supplied values at its destination.
 Missing, empty, invalid, or oversized credential material fails closed.
+Every credential action and authorization-provider output must declare exactly
+one `transport_security` value: `tls_required` or `cleartext_allowed`. There is
+no default or compatibility spelling. An allow/delegate rule that can reach an
+HTTP origin is rejected unless every effective global action, rule action, and
+selected-provider output explicitly uses `cleartext_allowed`; URL-less rules
+and `**` are HTTP-reachable. A default-allow policy applies the same requirement
+to global actions. HTTPS origin requests remain protected when routed through
+an HTTP parent proxy, so their credentials may remain `tls_required`.
 
 ### Header Effects
 

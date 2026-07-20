@@ -2,7 +2,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use http_access_types::CanonicalUrl;
-use http_access_url::{canonicalize_http_url, UrlError};
+#[cfg(test)]
+use http_access_url::canonicalize_http_url;
 use tokio::sync::{oneshot, Notify};
 
 use super::connector::WebhookConnector;
@@ -72,8 +73,6 @@ pub(crate) enum WebhookCompletionError {
 pub(crate) enum WebhookAuthorizationRuntimeError {
     #[error("webhook transport arena configuration is invalid")]
     Transport(#[from] WebhookTransportArenaError),
-    #[error("callback public URL is invalid")]
-    CallbackUrl(#[from] UrlError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -109,11 +108,6 @@ impl WebhookAuthorizationRuntime {
         static_config: &StaticProductConfig,
         connector: Arc<WebhookConnector>,
     ) -> Result<Arc<Self>, WebhookAuthorizationRuntimeError> {
-        let callback_url = static_config
-            .callback_public_url
-            .as_deref()
-            .map(canonicalize_http_url)
-            .transpose()?;
         Ok(Arc::new(Self {
             transport: WebhookTransportArena::try_new(
                 static_config.service.max_active_webhook_deliveries,
@@ -122,7 +116,7 @@ impl WebhookAuthorizationRuntime {
             )?,
             connector,
             pending: PendingCapabilityStore::new(),
-            callback_url,
+            callback_url: static_config.callback_public_url.clone(),
             accepting: Mutex::new(true),
         }))
     }

@@ -62,6 +62,7 @@ name = "x-remove-me"
 
 [[policy.rules.credential_actions]]
 kind = "bearer"
+transport_security = "tls_required"
 credential = "api_token"
 "#
     )

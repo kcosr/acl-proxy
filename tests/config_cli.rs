@@ -139,6 +139,24 @@ fn config_validate_rejects_old_missing_and_future_schema_versions() {
 }
 
 #[test]
+fn config_validate_rejects_missing_policy_and_default() {
+    for contents in [
+        MINIMAL.replace("[policy]\ndefault = \"deny\"\n", ""),
+        MINIMAL.replace("default = \"deny\"\n", ""),
+    ] {
+        let file = config_file(&contents);
+        command()
+            .args(["config", "validate", "--config"])
+            .arg(file.path())
+            .assert()
+            .failure()
+            .stdout(contains("Configuration is valid").not())
+            .stderr(contains("strict schema v3 TOML"))
+            .stderr(contains("missing required field"));
+    }
+}
+
+#[test]
 fn config_validate_reports_sanitized_syntax_errors() {
     let file = config_file("schema_version =\nsecret-value-that-must-not-leak");
     let output = command()
@@ -273,6 +291,54 @@ fn config_path_environment_is_the_only_static_command_override() {
         .env("ACL_PROXY_CONFIG", file.path())
         .env("PROXY_EXPLICIT_HTTP_BIND", "not-an-address")
         .env("LOG_LEVEL", "not-a-level")
+        .assert()
+        .success()
+        .stdout(contains("Configuration is valid"));
+}
+
+#[cfg(unix)]
+#[test]
+fn config_path_environment_preserves_non_unicode_paths() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let directory = TempDir::new().expect("create temporary directory");
+    let path = directory
+        .path()
+        .join(OsString::from_vec(b"acl-proxy-\xff.toml".to_vec()));
+    fs::write(&path, MINIMAL).expect("write non-Unicode config path");
+
+    command()
+        .args(["config", "validate"])
+        .current_dir(directory.path())
+        .env("ACL_PROXY_CONFIG", path.as_os_str())
+        .assert()
+        .success()
+        .stdout(contains("Configuration is valid"));
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_config_path_overrides_a_non_unicode_environment_path() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let directory = TempDir::new().expect("create temporary directory");
+    let explicit = directory.path().join("explicit.toml");
+    fs::write(&explicit, MINIMAL).expect("write explicit config");
+    let environment = directory
+        .path()
+        .join(OsString::from_vec(b"rejected-\xff.toml".to_vec()));
+    fs::write(
+        &environment,
+        MINIMAL.replace("schema_version = 3", "schema_version = 2"),
+    )
+    .expect("write environment config");
+
+    command()
+        .args(["config", "validate", "--config"])
+        .arg(&explicit)
+        .env("ACL_PROXY_CONFIG", environment.as_os_str())
         .assert()
         .success()
         .stdout(contains("Configuration is valid"));

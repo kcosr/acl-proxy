@@ -43,6 +43,12 @@ metadata = json.loads(sys.argv[2])
 package = next(package for package in metadata["packages"] if package["name"] == "acl-proxy")
 dependencies = {dependency["name"]: dependency for dependency in package["dependencies"]}
 
+for name in ("idna", "memchr", "url"):
+    if name in dependencies:
+        raise SystemExit(
+            f"{name} must not be a direct dependency; URL semantics belong to http-access-url"
+        )
+
 expected = {
     "http-access-types": (None, root.parent / "access-runtime" / "crates" / "http-access-types"),
     "http-access-url": (None, root.parent / "access-runtime" / "crates" / "http-access-url"),

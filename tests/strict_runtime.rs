@@ -326,7 +326,7 @@ import threading
 import time
 import urllib.parse
 
-port_file, event_file = sys.argv[1:]
+port_file, event_file, request_file = sys.argv[1:]
 
 def deliver_callback(callback_url, payload):
     time.sleep(0.05)
@@ -350,6 +350,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        with open(request_file, "a", encoding="utf-8") as handle:
+            handle.write(self.path + "\n")
         self.send_body(200, self.path.encode("ascii"), {
             "Content-Type": "text/plain",
             "X-Seen-Provider-Token": self.headers.get("x-provider-token", "missing"),
@@ -482,6 +484,7 @@ retire_timeout = "6s"
 
 [authorization.providers.local.outputs.token]
 kind = "custom_header"
+transport_security = "cleartext_allowed"
 header = "x-provider-token"
 required = true
 
@@ -495,6 +498,7 @@ max_response_bytes = 65536
 
 [authorization.providers.approval.outputs.token]
 kind = "bearer"
+transport_security = "cleartext_allowed"
 required = true
 
 [credentials]
@@ -606,9 +610,10 @@ fn start_origin(directory: &Path, python: &Path) -> (ChildGuard, SocketAddr) {
     let script = directory.join("origin.py");
     let port_file = directory.join("origin.port");
     let event_file = directory.join("webhook-events.jsonl");
+    let request_file = directory.join("origin-requests.txt");
     write_file(&script, origin_script());
     let child = Command::new(python)
-        .args([&script, &port_file, &event_file])
+        .args([&script, &port_file, &event_file, &request_file])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -811,6 +816,21 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
     let pass = proxy_request(data, "GET", &pass_url, &[]);
     assert_eq!(pass.status, 200);
     assert_eq!(pass.header("x-seen-provider-token"), Some("missing"));
+
+    let empty_segment_url = format!("http://{origin}//provider-pass");
+    assert_eq!(
+        proxy_request(data, "GET", &empty_segment_url, &[]).status,
+        400,
+        "request fact construction accepted an empty path segment"
+    );
+    let origin_requests = fs::read_to_string(directory.path().join("origin-requests.txt"))
+        .expect("read origin request log");
+    assert!(
+        !origin_requests
+            .lines()
+            .any(|path| path == "//provider-pass"),
+        "rejected empty path segment reached the origin"
+    );
 
     let replace_url = format!("http://{origin}/provider-replace");
     let replaced = proxy_request(data, "POST", &replace_url, b"client body");

@@ -1,5 +1,7 @@
 {
   "default": "deny",
+  "global_credential_mutations": [],
+  "provider_credential_outputs": {"approval": {}},
   "rules": [
     {
       "index": 0,

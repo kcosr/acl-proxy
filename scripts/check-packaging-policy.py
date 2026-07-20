@@ -436,6 +436,9 @@ def check_provenance(root: Path) -> None:
 
 
 def check_shipped_docs(root: Path) -> None:
+    demos = root / "demos"
+    if demos.exists() and any(path.is_file() or path.is_symlink() for path in demos.rglob("*")):
+        fail("obsolete pre-schema-3 demos are present")
     readme = read_text(root / "README.md")
     normalized = " ".join(readme.split())
     if f"The `{PRODUCT_VERSION}` candidate requires `schema_version = 3`" not in normalized:
@@ -465,6 +468,15 @@ def check_shipped_docs(root: Path) -> None:
     ):
         fail("README hardcodes a future release SHA prefix")
     sample = read_text(root / "acl-proxy.sample.toml")
+    for path, text in (("README.md", readme), ("acl-proxy.sample.toml", sample)):
+        for obsolete in (
+            "policy.external_auth_profiles",
+            "policy.approval_macros",
+            "external_auth_profile =",
+            "[[policy.rules.header_actions]]",
+        ):
+            if obsolete in text:
+                fail(f"{path} contains obsolete configuration surface: {obsolete}")
     if "schema_version = 3" not in sample:
         fail("sample configuration is not schema version 3")
     if "acl-proxy export-ca" not in sample:

@@ -101,8 +101,14 @@ pub(crate) struct CaptureSinkSpec {
 pub(crate) enum CaptureSinkSpecError {
     #[error("capture directory must not be empty")]
     EmptyDirectory,
-    #[error("capture filename template must be a nonempty basename")]
-    InvalidFilenameTemplate,
+    #[error("capture filename template must be a portable nonempty basename")]
+    InvalidFilenameBasename,
+    #[error("capture filename template must contain {{requestId}}")]
+    MissingRequestIdPlaceholder,
+    #[error("capture filename template must contain {{suffix}}")]
+    MissingSuffixPlaceholder,
+    #[error("capture filename template contains an unknown placeholder")]
+    UnknownFilenamePlaceholder,
     #[error("capture max_files must be at least 1")]
     ZeroMaxFiles,
     #[error("capture max_total_bytes must be at least 1")]
@@ -119,9 +125,7 @@ impl CaptureSinkSpec {
         if directory.as_os_str().is_empty() {
             return Err(CaptureSinkSpecError::EmptyDirectory);
         }
-        if !is_valid_capture_filename_template(&filename_template) {
-            return Err(CaptureSinkSpecError::InvalidFilenameTemplate);
-        }
+        validate_capture_filename_template(&filename_template)?;
         if max_files == 0 {
             return Err(CaptureSinkSpecError::ZeroMaxFiles);
         }
@@ -153,20 +157,37 @@ impl CaptureSinkSpec {
     }
 }
 
-fn is_valid_capture_filename_template(template: &str) -> bool {
+fn validate_capture_filename_template(template: &str) -> Result<(), CaptureSinkSpecError> {
     if template.is_empty()
         || template.contains('/')
         || template.contains('\\')
         || template.contains("..")
+        || template.contains(':')
         || template.chars().any(char::is_control)
     {
-        return false;
+        return Err(CaptureSinkSpecError::InvalidFilenameBasename);
     }
     let mut components = Path::new(template).components();
-    matches!(
+    if !matches!(
         (components.next(), components.next()),
         (Some(std::path::Component::Normal(_)), None)
-    )
+    ) {
+        return Err(CaptureSinkSpecError::InvalidFilenameBasename);
+    }
+    if !template.contains("{requestId}") {
+        return Err(CaptureSinkSpecError::MissingRequestIdPlaceholder);
+    }
+    if !template.contains("{suffix}") {
+        return Err(CaptureSinkSpecError::MissingSuffixPlaceholder);
+    }
+    let stripped = template
+        .replace("{requestId}", "")
+        .replace("{kind}", "")
+        .replace("{suffix}", "");
+    if stripped.contains('{') || stripped.contains('}') {
+        return Err(CaptureSinkSpecError::UnknownFilenamePlaceholder);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1818,23 +1839,85 @@ mod tests {
         assert_eq!(valid.filename_template(), "{requestId}-{suffix}.json");
         assert_eq!(valid.max_files(), 10);
         assert_eq!(valid.max_total_bytes(), 1024);
+        let with_kind = CaptureSinkSpec::new(
+            PathBuf::from("captures"),
+            "{requestId}-{kind}-{suffix}.json".to_string(),
+            10,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(
+            with_kind.filename_template(),
+            "{requestId}-{kind}-{suffix}.json"
+        );
 
         assert_eq!(
-            CaptureSinkSpec::new(PathBuf::new(), "capture.json".to_string(), 1, 1),
+            CaptureSinkSpec::new(
+                PathBuf::new(),
+                "{requestId}-{suffix}.json".to_string(),
+                1,
+                1,
+            ),
             Err(CaptureSinkSpecError::EmptyDirectory)
         );
-        for filename in ["", ".", "..", "nested/capture.json", "nested\\capture.json"] {
+        for filename in [
+            "",
+            ".",
+            "..",
+            "nested/{requestId}-{suffix}.json",
+            "nested\\{requestId}-{suffix}.json",
+            "C:{requestId}-{suffix}.json",
+            "{requestId}..{suffix}.json",
+            "{requestId}-\n-{suffix}.json",
+        ] {
             assert_eq!(
                 CaptureSinkSpec::new(PathBuf::from("captures"), filename.to_string(), 1, 1),
-                Err(CaptureSinkSpecError::InvalidFilenameTemplate)
+                Err(CaptureSinkSpecError::InvalidFilenameBasename)
             );
         }
         assert_eq!(
-            CaptureSinkSpec::new(PathBuf::from("captures"), "capture.json".to_string(), 0, 1,),
+            CaptureSinkSpec::new(
+                PathBuf::from("captures"),
+                "capture-{suffix}.json".to_string(),
+                1,
+                1,
+            ),
+            Err(CaptureSinkSpecError::MissingRequestIdPlaceholder)
+        );
+        assert_eq!(
+            CaptureSinkSpec::new(
+                PathBuf::from("captures"),
+                "{requestId}.json".to_string(),
+                1,
+                1,
+            ),
+            Err(CaptureSinkSpecError::MissingSuffixPlaceholder)
+        );
+        assert_eq!(
+            CaptureSinkSpec::new(
+                PathBuf::from("captures"),
+                "{requestId}-{unknown}-{suffix}.json".to_string(),
+                1,
+                1,
+            ),
+            Err(CaptureSinkSpecError::UnknownFilenamePlaceholder)
+        );
+        assert_eq!(
+            CaptureSinkSpec::new(
+                PathBuf::from("captures"),
+                "{requestId}-{suffix}.json".to_string(),
+                0,
+                1,
+            ),
             Err(CaptureSinkSpecError::ZeroMaxFiles)
         );
         assert_eq!(
-            CaptureSinkSpec::new(PathBuf::from("captures"), "capture.json".to_string(), 1, 0,),
+            CaptureSinkSpec::new(
+                PathBuf::from("captures"),
+                "{requestId}-{suffix}.json".to_string(),
+                1,
+                0,
+            ),
             Err(CaptureSinkSpecError::ZeroMaxTotalBytes)
         );
     }

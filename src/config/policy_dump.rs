@@ -1,14 +1,20 @@
+use std::collections::BTreeMap;
+
 use serde::Serialize;
 
 use super::compiler::{
-    CompiledDefaultDecision, CompiledHeaderEffectWhen, CompiledRuleDecision, CredentialActionPlan,
-    HeaderEffectPlan, HeaderValuePredicatePlan, PolicyPlan,
+    AuthorizationProviderPlan, CompiledDefaultDecision, CompiledHeaderEffectWhen,
+    CompiledRuleDecision, CompiledTransportSecurity, CredentialActionPlan, HeaderEffectPlan,
+    HeaderValuePredicatePlan, PolicyPlan, ProviderOutputPlan,
 };
 use super::facade::CompiledConfig;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct PolicyDump {
     pub(crate) default: PolicyDumpDefaultDecision,
+    pub(crate) global_credential_mutations: Vec<PolicyDumpCredentialMutation>,
+    pub(crate) provider_credential_outputs:
+        BTreeMap<String, BTreeMap<String, PolicyDumpProviderCredentialOutput>>,
     pub(crate) rules: Vec<PolicyDumpRule>,
 }
 
@@ -117,9 +123,38 @@ pub(crate) enum PolicyDumpHeaderWhen {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum PolicyDumpCredentialMutation {
-    Bearer { credential: String },
-    Basic { password_credential: String },
-    CustomHeader { header: String, credential: String },
+    Bearer {
+        credential: String,
+        transport_security: CompiledTransportSecurity,
+    },
+    Basic {
+        password_credential: String,
+        transport_security: CompiledTransportSecurity,
+    },
+    CustomHeader {
+        header: String,
+        credential: String,
+        transport_security: CompiledTransportSecurity,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum PolicyDumpProviderCredentialOutput {
+    Bearer {
+        required: bool,
+        transport_security: CompiledTransportSecurity,
+    },
+    Basic {
+        username: String,
+        required: bool,
+        transport_security: CompiledTransportSecurity,
+    },
+    CustomHeader {
+        header: String,
+        required: bool,
+        transport_security: CompiledTransportSecurity,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,7 +173,36 @@ pub(crate) struct PolicyDumpTableRow {
 
 impl PolicyDump {
     pub(crate) fn from_compiled(compiled: &CompiledConfig) -> Self {
-        Self::from_plan(&compiled.reloadable_plan.policy)
+        let mut dump = Self::from_plan(&compiled.reloadable_plan.policy);
+        dump.global_credential_mutations = compiled
+            .reloadable_plan
+            .egress
+            .credential_actions
+            .iter()
+            .map(project_credential_mutation)
+            .collect();
+        dump.provider_credential_outputs = compiled
+            .reloadable_plan
+            .authorization
+            .providers
+            .iter()
+            .map(|(provider_name, provider)| {
+                let outputs = match provider {
+                    AuthorizationProviderPlan::Webhook(provider) => &provider.outputs,
+                    AuthorizationProviderPlan::Process(provider) => &provider.outputs,
+                };
+                (
+                    provider_name.clone(),
+                    outputs
+                        .iter()
+                        .map(|(output_name, output)| {
+                            (output_name.clone(), project_provider_output(output))
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        dump
     }
 
     fn from_plan(plan: &PolicyPlan) -> Self {
@@ -147,6 +211,8 @@ impl PolicyDump {
                 CompiledDefaultDecision::Allow => PolicyDumpDefaultDecision::Allow,
                 CompiledDefaultDecision::Deny => PolicyDumpDefaultDecision::Deny,
             },
+            global_credential_mutations: Vec::new(),
+            provider_credential_outputs: BTreeMap::new(),
             rules: plan
                 .rules
                 .iter()
@@ -229,6 +295,36 @@ impl PolicyDump {
     }
 }
 
+fn project_provider_output(output: &ProviderOutputPlan) -> PolicyDumpProviderCredentialOutput {
+    match output {
+        ProviderOutputPlan::Bearer {
+            required,
+            transport_security,
+        } => PolicyDumpProviderCredentialOutput::Bearer {
+            required: *required,
+            transport_security: *transport_security,
+        },
+        ProviderOutputPlan::Basic {
+            username,
+            required,
+            transport_security,
+        } => PolicyDumpProviderCredentialOutput::Basic {
+            username: username.clone(),
+            required: *required,
+            transport_security: *transport_security,
+        },
+        ProviderOutputPlan::CustomHeader {
+            header,
+            required,
+            transport_security,
+        } => PolicyDumpProviderCredentialOutput::CustomHeader {
+            header: header.to_string(),
+            required: *required,
+            transport_security: *transport_security,
+        },
+    }
+}
+
 fn project_header_predicates(
     predicates: &[HeaderValuePredicatePlan],
 ) -> Vec<PolicyDumpHeaderValuePredicate> {
@@ -269,21 +365,30 @@ fn project_header_mutation(effect: &HeaderEffectPlan) -> PolicyDumpHeaderMutatio
 
 fn project_credential_mutation(action: &CredentialActionPlan) -> PolicyDumpCredentialMutation {
     match action {
-        CredentialActionPlan::Bearer { credential } => PolicyDumpCredentialMutation::Bearer {
+        CredentialActionPlan::Bearer {
+            credential,
+            transport_security,
+        } => PolicyDumpCredentialMutation::Bearer {
             credential: credential.clone(),
+            transport_security: *transport_security,
         },
         CredentialActionPlan::Basic {
             password_credential,
+            transport_security,
             ..
         } => PolicyDumpCredentialMutation::Basic {
             password_credential: password_credential.clone(),
+            transport_security: *transport_security,
         },
-        CredentialActionPlan::CustomHeader { header, credential } => {
-            PolicyDumpCredentialMutation::CustomHeader {
-                header: header.to_string(),
-                credential: credential.clone(),
-            }
-        }
+        CredentialActionPlan::CustomHeader {
+            header,
+            credential,
+            transport_security,
+        } => PolicyDumpCredentialMutation::CustomHeader {
+            header: header.to_string(),
+            credential: credential.clone(),
+            transport_security: *transport_security,
+        },
     }
 }
 
@@ -332,14 +437,31 @@ fn format_mutations(rule: &PolicyDumpRule) -> String {
         rule.credential_mutations
             .iter()
             .map(|mutation| match mutation {
-                PolicyDumpCredentialMutation::Bearer { credential } => {
-                    format!("credential:bearer:{credential}")
+                PolicyDumpCredentialMutation::Bearer {
+                    credential,
+                    transport_security,
+                } => {
+                    format!(
+                        "credential:bearer:{credential}:{}",
+                        transport_security.as_str()
+                    )
                 }
                 PolicyDumpCredentialMutation::Basic {
                     password_credential,
-                } => format!("credential:basic:{password_credential}"),
-                PolicyDumpCredentialMutation::CustomHeader { header, credential } => {
-                    format!("credential:custom_header:{header}:{credential}")
+                    transport_security,
+                } => format!(
+                    "credential:basic:{password_credential}:{}",
+                    transport_security.as_str()
+                ),
+                PolicyDumpCredentialMutation::CustomHeader {
+                    header,
+                    credential,
+                    transport_security,
+                } => {
+                    format!(
+                        "credential:custom_header:{header}:{credential}:{}",
+                        transport_security.as_str()
+                    )
                 }
             }),
     );
@@ -375,8 +497,13 @@ command = "/bin/sh"
 args = ["-c", "printf spawned > {}"]
 environment = {{ PROVIDER_SECRET = "provider-secret-value" }}
 
+[authorization.providers.local.outputs.provider_token]
+kind = "custom_header"
+transport_security = "tls_required"
+header = "x-provider-token"
+
 [credentials]
-allowed_custom_headers = ["x-api-key"]
+allowed_custom_headers = ["x-api-key", "x-global-token", "x-provider-token"]
 
 [credentials.sources.environment_source]
 source = "environment"
@@ -385,6 +512,16 @@ variable = "MISSING_POLICY_DUMP_SECRET"
 [credentials.sources.file_source]
 source = "file"
 path = "missing-secret-file"
+
+[credentials.sources.global_source]
+source = "environment"
+variable = "MISSING_GLOBAL_SECRET"
+
+[[egress.credential_actions]]
+kind = "custom_header"
+transport_security = "tls_required"
+header = "x-global-token"
+credential = "global_source"
 
 [redaction.profiles.secrets]
 rules = [{{ literals = ["literal-secret-value"], literal_environment_variables = ["MISSING_REDACTION_SECRET"] }}]
@@ -414,10 +551,12 @@ value = "literal-secret-value"
 
 [[policy.rules.credential_actions]]
 kind = "bearer"
+transport_security = "tls_required"
 credential = "environment_source"
 
 [[policy.rules.credential_actions]]
 kind = "custom_header"
+transport_security = "tls_required"
 header = "x-api-key"
 credential = "file_source"
 "#,
@@ -436,6 +575,7 @@ credential = "file_source"
         assert!(!marker.exists(), "static compilation spawned a provider");
         for excluded in [
             "MISSING_POLICY_DUMP_SECRET",
+            "MISSING_GLOBAL_SECRET",
             "missing-secret-file",
             "MISSING_REDACTION_SECRET",
             "literal-secret-value",
@@ -454,8 +594,18 @@ credential = "file_source"
             .unwrap();
         assert_eq!(mutations[0]["kind"], "bearer");
         assert_eq!(mutations[0]["credential"], "environment_source");
+        assert_eq!(mutations[0]["transport_security"], "tls_required");
         assert_eq!(mutations[1]["kind"], "custom_header");
         assert_eq!(mutations[1]["credential"], "file_source");
+        assert_eq!(mutations[1]["transport_security"], "tls_required");
+        assert_eq!(
+            value["global_credential_mutations"][0]["transport_security"],
+            "tls_required"
+        );
+        assert_eq!(
+            value["provider_credential_outputs"]["local"]["provider_token"]["transport_security"],
+            "tls_required"
+        );
 
         let rows = dump.table_rows();
         assert_eq!(dump.default.as_str(), "deny");
@@ -467,7 +617,7 @@ credential = "file_source"
         assert!(rows[0].header_predicates.contains("x-tenant=engineering"));
         assert!(rows[0]
             .mutations
-            .contains("credential:bearer:environment_source"));
+            .contains("credential:bearer:environment_source:tls_required"));
         assert!(!rows[0].mutations.contains("literal-secret-value"));
     }
 

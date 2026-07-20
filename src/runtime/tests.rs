@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use http_access_url::canonicalize_http_url;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, Notify, Semaphore};
 
@@ -832,7 +833,11 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
         providers: std::collections::BTreeMap::from([(
             "webhook".to_string(),
             AuthorizationProviderPlan::Webhook(WebhookProviderPlan {
-                url: format!("http://provider.test:{}/authorize", endpoint.port()),
+                url: canonicalize_http_url(&format!(
+                    "http://provider.test:{}/authorize",
+                    endpoint.port()
+                ))
+                .unwrap(),
                 timeout: Duration::from_secs(5),
                 on_failure: CompiledProviderFailureMode::Deny,
                 include_headers: vec![],
@@ -849,6 +854,7 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
         authorization_plan,
         provider_registry,
         webhook_runtime.clone(),
+        http_access_types::PolicyGeneration::new(7).unwrap(),
         ActivationCancellation::new_for_test(),
     )
     .await

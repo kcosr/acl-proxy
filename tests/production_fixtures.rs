@@ -198,6 +198,25 @@ fn sanitized_production_role_structure_matches_difference_record() {
         all_provider_names,
         BTreeSet::from(["agent_runner_acl", "gitlab_acl"])
     );
+
+    for name in [
+        "common-container-proxy.toml",
+        "internal-container-proxy.toml",
+    ] {
+        let config = parse_fixture(name);
+        let actions = table(&config, "egress")
+            .get("credential_actions")
+            .and_then(TomlValue::as_array)
+            .expect("container production fixture credential action");
+        assert_eq!(actions.len(), 1, "{name} credential action count");
+        assert_eq!(
+            actions[0]
+                .get("transport_security")
+                .and_then(TomlValue::as_str),
+            Some("cleartext_allowed"),
+            "{name} workload identity must explicitly permit its HTTP parent hop"
+        );
+    }
 }
 
 #[test]

@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use http::HeaderName;
+use http_access_types::PolicyGeneration;
 use tokio::time::Instant;
 
 use super::process::{
@@ -119,8 +120,12 @@ pub(crate) enum AuthorizationActivationError {
     ProviderRegistryMismatch,
     #[error("webhook authorization callback configuration is inconsistent")]
     InvalidWebhookConfiguration,
-    #[error("webhook authorization provider '{provider}' could not be activated")]
-    WebhookActivation { provider: String },
+    #[error("webhook authorization provider '{provider}' could not be activated: {reason}")]
+    WebhookActivation {
+        provider: String,
+        #[source]
+        reason: crate::tls::TlsActivationError,
+    },
     #[error("process authorization provider '{provider}' could not be activated")]
     ProcessActivation { provider: String },
 }
@@ -130,12 +135,14 @@ impl ProductAuthorizationSnapshot {
         plan: AuthorizationPlan,
         provider_registry: ProviderRegistry,
         webhook_runtime: Arc<WebhookAuthorizationRuntime>,
+        generation: PolicyGeneration,
         cancellation: ActivationCancellation,
     ) -> Result<AuthorizationActivation, AuthorizationActivationError> {
         Self::activate_inner(
             plan,
             provider_registry,
             webhook_runtime,
+            generation,
             cancellation,
             |_| {},
         )
@@ -147,6 +154,7 @@ impl ProductAuthorizationSnapshot {
         plan: AuthorizationPlan,
         provider_registry: ProviderRegistry,
         webhook_runtime: Arc<WebhookAuthorizationRuntime>,
+        generation: PolicyGeneration,
         cancellation: ActivationCancellation,
         after_provider_activation: impl FnMut(&Arc<ProcessProvider>),
     ) -> Result<AuthorizationActivation, AuthorizationActivationError> {
@@ -154,6 +162,7 @@ impl ProductAuthorizationSnapshot {
             plan,
             provider_registry,
             webhook_runtime,
+            generation,
             cancellation,
             after_provider_activation,
         )
@@ -164,6 +173,7 @@ impl ProductAuthorizationSnapshot {
         plan: AuthorizationPlan,
         provider_registry: ProviderRegistry,
         webhook_runtime: Arc<WebhookAuthorizationRuntime>,
+        generation: PolicyGeneration,
         cancellation: ActivationCancellation,
         mut after_provider_activation: impl FnMut(&Arc<ProcessProvider>),
     ) -> Result<AuthorizationActivation, AuthorizationActivationError> {
@@ -214,7 +224,7 @@ impl ProductAuthorizationSnapshot {
                     providers.push(ActiveProvider::Process(process));
                 }
                 AuthorizationProviderPlan::Webhook(webhook_plan) => {
-                    let webhook = match WebhookProvider::activate(webhook_plan, || {
+                    let webhook = match WebhookProvider::activate(webhook_plan, generation, || {
                         cancellation.is_cancelled()
                     }) {
                         Ok(webhook) => webhook,
@@ -578,11 +588,17 @@ fn map_webhook_activation_error(
     cancellation: &ActivationCancellation,
     provider: &str,
 ) -> AuthorizationActivationError {
-    if cancellation.is_cancelled() || matches!(error, WebhookActivationError::Cancelled) {
+    if cancellation.is_cancelled() || matches!(&error, WebhookActivationError::Cancelled) {
         AuthorizationActivationError::Cancelled
     } else {
-        AuthorizationActivationError::WebhookActivation {
-            provider: provider.to_owned(),
+        match error {
+            WebhookActivationError::Tls(reason) => {
+                AuthorizationActivationError::WebhookActivation {
+                    provider: provider.to_owned(),
+                    reason,
+                }
+            }
+            WebhookActivationError::Cancelled => AuthorizationActivationError::Cancelled,
         }
     }
 }
@@ -650,6 +666,7 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
+    use http_access_url::canonicalize_http_url;
     use tempfile::TempDir;
 
     use super::*;
@@ -730,6 +747,28 @@ mod tests {
         ActivationCancellation::new_for_test()
     }
 
+    #[test]
+    fn webhook_activation_error_preserves_sanitized_ca_classification() {
+        let cancellation = cancellation();
+        for (reason, expected) in [
+            (crate::tls::TlsActivationError::CaInvalid, "invalid"),
+            (
+                crate::tls::TlsActivationError::CaLimit,
+                "shared TLS root limits",
+            ),
+        ] {
+            let error = map_webhook_activation_error(
+                WebhookActivationError::Tls(reason),
+                &cancellation,
+                "safe-provider",
+            );
+            let rendered = error.to_string();
+            assert!(rendered.contains("safe-provider"));
+            assert!(rendered.contains(expected), "{rendered}");
+            assert!(!rendered.contains('/') && !rendered.contains('\\'));
+        }
+    }
+
     async fn activate(
         plan: AuthorizationPlan,
         cancellation: ActivationCancellation,
@@ -739,6 +778,7 @@ mod tests {
             plan,
             provider_registry,
             WebhookAuthorizationRuntime::for_test(None),
+            PolicyGeneration::new(7).unwrap(),
             cancellation,
         )
         .await
@@ -844,7 +884,7 @@ mod tests {
             providers: BTreeMap::from([(
                 "webhook".to_string(),
                 AuthorizationProviderPlan::Webhook(WebhookProviderPlan {
-                    url: "http://127.0.0.1:9/authorize".to_string(),
+                    url: canonicalize_http_url("http://127.0.0.1:9/authorize").unwrap(),
                     timeout: Duration::from_secs(2),
                     on_failure: CompiledProviderFailureMode::Deny,
                     include_headers: vec![HeaderName::from_static("x-context")],
@@ -862,6 +902,7 @@ mod tests {
             WebhookAuthorizationRuntime::for_test(Some(
                 "http://127.0.0.1:8888/_acl/external-auth/callback",
             )),
+            PolicyGeneration::new(7).unwrap(),
             cancellation(),
         )
         .await
@@ -890,7 +931,7 @@ mod tests {
             providers: BTreeMap::from([(
                 "webhook".to_string(),
                 AuthorizationProviderPlan::Webhook(WebhookProviderPlan {
-                    url: "http://127.0.0.1:9/authorize".to_string(),
+                    url: canonicalize_http_url("http://127.0.0.1:9/authorize").unwrap(),
                     timeout: Duration::from_secs(2),
                     on_failure: CompiledProviderFailureMode::Deny,
                     include_headers: vec![],
@@ -898,7 +939,11 @@ mod tests {
                     max_response_bytes: 4096,
                     outputs: BTreeMap::from([(
                         "token".to_string(),
-                        ProviderOutputPlan::Bearer { required: true },
+                        ProviderOutputPlan::Bearer {
+                            required: true,
+                            transport_security:
+                                crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+                        },
                     )]),
                     tls: None,
                 }),
@@ -911,6 +956,7 @@ mod tests {
             WebhookAuthorizationRuntime::for_test(Some(
                 "http://127.0.0.1:8888/_acl/external-auth/callback",
             )),
+            PolicyGeneration::new(7).unwrap(),
             cancellation(),
         )
         .await
@@ -1178,6 +1224,7 @@ for line in sys.stdin:
             plan,
             ProviderRegistry::from_names(["different".to_string()]),
             WebhookAuthorizationRuntime::for_test(None),
+            PolicyGeneration::new(7).unwrap(),
             cancellation(),
             |_| {
                 activations.fetch_add(1, Ordering::AcqRel);
@@ -1216,6 +1263,7 @@ for line in sys.stdin:
                 plan,
                 provider_registry,
                 WebhookAuthorizationRuntime::for_test(None),
+                PolicyGeneration::new(7).unwrap(),
                 cancellation,
                 move |provider| {
                     let pid = provider.child_id().expect("activated provider has a child");

@@ -1703,6 +1703,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn process_provider_accepts_id_first_standard_serializer_whitespace() {
+        let directory = TempDir::new().unwrap();
+        let script = write_python(
+            &directory,
+            r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({"id": request["id"], "type": "response", "decision": "allow"}), flush=True)
+"#,
+        );
+        let provider = ProcessProvider::activate(plan(&directory, &script), || false)
+            .await
+            .unwrap();
+        commit(&provider);
+
+        assert_eq!(
+            provider
+                .decide_effects_allowed_for_test(
+                    request("standard-serializer"),
+                    &body_guard(),
+                    request_deadline(),
+                )
+                .await,
+            Ok(ProcessDecision::Allow)
+        );
+        cleanup(&provider).await;
+    }
+
+    #[tokio::test]
     async fn responses_may_complete_out_of_request_order() {
         let directory = TempDir::new().unwrap();
         let script = write_python(
@@ -2221,7 +2250,10 @@ for line in sys.stdin:
         let mut candidate = plan(&directory, &script);
         candidate.outputs.insert(
             "credential".to_string(),
-            ProviderOutputPlan::Bearer { required: false },
+            ProviderOutputPlan::Bearer {
+                required: false,
+                transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+            },
         );
         candidate.allow_request_body_replacement = true;
         candidate.include_request_body = true;
@@ -2257,7 +2289,10 @@ for line in sys.stdin:
         let mut provider_plan = plan(&directory, &script);
         provider_plan.outputs.insert(
             "token".to_string(),
-            ProviderOutputPlan::Bearer { required: true },
+            ProviderOutputPlan::Bearer {
+                required: true,
+                transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+            },
         );
         provider_plan.allow_request_body_replacement = true;
         let provider = ProcessProvider::activate(provider_plan, || false)
@@ -2314,7 +2349,10 @@ for line in sys.stdin:
         provider_plan.allow_request_body_replacement = true;
         provider_plan.outputs.insert(
             "token".to_string(),
-            ProviderOutputPlan::Bearer { required: true },
+            ProviderOutputPlan::Bearer {
+                required: true,
+                transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+            },
         );
         let provider = ProcessProvider::activate(provider_plan, || false)
             .await
@@ -2369,7 +2407,10 @@ for line in sys.stdin:
         provider_plan.allow_request_body_replacement = true;
         provider_plan.outputs.insert(
             "token".to_string(),
-            ProviderOutputPlan::Bearer { required: true },
+            ProviderOutputPlan::Bearer {
+                required: true,
+                transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+            },
         );
         let provider = ProcessProvider::activate(provider_plan, || false)
             .await
@@ -2415,7 +2456,10 @@ for request in reversed(requests):
         provider_plan.include_request_body = true;
         provider_plan.outputs.insert(
             "token".to_string(),
-            ProviderOutputPlan::Bearer { required: true },
+            ProviderOutputPlan::Bearer {
+                required: true,
+                transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+            },
         );
         let provider = ProcessProvider::activate(provider_plan, || false)
             .await
@@ -2498,7 +2542,11 @@ for request in reversed(requests):
             let mut provider_plan = plan(&directory, &script);
             provider_plan.outputs.insert(
                 "token".to_string(),
-                ProviderOutputPlan::Bearer { required: true },
+                ProviderOutputPlan::Bearer {
+                    required: true,
+                    transport_security:
+                        crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+                },
             );
             provider_plan.allow_request_body_replacement = true;
             provider_plan.max_decoded_request_body_bytes = max_decoded_bytes;
@@ -2637,7 +2685,10 @@ for line in sys.stdin:
         let mut provider_plan = plan(&directory, &script);
         provider_plan.outputs.insert(
             "token".to_string(),
-            ProviderOutputPlan::Bearer { required: true },
+            ProviderOutputPlan::Bearer {
+                required: true,
+                transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+            },
         );
         let provider = ProcessProvider::activate(provider_plan, || false)
             .await
@@ -2679,7 +2730,10 @@ for line in sys.stdin:
         let mut provider_plan = plan(&directory, &script);
         provider_plan.outputs.insert(
             "token".to_string(),
-            ProviderOutputPlan::Bearer { required: true },
+            ProviderOutputPlan::Bearer {
+                required: true,
+                transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+            },
         );
         provider_plan.allow_request_body_replacement = true;
         let provider = ProcessProvider::activate(provider_plan, || false)

@@ -5,7 +5,7 @@ use http_access_types::{
     ClientTlsIntent, HttpProtocol, HttpProtocolSet, HttpScheme, PolicyGeneration, Route,
     SnapshotIdentity, StableId, TlsRootsRef, TlsTrust, TransportSecurity,
 };
-use http_access_url::{canonicalize_http_url, canonicalize_tls_server_name};
+use http_access_url::canonicalize_tls_server_name;
 
 use crate::config::compiler::{
     CompiledEgressRoute, CompiledHttpVersion, CompiledTlsTrust, EgressPlan, ParentProxyPlan,
@@ -47,7 +47,7 @@ struct EgressTrustLoader<'a> {
 pub(crate) enum EgressActivationError {
     #[error("egress activation was cancelled")]
     ActivationCancelled,
-    #[error("egress plan route and parent metadata are inconsistent")]
+    #[error("egress plan route is inconsistent")]
     Route,
     #[error("egress parent URL is invalid")]
     ParentUrl,
@@ -59,6 +59,8 @@ pub(crate) enum EgressActivationError {
     CaInvalid,
     #[error("custom CA certificate bundle is empty")]
     CaEmpty,
+    #[error("custom CA certificate bundle exceeds the shared TLS root limits")]
+    CaLimit,
     #[error("egress neutral TLS bindings are invalid")]
     NeutralTls,
 }
@@ -222,19 +224,9 @@ fn activate_parent(
     generation: PolicyGeneration,
     trust_loader: &mut EgressTrustLoader<'_>,
 ) -> Result<(Route, Option<TlsRootsRegistration>), EgressActivationError> {
-    let ParentProxyPlan {
-        url,
-        host,
-        port,
-        tls,
-        ..
-    } = plan;
-    let target = canonicalize_http_url(&url).map_err(|_| EgressActivationError::ParentUrl)?;
+    let ParentProxyPlan { target, tls, .. } = plan;
     if target.path() != "/" || target.query().is_some() {
         return Err(EgressActivationError::ParentUrl);
-    }
-    if target.authority().host().as_str() != host || target.authority().effective_port() != port {
-        return Err(EgressActivationError::Route);
     }
     let (security, roots) = match (target.scheme(), tls) {
         (HttpScheme::Http, None) => (TransportSecurity::Cleartext, None),
@@ -282,9 +274,8 @@ fn neutral_tls_trust(
                 .into_iter()
                 .map(TlsRootCertificate::new)
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| EgressActivationError::NeutralTls)?;
-            let roots = TlsRootSet::new(generation, certificates)
-                .map_err(|_| EgressActivationError::NeutralTls)?;
+                .map_err(map_shared_root_error)?;
+            let roots = TlsRootSet::new(generation, certificates).map_err(map_shared_root_error)?;
             let reference = TlsRootsRef::new(
                 identity.clone(),
                 StableId::new(id.to_owned()).map_err(|_| EgressActivationError::NeutralTls)?,
@@ -304,6 +295,13 @@ fn neutral_tls_trust(
             Ok((neutral_trust, Some(registration)))
         }
         _ => Err(EgressActivationError::NeutralTls),
+    }
+}
+
+fn map_shared_root_error(error: http_access_runtime::RuntimeError) -> EgressActivationError {
+    match error {
+        http_access_runtime::RuntimeError::LimitExceeded => EgressActivationError::CaLimit,
+        _ => EgressActivationError::CaInvalid,
     }
 }
 
@@ -332,6 +330,7 @@ impl From<TlsActivationError> for EgressActivationError {
             TlsActivationError::CaUnavailable => Self::CaUnavailable,
             TlsActivationError::CaInvalid => Self::CaInvalid,
             TlsActivationError::CaEmpty => Self::CaEmpty,
+            TlsActivationError::CaLimit => Self::CaLimit,
             TlsActivationError::NativeRoots
             | TlsActivationError::CaUnusable
             | TlsActivationError::Configuration => Self::NeutralTls,
@@ -342,16 +341,24 @@ impl From<TlsActivationError> for EgressActivationError {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
     use std::io::{self, Write};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex, Once};
+    use std::time::Duration;
 
     use http_access_types::CanonicalHost;
+    use http_access_url::canonicalize_http_url;
     use tempfile::TempDir;
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
+    use crate::authorization::webhook::provider::{WebhookActivationError, WebhookProvider};
+    use crate::config::compiler::{
+        CompiledProviderFailureMode, WebhookProviderPlan, WebhookTlsPlan,
+    };
     use crate::test_certificates::TestTlsIdentity;
+    use crate::tls::TlsActivationError;
 
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
@@ -461,6 +468,32 @@ mod tests {
         path
     }
 
+    fn webhook_ca_error(trust: CompiledTlsTrust, path: PathBuf) -> TlsActivationError {
+        let error = WebhookProvider::activate(
+            WebhookProviderPlan {
+                url: canonicalize_http_url("https://provider.test/authorize").unwrap(),
+                timeout: Duration::from_secs(3),
+                on_failure: CompiledProviderFailureMode::Deny,
+                include_headers: Vec::new(),
+                max_request_bytes: 8192,
+                max_response_bytes: 4096,
+                outputs: BTreeMap::new(),
+                tls: Some(WebhookTlsPlan {
+                    trust,
+                    ca_certificate: Some(path),
+                }),
+            },
+            PolicyGeneration::new(7).unwrap(),
+            || false,
+        )
+        .err()
+        .expect("invalid webhook roots must fail");
+        match error {
+            WebhookActivationError::Tls(error) => error,
+            WebhookActivationError::Cancelled => panic!("test activation is not cancelled"),
+        }
+    }
+
     #[test]
     fn direct_mapping_preserves_authored_protocol_order_and_trust() {
         let activation = activate(direct(CompiledTlsTrust::System, None));
@@ -484,9 +517,7 @@ mod tests {
             parent_proxy: Some(ParentProxyPlan {
                 #[cfg(test)]
                 kind: crate::config::compiler::CompiledParentProxyKind::Generic,
-                url: "https://parent.example:8443/".to_owned(),
-                host: "parent.example".to_owned(),
-                port: 8443,
+                target: canonicalize_http_url("https://parent.example:8443/").unwrap(),
                 tls: Some(ParentProxyTlsPlan {
                     trust: CompiledTlsTrust::Custom,
                     ca_certificate: Some(ca),
@@ -581,9 +612,7 @@ mod tests {
             parent_proxy: Some(ParentProxyPlan {
                 #[cfg(test)]
                 kind: crate::config::compiler::CompiledParentProxyKind::Generic,
-                url: "https://parent.example:8443/".to_owned(),
-                host: "parent.example".to_owned(),
-                port: 8443,
+                target: canonicalize_http_url("https://parent.example:8443/").unwrap(),
                 tls: Some(ParentProxyTlsPlan {
                     trust: CompiledTlsTrust::Custom,
                     ca_certificate: Some(ca),
@@ -635,9 +664,7 @@ mod tests {
         let parent = ParentProxyPlan {
             #[cfg(test)]
             kind: crate::config::compiler::CompiledParentProxyKind::AclProxy,
-            url: "http://parent.example:8080/".to_owned(),
-            host: "parent.example".to_owned(),
-            port: 8080,
+            target: canonicalize_http_url("http://parent.example:8080/").unwrap(),
             tls: None,
         };
         #[cfg(test)]
@@ -680,9 +707,7 @@ mod tests {
                 parent_proxy: Some(ParentProxyPlan {
                     #[cfg(test)]
                     kind: crate::config::compiler::CompiledParentProxyKind::Generic,
-                    url: "https://parent.example/".to_owned(),
-                    host: "parent.example".to_owned(),
-                    port: 443,
+                    target: canonicalize_http_url("https://parent.example/").unwrap(),
                     tls: Some(ParentProxyTlsPlan {
                         trust: CompiledTlsTrust::Insecure,
                         ca_certificate: None,
@@ -741,6 +766,43 @@ mod tests {
             assert!(!error
                 .to_string()
                 .contains(directory.path().to_str().unwrap()));
+        }
+    }
+
+    #[test]
+    fn webhook_and_egress_reject_duplicate_and_excess_root_bundles_identically() {
+        let directory = TempDir::new().unwrap();
+        let certificate = TestTlsIdentity::new("shared-bounds.example").root_certificate_pem();
+        let cases = [
+            (
+                directory.path().join("duplicate-sensitive.pem"),
+                [certificate.clone(), certificate.clone()].concat(),
+                EgressActivationError::CaInvalid,
+            ),
+            (
+                directory.path().join("excess-sensitive.pem"),
+                certificate.repeat(http_access_runtime::MAX_TLS_ROOT_CERTIFICATES + 1),
+                EgressActivationError::CaLimit,
+            ),
+        ];
+
+        for (path, contents, expected_egress) in cases {
+            crate::filesystem::write_public_file(&path, &contents).unwrap();
+            for trust in [CompiledTlsTrust::Custom, CompiledTlsTrust::SystemPlusCustom] {
+                let egress = EgressActivation::activate(
+                    direct(trust, Some(path.clone())),
+                    &SnapshotIdentity::new(),
+                    PolicyGeneration::new(7).unwrap(),
+                    || false,
+                )
+                .err()
+                .expect("invalid egress roots must fail");
+                let webhook = webhook_ca_error(trust, path.clone());
+
+                assert_eq!(egress, expected_egress);
+                assert_eq!(egress.to_string(), webhook.to_string());
+                assert!(!egress.to_string().contains(path.to_str().unwrap()));
+            }
         }
     }
 
@@ -805,30 +867,33 @@ mod tests {
     }
 
     #[test]
-    fn invalid_parent_metadata_is_rejected_without_reflecting_values() {
-        let plan = EgressPlan {
-            route: CompiledEgressRoute::ParentProxy,
-            origin_tls: origin(CompiledTlsTrust::System, None),
-            parent_proxy: Some(ParentProxyPlan {
-                #[cfg(test)]
-                kind: crate::config::compiler::CompiledParentProxyKind::Generic,
-                url: "http://parent.example:8080/".to_owned(),
-                host: "different.example".to_owned(),
-                port: 8080,
-                tls: None,
-            }),
-            request_headers: Vec::new(),
-            credential_actions: Vec::new(),
-        };
-        let error = EgressActivation::activate(
-            plan,
-            &SnapshotIdentity::new(),
-            PolicyGeneration::new(7).unwrap(),
-            || false,
-        )
-        .err()
-        .expect("inconsistent parent metadata must fail");
-        assert_eq!(error, EgressActivationError::Route);
-        assert!(!error.to_string().contains("different.example"));
+    fn parent_target_path_and_query_are_rejected() {
+        for target in [
+            "http://parent.example:8080/proxy",
+            "http://parent.example:8080/?mode=proxy",
+        ] {
+            let plan = EgressPlan {
+                route: CompiledEgressRoute::ParentProxy,
+                origin_tls: origin(CompiledTlsTrust::System, None),
+                parent_proxy: Some(ParentProxyPlan {
+                    #[cfg(test)]
+                    kind: crate::config::compiler::CompiledParentProxyKind::Generic,
+                    target: canonicalize_http_url(target).unwrap(),
+                    tls: None,
+                }),
+                request_headers: Vec::new(),
+                credential_actions: Vec::new(),
+            };
+            let error = EgressActivation::activate(
+                plan,
+                &SnapshotIdentity::new(),
+                PolicyGeneration::new(7).unwrap(),
+                || false,
+            )
+            .err()
+            .expect("parent target shape must fail");
+            assert_eq!(error, EgressActivationError::ParentUrl);
+            assert!(!error.to_string().contains(target));
+        }
     }
 }

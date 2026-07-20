@@ -347,6 +347,7 @@ async fn connect_mitm_outer_tunnel_omits_global_origin_credentials() {
     let credential_config = format!(
         r#"[[egress.credential_actions]]
 kind = "custom_header"
+transport_security = "tls_required"
 header = "x-aw-identity-token"
 credential = "outer_identity"
 

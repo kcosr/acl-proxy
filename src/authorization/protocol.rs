@@ -98,15 +98,15 @@ impl ProviderOutputRegistry {
                 },
             );
             definitions.push(match output {
-                ProviderOutputPlan::Bearer { required } => {
+                ProviderOutputPlan::Bearer { required, .. } => {
                     ProviderOutputDefinition::Bearer { required }
                 }
-                ProviderOutputPlan::Basic { username, required } => {
-                    ProviderOutputDefinition::Basic { username, required }
-                }
-                ProviderOutputPlan::CustomHeader { header, required } => {
-                    ProviderOutputDefinition::CustomHeader { header, required }
-                }
+                ProviderOutputPlan::Basic {
+                    username, required, ..
+                } => ProviderOutputDefinition::Basic { username, required },
+                ProviderOutputPlan::CustomHeader {
+                    header, required, ..
+                } => ProviderOutputDefinition::CustomHeader { header, required },
             });
         }
         Self {
@@ -1350,15 +1350,19 @@ where
 {
     let prefix_limit = max_line_bytes.min(MAX_RESPONSE_ID_PREFIX_BYTES);
     let mut consumed = 0usize;
-    let Some(first) = read_prefix_byte(reader, &mut consumed, prefix_limit).await? else {
-        return Ok(None);
+    let Some(first) = read_prefix_token_byte(reader, &mut consumed, prefix_limit).await? else {
+        return if consumed == 0 {
+            Ok(None)
+        } else {
+            Err(ResponsePrefixError::Invalid)
+        };
     };
     if first != b'{' {
         return Err(ResponsePrefixError::Invalid);
     }
-    expect_prefix_bytes(reader, &mut consumed, prefix_limit, b"\"id\"").await?;
-    expect_prefix_byte(reader, &mut consumed, prefix_limit, b':').await?;
-    expect_prefix_byte(reader, &mut consumed, prefix_limit, b'\"').await?;
+    expect_prefix_token(reader, &mut consumed, prefix_limit, b"\"id\"").await?;
+    expect_prefix_token(reader, &mut consumed, prefix_limit, b":").await?;
+    expect_prefix_token(reader, &mut consumed, prefix_limit, b"\"").await?;
 
     let mut id = Zeroizing::new([0u8; MAX_RESPONSE_ID_PREFIX_BYTES]);
     let mut id_len = 0usize;
@@ -1406,6 +1410,40 @@ where
         expect_prefix_byte(reader, consumed, limit, *expected).await?;
     }
     Ok(())
+}
+
+async fn expect_prefix_token<R>(
+    reader: &mut R,
+    consumed: &mut usize,
+    limit: usize,
+    expected: &[u8],
+) -> Result<(), ResponsePrefixError>
+where
+    R: AsyncRead + Unpin,
+{
+    let Some((first, remaining)) = expected.split_first() else {
+        return Ok(());
+    };
+    if read_prefix_token_byte(reader, consumed, limit).await? != Some(*first) {
+        return Err(ResponsePrefixError::Invalid);
+    }
+    expect_prefix_bytes(reader, consumed, limit, remaining).await
+}
+
+async fn read_prefix_token_byte<R>(
+    reader: &mut R,
+    consumed: &mut usize,
+    limit: usize,
+) -> Result<Option<u8>, ResponsePrefixError>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        match read_prefix_byte(reader, consumed, limit).await? {
+            Some(b' ' | b'\t') => {}
+            other => return Ok(other),
+        }
+    }
 }
 
 async fn expect_prefix_byte<R>(
@@ -2207,7 +2245,10 @@ mod tests {
     fn outputs(required: bool) -> ProviderOutputRegistry {
         ProviderOutputRegistry::activate(BTreeMap::from([(
             "token".to_string(),
-            ProviderOutputPlan::Bearer { required },
+            ProviderOutputPlan::Bearer {
+                required,
+                transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+            },
         )]))
     }
 
@@ -2692,6 +2733,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prefix_reader_accepts_only_bounded_horizontal_json_whitespace() {
+        let bytes =
+            b" \t{ \t\"id\" \t: \t\"request-1\" \t, \"type\": \"response\", \"decision\": \"deny\"}\n";
+        let mut reader = bytes.as_slice();
+        let prefix = read_provider_response_prefix_for_test(&mut reader, bytes.len())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prefix.id(), "request-1");
+        assert_eq!(
+            prefix.consumed_bytes(),
+            b" \t{ \t\"id\" \t: \t\"request-1\"".len()
+        );
+
+        let mut remaining = Vec::new();
+        AsyncReadExt::read_to_end(&mut reader, &mut remaining)
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining,
+            b" \t, \"type\": \"response\", \"decision\": \"deny\"}\n"
+        );
+
+        let mut over_bound = b"        {\"id\":\"request-1\"}\n".as_slice();
+        assert!(matches!(
+            read_provider_response_prefix_for_test(&mut over_bound, 8).await,
+            Err(ResponsePrefixError::TooLong)
+        ));
+
+        let mut whitespace_only = b" \t".as_slice();
+        assert!(matches!(
+            read_provider_response_prefix_for_test(&mut whitespace_only, 8).await,
+            Err(ResponsePrefixError::Invalid)
+        ));
+    }
+
+    #[tokio::test]
+    async fn prefix_reader_rejects_non_horizontal_whitespace_at_every_token_gap() {
+        let gaps = [
+            (b"".as_slice(), b"{\"id\":\"request-1\"}\n".as_slice()),
+            (b"{".as_slice(), b"\"id\":\"request-1\"}\n".as_slice()),
+            (b"{\"id\"".as_slice(), b":\"request-1\"}\n".as_slice()),
+            (b"{\"id\":".as_slice(), b"\"request-1\"}\n".as_slice()),
+        ];
+        for forbidden in [
+            b"\n".as_slice(),
+            b"\r".as_slice(),
+            b"\x0b".as_slice(),
+            b"\x0c".as_slice(),
+            "\u{a0}".as_bytes(),
+        ] {
+            for &(left, right) in &gaps {
+                let mut line = Vec::new();
+                line.extend_from_slice(left);
+                line.extend_from_slice(forbidden);
+                line.extend_from_slice(right);
+                let mut reader = line.as_slice();
+                assert!(matches!(
+                    read_provider_response_prefix_for_test(&mut reader, line.len()).await,
+                    Err(ResponsePrefixError::Invalid)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn prefix_reader_rejects_missing_first_id_unterminated_and_overlimit() {
         for bytes in [
             b"{\"type\":\"response\",\"id\":\"request-1\",\"decision\":\"deny\"}\n".as_slice(),
@@ -2800,6 +2907,8 @@ mod tests {
                 ProviderOutputPlan::Basic {
                     username: "agent".to_string(),
                     required: true,
+                    transport_security:
+                        crate::config::compiler::CompiledTransportSecurity::TlsRequired,
                 },
             ),
             (
@@ -2807,6 +2916,8 @@ mod tests {
                 ProviderOutputPlan::CustomHeader {
                     header: HeaderName::from_static("x-trace-token"),
                     required: true,
+                    transport_security:
+                        crate::config::compiler::CompiledTransportSecurity::TlsRequired,
                 },
             ),
         ]));
@@ -2886,6 +2997,8 @@ mod tests {
                 ProviderOutputPlan::CustomHeader {
                     header: HeaderName::from_static("x-conflict"),
                     required: false,
+                    transport_security:
+                        crate::config::compiler::CompiledTransportSecurity::TlsRequired,
                 },
             ),
             (
@@ -2893,6 +3006,8 @@ mod tests {
                 ProviderOutputPlan::CustomHeader {
                     header: HeaderName::from_static("x-conflict"),
                     required: false,
+                    transport_security:
+                        crate::config::compiler::CompiledTransportSecurity::TlsRequired,
                 },
             ),
         ]));

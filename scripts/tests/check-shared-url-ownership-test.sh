@@ -37,7 +37,7 @@ elif mode == "wrong-policy-path":
     policy_path = runtime / "http-access-conformance"
 elif mode == "wrong-policy-version":
     policy_version = "0.1.0"
-elif mode != "valid":
+elif mode not in ("valid", "direct-idna", "direct-memchr", "direct-url"):
     raise SystemExit(f"unknown fake metadata mode {mode}")
 
 dependencies = [
@@ -46,6 +46,8 @@ dependencies = [
     ("http-access-conformance", "dev", runtime / "http-access-conformance", "=0.1.0"),
     ("http-access-policy-acl", policy_kind, policy_path, policy_version),
 ]
+if mode.startswith("direct-"):
+    dependencies.append((mode.removeprefix("direct-"), None, None, "*"))
 json.dump(
     {
         "packages": [
@@ -55,7 +57,7 @@ json.dump(
                     {
                         "name": name,
                         "kind": kind,
-                        "path": str(path),
+                        "path": None if path is None else str(path),
                         "req": version,
                     }
                     for name, kind, path, version in dependencies
@@ -97,6 +99,12 @@ expect_failure wrong-policy-path 'wrong policy dependency path' \
     'http-access-policy-acl must use the exact sibling path'
 expect_failure wrong-policy-version 'loose policy dependency version' \
     'http-access-policy-acl must use exact version =0.1.0'
+expect_failure direct-idna 'direct idna dependency' \
+    'idna must not be a direct dependency'
+expect_failure direct-memchr 'direct memchr dependency' \
+    'memchr must not be a direct dependency'
+expect_failure direct-url 'direct url dependency' \
+    'url must not be a direct dependency'
 
 source_case="$TEST_ROOT/source-case"
 mkdir -p "$source_case/scripts"

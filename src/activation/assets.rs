@@ -9,7 +9,6 @@ use http_access_mitm::{
 };
 use http_access_runtime::{ForwardingNetworkError, ForwardingNetworkFacts, ForwardingNetworkGuard};
 use http_access_types::{HttpProtocol, HttpProtocolSet};
-use http_access_url::canonicalize_http_url;
 
 use crate::config::compiler::{
     CompiledHttp1ConnectPolicy, CompiledHttpVersion, StaticMitmConfig, StaticProductConfig,
@@ -247,12 +246,7 @@ fn forwarding_network_facts(
     .flatten()
     .collect();
     let control_bind = config.control.as_ref().map(|control| control.bind);
-    let reserved_control_url = config
-        .callback_public_url
-        .as_deref()
-        .map(canonicalize_http_url)
-        .transpose()
-        .map_err(|_| ForwardingNetworkError::InvalidFacts)?;
+    let reserved_control_url = config.callback_public_url.clone();
     let reserved_control_base_path = reserved_control_url
         .as_ref()
         .and(config.control.as_ref())
@@ -293,6 +287,7 @@ mod tests {
     use std::path::Path;
 
     use http_access_types::{HttpProtocol, Route};
+    use http_access_url::canonicalize_http_url;
     use tempfile::tempdir;
 
     use super::*;
@@ -406,8 +401,10 @@ default = "deny"
             config_root: Path::new("/etc/acl-proxy"),
         })
         .expect("production fixture compiles");
-        compiled.static_config.callback_public_url =
-            Some("https://control.example/_acl-proxy/external-auth/callback".to_string());
+        compiled.static_config.callback_public_url = Some(
+            canonicalize_http_url("https://control.example/_acl-proxy/external-auth/callback")
+                .expect("canonical callback URL"),
+        );
 
         let guard = ForwardingNetworkGuard::system(
             forwarding_network_facts(&compiled.static_config)

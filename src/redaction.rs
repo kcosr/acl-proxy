@@ -18,6 +18,11 @@ use crate::safety::wire_body::{
 };
 use crate::safety::{GuardedBody, HttpWireBodyGuard};
 
+type ProductBodySegments<'a> = std::iter::Map<
+    crate::safety::allocation::StableBodySegments<'a>,
+    fn(&'a [u8]) -> Result<&'a [u8], BufferFailure>,
+>;
+
 pub(crate) struct ProductRedactionPlan {
     pub(crate) profiles: BTreeMap<String, ProductRedactionProfile>,
     pub(crate) prepared: PreparedRedactionSnapshot,
@@ -178,35 +183,31 @@ fn capture_failure(error: CaptureAllocationError) -> BufferFailure {
     }
 }
 
+fn infallible_segment(segment: &[u8]) -> Result<&[u8], BufferFailure> {
+    Ok(segment)
+}
+
 impl RedactionBody for GuardedBody {
+    type Segments<'a> = ProductBodySegments<'a>;
+
     fn len(&self) -> usize {
         GuardedBody::len(self)
     }
 
-    fn try_for_each_segment<E>(
-        &self,
-        visitor: &mut impl FnMut(&[u8]) -> Result<(), E>,
-    ) -> Result<(), E> {
-        for segment in self.segments() {
-            visitor(segment)?;
-        }
-        Ok(())
+    fn segments(&self) -> Self::Segments<'_> {
+        GuardedBody::segments(self).map(infallible_segment)
     }
 }
 
 impl RedactionBody for CaptureBody {
+    type Segments<'a> = ProductBodySegments<'a>;
+
     fn len(&self) -> usize {
         CaptureBody::len(self)
     }
 
-    fn try_for_each_segment<E>(
-        &self,
-        visitor: &mut impl FnMut(&[u8]) -> Result<(), E>,
-    ) -> Result<(), E> {
-        for segment in self.segments() {
-            visitor(segment)?;
-        }
-        Ok(())
+    fn segments(&self) -> Self::Segments<'_> {
+        CaptureBody::segments(self).map(infallible_segment)
     }
 }
 

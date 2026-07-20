@@ -2,8 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http::HeaderName;
-use http_access_types::{CanonicalUrl, HttpScheme};
-use http_access_url::{canonicalize_http_url, UrlError};
+use http_access_types::{CanonicalUrl, HttpScheme, PolicyGeneration};
 use rustls::ClientConfig;
 
 use crate::authorization::protocol::ProviderOutputRegistry;
@@ -25,8 +24,6 @@ pub(crate) struct WebhookProvider {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum WebhookActivationError {
-    #[error("compiled webhook URL is invalid")]
-    InvalidUrl(#[source] UrlError),
     #[error("webhook TLS activation failed")]
     Tls(#[source] TlsActivationError),
     #[error("webhook activation was cancelled")]
@@ -36,12 +33,13 @@ pub(crate) enum WebhookActivationError {
 impl WebhookProvider {
     pub(crate) fn activate(
         plan: WebhookProviderPlan,
+        generation: PolicyGeneration,
         mut is_cancelled: impl FnMut() -> bool,
     ) -> Result<Arc<Self>, WebhookActivationError> {
         if is_cancelled() {
             return Err(WebhookActivationError::Cancelled);
         }
-        let url = canonicalize_http_url(&plan.url).map_err(WebhookActivationError::InvalidUrl)?;
+        let url = plan.url;
         let tls = if url.scheme() == HttpScheme::Https {
             let WebhookTlsPlan {
                 trust,
@@ -53,14 +51,19 @@ impl WebhookProvider {
             if trust == CompiledTlsTrust::Insecure {
                 tracing::warn!("webhook TLS certificate verification is disabled");
             }
-            let trust = load_client_trust(trust, ca_certificate.as_deref(), &mut is_cancelled)
-                .map_err(|error| {
-                    if error == TlsActivationError::ActivationCancelled {
-                        WebhookActivationError::Cancelled
-                    } else {
-                        WebhookActivationError::Tls(error)
-                    }
-                })?;
+            let trust = load_client_trust(
+                trust,
+                ca_certificate.as_deref(),
+                generation,
+                &mut is_cancelled,
+            )
+            .map_err(|error| {
+                if error == TlsActivationError::ActivationCancelled {
+                    WebhookActivationError::Cancelled
+                } else {
+                    WebhookActivationError::Tls(error)
+                }
+            })?;
             Some(Arc::new(
                 build_client_config(&trust, ClientAlpn::Http1, true)
                     .map_err(WebhookActivationError::Tls)?,
@@ -123,11 +126,13 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
 
+    use http_access_url::canonicalize_http_url;
+
     use super::*;
 
     fn plan(url: &str, tls: Option<WebhookTlsPlan>) -> WebhookProviderPlan {
         WebhookProviderPlan {
-            url: url.to_owned(),
+            url: canonicalize_http_url(url).unwrap(),
             timeout: Duration::from_secs(3),
             on_failure: CompiledProviderFailureMode::Deny,
             include_headers: vec![HeaderName::from_static("x-context")],
@@ -142,6 +147,7 @@ mod tests {
     fn http_provider_activation_is_typed_and_has_no_tls_client() {
         let provider = WebhookProvider::activate(
             plan("http://localhost:8080/a/../authorize?mode=one", None),
+            PolicyGeneration::new(7).unwrap(),
             || false,
         )
         .unwrap();
@@ -164,6 +170,7 @@ mod tests {
                     ca_certificate: None,
                 }),
             ),
+            PolicyGeneration::new(7).unwrap(),
             || false,
         )
         .unwrap();
@@ -180,6 +187,7 @@ mod tests {
                         ca_certificate: Some(PathBuf::from("unused.pem")),
                     }),
                 ),
+                PolicyGeneration::new(7).unwrap(),
                 || true,
             ),
             Err(WebhookActivationError::Cancelled)

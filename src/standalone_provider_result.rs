@@ -834,6 +834,7 @@ max_decoded_request_body_bytes = 4096
 
 [authorization.providers.approval.outputs.token]
 kind = "custom_header"
+transport_security = "tls_required"
 header = "x-provider-token"
 required = false
 
@@ -857,6 +858,7 @@ value = "application/global"
 
 [[egress.credential_actions]]
 kind = "custom_header"
+transport_security = "tls_required"
 header = "x-global-token"
 credential = "global"
 
@@ -884,6 +886,7 @@ name = "x-private"
 
 [[policy.rules.credential_actions]]
 kind = "custom_header"
+transport_security = "tls_required"
 header = "x-rule-token"
 credential = "rule"
 
@@ -1007,7 +1010,11 @@ header = "x-test-loop"
         let mut request = RuntimeRequest::new(
             facts.clone(),
             "192.0.2.10".parse().unwrap(),
-            PolicyHeaderFacts::new(facts.headers().to_vec(), Vec::new()).unwrap(),
+            PolicyHeaderFacts::new(
+                facts.headers().to_vec(),
+                generation.sensitive_headers().to_vec(),
+            )
+            .unwrap(),
             BodyRepresentation::PreservedContentCoded,
             body,
             30_001,
@@ -1039,7 +1046,11 @@ header = "x-test-loop"
         let mut request = RuntimeRequest::new(
             facts.clone(),
             "192.0.2.10".parse().unwrap(),
-            PolicyHeaderFacts::new(facts.headers().to_vec(), Vec::new()).unwrap(),
+            PolicyHeaderFacts::new(
+                facts.headers().to_vec(),
+                generation.sensitive_headers().to_vec(),
+            )
+            .unwrap(),
             BodyRepresentation::PreservedContentCoded,
             body,
             30_001,
