@@ -429,7 +429,7 @@ async fn closed_origin_captures_exact_local_502_and_abandons_incomplete_request(
     let policy = format!(
         r#"[redaction.profiles.failure_capture]
 replacement = "[MASKED]"
-rules = [{{ literals = ["unused-test-literal"], payloads = "both" }}]
+rules = [{{ literals = ["upstream failed"], payloads = "both" }}]
 
 [observation.capture]
 events = ["request.allowed", "response.allowed"]
@@ -495,7 +495,7 @@ methods = ["POST"]
     assert_eq!(captured.decision, crate::capture::CaptureDecision::Allow);
     assert_eq!(captured.status_code, Some(502));
     assert_eq!(captured.status_message.as_deref(), Some("Bad Gateway"));
-    assert_eq!(captured.decode_body_bytes().unwrap(), b"upstream failed\n");
+    assert_eq!(captured.decode_body_bytes().unwrap(), b"[MASKED]\n");
     let headers = captured.headers.as_ref().unwrap();
     assert_eq!(
         headers.get("content-type"),
