@@ -779,7 +779,6 @@ dependencies = [
  "if-addrs",
  "rand",
  "rustls",
- "rustls-native-certs",
  "sha2",
  "thiserror",
  "tokio",

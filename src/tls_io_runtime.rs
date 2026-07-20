@@ -6,24 +6,35 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
+use http_access_runtime::SystemTlsRootSet;
 use http_access_types::PolicyGeneration;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::runtime::ActivationCancellation;
-use crate::tls::{load_bounded_custom_ca, TlsActivationError};
+use crate::tls::{load_bounded_custom_ca, load_bounded_system_roots, TlsActivationError};
 
 const DEFAULT_MAX_OPERATIONS: usize = 32;
 const WORKER_STACK_BYTES: usize = 1024 * 1024;
 
+enum TlsIoJobOutput {
+    CustomCa(Vec<Vec<u8>>),
+    SystemRoots {
+        certificates: Vec<Vec<u8>>,
+        roots: SystemTlsRootSet,
+    },
+}
+
 type TlsIoJob =
-    Box<dyn FnOnce(Arc<AtomicBool>) -> Result<Vec<Vec<u8>>, TlsActivationError> + Send + 'static>;
+    Box<dyn FnOnce(Arc<AtomicBool>) -> Result<TlsIoJobOutput, TlsActivationError> + Send + 'static>;
 
 /// Process-owned admission and supervision for blocking custom-CA file I/O.
 pub(crate) struct TlsIoRuntime {
     inner: Arc<RuntimeInner>,
     supervisor: AsyncMutex<Option<JoinHandle<()>>>,
+    #[cfg(test)]
+    system_root_loads: std::sync::atomic::AtomicUsize,
 }
 
 struct RuntimeInner {
@@ -51,7 +62,7 @@ struct SupervisorCommand {
     slot: OperationSlotGuard,
     signal: Arc<OperationSignal>,
     job: TlsIoJob,
-    result: oneshot::Sender<Result<Vec<Vec<u8>>, TlsActivationError>>,
+    result: oneshot::Sender<Result<TlsIoJobOutput, TlsActivationError>>,
 }
 
 struct OperationSlotGuard {
@@ -80,7 +91,7 @@ struct OperationSignal {
 /// Dropping this future requests cancellation while the worker retains its
 /// capacity slot until the operating-system call actually returns.
 struct TlsIoOperation {
-    result: oneshot::Receiver<Result<Vec<Vec<u8>>, TlsActivationError>>,
+    result: oneshot::Receiver<Result<TlsIoJobOutput, TlsActivationError>>,
     signal: Arc<OperationSignal>,
 }
 
@@ -144,6 +155,8 @@ impl TlsIoRuntime {
         Ok(Arc::new(Self {
             inner,
             supervisor: AsyncMutex::new(Some(supervisor)),
+            #[cfg(test)]
+            system_root_loads: std::sync::atomic::AtomicUsize::new(0),
         }))
     }
 
@@ -158,20 +171,25 @@ impl TlsIoRuntime {
             .await
     }
 
-    async fn load_custom_ca_inner(
+    /// Loads and validates native system roots without blocking a Tokio worker.
+    pub(crate) async fn load_system_roots(
         &self,
-        path: PathBuf,
         generation: PolicyGeneration,
         cancellation: &ActivationCancellation,
-        before_submit: impl FnOnce(),
-    ) -> Result<Vec<Vec<u8>>, TlsActivationError> {
+    ) -> Result<(Vec<Vec<u8>>, SystemTlsRootSet), TlsActivationError> {
         if cancellation.is_cancelled() {
             return Err(TlsActivationError::ActivationCancelled);
         }
-        before_submit();
+        #[cfg(test)]
+        self.system_root_loads
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         let operation = match self.submit(Box::new(move |worker_cancellation| {
-            load_bounded_custom_ca(&path, generation, &mut || {
+            let (certificates, roots) = load_bounded_system_roots(generation, &mut || {
                 worker_cancellation.load(Ordering::Acquire)
+            })?;
+            Ok(TlsIoJobOutput::SystemRoots {
+                certificates,
+                roots,
             })
         })) {
             Ok(operation) => operation,
@@ -189,7 +207,58 @@ impl TlsIoRuntime {
         if cancellation.is_cancelled() {
             Err(TlsActivationError::ActivationCancelled)
         } else {
-            result
+            match result? {
+                TlsIoJobOutput::SystemRoots {
+                    certificates,
+                    roots,
+                } => Ok((certificates, roots)),
+                TlsIoJobOutput::CustomCa(_) => Err(TlsActivationError::Configuration),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn system_root_loads(&self) -> usize {
+        self.system_root_loads
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    async fn load_custom_ca_inner(
+        &self,
+        path: PathBuf,
+        generation: PolicyGeneration,
+        cancellation: &ActivationCancellation,
+        before_submit: impl FnOnce(),
+    ) -> Result<Vec<Vec<u8>>, TlsActivationError> {
+        if cancellation.is_cancelled() {
+            return Err(TlsActivationError::ActivationCancelled);
+        }
+        before_submit();
+        let operation = match self.submit(Box::new(move |worker_cancellation| {
+            load_bounded_custom_ca(&path, generation, &mut || {
+                worker_cancellation.load(Ordering::Acquire)
+            })
+            .map(TlsIoJobOutput::CustomCa)
+        })) {
+            Ok(operation) => operation,
+            Err(_) if cancellation.is_cancelled() => {
+                return Err(TlsActivationError::ActivationCancelled);
+            }
+            Err(_) => return Err(TlsActivationError::CaLoaderUnavailable),
+        };
+        tokio::pin!(operation);
+        let result = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Err(TlsActivationError::ActivationCancelled),
+            result = &mut operation => result,
+        };
+        if cancellation.is_cancelled() {
+            Err(TlsActivationError::ActivationCancelled)
+        } else {
+            match result? {
+                TlsIoJobOutput::CustomCa(certificates) => Ok(certificates),
+                TlsIoJobOutput::SystemRoots { .. } => Err(TlsActivationError::Configuration),
+            }
         }
     }
 
@@ -223,6 +292,7 @@ impl TlsIoRuntime {
                 &mut || worker_cancellation.load(Ordering::Acquire),
                 after_open,
             )
+            .map(TlsIoJobOutput::CustomCa)
         })) {
             Ok(operation) => operation,
             Err(_) if cancellation.is_cancelled() => {
@@ -239,7 +309,10 @@ impl TlsIoRuntime {
         if cancellation.is_cancelled() {
             Err(TlsActivationError::ActivationCancelled)
         } else {
-            result
+            match result? {
+                TlsIoJobOutput::CustomCa(certificates) => Ok(certificates),
+                TlsIoJobOutput::SystemRoots { .. } => Err(TlsActivationError::Configuration),
+            }
         }
     }
 
@@ -299,9 +372,16 @@ impl TlsIoRuntime {
         &self,
         job: impl FnOnce(Arc<AtomicBool>) -> Result<Vec<Vec<u8>>, TlsActivationError> + Send + 'static,
     ) -> Result<Vec<Vec<u8>>, TlsActivationError> {
-        self.submit(Box::new(job))
+        let output = self
+            .submit(Box::new(move |cancellation| {
+                job(cancellation).map(TlsIoJobOutput::CustomCa)
+            }))
             .map_err(|_| TlsActivationError::CaLoaderUnavailable)?
-            .await
+            .await?;
+        match output {
+            TlsIoJobOutput::CustomCa(certificates) => Ok(certificates),
+            TlsIoJobOutput::SystemRoots { .. } => Err(TlsActivationError::Configuration),
+        }
     }
 
     pub(crate) fn begin_shutdown(&self) {
@@ -403,7 +483,7 @@ impl Drop for TlsIoRuntime {
 }
 
 impl Future for TlsIoOperation {
-    type Output = Result<Vec<Vec<u8>>, TlsActivationError>;
+    type Output = Result<TlsIoJobOutput, TlsActivationError>;
 
     fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         match Pin::new(&mut self.result).poll(context) {
@@ -571,8 +651,8 @@ impl OperationSignal {
 
     fn publish_if_active(
         &self,
-        result: oneshot::Sender<Result<Vec<Vec<u8>>, TlsActivationError>>,
-        outcome: Result<Vec<Vec<u8>>, TlsActivationError>,
+        result: oneshot::Sender<Result<TlsIoJobOutput, TlsActivationError>>,
+        outcome: Result<TlsIoJobOutput, TlsActivationError>,
     ) {
         let _publication = lock(&self.publication);
         if !self.is_cancelled() && !result.is_closed() {
@@ -644,7 +724,7 @@ mod tests {
         }));
 
         assert!(runtime
-            .submit(Box::new(|_| Ok(Vec::new())))
+            .submit(Box::new(|_| Ok(TlsIoJobOutput::CustomCa(Vec::new()))))
             .unwrap()
             .await
             .is_ok());
@@ -652,7 +732,7 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("worker did not queue its completion");
         assert!(matches!(
-            runtime.submit(Box::new(|_| Ok(Vec::new()))),
+            runtime.submit(Box::new(|_| Ok(TlsIoJobOutput::CustomCa(Vec::new())))),
             Err(TlsIoAdmissionError::CapacityExhausted)
         ));
         assert_eq!(
@@ -853,18 +933,18 @@ mod tests {
             }))
             .unwrap();
         assert!(matches!(
-            runtime.submit(Box::new(|_| Ok(Vec::new()))),
+            runtime.submit(Box::new(|_| Ok(TlsIoJobOutput::CustomCa(Vec::new())))),
             Err(TlsIoAdmissionError::CapacityExhausted)
         ));
         runtime.begin_shutdown();
         assert!(matches!(
-            runtime.submit(Box::new(|_| Ok(Vec::new()))),
+            runtime.submit(Box::new(|_| Ok(TlsIoJobOutput::CustomCa(Vec::new())))),
             Err(TlsIoAdmissionError::Closed)
         ));
-        assert_eq!(
+        assert!(matches!(
             operation.await,
             Err(TlsActivationError::ActivationCancelled)
-        );
+        ));
         assert_eq!(
             runtime.shutdown_and_wait(None).await,
             TlsIoShutdownOutcome::Drained
@@ -891,7 +971,7 @@ mod tests {
                         let _ = started_tx.send(());
                         runtime_gate.wait();
                         worker_finished_tx.send(()).unwrap();
-                        Ok(Vec::new())
+                        Ok(TlsIoJobOutput::CustomCa(Vec::new()))
                     }))
                     .unwrap();
                 tokio::time::timeout(Duration::from_secs(1), started_rx)
@@ -908,10 +988,10 @@ mod tests {
                         detached_operations: 1,
                     }
                 );
-                assert_eq!(
+                assert!(matches!(
                     operation.await,
                     Err(TlsActivationError::ActivationCancelled)
-                );
+                ));
             });
             runtime_stopping_tx.send(()).unwrap();
             drop(tokio_runtime);

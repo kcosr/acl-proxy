@@ -10,6 +10,7 @@ trap 'rm -rf "$TEMP"' EXIT
 BASELINE="$TEMP/baseline"
 mkdir -p "$BASELINE/acl-proxy/fixtures/empty" \
     "$BASELINE/access-runtime/crates/example" \
+    "$BASELINE/access-runtime/crates/example/src" \
     "$BASELINE/access-runtime/.cargo"
 
 python3 - "$BASELINE" <<'PY'
@@ -23,12 +24,13 @@ rustls-pki-types = "=1.15.0"
 rustls-webpki = { version = "=0.103.13", default-features = false, features = ["alloc", "ring", "std"] }
 tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }
 '''
+runtime_tls = tls.replace('rustls-native-certs = "=0.8.3"\n', '')
 (root / "acl-proxy/Cargo.toml").write_text(
     '[package]\nname = "acl-proxy"\nversion = "0.3.0-rc.1"\n\n[dependencies]\n' + tls,
     encoding="utf-8",
 )
 (root / "access-runtime/Cargo.toml").write_text(
-    '[workspace]\nmembers = ["crates/example"]\n\n[workspace.dependencies]\n' + tls,
+    '[workspace]\nmembers = ["crates/example"]\n\n[workspace.dependencies]\n' + runtime_tls,
     encoding="utf-8",
 )
 (root / "access-runtime/crates/example/Cargo.toml").write_text(
@@ -42,22 +44,28 @@ tokio-rustls.workspace = true
 ''',
     encoding="utf-8",
 )
+(root / "access-runtime/crates/example/src/lib.rs").write_text(
+    'pub fn neutral_tls_fixture() {}\n', encoding="utf-8"
+)
 
-def lock(root_package):
+def lock(root_package, include_native):
     packages = [
         ("rustls", "0.23.42"),
-        ("rustls-native-certs", "0.8.3"),
         ("rustls-pki-types", "1.15.0"),
         ("rustls-webpki", "0.103.13"),
         ("tokio-rustls", "0.26.4"),
     ]
+    if include_native:
+        packages.insert(1, ("rustls-native-certs", "0.8.3"))
     text = 'version = 4\n\n[[package]]\nname = ' + repr(root_package) + '\nversion = "0.1.0"\n'
     for name, version in packages:
         text += f'\n[[package]]\nname = "{name}"\nversion = "{version}"\n'
     return text.replace("'", '"')
 
-(root / "acl-proxy/Cargo.lock").write_text(lock("acl-proxy"), encoding="utf-8")
-(root / "access-runtime/Cargo.lock").write_text(lock("access-runtime"), encoding="utf-8")
+(root / "acl-proxy/Cargo.lock").write_text(lock("acl-proxy", True), encoding="utf-8")
+(root / "access-runtime/Cargo.lock").write_text(
+    lock("access-runtime", False), encoding="utf-8"
+)
 (root / "acl-proxy/fixtures/empty/Cargo.lock").write_text(
     'version = 4\n\n[[package]]\nname = "empty"\nversion = "0.1.0"\n',
     encoding="utf-8",
@@ -109,6 +117,8 @@ def force_track(repo, path):
 
 if mode == "acl-missing-rustls":
     replace(acl, 'rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std", "tls12"] }\n', '')
+elif mode == "acl-missing-native":
+    replace(acl, 'rustls-native-certs = "=0.8.3"\n', '')
 elif mode == "acl-rustls-version":
     replace(acl, '=0.23.42', '=0.23.41')
 elif mode == "acl-rustls-default-features":
@@ -151,6 +161,20 @@ elif mode == "runtime-webpki-alias":
     replace(runtime, 'rustls-webpki = {', 'webpki = { package = "rustls-webpki",')
 elif mode == "runtime-rustls-feature":
     replace(runtime, '["ring", "std", "tls12"]', '["std", "tls12"]')
+elif mode == "runtime-native-dependency":
+    append(runtime, 'rustls-native-certs = "=0.8.3"\n')
+elif mode == "runtime-native-alias":
+    append(runtime, 'native-certs = { package = "rustls-native-certs", version = "=0.8.3" }\n')
+elif mode == "runtime-member-native":
+    append(
+        root / "access-runtime/crates/example/Cargo.toml",
+        'rustls-native-certs = "=0.8.3"\n',
+    )
+elif mode == "runtime-native-source":
+    append(
+        root / "access-runtime/crates/example/src/lib.rs",
+        'pub fn forbidden() { let _ = rustls_native_certs::load_native_certs(); }\n',
+    )
 elif mode == "member-wrong-rustls":
     replace(root / "access-runtime/crates/example/Cargo.toml", '\nrustls.workspace = true', '\nrustls = "0.23"')
 elif mode == "member-rustls-alias":
@@ -182,6 +206,14 @@ elif mode == "lock-missing-tokio":
     acl_lock.write_text(text, encoding="utf-8")
 elif mode == "runtime-lock-legacy":
     replace(runtime_lock, 'name = "rustls"\nversion = "0.23.42"', 'name = "rustls"\nversion = "0.21.12"')
+elif mode == "runtime-lock-native":
+    append(runtime_lock, '\n[[package]]\nname = "rustls-native-certs"\nversion = "0.8.3"\n')
+elif mode == "runtime-nested-lock-native":
+    nested = root / "access-runtime/crates/example/Cargo.lock"
+    nested.write_text(
+        'version = 4\n\n[[package]]\nname = "rustls-native-certs"\nversion = "0.8.3"\n',
+        encoding="utf-8",
+    )
 elif mode == "nested-lock-rcgen":
     append(root / "acl-proxy/fixtures/empty/Cargo.lock", '\n[[package]]\nname = "rcgen"\nversion = "0.13.2"\n')
 elif mode == "acl-deny-ignore":
@@ -439,6 +471,7 @@ expect_failure() {
 
 mutations=(
     acl-missing-rustls
+    acl-missing-native
     acl-rustls-version
     acl-rustls-default-features
     acl-rustls-missing-ring
@@ -460,6 +493,10 @@ mutations=(
     acl-pemfile-alias
     runtime-webpki-alias
     runtime-rustls-feature
+    runtime-native-dependency
+    runtime-native-alias
+    runtime-member-native
+    runtime-native-source
     member-wrong-rustls
     member-rustls-alias
     lock-version-rustls
@@ -474,6 +511,8 @@ mutations=(
     lock-duplicate-rustls
     lock-missing-tokio
     runtime-lock-legacy
+    runtime-lock-native
+    runtime-nested-lock-native
     nested-lock-rcgen
     acl-deny-ignore
     runtime-audit-ignore

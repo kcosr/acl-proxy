@@ -3,7 +3,7 @@ use std::sync::Arc;
 use http::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use http::HeaderMap;
 
-use super::{CaptureArtifactJob, SanitizedCaptureMetadata};
+use super::{CaptureArtifactJob, CaptureBodyOmission, SanitizedCaptureMetadata};
 use crate::http_body::{parse_capture_content_encoding, CaptureContentEncoding};
 use crate::observation::{CaptureBodyBuilder, CaptureEpoch, CaptureEvent};
 
@@ -16,6 +16,7 @@ pub(crate) struct HttpCaptureTap {
     encoding: Option<CaptureContentEncoding>,
     content_type: Option<String>,
     content_encoding_present: bool,
+    max_encoded_body_bytes: usize,
 }
 
 impl HttpCaptureTap {
@@ -26,7 +27,11 @@ impl HttpCaptureTap {
         headers: &HeaderMap,
         max_expansion_ratio: usize,
     ) -> Option<Self> {
-        let operation = epoch.capture()?.try_admit(event)?;
+        let policy = epoch.capture()?;
+        let operation = policy.try_admit(event)?;
+        let max_encoded_body_bytes = policy
+            .max_body_bytes()
+            .min(policy.profile().limits().max_body_bytes());
         // Parse and copy the narrow, noncredential header state before the tap
         // can outlive the caller's complete header map.
         let encoding = parse_capture_content_encoding(headers).ok();
@@ -37,7 +42,7 @@ impl HttpCaptureTap {
         let content_encoding_present = headers.contains_key(CONTENT_ENCODING);
         let metadata = metadata()?;
 
-        let job = match CaptureArtifactJob::begin_admitted(
+        let mut job = match CaptureArtifactJob::begin_admitted(
             epoch,
             operation,
             metadata,
@@ -49,13 +54,19 @@ impl HttpCaptureTap {
                 return None;
             }
         };
-        let body = encoding.map(|_| job.operation().body_buffer());
+        let body = if encoding.is_some() {
+            Some(job.operation().body_buffer())
+        } else {
+            job.omit_body(CaptureBodyOmission::DecodingFailed);
+            None
+        };
         Some(Self {
             job,
             body,
             encoding,
             content_type,
             content_encoding_present,
+            max_encoded_body_bytes,
         })
     }
 
@@ -65,20 +76,34 @@ impl HttpCaptureTap {
         let Some(body) = self.body.as_mut() else {
             return;
         };
+        let Some(next_len) = body.len().checked_add(bytes.len()) else {
+            self.body = None;
+            self.job.omit_body(CaptureBodyOmission::LimitExceeded);
+            return;
+        };
+        if next_len > self.max_encoded_body_bytes {
+            self.body = None;
+            self.job.omit_body(CaptureBodyOmission::LimitExceeded);
+            return;
+        }
         if body.try_extend_from_slice(bytes).is_err() {
             self.body = None;
+            self.job.omit_body(CaptureBodyOmission::ResourceExhausted);
         }
+    }
+
+    pub(crate) fn mark_trailers_omitted(&mut self) {
+        self.job.metadata.mark_trailers_omitted();
     }
 
     /// Completes the tap and returns its job exactly once. A failed tap becomes
     /// a metadata-only job.
     pub(crate) fn finish(mut self) -> CaptureArtifactJob {
         let Some(body) = self.body.take() else {
-            self.job.omit_body();
             return self.job;
         };
         let Some(encoding) = self.encoding else {
-            self.job.omit_body();
+            self.job.omit_body(CaptureBodyOmission::DecodingFailed);
             return self.job;
         };
         if self
@@ -91,7 +116,7 @@ impl HttpCaptureTap {
             )
             .is_err()
         {
-            self.job.omit_body();
+            self.job.omit_body(CaptureBodyOmission::ResourceExhausted);
         }
         self.job
     }
@@ -99,7 +124,7 @@ impl HttpCaptureTap {
     /// Abandons an incomplete body without retaining its buffered prefix.
     pub(crate) fn abandon(mut self) -> CaptureArtifactJob {
         self.body = None;
-        self.job.omit_body();
+        self.job.omit_body(CaptureBodyOmission::Incomplete);
         self.job
     }
 }
@@ -130,6 +155,18 @@ mod tests {
         Arc<CapturePool>,
         Arc<dyn GenerationOwner>,
     ) {
+        epoch_with_limits(directory, limit, 1024)
+    }
+
+    fn epoch_with_limits(
+        directory: &Path,
+        limit: usize,
+        max_body_bytes: usize,
+    ) -> (
+        Arc<CaptureEpoch>,
+        Arc<CapturePool>,
+        Arc<dyn GenerationOwner>,
+    ) {
         let (redaction, references) = test_snapshot(vec![TestProfile {
             name: "capture".to_owned(),
             replacement: b"REDACTED".to_vec(),
@@ -153,7 +190,7 @@ mod tests {
                         1024,
                     )
                     .expect("capture sink"),
-                    max_body_bytes: 1024,
+                    max_body_bytes,
                     max_inflight_body_bytes: limit,
                     working_set: CaptureWorkingSetPlan::default(),
                 }),
@@ -189,8 +226,8 @@ mod tests {
             headers: None,
             body: None,
             body_truncated: None,
-            provider_replacement_omitted: None,
-            provider_replacement_size: None,
+            body_omission: None,
+            trailers_omitted: None,
         }))
     }
 
@@ -240,9 +277,57 @@ mod tests {
 
         assert!(matches!(
             tap.finish().payload,
-            CaptureArtifactPayload::Unavailable
+            CaptureArtifactPayload::Omitted(CaptureBodyOmission::ResourceExhausted)
         ));
         assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn encoded_profile_limit_is_checked_before_growth_and_releases_the_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let (epoch, pool, _owner) = epoch_with_limit(directory.path(), 128 * 1024);
+        let mut tap = HttpCaptureTap::try_begin(
+            epoch,
+            CaptureEvent::RequestAllowed,
+            metadata,
+            &HeaderMap::new(),
+            16,
+        )
+        .expect("capture tap");
+
+        tap.push(&vec![b'a'; 1024]);
+        assert!(pool.used() > 0);
+        tap.push(b"x");
+
+        assert_eq!(pool.used(), 0, "overflow must release the captured prefix");
+        assert!(matches!(
+            tap.finish().payload,
+            CaptureArtifactPayload::Omitted(CaptureBodyOmission::LimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn lower_capture_limit_is_checked_before_growth_and_releases_the_prefix() {
+        let directory = tempfile::tempdir().unwrap();
+        let (epoch, pool, _owner) = epoch_with_limits(directory.path(), 128 * 1024, 8);
+        let mut tap = HttpCaptureTap::try_begin(
+            epoch,
+            CaptureEvent::RequestAllowed,
+            metadata,
+            &HeaderMap::new(),
+            16,
+        )
+        .expect("capture tap");
+
+        tap.push(b"12345678");
+        assert!(pool.used() > 0);
+        tap.push(b"9");
+
+        assert_eq!(pool.used(), 0, "overflow must release the captured prefix");
+        assert!(matches!(
+            tap.finish().payload,
+            CaptureArtifactPayload::Omitted(CaptureBodyOmission::LimitExceeded)
+        ));
     }
 
     #[test]
@@ -261,9 +346,27 @@ mod tests {
 
         assert!(matches!(
             tap.abandon().payload,
-            CaptureArtifactPayload::Unavailable
+            CaptureArtifactPayload::Omitted(CaptureBodyOmission::Incomplete)
         ));
         assert_eq!(pool.used(), 0);
+    }
+
+    #[test]
+    fn trailer_marker_is_retained_on_the_capture_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let (epoch, _pool, _owner) = epoch_with_limit(directory.path(), 128 * 1024);
+        let mut tap = HttpCaptureTap::try_begin(
+            epoch,
+            CaptureEvent::RequestAllowed,
+            metadata,
+            &HeaderMap::new(),
+            16,
+        )
+        .expect("capture tap");
+        tap.mark_trailers_omitted();
+
+        let job = tap.finish();
+        assert_eq!(job.metadata.record.trailers_omitted, Some(true));
     }
 
     #[test]
@@ -306,7 +409,7 @@ mod tests {
 
         assert!(matches!(
             tap.finish().payload,
-            CaptureArtifactPayload::Unavailable
+            CaptureArtifactPayload::Omitted(CaptureBodyOmission::DecodingFailed)
         ));
     }
 

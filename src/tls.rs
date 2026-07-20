@@ -4,7 +4,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use http_access_runtime::{
-    RuntimeError, TlsRootCertificate, TlsRootSet, MAX_TLS_ROOT_CERTIFICATES,
+    RuntimeError, SystemTlsRootSet, TlsRootCertificate, TlsRootSet,
+    MAX_SYSTEM_TLS_ROOT_CERTIFICATES, MAX_SYSTEM_TLS_ROOT_SET_BYTES, MAX_TLS_ROOT_CERTIFICATES,
     MAX_TLS_ROOT_CERTIFICATE_BYTES, MAX_TLS_ROOT_SET_BYTES,
 };
 use http_access_types::PolicyGeneration;
@@ -78,29 +79,87 @@ pub(crate) fn load_client_trust(
         }
         CompiledTlsTrust::System | CompiledTlsTrust::Insecure => None,
     };
-    load_client_trust_from_der(trust, custom_ca_der.as_deref(), is_cancelled)
+    let system_ca_der = if matches!(
+        trust,
+        CompiledTlsTrust::System | CompiledTlsTrust::SystemPlusCustom
+    ) {
+        load_bounded_system_roots(generation, is_cancelled)?.0
+    } else {
+        Vec::new()
+    };
+    load_client_trust_from_der(
+        trust,
+        &system_ca_der,
+        custom_ca_der.as_deref(),
+        is_cancelled,
+    )
 }
 
 pub(crate) fn load_client_trust_from_der(
     trust: CompiledTlsTrust,
+    system_ca_der: &[Vec<u8>],
     custom_ca_der: Option<&[Vec<u8>]>,
     is_cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<ClientTrust, TlsActivationError> {
     match (trust, custom_ca_der) {
         (CompiledTlsTrust::System, None) => {
-            root_store_with_native_roots(is_cancelled).map(ClientTrust::Roots)
+            root_store_from_system_ca(system_ca_der, is_cancelled).map(ClientTrust::Roots)
         }
         (CompiledTlsTrust::Custom, Some(custom_ca_der)) => {
             root_store_from_custom_ca(custom_ca_der).map(ClientTrust::Roots)
         }
         (CompiledTlsTrust::SystemPlusCustom, Some(custom_ca_der)) => {
-            let mut roots = root_store_with_native_roots(is_cancelled)?;
+            let mut roots = root_store_from_system_ca(system_ca_der, is_cancelled)?;
             add_custom_ca(&mut roots, custom_ca_der)?;
             Ok(ClientTrust::Roots(roots))
         }
         (CompiledTlsTrust::Insecure, None) => Ok(ClientTrust::Insecure),
         _ => Err(TlsActivationError::CaUnavailable),
     }
+}
+
+pub(crate) fn load_bounded_system_roots(
+    generation: PolicyGeneration,
+    is_cancelled: &mut dyn FnMut() -> bool,
+) -> Result<(Vec<Vec<u8>>, SystemTlsRootSet), TlsActivationError> {
+    check_activation_cancellation(is_cancelled)?;
+    let certificates = rustls_native_certs::load_native_certs();
+    check_activation_cancellation(is_cancelled)?;
+    if !certificates.errors.is_empty() || certificates.certs.is_empty() {
+        return Err(TlsActivationError::NativeRoots);
+    }
+    if certificates.certs.len() > MAX_SYSTEM_TLS_ROOT_CERTIFICATES {
+        return Err(TlsActivationError::NativeRoots);
+    }
+    let mut total_der_bytes = 0_usize;
+    let mut bounded = Vec::with_capacity(certificates.certs.len());
+    for certificate in certificates.certs {
+        check_activation_cancellation(is_cancelled)?;
+        let der = certificate.as_ref();
+        if der.is_empty() || der.len() > MAX_TLS_ROOT_CERTIFICATE_BYTES {
+            return Err(TlsActivationError::NativeRoots);
+        }
+        total_der_bytes = total_der_bytes
+            .checked_add(der.len())
+            .ok_or(TlsActivationError::NativeRoots)?;
+        if total_der_bytes > MAX_SYSTEM_TLS_ROOT_SET_BYTES {
+            return Err(TlsActivationError::NativeRoots);
+        }
+        bounded.push(der.to_vec());
+    }
+    let mut certificates = bounded;
+    certificates.sort_unstable();
+    certificates.dedup();
+    check_activation_cancellation(is_cancelled)?;
+    let roots = certificates
+        .iter()
+        .cloned()
+        .map(TlsRootCertificate::new)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| TlsActivationError::NativeRoots)?;
+    let roots =
+        SystemTlsRootSet::new(generation, roots).map_err(|_| TlsActivationError::NativeRoots)?;
+    Ok((certificates, roots))
 }
 
 pub(crate) fn load_bounded_custom_ca(
@@ -172,19 +231,18 @@ pub(crate) fn build_client_config(
     Ok(config)
 }
 
-fn root_store_with_native_roots(
+fn root_store_from_system_ca(
+    certificates: &[Vec<u8>],
     is_cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<RootCertStore, TlsActivationError> {
     let mut roots = RootCertStore::empty();
     check_activation_cancellation(is_cancelled)?;
-    let certificates = rustls_native_certs::load_native_certs();
-    check_activation_cancellation(is_cancelled)?;
-    if !certificates.errors.is_empty() || certificates.certs.is_empty() {
+    if certificates.is_empty() {
         return Err(TlsActivationError::NativeRoots);
     }
-    for certificate in certificates.certs {
+    for certificate in certificates {
         roots
-            .add(certificate)
+            .add(CertificateDer::from(certificate.clone()))
             .map_err(|_| TlsActivationError::NativeRoots)?;
     }
     validate_native_root_store(roots)

@@ -689,6 +689,38 @@ fn wait_for_records(capture_dir: &Path, url: &str, count: usize) -> Vec<Value> {
     }
 }
 
+fn assert_record_omits_secrets(record: &Value, context: &str, secrets: &[&str]) {
+    let encoded = serde_json::to_string(record).unwrap();
+    for secret in secrets {
+        assert!(
+            !encoded.contains(secret),
+            "{context} exposed {secret:?}: {encoded}"
+        );
+    }
+}
+
+fn assert_all_log_files_omit_secrets(log_dir: &Path, secrets: &[&str]) {
+    let entries = fs::read_dir(log_dir).expect("read runtime log directory");
+    let mut file_count = 0;
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if !path.is_file() {
+            continue;
+        }
+        file_count += 1;
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read log file {}: {error}", path.display()));
+        for secret in secrets {
+            assert!(
+                !contents.contains(secret),
+                "log file {} exposed {secret:?}",
+                path.display()
+            );
+        }
+    }
+    assert!(file_count > 0, "runtime produced no log files");
+}
+
 #[test]
 fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
     let directory = TempDir::new().expect("create runtime fixture");
@@ -808,6 +840,16 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
     assert_eq!(allow.status, 200);
     assert_eq!(allow.header("x-seen-provider-token"), Some("typed-secret"));
     assert_eq!(allow.header("x-generation"), Some("one"));
+    let allow_captures = wait_for_records(&directory.path().join("captures"), &allow_url, 2);
+    let allow_request = allow_captures
+        .iter()
+        .find(|record| record["kind"] == "request")
+        .expect("provider allow request capture");
+    assert_record_omits_secrets(
+        allow_request,
+        "provider allow request capture",
+        &[DECISION_LOG_SECRET, "typed-secret"],
+    );
 
     let deny_url = format!("http://{origin}/provider-deny");
     assert_eq!(proxy_request(data, "GET", &deny_url, &[]).status, 403);
@@ -853,6 +895,17 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
         Some("missing")
     );
     assert_eq!(webhook_allow.body, b"webhook allow body");
+    let webhook_allow_captures =
+        wait_for_records(&directory.path().join("captures"), &webhook_allow_url, 2);
+    let webhook_allow_request = webhook_allow_captures
+        .iter()
+        .find(|record| record["kind"] == "request")
+        .expect("webhook allow request capture");
+    assert_record_omits_secrets(
+        webhook_allow_request,
+        "webhook allow request capture",
+        &["webhook-typed-secret"],
+    );
 
     let webhook_pass_url = format!("http://{origin}/webhook-pass");
     let webhook_pass = proxy_request(data, "POST", &webhook_pass_url, b"webhook pass body");
@@ -915,8 +968,15 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
     assert_eq!(request["mode"], "http_proxy");
     assert_eq!(request["method"], "POST");
     assert!(request["body"].is_null());
-    assert_eq!(request["providerReplacementOmitted"], true);
-    assert_eq!(request["providerReplacementSize"], 20);
+    assert_eq!(
+        request["bodyOmission"],
+        json!({"reason": "provider_replacement", "size": 20})
+    );
+    assert_record_omits_secrets(
+        request,
+        "provider replacement request capture",
+        &["typed-secret"],
+    );
     let response = captures
         .iter()
         .find(|record| record["kind"] == "response")
@@ -977,6 +1037,10 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
     assert!(decision_logs.contains("policy decision"));
     assert!(decision_logs.contains("sensitive_header_presence=x-provider-token"));
     assert!(!decision_logs.contains(DECISION_LOG_SECRET));
+    assert_all_log_files_omit_secrets(
+        &directory.path().join("logs"),
+        &[DECISION_LOG_SECRET, "typed-secret", "webhook-typed-secret"],
+    );
     std::net::TcpListener::bind(data).expect("data listener was not released");
     std::net::TcpListener::bind(control).expect("control listener was not released");
 }

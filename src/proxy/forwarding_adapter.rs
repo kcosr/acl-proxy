@@ -52,7 +52,6 @@ pub(super) struct ProductObservationState {
     capture: HttpCaptureContext,
     request_provenance: TerminalRequestBodyProvenance,
     canonical_identity: bool,
-    request_headers: Option<HeaderMap>,
     request: Option<CaptureSubmission>,
     response: Option<CaptureSubmission>,
 }
@@ -67,7 +66,6 @@ impl ProductObservationState {
             capture,
             request_provenance,
             canonical_identity,
-            request_headers: None,
             request: None,
             response: None,
         }
@@ -112,6 +110,13 @@ struct ProductForwardingObservation {
 }
 
 impl ForwardingObservation for ProductForwardingObservation {
+    fn request_head_preparation_failed(&mut self) -> Result<(), RuntimeError> {
+        lock_observation(&self.state)
+            .capture
+            .submit_request_head_preparation_failed();
+        Ok(())
+    }
+
     fn request_head(&mut self, head: &ForwardingRequestHead) -> Result<(), RuntimeError> {
         let headers = crate::proxy::private_fields::product_headers(head.headers())
             .map_err(|_| RuntimeError::InvalidInput)?;
@@ -120,7 +125,6 @@ impl ForwardingObservation for ProductForwardingObservation {
         if state.canonical_identity {
             body_headers.insert(CONTENT_ENCODING, HeaderValue::from_static("identity"));
         }
-        state.request_headers = Some(headers.clone());
         state.request =
             state
                 .capture
@@ -135,7 +139,12 @@ impl ForwardingObservation for ProductForwardingObservation {
         Ok(())
     }
 
-    fn request_trailers(&mut self, _trailers: &[HeaderField]) -> Result<(), RuntimeError> {
+    fn request_trailers(&mut self, trailers: &[HeaderField]) -> Result<(), RuntimeError> {
+        if !trailers.is_empty() {
+            if let Some(request) = lock_observation(&self.state).request.as_mut() {
+                request.mark_trailers_omitted();
+            }
+        }
         Ok(())
     }
 
@@ -183,7 +192,12 @@ impl ForwardingObservation for ProductForwardingObservation {
         Ok(())
     }
 
-    fn response_trailers(&mut self, _trailers: &[HeaderField]) -> Result<(), RuntimeError> {
+    fn response_trailers(&mut self, trailers: &[HeaderField]) -> Result<(), RuntimeError> {
+        if !trailers.is_empty() {
+            if let Some(response) = lock_observation(&self.state).response.as_mut() {
+                response.mark_trailers_omitted();
+            }
+        }
         Ok(())
     }
 }
@@ -348,4 +362,59 @@ fn product_version(version: http_access_types::HttpVersion) -> Version {
         http_access_types::HttpVersion::Http11 => Version::HTTP_11,
         http_access_types::HttpVersion::Http2 => Version::HTTP_2,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_trailer_observation_for_test(
+    runtime: Arc<crate::observation::ProductObservationRuntime>,
+    epoch: Arc<crate::observation::CaptureEpoch>,
+    request_id: &str,
+    target: &http_access_url::CanonicalUrl,
+    with_trailers: bool,
+) {
+    let capture =
+        HttpCaptureContext::for_forwarding_trailer_test(runtime, epoch, request_id, target);
+    let headers = HeaderMap::new();
+    let request = capture.begin_allowed_request(
+        &headers,
+        &headers,
+        TerminalRequestBodyProvenance::CompleteOriginal,
+    );
+    let response = capture.begin(
+        CaptureEvent::ResponseAllowed,
+        || {
+            capture.response_record(
+                CaptureDecision::Allow,
+                Version::HTTP_2,
+                Some(&headers),
+                StatusCode::OK,
+                false,
+            )
+        },
+        &headers,
+    );
+    assert!(request.is_some(), "request capture was not admitted");
+    assert!(response.is_some(), "response capture was not admitted");
+
+    let state = Arc::new(Mutex::new(ProductObservationState {
+        capture,
+        request_provenance: TerminalRequestBodyProvenance::CompleteOriginal,
+        canonical_identity: false,
+        request,
+        response,
+    }));
+    let mut observer = ProductForwardingObservation {
+        state: Arc::clone(&state),
+    };
+    let trailers = with_trailers.then(|| {
+        HeaderField::new(
+            http_access_types::HeaderName::new("x-capture-trailer".to_owned()).unwrap(),
+            http_access_types::HeaderValue::new(b"present".to_vec()).unwrap(),
+        )
+    });
+    let trailers = trailers.as_slice();
+    observer.request_trailers(trailers).unwrap();
+    observer.request_complete().unwrap();
+    observer.response_trailers(trailers).unwrap();
+    lock_observation(&state).finish_response();
 }

@@ -455,7 +455,20 @@ Selected `response.allowed` capture also records sanitized listener-generated
 forwarding failures. The 500, 502, 503, or 504 status and pre-redaction fixed
 body come from the listener's authoritative mapping; persisted headers and body
 remain subject to the configured capture redaction and omission policy.
-Incomplete request or upstream response captures remain abandoned.
+Visible UTF-8 header values pass through the active capture redaction profile;
+non-UTF-8 values and values that cannot be redacted within the configured
+bounds are omitted.
+
+Every persisted record contains exactly one of `body` or `bodyOmission`.
+`bodyOmission.reason` is `empty`, `incomplete`, `limit_exceeded`,
+`resource_exhausted`, `decoding_failed`, `redaction_failed`,
+`text_protections_skipped`, `artifact_encoding_failed`,
+`head_preparation_failed`, or `provider_replacement`; provider replacement also
+records its bounded `size`. Nonempty forwarded trailers are represented by
+`trailersOmitted = true` because trailer values are not serialized. When a
+stored body is a redacted prefix, `bodyTruncated = true` and `body.length`
+retains the complete redacted length. `acl-proxy-extract-capture-body` still
+emits that prefix and writes a truncation warning to standard error.
 
 All HTTP ingress paths, including requests decrypted inside CONNECT MITM,
 serialize capture `mode` as `http_proxy`.

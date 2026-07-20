@@ -24,7 +24,10 @@ use crate::credential_io_runtime::{
     CredentialIoRuntime, CredentialIoRuntimeError, CredentialIoShutdownOutcome,
 };
 use crate::logging::{process_logging_level_control, LoggingLevelControl};
-use crate::observation::{ProductObservationRuntime, ProductObservationRuntimeStartError};
+use crate::observation::{
+    ProductObservationRuntime, ProductObservationRuntimeStartError,
+    ProductObservationShutdownOutcome,
+};
 use crate::runtime::{BoxFuture, ServiceReadiness, StaticResourceBrand, StaticResources};
 use crate::safety::WireBodyPool;
 use crate::tls_io_runtime::{TlsIoRuntime, TlsIoRuntimeError, TlsIoShutdownOutcome};
@@ -55,6 +58,13 @@ pub(crate) struct ProductStaticResources {
     listener_failure_notifications: AtomicUsize,
     listener_runtime: Mutex<Option<Arc<ListenerRuntime>>>,
     listener_shutdown_started: AtomicBool,
+    #[cfg(test)]
+    listener_shutdown_pause: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     listener_admission_closed: tokio::sync::OnceCell<()>,
     listener_shutdown: tokio::sync::OnceCell<()>,
     local_addresses_shutdown: tokio::sync::OnceCell<()>,
@@ -372,6 +382,8 @@ impl ProductStaticResources {
             listener_failure_notifications: AtomicUsize::new(0),
             listener_runtime: Mutex::new(None),
             listener_shutdown_started: AtomicBool::new(false),
+            #[cfg(test)]
+            listener_shutdown_pause: Mutex::new(None),
             listener_admission_closed: tokio::sync::OnceCell::new(),
             listener_shutdown: tokio::sync::OnceCell::new(),
             local_addresses_shutdown: tokio::sync::OnceCell::new(),
@@ -768,6 +780,18 @@ impl ProductStaticResources {
         if let Some(runtime) = runtime {
             self.listener_shutdown_started
                 .store(true, Ordering::Release);
+            #[cfg(test)]
+            let shutdown_pause = {
+                self.listener_shutdown_pause
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take()
+            };
+            #[cfg(test)]
+            if let Some((reached, release)) = shutdown_pause {
+                let _ = reached.send(());
+                let _ = release.await;
+            }
             let deadline = *self
                 .shutdown_deadline
                 .lock()
@@ -786,6 +810,23 @@ impl ProductStaticResources {
     #[cfg(test)]
     pub(crate) fn listener_shutdown_started_for_test(&self) -> bool {
         self.listener_shutdown_started.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_listener_shutdown_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (reached_send, reached_receive) = tokio::sync::oneshot::channel();
+        let (release_send, release_receive) = tokio::sync::oneshot::channel();
+        *self
+            .listener_shutdown_pause
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((reached_send, release_receive));
+        (reached_receive, release_send)
     }
 
     #[cfg(test)]
@@ -972,7 +1013,13 @@ impl StaticResources for ProductStaticResources {
                     }
                 })
                 .await;
-            self.observation_runtime.shutdown().await;
+            if self.observation_runtime.shutdown_until(deadline).await
+                == ProductObservationShutdownOutcome::DeadlineExceeded
+            {
+                tracing::warn!(
+                    "capture worker did not exit before the shutdown deadline; queued records were marked for discard and blocking record processing may remain detached"
+                );
+            }
         })
     }
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::authorization::{
     AuthorizationActivation, AuthorizationActivationError, ProductAuthorizationSnapshot,
 };
-use crate::candidate_ca::CandidateCaResolver;
+use crate::candidate_tls::CandidateTlsResolver;
 use crate::config::compiler::ReloadableProductPlan;
 use crate::config::StaticFingerprint;
 use crate::credentials::CredentialActivation;
@@ -175,12 +175,14 @@ impl ProductActivator {
 
         let generation = http_access_types::PolicyGeneration::new(standalone.version())
             .map_err(|_| RuntimeError::CandidateActivation("invalid generation".to_owned()))?;
-        let mut ca_resolver = CandidateCaResolver::new(
+        let mut tls_resolver = CandidateTlsResolver::activate(
             self.static_resources.tls_io_runtime(),
             cancellation.clone(),
             generation,
-        );
-        let egress = EgressActivation::activate(egress, standalone.identity(), &mut ca_resolver)
+        )
+        .await
+        .map_err(|error| map_egress_error(error.into(), &cancellation))?;
+        let egress = EgressActivation::activate(egress, standalone.identity(), &mut tls_resolver)
             .await
             .map_err(|error| map_egress_error(error, &cancellation))?;
         let (neutral_egress, executor_bindings) = egress.into_parts();
@@ -221,7 +223,7 @@ impl ProductActivator {
             authorization,
             provider_registry,
             self.static_resources.authorization_runtime(),
-            &mut ca_resolver,
+            &mut tls_resolver,
         )
         .await
         .map_err(|error| map_authorization_error(error, &cancellation))?;

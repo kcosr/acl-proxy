@@ -469,11 +469,13 @@ mod tests {
         ca_certificate: Option<PathBuf>,
     ) -> Arc<WebhookProvider> {
         let tls_io = crate::tls_io_runtime::TlsIoRuntime::new().unwrap();
-        let mut ca_resolver = crate::candidate_ca::CandidateCaResolver::new(
+        let mut tls_resolver = crate::candidate_tls::CandidateTlsResolver::activate(
             Arc::clone(&tls_io),
             crate::runtime::ActivationCancellation::new_for_test(),
             http_access_types::PolicyGeneration::new(7).unwrap(),
-        );
+        )
+        .await
+        .expect("test host system roots load");
         let provider = WebhookProvider::activate(
             WebhookProviderPlan {
                 url: canonicalize_http_url(&format!("https://{host}:{port}/authorize")).unwrap(),
@@ -488,7 +490,7 @@ mod tests {
                     ca_certificate,
                 }),
             },
-            &mut ca_resolver,
+            &mut tls_resolver,
         )
         .await
         .unwrap();

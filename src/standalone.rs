@@ -341,7 +341,8 @@ impl UnboundStandaloneGenerationPlan {
         mut self,
         neutral_egress: NeutralEgressBindings,
     ) -> Result<Self, StandaloneCompileError> {
-        let (origin_protocols, origin_https_trust, route, tls_roots) = neutral_egress.into_parts();
+        let (origin_protocols, origin_https_trust, route, tls_roots, system_tls_roots) =
+            neutral_egress.into_parts();
         let registries =
             self.core
                 .pending_registries
@@ -356,6 +357,7 @@ impl UnboundStandaloneGenerationPlan {
             registries,
             managed_network_policies: Vec::new(),
             tls_roots,
+            system_tls_roots: Some(system_tls_roots),
             resource_limits: self.core.resource_limits,
             templates: Vec::new(),
             handles: Vec::new(),
@@ -425,8 +427,9 @@ impl UnboundStandaloneGenerationPlan {
 
     #[cfg(test)]
     pub(crate) fn into_bound_for_runtime_test(self) -> StandaloneGenerationPlan {
+        let generation = self.core.generation;
         let finalized = self
-            .finalize(crate::egress::NeutralEgressBindings::direct_system_for_test())
+            .finalize(crate::egress::NeutralEgressBindings::direct_system_for_test(generation))
             .expect("runtime test standalone generation finalizes");
         StandaloneGenerationPlan {
             activated: StandaloneActivatedBindings {
@@ -1823,12 +1826,14 @@ header = "x-acl-proxy-request-id"
         }
         let draft = UnboundStandaloneGenerationPlan::compile(plan, id).unwrap();
         let tls_io = crate::tls_io_runtime::TlsIoRuntime::new().unwrap();
-        let mut ca_resolver = crate::candidate_ca::CandidateCaResolver::new(
+        let mut tls_resolver = crate::candidate_tls::CandidateTlsResolver::activate(
             std::sync::Arc::clone(&tls_io),
             crate::runtime::ActivationCancellation::new_for_test(),
             PolicyGeneration::new(draft.version()).unwrap(),
-        );
-        let activation = EgressActivation::activate(egress, draft.identity(), &mut ca_resolver)
+        )
+        .await
+        .expect("test host system roots load");
+        let activation = EgressActivation::activate(egress, draft.identity(), &mut tls_resolver)
             .await
             .unwrap();
         tls_io.shutdown_and_wait(None).await;

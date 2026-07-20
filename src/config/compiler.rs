@@ -9670,7 +9670,7 @@ trust = "insecure"
         .expect("a validated canonical IPv6 parent must activate");
 
         let (neutral, _) = activation.into_parts();
-        let (_, _, route, _) = neutral.into_parts();
+        let (_, _, route, _, _) = neutral.into_parts();
         assert!(matches!(route, http_access_types::Route::Parent { .. }));
     }
 

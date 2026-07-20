@@ -18,7 +18,7 @@ use super::protocol::{
 };
 use super::webhook::provider::{WebhookActivationError, WebhookProvider};
 use super::webhook::runtime::{WebhookAuthorizationRuntime, WebhookDispatchError};
-use crate::candidate_ca::CandidateCaResolver;
+use crate::candidate_tls::CandidateTlsResolver;
 use crate::config::compiler::{
     AuthorizationCallbackPlan, AuthorizationPlan, AuthorizationProviderPlan,
     CompiledProviderFailureMode,
@@ -137,13 +137,13 @@ impl ProductAuthorizationSnapshot {
         plan: AuthorizationPlan,
         provider_registry: ProviderRegistry,
         webhook_runtime: Arc<WebhookAuthorizationRuntime>,
-        ca_resolver: &mut CandidateCaResolver,
+        tls_resolver: &mut CandidateTlsResolver,
     ) -> Result<AuthorizationActivation, AuthorizationActivationError> {
         Self::activate_inner(
             plan,
             provider_registry,
             webhook_runtime,
-            ca_resolver,
+            tls_resolver,
             |_| {},
         )
         .await
@@ -159,12 +159,18 @@ impl ProductAuthorizationSnapshot {
         cancellation: ActivationCancellation,
         after_provider_activation: impl FnMut(&Arc<ProcessProvider>),
     ) -> Result<AuthorizationActivation, AuthorizationActivationError> {
-        let mut ca_resolver = CandidateCaResolver::new(tls_io_runtime, cancellation, generation);
+        let mut tls_resolver =
+            CandidateTlsResolver::activate(tls_io_runtime, cancellation, generation)
+                .await
+                .map_err(|error| AuthorizationActivationError::WebhookActivation {
+                    provider: "system-roots".to_owned(),
+                    reason: error,
+                })?;
         Self::activate_inner(
             plan,
             provider_registry,
             webhook_runtime,
-            &mut ca_resolver,
+            &mut tls_resolver,
             after_provider_activation,
         )
         .await
@@ -174,10 +180,10 @@ impl ProductAuthorizationSnapshot {
         plan: AuthorizationPlan,
         provider_registry: ProviderRegistry,
         webhook_runtime: Arc<WebhookAuthorizationRuntime>,
-        ca_resolver: &mut CandidateCaResolver,
+        tls_resolver: &mut CandidateTlsResolver,
         mut after_provider_activation: impl FnMut(&Arc<ProcessProvider>),
     ) -> Result<AuthorizationActivation, AuthorizationActivationError> {
-        if ca_resolver.cancellation().is_cancelled() {
+        if tls_resolver.cancellation().is_cancelled() {
             return Err(AuthorizationActivationError::Cancelled);
         }
         let has_webhook = plan
@@ -208,14 +214,14 @@ impl ProductAuthorizationSnapshot {
             match provider {
                 AuthorizationProviderPlan::Process(process_plan) => {
                     let process = match ProcessProvider::activate(process_plan, || {
-                        ca_resolver.cancellation().is_cancelled()
+                        tls_resolver.cancellation().is_cancelled()
                     })
                     .await
                     {
                         Ok(process) => process,
                         Err(error) => {
                             let error =
-                                map_activation_error(error, ca_resolver.cancellation(), &name);
+                                map_activation_error(error, tls_resolver.cancellation(), &name);
                             rollback.rollback().await;
                             return Err(error);
                         }
@@ -225,12 +231,13 @@ impl ProductAuthorizationSnapshot {
                     providers.push(ActiveProvider::Process(process));
                 }
                 AuthorizationProviderPlan::Webhook(webhook_plan) => {
-                    let webhook = match WebhookProvider::activate(webhook_plan, ca_resolver).await {
+                    let webhook = match WebhookProvider::activate(webhook_plan, tls_resolver).await
+                    {
                         Ok(webhook) => webhook,
                         Err(error) => {
                             let error = map_webhook_activation_error(
                                 error,
-                                ca_resolver.cancellation(),
+                                tls_resolver.cancellation(),
                                 &name,
                             );
                             rollback.rollback().await;
@@ -242,7 +249,7 @@ impl ProductAuthorizationSnapshot {
             }
         }
 
-        if ca_resolver.cancellation().is_cancelled() {
+        if tls_resolver.cancellation().is_cancelled() {
             rollback.rollback().await;
             return Err(AuthorizationActivationError::Cancelled);
         }
@@ -806,11 +813,13 @@ mod tests {
         let missing = plan("/sensitive/missing/provider-ca.pem");
         let registry = ProviderRegistry::from_names(missing.providers.keys().cloned());
         let tls_io = crate::tls_io_runtime::TlsIoRuntime::new().unwrap();
-        let mut resolver = CandidateCaResolver::new(
+        let mut resolver = CandidateTlsResolver::activate(
             Arc::clone(&tls_io),
             cancellation(),
             http_access_types::PolicyGeneration::new(7).unwrap(),
-        );
+        )
+        .await
+        .expect("test host system roots load");
         let error = ProductAuthorizationSnapshot::activate(
             missing,
             registry,
@@ -833,15 +842,17 @@ mod tests {
         tls_io.shutdown_and_wait(None).await;
 
         let cancellation = cancellation();
-        cancellation.cancel_for_test();
         let cancelled = plan("/sensitive/missing/provider-ca.pem");
         let registry = ProviderRegistry::from_names(cancelled.providers.keys().cloned());
         let tls_io = crate::tls_io_runtime::TlsIoRuntime::new().unwrap();
-        let mut resolver = CandidateCaResolver::new(
+        let mut resolver = CandidateTlsResolver::activate(
             Arc::clone(&tls_io),
-            cancellation,
+            cancellation.clone(),
             http_access_types::PolicyGeneration::new(7).unwrap(),
-        );
+        )
+        .await
+        .expect("test host system roots load");
+        cancellation.cancel_for_test();
         let error = ProductAuthorizationSnapshot::activate(
             cancelled,
             registry,
@@ -863,16 +874,18 @@ mod tests {
         cancellation: ActivationCancellation,
     ) -> Result<AuthorizationActivation, AuthorizationActivationError> {
         let provider_registry = ProviderRegistry::from_names(plan.providers.keys().cloned());
-        let mut ca_resolver = CandidateCaResolver::new(
+        let mut tls_resolver = CandidateTlsResolver::activate(
             crate::tls_io_runtime::TlsIoRuntime::new().unwrap(),
             cancellation,
             http_access_types::PolicyGeneration::new(7).unwrap(),
-        );
+        )
+        .await
+        .expect("test host system roots load");
         ProductAuthorizationSnapshot::activate(
             plan,
             provider_registry,
             WebhookAuthorizationRuntime::for_test(None),
-            &mut ca_resolver,
+            &mut tls_resolver,
         )
         .await
     }
@@ -989,18 +1002,20 @@ mod tests {
             )]),
         };
         let registry = ProviderRegistry::from_names(plan.providers.keys().cloned());
-        let mut ca_resolver = CandidateCaResolver::new(
+        let mut tls_resolver = CandidateTlsResolver::activate(
             crate::tls_io_runtime::TlsIoRuntime::new().unwrap(),
             cancellation(),
             http_access_types::PolicyGeneration::new(7).unwrap(),
-        );
+        )
+        .await
+        .expect("test host system roots load");
         let activation = ProductAuthorizationSnapshot::activate(
             plan,
             registry,
             WebhookAuthorizationRuntime::for_test(Some(
                 "http://127.0.0.1:8888/_acl/external-auth/callback",
             )),
-            &mut ca_resolver,
+            &mut tls_resolver,
         )
         .await
         .unwrap();
@@ -1047,18 +1062,20 @@ mod tests {
             )]),
         };
         let registry = ProviderRegistry::from_names(plan.providers.keys().cloned());
-        let mut ca_resolver = CandidateCaResolver::new(
+        let mut tls_resolver = CandidateTlsResolver::activate(
             crate::tls_io_runtime::TlsIoRuntime::new().unwrap(),
             cancellation(),
             http_access_types::PolicyGeneration::new(7).unwrap(),
-        );
+        )
+        .await
+        .expect("test host system roots load");
         let activation = ProductAuthorizationSnapshot::activate(
             plan,
             registry,
             WebhookAuthorizationRuntime::for_test(Some(
                 "http://127.0.0.1:8888/_acl/external-auth/callback",
             )),
-            &mut ca_resolver,
+            &mut tls_resolver,
         )
         .await
         .unwrap();
@@ -1300,12 +1317,29 @@ for line in sys.stdin:
     #[tokio::test]
     async fn pre_cancelled_activation_starts_no_provider() {
         let cancellation = cancellation();
+        let tls_io = crate::tls_io_runtime::TlsIoRuntime::new().unwrap();
+        let mut tls_resolver = CandidateTlsResolver::activate(
+            Arc::clone(&tls_io),
+            cancellation.clone(),
+            PolicyGeneration::new(7).unwrap(),
+        )
+        .await
+        .expect("test host system roots load");
         cancellation.cancel_for_test();
-        let result = activate(authorization_plan(BTreeMap::new()), cancellation).await;
+        let plan = authorization_plan(BTreeMap::new());
+        let result = ProductAuthorizationSnapshot::activate(
+            plan,
+            ProviderRegistry::from_names(std::iter::empty()),
+            WebhookAuthorizationRuntime::for_test(None),
+            &mut tls_resolver,
+        )
+        .await;
         assert!(matches!(
             result,
             Err(AuthorizationActivationError::Cancelled)
         ));
+        assert_eq!(tls_resolver.file_reads(), 0);
+        tls_io.shutdown_and_wait(None).await;
     }
 
     #[tokio::test]

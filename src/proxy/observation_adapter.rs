@@ -17,7 +17,8 @@ use http_access_types::{
 };
 
 use crate::capture::{
-    CaptureArtifactJob, CaptureDecision, CaptureKind, HttpCaptureTap, SanitizedCaptureMetadata,
+    CaptureArtifactJob, CaptureBodyOmission, CaptureDecision, CaptureKind, HttpCaptureTap,
+    SanitizedCaptureMetadata,
 };
 use crate::observation::{
     CaptureBodyBuilder, CaptureEpoch, CaptureEvent, ProductObservationRuntime,
@@ -53,6 +54,31 @@ pub(crate) struct DeniedCaptureBody {
 }
 
 impl HttpCaptureContext {
+    #[cfg(test)]
+    pub(super) fn for_forwarding_trailer_test(
+        runtime: Arc<ProductObservationRuntime>,
+        epoch: Arc<CaptureEpoch>,
+        request_id: &str,
+        target: &http_access_url::CanonicalUrl,
+    ) -> Self {
+        let mut capture = Self {
+            runtime,
+            epoch,
+            sensitive_headers: SensitiveHeaderPolicy::new([], [], [])
+                .expect("fixed sensitive headers are valid"),
+            request_id: request_id.to_owned(),
+            url: None,
+            canonical_url: None,
+            method: Method::POST,
+            client: SocketAddr::from(([127, 0, 0, 1], 42_000)),
+            ingress_mode: IngressMode::ExplicitHttp,
+            request_version: Version::HTTP_2,
+            max_expansion_ratio: 100,
+        };
+        capture.bind_target(target);
+        capture
+    }
+
     #[cfg(test)]
     pub(super) fn record_forwarding_terminal_completion(&self) {
         self.runtime.record_forwarding_terminal_completion();
@@ -254,7 +280,7 @@ impl HttpCaptureContext {
                 CaptureEvent::RequestAllowed,
                 || {
                     let mut record = self.request_record(CaptureDecision::Allow, Some(headers))?;
-                    record.mark_provider_replacement_omitted(size);
+                    record.omit_provider_replacement(size);
                     Some(record)
                 },
                 body_headers,
@@ -268,6 +294,21 @@ impl HttpCaptureContext {
             || self.request_record(CaptureDecision::Allow, Some(headers)),
             body_headers,
         )
+    }
+
+    pub(super) fn submit_request_head_preparation_failed(&self) {
+        let body_headers = HeaderMap::new();
+        if let Some(mut submission) = self.begin(
+            CaptureEvent::RequestAllowed,
+            || {
+                let mut record = self.request_record(CaptureDecision::Allow, None)?;
+                record.omit_body(CaptureBodyOmission::HeadPreparationFailed);
+                Some(record)
+            },
+            &body_headers,
+        ) {
+            submission.abandon();
+        }
     }
 
     pub(crate) fn submit_denied_request(
@@ -285,7 +326,7 @@ impl HttpCaptureContext {
             || {
                 let mut record = self.request_record(CaptureDecision::Deny, headers)?;
                 if let TerminalRequestBodyProvenance::ProviderReplacement { size } = provenance {
-                    record.mark_provider_replacement_omitted(size);
+                    record.omit_provider_replacement(size);
                 }
                 Some(record)
             },
@@ -367,6 +408,12 @@ impl CaptureSubmission {
     pub(super) fn abandon(&mut self) {
         if let Some(tap) = self.tap.take() {
             self.submit(tap.abandon());
+        }
+    }
+
+    pub(super) fn mark_trailers_omitted(&mut self) {
+        if let Some(tap) = self.tap.as_mut() {
+            tap.mark_trailers_omitted();
         }
     }
 
@@ -475,19 +522,20 @@ struct WebSocketMessageCapture {
 
 impl UpgradeCaptureAttempt for WebSocketMessageCapture {
     fn omit_body(&mut self) {
-        if self.body.take().is_some() {
-            self.job.omit_body();
-        }
+        self.omit_body_with(CaptureBodyOmission::Incomplete);
     }
 
     fn try_begin_frame(&mut self, encoded_payload_bytes: usize) -> bool {
         if encoded_payload_bytes > self.max_frame_bytes {
+            self.omit_body_with(CaptureBodyOmission::LimitExceeded);
             return false;
         }
         let Some(total) = self.encoded_bytes.checked_add(encoded_payload_bytes) else {
+            self.omit_body_with(CaptureBodyOmission::LimitExceeded);
             return false;
         };
         if total > self.max_message_bytes {
+            self.omit_body_with(CaptureBodyOmission::LimitExceeded);
             return false;
         }
         self.encoded_bytes = total;
@@ -495,9 +543,14 @@ impl UpgradeCaptureAttempt for WebSocketMessageCapture {
     }
 
     fn try_push_fragment(&mut self, fragment: &[u8]) -> bool {
-        self.body
+        let appended = self
+            .body
             .as_mut()
-            .is_some_and(|body| body.try_extend_from_slice(fragment).is_ok())
+            .is_some_and(|body| body.try_extend_from_slice(fragment).is_ok());
+        if !appended && self.body.is_some() {
+            self.omit_body_with(CaptureBodyOmission::ResourceExhausted);
+        }
+        appended
     }
 
     fn finish(mut self: Box<Self>, completion: UpgradeCaptureCompletion) {
@@ -511,7 +564,7 @@ impl UpgradeCaptureAttempt for WebSocketMessageCapture {
                 .complete_websocket_message(encoded, self.compressed, self.class)
                 .is_err()
             {
-                self.job.omit_body();
+                self.job.omit_body(CaptureBodyOmission::ResourceExhausted);
             }
         } else {
             self.omit_body();
@@ -521,11 +574,46 @@ impl UpgradeCaptureAttempt for WebSocketMessageCapture {
 }
 
 impl WebSocketMessageCapture {
+    fn omit_body_with(&mut self, reason: CaptureBodyOmission) {
+        if self.body.take().is_some() {
+            self.job.omit_body(reason);
+        }
+    }
+
     fn submit(self: Box<Self>) {
         if let Err(error) = self.runtime.try_submit_capture(self.job) {
             tracing::debug!(error = ?error, "WebSocket capture queue omitted record");
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn exercise_upgrade_allocation_failure_for_test(
+    runtime: Arc<ProductObservationRuntime>,
+    epoch: Arc<CaptureEpoch>,
+    request_id: &str,
+    target: &http_access_url::CanonicalUrl,
+) {
+    let capture = HttpCaptureContext::for_forwarding_trailer_test(
+        Arc::clone(&runtime),
+        epoch,
+        request_id,
+        target,
+    );
+    let upgrade = capture
+        .upgrade_capture_context(target)
+        .expect("upgrade capture is enabled");
+    let mut attempt = upgrade
+        .begin_message(
+            UpgradeCaptureDirection::ClientToUpstream,
+            false,
+            PayloadClass::Text,
+        )
+        .expect("upgrade capture is admitted");
+    runtime.fail_next_capture_allocation();
+    assert!(attempt.try_begin_frame(7));
+    assert!(!attempt.try_push_fragment(b"payload"));
+    Box::new(attempt).finish(UpgradeCaptureCompletion::Complete);
 }
 
 fn sanitize_capture_headers(

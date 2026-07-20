@@ -30,6 +30,9 @@ TLS_SPECS: dict[str, object] = {
         "features": ["ring", "tls12"],
     },
 }
+RUNTIME_TLS_SPECS = {
+    name: spec for name, spec in TLS_SPECS.items() if name != "rustls-native-certs"
+}
 TLS_VERSIONS = {
     "rustls": "0.23.42",
     "rustls-native-certs": "0.8.3",
@@ -89,7 +92,12 @@ def dependency_tables(document: dict[str, Any]) -> Iterator[tuple[str, dict[str,
                     yield f"target.{target_name}.{name}", table
 
 
-def check_manifest(path: Path, authority_section: str | None) -> None:
+def check_manifest(
+    path: Path,
+    authority_section: str | None,
+    authority_specs: dict[str, object],
+    forbidden_tls: set[str],
+) -> None:
     document = load_toml(path)
     authority: dict[str, Any] | None = None
     for section, dependencies in dependency_tables(document):
@@ -107,6 +115,8 @@ def check_manifest(path: Path, authority_section: str | None) -> None:
                 fail(f"{path}: forbidden dependency {name!r} resolves to {resolved_name!r}")
             if legacy_alias:
                 fail(f"{path}: forbidden legacy TLS dependency name {name!r}")
+            if resolved_name in forbidden_tls:
+                fail(f"{path}: forbidden TLS dependency {resolved_name!r}")
             if protected and package is not None:
                 fail(f"{path}: TLS dependency {name!r} must not use package aliases")
             if not protected:
@@ -121,14 +131,18 @@ def check_manifest(path: Path, authority_section: str | None) -> None:
     if authority_section is not None:
         if authority is None:
             fail(f"{path}: missing authoritative [{authority_section}] table")
-        for name, expected in TLS_SPECS.items():
+        for name, expected in authority_specs.items():
             if name not in authority:
                 fail(f"{path}: missing authoritative C06 dependency {name}")
             if not equivalent_spec(authority[name], expected):
                 fail(f"{path}: authoritative {name} version/features are not exact")
 
 
-def check_lock(path: Path, require_family: bool) -> None:
+def check_lock(
+    path: Path,
+    required_family: dict[str, object] | None,
+    forbidden_tls: set[str],
+) -> None:
     document = load_toml(path)
     packages = document.get("package")
     if not isinstance(packages, list):
@@ -142,13 +156,15 @@ def check_lock(path: Path, require_family: bool) -> None:
         if name in FORBIDDEN_PACKAGES:
             fail(f"{path}: forbidden lock node {name} {version}")
         if name in TLS_VERSIONS:
+            if name in forbidden_tls:
+                fail(f"{path}: forbidden TLS lock node {name} {version}")
             if version != TLS_VERSIONS[name]:
                 fail(f"{path}: legacy or unexpected lock node {name} {version}")
             observed[name].append(version)
     for name, versions in observed.items():
         if len(versions) > 1:
             fail(f"{path}: duplicate TLS lock nodes for {name}")
-        if require_family and versions != [TLS_VERSIONS[name]]:
+        if required_family is not None and name in required_family and versions != [TLS_VERSIONS[name]]:
             fail(f"{path}: missing exact TLS lock node {name} {TLS_VERSIONS[name]}")
 
 
@@ -241,6 +257,16 @@ def check_advisory_policy(root: Path) -> None:
             fail(f"{path}: repository file must not ignore RustSec IDs")
 
 
+def check_runtime_native_root_ownership(runtime_root: Path) -> None:
+    forbidden = (b"rustls_native_certs", b"load_native_certs")
+    for path in repository_regular_files(runtime_root):
+        if path.suffix != ".rs":
+            continue
+        contents = read_contents(path)
+        if any(token in contents for token in forbidden):
+            fail(f"{path}: native root discovery must remain product-owned")
+
+
 def check_repository(acl_root: Path, runtime_root: Path) -> None:
     roots = (acl_root.resolve(), runtime_root.resolve())
     for root in roots:
@@ -249,21 +275,31 @@ def check_repository(acl_root: Path, runtime_root: Path) -> None:
 
     acl_manifest = roots[0] / "Cargo.toml"
     runtime_manifest = roots[1] / "Cargo.toml"
-    for root in roots:
+    repository_policies = (
+        (roots[0], acl_manifest, "dependencies", TLS_SPECS, set()),
+        (
+            roots[1],
+            runtime_manifest,
+            "workspace.dependencies",
+            RUNTIME_TLS_SPECS,
+            {"rustls-native-certs"},
+        ),
+    )
+    for root, authority_manifest, authority_section, authority_specs, forbidden_tls in repository_policies:
         for manifest in repository_files(root, "Cargo.toml"):
             authority = None
-            if manifest == acl_manifest:
-                authority = "dependencies"
-            elif manifest == runtime_manifest:
-                authority = "workspace.dependencies"
-            check_manifest(manifest, authority)
+            if manifest == authority_manifest:
+                authority = authority_section
+            check_manifest(manifest, authority, authority_specs, forbidden_tls)
 
         main_lock = root / "Cargo.lock"
         if not main_lock.is_file():
             fail(f"missing repository lockfile: {main_lock}")
         for lock in repository_files(root, "Cargo.lock"):
-            check_lock(lock, require_family=lock == main_lock)
+            required_family = authority_specs if lock == main_lock else None
+            check_lock(lock, required_family, forbidden_tls)
         check_advisory_policy(root)
+    check_runtime_native_root_ownership(roots[1])
 
 
 def main() -> int:

@@ -36,8 +36,8 @@ fn capture_record(request_id: &str) -> CaptureRecord {
         headers: None,
         body: None,
         body_truncated: None,
-        provider_replacement_omitted: None,
-        provider_replacement_size: None,
+        body_omission: Some(super::CaptureBodyOmission::Empty),
+        trailers_omitted: None,
     }
 }
 
@@ -99,6 +99,7 @@ fn capture_write_creates_expected_file_and_json() {
         content_type: Some("text/plain".to_string()),
         content_encoding: None,
     });
+    record.body_omission = None;
 
     let sink = capture_sink(
         &capture_dir,

@@ -1,6 +1,6 @@
 mod activation;
 mod authorization;
-mod candidate_ca;
+mod candidate_tls;
 pub mod capture;
 mod cli;
 mod config;

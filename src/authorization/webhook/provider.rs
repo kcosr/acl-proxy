@@ -8,7 +8,7 @@ use http_access_types::{CanonicalUrl, HttpScheme};
 use rustls::ClientConfig;
 
 use crate::authorization::protocol::ProviderOutputRegistry;
-use crate::candidate_ca::CandidateCaResolver;
+use crate::candidate_tls::CandidateTlsResolver;
 use crate::config::compiler::{
     CompiledProviderFailureMode, CompiledTlsTrust, WebhookProviderPlan, WebhookTlsPlan,
 };
@@ -36,9 +36,9 @@ pub(crate) enum WebhookActivationError {
 impl WebhookProvider {
     pub(crate) async fn activate(
         plan: WebhookProviderPlan,
-        ca_resolver: &mut CandidateCaResolver,
+        tls_resolver: &mut CandidateTlsResolver,
     ) -> Result<Arc<Self>, WebhookActivationError> {
-        if ca_resolver.cancellation().is_cancelled() {
+        if tls_resolver.cancellation().is_cancelled() {
             return Err(WebhookActivationError::Cancelled);
         }
         let url = plan.url;
@@ -55,7 +55,7 @@ impl WebhookProvider {
             }
             let custom_ca_der = match trust {
                 CompiledTlsTrust::Custom | CompiledTlsTrust::SystemPlusCustom => Some(
-                    ca_resolver
+                    tls_resolver
                         .resolve(&ca_certificate.ok_or(WebhookActivationError::Tls(
                             TlsActivationError::CaUnavailable,
                         ))?)
@@ -70,9 +70,12 @@ impl WebhookProvider {
                 ),
                 CompiledTlsTrust::System | CompiledTlsTrust::Insecure => None,
             };
-            let trust = load_client_trust_from_der(trust, custom_ca_der.as_deref(), &mut || {
-                ca_resolver.cancellation().is_cancelled()
-            })
+            let trust = load_client_trust_from_der(
+                trust,
+                tls_resolver.system_material(),
+                custom_ca_der.as_deref(),
+                &mut || tls_resolver.cancellation().is_cancelled(),
+            )
             .map_err(|error| {
                 if error == TlsActivationError::ActivationCancelled {
                     WebhookActivationError::Cancelled
@@ -88,7 +91,7 @@ impl WebhookProvider {
             debug_assert!(plan.tls.is_none(), "HTTP webhook TLS was compile-rejected");
             None
         };
-        if ca_resolver.cancellation().is_cancelled() {
+        if tls_resolver.cancellation().is_cancelled() {
             return Err(WebhookActivationError::Cancelled);
         }
 
@@ -210,15 +213,17 @@ mod tests {
     use crate::runtime::ActivationCancellation;
     use crate::tls_io_runtime::TlsIoRuntime;
 
-    fn resolver(
+    async fn resolver(
         tls_io: &Arc<TlsIoRuntime>,
         cancellation: ActivationCancellation,
-    ) -> CandidateCaResolver {
-        CandidateCaResolver::new(
+    ) -> CandidateTlsResolver {
+        CandidateTlsResolver::activate(
             Arc::clone(tls_io),
             cancellation,
             http_access_types::PolicyGeneration::new(7).unwrap(),
         )
+        .await
+        .expect("test host system roots load")
     }
 
     fn plan(url: &str, tls: Option<WebhookTlsPlan>) -> WebhookProviderPlan {
@@ -237,10 +242,10 @@ mod tests {
     #[tokio::test]
     async fn http_provider_activation_is_typed_and_has_no_tls_client() {
         let tls_io = TlsIoRuntime::new().unwrap();
-        let mut ca_resolver = resolver(&tls_io, ActivationCancellation::new_for_test());
+        let mut tls_resolver = resolver(&tls_io, ActivationCancellation::new_for_test()).await;
         let provider = WebhookProvider::activate(
             plan("http://localhost:8080/a/../authorize?mode=one", None),
-            &mut ca_resolver,
+            &mut tls_resolver,
         )
         .await
         .unwrap();
@@ -257,7 +262,7 @@ mod tests {
     #[tokio::test]
     async fn https_provider_uses_exact_http1_tls_policy_and_honors_cancellation() {
         let tls_io = TlsIoRuntime::new().unwrap();
-        let mut ca_resolver = resolver(&tls_io, ActivationCancellation::new_for_test());
+        let mut tls_resolver = resolver(&tls_io, ActivationCancellation::new_for_test()).await;
         let provider = WebhookProvider::activate(
             plan(
                 "https://provider.test/authorize",
@@ -266,7 +271,7 @@ mod tests {
                     ca_certificate: None,
                 }),
             ),
-            &mut ca_resolver,
+            &mut tls_resolver,
         )
         .await
         .unwrap();
@@ -275,8 +280,8 @@ mod tests {
             [b"http/1.1".to_vec()]
         );
         let cancellation = ActivationCancellation::new_for_test();
+        let mut cancelled_resolver = resolver(&tls_io, cancellation.clone()).await;
         cancellation.cancel_for_test();
-        let mut cancelled_resolver = resolver(&tls_io, cancellation);
         assert!(matches!(
             WebhookProvider::activate(
                 plan(

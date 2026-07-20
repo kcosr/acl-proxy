@@ -1578,22 +1578,22 @@ private_key = "missing-server-key.pem"
             .await
             .unwrap();
 
+        let (shutdown_reached, shutdown_release) =
+            product.static_resources.pause_listener_shutdown_for_test();
         let shutdown_product = Arc::clone(&product);
         let first_shutdown = tokio::spawn(async move {
             shutdown_product.shutdown().await;
         });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !product
-                .static_resources
-                .listener_shutdown_started_for_test()
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("static shutdown did not begin joining the listener runtime");
+        tokio::time::timeout(Duration::from_secs(1), shutdown_reached)
+            .await
+            .expect("static shutdown did not begin joining the listener runtime")
+            .expect("listener shutdown pause was dropped before it was reached");
+        assert!(product
+            .static_resources
+            .listener_shutdown_started_for_test());
         first_shutdown.abort();
         assert!(first_shutdown.await.unwrap_err().is_cancelled());
+        drop(shutdown_release);
         assert!(product.static_resources.owns_listener_runtime_for_test());
 
         drop(partial_request);

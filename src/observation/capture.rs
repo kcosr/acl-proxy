@@ -220,7 +220,7 @@ impl CapturePool {
     }
 
     #[cfg(test)]
-    fn fail_next_allocation(&self) {
+    pub(super) fn fail_next_allocation(&self) {
         self.fail_next_allocation.store(true, Ordering::Release);
     }
 
