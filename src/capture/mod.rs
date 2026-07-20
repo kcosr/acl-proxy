@@ -48,7 +48,11 @@ static CAPTURE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 pub(crate) const REDACTED: &str = "[REDACTED]";
 const MAX_CAPTURE_FILENAME_BYTES: usize = 230;
 const MAX_CAPTURE_REQUEST_ID_COMPONENT_BYTES: usize = 128;
-const WINDOWS_RESERVED_BASENAMES: &[&str] = &["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
+const WINDOWS_RESERVED_BASENAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM0", "COM1", "COM2", "COM3", "COM4",
+    "COM5", "COM6", "COM7", "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+    "LPT7", "LPT8", "LPT9",
+];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -195,21 +199,28 @@ fn validate_capture_filename_template(template: &str) -> Result<(), CaptureSinkS
     let maximum_filename =
         render_capture_filename(template, &maximum_request_id, "response", "res");
     if maximum_filename.len() > MAX_CAPTURE_FILENAME_BYTES
-        || WINDOWS_RESERVED_BASENAMES.iter().any(|request_id| {
-            is_windows_reserved_basename(&render_capture_filename(
-                template, request_id, "response", "res",
-            ))
-        })
-        || is_windows_reserved_basename(&render_capture_filename(
-            template,
-            "request-id",
-            "response",
-            "res",
-        ))
+        || template_can_render_windows_reserved_basename(template)
     {
         return Err(CaptureSinkSpecError::InvalidFilenameBasename);
     }
     Ok(())
+}
+
+fn template_can_render_windows_reserved_basename(template: &str) -> bool {
+    WINDOWS_RESERVED_BASENAMES.iter().any(|reserved| {
+        (0..=reserved.len()).any(|start| {
+            (start..=reserved.len()).any(|end| {
+                let request_id = &reserved[start..end];
+                [("request", "req"), ("response", "res")]
+                    .into_iter()
+                    .any(|(kind, suffix)| {
+                        is_windows_reserved_basename(&render_capture_filename(
+                            template, request_id, kind, suffix,
+                        ))
+                    })
+            })
+        })
+    })
 }
 
 fn render_capture_filename(template: &str, request_id: &str, kind: &str, suffix: &str) -> String {
@@ -235,14 +246,9 @@ fn is_windows_reserved_basename(filename: &str) -> bool {
             character => character,
         })
         .collect();
-    if WINDOWS_RESERVED_BASENAMES
+    WINDOWS_RESERVED_BASENAMES
         .iter()
         .any(|reserved| normalized == *reserved)
-    {
-        return true;
-    }
-    let bytes = normalized.as_bytes();
-    bytes.len() == 4 && matches!(&bytes[..3], b"COM" | b"LPT") && bytes[3].is_ascii_digit()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1958,6 +1964,9 @@ mod tests {
             "COM\u{00b9}.{requestId}-{suffix}.json",
             "LPT0.{requestId}-{suffix}.json",
             "LPT\u{00b3}.{requestId}-{suffix}.json",
+            "COM{requestId}.{suffix}.json",
+            "AU{requestId}.{suffix}.json",
+            "{requestId}L.{suffix}.json",
         ] {
             assert_eq!(
                 CaptureSinkSpec::new(PathBuf::from("captures"), filename.to_string(), 1, 1),
@@ -1969,6 +1978,8 @@ mod tests {
             "LPT42.{requestId}-{suffix}.json",
             "CONIN.{requestId}-{suffix}.json",
             "CONOUT.{requestId}-{suffix}.json",
+            "COMx{requestId}.{suffix}.json",
+            "AUX-{requestId}.{suffix}.json",
         ] {
             CaptureSinkSpec::new(PathBuf::from("captures"), filename.to_string(), 1, 1)
                 .expect("nearby non-device basename is portable");
