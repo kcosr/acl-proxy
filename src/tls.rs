@@ -36,6 +36,8 @@ pub(crate) enum TlsActivationError {
     CaLimit,
     #[error("custom CA certificate bundle contains an unusable certificate")]
     CaUnusable,
+    #[error("custom CA certificate loader is unavailable")]
+    CaLoaderUnavailable,
     #[error("TLS client configuration is unavailable")]
     Configuration,
 }
@@ -59,44 +61,66 @@ impl ClientAlpn {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn load_client_trust(
     trust: CompiledTlsTrust,
     ca_certificate: Option<&Path>,
     generation: PolicyGeneration,
     is_cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<ClientTrust, TlsActivationError> {
-    match trust {
-        CompiledTlsTrust::System => {
+    let custom_ca_der = match trust {
+        CompiledTlsTrust::Custom | CompiledTlsTrust::SystemPlusCustom => {
+            Some(load_bounded_custom_ca(
+                ca_certificate.ok_or(TlsActivationError::CaUnavailable)?,
+                generation,
+                is_cancelled,
+            )?)
+        }
+        CompiledTlsTrust::System | CompiledTlsTrust::Insecure => None,
+    };
+    load_client_trust_from_der(trust, custom_ca_der.as_deref(), is_cancelled)
+}
+
+pub(crate) fn load_client_trust_from_der(
+    trust: CompiledTlsTrust,
+    custom_ca_der: Option<&[Vec<u8>]>,
+    is_cancelled: &mut dyn FnMut() -> bool,
+) -> Result<ClientTrust, TlsActivationError> {
+    match (trust, custom_ca_der) {
+        (CompiledTlsTrust::System, None) => {
             root_store_with_native_roots(is_cancelled).map(ClientTrust::Roots)
         }
-        CompiledTlsTrust::Custom => {
-            let custom_ca_der = load_bounded_custom_ca(
-                ca_certificate.ok_or(TlsActivationError::CaUnavailable)?,
-                generation,
-                is_cancelled,
-            )?;
-            root_store_from_custom_ca(&custom_ca_der).map(ClientTrust::Roots)
+        (CompiledTlsTrust::Custom, Some(custom_ca_der)) => {
+            root_store_from_custom_ca(custom_ca_der).map(ClientTrust::Roots)
         }
-        CompiledTlsTrust::SystemPlusCustom => {
-            let custom_ca_der = load_bounded_custom_ca(
-                ca_certificate.ok_or(TlsActivationError::CaUnavailable)?,
-                generation,
-                is_cancelled,
-            )?;
+        (CompiledTlsTrust::SystemPlusCustom, Some(custom_ca_der)) => {
             let mut roots = root_store_with_native_roots(is_cancelled)?;
-            add_custom_ca(&mut roots, &custom_ca_der)?;
+            add_custom_ca(&mut roots, custom_ca_der)?;
             Ok(ClientTrust::Roots(roots))
         }
-        CompiledTlsTrust::Insecure => Ok(ClientTrust::Insecure),
+        (CompiledTlsTrust::Insecure, None) => Ok(ClientTrust::Insecure),
+        _ => Err(TlsActivationError::CaUnavailable),
     }
 }
 
-fn load_bounded_custom_ca(
+pub(crate) fn load_bounded_custom_ca(
     path: &Path,
     generation: PolicyGeneration,
     is_cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<Vec<Vec<u8>>, TlsActivationError> {
     let certificates = load_custom_ca_der(path, is_cancelled)?;
+    validate_custom_ca_der(generation, &certificates)?;
+    Ok(certificates)
+}
+
+#[cfg(test)]
+pub(crate) fn load_bounded_custom_ca_with_open_hook(
+    path: &Path,
+    generation: PolicyGeneration,
+    is_cancelled: &mut dyn FnMut() -> bool,
+    after_open: impl FnOnce(),
+) -> Result<Vec<Vec<u8>>, TlsActivationError> {
+    let certificates = load_custom_ca_der_with_open_hook(path, is_cancelled, after_open)?;
     validate_custom_ca_der(generation, &certificates)?;
     Ok(certificates)
 }
@@ -198,10 +222,19 @@ pub(crate) fn load_custom_ca_der(
     path: &Path,
     is_cancelled: &mut dyn FnMut() -> bool,
 ) -> Result<Vec<Vec<u8>>, TlsActivationError> {
+    load_custom_ca_der_with_open_hook(path, is_cancelled, || {})
+}
+
+fn load_custom_ca_der_with_open_hook(
+    path: &Path,
+    is_cancelled: &mut dyn FnMut() -> bool,
+    after_open: impl FnOnce(),
+) -> Result<Vec<Vec<u8>>, TlsActivationError> {
     check_activation_cancellation(is_cancelled)?;
     let file = File::open(path);
     check_activation_cancellation(is_cancelled)?;
     let file = file.map_err(|_| TlsActivationError::CaUnavailable)?;
+    after_open();
     check_activation_cancellation(is_cancelled)?;
     let mut pem = Vec::new();
     let read_result = file

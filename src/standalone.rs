@@ -1794,7 +1794,7 @@ header = "x-acl-proxy-request-id"
         .expect("standalone generation fixture compiles")
     }
 
-    fn finalized(
+    async fn finalized(
         plan: &ReloadableProductPlan,
         id: GenerationId,
     ) -> UnboundStandaloneGenerationPlan {
@@ -1822,13 +1822,16 @@ header = "x-acl-proxy-request-id"
             }
         }
         let draft = UnboundStandaloneGenerationPlan::compile(plan, id).unwrap();
-        let activation = EgressActivation::activate(
-            egress,
-            draft.identity(),
+        let tls_io = crate::tls_io_runtime::TlsIoRuntime::new().unwrap();
+        let mut ca_resolver = crate::candidate_ca::CandidateCaResolver::new(
+            std::sync::Arc::clone(&tls_io),
+            crate::runtime::ActivationCancellation::new_for_test(),
             PolicyGeneration::new(draft.version()).unwrap(),
-            || false,
-        )
-        .unwrap();
+        );
+        let activation = EgressActivation::activate(egress, draft.identity(), &mut ca_resolver)
+            .await
+            .unwrap();
+        tls_io.shutdown_and_wait(None).await;
         let (neutral, _) = activation.into_parts();
         draft.finalize(neutral).unwrap()
     }
@@ -1846,10 +1849,10 @@ header = "x-acl-proxy-request-id"
         sources
     }
 
-    #[test]
-    fn compile_retains_exact_checked_generation_intent() {
+    #[tokio::test]
+    async fn compile_retains_exact_checked_generation_intent() {
         let compiled = compiled();
-        let plan = finalized(&compiled.reloadable_plan, GenerationId::for_test(17));
+        let plan = finalized(&compiled.reloadable_plan, GenerationId::for_test(17)).await;
 
         assert!(plan.snapshot_lease().owns(plan.identity()));
         assert_eq!(plan.snapshot_lease().generation().get(), 17);
@@ -2021,11 +2024,11 @@ header = "x-acl-proxy-request-id"
         assert_eq!(bindings.provider_for_action(1, &alpha), None);
     }
 
-    #[test]
-    fn each_compile_creates_a_fresh_snapshot_identity() {
+    #[tokio::test]
+    async fn each_compile_creates_a_fresh_snapshot_identity() {
         let compiled = compiled();
-        let first = finalized(&compiled.reloadable_plan, GenerationId::for_test(21));
-        let second = finalized(&compiled.reloadable_plan, GenerationId::for_test(21));
+        let first = finalized(&compiled.reloadable_plan, GenerationId::for_test(21)).await;
+        let second = finalized(&compiled.reloadable_plan, GenerationId::for_test(21)).await;
 
         assert!(!first.identity().same_snapshot(second.identity()));
         assert!(!first.snapshot_lease().owns(second.identity()));
@@ -2125,8 +2128,8 @@ header = "x-acl-proxy-request-id"
         ));
     }
 
-    #[test]
-    fn parent_route_retains_canonical_target_and_exact_custom_root_role() {
+    #[tokio::test]
+    async fn parent_route_retains_canonical_target_and_exact_custom_root_role() {
         let mut compiled = compiled();
         compiled.reloadable_plan.egress.route = CompiledEgressRoute::ParentProxy;
         compiled.reloadable_plan.egress.parent_proxy = Some(ParentProxyPlan {
@@ -2140,7 +2143,7 @@ header = "x-acl-proxy-request-id"
             }),
         });
 
-        let plan = finalized(&compiled.reloadable_plan, GenerationId::for_test(31));
+        let plan = finalized(&compiled.reloadable_plan, GenerationId::for_test(31)).await;
         let Route::Parent { target, security } = plan.route() else {
             panic!("parent route intent is retained")
         };

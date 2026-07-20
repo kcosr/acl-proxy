@@ -462,13 +462,19 @@ mod tests {
         }
     }
 
-    fn tls_provider(
+    async fn tls_provider(
         host: &str,
         port: u16,
         trust: CompiledTlsTrust,
         ca_certificate: Option<PathBuf>,
     ) -> Arc<WebhookProvider> {
-        WebhookProvider::activate(
+        let tls_io = crate::tls_io_runtime::TlsIoRuntime::new().unwrap();
+        let mut ca_resolver = crate::candidate_ca::CandidateCaResolver::new(
+            Arc::clone(&tls_io),
+            crate::runtime::ActivationCancellation::new_for_test(),
+            http_access_types::PolicyGeneration::new(7).unwrap(),
+        );
+        let provider = WebhookProvider::activate(
             WebhookProviderPlan {
                 url: canonicalize_http_url(&format!("https://{host}:{port}/authorize")).unwrap(),
                 timeout: Duration::from_secs(2),
@@ -482,10 +488,12 @@ mod tests {
                     ca_certificate,
                 }),
             },
-            http_access_types::PolicyGeneration::new(7).unwrap(),
-            || false,
+            &mut ca_resolver,
         )
-        .unwrap()
+        .await
+        .unwrap();
+        tls_io.shutdown_and_wait(None).await;
+        provider
     }
 
     fn loopback_destination(endpoint: SocketAddr) -> WebhookConnector {
@@ -581,7 +589,8 @@ mod tests {
             endpoint.port(),
             CompiledTlsTrust::Custom,
             Some(fixture.ca_certificate.clone()),
-        );
+        )
+        .await;
 
         for _ in 0..2 {
             assert_eq!(
@@ -611,7 +620,8 @@ mod tests {
             endpoint.port(),
             CompiledTlsTrust::Custom,
             Some(trusted.ca_certificate.clone()),
-        );
+        )
+        .await;
         assert_eq!(
             provider.tls().unwrap().alpn_protocols,
             [b"http/1.1".to_vec()]
@@ -638,7 +648,8 @@ mod tests {
             endpoint.port(),
             CompiledTlsTrust::Insecure,
             None,
-        );
+        )
+        .await;
         assert_eq!(
             deliver_over_loopback(endpoint, &provider)
                 .await
@@ -660,7 +671,8 @@ mod tests {
             endpoint.port(),
             CompiledTlsTrust::Custom,
             Some(wrong_trust.ca_certificate.clone()),
-        );
+        )
+        .await;
         assert!(matches!(
             deliver_over_loopback(endpoint, &provider).await,
             Err(WebhookDeliveryError::TlsHandshake(_))
@@ -677,7 +689,8 @@ mod tests {
             endpoint.port(),
             CompiledTlsTrust::Custom,
             Some(trusted.ca_certificate.clone()),
-        );
+        )
+        .await;
         assert!(matches!(
             deliver_over_loopback(endpoint, &provider).await,
             Err(WebhookDeliveryError::TlsHandshake(_))
@@ -705,7 +718,8 @@ mod tests {
             endpoint.port(),
             CompiledTlsTrust::Insecure,
             None,
-        );
+        )
+        .await;
         assert!(matches!(
             deliver_over_loopback(endpoint, &provider).await,
             Err(WebhookDeliveryError::TlsHandshake(_))
@@ -834,7 +848,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_deadline_covers_resolution_and_releases_admission() {
-        let provider = WebhookProvider::activate(
+        let provider = WebhookProvider::activate_for_test(
             WebhookProviderPlan {
                 url: canonicalize_http_url("http://localhost/authorize").unwrap(),
                 timeout: Duration::from_millis(10),
@@ -892,7 +906,7 @@ mod tests {
             let _ = hold_server.await;
             drop(stream);
         });
-        let provider = WebhookProvider::activate(
+        let provider = WebhookProvider::activate_for_test(
             WebhookProviderPlan {
                 url: canonicalize_http_url(&format!(
                     "http://localhost:{}/authorize",

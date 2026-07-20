@@ -27,6 +27,7 @@ use crate::logging::{process_logging_level_control, LoggingLevelControl};
 use crate::observation::{ProductObservationRuntime, ProductObservationRuntimeStartError};
 use crate::runtime::{BoxFuture, ServiceReadiness, StaticResourceBrand, StaticResources};
 use crate::safety::WireBodyPool;
+use crate::tls_io_runtime::{TlsIoRuntime, TlsIoRuntimeError, TlsIoShutdownOutcome};
 
 use super::assets::{ProductIngressAssets, ProductIngressAssetsError};
 use super::listeners::{
@@ -66,6 +67,7 @@ pub(crate) struct ProductStaticResources {
     observation_runtime: Arc<ProductObservationRuntime>,
     logging_level: LoggingLevelControl,
     credential_io_runtime: Arc<CredentialIoRuntime>,
+    tls_io_runtime: Arc<TlsIoRuntime>,
     authorization_runtime: Arc<WebhookAuthorizationRuntime>,
     upgrade_runtime: Arc<UpgradeRuntime>,
     local_addresses: OnceLock<Arc<ProductLocalAddressRuntime>>,
@@ -118,6 +120,7 @@ struct ProductStaticResourceStages {
     authorization_runtime: Option<Arc<WebhookAuthorizationRuntime>>,
     upgrade_runtime: Option<Arc<UpgradeRuntime>>,
     credential_io_runtime: Option<Arc<CredentialIoRuntime>>,
+    tls_io_runtime: Option<Arc<TlsIoRuntime>>,
     observation_runtime: Option<Arc<ProductObservationRuntime>>,
 }
 
@@ -128,6 +131,7 @@ impl ProductStaticResourceStages {
             authorization_runtime: None,
             upgrade_runtime: None,
             credential_io_runtime: None,
+            tls_io_runtime: None,
             observation_runtime: None,
         }
     }
@@ -138,6 +142,11 @@ impl ProductStaticResourceStages {
         }
         if let Some(credential_io) = self.credential_io_runtime.take() {
             let _ = credential_io
+                .shutdown_and_wait(Some(tokio::time::Instant::now()))
+                .await;
+        }
+        if let Some(tls_io) = self.tls_io_runtime.take() {
+            let _ = tls_io
                 .shutdown_and_wait(Some(tokio::time::Instant::now()))
                 .await;
         }
@@ -313,6 +322,14 @@ impl ProductStaticResources {
             }
         };
         stages.credential_io_runtime = Some(Arc::clone(&credential_io_runtime));
+        let tls_io_runtime = match TlsIoRuntime::new() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                stages.shutdown().await;
+                return Err(error.into());
+            }
+        };
+        stages.tls_io_runtime = Some(Arc::clone(&tls_io_runtime));
         let logging_level = process_logging_level_control();
         let observation_runtime =
             match ProductObservationRuntime::try_new(static_config.capture.max_pending_records) {
@@ -378,6 +395,7 @@ impl ProductStaticResources {
             observation_runtime,
             logging_level,
             credential_io_runtime,
+            tls_io_runtime,
             authorization_runtime,
             upgrade_runtime,
             local_addresses: OnceLock::new(),
@@ -403,6 +421,7 @@ impl ProductStaticResources {
         stages.authorization_runtime = None;
         stages.upgrade_runtime = None;
         stages.credential_io_runtime = None;
+        stages.tls_io_runtime = None;
         stages.observation_runtime = None;
         Ok(resources)
     }
@@ -433,6 +452,10 @@ impl ProductStaticResources {
 
     pub(crate) fn credential_io_runtime(&self) -> Arc<CredentialIoRuntime> {
         self.credential_io_runtime.clone()
+    }
+
+    pub(crate) fn tls_io_runtime(&self) -> Arc<TlsIoRuntime> {
+        self.tls_io_runtime.clone()
     }
 
     pub(crate) fn upgrade_runtime(&self) -> Arc<UpgradeRuntime> {
@@ -836,6 +859,7 @@ impl StaticResources for ProductStaticResources {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = deadline;
         self.observation_runtime.begin_shutdown();
         self.credential_io_runtime.begin_shutdown();
+        self.tls_io_runtime.begin_shutdown();
         self.authorization_runtime.begin_shutdown(deadline);
         if listener_runtime.is_none() {
             self.upgrade_runtime
@@ -918,6 +942,15 @@ impl StaticResources for ProductStaticResources {
                     "credential I/O shutdown deadline reached; blocking operating-system workers remain detached"
                 );
             }
+            if let TlsIoShutdownOutcome::DeadlineExceeded {
+                detached_operations,
+            } = self.tls_io_runtime.shutdown_and_wait(deadline).await
+            {
+                tracing::warn!(
+                    detached_operations,
+                    "TLS I/O shutdown deadline reached; blocking operating-system workers remain detached"
+                );
+            }
             self.upgrade_shutdown
                 .get_or_init(|| {
                     self.upgrade_runtime
@@ -961,6 +994,8 @@ pub(crate) enum ProductStaticResourcesError {
     WebhookConnector(#[from] crate::authorization::webhook::connector::WebhookConnectorError),
     #[error("static credential I/O runtime construction failed")]
     CredentialIo(#[from] CredentialIoRuntimeError),
+    #[error("static TLS I/O runtime construction failed")]
+    TlsIo(#[from] TlsIoRuntimeError),
     #[error("static upgrade runtime construction failed")]
     Upgrade(#[from] UpgradeRuntimeError),
     #[error("static local-address runtime construction failed")]
@@ -1325,6 +1360,103 @@ header = "x-acl-proxy-request-id"
         )
         .await
         .expect("static shutdown did not join the shared upgrade runtime");
+    }
+
+    #[tokio::test]
+    async fn static_shutdown_closes_owned_tls_io_admission() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<5>(&_test);
+        let addresses = reservations.addresses();
+        let directory = tempfile::tempdir().unwrap();
+        let resources =
+            ProductStaticResources::try_new(&static_config(addresses, directory.path()))
+                .await
+                .unwrap();
+        let tls_io = resources.tls_io_runtime();
+
+        StaticResources::begin_shutdown(resources.as_ref());
+        let sensitive_path = directory.path().join("closed-sensitive-ca.pem");
+        let error = tls_io
+            .load_custom_ca(
+                sensitive_path.clone(),
+                http_access_types::PolicyGeneration::new(7).unwrap(),
+                &crate::runtime::ActivationCancellation::new_for_test(),
+            )
+            .await
+            .expect_err("static shutdown must close TLS I/O admission");
+        assert_eq!(error, crate::tls::TlsActivationError::CaLoaderUnavailable);
+        assert!(!error.to_string().contains(sensitive_path.to_str().unwrap()));
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            StaticResources::shutdown(resources.as_ref()),
+        )
+        .await
+        .expect("static shutdown did not join the TLS I/O supervisor");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn static_shutdown_deadline_detaches_blocked_tls_io() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let reservations = super::super::reserve_listeners::<5>(&_test);
+        let addresses = reservations.addresses();
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = static_config(addresses, directory.path());
+        config.service.shutdown_drain_timeout = Some(Duration::from_millis(20));
+        let resources = ProductStaticResources::try_new(&config).await.unwrap();
+        let tls_io = resources.tls_io_runtime();
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let gate_for_job = Arc::clone(&gate);
+        let (started_tx, started_rx) = std_mpsc::channel();
+        let (finished_tx, finished_rx) = std_mpsc::channel();
+        let operation_runtime = Arc::clone(&tls_io);
+        let operation = tokio::spawn(async move {
+            operation_runtime
+                .run_for_test(move |_| {
+                    started_tx.send(()).unwrap();
+                    let (open, changed) = &*gate_for_job;
+                    let mut open = open.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    while !*open {
+                        open = changed
+                            .wait(open)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    }
+                    finished_tx.send(()).unwrap();
+                    Ok(Vec::new())
+                })
+                .await
+        });
+        tokio::task::spawn_blocking(move || started_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            StaticResources::shutdown(resources.as_ref()),
+        )
+        .await
+        .expect("static shutdown waited for blocked TLS I/O");
+        assert_eq!(
+            operation.await.unwrap(),
+            Err(crate::tls::TlsActivationError::ActivationCancelled)
+        );
+        assert!(matches!(
+            finished_rx.try_recv(),
+            Err(std_mpsc::TryRecvError::Empty)
+        ));
+
+        let (open, changed) = &*gate;
+        *open.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        changed.notify_all();
+        tokio::task::spawn_blocking(move || finished_rx.recv().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), tls_io.shutdown_and_wait(None))
+                .await
+                .expect("detached TLS worker did not release after process shutdown"),
+            TlsIoShutdownOutcome::Drained
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

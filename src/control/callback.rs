@@ -634,7 +634,7 @@ mod tests {
                 transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
             },
         );
-        WebhookProvider::activate(
+        WebhookProvider::activate_for_test(
             WebhookProviderPlan {
                 url: canonicalize_http_url("http://provider.test/authorize").unwrap(),
                 timeout: Duration::from_secs(30),

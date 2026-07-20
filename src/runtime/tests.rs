@@ -850,12 +850,16 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
     };
     let provider_registry = ProviderRegistry::from_names(["webhook".to_string()]);
     let provider = provider_registry.get("webhook").unwrap();
+    let mut ca_resolver = crate::candidate_ca::CandidateCaResolver::new(
+        crate::tls_io_runtime::TlsIoRuntime::new().unwrap(),
+        ActivationCancellation::new_for_test(),
+        http_access_types::PolicyGeneration::new(7).unwrap(),
+    );
     let authorization = ProductAuthorizationSnapshot::activate(
         authorization_plan,
         provider_registry,
         webhook_runtime.clone(),
-        http_access_types::PolicyGeneration::new(7).unwrap(),
-        ActivationCancellation::new_for_test(),
+        &mut ca_resolver,
     )
     .await
     .unwrap();

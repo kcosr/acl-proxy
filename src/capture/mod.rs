@@ -15,6 +15,7 @@ use once_cell::sync::Lazy;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
 
 use crate::filesystem::create_private_dir_all;
 use crate::http_body::{
@@ -45,6 +46,9 @@ static CAPTURE_DIRECTORY_LOCKS: Lazy<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
 static CAPTURE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) const REDACTED: &str = "[REDACTED]";
+const MAX_CAPTURE_FILENAME_BYTES: usize = 230;
+const MAX_CAPTURE_REQUEST_ID_COMPONENT_BYTES: usize = 128;
+const WINDOWS_RESERVED_BASENAMES: &[&str] = &["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -161,8 +165,8 @@ fn validate_capture_filename_template(template: &str) -> Result<(), CaptureSinkS
     if template.is_empty()
         || template.contains('/')
         || template.contains('\\')
-        || template.contains("..")
-        || template.contains(':')
+        || template.contains(['<', '>', ':', '"', '|', '?', '*'])
+        || template.ends_with([' ', '.'])
         || template.chars().any(char::is_control)
     {
         return Err(CaptureSinkSpecError::InvalidFilenameBasename);
@@ -187,7 +191,58 @@ fn validate_capture_filename_template(template: &str) -> Result<(), CaptureSinkS
     if stripped.contains('{') || stripped.contains('}') {
         return Err(CaptureSinkSpecError::UnknownFilenamePlaceholder);
     }
+    let maximum_request_id = "r".repeat(MAX_CAPTURE_REQUEST_ID_COMPONENT_BYTES);
+    let maximum_filename =
+        render_capture_filename(template, &maximum_request_id, "response", "res");
+    if maximum_filename.len() > MAX_CAPTURE_FILENAME_BYTES
+        || WINDOWS_RESERVED_BASENAMES.iter().any(|request_id| {
+            is_windows_reserved_basename(&render_capture_filename(
+                template, request_id, "response", "res",
+            ))
+        })
+        || is_windows_reserved_basename(&render_capture_filename(
+            template,
+            "request-id",
+            "response",
+            "res",
+        ))
+    {
+        return Err(CaptureSinkSpecError::InvalidFilenameBasename);
+    }
     Ok(())
+}
+
+fn render_capture_filename(template: &str, request_id: &str, kind: &str, suffix: &str) -> String {
+    template
+        .replace("{requestId}", request_id)
+        .replace("{kind}", kind)
+        .replace("{suffix}", suffix)
+}
+
+fn is_windows_reserved_basename(filename: &str) -> bool {
+    let stem = filename
+        .split(['.', ':'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(|character: char| character.is_ascii_whitespace());
+    let normalized: String = stem
+        .chars()
+        .map(|character| match character {
+            '\u{00b9}' => '1',
+            '\u{00b2}' => '2',
+            '\u{00b3}' => '3',
+            character if character.is_ascii() => character.to_ascii_uppercase(),
+            character => character,
+        })
+        .collect();
+    if WINDOWS_RESERVED_BASENAMES
+        .iter()
+        .any(|reserved| normalized == *reserved)
+    {
+        return true;
+    }
+    let bytes = normalized.as_bytes();
+    bytes.len() == 4 && matches!(&bytes[..3], b"COM" | b"LPT") && bytes[3].is_ascii_digit()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1045,7 +1100,7 @@ impl CaptureRecord {
 }
 
 fn sanitize_path_component(input: &str) -> String {
-    input
+    let sanitized: String = input
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -1054,7 +1109,19 @@ fn sanitize_path_component(input: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    if sanitized.len() <= MAX_CAPTURE_REQUEST_ID_COMPONENT_BYTES {
+        return sanitized;
+    }
+    let digest: [u8; 32] = Sha256::digest(input.as_bytes()).into();
+    let mut bounded = String::with_capacity(MAX_CAPTURE_REQUEST_ID_COMPONENT_BYTES);
+    bounded.push_str(&sanitized[..MAX_CAPTURE_REQUEST_ID_COMPONENT_BYTES - 65]);
+    bounded.push('-');
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut bounded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    bounded
 }
 
 /// Resolve the on-disk path for a capture record.
@@ -1071,16 +1138,15 @@ pub(crate) fn resolve_capture_path(sink: &CaptureSinkSpec, record: &CaptureRecor
     let safe_request_id = sanitize_path_component(&record.request_id);
     let raw_template = sink.filename_template();
 
-    let filename = raw_template
-        .replace("{requestId}", &safe_request_id)
-        .replace(
-            "{kind}",
-            match record.kind {
-                CaptureKind::Request => "request",
-                CaptureKind::Response => "response",
-            },
-        )
-        .replace("{suffix}", kind_suffix);
+    let filename = render_capture_filename(
+        raw_template,
+        &safe_request_id,
+        match record.kind {
+            CaptureKind::Request => "request",
+            CaptureKind::Response => "response",
+        },
+        kind_suffix,
+    );
 
     sink.directory().join(filename)
 }
@@ -1850,6 +1916,13 @@ mod tests {
             with_kind.filename_template(),
             "{requestId}-{kind}-{suffix}.json"
         );
+        CaptureSinkSpec::new(
+            PathBuf::from("captures"),
+            "capture..{requestId}-{suffix}.json".to_string(),
+            1,
+            1,
+        )
+        .expect("internal repeated dots are a portable basename");
 
         assert_eq!(
             CaptureSinkSpec::new(
@@ -1867,14 +1940,58 @@ mod tests {
             "nested/{requestId}-{suffix}.json",
             "nested\\{requestId}-{suffix}.json",
             "C:{requestId}-{suffix}.json",
-            "{requestId}..{suffix}.json",
+            "{requestId}-{suffix}?.json",
+            "{requestId}-{suffix}*.json",
+            "{requestId}-\"-{suffix}.json",
+            "{requestId}-<-{suffix}.json",
+            "{requestId}->-{suffix}.json",
+            "{requestId}-|-{suffix}.json",
+            "{requestId}-{suffix}.json ",
+            "{requestId}-{suffix}.",
             "{requestId}-\n-{suffix}.json",
+            "CON.{requestId}-{suffix}.json",
+            "CON .{requestId}-{suffix}.json",
+            "nul.{requestId}-{suffix}",
+            "{requestId}.{suffix}",
+            "COM0.{requestId}-{suffix}.json",
+            "com1.{requestId}-{suffix}.json",
+            "COM\u{00b9}.{requestId}-{suffix}.json",
+            "LPT0.{requestId}-{suffix}.json",
+            "LPT\u{00b3}.{requestId}-{suffix}.json",
         ] {
             assert_eq!(
                 CaptureSinkSpec::new(PathBuf::from("captures"), filename.to_string(), 1, 1),
                 Err(CaptureSinkSpecError::InvalidFilenameBasename)
             );
         }
+        for filename in [
+            "COM10.{requestId}-{suffix}.json",
+            "LPT42.{requestId}-{suffix}.json",
+            "CONIN.{requestId}-{suffix}.json",
+            "CONOUT.{requestId}-{suffix}.json",
+        ] {
+            CaptureSinkSpec::new(PathBuf::from("captures"), filename.to_string(), 1, 1)
+                .expect("nearby non-device basename is portable");
+        }
+        let exact_literal = "x".repeat(
+            MAX_CAPTURE_FILENAME_BYTES - MAX_CAPTURE_REQUEST_ID_COMPONENT_BYTES - "res".len(),
+        );
+        CaptureSinkSpec::new(
+            PathBuf::from("captures"),
+            format!("{exact_literal}{{requestId}}{{suffix}}"),
+            1,
+            1,
+        )
+        .expect("exact portable filename boundary");
+        assert_eq!(
+            CaptureSinkSpec::new(
+                PathBuf::from("captures"),
+                format!("x{exact_literal}{{requestId}}{{suffix}}"),
+                1,
+                1,
+            ),
+            Err(CaptureSinkSpecError::InvalidFilenameBasename)
+        );
         assert_eq!(
             CaptureSinkSpec::new(
                 PathBuf::from("captures"),
@@ -1920,6 +2037,19 @@ mod tests {
             ),
             Err(CaptureSinkSpecError::ZeroMaxTotalBytes)
         );
+    }
+
+    #[test]
+    fn capture_request_ids_are_bounded_with_a_collision_resistant_suffix() {
+        let first = sanitize_path_component(&format!("{}A", "x".repeat(4 * 1024)));
+        let second = sanitize_path_component(&format!("{}B", "x".repeat(4 * 1024)));
+        assert_eq!(first.len(), MAX_CAPTURE_REQUEST_ID_COMPONENT_BYTES);
+        assert_eq!(second.len(), MAX_CAPTURE_REQUEST_ID_COMPONENT_BYTES);
+        assert_ne!(first, second);
+        assert!(first.starts_with(&"x".repeat(MAX_CAPTURE_REQUEST_ID_COMPONENT_BYTES - 65)));
+        assert!(first
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'));
     }
 
     #[test]

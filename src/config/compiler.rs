@@ -8988,7 +8988,7 @@ max_total_bytes = 16384
             .replace("directory = \"captures-a\"", "directory = \"captures-b\"")
             .replace(
                 "filename = \"{requestId}-{suffix}.json\"",
-                "filename = \"{requestId}.next-{suffix}.json\"",
+                "filename = \"capture-{requestId}.next-{suffix}.json\"",
             )
             .replace("max_body_bytes = 1024", "max_body_bytes = 2048")
             .replace(
@@ -9009,7 +9009,7 @@ max_total_bytes = 16384
         assert!(capture.sink.directory().ends_with("captures-b"));
         assert_eq!(
             capture.sink.filename_template(),
-            "{requestId}.next-{suffix}.json"
+            "capture-{requestId}.next-{suffix}.json"
         );
         assert_eq!(capture.max_body_bytes, 2048);
         assert_eq!(capture.max_inflight_body_bytes, 268435456);
@@ -9661,7 +9661,7 @@ trust = "insecure"
 "#
         );
         let compiled = compile(&input).expect("canonical IPv6 parent must validate");
-        let activation = crate::egress::EgressActivation::activate(
+        let activation = crate::egress::EgressActivation::activate_for_test(
             compiled.reloadable_plan.egress,
             &SnapshotIdentity::new(),
             http_access_types::PolicyGeneration::new(1).unwrap(),
