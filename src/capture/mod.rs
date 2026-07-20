@@ -49,9 +49,9 @@ pub(crate) const REDACTED: &str = "[REDACTED]";
 const MAX_CAPTURE_FILENAME_BYTES: usize = 230;
 const MAX_CAPTURE_REQUEST_ID_COMPONENT_BYTES: usize = 128;
 const WINDOWS_RESERVED_BASENAMES: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM0", "COM1", "COM2", "COM3", "COM4",
-    "COM5", "COM6", "COM7", "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
-    "LPT7", "LPT8", "LPT9",
+    "CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$", "COM0", "COM1", "COM2", "COM3",
+    "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
+    "LPT6", "LPT7", "LPT8", "LPT9",
 ];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -211,6 +211,12 @@ fn template_can_render_windows_reserved_basename(template: &str) -> bool {
         (0..=reserved.len()).any(|start| {
             (start..=reserved.len()).any(|end| {
                 let request_id = &reserved[start..end];
+                if !request_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                {
+                    return false;
+                }
                 [("request", "req"), ("response", "res")]
                     .into_iter()
                     .any(|(kind, suffix)| {
@@ -1957,6 +1963,8 @@ mod tests {
             "{requestId}-\n-{suffix}.json",
             "CON.{requestId}-{suffix}.json",
             "CON .{requestId}-{suffix}.json",
+            "CLOCK$.{requestId}-{suffix}.json",
+            "{requestId}$.{suffix}.json",
             "nul.{requestId}-{suffix}",
             "{requestId}.{suffix}",
             "COM0.{requestId}-{suffix}.json",
@@ -1980,6 +1988,8 @@ mod tests {
             "CONOUT.{requestId}-{suffix}.json",
             "COMx{requestId}.{suffix}.json",
             "AUX-{requestId}.{suffix}.json",
+            "CLOCK{requestId}.{suffix}.json",
+            "CONIN{requestId}.{suffix}.json",
         ] {
             CaptureSinkSpec::new(PathBuf::from("captures"), filename.to_string(), 1, 1)
                 .expect("nearby non-device basename is portable");
