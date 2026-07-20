@@ -212,6 +212,9 @@ impl ProductRuntime {
         configure_services: impl FnOnce(ListenerServices) -> ListenerServices,
         before_adoption: impl FnOnce(),
     ) -> Result<(), ProductRuntimeError> {
+        if !self.runtime.has_active_generation() {
+            return Err(ProductRuntimeError::InitialGenerationNotPublished);
+        }
         let prepared = self.take_prepared_proxy_listeners_for_start()?;
         let bundle =
             match prepared.into_shared_bundle_with_transparent_support(transparent_supported) {
@@ -325,6 +328,8 @@ pub(crate) enum ProductRuntimeError {
     InitialActivationAlreadyAttempted,
     #[error("initial activation coordinator did not complete")]
     InitialActivationCoordinator,
+    #[error("proxy listeners cannot start before the initial generation is published")]
+    InitialGenerationNotPublished,
 }
 
 #[cfg(test)]
@@ -1378,7 +1383,7 @@ allow_upgrades = true
     }
 
     #[tokio::test]
-    async fn ingress_confirmation_before_publication_stays_not_ready() {
+    async fn listener_start_rejects_before_initial_publication() {
         let _test = super::super::LISTENER_TEST_LOCK.lock().await;
         let reservations = super::super::reserve_listeners::<2>(&_test);
         let addresses = reservations.addresses();
@@ -1387,10 +1392,18 @@ allow_upgrades = true
             .await
             .unwrap();
 
-        product.start_listeners().await.unwrap();
+        assert!(matches!(
+            product.start_listeners().await,
+            Err(ProductRuntimeError::InitialGenerationNotPublished)
+        ));
         assert!(!product.runtime().is_ready());
+        for address in addresses {
+            assert!(TcpListener::bind(address).is_err());
+        }
 
         product.activate_initial().await.unwrap();
+        assert!(!product.runtime().is_ready());
+        product.start_listeners().await.unwrap();
         assert!(product.runtime().is_ready());
 
         product.shutdown().await;
@@ -1468,6 +1481,7 @@ http_versions = ["http1"]
         let product = ProductRuntime::prepare_from_prebound(loaded, reservations.into_listeners())
             .await
             .unwrap();
+        product.activate_initial().await.unwrap();
 
         assert!(matches!(
             product
@@ -1571,6 +1585,7 @@ private_key = "missing-server-key.pem"
         let product = ProductRuntime::prepare_from_prebound(loaded, reservations.into_listeners())
             .await
             .unwrap();
+        product.activate_initial().await.unwrap();
         product.start_listeners().await.unwrap();
         let mut partial_request = tokio::net::TcpStream::connect(addresses[0]).await.unwrap();
         partial_request
@@ -1612,6 +1627,7 @@ private_key = "missing-server-key.pem"
         let product = ProductRuntime::prepare_from_prebound(loaded, reservations.into_listeners())
             .await
             .unwrap();
+        product.activate_initial().await.unwrap();
         let shutdown_resources = Arc::clone(&product.static_resources);
 
         let result = product

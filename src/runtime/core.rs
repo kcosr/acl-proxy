@@ -290,6 +290,10 @@ impl Runtime {
         LifecycleState::from_raw(self.lifecycle.load(Ordering::Acquire))
     }
 
+    pub(crate) fn has_active_generation(&self) -> bool {
+        self.active.load().is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn is_ready(&self) -> bool {
         self.static_ownership.readiness.is_ready()

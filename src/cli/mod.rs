@@ -227,12 +227,12 @@ async fn run_product(loaded: LoadedCompiledConfig) -> Result<(), CliError> {
     let product = ProductRuntime::prepare(loaded)
         .await
         .map_err(|error| CliError::Product(error.to_string()))?;
-    product
-        .start_listeners()
-        .await
-        .map_err(|error| CliError::Product(error.to_string()))?;
     let generation = product
         .activate_initial()
+        .await
+        .map_err(|error| CliError::Product(error.to_string()))?;
+    product
+        .start_listeners()
         .await
         .map_err(|error| CliError::Product(error.to_string()))?;
     tracing::info!(
@@ -304,7 +304,12 @@ async fn supervise_process(
         }
     };
 
-    product.shutdown().await;
+    if let Some(signal) = shutdown_while_polling_signals(product, signals).await {
+        return Err(CliError::Process(format!(
+            "received {} during graceful shutdown; forcing immediate process termination",
+            signal.name()
+        )));
+    }
     let shutdown_diagnostic = product.shutdown_diagnostic();
     if let Some(reload) = reload_task {
         match reload.await {
@@ -324,6 +329,33 @@ async fn supervise_process(
         (Err(error), Some(shutdown)) => Err(CliError::Process(format!(
             "{error}; additional shutdown failure: {shutdown}"
         ))),
+    }
+}
+
+async fn shutdown_while_polling_signals(
+    product: &Arc<ProductRuntime>,
+    signals: &mut ProcessSignals,
+) -> Option<ProcessSignal> {
+    let shutdown = product.shutdown();
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            () = &mut shutdown => return None,
+            signal = signals.next() => match signal {
+                Ok(signal @ (ProcessSignal::Interrupt | ProcessSignal::Terminate)) => {
+                    tracing::warn!(signal = signal.name(), "received terminal signal during graceful shutdown; forcing process termination");
+                    return Some(signal);
+                }
+                Ok(ProcessSignal::Reload) => {
+                    tracing::debug!("ignoring reload signal during graceful shutdown");
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "signal polling ended during graceful shutdown");
+                    shutdown.await;
+                    return None;
+                }
+            }
+        }
     }
 }
 
@@ -366,6 +398,16 @@ enum ProcessSignal {
     Interrupt,
     Terminate,
     Reload,
+}
+
+impl ProcessSignal {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Interrupt => "SIGINT",
+            Self::Terminate => "SIGTERM",
+            Self::Reload => "SIGHUP",
+        }
+    }
 }
 
 #[cfg(unix)]

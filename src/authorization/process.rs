@@ -803,12 +803,12 @@ async fn spawn_child(config: &SpawnConfig) -> Result<SpawnedChild, ProcessActiva
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[cfg(unix)]
     command.process_group(0);
     let mut child = command.spawn().map_err(|_| ProcessActivationError::Spawn)?;
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[cfg(unix)]
     let process_group_id = child.id();
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    #[cfg(not(unix))]
     let process_group_id = None;
     let Some(stdin) = child.stdin.take() else {
         terminate_child(child, process_group_id).await;
@@ -1201,7 +1201,7 @@ async fn handle_child_exit(inner: &Arc<Inner>, epoch: u64, restart_at: &mut Opti
         }
         (state.child.take(), state.process_group_id.take())
     };
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[cfg(unix)]
     kill_process_group(process_group_id, libc::SIGKILL);
     if let Some(child) = child {
         reap_child(child).await;
@@ -1371,25 +1371,14 @@ async fn terminate_child(mut child: Child, process_group_id: Option<u32>) {
         not(any(target_os = "linux", target_os = "android", target_os = "macos"))
     ))]
     {
-        let _ = process_group_id;
-        let deadline = Instant::now() + TERMINATE_GRACE;
-        signal_child(&child, libc::SIGTERM);
-        loop {
-            match observe_child_exit(&mut child) {
-                Ok(true) => {
-                    reap_child(child).await;
-                    return;
-                }
-                Ok(false) if Instant::now() < deadline => {
-                    time::sleep(CHILD_EXIT_POLL_INTERVAL).await;
-                }
-                Ok(false) | Err(()) => {
-                    let _ = child.start_kill();
-                    reap_child(child).await;
-                    return;
-                }
-            }
-        }
+        kill_process_group(process_group_id, libc::SIGTERM);
+        // These targets cannot safely observe exit without reaping the group leader.
+        // Retain it for the complete grace period so the numeric PGID cannot be reused
+        // before the final group signal.
+        time::sleep(TERMINATE_GRACE).await;
+        kill_process_group(process_group_id, libc::SIGKILL);
+        let _ = child.start_kill();
+        reap_child(child).await;
     }
     #[cfg(not(unix))]
     {
@@ -1403,7 +1392,7 @@ async fn reap_child(mut child: Child) {
     let _ = child.wait().await;
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(unix)]
 fn kill_process_group(process_group_id: Option<u32>, signal: libc::c_int) {
     let Some(process_group_id) = process_group_id.filter(|id| *id <= libc::pid_t::MAX as u32)
     else {
@@ -1445,21 +1434,14 @@ fn observe_child_exit(child: &mut Child) -> Result<bool, ()> {
     unix,
     not(any(target_os = "linux", target_os = "android", target_os = "macos"))
 ))]
-fn signal_child(child: &Child, signal: libc::c_int) {
-    let Some(pid) = child.id().filter(|id| *id <= libc::pid_t::MAX as u32) else {
-        return;
-    };
-    // The unreaped Child owns this PID when the signal is sent.
-    // SAFETY: kill does not dereference pointers, and the PID came from Child::id.
-    unsafe {
-        libc::kill(pid as libc::pid_t, signal);
-    }
+fn observe_child_exit(_child: &mut Child) -> Result<bool, ()> {
+    // Reader EOF reports a fatal epoch and drives group cleanup. Polling Child here
+    // would reap its leader and permit the numeric PGID to be reused before cleanup.
+    Ok(false)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+#[cfg(not(unix))]
 fn observe_child_exit(child: &mut Child) -> Result<bool, ()> {
-    // These targets retain no process-group ID, so reaping here cannot make a later
-    // group signal target a recycled numeric identifier.
     child
         .try_wait()
         .map(|status| status.is_some())
@@ -3467,7 +3449,7 @@ while True:
         assert_eq!(fs::read_to_string(handled_path).unwrap(), "handled");
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[cfg(unix)]
     #[tokio::test]
     async fn cleanup_kills_same_group_descendant_that_ignores_sigterm() {
         let directory = TempDir::new().unwrap();

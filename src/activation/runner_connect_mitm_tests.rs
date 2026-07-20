@@ -317,6 +317,68 @@ async fn connect_mitm_forwards_inner_request_and_rejects_nested_connect() {
 }
 
 #[tokio::test]
+async fn connect_mitm_rejects_origin_form_host_mismatch_without_dialing_decoy() {
+    let _test = super::super::super::LISTENER_TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let target_origin = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let target_address = target_origin.local_addr().unwrap();
+    let decoy_origin = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let decoy_address = decoy_origin.local_addr().unwrap();
+    let (proxy, listener) = prebound_listener();
+    let target = format!("localhost:{}", target_address.port());
+    let decoy = format!("localhost:{}", decoy_address.port());
+    let ca = initialize_generated_ca(&directory.path().join("mitm"));
+    let text = connect_config(proxy, &target, "explicit_http", "", "", "");
+    let facts =
+        http_access_runtime::ForwardingNetworkFacts::new(vec![proxy], None, None, None).unwrap();
+    let target_url = http_access_url::canonicalize_http_url(&format!("https://{target}/")).unwrap();
+    let decoy_url = http_access_url::canonicalize_http_url(&format!("https://{decoy}/")).unwrap();
+    let network = Arc::new(
+        http_access_runtime::ForwardingDevHarness::new(facts)
+            .map_prebound(&target_url, target_address)
+            .unwrap()
+            .map_prebound(&decoy_url, decoy_address)
+            .unwrap()
+            .into_standalone_guard(),
+    );
+    let product = start_product(&directory, &text, listener, Some(network)).await;
+    let stream = open_connect(proxy, &target).await;
+    let connector = tls_connector(ca, &[b"http/1.1"]);
+    let mut tunnel = connector
+        .connect(ServerName::try_from("localhost").unwrap(), stream)
+        .await
+        .unwrap();
+
+    tunnel
+        .write_all(
+            format!("GET /must-reject HTTP/1.1\r\nHost: {decoy}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let response = read_http_message(&mut tunnel).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 400 "),
+        "unexpected mismatched-Host response: {}",
+        String::from_utf8_lossy(&response)
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), decoy_origin.accept())
+            .await
+            .is_err(),
+        "mismatched inner Host dialed the decoy origin"
+    );
+
+    drop(tunnel);
+    product.shutdown().await;
+    assert!(StdTcpListener::bind(proxy).is_ok());
+}
+
+#[tokio::test]
 async fn connect_mitm_outer_tunnel_omits_global_origin_credentials() {
     const VARIABLE: &str = "ACL_PROXY_OUTER_CONNECT_IDENTITY";
     let _test = super::super::super::LISTENER_TEST_LOCK.lock().await;
