@@ -532,6 +532,7 @@ max_decoded_body_bytes = 52428800
 max_frame_bytes = 262144
 max_message_bytes = 1048576
 allow_permessage_deflate = false
+unsupported_extensions = "strip"
 max_environment_literal_sources = 64
 max_environment_literal_bytes = 65536
 max_environment_literal_total_bytes = 1048576

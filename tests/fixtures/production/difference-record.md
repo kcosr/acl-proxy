@@ -56,6 +56,7 @@ below.
 | legacy plugin profiles | generation-owned process providers with config-rooted command/arguments, no environment inheritance, and a minimal explicit PATH |
 | implicit provider retirement | explicit two-hour retirement windows cover the host role's greatest effective request timeout |
 | exact environment placeholders in redaction literals | five typed `literal_environment_variables` plus one ordinary synthetic literal and one expression |
+| request-header rule removing `Sec-WebSocket-Extensions` | typed `unsupported_extensions = "strip"` on `sensitive_strings`; protected upgrades strip unsupported compression before origin forwarding |
 | content-coded telemetry forwarded without mandatory normalization | the Sentry/Datadog telemetry rule selects `sensitive_strings`, producing bounded identity-coded upstream bytes under the R7 contract |
 | all capture events disabled | capture table absent |
 | relative runtime paths with legacy ownership | config-rooted fixture paths |

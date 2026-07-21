@@ -131,6 +131,18 @@ fn sanitized_production_role_structure_matches_difference_record() {
     }
 
     let host = parse_fixture("host-proxy.toml");
+    let sensitive_strings = table(&host, "redaction")
+        .get("profiles")
+        .and_then(TomlValue::as_table)
+        .and_then(|profiles| profiles.get("sensitive_strings"))
+        .and_then(TomlValue::as_table)
+        .expect("host sensitive_strings redaction profile");
+    assert_eq!(
+        sensitive_strings
+            .get("unsupported_extensions")
+            .and_then(TomlValue::as_str),
+        Some("strip")
+    );
     let decisions = rules(&host)
         .iter()
         .fold(BTreeMap::new(), |mut counts, rule| {

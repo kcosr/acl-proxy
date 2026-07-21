@@ -1047,6 +1047,9 @@ pub(super) struct RedactionProfileConfig {
     #[serde(default)]
     pub allow_permessage_deflate: bool,
 
+    #[serde(default)]
+    pub unsupported_extensions: UnsupportedExtensions,
+
     #[serde(default = "default_max_environment_literal_sources")]
     pub max_environment_literal_sources: usize,
 
@@ -1057,6 +1060,14 @@ pub(super) struct RedactionProfileConfig {
     pub max_environment_literal_total_bytes: usize,
 
     pub rules: Vec<RedactionRuleConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum UnsupportedExtensions {
+    #[default]
+    Deny,
+    Strip,
 }
 
 fn default_redaction_replacement() -> String {
@@ -1787,6 +1798,10 @@ max_inflight_body_bytes = 134217728
         assert_eq!(redaction.max_environment_literal_sources, 64);
         assert_eq!(redaction.max_environment_literal_bytes, 64 * 1024);
         assert_eq!(redaction.max_environment_literal_total_bytes, 1024 * 1024);
+        assert_eq!(
+            redaction.unsupported_extensions,
+            UnsupportedExtensions::Deny
+        );
         let capture = parsed.observation.capture.unwrap();
         assert_eq!(capture.events.len(), 2);
         assert_eq!(capture.redaction_profile, "secrets");
@@ -1891,13 +1906,36 @@ directory = "certs"
         );
         assert!(toml::from_str::<AuthoringConfig>(&legacy_top).is_err());
 
-        for obsolete in [
-            MINIMAL.replace("inject = true", "enabled = true\ninject = true"),
-            format!(
-                "{MINIMAL}\n[redaction.profiles.legacy]\nunsupported_extensions = \"deny\"\nrules = []\n"
+        let obsolete = MINIMAL.replace("inject = true", "enabled = true\ninject = true");
+        assert!(toml::from_str::<AuthoringConfig>(&obsolete).is_err());
+    }
+
+    #[test]
+    fn redaction_unsupported_extensions_is_typed_and_defaults_to_deny() {
+        for (authored, expected) in [
+            ("", UnsupportedExtensions::Deny),
+            (
+                "unsupported_extensions = \"deny\"\n",
+                UnsupportedExtensions::Deny,
+            ),
+            (
+                "unsupported_extensions = \"strip\"\n",
+                UnsupportedExtensions::Strip,
             ),
         ] {
-            assert!(toml::from_str::<AuthoringConfig>(&obsolete).is_err());
+            let config = format!(
+                "{MINIMAL}\n[redaction.profiles.websocket]\n{authored}rules = [{{ literals = [\"secret\"] }}]\n"
+            );
+            let parsed: AuthoringConfig = toml::from_str(&config).unwrap();
+            assert_eq!(
+                parsed.redaction.profiles["websocket"].unsupported_extensions,
+                expected
+            );
         }
+
+        let invalid = format!(
+            "{MINIMAL}\n[redaction.profiles.websocket]\nunsupported_extensions = \"allow\"\nrules = [{{ literals = [\"secret\"] }}]\n"
+        );
+        assert!(toml::from_str::<AuthoringConfig>(&invalid).is_err());
     }
 }

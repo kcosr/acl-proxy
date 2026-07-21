@@ -16,9 +16,9 @@ use http::Method;
 use http_access_redaction::MAX_MATCHER_SCRATCH_BYTES;
 use http_access_redaction::{
     ExternalLiteralSlot, PreparedRedactionSnapshot, RedactionLimits, RedactionProfileSpec,
-    RedactionRuleSpec, RedactionSnapshotSpec, RulePayloads, MAX_AUTHORED_LITERALS_PER_PROFILE,
-    MAX_AUTHORED_LITERAL_BYTES_PER_PROFILE, MAX_EXPRESSIONS_PER_PROFILE,
-    MAX_EXPRESSION_BYTES_PER_PROFILE, MAX_EXTERNAL_LITERAL_BYTES,
+    RedactionRuleSpec, RedactionSnapshotSpec, RulePayloads, UnsupportedWebSocketExtensions,
+    MAX_AUTHORED_LITERALS_PER_PROFILE, MAX_AUTHORED_LITERAL_BYTES_PER_PROFILE,
+    MAX_EXPRESSIONS_PER_PROFILE, MAX_EXPRESSION_BYTES_PER_PROFILE, MAX_EXTERNAL_LITERAL_BYTES,
     MAX_EXTERNAL_LITERAL_BYTES_PER_PROFILE, MAX_EXTERNAL_LITERAL_BYTES_PER_SNAPSHOT,
     MAX_EXTERNAL_SLOTS_PER_PROFILE, MAX_EXTERNAL_SLOTS_PER_SNAPSHOT, MAX_PROFILES,
     MAX_RULES_PER_PROFILE,
@@ -60,7 +60,7 @@ use super::authoring::{
     HeaderEffectWhen, Http1ConnectPolicy, HttpVersion, ListenersConfig, MitmConfig,
     ObservationConfig, ParentProxyKind, PolicyConfig, PolicyRuleConfig, RedactionConfig,
     RedactionPayloads, RuleDecision, SafetyConfig, StaticTlsIdentityConfig, TlsTrust,
-    TransportSecurity, TransportTlsConfig,
+    TransportSecurity, TransportTlsConfig, UnsupportedExtensions,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -5882,7 +5882,11 @@ fn compile_redaction_plan(
             profile.max_environment_literal_bytes,
             profile.max_environment_literal_total_bytes,
         )
-        .map_err(|error| ConfigCompileError::at(&prefix, error.to_string()))?;
+        .map_err(|error| ConfigCompileError::at(&prefix, error.to_string()))?
+        .with_unsupported_websocket_extensions(match profile.unsupported_extensions {
+            UnsupportedExtensions::Deny => UnsupportedWebSocketExtensions::Deny,
+            UnsupportedExtensions::Strip => UnsupportedWebSocketExtensions::Strip,
+        });
         let mut rules = Vec::new();
         rules.try_reserve_exact(profile.rules.len()).map_err(|_| {
             ConfigCompileError::at(&prefix, "redaction preparation allocation failed")
@@ -10847,6 +10851,7 @@ rules = [{ literals = ["plain-test-literal"] }]
 [redaction.profiles.deflate]
 max_message_bytes = 1048576
 allow_permessage_deflate = true
+unsupported_extensions = "strip"
 rules = [{ literals = ["deflate-test-literal"] }]
 "#,
             r#"
@@ -10877,6 +10882,18 @@ methods = ["DELETE"]
 "#,
         );
         let compiled = compile(&input).unwrap();
+        assert_eq!(
+            compiled.reloadable_plan.redaction.profiles["plain"]
+                .limits
+                .unsupported_websocket_extensions(),
+            UnsupportedWebSocketExtensions::Deny
+        );
+        assert_eq!(
+            compiled.reloadable_plan.redaction.profiles["deflate"]
+                .limits
+                .unsupported_websocket_extensions(),
+            UnsupportedWebSocketExtensions::Strip
+        );
         let plan = &compiled.reloadable_plan.resource_plan;
         let transport = 2 * 64 * 1024;
         let plain_scratch = shared_matcher_scratch_bytes("plain-test-literal".len());

@@ -29,6 +29,9 @@
   sanitized production topology fixtures.
 - Added ordered file-backed CA-chain support, short-lived generated leaf
   certificates, and bounded optional leaf-certificate persistence.
+- Added typed WebSocket `unsupported_extensions = "deny" | "strip"` redaction
+  policy, defaulting to fail-closed denial while allowing unsafe offers to be
+  removed before origin forwarding.
 
 ### Changed
 

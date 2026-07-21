@@ -478,6 +478,7 @@ max_decoded_body_bytes = 52428800
 max_frame_bytes = 262144
 max_message_bytes = 1048576
 allow_permessage_deflate = false
+unsupported_extensions = "deny" # deny | strip
 
 [[redaction.profiles.sensitive.rules]]
 literals = ["safe-fixture-literal"]
@@ -485,6 +486,13 @@ literal_environment_variables = ["REDACT_SECRET_A", "REDACT_SECRET_B"]
 expressions = ["token-[A-Za-z0-9_.-]{20,}"]
 payloads = "text"
 ```
+
+Protected WebSocket upgrades validate extension offers before contacting the
+origin. `deny` rejects a well-formed but unsupported offer, while `strip`
+removes all `Sec-WebSocket-Extensions` fields and establishes an uncompressed
+connection. Malformed extension syntax always fails closed. Compression is
+forwarded only when `allow_permessage_deflate = true` and both peers negotiate
+the supported no-context-takeover subset.
 
 Complete HTTP bodies are classified as text only when they are valid UTF-8;
 otherwise they are binary. Text-only literals and every expression are skipped
