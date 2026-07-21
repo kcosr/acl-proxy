@@ -726,7 +726,8 @@ request_timeout = "{request_timeout}"
 max_retiring_generations = {max_retiring_generations}
 
 [listeners.explicit_http]
-bind = "{bind}"
+endpoint.kind = "tcp"
+endpoint.address = "{bind}"
 http_versions = ["http1"]
 
 [listeners.explicit_http.connect]
@@ -1320,7 +1321,8 @@ max_connections = 2
 max_request_body_bytes = 65536
 
 [listeners.explicit_http]
-bind = "{explicit_http}"
+endpoint.kind = "tcp"
+endpoint.address = "{explicit_http}"
 http_versions = ["http1"]
 
 [listeners.explicit_http.connect]

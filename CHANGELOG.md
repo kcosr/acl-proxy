@@ -4,6 +4,10 @@
 
 ### Breaking Changes
 
+- Replaced scalar data-listener `bind` fields with the closed typed `endpoint`
+  contract. TCP listeners use `{ kind = "tcp", address = "..." }`; transparent
+  HTTP and HTTPS may use Unix-PROXY-v2 endpoints. Legacy `bind` is rejected with
+  an actionable migration diagnostic and is not retained as an alias.
 - Replaced the unreleased schema-2 draft with the strict integer
   `schema_version = 3` contract. Missing, string, schema-1, schema-2, and future
   versions are rejected without migration aliases or fallback parsing.
@@ -22,6 +26,12 @@
 
 ### Added
 
+- Added host-owned transparent HTTP/HTTPS Unix listeners and the minimal
+  Linux-only `acl-proxy-transparent-uds-relay` artifact, including strict PROXY
+  v2 framing, bounded relay resources, fail-closed pre-existing path refusal,
+  bounded diagnostic socket liveness probes, atomic no-replace socket
+  publication, explicit supervisor-owned pathname cleanup, and distinct
+  sanitized TCP and UDS production fixtures.
 - Added one common ingress runtime for explicit and transparent HTTP/HTTPS,
   CONNECT MITM, HTTP/1.1, HTTP/2, upgrades, and direct or parent egress.
 - Added generation-owned process and webhook authorization providers, typed

@@ -1803,7 +1803,7 @@ for line in sys.stdin:
     async fn production_process_plans_activate_dispatch_retire_and_reactivate() {
         let fixture_root =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/production");
-        let loaded = load_and_compile_exact_config(&fixture_root.join("host-proxy.toml"))
+        let loaded = load_and_compile_exact_config(&fixture_root.join("host-proxy-tcp.toml"))
             .expect("production host fixture must load and compile");
         let mut providers = loaded.compiled.reloadable_plan.authorization.providers;
 

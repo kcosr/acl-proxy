@@ -29,7 +29,7 @@ max_connections = 128
 max_request_body_bytes = 65536
 
 [listeners.explicit_http]
-bind = "127.0.0.1:8881"
+endpoint = { kind = "tcp", address = "127.0.0.1:8881" }
 http_versions = ["http1"]
 request_header_timeout = "10s"
 max_connections = 1024

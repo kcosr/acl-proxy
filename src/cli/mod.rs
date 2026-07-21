@@ -506,36 +506,48 @@ fn table_value(value: &str) -> &str {
 
 fn log_startup(config: &StaticProductConfig) {
     let listeners = &config.listeners;
-    for (name, bind) in [
+    for (name, endpoint) in [
         (
             "explicit_http",
-            listeners.explicit_http.as_ref().map(|value| value.bind),
+            listeners
+                .explicit_http
+                .as_ref()
+                .map(|value| &value.endpoint),
         ),
         (
             "transparent_http",
-            listeners.transparent_http.as_ref().map(|value| value.bind),
+            listeners
+                .transparent_http
+                .as_ref()
+                .map(|value| &value.endpoint),
         ),
         (
             "explicit_https",
-            listeners.explicit_https.as_ref().map(|value| value.bind),
+            listeners
+                .explicit_https
+                .as_ref()
+                .map(|value| &value.endpoint),
         ),
         (
             "transparent_https",
-            listeners.transparent_https.as_ref().map(|value| value.bind),
+            listeners
+                .transparent_https
+                .as_ref()
+                .map(|value| &value.endpoint),
         ),
     ] {
-        if let Some(bind) = bind {
-            warn_on_unspecified_bind(name, bind);
+        if let Some(crate::config::compiler::StaticListenerEndpoint::Tcp { address }) = endpoint {
+            warn_on_unspecified_bind(name, *address);
         }
     }
 
     tracing::info!(
         target: "acl_proxy::startup",
         schema_version = config.schema_version,
-        explicit_http_bind = ?listeners.explicit_http.as_ref().map(|value| value.bind),
-        transparent_http_bind = ?listeners.transparent_http.as_ref().map(|value| value.bind),
-        explicit_https_bind = ?listeners.explicit_https.as_ref().map(|value| value.bind),
-        transparent_https_bind = ?listeners.transparent_https.as_ref().map(|value| value.bind),
+        explicit_http_endpoint = ?listeners.explicit_http.as_ref().map(|value| &value.endpoint),
+        transparent_http_endpoint = ?listeners.transparent_http.as_ref().map(|value| &value.endpoint),
+        explicit_https_endpoint = ?listeners.explicit_https.as_ref().map(|value| &value.endpoint),
+        transparent_https_endpoint = ?listeners.transparent_https.as_ref().map(|value| &value.endpoint),
         control_bind = ?config.control.as_ref().map(|value| value.bind),
         mitm_enabled = config.mitm.is_some(),
         "acl-proxy starting"

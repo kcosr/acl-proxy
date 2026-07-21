@@ -612,7 +612,8 @@ max_trailer_count = 16
 max_trailer_bytes = 8192
 
 [listeners.explicit_http]
-bind = "{bind}"
+endpoint.kind = "tcp"
+endpoint.address = "{bind}"
 http_versions = ["http1", "http2"]
 max_connections = 128
 max_concurrent_streams = 64

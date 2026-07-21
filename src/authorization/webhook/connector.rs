@@ -206,19 +206,19 @@ impl WebhookDestinationFacts {
             listeners
                 .explicit_http
                 .as_ref()
-                .map(|listener| listener.bind),
+                .and_then(|listener| tcp_listener_address(&listener.endpoint)),
             listeners
                 .transparent_http
                 .as_ref()
-                .map(|listener| listener.bind),
+                .and_then(|listener| tcp_listener_address(&listener.endpoint)),
             listeners
                 .explicit_https
                 .as_ref()
-                .map(|listener| listener.bind),
+                .and_then(|listener| tcp_listener_address(&listener.endpoint)),
             listeners
                 .transparent_https
                 .as_ref()
-                .map(|listener| listener.bind),
+                .and_then(|listener| tcp_listener_address(&listener.endpoint)),
         ]
         .into_iter()
         .flatten()
@@ -288,6 +288,15 @@ impl WebhookDestinationFacts {
                 .map(|(url, base)| ReservedWebhookControlSubtree::new(url, base.to_owned())),
             max_resolved_addresses,
         })
+    }
+}
+
+fn tcp_listener_address(
+    endpoint: &crate::config::compiler::StaticListenerEndpoint,
+) -> Option<SocketAddr> {
+    match endpoint {
+        crate::config::compiler::StaticListenerEndpoint::Tcp { address } => Some(*address),
+        crate::config::compiler::StaticListenerEndpoint::UnixProxyV2 { .. } => None,
     }
 }
 

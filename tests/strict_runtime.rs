@@ -452,7 +452,8 @@ max_connections = 16
 max_request_body_bytes = 65536
 
 [listeners.explicit_http]
-bind = "{data}"
+endpoint.kind = "tcp"
+endpoint.address = "{data}"
 http_versions = ["http1"]
 request_header_timeout = "2s"
 max_connections = 32

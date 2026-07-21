@@ -1,0 +1,48 @@
+schema_version = 3
+
+[service]
+request_timeout = "30s"
+shutdown_drain_timeout = "30s"
+
+[listeners.transparent_http]
+endpoint.kind = "unix_proxy_v2"
+endpoint.path = "/Users/your-user/Library/Application Support/AW Gateway/runtime/transparent-http.sock"
+endpoint.mode = "0606"
+proxy_header_timeout = "1s"
+http_versions = ["http1"]
+
+[listeners.transparent_https]
+endpoint.kind = "unix_proxy_v2"
+endpoint.path = "/Users/your-user/Library/Application Support/AW Gateway/runtime/transparent-https.sock"
+endpoint.mode = "0606"
+proxy_header_timeout = "1s"
+http_versions = ["http1", "http2"]
+
+[mitm]
+mode = "generated"
+directory = "runtime/certs"
+
+[egress]
+route = "parent_proxy"
+
+[egress.origin_tls]
+trust = "system"
+http_versions = ["http1", "http2"]
+
+[egress.parent_proxy]
+kind = "generic"
+url = "https://external-proxy.example.test:8443"
+
+[egress.parent_proxy.tls]
+trust = "system"
+
+[policy]
+default = "deny"
+
+[observation.logging]
+level = "info"
+console = true
+
+[safety.loop_detection]
+inject = true
+header = "x-acl-proxy-request-id"

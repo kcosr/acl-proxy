@@ -35,7 +35,7 @@ use crate::tls_io_runtime::{TlsIoRuntime, TlsIoRuntimeError, TlsIoShutdownOutcom
 use super::assets::{ProductIngressAssets, ProductIngressAssetsError};
 use super::listeners::{
     LocalAddressRefreshFailureObserver, PreparedProxyListeners, ProductLocalAddressRuntime,
-    ProxyListenerBindError, ProxyListenerFailure,
+    ProxyListenerBindError, ProxyListenerFailure, UnixSocketLifetime,
 };
 use super::product::ProductActivator;
 
@@ -57,6 +57,7 @@ pub(crate) struct ProductStaticResources {
     #[cfg(test)]
     listener_failure_notifications: AtomicUsize,
     listener_runtime: Mutex<Option<Arc<ListenerRuntime>>>,
+    unix_socket_lifetimes: Mutex<Vec<Arc<UnixSocketLifetime>>>,
     listener_shutdown_started: AtomicBool,
     #[cfg(test)]
     listener_shutdown_pause: Mutex<
@@ -381,6 +382,7 @@ impl ProductStaticResources {
             #[cfg(test)]
             listener_failure_notifications: AtomicUsize::new(0),
             listener_runtime: Mutex::new(None),
+            unix_socket_lifetimes: Mutex::new(Vec::new()),
             listener_shutdown_started: AtomicBool::new(false),
             #[cfg(test)]
             listener_shutdown_pause: Mutex::new(None),
@@ -722,6 +724,7 @@ impl ProductStaticResources {
     pub(super) fn adopt_listener_runtime(
         &self,
         runtime: ListenerRuntime,
+        unix_socket_lifetimes: Vec<Arc<UnixSocketLifetime>>,
     ) -> Result<(), ProductStaticResourcesError> {
         let mut owned = self
             .listener_runtime
@@ -731,6 +734,10 @@ impl ProductStaticResources {
             return Err(ProductStaticResourcesError::ListenerRuntimeAlreadyAdopted);
         }
         *owned = Some(Arc::new(runtime));
+        *self
+            .unix_socket_lifetimes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = unix_socket_lifetimes;
         if self.shutdown_started.load(Ordering::Acquire) {
             owned
                 .as_ref()
@@ -800,6 +807,10 @@ impl ProductStaticResources {
                 .shutdown_and_wait(deadline.map(tokio::time::Instant::into_std))
                 .await;
         }
+        self.unix_socket_lifetimes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
     }
 
     #[cfg(test)]
@@ -1108,7 +1119,8 @@ max_connections = 2
 max_request_body_bytes = 65536
 
 [listeners.explicit_http]
-bind = "{explicit_http}"
+endpoint.kind = "tcp"
+endpoint.address = "{explicit_http}"
 http_versions = ["http1"]
 
 [listeners.explicit_http.connect]
@@ -1140,7 +1152,10 @@ header = "x-acl-proxy-request-id"
         let max_connections = explicit.max_connections;
         let max_concurrent_streams = explicit.max_concurrent_streams;
         config.listeners.transparent_http = Some(StaticCleartextListener {
-            bind: transparent_http,
+            endpoint: crate::config::compiler::StaticListenerEndpoint::Tcp {
+                address: transparent_http,
+            },
+            proxy_header_timeout: None,
             http_versions: versions.clone(),
             request_header_timeout,
             max_connections,
@@ -1155,7 +1170,10 @@ header = "x-acl-proxy-request-id"
             .unwrap();
         crate::filesystem::write_private_file(&private_key, identity.private_key_pem()).unwrap();
         config.listeners.explicit_https = Some(StaticExplicitHttpsListener {
-            bind: explicit_https,
+            endpoint: crate::config::compiler::StaticListenerEndpoint::Tcp {
+                address: explicit_https,
+            },
+            proxy_header_timeout: None,
             http_versions: versions.clone(),
             handshake_timeout: Duration::from_secs(1),
             request_header_timeout: Duration::from_secs(1),
@@ -1168,7 +1186,10 @@ header = "x-acl-proxy-request-id"
             },
         });
         config.listeners.transparent_https = Some(StaticTransparentHttpsListener {
-            bind: transparent_https,
+            endpoint: crate::config::compiler::StaticListenerEndpoint::Tcp {
+                address: transparent_https,
+            },
+            proxy_header_timeout: None,
             http_versions: versions,
             handshake_timeout: Duration::from_secs(1),
             request_header_timeout: Duration::from_secs(1),
@@ -1228,7 +1249,7 @@ header = "x-acl-proxy-request-id"
         assert!(matches!(
             resources.prepare_ingress_from_prebound(listeners),
             Err(ProductStaticResourcesError::ProxyListenerBind(error))
-                if error.name == "explicit_https" && error.address == addresses[2]
+                if error.name == "explicit_https" && error.address == Some(addresses[2])
         ));
         super::super::assert_listener_addresses_released(
             &_test,

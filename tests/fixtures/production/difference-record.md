@@ -13,9 +13,15 @@ traceability without retaining their contents:
 
 | Role | Source bytes | Source SHA256 | Sanitized v3 fixture |
 | --- | ---: | --- | --- |
-| host | 15,597 | `401d5573e9ee82d1f042e66c15034644741ab297f3e45e88e844bad0943aed00` | `host-proxy.toml` |
+| host TCP | 15,597 | `401d5573e9ee82d1f042e66c15034644741ab297f3e45e88e844bad0943aed00` | `host-proxy-tcp.toml` |
+| host UDS workstation | new topology | not derived from a production source file | `host-proxy-uds.toml` |
 | common container | 1,077 | `a93af31c7a0c74e6f44ea6c8b58fbcddf2648933a61ee28d1421e0fa3ca04bd4` | `common-container-proxy.toml` |
 | internal container | 2,907 | `0c8965f1529ed55618624d0fd5f4c2a39f066cf076a6400acf4dd91b8d0d09e0` | `internal-container-proxy.toml` |
+
+The TCP fixture preserves the migrated source topology. The separate UDS host
+fixture records the workstation end state: only transparent Unix-PROXY-v2 data
+listeners, one fixed local-workstation principal with no `client_cidrs`, and
+mandatory TLS parent-proxy egress with typed workstation identity injection.
 
 The sanitized v1 files retain only obsolete authoring shapes needed for strict
 negative tests. They are not production byte copies.
@@ -24,7 +30,8 @@ negative tests. They are not production byte copies.
 
 | Role | V3 rules | V3 patterns | Actions | Scheme intent |
 | --- | ---: | ---: | --- | --- |
-| host | 45 | 134 | 37 allow, 7 deny, 1 delegate | 118 HTTPS, 13 HTTP, 3 catchall |
+| host TCP | 45 | 134 | 37 allow, 7 deny, 1 delegate | 118 HTTPS, 13 HTTP, 3 catchall |
+| host UDS workstation | 1 | 1 | 1 allow | catchall under fixed workstation identity |
 | common container | 1 | 1 | 1 allow | catchall |
 | internal container | 8 | 12 | 8 allow | 11 HTTPS, 1 HTTP |
 
@@ -165,7 +172,7 @@ destinations and paths are replaced, but the stated counts apply to each row.
 
 ## Required Integration Assertions
 
-1. Parse the three v3 fixtures through `AuthoringConfig` and compile them with temporary
+1. Parse the four v3 fixtures through `AuthoringConfig` and compile them with temporary
    CA files and five deterministic redaction environment values.
 2. Reject all three sanitized v1 shapes through the strict runtime and CLI.
 3. Assert the exact rule IDs, counts, pattern counts, method sets, wildcard

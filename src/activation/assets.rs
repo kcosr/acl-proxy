@@ -228,19 +228,19 @@ fn forwarding_network_facts(
         listeners
             .explicit_http
             .as_ref()
-            .map(|listener| listener.bind),
+            .and_then(|listener| tcp_endpoint_address(&listener.endpoint)),
         listeners
             .transparent_http
             .as_ref()
-            .map(|listener| listener.bind),
+            .and_then(|listener| tcp_endpoint_address(&listener.endpoint)),
         listeners
             .explicit_https
             .as_ref()
-            .map(|listener| listener.bind),
+            .and_then(|listener| tcp_endpoint_address(&listener.endpoint)),
         listeners
             .transparent_https
             .as_ref()
-            .map(|listener| listener.bind),
+            .and_then(|listener| tcp_endpoint_address(&listener.endpoint)),
     ]
     .into_iter()
     .flatten()
@@ -258,6 +258,15 @@ fn forwarding_network_facts(
         reserved_control_url,
         reserved_control_base_path,
     )
+}
+
+fn tcp_endpoint_address(
+    endpoint: &crate::config::compiler::StaticListenerEndpoint,
+) -> Option<std::net::SocketAddr> {
+    match endpoint {
+        crate::config::compiler::StaticListenerEndpoint::Tcp { address } => Some(*address),
+        crate::config::compiler::StaticListenerEndpoint::UnixProxyV2 { .. } => None,
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -311,14 +320,16 @@ mod tests {
         let text = r#"schema_version = 3
 
 [listeners.explicit_http]
-bind = "127.0.0.2:31880"
+endpoint.kind = "tcp"
+endpoint.address = "127.0.0.2:31880"
 http_versions = ["http1"]
 
 [listeners.explicit_http.connect]
 http1 = "mitm"
 
 [listeners.explicit_https]
-bind = "127.0.0.2:31881"
+endpoint.kind = "tcp"
+endpoint.address = "127.0.0.2:31881"
 http_versions = ["http2", "http1"]
 
 [listeners.explicit_https.connect]
@@ -330,7 +341,8 @@ certificate_chain = "server.pem"
 private_key = "server-key.pem"
 
 [listeners.transparent_https]
-bind = "127.0.0.2:31882"
+endpoint.kind = "tcp"
+endpoint.address = "127.0.0.2:31882"
 http_versions = ["http1"]
 
 [mitm]
@@ -396,8 +408,8 @@ default = "deny"
     #[test]
     fn forwarding_network_facts_derive_from_compiled_static_config() {
         let mut compiled = crate::config::compile_config_text(crate::config::ConfigTextInput {
-            text: include_str!("../../tests/fixtures/production/host-proxy.toml"),
-            source_path: Path::new("host-proxy.toml"),
+            text: include_str!("../../tests/fixtures/production/host-proxy-tcp.toml"),
+            source_path: Path::new("host-proxy-tcp.toml"),
             config_root: Path::new("/etc/acl-proxy"),
         })
         .expect("production fixture compiles");
@@ -447,7 +459,9 @@ default = "deny"
             .explicit_http
             .as_mut()
             .expect("explicit HTTP listener")
-            .bind = "127.0.0.1:8898".parse().expect("test bind");
+            .endpoint = crate::config::compiler::StaticListenerEndpoint::Tcp {
+            address: "127.0.0.1:8898".parse().expect("test bind"),
+        };
         assert!(matches!(
             forwarding_network_facts(&overlapping),
             Err(ForwardingNetworkError::InvalidFacts)
