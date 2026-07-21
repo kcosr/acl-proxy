@@ -101,6 +101,32 @@ PY
     fi
 }
 
+expect_created_path_rejected() {
+    local name=$1
+    local path=$2
+    local fixture="$TMP/$name"
+    cp -a "$BASELINE" "$fixture"
+    mkdir -p "$(dirname -- "$fixture/$path")"
+    printf 'obsolete\n' >"$fixture/$path"
+    if run_gate "$fixture" >"$fixture.out" 2>&1; then
+        printf 'packaging created-path mutation unexpectedly passed: %s\n' "$name" >&2
+        exit 1
+    fi
+}
+
+expect_obsolete_surface_rejected() {
+    local name=$1
+    local file=$2
+    local marker=$3
+    local fixture="$TMP/$name"
+    cp -a "$BASELINE" "$fixture"
+    printf '\n%s\n' "$marker" >>"$fixture/$file"
+    if run_gate "$fixture" >"$fixture.out" 2>&1; then
+        printf 'packaging obsolete-surface mutation unexpectedly passed: %s\n' "$name" >&2
+        exit 1
+    fi
+}
+
 expect_rejected product-version 'version = "0.3.0-rc.1"' 'version = "0.3.0-rc.2"' Cargo.toml
 expect_rejected publish-guard 'publish = false' 'publish = true' Cargo.toml
 expect_rejected lock-product-version $'name = "acl-proxy"\nversion = "0.3.0-rc.1"' $'name = "acl-proxy"\nversion = "0.3.0-rc.2"' Cargo.lock
@@ -163,6 +189,22 @@ expect_rejected gate-order $'cargo audit --no-fetch --no-yanked --deny warnings\
 expect_rejected archive-root 'acl-proxy-<version>-<acl12>/' 'acl-proxy-release/' README.md
 expect_rejected archive-hardcoded-sha 'acl-proxy-<version>-<acl12>/' 'acl-proxy-0.3.0-rc.1-0123456789ab/' README.md
 expect_rejected candidate-doc-version 'The `0.3.0-rc.1` candidate requires' 'The `0.3.0-rc.2` candidate requires' README.md
+expect_created_path_rejected obsolete-demo demos/auth-plugin-stdio/README.md
+obsolete_markers=(
+    'policy.external_auth_profiles'
+    'policy.approval_macros'
+    'external_auth_profile ='
+    '[[policy.rules.header_actions]]'
+)
+for file in README.md acl-proxy.sample.toml; do
+    surface=${file//[^[:alnum:]]/-}
+    for index in "${!obsolete_markers[@]}"; do
+        expect_obsolete_surface_rejected \
+            "obsolete-${surface}-${index}" \
+            "$file" \
+            "${obsolete_markers[$index]}"
+    done
+done
 expect_rejected archive-bin '  bin/acl-proxy-extract-capture-body' '  acl-proxy-extract-capture-body' README.md
 expect_rejected sample-export 'acl-proxy export-ca' 'ca-cert.pem' acl-proxy.sample.toml
 

@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
@@ -126,7 +127,7 @@ pub(super) enum ConfigLoadError {
 
 pub(super) fn load_config(explicit_path: Option<&Path>) -> Result<LoadedConfig, ConfigLoadError> {
     let environment_path = if explicit_path.is_none() {
-        env::var(CONFIG_PATH_ENV).ok()
+        env::var_os(CONFIG_PATH_ENV)
     } else {
         None
     };
@@ -156,7 +157,7 @@ pub(super) fn load_exact_config(path: &Path) -> Result<LoadedConfig, ConfigLoadE
 
 pub(super) fn select_config_path(
     explicit_path: Option<&Path>,
-    environment_path: Option<&str>,
+    environment_path: Option<&OsStr>,
 ) -> SelectedConfigPath {
     if let Some(path) = explicit_path {
         SelectedConfigPath {
@@ -329,14 +330,14 @@ default = "deny"
     #[test]
     fn config_path_precedence_is_explicit_then_environment_then_default() {
         assert_eq!(
-            select_config_path(Some(Path::new("cli.toml")), Some("env.toml")),
+            select_config_path(Some(Path::new("cli.toml")), Some(OsStr::new("env.toml")),),
             SelectedConfigPath {
                 path: PathBuf::from("cli.toml"),
                 source: ConfigPathSource::Explicit,
             }
         );
         assert_eq!(
-            select_config_path(None, Some("env.toml")),
+            select_config_path(None, Some(OsStr::new("env.toml"))),
             SelectedConfigPath {
                 path: PathBuf::from("env.toml"),
                 source: ConfigPathSource::Environment,

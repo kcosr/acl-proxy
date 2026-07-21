@@ -978,13 +978,19 @@ mod tests {
         ProviderOutputRegistry::activate(BTreeMap::from([
             (
                 "api_token".to_string(),
-                ProviderOutputPlan::Bearer { required },
+                ProviderOutputPlan::Bearer {
+                    required,
+                    transport_security:
+                        crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+                },
             ),
             (
                 "trace_id".to_string(),
                 ProviderOutputPlan::CustomHeader {
                     header: HeaderName::from_static("x-trace-id"),
                     required: false,
+                    transport_security:
+                        crate::config::compiler::CompiledTransportSecurity::TlsRequired,
                 },
             ),
         ]))

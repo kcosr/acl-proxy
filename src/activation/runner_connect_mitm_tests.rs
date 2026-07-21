@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
 use rustls::pki_types::ServerName;
 use tempfile::TempDir;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -128,6 +129,14 @@ fn mapped_network(
     )
 }
 
+fn assert_origin_not_dialed(origin: &StdTcpListener) {
+    match origin.accept() {
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+        Ok(_) => panic!("WebSocket extension policy dialed the origin"),
+        Err(error) => panic!("failed to inspect the origin listener: {error}"),
+    }
+}
+
 async fn start_product(
     directory: &TempDir,
     text: &str,
@@ -175,8 +184,22 @@ async fn write_websocket_frame<W: AsyncWrite + Unpin>(
     payload: &[u8],
     masked: bool,
 ) -> io::Result<()> {
+    write_websocket_frame_with_compression(writer, opcode, payload, masked, false).await
+}
+
+async fn write_websocket_frame_with_compression<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    opcode: u8,
+    payload: &[u8],
+    masked: bool,
+    compressed: bool,
+) -> io::Result<()> {
     assert!(payload.len() < 126);
-    let mut frame = vec![0x80 | opcode, u8::try_from(payload.len()).unwrap()];
+    let mut first = 0x80 | opcode;
+    if compressed {
+        first |= 0x40;
+    }
+    let mut frame = vec![first, u8::try_from(payload.len()).unwrap()];
     if masked {
         frame[1] |= 0x80;
         let mask = [0x11, 0x22, 0x33, 0x44];
@@ -194,8 +217,17 @@ async fn write_websocket_frame<W: AsyncWrite + Unpin>(
 }
 
 async fn read_websocket_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<(u8, Vec<u8>)> {
+    let (compressed, opcode, payload) = read_websocket_frame_with_compression(reader).await?;
+    assert!(!compressed, "expected an uncompressed WebSocket frame");
+    Ok((opcode, payload))
+}
+
+async fn read_websocket_frame_with_compression<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> io::Result<(bool, u8, Vec<u8>)> {
     let mut header = [0_u8; 2];
     reader.read_exact(&mut header).await?;
+    let compressed = header[0] & 0x40 != 0;
     let opcode = header[0] & 0x0f;
     let masked = header[1] & 0x80 != 0;
     let length = usize::from(header[1] & 0x7f);
@@ -211,7 +243,31 @@ async fn read_websocket_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Resul
             *byte ^= mask[index % mask.len()];
         }
     }
-    Ok((opcode, payload))
+    Ok((compressed, opcode, payload))
+}
+
+fn deflate_websocket_payload(payload: &[u8]) -> Vec<u8> {
+    const TAIL_LENGTH: usize = 4;
+    let mut encoder = Compress::new(Compression::default(), false);
+    let mut output = vec![0_u8; payload.len() * 2 + 64];
+    encoder
+        .compress(payload, &mut output, FlushCompress::Sync)
+        .unwrap();
+    output.truncate(usize::try_from(encoder.total_out()).unwrap() - TAIL_LENGTH);
+    output
+}
+
+fn inflate_websocket_payload(payload: &[u8], limit: usize) -> Vec<u8> {
+    const DEFLATE_TAIL: [u8; 4] = [0x00, 0x00, 0xff, 0xff];
+    let mut decoder = Decompress::new(false);
+    let mut input = payload.to_vec();
+    input.extend_from_slice(&DEFLATE_TAIL);
+    let mut output = vec![0_u8; limit];
+    decoder
+        .decompress(&input, &mut output, FlushDecompress::Sync)
+        .unwrap();
+    output.truncate(usize::try_from(decoder.total_out()).unwrap());
+    output
 }
 
 #[tokio::test]
@@ -317,6 +373,68 @@ async fn connect_mitm_forwards_inner_request_and_rejects_nested_connect() {
 }
 
 #[tokio::test]
+async fn connect_mitm_rejects_origin_form_host_mismatch_without_dialing_decoy() {
+    let _test = super::super::super::LISTENER_TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let target_origin = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let target_address = target_origin.local_addr().unwrap();
+    let decoy_origin = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let decoy_address = decoy_origin.local_addr().unwrap();
+    let (proxy, listener) = prebound_listener();
+    let target = format!("localhost:{}", target_address.port());
+    let decoy = format!("localhost:{}", decoy_address.port());
+    let ca = initialize_generated_ca(&directory.path().join("mitm"));
+    let text = connect_config(proxy, &target, "explicit_http", "", "", "");
+    let facts =
+        http_access_runtime::ForwardingNetworkFacts::new(vec![proxy], None, None, None).unwrap();
+    let target_url = http_access_url::canonicalize_http_url(&format!("https://{target}/")).unwrap();
+    let decoy_url = http_access_url::canonicalize_http_url(&format!("https://{decoy}/")).unwrap();
+    let network = Arc::new(
+        http_access_runtime::ForwardingDevHarness::new(facts)
+            .map_prebound(&target_url, target_address)
+            .unwrap()
+            .map_prebound(&decoy_url, decoy_address)
+            .unwrap()
+            .into_standalone_guard(),
+    );
+    let product = start_product(&directory, &text, listener, Some(network)).await;
+    let stream = open_connect(proxy, &target).await;
+    let connector = tls_connector(ca, &[b"http/1.1"]);
+    let mut tunnel = connector
+        .connect(ServerName::try_from("localhost").unwrap(), stream)
+        .await
+        .unwrap();
+
+    tunnel
+        .write_all(
+            format!("GET /must-reject HTTP/1.1\r\nHost: {decoy}\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let response = read_http_message(&mut tunnel).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 400 "),
+        "unexpected mismatched-Host response: {}",
+        String::from_utf8_lossy(&response)
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), decoy_origin.accept())
+            .await
+            .is_err(),
+        "mismatched inner Host dialed the decoy origin"
+    );
+
+    drop(tunnel);
+    product.shutdown().await;
+    assert!(StdTcpListener::bind(proxy).is_ok());
+}
+
+#[tokio::test]
 async fn connect_mitm_outer_tunnel_omits_global_origin_credentials() {
     const VARIABLE: &str = "ACL_PROXY_OUTER_CONNECT_IDENTITY";
     let _test = super::super::super::LISTENER_TEST_LOCK.lock().await;
@@ -347,6 +465,7 @@ async fn connect_mitm_outer_tunnel_omits_global_origin_credentials() {
     let credential_config = format!(
         r#"[[egress.credential_actions]]
 kind = "custom_header"
+transport_security = "tls_required"
 header = "x-aw-identity-token"
 credential = "outer_identity"
 
@@ -472,7 +591,7 @@ async fn connect_mitm_inner_h2_alpn_forwards_canonical_origin_request() {
 }
 
 #[tokio::test]
-async fn connect_mitm_websocket_applies_wire_redaction() {
+async fn connect_mitm_websocket_strips_unsafe_compression_and_redacts() {
     let _test = super::super::super::LISTENER_TEST_LOCK.lock().await;
     let directory = tempfile::tempdir().unwrap();
     let origin_identity = write_identity(directory.path(), "localhost");
@@ -485,13 +604,21 @@ async fn connect_mitm_websocket_applies_wire_redaction() {
         let (stream, _) = origin.accept().await.unwrap();
         let mut stream = acceptor.accept(stream).await.unwrap();
         let request = read_http_message(&mut stream).await;
-        assert!(String::from_utf8_lossy(&request)
-            .to_ascii_lowercase()
-            .contains("\r\nupgrade: websocket\r\n"));
+        let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+        assert!(request.contains("\r\nupgrade: websocket\r\n"));
+        assert!(
+            !request.contains("\r\nsec-websocket-extensions:"),
+            "unsafe compression offer reached the origin"
+        );
+        let negotiated_extensions = if request.contains("sec-websocket-extensions") {
+            "Sec-WebSocket-Extensions: permessage-deflate\r\n"
+        } else {
+            ""
+        };
         stream
-            .write_all(
-                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n",
-            )
+            .write_all(format!(
+                "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n{negotiated_extensions}\r\n"
+            ).as_bytes())
             .await
             .unwrap();
         let frame = read_websocket_frame(&mut stream).await.unwrap();
@@ -500,6 +627,68 @@ async fn connect_mitm_websocket_applies_wire_redaction() {
             .unwrap();
         frame
     });
+    let (proxy, listener) = prebound_listener();
+    let target = format!("localhost:{}", origin_address.port());
+    let ca = initialize_generated_ca(&directory.path().join("mitm"));
+    let redaction = r#"[redaction.profiles.wire]
+replacement = "[REDACTED]"
+max_frame_bytes = 1024
+max_message_bytes = 1024
+unsupported_extensions = "strip"
+rules = [{ literals = ["password"], payloads = "text" }]
+"#;
+    let text = connect_config(
+        proxy,
+        &target,
+        "explicit_http",
+        "",
+        "allow_upgrades = true\nredaction_profile = \"wire\"",
+        redaction,
+    );
+    let network = mapped_network(proxy, &format!("https://{target}/"), origin_address);
+    let product = start_product(&directory, &text, listener, Some(network)).await;
+    let stream = open_connect(proxy, &target).await;
+    let connector = tls_connector(ca, &[b"http/1.1"]);
+    let mut tunnel = connector
+        .connect(ServerName::try_from("localhost").unwrap(), stream)
+        .await
+        .unwrap();
+    tunnel
+        .write_all(
+            format!(
+                "GET /socket HTTP/1.1\r\nHost: {target}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let response = read_http_message(&mut tunnel).await;
+    assert!(response.starts_with(b"HTTP/1.1 101 "));
+    assert!(
+        !String::from_utf8_lossy(&response)
+            .to_ascii_lowercase()
+            .contains("\r\nsec-websocket-extensions:"),
+        "stripped compression was advertised to the downstream client"
+    );
+    write_websocket_frame(&mut tunnel, 0x1, b"client password", true)
+        .await
+        .unwrap();
+    let reply = read_websocket_frame(&mut tunnel).await.unwrap();
+    let seen = origin_task.await.unwrap();
+    assert_eq!(seen, (0x1, b"client [REDACTED]".to_vec()));
+    assert_eq!(reply, (0x1, b"server response".to_vec()));
+    drop(tunnel);
+    product.shutdown().await;
+    assert_eq!(product.forwarding_terminal_completions_for_test(), 1);
+}
+
+#[tokio::test]
+async fn connect_mitm_websocket_denies_unsafe_compression_before_origin_dial() {
+    let _test = super::super::super::LISTENER_TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let origin = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    origin.set_nonblocking(true).unwrap();
+    let origin_address = origin.local_addr().unwrap();
     let (proxy, listener) = prebound_listener();
     let target = format!("localhost:{}", origin_address.port());
     let ca = initialize_generated_ca(&directory.path().join("mitm"));
@@ -528,7 +717,217 @@ rules = [{ literals = ["password"], payloads = "text" }]
     tunnel
         .write_all(
             format!(
-                "GET /socket HTTP/1.1\r\nHost: {target}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+                "GET /socket HTTP/1.1\r\nHost: {target}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let response = read_http_message(&mut tunnel).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 500 "),
+        "unexpected unsafe-extension response: {}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_origin_not_dialed(&origin);
+    drop(tunnel);
+    product.shutdown().await;
+    assert_eq!(product.forwarding_terminal_completions_for_test(), 1);
+}
+
+#[tokio::test]
+async fn connect_mitm_websocket_malformed_extensions_strip_denies_before_origin_dial() {
+    let _test = super::super::super::LISTENER_TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let origin = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    origin.set_nonblocking(true).unwrap();
+    let origin_address = origin.local_addr().unwrap();
+    let (proxy, listener) = prebound_listener();
+    let target = format!("localhost:{}", origin_address.port());
+    let ca = initialize_generated_ca(&directory.path().join("mitm"));
+    let redaction = r#"[redaction.profiles.wire]
+replacement = "[REDACTED]"
+max_frame_bytes = 1024
+max_message_bytes = 1024
+unsupported_extensions = "strip"
+rules = [{ literals = ["password"], payloads = "text" }]
+"#;
+    let text = connect_config(
+        proxy,
+        &target,
+        "explicit_http",
+        "",
+        "allow_upgrades = true\nredaction_profile = \"wire\"",
+        redaction,
+    );
+    let network = mapped_network(proxy, &format!("https://{target}/"), origin_address);
+    let product = start_product(&directory, &text, listener, Some(network)).await;
+    let stream = open_connect(proxy, &target).await;
+    let connector = tls_connector(ca, &[b"http/1.1"]);
+    let mut tunnel = connector
+        .connect(ServerName::try_from("localhost").unwrap(), stream)
+        .await
+        .unwrap();
+    tunnel
+        .write_all(
+            format!(
+                "GET /socket HTTP/1.1\r\nHost: {target}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Extensions: permessage-deflate;\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let response = read_http_message(&mut tunnel).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 500 "),
+        "unexpected malformed-extension response: {}",
+        String::from_utf8_lossy(&response)
+    );
+    assert_origin_not_dialed(&origin);
+    drop(tunnel);
+    product.shutdown().await;
+    assert_eq!(product.forwarding_terminal_completions_for_test(), 1);
+}
+
+#[tokio::test]
+async fn connect_mitm_websocket_rejects_unsafe_origin_extension_before_101() {
+    let _test = super::super::super::LISTENER_TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let origin_identity = write_identity(directory.path(), "localhost");
+    let origin = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let origin_address = origin.local_addr().unwrap();
+    let acceptor = tls_acceptor(&origin_identity, &[b"http/1.1"]);
+    let origin_task = tokio::spawn(async move {
+        let (stream, _) = origin.accept().await.unwrap();
+        let mut stream = acceptor.accept(stream).await.unwrap();
+        let request = read_http_message(&mut stream).await;
+        let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+        assert!(request.contains(
+            "\r\nsec-websocket-extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover\r\n"
+        ));
+        stream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n",
+            )
+            .await
+            .unwrap();
+    });
+    let (proxy, listener) = prebound_listener();
+    let target = format!("localhost:{}", origin_address.port());
+    let ca = initialize_generated_ca(&directory.path().join("mitm"));
+    let redaction = r#"[redaction.profiles.wire]
+replacement = "[REDACTED]"
+max_frame_bytes = 1024
+max_message_bytes = 1024
+allow_permessage_deflate = true
+rules = [{ literals = ["password"], payloads = "text" }]
+"#;
+    let text = connect_config(
+        proxy,
+        &target,
+        "explicit_http",
+        "",
+        "allow_upgrades = true\nredaction_profile = \"wire\"",
+        redaction,
+    );
+    let network = mapped_network(proxy, &format!("https://{target}/"), origin_address);
+    let product = start_product(&directory, &text, listener, Some(network)).await;
+    let stream = open_connect(proxy, &target).await;
+    let connector = tls_connector(ca, &[b"http/1.1"]);
+    let mut tunnel = connector
+        .connect(ServerName::try_from("localhost").unwrap(), stream)
+        .await
+        .unwrap();
+    tunnel
+        .write_all(
+            format!(
+                "GET /socket HTTP/1.1\r\nHost: {target}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let response = read_http_message(&mut tunnel).await;
+    assert!(
+        response.starts_with(b"HTTP/1.1 500 "),
+        "unsafe origin extension reached downstream publication: {}",
+        String::from_utf8_lossy(&response)
+    );
+    origin_task.await.unwrap();
+    drop(tunnel);
+    product.shutdown().await;
+    assert_eq!(product.forwarding_terminal_completions_for_test(), 1);
+}
+
+#[tokio::test]
+async fn connect_mitm_websocket_redacts_safe_no_context_compression() {
+    let _test = super::super::super::LISTENER_TEST_LOCK.lock().await;
+    let directory = tempfile::tempdir().unwrap();
+    let origin_identity = write_identity(directory.path(), "localhost");
+    let origin = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let origin_address = origin.local_addr().unwrap();
+    let acceptor = tls_acceptor(&origin_identity, &[b"http/1.1"]);
+    let origin_task = tokio::spawn(async move {
+        let (stream, _) = origin.accept().await.unwrap();
+        let mut stream = acceptor.accept(stream).await.unwrap();
+        let request = read_http_message(&mut stream).await;
+        let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+        assert!(request.contains("\r\nupgrade: websocket\r\n"));
+        assert!(request.contains(
+            "\r\nsec-websocket-extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover\r\n"
+        ));
+        stream
+            .write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let (compressed, opcode, payload) =
+            read_websocket_frame_with_compression(&mut stream).await.unwrap();
+        assert!(
+            !compressed,
+            "redacted client messages must use the legal uncompressed form"
+        );
+        let response = deflate_websocket_payload(b"server response");
+        write_websocket_frame_with_compression(&mut stream, 0x1, &response, false, true)
+            .await
+            .unwrap();
+        (opcode, payload)
+    });
+    let (proxy, listener) = prebound_listener();
+    let target = format!("localhost:{}", origin_address.port());
+    let ca = initialize_generated_ca(&directory.path().join("mitm"));
+    let redaction = r#"[redaction.profiles.wire]
+replacement = "[REDACTED]"
+max_frame_bytes = 1024
+max_message_bytes = 1024
+allow_permessage_deflate = true
+rules = [{ literals = ["password"], payloads = "text" }]
+"#;
+    let text = connect_config(
+        proxy,
+        &target,
+        "explicit_http",
+        "",
+        "allow_upgrades = true\nredaction_profile = \"wire\"",
+        redaction,
+    );
+    let network = mapped_network(proxy, &format!("https://{target}/"), origin_address);
+    let product = start_product(&directory, &text, listener, Some(network)).await;
+    let stream = open_connect(proxy, &target).await;
+    let connector = tls_connector(ca, &[b"http/1.1"]);
+    let mut tunnel = connector
+        .connect(ServerName::try_from("localhost").unwrap(), stream)
+        .await
+        .unwrap();
+    tunnel
+        .write_all(
+            format!(
+                "GET /socket HTTP/1.1\r\nHost: {target}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover\r\n\r\n"
             )
             .as_bytes(),
         )
@@ -536,13 +935,32 @@ rules = [{ literals = ["password"], payloads = "text" }]
         .unwrap();
     let response = read_http_message(&mut tunnel).await;
     assert!(response.starts_with(b"HTTP/1.1 101 "));
-    write_websocket_frame(&mut tunnel, 0x1, b"client password", true)
+    assert!(
+        String::from_utf8_lossy(&response)
+            .to_ascii_lowercase()
+            .contains(
+                "\r\nsec-websocket-extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover\r\n"
+            ),
+        "safe no-context compression was not advertised downstream"
+    );
+    let compressed = deflate_websocket_payload(b"client password");
+    write_websocket_frame_with_compression(&mut tunnel, 0x1, &compressed, true, true)
         .await
         .unwrap();
-    let reply = read_websocket_frame(&mut tunnel).await.unwrap();
+    let (reply_compressed, reply_opcode, reply_payload) =
+        read_websocket_frame_with_compression(&mut tunnel)
+            .await
+            .unwrap();
+    assert!(
+        reply_compressed,
+        "negotiated server compression was not relayed downstream"
+    );
     let seen = origin_task.await.unwrap();
     assert_eq!(seen, (0x1, b"client [REDACTED]".to_vec()));
-    assert_eq!(reply, (0x1, b"server response".to_vec()));
+    assert_eq!(
+        (reply_opcode, inflate_websocket_payload(&reply_payload, 1024)),
+        (0x1, b"server response".to_vec())
+    );
     drop(tunnel);
     product.shutdown().await;
     assert_eq!(product.forwarding_terminal_completions_for_test(), 1);

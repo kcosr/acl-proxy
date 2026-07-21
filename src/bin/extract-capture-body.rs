@@ -52,6 +52,18 @@ fn run(path: &Path) -> Result<(), String> {
         }
     })?;
 
+    if record.body_truncated == Some(true) {
+        let original_length = record
+            .body
+            .as_ref()
+            .expect("validated capture record with bodyTruncated has a body")
+            .length;
+        eprintln!(
+            "warning: capture body is truncated; emitting {} of {original_length} bytes",
+            bytes.len()
+        );
+    }
+
     if let Some(content_encoding) = record
         .body
         .as_ref()

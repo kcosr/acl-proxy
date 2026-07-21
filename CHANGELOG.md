@@ -29,6 +29,9 @@
   sanitized production topology fixtures.
 - Added ordered file-backed CA-chain support, short-lived generated leaf
   certificates, and bounded optional leaf-certificate persistence.
+- Added typed WebSocket `unsupported_extensions = "deny" | "strip"` redaction
+  policy, defaulting to fail-closed denial while allowing unsafe offers to be
+  removed before origin forwarding. ([#1](https://github.com/kcosr/acl-proxy-access-runtime/pull/1))
 
 ### Changed
 
@@ -56,6 +59,8 @@
 - Made capture publication collision-safe and retention-atomic across threads,
   path aliases, and overlapping proxy processes; abandoned temp files no longer
   consume retention limits.
+- Restored `response.allowed` capture records for sanitized listener-generated
+  forwarding failures while abandoning incomplete request and upstream taps.
 
 ## [0.2.0] - 2026-06-25
 

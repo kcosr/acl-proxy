@@ -550,6 +550,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use http_access_url::canonicalize_http_url;
     use tokio::sync::oneshot;
 
     use super::*;
@@ -628,11 +629,14 @@ mod tests {
         let mut outputs = BTreeMap::new();
         outputs.insert(
             "api_token".to_string(),
-            ProviderOutputPlan::Bearer { required: true },
+            ProviderOutputPlan::Bearer {
+                required: true,
+                transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+            },
         );
-        WebhookProvider::activate(
+        WebhookProvider::activate_for_test(
             WebhookProviderPlan {
-                url: "http://provider.test/authorize".to_string(),
+                url: canonicalize_http_url("http://provider.test/authorize").unwrap(),
                 timeout: Duration::from_secs(30),
                 on_failure: CompiledProviderFailureMode::Deny,
                 include_headers: Vec::new(),
@@ -641,6 +645,7 @@ mod tests {
                 outputs,
                 tls: None,
             },
+            http_access_types::PolicyGeneration::new(7).unwrap(),
             || false,
         )
         .unwrap()

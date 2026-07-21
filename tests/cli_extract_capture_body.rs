@@ -2,12 +2,13 @@ use std::fs::File;
 use std::io::Write;
 use std::process::Command;
 
-use acl_proxy::capture::{CaptureBody, CaptureKind, CaptureRecord};
+use acl_proxy::capture::{CaptureBody, CaptureBodyOmission, CaptureKind, CaptureRecord};
 use assert_cmd::prelude::*;
 use predicates::str::contains;
 use tempfile::{NamedTempFile, TempDir};
 
 fn sample_record(body: Option<CaptureBody>) -> CaptureRecord {
+    let body_omission = body.is_none().then_some(CaptureBodyOmission::Empty {});
     CaptureRecord {
         timestamp: "2024-01-01T00:00:00Z".to_string(),
         request_id: "req-1".to_string(),
@@ -24,8 +25,8 @@ fn sample_record(body: Option<CaptureBody>) -> CaptureRecord {
         headers: None,
         body,
         body_truncated: None,
-        provider_replacement_omitted: None,
-        provider_replacement_size: None,
+        body_omission,
+        trailers_omitted: None,
     }
 }
 
@@ -86,6 +87,37 @@ fn cli_warns_when_capture_body_remains_content_encoded() {
         .success()
         .stdout(contains("compressed bytes"))
         .stderr(contains("Content-Encoding \"gzip\""));
+}
+
+#[test]
+fn cli_warns_when_output_is_only_a_truncated_prefix() {
+    let body_bytes = b"captured prefix";
+    use base64::engine::general_purpose;
+    use base64::Engine as _;
+
+    let body = CaptureBody {
+        encoding: "base64".to_string(),
+        length: 4096,
+        data: general_purpose::STANDARD.encode(body_bytes),
+        content_type: Some("text/plain".to_string()),
+        content_encoding: None,
+    };
+    let mut record = sample_record(Some(body));
+    record.body_truncated = Some(true);
+    let json = serde_json::to_string(&record).expect("serialize record");
+
+    let mut file = NamedTempFile::new().expect("create temp capture file");
+    write!(file, "{json}").expect("write capture json");
+
+    let mut cmd = Command::new(assert_cmd::cargo_bin!("acl-proxy-extract-capture-body"));
+    cmd.arg(file.path());
+
+    cmd.assert()
+        .success()
+        .stdout(body_bytes.as_slice())
+        .stderr(contains(
+            "warning: capture body is truncated; emitting 15 of 4096 bytes",
+        ));
 }
 
 #[test]

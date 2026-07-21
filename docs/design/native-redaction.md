@@ -53,7 +53,7 @@ For a matched HTTP/1.1 WebSocket upgrade, acl-proxy validates/sanitizes the hand
 
 The relay buffers one complete client-to-upstream data message at a time, decompresses `permessage-deflate` messages when negotiated, applies the shared redaction profile, recompresses if needed, and reframes before forwarding upstream. Upstream-to-client data frames are forwarded without redaction or message reassembly, though the per-frame safety limit still applies in both directions.
 
-`permessage-deflate` remains opt-in. When enabled, acl-proxy only permits the no-context-takeover subset so each message is independently decompressible/recompressible. Unsupported extension negotiation is denied or stripped according to the profile.
+`permessage-deflate` remains opt-in. When enabled, acl-proxy only permits the no-context-takeover subset so each message is independently decompressible/recompressible. Before the upgrade is forwarded, a well-formed offer that could negotiate any unsupported mode is denied by default or has every `Sec-WebSocket-Extensions` field removed when `unsupported_extensions = "strip"`. Malformed extension syntax always fails closed. The upstream response is checked against the exact forwarded offer, and any response-side attempt to select an unoffered or context-takeover mode is rejected before the downstream `101` is committed.
 
 ## Non-Goals
 

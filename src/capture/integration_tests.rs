@@ -36,8 +36,8 @@ fn capture_record(request_id: &str) -> CaptureRecord {
         headers: None,
         body: None,
         body_truncated: None,
-        provider_replacement_omitted: None,
-        provider_replacement_size: None,
+        body_omission: Some(super::CaptureBodyOmission::Empty {}),
+        trailers_omitted: None,
     }
 }
 
@@ -99,6 +99,7 @@ fn capture_write_creates_expected_file_and_json() {
         content_type: Some("text/plain".to_string()),
         content_encoding: None,
     });
+    record.body_omission = None;
 
     let sink = capture_sink(
         &capture_dir,
@@ -128,7 +129,7 @@ fn capture_write_prunes_by_max_files() {
     let temp_dir = TempDir::new().expect("create temp dir");
     let capture_dir = temp_dir.path().join("captures");
 
-    let sink = capture_sink(&capture_dir, "{requestId}.json", 2, u64::MAX);
+    let sink = capture_sink(&capture_dir, "{requestId}-{suffix}.json", 2, u64::MAX);
 
     for request_id in ["req-001", "req-002", "req-003"] {
         let record = capture_record(request_id);
@@ -137,7 +138,10 @@ fn capture_write_prunes_by_max_files() {
 
     assert_eq!(
         capture_file_names(&capture_dir),
-        vec!["req-002.json".to_string(), "req-003.json".to_string()]
+        vec![
+            "req-002-req.json".to_string(),
+            "req-003-req.json".to_string()
+        ]
     );
 }
 
@@ -146,7 +150,7 @@ fn capture_write_prunes_by_max_total_bytes() {
     let temp_dir = TempDir::new().expect("create temp dir");
     let capture_dir = temp_dir.path().join("captures");
 
-    let sink = capture_sink(&capture_dir, "{requestId}.json", 10, 1);
+    let sink = capture_sink(&capture_dir, "{requestId}-{suffix}.json", 10, 1);
 
     for request_id in ["req-001", "req-002", "req-003"] {
         let record = capture_record(request_id);
@@ -155,7 +159,7 @@ fn capture_write_prunes_by_max_total_bytes() {
 
     assert_eq!(
         capture_file_names(&capture_dir),
-        vec!["req-003.json".to_string()]
+        vec!["req-003-req.json".to_string()]
     );
 }
 
@@ -164,7 +168,12 @@ fn concurrent_capture_writes_prune_as_one_transaction_per_directory() {
     let temp_dir = TempDir::new().expect("create temp dir");
     let capture_dir = temp_dir.path().join("captures");
 
-    let sink = Arc::new(capture_sink(&capture_dir, "{requestId}.json", 1, u64::MAX));
+    let sink = Arc::new(capture_sink(
+        &capture_dir,
+        "{requestId}-{suffix}.json",
+        1,
+        u64::MAX,
+    ));
     let barrier = Arc::new(Barrier::new(9));
 
     let writers: Vec<_> = (0..8)
@@ -201,10 +210,15 @@ fn concurrent_filename_collisions_keep_complete_records() {
     let temp_dir = TempDir::new().expect("create temp dir");
     let capture_dir = temp_dir.path().join("captures");
 
-    let sink = Arc::new(capture_sink(&capture_dir, "capture.json", 10, u64::MAX));
+    let sink = Arc::new(capture_sink(
+        &capture_dir,
+        "capture-{requestId}-{suffix}.json",
+        10,
+        u64::MAX,
+    ));
     let barrier = Arc::new(Barrier::new(3));
 
-    let writers: Vec<_> = ["first", "second"]
+    let writers: Vec<_> = ["collision/", "collision?"]
         .into_iter()
         .map(|request_id| {
             let sink = Arc::clone(&sink);
@@ -226,13 +240,16 @@ fn concurrent_filename_collisions_keep_complete_records() {
 
     assert_eq!(
         capture_file_names(&capture_dir),
-        vec!["capture.1.json".to_string(), "capture.json".to_string()]
+        vec![
+            "capture-collision_-req.1.json".to_string(),
+            "capture-collision_-req.json".to_string()
+        ]
     );
     assert_eq!(
         paths,
         vec![
-            capture_dir.join("capture.1.json"),
-            capture_dir.join("capture.json")
+            capture_dir.join("capture-collision_-req.1.json"),
+            capture_dir.join("capture-collision_-req.json")
         ]
     );
 
@@ -246,7 +263,7 @@ fn concurrent_filename_collisions_keep_complete_records() {
         })
         .collect();
     request_ids.sort();
-    assert_eq!(request_ids, vec!["first", "second"]);
+    assert_eq!(request_ids, vec!["collision/", "collision?"]);
     assert!(capture_file_names(&capture_dir)
         .iter()
         .all(|name| !name.starts_with('.')));
@@ -263,16 +280,21 @@ fn aliased_capture_directories_share_collision_and_retention_transaction() {
     let capture_dir = temp_dir.path().join("captures");
     fs::create_dir(&capture_dir).expect("create capture dir");
 
-    let direct = capture_sink(&capture_dir, "capture.json", 10, u64::MAX);
+    let direct = capture_sink(
+        &capture_dir,
+        "capture-{requestId}-{suffix}.json",
+        10,
+        u64::MAX,
+    );
     let aliased = capture_sink(
         &capture_dir.join("..").join("captures"),
-        "capture.json",
+        "capture-{requestId}-{suffix}.json",
         10,
         u64::MAX,
     );
 
     let barrier = Arc::new(Barrier::new(3));
-    let writers: Vec<_> = [(direct, "direct"), (aliased, "aliased")]
+    let writers: Vec<_> = [(direct, "aliased/"), (aliased, "aliased?")]
         .into_iter()
         .map(|(sink, request_id)| {
             let barrier = Arc::clone(&barrier);
@@ -290,7 +312,10 @@ fn aliased_capture_directories_share_collision_and_retention_transaction() {
 
     assert_eq!(
         capture_file_names(&capture_dir),
-        vec!["capture.1.json".to_string(), "capture.json".to_string()]
+        vec![
+            "capture-aliased_-req.1.json".to_string(),
+            "capture-aliased_-req.json".to_string()
+        ]
     );
 }
 
@@ -302,14 +327,17 @@ fn stale_internal_temp_files_do_not_consume_retention() {
     let stale_temp = capture_dir.join(".capture.123.456.tmp");
     fs::write(&stale_temp, vec![b'x'; 4096]).expect("seed stale capture temp");
 
-    let sink = capture_sink(&capture_dir, "capture.json", 1, 1024);
+    let sink = capture_sink(&capture_dir, "capture-{requestId}-{suffix}.json", 1, 1024);
 
     let path = crate::capture::write_capture_record(&sink, &capture_record("current"))
         .expect("write capture with stale temp");
 
-    assert_eq!(path.file_name().unwrap(), "capture.json");
+    assert_eq!(path.file_name().unwrap(), "capture-current-req.json");
     assert!(!stale_temp.exists(), "stale temp must be cleaned");
-    assert_eq!(capture_file_names(&capture_dir), vec!["capture.json"]);
+    assert_eq!(
+        capture_file_names(&capture_dir),
+        vec!["capture-current-req.json"]
+    );
     assert!(capture_dir.join(".capture-state/lock").is_file());
 }
 
@@ -319,13 +347,22 @@ fn overlapping_processes_preserve_colliding_capture_records() {
     let capture_dir = temp_dir.path().join("captures");
     let test_binary = std::env::current_exe().expect("locate capture test binary");
 
-    let mut children: Vec<_> = (0..6)
-        .map(|index| {
+    let authored_request_ids = [
+        "process/",
+        "process\\",
+        "process?",
+        "process*",
+        "process:",
+        "process|",
+    ];
+    let mut children: Vec<_> = authored_request_ids
+        .iter()
+        .map(|request_id| {
             Command::new(&test_binary)
                 .arg("capture::integration_tests::capture_subprocess_writer")
                 .arg("--exact")
                 .env("ACL_PROXY_CAPTURE_TEST_DIR", &capture_dir)
-                .env("ACL_PROXY_CAPTURE_TEST_ID", format!("process-{index}"))
+                .env("ACL_PROXY_CAPTURE_TEST_ID", request_id)
                 .spawn()
                 .expect("spawn capture writer process")
         })
@@ -337,7 +374,7 @@ fn overlapping_processes_preserve_colliding_capture_records() {
 
     let names = capture_file_names(&capture_dir);
     assert_eq!(names.len(), 6);
-    let mut request_ids: Vec<_> = names
+    let mut decoded_request_ids: Vec<_> = names
         .iter()
         .map(|name| {
             let contents = fs::read_to_string(capture_dir.join(name)).expect("read capture");
@@ -346,13 +383,10 @@ fn overlapping_processes_preserve_colliding_capture_records() {
                 .request_id
         })
         .collect();
-    request_ids.sort();
-    assert_eq!(
-        request_ids,
-        (0..6)
-            .map(|index| format!("process-{index}"))
-            .collect::<Vec<_>>()
-    );
+    decoded_request_ids.sort();
+    let mut expected_request_ids = authored_request_ids.to_vec();
+    expected_request_ids.sort();
+    assert_eq!(decoded_request_ids, expected_request_ids);
 }
 
 #[test]
@@ -361,19 +395,29 @@ fn overlapping_processes_serialize_retention_limits() {
     let capture_dir = temp_dir.path().join("captures");
     let test_binary = std::env::current_exe().expect("locate capture test binary");
 
-    let mut children: Vec<_> = (0..8)
-        .map(|index| {
-            Command::new(&test_binary)
-                .arg("capture::integration_tests::capture_subprocess_writer")
-                .arg("--exact")
-                .env("ACL_PROXY_CAPTURE_TEST_DIR", &capture_dir)
-                .env("ACL_PROXY_CAPTURE_TEST_ID", format!("retention-{index}"))
-                .env("ACL_PROXY_CAPTURE_TEST_MAX_FILES", "2")
-                .env("ACL_PROXY_CAPTURE_TEST_MAX_BYTES", "1024")
-                .spawn()
-                .expect("spawn retained capture writer process")
-        })
-        .collect();
+    let mut children: Vec<_> = [
+        "retention/",
+        "retention\\",
+        "retention?",
+        "retention*",
+        "retention:",
+        "retention|",
+        "retention<",
+        "retention>",
+    ]
+    .into_iter()
+    .map(|request_id| {
+        Command::new(&test_binary)
+            .arg("capture::integration_tests::capture_subprocess_writer")
+            .arg("--exact")
+            .env("ACL_PROXY_CAPTURE_TEST_DIR", &capture_dir)
+            .env("ACL_PROXY_CAPTURE_TEST_ID", request_id)
+            .env("ACL_PROXY_CAPTURE_TEST_MAX_FILES", "2")
+            .env("ACL_PROXY_CAPTURE_TEST_MAX_BYTES", "1024")
+            .spawn()
+            .expect("spawn retained capture writer process")
+    })
+    .collect();
 
     for child in &mut children {
         assert!(child.wait().expect("wait for capture writer").success());
@@ -413,7 +457,7 @@ fn capture_subprocess_writer() {
         .unwrap_or(u64::MAX);
     let sink = capture_sink(
         std::path::Path::new(&capture_dir),
-        "capture.json",
+        "capture-{requestId}-{suffix}.json",
         max_files,
         max_total_bytes,
     );

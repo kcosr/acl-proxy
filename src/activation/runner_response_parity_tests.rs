@@ -88,6 +88,74 @@ async fn response_send_raw(proxy: SocketAddr, request: &[u8]) -> Vec<u8> {
     response_read_to_close(stream).await
 }
 
+fn local_failure_capture_config() -> &'static str {
+    r#"[redaction.profiles.failure_capture]
+replacement = "[MASKED]"
+rules = [{ literals = ["request failed", "upstream failed", "service unavailable", "request timed out"], payloads = "both" }]
+
+[observation.capture]
+events = ["request.allowed", "response.allowed", "request.denied", "response.denied"]
+redaction_profile = "failure_capture"
+directory = "captures"
+max_body_bytes = 1048576
+max_inflight_body_bytes = 134217728
+max_pending_records = 32
+max_files = 32
+max_total_bytes = 1048576
+"#
+}
+
+fn response_capture_records(directory: &TempDir) -> Vec<crate::capture::CaptureRecord> {
+    let mut records = Vec::new();
+    for entry in fs::read_dir(directory.path().join("captures")).unwrap() {
+        let path = entry.unwrap().path();
+        if !path.is_file() {
+            continue;
+        }
+        let contents = fs::read_to_string(path).unwrap();
+        records.extend(
+            contents
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_str(line).unwrap()),
+        );
+    }
+    records
+}
+
+fn assert_sanitized_local_failure_capture(
+    records: &[crate::capture::CaptureRecord],
+    url: &str,
+    status: u16,
+    status_message: &str,
+    original_body_len: usize,
+    decision: crate::capture::CaptureDecision,
+) {
+    let captured = records
+        .iter()
+        .find(|record| {
+            record.kind == crate::capture::CaptureKind::Response
+                && record.url == url
+                && record.status_code == Some(status)
+        })
+        .unwrap_or_else(|| panic!("missing local {status} capture for {url}: {records:?}"));
+    assert_eq!(captured.decision, decision);
+    assert_eq!(captured.status_message.as_deref(), Some(status_message));
+    assert_eq!(captured.decode_body_bytes().unwrap(), b"[MASKED]\n");
+    assert!(captured.body_omission.is_none());
+    let headers = captured.headers.as_ref().unwrap();
+    assert_eq!(
+        headers.get("content-type"),
+        Some(&serde_json::Value::String(
+            "text/plain; charset=utf-8".to_owned()
+        ))
+    );
+    assert_eq!(
+        headers.get("content-length"),
+        Some(&serde_json::Value::String(original_body_len.to_string()))
+    );
+}
+
 async fn response_read_head(stream: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
     let mut head = Vec::new();
     let mut byte = [0_u8; 1];
@@ -196,6 +264,105 @@ default = "allow"
     assert!(!wire.contains("connection: x-remove"));
     assert!(!wire.contains("x-remove: private"));
     product.shutdown().await;
+}
+
+#[tokio::test]
+async fn forwarding_capture_marks_only_nonempty_request_and_response_trailers_omitted() {
+    let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+    let (proxy, listener) = response_prebound_listener();
+    let config = response_base_config(
+        proxy,
+        &format!(
+            r#"[policy]
+default = "allow"
+
+{}"#,
+            local_failure_capture_config()
+        ),
+    );
+    let (directory, product) = start_response_product(&config, listener, []).await;
+
+    for with_trailers in [true, false] {
+        let path = if with_trailers {
+            "/with-trailers"
+        } else {
+            "/without-trailers"
+        };
+        let target =
+            http_access_url::canonicalize_http_url(&format!("http://capture-trailers.test{path}"))
+                .unwrap();
+        crate::proxy::forwarding_adapter::exercise_trailer_observation_for_test(
+            Arc::clone(&product.observation_runtime),
+            product.observation_runtime.current_capture_epoch(),
+            if with_trailers {
+                "capture-with-trailers"
+            } else {
+                "capture-without-trailers"
+            },
+            &target,
+            with_trailers,
+        );
+    }
+
+    product.shutdown().await;
+    let records = response_capture_records(&directory);
+    for with_trailers in [true, false] {
+        let path = if with_trailers {
+            "/with-trailers"
+        } else {
+            "/without-trailers"
+        };
+        let url = format!("http://capture-trailers.test{path}");
+        for kind in [
+            crate::capture::CaptureKind::Request,
+            crate::capture::CaptureKind::Response,
+        ] {
+            let captured = records
+                .iter()
+                .find(|record| record.kind == kind && record.url == url)
+                .unwrap_or_else(|| panic!("missing {kind:?} capture for {url}: {records:?}"));
+            assert_eq!(captured.trailers_omitted, with_trailers.then_some(true));
+        }
+    }
+}
+
+#[tokio::test]
+async fn websocket_capture_records_fragment_allocation_failure_without_body() {
+    let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+    let (proxy, listener) = response_prebound_listener();
+    let config = response_base_config(
+        proxy,
+        &format!(
+            r#"[policy]
+default = "allow"
+
+{}"#,
+            local_failure_capture_config()
+        ),
+    );
+    let (directory, product) = start_response_product(&config, listener, []).await;
+    let target =
+        http_access_url::canonicalize_http_url("http://capture-websocket.test/allocation")
+            .unwrap();
+    crate::proxy::observation_adapter::exercise_upgrade_allocation_failure_for_test(
+        Arc::clone(&product.observation_runtime),
+        product.observation_runtime.current_capture_epoch(),
+        "capture-allocation-failure",
+        &target,
+    );
+
+    product.shutdown().await;
+    let records = response_capture_records(&directory);
+    let captured = records
+        .iter()
+        .find(|record| record.request_id == "capture-allocation-failure-ws-request-0")
+        .unwrap_or_else(|| panic!("missing WebSocket allocation-failure capture: {records:?}"));
+    assert!(captured.body.is_none());
+    assert!(captured.body_truncated.is_none());
+    assert_eq!(
+        captured.body_omission,
+        Some(crate::capture::CaptureBodyOmission::ResourceExhausted {})
+    );
 }
 
 #[tokio::test]
@@ -417,6 +584,285 @@ urls = ["http://{unavailable_origin}/failure"]
         assert_eq!(response_decoded_body(&response), expected_body);
     }
     product.shutdown().await;
+}
+
+#[tokio::test]
+async fn closed_origin_captures_exact_local_502_and_abandons_incomplete_request() {
+    let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+    let (proxy, listener) = response_prebound_listener();
+    let closed = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let unavailable_origin = closed.local_addr().unwrap();
+    drop(closed);
+    let policy = format!(
+        r#"{}
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "allow-unavailable-origin"
+decision = "allow"
+urls = ["http://{unavailable_origin}/failure"]
+methods = ["POST"]
+"#,
+        local_failure_capture_config(),
+    );
+    let config = response_base_config(proxy, &policy);
+    let (directory, product) = start_response_product(
+        &config,
+        listener,
+        [(format!("http://{unavailable_origin}/"), unavailable_origin)],
+    )
+    .await;
+    let request = format!(
+        "POST http://{unavailable_origin}/failure HTTP/1.1\r\nHost: {unavailable_origin}\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n7\r\npartial\r\n"
+    );
+
+    let response = response_send_raw(proxy, request.as_bytes()).await;
+    assert!(response.starts_with(b"HTTP/1.1 502"));
+    assert_eq!(response_decoded_body(&response), b"upstream failed\n");
+
+    product.shutdown().await;
+    let records = response_capture_records(&directory);
+    let request = records
+        .iter()
+        .find(|record| record.kind == crate::capture::CaptureKind::Request)
+        .expect("missing abandoned request metadata");
+    assert!(request.body.is_none());
+    assert!(request.body_truncated.is_none());
+    assert_eq!(
+        request.body_omission,
+        Some(crate::capture::CaptureBodyOmission::Incomplete {})
+    );
+    assert_sanitized_local_failure_capture(
+        &records,
+        &format!("http://{unavailable_origin}/failure"),
+        502,
+        "Bad Gateway",
+        b"upstream failed\n".len(),
+        crate::capture::CaptureDecision::Allow,
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn disappeared_file_credential_captures_sanitized_local_500() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const SOURCE_SECRET: &str = "caller-source-secret-500";
+    const INJECTED_SECRET: &str = "injected-file-secret-500";
+
+    let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+    let (proxy, listener) = response_prebound_listener();
+    let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let origin = origin_listener.local_addr().unwrap();
+    let origin_task = tokio::spawn(async move {
+        let (mut stream, _) = origin_listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut bytes))
+            .await
+            .expect("credential failure did not close the origin connection")
+            .unwrap();
+        assert!(bytes.is_empty(), "credential failure emitted request bytes");
+    });
+    let policy = format!(
+        r#"{}
+[credentials.sources.rotating]
+source = "file"
+path = "rotating-token"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "missing-credential"
+decision = "allow"
+urls = ["http://{origin}/failure"]
+methods = ["GET"]
+
+[[policy.rules.credential_actions]]
+kind = "bearer"
+transport_security = "cleartext_allowed"
+credential = "rotating"
+"#,
+        local_failure_capture_config(),
+    );
+    let (directory, product) = start_response_product(
+        &response_base_config(proxy, &policy),
+        listener,
+        [(format!("http://{origin}/"), origin)],
+    )
+    .await;
+    let credential = directory.path().join("rotating-token");
+    fs::write(&credential, INJECTED_SECRET).unwrap();
+    fs::set_permissions(&credential, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::remove_file(&credential).unwrap();
+
+    let url = format!("http://{origin}/failure");
+    let request = format!(
+        "GET {url} HTTP/1.1\r\nHost: {origin}\r\nAuthorization: Bearer {SOURCE_SECRET}\r\nConnection: close\r\n\r\n"
+    );
+    let response = response_send_raw(proxy, request.as_bytes()).await;
+    assert!(response.starts_with(b"HTTP/1.1 500"));
+    assert_eq!(response_decoded_body(&response), b"request failed\n");
+    origin_task.await.unwrap();
+
+    product.shutdown().await;
+    let records = response_capture_records(&directory);
+    let request_capture = records
+        .iter()
+        .find(|record| record.kind == crate::capture::CaptureKind::Request && record.url == url)
+        .expect("missing failed request capture");
+    let request_json = serde_json::to_string(request_capture).unwrap();
+    assert!(!request_json.contains(SOURCE_SECRET));
+    assert!(!request_json.contains(INJECTED_SECRET));
+    assert_sanitized_local_failure_capture(
+        &records,
+        &url,
+        500,
+        "Internal Server Error",
+        b"request failed\n".len(),
+        crate::capture::CaptureDecision::Allow,
+    );
+}
+
+#[tokio::test]
+async fn request_head_mutation_failure_captures_typed_metadata_only_omission() {
+    let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+    let (proxy, listener) = response_prebound_listener();
+    let unused_origin = StdTcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    unused_origin.set_nonblocking(true).unwrap();
+    let origin = unused_origin.local_addr().unwrap();
+    let replacement = "r".repeat(64 * 1024);
+    let policy = format!(
+        r#"{}
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "head-mutation-limit"
+decision = "allow"
+urls = ["http://{origin}/head-failure"]
+methods = ["GET"]
+
+[[policy.rules.request_headers]]
+operation = "replace"
+when = "always"
+name = "x-trigger"
+search = "x"
+replace = {replacement:?}
+"#,
+        local_failure_capture_config(),
+    );
+    let (directory, product) = start_response_product(
+        &response_base_config(proxy, &policy),
+        listener,
+        [(format!("http://{origin}/"), origin)],
+    )
+    .await;
+    let url = format!("http://{origin}/head-failure");
+    let request = format!(
+        "GET {url} HTTP/1.1\r\nHost: {origin}\r\nX-Trigger: xx\r\nConnection: close\r\n\r\n"
+    );
+    let response = response_send_raw(proxy, request.as_bytes()).await;
+    assert!(response.starts_with(b"HTTP/1.1 500"));
+    assert_eq!(response_decoded_body(&response), b"request failed\n");
+    assert!(
+        unused_origin.accept().is_err(),
+        "head preparation failure connected to the origin"
+    );
+
+    product.shutdown().await;
+    let records = response_capture_records(&directory);
+    let request_capture = records
+        .iter()
+        .find(|record| record.kind == crate::capture::CaptureKind::Request && record.url == url)
+        .expect("missing request-head failure capture");
+    assert!(request_capture.headers.is_none());
+    assert!(request_capture.body.is_none());
+    assert!(request_capture.body_truncated.is_none());
+    assert_eq!(
+        request_capture.body_omission,
+        Some(crate::capture::CaptureBodyOmission::HeadPreparationFailed {})
+    );
+    assert_sanitized_local_failure_capture(
+        &records,
+        &url,
+        500,
+        "Internal Server Error",
+        b"request failed\n".len(),
+        crate::capture::CaptureDecision::Allow,
+    );
+}
+
+#[tokio::test]
+async fn stalled_origin_response_head_captures_sanitized_local_504() {
+    let _serial = crate::activation::LISTENER_TEST_LOCK.lock().await;
+    let (proxy, listener) = response_prebound_listener();
+    let origin_listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let origin = origin_listener.local_addr().unwrap();
+    let origin_task = tokio::spawn(async move {
+        let (mut stream, _) = origin_listener.accept().await.unwrap();
+        response_read_head(&mut stream).await;
+        let mut byte = [0_u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+            .await
+            .expect("response-head timeout did not close the origin");
+        assert_origin_closed(closed, "timed-out origin connection remained open");
+    });
+    let policy = format!(
+        r#"{}
+[service.forwarding]
+connect_timeout = "1s"
+response_head_timeout = "200ms"
+body_idle_timeout = "1s"
+upgrade_idle_timeout = "1s"
+max_request_wire_bytes = 65536
+max_request_decoded_bytes = 65536
+max_response_wire_bytes = 65536
+max_response_decoded_bytes = 65536
+chunk_bytes = 16384
+preserve_request_trailers = false
+max_trailer_count = 4
+max_trailer_bytes = 256
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "stalled-origin"
+decision = "allow"
+urls = ["http://{origin}/timeout"]
+methods = ["GET"]
+"#,
+        local_failure_capture_config(),
+    );
+    let (directory, product) = start_response_product(
+        &response_base_config(proxy, &policy),
+        listener,
+        [(format!("http://{origin}/"), origin)],
+    )
+    .await;
+    let url = format!("http://{origin}/timeout");
+    let request = format!("GET {url} HTTP/1.1\r\nHost: {origin}\r\nConnection: close\r\n\r\n");
+    let response = response_send_raw(proxy, request.as_bytes()).await;
+    assert!(response.starts_with(b"HTTP/1.1 504"));
+    assert_eq!(response_decoded_body(&response), b"request timed out\n");
+    origin_task.await.unwrap();
+
+    product.shutdown().await;
+    let records = response_capture_records(&directory);
+    assert_sanitized_local_failure_capture(
+        &records,
+        &url,
+        504,
+        "Gateway Timeout",
+        b"request timed out\n".len(),
+        crate::capture::CaptureDecision::Allow,
+    );
 }
 
 async fn assert_empty_chunked_request_body(stream: &mut (impl AsyncRead + Unpin)) {
@@ -1219,7 +1665,8 @@ async fn ordinary_response_admission_saturates_before_origin_connect_and_release
     });
     let (proxy, listener) = response_prebound_listener();
     let policy = format!(
-        r#"[service.forwarding]
+        r#"{}
+[service.forwarding]
 max_request_wire_bytes = 1024
 max_request_decoded_bytes = 1024
 max_response_wire_bytes = 1024
@@ -1237,7 +1684,8 @@ id = "bounded-response"
 decision = "allow"
 methods = ["GET"]
 urls = ["http://{origin}/**"]
-"#
+"#,
+        local_failure_capture_config(),
     );
     let sizing_config = response_base_config(proxy, &policy);
     let sizing_root = tempdir().unwrap();
@@ -1260,7 +1708,7 @@ urls = ["http://{origin}/**"]
         ),
         1,
     );
-    let (_directory, product) =
+    let (directory, product) =
         start_response_product(&config, listener, [(format!("http://{origin}/"), origin)]).await;
     let pool = product.wire_body_pool();
 
@@ -1293,6 +1741,10 @@ urls = ["http://{origin}/**"]
         "unexpected saturated response: {}",
         String::from_utf8_lossy(&second_response)
     );
+    assert_eq!(
+        response_decoded_body(&second_response),
+        b"service unavailable\n"
+    );
     checked_rx.await.unwrap();
 
     release_tx.send(()).unwrap();
@@ -1321,4 +1773,14 @@ urls = ["http://{origin}/**"]
     origin_task.await.unwrap();
     assert_eq!(pool.global_charge(), 0);
     product.shutdown().await;
+    let second_url = format!("http://{origin}/second");
+    let records = response_capture_records(&directory);
+    assert_sanitized_local_failure_capture(
+        &records,
+        &second_url,
+        503,
+        "Service Unavailable",
+        b"service unavailable\n".len(),
+        crate::capture::CaptureDecision::Deny,
+    );
 }

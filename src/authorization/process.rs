@@ -803,12 +803,12 @@ async fn spawn_child(config: &SpawnConfig) -> Result<SpawnedChild, ProcessActiva
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[cfg(unix)]
     command.process_group(0);
     let mut child = command.spawn().map_err(|_| ProcessActivationError::Spawn)?;
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[cfg(unix)]
     let process_group_id = child.id();
-    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    #[cfg(not(unix))]
     let process_group_id = None;
     let Some(stdin) = child.stdin.take() else {
         terminate_child(child, process_group_id).await;
@@ -1201,7 +1201,7 @@ async fn handle_child_exit(inner: &Arc<Inner>, epoch: u64, restart_at: &mut Opti
         }
         (state.child.take(), state.process_group_id.take())
     };
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[cfg(unix)]
     kill_process_group(process_group_id, libc::SIGKILL);
     if let Some(child) = child {
         reap_child(child).await;
@@ -1371,25 +1371,14 @@ async fn terminate_child(mut child: Child, process_group_id: Option<u32>) {
         not(any(target_os = "linux", target_os = "android", target_os = "macos"))
     ))]
     {
-        let _ = process_group_id;
-        let deadline = Instant::now() + TERMINATE_GRACE;
-        signal_child(&child, libc::SIGTERM);
-        loop {
-            match observe_child_exit(&mut child) {
-                Ok(true) => {
-                    reap_child(child).await;
-                    return;
-                }
-                Ok(false) if Instant::now() < deadline => {
-                    time::sleep(CHILD_EXIT_POLL_INTERVAL).await;
-                }
-                Ok(false) | Err(()) => {
-                    let _ = child.start_kill();
-                    reap_child(child).await;
-                    return;
-                }
-            }
-        }
+        kill_process_group(process_group_id, libc::SIGTERM);
+        // These targets cannot safely observe exit without reaping the group leader.
+        // Retain it for the complete grace period so the numeric PGID cannot be reused
+        // before the final group signal.
+        time::sleep(TERMINATE_GRACE).await;
+        kill_process_group(process_group_id, libc::SIGKILL);
+        let _ = child.start_kill();
+        reap_child(child).await;
     }
     #[cfg(not(unix))]
     {
@@ -1403,7 +1392,7 @@ async fn reap_child(mut child: Child) {
     let _ = child.wait().await;
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(unix)]
 fn kill_process_group(process_group_id: Option<u32>, signal: libc::c_int) {
     let Some(process_group_id) = process_group_id.filter(|id| *id <= libc::pid_t::MAX as u32)
     else {
@@ -1445,21 +1434,14 @@ fn observe_child_exit(child: &mut Child) -> Result<bool, ()> {
     unix,
     not(any(target_os = "linux", target_os = "android", target_os = "macos"))
 ))]
-fn signal_child(child: &Child, signal: libc::c_int) {
-    let Some(pid) = child.id().filter(|id| *id <= libc::pid_t::MAX as u32) else {
-        return;
-    };
-    // The unreaped Child owns this PID when the signal is sent.
-    // SAFETY: kill does not dereference pointers, and the PID came from Child::id.
-    unsafe {
-        libc::kill(pid as libc::pid_t, signal);
-    }
+fn observe_child_exit(_child: &mut Child) -> Result<bool, ()> {
+    // Reader EOF reports a fatal epoch and drives group cleanup. Polling Child here
+    // would reap its leader and permit the numeric PGID to be reused before cleanup.
+    Ok(false)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+#[cfg(not(unix))]
 fn observe_child_exit(child: &mut Child) -> Result<bool, ()> {
-    // These targets retain no process-group ID, so reaping here cannot make a later
-    // group signal target a recycled numeric identifier.
     child
         .try_wait()
         .map(|status| status.is_some())
@@ -1530,7 +1512,8 @@ mod tests {
         GuardedProviderBody, IncludedHeader, ProviderBodyReplacementDecodeError,
         ProviderRequestHeaders,
     };
-    use crate::config::compiler::ProviderOutputPlan;
+    use crate::config::compiler::{AuthorizationProviderPlan, ProviderOutputPlan};
+    use crate::config::load_and_compile_exact_config;
     use crate::safety::{WireBodyPool, WireBodyQuotaKey};
 
     fn write_python(directory: &TempDir, source: &str) -> PathBuf {
@@ -1600,6 +1583,91 @@ mod tests {
 
     async fn cleanup(provider: &ProcessProvider) {
         provider.cleanup(CleanupReason::Shutdown).await;
+    }
+
+    async fn production_decision(
+        provider: &ProcessProvider,
+        request_id: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> ProcessDecision {
+        let names = headers
+            .iter()
+            .map(|(name, _)| HeaderName::from_bytes(name.as_bytes()).unwrap())
+            .collect::<Vec<_>>();
+        let values = headers
+            .iter()
+            .map(|(_, value)| [HeaderValue::from_str(value).unwrap()])
+            .collect::<Vec<_>>();
+        let fields = names
+            .iter()
+            .zip(&values)
+            .map(|(name, values)| IncludedHeader::new(name, values))
+            .collect::<Vec<_>>();
+        let headers = ProviderRequestHeaders::new(&fields).unwrap();
+        provider
+            .decide_effects_allowed_for_test(
+                ProviderRequest {
+                    request_id,
+                    url,
+                    method: "GET",
+                    client_ip: "198.18.1.10",
+                    headers: Some(&headers),
+                    body: None,
+                },
+                &body_guard(),
+                request_deadline(),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn assert_production_plan(
+        fixture_root: &Path,
+        name: &str,
+        plan: &ProcessProviderPlan,
+        command: &str,
+        config: &str,
+        include_headers: &[&str],
+    ) {
+        assert_eq!(plan.command, fixture_root.join(command), "{name} command");
+        assert_eq!(
+            plan.working_directory, fixture_root,
+            "{name} working directory"
+        );
+        assert_eq!(plan.args, ["--config", config], "{name} arguments");
+        assert_eq!(plan.timeout, Duration::from_secs(1), "{name} timeout");
+        assert!(plan.on_failure == CompiledProviderFailureMode::Deny);
+        assert!(!plan.inherit_environment, "{name} must use env_clear");
+        assert!(
+            plan.pass_environment.is_empty(),
+            "{name} must not inherit named host variables"
+        );
+        assert_eq!(
+            plan.environment
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect::<Vec<_>>(),
+            [("PATH", "/usr/bin:/bin")],
+            "{name} must receive only its configured environment"
+        );
+        assert_eq!(
+            plan.include_headers
+                .iter()
+                .map(HeaderName::as_str)
+                .collect::<Vec<_>>(),
+            include_headers,
+            "{name} included headers"
+        );
+        assert!(!plan.include_request_body);
+        assert!(!plan.allow_request_body_replacement);
+        assert_eq!(plan.max_request_body_bytes, 10 * 1024 * 1024);
+        assert_eq!(plan.max_decoded_request_body_bytes, 50 * 1024 * 1024);
+        assert_eq!(plan.max_stdout_line_bytes, 1024 * 1024);
+        assert_eq!(plan.max_pending_requests, 256);
+        assert_eq!(plan.restart_backoff, Duration::from_secs(1));
+        assert_eq!(plan.retire_timeout, Duration::from_secs(2 * 60 * 60));
+        assert!(plan.outputs.is_empty());
     }
 
     async fn wait_for_file(path: &Path) {
@@ -1700,6 +1768,226 @@ mod tests {
         assert!(matches!(error, RuntimeError::CandidateNotLive(_)));
         assert!(!error.to_string().contains(script.to_str().unwrap()));
         cleanup(&provider).await;
+    }
+
+    #[tokio::test]
+    async fn process_provider_accepts_id_first_standard_serializer_whitespace() {
+        let directory = TempDir::new().unwrap();
+        let script = write_python(
+            &directory,
+            r#"import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    print(json.dumps({"id": request["id"], "type": "response", "decision": "allow"}), flush=True)
+"#,
+        );
+        let provider = ProcessProvider::activate(plan(&directory, &script), || false)
+            .await
+            .unwrap();
+        commit(&provider);
+
+        assert_eq!(
+            provider
+                .decide_effects_allowed_for_test(
+                    request("standard-serializer"),
+                    &body_guard(),
+                    request_deadline(),
+                )
+                .await,
+            Ok(ProcessDecision::Allow)
+        );
+        cleanup(&provider).await;
+    }
+
+    #[tokio::test]
+    async fn production_process_plans_activate_dispatch_retire_and_reactivate() {
+        let fixture_root =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/production");
+        let loaded = load_and_compile_exact_config(&fixture_root.join("host-proxy.toml"))
+            .expect("production host fixture must load and compile");
+        let mut providers = loaded.compiled.reloadable_plan.authorization.providers;
+
+        let AuthorizationProviderPlan::Process(gitlab_plan) = providers
+            .remove("gitlab_acl")
+            .expect("compiled GitLab process provider")
+        else {
+            panic!("gitlab_acl must compile as a process provider");
+        };
+        assert_production_plan(
+            &fixture_root,
+            "gitlab_acl",
+            &gitlab_plan,
+            "providers/gitlab_acl.py",
+            "providers/gitlab_acl.json",
+            &["x-aw-identity-token", "x-aw-policy-context"],
+        );
+        let gitlab_restart_plan = gitlab_plan.clone();
+        let gitlab = ProcessProvider::activate(gitlab_plan, || false)
+            .await
+            .expect("activate compiled GitLab provider");
+        assert_eq!(
+            gitlab
+                .inner
+                .spawn
+                .environment
+                .iter()
+                .map(|(key, value)| (key.to_str(), value.to_str()))
+                .collect::<Vec<_>>(),
+            [(Some("PATH"), Some("/usr/bin:/bin"))]
+        );
+        commit(&gitlab);
+        assert_eq!(
+            production_decision(
+                &gitlab,
+                "git-allow",
+                "https://gitlab.example.test/group/internal.git",
+                &[
+                    ("x-aw-identity-token", "fixture-internal-identity"),
+                    ("x-aw-policy-context", "fixture-internal"),
+                ],
+            )
+            .await,
+            ProcessDecision::Allow
+        );
+        assert_eq!(
+            production_decision(
+                &gitlab,
+                "git-deny",
+                "https://gitlab.example.test/group/private.git",
+                &[("x-aw-identity-token", "fixture-internal-identity")],
+            )
+            .await,
+            ProcessDecision::Deny
+        );
+        assert_eq!(
+            production_decision(
+                &gitlab,
+                "git-missing",
+                "https://gitlab.example.test/group/internal.git",
+                &[("x-aw-policy-context", "fixture-internal")],
+            )
+            .await,
+            ProcessDecision::Deny
+        );
+        assert_eq!(
+            production_decision(
+                &gitlab,
+                "git-unknown",
+                "https://gitlab.example.test/group/internal.git",
+                &[
+                    ("x-aw-identity-token", "fixture-unknown"),
+                    ("x-aw-policy-context", "fixture-internal"),
+                ],
+            )
+            .await,
+            ProcessDecision::Deny
+        );
+        gitlab.retirement_started(CleanupReason::Retired);
+        gitlab.cleanup(CleanupReason::Retired).await;
+        assert_eq!(gitlab.cleanup_starts(), 1);
+        assert_eq!(gitlab.cleanup_reasons(), [CleanupReason::Retired]);
+
+        let gitlab = ProcessProvider::activate(gitlab_restart_plan, || false)
+            .await
+            .expect("reactivate cloned GitLab plan");
+        commit(&gitlab);
+        assert_eq!(
+            production_decision(
+                &gitlab,
+                "git-restart",
+                "https://gitlab.example.test/group/internal.git",
+                &[
+                    ("x-aw-identity-token", "fixture-internal-identity"),
+                    ("x-aw-policy-context", "fixture-internal"),
+                ],
+            )
+            .await,
+            ProcessDecision::Allow
+        );
+        gitlab.retirement_started(CleanupReason::Retired);
+        gitlab.cleanup(CleanupReason::Retired).await;
+
+        let AuthorizationProviderPlan::Process(runner_plan) = providers
+            .remove("agent_runner_acl")
+            .expect("compiled agent-runner process provider")
+        else {
+            panic!("agent_runner_acl must compile as a process provider");
+        };
+        assert!(providers.is_empty(), "unexpected production providers");
+        assert_production_plan(
+            &fixture_root,
+            "agent_runner_acl",
+            &runner_plan,
+            "providers/agent_runner_acl.py",
+            "providers/agent_runner_acl.json",
+            &["x-aw-identity-token"],
+        );
+        let runner_restart_plan = runner_plan.clone();
+        let runner = ProcessProvider::activate(runner_plan, || false)
+            .await
+            .expect("activate compiled agent-runner provider");
+        commit(&runner);
+        assert_eq!(
+            production_decision(
+                &runner,
+                "runner-allow",
+                "https://runner.example.test/jobs/42",
+                &[("x-aw-identity-token", "fixture-runner-identity")],
+            )
+            .await,
+            ProcessDecision::Allow
+        );
+        assert_eq!(
+            production_decision(
+                &runner,
+                "runner-deny",
+                "https://runner.example.test/admin",
+                &[("x-aw-identity-token", "fixture-runner-identity")],
+            )
+            .await,
+            ProcessDecision::Deny
+        );
+        assert_eq!(
+            production_decision(
+                &runner,
+                "runner-missing",
+                "https://runner.example.test/jobs/42",
+                &[],
+            )
+            .await,
+            ProcessDecision::Deny
+        );
+        assert_eq!(
+            production_decision(
+                &runner,
+                "runner-unknown",
+                "https://runner.example.test/jobs/42",
+                &[("x-aw-identity-token", "fixture-unknown")],
+            )
+            .await,
+            ProcessDecision::Deny
+        );
+        runner.retirement_started(CleanupReason::Retired);
+        runner.cleanup(CleanupReason::Retired).await;
+        assert_eq!(runner.cleanup_starts(), 1);
+        assert_eq!(runner.cleanup_reasons(), [CleanupReason::Retired]);
+
+        let runner = ProcessProvider::activate(runner_restart_plan, || false)
+            .await
+            .expect("reactivate cloned agent-runner plan");
+        commit(&runner);
+        assert_eq!(
+            production_decision(
+                &runner,
+                "runner-restart",
+                "https://runner.example.test/jobs/42",
+                &[("x-aw-identity-token", "fixture-runner-identity")],
+            )
+            .await,
+            ProcessDecision::Allow
+        );
+        runner.retirement_started(CleanupReason::Retired);
+        runner.cleanup(CleanupReason::Retired).await;
     }
 
     #[tokio::test]
@@ -2221,7 +2509,10 @@ for line in sys.stdin:
         let mut candidate = plan(&directory, &script);
         candidate.outputs.insert(
             "credential".to_string(),
-            ProviderOutputPlan::Bearer { required: false },
+            ProviderOutputPlan::Bearer {
+                required: false,
+                transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+            },
         );
         candidate.allow_request_body_replacement = true;
         candidate.include_request_body = true;
@@ -2257,7 +2548,10 @@ for line in sys.stdin:
         let mut provider_plan = plan(&directory, &script);
         provider_plan.outputs.insert(
             "token".to_string(),
-            ProviderOutputPlan::Bearer { required: true },
+            ProviderOutputPlan::Bearer {
+                required: true,
+                transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+            },
         );
         provider_plan.allow_request_body_replacement = true;
         let provider = ProcessProvider::activate(provider_plan, || false)
@@ -2314,7 +2608,10 @@ for line in sys.stdin:
         provider_plan.allow_request_body_replacement = true;
         provider_plan.outputs.insert(
             "token".to_string(),
-            ProviderOutputPlan::Bearer { required: true },
+            ProviderOutputPlan::Bearer {
+                required: true,
+                transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+            },
         );
         let provider = ProcessProvider::activate(provider_plan, || false)
             .await
@@ -2369,7 +2666,10 @@ for line in sys.stdin:
         provider_plan.allow_request_body_replacement = true;
         provider_plan.outputs.insert(
             "token".to_string(),
-            ProviderOutputPlan::Bearer { required: true },
+            ProviderOutputPlan::Bearer {
+                required: true,
+                transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+            },
         );
         let provider = ProcessProvider::activate(provider_plan, || false)
             .await
@@ -2415,7 +2715,10 @@ for request in reversed(requests):
         provider_plan.include_request_body = true;
         provider_plan.outputs.insert(
             "token".to_string(),
-            ProviderOutputPlan::Bearer { required: true },
+            ProviderOutputPlan::Bearer {
+                required: true,
+                transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+            },
         );
         let provider = ProcessProvider::activate(provider_plan, || false)
             .await
@@ -2498,7 +2801,11 @@ for request in reversed(requests):
             let mut provider_plan = plan(&directory, &script);
             provider_plan.outputs.insert(
                 "token".to_string(),
-                ProviderOutputPlan::Bearer { required: true },
+                ProviderOutputPlan::Bearer {
+                    required: true,
+                    transport_security:
+                        crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+                },
             );
             provider_plan.allow_request_body_replacement = true;
             provider_plan.max_decoded_request_body_bytes = max_decoded_bytes;
@@ -2637,7 +2944,10 @@ for line in sys.stdin:
         let mut provider_plan = plan(&directory, &script);
         provider_plan.outputs.insert(
             "token".to_string(),
-            ProviderOutputPlan::Bearer { required: true },
+            ProviderOutputPlan::Bearer {
+                required: true,
+                transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+            },
         );
         let provider = ProcessProvider::activate(provider_plan, || false)
             .await
@@ -2679,7 +2989,10 @@ for line in sys.stdin:
         let mut provider_plan = plan(&directory, &script);
         provider_plan.outputs.insert(
             "token".to_string(),
-            ProviderOutputPlan::Bearer { required: true },
+            ProviderOutputPlan::Bearer {
+                required: true,
+                transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+            },
         );
         provider_plan.allow_request_body_replacement = true;
         let provider = ProcessProvider::activate(provider_plan, || false)
@@ -3136,7 +3449,7 @@ while True:
         assert_eq!(fs::read_to_string(handled_path).unwrap(), "handled");
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    #[cfg(unix)]
     #[tokio::test]
     async fn cleanup_kills_same_group_descendant_that_ignores_sigterm() {
         let directory = TempDir::new().unwrap();

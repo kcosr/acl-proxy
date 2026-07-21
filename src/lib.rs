@@ -1,5 +1,6 @@
 mod activation;
 mod authorization;
+mod candidate_tls;
 pub mod capture;
 mod cli;
 mod config;
@@ -25,5 +26,6 @@ mod standalone_provider_result;
 #[cfg(test)]
 mod test_certificates;
 mod tls;
+mod tls_io_runtime;
 
 pub use cli::run;

@@ -22,12 +22,9 @@ once_cell = "1.19"
 arc-swap = "1.7"
 ipnet = { version = "2.9", features = ["serde"] }
 if-addrs = { version = "0.15.0", features = ["link-local"] }
-idna = "1.1"
 regex = "1.11"
-memchr = "2.7"
 zeroize = "1.9"
 allocator-api2 = "0.2"
-url = "2.5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 base64 = "0.22"

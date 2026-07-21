@@ -248,8 +248,6 @@ impl WebhookDestinationFacts {
         }
         let reserved_control = match (&config.control, &config.callback_public_url) {
             (Some(control), Some(public_url)) => {
-                let public_url = http_access_url::canonicalize_http_url(public_url)
-                    .map_err(|_| WebhookConnectorError::InconsistentFacts)?;
                 let expected_path = format!(
                     "{}/external-auth/callback",
                     control.base_path.trim_end_matches('/')
@@ -258,7 +256,7 @@ impl WebhookDestinationFacts {
                     return Err(WebhookConnectorError::InconsistentFacts);
                 }
                 Some(ReservedWebhookControlSubtree::new(
-                    &public_url,
+                    public_url,
                     control.base_path.clone(),
                 ))
             }

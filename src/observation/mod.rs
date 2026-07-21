@@ -63,6 +63,12 @@ pub(crate) struct ProductObservationRuntime {
     warn_decisions: ObservationQueue,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ProductObservationShutdownOutcome {
+    Drained,
+    DeadlineExceeded,
+}
+
 impl ProductObservationRuntime {
     pub(crate) fn try_new(
         max_pending_records: usize,
@@ -91,6 +97,25 @@ impl ProductObservationRuntime {
         })
     }
 
+    #[cfg(test)]
+    fn try_new_with_capture_processor(
+        max_pending_records: usize,
+        process: impl FnMut(CaptureArtifactJob) + Send + 'static,
+    ) -> Result<Self, ProductObservationRuntimeStartError> {
+        Ok(Self {
+            capture_pool: CapturePool::new(),
+            capture_worker: CaptureArtifactWorker::start_with_processor(
+                max_pending_records,
+                process,
+            )?,
+            forwarding_terminal_completions: std::sync::atomic::AtomicUsize::new(0),
+            forwarding_terminal_completed: std::sync::atomic::AtomicUsize::new(0),
+            forwarding_terminal_failed: std::sync::atomic::AtomicUsize::new(0),
+            forwarding_terminal_cancelled: std::sync::atomic::AtomicUsize::new(0),
+            forwarding_terminal_abandoned: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
     pub(crate) fn activate(
         &self,
         plan: ObservationPlan,
@@ -114,6 +139,11 @@ impl ProductObservationRuntime {
     #[cfg(test)]
     pub(crate) fn capture_pool_used(&self) -> usize {
         self.capture_pool.used()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_capture_allocation(&self) {
+        self.capture_pool.fail_next_allocation();
     }
 
     pub(crate) fn try_submit_capture(
@@ -155,6 +185,26 @@ impl ProductObservationRuntime {
     pub(crate) async fn shutdown(&self) {
         self.begin_shutdown();
         self.capture_worker.shutdown().await;
+    }
+
+    pub(crate) async fn shutdown_until(
+        &self,
+        deadline: Option<tokio::time::Instant>,
+    ) -> ProductObservationShutdownOutcome {
+        let Some(deadline) = deadline else {
+            self.shutdown().await;
+            return ProductObservationShutdownOutcome::Drained;
+        };
+        self.begin_shutdown();
+        let worker_shutdown = self.capture_worker.shutdown();
+        tokio::pin!(worker_shutdown);
+        tokio::select! {
+            biased;
+            () = &mut worker_shutdown => ProductObservationShutdownOutcome::Drained,
+            () = tokio::time::sleep_until(deadline) => {
+                ProductObservationShutdownOutcome::DeadlineExceeded
+            }
+        }
     }
 
     #[cfg(test)]
@@ -599,7 +649,7 @@ impl CapturePolicy {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
     use crate::config::compiler::{CaptureWorkingSetPlan, PolicyDecisionLoggingPlan};
@@ -1035,6 +1085,78 @@ mod tests {
         assert!(!runtime.current_capture_epoch().is_enabled());
         assert_eq!(runtime.committed_capture_limit(), 0);
         assert!(leased.is_enabled());
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn expired_shutdown_deadline_returns_while_capture_processing_is_blocked() {
+        let processing = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let runtime = ProductObservationRuntime::try_new_with_capture_processor(1, {
+            let processing = Arc::clone(&processing);
+            let release = Arc::clone(&release);
+            move |_| {
+                processing.store(true, Ordering::Release);
+                while !release.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            }
+        })
+        .expect("capture worker");
+        let (redaction, references) = redaction([("profile", 8)]);
+        let activation = runtime
+            .activate(
+                plan("profile", vec![CompiledCaptureEvent::RequestAllowed], 16),
+                &redaction,
+                references.get("profile"),
+            )
+            .expect("observation activation");
+        let (_snapshot, owner) = activation.into_parts();
+        commit(&owner);
+        let job = CaptureArtifactJob::try_begin(
+            runtime.current_capture_epoch(),
+            CaptureEvent::RequestAllowed,
+            crate::capture::CaptureRecord {
+                timestamp: "2026-01-01T00:00:00Z".to_owned(),
+                request_id: "blocked-shutdown".to_owned(),
+                kind: crate::capture::CaptureKind::Request,
+                decision: crate::capture::CaptureDecision::Allow,
+                mode: crate::capture::CaptureMode::HttpProxy,
+                url: "https://example.test/".to_owned(),
+                method: "GET".to_owned(),
+                status_code: None,
+                status_message: None,
+                client: crate::capture::CaptureEndpoint::default(),
+                target: None,
+                http_version: Some("1.1".to_owned()),
+                headers: None,
+                body: None,
+                body_truncated: None,
+                body_omission: None,
+                trailers_omitted: None,
+            },
+            1,
+        )
+        .expect("capture job construction")
+        .expect("capture admission");
+        runtime.try_submit_capture(job).expect("capture submission");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !processing.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("capture processor did not block");
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            runtime.shutdown_until(Some(tokio::time::Instant::now())),
+        )
+        .await
+        .expect("expired observation shutdown deadline blocked");
+        assert_eq!(outcome, ProductObservationShutdownOutcome::DeadlineExceeded);
+
+        release.store(true, Ordering::Release);
         runtime.shutdown().await;
     }
 

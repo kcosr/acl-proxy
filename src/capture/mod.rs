@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind as IoErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -15,6 +15,7 @@ use once_cell::sync::Lazy;
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value as JsonValue;
+use sha2::{Digest, Sha256};
 
 use crate::filesystem::create_private_dir_all;
 use crate::http_body::{
@@ -45,6 +46,13 @@ static CAPTURE_DIRECTORY_LOCKS: Lazy<Mutex<HashMap<PathBuf, Weak<Mutex<()>>>>> =
 static CAPTURE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) const REDACTED: &str = "[REDACTED]";
+const MAX_CAPTURE_FILENAME_BYTES: usize = 230;
+const MAX_CAPTURE_REQUEST_ID_COMPONENT_BYTES: usize = 128;
+const WINDOWS_RESERVED_BASENAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$", "COM0", "COM1", "COM2", "COM3",
+    "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT0", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5",
+    "LPT6", "LPT7", "LPT8", "LPT9",
+];
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -101,8 +109,14 @@ pub(crate) struct CaptureSinkSpec {
 pub(crate) enum CaptureSinkSpecError {
     #[error("capture directory must not be empty")]
     EmptyDirectory,
-    #[error("capture filename template must be a nonempty basename")]
-    InvalidFilenameTemplate,
+    #[error("capture filename template must be a portable nonempty basename")]
+    InvalidFilenameBasename,
+    #[error("capture filename template must contain {{requestId}}")]
+    MissingRequestIdPlaceholder,
+    #[error("capture filename template must contain {{suffix}}")]
+    MissingSuffixPlaceholder,
+    #[error("capture filename template contains an unknown placeholder")]
+    UnknownFilenamePlaceholder,
     #[error("capture max_files must be at least 1")]
     ZeroMaxFiles,
     #[error("capture max_total_bytes must be at least 1")]
@@ -119,9 +133,7 @@ impl CaptureSinkSpec {
         if directory.as_os_str().is_empty() {
             return Err(CaptureSinkSpecError::EmptyDirectory);
         }
-        if !is_valid_capture_filename_template(&filename_template) {
-            return Err(CaptureSinkSpecError::InvalidFilenameTemplate);
-        }
+        validate_capture_filename_template(&filename_template)?;
         if max_files == 0 {
             return Err(CaptureSinkSpecError::ZeroMaxFiles);
         }
@@ -153,20 +165,96 @@ impl CaptureSinkSpec {
     }
 }
 
-fn is_valid_capture_filename_template(template: &str) -> bool {
+fn validate_capture_filename_template(template: &str) -> Result<(), CaptureSinkSpecError> {
     if template.is_empty()
         || template.contains('/')
         || template.contains('\\')
-        || template.contains("..")
+        || template.contains(['<', '>', ':', '"', '|', '?', '*'])
+        || template.ends_with([' ', '.'])
         || template.chars().any(char::is_control)
     {
-        return false;
+        return Err(CaptureSinkSpecError::InvalidFilenameBasename);
     }
     let mut components = Path::new(template).components();
-    matches!(
+    if !matches!(
         (components.next(), components.next()),
         (Some(std::path::Component::Normal(_)), None)
-    )
+    ) {
+        return Err(CaptureSinkSpecError::InvalidFilenameBasename);
+    }
+    if !template.contains("{requestId}") {
+        return Err(CaptureSinkSpecError::MissingRequestIdPlaceholder);
+    }
+    if !template.contains("{suffix}") {
+        return Err(CaptureSinkSpecError::MissingSuffixPlaceholder);
+    }
+    let stripped = template
+        .replace("{requestId}", "")
+        .replace("{kind}", "")
+        .replace("{suffix}", "");
+    if stripped.contains('{') || stripped.contains('}') {
+        return Err(CaptureSinkSpecError::UnknownFilenamePlaceholder);
+    }
+    let maximum_request_id = "r".repeat(MAX_CAPTURE_REQUEST_ID_COMPONENT_BYTES);
+    let maximum_filename =
+        render_capture_filename(template, &maximum_request_id, "response", "res");
+    if maximum_filename.len() > MAX_CAPTURE_FILENAME_BYTES
+        || template_can_render_windows_reserved_basename(template)
+    {
+        return Err(CaptureSinkSpecError::InvalidFilenameBasename);
+    }
+    Ok(())
+}
+
+fn template_can_render_windows_reserved_basename(template: &str) -> bool {
+    WINDOWS_RESERVED_BASENAMES.iter().any(|reserved| {
+        (0..=reserved.len()).any(|start| {
+            (start..=reserved.len()).any(|end| {
+                let request_id = &reserved[start..end];
+                if !request_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                {
+                    return false;
+                }
+                [("request", "req"), ("response", "res")]
+                    .into_iter()
+                    .any(|(kind, suffix)| {
+                        is_windows_reserved_basename(&render_capture_filename(
+                            template, request_id, kind, suffix,
+                        ))
+                    })
+            })
+        })
+    })
+}
+
+fn render_capture_filename(template: &str, request_id: &str, kind: &str, suffix: &str) -> String {
+    template
+        .replace("{requestId}", request_id)
+        .replace("{kind}", kind)
+        .replace("{suffix}", suffix)
+}
+
+fn is_windows_reserved_basename(filename: &str) -> bool {
+    let stem = filename
+        .split(['.', ':'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(|character: char| character.is_ascii_whitespace());
+    let normalized: String = stem
+        .chars()
+        .map(|character| match character {
+            '\u{00b9}' => '1',
+            '\u{00b2}' => '2',
+            '\u{00b3}' => '3',
+            character if character.is_ascii() => character.to_ascii_uppercase(),
+            character => character,
+        })
+        .collect();
+    WINDOWS_RESERVED_BASENAMES
+        .iter()
+        .any(|reserved| normalized == *reserved)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -204,8 +292,23 @@ pub struct CaptureRecord {
     pub body: Option<CaptureBody>,
 
     pub body_truncated: Option<bool>,
-    pub provider_replacement_omitted: Option<bool>,
-    pub provider_replacement_size: Option<usize>,
+    pub body_omission: Option<CaptureBodyOmission>,
+    pub trailers_omitted: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "reason", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CaptureBodyOmission {
+    Empty {},
+    Incomplete {},
+    LimitExceeded {},
+    ResourceExhausted {},
+    DecodingFailed {},
+    RedactionFailed {},
+    TextProtectionsSkipped {},
+    ArtifactEncodingFailed {},
+    HeadPreparationFailed {},
+    ProviderReplacement { size: usize },
 }
 
 pub(crate) struct CaptureArtifactBody {
@@ -237,6 +340,7 @@ pub(crate) struct CaptureArtifactJob {
 #[derive(Clone)]
 pub(crate) struct SanitizedCaptureMetadata {
     record: CaptureRecord,
+    visible_header_names: BTreeSet<String>,
 }
 
 impl SanitizedCaptureMetadata {
@@ -253,7 +357,12 @@ impl SanitizedCaptureMetadata {
             CaptureEvent::RequestDenied => (CaptureKind::Request, CaptureDecision::Deny),
             CaptureEvent::ResponseDenied => (CaptureKind::Response, CaptureDecision::Deny),
         };
-        let headers = include_headers.then(|| capture_headers(facts.headers()));
+        let (headers, visible_header_names) = if include_headers {
+            let (headers, names) = capture_headers(facts.headers());
+            (Some(headers), names)
+        } else {
+            (None, BTreeSet::new())
+        };
         Self {
             record: CaptureRecord {
                 timestamp,
@@ -281,18 +390,29 @@ impl SanitizedCaptureMetadata {
                 headers,
                 body: None,
                 body_truncated: None,
-                provider_replacement_omitted: None,
-                provider_replacement_size: None,
+                body_omission: None,
+                trailers_omitted: None,
             },
+            visible_header_names,
         }
     }
 
-    pub(crate) fn mark_provider_replacement_omitted(&mut self, size: usize) {
-        self.record.mark_provider_replacement_omitted(size);
+    pub(crate) fn omit_provider_replacement(&mut self, size: usize) {
+        self.record
+            .omit_body(CaptureBodyOmission::ProviderReplacement { size });
+    }
+
+    pub(crate) fn omit_body(&mut self, reason: CaptureBodyOmission) {
+        self.record.omit_body(reason);
+    }
+
+    pub(crate) fn mark_trailers_omitted(&mut self) {
+        self.record.trailers_omitted = Some(true);
     }
 
     pub(crate) fn without_headers(mut self) -> Self {
         self.record.headers = None;
+        self.visible_header_names.clear();
         self
     }
 
@@ -314,12 +434,37 @@ impl SanitizedCaptureMetadata {
 
     #[cfg(test)]
     pub(crate) fn from_test_record(record: CaptureRecord) -> Self {
-        Self { record }
+        Self {
+            record,
+            visible_header_names: BTreeSet::new(),
+        }
+    }
+
+    fn redact_visible_headers(
+        &mut self,
+        operation: &CaptureOperation,
+        profile: &http_access_redaction::RedactionProfile,
+    ) {
+        let Some(headers) = self.record.headers.as_mut() else {
+            return;
+        };
+        for name in &self.visible_header_names {
+            let Some(value) = headers.remove(name) else {
+                continue;
+            };
+            let Some(redacted) = redact_header_value(operation, profile, value) else {
+                continue;
+            };
+            headers.insert(name.clone(), redacted);
+        }
     }
 }
 
-fn capture_headers(fields: &[http_access_types::SanitizedHeaderField]) -> HeaderMap {
+fn capture_headers(
+    fields: &[http_access_types::SanitizedHeaderField],
+) -> (HeaderMap, BTreeSet<String>) {
     let mut captured = HeaderMap::new();
+    let mut visible_names = BTreeSet::new();
     for field in fields {
         let name = field.name().as_str().to_owned();
         let value = match field.value() {
@@ -328,6 +473,7 @@ fn capture_headers(fields: &[http_access_types::SanitizedHeaderField]) -> Header
                 let Ok(value) = std::str::from_utf8(value.as_bytes()) else {
                     continue;
                 };
+                visible_names.insert(name.clone());
                 JsonValue::String(value.to_owned())
             }
         };
@@ -345,7 +491,47 @@ fn capture_headers(fields: &[http_access_types::SanitizedHeaderField]) -> Header
             },
         }
     }
-    captured
+    (captured, visible_names)
+}
+
+fn redact_header_value(
+    operation: &CaptureOperation,
+    profile: &http_access_redaction::RedactionProfile,
+    value: JsonValue,
+) -> Option<JsonValue> {
+    match value {
+        JsonValue::String(value) => {
+            redact_header_string(operation, profile, value).map(JsonValue::String)
+        }
+        JsonValue::Array(values) => values
+            .into_iter()
+            .map(|value| match value {
+                JsonValue::String(value) => {
+                    redact_header_string(operation, profile, value).map(JsonValue::String)
+                }
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(JsonValue::Array),
+        _ => None,
+    }
+}
+
+fn redact_header_string(
+    operation: &CaptureOperation,
+    profile: &http_access_redaction::RedactionProfile,
+    value: String,
+) -> Option<String> {
+    let mut builder = operation.body_buffer();
+    builder.try_extend_from_slice(value.as_bytes()).ok()?;
+    let outcome = profile.redact_http_body(operation, builder.finish()).ok()?;
+    debug_assert_eq!(outcome.class(), PayloadClass::Text);
+    let body = outcome.into_body();
+    let mut output = String::with_capacity(body.len());
+    for segment in body.segments() {
+        output.push_str(std::str::from_utf8(segment).ok()?);
+    }
+    Some(output)
 }
 
 const fn capture_http_version(version: HttpVersion) -> &'static str {
@@ -357,7 +543,7 @@ const fn capture_http_version(version: HttpVersion) -> &'static str {
 }
 
 enum CaptureArtifactPayload {
-    Unavailable,
+    Omitted(CaptureBodyOmission),
     Http {
         encoded: OwnedCaptureBody,
         encoding: CaptureContentEncoding,
@@ -391,6 +577,38 @@ enum CaptureArtifactProcessError {
     UnsupportedWebSocketCompression,
 }
 
+impl CaptureArtifactProcessError {
+    const fn omission(&self) -> CaptureBodyOmission {
+        match self {
+            Self::HttpDecode(
+                CaptureHttpDecodeError::EncodedLimitExceeded
+                | CaptureHttpDecodeError::DecodedLimitExceeded
+                | CaptureHttpDecodeError::ExpansionRatioExceeded
+                | CaptureHttpDecodeError::DecoderWindowExceeded,
+            ) => CaptureBodyOmission::LimitExceeded {},
+            Self::HttpDecode(CaptureHttpDecodeError::ResourceExhausted) => {
+                CaptureBodyOmission::ResourceExhausted {}
+            }
+            Self::HttpDecode(_) | Self::UnsupportedWebSocketCompression => {
+                CaptureBodyOmission::DecodingFailed {}
+            }
+            Self::Redaction(
+                RedactionError::PayloadTooLarge { .. } | RedactionError::OutputTooLarge,
+            ) => CaptureBodyOmission::LimitExceeded {},
+            Self::Redaction(
+                RedactionError::Buffer(_) | RedactionError::ScratchAllocationFailed,
+            ) => CaptureBodyOmission::ResourceExhausted {},
+            Self::Redaction(RedactionError::InvalidText) => CaptureBodyOmission::RedactionFailed {},
+            Self::Artifact(CaptureArtifactBodyError::Allocation(_)) => {
+                CaptureBodyOmission::ResourceExhausted {}
+            }
+            Self::Artifact(
+                CaptureArtifactBodyError::LengthOverflow | CaptureArtifactBodyError::Encode(_),
+            ) => CaptureBodyOmission::ArtifactEncodingFailed {},
+        }
+    }
+}
+
 pub(crate) struct CaptureArtifactWorker {
     worker: BoundedCaptureWorker<CaptureArtifactJob>,
 }
@@ -419,7 +637,7 @@ impl CaptureArtifactJob {
             operation,
             epoch,
             metadata: SanitizedCaptureMetadata::from_test_record(metadata),
-            payload: CaptureArtifactPayload::Unavailable,
+            payload: CaptureArtifactPayload::Omitted(CaptureBodyOmission::Incomplete {}),
             max_expansion_ratio,
         }))
     }
@@ -437,7 +655,7 @@ impl CaptureArtifactJob {
             operation,
             epoch,
             metadata,
-            payload: CaptureArtifactPayload::Unavailable,
+            payload: CaptureArtifactPayload::Omitted(CaptureBodyOmission::Incomplete {}),
             max_expansion_ratio,
         })
     }
@@ -454,9 +672,7 @@ impl CaptureArtifactJob {
         content_encoding_present: bool,
     ) -> Result<(), CaptureArtifactJobError> {
         self.operation.validate_body(&encoded)?;
-        if self.metadata.record.provider_replacement_omitted.is_some()
-            || self.metadata.record.provider_replacement_size.is_some()
-        {
+        if self.metadata.record.body_omission.is_some() {
             return Err(CaptureArtifactJobError::MetadataAlreadyHasBodyOutcome);
         }
         self.payload = CaptureArtifactPayload::Http {
@@ -468,8 +684,10 @@ impl CaptureArtifactJob {
         Ok(())
     }
 
-    pub(crate) fn omit_body(&mut self) {
-        self.payload = CaptureArtifactPayload::Unavailable;
+    pub(crate) fn omit_body(&mut self, reason: CaptureBodyOmission) {
+        if self.metadata.record.body_omission.is_none() {
+            self.payload = CaptureArtifactPayload::Omitted(reason);
+        }
     }
 
     pub(crate) fn complete_websocket_message(
@@ -479,9 +697,7 @@ impl CaptureArtifactJob {
         class: PayloadClass,
     ) -> Result<(), CaptureArtifactJobError> {
         self.operation.validate_body(&encoded)?;
-        if self.metadata.record.provider_replacement_omitted.is_some()
-            || self.metadata.record.provider_replacement_size.is_some()
-        {
+        if self.metadata.record.body_omission.is_some() {
             return Err(CaptureArtifactJobError::MetadataAlreadyHasBodyOutcome);
         }
         self.payload = CaptureArtifactPayload::WebSocket {
@@ -493,18 +709,25 @@ impl CaptureArtifactJob {
     }
 
     fn process(mut self) {
+        let (profile, sink) = {
+            let Some(policy) = self.epoch.capture() else {
+                return;
+            };
+            (policy.profile().clone(), policy.sink().clone())
+        };
+        self.metadata
+            .redact_visible_headers(&self.operation, &profile);
         let body = self.process_body().map_err(|error| {
             tracing::debug!(error = %error, "capture payload omitted during artifact processing");
             error
         });
-        let Some(policy) = self.epoch.capture() else {
-            return;
-        };
         let result = match body {
-            Ok(Some(body)) => {
-                write_borrowed_capture_record(policy.sink(), &self.metadata.record, &body)
+            Ok(Some(body)) => write_borrowed_capture_record(&sink, &self.metadata.record, &body),
+            Ok(None) => write_capture_record(&sink, &self.metadata.record),
+            Err(error) => {
+                self.metadata.record.omit_body(error.omission());
+                write_capture_record(&sink, &self.metadata.record)
             }
-            Ok(None) | Err(_) => write_capture_record(policy.sink(), &self.metadata.record),
         };
         if let Err(error) = result {
             tracing::warn!(error = %error, "capture artifact write failed");
@@ -512,12 +735,20 @@ impl CaptureArtifactJob {
     }
 
     fn process_body(&mut self) -> Result<Option<CaptureArtifactBody>, CaptureArtifactProcessError> {
-        let payload = std::mem::replace(&mut self.payload, CaptureArtifactPayload::Unavailable);
+        let payload = std::mem::replace(
+            &mut self.payload,
+            CaptureArtifactPayload::Omitted(CaptureBodyOmission::Incomplete {}),
+        );
         let Some(policy) = self.epoch.capture() else {
             return Ok(None);
         };
         match payload {
-            CaptureArtifactPayload::Unavailable => Ok(None),
+            CaptureArtifactPayload::Omitted(reason) => {
+                if self.metadata.record.body_omission.is_none() {
+                    self.metadata.record.omit_body(reason);
+                }
+                Ok(None)
+            }
             CaptureArtifactPayload::Http {
                 encoded,
                 encoding,
@@ -533,9 +764,20 @@ impl CaptureArtifactJob {
                 )?;
                 let redacted = policy
                     .profile()
-                    .redact_http_body(&self.operation, decoded)?
-                    .into_body();
+                    .redact_http_body(&self.operation, decoded)?;
+                if redacted.class() == PayloadClass::Binary
+                    && policy.profile().requires_text_class()
+                {
+                    self.metadata
+                        .record
+                        .omit_body(CaptureBodyOmission::TextProtectionsSkipped {});
+                    return Ok(None);
+                }
+                let redacted = redacted.into_body();
                 if redacted.is_empty() {
+                    self.metadata
+                        .record
+                        .omit_body(CaptureBodyOmission::Empty {});
                     return Ok(None);
                 }
                 let body = CaptureArtifactBody::encode(
@@ -565,12 +807,21 @@ impl CaptureArtifactJob {
                 } else {
                     encoded
                 };
+                if class == PayloadClass::Binary && policy.profile().requires_text_class() {
+                    self.metadata
+                        .record
+                        .omit_body(CaptureBodyOmission::TextProtectionsSkipped {});
+                    return Ok(None);
+                }
                 let redacted =
                     policy
                         .profile()
                         .redact_websocket_message(&self.operation, decoded, class)?;
                 let redacted = redacted.into_body();
                 if redacted.is_empty() {
+                    self.metadata
+                        .record
+                        .omit_body(CaptureBodyOmission::Empty {});
                     return Ok(None);
                 }
                 let body = CaptureArtifactBody::encode(
@@ -590,6 +841,16 @@ impl CaptureArtifactWorker {
     pub(crate) fn start(capacity: usize) -> Result<Self, CaptureWorkerStartError> {
         Ok(Self {
             worker: BoundedCaptureWorker::start(capacity, CaptureArtifactJob::process)?,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_with_processor(
+        capacity: usize,
+        process: impl FnMut(CaptureArtifactJob) + Send + 'static,
+    ) -> Result<Self, CaptureWorkerStartError> {
+        Ok(Self {
+            worker: BoundedCaptureWorker::start(capacity, process)?,
         })
     }
 
@@ -685,8 +946,7 @@ impl Serialize for BorrowedCaptureArtifactRecord<'_> {
     {
         if self.metadata.body.is_some()
             || self.metadata.body_truncated.is_some()
-            || self.metadata.provider_replacement_omitted.is_some()
-            || self.metadata.provider_replacement_size.is_some()
+            || self.metadata.body_omission.is_some()
         {
             return Err(serde::ser::Error::custom(
                 "capture artifact metadata already contains a body outcome",
@@ -705,6 +965,14 @@ impl Serialize for BorrowedCaptureArtifactRecord<'_> {
         if self.body.is_truncated() {
             state.serialize_field("bodyTruncated", &true)?;
         }
+        if let Some(value) = &self.metadata.trailers_omitted {
+            if !value {
+                return Err(serde::ser::Error::custom(
+                    "trailersOmitted may only be present as true",
+                ));
+            }
+            state.serialize_field("trailersOmitted", value)?;
+        }
         state.end()
     }
 }
@@ -712,14 +980,15 @@ impl Serialize for BorrowedCaptureArtifactRecord<'_> {
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 enum CaptureRecordInvariantError {
     #[error("bodyTruncated must be present only as true for a shorter base64 body prefix")]
-    InvalidBodyTruncated,
-    #[error("providerReplacementOmitted must be true and paired with providerReplacementSize")]
-    InvalidProviderReplacementMarker,
-    #[error("provider replacement records must omit body and bodyTruncated")]
-    ProviderReplacementContainsBody,
+    BodyTruncated,
+    #[error("exactly one of body or bodyOmission must be present")]
+    BodyOutcome,
+    #[error("trailersOmitted may only be present as true")]
+    TrailersOmitted,
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CaptureRecordWire {
     timestamp: String,
     #[serde(rename = "requestId")]
@@ -741,32 +1010,25 @@ struct CaptureRecordWire {
     body: Option<CaptureBody>,
     #[serde(rename = "bodyTruncated")]
     body_truncated: Option<bool>,
-    #[serde(rename = "providerReplacementOmitted")]
-    provider_replacement_omitted: Option<bool>,
-    #[serde(rename = "providerReplacementSize")]
-    provider_replacement_size: Option<usize>,
+    #[serde(rename = "bodyOmission")]
+    body_omission: Option<CaptureBodyOmission>,
+    #[serde(rename = "trailersOmitted")]
+    trailers_omitted: Option<bool>,
 }
 
 impl CaptureRecord {
     fn validate_invariants(&self) -> Result<(), CaptureRecordInvariantError> {
-        match (
-            self.provider_replacement_omitted,
-            self.provider_replacement_size,
-        ) {
-            (None, None) => {}
-            (Some(true), Some(_)) => {
-                if self.body.is_some() || self.body_truncated.is_some() {
-                    return Err(CaptureRecordInvariantError::ProviderReplacementContainsBody);
-                }
-                return Ok(());
-            }
-            _ => return Err(CaptureRecordInvariantError::InvalidProviderReplacementMarker),
+        if self.body.is_some() == self.body_omission.is_some() {
+            return Err(CaptureRecordInvariantError::BodyOutcome);
+        }
+        if self.trailers_omitted == Some(false) {
+            return Err(CaptureRecordInvariantError::TrailersOmitted);
         }
 
         if self.body_truncated == Some(false)
             || self.body_truncated.is_some() && self.body.is_none()
         {
-            return Err(CaptureRecordInvariantError::InvalidBodyTruncated);
+            return Err(CaptureRecordInvariantError::BodyTruncated);
         }
         if let Some(body) = &self.body {
             if body.encoding == "base64" {
@@ -775,24 +1037,23 @@ impl CaptureRecord {
                         .body_truncated
                         .is_none()
                         .then_some(())
-                        .ok_or(CaptureRecordInvariantError::InvalidBodyTruncated);
+                        .ok_or(CaptureRecordInvariantError::BodyTruncated);
                 };
                 let truncated = stored_len < body.length;
                 if stored_len > body.length || self.body_truncated != truncated.then_some(true) {
-                    return Err(CaptureRecordInvariantError::InvalidBodyTruncated);
+                    return Err(CaptureRecordInvariantError::BodyTruncated);
                 }
             } else if self.body_truncated.is_some() {
-                return Err(CaptureRecordInvariantError::InvalidBodyTruncated);
+                return Err(CaptureRecordInvariantError::BodyTruncated);
             }
         }
         Ok(())
     }
 
-    pub(crate) fn mark_provider_replacement_omitted(&mut self, size: usize) {
+    pub(crate) fn omit_body(&mut self, reason: CaptureBodyOmission) {
         self.body = None;
         self.body_truncated = None;
-        self.provider_replacement_omitted = Some(true);
-        self.provider_replacement_size = Some(size);
+        self.body_omission = Some(reason);
     }
 }
 
@@ -851,7 +1112,7 @@ impl Serialize for CaptureRecord {
     {
         self.validate_invariants()
             .map_err(serde::ser::Error::custom)?;
-        let mut state = serializer.serialize_struct("CaptureRecord", 18)?;
+        let mut state = serializer.serialize_struct("CaptureRecord", 17)?;
         serialize_capture_metadata(&mut state, self)?;
         if let Some(value) = &self.body {
             state.serialize_field("body", value)?;
@@ -859,11 +1120,11 @@ impl Serialize for CaptureRecord {
         if let Some(value) = &self.body_truncated {
             state.serialize_field("bodyTruncated", value)?;
         }
-        if let Some(value) = &self.provider_replacement_omitted {
-            state.serialize_field("providerReplacementOmitted", value)?;
+        if let Some(value) = &self.body_omission {
+            state.serialize_field("bodyOmission", value)?;
         }
-        if let Some(value) = &self.provider_replacement_size {
-            state.serialize_field("providerReplacementSize", value)?;
+        if let Some(value) = &self.trailers_omitted {
+            state.serialize_field("trailersOmitted", value)?;
         }
         state.end()
     }
@@ -921,8 +1182,8 @@ impl<'de> Deserialize<'de> for CaptureRecord {
             headers: wire.headers,
             body: wire.body,
             body_truncated: wire.body_truncated,
-            provider_replacement_omitted: wire.provider_replacement_omitted,
-            provider_replacement_size: wire.provider_replacement_size,
+            body_omission: wire.body_omission,
+            trailers_omitted: wire.trailers_omitted,
         };
         record
             .validate_invariants()
@@ -1024,7 +1285,7 @@ impl CaptureRecord {
 }
 
 fn sanitize_path_component(input: &str) -> String {
-    input
+    let sanitized: String = input
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
@@ -1033,7 +1294,19 @@ fn sanitize_path_component(input: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+    if sanitized.len() <= MAX_CAPTURE_REQUEST_ID_COMPONENT_BYTES {
+        return sanitized;
+    }
+    let digest: [u8; 32] = Sha256::digest(input.as_bytes()).into();
+    let mut bounded = String::with_capacity(MAX_CAPTURE_REQUEST_ID_COMPONENT_BYTES);
+    bounded.push_str(&sanitized[..MAX_CAPTURE_REQUEST_ID_COMPONENT_BYTES - 65]);
+    bounded.push('-');
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut bounded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    bounded
 }
 
 /// Resolve the on-disk path for a capture record.
@@ -1050,16 +1323,15 @@ pub(crate) fn resolve_capture_path(sink: &CaptureSinkSpec, record: &CaptureRecor
     let safe_request_id = sanitize_path_component(&record.request_id);
     let raw_template = sink.filename_template();
 
-    let filename = raw_template
-        .replace("{requestId}", &safe_request_id)
-        .replace(
-            "{kind}",
-            match record.kind {
-                CaptureKind::Request => "request",
-                CaptureKind::Response => "response",
-            },
-        )
-        .replace("{suffix}", kind_suffix);
+    let filename = render_capture_filename(
+        raw_template,
+        &safe_request_id,
+        match record.kind {
+            CaptureKind::Request => "request",
+            CaptureKind::Response => "response",
+        },
+        kind_suffix,
+    );
 
     sink.directory().join(filename)
 }
@@ -1440,8 +1712,8 @@ mod tests {
             headers: None,
             body,
             body_truncated: None,
-            provider_replacement_omitted: None,
-            provider_replacement_size: None,
+            body_omission: None,
+            trailers_omitted: None,
         }
     }
 
@@ -1495,6 +1767,70 @@ mod tests {
             .publication_guard()
             .expect("capture publication")
             .commit();
+        (pool.current_epoch(), owner)
+    }
+
+    fn capture_engine_epoch_with_payloads(
+        directory: &Path,
+        payloads: http_access_redaction::RulePayloads,
+    ) -> (
+        Arc<crate::observation::CaptureEpoch>,
+        Arc<dyn GenerationOwner>,
+    ) {
+        use http_access_redaction::{
+            PreparedRedactionSnapshot, RedactionLimits, RedactionProfileSpec, RedactionRuleSpec,
+            RedactionSnapshot, RedactionSnapshotSpec,
+        };
+        use http_access_types::{RedactionRef, SnapshotIdentity, StableId};
+
+        let identity = SnapshotIdentity::new();
+        let version = 1;
+        let id = StableId::new("capture-classification").unwrap();
+        let reference = RedactionRef::new(identity.clone(), id.clone(), version).unwrap();
+        let limits = RedactionLimits::new(1024, 1024, 1024, 1024, false, 1, 64, 64).unwrap();
+        let prepared = PreparedRedactionSnapshot::prepare(
+            RedactionSnapshotSpec::new(vec![RedactionProfileSpec::new(
+                id,
+                b"REDACTED".to_vec(),
+                limits,
+                vec![RedactionRuleSpec::new(
+                    vec![b"secret".to_vec()],
+                    Vec::new(),
+                    Vec::new(),
+                    payloads,
+                )],
+            )]),
+            || false,
+        )
+        .unwrap();
+        let redaction =
+            RedactionSnapshot::activate(identity, version, prepared, Vec::new(), || false).unwrap();
+        let pool = CapturePool::new();
+        let activation = ProductObservationSnapshot::activate(
+            ObservationPlan {
+                capture: Some(CapturePlan {
+                    events: vec![CompiledCaptureEvent::RequestAllowed],
+                    redaction_profile: "capture-classification".to_owned(),
+                    sink: CaptureSinkSpec::new(
+                        directory.to_path_buf(),
+                        "{requestId}-{suffix}.json".to_owned(),
+                        16,
+                        1024 * 1024,
+                    )
+                    .unwrap(),
+                    max_body_bytes: 1024,
+                    max_inflight_body_bytes: 1024 * 1024,
+                    working_set: CaptureWorkingSetPlan::default(),
+                }),
+                ..ObservationPlan::default()
+            },
+            &redaction,
+            Some(&reference),
+            pool.clone(),
+        )
+        .unwrap();
+        let (_snapshot, owner) = activation.into_parts();
+        owner.publication_guard().unwrap().commit();
         (pool.current_epoch(), owner)
     }
 
@@ -1595,6 +1931,10 @@ mod tests {
         let record = read_only_capture_record(directory.path());
         assert!(record.body.is_none());
         assert!(record.body_truncated.is_none());
+        assert_eq!(
+            record.body_omission,
+            Some(CaptureBodyOmission::DecodingFailed {})
+        );
     }
 
     #[tokio::test]
@@ -1620,6 +1960,7 @@ mod tests {
         let record = read_only_capture_record(directory.path());
         assert!(record.body.is_none());
         assert!(record.body_truncated.is_none());
+        assert_eq!(record.body_omission, Some(CaptureBodyOmission::Empty {}));
     }
 
     #[tokio::test]
@@ -1650,6 +1991,79 @@ mod tests {
             b"before REDACTED after"
         );
         assert_eq!(record.body_truncated, None);
+    }
+
+    #[tokio::test]
+    async fn mixed_binary_http_body_is_omitted_when_text_protections_would_be_skipped() {
+        let directory = tempfile::tempdir().unwrap();
+        let (epoch, _owner) = capture_engine_epoch_with_payloads(
+            directory.path(),
+            http_access_redaction::RulePayloads::Text,
+        );
+        let mut job = CaptureArtifactJob::try_begin(
+            epoch,
+            CaptureEvent::RequestAllowed,
+            sample_record_with_body(None),
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        let encoded = operation_body(&job, b"before secret \xff after");
+        job.complete_http_body(encoded, CaptureContentEncoding::Identity, None, false)
+            .unwrap();
+
+        let worker = CaptureArtifactWorker::start(1).unwrap();
+        worker.try_submit(job).unwrap();
+        worker.shutdown().await;
+
+        let record = read_only_capture_record(directory.path());
+        assert_eq!(
+            record.body_omission,
+            Some(CaptureBodyOmission::TextProtectionsSkipped {})
+        );
+        assert!(record.body.is_none());
+        let artifact = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find_map(|entry| fs::read(entry.path()).ok())
+            .unwrap();
+        assert!(!artifact.windows(6).any(|window| window == b"secret"));
+    }
+
+    #[tokio::test]
+    async fn mixed_binary_http_body_is_persisted_only_after_both_class_redaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let (epoch, _owner) = capture_engine_epoch_with_payloads(
+            directory.path(),
+            http_access_redaction::RulePayloads::Both,
+        );
+        let mut job = CaptureArtifactJob::try_begin(
+            epoch,
+            CaptureEvent::RequestAllowed,
+            sample_record_with_body(None),
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        let encoded = operation_body(&job, b"before secret \xff after");
+        job.complete_http_body(encoded, CaptureContentEncoding::Identity, None, false)
+            .unwrap();
+
+        let worker = CaptureArtifactWorker::start(1).unwrap();
+        worker.try_submit(job).unwrap();
+        worker.shutdown().await;
+
+        let record = read_only_capture_record(directory.path());
+        assert_eq!(
+            record.decode_body_bytes().unwrap(),
+            b"before REDACTED \xff after"
+        );
+        let artifact = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .find_map(|entry| fs::read(entry.path()).ok())
+            .unwrap();
+        assert!(!artifact.windows(6).any(|window| window == b"secret"));
     }
 
     #[tokio::test]
@@ -1714,6 +2128,7 @@ mod tests {
         let record = read_only_capture_record(directory.path());
         assert!(record.body.is_none());
         assert!(record.body_truncated.is_none());
+        assert_eq!(record.body_omission, Some(CaptureBodyOmission::Empty {}));
     }
 
     #[tokio::test]
@@ -1737,6 +2152,30 @@ mod tests {
                 &policy,
                 http_access_types::HeaderName::new("content-type").unwrap(),
                 http_access_types::HeaderValue::new(b"text/plain".to_vec()).unwrap(),
+            )
+            .unwrap(),
+            http_access_types::SanitizedHeaderField::visible(
+                &policy,
+                http_access_types::HeaderName::new("x-note").unwrap(),
+                http_access_types::HeaderValue::new(b"before secret after".to_vec()).unwrap(),
+            )
+            .unwrap(),
+            http_access_types::SanitizedHeaderField::visible(
+                &policy,
+                http_access_types::HeaderName::new("x-note").unwrap(),
+                http_access_types::HeaderValue::new(vec![0xff]).unwrap(),
+            )
+            .unwrap(),
+            http_access_types::SanitizedHeaderField::visible(
+                &policy,
+                http_access_types::HeaderName::new("x-binary").unwrap(),
+                http_access_types::HeaderValue::new(vec![0xff]).unwrap(),
+            )
+            .unwrap(),
+            http_access_types::SanitizedHeaderField::visible(
+                &policy,
+                http_access_types::HeaderName::new("x-oversized").unwrap(),
+                http_access_types::HeaderValue::new(vec![b'a'; 1025]).unwrap(),
             )
             .unwrap(),
         ];
@@ -1789,6 +2228,12 @@ mod tests {
             headers.get("content-type"),
             Some(&JsonValue::String("text/plain".to_owned()))
         );
+        assert_eq!(
+            headers.get("x-note"),
+            Some(&JsonValue::String("before REDACTED after".to_owned()))
+        );
+        assert!(headers.get("x-binary").is_none());
+        assert!(headers.get("x-oversized").is_none());
         let artifact = fs::read_dir(directory.path())
             .unwrap()
             .filter_map(Result::ok)
@@ -1803,6 +2248,9 @@ mod tests {
         assert!(!artifact
             .windows(secret.len())
             .any(|window| window == secret));
+        assert!(!artifact
+            .windows(b"before secret after".len())
+            .any(|window| window == b"before secret after"));
     }
 
     #[test]
@@ -1818,25 +2266,160 @@ mod tests {
         assert_eq!(valid.filename_template(), "{requestId}-{suffix}.json");
         assert_eq!(valid.max_files(), 10);
         assert_eq!(valid.max_total_bytes(), 1024);
+        let with_kind = CaptureSinkSpec::new(
+            PathBuf::from("captures"),
+            "{requestId}-{kind}-{suffix}.json".to_string(),
+            10,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(
+            with_kind.filename_template(),
+            "{requestId}-{kind}-{suffix}.json"
+        );
+        CaptureSinkSpec::new(
+            PathBuf::from("captures"),
+            "capture..{requestId}-{suffix}.json".to_string(),
+            1,
+            1,
+        )
+        .expect("internal repeated dots are a portable basename");
 
         assert_eq!(
-            CaptureSinkSpec::new(PathBuf::new(), "capture.json".to_string(), 1, 1),
+            CaptureSinkSpec::new(
+                PathBuf::new(),
+                "{requestId}-{suffix}.json".to_string(),
+                1,
+                1,
+            ),
             Err(CaptureSinkSpecError::EmptyDirectory)
         );
-        for filename in ["", ".", "..", "nested/capture.json", "nested\\capture.json"] {
+        for filename in [
+            "",
+            ".",
+            "..",
+            "nested/{requestId}-{suffix}.json",
+            "nested\\{requestId}-{suffix}.json",
+            "C:{requestId}-{suffix}.json",
+            "{requestId}-{suffix}?.json",
+            "{requestId}-{suffix}*.json",
+            "{requestId}-\"-{suffix}.json",
+            "{requestId}-<-{suffix}.json",
+            "{requestId}->-{suffix}.json",
+            "{requestId}-|-{suffix}.json",
+            "{requestId}-{suffix}.json ",
+            "{requestId}-{suffix}.",
+            "{requestId}-\n-{suffix}.json",
+            "CON.{requestId}-{suffix}.json",
+            "CON .{requestId}-{suffix}.json",
+            "CLOCK$.{requestId}-{suffix}.json",
+            "{requestId}$.{suffix}.json",
+            "nul.{requestId}-{suffix}",
+            "{requestId}.{suffix}",
+            "COM0.{requestId}-{suffix}.json",
+            "com1.{requestId}-{suffix}.json",
+            "COM\u{00b9}.{requestId}-{suffix}.json",
+            "LPT0.{requestId}-{suffix}.json",
+            "LPT\u{00b3}.{requestId}-{suffix}.json",
+            "COM{requestId}.{suffix}.json",
+            "AU{requestId}.{suffix}.json",
+            "{requestId}L.{suffix}.json",
+        ] {
             assert_eq!(
                 CaptureSinkSpec::new(PathBuf::from("captures"), filename.to_string(), 1, 1),
-                Err(CaptureSinkSpecError::InvalidFilenameTemplate)
+                Err(CaptureSinkSpecError::InvalidFilenameBasename)
             );
         }
+        for filename in [
+            "COM10.{requestId}-{suffix}.json",
+            "LPT42.{requestId}-{suffix}.json",
+            "CONIN.{requestId}-{suffix}.json",
+            "CONOUT.{requestId}-{suffix}.json",
+            "COMx{requestId}.{suffix}.json",
+            "AUX-{requestId}.{suffix}.json",
+            "CLOCK{requestId}.{suffix}.json",
+            "CONIN{requestId}.{suffix}.json",
+        ] {
+            CaptureSinkSpec::new(PathBuf::from("captures"), filename.to_string(), 1, 1)
+                .expect("nearby non-device basename is portable");
+        }
+        let exact_literal = "x".repeat(
+            MAX_CAPTURE_FILENAME_BYTES - MAX_CAPTURE_REQUEST_ID_COMPONENT_BYTES - "res".len(),
+        );
+        CaptureSinkSpec::new(
+            PathBuf::from("captures"),
+            format!("{exact_literal}{{requestId}}{{suffix}}"),
+            1,
+            1,
+        )
+        .expect("exact portable filename boundary");
         assert_eq!(
-            CaptureSinkSpec::new(PathBuf::from("captures"), "capture.json".to_string(), 0, 1,),
+            CaptureSinkSpec::new(
+                PathBuf::from("captures"),
+                format!("x{exact_literal}{{requestId}}{{suffix}}"),
+                1,
+                1,
+            ),
+            Err(CaptureSinkSpecError::InvalidFilenameBasename)
+        );
+        assert_eq!(
+            CaptureSinkSpec::new(
+                PathBuf::from("captures"),
+                "capture-{suffix}.json".to_string(),
+                1,
+                1,
+            ),
+            Err(CaptureSinkSpecError::MissingRequestIdPlaceholder)
+        );
+        assert_eq!(
+            CaptureSinkSpec::new(
+                PathBuf::from("captures"),
+                "{requestId}.json".to_string(),
+                1,
+                1,
+            ),
+            Err(CaptureSinkSpecError::MissingSuffixPlaceholder)
+        );
+        assert_eq!(
+            CaptureSinkSpec::new(
+                PathBuf::from("captures"),
+                "{requestId}-{unknown}-{suffix}.json".to_string(),
+                1,
+                1,
+            ),
+            Err(CaptureSinkSpecError::UnknownFilenamePlaceholder)
+        );
+        assert_eq!(
+            CaptureSinkSpec::new(
+                PathBuf::from("captures"),
+                "{requestId}-{suffix}.json".to_string(),
+                0,
+                1,
+            ),
             Err(CaptureSinkSpecError::ZeroMaxFiles)
         );
         assert_eq!(
-            CaptureSinkSpec::new(PathBuf::from("captures"), "capture.json".to_string(), 1, 0,),
+            CaptureSinkSpec::new(
+                PathBuf::from("captures"),
+                "{requestId}-{suffix}.json".to_string(),
+                1,
+                0,
+            ),
             Err(CaptureSinkSpecError::ZeroMaxTotalBytes)
         );
+    }
+
+    #[test]
+    fn capture_request_ids_are_bounded_with_a_collision_resistant_suffix() {
+        let first = sanitize_path_component(&format!("{}A", "x".repeat(4 * 1024)));
+        let second = sanitize_path_component(&format!("{}B", "x".repeat(4 * 1024)));
+        assert_eq!(first.len(), MAX_CAPTURE_REQUEST_ID_COMPONENT_BYTES);
+        assert_eq!(second.len(), MAX_CAPTURE_REQUEST_ID_COMPONENT_BYTES);
+        assert_ne!(first, second);
+        assert!(first.starts_with(&"x".repeat(MAX_CAPTURE_REQUEST_ID_COMPONENT_BYTES - 65)));
+        assert!(first
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'));
     }
 
     #[test]
@@ -1890,8 +2473,7 @@ mod tests {
         let value = serde_json::to_value(&record).unwrap();
         assert_eq!(value["bodyTruncated"], true);
         assert_eq!(value["body"]["length"], 12);
-        assert!(value.get("providerReplacementOmitted").is_none());
-        assert!(value.get("providerReplacementSize").is_none());
+        assert!(value.get("bodyOmission").is_none());
         let decoded: CaptureRecord = serde_json::from_value(value).unwrap();
         assert_eq!(decoded.body_truncated, Some(true));
 
@@ -1908,16 +2490,21 @@ mod tests {
 
     #[test]
     fn invalid_body_truncated_shapes_are_rejected() {
-        let mut value = serde_json::to_value(sample_record_with_body(None)).unwrap();
+        let mut empty = sample_record_with_body(None);
+        empty.body_omission = Some(CaptureBodyOmission::Empty {});
+        let mut value = serde_json::to_value(&empty).unwrap();
         value["bodyTruncated"] = JsonValue::Bool(false);
         assert!(serde_json::from_value::<CaptureRecord>(value).is_err());
 
-        let mut value = serde_json::to_value(sample_record_with_body(None)).unwrap();
-        value["body"] = serde_json::json!({
-            "encoding": "base64",
-            "length": 8,
-            "data": general_purpose::STANDARD.encode(b"short")
-        });
+        let mut value = serde_json::to_value(sample_record_with_body(Some(CaptureBody {
+            encoding: "base64".to_owned(),
+            length: 5,
+            data: general_purpose::STANDARD.encode(b"short"),
+            content_type: None,
+            content_encoding: None,
+        })))
+        .unwrap();
+        value["body"]["length"] = JsonValue::from(8);
         assert!(serde_json::from_value::<CaptureRecord>(value).is_err());
 
         let mut record = sample_record_with_body(Some(CaptureBody {
@@ -1932,7 +2519,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_replacement_marker_pair_is_exact_and_excludes_body() {
+    fn provider_replacement_omission_is_typed_and_excludes_body() {
         let mut record = sample_record_with_body(Some(CaptureBody {
             encoding: "base64".to_string(),
             length: 4,
@@ -1940,39 +2527,103 @@ mod tests {
             content_type: None,
             content_encoding: None,
         }));
-        record.mark_provider_replacement_omitted(4096);
+        record.omit_body(CaptureBodyOmission::ProviderReplacement { size: 4096 });
 
         let value = serde_json::to_value(&record).unwrap();
-        assert_eq!(value["providerReplacementOmitted"], true);
-        assert_eq!(value["providerReplacementSize"], 4096);
+        assert_eq!(value["bodyOmission"]["reason"], "provider_replacement");
+        assert_eq!(value["bodyOmission"]["size"], 4096);
         assert!(value.get("body").is_none());
         assert!(value.get("bodyTruncated").is_none());
         let decoded: CaptureRecord = serde_json::from_value(value).unwrap();
-        assert_eq!(decoded.provider_replacement_omitted, Some(true));
-        assert_eq!(decoded.provider_replacement_size, Some(4096));
+        assert_eq!(
+            decoded.body_omission,
+            Some(CaptureBodyOmission::ProviderReplacement { size: 4096 })
+        );
     }
 
     #[test]
-    fn invalid_provider_replacement_shapes_are_rejected() {
-        let base = serde_json::to_value(sample_record_with_body(None)).unwrap();
-        for fields in [
-            serde_json::json!({"providerReplacementOmitted": true}),
-            serde_json::json!({"providerReplacementSize": 1}),
-            serde_json::json!({
-                "providerReplacementOmitted": false,
-                "providerReplacementSize": 1
-            }),
-        ] {
-            let mut value = base.clone();
-            value.as_object_mut().unwrap().extend(
-                fields
-                    .as_object()
+    fn invalid_body_outcome_shapes_are_rejected() {
+        let mut absent = sample_record_with_body(None);
+        absent.body_omission = Some(CaptureBodyOmission::Empty {});
+        let base = serde_json::to_value(absent).unwrap();
+
+        let mut neither = base.clone();
+        neither.as_object_mut().unwrap().remove("bodyOmission");
+        assert!(serde_json::from_value::<CaptureRecord>(neither).is_err());
+
+        let mut both = base.clone();
+        both["body"] = serde_json::json!({"encoding":"base64","length":0,"data":""});
+        assert!(serde_json::from_value::<CaptureRecord>(both).is_err());
+
+        let mut unexpected = base.clone();
+        unexpected["bodyOmission"] = serde_json::json!({"reason":"empty","size":0});
+        assert!(serde_json::from_value::<CaptureRecord>(unexpected).is_err());
+
+        let mut unknown = base;
+        unknown["bodyOmission"] = serde_json::json!({"reason":"unknown"});
+        assert!(serde_json::from_value::<CaptureRecord>(unknown).is_err());
+    }
+
+    #[test]
+    fn every_typed_body_omission_round_trips_and_legacy_fields_are_rejected() {
+        let reasons = [
+            CaptureBodyOmission::Empty {},
+            CaptureBodyOmission::Incomplete {},
+            CaptureBodyOmission::LimitExceeded {},
+            CaptureBodyOmission::ResourceExhausted {},
+            CaptureBodyOmission::DecodingFailed {},
+            CaptureBodyOmission::RedactionFailed {},
+            CaptureBodyOmission::TextProtectionsSkipped {},
+            CaptureBodyOmission::ArtifactEncodingFailed {},
+            CaptureBodyOmission::HeadPreparationFailed {},
+            CaptureBodyOmission::ProviderReplacement { size: 73 },
+        ];
+        for reason in reasons {
+            let mut record = sample_record_with_body(None);
+            record.body_omission = Some(reason.clone());
+            let value = serde_json::to_value(&record).unwrap();
+            assert_eq!(
+                serde_json::from_value::<CaptureRecord>(value)
                     .unwrap()
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone())),
+                    .body_omission,
+                Some(reason)
             );
-            assert!(serde_json::from_value::<CaptureRecord>(value).is_err());
         }
+
+        let mut record = sample_record_with_body(None);
+        record.body_omission = Some(CaptureBodyOmission::Empty {});
+        let mut legacy = serde_json::to_value(record).unwrap();
+        legacy["providerReplacementOmitted"] = JsonValue::Bool(true);
+        legacy["providerReplacementSize"] = JsonValue::from(1);
+        assert!(serde_json::from_value::<CaptureRecord>(legacy).is_err());
+    }
+
+    #[test]
+    fn trailers_omitted_is_true_only_and_round_trips_with_each_body_outcome() {
+        let mut omitted = sample_record_with_body(None);
+        omitted.body_omission = Some(CaptureBodyOmission::Empty {});
+        omitted.trailers_omitted = Some(true);
+        let value = serde_json::to_value(&omitted).unwrap();
+        assert_eq!(value["trailersOmitted"], true);
+        assert_eq!(
+            serde_json::from_value::<CaptureRecord>(value)
+                .unwrap()
+                .trailers_omitted,
+            Some(true)
+        );
+
+        omitted.trailers_omitted = Some(false);
+        assert!(serde_json::to_value(omitted).is_err());
+
+        let mut body = sample_record_with_body(Some(CaptureBody {
+            encoding: "base64".to_owned(),
+            length: 0,
+            data: String::new(),
+            content_type: None,
+            content_encoding: None,
+        }));
+        body.trailers_omitted = Some(true);
+        assert_eq!(serde_json::to_value(body).unwrap()["trailersOmitted"], true);
     }
 
     #[test]
@@ -2059,8 +2710,8 @@ mod tests {
             headers: None,
             body: None,
             body_truncated: None,
-            provider_replacement_omitted: None,
-            provider_replacement_size: None,
+            body_omission: Some(CaptureBodyOmission::Empty {}),
+            trailers_omitted: None,
         };
 
         let path = resolve_capture_path(&capture_sink(PathBuf::from("logs-capture")), &record);
@@ -2104,8 +2755,8 @@ mod tests {
                 content_encoding: None,
             }),
             body_truncated: None,
-            provider_replacement_omitted: None,
-            provider_replacement_size: None,
+            body_omission: None,
+            trailers_omitted: None,
         };
 
         let actual = serde_json::to_value(&record).expect("serialize capture record");
@@ -2136,8 +2787,8 @@ mod tests {
             headers: None,
             body: None,
             body_truncated: None,
-            provider_replacement_omitted: None,
-            provider_replacement_size: None,
+            body_omission: Some(CaptureBodyOmission::Empty {}),
+            trailers_omitted: None,
         };
 
         let sanitized = sanitize_path_component(raw_request_id);

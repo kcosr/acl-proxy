@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use http_access_url::canonicalize_http_url;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{oneshot, Notify, Semaphore};
 
@@ -26,6 +27,7 @@ use crate::authorization::webhook::connector::{
 };
 use crate::authorization::webhook::runtime::WebhookAuthorizationRuntime;
 use crate::authorization::ProductAuthorizationSnapshot;
+use crate::capture::CaptureBodyOmission;
 use crate::config::compiler::{
     AuthorizationCallbackPlan, AuthorizationPlan, AuthorizationProviderPlan,
     CompiledProviderFailureMode, CredentialsPlan, PendingOperationLimit, WebhookProviderPlan,
@@ -832,7 +834,11 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
         providers: std::collections::BTreeMap::from([(
             "webhook".to_string(),
             AuthorizationProviderPlan::Webhook(WebhookProviderPlan {
-                url: format!("http://provider.test:{}/authorize", endpoint.port()),
+                url: canonicalize_http_url(&format!(
+                    "http://provider.test:{}/authorize",
+                    endpoint.port()
+                ))
+                .unwrap(),
                 timeout: Duration::from_secs(5),
                 on_failure: CompiledProviderFailureMode::Deny,
                 include_headers: vec![],
@@ -845,11 +851,18 @@ async fn webhook_delivery_resources_end_before_callback_wait() {
     };
     let provider_registry = ProviderRegistry::from_names(["webhook".to_string()]);
     let provider = provider_registry.get("webhook").unwrap();
+    let mut tls_resolver = crate::candidate_tls::CandidateTlsResolver::activate(
+        crate::tls_io_runtime::TlsIoRuntime::new().unwrap(),
+        ActivationCancellation::new_for_test(),
+        http_access_types::PolicyGeneration::new(7).unwrap(),
+    )
+    .await
+    .expect("test host system roots load");
     let authorization = ProductAuthorizationSnapshot::activate(
         authorization_plan,
         provider_registry,
         webhook_runtime.clone(),
-        ActivationCancellation::new_for_test(),
+        &mut tls_resolver,
     )
     .await
     .unwrap();
@@ -1790,12 +1803,14 @@ async fn websocket_capture_submits_metadata_for_over_limit_and_incomplete_messag
     .await
     .expect("over-limit WebSocket capture retained its buffered prefix");
 
-    for frame in [
-        websocket_frame(true, 0x0, true, &final_fragment),
-        websocket_frame(false, 0x1, true, &incomplete),
-    ] {
-        client.write_all(&frame).await.unwrap();
-    }
+    client
+        .write_all(&websocket_frame(true, 0x0, true, &final_fragment))
+        .await
+        .unwrap();
+    client
+        .write_all(&websocket_frame(false, 0x1, true, &incomplete))
+        .await
+        .unwrap();
     drop(client);
     origin_task.await.unwrap();
     tokio::time::timeout(Duration::from_secs(2), product.shutdown())
@@ -1809,12 +1824,17 @@ async fn websocket_capture_submits_metadata_for_over_limit_and_incomplete_messag
         .collect::<Vec<_>>();
     websocket_records.sort_by(|left, right| left.request_id.cmp(&right.request_id));
     assert_eq!(websocket_records.len(), 3);
-    assert!(websocket_records.iter().all(|record| {
-        record.body.is_none()
-            && record.body_truncated.is_none()
-            && record.provider_replacement_omitted.is_none()
-    }));
-    for (sequence, record) in websocket_records.iter().enumerate() {
+    let expected_omissions = [
+        CaptureBodyOmission::LimitExceeded {},
+        CaptureBodyOmission::LimitExceeded {},
+        CaptureBodyOmission::Incomplete {},
+    ];
+    for (sequence, (record, expected_omission)) in
+        websocket_records.iter().zip(expected_omissions).enumerate()
+    {
+        assert!(record.body.is_none());
+        assert!(record.body_truncated.is_none());
+        assert_eq!(record.body_omission, Some(expected_omission));
         assert!(record
             .request_id
             .ends_with(&format!("-ws-request-{sequence}")));

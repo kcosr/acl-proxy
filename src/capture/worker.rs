@@ -1,37 +1,53 @@
+use std::collections::VecDeque;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
-
-use tokio::sync::mpsc;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 const CLOSED_BIT: usize = 1usize << (usize::BITS - 1);
 const ACTIVE_MASK: usize = CLOSED_BIT - 1;
+const ADMISSION_QUIESCENCE_POLL: Duration = Duration::from_millis(5);
 
 pub(super) struct BoundedCaptureWorker<Job> {
-    admission: std::sync::Arc<AdmissionState>,
-    sender: mpsc::Sender<WorkerMessage<Job>>,
+    admission: Arc<AdmissionState>,
+    queue: Arc<WorkerQueue<Job>>,
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
-    shutdown: OnceLock<std::sync::Arc<ShutdownCompletion>>,
-}
-
-enum WorkerMessage<Job> {
-    Job(Job),
-    Shutdown,
+    completion: Arc<ShutdownCompletion>,
 }
 
 struct AdmissionState {
     state: AtomicUsize,
-    wait_lock: Mutex<()>,
-    quiescent: Condvar,
 }
 
 struct AdmissionGuard<'state> {
     state: &'state AdmissionState,
 }
 
+struct WorkerQueue<Job> {
+    state: Mutex<WorkerQueueState<Job>>,
+    changed: Condvar,
+}
+
+struct WorkerQueueState<Job> {
+    jobs: VecDeque<Job>,
+    capacity: usize,
+    force_discard: bool,
+    processing: bool,
+    discarded: usize,
+}
+
 struct ShutdownCompletion {
     complete: AtomicBool,
     changed: tokio::sync::Notify,
+}
+
+struct ThreadCompletionGuard {
+    completion: Arc<ShutdownCompletion>,
+}
+
+struct ShutdownWaitGuard<'worker, Job> {
+    worker: &'worker BoundedCaptureWorker<Job>,
+    armed: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -51,97 +67,182 @@ pub(super) enum CaptureSubmitError<Job> {
 impl<Job: Send + 'static> BoundedCaptureWorker<Job> {
     pub(super) fn start(
         capacity: usize,
-        mut process: impl FnMut(Job) + Send + 'static,
+        process: impl FnMut(Job) + Send + 'static,
     ) -> Result<Self, CaptureWorkerStartError> {
         if capacity == 0 {
             return Err(CaptureWorkerStartError::ZeroCapacity);
         }
-        let (sender, mut receiver) = mpsc::channel(capacity);
+        let admission = Arc::new(AdmissionState {
+            state: AtomicUsize::new(0),
+        });
+        let queue = Arc::new(WorkerQueue {
+            state: Mutex::new(WorkerQueueState {
+                jobs: VecDeque::with_capacity(capacity),
+                capacity,
+                force_discard: false,
+                processing: false,
+                discarded: 0,
+            }),
+            changed: Condvar::new(),
+        });
+        let completion = Arc::new(ShutdownCompletion {
+            complete: AtomicBool::new(false),
+            changed: tokio::sync::Notify::new(),
+        });
+        let worker_admission = Arc::clone(&admission);
+        let worker_queue = Arc::clone(&queue);
+        let worker_completion = Arc::clone(&completion);
         let join = std::thread::Builder::new()
             .name("acl-proxy-capture".to_owned())
             .spawn(move || {
-                while let Some(message) = receiver.blocking_recv() {
-                    match message {
-                        WorkerMessage::Job(job) => {
-                            if catch_unwind(AssertUnwindSafe(|| process(job))).is_err() {
-                                tracing::error!(
-                                    "capture worker isolated a record-processing panic"
-                                );
-                            }
-                        }
-                        WorkerMessage::Shutdown => break,
-                    }
-                }
+                let _completion = ThreadCompletionGuard {
+                    completion: worker_completion,
+                };
+                run_worker(worker_admission, worker_queue, process);
             })
             .map_err(CaptureWorkerStartError::Spawn)?;
         Ok(Self {
-            admission: std::sync::Arc::new(AdmissionState {
-                state: AtomicUsize::new(0),
-                wait_lock: Mutex::new(()),
-                quiescent: Condvar::new(),
-            }),
-            sender,
+            admission,
+            queue,
             join: Mutex::new(Some(join)),
-            shutdown: OnceLock::new(),
+            completion,
         })
     }
+}
 
+impl<Job> BoundedCaptureWorker<Job> {
     pub(super) fn try_submit(&self, job: Job) -> Result<(), CaptureSubmitError<Job>> {
+        if self.completion.complete.load(Ordering::Acquire) {
+            return Err(CaptureSubmitError::Closed(job));
+        }
         let Some(_admission) = self.admission.try_enter() else {
             return Err(CaptureSubmitError::Closed(job));
         };
-        match self.sender.try_send(WorkerMessage::Job(job)) {
-            Ok(()) => Ok(()),
-            Err(mpsc::error::TrySendError::Full(WorkerMessage::Job(job))) => {
-                Err(CaptureSubmitError::Full(job))
+        let mut state = match self.queue.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(CaptureSubmitError::Full(job));
             }
-            Err(mpsc::error::TrySendError::Closed(WorkerMessage::Job(job))) => {
-                Err(CaptureSubmitError::Closed(job))
-            }
-            Err(mpsc::error::TrySendError::Full(WorkerMessage::Shutdown))
-            | Err(mpsc::error::TrySendError::Closed(WorkerMessage::Shutdown)) => {
-                unreachable!("submit sends only capture jobs")
-            }
+        };
+        if self.completion.complete.load(Ordering::Acquire) {
+            return Err(CaptureSubmitError::Closed(job));
         }
+        if state.jobs.len() == state.capacity {
+            return Err(CaptureSubmitError::Full(job));
+        }
+        state.jobs.push_back(job);
+        drop(state);
+        self.queue.changed.notify_one();
+        Ok(())
     }
 
     pub(super) fn begin_shutdown(&self) {
         self.admission.close();
+        self.queue.changed.notify_all();
     }
 
     pub(super) async fn shutdown(&self) {
-        let completion = self
-            .shutdown
-            .get_or_init(|| {
-                self.begin_shutdown();
-                let join = self
-                    .join
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .take();
-                let completion = std::sync::Arc::new(ShutdownCompletion {
-                    complete: AtomicBool::new(false),
-                    changed: tokio::sync::Notify::new(),
-                });
-                let worker_completion = completion.clone();
-                let admission = self.admission.clone();
-                let sender = self.sender.clone();
-                tokio::task::spawn_blocking(move || {
-                    if let Some(join) = join {
-                        admission.wait_until_quiescent();
-                        let _ = sender.blocking_send(WorkerMessage::Shutdown);
-                        if join.join().is_err() {
-                            tracing::error!("capture worker thread panicked during shutdown");
-                        }
-                    }
-                    worker_completion.complete.store(true, Ordering::Release);
-                    worker_completion.changed.notify_waiters();
-                });
-                completion
-            })
-            .clone();
-        completion.wait().await;
+        self.begin_shutdown();
+        let mut wait = ShutdownWaitGuard {
+            worker: self,
+            armed: true,
+        };
+        self.completion.wait().await;
+        wait.armed = false;
+        self.join_completed_worker();
     }
+
+    fn join_completed_worker(&self) {
+        let join = lock(&self.join).take();
+        if let Some(join) = join {
+            if join.join().is_err() {
+                tracing::error!("capture worker thread panicked during shutdown");
+            }
+        }
+    }
+
+    fn force_discard(&self) -> DetachedCaptureWork {
+        let mut state = lock(&self.queue.state);
+        state.force_discard = true;
+        let detached = DetachedCaptureWork {
+            processing_records: usize::from(state.processing),
+            queued_records: state.jobs.len(),
+            admitted_submissions: self.admission.active(),
+        };
+        drop(state);
+        self.queue.changed.notify_all();
+        detached
+    }
+
+    #[cfg(test)]
+    fn discarded_records(&self) -> usize {
+        lock(&self.queue.state).discarded
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DetachedCaptureWork {
+    processing_records: usize,
+    queued_records: usize,
+    admitted_submissions: usize,
+}
+
+fn run_worker<Job>(
+    admission: Arc<AdmissionState>,
+    queue: Arc<WorkerQueue<Job>>,
+    mut process: impl FnMut(Job),
+) {
+    loop {
+        let job = {
+            let mut state = lock(&queue.state);
+            loop {
+                if state.force_discard {
+                    if let Some(job) = state.jobs.pop_front() {
+                        state.discarded = state
+                            .discarded
+                            .checked_add(1)
+                            .expect("capture discard accounting overflow");
+                        break WorkerAction::Discard(job);
+                    }
+                    if !state.processing && admission.is_closed_and_quiescent() {
+                        break WorkerAction::Exit;
+                    }
+                } else if let Some(job) = state.jobs.pop_front() {
+                    state.processing = true;
+                    break WorkerAction::Process(job);
+                } else if admission.is_closed_and_quiescent() {
+                    break WorkerAction::Exit;
+                }
+
+                let (next, _) = queue
+                    .changed
+                    .wait_timeout(state, ADMISSION_QUIESCENCE_POLL)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state = next;
+            }
+        };
+
+        match job {
+            WorkerAction::Process(job) => {
+                if catch_unwind(AssertUnwindSafe(|| process(job))).is_err() {
+                    tracing::error!("capture worker isolated a record-processing panic");
+                }
+                let mut state = lock(&queue.state);
+                state.processing = false;
+                drop(state);
+                queue.changed.notify_all();
+            }
+            WorkerAction::Discard(job) => drop(job),
+            WorkerAction::Exit => return,
+        }
+    }
+}
+
+enum WorkerAction<Job> {
+    Process(Job),
+    Discard(Job),
+    Exit,
 }
 
 impl AdmissionState {
@@ -164,23 +265,15 @@ impl AdmissionState {
     }
 
     fn close(&self) {
-        let before = self.state.fetch_or(CLOSED_BIT, Ordering::AcqRel);
-        if before & ACTIVE_MASK == 0 {
-            self.quiescent.notify_all();
-        }
+        self.state.fetch_or(CLOSED_BIT, Ordering::AcqRel);
     }
 
-    fn wait_until_quiescent(&self) {
-        let mut guard = self
-            .wait_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        while self.state.load(Ordering::Acquire) & ACTIVE_MASK != 0 {
-            guard = self
-                .quiescent
-                .wait(guard)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-        }
+    fn is_closed_and_quiescent(&self) -> bool {
+        self.state.load(Ordering::Acquire) == CLOSED_BIT
+    }
+
+    fn active(&self) -> usize {
+        self.state.load(Ordering::Acquire) & ACTIVE_MASK
     }
 }
 
@@ -188,14 +281,6 @@ impl Drop for AdmissionGuard<'_> {
     fn drop(&mut self) {
         let before = self.state.state.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(before & ACTIVE_MASK != 0, "capture admission underflow");
-        if before & CLOSED_BIT != 0 && before & ACTIVE_MASK == 1 {
-            let _guard = self
-                .state
-                .wait_lock
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            self.state.quiescent.notify_all();
-        }
     }
 }
 
@@ -203,6 +288,8 @@ impl ShutdownCompletion {
     async fn wait(&self) {
         loop {
             let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
             if self.complete.load(Ordering::Acquire) {
                 return;
             }
@@ -211,18 +298,46 @@ impl ShutdownCompletion {
     }
 }
 
+impl Drop for ThreadCompletionGuard {
+    fn drop(&mut self) {
+        self.completion.complete.store(true, Ordering::Release);
+        self.completion.changed.notify_waiters();
+    }
+}
+
+impl<Job> Drop for ShutdownWaitGuard<'_, Job> {
+    fn drop(&mut self) {
+        if !self.armed || self.worker.completion.complete.load(Ordering::Acquire) {
+            return;
+        }
+        let detached = self.worker.force_discard();
+        tracing::warn!(
+            detached_records = detached.processing_records,
+            queued_records_marked_for_discard = detached.queued_records,
+            admitted_submissions_still_in_flight = detached.admitted_submissions,
+            "capture worker shutdown wait ended before the worker exited"
+        );
+    }
+}
+
 impl<Job> Drop for BoundedCaptureWorker<Job> {
     fn drop(&mut self) {
-        self.admission.close();
-        if self
-            .join
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_some()
-        {
-            tracing::error!("capture worker dropped before joined shutdown");
+        self.begin_shutdown();
+        if self.completion.complete.load(Ordering::Acquire) {
+            self.join_completed_worker();
+            return;
+        }
+        if !lock(&self.queue.state).force_discard {
+            tracing::error!("capture worker dropped before bounded shutdown");
+            let _ = self.force_discard();
         }
     }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]
@@ -233,14 +348,25 @@ mod tests {
 
     use super::*;
 
+    fn wait_until(test: impl Fn() -> bool) {
+        let started = std::time::Instant::now();
+        while !test() {
+            assert!(started.elapsed() < Duration::from_secs(1));
+            std::thread::yield_now();
+        }
+    }
+
     #[tokio::test]
     async fn full_queue_rejects_without_waiting_and_shutdown_drains_accepted_jobs() {
         let gate = Arc::new(Barrier::new(2));
+        let processing = Arc::new(AtomicBool::new(false));
         let processed = Arc::new(Mutex::new(Vec::new()));
         let worker = BoundedCaptureWorker::start(1, {
-            let gate = gate.clone();
-            let processed = processed.clone();
+            let gate = Arc::clone(&gate);
+            let processing = Arc::clone(&processing);
+            let processed = Arc::clone(&processed);
             move |job| {
+                processing.store(true, Ordering::Release);
                 if job == 1 {
                     gate.wait();
                 }
@@ -250,9 +376,7 @@ mod tests {
         .unwrap();
 
         worker.try_submit(1).unwrap();
-        while worker.sender.capacity() != 1 {
-            std::thread::yield_now();
-        }
+        wait_until(|| processing.load(Ordering::Acquire));
         worker.try_submit(2).unwrap();
         assert_eq!(worker.try_submit(3), Err(CaptureSubmitError::Full(3)));
 
@@ -267,7 +391,7 @@ mod tests {
     async fn processing_panic_isolated_and_shutdown_is_idempotent() {
         let processed = Arc::new(AtomicUsize::new(0));
         let worker = BoundedCaptureWorker::start(2, {
-            let processed = processed.clone();
+            let processed = Arc::clone(&processed);
             move |job| {
                 if job == 1 {
                     panic!("injected capture panic");
@@ -278,7 +402,7 @@ mod tests {
         .unwrap();
         worker.try_submit(1).unwrap();
         worker.try_submit(2).unwrap();
-        worker.shutdown().await;
+        let ((), ()) = tokio::join!(worker.shutdown(), worker.shutdown());
         worker.shutdown().await;
         assert_eq!(processed.load(Ordering::Relaxed), 2);
     }
@@ -290,7 +414,7 @@ mod tests {
         let processed = Arc::new(AtomicUsize::new(0));
         let worker = Arc::new(
             BoundedCaptureWorker::start(4, {
-                let processed = processed.clone();
+                let processed = Arc::clone(&processed);
                 move |_| {
                     processed.fetch_add(1, Ordering::Relaxed);
                 }
@@ -299,25 +423,26 @@ mod tests {
         );
 
         let submitter = {
-            let worker = worker.clone();
-            let admission_entered = admission_entered.clone();
-            let release_admission = release_admission.clone();
+            let worker = Arc::clone(&worker);
+            let admission_entered = Arc::clone(&admission_entered);
+            let release_admission = Arc::clone(&release_admission);
             std::thread::spawn(move || {
                 let guard = worker.admission.try_enter().unwrap();
                 admission_entered.store(true, Ordering::Release);
                 while !release_admission.load(Ordering::Acquire) {
                     std::thread::yield_now();
                 }
-                worker.sender.try_send(WorkerMessage::Job(())).unwrap();
+                let mut state = lock(&worker.queue.state);
+                state.jobs.push_back(());
+                drop(state);
+                worker.queue.changed.notify_one();
                 drop(guard);
             })
         };
-        while !admission_entered.load(Ordering::Acquire) {
-            tokio::task::yield_now().await;
-        }
+        wait_until(|| admission_entered.load(Ordering::Acquire));
         worker.begin_shutdown();
         let shutdown = {
-            let worker = worker.clone();
+            let worker = Arc::clone(&worker);
             tokio::spawn(async move { worker.shutdown().await })
         };
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -329,34 +454,131 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cancelled_shutdown_waiter_cannot_detach_the_worker_join() {
+    async fn cancelled_shutdown_discards_queued_work_and_detaches_only_the_running_job() {
         let gate = Arc::new(Barrier::new(2));
+        let processing = Arc::new(AtomicBool::new(false));
+        let processed = Arc::new(Mutex::new(Vec::new()));
+        let worker = Arc::new(
+            BoundedCaptureWorker::start(2, {
+                let gate = Arc::clone(&gate);
+                let processing = Arc::clone(&processing);
+                let processed = Arc::clone(&processed);
+                move |job| {
+                    processing.store(true, Ordering::Release);
+                    if job == 1 {
+                        gate.wait();
+                    }
+                    processed.lock().unwrap().push(job);
+                }
+            })
+            .unwrap(),
+        );
+        worker.try_submit(1).unwrap();
+        wait_until(|| processing.load(Ordering::Acquire));
+        worker.try_submit(2).unwrap();
+        worker.try_submit(3).unwrap();
+
+        let waiter = {
+            let worker = Arc::clone(&worker);
+            tokio::spawn(async move { worker.shutdown().await })
+        };
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        waiter.abort();
+        assert!(waiter.await.is_err());
+        assert_eq!(
+            worker.force_discard(),
+            DetachedCaptureWork {
+                processing_records: 1,
+                queued_records: 2,
+                admitted_submissions: 0,
+            }
+        );
+
+        gate.wait();
+        tokio::time::timeout(Duration::from_secs(1), worker.shutdown())
+            .await
+            .expect("replacement waiter observes eventual raw-thread exit");
+        assert_eq!(*processed.lock().unwrap(), [1]);
+        assert_eq!(worker.discarded_records(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forced_shutdown_waits_for_a_preclosed_submitter_then_discards_its_job() {
         let processed = Arc::new(AtomicUsize::new(0));
         let worker = Arc::new(
             BoundedCaptureWorker::start(1, {
-                let gate = gate.clone();
-                let processed = processed.clone();
+                let processed = Arc::clone(&processed);
                 move |_| {
-                    gate.wait();
                     processed.fetch_add(1, Ordering::Release);
                 }
             })
             .unwrap(),
         );
-        worker.try_submit(()).unwrap();
-
-        let first_waiter = {
-            let worker = worker.clone();
+        let admission = worker
+            .admission
+            .try_enter()
+            .expect("submitter crosses admission before shutdown");
+        let waiter = {
+            let worker = Arc::clone(&worker);
             tokio::spawn(async move { worker.shutdown().await })
         };
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        first_waiter.abort();
-        assert!(first_waiter.await.is_err());
-        gate.wait();
+        wait_until(|| worker.admission.state.load(Ordering::Acquire) & CLOSED_BIT != 0);
+        waiter.abort();
+        assert!(waiter.await.is_err());
+        assert!(!worker.completion.complete.load(Ordering::Acquire));
+        assert_eq!(
+            worker.force_discard(),
+            DetachedCaptureWork {
+                processing_records: 0,
+                queued_records: 0,
+                admitted_submissions: 1,
+            }
+        );
+
+        lock(&worker.queue.state).jobs.push_back(());
+        worker.queue.changed.notify_one();
+        drop(admission);
 
         tokio::time::timeout(Duration::from_secs(1), worker.shutdown())
             .await
-            .expect("a replacement waiter observes the same worker join");
-        assert_eq!(processed.load(Ordering::Acquire), 1);
+            .expect("worker exits after the admitted submitter becomes quiescent");
+        assert_eq!(processed.load(Ordering::Acquire), 0);
+        assert_eq!(worker.discarded_records(), 1);
+    }
+
+    #[test]
+    fn detached_worker_exits_after_its_tokio_runtime_is_dropped() {
+        let gate = Arc::new(Barrier::new(2));
+        let processing = Arc::new(AtomicBool::new(false));
+        let worker = Arc::new(
+            BoundedCaptureWorker::start(1, {
+                let gate = Arc::clone(&gate);
+                let processing = Arc::clone(&processing);
+                move |()| {
+                    processing.store(true, Ordering::Release);
+                    gate.wait();
+                }
+            })
+            .unwrap(),
+        );
+        worker.try_submit(()).unwrap();
+        wait_until(|| processing.load(Ordering::Acquire));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let result = tokio::time::timeout(Duration::from_millis(10), worker.shutdown()).await;
+            assert!(result.is_err());
+        });
+        drop(runtime);
+
+        gate.wait();
+        wait_until(|| worker.completion.complete.load(Ordering::Acquire));
+        let join = lock(&worker.join)
+            .take()
+            .expect("worker join remains owned");
+        join.join().unwrap();
     }
 }

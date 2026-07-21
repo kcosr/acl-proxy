@@ -1,24 +1,23 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use http_access_runtime::{TlsRootCertificate, TlsRootSet, TlsRootsRegistration};
+use http_access_runtime::{SystemTlsRootSet, TlsRootCertificate, TlsRootSet, TlsRootsRegistration};
 use http_access_types::{
     ClientTlsIntent, HttpProtocol, HttpProtocolSet, HttpScheme, PolicyGeneration, Route,
     SnapshotIdentity, StableId, TlsRootsRef, TlsTrust, TransportSecurity,
 };
-use http_access_url::{canonicalize_http_url, canonicalize_tls_server_name};
+use http_access_url::canonicalize_tls_server_name;
 
+use crate::candidate_tls::CandidateTlsResolver;
 use crate::config::compiler::{
     CompiledEgressRoute, CompiledHttpVersion, CompiledTlsTrust, EgressPlan, ParentProxyPlan,
     ParentProxyTlsPlan, TransportTlsPlan,
 };
-use crate::tls::{load_custom_ca_der, TlsActivationError};
+use crate::tls::TlsActivationError;
 
 /// Exact neutral egress inputs produced from one compiled product generation.
 pub(crate) struct EgressActivation {
     neutral: NeutralEgressBindings,
     executor: ForwardingExecutorBindings,
-    #[cfg(test)]
-    custom_ca_file_reads: usize,
 }
 
 /// Snapshot material consumed exactly once during standalone finalization.
@@ -27,6 +26,7 @@ pub(crate) struct NeutralEgressBindings {
     origin_https_trust: TlsTrust,
     route: Route,
     tls_roots: Vec<TlsRootsRegistration>,
+    system_tls_roots: SystemTlsRootSet,
 }
 
 /// Cloneable non-secret inputs retained until shared executor activation.
@@ -36,18 +36,11 @@ pub(crate) struct ForwardingExecutorBindings {
     route: Route,
 }
 
-struct EgressTrustLoader<'a> {
-    custom_ca_der: Vec<(PathBuf, Vec<Vec<u8>>)>,
-    is_cancelled: &'a mut dyn FnMut() -> bool,
-    #[cfg(test)]
-    custom_ca_file_reads: usize,
-}
-
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub(crate) enum EgressActivationError {
     #[error("egress activation was cancelled")]
     ActivationCancelled,
-    #[error("egress plan route and parent metadata are inconsistent")]
+    #[error("egress plan route is inconsistent")]
     Route,
     #[error("egress parent URL is invalid")]
     ParentUrl,
@@ -59,40 +52,43 @@ pub(crate) enum EgressActivationError {
     CaInvalid,
     #[error("custom CA certificate bundle is empty")]
     CaEmpty,
+    #[error("custom CA certificate bundle exceeds the shared TLS root limits")]
+    CaLimit,
+    #[error("custom CA certificate loader is unavailable")]
+    CaLoaderUnavailable,
+    #[error("system certificate roots are unavailable")]
+    SystemRoots,
     #[error("egress neutral TLS bindings are invalid")]
     NeutralTls,
 }
 
 impl EgressActivation {
-    pub(crate) fn activate(
+    pub(crate) async fn activate(
         plan: EgressPlan,
         identity: &SnapshotIdentity,
-        generation: PolicyGeneration,
-        mut is_cancelled: impl FnMut() -> bool,
+        tls_resolver: &mut CandidateTlsResolver,
     ) -> Result<Self, EgressActivationError> {
-        check_cancellation(&mut is_cancelled)?;
+        check_cancellation(tls_resolver)?;
+        let system_tls_roots = tls_resolver
+            .take_system_roots()
+            .map_err(EgressActivationError::from)?;
         let EgressPlan {
             route,
             origin_tls,
             parent_proxy,
             ..
         } = plan;
-        let mut trust_loader = EgressTrustLoader {
-            custom_ca_der: Vec::new(),
-            is_cancelled: &mut is_cancelled,
-            #[cfg(test)]
-            custom_ca_file_reads: 0,
-        };
+        let generation = tls_resolver.generation();
         let (protocols, origin_https_trust, origin_roots) =
-            activate_origin_tls(origin_tls, identity, generation, &mut trust_loader)?;
+            activate_origin_tls(origin_tls, identity, generation, tls_resolver).await?;
         let (route, parent_roots) = match (route, parent_proxy) {
             (CompiledEgressRoute::Direct, None) => (Route::Direct, None),
             (CompiledEgressRoute::ParentProxy, Some(parent)) => {
-                activate_parent(parent, identity, generation, &mut trust_loader)?
+                activate_parent(parent, identity, generation, tls_resolver).await?
             }
             _ => return Err(EgressActivationError::Route),
         };
-        check_cancellation(trust_loader.is_cancelled)?;
+        check_cancellation(tls_resolver)?;
 
         let executor = ForwardingExecutorBindings {
             protocols: protocols.clone(),
@@ -105,10 +101,9 @@ impl EgressActivation {
                 origin_https_trust,
                 route,
                 tls_roots: origin_roots.into_iter().chain(parent_roots).collect(),
+                system_tls_roots,
             },
             executor,
-            #[cfg(test)]
-            custom_ca_file_reads: trust_loader.custom_ca_file_reads,
         })
     }
 
@@ -117,31 +112,80 @@ impl EgressActivation {
     }
 
     #[cfg(test)]
-    fn custom_ca_file_reads(&self) -> usize {
-        self.custom_ca_file_reads
+    pub(crate) fn activate_for_test(
+        plan: EgressPlan,
+        identity: &SnapshotIdentity,
+        generation: PolicyGeneration,
+        mut is_cancelled: impl FnMut() -> bool,
+    ) -> Result<Self, EgressActivationError> {
+        assert!(
+            !matches!(
+                plan.origin_tls.trust,
+                CompiledTlsTrust::Custom | CompiledTlsTrust::SystemPlusCustom
+            ) && !plan.parent_proxy.as_ref().is_some_and(|parent| {
+                parent.tls.as_ref().is_some_and(|tls| {
+                    matches!(
+                        tls.trust,
+                        CompiledTlsTrust::Custom | CompiledTlsTrust::SystemPlusCustom
+                    )
+                })
+            }),
+            "custom-CA egress plans must use async production activation"
+        );
+        if is_cancelled() {
+            return Err(EgressActivationError::ActivationCancelled);
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test TLS I/O runtime builds");
+        runtime.block_on(async {
+            let tls_io =
+                crate::tls_io_runtime::TlsIoRuntime::new().expect("test TLS I/O supervisor starts");
+            let mut tls_resolver = CandidateTlsResolver::activate(
+                std::sync::Arc::clone(&tls_io),
+                crate::runtime::ActivationCancellation::new_for_test(),
+                generation,
+            )
+            .await?;
+            let result = Self::activate(plan, identity, &mut tls_resolver).await;
+            let _ = tls_io.shutdown_and_wait(None).await;
+            result
+        })
     }
 }
 
 impl NeutralEgressBindings {
     pub(crate) fn into_parts(
         self,
-    ) -> (HttpProtocolSet, TlsTrust, Route, Vec<TlsRootsRegistration>) {
+    ) -> (
+        HttpProtocolSet,
+        TlsTrust,
+        Route,
+        Vec<TlsRootsRegistration>,
+        SystemTlsRootSet,
+    ) {
         (
             self.protocols,
             self.origin_https_trust,
             self.route,
             self.tls_roots,
+            self.system_tls_roots,
         )
     }
 
     #[cfg(test)]
-    pub(crate) fn direct_system_for_test() -> Self {
+    pub(crate) fn direct_system_for_test(generation: PolicyGeneration) -> Self {
+        let (_, system_tls_roots) =
+            crate::tls::load_bounded_system_roots(generation, &mut || false)
+                .expect("test host system roots load");
         Self {
             protocols: HttpProtocolSet::new(vec![HttpProtocol::Http1, HttpProtocol::Http2])
                 .unwrap(),
             origin_https_trust: TlsTrust::SystemRoots,
             route: Route::Direct,
             tls_roots: Vec::new(),
+            system_tls_roots,
         }
     }
 }
@@ -152,42 +196,30 @@ impl ForwardingExecutorBindings {
     }
 }
 
-impl EgressTrustLoader<'_> {
-    fn load_custom(
-        &mut self,
-        trust: CompiledTlsTrust,
-        ca_certificate: Option<&Path>,
-    ) -> Result<Option<Vec<Vec<u8>>>, EgressActivationError> {
-        if !matches!(
-            trust,
-            CompiledTlsTrust::Custom | CompiledTlsTrust::SystemPlusCustom
-        ) {
-            return Ok(None);
-        }
-        let path = ca_certificate.ok_or(EgressActivationError::CaUnavailable)?;
-        if let Some((_, certificates)) = self
-            .custom_ca_der
-            .iter()
-            .find(|(candidate, _)| candidate == path)
-        {
-            return Ok(Some(certificates.clone()));
-        }
-        #[cfg(test)]
-        {
-            self.custom_ca_file_reads += 1;
-        }
-        let certificates = load_custom_ca_der(path, self.is_cancelled)?;
-        self.custom_ca_der
-            .push((path.to_path_buf(), certificates.clone()));
-        Ok(Some(certificates))
+async fn load_custom(
+    trust: CompiledTlsTrust,
+    ca_certificate: Option<&Path>,
+    tls_resolver: &mut CandidateTlsResolver,
+) -> Result<Option<std::sync::Arc<[Vec<u8>]>>, EgressActivationError> {
+    if !matches!(
+        trust,
+        CompiledTlsTrust::Custom | CompiledTlsTrust::SystemPlusCustom
+    ) {
+        return Ok(None);
     }
+    let path = ca_certificate.ok_or(EgressActivationError::CaUnavailable)?;
+    tls_resolver
+        .resolve(path)
+        .await
+        .map(Some)
+        .map_err(Into::into)
 }
 
-fn activate_origin_tls(
+async fn activate_origin_tls(
     plan: TransportTlsPlan,
     identity: &SnapshotIdentity,
     generation: PolicyGeneration,
-    trust_loader: &mut EgressTrustLoader<'_>,
+    tls_resolver: &mut CandidateTlsResolver,
 ) -> Result<(HttpProtocolSet, TlsTrust, Option<TlsRootsRegistration>), EgressActivationError> {
     let TransportTlsPlan {
         trust,
@@ -204,7 +236,7 @@ fn activate_origin_tls(
             .collect(),
     )
     .map_err(|_| EgressActivationError::Route)?;
-    let custom_ca_der = trust_loader.load_custom(trust, ca_certificate.as_deref())?;
+    let custom_ca_der = load_custom(trust, ca_certificate.as_deref(), tls_resolver).await?;
     let (neutral_trust, roots) = neutral_tls_trust(
         trust,
         identity,
@@ -216,30 +248,21 @@ fn activate_origin_tls(
     Ok((protocols, neutral_trust, roots))
 }
 
-fn activate_parent(
+async fn activate_parent(
     plan: ParentProxyPlan,
     identity: &SnapshotIdentity,
     generation: PolicyGeneration,
-    trust_loader: &mut EgressTrustLoader<'_>,
+    tls_resolver: &mut CandidateTlsResolver,
 ) -> Result<(Route, Option<TlsRootsRegistration>), EgressActivationError> {
-    let ParentProxyPlan {
-        url,
-        host,
-        port,
-        tls,
-        ..
-    } = plan;
-    let target = canonicalize_http_url(&url).map_err(|_| EgressActivationError::ParentUrl)?;
+    let ParentProxyPlan { target, tls, .. } = plan;
     if target.path() != "/" || target.query().is_some() {
         return Err(EgressActivationError::ParentUrl);
-    }
-    if target.authority().host().as_str() != host || target.authority().effective_port() != port {
-        return Err(EgressActivationError::Route);
     }
     let (security, roots) = match (target.scheme(), tls) {
         (HttpScheme::Http, None) => (TransportSecurity::Cleartext, None),
         (HttpScheme::Https, Some(tls)) => {
-            let (intent, roots) = activate_parent_tls(tls, identity, generation, trust_loader)?;
+            let (intent, roots) =
+                activate_parent_tls(tls, identity, generation, tls_resolver).await?;
             (TransportSecurity::Tls(intent), roots)
         }
         _ => return Err(EgressActivationError::Route),
@@ -247,15 +270,16 @@ fn activate_parent(
     Ok((Route::Parent { target, security }, roots))
 }
 
-fn activate_parent_tls(
+async fn activate_parent_tls(
     plan: ParentProxyTlsPlan,
     identity: &SnapshotIdentity,
     generation: PolicyGeneration,
-    trust_loader: &mut EgressTrustLoader<'_>,
+    tls_resolver: &mut CandidateTlsResolver,
 ) -> Result<(ClientTlsIntent, Option<TlsRootsRegistration>), EgressActivationError> {
     let server_name = canonicalize_tls_server_name(&plan.server_name)
         .map_err(|_| EgressActivationError::ParentServerName)?;
-    let custom_ca_der = trust_loader.load_custom(plan.trust, plan.ca_certificate.as_deref())?;
+    let custom_ca_der =
+        load_custom(plan.trust, plan.ca_certificate.as_deref(), tls_resolver).await?;
     let (trust, roots) = neutral_tls_trust(
         plan.trust,
         identity,
@@ -272,19 +296,19 @@ fn neutral_tls_trust(
     identity: &SnapshotIdentity,
     generation: PolicyGeneration,
     id: &'static str,
-    custom_ca_der: Option<Vec<Vec<u8>>>,
+    custom_ca_der: Option<std::sync::Arc<[Vec<u8>]>>,
 ) -> Result<(TlsTrust, Option<TlsRootsRegistration>), EgressActivationError> {
     match (trust, custom_ca_der) {
         (CompiledTlsTrust::System, None) => Ok((TlsTrust::SystemRoots, None)),
         (CompiledTlsTrust::Insecure, None) => Ok((TlsTrust::Insecure, None)),
         (CompiledTlsTrust::Custom | CompiledTlsTrust::SystemPlusCustom, Some(certificates)) => {
             let certificates = certificates
-                .into_iter()
+                .iter()
+                .cloned()
                 .map(TlsRootCertificate::new)
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| EgressActivationError::NeutralTls)?;
-            let roots = TlsRootSet::new(generation, certificates)
-                .map_err(|_| EgressActivationError::NeutralTls)?;
+                .map_err(map_shared_root_error)?;
+            let roots = TlsRootSet::new(generation, certificates).map_err(map_shared_root_error)?;
             let reference = TlsRootsRef::new(
                 identity.clone(),
                 StableId::new(id.to_owned()).map_err(|_| EgressActivationError::NeutralTls)?,
@@ -307,8 +331,15 @@ fn neutral_tls_trust(
     }
 }
 
-fn check_cancellation(is_cancelled: &mut dyn FnMut() -> bool) -> Result<(), EgressActivationError> {
-    if is_cancelled() {
+fn map_shared_root_error(error: http_access_runtime::RuntimeError) -> EgressActivationError {
+    match error {
+        http_access_runtime::RuntimeError::LimitExceeded => EgressActivationError::CaLimit,
+        _ => EgressActivationError::CaInvalid,
+    }
+}
+
+fn check_cancellation(tls_resolver: &CandidateTlsResolver) -> Result<(), EgressActivationError> {
+    if tls_resolver.cancellation().is_cancelled() {
         Err(EgressActivationError::ActivationCancelled)
     } else {
         Ok(())
@@ -332,26 +363,35 @@ impl From<TlsActivationError> for EgressActivationError {
             TlsActivationError::CaUnavailable => Self::CaUnavailable,
             TlsActivationError::CaInvalid => Self::CaInvalid,
             TlsActivationError::CaEmpty => Self::CaEmpty,
-            TlsActivationError::NativeRoots
-            | TlsActivationError::CaUnusable
-            | TlsActivationError::Configuration => Self::NeutralTls,
+            TlsActivationError::CaLimit => Self::CaLimit,
+            TlsActivationError::CaLoaderUnavailable => Self::CaLoaderUnavailable,
+            TlsActivationError::NativeRoots => Self::SystemRoots,
+            TlsActivationError::CaUnusable | TlsActivationError::Configuration => Self::NeutralTls,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
     use std::io::{self, Write};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex, Once};
+    use std::time::Duration;
 
     use http_access_types::CanonicalHost;
+    use http_access_url::canonicalize_http_url;
     use tempfile::TempDir;
     use tracing_subscriber::fmt::MakeWriter;
 
     use super::*;
+    use crate::authorization::webhook::provider::{WebhookActivationError, WebhookProvider};
+    use crate::config::compiler::{
+        CompiledProviderFailureMode, WebhookProviderPlan, WebhookTlsPlan,
+    };
     use crate::test_certificates::TestTlsIdentity;
+    use crate::tls::TlsActivationError;
 
     #[derive(Clone, Default)]
     struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
@@ -444,8 +484,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn native_root_failure_retains_its_distinct_activation_error() {
+        assert_eq!(
+            EgressActivationError::from(TlsActivationError::NativeRoots),
+            EgressActivationError::SystemRoots
+        );
+    }
+
     fn activate(plan: EgressPlan) -> EgressActivation {
-        EgressActivation::activate(
+        EgressActivation::activate_for_test(
             plan,
             &SnapshotIdentity::new(),
             PolicyGeneration::new(7).unwrap(),
@@ -454,11 +502,72 @@ mod tests {
         .unwrap()
     }
 
+    async fn activate_candidate(
+        plan: EgressPlan,
+        identity: &SnapshotIdentity,
+        generation: PolicyGeneration,
+        cancellation: crate::runtime::ActivationCancellation,
+    ) -> (Result<EgressActivation, EgressActivationError>, usize) {
+        let tls_io = crate::tls_io_runtime::TlsIoRuntime::new().unwrap();
+        let mut tls_resolver = match CandidateTlsResolver::activate(
+            std::sync::Arc::clone(&tls_io),
+            cancellation,
+            generation,
+        )
+        .await
+        {
+            Ok(resolver) => resolver,
+            Err(error) => {
+                tls_io.shutdown_and_wait(None).await;
+                return (Err(error.into()), 0);
+            }
+        };
+        let result = EgressActivation::activate(plan, identity, &mut tls_resolver).await;
+        let reads = tls_resolver.file_reads();
+        tls_io.shutdown_and_wait(None).await;
+        (result, reads)
+    }
+
     fn write_ca(directory: &TempDir) -> PathBuf {
         let generated = TestTlsIdentity::new("test-ca.example");
         let path = directory.path().join("ca.pem");
         crate::filesystem::write_public_file(&path, generated.root_certificate_pem()).unwrap();
         path
+    }
+
+    async fn webhook_ca_error(trust: CompiledTlsTrust, path: PathBuf) -> TlsActivationError {
+        let tls_io = crate::tls_io_runtime::TlsIoRuntime::new().unwrap();
+        let mut tls_resolver = CandidateTlsResolver::activate(
+            std::sync::Arc::clone(&tls_io),
+            crate::runtime::ActivationCancellation::new_for_test(),
+            PolicyGeneration::new(7).unwrap(),
+        )
+        .await
+        .expect("test host system roots load");
+        let error = WebhookProvider::activate(
+            WebhookProviderPlan {
+                url: canonicalize_http_url("https://provider.test/authorize").unwrap(),
+                timeout: Duration::from_secs(3),
+                on_failure: CompiledProviderFailureMode::Deny,
+                include_headers: Vec::new(),
+                max_request_bytes: 8192,
+                max_response_bytes: 4096,
+                outputs: BTreeMap::new(),
+                tls: Some(WebhookTlsPlan {
+                    trust,
+                    ca_certificate: Some(path),
+                }),
+            },
+            &mut tls_resolver,
+        )
+        .await
+        .err()
+        .expect("invalid webhook roots must fail");
+        tls_io.shutdown_and_wait(None).await;
+        match error {
+            WebhookActivationError::Tls(error) => error,
+            WebhookActivationError::Cancelled => panic!("test activation is not cancelled"),
+        }
     }
 
     #[test]
@@ -474,8 +583,8 @@ mod tests {
         assert_eq!(route, Route::Direct);
     }
 
-    #[test]
-    fn repeated_custom_ca_path_is_read_once_per_generation() {
+    #[tokio::test]
+    async fn repeated_custom_ca_path_is_read_once_per_generation() {
         let directory = TempDir::new().unwrap();
         let ca = write_ca(&directory);
         let plan = EgressPlan {
@@ -484,9 +593,7 @@ mod tests {
             parent_proxy: Some(ParentProxyPlan {
                 #[cfg(test)]
                 kind: crate::config::compiler::CompiledParentProxyKind::Generic,
-                url: "https://parent.example:8443/".to_owned(),
-                host: "parent.example".to_owned(),
-                port: 8443,
+                target: canonicalize_http_url("https://parent.example:8443/").unwrap(),
                 tls: Some(ParentProxyTlsPlan {
                     trust: CompiledTlsTrust::Custom,
                     ca_certificate: Some(ca),
@@ -496,8 +603,15 @@ mod tests {
             request_headers: Vec::new(),
             credential_actions: Vec::new(),
         };
-        let activation = activate(plan);
-        assert_eq!(activation.custom_ca_file_reads(), 1);
+        let (activation, reads) = activate_candidate(
+            plan,
+            &SnapshotIdentity::new(),
+            PolicyGeneration::new(7).unwrap(),
+            crate::runtime::ActivationCancellation::new_for_test(),
+        )
+        .await;
+        let activation = activation.unwrap();
+        assert_eq!(reads, 1);
         let (_, executor) = activation.into_parts();
         let (_, origin_trust, route) = executor.into_parts();
         assert!(matches!(origin_trust, TlsTrust::CustomRoots(_)));
@@ -515,24 +629,109 @@ mod tests {
         assert!(matches!(intent.trust(), TlsTrust::CustomRoots(_)));
     }
 
-    #[test]
-    fn neutral_root_bindings_change_for_content_and_generation_and_preserve_trust_mode() {
+    #[tokio::test]
+    async fn egress_and_webhook_share_one_immutable_candidate_tls_snapshot() {
+        let directory = TempDir::new().unwrap();
+        let ca = write_ca(&directory);
+        let tls_io = crate::tls_io_runtime::TlsIoRuntime::new().unwrap();
+        let mut tls_resolver = CandidateTlsResolver::activate(
+            std::sync::Arc::clone(&tls_io),
+            crate::runtime::ActivationCancellation::new_for_test(),
+            PolicyGeneration::new(7).unwrap(),
+        )
+        .await
+        .expect("test host system roots load");
+        let system_material = tls_resolver.system_material().to_vec();
+        assert!(!system_material.is_empty());
+        assert_eq!(tls_io.system_root_loads(), 1);
+
+        EgressActivation::activate(
+            direct(CompiledTlsTrust::Custom, Some(ca.clone())),
+            &SnapshotIdentity::new(),
+            &mut tls_resolver,
+        )
+        .await
+        .expect("egress consumes the candidate CA snapshot");
+        crate::filesystem::write_public_file(&ca, b"not a certificate").unwrap();
+
+        let webhook = WebhookProvider::activate(
+            WebhookProviderPlan {
+                url: canonicalize_http_url("https://provider.test/authorize").unwrap(),
+                timeout: Duration::from_secs(3),
+                on_failure: CompiledProviderFailureMode::Deny,
+                include_headers: Vec::new(),
+                max_request_bytes: 8192,
+                max_response_bytes: 4096,
+                outputs: BTreeMap::new(),
+                tls: Some(WebhookTlsPlan {
+                    trust: CompiledTlsTrust::Custom,
+                    ca_certificate: Some(ca),
+                }),
+            },
+            &mut tls_resolver,
+        )
+        .await
+        .expect("webhook reuses the egress CA snapshot");
+
+        assert!(webhook.tls().is_some());
+        assert_eq!(tls_resolver.file_reads(), 1);
+
+        let system_webhook = WebhookProvider::activate(
+            WebhookProviderPlan {
+                url: canonicalize_http_url("https://system-provider.test/authorize").unwrap(),
+                timeout: Duration::from_secs(3),
+                on_failure: CompiledProviderFailureMode::Deny,
+                include_headers: Vec::new(),
+                max_request_bytes: 8192,
+                max_response_bytes: 4096,
+                outputs: BTreeMap::new(),
+                tls: Some(WebhookTlsPlan {
+                    trust: CompiledTlsTrust::System,
+                    ca_certificate: None,
+                }),
+            },
+            &mut tls_resolver,
+        )
+        .await
+        .expect("webhook reuses candidate system roots");
+        assert!(system_webhook.tls().is_some());
+        assert_eq!(tls_resolver.system_material(), system_material.as_slice());
+        assert_eq!(tls_io.system_root_loads(), 1);
+        tls_io.shutdown_and_wait(None).await;
+    }
+
+    #[tokio::test]
+    async fn neutral_root_bindings_change_for_content_and_generation_and_preserve_trust_mode() {
         let first_directory = TempDir::new().unwrap();
         let second_directory = TempDir::new().unwrap();
         let first_ca = write_ca(&first_directory);
         let second_ca = write_ca(&second_directory);
         let identity = SnapshotIdentity::new();
-        let activate_trust = |trust, ca: PathBuf, generation| {
-            EgressActivation::activate(direct(trust, Some(ca)), &identity, generation, || false)
-                .unwrap()
-                .neutral
-        };
+        async fn activate_trust(
+            trust: CompiledTlsTrust,
+            ca: PathBuf,
+            identity: &SnapshotIdentity,
+            generation: PolicyGeneration,
+        ) -> NeutralEgressBindings {
+            activate_candidate(
+                direct(trust, Some(ca)),
+                identity,
+                generation,
+                crate::runtime::ActivationCancellation::new_for_test(),
+            )
+            .await
+            .0
+            .unwrap()
+            .neutral
+        }
 
         let custom = activate_trust(
             CompiledTlsTrust::Custom,
             first_ca.clone(),
+            &identity,
             PolicyGeneration::new(7).unwrap(),
-        );
+        )
+        .await;
         let TlsTrust::CustomRoots(custom_ref) = &custom.origin_https_trust else {
             panic!("custom trust must remain custom-only")
         };
@@ -541,8 +740,10 @@ mod tests {
         let combined = activate_trust(
             CompiledTlsTrust::SystemPlusCustom,
             first_ca.clone(),
+            &identity,
             PolicyGeneration::new(7).unwrap(),
-        );
+        )
+        .await;
         let TlsTrust::SystemAndCustomRoots(combined_ref) = &combined.origin_https_trust else {
             panic!("combined trust must retain system roots")
         };
@@ -551,8 +752,10 @@ mod tests {
         let substituted = activate_trust(
             CompiledTlsTrust::Custom,
             second_ca,
+            &identity,
             PolicyGeneration::new(7).unwrap(),
-        );
+        )
+        .await;
         let TlsTrust::CustomRoots(substituted_ref) = &substituted.origin_https_trust else {
             panic!("substituted trust remains custom-only")
         };
@@ -561,8 +764,10 @@ mod tests {
         let rotated = activate_trust(
             CompiledTlsTrust::Custom,
             first_ca,
+            &identity,
             PolicyGeneration::new(8).unwrap(),
-        );
+        )
+        .await;
         let TlsTrust::CustomRoots(rotated_ref) = &rotated.origin_https_trust else {
             panic!("rotated trust remains custom-only")
         };
@@ -571,8 +776,8 @@ mod tests {
         assert_ne!(custom_ref.binding(), rotated_ref.binding());
     }
 
-    #[test]
-    fn one_custom_ca_read_feeds_origin_parent_and_exact_registrations() {
+    #[tokio::test]
+    async fn one_custom_ca_read_feeds_origin_parent_and_exact_registrations() {
         let directory = TempDir::new().unwrap();
         let ca = write_ca(&directory);
         let plan = EgressPlan {
@@ -581,9 +786,7 @@ mod tests {
             parent_proxy: Some(ParentProxyPlan {
                 #[cfg(test)]
                 kind: crate::config::compiler::CompiledParentProxyKind::Generic,
-                url: "https://parent.example:8443/".to_owned(),
-                host: "parent.example".to_owned(),
-                port: 8443,
+                target: canonicalize_http_url("https://parent.example:8443/").unwrap(),
                 tls: Some(ParentProxyTlsPlan {
                     trust: CompiledTlsTrust::Custom,
                     ca_certificate: Some(ca),
@@ -594,13 +797,16 @@ mod tests {
             credential_actions: Vec::new(),
         };
         let identity = SnapshotIdentity::new();
-        let activation =
-            EgressActivation::activate(plan, &identity, PolicyGeneration::new(7).unwrap(), || {
-                false
-            })
-            .unwrap();
+        let (activation, reads) = activate_candidate(
+            plan,
+            &identity,
+            PolicyGeneration::new(7).unwrap(),
+            crate::runtime::ActivationCancellation::new_for_test(),
+        )
+        .await;
+        let activation = activation.unwrap();
 
-        assert_eq!(activation.custom_ca_file_reads(), 1);
+        assert_eq!(reads, 1);
         assert_eq!(activation.neutral.tls_roots.len(), 2);
         assert_eq!(
             activation.neutral.protocols.protocols(),
@@ -635,9 +841,7 @@ mod tests {
         let parent = ParentProxyPlan {
             #[cfg(test)]
             kind: crate::config::compiler::CompiledParentProxyKind::AclProxy,
-            url: "http://parent.example:8080/".to_owned(),
-            host: "parent.example".to_owned(),
-            port: 8080,
+            target: canonicalize_http_url("http://parent.example:8080/").unwrap(),
             tls: None,
         };
         #[cfg(test)]
@@ -680,9 +884,7 @@ mod tests {
                 parent_proxy: Some(ParentProxyPlan {
                     #[cfg(test)]
                     kind: crate::config::compiler::CompiledParentProxyKind::Generic,
-                    url: "https://parent.example/".to_owned(),
-                    host: "parent.example".to_owned(),
-                    port: 443,
+                    target: canonicalize_http_url("https://parent.example/").unwrap(),
                     tls: Some(ParentProxyTlsPlan {
                         trust: CompiledTlsTrust::Insecure,
                         ca_certificate: None,
@@ -704,8 +906,8 @@ mod tests {
         assert!(!parent_logs.contains("sensitive-parent-name.example"));
     }
 
-    #[test]
-    fn custom_ca_failures_are_classified_without_exposing_paths() {
+    #[tokio::test]
+    async fn custom_ca_failures_are_classified_without_exposing_paths() {
         let directory = TempDir::new().unwrap();
         let cases = [
             (directory.path().join("missing-sensitive.pem"), None),
@@ -720,12 +922,14 @@ mod tests {
             if let Some(contents) = contents {
                 std::fs::write(&path, contents).unwrap();
             }
-            let error = EgressActivation::activate(
+            let error = activate_candidate(
                 direct(CompiledTlsTrust::Custom, Some(path.clone())),
                 &SnapshotIdentity::new(),
                 PolicyGeneration::new(7).unwrap(),
-                || false,
+                crate::runtime::ActivationCancellation::new_for_test(),
             )
+            .await
+            .0
             .err()
             .expect("invalid CA input must fail activation");
             match index {
@@ -744,91 +948,93 @@ mod tests {
         }
     }
 
-    #[test]
-    fn custom_ca_material_reads_are_bracketed_by_cancellation_checks() {
+    #[tokio::test]
+    async fn webhook_and_egress_reject_duplicate_and_excess_root_bundles_identically() {
         let directory = TempDir::new().unwrap();
-        let ca = write_ca(&directory);
+        let certificate = TestTlsIdentity::new("shared-bounds.example").root_certificate_pem();
+        let cases = [
+            (
+                directory.path().join("duplicate-sensitive.pem"),
+                [certificate.clone(), certificate.clone()].concat(),
+                EgressActivationError::CaInvalid,
+            ),
+            (
+                directory.path().join("excess-sensitive.pem"),
+                certificate.repeat(http_access_runtime::MAX_TLS_ROOT_CERTIFICATES + 1),
+                EgressActivationError::CaLimit,
+            ),
+        ];
 
-        let pre_read_checks = Cell::new(0_usize);
-        let missing = directory.path().join("unopened-sensitive-ca.pem");
-        let pre_read_error = EgressActivation::activate(
-            direct(CompiledTlsTrust::Custom, Some(missing.clone())),
-            &SnapshotIdentity::new(),
-            PolicyGeneration::new(7).unwrap(),
-            || {
-                let next = pre_read_checks.get() + 1;
-                pre_read_checks.set(next);
-                next == 2
-            },
-        )
-        .err()
-        .expect("pre-read cancellation must win over missing-file failure");
-        assert_eq!(pre_read_error, EgressActivationError::ActivationCancelled);
-        assert_eq!(pre_read_checks.get(), 2);
-        assert!(!pre_read_error
-            .to_string()
-            .contains(missing.to_str().unwrap()));
+        for (path, contents, expected_egress) in cases {
+            crate::filesystem::write_public_file(&path, &contents).unwrap();
+            for trust in [CompiledTlsTrust::Custom, CompiledTlsTrust::SystemPlusCustom] {
+                let egress = activate_candidate(
+                    direct(trust, Some(path.clone())),
+                    &SnapshotIdentity::new(),
+                    PolicyGeneration::new(7).unwrap(),
+                    crate::runtime::ActivationCancellation::new_for_test(),
+                )
+                .await
+                .0
+                .err()
+                .expect("invalid egress roots must fail");
+                let webhook = webhook_ca_error(trust, path.clone()).await;
 
-        let post_read_checks = Cell::new(0_usize);
-        let post_read_error = EgressActivation::activate(
-            direct(CompiledTlsTrust::Custom, Some(ca.clone())),
-            &SnapshotIdentity::new(),
-            PolicyGeneration::new(7).unwrap(),
-            || {
-                let next = post_read_checks.get() + 1;
-                post_read_checks.set(next);
-                next == 5
-            },
-        )
-        .err()
-        .expect("post-read cancellation must prevent activation");
-        assert_eq!(post_read_error, EgressActivationError::ActivationCancelled);
-        assert_eq!(post_read_checks.get(), 5);
-        assert!(!post_read_error.to_string().contains(ca.to_str().unwrap()));
+                assert_eq!(egress, expected_egress);
+                assert_eq!(egress.to_string(), webhook.to_string());
+                assert!(!egress.to_string().contains(path.to_str().unwrap()));
+            }
+        }
     }
 
-    #[test]
-    fn cancellation_precedes_ca_file_io() {
-        let error = EgressActivation::activate(
+    #[tokio::test]
+    async fn cancellation_precedes_ca_file_io() {
+        let cancellation = crate::runtime::ActivationCancellation::new_for_test();
+        cancellation.cancel_for_test();
+        let (error, reads) = activate_candidate(
             direct(
                 CompiledTlsTrust::Custom,
                 Some("/sensitive/missing/ca.pem".into()),
             ),
             &SnapshotIdentity::new(),
             PolicyGeneration::new(7).unwrap(),
-            || true,
+            cancellation,
         )
-        .err()
-        .expect("cancelled activation must fail");
+        .await;
+        let error = error.err().expect("cancelled activation must fail");
         assert_eq!(error, EgressActivationError::ActivationCancelled);
+        assert_eq!(reads, 0);
         assert!(!error.to_string().contains("/sensitive/"));
     }
 
     #[test]
-    fn invalid_parent_metadata_is_rejected_without_reflecting_values() {
-        let plan = EgressPlan {
-            route: CompiledEgressRoute::ParentProxy,
-            origin_tls: origin(CompiledTlsTrust::System, None),
-            parent_proxy: Some(ParentProxyPlan {
-                #[cfg(test)]
-                kind: crate::config::compiler::CompiledParentProxyKind::Generic,
-                url: "http://parent.example:8080/".to_owned(),
-                host: "different.example".to_owned(),
-                port: 8080,
-                tls: None,
-            }),
-            request_headers: Vec::new(),
-            credential_actions: Vec::new(),
-        };
-        let error = EgressActivation::activate(
-            plan,
-            &SnapshotIdentity::new(),
-            PolicyGeneration::new(7).unwrap(),
-            || false,
-        )
-        .err()
-        .expect("inconsistent parent metadata must fail");
-        assert_eq!(error, EgressActivationError::Route);
-        assert!(!error.to_string().contains("different.example"));
+    fn parent_target_path_and_query_are_rejected() {
+        for target in [
+            "http://parent.example:8080/proxy",
+            "http://parent.example:8080/?mode=proxy",
+        ] {
+            let plan = EgressPlan {
+                route: CompiledEgressRoute::ParentProxy,
+                origin_tls: origin(CompiledTlsTrust::System, None),
+                parent_proxy: Some(ParentProxyPlan {
+                    #[cfg(test)]
+                    kind: crate::config::compiler::CompiledParentProxyKind::Generic,
+                    target: canonicalize_http_url(target).unwrap(),
+                    tls: None,
+                }),
+                request_headers: Vec::new(),
+                credential_actions: Vec::new(),
+            };
+            let error = EgressActivation::activate_for_test(
+                plan,
+                &SnapshotIdentity::new(),
+                PolicyGeneration::new(7).unwrap(),
+                || false,
+            )
+            .err()
+            .expect("parent target shape must fail");
+            assert_eq!(error, EgressActivationError::ParentUrl);
+            assert!(!error.to_string().contains(target));
+        }
     }
 }

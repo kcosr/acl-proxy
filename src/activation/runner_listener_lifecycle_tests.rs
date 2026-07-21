@@ -911,6 +911,7 @@ max_stdout_line_bytes = 4096
 
 [authorization.providers.corpus.outputs.token]
 kind = "bearer"
+transport_security = "cleartext_allowed"
 required = true
 
 [policy]

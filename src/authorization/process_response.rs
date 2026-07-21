@@ -1114,8 +1114,7 @@ mod tests {
 
     #[tokio::test]
     async fn decision_only_and_expanded_accept_equivalent_json_whitespace() {
-        let line =
-            b"{\"id\":\"r\" \t, \"type\" : \"response\" , \"decision\" : \"allow\" \t } \r\n";
+        let line = b" \t{ \t\"id\" \t: \t\"r\" \t, \"type\" : \"response\" , \"decision\" : \"allow\" \t } \r\n";
         assert_eq!(
             run(line, line.len()).await.0.unwrap(),
             DecisionOnlyResponse::Decision(DecisionOnlyProviderDecision::Allow)
@@ -1130,7 +1129,10 @@ mod tests {
         let charge = guard.provider_response_charge();
         let outputs = ProviderOutputRegistry::activate(BTreeMap::from([(
             "token".to_string(),
-            ProviderOutputPlan::Bearer { required: false },
+            ProviderOutputPlan::Bearer {
+                required: false,
+                transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+            },
         )]));
         let response = read_expanded_response(&mut reader, continuation, &charge, &outputs, None)
             .await
@@ -1161,7 +1163,10 @@ mod tests {
         let charge = guard.provider_response_charge();
         let outputs = ProviderOutputRegistry::activate(BTreeMap::from([(
             "token".to_string(),
-            ProviderOutputPlan::Bearer { required: false },
+            ProviderOutputPlan::Bearer {
+                required: false,
+                transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+            },
         )]));
         let response = read_expanded_response(&mut reader, continuation, &charge, &outputs, None)
             .await
@@ -1190,7 +1195,10 @@ mod tests {
         let charge = guard.provider_response_charge();
         let outputs = ProviderOutputRegistry::activate(BTreeMap::from([(
             output_name.clone(),
-            ProviderOutputPlan::Bearer { required: true },
+            ProviderOutputPlan::Bearer {
+                required: true,
+                transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+            },
         )]));
         let response = read_expanded_response(&mut reader, continuation, &charge, &outputs, None)
             .await
@@ -1329,7 +1337,10 @@ mod tests {
         );
         let outputs = BTreeMap::from([(
             "token".to_string(),
-            ProviderOutputPlan::Bearer { required: false },
+            ProviderOutputPlan::Bearer {
+                required: false,
+                transport_security: crate::config::compiler::CompiledTransportSecurity::TlsRequired,
+            },
         )]);
         assert!(DecisionOnlyResponseSchema::activate(&process_plan(outputs, false)).is_none());
     }

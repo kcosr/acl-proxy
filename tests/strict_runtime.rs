@@ -326,7 +326,7 @@ import threading
 import time
 import urllib.parse
 
-port_file, event_file = sys.argv[1:]
+port_file, event_file, request_file = sys.argv[1:]
 
 def deliver_callback(callback_url, payload):
     time.sleep(0.05)
@@ -350,6 +350,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        with open(request_file, "a", encoding="utf-8") as handle:
+            handle.write(self.path + "\n")
         self.send_body(200, self.path.encode("ascii"), {
             "Content-Type": "text/plain",
             "X-Seen-Provider-Token": self.headers.get("x-provider-token", "missing"),
@@ -482,6 +484,7 @@ retire_timeout = "6s"
 
 [authorization.providers.local.outputs.token]
 kind = "custom_header"
+transport_security = "cleartext_allowed"
 header = "x-provider-token"
 required = true
 
@@ -495,6 +498,7 @@ max_response_bytes = 65536
 
 [authorization.providers.approval.outputs.token]
 kind = "bearer"
+transport_security = "cleartext_allowed"
 required = true
 
 [credentials]
@@ -606,9 +610,10 @@ fn start_origin(directory: &Path, python: &Path) -> (ChildGuard, SocketAddr) {
     let script = directory.join("origin.py");
     let port_file = directory.join("origin.port");
     let event_file = directory.join("webhook-events.jsonl");
+    let request_file = directory.join("origin-requests.txt");
     write_file(&script, origin_script());
     let child = Command::new(python)
-        .args([&script, &port_file, &event_file])
+        .args([&script, &port_file, &event_file, &request_file])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -682,6 +687,38 @@ fn wait_for_records(capture_dir: &Path, url: &str, count: usize) -> Vec<Value> {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+fn assert_record_omits_secrets(record: &Value, context: &str, secrets: &[&str]) {
+    let encoded = serde_json::to_string(record).unwrap();
+    for secret in secrets {
+        assert!(
+            !encoded.contains(secret),
+            "{context} exposed {secret:?}: {encoded}"
+        );
+    }
+}
+
+fn assert_all_log_files_omit_secrets(log_dir: &Path, secrets: &[&str]) {
+    let entries = fs::read_dir(log_dir).expect("read runtime log directory");
+    let mut file_count = 0;
+    for entry in entries {
+        let path = entry.unwrap().path();
+        if !path.is_file() {
+            continue;
+        }
+        file_count += 1;
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("read log file {}: {error}", path.display()));
+        for secret in secrets {
+            assert!(
+                !contents.contains(secret),
+                "log file {} exposed {secret:?}",
+                path.display()
+            );
+        }
+    }
+    assert!(file_count > 0, "runtime produced no log files");
 }
 
 #[test]
@@ -803,6 +840,16 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
     assert_eq!(allow.status, 200);
     assert_eq!(allow.header("x-seen-provider-token"), Some("typed-secret"));
     assert_eq!(allow.header("x-generation"), Some("one"));
+    let allow_captures = wait_for_records(&directory.path().join("captures"), &allow_url, 2);
+    let allow_request = allow_captures
+        .iter()
+        .find(|record| record["kind"] == "request")
+        .expect("provider allow request capture");
+    assert_record_omits_secrets(
+        allow_request,
+        "provider allow request capture",
+        &[DECISION_LOG_SECRET, "typed-secret"],
+    );
 
     let deny_url = format!("http://{origin}/provider-deny");
     assert_eq!(proxy_request(data, "GET", &deny_url, &[]).status, 403);
@@ -811,6 +858,21 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
     let pass = proxy_request(data, "GET", &pass_url, &[]);
     assert_eq!(pass.status, 200);
     assert_eq!(pass.header("x-seen-provider-token"), Some("missing"));
+
+    let empty_segment_url = format!("http://{origin}//provider-pass");
+    assert_eq!(
+        proxy_request(data, "GET", &empty_segment_url, &[]).status,
+        400,
+        "request fact construction accepted an empty path segment"
+    );
+    let origin_requests = fs::read_to_string(directory.path().join("origin-requests.txt"))
+        .expect("read origin request log");
+    assert!(
+        !origin_requests
+            .lines()
+            .any(|path| path == "//provider-pass"),
+        "rejected empty path segment reached the origin"
+    );
 
     let replace_url = format!("http://{origin}/provider-replace");
     let replaced = proxy_request(data, "POST", &replace_url, b"client body");
@@ -833,6 +895,17 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
         Some("missing")
     );
     assert_eq!(webhook_allow.body, b"webhook allow body");
+    let webhook_allow_captures =
+        wait_for_records(&directory.path().join("captures"), &webhook_allow_url, 2);
+    let webhook_allow_request = webhook_allow_captures
+        .iter()
+        .find(|record| record["kind"] == "request")
+        .expect("webhook allow request capture");
+    assert_record_omits_secrets(
+        webhook_allow_request,
+        "webhook allow request capture",
+        &["webhook-typed-secret"],
+    );
 
     let webhook_pass_url = format!("http://{origin}/webhook-pass");
     let webhook_pass = proxy_request(data, "POST", &webhook_pass_url, b"webhook pass body");
@@ -895,8 +968,15 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
     assert_eq!(request["mode"], "http_proxy");
     assert_eq!(request["method"], "POST");
     assert!(request["body"].is_null());
-    assert_eq!(request["providerReplacementOmitted"], true);
-    assert_eq!(request["providerReplacementSize"], 20);
+    assert_eq!(
+        request["bodyOmission"],
+        json!({"reason": "provider_replacement", "size": 20})
+    );
+    assert_record_omits_secrets(
+        request,
+        "provider replacement request capture",
+        &["typed-secret"],
+    );
     let response = captures
         .iter()
         .find(|record| record["kind"] == "response")
@@ -957,6 +1037,10 @@ fn strict_runtime_provider_webhook_capture_and_reload_are_live() {
     assert!(decision_logs.contains("policy decision"));
     assert!(decision_logs.contains("sensitive_header_presence=x-provider-token"));
     assert!(!decision_logs.contains(DECISION_LOG_SECRET));
+    assert_all_log_files_omit_secrets(
+        &directory.path().join("logs"),
+        &[DECISION_LOG_SECRET, "typed-secret", "webhook-typed-secret"],
+    );
     std::net::TcpListener::bind(data).expect("data listener was not released");
     std::net::TcpListener::bind(control).expect("control listener was not released");
 }

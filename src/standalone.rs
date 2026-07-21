@@ -210,6 +210,19 @@ impl UnboundStandaloneGenerationPlan {
     ) -> Result<Self, StandaloneCompileError> {
         let generation =
             PolicyGeneration::new(id.get()).map_err(|_| StandaloneCompileError::Generation)?;
+        Self::compile_with_generation(plan, generation)
+    }
+
+    pub(crate) fn preflight(plan: &ReloadableProductPlan) -> Result<(), StandaloneCompileError> {
+        let generation =
+            PolicyGeneration::new(1).expect("the structural preflight generation is nonzero");
+        Self::compile_with_generation(plan, generation).map(drop)
+    }
+
+    fn compile_with_generation(
+        plan: &ReloadableProductPlan,
+        generation: PolicyGeneration,
+    ) -> Result<Self, StandaloneCompileError> {
         let identity = SnapshotIdentity::new();
         let version = generation.get();
 
@@ -328,7 +341,8 @@ impl UnboundStandaloneGenerationPlan {
         mut self,
         neutral_egress: NeutralEgressBindings,
     ) -> Result<Self, StandaloneCompileError> {
-        let (origin_protocols, origin_https_trust, route, tls_roots) = neutral_egress.into_parts();
+        let (origin_protocols, origin_https_trust, route, tls_roots, system_tls_roots) =
+            neutral_egress.into_parts();
         let registries =
             self.core
                 .pending_registries
@@ -343,6 +357,7 @@ impl UnboundStandaloneGenerationPlan {
             registries,
             managed_network_policies: Vec::new(),
             tls_roots,
+            system_tls_roots: Some(system_tls_roots),
             resource_limits: self.core.resource_limits,
             templates: Vec::new(),
             handles: Vec::new(),
@@ -412,8 +427,9 @@ impl UnboundStandaloneGenerationPlan {
 
     #[cfg(test)]
     pub(crate) fn into_bound_for_runtime_test(self) -> StandaloneGenerationPlan {
+        let generation = self.core.generation;
         let finalized = self
-            .finalize(crate::egress::NeutralEgressBindings::direct_system_for_test())
+            .finalize(crate::egress::NeutralEgressBindings::direct_system_for_test(generation))
             .expect("runtime test standalone generation finalizes");
         StandaloneGenerationPlan {
             activated: StandaloneActivatedBindings {
@@ -763,7 +779,7 @@ fn compile_resource_proof(
 
 fn credential_source_name(action: &CredentialActionPlan) -> &str {
     match action {
-        CredentialActionPlan::Bearer { credential }
+        CredentialActionPlan::Bearer { credential, .. }
         | CredentialActionPlan::CustomHeader { credential, .. } => credential,
         CredentialActionPlan::Basic {
             password_credential,
@@ -775,14 +791,18 @@ fn credential_source_name(action: &CredentialActionPlan) -> &str {
 impl StandaloneProviderOutputShape {
     fn from_plan(plan: &ProviderOutputPlan) -> Self {
         match plan {
-            ProviderOutputPlan::Bearer { required } => Self::Bearer {
+            ProviderOutputPlan::Bearer { required, .. } => Self::Bearer {
                 required: *required,
             },
-            ProviderOutputPlan::Basic { username, required } => Self::Basic {
+            ProviderOutputPlan::Basic {
+                username, required, ..
+            } => Self::Basic {
                 username: username.clone(),
                 required: *required,
             },
-            ProviderOutputPlan::CustomHeader { header, required } => Self::CustomHeader {
+            ProviderOutputPlan::CustomHeader {
+                header, required, ..
+            } => Self::CustomHeader {
                 header: header.clone(),
                 required: *required,
             },
@@ -1278,6 +1298,15 @@ fn compile_sensitive_headers(
                 .iter()
                 .map(neutral_header_name),
         )
+        .chain(
+            http_access_runtime::PREPARTITION_CALLER_CREDENTIAL_HEADERS
+                .iter()
+                .map(|name| {
+                    HeaderName::new(*name).map_err(|_| {
+                        StandaloneCompileError::Checked("caller credential header name")
+                    })
+                }),
+        )
         .collect::<Result<Vec<_>, _>>()?;
     headers.sort();
     if headers.windows(2).any(|pair| pair[0] == pair[1]) {
@@ -1460,15 +1489,19 @@ fn compile_provider_credential(
     reference: CredentialRef,
 ) -> Result<(bool, CredentialMutation), StandaloneCompileError> {
     match output {
-        ProviderOutputPlan::Bearer { required } => {
+        ProviderOutputPlan::Bearer { required, .. } => {
             Ok((*required, CredentialMutation::bearer(reference)))
         }
-        ProviderOutputPlan::Basic { username, required } => Ok((
+        ProviderOutputPlan::Basic {
+            username, required, ..
+        } => Ok((
             *required,
             CredentialMutation::basic(username.clone(), reference)
                 .map_err(|_| StandaloneCompileError::Checked("provider basic credential"))?,
         )),
-        ProviderOutputPlan::CustomHeader { header, required } => Ok((
+        ProviderOutputPlan::CustomHeader {
+            header, required, ..
+        } => Ok((
             *required,
             CredentialMutation::custom_header(neutral_header_name(header)?, reference).map_err(
                 |_| StandaloneCompileError::Checked("provider custom-header credential"),
@@ -1679,6 +1712,7 @@ include_headers = ["x-zeta-secret", "x-alpha-secret", "x-internal-context"]
 
 [authorization.providers.approval.outputs.token]
 kind = "custom_header"
+transport_security = "cleartext_allowed"
 header = "x-provider-token"
 required = true
 
@@ -1702,6 +1736,7 @@ name = "x-internal-context"
 
 [[egress.credential_actions]]
 kind = "custom_header"
+transport_security = "cleartext_allowed"
 header = "x-global-token"
 credential = "global"
 
@@ -1740,6 +1775,7 @@ name = "x-private"
 
 [[policy.rules.credential_actions]]
 kind = "custom_header"
+transport_security = "cleartext_allowed"
 header = "x-rule-token"
 credential = "rule"
 
@@ -1761,7 +1797,7 @@ header = "x-acl-proxy-request-id"
         .expect("standalone generation fixture compiles")
     }
 
-    fn finalized(
+    async fn finalized(
         plan: &ReloadableProductPlan,
         id: GenerationId,
     ) -> UnboundStandaloneGenerationPlan {
@@ -1789,13 +1825,18 @@ header = "x-acl-proxy-request-id"
             }
         }
         let draft = UnboundStandaloneGenerationPlan::compile(plan, id).unwrap();
-        let activation = EgressActivation::activate(
-            egress,
-            draft.identity(),
+        let tls_io = crate::tls_io_runtime::TlsIoRuntime::new().unwrap();
+        let mut tls_resolver = crate::candidate_tls::CandidateTlsResolver::activate(
+            std::sync::Arc::clone(&tls_io),
+            crate::runtime::ActivationCancellation::new_for_test(),
             PolicyGeneration::new(draft.version()).unwrap(),
-            || false,
         )
-        .unwrap();
+        .await
+        .expect("test host system roots load");
+        let activation = EgressActivation::activate(egress, draft.identity(), &mut tls_resolver)
+            .await
+            .unwrap();
+        tls_io.shutdown_and_wait(None).await;
         let (neutral, _) = activation.into_parts();
         draft.finalize(neutral).unwrap()
     }
@@ -1813,10 +1854,10 @@ header = "x-acl-proxy-request-id"
         sources
     }
 
-    #[test]
-    fn compile_retains_exact_checked_generation_intent() {
+    #[tokio::test]
+    async fn compile_retains_exact_checked_generation_intent() {
         let compiled = compiled();
-        let plan = finalized(&compiled.reloadable_plan, GenerationId::for_test(17));
+        let plan = finalized(&compiled.reloadable_plan, GenerationId::for_test(17)).await;
 
         assert!(plan.snapshot_lease().owns(plan.identity()));
         assert_eq!(plan.snapshot_lease().generation().get(), 17);
@@ -1869,7 +1910,12 @@ header = "x-acl-proxy-request-id"
                 .iter()
                 .map(HeaderName::as_str)
                 .collect::<Vec<_>>(),
-            ["x-alpha-secret", "x-internal-context", "x-zeta-secret"]
+            [
+                "proxy-authorization",
+                "x-alpha-secret",
+                "x-internal-context",
+                "x-zeta-secret",
+            ]
         );
         assert_eq!(
             plan.sensitive_header_policy()
@@ -1983,11 +2029,11 @@ header = "x-acl-proxy-request-id"
         assert_eq!(bindings.provider_for_action(1, &alpha), None);
     }
 
-    #[test]
-    fn each_compile_creates_a_fresh_snapshot_identity() {
+    #[tokio::test]
+    async fn each_compile_creates_a_fresh_snapshot_identity() {
         let compiled = compiled();
-        let first = finalized(&compiled.reloadable_plan, GenerationId::for_test(21));
-        let second = finalized(&compiled.reloadable_plan, GenerationId::for_test(21));
+        let first = finalized(&compiled.reloadable_plan, GenerationId::for_test(21)).await;
+        let second = finalized(&compiled.reloadable_plan, GenerationId::for_test(21)).await;
 
         assert!(!first.identity().same_snapshot(second.identity()));
         assert!(!first.snapshot_lease().owns(second.identity()));
@@ -2003,6 +2049,7 @@ header = "x-acl-proxy-request-id"
         )
         .unwrap();
         let complete_headers = [
+            ("proxy-authorization", b"caller-secret".as_slice()),
             ("x-alpha-secret", b"alpha".as_slice()),
             ("x-internal-context", b"context".as_slice()),
             ("x-ordinary", b"ordinary".as_slice()),
@@ -2026,7 +2073,12 @@ header = "x-acl-proxy-request-id"
                 .iter()
                 .map(HeaderName::as_str)
                 .collect::<Vec<_>>(),
-            ["x-alpha-secret", "x-internal-context", "x-zeta-secret"]
+            [
+                "proxy-authorization",
+                "x-alpha-secret",
+                "x-internal-context",
+                "x-zeta-secret",
+            ]
         );
         assert_eq!(
             partition
@@ -2034,7 +2086,12 @@ header = "x-acl-proxy-request-id"
                 .iter()
                 .map(HeaderName::as_str)
                 .collect::<Vec<_>>(),
-            ["x-alpha-secret", "x-internal-context", "x-zeta-secret"]
+            [
+                "proxy-authorization",
+                "x-alpha-secret",
+                "x-internal-context",
+                "x-zeta-secret",
+            ]
         );
         assert_eq!(partition.ordinary_headers().len(), 1);
         assert_eq!(
@@ -2076,15 +2133,14 @@ header = "x-acl-proxy-request-id"
         ));
     }
 
-    #[test]
-    fn parent_route_retains_canonical_target_and_exact_custom_root_role() {
+    #[tokio::test]
+    async fn parent_route_retains_canonical_target_and_exact_custom_root_role() {
         let mut compiled = compiled();
         compiled.reloadable_plan.egress.route = CompiledEgressRoute::ParentProxy;
         compiled.reloadable_plan.egress.parent_proxy = Some(ParentProxyPlan {
             kind: CompiledParentProxyKind::Generic,
-            url: "https://parent.example.test:8443/".to_owned(),
-            host: "parent.example.test".to_owned(),
-            port: 8443,
+            target: http_access_url::canonicalize_http_url("https://parent.example.test:8443/")
+                .unwrap(),
             tls: Some(ParentProxyTlsPlan {
                 trust: CompiledTlsTrust::Custom,
                 ca_certificate: Some("parent-root.pem".into()),
@@ -2092,7 +2148,7 @@ header = "x-acl-proxy-request-id"
             }),
         });
 
-        let plan = finalized(&compiled.reloadable_plan, GenerationId::for_test(31));
+        let plan = finalized(&compiled.reloadable_plan, GenerationId::for_test(31)).await;
         let Route::Parent { target, security } = plan.route() else {
             panic!("parent route intent is retained")
         };

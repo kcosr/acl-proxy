@@ -42,6 +42,8 @@ pub(crate) enum ProductPartitionError {
     InvalidProductHeaderValue,
     #[error("request sensitive-header partition is incomplete")]
     SensitivePartition,
+    #[error("request URL path contains an empty interior segment")]
+    EmptyPathSegment,
     #[error("inbound credential partition failed")]
     Credential(#[from] crate::credentials::CredentialError),
     #[error("request facts contain an invalid checked value")]
@@ -108,6 +110,9 @@ pub(crate) fn rebuild_standalone_facts(
 ) -> Result<InterceptedRequestFacts, ProductPartitionError> {
     if !shape.headers().is_empty() {
         return Err(ProductPartitionError::SensitivePartition);
+    }
+    if shape.url().path().contains("//") {
+        return Err(ProductPartitionError::EmptyPathSegment);
     }
     Ok(InterceptedRequestFacts::new(
         shape.ingress_mode(),
@@ -290,6 +295,35 @@ mod tests {
         assert_eq!(rebuilt.method().as_str(), "CONNECT");
         assert!(rebuilt.headers().is_empty());
         assert!(partitioned.retained_private.is_empty());
+    }
+
+    #[test]
+    fn standalone_facts_reject_empty_interior_path_segments() {
+        for url in [
+            "https://example.test//admin",
+            "https://example.test/a//b",
+            "https://example.test///",
+        ] {
+            assert!(matches!(
+                rebuild_standalone_facts(facts(IngressMode::ExplicitHttp, "GET", url), Vec::new(),),
+                Err(ProductPartitionError::EmptyPathSegment)
+            ));
+        }
+    }
+
+    #[test]
+    fn standalone_facts_preserve_unambiguous_path_and_query_spellings() {
+        for url in [
+            "https://example.test/",
+            "https://example.test/a/",
+            "https://example.test/a/%2F/b",
+            "https://example.test/a?next=//elsewhere",
+        ] {
+            let rebuilt =
+                rebuild_standalone_facts(facts(IngressMode::ExplicitHttp, "GET", url), Vec::new())
+                    .expect("unambiguous path must remain valid");
+            assert_eq!(rebuilt.url().as_str(), url);
+        }
     }
 
     #[test]

@@ -107,8 +107,13 @@ impl StandaloneRequestFactory for ProductStandaloneRequestFactory {
                 private_fields,
             )
             .map_err(|_| http_access_runtime::RuntimeError::InvalidInput)?;
-            let facts = rebuild_standalone_facts(facts, visible_fields)
-                .map_err(|_| http_access_runtime::RuntimeError::InvalidInput)?;
+            let facts =
+                rebuild_standalone_facts(facts, visible_fields).map_err(|error| match error {
+                    ProductPartitionError::EmptyPathSegment => {
+                        http_access_runtime::RuntimeError::RequestRejected
+                    }
+                    _ => http_access_runtime::RuntimeError::InvalidInput,
+                })?;
             let ingress_protocol = ingress_protocol(facts.version());
             let preflight_target = self
                 .assets

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use http_access_policy_acl::MatchedEffects;
 #[cfg(all(test, unix))]
 use http_access_policy_acl::{EvaluationInput, PolicyEvaluation, ProviderDisposition};
+use http_access_redaction::{PayloadClass, RedactionProfile};
 use http_access_runtime::{
     RuntimeRequest, StandalonePlan, StandaloneTrusted, UpgradeAdmissionPlan,
     UpgradeAdmissionPlanError,
@@ -255,11 +256,7 @@ fn adapt_provider_allow_inner(
         }
         let content_type = content_type_batch(content_type)?;
         let replacement = match redaction {
-            Some(binding) => binding
-                .handle()
-                .redact_http_body(&guard, decoded)
-                .map_err(|_| StandaloneProviderAllowError::Redaction)?
-                .into_body(),
+            Some(binding) => redact_required_wire_body(binding.handle(), &guard, decoded)?,
             None => decoded,
         };
         let replacement_length =
@@ -357,17 +354,27 @@ fn redact_and_rehome(
 ) -> Result<(), StandaloneProviderAllowError> {
     let body = match rule_ordinal.and_then(|ordinal| generation.activated().rule_redaction(ordinal))
     {
-        Some(binding) => binding
-            .handle()
-            .redact_http_body(guard, body)
-            .map_err(|_| StandaloneProviderAllowError::Redaction)?
-            .into_body(),
+        Some(binding) => redact_required_wire_body(binding.handle(), guard, body)?,
         None => body,
     };
     let length = u64::try_from(body.len()).map_err(|_| StandaloneProviderAllowError::Binding)?;
     request
         .replace_body_fragments(length, body.segments())
         .map_err(StandaloneProviderAllowError::Runtime)
+}
+
+fn redact_required_wire_body(
+    profile: &RedactionProfile,
+    guard: &HttpWireBodyGuard,
+    body: GuardedBody,
+) -> Result<GuardedBody, StandaloneProviderAllowError> {
+    let outcome = profile
+        .redact_http_body(guard, body)
+        .map_err(|_| StandaloneProviderAllowError::Redaction)?;
+    if outcome.class() == PayloadClass::Binary && profile.requires_text_class() {
+        return Err(StandaloneProviderAllowError::Redaction);
+    }
+    Ok(outcome.into_body())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -834,6 +841,7 @@ max_decoded_request_body_bytes = 4096
 
 [authorization.providers.approval.outputs.token]
 kind = "custom_header"
+transport_security = "tls_required"
 header = "x-provider-token"
 required = false
 
@@ -857,6 +865,7 @@ value = "application/global"
 
 [[egress.credential_actions]]
 kind = "custom_header"
+transport_security = "tls_required"
 header = "x-global-token"
 credential = "global"
 
@@ -884,6 +893,7 @@ name = "x-private"
 
 [[policy.rules.credential_actions]]
 kind = "custom_header"
+transport_security = "tls_required"
 header = "x-rule-token"
 credential = "rule"
 
@@ -1007,7 +1017,11 @@ header = "x-test-loop"
         let mut request = RuntimeRequest::new(
             facts.clone(),
             "192.0.2.10".parse().unwrap(),
-            PolicyHeaderFacts::new(facts.headers().to_vec(), Vec::new()).unwrap(),
+            PolicyHeaderFacts::new(
+                facts.headers().to_vec(),
+                generation.sensitive_headers().to_vec(),
+            )
+            .unwrap(),
             BodyRepresentation::PreservedContentCoded,
             body,
             30_001,
@@ -1039,7 +1053,11 @@ header = "x-test-loop"
         let mut request = RuntimeRequest::new(
             facts.clone(),
             "192.0.2.10".parse().unwrap(),
-            PolicyHeaderFacts::new(facts.headers().to_vec(), Vec::new()).unwrap(),
+            PolicyHeaderFacts::new(
+                facts.headers().to_vec(),
+                generation.sensitive_headers().to_vec(),
+            )
+            .unwrap(),
             BodyRepresentation::PreservedContentCoded,
             body,
             30_001,
@@ -1628,11 +1646,11 @@ header = "x-test-loop"
         result.plan.validate_request(&result.request).unwrap();
         let StandaloneProviderAllow {
             plan,
-            request,
+            request: forwarded_request,
             sidecar,
             credentials,
         } = result;
-        let mut exchange = prepare_standalone_exchange(lineage, plan, request).unwrap();
+        let mut exchange = prepare_standalone_exchange(lineage, plan, forwarded_request).unwrap();
         assert_eq!(replay_exchange(&mut exchange), b"before [MASKED] after");
         drop(exchange);
         drop(credentials);
@@ -1678,6 +1696,117 @@ header = "x-test-loop"
         } = result;
         let mut exchange = prepare_standalone_exchange(lineage, plan, request).unwrap();
         assert_eq!(replay_exchange(&mut exchange), b"before [MASKED] after");
+        drop((exchange, sidecar, credentials, lease));
+        assert_eq!(pool.global_charge(), 0);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn text_only_wire_redaction_rejects_binary_inspected_and_provider_bodies() {
+        let local_config = CONFIG
+            .replace("decision = \"delegate\"", "decision = \"allow\"")
+            .replace("authorization_provider = \"approval\"\n", "");
+        let (local_runtime, lease, pool) = runtime_from_config(&local_config).await;
+        let generation = lease.standalone();
+        let guard = local_admission(&lease);
+        let mut inspected = guard.buffer();
+        inspected.try_extend_from_slice(b"secret\xff").unwrap();
+        let error = adapt_local_allow(
+            &lease,
+            Some(0),
+            Some(inspected.finish()),
+            guard,
+            request(generation, vec![b"secret\xff".to_vec()]),
+        )
+        .err()
+        .expect("text-only wire protection must reject a binary inspected body");
+        assert!(matches!(error, StandaloneProviderAllowError::Redaction));
+        assert_eq!(pool.global_charge(), 0);
+        drop(lease);
+        local_runtime.shutdown().await;
+
+        let (runtime, lease, pool) = runtime().await;
+        let generation = lease.standalone();
+        let (guard, provider) = admission(&lease);
+        let replacement = replacement(&guard, &[b"secret\xff"], Some("application/octet-stream"));
+        let error = adapt_provider_allow(
+            &lease,
+            0,
+            provider,
+            output(&lease, provider, false, Some(replacement)),
+            None,
+            guard,
+            request(generation, vec![b"original".to_vec()]),
+        )
+        .err()
+        .expect("text-only wire protection must reject a binary provider replacement");
+        assert_eq!(error.provider_replacement_size(), Some(b"secret\xff".len()));
+        assert!(matches!(
+            error.into_error(),
+            StandaloneProviderAllowError::Redaction
+        ));
+        assert_eq!(pool.global_charge(), 0);
+        drop(lease);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn both_wire_redaction_protects_binary_inspected_and_provider_bodies() {
+        let both_config = CONFIG.replace("payloads = \"text\"", "payloads = \"both\"");
+        let local_config = both_config
+            .replace("decision = \"delegate\"", "decision = \"allow\"")
+            .replace("authorization_provider = \"approval\"\n", "");
+        let (local_runtime, lease, pool) = runtime_from_config(&local_config).await;
+        let generation = lease.standalone();
+        let guard = local_admission(&lease);
+        let mut inspected = guard.buffer();
+        inspected.try_extend_from_slice(b"secret\xff").unwrap();
+        let local_request = request(generation, vec![b"secret\xff".to_vec()]);
+        let lineage = local_request.begin_provider_invocation();
+        let result = adapt_local_allow(
+            &lease,
+            Some(0),
+            Some(inspected.finish()),
+            guard,
+            local_request,
+        )
+        .unwrap();
+        let StandaloneProviderAllow {
+            plan,
+            request: forwarded_request,
+            sidecar,
+            credentials,
+        } = result;
+        let mut exchange = prepare_standalone_exchange(lineage, plan, forwarded_request).unwrap();
+        assert_eq!(replay_exchange(&mut exchange), b"[MASKED]\xff");
+        drop((exchange, sidecar, credentials, lease));
+        assert_eq!(pool.global_charge(), 0);
+        local_runtime.shutdown().await;
+
+        let (runtime, lease, pool) = runtime_from_config(&both_config).await;
+        let generation = lease.standalone();
+        let (guard, provider) = admission(&lease);
+        let replacement = replacement(&guard, &[b"secret\xff"], Some("application/octet-stream"));
+        let request = request(generation, vec![b"original".to_vec()]);
+        let lineage = request.begin_provider_invocation();
+        let result = adapt_provider_allow(
+            &lease,
+            0,
+            provider,
+            output(&lease, provider, false, Some(replacement)),
+            None,
+            guard,
+            request,
+        )
+        .unwrap();
+        let StandaloneProviderAllow {
+            plan,
+            request,
+            sidecar,
+            credentials,
+        } = result;
+        let mut exchange = prepare_standalone_exchange(lineage, plan, request).unwrap();
+        assert_eq!(replay_exchange(&mut exchange), b"[MASKED]\xff");
         drop((exchange, sidecar, credentials, lease));
         assert_eq!(pool.global_charge(), 0);
         runtime.shutdown().await;

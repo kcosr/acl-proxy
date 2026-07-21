@@ -512,6 +512,7 @@ mod tests {
             .unwrap(),
             managed_network_policies: Vec::new(),
             tls_roots: Vec::new(),
+            system_tls_roots: None,
             resource_limits: RuntimeResourceLimits::new(1024 * 1024, 1024 * 1024, 0).unwrap(),
             templates: Vec::new(),
             handles: Vec::new(),

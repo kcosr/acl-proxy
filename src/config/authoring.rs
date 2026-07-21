@@ -913,9 +913,18 @@ pub(super) enum ProviderOutputConfig {
     CustomHeader(CustomHeaderProviderOutputConfig),
 }
 
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum TransportSecurity {
+    TlsRequired,
+    CleartextAllowed,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct BearerProviderOutputConfig {
+    pub transport_security: TransportSecurity,
+
     #[serde(default)]
     pub required: bool,
 }
@@ -924,6 +933,7 @@ pub(super) struct BearerProviderOutputConfig {
 #[serde(deny_unknown_fields)]
 pub(super) struct BasicProviderOutputConfig {
     pub username: String,
+    pub transport_security: TransportSecurity,
 
     #[serde(default)]
     pub required: bool,
@@ -933,6 +943,7 @@ pub(super) struct BasicProviderOutputConfig {
 #[serde(deny_unknown_fields)]
 pub(super) struct CustomHeaderProviderOutputConfig {
     pub header: String,
+    pub transport_security: TransportSecurity,
 
     #[serde(default)]
     pub required: bool,
@@ -989,6 +1000,7 @@ pub(super) enum CredentialActionConfig {
 #[serde(deny_unknown_fields)]
 pub(super) struct BearerCredentialActionConfig {
     pub credential: String,
+    pub transport_security: TransportSecurity,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -996,6 +1008,7 @@ pub(super) struct BearerCredentialActionConfig {
 pub(super) struct BasicCredentialActionConfig {
     pub username: String,
     pub password_credential: String,
+    pub transport_security: TransportSecurity,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1003,6 +1016,7 @@ pub(super) struct BasicCredentialActionConfig {
 pub(super) struct CustomHeaderCredentialActionConfig {
     pub header: String,
     pub credential: String,
+    pub transport_security: TransportSecurity,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -1033,6 +1047,9 @@ pub(super) struct RedactionProfileConfig {
     #[serde(default)]
     pub allow_permessage_deflate: bool,
 
+    #[serde(default)]
+    pub unsupported_extensions: UnsupportedExtensions,
+
     #[serde(default = "default_max_environment_literal_sources")]
     pub max_environment_literal_sources: usize,
 
@@ -1043,6 +1060,14 @@ pub(super) struct RedactionProfileConfig {
     pub max_environment_literal_total_bytes: usize,
 
     pub rules: Vec<RedactionRuleConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Default, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum UnsupportedExtensions {
+    #[default]
+    Deny,
+    Strip,
 }
 
 fn default_redaction_replacement() -> String {
@@ -1559,6 +1584,105 @@ max_trailer_bytes = 11
     }
 
     #[test]
+    fn every_credential_variant_requires_known_transport_security() {
+        let variants = [
+            (
+                r#"[[egress.credential_actions]]
+kind = "bearer"
+credential = "token"
+"#,
+                "kind = \"bearer\"\n",
+            ),
+            (
+                r#"[[egress.credential_actions]]
+kind = "basic"
+username = "agent"
+password_credential = "token"
+"#,
+                "kind = \"basic\"\n",
+            ),
+            (
+                r#"[[egress.credential_actions]]
+kind = "custom_header"
+header = "x-token"
+credential = "token"
+"#,
+                "kind = \"custom_header\"\n",
+            ),
+            (
+                r#"[authorization.providers.local]
+kind = "process"
+command = "/bin/false"
+
+[authorization.providers.local.outputs.token]
+kind = "bearer"
+"#,
+                "kind = \"bearer\"\n",
+            ),
+            (
+                r#"[authorization.providers.local]
+kind = "process"
+command = "/bin/false"
+
+[authorization.providers.local.outputs.token]
+kind = "basic"
+username = "agent"
+"#,
+                "kind = \"basic\"\n",
+            ),
+            (
+                r#"[authorization.providers.local]
+kind = "process"
+command = "/bin/false"
+
+[authorization.providers.local.outputs.token]
+kind = "custom_header"
+header = "x-token"
+"#,
+                "kind = \"custom_header\"\n",
+            ),
+        ];
+
+        for (variant, credential_kind) in variants {
+            let missing = format!("{MINIMAL}\n{variant}");
+            let error = toml::from_str::<AuthoringConfig>(&missing)
+                .expect_err("transport_security must be required on every variant");
+            assert!(error.to_string().contains("transport_security"), "{error}");
+
+            let unknown = variant.replacen(
+                credential_kind,
+                &format!("{credential_kind}transport_security = \"opportunistic\"\n"),
+                1,
+            );
+            let error = toml::from_str::<AuthoringConfig>(&format!("{MINIMAL}\n{unknown}"))
+                .expect_err("unknown transport_security must fail every variant");
+            let rendered = error.to_string();
+            assert!(
+                rendered.contains("unknown variant `opportunistic`"),
+                "{error}"
+            );
+            assert!(rendered.contains("cleartext_allowed"), "{error}");
+
+            let boolean = variant.replacen(
+                credential_kind,
+                &format!("{credential_kind}transport_security = true\n"),
+                1,
+            );
+            toml::from_str::<AuthoringConfig>(&format!("{MINIMAL}\n{boolean}"))
+                .expect_err("boolean transport security must fail every variant");
+
+            let alias = variant.replacen(
+                credential_kind,
+                &format!("{credential_kind}transport = \"cleartext_allowed\"\n"),
+                1,
+            );
+            let error = toml::from_str::<AuthoringConfig>(&format!("{MINIMAL}\n{alias}"))
+                .expect_err("transport aliases must fail every variant");
+            assert!(error.to_string().contains("transport"), "{error}");
+        }
+    }
+
+    #[test]
     fn complete_provider_and_observation_shapes_parse() {
         let config = format!(
             r#"{MINIMAL}
@@ -1581,6 +1705,7 @@ max_response_bytes = 65536
 
 [authorization.providers.approval.outputs.session]
 kind = "bearer"
+transport_security = "tls_required"
 required = true
 
 [authorization.providers.local]
@@ -1598,6 +1723,7 @@ retire_timeout = "30s"
 
 [authorization.providers.local.outputs.api_key]
 kind = "custom_header"
+transport_security = "tls_required"
 header = "x-api-key"
 
 [credentials]
@@ -1672,6 +1798,10 @@ max_inflight_body_bytes = 134217728
         assert_eq!(redaction.max_environment_literal_sources, 64);
         assert_eq!(redaction.max_environment_literal_bytes, 64 * 1024);
         assert_eq!(redaction.max_environment_literal_total_bytes, 1024 * 1024);
+        assert_eq!(
+            redaction.unsupported_extensions,
+            UnsupportedExtensions::Deny
+        );
         let capture = parsed.observation.capture.unwrap();
         assert_eq!(capture.events.len(), 2);
         assert_eq!(capture.redaction_profile, "secrets");
@@ -1694,6 +1824,7 @@ present_all = ["x-aw-identity-token"]
 
 [[policy.rules.credential_actions]]
 kind = "custom_header"
+transport_security = "tls_required"
 header = "x-aw-identity-token"
 credential = "identity"
 
@@ -1775,13 +1906,36 @@ directory = "certs"
         );
         assert!(toml::from_str::<AuthoringConfig>(&legacy_top).is_err());
 
-        for obsolete in [
-            MINIMAL.replace("inject = true", "enabled = true\ninject = true"),
-            format!(
-                "{MINIMAL}\n[redaction.profiles.legacy]\nunsupported_extensions = \"deny\"\nrules = []\n"
+        let obsolete = MINIMAL.replace("inject = true", "enabled = true\ninject = true");
+        assert!(toml::from_str::<AuthoringConfig>(&obsolete).is_err());
+    }
+
+    #[test]
+    fn redaction_unsupported_extensions_is_typed_and_defaults_to_deny() {
+        for (authored, expected) in [
+            ("", UnsupportedExtensions::Deny),
+            (
+                "unsupported_extensions = \"deny\"\n",
+                UnsupportedExtensions::Deny,
+            ),
+            (
+                "unsupported_extensions = \"strip\"\n",
+                UnsupportedExtensions::Strip,
             ),
         ] {
-            assert!(toml::from_str::<AuthoringConfig>(&obsolete).is_err());
+            let config = format!(
+                "{MINIMAL}\n[redaction.profiles.websocket]\n{authored}rules = [{{ literals = [\"secret\"] }}]\n"
+            );
+            let parsed: AuthoringConfig = toml::from_str(&config).unwrap();
+            assert_eq!(
+                parsed.redaction.profiles["websocket"].unsupported_extensions,
+                expected
+            );
         }
+
+        let invalid = format!(
+            "{MINIMAL}\n[redaction.profiles.websocket]\nunsupported_extensions = \"allow\"\nrules = [{{ literals = [\"secret\"] }}]\n"
+        );
+        assert!(toml::from_str::<AuthoringConfig>(&invalid).is_err());
     }
 }

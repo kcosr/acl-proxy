@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::authorization::{
     AuthorizationActivation, AuthorizationActivationError, ProductAuthorizationSnapshot,
 };
+use crate::candidate_tls::CandidateTlsResolver;
 use crate::config::compiler::ReloadableProductPlan;
 use crate::config::StaticFingerprint;
 use crate::credentials::CredentialActivation;
@@ -172,14 +173,18 @@ impl ProductActivator {
             .map_err(|error| candidate_error(&cancellation, "observation", error.to_string()))?;
         cancellation.check()?;
 
-        let egress = EgressActivation::activate(
-            egress,
-            standalone.identity(),
-            http_access_types::PolicyGeneration::new(standalone.version())
-                .map_err(|_| RuntimeError::CandidateActivation("invalid generation".to_owned()))?,
-            || cancellation.is_cancelled(),
+        let generation = http_access_types::PolicyGeneration::new(standalone.version())
+            .map_err(|_| RuntimeError::CandidateActivation("invalid generation".to_owned()))?;
+        let mut tls_resolver = CandidateTlsResolver::activate(
+            self.static_resources.tls_io_runtime(),
+            cancellation.clone(),
+            generation,
         )
-        .map_err(|error| map_egress_error(error, &cancellation))?;
+        .await
+        .map_err(|error| map_egress_error(error.into(), &cancellation))?;
+        let egress = EgressActivation::activate(egress, standalone.identity(), &mut tls_resolver)
+            .await
+            .map_err(|error| map_egress_error(error, &cancellation))?;
         let (neutral_egress, executor_bindings) = egress.into_parts();
         standalone = standalone.finalize(neutral_egress).map_err(|error| {
             candidate_error(
@@ -218,7 +223,7 @@ impl ProductActivator {
             authorization,
             provider_registry,
             self.static_resources.authorization_runtime(),
-            cancellation.clone(),
+            &mut tls_resolver,
         )
         .await
         .map_err(|error| map_authorization_error(error, &cancellation))?;
@@ -1104,6 +1109,7 @@ retire_timeout = "1s"
 
 [authorization.providers.local.outputs.token]
 kind = "bearer"
+transport_security = "tls_required"
 required = true
 
 [credentials.sources.global]
@@ -1112,6 +1118,7 @@ variable = "ACL_PROXY_TEST_GLOBAL_TOKEN"
 
 [[egress.credential_actions]]
 kind = "bearer"
+transport_security = "tls_required"
 credential = "global"
 
 [policy]
@@ -1244,6 +1251,7 @@ retire_timeout = "1s"
 
 [authorization.providers.local.outputs.token]
 kind = "bearer"
+transport_security = "tls_required"
 required = true
 
 [policy]
