@@ -154,17 +154,17 @@ stream:
 [listeners.transparent_http]
 endpoint.kind = "unix_proxy_v2"
 endpoint.path = "/Users/your-user/Library/Application Support/AW Gateway/runtime/transparent-http.sock"
-endpoint.mode = "0606"
+endpoint.mode = "0600"
 proxy_header_timeout = "1s"
 http_versions = ["http1"]
 ```
 
 The workstation host path must be inside a user-writable runtime directory
 owned by the workstation user and protected with mode `0700`; the placeholder
-above must be replaced with that user's actual home path. Mode `0606` is
-deliberate for Apple Container's root-owned guest endpoint mapping. Other Unix
-deployments should select the narrowest socket mode compatible with their relay
-account.
+above must be replaced with that user's actual home path. Mode `0600` keeps the
+host listener private and is sufficient for the root-owned guest endpoint and
+root-supervised relay. Other Unix deployments should select the narrowest
+socket mode compatible with their relay process.
 
 The path must be absolute. ACL Proxy refuses every pre-existing path and never
 unlinks it. For a socket owned by the current user, a bounded liveness probe

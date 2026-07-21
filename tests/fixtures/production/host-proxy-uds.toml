@@ -15,7 +15,7 @@ request_body_timeout = "10s"
 [listeners.transparent_http]
 endpoint.kind = "unix_proxy_v2"
 endpoint.path = "/Users/fixture-user/Library/Application Support/AW Gateway/runtime/transparent-http.sock"
-endpoint.mode = "0606"
+endpoint.mode = "0600"
 proxy_header_timeout = "1s"
 http_versions = ["http1"]
 max_connections = 1024
@@ -23,7 +23,7 @@ max_connections = 1024
 [listeners.transparent_https]
 endpoint.kind = "unix_proxy_v2"
 endpoint.path = "/Users/fixture-user/Library/Application Support/AW Gateway/runtime/transparent-https.sock"
-endpoint.mode = "0606"
+endpoint.mode = "0600"
 proxy_header_timeout = "1s"
 http_versions = ["http1", "http2"]
 max_connections = 1024

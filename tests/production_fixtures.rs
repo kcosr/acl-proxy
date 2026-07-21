@@ -230,7 +230,7 @@ fn sanitized_production_role_structure_matches_difference_record() {
         );
         assert_eq!(
             endpoint.get("mode").and_then(TomlValue::as_str),
-            Some("0606")
+            Some("0600")
         );
     }
     assert!(rules(&uds)
