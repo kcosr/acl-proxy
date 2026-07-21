@@ -31,7 +31,7 @@
   certificates, and bounded optional leaf-certificate persistence.
 - Added typed WebSocket `unsupported_extensions = "deny" | "strip"` redaction
   policy, defaulting to fail-closed denial while allowing unsafe offers to be
-  removed before origin forwarding.
+  removed before origin forwarding. ([#1](https://github.com/kcosr/acl-proxy-access-runtime/pull/1))
 
 ### Changed
 
