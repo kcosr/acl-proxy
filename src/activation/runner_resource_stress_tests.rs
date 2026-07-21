@@ -16,7 +16,9 @@ use std::time::Instant;
 use bytes::Bytes;
 use http::{Request, Response, StatusCode, Version};
 use http_access_runtime::{ForwardingDevHarness, ForwardingNetworkFacts};
-use tempfile::{tempdir, TempDir};
+#[cfg(target_os = "linux")]
+use tempfile::tempdir;
+use tempfile::TempDir;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::task::JoinHandle;
 
@@ -284,7 +286,7 @@ async fn read_http_head(stream: &mut (impl AsyncRead + Unpin)) -> Vec<u8> {
 }
 
 #[cfg(target_os = "linux")]
-async fn wait_for_tcp_close_without_reading(stream: &tokio::net::TcpStream, message: &str) {
+async fn wait_for_tcp_close_without_reading(stream: &mut tokio::net::TcpStream, message: &str) {
     let deadline = Instant::now() + QUIESCENCE_TIMEOUT;
     loop {
         assert!(Instant::now() < deadline, "{message}");
@@ -303,8 +305,7 @@ async fn wait_for_tcp_close_without_reading(stream: &tokio::net::TcpStream, mess
 }
 
 #[cfg(not(target_os = "linux"))]
-async fn wait_for_tcp_close_without_reading(stream: &tokio::net::TcpStream, message: &str) {
-    let mut stream = stream;
+async fn wait_for_tcp_close_without_reading(stream: &mut tokio::net::TcpStream, message: &str) {
     let mut sink = Vec::new();
     tokio::time::timeout(QUIESCENCE_TIMEOUT, stream.read_to_end(&mut sink))
         .await
@@ -361,7 +362,7 @@ async fn h1_request_backpressure_origin(mut stream: tokio::net::TcpStream) {
         written < H1_BODY_BYTES,
         "request-backpressure response was completely buffered"
     );
-    wait_for_tcp_close_without_reading(&stream, "request-backpressure origin was not closed")
+    wait_for_tcp_close_without_reading(&mut stream, "request-backpressure origin was not closed")
         .await;
 }
 
@@ -394,7 +395,7 @@ async fn h1_response_backpressure_origin(mut stream: tokio::net::TcpStream) {
         written < H1_BODY_BYTES,
         "response backpressure buffered the complete origin body"
     );
-    wait_for_tcp_close_without_reading(&stream, "response-backpressure origin was not closed")
+    wait_for_tcp_close_without_reading(&mut stream, "response-backpressure origin was not closed")
         .await;
 }
 
@@ -847,7 +848,7 @@ async fn websocket_client(proxy: SocketAddr, origin: SocketAddr, batch: usize, i
         .unwrap();
     let close = read_websocket_frame(&mut stream).await.unwrap();
     assert_eq!(close.opcode, 0x8);
-    wait_for_tcp_close_without_reading(&stream, "WebSocket downstream was not closed").await;
+    wait_for_tcp_close_without_reading(&mut stream, "WebSocket downstream was not closed").await;
 }
 
 async fn run_stress_batch(proxy: SocketAddr, origins: &StressOrigins, batch: usize) {
