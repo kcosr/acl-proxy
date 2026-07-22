@@ -469,7 +469,7 @@ text = text.replace(
 )
 listener = '''
 [listeners.explicit_https]
-bind = "0.0.0.0:8443"
+endpoint = { kind = "tcp", address = "0.0.0.0:8443" }
 http_versions = ["http1"]
 handshake_timeout = "2s"
 

@@ -160,7 +160,7 @@ bind = "127.0.0.1:$CONTROL_PORT"
 base_path = "/_acl-proxy"
 
 [listeners.explicit_http]
-bind = "127.0.0.1:$DATA_PORT"
+endpoint = { kind = "tcp", address = "127.0.0.1:$DATA_PORT" }
 http_versions = ["http1"]
 
 [listeners.explicit_http.connect]
