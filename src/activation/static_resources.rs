@@ -91,7 +91,7 @@ struct IngressOwnership {
 
 enum IngressState {
     Unprepared,
-    Prepared(PreparedProxyListeners),
+    Prepared(Box<PreparedProxyListeners>),
     Adopted,
 }
 
@@ -577,7 +577,7 @@ impl ProductStaticResources {
             control.server = Some(start_control(config, listener, failure_observer)?);
         }
 
-        ingress.state = IngressState::Prepared(listeners);
+        ingress.state = IngressState::Prepared(Box::new(listeners));
         Ok(())
     }
 
@@ -604,7 +604,7 @@ impl ProductStaticResources {
         else {
             unreachable!();
         };
-        Ok(listeners)
+        Ok(*listeners)
     }
 
     #[cfg(test)]
@@ -1155,7 +1155,6 @@ header = "x-acl-proxy-request-id"
             endpoint: crate::config::compiler::StaticListenerEndpoint::Tcp {
                 address: transparent_http,
             },
-            proxy_header_timeout: None,
             http_versions: versions.clone(),
             request_header_timeout,
             max_connections,
@@ -1173,7 +1172,6 @@ header = "x-acl-proxy-request-id"
             endpoint: crate::config::compiler::StaticListenerEndpoint::Tcp {
                 address: explicit_https,
             },
-            proxy_header_timeout: None,
             http_versions: versions.clone(),
             handshake_timeout: Duration::from_secs(1),
             request_header_timeout: Duration::from_secs(1),
@@ -1189,7 +1187,6 @@ header = "x-acl-proxy-request-id"
             endpoint: crate::config::compiler::StaticListenerEndpoint::Tcp {
                 address: transparent_https,
             },
-            proxy_header_timeout: None,
             http_versions: versions,
             handshake_timeout: Duration::from_secs(1),
             request_header_timeout: Duration::from_secs(1),

@@ -13,13 +13,14 @@ parser or migration mode.
 ## Install
 
 Release archives contain `acl-proxy`, the capture-body extraction helper, this
-README, `LICENSE`, `THIRD_PARTY_NOTICES`, and `acl-proxy.sample.toml`. To build
-locally:
+README, `LICENSE`, `THIRD_PARTY_NOTICES`, and `acl-proxy.sample.toml`. Linux
+archives also contain the Linux-only transparent UDS relay. To build locally:
 
 ```text
 acl-proxy-<version>-<acl12>/
   bin/acl-proxy
   bin/acl-proxy-extract-capture-body
+  bin/acl-proxy-transparent-uds-relay  # Linux archives only
   README.md
   LICENSE
   THIRD_PARTY_NOTICES
@@ -28,8 +29,8 @@ acl-proxy-<version>-<acl12>/
 
 `<version>` is the exact Cargo package version and `<acl12>` is the first 12
 lowercase hexadecimal characters of the packaged `acl-proxy` commit. That
-directory is the archive root, and the two executables are its only `bin/`
-entries.
+directory is the archive root. Linux archives have the three shown `bin/`
+entries; non-Linux archives omit the Linux-only relay and have the other two.
 
 The `0.3.0-rc.1` candidate requires `schema_version = 3`; configurations for
 the `0.2.x` contract must be rewritten rather than migrated through aliases or
@@ -155,7 +156,8 @@ stream:
 endpoint.kind = "unix_proxy_v2"
 endpoint.path = "/Users/your-user/Library/Application Support/AW Gateway/runtime/transparent-http.sock"
 endpoint.mode = "0600"
-proxy_header_timeout = "1s"
+endpoint.proxy_header_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
 http_versions = ["http1"]
 ```
 
@@ -177,14 +179,16 @@ ACL Proxy prepares the socket and its mode under a private same-directory name,
 then atomically publishes it without replacing an occupied final path. Linux
 uses `renameat2(RENAME_NOREPLACE)` and Apple platforms use
 `renameatx_np(RENAME_EXCL)`; Unix targets without a supported no-replace
-primitive reject this listener kind. The lifetime lock coordinates ACL Proxy
-instances, but is not a security boundary against other processes running as
+primitive reject this listener kind. One lifetime-held lock per Unix endpoint
+coordinates overlapping ACL Proxy instances while permitting disjoint endpoint
+sets; the locks are not a security boundary against other processes running as
 the same trusted workstation user.
 
 ACL Proxy deliberately does not unlink the final path during shutdown because
 POSIX has no atomic compare-inode-and-unlink operation. The service supervisor
 or operator must remove the socket after the proxy has exited and released its
-lock, before starting it again. This is also required after a later startup
+endpoint lock, before starting it again. This is also required after a later
+startup
 stage fails following socket publication. The immediate parent must already
 exist as a real directory owned by the workstation user with no group or other
 permission bits (normally mode `0700`).
@@ -192,9 +196,10 @@ permission bits (normally mode `0700`).
 Unix-PROXY-v2 ingress represents one local workstation principal. The asserted
 PROXY source is discarded, the effective client is loopback and local for quota
 purposes, and configurations using this transport may not contain
-`client_cidrs` predicates. The validated original destination is retained;
-transparent HTTP accepts destination port 80 and transparent HTTPS accepts
-port 443. This transport is available on supported Unix hosts. The companion
+`client_cidrs` predicates. The validated original destination is retained and
+must belong to that endpoint's nonempty `allowed_destination_ports` set. The
+workstation profile uses port 80 for transparent HTTP and port 443 for
+transparent HTTPS. This transport is available on supported Unix hosts. The companion
 `acl-proxy-transparent-uds-relay` artifact is Linux-only because it retrieves
 `SO_ORIGINAL_DST` from redirected TCP connections.
 

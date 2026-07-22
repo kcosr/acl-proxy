@@ -4,13 +4,13 @@
       "name": "http",
       "listen": "127.0.0.1:3128",
       "allowedOriginalPorts": [80],
-      "upstreamSocket": "/run/aw-gateway/transparent-http.sock"
+      "upstreamSocket": "/run/acl-proxy/transparent-http.sock"
     },
     {
       "name": "https",
       "listen": "127.0.0.1:3129",
       "allowedOriginalPorts": [443],
-      "upstreamSocket": "/run/aw-gateway/transparent-https.sock"
+      "upstreamSocket": "/run/acl-proxy/transparent-https.sock"
     }
   ],
   "setupTimeout": "2s",

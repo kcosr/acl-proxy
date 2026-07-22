@@ -1,6 +1,6 @@
 [package]
 name = "acl-proxy-transparent-uds-relay"
-version = "0.3.0-rc.1"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 publish = false
@@ -12,6 +12,7 @@ test-seam = []
 [target.'cfg(target_os = "linux")'.dependencies]
 humantime = "2.1"
 libc = "0.2"
+proxy-protocol-v2-codec = { path = "../../../access-runtime/crates/proxy-protocol-v2-codec", version = "=0.1.0" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"

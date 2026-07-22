@@ -6,8 +6,10 @@
 
 - Replaced scalar data-listener `bind` fields with the closed typed `endpoint`
   contract. TCP listeners use `{ kind = "tcp", address = "..." }`; transparent
-  HTTP and HTTPS may use Unix-PROXY-v2 endpoints. Legacy `bind` is rejected with
-  an actionable migration diagnostic and is not retained as an alias.
+  HTTP and HTTPS may use Unix-PROXY-v2 endpoints whose preface timeout and
+  allowed destination ports are structurally owned by that endpoint. Legacy
+  `bind` is rejected with an actionable migration diagnostic and is not
+  retained as an alias.
 - Replaced the unreleased schema-2 draft with the strict integer
   `schema_version = 3` contract. Missing, string, schema-1, schema-2, and future
   versions are rejected without migration aliases or fallback parsing.
@@ -30,7 +32,8 @@
   Linux-only `acl-proxy-transparent-uds-relay` artifact, including strict PROXY
   v2 framing, bounded relay resources, fail-closed pre-existing path refusal,
   bounded diagnostic socket liveness probes, atomic no-replace socket
-  publication, explicit supervisor-owned pathname cleanup, and distinct
+  publication with verified ownership/mode, explicit supervisor-owned pathname
+  cleanup, shared strict wire codec, Linux release packaging, and distinct
   sanitized TCP and UDS production fixtures.
 - Added one common ingress runtime for explicit and transparent HTTP/HTTPS,
   CONNECT MITM, HTTP/1.1, HTTP/2, upgrades, and direct or parent egress.
@@ -65,6 +68,9 @@
 
 ### Fixed
 
+- Made the proxy and transparent relay inherit one workspace version, and made
+  the release workflow validate and publish both packages through the
+  authoritative `acl-proxy-access-runtime` repository.
 - Corrected the documented curl CA option for CONNECT MITM through a cleartext HTTP proxy.
 - Made capture publication collision-safe and retention-atomic across threads,
   path aliases, and overlapping proxy processes; abandoned temp files no longer

@@ -18,6 +18,7 @@ fn config_path() -> Result<PathBuf, &'static str> {
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .json()
+        .with_writer(std::io::stderr)
         .with_target(false)
         .with_current_span(false)
         .with_span_list(false)

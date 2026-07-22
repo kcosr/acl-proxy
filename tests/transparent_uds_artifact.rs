@@ -105,7 +105,8 @@ base_path = "/_acl-proxy"
 endpoint.kind = "unix_proxy_v2"
 endpoint.path = {socket:?}
 endpoint.mode = "0600"
-proxy_header_timeout = "1s"
+endpoint.proxy_header_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
 http_versions = ["http1"]
 
 [egress]
@@ -127,6 +128,43 @@ default = "deny"
             .unwrap(),
     );
     wait_until_ready(&mut child.0, control, &socket).await;
+
+    let rejected_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let rejected_address = rejected_listener.local_addr().unwrap();
+    let rejected_client_task = tokio::spawn(TcpStream::connect(rejected_address));
+    let (rejected_relay_client, rejected_peer) = rejected_listener.accept().await.unwrap();
+    let mut rejected_client = rejected_client_task.await.unwrap().unwrap();
+    let rejected_route = Route {
+        name: "disallowed-product-port".to_owned(),
+        listen: rejected_address,
+        allowed_original_ports: vec![443],
+        upstream_socket: PathBuf::from(&socket),
+    };
+    let rejected_relay = tokio::spawn(relay_known_destination_for_test(
+        rejected_relay_client,
+        rejected_peer,
+        "203.0.113.8:443".parse().unwrap(),
+        rejected_route,
+        Duration::from_secs(1),
+        1024,
+    ));
+    rejected_client
+        .write_all(
+            b"GET /must-not-dispatch HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    rejected_client.shutdown().await.unwrap();
+    let mut rejected_response = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        rejected_client.read_to_end(&mut rejected_response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(rejected_response.is_empty());
+    assert_eq!(rejected_relay.await.unwrap().bytes_to_client, 0);
 
     let relay_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
     let relay_address = relay_listener.local_addr().unwrap();

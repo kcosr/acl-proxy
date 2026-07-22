@@ -211,8 +211,15 @@ pub(crate) struct StaticListenersConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum StaticListenerEndpoint {
-    Tcp { address: SocketAddr },
-    UnixProxyV2 { path: PathBuf, mode: u32 },
+    Tcp {
+        address: SocketAddr,
+    },
+    UnixProxyV2 {
+        path: PathBuf,
+        mode: u32,
+        proxy_header_timeout: Duration,
+        allowed_destination_ports: Vec<u16>,
+    },
 }
 
 pub(crate) fn unix_listener_lock_path(path: &Path) -> PathBuf {
@@ -224,7 +231,6 @@ pub(crate) fn unix_listener_lock_path(path: &Path) -> PathBuf {
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct StaticCleartextListener {
     pub(crate) endpoint: StaticListenerEndpoint,
-    pub(crate) proxy_header_timeout: Option<Duration>,
     pub(crate) http_versions: Vec<CompiledHttpVersion>,
     pub(crate) request_header_timeout: Duration,
     pub(crate) max_connections: usize,
@@ -235,7 +241,6 @@ pub(crate) struct StaticCleartextListener {
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct StaticExplicitHttpsListener {
     pub(crate) endpoint: StaticListenerEndpoint,
-    pub(crate) proxy_header_timeout: Option<Duration>,
     pub(crate) http_versions: Vec<CompiledHttpVersion>,
     pub(crate) handshake_timeout: Duration,
     pub(crate) request_header_timeout: Duration,
@@ -248,7 +253,6 @@ pub(crate) struct StaticExplicitHttpsListener {
 #[derive(Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct StaticTransparentHttpsListener {
     pub(crate) endpoint: StaticListenerEndpoint,
-    pub(crate) proxy_header_timeout: Option<Duration>,
     pub(crate) http_versions: Vec<CompiledHttpVersion>,
     pub(crate) handshake_timeout: Duration,
     pub(crate) request_header_timeout: Duration,
@@ -1502,7 +1506,6 @@ fn validate_listener_control_mitm_matrix(
     if let Some(listener) = &listeners.explicit_http {
         validate_listener_endpoint(
             &listener.endpoint,
-            listener.proxy_header_timeout.as_ref(),
             "listeners.explicit_http",
             false,
             &mut facts,
@@ -1525,7 +1528,6 @@ fn validate_listener_control_mitm_matrix(
     if let Some(listener) = &listeners.transparent_http {
         validate_listener_endpoint(
             &listener.endpoint,
-            listener.proxy_header_timeout.as_ref(),
             "listeners.transparent_http",
             true,
             &mut facts,
@@ -1543,7 +1545,6 @@ fn validate_listener_control_mitm_matrix(
     if let Some(listener) = &listeners.explicit_https {
         validate_listener_endpoint(
             &listener.endpoint,
-            listener.proxy_header_timeout.as_ref(),
             "listeners.explicit_https",
             false,
             &mut facts,
@@ -1566,7 +1567,6 @@ fn validate_listener_control_mitm_matrix(
     if let Some(listener) = &listeners.transparent_https {
         validate_listener_endpoint(
             &listener.endpoint,
-            listener.proxy_header_timeout.as_ref(),
             "listeners.transparent_https",
             true,
             &mut facts,
@@ -1656,24 +1656,22 @@ fn validate_listener_control_mitm_matrix(
 
 fn validate_listener_endpoint(
     endpoint: &ListenerEndpointConfig,
-    proxy_header_timeout: Option<&super::duration::PositiveDuration>,
     prefix: &str,
     allow_unix: bool,
     facts: &mut ListenerFacts,
 ) -> Result<(), ConfigCompileError> {
     match endpoint {
         ListenerEndpointConfig::Tcp { address } => {
-            if proxy_header_timeout.is_some() {
-                return Err(ConfigCompileError::at(
-                    format!("{prefix}.proxy_header_timeout"),
-                    "must be absent for a tcp endpoint",
-                ));
-            }
             let path = format!("{prefix}.endpoint.address");
             let bind = validate_bind(*address, &path, false)?;
             insert_unique_bind(&mut facts.binds, bind, &path)?;
         }
-        ListenerEndpointConfig::UnixProxyV2 { path, mode } => {
+        ListenerEndpointConfig::UnixProxyV2 {
+            path,
+            mode,
+            proxy_header_timeout: _,
+            allowed_destination_ports,
+        } => {
             if !allow_unix {
                 return Err(ConfigCompileError::at(
                     format!("{prefix}.endpoint.kind"),
@@ -1686,10 +1684,20 @@ fn validate_listener_endpoint(
                     "unix_proxy_v2 is not supported on this platform",
                 ));
             }
-            if proxy_header_timeout.is_none() {
+            if allowed_destination_ports.is_empty() {
                 return Err(ConfigCompileError::at(
-                    format!("{prefix}.proxy_header_timeout"),
-                    "is required for a unix_proxy_v2 endpoint",
+                    format!("{prefix}.endpoint.allowed_destination_ports"),
+                    "must contain at least one destination port",
+                ));
+            }
+            let unique_ports = allowed_destination_ports
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>();
+            if unique_ports.contains(&0) || unique_ports.len() != allowed_destination_ports.len() {
+                return Err(ConfigCompileError::at(
+                    format!("{prefix}.endpoint.allowed_destination_ports"),
+                    "must contain unique nonzero destination ports",
                 ));
             }
             let path_field = format!("{prefix}.endpoint.path");
@@ -6392,10 +6400,6 @@ fn compile_listeners(value: &ListenersConfig) -> StaticListenersConfig {
             .as_ref()
             .map(|listener| StaticCleartextListener {
                 endpoint: compile_listener_endpoint(&listener.endpoint),
-                proxy_header_timeout: listener
-                    .proxy_header_timeout
-                    .as_ref()
-                    .map(|timeout| timeout.get()),
                 http_versions: compile_http_versions(&listener.http_versions),
                 request_header_timeout: listener.request_header_timeout.get(),
                 max_connections: listener.max_connections,
@@ -6407,10 +6411,6 @@ fn compile_listeners(value: &ListenersConfig) -> StaticListenersConfig {
             .as_ref()
             .map(|listener| StaticCleartextListener {
                 endpoint: compile_listener_endpoint(&listener.endpoint),
-                proxy_header_timeout: listener
-                    .proxy_header_timeout
-                    .as_ref()
-                    .map(|timeout| timeout.get()),
                 http_versions: compile_http_versions(&listener.http_versions),
                 request_header_timeout: listener.request_header_timeout.get(),
                 max_connections: listener.max_connections,
@@ -6422,10 +6422,6 @@ fn compile_listeners(value: &ListenersConfig) -> StaticListenersConfig {
             .as_ref()
             .map(|listener| StaticExplicitHttpsListener {
                 endpoint: compile_listener_endpoint(&listener.endpoint),
-                proxy_header_timeout: listener
-                    .proxy_header_timeout
-                    .as_ref()
-                    .map(|timeout| timeout.get()),
                 http_versions: compile_http_versions(&listener.http_versions),
                 handshake_timeout: listener.handshake_timeout.get(),
                 request_header_timeout: listener.request_header_timeout.get(),
@@ -6437,10 +6433,6 @@ fn compile_listeners(value: &ListenersConfig) -> StaticListenersConfig {
         transparent_https: value.transparent_https.as_ref().map(|listener| {
             StaticTransparentHttpsListener {
                 endpoint: compile_listener_endpoint(&listener.endpoint),
-                proxy_header_timeout: listener
-                    .proxy_header_timeout
-                    .as_ref()
-                    .map(|timeout| timeout.get()),
                 http_versions: compile_http_versions(&listener.http_versions),
                 handshake_timeout: listener.handshake_timeout.get(),
                 request_header_timeout: listener.request_header_timeout.get(),
@@ -6456,11 +6448,22 @@ fn compile_listener_endpoint(value: &ListenerEndpointConfig) -> StaticListenerEn
         ListenerEndpointConfig::Tcp { address } => StaticListenerEndpoint::Tcp {
             address: canonical_socket_addr(*address),
         },
-        ListenerEndpointConfig::UnixProxyV2 { path, mode } => StaticListenerEndpoint::UnixProxyV2 {
-            path: path.clone(),
-            mode: u32::from_str_radix(mode, 8)
-                .expect("Unix listener mode was validated before compilation"),
-        },
+        ListenerEndpointConfig::UnixProxyV2 {
+            path,
+            mode,
+            proxy_header_timeout,
+            allowed_destination_ports,
+        } => {
+            let mut allowed_destination_ports = allowed_destination_ports.clone();
+            allowed_destination_ports.sort_unstable();
+            StaticListenerEndpoint::UnixProxyV2 {
+                path: path.clone(),
+                mode: u32::from_str_radix(mode, 8)
+                    .expect("Unix listener mode was validated before compilation"),
+                proxy_header_timeout: proxy_header_timeout.get(),
+                allowed_destination_ports,
+            }
+        }
     }
 }
 
@@ -10083,7 +10086,8 @@ trust = "system"
 endpoint.kind = "unix_proxy_v2"
 endpoint.path = "{socket}"
 endpoint.mode = "0606"
-proxy_header_timeout = "1s"
+endpoint.proxy_header_timeout = "2s"
+endpoint.allowed_destination_ports = [80, 8080]
 http_versions = ["http1"]
 "#
         );
@@ -10096,10 +10100,16 @@ http_versions = ["http1"]
             .unwrap();
         assert!(matches!(
             &listener.endpoint,
-            StaticListenerEndpoint::UnixProxyV2 { path, mode }
-                if path == Path::new(socket) && *mode == 0o606
+            StaticListenerEndpoint::UnixProxyV2 {
+                path,
+                mode,
+                proxy_header_timeout,
+                allowed_destination_ports,
+            } if path == Path::new(socket)
+                && *mode == 0o606
+                && *proxy_header_timeout == Duration::from_secs(2)
+                && allowed_destination_ports == &[80, 8080]
         ));
-        assert_eq!(listener.proxy_header_timeout, Some(Duration::from_secs(1)));
 
         let tcp_only = compile(MINIMAL).unwrap();
         assert_ne!(tcp_only.static_fingerprint, compiled.static_fingerprint);
@@ -10107,8 +10117,44 @@ http_versions = ["http1"]
         for (name, input, expected) in [
             (
                 "missing timeout",
-                unix.replace("proxy_header_timeout = \"1s\"\n", ""),
+                unix.replace("endpoint.proxy_header_timeout = \"2s\"\n", ""),
                 "proxy_header_timeout",
+            ),
+            (
+                "missing destination ports",
+                unix.replace("endpoint.allowed_destination_ports = [80, 8080]\n", ""),
+                "allowed_destination_ports",
+            ),
+            (
+                "obsolete sibling timeout",
+                MINIMAL.replace(
+                    "http_versions = [\"http1\"]",
+                    "proxy_header_timeout = \"1s\"\nhttp_versions = [\"http1\"]",
+                ),
+                "proxy_header_timeout",
+            ),
+        ] {
+            let error =
+                toml::from_str::<super::super::authoring::AuthoringConfig>(&input).unwrap_err();
+            assert!(error.to_string().contains(expected), "{name}: {error}");
+        }
+
+        for (name, input, expected) in [
+            (
+                "duplicate destination ports",
+                unix.replace(
+                    "endpoint.allowed_destination_ports = [80, 8080]",
+                    "endpoint.allowed_destination_ports = [80, 80]",
+                ),
+                "unique nonzero",
+            ),
+            (
+                "zero destination port",
+                unix.replace(
+                    "endpoint.allowed_destination_ports = [80, 8080]",
+                    "endpoint.allowed_destination_ports = [0]",
+                ),
+                "unique nonzero",
             ),
             (
                 "invalid mode",
@@ -10126,20 +10172,12 @@ http_versions = ["http1"]
                 "already be normalized",
             ),
             (
-                "tcp timeout",
-                MINIMAL.replace(
-                    "http_versions = [\"http1\"]",
-                    "proxy_header_timeout = \"1s\"\nhttp_versions = [\"http1\"]",
-                ),
-                "must be absent for a tcp endpoint",
-            ),
-            (
                 "explicit Unix endpoint",
                 MINIMAL
                     .replace(
                         "endpoint.kind = \"tcp\"\nendpoint.address = \"127.0.0.1:8881\"",
                         &format!(
-                            "endpoint.kind = \"unix_proxy_v2\"\nendpoint.path = \"{socket}\"\nendpoint.mode = \"0600\"\nproxy_header_timeout = \"1s\""
+                            "endpoint.kind = \"unix_proxy_v2\"\nendpoint.path = \"{socket}\"\nendpoint.mode = \"0600\"\nendpoint.proxy_header_timeout = \"2s\"\nendpoint.allowed_destination_ports = [80]"
                         ),
                     ),
                 "valid only for transparent",
@@ -10158,14 +10196,16 @@ http_versions = ["http1"]
 endpoint.kind = "unix_proxy_v2"
 endpoint.path = "/tmp/acl-proxy-traffic.sock"
 endpoint.mode = "0600"
-proxy_header_timeout = "1s"
+endpoint.proxy_header_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
 http_versions = ["http1"]
 
 [listeners.transparent_https]
 endpoint.kind = "unix_proxy_v2"
 endpoint.path = "/tmp/acl-proxy-traffic.sock"
 endpoint.mode = "0600"
-proxy_header_timeout = "1s"
+endpoint.proxy_header_timeout = "2s"
+endpoint.allowed_destination_ports = [443]
 http_versions = ["http1"]
 
 [mitm]
@@ -10196,7 +10236,8 @@ directory = "mitm"
 endpoint.kind = "unix_proxy_v2"
 endpoint.path = "/tmp/acl-proxy-traffic.sock"
 endpoint.mode = "0600"
-proxy_header_timeout = "1s"
+endpoint.proxy_header_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
 http_versions = ["http1"]
 
 [[policy.rules]]

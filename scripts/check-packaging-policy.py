@@ -175,11 +175,22 @@ def load_metadata(root: Path, supplied: Path | None) -> dict[str, Any]:
 
 def check_manifest(root: Path) -> None:
     manifest = load_toml(root / "Cargo.toml")
+    workspace = manifest.get("workspace")
+    if not isinstance(workspace, dict):
+        fail("Cargo.toml lacks [workspace]")
+    expected_members = [".", "crates/transparent-uds-relay"]
+    if workspace.get("members") != expected_members:
+        fail("workspace members must include exactly the product and relay")
+    if workspace.get("default-members") != expected_members:
+        fail("workspace default-members must validate both the product and relay")
+    workspace_package = workspace.get("package", {})
+    if workspace_package.get("version") != PRODUCT_VERSION:
+        fail(f"workspace package version must remain {PRODUCT_VERSION}")
     package = manifest.get("package")
     if not isinstance(package, dict):
         fail("Cargo.toml lacks [package]")
-    if package.get("version") != PRODUCT_VERSION or package.get("license") != "MIT":
-        fail(f"product package must remain version {PRODUCT_VERSION} under MIT")
+    if package.get("version") != {"workspace": True} or package.get("license") != "MIT":
+        fail("product package must inherit the workspace version under MIT")
     if package.get("publish") is not False:
         fail("product package must remain non-publishable during the local candidate program")
 
@@ -187,11 +198,25 @@ def check_manifest(root: Path) -> None:
     lock_packages = lock.get("package")
     if not isinstance(lock_packages, list):
         fail("Cargo.lock lacks package records")
-    locked_product = [
-        package for package in lock_packages if package.get("name") == "acl-proxy"
-    ]
-    if len(locked_product) != 1 or locked_product[0].get("version") != PRODUCT_VERSION:
-        fail(f"Cargo.lock must contain exactly one acl-proxy {PRODUCT_VERSION} package")
+    for package_name in ("acl-proxy", "acl-proxy-transparent-uds-relay"):
+        locked_product = [
+            package for package in lock_packages if package.get("name") == package_name
+        ]
+        if len(locked_product) != 1 or locked_product[0].get("version") != PRODUCT_VERSION:
+            fail(
+                f"Cargo.lock must contain exactly one {package_name} "
+                f"{PRODUCT_VERSION} package"
+            )
+
+    relay = load_toml(root / "crates/transparent-uds-relay/Cargo.toml").get("package")
+    if not isinstance(relay, dict) or relay.get("version") != {"workspace": True}:
+        fail("transparent UDS relay must inherit the workspace version")
+
+    release_script = read_text(root / "scripts/release.mjs")
+    if 'const REPO = "kcosr/acl-proxy-access-runtime";' not in release_script:
+        fail("release script must target the authoritative ACL Proxy repository")
+    if 'const RELEASE_REMOTE = "access-runtime";' not in release_script:
+        fail("release script must push through the authoritative access-runtime remote")
     dependencies = manifest.get("dependencies")
     if not isinstance(dependencies, dict):
         fail("Cargo.toml lacks [dependencies]")
@@ -446,7 +471,8 @@ def check_shipped_docs(root: Path) -> None:
     archive_inventory = (
         "Release archives contain `acl-proxy`, the capture-body extraction helper, "
         "this README, `LICENSE`, `THIRD_PARTY_NOTICES`, and "
-        "`acl-proxy.sample.toml`."
+        "`acl-proxy.sample.toml`. Linux archives also contain the Linux-only "
+        "transparent UDS relay."
     )
     if archive_inventory not in normalized:
         fail("README lacks the exact release archive inventory")
@@ -455,6 +481,7 @@ def check_shipped_docs(root: Path) -> None:
         archive_root,
         "  bin/acl-proxy",
         "  bin/acl-proxy-extract-capture-body",
+        "  bin/acl-proxy-transparent-uds-relay  # Linux archives only",
         "  README.md",
         "  LICENSE",
         "  THIRD_PARTY_NOTICES",
@@ -462,6 +489,12 @@ def check_shipped_docs(root: Path) -> None:
     )
     if any(entry not in readme for entry in required_layout):
         fail("README lacks the exact versioned release layout")
+    platform_inventory = (
+        "Linux archives have the three shown `bin/` entries; non-Linux archives "
+        "omit the Linux-only relay and have the other two."
+    )
+    if platform_inventory not in normalized:
+        fail("README lacks the platform-specific relay archive contract")
     if re.search(
         r"acl-proxy-[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?-[0-9a-f]{12}/",
         readme,

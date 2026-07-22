@@ -68,6 +68,7 @@ version = "0.3.0-rc.1"
 dependencies = [
  "humantime",
  "libc",
+ "proxy-protocol-v2-codec",
  "serde",
  "serde_json",
  "tempfile",
@@ -793,6 +794,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "if-addrs",
+ "proxy-protocol-v2-codec",
  "rand",
  "rustls",
  "sha2",
@@ -1309,6 +1311,10 @@ checksum = "5ee95bc4ef87b8d5ba32e8b7714ccc834865276eab0aed5c9958d00ec45f49e8"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "proxy-protocol-v2-codec"
+version = "0.1.0"
 
 [[package]]
 name = "quote"

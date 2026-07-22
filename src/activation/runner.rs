@@ -1166,7 +1166,8 @@ shutdown_drain_timeout = "1s"
 endpoint.kind = "unix_proxy_v2"
 endpoint.path = {:?}
 endpoint.mode = "0600"
-proxy_header_timeout = "1s"
+endpoint.proxy_header_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
 http_versions = ["http1"]
 
 [egress]
@@ -1279,7 +1280,8 @@ shutdown_drain_timeout = "1s"
 endpoint.kind = "unix_proxy_v2"
 endpoint.path = {:?}
 endpoint.mode = "0600"
-proxy_header_timeout = "1s"
+endpoint.proxy_header_timeout = "2s"
+endpoint.allowed_destination_ports = [443]
 http_versions = ["http1"]
 handshake_timeout = "1s"
 

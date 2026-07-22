@@ -8,10 +8,13 @@ trap 'rm -rf "$TMP"' EXIT
 
 BASELINE="$TMP/baseline"
 mkdir -p "$BASELINE/scripts"
+mkdir -p "$BASELINE/crates/transparent-uds-relay"
 for file in Cargo.toml Cargo.lock README.md acl-proxy.sample.toml deny.toml PROVENANCE.md THIRD_PARTY_NOTICES; do
     cp "$ROOT/$file" "$BASELINE/$file"
 done
+cp "$ROOT/crates/transparent-uds-relay/Cargo.toml" "$BASELINE/crates/transparent-uds-relay/"
 cp "$ROOT/scripts/check-packaging-policy.sh" "$BASELINE/scripts/"
+cp "$ROOT/scripts/release.mjs" "$BASELINE/scripts/"
 cargo metadata --locked --offline --format-version 1 >"$BASELINE/metadata.json"
 
 run_gate() {
@@ -128,6 +131,12 @@ expect_obsolete_surface_rejected() {
 }
 
 expect_rejected product-version 'version = "0.3.0-rc.1"' 'version = "0.3.0-rc.2"' Cargo.toml
+expect_rejected product-version-inheritance 'version.workspace = true' 'version = "0.3.0-rc.1"' Cargo.toml
+expect_rejected relay-version-inheritance 'version.workspace = true' 'version = "0.3.0-rc.1"' crates/transparent-uds-relay/Cargo.toml
+expect_rejected relay-workspace-member $'[workspace]\nmembers = [".", "crates/transparent-uds-relay"]' $'[workspace]\nmembers = ["."]' Cargo.toml
+expect_rejected relay-default-member 'default-members = [".", "crates/transparent-uds-relay"]' 'default-members = ["."]' Cargo.toml
+expect_rejected release-repository 'kcosr/acl-proxy-access-runtime' 'kcosr/acl-proxy' scripts/release.mjs
+expect_rejected release-remote 'const RELEASE_REMOTE = "access-runtime";' 'const RELEASE_REMOTE = "origin";' scripts/release.mjs
 expect_rejected publish-guard 'publish = false' 'publish = true' Cargo.toml
 expect_rejected lock-product-version $'name = "acl-proxy"\nversion = "0.3.0-rc.1"' $'name = "acl-proxy"\nversion = "0.3.0-rc.2"' Cargo.lock
 expect_metadata_rejected metadata-product-version acl-proxy version 0.3.0-rc.2
@@ -206,6 +215,7 @@ for file in README.md acl-proxy.sample.toml; do
     done
 done
 expect_rejected archive-bin '  bin/acl-proxy-extract-capture-body' '  acl-proxy-extract-capture-body' README.md
+expect_rejected archive-relay-bin '  bin/acl-proxy-transparent-uds-relay  # Linux archives only' '  acl-proxy-transparent-uds-relay' README.md
 expect_rejected sample-export 'acl-proxy export-ca' 'ca-cert.pem' acl-proxy.sample.toml
 
 printf 'packaging policy mutation suite passed\n'

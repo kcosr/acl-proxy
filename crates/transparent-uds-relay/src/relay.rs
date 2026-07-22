@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use proxy_protocol_v2_codec::{Ipv4StreamHeader, IPV4_STREAM_HEADER_LEN};
 use thiserror::Error;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
@@ -20,7 +21,6 @@ use tokio::{
 use crate::{
     config::{Config, Route},
     original_dst::original_destination,
-    proxy_v2::encode_ipv4_stream,
 };
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
@@ -255,9 +255,9 @@ async fn process_known_destination(
     if !route.allowed_original_ports.contains(&destination.port()) {
         return outcome(CloseCategory::OriginalPort, Some(destination));
     }
-    let header = match encode_ipv4_stream(peer, destination) {
+    let header = match encode_proxy_preface(peer, destination) {
         Ok(header) => header,
-        Err(_) => return outcome(CloseCategory::OriginalDestination, Some(destination)),
+        Err(category) => return outcome(category, Some(destination)),
     };
 
     let setup_started = Instant::now();
@@ -316,6 +316,20 @@ async fn process_known_destination(
         connected_after: Some(connected_after),
         bytes_to_upstream: bytes_to_upstream.load(Ordering::Relaxed),
         bytes_to_client: bytes_to_client.load(Ordering::Relaxed),
+    }
+}
+
+fn encode_proxy_preface(
+    peer: SocketAddr,
+    destination: SocketAddr,
+) -> Result<[u8; IPV4_STREAM_HEADER_LEN], CloseCategory> {
+    match (peer, destination) {
+        (SocketAddr::V4(source), SocketAddr::V4(destination))
+            if source.port() != 0 && destination.port() != 0 =>
+        {
+            Ok(Ipv4StreamHeader::new(source, destination).encode())
+        }
+        _ => Err(CloseCategory::OriginalDestination),
     }
 }
 
@@ -532,6 +546,25 @@ mod tests {
         assert_eq!(result.category, CloseCategory::OriginalPort);
     }
 
+    #[test]
+    fn proxy_preface_rejects_zero_ports_and_non_ipv4_addresses() {
+        let source: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        let destination: SocketAddr = "203.0.113.8:80".parse().unwrap();
+        assert!(encode_proxy_preface(source, destination).is_ok());
+
+        for (source, destination) in [
+            ("127.0.0.1:0", "203.0.113.8:80"),
+            ("127.0.0.1:50000", "203.0.113.8:0"),
+            ("[::1]:50000", "203.0.113.8:80"),
+            ("127.0.0.1:50000", "[2001:db8::8]:80"),
+        ] {
+            assert_eq!(
+                encode_proxy_preface(source.parse().unwrap(), destination.parse().unwrap()),
+                Err(CloseCategory::OriginalDestination)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn unix_socket_refusal_closes_during_setup() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -635,9 +668,15 @@ mod tests {
         });
 
         let (mut host_stream, _) = host.accept().await.unwrap();
-        let mut preface = [0_u8; crate::proxy_v2::IPV4_STREAM_HEADER_LEN];
+        let mut preface = [0_u8; proxy_protocol_v2_codec::IPV4_STREAM_HEADER_LEN];
         host_stream.read_exact(&mut preface).await.unwrap();
-        assert_eq!(preface, encode_ipv4_stream(peer, destination).unwrap());
+        let (SocketAddr::V4(peer_v4), SocketAddr::V4(destination_v4)) = (peer, destination) else {
+            panic!("test addresses must be IPv4")
+        };
+        assert_eq!(
+            preface,
+            Ipv4StreamHeader::new(peer_v4, destination_v4).encode()
+        );
 
         client.write_all(b"untouched-request").await.unwrap();
         client.shutdown().await.unwrap();

@@ -18,7 +18,12 @@ import { fileURLToPath } from "node:url";
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, "..");
 const PACKAGE_NAME = "acl-proxy";
-const REPO = "kcosr/acl-proxy";
+const WORKSPACE_PACKAGE_NAMES = [
+	PACKAGE_NAME,
+	"acl-proxy-transparent-uds-relay",
+];
+const REPO = "kcosr/acl-proxy-access-runtime";
+const RELEASE_REMOTE = "access-runtime";
 const RELEASE_BRANCH = "main";
 const RELEASE_ARG = process.argv[2];
 const BUMP_ARGS = new Set(["major", "minor", "patch"]);
@@ -75,9 +80,9 @@ function runFile(command, args, options = {}) {
 
 function getVersion() {
 	const content = readFileSync(cargoTomlPath, "utf-8");
-	const match = content.match(/\[package\][\s\S]*?\nversion\s*=\s*"([^"]+)"/);
+	const match = content.match(/\[workspace\.package\][\s\S]*?\nversion\s*=\s*"([^"]+)"/);
 	if (!match) {
-		console.error("Could not find version in Cargo.toml [package] section");
+		console.error("Could not find version in Cargo.toml [workspace.package] section");
 		process.exit(1);
 	}
 	return match[1];
@@ -129,9 +134,9 @@ function escapeRegex(value) {
 
 function updateCargoTomlVersion(newVersion) {
 	let content = readFileSync(cargoTomlPath, "utf-8");
-	const versionRegex = /(\[package\][\s\S]*?\nversion\s*=\s*")[^"]*(")/;
+	const versionRegex = /(\[workspace\.package\][\s\S]*?\nversion\s*=\s*")[^"]*(")/;
 	if (!versionRegex.test(content)) {
-		console.error("Cargo.toml [package] version not found");
+		console.error("Cargo.toml [workspace.package] version not found");
 		process.exit(1);
 	}
 	content = content.replace(versionRegex, `$1${newVersion}$2`);
@@ -143,14 +148,16 @@ function updateCargoLockVersion(newVersion) {
 		return;
 	}
 	let content = readFileSync(cargoLockPath, "utf-8");
-	const packageRegex = new RegExp(
-		`(\\[\\[package\\]\\]\\nname = "${escapeRegex(PACKAGE_NAME)}"\\nversion = ")[^"]*(")`
-	);
-	if (!packageRegex.test(content)) {
-		console.error(`Cargo.lock package entry not found for ${PACKAGE_NAME}`);
-		process.exit(1);
+	for (const packageName of WORKSPACE_PACKAGE_NAMES) {
+		const packageRegex = new RegExp(
+			`(\\[\\[package\\]\\]\\nname = "${escapeRegex(packageName)}"\\nversion = ")[^"]*(")`
+		);
+		if (!packageRegex.test(content)) {
+			console.error(`Cargo.lock package entry not found for ${packageName}`);
+			process.exit(1);
+		}
+		content = content.replace(packageRegex, `$1${newVersion}$2`);
 	}
-	content = content.replace(packageRegex, `$1${newVersion}$2`);
 	writeFileSync(cargoLockPath, content, "utf-8");
 }
 
@@ -184,18 +191,18 @@ function ensureSyncedMain() {
 		"git",
 		[
 			"fetch",
-			"origin",
-			`refs/heads/${RELEASE_BRANCH}:refs/remotes/origin/${RELEASE_BRANCH}`,
+			RELEASE_REMOTE,
+			`refs/heads/${RELEASE_BRANCH}:refs/remotes/${RELEASE_REMOTE}/${RELEASE_BRANCH}`,
 		],
 		{ silent: true }
 	);
 	const local = runFile("git", ["rev-parse", RELEASE_BRANCH], { silent: true }).trim();
-	const remote = runFile("git", ["rev-parse", `origin/${RELEASE_BRANCH}`], {
+	const remote = runFile("git", ["rev-parse", `${RELEASE_REMOTE}/${RELEASE_BRANCH}`], {
 		silent: true,
 	}).trim();
 	if (local !== remote) {
 		console.error(
-			`Error: ${RELEASE_BRANCH} must match origin/${RELEASE_BRANCH}. Run git pull --ff-only first.`
+			`Error: ${RELEASE_BRANCH} must match ${RELEASE_REMOTE}/${RELEASE_BRANCH}. Run git pull --ff-only first.`
 		);
 		process.exit(1);
 	}
@@ -211,11 +218,11 @@ function ensureTagAvailable(version) {
 		process.exit(1);
 	}
 
-	const remoteTagExists = run(`git ls-remote --tags origin refs/tags/v${version}`, {
+	const remoteTagExists = run(`git ls-remote --tags ${RELEASE_REMOTE} refs/tags/v${version}`, {
 		silent: true,
 	});
 	if (remoteTagExists && remoteTagExists.trim()) {
-		console.error(`Error: tag v${version} already exists on origin.`);
+		console.error(`Error: tag v${version} already exists on ${RELEASE_REMOTE}.`);
 		process.exit(1);
 	}
 }
@@ -310,7 +317,7 @@ if (existsSync(cargoLockPath)) {
 runFile("git", ["add", ...releaseCommitPaths]);
 runFile("git", ["commit", "-m", `Release v${version}`]);
 runFile("git", ["tag", `v${version}`]);
-runFile("git", ["push", "--atomic", "origin", RELEASE_BRANCH, `v${version}`]);
+runFile("git", ["push", "--atomic", RELEASE_REMOTE, RELEASE_BRANCH, `v${version}`]);
 
 const notesFile = join(ROOT, ".release-notes-tmp.md");
 writeFileSync(notesFile, extractReleaseNotes(version), "utf-8");
@@ -347,7 +354,7 @@ if (!releaseCreated) {
 addUnreleasedSection();
 runFile("git", ["add", "CHANGELOG.md"]);
 runFile("git", ["commit", "-m", "Prepare for next release"]);
-runFile("git", ["push", "origin", RELEASE_BRANCH]);
+runFile("git", ["push", RELEASE_REMOTE, RELEASE_BRANCH]);
 
 console.log(`=== Released v${version} ===`);
 console.log(`https://github.com/${REPO}/releases/tag/v${version}`);

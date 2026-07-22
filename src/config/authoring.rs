@@ -349,16 +349,21 @@ pub(super) enum HttpVersion {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum ListenerEndpointConfig {
-    Tcp { address: SocketAddr },
-    UnixProxyV2 { path: PathBuf, mode: String },
+    Tcp {
+        address: SocketAddr,
+    },
+    UnixProxyV2 {
+        path: PathBuf,
+        mode: String,
+        proxy_header_timeout: PositiveDuration,
+        allowed_destination_ports: Vec<u16>,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ExplicitHttpListenerConfig {
     pub endpoint: ListenerEndpointConfig,
-    #[serde(default)]
-    pub proxy_header_timeout: Option<PositiveDuration>,
     pub http_versions: Vec<HttpVersion>,
 
     #[serde(default = "default_listener_timeout")]
@@ -377,8 +382,6 @@ pub(super) struct ExplicitHttpListenerConfig {
 #[serde(deny_unknown_fields)]
 pub(super) struct TransparentHttpListenerConfig {
     pub endpoint: ListenerEndpointConfig,
-    #[serde(default)]
-    pub proxy_header_timeout: Option<PositiveDuration>,
     pub http_versions: Vec<HttpVersion>,
 
     #[serde(default = "default_listener_timeout")]
@@ -395,8 +398,6 @@ pub(super) struct TransparentHttpListenerConfig {
 #[serde(deny_unknown_fields)]
 pub(super) struct ExplicitHttpsListenerConfig {
     pub endpoint: ListenerEndpointConfig,
-    #[serde(default)]
-    pub proxy_header_timeout: Option<PositiveDuration>,
     pub http_versions: Vec<HttpVersion>,
 
     #[serde(default = "default_listener_timeout")]
@@ -419,8 +420,6 @@ pub(super) struct ExplicitHttpsListenerConfig {
 #[serde(deny_unknown_fields)]
 pub(super) struct TransparentHttpsListenerConfig {
     pub endpoint: ListenerEndpointConfig,
-    #[serde(default)]
-    pub proxy_header_timeout: Option<PositiveDuration>,
     pub http_versions: Vec<HttpVersion>,
 
     #[serde(default = "default_listener_timeout")]

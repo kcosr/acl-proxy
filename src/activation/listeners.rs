@@ -16,8 +16,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use http_access_runtime::{
-    Http1ConnectPolicy, ListenerConfig, ListenerLimits, ListenerMode, LocalAddressProvider,
-    OriginalDestinationProvider, PreboundListener, PreboundListenerBundle,
+    AllowedDestinationPorts, Http1ConnectPolicy, ListenerConfig, ListenerLimits, ListenerMode,
+    LocalAddressProvider, OriginalDestinationProvider, PreboundListener, PreboundListenerBundle,
     PreboundListenerEndpoint, RuntimeError as SharedRuntimeError,
 };
 use http_access_types::{HttpProtocol, HttpProtocolSet};
@@ -100,16 +100,6 @@ impl ProxyListenerConfig {
             Self::TransparentHttps(config) => &config.endpoint,
         }
     }
-
-    fn proxy_header_timeout(&self) -> Option<Duration> {
-        match self {
-            Self::ExplicitHttp(config) | Self::TransparentHttp(config) => {
-                config.proxy_header_timeout
-            }
-            Self::ExplicitHttps(config) => config.proxy_header_timeout,
-            Self::TransparentHttps(config) => config.proxy_header_timeout,
-        }
-    }
 }
 
 pub(crate) struct PreparedProxyListener {
@@ -123,6 +113,8 @@ enum PreparedListenerEndpoint {
     UnixProxyV2 {
         listener: UnixListener,
         lifetime: Arc<UnixSocketLifetime>,
+        proxy_header_timeout: Duration,
+        allowed_destination_ports: Vec<u16>,
     },
 }
 
@@ -235,7 +227,6 @@ impl PreparedProxyListener {
     fn into_shared_with_lifetime(
         self,
     ) -> Result<(PreboundListener, Option<Arc<UnixSocketLifetime>>), SharedRuntimeError> {
-        let proxy_header_timeout = self.config.proxy_header_timeout();
         let config = match self.config {
             ProxyListenerConfig::ExplicitHttp(config) => ListenerConfig::explicit_http(
                 protocol_set(&config.http_versions)?,
@@ -279,11 +270,18 @@ impl PreparedProxyListener {
                 (PreboundListenerEndpoint::Tcp(listener), None)
             }
             #[cfg(unix)]
-            PreparedListenerEndpoint::UnixProxyV2 { listener, lifetime } => (
+            PreparedListenerEndpoint::UnixProxyV2 {
+                listener,
+                lifetime,
+                proxy_header_timeout,
+                allowed_destination_ports,
+            } => (
                 PreboundListenerEndpoint::UnixProxyV2 {
                     listener,
-                    proxy_header_timeout: proxy_header_timeout
-                        .expect("compiled Unix listener has a PROXY header timeout"),
+                    proxy_header_timeout,
+                    allowed_destination_ports: AllowedDestinationPorts::new(
+                        allowed_destination_ports,
+                    )?,
                 },
                 Some(lifetime),
             ),
@@ -564,14 +562,23 @@ fn bind_configured(
                         address: Some(*address),
                         source,
                     })?,
-                StaticListenerEndpoint::UnixProxyV2 { path, mode } => {
-                    bind_unix_proxy_v2(path, *mode).map_err(|source| ProxyListenerBindError {
-                        name,
-                        endpoint: path.display().to_string(),
-                        address: None,
-                        source,
-                    })?
-                }
+                StaticListenerEndpoint::UnixProxyV2 {
+                    path,
+                    mode,
+                    proxy_header_timeout,
+                    allowed_destination_ports,
+                } => bind_unix_proxy_v2(
+                    path,
+                    *mode,
+                    *proxy_header_timeout,
+                    allowed_destination_ports.clone(),
+                )
+                .map_err(|source| ProxyListenerBindError {
+                    name,
+                    endpoint: path.display().to_string(),
+                    address: None,
+                    source,
+                })?,
             };
             Ok(PreparedProxyListener { config, endpoint })
         })
@@ -579,7 +586,12 @@ fn bind_configured(
 }
 
 #[cfg(unix)]
-fn bind_unix_proxy_v2(path: &Path, mode: u32) -> io::Result<PreparedListenerEndpoint> {
+fn bind_unix_proxy_v2(
+    path: &Path,
+    mode: u32,
+    proxy_header_timeout: Duration,
+    allowed_destination_ports: Vec<u16>,
+) -> io::Result<PreparedListenerEndpoint> {
     use fs2::FileExt;
 
     let effective_uid = rustix::process::geteuid().as_raw();
@@ -617,13 +629,41 @@ fn bind_unix_proxy_v2(path: &Path, mode: u32) -> io::Result<PreparedListenerEndp
         let _ = std::fs::remove_file(&private_path);
         return Err(error);
     }
+    let private_metadata = std::fs::symlink_metadata(&private_path)?;
+    if let Err(error) = verify_staged_unix_socket(&private_metadata, effective_uid, mode) {
+        let _ = std::fs::remove_file(&private_path);
+        return Err(error);
+    }
     if let Err(error) = publish_unix_socket_noreplace(&private_path, path) {
         let _ = std::fs::remove_file(&private_path);
         return Err(error);
     }
 
     let lifetime = Arc::new(UnixSocketLifetime { _lock: lock });
-    Ok(PreparedListenerEndpoint::UnixProxyV2 { listener, lifetime })
+    Ok(PreparedListenerEndpoint::UnixProxyV2 {
+        listener,
+        lifetime,
+        proxy_header_timeout,
+        allowed_destination_ports,
+    })
+}
+
+#[cfg(unix)]
+fn verify_staged_unix_socket(
+    metadata: &std::fs::Metadata,
+    effective_uid: u32,
+    mode: u32,
+) -> io::Result<()> {
+    if metadata.file_type().is_socket()
+        && metadata.uid() == effective_uid
+        && metadata.permissions().mode() & 0o777 == mode
+    {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "Unix proxy listener staging socket mode or ownership verification failed",
+    ))
 }
 
 #[cfg(unix)]
@@ -819,7 +859,12 @@ fn validate_owned_socket(metadata: &std::fs::Metadata, effective_uid: u32) -> io
 }
 
 #[cfg(not(unix))]
-fn bind_unix_proxy_v2(_path: &std::path::Path, _mode: u32) -> io::Result<PreparedListenerEndpoint> {
+fn bind_unix_proxy_v2(
+    _path: &std::path::Path,
+    _mode: u32,
+    _proxy_header_timeout: Duration,
+    _allowed_destination_ports: Vec<u16>,
+) -> io::Result<PreparedListenerEndpoint> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "Unix proxy listeners are not supported on this platform",
@@ -864,7 +909,6 @@ mod tests {
         PreparedProxyListener {
             config: ProxyListenerConfig::TransparentHttp(Box::new(StaticCleartextListener {
                 endpoint: StaticListenerEndpoint::Tcp { address },
-                proxy_header_timeout: None,
                 http_versions: vec![CompiledHttpVersion::Http1],
                 request_header_timeout: Duration::from_secs(1),
                 max_connections: 1,
@@ -1002,7 +1046,6 @@ mod tests {
                 endpoint: StaticListenerEndpoint::Tcp {
                     address: addresses[0],
                 },
-                proxy_header_timeout: None,
                 http_versions: vec![CompiledHttpVersion::Http1, CompiledHttpVersion::Http2],
                 request_header_timeout: Duration::from_secs(5),
                 max_connections: 17,
@@ -1013,7 +1056,6 @@ mod tests {
                 endpoint: StaticListenerEndpoint::Tcp {
                     address: addresses[1],
                 },
-                proxy_header_timeout: None,
                 http_versions: vec![CompiledHttpVersion::Http1],
                 request_header_timeout: Duration::from_secs(7),
                 max_connections: 23,
@@ -1024,7 +1066,6 @@ mod tests {
                 endpoint: StaticListenerEndpoint::Tcp {
                     address: addresses[2],
                 },
-                proxy_header_timeout: None,
                 http_versions: vec![CompiledHttpVersion::Http2],
                 handshake_timeout: Duration::from_secs(3),
                 request_header_timeout: Duration::from_secs(5),
@@ -1040,7 +1081,6 @@ mod tests {
                 endpoint: StaticListenerEndpoint::Tcp {
                     address: addresses[3],
                 },
-                proxy_header_timeout: None,
                 http_versions: vec![CompiledHttpVersion::Http1],
                 handshake_timeout: Duration::from_secs(7),
                 request_header_timeout: Duration::from_secs(11),
@@ -1318,8 +1358,9 @@ mod tests {
                 endpoint: StaticListenerEndpoint::UnixProxyV2 {
                     path: path.to_path_buf(),
                     mode,
+                    proxy_header_timeout: Duration::from_secs(1),
+                    allowed_destination_ports: vec![80],
                 },
-                proxy_header_timeout: Some(Duration::from_secs(1)),
                 http_versions: vec![CompiledHttpVersion::Http1],
                 request_header_timeout: Duration::from_secs(1),
                 max_connections: 4,
@@ -1479,6 +1520,42 @@ mod tests {
         validate_owned_socket(&metadata, effective_uid).unwrap();
         assert_eq!(
             validate_owned_socket(&metadata, other_uid)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        drop(socket);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_unix_listener_verification_rejects_wrong_type_owner_and_mode() {
+        let directory = private_unix_tempdir();
+        let socket_path = directory.path().join("staged.sock");
+        let socket = UnixListener::bind(&socket_path).unwrap();
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o620)).unwrap();
+        let socket_metadata = std::fs::symlink_metadata(&socket_path).unwrap();
+        let effective_uid = rustix::process::geteuid().as_raw();
+
+        verify_staged_unix_socket(&socket_metadata, effective_uid, 0o620).unwrap();
+        assert_eq!(
+            verify_staged_unix_socket(&socket_metadata, effective_uid, 0o600)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            verify_staged_unix_socket(&socket_metadata, effective_uid.wrapping_add(1), 0o620)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let regular_path = directory.path().join("regular");
+        std::fs::write(&regular_path, b"not a socket").unwrap();
+        let regular_metadata = std::fs::symlink_metadata(regular_path).unwrap();
+        assert_eq!(
+            verify_staged_unix_socket(&regular_metadata, effective_uid, 0o600)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::PermissionDenied
