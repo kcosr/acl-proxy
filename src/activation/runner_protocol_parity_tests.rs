@@ -88,7 +88,8 @@ request_timeout = "5s"
 shutdown_drain_timeout = "1s"
 
 [listeners.{table}]
-bind = "{bind}"
+endpoint.kind = "tcp"
+endpoint.address = "{bind}"
 http_versions = [{versions}]
 
 [egress]

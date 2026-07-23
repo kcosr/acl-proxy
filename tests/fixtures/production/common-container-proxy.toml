@@ -17,14 +17,16 @@ base_path = "/_acl-proxy"
 request_body_timeout = "10s"
 
 [listeners.explicit_http]
-bind = "0.0.0.0:8881"
+endpoint.kind = "tcp"
+endpoint.address = "0.0.0.0:8881"
 http_versions = ["http1"]
 
 [listeners.explicit_http.connect]
 http1 = "mitm"
 
 [listeners.transparent_https]
-bind = "0.0.0.0:8889"
+endpoint.kind = "tcp"
+endpoint.address = "0.0.0.0:8889"
 http_versions = ["http1", "http2"]
 
 [mitm]

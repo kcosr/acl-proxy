@@ -55,7 +55,8 @@ fn strings<'a>(value: &'a TomlValue, key: &str) -> Vec<&'a str> {
 #[test]
 fn sanitized_production_role_structure_matches_difference_record() {
     let expectations = [
-        ("host-proxy.toml", 45, 134, 22, 2, 4),
+        ("host-proxy-tcp.toml", 45, 134, 22, 2, 4),
+        ("host-proxy-uds.toml", 1, 1, 0, 0, 0),
         ("common-container-proxy.toml", 1, 1, 0, 0, 0),
         ("internal-container-proxy.toml", 8, 12, 1, 0, 0),
     ];
@@ -130,7 +131,7 @@ fn sanitized_production_role_structure_matches_difference_record() {
             .all(|rule| rule.get("action").is_none() && rule.get("pattern").is_none()));
     }
 
-    let host = parse_fixture("host-proxy.toml");
+    let host = parse_fixture("host-proxy-tcp.toml");
     let sensitive_strings = table(&host, "redaction")
         .get("profiles")
         .and_then(TomlValue::as_table)
@@ -211,6 +212,38 @@ fn sanitized_production_role_structure_matches_difference_record() {
         BTreeSet::from(["agent_runner_acl", "gitlab_acl"])
     );
 
+    let uds = parse_fixture("host-proxy-uds.toml");
+    let listeners = table(&uds, "listeners");
+    assert_eq!(
+        listeners
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["transparent_http", "transparent_https"])
+    );
+    for name in ["transparent_http", "transparent_https"] {
+        let listener = table(&uds, "listeners").get(name).unwrap();
+        let endpoint = table(listener, "endpoint");
+        assert_eq!(
+            endpoint.get("kind").and_then(TomlValue::as_str),
+            Some("unix_proxy_v2")
+        );
+        assert_eq!(
+            endpoint.get("mode").and_then(TomlValue::as_str),
+            Some("0600")
+        );
+    }
+    assert!(rules(&uds)
+        .iter()
+        .all(|rule| strings(rule, "client_cidrs").is_empty()));
+    assert_eq!(
+        table(&uds, "egress")
+            .get("route")
+            .and_then(TomlValue::as_str),
+        Some("parent_proxy")
+    );
+    assert!(table(&uds, "egress").get("parent_proxy").is_some());
+
     for name in [
         "common-container-proxy.toml",
         "internal-container-proxy.toml",
@@ -261,7 +294,7 @@ fn sanitized_v1_fixtures_are_structurally_incompatible_with_v3() {
 
 #[test]
 fn legacy_single_star_host_rules_receive_explicit_v3_intent() {
-    let host = parse_fixture("host-proxy.toml");
+    let host = parse_fixture("host-proxy-tcp.toml");
     let internal = parse_fixture("internal-container-proxy.toml");
     let patterns: BTreeSet<_> = rules(&host)
         .iter()

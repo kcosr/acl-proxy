@@ -217,7 +217,8 @@ request_timeout = "5s"
 shutdown_drain_timeout = "1s"
 
 [listeners.explicit_https]
-bind = "{bind}"
+endpoint.kind = "tcp"
+endpoint.address = "{bind}"
 http_versions = ["http1"]
 handshake_timeout = "1s"
 
@@ -296,7 +297,8 @@ request_timeout = "5s"
 shutdown_drain_timeout = "1s"
 
 [listeners.transparent_https]
-bind = "{bind}"
+endpoint.kind = "tcp"
+endpoint.address = "{bind}"
 http_versions = ["http1"]
 handshake_timeout = "1s"
 
@@ -574,7 +576,7 @@ fn gzip_body(body: &[u8]) -> Vec<u8> {
 async fn production_compressed_telemetry_body_compatibility() {
     let _test = super::super::super::LISTENER_TEST_LOCK.lock().await;
     let production_fixture: toml::Value = toml::from_str(include_str!(
-        "../../tests/fixtures/production/host-proxy.toml"
+        "../../tests/fixtures/production/host-proxy-tcp.toml"
     ))
     .unwrap();
     let telemetry_rule = production_fixture["policy"]["rules"]
@@ -642,7 +644,8 @@ shutdown_drain_timeout = "1s"
 max_content_decoding_expansion_ratio = 128
 
 [listeners.transparent_https]
-bind = "{proxy}"
+endpoint.kind = "tcp"
+endpoint.address = "{proxy}"
 http_versions = ["http1"]
 handshake_timeout = "1s"
 

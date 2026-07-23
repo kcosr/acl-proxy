@@ -94,6 +94,7 @@ impl StandaloneRequestFactory for ProductStandaloneRequestFactory {
     ) -> BoxFuture<'_, Result<PreparedStandaloneRequest, http_access_runtime::RuntimeError>> {
         Box::pin(async move {
             let started_at = Instant::now();
+            let listener_transport = ingress.listener_transport();
             let (facts, peer, peer_is_local, listener_connect_denied, body, private_fields) =
                 ingress.into_parts();
             let lease = self
@@ -102,6 +103,16 @@ impl StandaloneRequestFactory for ProductStandaloneRequestFactory {
                 .await
                 .ok_or(http_access_runtime::RuntimeError::ServiceFailure)?;
             let request_id = request_id();
+            tracing::debug!(
+                target: "acl_proxy::traffic",
+                request_id,
+                listener_transport = match listener_transport {
+                    http_access_runtime::ListenerTransport::Tcp => "tcp",
+                    http_access_runtime::ListenerTransport::UnixProxyV2 => "unix_proxy_v2",
+                },
+                ingress_mode = ?facts.ingress_mode(),
+                "proxy request admitted"
+            );
             let (visible_fields, partitioned) = partition_standalone_private_fields(
                 &IngressPartitionPolicy::from_lease(&lease),
                 private_fields,

@@ -13,13 +13,14 @@ parser or migration mode.
 ## Install
 
 Release archives contain `acl-proxy`, the capture-body extraction helper, this
-README, `LICENSE`, `THIRD_PARTY_NOTICES`, and `acl-proxy.sample.toml`. To build
-locally:
+README, `LICENSE`, `THIRD_PARTY_NOTICES`, and `acl-proxy.sample.toml`. Linux
+archives also contain the Linux-only transparent UDS relay. To build locally:
 
 ```text
 acl-proxy-<version>-<acl12>/
   bin/acl-proxy
   bin/acl-proxy-extract-capture-body
+  bin/acl-proxy-transparent-uds-relay  # Linux archives only
   README.md
   LICENSE
   THIRD_PARTY_NOTICES
@@ -28,8 +29,8 @@ acl-proxy-<version>-<acl12>/
 
 `<version>` is the exact Cargo package version and `<acl12>` is the first 12
 lowercase hexadecimal characters of the packaged `acl-proxy` commit. That
-directory is the archive root, and the two executables are its only `bin/`
-entries.
+directory is the archive root. Linux archives have the three shown `bin/`
+entries; non-Linux archives omit the Linux-only relay and have the other two.
 
 The `0.3.0-rc.1` candidate requires `schema_version = 3`; configurations for
 the `0.2.x` contract must be rewritten rather than migrated through aliases or
@@ -123,6 +124,8 @@ needed.
 ### Listeners
 
 Listener sections are independent; omitted listeners are disabled.
+Every data listener uses a typed `endpoint`. The legacy scalar `bind` field is
+not accepted.
 
 | Section | Ingress |
 | --- | --- |
@@ -133,7 +136,8 @@ Listener sections are independent; omitted listeners are disabled.
 
 ```toml
 [listeners.explicit_http]
-bind = "127.0.0.1:8881"
+endpoint.kind = "tcp"
+endpoint.address = "127.0.0.1:8881"
 http_versions = ["http1"]
 request_header_timeout = "10s"
 max_connections = 1024
@@ -142,6 +146,86 @@ max_concurrent_streams = 128
 [listeners.explicit_http.connect]
 http1 = "deny" # deny | mitm
 ```
+
+Transparent HTTP and HTTPS listeners may instead accept a Unix stream carrying
+one strict PROXY Protocol v2 IPv4/STREAM preface followed by the untouched TCP
+stream:
+
+```toml
+[listeners.transparent_http]
+endpoint.kind = "unix_proxy_v2"
+endpoint.path = "/Users/your-user/Library/Application Support/AW Gateway/runtime/transparent-http.sock"
+endpoint.mode = "0600"
+endpoint.proxy_header_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
+http_versions = ["http1"]
+```
+
+The workstation host path must be inside a user-writable runtime directory
+owned by the workstation user and protected with mode `0700`; the placeholder
+above must be replaced with that user's actual home path. Mode `0600` keeps the
+host listener private and is sufficient for the root-owned guest endpoint and
+root-supervised relay. Other Unix deployments should select the narrowest
+socket mode compatible with their relay process.
+
+The path must be absolute. ACL Proxy refuses every pre-existing path and never
+unlinks it. For a socket owned by the current user, a bounded liveness probe
+only improves the diagnostic: live, busy, and indeterminate sockets report
+`AddrInUse`, while a refused connection identifies a stale socket that must be
+removed explicitly. Symlinks, non-sockets, sockets owned by another user, and
+other probe failures are rejected.
+
+ACL Proxy prepares the socket and its mode under a private same-directory name,
+then atomically publishes it without replacing an occupied final path. Linux
+uses `renameat2(RENAME_NOREPLACE)` and Apple platforms use
+`renameatx_np(RENAME_EXCL)`; Unix targets without a supported no-replace
+primitive reject this listener kind. One lifetime-held lock per Unix endpoint
+coordinates overlapping ACL Proxy instances while permitting disjoint endpoint
+sets; the locks are not a security boundary against other processes running as
+the same trusted workstation user.
+
+ACL Proxy deliberately does not unlink the final path during shutdown because
+POSIX has no atomic compare-inode-and-unlink operation. The service supervisor
+or operator must remove the socket after the proxy has exited and released its
+endpoint lock, before starting it again. This is also required after a later
+startup
+stage fails following socket publication. The immediate parent must already
+exist as a real directory owned by the workstation user with no group or other
+permission bits (normally mode `0700`).
+
+Unix-PROXY-v2 ingress represents one local workstation principal. The asserted
+PROXY source is discarded, the effective client is loopback and local for quota
+purposes, and configurations using this transport may not contain
+`client_cidrs` predicates. The validated original destination is retained and
+must belong to that endpoint's nonempty `allowed_destination_ports` set. The
+workstation profile uses port 80 for transparent HTTP and port 443 for
+transparent HTTPS. This transport is available on supported Unix hosts. The companion
+`acl-proxy-transparent-uds-relay` artifact is Linux-only because it retrieves
+`SO_ORIGINAL_DST` from redirected TCP connections.
+
+Run the relay with its separate strict JSON configuration:
+
+```bash
+acl-proxy-transparent-uds-relay --config /etc/acl-proxy/transparent-uds-relay.json
+```
+
+See `examples/transparent-uds-relay.json` for the complete schema and
+`examples/acl-proxy-transparent-uds.toml` for the paired host listeners. Relay
+listener addresses must be unprivileged IPv4 loopback addresses. Route names,
+listeners, original-port sets, and Unix paths are unique. `setupTimeout` covers
+both the Unix connection and complete PROXY preface write. `maxConnections` is
+global across routes, and the relay validates its projected file descriptors
+and `maxConnections * 2 * copyBufferBytesPerDirection` memory before binding.
+The relay never parses HTTP or TLS and has no TCP egress fallback.
+The shipped host example requires TLS parent-proxy egress; it does not silently
+fall back to direct origin access.
+
+Repository tests cover the relay-to-ACL HTTP artifact boundary through an
+injected original-destination seam and cover TLS MITM on the Unix listener.
+Kernel `SO_ORIGINAL_DST`/iptables netns behavior and the complete
+TLS/HTTP2/WebSocket topology remain the T04 AW Gateway cross-repository release
+gates because they require the privileged Linux redirect environment and the
+Apple host socket relay.
 
 HTTP/2 CONNECT is intentionally deny-only. Enabling `http1 = "mitm"` or a
 transparent HTTPS listener requires `[mitm]`:

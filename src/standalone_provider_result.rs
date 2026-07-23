@@ -813,7 +813,8 @@ max_trailer_count = 8
 max_trailer_bytes = 1024
 
 [listeners.explicit_http]
-bind = "127.0.0.1:8881"
+endpoint.kind = "tcp"
+endpoint.address = "127.0.0.1:8881"
 http_versions = ["http1"]
 
 [listeners.explicit_http.connect]

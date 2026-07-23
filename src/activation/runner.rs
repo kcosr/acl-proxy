@@ -46,6 +46,29 @@ impl ListenerFailureObserver for ProductListenerFailureObserver {
         static_resources.record_listener_failure(error);
         StaticResources::begin_shutdown(static_resources.as_ref());
     }
+
+    fn connection_rejected(
+        &self,
+        mode: ListenerMode,
+        transport: http_access_runtime::ListenerTransport,
+        error: http_access_runtime::RuntimeError,
+    ) {
+        tracing::warn!(
+            target: "acl_proxy::traffic",
+            listener = %super::listeners::ProxyListenerKind::from_shared(mode),
+            listener_transport = listener_transport_name(transport),
+            category = "connection_rejected",
+            error = %error,
+            "proxy listener rejected a connection before HTTP/TLS processing"
+        );
+    }
+}
+
+fn listener_transport_name(transport: http_access_runtime::ListenerTransport) -> &'static str {
+    match transport {
+        http_access_runtime::ListenerTransport::Tcp => "tcp",
+        http_access_runtime::ListenerTransport::UnixProxyV2 => "unix_proxy_v2",
+    }
 }
 
 impl ProductRuntime {
@@ -216,7 +239,7 @@ impl ProductRuntime {
             return Err(ProductRuntimeError::InitialGenerationNotPublished);
         }
         let prepared = self.take_prepared_proxy_listeners_for_start()?;
-        let bundle =
+        let (bundle, unix_socket_lifetimes) =
             match prepared.into_shared_bundle_with_transparent_support(transparent_supported) {
                 Ok(bundle) => bundle,
                 Err(error) => {
@@ -258,7 +281,7 @@ impl ProductRuntime {
         before_adoption();
         if let Err(error) = self
             .static_resources
-            .adopt_listener_runtime(listener_runtime)
+            .adopt_listener_runtime(listener_runtime, unix_socket_lifetimes)
         {
             self.shutdown().await;
             return Err(error.into());
@@ -337,6 +360,8 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::net::{SocketAddr, TcpListener};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::time::Duration;
 
@@ -369,7 +394,8 @@ max_connections = 2
 max_request_body_bytes = 65536
 
 [listeners.explicit_http]
-bind = "{explicit_http}"
+endpoint.kind = "tcp"
+endpoint.address = "{explicit_http}"
 http_versions = ["http1"]
 
 [listeners.explicit_http.connect]
@@ -926,7 +952,8 @@ request_timeout = "5s"
 shutdown_drain_timeout = "1s"
 
 [listeners.{listener_table}]
-bind = "{}"
+endpoint.kind = "tcp"
+endpoint.address = "{}"
 http_versions = ["http1"]
 
 {listener_connect}
@@ -1114,6 +1141,251 @@ value = "policy"
                 .as_deref(),
             Some("identity")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_proxy_v2_transparent_http_uses_the_existing_product_pipeline() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_path = directory.path().join("transparent-http.sock");
+        let config_path = directory.path().join("acl-proxy.toml");
+        let origin = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let text = format!(
+            r#"schema_version = 3
+
+[service]
+request_timeout = "5s"
+shutdown_drain_timeout = "1s"
+
+[listeners.transparent_http]
+endpoint.kind = "unix_proxy_v2"
+endpoint.path = {:?}
+endpoint.mode = "0600"
+endpoint.proxy_header_timeout = "2s"
+endpoint.allowed_destination_ports = [80]
+http_versions = ["http1"]
+
+[egress]
+route = "direct"
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "unix-transparent"
+decision = "allow"
+urls = ["http://origin.example.test/**"]
+methods = ["GET"]
+
+[safety.loop_detection]
+inject = true
+header = "x-test-loop"
+"#,
+            socket_path
+        );
+        fs::write(&config_path, text).unwrap();
+        let loaded = load_and_compile_exact_config(&config_path).unwrap();
+        let origin_url =
+            http_access_url::canonicalize_http_url("http://origin.example.test/").unwrap();
+        let network = Arc::new(
+            http_access_runtime::ForwardingDevHarness::new(
+                http_access_runtime::ForwardingNetworkFacts::new(Vec::new(), None, None, None)
+                    .unwrap(),
+            )
+            .map_prebound(&origin_url, origin_address)
+            .unwrap()
+            .into_standalone_guard(),
+        );
+        let product = ProductRuntime::prepare_from_prebound_with_forwarding_network(
+            loaded,
+            Vec::new(),
+            network,
+        )
+        .await
+        .unwrap();
+        product.activate_initial().await.unwrap();
+        product.start_listeners().await.unwrap();
+
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let request = read_http_message(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\naccepted",
+                )
+                .await
+                .unwrap();
+            request
+        });
+
+        let mut client = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let mut proxy = [0_u8; 28];
+        proxy[..12].copy_from_slice(b"\r\n\r\n\0\r\nQUIT\n");
+        proxy[12] = 0x21;
+        proxy[13] = 0x11;
+        proxy[14..16].copy_from_slice(&12_u16.to_be_bytes());
+        proxy[16..20].copy_from_slice(&[198, 51, 100, 77]);
+        proxy[20..24].copy_from_slice(&[203, 0, 113, 8]);
+        proxy[24..26].copy_from_slice(&40_000_u16.to_be_bytes());
+        proxy[26..28].copy_from_slice(&80_u16.to_be_bytes());
+        client.write_all(&proxy).await.unwrap();
+        client
+            .write_all(
+                b"GET /uds HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let response = read_http_message(&mut client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200 "));
+        assert!(response.ends_with(b"\r\n\r\naccepted"));
+        let request = origin_task.await.unwrap();
+        assert!(request.starts_with(b"GET /uds HTTP/1.1\r\n"));
+        assert!(String::from_utf8_lossy(&request)
+            .to_ascii_lowercase()
+            .contains("\r\nx-test-loop:"));
+
+        product.shutdown().await;
+        assert!(socket_path.exists());
+        fs::remove_file(&socket_path).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_proxy_v2_transparent_https_performs_mitm_in_the_existing_product_pipeline() {
+        let _test = super::super::LISTENER_TEST_LOCK.lock().await;
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let socket_path = directory.path().join("transparent-https.sock");
+        let config_path = directory.path().join("acl-proxy.toml");
+        let origin = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let origin_identity = TestTlsIdentity::new("origin.example.test");
+        let origin_acceptor =
+            TlsAcceptor::from(Arc::new(origin_identity.server_config(&[b"http/1.1"])));
+        let text = format!(
+            r#"schema_version = 3
+
+[service]
+request_timeout = "5s"
+shutdown_drain_timeout = "1s"
+
+[listeners.transparent_https]
+endpoint.kind = "unix_proxy_v2"
+endpoint.path = {:?}
+endpoint.mode = "0600"
+endpoint.proxy_header_timeout = "2s"
+endpoint.allowed_destination_ports = [443]
+http_versions = ["http1"]
+handshake_timeout = "1s"
+
+[mitm]
+mode = "generated"
+directory = "mitm"
+
+[egress]
+route = "direct"
+
+[egress.origin_tls]
+trust = "insecure"
+http_versions = ["http1"]
+
+[policy]
+default = "deny"
+
+[[policy.rules]]
+id = "unix-transparent-tls"
+decision = "allow"
+methods = ["GET"]
+urls = ["https://origin.example.test/**"]
+"#,
+            socket_path
+        );
+        fs::write(&config_path, text).unwrap();
+        let loaded = load_and_compile_exact_config(&config_path).unwrap();
+        let ca_root = PrivateStorageRoot::open_or_create(&directory.path().join("mitm")).unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let generated =
+            GeneratedCertificateAuthority::open_or_generate(ca_root, i64::try_from(now).unwrap())
+                .unwrap();
+        let ca_chain = generated.public_ca_chain_der();
+        drop(generated);
+        let origin_url =
+            http_access_url::canonicalize_http_url("https://origin.example.test/").unwrap();
+        let network = Arc::new(
+            http_access_runtime::ForwardingDevHarness::new(
+                http_access_runtime::ForwardingNetworkFacts::new(Vec::new(), None, None, None)
+                    .unwrap(),
+            )
+            .map_prebound(&origin_url, origin_address)
+            .unwrap()
+            .into_standalone_guard(),
+        );
+        let product = ProductRuntime::prepare_from_prebound_with_forwarding_network(
+            loaded,
+            Vec::new(),
+            network,
+        )
+        .await
+        .unwrap();
+        product.activate_initial().await.unwrap();
+        product.start_listeners().await.unwrap();
+
+        let origin_task = tokio::spawn(async move {
+            let (stream, _) = origin.accept().await.unwrap();
+            let mut stream = origin_acceptor.accept(stream).await.unwrap();
+            let request = read_http_message(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nmitm accepted",
+                )
+                .await
+                .unwrap();
+            request
+        });
+
+        let mut unix = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        let mut proxy = [0_u8; 28];
+        proxy[..12].copy_from_slice(b"\r\n\r\n\0\r\nQUIT\n");
+        proxy[12] = 0x21;
+        proxy[13] = 0x11;
+        proxy[14..16].copy_from_slice(&12_u16.to_be_bytes());
+        proxy[16..20].copy_from_slice(&[198, 51, 100, 77]);
+        proxy[20..24].copy_from_slice(&[203, 0, 113, 8]);
+        proxy[24..26].copy_from_slice(&40_000_u16.to_be_bytes());
+        proxy[26..28].copy_from_slice(&443_u16.to_be_bytes());
+        unix.write_all(&proxy).await.unwrap();
+
+        let connector =
+            TlsConnector::from(Arc::new(client_config_for_roots(ca_chain, &[b"http/1.1"])));
+        let mut client = connector
+            .connect(ServerName::try_from("origin.example.test").unwrap(), unix)
+            .await
+            .unwrap();
+        client
+            .write_all(
+                b"GET /uds-tls HTTP/1.1\r\nHost: origin.example.test\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let response = read_http_message(&mut client).await;
+        assert!(response.starts_with(b"HTTP/1.1 200 "));
+        assert!(response.ends_with(b"\r\n\r\nmitm accepted"));
+        let request = origin_task.await.unwrap();
+        assert!(request.starts_with(b"GET /uds-tls HTTP/1.1\r\n"));
+
+        product.shutdown().await;
+        assert!(socket_path.exists());
+        fs::remove_file(&socket_path).unwrap();
     }
 
     #[tokio::test]
@@ -1472,7 +1744,8 @@ rules = [{{ literal_environment_variables = ["{missing_variable}"] }}]
         let addresses = reservations.addresses();
         let extra = format!(
             r#"[listeners.transparent_http]
-bind = "{}"
+endpoint.kind = "tcp"
+endpoint.address = "{}"
 http_versions = ["http1"]
 "#,
             addresses[1]
@@ -1505,7 +1778,8 @@ http_versions = ["http1"]
         let addresses = reservations.addresses();
         let extra = format!(
             r#"[listeners.explicit_https]
-bind = "{}"
+endpoint.kind = "tcp"
+endpoint.address = "{}"
 http_versions = ["http1"]
 
 [listeners.explicit_https.connect]

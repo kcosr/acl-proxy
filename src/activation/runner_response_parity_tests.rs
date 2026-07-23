@@ -26,7 +26,8 @@ request_timeout = "5s"
 shutdown_drain_timeout = "1s"
 
 [listeners.explicit_http]
-bind = "{bind}"
+endpoint.kind = "tcp"
+endpoint.address = "{bind}"
 http_versions = ["http1"]
 
 [listeners.explicit_http.connect]

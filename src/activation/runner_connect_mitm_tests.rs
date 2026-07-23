@@ -87,7 +87,8 @@ request_timeout = "5s"
 shutdown_drain_timeout = "1s"
 
 [listeners.{listener_kind}]
-bind = "{proxy}"
+endpoint.kind = "tcp"
+endpoint.address = "{proxy}"
 http_versions = ["http1"]
 {listener_extra}
 
@@ -282,7 +283,8 @@ async fn connect_deny_policy_returns_forbidden_without_mitm_activation() {
 shutdown_drain_timeout = "1s"
 
 [listeners.explicit_http]
-bind = "{proxy}"
+endpoint.kind = "tcp"
+endpoint.address = "{proxy}"
 http_versions = ["http1"]
 
 [listeners.explicit_http.connect]

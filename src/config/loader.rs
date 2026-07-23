@@ -123,6 +123,11 @@ pub(super) enum ConfigLoadError {
         path: PathBuf,
         diagnostic: SanitizedTomlDiagnostic,
     },
+
+    #[error(
+        "configuration file {path} uses the removed data-listener field `bind`; use `endpoint = {{ kind = \"tcp\", address = \"127.0.0.1:8881\" }}` instead"
+    )]
+    LegacyListenerBind { path: PathBuf },
 }
 
 pub(super) fn load_config(explicit_path: Option<&Path>) -> Result<LoadedConfig, ConfigLoadError> {
@@ -212,9 +217,39 @@ pub(super) fn parse_config_text(
             max_bytes: MAX_CONFIG_BYTES,
         });
     }
-    toml::from_str(text).map_err(|source| ConfigLoadError::ParseToml {
-        path: path.to_path_buf(),
-        diagnostic: sanitize_toml_error(text, &source),
+    toml::from_str(text).map_err(|source| {
+        if contains_legacy_listener_bind(text) {
+            ConfigLoadError::LegacyListenerBind {
+                path: path.to_path_buf(),
+            }
+        } else {
+            ConfigLoadError::ParseToml {
+                path: path.to_path_buf(),
+                diagnostic: sanitize_toml_error(text, &source),
+            }
+        }
+    })
+}
+
+fn contains_legacy_listener_bind(text: &str) -> bool {
+    let Ok(config) = toml::from_str::<toml::Value>(text) else {
+        return false;
+    };
+    let Some(listeners) = config.get("listeners").and_then(toml::Value::as_table) else {
+        return false;
+    };
+    [
+        "explicit_http",
+        "transparent_http",
+        "explicit_https",
+        "transparent_https",
+    ]
+    .into_iter()
+    .any(|name| {
+        listeners
+            .get(name)
+            .and_then(toml::Value::as_table)
+            .is_some_and(|listener| listener.contains_key("bind"))
     })
 }
 
@@ -317,7 +352,8 @@ mod tests {
 schema_version = 3
 
 [listeners.explicit_http]
-bind = "127.0.0.1:8881"
+endpoint.kind = "tcp"
+endpoint.address = "127.0.0.1:8881"
 http_versions = ["http1"]
 
 [listeners.explicit_http.connect]
@@ -480,6 +516,23 @@ literal_environment_variables = ["MISSING_CONFIG_LOADER_REDACTION_SECRET"]
         let unknown = load_path(&config_path).unwrap_err();
         assert!(matches!(unknown, ConfigLoadError::ParseToml { .. }));
         assert!(unknown.to_string().contains("unknown field"));
+
+        fs::write(
+            &config_path,
+            MINIMAL_CONFIG.replace(
+                "endpoint.kind = \"tcp\"\nendpoint.address = \"127.0.0.1:8881\"",
+                "bind = \"127.0.0.1:8881\"",
+            ),
+        )
+        .unwrap();
+        let legacy_bind = load_path(&config_path).unwrap_err();
+        assert!(matches!(
+            legacy_bind,
+            ConfigLoadError::LegacyListenerBind { .. }
+        ));
+        assert!(legacy_bind
+            .to_string()
+            .contains("endpoint = { kind = \"tcp\""));
     }
 
     #[test]

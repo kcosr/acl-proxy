@@ -1,11 +1,19 @@
 [package]
 name = "acl-proxy"
-version = "0.3.0-rc.1"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 publish = false
 authors = ["tsagent <tsagent@example.com>"]
 description = "Rust rewrite of acl-proxy with HTTP/2, streaming, and TOML configuration."
+
+[workspace]
+members = [".", "crates/transparent-uds-relay"]
+default-members = [".", "crates/transparent-uds-relay"]
+resolver = "2"
+
+[workspace.package]
+version = "0.3.0-rc.1"
 
 [[bin]]
 name = "acl-proxy-extract-capture-body"
@@ -59,9 +67,10 @@ credential-core = { path = "../access-runtime/crates/credential-core", version =
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 rustix = { version = "=1.1.4", default-features = false, features = ["std", "fs", "process"] }
-
-[target.'cfg(target_os = "linux")'.dependencies]
 socket2 = { version = "0.6", features = ["all"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+acl-proxy-transparent-uds-relay = { path = "crates/transparent-uds-relay", features = ["test-seam"] }
 
 [dev-dependencies]
 assert_cmd = "2.0"

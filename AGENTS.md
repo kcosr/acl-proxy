@@ -113,6 +113,8 @@ script. Then add a fresh `## [Unreleased]` section with the standard
 Release archives are packaged separately after the GitHub release exists. Use
 the README release section as the source of truth for archive names and
 contents. The intended platform set includes `linux-x86_64` and `macos-arm64`,
-with both binaries in the archive. The current local core program has validated
+with the proxy and capture helper in both archives and the transparent UDS relay
+additionally present only in Linux archives. The current local core program has
+validated
 Linux x86_64 and Linux arm64 compilation only; macOS arm64 and Windows MSVC
 x86_64 remain incomplete until suitable hosts are available.

@@ -21,7 +21,8 @@ min_wire_body_concurrency = 64
 max_content_decoding_expansion_ratio = 128
 
 [listeners.explicit_http]
-bind = "127.0.0.1:8881"
+endpoint.kind = "tcp"
+endpoint.address = "127.0.0.1:8881"
 http_versions = ["http1"]
 
 [listeners.explicit_http.connect]
@@ -63,16 +64,11 @@ mod tests {
             toml::from_str(DEFAULT_CONFIG).expect("default template must parse");
         let compiled = super::super::compiler::compile_config(authored, Path::new("/tmp/config"))
             .expect("default template must compile without activation");
-        assert_eq!(
-            compiled
-                .static_config
-                .listeners
-                .explicit_http
-                .unwrap()
-                .bind
-                .port(),
-            8881
-        );
+        assert!(matches!(
+            compiled.static_config.listeners.explicit_http.unwrap().endpoint,
+            super::super::compiler::StaticListenerEndpoint::Tcp { address }
+                if address.port() == 8881
+        ));
         assert!(compiled.static_config.control.is_none());
         assert_eq!(
             compiled.static_config.service.max_active_webhook_deliveries,

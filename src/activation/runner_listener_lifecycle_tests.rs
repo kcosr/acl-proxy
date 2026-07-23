@@ -91,7 +91,8 @@ request_timeout = "200ms"
 shutdown_drain_timeout = "1s"
 
 [listeners.explicit_http]
-bind = "{bind}"
+endpoint.kind = "tcp"
+endpoint.address = "{bind}"
 http_versions = ["http1"]
 
 [listeners.explicit_http.connect]
@@ -114,7 +115,8 @@ request_timeout = "200ms"
 shutdown_drain_timeout = "1s"
 
 [listeners.explicit_https]
-bind = "{bind}"
+endpoint.kind = "tcp"
+endpoint.address = "{bind}"
 http_versions = ["http1"]
 handshake_timeout = "1s"
 
@@ -144,7 +146,8 @@ request_timeout = "200ms"
 shutdown_drain_timeout = "1s"
 
 [listeners.transparent_https]
-bind = "{bind}"
+endpoint.kind = "tcp"
+endpoint.address = "{bind}"
 http_versions = ["http1"]
 handshake_timeout = "1s"
 
@@ -387,7 +390,8 @@ max_request_bytes = 4097
 max_response_bytes = 97
 
 [listeners.explicit_http]
-bind = "{proxy}"
+endpoint.kind = "tcp"
+endpoint.address = "{proxy}"
 http_versions = ["http1"]
 
 [listeners.explicit_http.connect]
@@ -1093,7 +1097,8 @@ request_timeout = "5s"
 shutdown_drain_timeout = "1s"
 
 [listeners.{listener_table}]
-bind = "{proxy}"
+endpoint.kind = "tcp"
+endpoint.address = "{proxy}"
 http_versions = ["http1"]
 
 [egress]

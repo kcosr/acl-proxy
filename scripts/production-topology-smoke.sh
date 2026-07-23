@@ -290,7 +290,8 @@ validate_fixture() {
 }
 
 for fixture in \
-    "$FIXTURE_DIR/host-proxy.toml" \
+    "$FIXTURE_DIR/host-proxy-tcp.toml" \
+    "$FIXTURE_DIR/host-proxy-uds.toml" \
     "$FIXTURE_DIR/common-container-proxy.toml" \
     "$FIXTURE_DIR/internal-container-proxy.toml"; do
     validate_fixture "$fixture"
@@ -399,7 +400,7 @@ done
 mkdir -p "$TMP_DIR/host/providers" "$TMP_DIR/host/tls" \
     "$TMP_DIR/common/providers" "$TMP_DIR/common/tls" \
     "$TMP_DIR/internal/providers" "$TMP_DIR/internal/tls" "$TMP_DIR/origin"
-cp "$FIXTURE_DIR/host-proxy.toml" "$TMP_DIR/host/acl-proxy.toml"
+cp "$FIXTURE_DIR/host-proxy-tcp.toml" "$TMP_DIR/host/acl-proxy.toml"
 cp "$FIXTURE_DIR/common-container-proxy.toml" "$TMP_DIR/common/acl-proxy.toml"
 cp "$FIXTURE_DIR/internal-container-proxy.toml" "$TMP_DIR/internal/acl-proxy.toml"
 cp "$FIXTURE_DIR/providers/"* "$TMP_DIR/host/providers/"
@@ -468,7 +469,7 @@ text = text.replace(
 )
 listener = '''
 [listeners.explicit_https]
-bind = "0.0.0.0:8443"
+endpoint = { kind = "tcp", address = "0.0.0.0:8443" }
 http_versions = ["http1"]
 handshake_timeout = "2s"
 

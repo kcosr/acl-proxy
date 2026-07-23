@@ -347,9 +347,23 @@ pub(super) enum HttpVersion {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub(super) enum ListenerEndpointConfig {
+    Tcp {
+        address: SocketAddr,
+    },
+    UnixProxyV2 {
+        path: PathBuf,
+        mode: String,
+        proxy_header_timeout: PositiveDuration,
+        allowed_destination_ports: Vec<u16>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ExplicitHttpListenerConfig {
-    pub bind: SocketAddr,
+    pub endpoint: ListenerEndpointConfig,
     pub http_versions: Vec<HttpVersion>,
 
     #[serde(default = "default_listener_timeout")]
@@ -367,7 +381,7 @@ pub(super) struct ExplicitHttpListenerConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct TransparentHttpListenerConfig {
-    pub bind: SocketAddr,
+    pub endpoint: ListenerEndpointConfig,
     pub http_versions: Vec<HttpVersion>,
 
     #[serde(default = "default_listener_timeout")]
@@ -383,7 +397,7 @@ pub(super) struct TransparentHttpListenerConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ExplicitHttpsListenerConfig {
-    pub bind: SocketAddr,
+    pub endpoint: ListenerEndpointConfig,
     pub http_versions: Vec<HttpVersion>,
 
     #[serde(default = "default_listener_timeout")]
@@ -405,7 +419,7 @@ pub(super) struct ExplicitHttpsListenerConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct TransparentHttpsListenerConfig {
-    pub bind: SocketAddr,
+    pub endpoint: ListenerEndpointConfig,
     pub http_versions: Vec<HttpVersion>,
 
     #[serde(default = "default_listener_timeout")]
@@ -1329,7 +1343,8 @@ request_timeout = "30s"
 shutdown_drain_timeout = "30s"
 
 [listeners.explicit_http]
-bind = "127.0.0.1:8881"
+endpoint.kind = "tcp"
+endpoint.address = "127.0.0.1:8881"
 http_versions = ["http1"]
 
 [listeners.explicit_http.connect]
@@ -1418,7 +1433,11 @@ header = "x-acl-proxy-request-id"
         assert!(config.credentials.sources.is_empty());
 
         let listener = config.listeners.explicit_http.unwrap();
-        assert_eq!(listener.bind, "127.0.0.1:8881".parse().unwrap());
+        assert!(matches!(
+            listener.endpoint,
+            ListenerEndpointConfig::Tcp { address }
+                if address == "127.0.0.1:8881".parse().unwrap()
+        ));
         assert_eq!(listener.http_versions, vec![HttpVersion::Http1]);
         assert_eq!(listener.connect.http1, Some(Http1ConnectPolicy::Deny));
         assert_eq!(listener.connect.http2, None);

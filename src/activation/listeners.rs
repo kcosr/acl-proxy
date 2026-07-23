@@ -1,20 +1,31 @@
 use std::collections::HashSet;
+#[cfg(unix)]
+use std::fs::{File, OpenOptions};
 use std::io;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
+#[cfg(unix)]
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use http_access_runtime::{
-    Http1ConnectPolicy, ListenerConfig, ListenerLimits, ListenerMode, LocalAddressProvider,
-    OriginalDestinationProvider, PreboundListener, PreboundListenerBundle,
-    RuntimeError as SharedRuntimeError,
+    AllowedDestinationPorts, Http1ConnectPolicy, ListenerConfig, ListenerLimits, ListenerMode,
+    LocalAddressProvider, OriginalDestinationProvider, PreboundListener, PreboundListenerBundle,
+    PreboundListenerEndpoint, RuntimeError as SharedRuntimeError,
 };
 use http_access_types::{HttpProtocol, HttpProtocolSet};
 
 use crate::config::compiler::{
-    CompiledHttp1ConnectPolicy, CompiledHttpVersion, StaticCleartextListener,
-    StaticExplicitHttpsListener, StaticListenersConfig, StaticTransparentHttpsListener,
+    unix_listener_lock_path, CompiledHttp1ConnectPolicy, CompiledHttpVersion,
+    StaticCleartextListener, StaticExplicitHttpsListener, StaticListenerEndpoint,
+    StaticListenersConfig, StaticTransparentHttpsListener,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,19 +93,38 @@ impl ProxyListenerConfig {
         }
     }
 
-    fn bind(&self) -> SocketAddr {
+    fn endpoint(&self) -> &StaticListenerEndpoint {
         match self {
-            Self::ExplicitHttp(config) | Self::TransparentHttp(config) => config.bind,
-            Self::ExplicitHttps(config) => config.bind,
-            Self::TransparentHttps(config) => config.bind,
+            Self::ExplicitHttp(config) | Self::TransparentHttp(config) => &config.endpoint,
+            Self::ExplicitHttps(config) => &config.endpoint,
+            Self::TransparentHttps(config) => &config.endpoint,
         }
     }
 }
 
 pub(crate) struct PreparedProxyListener {
     pub(crate) config: ProxyListenerConfig,
-    pub(crate) listener: TcpListener,
+    endpoint: PreparedListenerEndpoint,
 }
+
+enum PreparedListenerEndpoint {
+    Tcp(TcpListener),
+    #[cfg(unix)]
+    UnixProxyV2 {
+        listener: UnixListener,
+        lifetime: Arc<UnixSocketLifetime>,
+        proxy_header_timeout: Duration,
+        allowed_destination_ports: Vec<u16>,
+    },
+}
+
+#[cfg(unix)]
+pub(super) struct UnixSocketLifetime {
+    _lock: File,
+}
+
+#[cfg(not(unix))]
+pub(super) struct UnixSocketLifetime;
 
 #[derive(Default)]
 pub(super) struct PreparedProxyListeners {
@@ -165,23 +195,38 @@ impl PreparedProxyListeners {
     pub(super) fn into_shared_bundle_with_transparent_support(
         self,
         transparent_supported: bool,
-    ) -> Result<PreboundListenerBundle, SharedRuntimeError> {
+    ) -> Result<(PreboundListenerBundle, Vec<Arc<UnixSocketLifetime>>), SharedRuntimeError> {
         if !transparent_supported
-            && (self.transparent_http.is_some() || self.transparent_https.is_some())
+            && [
+                self.transparent_http.as_ref(),
+                self.transparent_https.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|listener| {
+                matches!(
+                    listener.config.endpoint(),
+                    StaticListenerEndpoint::Tcp { .. }
+                )
+            })
         {
             return Err(SharedRuntimeError::InvalidInput);
         }
-        let listeners = self
+        let prepared = self
             .into_entries()
             .into_iter()
-            .map(PreparedProxyListener::into_shared)
+            .map(PreparedProxyListener::into_shared_with_lifetime)
             .collect::<Result<Vec<_>, _>>()?;
-        PreboundListenerBundle::new(listeners)
+        let (listeners, lifetimes): (Vec<_>, Vec<_>) = prepared.into_iter().unzip();
+        let lifetimes = lifetimes.into_iter().flatten().collect();
+        Ok((PreboundListenerBundle::new(listeners)?, lifetimes))
     }
 }
 
 impl PreparedProxyListener {
-    fn into_shared(self) -> Result<PreboundListener, SharedRuntimeError> {
+    fn into_shared_with_lifetime(
+        self,
+    ) -> Result<(PreboundListener, Option<Arc<UnixSocketLifetime>>), SharedRuntimeError> {
         let config = match self.config {
             ProxyListenerConfig::ExplicitHttp(config) => ListenerConfig::explicit_http(
                 protocol_set(&config.http_versions)?,
@@ -220,7 +265,34 @@ impl PreparedProxyListener {
                 )?,
             )?,
         };
-        PreboundListener::new(config, self.listener)
+        let (endpoint, lifetime) = match self.endpoint {
+            PreparedListenerEndpoint::Tcp(listener) => {
+                (PreboundListenerEndpoint::Tcp(listener), None)
+            }
+            #[cfg(unix)]
+            PreparedListenerEndpoint::UnixProxyV2 {
+                listener,
+                lifetime,
+                proxy_header_timeout,
+                allowed_destination_ports,
+            } => (
+                PreboundListenerEndpoint::UnixProxyV2 {
+                    listener,
+                    proxy_header_timeout,
+                    allowed_destination_ports: AllowedDestinationPorts::new(
+                        allowed_destination_ports,
+                    )?,
+                },
+                Some(lifetime),
+            ),
+        };
+        Ok((PreboundListener::new(config, endpoint)?, lifetime))
+    }
+
+    #[cfg(test)]
+    fn into_shared(self) -> Result<PreboundListener, SharedRuntimeError> {
+        self.into_shared_with_lifetime()
+            .map(|(listener, _)| listener)
     }
 }
 
@@ -480,24 +552,331 @@ fn bind_configured(
 ) -> Result<Option<PreparedProxyListener>, ProxyListenerBindError> {
     config
         .map(|config| {
-            let address = config.bind();
             let name = config.kind().as_str();
-            bind(address)
-                .map(|listener| PreparedProxyListener { config, listener })
+            let endpoint = match config.endpoint() {
+                StaticListenerEndpoint::Tcp { address } => bind(*address)
+                    .map(PreparedListenerEndpoint::Tcp)
+                    .map_err(|source| ProxyListenerBindError {
+                        name,
+                        endpoint: address.to_string(),
+                        address: Some(*address),
+                        source,
+                    })?,
+                StaticListenerEndpoint::UnixProxyV2 {
+                    path,
+                    mode,
+                    proxy_header_timeout,
+                    allowed_destination_ports,
+                } => bind_unix_proxy_v2(
+                    path,
+                    *mode,
+                    *proxy_header_timeout,
+                    allowed_destination_ports.clone(),
+                )
                 .map_err(|source| ProxyListenerBindError {
                     name,
-                    address,
+                    endpoint: path.display().to_string(),
+                    address: None,
                     source,
-                })
+                })?,
+            };
+            Ok(PreparedProxyListener { config, endpoint })
         })
         .transpose()
 }
 
+#[cfg(unix)]
+fn bind_unix_proxy_v2(
+    path: &Path,
+    mode: u32,
+    proxy_header_timeout: Duration,
+    allowed_destination_ports: Vec<u16>,
+) -> io::Result<PreparedListenerEndpoint> {
+    use fs2::FileExt;
+
+    let effective_uid = rustix::process::geteuid().as_raw();
+    validate_private_unix_parent(path, effective_uid)?;
+
+    let lock_path = unix_listener_lock_path(path);
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock_path)?;
+    let lock_metadata = lock.metadata()?;
+    if !lock_metadata.file_type().is_file() || lock_metadata.uid() != effective_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Unix proxy listener lock must be a regular file owned by the current user",
+        ));
+    }
+    lock.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    lock.try_lock_exclusive().map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("Unix proxy listener lock is held: {error}"),
+        )
+    })?;
+
+    reject_preexisting_unix_socket(path, effective_uid, probe_existing_unix_socket)?;
+
+    let (listener, private_path) = bind_private_unix_socket(path)?;
+    if let Err(error) =
+        std::fs::set_permissions(&private_path, std::fs::Permissions::from_mode(mode))
+    {
+        let _ = std::fs::remove_file(&private_path);
+        return Err(error);
+    }
+    let private_metadata = std::fs::symlink_metadata(&private_path)?;
+    if let Err(error) = verify_staged_unix_socket(&private_metadata, effective_uid, mode) {
+        let _ = std::fs::remove_file(&private_path);
+        return Err(error);
+    }
+    if let Err(error) = publish_unix_socket_noreplace(&private_path, path) {
+        let _ = std::fs::remove_file(&private_path);
+        return Err(error);
+    }
+
+    let lifetime = Arc::new(UnixSocketLifetime { _lock: lock });
+    Ok(PreparedListenerEndpoint::UnixProxyV2 {
+        listener,
+        lifetime,
+        proxy_header_timeout,
+        allowed_destination_ports,
+    })
+}
+
+#[cfg(unix)]
+fn verify_staged_unix_socket(
+    metadata: &std::fs::Metadata,
+    effective_uid: u32,
+    mode: u32,
+) -> io::Result<()> {
+    if metadata.file_type().is_socket()
+        && metadata.uid() == effective_uid
+        && metadata.permissions().mode() & 0o777 == mode
+    {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "Unix proxy listener staging socket mode or ownership verification failed",
+    ))
+}
+
+#[cfg(unix)]
+fn validate_private_unix_parent(path: &Path, effective_uid: u32) -> io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Unix proxy listener path has no parent directory",
+        )
+    })?;
+    let metadata = std::fs::symlink_metadata(parent)?;
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != effective_uid
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Unix proxy listener parent must be a directory owned by the current user with no group or other permissions",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn bind_private_unix_socket(final_path: &Path) -> io::Result<(UnixListener, PathBuf)> {
+    use rand::RngCore;
+
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const MAX_ATTEMPTS: usize = 128;
+
+    let parent = final_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Unix proxy listener path has no parent directory",
+        )
+    })?;
+    let name_length = final_path
+        .file_name()
+        .map(OsStrExt::as_bytes)
+        .map(<[u8]>::len)
+        .filter(|length| *length > 0)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Unix proxy listener path has no file name",
+            )
+        })?;
+
+    let mut random = vec![0_u8; name_length];
+    for _ in 0..MAX_ATTEMPTS {
+        rand::rngs::OsRng.fill_bytes(&mut random);
+        let mut name = random
+            .iter()
+            .map(|value| ALPHABET[usize::from(*value) % ALPHABET.len()])
+            .collect::<Vec<_>>();
+        if name.len() > 1 {
+            name[0] = b'.';
+        }
+        let private_path = parent.join(std::ffi::OsString::from_vec(name));
+        if private_path == final_path {
+            continue;
+        }
+        match UnixListener::bind(&private_path) {
+            Ok(listener) => return Ok((listener, private_path)),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::AddrInUse | io::ErrorKind::AlreadyExists
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        "could not reserve a private Unix proxy listener staging path",
+    ))
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "tvos",
+    target_os = "watchos",
+    target_os = "visionos",
+    target_os = "redox"
+))]
+fn publish_unix_socket_noreplace(private_path: &Path, final_path: &Path) -> io::Result<()> {
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        private_path,
+        rustix::fs::CWD,
+        final_path,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| {
+        let error = io::Error::from_raw_os_error(error.raw_os_error());
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "Unix proxy listener path became occupied before publication",
+            )
+        } else {
+            error
+        }
+    })
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "redox"
+    ))
+))]
+fn publish_unix_socket_noreplace(_private_path: &Path, _final_path: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "this Unix platform has no supported atomic no-replace socket publication primitive",
+    ))
+}
+
+#[cfg(unix)]
+fn reject_preexisting_unix_socket(
+    path: &Path,
+    effective_uid: u32,
+    probe: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    validate_owned_socket(&metadata, effective_uid)?;
+
+    match probe(path) {
+        Ok(()) => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "Unix proxy listener socket is live",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "Unix proxy listener socket is stale; remove it explicitly before startup",
+        )),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) || matches!(
+                error.raw_os_error(),
+                Some(libc::EINPROGRESS) | Some(libc::EAGAIN)
+            ) =>
+        {
+            Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "Unix proxy listener socket is live or its accept backlog is unavailable",
+            ))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(unix)]
+fn probe_existing_unix_socket(path: &Path) -> io::Result<()> {
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+    let address = socket2::SockAddr::unix(path)?;
+    socket.connect_timeout(&address, Duration::from_millis(100))
+}
+
+#[cfg(unix)]
+fn validate_owned_socket(metadata: &std::fs::Metadata, effective_uid: u32) -> io::Result<()> {
+    if !metadata.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "Unix proxy listener path exists and is not a socket",
+        ));
+    }
+    if metadata.uid() != effective_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Unix proxy listener socket is not owned by the current user",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn bind_unix_proxy_v2(
+    _path: &std::path::Path,
+    _mode: u32,
+    _proxy_header_timeout: Duration,
+    _allowed_destination_ports: Vec<u16>,
+) -> io::Result<PreparedListenerEndpoint> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Unix proxy listeners are not supported on this platform",
+    ))
+}
+
 #[derive(Debug, thiserror::Error)]
-#[error("failed to bind {name} proxy listener {address}: {source}")]
+#[error("failed to bind {name} proxy listener {endpoint}: {source}")]
 pub(crate) struct ProxyListenerBindError {
     pub(crate) name: &'static str,
-    pub(crate) address: SocketAddr,
+    pub(crate) endpoint: String,
+    pub(crate) address: Option<SocketAddr>,
     #[source]
     pub(crate) source: io::Error,
 }
@@ -526,16 +905,17 @@ mod tests {
     }
 
     fn transparent_http_listener(listener: TcpListener) -> PreparedProxyListener {
+        let address = listener.local_addr().unwrap();
         PreparedProxyListener {
             config: ProxyListenerConfig::TransparentHttp(Box::new(StaticCleartextListener {
-                bind: listener.local_addr().unwrap(),
+                endpoint: StaticListenerEndpoint::Tcp { address },
                 http_versions: vec![CompiledHttpVersion::Http1],
                 request_header_timeout: Duration::from_secs(1),
                 max_connections: 1,
                 max_concurrent_streams: 1,
                 connect: None,
             })),
-            listener,
+            endpoint: PreparedListenerEndpoint::Tcp(listener),
         }
     }
 
@@ -663,7 +1043,9 @@ mod tests {
         };
         let config = StaticListenersConfig {
             explicit_http: Some(StaticCleartextListener {
-                bind: addresses[0],
+                endpoint: StaticListenerEndpoint::Tcp {
+                    address: addresses[0],
+                },
                 http_versions: vec![CompiledHttpVersion::Http1, CompiledHttpVersion::Http2],
                 request_header_timeout: Duration::from_secs(5),
                 max_connections: 17,
@@ -671,7 +1053,9 @@ mod tests {
                 connect: Some(cleartext_connect.clone()),
             }),
             transparent_http: Some(StaticCleartextListener {
-                bind: addresses[1],
+                endpoint: StaticListenerEndpoint::Tcp {
+                    address: addresses[1],
+                },
                 http_versions: vec![CompiledHttpVersion::Http1],
                 request_header_timeout: Duration::from_secs(7),
                 max_connections: 23,
@@ -679,7 +1063,9 @@ mod tests {
                 connect: None,
             }),
             explicit_https: Some(StaticExplicitHttpsListener {
-                bind: addresses[2],
+                endpoint: StaticListenerEndpoint::Tcp {
+                    address: addresses[2],
+                },
                 http_versions: vec![CompiledHttpVersion::Http2],
                 handshake_timeout: Duration::from_secs(3),
                 request_header_timeout: Duration::from_secs(5),
@@ -692,7 +1078,9 @@ mod tests {
                 },
             }),
             transparent_https: Some(StaticTransparentHttpsListener {
-                bind: addresses[3],
+                endpoint: StaticListenerEndpoint::Tcp {
+                    address: addresses[3],
+                },
                 http_versions: vec![CompiledHttpVersion::Http1],
                 handshake_timeout: Duration::from_secs(7),
                 request_header_timeout: Duration::from_secs(11),
@@ -718,7 +1106,10 @@ mod tests {
                     ProxyListenerKind::TransparentHttps,
                 ][index]
             );
-            assert_eq!(entry.listener.local_addr().unwrap(), addresses[index]);
+            let PreparedListenerEndpoint::Tcp(listener) = &entry.endpoint else {
+                panic!("test config uses only TCP endpoints");
+            };
+            assert_eq!(listener.local_addr().unwrap(), addresses[index]);
         }
         assert!(matches!(
             &entries[0].config,
@@ -957,5 +1348,306 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_empty());
+    }
+
+    #[cfg(unix)]
+    fn unix_transparent_config(path: &Path, mode: u32) -> StaticListenersConfig {
+        StaticListenersConfig {
+            explicit_http: None,
+            transparent_http: Some(StaticCleartextListener {
+                endpoint: StaticListenerEndpoint::UnixProxyV2 {
+                    path: path.to_path_buf(),
+                    mode,
+                    proxy_header_timeout: Duration::from_secs(1),
+                    allowed_destination_ports: vec![80],
+                },
+                http_versions: vec![CompiledHttpVersion::Http1],
+                request_header_timeout: Duration::from_secs(1),
+                max_connections: 4,
+                max_concurrent_streams: 4,
+                connect: None,
+            }),
+            explicit_https: None,
+            transparent_https: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn private_unix_tempdir() -> tempfile::TempDir {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        directory
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_listener_lock_mode_and_explicit_cleanup_contract() {
+        let directory = private_unix_tempdir();
+        let path = directory.path().join("transparent-http.sock");
+        let config = unix_transparent_config(&path, 0o606);
+        let first = PreparedProxyListeners::bind(&config, |_| {
+            panic!("Unix config must not invoke the TCP binder")
+        })
+        .unwrap();
+        let metadata = std::fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o606);
+        let first_inode = metadata.ino();
+
+        let error = match PreparedProxyListeners::bind(&config, |_| unreachable!()) {
+            Ok(_) => panic!("second process must not acquire a held Unix listener lock"),
+            Err(error) => error,
+        };
+        assert_eq!(error.name, "transparent_http");
+        assert_eq!(error.address, None);
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), first_inode);
+
+        drop(first);
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), first_inode);
+        let error = match PreparedProxyListeners::bind(&config, |_| unreachable!()) {
+            Ok(_) => panic!("stale Unix socket must require explicit cleanup"),
+            Err(error) => error,
+        };
+        assert_eq!(error.source.kind(), io::ErrorKind::AddrInUse);
+        assert!(error.source.to_string().contains("remove it explicitly"));
+
+        std::fs::remove_file(&path).unwrap();
+        let rebound = PreparedProxyListeners::bind(&config, |_| unreachable!()).unwrap();
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_socket());
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"external replacement").unwrap();
+        drop(rebound);
+        assert_eq!(std::fs::read(&path).unwrap(), b"external replacement");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_listener_never_unlinks_preexisting_paths() {
+        use std::os::unix::fs::symlink;
+
+        let directory = private_unix_tempdir();
+        let path = directory.path().join("traffic.sock");
+        drop(UnixListener::bind(&path).unwrap());
+        let stale_inode = std::fs::symlink_metadata(&path).unwrap().ino();
+        let error = match PreparedProxyListeners::bind(
+            &unix_transparent_config(&path, 0o600),
+            |_| unreachable!(),
+        ) {
+            Ok(_) => panic!("stale Unix socket must require explicit cleanup"),
+            Err(error) => error,
+        };
+        assert_eq!(error.source.kind(), io::ErrorKind::AddrInUse);
+        assert!(error.source.to_string().contains("remove it explicitly"));
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), stale_inode);
+
+        std::fs::remove_file(&path).unwrap();
+        let prepared = PreparedProxyListeners::bind(
+            &unix_transparent_config(&path, 0o600),
+            |_| unreachable!(),
+        )
+        .unwrap();
+        drop(prepared);
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_socket());
+        std::fs::remove_file(&path).unwrap();
+
+        std::fs::write(&path, b"collision").unwrap();
+        assert!(PreparedProxyListeners::bind(
+            &unix_transparent_config(&path, 0o600),
+            |_| unreachable!(),
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"collision");
+        std::fs::remove_file(&path).unwrap();
+
+        let target = directory.path().join("target");
+        std::fs::write(&target, b"target").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(PreparedProxyListeners::bind(
+            &unix_transparent_config(&path, 0o600),
+            |_| unreachable!(),
+        )
+        .is_err());
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_listener_requires_a_private_owned_parent_directory() {
+        let directory = private_unix_tempdir();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = directory.path().join("traffic.sock");
+
+        let error = match PreparedProxyListeners::bind(
+            &unix_transparent_config(&path, 0o600),
+            |_| unreachable!(),
+        ) {
+            Ok(_) => panic!("non-private Unix socket parent must be rejected"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.source.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_listener_filesystem_ownership_uses_the_effective_uid() {
+        let directory = private_unix_tempdir();
+        let socket_path = directory.path().join("owned.sock");
+        let socket = UnixListener::bind(&socket_path).unwrap();
+        let effective_uid = rustix::process::geteuid().as_raw();
+        let other_uid = effective_uid.wrapping_add(1);
+
+        validate_private_unix_parent(&socket_path, effective_uid).unwrap();
+        assert_eq!(
+            validate_private_unix_parent(&socket_path, other_uid)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let metadata = std::fs::symlink_metadata(&socket_path).unwrap();
+        validate_owned_socket(&metadata, effective_uid).unwrap();
+        assert_eq!(
+            validate_owned_socket(&metadata, other_uid)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        drop(socket);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn staged_unix_listener_verification_rejects_wrong_type_owner_and_mode() {
+        let directory = private_unix_tempdir();
+        let socket_path = directory.path().join("staged.sock");
+        let socket = UnixListener::bind(&socket_path).unwrap();
+        std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o620)).unwrap();
+        let socket_metadata = std::fs::symlink_metadata(&socket_path).unwrap();
+        let effective_uid = rustix::process::geteuid().as_raw();
+
+        verify_staged_unix_socket(&socket_metadata, effective_uid, 0o620).unwrap();
+        assert_eq!(
+            verify_staged_unix_socket(&socket_metadata, effective_uid, 0o600)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            verify_staged_unix_socket(&socket_metadata, effective_uid.wrapping_add(1), 0o620)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+
+        let regular_path = directory.path().join("regular");
+        std::fs::write(&regular_path, b"not a socket").unwrap();
+        let regular_metadata = std::fs::symlink_metadata(regular_path).unwrap();
+        assert_eq!(
+            verify_staged_unix_socket(&regular_metadata, effective_uid, 0o600)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        drop(socket);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_listener_refuses_a_live_same_user_socket_without_unlinking_it() {
+        let directory = private_unix_tempdir();
+        let path = directory.path().join("live.sock");
+        let live = UnixListener::bind(&path).unwrap();
+        let inode = std::fs::symlink_metadata(&path).unwrap().ino();
+
+        let error = match PreparedProxyListeners::bind(
+            &unix_transparent_config(&path, 0o600),
+            |_| unreachable!(),
+        ) {
+            Ok(_) => panic!("live Unix socket must not be replaced"),
+            Err(error) => error,
+        };
+        assert_eq!(error.source.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), inode);
+        let (connected, _) = live.accept().unwrap();
+        drop(connected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preexisting_socket_probe_classification_is_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("existing.sock");
+        drop(UnixListener::bind(&path).unwrap());
+        let inode = std::fs::symlink_metadata(&path).unwrap().ino();
+        let effective_uid = rustix::process::geteuid().as_raw();
+
+        for (probe_error, expected_fragment) in [
+            (
+                io::Error::from(io::ErrorKind::ConnectionRefused),
+                "remove it explicitly",
+            ),
+            (
+                io::Error::from(io::ErrorKind::TimedOut),
+                "backlog is unavailable",
+            ),
+            (
+                io::Error::from(io::ErrorKind::WouldBlock),
+                "backlog is unavailable",
+            ),
+        ] {
+            let error = reject_preexisting_unix_socket(&path, effective_uid, |_| Err(probe_error))
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+            assert!(error.to_string().contains(expected_fragment));
+            assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), inode);
+        }
+
+        let error = reject_preexisting_unix_socket(&path, effective_uid, |_| {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::symlink_metadata(&path).unwrap().ino(), inode);
+    }
+
+    #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "watchos",
+        target_os = "visionos",
+        target_os = "redox"
+    ))]
+    #[test]
+    fn unix_listener_publication_never_replaces_an_occupied_final_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let private_path = directory.path().join("private.sock");
+        let final_path = directory.path().join("final.sock");
+        let private = UnixListener::bind(&private_path).unwrap();
+        std::fs::write(&final_path, b"occupied").unwrap();
+
+        let error = publish_unix_socket_noreplace(&private_path, &final_path).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(std::fs::read(&final_path).unwrap(), b"occupied");
+        assert!(std::fs::symlink_metadata(&private_path)
+            .unwrap()
+            .file_type()
+            .is_socket());
+        drop(private);
     }
 }

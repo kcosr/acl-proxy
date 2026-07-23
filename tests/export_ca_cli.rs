@@ -43,7 +43,8 @@ fn write_config(directory: &TempDir, mitm: Option<&str>) -> PathBuf {
         r#"schema_version = 3
 
 [listeners.explicit_http]
-bind = "127.0.0.1:8881"
+endpoint.kind = "tcp"
+endpoint.address = "127.0.0.1:8881"
 http_versions = ["http1"]
 
 [listeners.explicit_http.connect]
@@ -256,7 +257,8 @@ fn export_is_static_except_for_generated_ca_and_caller_output() {
             r#"schema_version = 3
 
 [listeners.explicit_http]
-bind = "{bind}"
+endpoint.kind = "tcp"
+endpoint.address = "{bind}"
 http_versions = ["http1"]
 
 [listeners.explicit_http.connect]

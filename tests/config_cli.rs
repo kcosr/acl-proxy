@@ -15,7 +15,8 @@ use tempfile::{NamedTempFile, TempDir};
 const MINIMAL: &str = r#"schema_version = 3
 
 [listeners.explicit_http]
-bind = "127.0.0.1:8881"
+endpoint.kind = "tcp"
+endpoint.address = "127.0.0.1:8881"
 http_versions = ["http1"]
 
 [listeners.explicit_http.connect]
@@ -190,7 +191,8 @@ max_connections = 8
 max_request_body_bytes = 65536
 
 [listeners.explicit_http]
-bind = "{proxy}"
+endpoint.kind = "tcp"
+endpoint.address = "{proxy}"
 http_versions = ["http1"]
 request_header_timeout = "1s"
 max_connections = 8
@@ -384,6 +386,23 @@ fn config_validate_rejects_missing_policy_and_default() {
 }
 
 #[test]
+fn config_validate_explains_the_removed_data_listener_bind_shape() {
+    let file = config_file(&MINIMAL.replace(
+        "endpoint.kind = \"tcp\"\nendpoint.address = \"127.0.0.1:8881\"",
+        "bind = \"127.0.0.1:8881\"",
+    ));
+    command()
+        .args(["config", "validate", "--config"])
+        .arg(file.path())
+        .assert()
+        .failure()
+        .stderr(contains("removed data-listener field `bind`"))
+        .stderr(contains(
+            "endpoint = { kind = \"tcp\", address = \"127.0.0.1:8881\" }",
+        ));
+}
+
+#[test]
 fn config_validate_reports_sanitized_syntax_errors() {
     let file = config_file("schema_version =\nsecret-value-that-must-not-leak");
     let output = command()
@@ -420,7 +439,8 @@ certificate_chain = "missing-control-cert.pem"
 private_key = "missing-control-key.pem"
 
 [listeners.explicit_http]
-bind = "{bind}"
+endpoint.kind = "tcp"
+endpoint.address = "{bind}"
 http_versions = ["http1"]
 
 [listeners.explicit_http.connect]
@@ -616,7 +636,8 @@ max_connections = 8
 max_request_body_bytes = 65536
 
 [listeners.explicit_http]
-bind = "{proxy}"
+endpoint.kind = "tcp"
+endpoint.address = "{proxy}"
 http_versions = ["http1"]
 request_header_timeout = "1s"
 max_connections = 8

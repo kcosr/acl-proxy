@@ -15,6 +15,7 @@ ownership_gates=(
     scripts/check-c06-tls-dependencies.py
     scripts/check-shared-redaction-ownership.sh
     scripts/check-shared-credential-ownership.sh
+    scripts/check-smoke-config-schema.py
     scripts/check-production-websocket-smoke.sh
     scripts/check-transport-oracles.py
 )
@@ -27,6 +28,7 @@ mutation_suites=(
     scripts/tests/check-c06-tls-dependencies-test.sh
     scripts/tests/check-shared-redaction-ownership-test.sh
     scripts/tests/check-shared-credential-ownership-test.sh
+    scripts/tests/check-smoke-config-schema-test.sh
     scripts/tests/check-production-websocket-smoke-test.sh
     scripts/tests/check-transport-oracles-test.py
 )
